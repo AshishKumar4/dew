@@ -388,7 +388,7 @@ def counted_places(segments=None, valid=None, positions=None) -> jax.Array | Non
     if given is None:
         return count
     firsts = starts | (real & (jnp.cumsum(real, axis=1) == 1))
-    slots = jax.lax.cummax(jnp.where(firsts, jnp.arange(shape[1]), 0), axis=1)
+    slots = _last_marked(firsts)
     return jnp.take_along_axis(jnp.broadcast_to(given, shape), slots, axis=1) + count
 
 
@@ -409,9 +409,15 @@ def document_reach(segments, valid, places) -> jax.Array:
     following = jnp.flip(jax.lax.cummin(jnp.flip(following, axis=1), axis=1), axis=1)
     following = jnp.concatenate([following[:, 1:], jnp.full((shape[0], 1), shape[1])], axis=1)
     # The last real token before it, which ends the slot's document.
-    last = jax.lax.cummax(jnp.where(real, index, 0), axis=1)
-    ends = jnp.take_along_axis(last, following - 1, axis=1)
+    ends = jnp.take_along_axis(_last_marked(real), following - 1, axis=1)
     return jnp.take_along_axis(places, ends, axis=1)
+
+
+def _last_marked(marked: jax.Array) -> jax.Array:
+    """Each slot's last `marked` slot at or before it `[B, S]`, 0 before any: a document's first
+    slot where `marked` holds its starts (`counted_places`), its last real one where it holds the
+    real tokens (`document_reach`)."""
+    return jax.lax.cummax(jnp.where(marked, jnp.arange(marked.shape[1]), 0), axis=1)
 
 
 def document_starts(segments, valid, *, xp=jnp):
