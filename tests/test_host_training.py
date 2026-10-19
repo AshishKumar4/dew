@@ -19,6 +19,7 @@ from dew.checkpoints import Checkpoints
 from dew.config.data import RecordsData, loader
 from dew.data import Loading
 from dew.data.dataset import DataPartition
+from dew.data.pipeline import DeviceStep
 from dew.inference.banks import spread
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -722,3 +723,33 @@ def test_place_streams_the_held_tree_and_releases_each_source():
         ).variables,
         resident.variables,
     )
+
+
+class _Scaled(DeviceStep):
+    """A device step whose setting its repr leaves out, as a plain class's repr does."""
+
+    def __init__(self, scale: float):
+        self.scale = scale
+
+    def __call__(self, batch):
+        return {**batch, "x": batch["x"] * self.scale}
+
+
+def test_runs_of_one_objective_with_unlike_device_steps_each_train_on_their_own():
+    """A host-held run compiles its forward with the dataset's device steps inside, under the
+    objective's program cache: two runs of one objective whose steps differ only in a setting
+    their reprs leave out each train on their own steps, as a fresh objective does."""
+    from affine_run import Regression, batches as affine_batches
+
+    from dew.data.dataset import Loader
+
+    def fit(objective, scale):
+        data = Loader(lambda partition: affine_batches(), None, None, 8, device=(_Scaled(scale),))
+        return Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), layout=HOST).fit(
+            data, steps=2, log_every=1)
+
+    shared = Regression()
+    fit(shared, 1.0)
+    reused, fresh = fit(shared, 3.0), fit(Regression(), 3.0)
+    for left, right in zip(jax.tree.leaves(reused.variables), jax.tree.leaves(fresh.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
