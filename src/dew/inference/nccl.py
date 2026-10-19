@@ -143,8 +143,14 @@ class _Library:
         self.current()
         comm = ctypes.c_void_p()
         config = _nonblocking()
-        self._issued(self.nccl.ncclCommInitRankConfig(ctypes.byref(comm), world, uid, rank,
-                                                      ctypes.byref(config)))
+        status = self.nccl.ncclCommInitRankConfig(ctypes.byref(comm), world, uid, rank, ctypes.byref(config))
+        try:
+            self._issued(status)
+        except RuntimeError:
+            # NCCL may hand out the communicator before its start fails, and only an abort frees it.
+            if comm.value is not None:
+                self.abort(comm)
+            raise
         return comm
 
     def all_reduce(self, comm: ctypes.c_void_p, pointer: int, count: int, dtype: str) -> None:
