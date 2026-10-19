@@ -427,15 +427,15 @@ def _stack_leaves(*trees):
 
 
 def _refuse_unlike(collection: str, trees: Sequence, names: Sequence[str]) -> None:
-    """Refuse layers one scanned run or the stages' like positions read whose
-    `collection` differs in structure, as layers a checkpoint quantizes
-    differently do; the run reads one body for all of them."""
+    """Refuse the stages' like positions whose `collection` differs in
+    structure, as layers a checkpoint quantizes differently do: every stage
+    runs stage 0's body. A scanned run holds only layers alike
+    (`StackView.layer_structures`), so on one stage this never refuses."""
     structures = [jax.tree.structure(tree) for tree in trees]
     unlike = [name for name, structure in zip(names, structures, strict=True) if structure != structures[0]]
     if unlike:
         raise ValueError(f"collection {collection!r} differs between {names[0]} and {', '.join(unlike)}, "
-                         "which one scanned run or pipeline stage reads as like layers; run these layers "
-                         "unscanned on one stage")
+                         "which the pipeline's stages read as like layers; run these layers on one stage")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -478,6 +478,18 @@ class StackView:
         """The stored names of a run's layers, one list per stage."""
         return [[f'layers_{stage * self.per_stage + first + offset}' for offset in range(count)]
                 for stage in range(self.stages)]
+
+    @staticmethod
+    def layer_structures(variables: Mapping[str, Mapping], layers: int) -> tuple[tuple, ...]:
+        """What one scanned body has to share beyond its spec, for each of `layers`
+        stored layers: the structure of its subtree in every collection that keeps
+        one per layer (`layers_N`), as layers a checkpoint quantizes differently,
+        or adapts in part, differ. A banked collection, stored by run, adds
+        nothing, and nor does a collection no layer holds."""
+        return tuple(tuple((collection, jax.tree.structure(tree[f'layers_{index}']))
+                           for collection, tree in sorted(variables.items())
+                           if f'layers_{index}' in tree)
+                     for index in range(layers))
 
     def bank_names(self) -> list[str]:
         """Return every run's stored name, in order. A banked store uses these names as keys."""
