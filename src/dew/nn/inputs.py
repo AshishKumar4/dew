@@ -531,24 +531,23 @@ COORDINATES_FIELD = "coordinates"
 validity field, `segment_ids` and `positions`."""
 
 
-def token_layout(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], *, xp=jnp):
-    """The validity `[B, S]` and documents `[B, S]` of a row's token fields as the decoder reads them:
-    their `Coordinates`' where the fields carry them, else the validity field and `segment_ids`. Each
-    is None where nothing gives it (every slot real, one document a row). `xp` is the array module."""
-    laid = fields.get(COORDINATES_FIELD)
-    if isinstance(laid, Coordinates):
-        valid, segments = laid.valid, laid.segments
-    else:
-        valid, segments = fields.get(VALIDITY_FIELD), fields.get("segment_ids")
-    return (None if valid is None else xp.asarray(valid, bool),
-            None if segments is None else xp.asarray(segments))
-
-
 def token_validity(fields: Mapping[str, jax.Array | np.ndarray | Coordinates]):
     """The validity `[B, S]` a row's token fields hold, as given: their `Coordinates`' where the fields
     carry them, else the validity field; None where neither holds one."""
     laid = fields.get(COORDINATES_FIELD)
     return laid.valid if isinstance(laid, Coordinates) else fields.get(VALIDITY_FIELD)
+
+
+def token_layout(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], *, xp=jnp):
+    """The validity `[B, S]` and documents `[B, S]` of a row's token fields as the decoder reads them:
+    their `Coordinates`' where the fields carry them, else the validity field (`token_validity`) and
+    `segment_ids`. Each is None where nothing gives it (every slot real, one document a row). `xp` is
+    the array module."""
+    laid = fields.get(COORDINATES_FIELD)
+    valid = token_validity(fields)
+    segments = laid.segments if isinstance(laid, Coordinates) else fields.get("segment_ids")
+    return (None if valid is None else xp.asarray(valid, bool),
+            None if segments is None else xp.asarray(segments))
 
 
 def with_validity(fields: Mapping[str, jax.Array | np.ndarray | Coordinates],
