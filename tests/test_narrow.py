@@ -69,6 +69,21 @@ def test_a_scan_over_a_stack_of_layers_copies_each_layer():
     assert paths == {("first",): jnp.dtype(jnp.bfloat16), ("second",): jnp.dtype(jnp.bfloat16)}
 
 
+def test_a_stack_of_weights_one_of_which_is_read_elsewhere_copies_none():
+    """A stack takes one dtype: where one of its weights is read apart from it, in its own
+    precision, none of the stack's weights is copied, and the loss traces with copies as without."""
+    def loss(params, x):
+        stacked = jax.lax.stack([params["first"], params["second"]])
+
+        def layer(h, w):
+            return h @ w.astype(jnp.bfloat16), None
+        scanned = jax.lax.scan(layer, x, stacked)[0].astype(jnp.float32)
+        return jnp.sum(scanned) + jnp.sum(params["second"])
+
+    params = {name: jnp.ones((4, 4), jnp.float32) for name in ("first", "second")}
+    assert narrowed_paths(loss, params, jnp.ones((2, 4), jnp.bfloat16)) == {}
+
+
 def _keeping_gradients(optimizer):
     """`optimizer` after a transformation whose state is the last gradient
     the update read, so a run's state holds its gradient as committed."""
