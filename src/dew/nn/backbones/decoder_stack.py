@@ -22,7 +22,6 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.objectives.base import merge
 
-from ..hyper_connections import Carried
 from ..kv_cache import CURSOR
 from ..mla import INDEXER_COLLECTION
 from ..sharding import STAGE_AXIS, microbatched
@@ -373,10 +372,12 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     return x
 
 
-def _applied(run: DecoderBlock, opened: list[str], store, read, state, cache, hidden, per_layer_slice, *,
-             train: bool, decode: bool, attention_metadata) -> tuple[jax.Array | Carried, dict]:
+def _applied[Hidden](run: DecoderBlock, opened: list[str], store, read, state, cache, hidden: Hidden,
+                     per_layer_slice, *, train: bool, decode: bool,
+                     attention_metadata) -> tuple[Hidden, dict]:
     """One layer of `run` applied in a scope of its own: `read` its read-only variables, `state`
-    the caller's held collections and `cache` its cache slice, writing the `opened` collections."""
+    the caller's held collections and `cache` its cache slice, writing the `opened` collections.
+    The hidden state comes out as it went in, a residual stream or `Carried` streams."""
     variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
     hidden, changed = run.apply(
         variables, hidden, mutable=opened, train=train, decode=decode, kv_store=store,
