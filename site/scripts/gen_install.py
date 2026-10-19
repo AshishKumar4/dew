@@ -1,5 +1,5 @@
 """Generate the install facts other files repeat from their owners: the CUDA builds' minima
-(dew.telemetry.devices.CUDA_BUILDS) and Dew's least Python (pyproject.toml's requires-python),
+(dew.telemetry.builds.CUDA_BUILDS) and Dew's least Python (pyproject.toml's requires-python),
 into the standalone installer, docs/installation.md's table and the least Python the README and
 docs/installation.md state."""
 
@@ -18,7 +18,7 @@ LEAST = ("<!-- BEGIN least Python (site/scripts/gen_install.py) -->", "<!-- END 
 def facts() -> tuple[list[tuple[str, int, tuple[int, int]]], str]:
     """The CUDA builds and the least Python, read as literals so the installer stays independent
     of Dew's runtime imports."""
-    source = ast.parse((REPO / "src/dew/telemetry/devices.py").read_text())
+    source = ast.parse((REPO / "src/dew/telemetry/builds.py").read_text())
     builds = next(ast.literal_eval(node.value) for node in source.body
                   if isinstance(node, ast.Assign)
                   and any(isinstance(name, ast.Name) and name.id == "CUDA_BUILDS" for name in node.targets))
@@ -42,10 +42,11 @@ def main() -> None:
     args = parser.parse_args()
     builds, python = facts()
     shell = [f"python_min={python}"]
-    table = ["| Build | NVIDIA driver | GPU (SM) |", "|---|---|---|"]
-    for build, driver, (major, minor) in builds:
+    table = ["| Build | CUDA | NVIDIA driver | GPU (SM) |", "|---|---|---|---|"]
+    for build, driver, (major, minor), cuda in builds:
         shell.extend((f"{build}_driver={driver}", f"{build}_sm={major}.{minor}"))
-        table.append(f"| `{build}` | {driver} or later | {major}.{minor} or later |")
+        table.append(f"| `{build}` | {cuda // 1000}.{cuda % 1000 // 10} or later | {driver} or later, or an older "
+                     f"one under NVIDIA's cuda-compat | {major}.{minor} or later |")
     least = [f"Dew needs Python {python} or newer."]
     stale = []
     for path, blocks in ((REPO / "site/public/install.sh", ((SHELL, shell),)),

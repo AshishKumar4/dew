@@ -19,8 +19,9 @@ point with Dew's model registered:
 
 `--openai-base-url` adds a served comparison: the same prompts through the
 OpenAI SDK (vLLM serves the same API), or `--ollama-host` through
-ollama's. Both are optional extras; without them, or with the endpoint
-unreachable, the report says so and the rest of the run is unaffected. The
+ollama's. Each SDK is an optional extra, needed only when its flag is given;
+with the endpoint unreachable, the report says so and the rest of the run is
+unaffected. The
 OpenAI key is `OPENAI_API_KEY` when set; a vLLM server started without
 `--api-key` takes any key, so an unset one sends vLLM's placeholder.
 
@@ -203,45 +204,38 @@ def image_metrics(config: Config) -> dict[str, float]:
 def served(config: Config) -> dict[str, str]:
     """The same prompt through a served model, when one is configured.
 
-    Both adapters bind an SDK client the caller owns, and both SDKs are
-    optional extras; an absent one or an endpoint that does not answer is
-    reported rather than raised, because the local numbers above do not
-    depend on it.
+    Both adapters bind an SDK client the caller owns. An endpoint that does
+    not answer is reported rather than raised, because the local numbers
+    above do not depend on it.
     """
     answers: dict[str, str] = {}
     if config.openai_base_url is not None:
-        try:
-            from openai import APIConnectionError, OpenAI
-        except ImportError:
-            answers["openai"] = "skipped: pip install openai"
-        else:
-            from dew.inference import OpenAICompletion
+        from openai import APIConnectionError, OpenAI
 
-            # The SDK refuses to build a client with no key, and a local
-            # vLLM endpoint needs none: "EMPTY" is the placeholder vLLM's
-            # own OpenAI-client examples send.
-            sdk = OpenAI(base_url=config.openai_base_url,
-                         api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"))
-            client = OpenAICompletion(config.openai_model, sdk, provider=config.openai_provider)
-            try:
-                answers["openai"] = client(config.prompt, config.max_new_tokens,
-                                           sampling=GREEDY).texts[0]
-            except APIConnectionError as error:
-                answers["openai"] = f"unreachable: {config.openai_base_url}: {error}"
+        from dew.inference import OpenAICompletion
+
+        # The SDK refuses to build a client with no key, and a local
+        # vLLM endpoint needs none: "EMPTY" is the placeholder vLLM's
+        # own OpenAI-client examples send.
+        sdk = OpenAI(base_url=config.openai_base_url,
+                     api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"))
+        client = OpenAICompletion(config.openai_model, sdk, provider=config.openai_provider)
+        try:
+            answers["openai"] = client(config.prompt, config.max_new_tokens,
+                                       sampling=GREEDY).texts[0]
+        except APIConnectionError as error:
+            answers["openai"] = f"unreachable: {config.openai_base_url}: {error}"
     if config.ollama_host is not None:
-        try:
-            from ollama import Client
-        except ImportError:
-            answers["ollama"] = "skipped: pip install ollama"
-        else:
-            from dew.inference import OllamaCompletion
+        from ollama import Client
 
-            client = OllamaCompletion(config.ollama_model, Client(host=config.ollama_host))
-            try:
-                answers["ollama"] = client(config.prompt, config.max_new_tokens,
-                                           sampling=GREEDY).texts[0]
-            except ConnectionError as error:
-                answers["ollama"] = f"unreachable: {config.ollama_host}: {error}"
+        from dew.inference import OllamaCompletion
+
+        client = OllamaCompletion(config.ollama_model, Client(host=config.ollama_host))
+        try:
+            answers["ollama"] = client(config.prompt, config.max_new_tokens,
+                                       sampling=GREEDY).texts[0]
+        except ConnectionError as error:
+            answers["ollama"] = f"unreachable: {config.ollama_host}: {error}"
     return answers
 
 

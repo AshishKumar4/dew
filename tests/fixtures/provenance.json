@@ -2930,7 +2930,7 @@
      "runs": "torch"
     }
    ],
-   "note": "PEFT 0.20.0's get_peft_model on tests/fixtures/hf/llama-tiny writes each adapter directory and runs its forward and backward: use_rslora with a rank and an alpha pattern, and lora_dropout 0.25 in training mode with each target's dropout module on a recorded mask; logits, mean next-token cross entropy and every factor's gradient in float32 and float64."
+   "note": "PEFT 0.20.0's get_peft_model on tests/fixtures/hf/llama-tiny writes each adapter directory and runs its forward and backward: use_rslora with a rank and an alpha pattern, and lora_dropout 0.25 in training mode with each target's dropout module on the mask Dew's branch draws in the LM objective's first step (masks.npz); logits, mean next-token cross entropy and every factor's gradient in float32 and float64."
   },
   "lpips": {
    "tool": "tools/lpips_reference.py",

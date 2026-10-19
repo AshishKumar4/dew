@@ -98,9 +98,10 @@ PYTHONS = tuple(sorted((classifier.removeprefix(_PREFIX) for classifier in _CLAS
                         if re.fullmatch(re.escape(_PREFIX) + r"\d+\.\d+", classifier)),
                        key=lambda version: tuple(int(part) for part in version.split("."))))
 """The tested versions pyproject.toml's classifiers declare, oldest first: the floor runs every
-test, the newest the files whose behaviour changed with it (`NEWEST_FILES`). `pythons` prints them
-for tools/armada/install.sh, and `pythons --check` holds .python-version and the environment's
-smoke (.armada.json) to them."""
+test on every run, the newest every test on the daily run (DEW_TEST_CACHE off) and on a pushed
+run the files whose behaviour changed with it (`NEWEST_FILES`). `pythons` prints them for
+tools/armada/install.sh, and `pythons --check` holds .python-version and the environment's smoke
+(.armada.json) to them."""
 NEWEST_FILES = (
     # Annotations, which 3.14 evaluates lazily (PEP 649): records and their config (326e40fd5).
     "tests/test_config.py", "tests/test_encoders.py", "tests/test_registry_records.py",
@@ -119,9 +120,14 @@ NEWEST_FILES = (
     "tests/test_iterator_lifecycle.py", "tests/test_native_rollout_server.py", "tests/test_distribution.py",
     "tests/test_instrumentation.py",
 )
-"""The files the newest Python runs whole: those its changes broke before, and the ones around
-the same machinery. It imports every other test file (`COLLECT`). Across 34 suite runs no file
-was red on 3.14 alone."""
+"""The files the newest Python runs whole on a pushed run: those its changes broke before, and
+the ones around the same machinery. It imports every other test file there (`COLLECT`), and runs
+every file on the daily run. The list is kept by hand, from those breaks, because no record can
+derive it: the test cache records the checkout's files a run executed and read (executed.py),
+while each break lived in the standard library's or a dependency's behaviour under the new
+Python (PEP 649's lazy annotations read through tyro, forkserver as the default start method,
+threads ended at interpreter exit), which no record sees; and the plan runs where the records'
+token is not. Across 34 suite runs no file was red on 3.14 alone."""
 COLLECT = "collect"
 """The split of a task that imports test files without running them."""
 COLLECT_TASKS = 4
@@ -383,7 +389,9 @@ def plan(target: float, timings: dict) -> list[dict]:
     recorded = recorded_tests()
     entries = []
     for python in PYTHONS:
-        files = every if python == PYTHONS[0] else [name for name in every if name in NEWEST_FILES]
+        # Every file on every Python daily; on a pushed run the newest takes `NEWEST_FILES` whole.
+        whole = python == PYTHONS[0] or cache == "off"
+        files = every if whole else [name for name in every if name in NEWEST_FILES]
         timed = weights(files, timings, python)
         tasks: list[tuple[list[str], str, float]] = [
             ([name], "", target) for name, seconds in timed.items() if seconds is None]
@@ -403,8 +411,8 @@ def plan(target: float, timings: dict) -> list[dict]:
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(names),
                             "split": group, "rows": [row(python, name, group) for name in names],
                             "weight": weight, "cache": cache})
-    rest = [name for name in every if name not in NEWEST_FILES]
-    for index in range(COLLECT_TASKS):
+    rest = [] if cache == "off" else [name for name in every if name not in NEWEST_FILES]
+    for index in range(COLLECT_TASKS if rest else 0):
         names = rest[index::COLLECT_TASKS]
         entries.append({"name": f"{PYTHONS[-1]}-{COLLECT}-{index + 1}", "python": PYTHONS[-1],
                         "tests": " ".join(names), "split": COLLECT,
@@ -667,8 +675,8 @@ def marked(python: str) -> dict[str, int]:
     """Each test file of this checkout with tests marked one of `MARKS`, and how many, as pytest
     collects it on the CPU: what a batch's GPU run holds, whatever the records say."""
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
-    done = subprocess.run([f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q", "-p",
-                           "no:cacheprovider", "-m", " or ".join(MARKS), *every],
+    done = subprocess.run([f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q",
+                           "-m", " or ".join(MARKS), *every],
                           capture_output=True, text=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
     if done.returncode not in (0, 5):
         raise SystemExit(f"collecting the marked tests exited {done.returncode}\n"

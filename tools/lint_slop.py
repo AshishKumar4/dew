@@ -146,7 +146,7 @@ SOURCE_READERS = {"inspect.getsource", "inspect.getsourcelines", "inspect.getsou
 CALL_ARGUMENTS = {"decode", "kv_store", "attention_metadata", "call"}
 # Process-wide state a module must not change while it is imported.
 GLOBAL_WRITES = ("config.update", "environ.setdefault", "environ.update", "putenv", "basicConfig",
-                 "register_event_listener", "filterwarnings", "simplefilter")
+                 "mark_as_parsed", "register_event_listener", "filterwarnings", "simplefilter")
 
 
 @dataclass(frozen=True)
@@ -911,11 +911,67 @@ def _spelled_in_captured(node: ast.AST, names: Set[str]) -> bool:
             and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str))
 
 
+def _errors(function: ast.FunctionDef | ast.AsyncFunctionDef,
+            raises: Set[int]) -> tuple[frozenset[str], frozenset[str]]:
+    """The names a test binds to an error it caught: an `except` clause's, and the target of a
+    block whose context is one of the `pytest.raises` calls `raises` holds by id, whose `.value`
+    the error is."""
+    nodes = list(scopes.own(function))
+    caught = {node.name for node in nodes if isinstance(node, ast.ExceptHandler) and node.name}
+    raised = {item.optional_vars.id for node in nodes if isinstance(node, ast.With | ast.AsyncWith)
+              for item in node.items if isinstance(item.optional_vars, ast.Name)
+              and id(item.context_expr) in raises}
+    return frozenset(caught), frozenset(raised)
+
+
+def _worded(node: ast.AST, caught: Set[str], raised: Set[str]) -> bool:
+    """Does `node` look for a sentence the source spells in a process's `stdout` or `stderr`, by
+    `in`, `startswith`, `endswith` or `count`, or match a caught error's text (`str` or `repr` of
+    it) so or by `==`? A process's whole output compared, or parsed first, is the value it reports."""
+    def output(expr: ast.expr) -> bool:
+        return isinstance(expr, ast.Attribute) and expr.attr in ("stdout", "stderr")
+
+    def error(expr: ast.expr) -> bool:
+        if not (isinstance(expr, ast.Call) and _named(expr.func) in ("str", "repr") and len(expr.args) == 1):
+            return False
+        held = expr.args[0]
+        return (isinstance(held, ast.Name) and held.id in caught) or (
+            isinstance(held, ast.Attribute) and held.attr == "value" and isinstance(held.value, ast.Name)
+            and held.value.id in raised)
+
+    def spelled(expr: ast.expr) -> bool:
+        return isinstance(expr, ast.Constant) and isinstance(expr.value, str)
+
+    if isinstance(node, ast.Compare) and len(node.ops) == 1:
+        left, right = node.left, node.comparators[0]
+        if isinstance(node.ops[0], ast.In | ast.NotIn):
+            return spelled(left) and (output(right) or error(right))
+        return isinstance(node.ops[0], ast.Eq | ast.NotEq) and (
+            (spelled(left) and error(right)) or (spelled(right) and error(left)))
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("startswith", "endswith", "count")
+            and (output(node.func.value) or error(node.func.value))
+            and bool(node.args) and spelled(node.args[0]))
+
+
 def wording(module: Module) -> Iterator[Finding]:
     """SLOP011: a test that checks wording or source text instead of behaviour: an error's or a
-    warning's text matched, a sentence looked for in captured output, or source text read."""
+    warning's text matched, a sentence looked for in captured output, in a caught error's text or
+    in a process's output, or source text read. A name is read through the imports of its own
+    scope, so `pytest.raises` imported under another name is `pytest.raises`."""
+    named = list(scopes.scoped(module.tree.body, {}, _parent(module)))
+    raises = {id(node) for node, table in named
+              if isinstance(node, ast.Call) and scopes.resolved(node.func, table) == "pytest.raises"}
+    for function in ast.walk(module.tree):
+        if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            caught, raised = _errors(function, raises)
+            for node in scopes.own(function):
+                if _worded(node, caught, raised):
+                    yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
+                                  "looks for a sentence in an error's or a process's text; assert its "
+                                  "type, its exit status or the value it reports")
     held = _held(module.tree)
-    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+    for node, table in named:
         if isinstance(node, ast.expr) and _spelled_in_captured(node, held.get(id(node), frozenset())):
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                           "looks for a sentence in captured output; assert the state it reports")
@@ -970,14 +1026,11 @@ def patches(module: Module) -> Iterator[Finding]:
 
 
 def _module_level(body: Sequence[ast.stmt]) -> Iterator[ast.AST]:
-    """The statements an import executes: every block but function bodies and the
-    script guard's body (its `else` still runs), class bodies included."""
+    """The statements an import executes: every block but the script guard's body
+    (its `else` still runs). A definition among them runs what `_executed` says:
+    its decorators and defaults, and a class's bases, keywords and body."""
     for node in body:
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            continue
-        if isinstance(node, ast.ClassDef):
-            yield from _module_level(node.body)
-        elif isinstance(node, ast.If):
+        if isinstance(node, ast.If):
             if not _script_guard(node):
                 yield node.test
                 yield from _module_level(node.body)
@@ -993,18 +1046,17 @@ def _module_level(body: Sequence[ast.stmt]) -> Iterator[ast.AST]:
 
 def imports(module: Module) -> Iterator[Finding]:
     """SLOP013: importing the module changes process-wide state."""
-    for statement in _module_level(module.tree.body):
-        for node in ast.walk(statement):
-            if isinstance(node, ast.Assign):
-                written = any(isinstance(target, ast.Subscript) and _named(target.value).endswith("environ")
-                              for target in node.targets)
-            elif isinstance(node, ast.Call):
-                written = _named(node.func).endswith(GLOBAL_WRITES)
-            else:
-                continue
-            if written:
-                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP013",
-                              "changes process-wide state at import; do it where the caller asks for it")
+    for node in _executed(_module_level(module.tree.body)):
+        if isinstance(node, ast.Assign):
+            written = any(isinstance(target, ast.Subscript) and _named(target.value).endswith("environ")
+                          for target in node.targets)
+        elif isinstance(node, ast.Call):
+            written = _named(node.func).endswith(GLOBAL_WRITES)
+        else:
+            continue
+        if written:
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP013",
+                          "changes process-wide state at import; do it where the caller asks for it")
 
 
 def _mixing(module: Module) -> frozenset[str]:

@@ -162,17 +162,61 @@ def test_each_suites_best_policy_ranks_that_suites_instance_of_a_metric_two_suit
     assert run.checkpoints.resolve('best:rare/value') == 1
 
 
-def test_restore_best_without_checkpoints_is_refused_before_training():
-    """The best state restore_best returns is a checkpoint, restored: a trainer that writes none is
-    refused before it trains, rather than handing back its final weights as the best. A best policy
-    alone ranks checkpoints, of which there are none to rank, and the run trains as asked."""
-    metric = Value('value', Shown(better='higher'))
-    unsaved = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0))
-    with pytest.raises(ValueError):
-        unsaved.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric], restore_best=True)
-    state = unsaved.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric], best=metric)
-    assert int(state.step) == 2
+def leaf_values(leaf) -> np.ndarray:
+    """A state leaf's values, a random key's as its key data."""
+    return np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
 
+
+def test_restore_best_without_checkpoints_returns_the_best_state_it_held(tmp_path):
+    """A trainer that writes no checkpoints keeps its best state in host memory as it evaluates, so
+    restore_best returns the state a checkpointed run restores as its best, every leaf of it: by the
+    validation loss, an earlier state than the last, and by a best policy in its own direction."""
+    metric = Value('value', Shown(better='higher'))
+    for name, policy in (('loss', {}), ('value', {'metrics': [metric], 'best': metric})):
+        saved = trainer(tmp_path / name).fit(data(), steps=8, log_every=1, eval_every=1, checkpoint_every=4,
+                                             restore_best=True, **policy)
+        unsaved = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0)).fit(
+            data(), steps=8, log_every=1, eval_every=1, restore_best=True, **policy)
+        assert int(unsaved.step) == int(saved.step) == (3 if name == 'loss' else 8)
+        for left, right in zip(jax.tree.leaves(unsaved), jax.tree.leaves(saved), strict=True):
+            np.testing.assert_array_equal(leaf_values(left), leaf_values(right))
+
+
+def test_restore_best_without_checkpoints_ranks_by_the_training_loss_without_validation(tmp_path):
+    """Without validation a run ranks its states by the training loss, as a checkpointed run's best
+    does, and returns the state that ranked best though a later step ended the run."""
+    stream = dataclasses.replace(data(), val=None)
+    saved = trainer(tmp_path / 'run').fit(stream, steps=8, log_every=1, eval_every=1, checkpoint_every=1,
+                                         restore_best=True)
+    unsaved = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0)).fit(
+        stream, steps=8, log_every=1, eval_every=1, restore_best=True)
+    assert int(unsaved.step) == int(saved.step)
+    for left, right in zip(jax.tree.leaves(unsaved), jax.tree.leaves(saved), strict=True):
+        np.testing.assert_array_equal(leaf_values(left), leaf_values(right))
+
+
+def test_a_held_best_no_evaluation_ranks_ends_the_run_failed():
+    """Without checkpoints, a restore_best whose every evaluation its threshold leaves unranked has
+    no state to return: the trackers hear a failed run, as a checkpointed one's do, not the final
+    state handed back as the best."""
+    metric = Value('value', Shown(better='lower'))
+    tracker = Outcomes()
+    run = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker)
+    with pytest.raises(ValueError):
+        run.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric],
+                best=Best(metric, threshold=-1.0), restore_best=True)
+    assert tracker.ended == ['failed']
+
+
+def test_a_scheduled_validation_records_its_loss_whatever_the_best_ranks_by():
+    """A validation scheduled with no metric and a best that ranks by the training loss still
+    reads its batches: it records the objective's validation loss, and restore_best returns the
+    state the training loss ranked best, as a checkpointed run's best does."""
+    tracker = Outcomes()
+    run = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker)
+    run.fit(data(), steps=4, log_every=1, eval_every=1, best=run.objective.loss, restore_best=True)
+    assert tracker.ended == ['completed']
+    assert any('val/loss' in scalars for scalars in tracker.logged)
 
 def test_ranked_loss_and_periodic_retention(tmp_path):
     run = trainer(tmp_path / 'run', keep=Keep(latest=1, every=2))
@@ -268,13 +312,13 @@ def test_a_finished_run_fit_again_returns_its_best_state(tmp_path):
 
 
 class Outcomes:
-    """A tracker that keeps the run's reported end."""
+    """A tracker that keeps the run's reported end and the scalars it logged."""
 
     def __init__(self):
-        self.ended = []
+        self.ended, self.logged = [], []
 
     def log(self, scalars, step):
-        pass
+        self.logged.append(dict(scalars))
 
     def artifact(self, value, step):
         if isinstance(value, FitEnded):
