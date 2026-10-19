@@ -42,7 +42,7 @@ from typing_extensions import TypeIs, TypeVar
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import compensated_sum
-from dew.nn.protocols import ProjectsParameters
+from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.records import JSON
 
 if TYPE_CHECKING:
@@ -351,7 +351,7 @@ def part(variables: Variables, name: str) -> Variables:
     return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
 
 
-def projected_parts(params: Variables, owners: Mapping[str, ProjectsParameters | nn.Module], *,
+def projected_parts(params: Variables, owners: Mapping[str, ProjectsParameters | nn.Module | HiddenStates], *,
                     updated: bool) -> Variables:
     """`params` with each part `owners` names projected by its owner's constraint
     (`dew.nn.protocols.ProjectsParameters`, which an objective's `projected` also

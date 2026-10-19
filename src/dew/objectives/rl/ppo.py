@@ -60,6 +60,12 @@ class ValueHead(nn.Module):
 
     backbone: HiddenStates
 
+    @nn.nowrap
+    def projected(self, params: Variables, *, updated: bool) -> Variables:
+        """The backbone's projection of its own parameters (`ProjectsParameters`); the value map's
+        as they are."""
+        return projected_parts(params, {"backbone": self.backbone}, updated=updated)
+
     @nn.compact
     def __call__(self, tokens: jax.Array, *, segment_ids: jax.Array | None = None,
                  positions: jax.Array | None = None) -> jax.Array:
