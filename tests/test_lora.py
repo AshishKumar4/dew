@@ -749,7 +749,7 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
     class Squared(Objective):
         """The mean squared output, over whatever tree it is handed."""
 
-        inputs = InputSpec(Field("x", (6,), np.float32))
+        inputs = InputSpec(Field("x", (6,)))
 
         def __init__(self, model, variables):
             self.model, self.variables = model, variables
