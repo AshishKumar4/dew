@@ -6,6 +6,7 @@ import optax
 import pytest
 from affine_run import raw_leaf
 from flax import linen as nn, struct
+from reference_error import assert_leaves_as_exact, widened
 
 from dew.checkpoints import Checkpoints
 from dew.nn.blocks import TokenEmbedding
@@ -97,24 +98,24 @@ class DenseObjective(Objective):
         return super().reduce_loss(stats)
 
 
-def compare(actual, expected, *, exact=False, tolerance=2e-6, moment_rounding=False):
+def compare(actual, expected, *, exact=False, tolerance=2e-6):
     for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         got, want = raw_leaf(got), raw_leaf(want)
         assert got.dtype == want.dtype
-        if moment_rounding and not exact and got.dtype == jnp.bfloat16:
-            # A materialized accumulation boundary can round the gradient before
-            # Adam, unlike the fused reference. Allow one adjacent bf16 moment,
-            # not a relative tolerance on parameters, EMA, or resumed state.
-            # These fixtures differ by at most one neighbor on JAX 0.11.1/CUDA
-            # (four accumulation cases); CPU matches the compiled reference.
-            reference = np.asarray(want)
-            lower = np.nextafter(reference, np.full_like(reference, -np.inf))
-            upper = np.nextafter(reference, np.full_like(reference, np.inf))
-            assert np.all(np.asarray(got) >= lower) and np.all(np.asarray(got) <= upper)
-        elif exact or got.dtype == jnp.bfloat16:
+        if exact or got.dtype == jnp.bfloat16:
             np.testing.assert_array_equal(got, want)
         else:
             np.testing.assert_allclose(got, want, rtol=tolerance, atol=tolerance * .1)
+
+
+def as_exact(actual, expected, truth, label):
+    """Each leaf of `actual` as near its float64 `truth` as Optax's compiled update in the native
+    dtypes (`expected`) is (`assert_leaves_as_exact`), its dtype the reference's."""
+    actual, expected = jax.tree.map(raw_leaf, actual), jax.tree.map(raw_leaf, expected)
+    for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        assert got.dtype == want.dtype, label
+    assert_leaves_as_exact(jax.tree.map(np.asarray, actual), jax.tree.map(np.asarray, expected),
+                           jax.tree.map(np.asarray, truth), rows=False)
 
 
 # XLA's TPU backend rewrites a program's 64-bit types into pairs of 32-bit
@@ -156,8 +157,22 @@ def exercise_updates_and_resume(
         updates, opt_state = optimizer.update(grads, opt_state, params)
         return loss, optax.apply_updates(params, updates), opt_state
 
+    # The same update in float64 over the same values, the truth both are held to where the
+    # parameters are narrower than float64: the modules compute in their inputs' dtype.
+    widths = parameter_kind not in ("float64", "mixed64")
+    if widths:
+        with jax.enable_x64():
+            truth = widened((expected_params, expected_opt, expected_ema))
     for window in range(2):
         expected_loss, expected_params, expected_opt = reference_update(expected_params, expected_opt, batch)
+        if widths:
+            with jax.enable_x64():
+                truth_params, truth_opt, truth_ema = truth
+                _, truth_params, truth_opt = reference_update(truth_params, truth_opt, widened(batch))
+                if truth_ema is not None:
+                    truth_ema = jax.tree.map(lambda old, new: ema_decay * old + (1 - ema_decay) * new,
+                                             truth_ema, {"params": truth_params})
+                truth = widened((truth_params, truth_opt, truth_ema))
         if expected_ema is not None:
             def average(old, new):
                 work = np.float64 if old.dtype == jnp.float64 or new.dtype == jnp.float64 else np.float32
@@ -177,9 +192,15 @@ def exercise_updates_and_resume(
                                                 jax.tree.leaves(state.variables["params"]), strict=True):
                     assert gradient.dtype == jnp.promote_types(parameter.dtype, jnp.float32)
         np.testing.assert_allclose(loss, expected_loss, rtol=tolerance, atol=tolerance * .1)
-        compare(state.variables["params"], expected_params, tolerance=tolerance)
-        compare(state.opt_state, expected_opt, tolerance=tolerance, moment_rounding=True)
-        compare(state.ema, expected_ema, tolerance=tolerance)
+        if widths:
+            as_exact(state.variables["params"], expected_params, truth[0], "parameters")
+            as_exact(state.opt_state, expected_opt, truth[1], "optimizer state")
+            if expected_ema is not None:
+                as_exact(state.ema, expected_ema, truth[2], "averaged parameters")
+        else:
+            compare(state.variables["params"], expected_params, tolerance=tolerance)
+            compare(state.opt_state, expected_opt, tolerance=tolerance)
+            compare(state.ema, expected_ema, tolerance=tolerance)
     assert int(state.updates) == 2
     checkpoints.wait()
     resumed_trainer = trainer()
