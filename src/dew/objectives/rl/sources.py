@@ -48,6 +48,7 @@ from uuid import uuid4
 import jax
 import numpy as np
 
+from dew.data.prompts import PromptRecord
 from dew.inference.rollouts import Draw, InfrastructureError, RolloutServer
 from dew.objectives.base import Batch
 
@@ -241,42 +242,35 @@ class EnvironmentSource:
 
 
 def prompt_tasks(batch: Batch) -> list[Task]:
-    """Return one single-turn task per prompt row, with its prompt ids and the reward's three strings.
+    """Return one single-turn task per prompt row, with its prompt ids and its `PromptRecord`.
 
     A task's id is a digest of its prompt ids, so repeated prompts share an
     id; their groups keep them apart.
     """
-    prompts, lengths, sources, truths, infos = prompt_rows(batch)
+    prompts, lengths, records = prompt_rows(batch)
     rows, width = prompts.shape
     tasks = []
     for row in range(rows):
         ids = tuple(int(token) for token in prompts[row, width - int(lengths[row]):])
         name = hashlib.sha256(np.asarray(ids, np.int64).tobytes()).hexdigest()[:16]
-        tasks.append(
-            Task(name, {"prompt": ids, "source": sources[row], "truth": truths[row], "info": infos[row]})
-        )
+        tasks.append(Task(name, {"prompt": ids, "record": records[row]}))
     return tasks
 
 
 @dataclass(frozen=True)
 class _Prompt:
-    """What `prompt_tasks` puts in a task: the prompt ids and the reward's three strings."""
+    """What `prompt_tasks` puts in a task: the prompt ids and the `PromptRecord` its reward reads."""
 
     ids: tuple[int, ...]
-    source: str
-    truth: str
-    info: str
+    record: PromptRecord
 
     @classmethod
     def of(cls, task: Task) -> _Prompt:
-        ids, source, truth, extra_info = (
-            task.data.get(name) for name in ("prompt", "source", "truth", "info")
-        )
-        if not (isinstance(ids, tuple) and isinstance(source, str) and isinstance(truth, str)
-                and isinstance(extra_info, str)):
+        ids, record = task.data.get("prompt"), task.data.get("record")
+        if not (isinstance(ids, tuple) and isinstance(record, PromptRecord)):
             raise TypeError(f"task {task.id!r} is not a prompt_tasks task: it needs prompt ids "
-                            "and source, truth and info strings")
-        return cls(ids, source, truth, extra_info)
+                            "and a PromptRecord")
+        return cls(ids, record)
 
 
 class PromptSource:
@@ -342,7 +336,7 @@ class PromptSource:
         status = Status.COMPLETED if draw.terminated else Status.TRUNCATED
         text = self.decode(draw.tokens[:len(draw.tokens) - int(draw.terminated)])
         try:
-            score = self.reward(prompt.source, text, prompt.truth, prompt.info)
+            score = self.reward(text, prompt.record)
         except _INFRASTRUCTURE as error:
             # The reward's boundary failed, a sandbox or a service: infrastructure, retried.
             return Session(

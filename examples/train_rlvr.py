@@ -65,6 +65,7 @@ import tyro
 from dew.config import OptimConfig
 from dew.config.data import PromptData, loader
 from dew.data import HFTokenizer, Loading
+from dew.data.prompts import PromptRecord
 from dew.inference import (
     NativeRolloutServer,
     OpenAICompletion,
@@ -132,7 +133,7 @@ def _cases(ground_truth: str) -> list[tuple[str, str]]:
 class CodeReward:
     """Run the completion's program on every test case; reward the fraction that pass.
 
-    The ground truth is a JSON list of `{"stdin", "stdout"}` cases. A case
+    The record's ground truth is a JSON list of `{"stdin", "stdout"}` cases. A case
     passes when the program completes and its stdout matches, line by line
     up to trailing whitespace. A completion without a code block scores
     zero, as do timeouts, crashes and oversized output. `all_or_nothing`
@@ -147,8 +148,8 @@ class CodeReward:
     filename: str = "main.py"
     all_or_nothing: bool = False
 
-    def __call__(self, data_source: str, completion: str, ground_truth: str, extra_info: str) -> float:
-        cases = _cases(ground_truth)
+    def __call__(self, completion: str, record: PromptRecord) -> float:
+        cases = _cases(record.ground_truth)
         source = code_block(completion, self.language)
         if source is None:
             return 0.0
@@ -333,7 +334,7 @@ def attempt_scorer(
     """The fraction of `cases` an attempt's program passes, its EOS excluded; each program runs once."""
     @functools.lru_cache(maxsize=4096)
     def passed(cases: str, program: tuple[int, ...]) -> float:
-        return reward("code", decode(program), cases, "")
+        return reward(decode(program), PromptRecord("code", cases))
 
     return lambda cases, action: passed(cases, action.tokens[:len(action.tokens) - int(action.terminated)])
 
