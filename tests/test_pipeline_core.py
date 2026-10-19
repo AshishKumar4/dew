@@ -18,7 +18,7 @@ import pytest
 
 from dew import position
 from dew.data.cache import Cache
-from dew.data.compile import compile, iterate, publish
+from dew.data.compile import compile, iterate, publish, validation
 from dew.data.dataset import DataPartition, Loading
 from dew.data.mixing import SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import Configured, Pipeline, Rejected, mix
@@ -117,19 +117,26 @@ class Decoding(Memory):
         return rows
 
 
-def test_a_memory_loader_holds_the_rows_it_made_and_lets_the_read_it_made_them_from_go():
+@pytest.mark.parametrize("configured", [False, True])
+def test_a_memory_loader_holds_the_rows_it_made_and_lets_the_read_it_made_them_from_go(configured):
     """A memory compile reads its source once, and once it has materialized every branch from that
-    read it lets it go: the loader holds the rows its steps made, and reads them."""
+    read it lets it go: the loader holds the rows its steps made, and reads them, a step configured
+    from the source's facts, which preparation runs over the read first, too, and a validation
+    branch's."""
     reads = []
     stored = Decoding(source(8).values, reads=reads)
-    data = compile(Pipeline(stored).map(Tagged()).shuffle(0).repeat().batch(2), read="memory", loading=READ)
+    steps = (Configured(Shifting(0), needs=()), Tagged()) if configured else (Tagged(),)
+    data = compile(Pipeline(stored).map(*steps).shuffle(0).repeat().batch(2), read="memory", loading=READ)
+    held = validation(Pipeline(stored).map(*steps).batch(2), batch=2, read="memory", loading=READ)
     gc.collect()
-    assert len(reads) == 1 and reads[0]() is None
-    reader = data.train(DataPartition())
+    assert len(reads) == 2 and all(read() is None for read in reads)
+    reader, checked = data.train(DataPartition()), held(DataPartition())
     try:
         assert sorted(value for batch in take(reader, 4) for value in batch["tag"]) == list(range(0, 80, 10))
+        assert sorted(value for batch in checked for value in batch["tag"]) == list(range(0, 80, 10))
     finally:
         reader.close()
+        checked.close()
 
 
 def test_memory_rejections_are_dense_before_global_order():
