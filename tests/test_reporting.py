@@ -97,8 +97,6 @@ def test_a_journal_reads_back_what_a_fit_logged_its_final_validation_and_nonfini
     """A tracker over a tracking directory reads its scalars back as they were logged, in order:
     every report a fit sent it, the final validation's scores under the run's last step among them,
     and the spellings of a nonfinite value as that value."""
-    from dew.data.dataset import Dataset
-
     class Recording(LocalTracker):
         def __init__(self, directory):
             super().__init__(directory)
@@ -111,7 +109,7 @@ def test_a_journal_reads_back_what_a_fit_logged_its_final_validation_and_nonfini
     held = next(batches())
     tracker = Recording(tmp_path / 'tracking')
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0), tracker=tracker)
-    state = trainer.fit(Dataset(lambda partition: batches(), lambda partition: iter([held]), None, 8),
+    state = trainer.fit(Loader(lambda partition: batches(), lambda partition: iter([held]), None, 8),
                         steps=2, log_every=1, eval_every=1)
     tracker.log({'psnr': math.inf, 'loss': math.nan, 'floor': -math.inf}, 3)
     tracker.close()
