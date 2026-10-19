@@ -126,10 +126,7 @@ def rankings(best: Sequence[Best], scores: Mapping[str, float], *, validation: s
             value = scores.get(name, float('nan'))
         else:
             name = f'aggregate:{index}'
-            try:
-                value = float(metric(MetricScores(scored, scores, objective)))
-            except KeyError:
-                value = float('nan')
+            value = float(metric(MetricScores(scored, scores, objective)))
         mode = selection.mode or 'min'
         threshold = selection.threshold
         if threshold is not None and (value >= threshold if mode == 'min' else value <= threshold):

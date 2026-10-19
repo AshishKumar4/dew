@@ -566,7 +566,10 @@ def _close_source(held) -> None:
 
 class MetricScores[Statistics, Additions](Mapping):
     """A fit's scores keyed by the metric objects, objective scalars and
-    `(split, metric)` pairs that `best=` and `stop=` name."""
+    `(split, metric)` pairs that `best=` and `stop=` name. A declared metric
+    this evaluation did not score, as one evaluated on a cadence of its own,
+    reads as NaN, which ranks nothing; one no split of the fit records, or a
+    metric `fit` was not given, raises."""
 
     def __init__(
         self,
@@ -591,6 +594,9 @@ class MetricScores[Statistics, Additions](Mapping):
         named = metric[1] if isinstance(metric, tuple) and len(metric) == 2 else metric
         if not isinstance(named, TrainingScalar) and not any(declared is named for declared in self.metrics):
             raise KeyError("the score refers to a metric not passed to fit")
+        prefix = "train/" if isinstance(named, TrainingScalar) else ""
+        if not any(name.startswith(prefix) and name.rpartition("/")[2] == named.name for name in self.scores):
+            return float("nan")
         return self.scores[recorded_name(metric, self.scores, self.objective)]
 
     def __iter__(self):
