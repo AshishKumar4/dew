@@ -16,7 +16,7 @@ from dew.decision.config import DecisionRunConfig
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.objectives.jepa import JepaRunConfig
 from dew.objectives.lm.config import LMRunConfig
-from dew.training.quantization import Quantization
+from dew.quantization import Quantization
 
 ROOT = Path(__file__).resolve().parents[1]
 

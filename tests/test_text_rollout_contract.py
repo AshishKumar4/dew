@@ -1,5 +1,6 @@
 """Cached actions, padding and policy likelihoods on real small decoders."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import jax
@@ -11,9 +12,11 @@ from model_support import decoder
 from rl_support import clipped_surrogate
 
 from dew.data.dataset import Loader
+from dew.inference import TextGeneration
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective, SampledRollout
+from dew.objectives.rl.episodes import EpisodeRollout, EpisodeStatus, Observation
 from dew.sampling import Sampling, generate
 from dew.training import Trainer
 
@@ -213,3 +216,41 @@ def test_any_declared_eos_id_stops_the_generation():
     np.testing.assert_array_equal(result.lengths, [1])
     np.testing.assert_array_equal(result.terminated, [True])
     np.testing.assert_allclose(result.raw_log_probs[0, 0], baseline.raw_log_probs[0, 0], atol=1e-6)
+
+
+class Answered:
+    """An environment whose episode ends on the first action the policy finishes."""
+
+    def reset(self):
+        return Observation((1, 2))
+
+    def step(self, action):
+        return Observation((), EpisodeStatus.COMPLETED, " ".join(map(str, action.tokens)))
+
+
+@contextmanager
+def answered(identity):
+    yield Answered()
+
+
+def test_a_rollout_draws_the_same_rows_from_a_legacy_key_as_from_its_typed_one():
+    """A rollout takes a single key in either of JAX's spellings, a typed key or a legacy uint32
+    pair, which the generation it runs reads alike (`request_key`): sampled prompts and native
+    episodes give the same rows from both, where the legacy key was once refused for its shape."""
+    model = decoder()
+    objective = GRPOObjective(model, seq_len=7)
+    params = objective.init(jax.random.key(0))
+    sampling = Sampling(temperature=1.2, eos_token_ids=(3, 7), pad_token_id=12)
+    sampled = SampledRollout(objective, lambda source, text, truth, info: float(len(text) % 3),
+                             groups=2, max_new_tokens=4, sampling=sampling)
+    state = Trainer(objective, optax.sgd(.01), key=jax.random.key(1)).initial_state()
+    episodes = EpisodeRollout(
+        TextGeneration(model, params), answered,
+        lambda episode: float(sum(sum(turn.action.tokens) for turn in episode.transitions) % 5),
+        4, 4, 1, groups=2, sampling=sampling)
+    for rollout, batch in ((sampled, prompts()), (episodes, {"task_id": np.array([31], np.int32)})):
+        typed = rollout(state, batch, jax.random.key(3))
+        legacy = rollout(state, batch, jax.random.PRNGKey(3))
+        assert typed.keys() == legacy.keys()
+        for name in typed:
+            np.testing.assert_array_equal(np.asarray(typed[name]), np.asarray(legacy[name]))
