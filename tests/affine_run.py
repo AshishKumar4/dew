@@ -57,6 +57,12 @@ def batches():
         yield batch
 
 
+def fit_one_step() -> None:
+    """One step of a plain run over `batches`, the least `Trainer.fit` that readies its process."""
+    Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0)).fit(
+        Loader(lambda partition: batches(), None, None, 8), steps=1, log_every=1)
+
+
 class Counting:
     """An endless, checkpointable stream whose batches say which they are."""
 
