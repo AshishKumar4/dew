@@ -261,13 +261,13 @@ def test_generate_refuses_an_exchange_wherever_the_decoder_routes_it(rng, site):
     prompt = jax.random.randint(rng, (2, 4), 0, VOCAB)
     params = model("global").init(rng, prompt)
     greedy = Sampling(temperature=0)
-    assert model("global").generation_refusal() is None
     generate(model("global"), params, prompt, 2, key=jax.random.key(1), sampling=greedy)
-    assert model("exchange").generation_refusal() is not None
     # The refusal itself, not the expert layout an unrefused exchange would fail on downstream.
     with pytest.raises(ValueError) as refused:
         generate(model("exchange"), params, prompt, 2, key=jax.random.key(1), sampling=greedy)
     assert type(refused.value) is ValueError
+    assert model("global").generation_refusal() is None
+    assert model("exchange").generation_refusal() is not None
 
 
 def copy_batch(rng, size):
