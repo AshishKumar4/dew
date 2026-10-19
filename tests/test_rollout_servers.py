@@ -417,8 +417,8 @@ class NCCLReplica(BaseHTTPRequestHandler):
             elif path == "/update_weights":
                 self.server.worker.update(body["update_info"])
             status = 200
-            answer = {"status": "paused" if path == "/pause" else "resumed"} if path in ("/pause", "/resume") \
-                else {"success": True}
+            answer = ({"status": "paused" if path == "/pause" else "resumed"} if path in ("/pause", "/resume")
+                      else {"success": True})
         self.server.seen.append((arrived, next(ORDER), path, query, body))
         self.answer(status, answer)
 
