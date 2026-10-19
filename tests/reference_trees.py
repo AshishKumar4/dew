@@ -7,24 +7,26 @@ gate takes the reference's error at an element as the worst over a declared ense
 each summing the same terms in float32 with an error bound of the reference's own:
 
 - "pairwise": adjacent terms added, then their sums, recursively, as a tree reduction does;
-- "blocked": each block of `block` consecutive terms summed pairwise, then the blocks' sums left to
+- "blocked-<b>": each block of b consecutive terms summed pairwise, then the blocks' sums left to
   right, as a tiled kernel accumulates its tiles.
 
 A sequential sum is no member: its error grows with the term count (one large term and 127 ones,
 uniformly placed, part from float64 by 63 on average against pairwise's 1), so it would raise the
 bar past what an equally exact reference allows. A block size is one the reference's own kernels
-could use, and a member is admitted only where, on such adversarial rows, it is no further from
-float64 than the reference (`mean_absolute_error`). A reduction is written once with `tree_sum` or
-`tree_contract` and the tree passed down, so a reference computes the same math under each. Zeros
-padding a sum to whole pairs or blocks add exactly.
+could use. A member is admitted where, on the test's own data, it is no less exact than the
+reference (tests/reference_error.py), and on adversarial rows it can be checked the same way
+(`mean_absolute_error`). A reduction is written once with `tree_sum` or `tree_contract` and the tree
+passed down, so a reference computes the same math under each; a function of several reduction
+classes takes its members' trees from `assignments`. Zeros padding a sum to whole pairs or blocks
+add exactly.
 """
+
+import itertools
+from collections.abc import Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-
-TREES = ("pairwise", "blocked")
-"""The trees a reduction class declares its members from (`tree_sum`)."""
 
 
 def _pairwise(x):
@@ -45,23 +47,40 @@ def _sequential(x):
     return total
 
 
-def tree_sum(x, axis: int, tree: str, *, block: int):
-    """`x` summed over `axis` in its own dtype under `tree` (TREES); "blocked" takes `block` terms
-    a block."""
+def tree_sum(x, axis: int, tree: str):
+    """`x` summed over `axis` in its own dtype under `tree`: "pairwise", or "blocked-<b>", each block
+    of b terms pairwise and the blocks' sums in turn."""
     x = jnp.moveaxis(x, axis, -1)
     if tree == "pairwise":
         return _pairwise(x)
-    if tree != "blocked":
-        raise ValueError(f"no summation tree {tree!r}; the trees are {TREES}")
+    kind, _, size = tree.partition("-")
+    if kind != "blocked" or not size.isdigit():
+        raise ValueError(f"no summation tree {tree!r}: a tree is 'pairwise' or 'blocked-<b>'")
+    block = int(size)
     count = -(-x.shape[-1] // block)
     padded = jnp.concatenate([x, jnp.zeros((*x.shape[:-1], count * block - x.shape[-1]), x.dtype)], axis=-1)
     return _sequential(_pairwise(padded.reshape(*x.shape[:-1], count, block)))
 
 
-def tree_contract(a, b, axis: int, tree: str, *, block: int):
+def tree_contract(a, b, axis: int, tree: str):
     """The products of `a` and `b`, broadcast against each other, summed over `axis` under `tree`
     (`tree_sum`): each product rounded once, as an unfused float32 dot rounds it."""
-    return tree_sum(a * b, axis, tree, block=block)
+    return tree_sum(a * b, axis, tree)
+
+
+def assignments(classes: Mapping[str, Sequence[str]], *, bound: int = 8) -> list[dict[str, str]]:
+    """The tree each member gives each of a computation's reduction classes, declared before any run:
+    every combination of the classes' trees where they number at most `bound`, as a function summing
+    one class's terms under one tree and another's under another can cancel where every homogeneous
+    member does not (f = T_A(a) + T_B(-a)); past `bound`, each class's trees in turn with every other
+    class at its first, which reaches every tree of every class and not every pairing of them."""
+    names = list(classes)
+    product = [dict(zip(names, chosen, strict=True))
+               for chosen in itertools.product(*(classes[name] for name in names))]
+    if len(product) <= bound:
+        return product
+    first = {name: classes[name][0] for name in names}
+    return [first] + [{**first, name: tree} for name in names for tree in classes[name][1:]]
 
 
 def adversarial_rows(terms: int, orders: int, seed: int = 0) -> np.ndarray:

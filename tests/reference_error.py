@@ -271,72 +271,95 @@ def assert_leaves_as_exact(dew, reference, truth, *, terms=None, rows: bool = Tr
 
 def _batch(draw, stage: int, terms, rows: bool) -> tuple[dict, dict, list, list, dict]:
     """Batch `stage` of ORDERS draws (`assert_leaves_as_exact_over_orders`), orders `stage` ORDERS on:
-    each leaf's absolute distance from float64 at every element summed over them, Dew's and the
-    reference's, by the leaf's path; each order's RMS distance of each leaf, both sides, and, where
-    `rows`, of each row (`row_errors`); and each leaf's row sizes, from the batch's first truth and
-    `terms`."""
-    dew_sums, reference_sums, leaves, row_distances, sizes = {}, {}, [], [], {}
+    each leaf's absolute distance from float64 at every element summed over them, Dew's by the leaf's
+    path and each reference member's by member and path; each order's RMS distance of each leaf, and,
+    where `rows`, of each row (`row_errors`), Dew's and each member's; and each leaf's row sizes, from
+    the batch's first truth and `terms`."""
+    dew_sums, member_sums, leaves, row_distances, sizes = {}, {}, [], [], {}
     for order in range(stage * ORDERS, (stage + 1) * ORDERS):
-        dew, reference, truth = draw(order)
+        dew, members, truth = draw(order)
         summed = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
+        named = {member: jax.tree.leaves(tree) for member, tree in members.items()}
         at_order, rows_at_order = {}, {}
-        for (path, mine), theirs, true, size in zip(
-                jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
-                summed, strict=True):
+        for index, ((path, mine), true, size) in enumerate(zip(
+                jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(truth), summed, strict=True)):
             name, true = jax.tree_util.keystr(path), np.asarray(true, np.float64)
-            for sums, side in ((dew_sums, mine), (reference_sums, theirs)):
+            theirs = {member: leaves_of[index] for member, leaves_of in named.items()}
+
+            def add(sums, side, name=name, true=true):
                 error = np.abs(np.asarray(side, np.float64) - true)
                 sums[name] = error if name not in sums else sums[name] + error
-            at_order[name] = (distance(mine, true), distance(theirs, true))
+
+            add(dew_sums, mine)
+            for member, leaf in theirs.items():
+                add(member_sums.setdefault(member, {}), leaf)
+            at_order[name] = (distance(mine, true),
+                              {member: distance(leaf, true) for member, leaf in theirs.items()})
             if rows:
                 held = None if terms is None else size
                 row_sizes, ours = row_errors(mine, true, held)
-                _, others = row_errors(theirs, true, held)
                 sizes.setdefault(name, row_sizes)
-                rows_at_order[name] = (ours, others)
+                rows_at_order[name] = (ours, {member: row_errors(leaf, true, held)[1]
+                                              for member, leaf in theirs.items()})
         leaves.append(at_order)
         row_distances.append(rows_at_order)
-    return dew_sums, reference_sums, leaves, row_distances, sizes
+    return dew_sums, member_sums, leaves, row_distances, sizes
 
 
-def assert_leaves_as_exact_over_orders(draw, label: str, *, terms=None, rows: bool = True) -> None:
+def assert_leaves_as_exact_over_orders(draw, label: str, *, terms=None, rows: bool = True) -> dict:
     """The K-order gate over a comparison's rounding draws. `draw(order)` gives one draw `(dew,
-    reference, truth)`: order 0 the case's own, every other the same input under an exact symmetry
-    of the computation that reorders its sums (tests/residual_orders.py), every order's trees in
-    order 0's layout (a permuted output's cotangent permuted with it, a permuted parameter's
-    gradient permuted back). `terms`, None or each leaf's float64 terms in that layout
-    (`float64_terms`, order 0's), size the rows: a symmetry moves no row's size, so a draw computes
-    them once, not once an order. Another input is another element, not another rounding of this
-    one, so it is no order. A sum no symmetry reorders (attention's over keys, where a kernel fixes
-    their order) rounds alike in every order: an element whose error it carries is held to that one
-    rounding, and where Dew stays past the factor at every stage that is a finding to diagnose (the
-    code, the reference arm or the orders), not chance.
+    members, truth)`: order 0 the case's own, every other the same input under an exact symmetry of
+    the computation that reorders its sums (tests/residual_orders.py), and `members` the reference's
+    ensemble, by name, each its run of the same math under one declared summation tree
+    (tests/reference_trees.py) or, for an external reference whose tree is fixed, that run beside
+    Dew's float32 references. Every order's trees are in order 0's layout (a permuted output's
+    cotangent permuted with it, a permuted parameter's gradient permuted back). `terms`, None or
+    each leaf's float64 terms in that layout (`float64_terms`, order 0's), size the rows: a symmetry
+    moves no row's size, so a draw computes them once, not once an order. Another input is another
+    element, not another rounding of this one, so it is no order. A sum no symmetry reorders
+    (attention's over keys, where a kernel fixes their order) is reordered only by the trees the
+    members sum it under, and the orbit a test draws names the axes it moves.
 
     Every element of every leaf is held by `assert_elements_as_exact`, over batches of ORDERS orders:
     orders 0 to ORDERS - 1 first, and the next ORDERS for each confirmation while an element stays
-    flagged. Over the first batch each leaf's RMS distance is held too, within FACTOR of the
-    reference's (`assert_as_exact_over_orders`), and, unless `rows` is false, its worst row within
-    ROW_FACTOR of the reference's worst (`assert_rows_as_exact_over_orders`): supplements, the leaf's
-    rule derived for Gaussian roundings independent across orders and the row's uncalibrated
-    (ORDERS, ROW_FACTOR). One draw within its factors is no evidence that a few elements are, so the
-    first batch is always taken whole. After a second training step a row inherits the first step's
-    rounding through the parameters it reads, which its own terms do not see, so such a comparison
-    passes `rows=False` and its first step holds the rows."""
+    flagged. Over the first batch each leaf's RMS distance is held too, within FACTOR of the worst
+    admitted member's (`assert_as_exact_over_orders`), and, unless `rows` is false, its worst row
+    within ROW_FACTOR of the admitted members' worst at each row (`assert_rows_as_exact_over_orders`):
+    supplements, the leaf's rule derived for Gaussian roundings independent across orders and the row's
+    uncalibrated (ORDERS, ROW_FACTOR). One draw within its factors is no evidence that a few elements
+    are, so the first batch is always taken whole. After a second training step a row inherits the
+    first step's rounding through the parameters it reads, which its own terms do not see, so such a
+    comparison passes `rows=False` and its first step holds the rows.
+
+    A member other than the reference (`REFERENCE`) is admitted at a leaf only where its RMS distance
+    from float64 over the first batch is no more than the reference's own; the leaf, row and element
+    rules hold Dew to the worst admitted member. Returns `assert_elements_as_exact`'s report: by leaf,
+    the members admitted and the bar's inflation over the reference alone."""
     batches = {0: _batch(draw, 0, terms, rows)}
     _, _, leaves, row_distances, sizes = batches[0]
+    admitted = {}
     for name in leaves[0]:
-        mine, theirs = (np.asarray([order[name][side] for order in leaves]) for side in (0, 1))
-        assert_as_exact_over_orders(mine, theirs, f"{label} {name}")
+        mine = np.asarray([order[name][0] for order in leaves])
+        theirs = {member: np.asarray([order[name][1][member] for order in leaves])
+                  for member in leaves[0][name][1]}
+        assert REFERENCE in theirs, f"{label} {name}: the ensemble {sorted(theirs)} holds no {REFERENCE!r}"
+        rms = {member: float(np.sqrt(np.mean(np.square(distances)))) for member, distances in theirs.items()}
+        # A member is admitted where it is no less exact than the reference over the leaf.
+        admitted[name] = [member for member in theirs if rms[member] <= rms[REFERENCE]]
+        worst = max(admitted[name], key=rms.__getitem__)
+        assert_as_exact_over_orders(mine, theirs[worst], f"{label} {name}")
         if rows and sizes[name].size:
-            mine, theirs = (np.stack([order[name][side] for order in row_distances]) for side in (0, 1))
-            assert_rows_as_exact_over_orders(mine, theirs, f"{label} {name}", sizes[name])
+            ours = np.stack([order[name][0] for order in row_distances])
+            held = np.stack([np.stack([order[name][1][member] for order in row_distances])
+                             for member in admitted[name]])
+            _assert_rows_over_orders(ours, held, f"{label} {name}", sizes[name])
 
     def batch(stage):
         if stage not in batches:
             batches[stage] = _batch(draw, stage, terms, rows=False)
         return batches[stage][0], batches[stage][1]
 
-    assert_elements_as_exact(batch, label)
+    return assert_elements_as_exact(batch, label, admitted=admitted)
 
 
 SUMS = frozenset({"dot_general", "ragged_dot_general", "reduce_sum", "conv_general_dilated", "cumsum",
@@ -636,15 +659,21 @@ def assert_rows_as_exact_over_orders(dew, reference, label: str, sizes=None) -> 
     `sizes` `[rows]` each row's float64 size (its terms', `row_errors`), one where none is given. Each
     row's RMS over the orders over its size, Dew's worst within ROW_FACTOR of the reference's worst,
     as `rows_over` holds one draw."""
-    dew, reference = np.asarray(dew, np.float64), np.asarray(reference, np.float64)
-    assert dew.shape == reference.shape and dew.shape[0] == ORDERS, (
-        f"{label}: {dew.shape} and {reference.shape} rows over orders, the rule takes {ORDERS} orders")
+    _assert_rows_over_orders(dew, np.asarray(reference, np.float64)[None], label, sizes)
+
+
+def _assert_rows_over_orders(dew, members, label: str, sizes=None) -> None:
+    """`assert_rows_as_exact_over_orders` against the worst of `members` `[members, ORDERS, rows]`
+    at each row."""
+    dew, members = np.asarray(dew, np.float64), np.asarray(members, np.float64)
+    assert members.shape[1:] == dew.shape and dew.shape[0] == ORDERS, (
+        f"{label}: {dew.shape} and {members.shape[1:]} rows over orders, the rule takes {ORDERS} orders")
     sizes = np.ones(dew.shape[1]) if sizes is None else np.asarray(sizes, np.float64)
     sized = sizes > 0
     if not sized.any():
         return  # rows of float64 zero, which the element rule holds (`assert_elements_as_exact`)
-    mine, theirs = (np.sqrt(np.mean(np.square(rows), axis=0))[sized] / sizes[sized]
-                    for rows in (dew, reference))
+    mine = np.sqrt(np.mean(np.square(dew), axis=0))[sized] / sizes[sized]
+    theirs = np.max(np.sqrt(np.mean(np.square(members), axis=1)), axis=0)[sized] / sizes[sized]
     worst, their_worst = float(np.max(mine)), float(np.max(theirs))
     assert within(worst, ROW_FACTOR * their_worst), (
         f"{label}: dew's worst row is {worst:.3e} from float64 (rms over {ORDERS} orders, over its size), "
@@ -664,46 +693,81 @@ where a sum's order no symmetry changes: that rounding is the same at every stag
 do not redraw it, and an element it parts past the factor stays flagged."""
 
 
-def assert_elements_as_exact(batch, label: str) -> None:
+REFERENCE = "reference"
+"""The member of an ensemble that is the reference itself (`assert_elements_as_exact`)."""
+
+
+def assert_elements_as_exact(batch, label: str, *, reference: str = REFERENCE, admitted=None) -> dict:
     """Every element on par with the reference at that element, measured over fresh batches of ORDERS
-    orders. `batch(stage)` gives `(dew, reference)` for stage 0, 1, ...: arrays, or trees of them, each
-    element's absolute distance from float64 summed over the stage's ORDERS orders, the same orders on
-    both sides; it is asked for a stage only while elements stay flagged, up to STAGES.
+    orders. `batch(stage)` gives `(dew, members)` for stage 0, 1, ...: Dew's sums and the reference's
+    ensemble's, by member, each member's tree of Dew's shape, arrays or trees of them holding each
+    element's absolute distance from float64 summed over the stage's ORDERS orders, the same orders
+    for every side. The member `reference` is the reference itself; every other is the reference's
+    math under another declared summation tree (tests/reference_trees.py), declared before Dew runs
+    and computing every element at every order and stage. `admitted` maps each leaf's path to the
+    members admitted there, those no less exact than the reference over the leaf
+    (`assert_leaves_as_exact_over_orders` measures it), every member where it is None. `batch` is
+    asked for a stage only while elements stay flagged, up to STAGES.
 
     An element is flagged at a stage where Dew's mean absolute error over its orders is more than
-    FACTOR times the reference's own there: no floor, no error borrowed from its row or from a model
-    of rounding. Where both sides measure zero, both computed it exactly and it passes; where Dew's is
-    positive and the reference's zero across its orders, it is flagged. An element fails only where
-    every stage flags it, each re-measuring the same element over fresh orders on both sides, so an
-    element that parts by chance at one stage clears at the next and a port that rounds more stays
-    flagged at every one. Any non-finite value fails at once. The mean absolute error rather than the
-    RMS: a bf16 rounding's flips give errors heavier-tailed than a Gaussian's, whose squares' mean
-    varies with their kurtosis."""
-    flagged = None
+    FACTOR times the worst admitted member's there: no floor, no error borrowed from its row or from a
+    model of rounding. Two equally exact trees cross a sum's rounding boundaries at different rates, so
+    at an element the reference's own tree can be lucky in every order; the worst admitted member says
+    what the reference's accuracy allows there, and a member is admitted only where it is no less exact
+    than the reference over its leaf, so the ensemble moves the reference's accuracy between elements
+    and never loosens it overall. Where every admitted member measures zero and Dew does not, the
+    element is flagged; where all measure zero, it passes. An element fails only where every stage
+    flags it, each re-measuring it over fresh orders on every side. Any non-finite value fails at
+    once. The mean absolute error rather than the RMS: a bf16 rounding's flips give errors
+    heavier-tailed than a Gaussian's, whose squares' mean varies with their kurtosis.
+
+    Returns, by leaf, the members admitted and the bar's inflation over the reference's alone: the
+    worst admitted member's mean absolute error over the leaf's elements, over the reference's."""
+    flagged, report = None, {}
     for stage in range(STAGES):
-        dew, reference = batch(stage)
+        dew, members = batch(stage)
+        assert reference in members, f"{label}: the ensemble {sorted(members)} holds no {reference!r}"
         paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
-        mines, theirs = ([np.asarray(leaf, np.float64) for leaf in jax.tree.leaves(tree)]
-                         for tree in (dew, reference))
-        for name, mine, their in zip(paths, mines, theirs, strict=True):
-            assert mine.shape == their.shape, f"{label} {name}: {mine.shape} and {their.shape} elements"
-            broken = int(np.count_nonzero(~np.isfinite(mine)) + np.count_nonzero(~np.isfinite(their)))
-            assert broken == 0, f"{label} {name}: {broken} non-finite element sums at stage {stage}"
-        over = [mine > FACTOR * their for mine, their in zip(mines, theirs, strict=True)]
+        mines = [np.asarray(leaf, np.float64) for leaf in jax.tree.leaves(dew)]
+        named = {member: [np.asarray(leaf, np.float64) for leaf in jax.tree.leaves(tree)]
+                 for member, tree in members.items()}
+        for member, leaves in named.items():
+            assert len(leaves) == len(mines), (
+                f"{label}: member {member!r} has {len(leaves)} leaves, Dew {len(mines)}")
+        bars = []
+        for index, (name, mine) in enumerate(zip(paths, mines, strict=True)):
+            held = list(members) if admitted is None else list(admitted[name])
+            assert reference in held, f"{label} {name}: the admitted members {held} leave out {reference!r}"
+            for member, leaves in named.items():
+                theirs = leaves[index]
+                assert theirs.shape == mine.shape, (
+                    f"{label} {name}: member {member!r} {theirs.shape}, Dew {mine.shape}")
+                broken = int(np.count_nonzero(~np.isfinite(theirs)))
+                assert broken == 0, (
+                    f"{label} {name}: {broken} non-finite sums of member {member!r} at stage {stage}")
+            broken = int(np.count_nonzero(~np.isfinite(mine)))
+            assert broken == 0, f"{label} {name}: {broken} non-finite element sums of Dew's at stage {stage}"
+            worst = np.max(np.stack([named[member][index] for member in held]), axis=0)
+            bars.append(worst)
+            if stage == 0:
+                alone = float(np.mean(named[reference][index]))
+                report[name] = {"admitted": held,
+                                "inflation": float(np.mean(worst)) / alone if alone > 0 else 1.0}
+        over = [mine > FACTOR * bar for mine, bar in zip(mines, bars, strict=True)]
         # A confirmation clears an element it does not flag again; one flagged before stays so only if it is.
         flagged = over if flagged is None else [now & then for now, then in zip(over, flagged, strict=True)]
         if not any(leaf.any() for leaf in flagged):
-            return
-    failing = [(name, leaf, mine, their)
-               for name, leaf, mine, their in zip(paths, flagged, mines, theirs, strict=True) if leaf.any()]
-    name, leaf, mine, their = failing[0]
-    at = np.unravel_index(int(np.argmax(np.where(leaf, mine - FACTOR * their, -np.inf))), leaf.shape)
+            return report
+    failing = [(name, leaf, mine, bar)
+               for name, leaf, mine, bar in zip(paths, flagged, mines, bars, strict=True) if leaf.any()]
+    name, leaf, mine, bar = failing[0]
+    at = np.unravel_index(int(np.argmax(np.where(leaf, mine - FACTOR * bar, -np.inf))), leaf.shape)
     count = sum(int(np.count_nonzero(leaf)) for _, leaf, _, _ in failing)
     raise AssertionError(
-        f"{label}: {count} elements past FACTOR {FACTOR:g} times the reference's own error at every one of "
-        f"{STAGES} stages of {ORDERS} orders; in {name}, element {tuple(int(i) for i in at)} is "
-        f"{mine[at] / ORDERS:.3e} from float64 at the last (mean absolute over its orders), the "
-        f"reference {their[at] / ORDERS:.3e}")
+        f"{label}: {count} elements past FACTOR {FACTOR:g} times the worst admitted member's error at every "
+        f"one of {STAGES} stages of {ORDERS} orders; in {name}, element {tuple(int(i) for i in at)} is "
+        f"{mine[at] / ORDERS:.3e} from float64 at the last (mean absolute over its orders), the worst "
+        f"admitted member {bar[at] / ORDERS:.3e} ({report[name]['admitted']})")
 
 
 def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, roundings: int) -> None:
