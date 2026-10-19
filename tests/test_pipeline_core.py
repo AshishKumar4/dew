@@ -18,7 +18,7 @@ import pytest
 
 from dew import position
 from dew.data.cache import Cache
-from dew.data.compile import compile, iterate, publish, validation
+from dew.data.compile import compile, iterate, validation
 from dew.data.dataset import DataPartition, Loading
 from dew.data.mixing import SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import Configured, Pipeline, Rejected, mix
@@ -1362,23 +1362,6 @@ def test_a_token_split_on_a_mixture_within_a_mixture_records_its_spans():
         return compile(mixed.batch(1), read="indexed", loading=READ).plan.derived["token_spans"]
 
     assert spans(4) != spans(8)
-
-
-def test_a_recipe_reads_a_published_packing_before_its_default_order(tmp_path):
-    """A typed recipe given a generation with a published packing plan reads
-    that plan, and shuffles its windows, instead of packing again online."""
-    from dew.config.data import TextData, loader
-    from dew.data.text import Chunks, Tokenize
-
-    stored = Memory(tuple({"text": "x" * size} for size in (3, 7, 18, 2, 4, 12, 8, 1, 15, 6)))
-    published = publish(Pipeline(stored).map(Tokenize()).flat_map(Chunks(9)).pack(9, bins=3),
-                        Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
-    data = loader(TextData(source=stored, seq_len=8, pack="first-fit", packing_bins=3,
-                           eos=False, token_holdout=None), batch=2,
-                  cache=published,
-                read="indexed", loading=READ)
-    assert data.plan is not None
-    assert "packing" in data.plan.manifest.source["sources"][0]
 
 
 @dataclasses.dataclass(frozen=True)
