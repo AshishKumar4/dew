@@ -74,7 +74,13 @@ from dew.nn.protocols import (
     CountedVideo,
 )
 from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
-from dew.quantization import FROZEN_FP8, QUANTIZATION, InputQuantization, frozen_fp8_kernel, measured_fp8_sites
+from dew.quantization import (
+    FROZEN_FP8,
+    QUANTIZATION,
+    InputQuantization,
+    frozen_fp8_kernel,
+    measured_fp8_sites,
+)
 from dew.registry import wrapper_layers
 
 PEFT_CONFIG = "adapter_config.json"

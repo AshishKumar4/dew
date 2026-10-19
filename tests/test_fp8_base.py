@@ -34,8 +34,6 @@ from dew.lora import LoRA, unadapted
 from dew.nn.kernels.generation import assumed, device_generation, gpu_target
 from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
-from dew.registry import models, wrapper_layers
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
@@ -46,6 +44,8 @@ from dew.quantization import (
     frozen_fp8_product,
     measured_fp8_sites,
 )
+from dew.registry import models, wrapper_layers
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 VOCAB, SEQ, BATCH = 64, 16, 8
 FEATURES, MLP = 64, 128
