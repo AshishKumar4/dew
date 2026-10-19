@@ -44,7 +44,6 @@ from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.kernels.generation import backend
-from dew.nn.precision import unquantized
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import logical_spec, manual_map, mesh_axes
 
@@ -165,7 +164,6 @@ def hadamard(size: int) -> jax.Array:
     return matrix / math.sqrt(size)
 
 
-@unquantized("kv_cache")
 def rotated(values: jax.Array, rotation: jax.Array) -> jax.Array:
     """`values` `[..., head_dim]` times the rotation, computed in float32, in `values`' dtype."""
     product = jnp.einsum("...d,de->...e", values.astype(jnp.float32), rotation,
