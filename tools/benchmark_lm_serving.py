@@ -14,8 +14,10 @@ client's. TTFT is then from the request's arrival, and the token gaps are
 per token: each decoding row's time between consecutive tokens.
 
 Start vLLM in its own environment with bf16, --generation-config vllm and
---gpu-memory-utilization 0.90. Pass the same snapshot and --vocab-limit to
-all runs. Warmup uses disjoint prompts and the full measured output length.
+--gpu-memory-utilization 0.90. sglang-engine runs SGLang's engine in-process,
+in its own environment, the same way (bf16, 0.90 of the GPU, no prefix cache).
+Pass the same snapshot and --vocab-limit to all runs. Warmup uses disjoint
+prompts and the full measured output length.
 
 `--mesh` places Dew's weights on a mesh of those MeshSpec fields before the
 server is built, as `dew.pipeline(mesh=...)` does, to time sharded decode;
@@ -373,9 +375,44 @@ async def engine_points(args):
     return {"label": args.hardware}, points
 
 
+async def sglang_points(args):
+    """SGLang's engine in-process, on the same clocks as vllm-engine."""
+    import sglang
+
+    engine = sglang.Engine(model_path=args.model, dtype="bfloat16", context_length=args.prompt + args.output,
+                           max_running_requests=max(args.slots), mem_fraction_static=0.90,
+                           disable_radix_cache=True, skip_tokenizer_init=True, log_level="error")
+    policy = {"temperature": 0, "top_p": 1, "top_k": -1, "min_p": 0, "repetition_penalty": 1,
+              "ignore_eos": True}
+
+    async def tokens_of(prompt, output):
+        """Each of a request's tokens' arrival time, from SGLang's stream of growing output ids."""
+        stamps: list[float] = []
+        async for chunk in await engine.async_generate(input_ids=prompt.tolist(), stream=True,
+                                                       sampling_params={**policy, "max_new_tokens": output}):
+            arrived = chunk["meta_info"]["completion_tokens"] - len(stamps)
+            stamps.extend([time.perf_counter()] * arrived)
+        return stamps
+
+    async def request(prompt, output, gate, queued):
+        async with gate:
+            sent = time.perf_counter()
+            stamps = await tokens_of(prompt, output)
+            assert len(stamps) == output, (len(stamps), output)
+            return {"tokens": output, "ttft": stamps[0] - sent,
+                    "itl": (stamps[-1] - stamps[0]) / max(output - 1, 1),
+                    "latency": stamps[-1] - sent, "client_queue": sent - queued}
+
+    try:
+        points = await async_sweep(args, request, tokens_of)
+    finally:
+        engine.shutdown()
+    return {"label": args.hardware}, points
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("dew", "vllm", "vllm-engine"), required=True)
+    parser.add_argument("--backend", choices=("dew", "vllm", "vllm-engine", "sglang-engine"), required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--url", default="http://127.0.0.1:8100/v1")
     parser.add_argument("--hardware", default="")
@@ -399,15 +436,15 @@ def main():
     args.slots = [int(value) for value in args.slots.split(",")]
     args.rate = [float(value) for value in args.rate.split(",") if value]
     if args.rate and args.backend == "vllm":
-        parser.error("--rate runs Dew and vllm-engine in-process")
+        parser.error("--rate runs Dew and the in-process engines")
     if args.mesh is not None and args.backend != "dew":
         parser.error("--mesh places Dew's weights; vLLM takes its own parallelism flags")
     if (min(args.slots) < 1 or min(args.prompt, args.output, args.repeats, args.profile_steps) < 1
             or args.requests < 0 or args.vocab_limit <= 100):
         parser.error("counts must be positive; --requests=0 chooses the default")
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    run = engine_points if args.backend == "vllm-engine" else vllm_points
-    hardware, points = dew_points(args) if args.backend == "dew" else asyncio.run(run(args))
+    engines = {"vllm": vllm_points, "vllm-engine": engine_points, "sglang-engine": sglang_points}
+    hardware, points = dew_points(args) if args.backend == "dew" else asyncio.run(engines[args.backend](args))
     record = {"backend": args.backend, "model": args.model, "hardware": hardware,
               "prompt": args.prompt, "output": args.output, "vocab_limit": args.vocab_limit,
               "sampling": {"temperature": 0, "ignore_eos": True}, "warm_output": args.output,
