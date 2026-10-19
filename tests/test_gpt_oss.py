@@ -71,7 +71,6 @@ def test_a_mixture_builds_gpt_oss_experts_wherever_a_layer_routes():
 
     from flax import linen as nn
 
-    from dew.nn.attention import RMSNorm
     from dew.nn.backbones.decoder_block import Mixture
     from dew.nn.mixers.mlp import MLPMixer
 
@@ -85,7 +84,7 @@ def test_a_mixture_builds_gpt_oss_experts_wherever_a_layer_routes():
 
     def built(mixture, **fields):
         return mixture.build(out_features=16, hidden_features=24, activation="swigluoai",
-                             dense=functools.partial(nn.Dense, 16), norm=RMSNorm, **fields)
+                             dense=functools.partial(nn.Dense, 16), norm_eps=1e-6, **fields)
 
     module = built(Mixture(experts=4, top_k=2))(parent=None)
     output = module.apply({"params": params}, arrays["hidden"])
