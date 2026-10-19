@@ -409,6 +409,22 @@ def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
                                           gated_product("swiglu", implementation="xla")(gate, up))
 
 
+@pytest.mark.parametrize("dtype, kernel", [(jnp.bfloat16, "pallas"), (jnp.float32, "xla")])
+def test_a_swiglu_takes_the_kernel_its_target_measured_at_its_width(dtype, kernel):
+    """On an A100's row (`generation.assumed`), a bf16 SiLU product with no kernel named takes the
+    Pallas kernel the row measured, and an fp32 one, which no row measured and XLA fuses with its
+    neighbours, takes XLA, the route saying why; a named 'pallas' still runs the kernel at fp32."""
+    from dew.nn.kernels import generation, norm_swiglu
+
+    gate = up = jnp.ones((2, 4096), dtype)
+    with generation.assumed("sm80"), generation.routes() as found:
+        assert norm_swiglu.swiglu_kernel("auto", gate, up) == kernel
+    (route,) = found
+    assert route.kernel == kernel and route.preferred == "pallas"
+    if dtype == jnp.float32:
+        assert "bf16 products alone" in str(route.refusal)
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("implementation", ["auto", "pallas"])
 def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_deterministic_ops, implementation):

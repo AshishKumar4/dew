@@ -205,7 +205,9 @@ def _selected(choice: str, implementation: str, refusal: str | None) -> str:
         (placed, "the Pallas kernels need a GPU of sm80 or later"),
         (not FORWARD_MODE.get(), "forward_mode_attention needs a JVP; these kernels implement VJPs"),
     ) or refusal
-    return 'pallas' if reason is None else generation.ran_kernel(choice, 'xla', reason)
+    if reason is None:
+        return generation.route(choice, kernel='pallas').kernel
+    return generation.ran_kernel(choice, 'xla', reason)
 
 
 def _split() -> bool:
@@ -294,11 +296,21 @@ def _swiglu_refusal(operands, axes) -> str | None:
     )
 
 
+def _measured_width(implementation: str, dtype) -> str | None:
+    """Why an fp32 SiLU product takes XLA where no kernel is named: every target row measured the
+    kernel on bf16 products alone, and at fp32 XLA fuses the product's converts and neighbours into
+    one pass the kernel's launch splits (8 layers of Dory's 1 x 2048 nGPT block on an A100: 5.4 ms a
+    step through the kernel, 2.6 through XLA). A named 'pallas' runs it."""
+    if implementation == 'auto' and jnp.dtype(dtype) == jnp.float32:
+        return "the target row measured the SwiGLU kernel on bf16 products alone; XLA fuses an fp32 one"
+    return None
+
+
 def swiglu_kernel(implementation: str, gate, up, *, axes=None) -> str:
     """Resolve the SiLU product only. GeGLU and SiTU keep their own XLA
     arithmetic; broadcasting or mixed operand dtypes also stay there.
     `axes`, the operands' logical axes, places the kernel on a mesh (`_placed`)."""
-    return _selected('swiglu', implementation, first_refusal(
+    return _selected('swiglu', implementation, _measured_width(implementation, gate.dtype) or first_refusal(
         (gate.dtype in DTYPES and gate.dtype == up.dtype,
          "SwiGLU needs matching float32 or bfloat16 operands"),
         (gate.shape == up.shape and bool(gate.shape) and gate.size > 0,
@@ -310,7 +322,8 @@ def packed_swiglu_kernel(implementation: str, gate_up, *, axes=None) -> str:
     """Resolve the SiLU product of one packed projection's `[..., 2, H]` output (`packed_swiglu`),
     the kernel `KERNELS` names 'swiglu', which reads the halves where the projection wrote them.
     `axes` are the product's logical axes, `[..., H]`'s."""
-    return _selected('swiglu', implementation, first_refusal(
+    measured = _measured_width(implementation, gate_up.dtype)
+    return _selected('swiglu', implementation, measured or first_refusal(
         (gate_up.dtype in DTYPES, "SwiGLU needs float32 or bfloat16 operands"),
         (gate_up.ndim >= 2 and gate_up.shape[-2] == 2 and gate_up.size > 0,
          "a packed SwiGLU takes a nonempty [..., 2, H] gate and up"),
