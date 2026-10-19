@@ -11,16 +11,17 @@ than human captions, so each target is "a photo of a <class name>". The image
 sits in the clean prompt as placeholder slots that the vision tower's
 features fill, and the caption is the response canvas the denoiser learns.
 
-The first run reads the dataset's three splits with `datasets` and stores
-them once beside the run, shrunk so that their shorter side is
-`--staging-size` pixels, as parquet. Training reads the train and validation
-splits with random crops and flips. Every `--eval-every` steps the trainer
+The run reads the dataset's three splits from the Hub at the commit
+`--revision` names, prepared once by `datasets`, and the data chain decodes
+each image once into memory, shrunk so that its shorter side is
+`--staging-size` pixels. Training reads the train and validation splits with
+random crops and flips. Every `--eval-every` steps the trainer
 scores the canvas cross entropy over held-out test images. At the end the
 script loads the run back with `dew.pipeline`, which returns a
 `BlockGeneration` task. That task captions every test image, and
 `result.json` records how many captions name the right flower. `--smoke`
 writes a few synthetic images as parquet and trains a tiny model for four
-steps on one CPU device. It needs no network.
+steps on one CPU device, on the same path. It needs no network.
 """
 
 import json
@@ -35,7 +36,7 @@ import tyro
 import dew
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.config.data import Augment, ImageData, loader
-from dew.data import ByteTokenizer, Files, Loading
+from dew.data import ByteTokenizer, Concatenate, Files, Hub, Loading, Source
 from dew.data.dataset import DataPartition
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
@@ -55,9 +56,10 @@ class Config:
     dataset: str = "Donghyun99/Oxford-Flower-102"
     """A Hugging Face dataset with an image column, a ClassLabel `label` and these three splits."""
     revision: str | None = None
+    """The dataset's commit, branch or tag; None reads the default branch's commit."""
     image_size: int = 64
     staging_size: int = 80
-    """The shorter side the stored images are shrunk to, which random crops cut from."""
+    """The shorter side each image is shrunk to once, which random crops cut from."""
     patch_size: int = 4
     prompt_tokens: int = 80
     canvas_length: int = 64
@@ -152,32 +154,17 @@ def caption_batch(batch, config: Config, labels):
     return {**{key: value for key, value in batch.items() if key != "image"}, "text": prepared}
 
 
-def staged_splits(config: Config) -> dict[str, str]:
-    """Each split as parquet beside the run, its images shrunk once so the
-    shorter side is `staging_size`; a later run reads the files it finds."""
-    import datasets
-    from PIL import Image
-
-    files = {split: str(config.out / "data" / f"{split}.parquet") for split in SPLITS}
-    if all(Path(path).is_file() for path in files.values()):
-        return files
-
-    def shrink(row):
-        image = row["image"].convert("RGB")
-        scale = config.staging_size / min(image.size)
-        row["image"] = image.resize((round(image.width * scale), round(image.height * scale)),
-                                    Image.Resampling.BICUBIC)
-        return row
-
-    for split, path in files.items():
-        table = datasets.load_dataset(config.dataset, split=split, revision=config.revision)
-        table.map(shrink, num_proc=8, desc=f"shrinking {split}").to_parquet(path + ".partial")
-        Path(path + ".partial").rename(path)
-    return files
+def splits(config: Config) -> dict[str, Source]:
+    """The dataset's three splits on the Hub at `revision`, or with `--smoke` a
+    few synthetic images of each as parquet."""
+    if config.smoke:
+        return {split: Files(path, format="parquet") for split, path in smoke_splits(config).items()}
+    hub = Hub(config.dataset, revision=config.revision)
+    return {split: hub.with_split(split) for split in SPLITS}
 
 
 def smoke_splits(config: Config) -> dict[str, str]:
-    """Synthetic images of two classes, as parquet in the layout `staged_splits` writes."""
+    """Synthetic images of two classes as parquet, in the Hub dataset's schema."""
     import datasets
     from PIL import Image
 
@@ -199,14 +186,15 @@ def main(config: Config) -> Path:
                          batch_size=8, steps=4, warmup_steps=1, features=32, layers=1,
                          vision_features=16, vision_layers=1, eval_every=2)
     (config.out / "data").mkdir(parents=True, exist_ok=True)
-    files = smoke_splits(config) if config.smoke else staged_splits(config)
+    parts = splits(config)
     # Train on train + validation, score on test, which the run never reads.
-    source = Files((files["train"], files["validation"]), format="parquet")
-    spec = ImageData(source=source, validation=Files(files["test"], format="parquet"), caption_columns=(),
-                  image_size=config.image_size, staging_size=config.staging_size,
-                  augment=Augment(flip=True, crop_scale=(0.6, 1.0)))
-    # The label names the staged Parquet's Hugging Face schema records, as Files reads them.
-    names = read_record(source.metadata().get("class_names", {}), "class names").get("label")
+    # The crops and flips run on the host, before the caption layout reads their pixels into the
+    # model's inputs; a device augment would run after it, on the batch the layout already made.
+    spec = ImageData(source=Concatenate((parts["train"], parts["validation"])), validation=parts["test"],
+                     caption_columns=(), image_size=config.image_size, staging_size=config.staging_size,
+                     augment=Augment(flip=True, crop_scale=(0.6, 1.0), backend="host"))
+    # The label names the dataset's Hugging Face schema records, as its source reads them.
+    names = read_record(parts["train"].metadata().get("class_names", {}), "class names").get("label")
     labels = tuple(name.strip() for name in strings(names, "class_names.label"))
     record = model_config(config)
     model = build(record, dtype="float32" if config.smoke else "bfloat16")
@@ -225,8 +213,8 @@ def main(config: Config) -> Path:
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
                     run.trainer.compilation_cache_dir, layout=run.trainer.layout)
     objective = run.objective.build(model=model)
-    data = loader(spec, batch=run.trainer.batch_size, read="memory", loading=run.loading,
-                host=(CaptionLayout(config, labels),))
+    data = loader(spec, batch=run.trainer.batch_size, read="memory", provision=True, loading=run.loading,
+                  host=(CaptionLayout(config, labels),))
     started = time.perf_counter()
     name = "flowers-caption"
     run.train(objective, data, name=name, metrics=(Perplexity(),),
