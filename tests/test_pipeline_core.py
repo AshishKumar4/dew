@@ -1,11 +1,13 @@
 """The pipeline's observable order, branch scope and exact positions."""
 
 import dataclasses
+import gc
 import importlib
 import itertools
 import json
 import multiprocessing
 import os
+import weakref
 from uuid import uuid4
 
 import grain.python as grain
@@ -95,6 +97,39 @@ def test_a_memory_compile_reads_each_source_once():
     finally:
         reader.close()
     assert reads.count("memory") == 1
+
+
+class Decoded(list):
+    """The rows one read of a source made, which a test can watch be let go."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Decoding(Memory):
+    """Records in memory each read builds anew, as a file source decodes its rows, keeping a weak
+    reference to each memory read it made."""
+
+    reads: list = dataclasses.field(default_factory=list, compare=False)
+
+    def records(self, read):
+        rows = Decoded(super().records(read))
+        if read == "memory":
+            self.reads.append(weakref.ref(rows))
+        return rows
+
+
+def test_a_memory_loader_holds_the_rows_it_made_and_lets_the_read_it_made_them_from_go():
+    """A memory compile reads its source once, and once it has materialized every branch from that
+    read it lets it go: the loader holds the rows its steps made, and reads them."""
+    reads = []
+    stored = Decoding(source(8).values, reads=reads)
+    data = compile(Pipeline(stored).map(Tagged()).shuffle(0).repeat().batch(2), read="memory", loading=READ)
+    gc.collect()
+    assert len(reads) == 1 and reads[0]() is None
+    reader = data.train(DataPartition())
+    try:
+        assert sorted(value for batch in take(reader, 4) for value in batch["tag"]) == list(range(0, 80, 10))
+    finally:
+        reader.close()
 
 
 def test_memory_rejections_are_dense_before_global_order():

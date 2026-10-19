@@ -773,6 +773,21 @@ def test_a_ramped_steps_position_counts_every_process(data):
         assert pooled(build, 2, 6 - steps, stopped.get_state()) == whole[steps:]
 
 
+@pytest.mark.parametrize("data", [indexed_data, batch_shuffled_data])
+def test_a_ramped_run_resumed_by_more_processes_inside_a_batch_reads_on_in_order(data):
+    """One process stops a ramp of two, then four, after its first step, two records into a batch
+    of four. Four processes resume it in the four-record stage: the records after the count go to
+    them in turn from the first on, so each takes the place the count leaves it, and the pool's
+    steps are the one process's."""
+    build = ramped(data(64, 4), Ramp(start=2, increment=2, samples=2)).train
+    whole = pooled(build, 1, 5)
+    stopped = build(DataPartition())
+    taken(stopped, 1)
+    assert [len(step) for step in whole] == [2, 4, 4, 4, 4]
+    assert json.loads(stopped.get_state())["dew_global_position"]["records"] == 2
+    assert pooled(build, 4, 4, stopped.get_state()) == whole[1:]
+
+
 def test_a_ramp_reads_through_a_captioned_datasets_tokenized_stream():
     """An image or video dataset opens `tokenized` over its global stream, so
     the ramp has to cut the batches that stage hands over and save the
