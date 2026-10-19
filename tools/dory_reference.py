@@ -14,21 +14,12 @@ earlier ones (dory.py:146-149).
     PYTHONPATH=src:tools .venv/bin/python tools/dory_reference.py
 
 writes tests/fixtures/hf/dory-tiny/: a random DoryForCausalLM of eight
-layers, attentions and MLPs alternating as the release's do, over a width of 32 with a window of 5,
-its middle four layers looped, a tokenizer of the release's kind, fp32 and
-float64 logits at one, two and four loops, both caches' greedy continuations
-with each step's logits, packed documents, prompts of two lengths, and the
-gradients of a loss over the logits through the loop and through its last
-pass alone.
-
-    PYTHONPATH=src:tools .venv/bin/python tools/dory_reference.py --released --device cuda
-
-writes tests/fixtures/hf/dory-1.0-4b/probe.npz from the released checkpoint
-(`source.json`'s revision): the logits of two prompts, a sentence and
-`WINDOW` ids past the 1024-token window, at float64, fp32 and bf16 on
-`PROBE_COLUMNS` columns, and each cache's float64 greedy continuation of the
-sentence. The float64 runs take the host's CPU, whose 32 GB of float64
-weights an A100 of 40 GB does not hold; fp32 and bf16 run on `--device`.
+layers, attentions and MLPs alternating as the release's do, over a width
+of 32 with a window of 5, its middle four layers looped, a tokenizer of the
+release's kind, fp32 and float64 logits at one, two and four loops and of
+the variant configs, both caches' greedy continuations with each step's
+logits, packed documents, prompts of two lengths, and the gradients of a
+loss over the logits through the loop and through its last pass alone.
 """
 
 from __future__ import annotations
@@ -432,66 +423,10 @@ def write_tiny() -> None:
     print(f'{FIXTURE}: {sorted(path.name for path in FIXTURE.iterdir())}')
 
 
-RELEASED = FIXTURE.parent / 'dory-1.0-4b'
-PROBE_TEXT = 'The capital of France is Paris, and the capital of Japan is'
-PROBE_COLUMNS = 256
-"""Columns the probe keeps of each position's logits: the float64 top half at the sentence's last
-position, then random others."""
-WINDOW = 1100
-"""The random ids' length, past the release's 1024-token sliding window; the probe keeps the last
-64 positions, whose sliding layers no longer see the first ids."""
-
-
-def write_released(device: str) -> None:
-    """The released checkpoint's probe (module docstring), its bf16 tensors widened to each dtype:
-    float64 logits on the host's CPU, fp32 and bf16 ones on `device`, each position's float64 argmax
-    and top-two margin, and each cache's float64 greedy continuation of the sentence."""
-    from huggingface_hub import snapshot_download
-    from safetensors.torch import load_file
-    from tokenizers import Tokenizer
-
-    source = json.loads((RELEASED / 'source.json').read_text())
-    directory = Path(snapshot_download(source['repo'], revision=source['revision'],
-                                       allow_patterns=['config.json', 'model.safetensors', 'tokenizer.json']))
-    config = json.loads((directory / 'config.json').read_text())
-    tensors = load_file(str(directory / 'model.safetensors'))
-    tokenizer = Tokenizer.from_file(str(directory / 'tokenizer.json'))
-    prompts = {'sentence': np.asarray(tokenizer.encode(PROBE_TEXT).ids),
-               'window': np.random.default_rng(7).integers(1000, config['vocab_size'], WINDOW)}
-    kept = {'sentence': slice(None), 'window': slice(WINDOW - 64, None)}
-    arrays: dict[str, np.ndarray] = dict(prompts)
-    runs = (('_f64', torch.float64, 'cpu'), ('', torch.float32, device), ('_bf16', torch.bfloat16, device))
-    for suffix, dtype, where in runs:
-        reference = DoryReference(config, tensors, dtype, device=where)
-        for name, ids in prompts.items():
-            logits = reference.forward(ids[None])[0][kept[name]]
-            if dtype == torch.float64:
-                if name == 'sentence':
-                    top = np.argsort(-logits[-1])[:PROBE_COLUMNS // 2]
-                    others = np.setdiff1d(np.random.default_rng(8).permutation(config['vocab_size']), top)
-                    arrays['columns'] = np.concatenate([top, others[:PROBE_COLUMNS - len(top)]])
-                ranked = np.sort(logits, axis=-1)
-                arrays[f'{name}_argmax'] = logits.argmax(-1)
-                arrays[f'{name}_margin'] = ranked[:, -1] - ranked[:, -2]
-            arrays[f'{name}_logits{suffix}'] = logits[:, arrays['columns']]
-        del reference
-    for mode in ('per_loop', 'last_loop'):
-        reference = DoryReference(config, tensors, torch.float64, mode=mode, device='cpu')
-        arrays[f'generated_{mode}'] = reference.decode(prompts['sentence'], 16)[0][len(prompts['sentence']):]
-        del reference
-    np.savez(RELEASED / 'probe.npz', **arrays)
-    print(f'{RELEASED / "probe.npz"}: {sorted(arrays)}')
-
-
 if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--released', action='store_true', help="write the released checkpoint's probe")
-    parser.add_argument('--device', default='cpu', help='the torch device the reference runs on')
-    args = parser.parse_args()
-    if args.released:
-        write_released(args.device)
-    else:
-        write_tiny()
+    parser.parse_args()
+    write_tiny()
