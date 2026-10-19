@@ -36,7 +36,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Mapping
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -235,20 +235,14 @@ def from_words(words: jax.Array, dtype: jnp.dtype) -> jax.Array:
     """The `dtype` elements `as_words` packed into `words`."""
     if words.dtype == jnp.dtype(dtype):
         return words
-    return jax.lax.bitcast_convert_type(words, dtype).reshape(*words.shape[:-1], -1)
+    unpacked = jax.lax.bitcast_convert_type(words, dtype)
+    # The last axis named, not inferred, so a leaf with no elements (a one-tap conv's history) keeps it.
+    return unpacked.reshape(*words.shape[:-1], words.shape[-1] * unpacked.shape[-1])
 
 
 def filled_slots(cursor: jax.Array, capacity: int) -> jax.Array:
     """Which of `capacity` slots hold a token, `[rows, capacity]`, for per-row cursors `[rows]`."""
     return jnp.arange(capacity)[None, :] < cursor[:, None]
-
-
-@runtime_checkable
-class Layered(Protocol):
-    """A model that declares its decode cache's layout, as `CausalTransformer` does."""
-
-    @property
-    def kv_cache(self) -> KVCache: ...
 
 
 def refuse_unassigned(layout: KVCache, rows: int, capacity: int) -> None:
@@ -605,4 +599,4 @@ def gather_cache_rows(cache, rows):
     return jax.tree.map(lambda leaf: jnp.take(leaf, rows, axis=0), cache)
 
 
-__all__ = ["Append", "KVCache", "KVStore", "Layered"]
+__all__ = ["Append", "KVCache", "KVStore"]

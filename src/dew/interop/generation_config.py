@@ -26,10 +26,11 @@ from flax import linen as nn
 
 from dew import records
 from dew.coordination import agreed
+from dew.nn.protocols import Bounded, Predicting
 from dew.records import JSON
 from dew.sampling import decoding
 from dew.sampling.strategies import Beam, Speculative, Strategy
-from dew.sampling.text import Bounded, Predicting, Sampling, ordered_transforms, with_ids_of
+from dew.sampling.text import Sampling, ordered_transforms, with_ids_of
 
 
 def read_generation_config(directory: Path) -> Mapping[str, object]:

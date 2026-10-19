@@ -61,11 +61,8 @@ def main():
 
     result = {"impl": "torch._grouped_mm", "device": torch.cuda.get_device_name(), "torch": torch.__version__,
               "shape": [rows, width, features, experts]}
-    try:
-        result["forward"] = timed(forward, args.repeats)
-        result["forward_backward"] = timed(both, args.repeats)
-    except Exception as error:
-        result["error"] = str(error)[:300]
+    result["forward"] = timed(forward, args.repeats)
+    result["forward_backward"] = timed(both, args.repeats)
     print(json.dumps(result))
 
 
