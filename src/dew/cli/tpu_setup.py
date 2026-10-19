@@ -48,30 +48,38 @@ step() { echo "== $*"; }
 step "apt packages"
 if ! command -v gcsfuse >/dev/null || ! command -v rsync >/dev/null; then
   repo="gcsfuse-$(lsb_release -c -s)"
-  echo "deb [signed-by=/usr/share/keyrings/cloud.google.asc]" \\
-    "https://packages.cloud.google.com/apt $repo main" \\
-    | sudo -n tee /etc/apt/sources.list.d/gcsfuse.list >/dev/null
-  curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \\
-    | sudo -n tee /usr/share/keyrings/cloud.google.asc >/dev/null
+  sudo -n tee /etc/apt/sources.list.d/gcsfuse.list >/dev/null \\
+    <<<"deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt $repo main"
+  sudo -n curl -fsSL -o /usr/share/keyrings/cloud.google.asc https://packages.cloud.google.com/apt/doc/apt-key.gpg
   sudo -n apt-get update -qq
   sudo -n apt-get install -y -qq gcsfuse libgl1 rsync lsof
 fi
 
 step "open file limits"
-grep -q "dew nofile" /etc/security/limits.conf || printf '%s\\n' \\
-  "# dew nofile" "* soft nofile 1048576" "* hard nofile 1048576" \\
-  | sudo -n tee -a /etc/security/limits.conf >/dev/null
+# Each privileged write reads a here-document, written whole before the command runs, so no writer
+# can outlive a reader that exits without reading, which `set -o pipefail` reports as a failure.
+limits=/etc/security/limits.conf
+grep -q "dew nofile" "$limits" || sudo -n tee -a "$limits" >/dev/null <<'LIMITS'
+# dew nofile
+* soft nofile 1048576
+* hard nofile 1048576
+LIMITS
 override=/etc/systemd/system.conf.d/99-dew-nofile.conf
 wanted="[Manager]
 DefaultLimitNOFILE=1048576"
 if [ "$(cat $override 2>/dev/null)" != "$wanted" ]; then
   sudo -n mkdir -p /etc/systemd/system.conf.d
-  echo "$wanted" | sudo -n tee $override >/dev/null
+  sudo -n tee "$override" >/dev/null <<<"$wanted"
   sudo -n systemctl daemon-reload
 fi
 
 step "uv"
-command -v uv >/dev/null || [ -x "$HOME/.local/bin/uv" ] || curl -fsSL https://astral.sh/uv/install.sh | sh
+if ! command -v uv >/dev/null && [ ! -x "$HOME/.local/bin/uv" ]; then
+  installer=$(mktemp)
+  curl -fsSL -o "$installer" https://astral.sh/uv/install.sh
+  sh "$installer"
+  rm -f "$installer"
+fi
 export PATH="$HOME/.local/bin:$PATH"
 
 step "python $PYTHON_VERSION"
