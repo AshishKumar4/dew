@@ -109,6 +109,16 @@ def test_default_retains_the_weights_with_lowest_validation_loss(tmp_path):
     assert float(restored['variables']['params']['w']) == pytest.approx(0.488)
 
 
+def test_an_aggregate_score_that_fails_fails_its_run(tmp_path):
+    """An aggregate score whose own code fails, here by reading a score no split records, fails
+    the run that asked for it, where it once ranked nothing and the run went on without a best."""
+    metric = Value('accuracy', Shown(better='higher'))
+    run = trainer(tmp_path / 'run')
+    with pytest.raises(KeyError):
+        run.fit(data(), steps=2, log_every=1, eval_every=1, checkpoint_every=2, metrics=[metric],
+                best=Best(lambda scores: scores['val/acuracy']))
+
+
 @pytest.mark.parametrize('by_name', [False, True], ids=['object', 'name'])
 def test_multiple_directions_and_threshold(tmp_path, by_name):
     """An aggregate score reads a metric by its object or by the name its score is recorded under."""
