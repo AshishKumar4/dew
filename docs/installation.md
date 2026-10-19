@@ -22,24 +22,48 @@ curl -LsSf https://dewml.dev/install.sh | sh -s -- -y --venv ~/envs/dew --cuda 1
 
 ## uv or pip
 
-Each command installs the accelerator build of JAX 0.12.0, the version Dew requires:
+Dew runs on its own build of JAX 0.12.0, which [Dew's package index](#dews-jax-build) serves, so every install names it:
+
+```bash
+uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple
+```
+
+Each command installs that JAX build and the accelerator build of jaxlib 0.12.0 for the hardware:
 
 | Hardware | uv | pip |
 |---|---|---|
-| CPU | `uv pip install dewml` | `pip install dewml` |
-| NVIDIA GPU, CUDA 13 | `uv pip install "dewml[cuda13]"` | `pip install "dewml[cuda13]"` |
-| NVIDIA GPU, CUDA 12 | `uv pip install "dewml[cuda12]"` | `pip install "dewml[cuda12]"` |
-| Google TPU VM | `uv pip install "dewml[tpu]"` | `pip install "dewml[tpu]"` |
+| CPU | `uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple` | `pip install dewml --extra-index-url https://pypi.dewml.dev/simple` |
+| NVIDIA GPU, CUDA 13 | `uv pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` |
+| NVIDIA GPU, CUDA 12 | `uv pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` |
+| Google TPU VM | `uv pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` |
+
+Without the index the install stops before it installs anything, at resolving jax, since PyPI has no JAX build Dew accepts. uv says:
+
+```
+  × No solution found when resolving dependencies:
+  ╰─▶ Because only jax<=0.12.0 is available and dewml==0.1.0 depends on
+      jax>=0.12.0.post5,<0.12.1, we can conclude that dewml==0.1.0 cannot
+      be used.
+```
+
+and pip:
+
+```
+ERROR: Could not find a version that satisfies the requirement jax<0.12.1,>=0.12.0.post5 (from dewml) (from versions: ...)
+ERROR: No matching distribution found for jax<0.12.1,>=0.12.0.post5
+```
+
+Add `--extra-index-url https://pypi.dewml.dev/simple` and run it again.
 
 [Which CUDA build](#which-cuda-build) explains the choice between the two. With uv, make an environment first:
 
 ```bash
 uv venv --python 3.14
 source .venv/bin/activate
-uv pip install dewml
+uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple
 ```
 
-To install the current revision of the repository instead of the release, name it: `uv pip install "dewml @ git+https://github.com/AshishKumar4/dew"`, and pin a commit, `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`, to reproduce a run later. Dew installs JAX 0.11.2 and Flax 0.12.10 or a later 0.12 release. A process pool across GPUs needs a patched JAX to keep its compilation cache; [Process pools across GPUs](#process-pools-across-gpus) covers it.
+To install the current revision of the repository instead of the release, name it: `uv pip install "dewml @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`, and pin a commit, `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`, to reproduce a run later. Dew installs its JAX build of 0.12.0 and Flax 0.12.10 or a later 0.12 release.
 
 The CPU install is enough for the [Quickstart](getting-started.md).
 
@@ -60,7 +84,7 @@ print("Devices:", jax.devices())
 
 ## GPUs and TPUs
 
-The `cuda13`, `cuda12` and `tpu` extras each install the accelerator build of JAX 0.12.0, the version Dew requires; they are JAX's own extras of the same names. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. Extras combine, as in `dewml[cuda13,interop,streaming]`.
+The `cuda13`, `cuda12` and `tpu` extras each install the accelerator build of jaxlib 0.12.0, under Dew's JAX build; they are JAX's own extras of the same names. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. Extras combine, as in `dewml[cuda13,interop,streaming]`.
 
 ### Which CUDA build
 
@@ -77,18 +101,15 @@ The driver and the GPU decide the build, newest first:
 
 A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the first `Trainer.fit` of a program that never called it, raises `dew.telemetry.devices.CPUOnlyJax` when JAX opened on the CPU, naming the install that fixes it where no CUDA build is installed or the installed one can't run on this driver. `import dew` asks nothing of the hardware, so the check runs once the process's XLA flags are set. `JAX_PLATFORMS` selects the backend before JAX is imported. `JAX_PLATFORMS=cpu python train.py` runs on the CPU on a GPU machine, and the check leaves it alone. On Colab the tutorials install `dewml[cuda13]`. [Cloud TPUs](tpu.md) covers TPU provisioning.
 
-### Process pools across GPUs
+### Dew's JAX build
 
-JAX 0.12.0 keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links. In a process pool across GPUs that are linked differently, the processes key the same step differently. On the next run some load it from the persistent compilation cache while the others compile it, and that compile then waits forever for every process to join. The fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940), sent as [jax-ml/jax#41776](https://github.com/jax-ml/jax/pull/41776)) is in no JAX release yet. With the 0.12.0 release, Dew compiles a GPU pool without the persistent cache and prints on every process that it does; the pool trains correctly, but compiles its steps again on every run. To keep the cache, install the patched build from Dew's package index, which serves JAX's releases with Dew's fixes on top (0.12.0.post4 and later) and nothing else:
+Dew requires `jax>=0.12.0.post5,<0.12.1`: JAX 0.12.0 with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, `https://pypi.dewml.dev/simple`, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
 
-```bash
-uv pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple
-pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple
-```
+- A computation that spans processes keys the persistent compilation cache alike on every process ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940), sent as [jax-ml/jax#41776](https://github.com/jax-ml/jax/pull/41776)). The 0.12.0 release keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links, so in a pool across GPUs linked differently some processes load a step from the cache while the others compile it, and that compile waits forever for every process to join.
+- A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502), sent as [jax-ml/jax#41777](https://github.com/jax-ml/jax/pull/41777)), so two checkouts share one compiled kernel.
+- `linear_call` batches, and differentiates in its residuals, which the experts' fused SwiGLU route needs.
 
-Every other package comes from PyPI. `constraints.txt` names the same build for CI and development installs.
-
-A pool of one process, and a TPU or CPU pool, needs nothing more.
+Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
 ## Optional extras
 
@@ -120,14 +141,14 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `ci` | The test suite's whole environment: `test` and every extra a test file imports |
 
 ```bash
-uv pip install 'dewml[interop,streaming] @ git+https://github.com/AshishKumar4/dew'
+uv pip install 'dewml[interop,streaming] @ git+https://github.com/AshishKumar4/dew' --extra-index-url https://pypi.dewml.dev/simple
 ```
 
 The `vision` extra expects CPU builds of PyTorch and torchvision, installed first, so that no CUDA PyTorch sits beside JAX's accelerator runtime. Without it the native multimodal checkpoints still load, but their processors raise an error when given images.
 
 ```bash
 uv pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cpu
-uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
+uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew' --extra-index-url https://pypi.dewml.dev/simple
 ```
 
 Run the first command even if CPU torch is already installed. Installing `vision`

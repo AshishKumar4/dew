@@ -127,7 +127,7 @@ jobs:
         if "$RUNNER_TEMP/plain/bin/pip" install --index-url https://pypi.org/simple dist/*.whl > plain.txt 2>&1; then
           cat plain.txt; echo "dewml installed from PyPI alone, on a jax without Dew's fixes"; exit 1
         fi
-        grep -q "jax>=0.12.0.post5" plain.txt || { cat plain.txt; exit 1; }
+        grep -q "No matching distribution found for jax" plain.txt || { cat plain.txt; exit 1; }
     - name: Install the wheel into an empty environment, jax from Dew's package index
       run: |
         python -m venv "$RUNNER_TEMP/clean"

@@ -47,7 +47,7 @@ git clone https://github.com/AshishKumar4/dew.git
 cd dew
 uv venv --python 3.14
 source .venv/bin/activate
-uv pip install -e ".[tfds,cuda12]"
+uv pip install -e ".[tfds,cuda12]" --extra-index-url https://pypi.dewml.dev/simple
 ```
 
 Prepare the dataset once, in a separate environment. The TFDS builder needs TensorFlow, but training reads the prepared files without it. TFDS 4.9.10 imports `importlib_resources` while it prepares a dataset but only declares that dependency for Python before 3.9, so the command installs it explicitly.
@@ -1454,10 +1454,12 @@ I recommend 3.14, and CI tests both. To install it yourself, choose the extra fo
 
 | Hardware | uv | pip |
 |---|---|---|
-| CPU | `uv pip install dewml` | `pip install dewml` |
-| NVIDIA GPU, driver 580+ | `uv pip install "dewml[cuda13]"` | `pip install "dewml[cuda13]"` |
-| NVIDIA GPU, driver 525+ | `uv pip install "dewml[cuda12]"` | `pip install "dewml[cuda12]"` |
-| Google TPU VM | `uv pip install "dewml[tpu]"` | `pip install "dewml[tpu]"` |
+| CPU | `uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple` | `pip install dewml --extra-index-url https://pypi.dewml.dev/simple` |
+| NVIDIA GPU, driver 580+ | `uv pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` |
+| NVIDIA GPU, driver 525+ | `uv pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` |
+| Google TPU VM | `uv pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` |
+
+Dew runs on its own build of JAX 0.12.0, which only its package index serves; without `--extra-index-url https://pypi.dewml.dev/simple` the install stops at resolving jax ([installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#dews-jax-build)).
 
 CUDA 13 also needs a GPU of compute capability 7.5 or later ([which CUDA build](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#which-cuda-build)).
 
@@ -1468,10 +1470,10 @@ git clone https://github.com/AshishKumar4/dew.git
 cd dew
 uv venv --python 3.14
 source .venv/bin/activate
-uv pip install -e ".[cuda12]"
+uv pip install -e ".[cuda12]" --extra-index-url https://pypi.dewml.dev/simple
 ```
 
-To install the main branch without cloning it, run `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. The extras install the accelerator build of jax 0.11.2, the version Dew requires. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. A process pool across GPUs keeps its compilation cache only with a patched jax 0.11.2 ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)); the [installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#process-pools-across-gpus) explains how to install it.
+To install the main branch without cloning it, run `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`. The extras install the accelerator build of jaxlib 0.12.0 under Dew's JAX build. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on.
 
 `pyproject.toml` lists every optional extra, and the installation guide's [Optional extras](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#optional-extras) says what each adds. `interop` reads and writes safetensors, `vision` provides the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs used in the serving section. The sections above name the extra each feature needs. The [installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md) covers development dependencies and dataset preparation.
 
