@@ -168,12 +168,12 @@ def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width
                     reason="Dew refuses a grouped quantized convolution on a GPU; "
                            "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
 @pytest.mark.parametrize("groups", [1, 16])
-def test_a_quantized_convolution_keeps_its_calls_precision_and_result_dtype(groups):
-    """A quantized convolution keeps its call's contract, as a quantized matmul does: one pinned at
-    the highest precision, Dew's Conv and lax's alike, has no quantized form and runs unquantized at
-    it, bitwise the float convolution; one that asks for a float32 result from bf16 operands
-    returns float32, within int8's rounding of the float convolution. Before, both quantized and
-    returned the bf16 input's dtype."""
+def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision_it_pins(groups):
+    """A quantized convolution keeps its call's contract, as a quantized matmul does: one that asks
+    for a float32 result from bf16 operands returns float32, within int8's rounding of the float
+    convolution, where before it returned the bf16 input's dtype; and one pinned at the highest
+    precision, Dew's Conv and lax's alike, quantizes as any other does, a quantized product having
+    no precision to honour, within int8's rounding of the float convolution."""
     pytest.importorskip("qwix")
     from flax import linen as nn
 
@@ -197,8 +197,9 @@ def test_a_quantized_convolution_keeps_its_calls_precision_and_result_dtype(grou
               Native(precision=jax.lax.Precision.HIGHEST))
     for module in pinned:
         variables = module.init(jax.random.key(1), x)
-        np.testing.assert_array_equal(Quantization().apply(module).apply(variables, x),
-                                      module.apply(variables, x))
+        got = Quantization().apply(module).apply(variables, x).astype(jnp.float32)
+        want = module.apply(variables, x).astype(jnp.float32)
+        assert 0.0 < float(jnp.linalg.norm(got - want) / jnp.linalg.norm(want)) < 0.02
     wide = Native(preferred=jnp.float32)
     variables = wide.init(jax.random.key(1), x)
     got = Quantization().apply(wide).apply(variables, x)
@@ -974,10 +975,10 @@ class Calls(nn.Module):
 
 def zone_cases(dtype) -> dict[str, tuple[Callable[..., jax.Array], tuple, dict]]:
     """Each `UNQUANTIZED` function, its operands in `dtype` and its keywords."""
-    keys = iter(jax.random.split(jax.random.key(0), 8))
+    rng = np.random.default_rng(0)
 
     def normal(*shape):
-        return jax.random.normal(next(keys), shape, jnp.float32).astype(dtype)
+        return jnp.asarray(rng.standard_normal(shape), jnp.float32).astype(dtype)
 
     pole = jnp.exp(jax.lax.complex(-jnp.linspace(0.05, 0.4, 4), jnp.linspace(0.3, 2.0, 4)))
     return {
