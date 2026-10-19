@@ -151,20 +151,22 @@ def test_the_sparse_mlp_trains_on_padded_rows_as_the_reference_does():
                            reductions=hidden.shape[0] * hidden.shape[1])
 
 
-def sparse_mlps(sparsity: float, width: int, rows: int, dtype):
+def sparse_mlps(sparsity: float, width: int, rows: int, dtype, hidden: int = HIDDEN):
     """The reference's public `Gemma3nTextMLP` and Dew's `GatedMLP` at `sparsity` over the
-    same random weights, `width` gate activations a row, and `rows` random inputs."""
+    same random weights, `width` gate activations a row of `hidden` features, and `rows`
+    random inputs."""
     import torch
     from transformers import Gemma3nTextConfig
     from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextMLP
 
     draws = np.random.default_rng(0)
     names = ("gate_proj", "up_proj", "down_proj")
-    shapes = {"gate_proj": (width, HIDDEN), "up_proj": (width, HIDDEN), "down_proj": (HIDDEN, width)}
+    shapes = {"gate_proj": (width, hidden), "up_proj": (width, hidden), "down_proj": (hidden, width)}
     weights = {name: (draws.standard_normal(shape) / np.sqrt(shape[1])).astype(np.float32)
                for name, shape in shapes.items()}
-    hidden = draws.standard_normal((rows, HIDDEN)).astype(np.float32)
-    config = Gemma3nTextConfig(hidden_size=HIDDEN, intermediate_size=width, num_hidden_layers=1,
+    inputs = draws.standard_normal((rows, hidden)).astype(np.float32)
+    config = Gemma3nTextConfig(hidden_size=hidden, intermediate_size=width, num_hidden_layers=1,
+                               num_attention_heads=1, num_key_value_heads=1, head_dim=max(hidden, 2),
                                activation_sparsity_pattern=[sparsity])
 
     def reference(torch_dtype, cotangent=None):
@@ -172,7 +174,7 @@ def sparse_mlps(sparsity: float, width: int, rows: int, dtype):
         with torch.no_grad():
             for name in names:
                 getattr(mlp, name).weight.copy_(torch.from_numpy(weights[name]))
-        x = torch.tensor(hidden).to(torch_dtype).requires_grad_()
+        x = torch.tensor(inputs).to(torch_dtype).requires_grad_()
         output = mlp(x)
         if cotangent is None:
             return {"output": output.detach().float().numpy()}
@@ -180,10 +182,10 @@ def sparse_mlps(sparsity: float, width: int, rows: int, dtype):
         return {"output": output.detach().numpy(), "input": x.grad.numpy(),
                 **{name: getattr(mlp, name).weight.grad.numpy().T for name in names}}
 
-    model = GatedMLP(hidden_features=width, out_features=HIDDEN, activation="geglu",
+    model = GatedMLP(hidden_features=width, out_features=hidden, activation="geglu",
                      activation_sparsity=sparsity, dtype=dtype)
     params = {name: {"kernel": jnp.asarray(weights[name].T, dtype)} for name in names}
-    return reference, model, params, jnp.asarray(hidden, dtype)
+    return reference, model, params, jnp.asarray(inputs, dtype)
 
 
 @pytest.mark.parametrize("sparsity", [0.9, 0.95, 0.99])
@@ -192,11 +194,14 @@ def test_the_sparse_mlp_is_as_exact_as_the_reference_at_each_sparsity(sparsity):
     2048 gate activations, at each sparsity a released pattern uses or bounds: Dew's fp32
     output and gradients are within tests/reference_error.py's rule of the reference's fp32,
     both from the reference in float64. The gate's cutoff multiplier is the reference's (its
-    fp32 icdf); jax's own fp32 erfinv lands two ulps from it at 0.95."""
+    fp32 icdf); jax's own fp32 erfinv lands two ulps from it at 0.95. Four features a row keep
+    the projections' own rounding below the cutoff's, which a wide row hides: that multiplier
+    put the down projection's gradient 3.4 and 2.4 times the reference's distance at 0.9 and
+    0.95, and the right one 1.0 and 1.1."""
     import torch
 
-    reference, model, params, hidden = sparse_mlps(sparsity, 2048, 256, jnp.float32)
-    cotangent = np.random.default_rng(1).standard_normal((256, HIDDEN)).astype(np.float32)
+    reference, model, params, hidden = sparse_mlps(sparsity, 2048, 256, jnp.float32, hidden=4)
+    cotangent = np.random.default_rng(1).standard_normal((256, 4)).astype(np.float32)
 
     def loss(params, x):
         output = model.apply({"params": params}, x)
