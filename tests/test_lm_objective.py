@@ -781,8 +781,8 @@ def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_ma
     gradient and the head's, none again, and its loss and gradients are the
     per-token tiled head's, z-loss and padding included. Unfused
     (`unfuse_head`, the fit ladder's rung for a fused chunk that does not
-    fit), the step takes the tiled head's gradient in its backward,
-    contracting the vocabulary more, to the same loss and gradients."""
+    fit), the step takes the tiled head's gradient in its backward, a tile
+    of the vocabulary at a time, to the same loss and gradients."""
     vocab = 61
     model, tokens = head_scored(vocab, remat="full")
     tokens = tokens.at[1, 6:].set(0)
@@ -804,7 +804,8 @@ def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_ma
         return vocabulary_products(program.jaxpr, vocab)
 
     assert step_products(fused) == 3
-    assert step_products(unfused) > 3
+    # The tiled head contracts the vocabulary a tile of its columns at a time, so no product spans it.
+    assert step_products(unfused) == 0
     with jax.default_matmul_precision("highest"):
         theirs = jax.value_and_grad(loss(fused, training=False))(params)
         for objective in (fused, unfused):
