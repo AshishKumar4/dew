@@ -377,3 +377,11 @@ def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Out
 
     run.defvjp(forward, backward)
     return run
+
+
+def sqrt_or_zero(square):
+    """`sqrt(square)`, and zero with a zero gradient where `square` is zero:
+    sqrt's infinite derivative there would turn a masked row's zero upstream
+    gradient into NaN for every parameter it touches."""
+    positive = square > 0
+    return jnp.where(positive, jnp.sqrt(jnp.where(positive, square, 1.0)), 0.0)
