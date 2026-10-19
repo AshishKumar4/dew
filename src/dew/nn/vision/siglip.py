@@ -18,7 +18,7 @@ from dew import records
 from dew.interop.weights import checkpoint_array
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.conv import Conv
-from dew.nn.precision import Float32Products
+from dew.nn.precision import float32_dot_general
 from dew.nn.text_encoders import (
     TOWER_ACTIVATIONS,
     _encoder_layer_path,
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
 
 
-class SiglipVisionTransformer(Float32Products, nn.Module):
+class SiglipVisionTransformer(nn.Module):
     """The SigLIP vision trunk, param layout of `SiglipVisionConfig`.
 
     `pixel_values` are what the checkpoint's image processor emits: [B, C, H,
@@ -67,14 +67,14 @@ class SiglipVisionTransformer(Float32Products, nn.Module):
         self.patch_embedding = Conv(
             cfg.hidden_size, (cfg.patch_size, cfg.patch_size),
             strides=(cfg.patch_size, cfg.patch_size), padding="VALID",
-            use_bias=True, dtype=self.dtype, precision=self.products,
+            use_bias=True, dtype=self.dtype, precision=self.precision,
             name="patch_embedding")
         self.position_embedding = nn.Embed(patches, cfg.hidden_size,
                                            dtype=self.dtype, name="position_embedding")
         self.layers = [
             clip_layer(cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, patches,
                        activation=tower_activation(cfg.hidden_act), eps=cfg.layer_norm_eps, dtype=self.dtype,
-                       precision=self.products, name=f"layers_{index}")
+                       precision=self.precision, name=f"layers_{index}")
             for index in range(cfg.num_layers)]
         self.post_layernorm = LayerNorm(
             epsilon=cfg.layer_norm_eps, dtype=self.dtype, name="post_layernorm")
@@ -114,7 +114,7 @@ class SiglipVision(TowerBase):
                              channels=self.num_channels)
 
 
-class GemmaProjectorModule(Float32Products, nn.Module):
+class GemmaProjectorModule(nn.Module):
     """Patch features into soft tokens: block average, norm, map to text width.
 
     The reference reshapes the trunk sequence into its patch grid, averages
@@ -139,7 +139,7 @@ class GemmaProjectorModule(Float32Products, nn.Module):
             name="mm_soft_emb_norm")
         self.mm_input_projection = nn.Dense(
             self.text_width, use_bias=False, dtype=self.dtype,
-            precision=self.products, name="mm_input_projection")
+            precision=self.precision, name="mm_input_projection", dot_general=float32_dot_general)
 
     def __call__(self, vision_outputs) -> jax.Array:
         batch, length, width = vision_outputs.shape

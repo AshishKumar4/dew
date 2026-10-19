@@ -27,7 +27,7 @@ from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.multimodal import VisionConditioner
-from dew.nn.precision import Float32Products, at_least_fp32, float32_products
+from dew.nn.precision import at_least_fp32, float32_dot_general, float32_products
 from dew.nn.protocols import OutputTable
 
 if TYPE_CHECKING:
@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 
 # The layers follow Transformers' modeling_diffusion_gemma.py:790-823.
-class SelfConditioning(Float32Products, nn.Module):
+class SelfConditioning(nn.Module):
     """Folds the previous step's soft embeddings into the canvas embeddings."""
 
     hidden_size: int
@@ -52,7 +52,7 @@ class SelfConditioning(Float32Products, nn.Module):
             epsilon=self.norm_eps, with_scale=False, dtype=self.dtype,
             name="post_norm")
         dense = functools.partial(nn.Dense, use_bias=False,
-                                  dtype=self.dtype, precision=self.products)
+                                  dtype=self.dtype, precision=self.precision, dot_general=float32_dot_general)
         self.gate_proj = dense(self.intermediate_size, name="gate_proj")
         self.up_proj = dense(self.intermediate_size, name="up_proj")
         self.down_proj = dense(self.hidden_size, name="down_proj")

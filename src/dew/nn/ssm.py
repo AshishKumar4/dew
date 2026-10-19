@@ -15,7 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from .conv import Conv
 from .flops import conv_flops, projection_flops
-from .precision import Float32Products, at_least_fp32, computes_in, float32_products
+from .precision import at_least_fp32, float32_dot_general, float32_products
 
 
 def hippo_a_imag_init(key, shape, dtype=jnp.float32):
@@ -273,10 +273,10 @@ class BidirectionalS5Layer(nn.Module):
         y_fwd, y_bwd = _directions(u, operators, (False, True), dtype)
         y_cat = jnp.concatenate([y_fwd, y_bwd], axis=-1)  # [B, S, 2F]
         return nn.Dense(features=self.features, dtype=self.dtype, name="out_proj",
-                        precision=float32_products(computes_in(self)))(y_cat)
+                        dot_general=float32_dot_general)(y_cat)
 
 
-class SpatialFusionConv(Float32Products, nn.Module):
+class SpatialFusionConv(nn.Module):
     """Multi-dilation depthwise 2D convs summed as a residual over the SSM output grid.
     The 1D scan scrambles 2D locality; this recovers a direction-balanced local
     receptive field. Kernels are zero-init so the fusion starts as a pass-through.
@@ -308,7 +308,7 @@ class SpatialFusionConv(Float32Products, nn.Module):
                 use_bias=False,
                 kernel_init=nn.initializers.zeros,
                 dtype=self.dtype,
-                precision=self.products,
+                precision=self.precision,
                 name=f"dwconv_dil{dil}",
             )(y_2d)
             out = out + dw

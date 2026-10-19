@@ -21,7 +21,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.interop.weights import translate_parameters
-from dew.nn.precision import Float32Products
+from dew.nn.precision import float32_conv_general_dilated, float32_dot_general
 from dew.registry import Record
 
 from .activations import gelu_exact
@@ -109,7 +109,7 @@ class MiMoAudio(TowerBase):
         return TowerGeometry(mel_features=self.tokenizer.n_mels)
 
 
-class AudioTokenizerEncoder(Float32Products, nn.Module):
+class AudioTokenizerEncoder(nn.Module):
     """The tokenizer's encoder up to its codes (AudioTokenizerEncoder.get_features, then the
     quantizer). Each row is one sequence of `lengths` mel frames: two GELU convolutions, the second
     halving time; the blocks, the output of layer `encoder_skip_layer_id - 1` added back after the
@@ -128,7 +128,8 @@ class AudioTokenizerEncoder(Float32Products, nn.Module):
     def __call__(self, mels, lengths, batch_lengths=None):
         cfg = self.config
         batch_lengths = jnp.max(lengths) if batch_lengths is None else batch_lengths
-        conv = functools.partial(nn.Conv, cfg.d_model, dtype=self.dtype, precision=self.products)
+        conv = functools.partial(nn.Conv, cfg.d_model, dtype=self.dtype, precision=self.precision,
+                                 conv_general_dilated=float32_conv_general_dilated)
         place = jnp.arange(mels.shape[1])[None, :]
         x = jnp.where((place < lengths[:, None])[..., None], mels, 0)
         x = gelu_exact(conv((cfg.kernel_size,), padding=((1, 1),), name="conv1")(x))
@@ -154,12 +155,12 @@ class AudioTokenizerEncoder(Float32Products, nn.Module):
                     # The reference masks keys past `window` places back: |q - k| < window + 1
                     # (`window_sides`).
                     sliding_window=cfg.encoder_attn_window_size[0] + 1 if cfg.windowed(index) else None,
-                    bidirectional_window=not cfg.encoder_causal, dtype=self.dtype, precision=self.products))
+                    bidirectional_window=not cfg.encoder_causal, dtype=self.dtype, precision=self.precision))
             mlp = functools.partial(GatedMLP, hidden_features=cfg.encoder_ffn_dim, out_features=cfg.d_model,
                                     activation="gelu_exact", use_bias=True, dtype=self.dtype,
-                                    precision=self.products)
+                                    precision=self.precision)
             block = DecoderBlock(attention, mlp, cfg.d_model, BlockWiring(), norm_eps=1e-5, norm_type="layer",
-                                 norm_bias=True, dtype=self.dtype, precision=self.products,
+                                 norm_bias=True, dtype=self.dtype, precision=self.precision,
                                  name=f"layers_{index}")
             # The padding runs as a document of its own; each frame keeps its index as its position.
             places = jnp.broadcast_to(jnp.arange(valid.shape[1]), valid.shape)
@@ -199,7 +200,7 @@ class ResidualQuantizer(nn.Module):
             for stage, size in enumerate(self.sizes)])
 
 
-class MiMoAudioCodeEncoder(Float32Products, nn.Module):
+class MiMoAudioCodeEncoder(nn.Module):
     """The audio encoder over codes (MiMoAudioEncoder._process_audio_codes): each code frame the sum
     of its stages' embeddings, `group_size` frames a group, a row's last group filled with its last
     frame; the groups through Qwen 2 blocks, bidirectional where `input_full_attention`, its final
@@ -230,26 +231,27 @@ class MiMoAudioCodeEncoder(Float32Products, nn.Module):
                 emb_features=cfg.input_local_dim, num_heads=heads, num_kv_heads=heads,
                 head_dim=cfg.input_local_dim // heads, max_seq_len=cfg.group_size,
                 causal=not cfg.input_full_attention, qk_norm=False, attention_bias=True, o_proj_bias=False,
-                rope_theta=cfg.rope_theta, dtype=self.dtype, precision=self.products))
+                rope_theta=cfg.rope_theta, dtype=self.dtype, precision=self.precision))
         mlp = functools.partial(GatedMLP, hidden_features=cfg.input_local_intermediate_size,
-                                out_features=cfg.input_local_dim, dtype=self.dtype, precision=self.products)
+                                out_features=cfg.input_local_dim, dtype=self.dtype, precision=self.precision)
         # Qwen2RMSNorm casts the normalized activations back before its weight
         # multiplies them (modeling_qwen2.py:247-252), at every block norm and the final one.
         for index in range(cfg.input_local_layers):
             x = DecoderBlock(attention, mlp, cfg.input_local_dim, BlockWiring(), norm_eps=cfg.rms_norm_eps,
-                             scale_after_cast=True, dtype=self.dtype, precision=self.products,
+                             scale_after_cast=True, dtype=self.dtype, precision=self.precision,
                              name=f"layers_{index}")(x)
         if cfg.add_post_norm:
             x = RMSNorm(epsilon=cfg.rms_norm_eps, scale_after_cast=True, dtype=self.dtype, name="norm")(x)
         x = x.reshape(batch, groups, cfg.group_size * cfg.input_local_dim)
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.products)
+        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
         if cfg.projection_layers == 1:
             return dense(cfg.out_hidden_size, name="projection")(x)
         hidden = dense(4 * cfg.group_size * cfg.input_local_dim, name="projection_fc1")(x)
         return dense(cfg.out_hidden_size, name="projection_fc2")(gelu_exact(hidden))
 
 
-class MiMoAudioTower(Float32Products, nn.Module):
+class MiMoAudioTower(nn.Module):
     """Mel frames `[clips, frames, n_mels]` with their valid-frame mask to the decoder's embeddings:
     each clip cut into segments of `audio_segment_size` frames, every segment tokenized as its own
     sequence (tokenize_audio_batch), a clip's codes joined, then the code encoder. The mask marks the
@@ -269,14 +271,14 @@ class MiMoAudioTower(Float32Products, nn.Module):
         mels = jnp.pad(input_features, ((0, 0), (0, segments * size - frames), (0, 0)))
         mels = mels.reshape(clips * segments, size, mel)
         spans = jnp.clip(lengths[:, None] - jnp.arange(segments)[None, :] * size, 0, size).reshape(-1)
-        features, valid = AudioTokenizerEncoder(cfg.tokenizer, dtype=self.dtype, precision=self.products,
+        features, valid = AudioTokenizerEncoder(cfg.tokenizer, dtype=self.dtype, precision=self.precision,
                                                 name="tokenizer")(mels, spans, batch_longest(spans, cfg))
         codes = ResidualQuantizer(cfg.tokenizer.codebook_size, cfg.tokenizer.d_model,
                                   name="quantizer")(features)
         # Only a clip's last segment is short, so its codes are a prefix of the joined rows.
         codes = codes.reshape(clips, -1, codes.shape[-1])
         counts = jnp.sum(valid.reshape(clips, -1), axis=1)
-        features = MiMoAudioCodeEncoder(cfg, dtype=self.dtype, precision=self.products, name="encoder")(
+        features = MiMoAudioCodeEncoder(cfg, dtype=self.dtype, precision=self.precision, name="encoder")(
             codes, counts)
         groups = -(-counts // cfg.group_size)
         return AudioEncoding(features, jnp.arange(features.shape[1])[None, :] < groups[:, None])

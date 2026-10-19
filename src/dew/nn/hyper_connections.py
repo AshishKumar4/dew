@@ -44,7 +44,7 @@ from flax import linen as nn
 
 from .attention import unweighted_rmsnorm
 from .flops import projection_flops
-from .precision import at_least_fp32, float32_products
+from .precision import at_least_fp32, float32_matmul, float32_products
 
 HEADS = ('mean', 'weighted', 'carried')
 
@@ -166,7 +166,7 @@ class HyperConnection(nn.Module):
         flat = unweighted_rmsnorm(
             streams.reshape(*streams.shape[:2], hc * streams.shape[-1]).astype(at_least_fp32(streams.dtype)),
             self.norm_eps)
-        mixes = flat @ fn.T
+        mixes = float32_matmul(flat, fn.T)
         pre = nn.sigmoid(mixes[..., :hc] * scale[0] + base[:hc]) + self.spec.hc_eps
         post = 2 * nn.sigmoid(mixes[..., hc:2 * hc] * scale[1] + base[hc:2 * hc])
         logits = mixes[..., 2 * hc :].reshape(*mixes.shape[:-1], hc, hc) * scale[2] + base[2 * hc :].reshape(
@@ -225,7 +225,7 @@ class HyperHead(nn.Module):
         flat = unweighted_rmsnorm(
             streams.reshape(*streams.shape[:2], hc * streams.shape[-1]).astype(at_least_fp32(streams.dtype)),
             self.norm_eps)
-        pre = nn.sigmoid(flat @ fn.T * scale + base) + self.spec.hc_eps
+        pre = nn.sigmoid(float32_matmul(flat, fn.T) * scale + base) + self.spec.hc_eps
         return collapse_by(pre, streams)
 
 

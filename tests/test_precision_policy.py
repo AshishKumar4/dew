@@ -16,6 +16,7 @@ from dew.nn.llama4 import Llama4Mixer
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mla import MultiHeadLatentAttention
+from dew.nn.mlp import GatedMLP
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
 
@@ -294,26 +295,53 @@ def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
 
 
 def dot_precisions(function, *arguments) -> list:
-    """The precision of every dot_general `function` traces over `arguments`, with its operands'
-    dtype, sub-jaxprs included."""
-    return [(equation.params["precision"], equation.invars[0].aval.dtype)
+    """The precision of every dot_general `function` traces over `arguments`, with the dtype its
+    operands promote to, sub-jaxprs included."""
+    return [(equation.params["precision"],
+             jnp.result_type(*(variable.aval.dtype for variable in equation.invars)))
             for equation in equations(jax.make_jaxpr(function)(*arguments))
             if equation.primitive.name == "dot_general"]
 
 
-def test_a_model_with_no_dtype_multiplies_as_its_parameters_compute():
-    """A model with no dtype computes in the dtype its parameters promote to (flax's layers do), so
-    over float32 parameters every float32 product multiplies at HIGHEST, and over bfloat16 ones
-    none does: an unset dtype is not taken for float32, which pinned HIGHEST on bf16 products and
-    turned away their preset and the fused attention kernels."""
+HIGHEST = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
+
+
+def assert_float32_products(precisions) -> None:
+    """Every product of float32 operands at HIGHEST, and no other at it."""
+    assert precisions
+    off = [(precision, dtype) for precision, dtype in precisions
+           if (precision == HIGHEST) != (dtype == jnp.float32)]
+    assert not off, off
+
+
+@pytest.mark.parametrize("stored", ["float32", "bfloat16", "bfloat16 kernels"])
+def test_a_model_with_no_dtype_multiplies_each_product_as_its_operands_compute(stored):
+    """A model with no dtype computes each product in the dtype its operands promote to, as flax's
+    layers do, so float32 products multiply at HIGHEST and bf16 ones at their own precision, product
+    by product: over float32 parameters, bf16 ones, and bf16 kernels beside float32 norm scales.
+    Initializing it multiplies as applying it does. A precision resolved once for the whole model
+    from its parameters pinned HIGHEST on bf16 products and missed float32 ones."""
     model = LAYERS["packed"]()
     tokens = jnp.arange(16, dtype=jnp.int32).reshape(1, 16) % 64
     variables = model.init(jax.random.key(0), tokens)
-    highest = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
-    float32 = dot_precisions(model.apply, variables, tokens)
-    assert float32 and all(precision == highest for precision, dtype in float32 if dtype == jnp.float32)
-    narrow = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), variables)
-    assert all(precision != highest for precision, _ in dot_precisions(model.apply, narrow, tokens))
+    if stored != "float32":
+        kept = stored == "bfloat16 kernels"
+        variables = jax.tree_util.tree_map_with_path(
+            lambda path, leaf: leaf if kept and "kernel" not in jax.tree_util.keystr(path)
+            else leaf.astype(jnp.bfloat16), variables)
+    assert_float32_products(dot_precisions(model.apply, variables, tokens))
+    assert_float32_products(dot_precisions(lambda key: model.init(key, tokens), jax.random.key(0)))
+
+
+def test_a_layer_over_bf16_parameters_fed_float32_multiplies_float32_products():
+    """flax promotes a layer with no dtype over bf16 parameters and a float32 input to float32, so
+    its products multiply at HIGHEST, though its parameters are bf16."""
+    layer = GatedMLP(hidden_features=24, out_features=16)
+    x = jax.random.normal(jax.random.key(0), (2, 16), jnp.float32)
+    variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), layer.init(jax.random.key(1), x))
+    precisions = dot_precisions(layer.apply, variables, x)
+    assert precisions and all(dtype == jnp.float32 for _, dtype in precisions)
+    assert_float32_products(precisions)
 
 
 def test_xla_attention_honours_a_precision_only_where_jax_nn_multiplies_at_it():
@@ -322,10 +350,9 @@ def test_xla_attention_honours_a_precision_only_where_jax_nn_multiplies_at_it():
     dot algorithm jax.nn picks for bf16 whatever the config says, so 'xla' refuses a precision
     past the default there, as every fused kernel does, and the reference path takes it."""
     query, key, value = jax.random.normal(jax.random.key(1), (3, *BF16_QKV), jnp.float32)
-    highest = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
     precisions = dot_precisions(lambda q, k, v: scaled_dot_product_attention(
         q, k, v, implementation="xla", precision=jax.lax.Precision.HIGHEST), query, key, value)
-    assert precisions and all(precision == highest for precision, _ in precisions)
+    assert precisions and all(precision == HIGHEST for precision, _ in precisions)
     narrow = (query.astype(jnp.bfloat16), key.astype(jnp.bfloat16), value.astype(jnp.bfloat16))
     with pytest.raises(ValueError):
         scaled_dot_product_attention(*narrow, implementation="xla", precision=jax.lax.Precision.HIGHEST)

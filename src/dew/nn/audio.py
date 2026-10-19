@@ -22,7 +22,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.interop.weights import ParamTree, placed
-from dew.nn.precision import Float32Products
+from dew.nn.precision import float32_dot_general, float32_products
 from dew.registry import from_record
 
 from .activations import activation
@@ -128,7 +128,8 @@ def _clip(x, bound: float):
 def _dense(config: Gemma3nAudio | Gemma4Audio, dtype: Dtype | None, precision: PrecisionLike):
     """The encoders' bias-free linear map, its kernel drawn at `initializer_range`."""
     return functools.partial(nn.Dense, use_bias=False, dtype=dtype, precision=precision,
-                             kernel_init=nn.initializers.normal(config.initializer_range))
+                             kernel_init=nn.initializers.normal(config.initializer_range),
+                             dot_general=float32_dot_general)
 
 
 @logical_axes({("linear",): ("embed", "mlp")})
@@ -180,7 +181,7 @@ def _every_nth_frame(z, stride: int):
     return z if stride == 1 else z[:, jnp.arange(-(-z.shape[1] // stride)) * stride]
 
 
-class AudioSubsampleLayer(Float32Products, nn.Module):
+class AudioSubsampleLayer(nn.Module):
     features: int
     kernel: tuple[int, int]
     stride: tuple[int, int]
@@ -196,7 +197,7 @@ class AudioSubsampleLayer(Float32Products, nn.Module):
             x = x * mask[:, :, None, None]
         padding = ((0, self.kernel[0] - 1), (1, 1)) if self.cumulative else ((1, 1), (1, 1))
         x = Conv(self.features, self.kernel, strides=self.stride, padding=padding,
-                 use_bias=False, dtype=self.dtype, precision=self.products,
+                 use_bias=False, dtype=self.dtype, precision=self.precision,
                  kernel_init=nn.initializers.normal(self.initializer_range), name="conv")(x)
         if self.cumulative:
             x = CumulativeGroupNorm(self.norm_eps, name="norm")(x)
@@ -206,7 +207,7 @@ class AudioSubsampleLayer(Float32Products, nn.Module):
         return jax.nn.relu(x), _every_nth_frame(mask, self.stride[0])[:, :x.shape[1]]
 
 
-class AudioSubsample(Float32Products, nn.Module):
+class AudioSubsample(nn.Module):
     config: Gemma3nAudio | Gemma4Audio
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -223,10 +224,10 @@ class AudioSubsample(Float32Products, nn.Module):
         for i in range(2):
             x, mask = AudioSubsampleLayer(
                 channels[i], kernels[i], strides[i], old, eps, dtype=self.dtype,
-                precision=self.products, initializer_range=cfg.initializer_range,
+                precision=self.precision, initializer_range=cfg.initializer_range,
                 name=f"conv_{i}" if old else f"layer{i}")(x, mask)
         x = x.reshape(x.shape[0], x.shape[1], -1)
-        return _dense(cfg, self.dtype, self.products)(cfg.hidden_size, name="input_proj_linear")(x), mask
+        return _dense(cfg, self.dtype, self.precision)(cfg.hidden_size, name="input_proj_linear")(x), mask
 
 
 def _block_context(x, chunk: int, left: int, right: int):
@@ -270,9 +271,10 @@ def _relative_logits(query, key, positional, precision: PrecisionLike = None):
     batch, blocks, chunk, heads, dim = query.shape
     context = key.shape[2]
     q = query.transpose(0, 3, 1, 2, 4)
-    content = jnp.matmul(q, key.transpose(0, 3, 1, 4, 2), precision=precision)
+    products = float32_products(jnp.result_type(q, key, positional), precision)
+    content = jnp.matmul(q, key.transpose(0, 3, 1, 4, 2), precision=products)
     positions = positional.reshape(-1, heads, dim).transpose(1, 2, 0)
-    relative = jnp.matmul(q.reshape(batch, heads, blocks * chunk, dim), positions, precision=precision)
+    relative = jnp.matmul(q.reshape(batch, heads, blocks * chunk, dim), positions, precision=products)
     relative = relative.reshape(batch, heads, blocks, chunk, -1)
     relative = jnp.pad(relative, ((0, 0),) * 4 + ((0, context + 1 - relative.shape[-1]),))
     relative = relative.reshape(batch, heads, blocks, chunk * (context + 1))
@@ -303,11 +305,12 @@ def _chunked_attention(query, key, value, positional, valid, chunk: int, left: i
     allowed = _block_context(valid, chunk, left, right)[:, None, :, None, :] & window(distance)
     logits = jnp.where(allowed, logits, fill)
     probabilities = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(value.dtype)
-    out = jnp.matmul(probabilities, value.transpose(0, 3, 1, 2, 4), precision=precision)
+    out = jnp.matmul(probabilities, value.transpose(0, 3, 1, 2, 4),
+                     precision=float32_products(value.dtype, precision))
     return out.transpose(0, 2, 3, 1, 4).reshape(batch, -1, heads * dim)[:, :length]
 
 
-class Gemma3nRelativePosition(Float32Products, nn.Module):
+class Gemma3nRelativePosition(nn.Module):
     config: Gemma3nAudio
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -318,10 +321,10 @@ class Gemma3nRelativePosition(Float32Products, nn.Module):
         positions = jnp.arange(cfg.conf_attention_context_left - 1,
                                -cfg.conf_attention_context_right - 1, -1)
         signal = _position_signal(cfg.hidden_size, positions, queries.dtype)
-        return _dense(cfg, self.dtype, self.products)(cfg.hidden_size, name="pos_proj")(signal)
+        return _dense(cfg, self.dtype, self.precision)(cfg.hidden_size, name="pos_proj")(signal)
 
 
-class Gemma3nAttention(Float32Products, nn.Module):
+class Gemma3nAttention(nn.Module):
     config: Gemma3nAudio
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -330,7 +333,7 @@ class Gemma3nAttention(Float32Products, nn.Module):
     def __call__(self, x, valid):
         cfg = self.config
         heads, dim = cfg.conf_num_attention_heads, cfg.hidden_size // cfg.conf_num_attention_heads
-        dense = _dense(cfg, self.dtype, self.products)
+        dense = _dense(cfg, self.dtype, self.precision)
         projected = [dense(cfg.hidden_size, name=name)(x).reshape(*x.shape[:2], heads, dim)
                      for name in ("q_proj", "k_proj", "v_proj")]
         query, key, value = projected
@@ -338,16 +341,16 @@ class Gemma3nAttention(Float32Products, nn.Module):
         query = query * jnp.asarray(dim ** -0.5 / math.log(2), query.dtype)
         query = query * jax.nn.softplus(per_dim).astype(query.dtype)
         left, right = cfg.conf_attention_context_left - 1, cfg.conf_attention_context_right
-        positional = Gemma3nRelativePosition(cfg, dtype=self.dtype, precision=self.products,
+        positional = Gemma3nRelativePosition(cfg, dtype=self.dtype, precision=self.precision,
                                              name="relative_position_embedding")(query)
         return _chunked_attention(
             query, key, value, positional, valid, cfg.conf_attention_chunk_size, left, right,
             cap=cfg.conf_attention_logit_cap,
             window=lambda distance: (distance >= -right) & (distance <= left),
-            fill=float(jnp.finfo(query.dtype).min), precision=self.products)
+            fill=float(jnp.finfo(query.dtype).min), precision=self.precision)
 
 
-class Gemma4Attention(Float32Products, nn.Module):
+class Gemma4Attention(nn.Module):
     config: Gemma4Audio
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -356,7 +359,7 @@ class Gemma4Attention(Float32Products, nn.Module):
     def __call__(self, x, valid):
         cfg = self.config
         heads, dim = cfg.num_attention_heads, cfg.hidden_size // cfg.num_attention_heads
-        linear = _clippable(cfg, self.dtype, self.products)
+        linear = _clippable(cfg, self.dtype, self.precision)
         projected = [
             linear(cfg.hidden_size, name=name)(x).astype(jnp.float32).reshape(*x.shape[:2], heads, dim)
             for name in ("q_proj", "k_proj", "v_proj")
@@ -368,13 +371,13 @@ class Gemma4Attention(Float32Products, nn.Module):
         chunk, left, right = (cfg.attention_chunk_size, cfg.attention_context_left - 1,
                               cfg.attention_context_right)
         signal = _position_signal(cfg.hidden_size, jnp.arange((chunk + left + right) // 2, -1, -1), x.dtype)
-        positional = _dense(cfg, self.dtype, self.products)(cfg.hidden_size, name="relative_k_proj")(signal)
+        positional = _dense(cfg, self.dtype, self.precision)(cfg.hidden_size, name="relative_k_proj")(signal)
         out = _chunked_attention(
             query, key, value, positional.astype(jnp.float32), valid, chunk, left, right,
             cap=cfg.attention_logit_cap,
             window=lambda distance: (((distance >= 0) & (distance < left))
                                      | ((distance < 0) & (distance > -right))),
-            fill=cfg.attention_invalid_logits_value, precision=self.products)
+            fill=cfg.attention_invalid_logits_value, precision=self.precision)
         return linear(cfg.hidden_size, name="post")(out.astype(x.dtype))
 
 
@@ -396,7 +399,7 @@ class AudioFeedForward(nn.Module):
         return residual + x * self.residual_weight
 
 
-class AudioLightConv(Float32Products, nn.Module):
+class AudioLightConv(nn.Module):
     width: int
     kernel_size: int
     norm_eps: float
@@ -421,7 +424,7 @@ class AudioLightConv(Float32Products, nn.Module):
             feature_group_count=self.width,
             use_bias=False,
             dtype=self.dtype,
-            precision=self.products,
+            precision=self.precision,
             kernel_init=nn.initializers.normal(self.initializer_range),
             name="depthwise_conv1d",
         )(x)
@@ -429,7 +432,7 @@ class AudioLightConv(Float32Products, nn.Module):
         return residual + self.linear(self.width, name="linear_end")(activation(self.activation)(x))
 
 
-class Gemma3nConformerAttention(Float32Products, nn.Module):
+class Gemma3nConformerAttention(nn.Module):
     config: Gemma3nAudio
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -438,14 +441,14 @@ class Gemma3nConformerAttention(Float32Products, nn.Module):
     def __call__(self, x, valid):
         residual, cfg = x, self.config
         x = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="pre_attn_norm")(_clip(x, cfg.gradient_clipping))
-        x = Gemma3nAttention(cfg, dtype=self.dtype, precision=self.products, name="attn")(x, valid)
-        x = _dense(cfg, self.dtype, self.products)(cfg.hidden_size, name="post")(x)
+        x = Gemma3nAttention(cfg, dtype=self.dtype, precision=self.precision, name="attn")(x, valid)
+        x = _dense(cfg, self.dtype, self.precision)(cfg.hidden_size, name="post")(x)
         return residual + RMSNorm(epsilon=1e-6, dtype=self.dtype, name="post_norm")(
             _clip(x, cfg.gradient_clipping)
         )
 
 
-class Gemma3nConformer(Float32Products, nn.Module):
+class Gemma3nConformer(nn.Module):
     config: Gemma3nAudio
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -453,21 +456,21 @@ class Gemma3nConformer(Float32Products, nn.Module):
     @nn.compact
     def __call__(self, x, valid):
         cfg = self.config
-        dense = _dense(cfg, self.dtype, self.products)
+        dense = _dense(cfg, self.dtype, self.precision)
         feed_forward = functools.partial(AudioFeedForward, cfg.hidden_size, cfg.conf_residual_weight,
                                          cfg.gradient_clipping, dense, dtype=self.dtype)
         x = feed_forward(name="ffw_layer_start")(x)
-        x = Gemma3nConformerAttention(cfg, dtype=self.dtype, precision=self.products, name="attention")(
+        x = Gemma3nConformerAttention(cfg, dtype=self.dtype, precision=self.precision, name="attention")(
             x, valid
         )
         x = AudioLightConv(cfg.hidden_size, cfg.conf_conv_kernel_size, cfg.rms_norm_eps,
-                           cfg.gradient_clipping, dense, dtype=self.dtype, precision=self.products,
+                           cfg.gradient_clipping, dense, dtype=self.dtype, precision=self.precision,
                            initializer_range=cfg.initializer_range, name="lconv1d")(x * valid[..., None])
         x = feed_forward(name="ffw_layer_end")(x)
         return RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm")(_clip(x, cfg.gradient_clipping))
 
 
-class Gemma4Conformer(Float32Products, nn.Module):
+class Gemma4Conformer(nn.Module):
     config: Gemma4Audio
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -475,24 +478,24 @@ class Gemma4Conformer(Float32Products, nn.Module):
     @nn.compact
     def __call__(self, x, valid):
         cfg = self.config
-        linear = _clippable(cfg, self.dtype, self.products)
+        linear = _clippable(cfg, self.dtype, self.precision)
         feed_forward = functools.partial(AudioFeedForward, cfg.hidden_size, cfg.residual_weight,
                                          cfg.gradient_clipping, linear, cfg.hidden_act, dtype=self.dtype)
         x = feed_forward(name="feed_forward1")(x)
         residual = x
         x = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_pre_attn")(_clip(x, cfg.gradient_clipping))
-        x = Gemma4Attention(cfg, dtype=self.dtype, precision=self.products, name="self_attn")(x, valid)
+        x = Gemma4Attention(cfg, dtype=self.dtype, precision=self.precision, name="self_attn")(x, valid)
         x = residual + RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_post_attn")(
             _clip(x, cfg.gradient_clipping)
         )
         x = AudioLightConv(cfg.hidden_size, cfg.conv_kernel_size, cfg.rms_norm_eps, cfg.gradient_clipping,
-                           linear, cfg.hidden_act, dtype=self.dtype, precision=self.products,
+                           linear, cfg.hidden_act, dtype=self.dtype, precision=self.precision,
                            initializer_range=cfg.initializer_range, name="lconv1d")(x)
         x = feed_forward(name="feed_forward2")(x)
         return RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_out")(_clip(x, cfg.gradient_clipping))
 
 
-class Gemma3nAudioEncoder(Float32Products, nn.Module):
+class Gemma3nAudioEncoder(nn.Module):
     config: Gemma3nAudio = Gemma3nAudio()
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -513,16 +516,16 @@ class Gemma3nAudioEncoder(Float32Products, nn.Module):
         if cfg.conf_reduction_factor < 1:
             raise ValueError("conf_reduction_factor must be positive")
         x, mask = _inputs(input_features, input_features_mask, cfg.input_feat_size)
-        x, mask = AudioSubsample(cfg, dtype=self.dtype, precision=self.products,
+        x, mask = AudioSubsample(cfg, dtype=self.dtype, precision=self.precision,
                                  name="subsample_conv_projection")(x, mask)
         for index in range(cfg.conf_num_hidden_layers):
-            x = Gemma3nConformer(cfg, dtype=self.dtype, precision=self.products,
+            x = Gemma3nConformer(cfg, dtype=self.dtype, precision=self.precision,
                                  name=f"conformer_{index}")(x, mask)
         x, mask = (_every_nth_frame(z, cfg.conf_reduction_factor) for z in (x, mask))
         return AudioEncoding(jnp.where(mask[..., None], x, 0), mask)
 
 
-class Gemma4AudioEncoder(Float32Products, nn.Module):
+class Gemma4AudioEncoder(nn.Module):
     config: Gemma4Audio = Gemma4Audio()
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -536,14 +539,15 @@ class Gemma4AudioEncoder(Float32Products, nn.Module):
         x, mask = _inputs(input_features, input_features_mask, cfg.subsampling_conv_channels[0])
         if cfg.subsampling_conv_channels[0] % 4:
             raise ValueError("Gemma4 subsampling_conv_channels[0] must be divisible by four")
-        x, mask = AudioSubsample(cfg, dtype=self.dtype, precision=self.products,
+        x, mask = AudioSubsample(cfg, dtype=self.dtype, precision=self.precision,
                                  name="subsample_conv_projection")(x, mask)
         for index in range(cfg.num_hidden_layers):
-            x = Gemma4Conformer(cfg, dtype=self.dtype, precision=self.products, name=f"layers_{index}")(
+            x = Gemma4Conformer(cfg, dtype=self.dtype, precision=self.precision, name=f"layers_{index}")(
                 x, mask
             )
-        x = nn.Dense(cfg.output_proj_dims, use_bias=True, dtype=self.dtype, precision=self.products,
-                     kernel_init=nn.initializers.normal(cfg.initializer_range), name="output_proj")(x)
+        x = nn.Dense(cfg.output_proj_dims, use_bias=True, dtype=self.dtype, precision=self.precision,
+                     kernel_init=nn.initializers.normal(cfg.initializer_range), name="output_proj",
+                     dot_general=float32_dot_general)(x)
         return AudioEncoding(x, mask)
 
 

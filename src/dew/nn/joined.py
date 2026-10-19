@@ -15,6 +15,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.core import meta
 
+from dew.nn.precision import float32_dot_general
+
 from ..registry import wrapper_layers
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel
 
@@ -76,7 +78,7 @@ def joined_dense(x: jax.Array, projections: Sequence[nn.Module], *, axis: int) -
     inputs = promoted[0][0]
     # A kernel is [inputs, features]; the stacked axis sits beside its features as it will in the output.
     kernel = jnp.stack([kernel for _, kernel, _ in promoted], axis=axis + 3)
-    y = jax.lax.dot_general(inputs, kernel, (((inputs.ndim - 1,), (0,)), ((), ())),
+    y = float32_dot_general(inputs, kernel, (((inputs.ndim - 1,), (0,)), ((), ())),
                             precision=projections[0].precision)
     if not projections[0].use_bias:
         return y

@@ -72,7 +72,7 @@ from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
 from dew.nn.linear import DepthwiseConv1d, causal_conv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
-from dew.nn.precision import Float32Products, at_least_fp32, float32_products
+from dew.nn.precision import at_least_fp32, float32_dot_general, float32_products
 from dew.nn.sharding import (
     SEQUENCE_AXIS,
     LayoutRefused,
@@ -347,7 +347,7 @@ class MambaRMSNormGated(nn.Module):
     ("in_proj",): ("embed", "linear"),
     ("out_proj",): ("attention", "embed"),
 })
-class Mamba2(Float32Products, nn.Module):
+class Mamba2(nn.Module):
     """The token mixer of a Mamba-2 layer, `Mamba2Mixer` (modeling_mamba2.py:360-588).
 
     `intermediate = num_heads * head_dim` (the config's `expand *
@@ -420,7 +420,8 @@ class Mamba2(Float32Products, nn.Module):
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
         dense = functools.partial(
-            nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.products
+            nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
+            dot_general=float32_dot_general
         )
         self.in_proj = dense(
             2 * self.intermediate_size + 2 * self.n_groups * self.state_size + self.num_heads,

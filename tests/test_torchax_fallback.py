@@ -391,7 +391,10 @@ def test_a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(
     table = np.asarray(loaded.model.apply(loaded.variables, method="output_table").logits(hidden),
                        np.float64)
     reference = torch_logits(model, ids).astype(np.float64)
-    with torch.no_grad():
-        truth = model.double()(torch.from_numpy(np.asarray(ids, np.int64))).logits.numpy()
+    with float64(), torch.no_grad():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+        truth = wide(torch.from_numpy(np.asarray(ids, np.int64))).logits.numpy()
     assert_as_exact_as_the_reference(direct, reference, truth, "the forward's logits")
     assert_as_exact_as_the_reference(table, reference, truth, "the output table's logits")

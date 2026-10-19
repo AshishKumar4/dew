@@ -44,11 +44,12 @@ from .kernels.generation import (
 )
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
-    Float32Products,
     asks_default_precision,
     at_default_precision,
     at_least_fp32,
     configured_precision,
+    float32_dot_general,
+    float32_einsum,
     float32_products,
     jax_attention_honors,
     operand_precision,
@@ -1241,7 +1242,7 @@ def _blocked_values(weights, value, precision) -> jax.Array:
     value = jnp.pad(value, [(0, 0)] * (value.ndim - 3) + [(0, pad), (0, 0), (0, 0)])
     weights = weights.reshape(*weights.shape[:-1], blocks, VALUE_BLOCK)
     value = value.reshape(*value.shape[:-3], blocks, VALUE_BLOCK, *value.shape[-2:])
-    return jnp.einsum('...hqck,...ckhd->...qhdc', weights, value, precision=precision).sum(-1)
+    return float32_einsum('...hqck,...ckhd->...qhdc', weights, value, precision=precision).sum(-1)
 
 
 
@@ -1269,10 +1270,10 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     scaled_query = query / jnp.sqrt(width).astype(dtype)
     if sinks is None:
         key, value = repeat_kv_heads(key, heads), repeat_kv_heads(value, heads)
-        logits = jnp.einsum('...qhd,...khd->...hqk', scaled_query, key, precision=precision)
+        logits = float32_einsum('...qhd,...khd->...hqk', scaled_query, key, precision=precision)
     else:
         grouped = scaled_query.reshape(*rows, length, kv_heads, heads // kv_heads, width)
-        logits = jnp.einsum('...tkgd,...skd->...kgts', grouped, key, precision=precision).reshape(
+        logits = float32_einsum('...tkgd,...skd->...kgts', grouped, key, precision=precision).reshape(
             *rows, heads, length, keys)
     if softcap is not None:
         logits = jnp.tanh(logits / softcap) * softcap
@@ -1299,7 +1300,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     if sinks is None:
         return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
     groups = weights.astype(value.dtype).reshape(*rows, kv_heads, heads // kv_heads, length, keys)
-    return jnp.einsum('...kgts,...skd->...tkgd', groups, value, precision=precision).reshape(
+    return float32_einsum('...kgts,...skd->...tkgd', groups, value, precision=precision).reshape(
         *rows, length, heads, value.shape[-1])
 
 
@@ -1341,6 +1342,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     can save it instead of replaying the kernel (`remat_block` in dit.py).
     """
     shards = sequence_shards()
+    precision = float32_products(jnp.result_type(query, key, value) if dtype is None else dtype, precision)
     if not 0 <= dropout_rate < 1:
         raise ValueError(f"dropout_rate must be within [0, 1), got {dropout_rate}")
     if key_segment_ids is not None:
@@ -1470,8 +1472,7 @@ def folded_attention(query, key, value, mask=None, precision=None):
     operands, the scale after, an fp32 softmax of logits masked to -0.7
     times the largest fp32, probabilities in the value's dtype). Six layers
     of Qwen3.5's decode took 1.21 against 2.48 ms at 128 rows and 0.33
-    against 0.47 at 32 on an RTX 4080 (docs/performance.md). Both products
-    multiply at `precision` where the caller states one (`jax_attention_honors`).
+    against 0.47 at 32 on an RTX 4080 (docs/performance.md), at `precision`.
     """
     batch, positions, heads, width = query.shape
     keys = key.shape[-3]
@@ -2133,10 +2134,11 @@ def projected_heads(x, name: str, heads: int, head_dim: int, *, flat: bool, bias
     """
     width = heads * head_dim
     if flat:
-        projected = nn.Dense(width, use_bias=bias, dtype=dtype, precision=precision, name=name)(x)
+        projected = nn.Dense(width, use_bias=bias, dtype=dtype, precision=precision, name=name,
+                             dot_general=float32_dot_general)(x)
     else:
         projected = nn.DenseGeneral((heads, head_dim), use_bias=bias, dtype=dtype, precision=precision,
-                                    name=name)(x)
+                                    name=name, dot_general=float32_dot_general)(x)
     if norm is not None and across_heads:
         projected = norm(projected.reshape(*x.shape[:-1], width))
     projected = projected.reshape(*x.shape[:-1], heads, head_dim)
@@ -2150,10 +2152,11 @@ def projected_output(attended, name: str, features: int, *, flat: bool, bias: bo
     own: `[heads * head_dim, features]` flat, else `[heads, head_dim, features]`."""
     if flat:
         # The width is named, not inferred: an empty stream (no context tokens) has nothing to infer it from.
-        return nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name)(
+        return nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name,
+                        dot_general=float32_dot_general)(
             attended.reshape(*attended.shape[:-2], math.prod(attended.shape[-2:])))
     return nn.DenseGeneral(features, axis=(-2, -1), use_bias=bias, dtype=dtype, precision=precision,
-                           name=name)(attended)
+                           name=name, dot_general=float32_dot_general)(attended)
 
 
 @logical_axes({
@@ -2162,7 +2165,7 @@ def projected_output(attended, name: str, features: int, *, flat: bool, bias: bo
     ("to_v",): ("embed", "heads", "head_dim"),
     ("to_out_0",): ("heads", "head_dim", "embed"),
 })
-class NormalAttention(Float32Products, nn.Module):
+class NormalAttention(nn.Module):
     """Attend over a `[B, S, C]` or `[B, H, W, C]` input with multiple heads.
 
     `freqs_cis` rotates the queries and keys of a self-attention call;
@@ -2214,7 +2217,7 @@ class NormalAttention(Float32Products, nn.Module):
         projected = projected_heads(
             x, name, self.heads, self.dim_head, flat=False,
             bias=self.use_bias if self.qkv_bias is None else self.qkv_bias, dtype=self.dtype,
-            precision=self.products,
+            precision=self.precision,
             norm=RMSNorm(epsilon=1e-6, dtype=self.dtype, name=norm) if norm and self.qk_norm else None)
         return constrain(projected, HEADS)
 
@@ -2241,17 +2244,17 @@ class NormalAttention(Float32Products, nn.Module):
             key = rotate(key, freqs_cos, freqs_sin)
 
         hidden_states = scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.products,
+            query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=self.attention_impl, mask=mask, key_value_seq_lengths=key_value_seq_lengths,
             segment_ids=segment_ids, key_segment_ids=key_segment_ids, max_segments=max_segments,
         )
         proj = projected_output(constrain(hidden_states, HEADS), "to_out_0", self.query_dim, flat=False,
-                                bias=self.use_bias, dtype=self.dtype, precision=self.products)
+                                bias=self.use_bias, dtype=self.dtype, precision=self.precision)
         return proj.reshape(orig_x_shape)
 
 
-class FlaxGEGLU(Float32Products, nn.Module):
+class FlaxGEGLU(nn.Module):
     """Project to twice the hidden width, then gate one half by the other.
 
     The gate is GELU, the gated linear unit of Shazeer 2020
@@ -2274,7 +2277,8 @@ class FlaxGEGLU(Float32Products, nn.Module):
         return projection_flops(lengths, *self.projections()["proj"])
 
     def setup(self):
-        self.proj = nn.Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.products)
+        self.proj = nn.Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision,
+                             dot_general=float32_dot_general)
 
     def __call__(self, hidden_states):
         hidden_states = self.proj(hidden_states)
@@ -2283,7 +2287,7 @@ class FlaxGEGLU(Float32Products, nn.Module):
 
 
 @logical_axes({("net_0", "proj"): ("embed", "mlp"), ("net_2",): ("mlp", "embed")})
-class FlaxFeedForward(Float32Products, nn.Module):
+class FlaxFeedForward(nn.Module):
     """Run GEGLU then a linear layer back to `dim`, as diffusers does.
 
     The checkpoint keys `net_0` and `net_2` are the indices the reference's
@@ -2309,9 +2313,10 @@ class FlaxFeedForward(Float32Products, nn.Module):
 
     def setup(self):
         self.net_0 = FlaxGEGLU(
-            self.dim, dtype=self.dtype, precision=self.products, approximate=self.approximate_gelu
+            self.dim, dtype=self.dtype, precision=self.precision, approximate=self.approximate_gelu
         )
-        self.net_2 = nn.Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.products)
+        self.net_2 = nn.Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.precision,
+                              dot_general=float32_dot_general)
         self.dropout_layer = nn.Dropout(self.dropout)
 
     def __call__(self, hidden_states, *, train: bool = False):
@@ -2321,7 +2326,7 @@ class FlaxFeedForward(Float32Products, nn.Module):
         return self.net_2(hidden_states)
 
 
-class BasicTransformerBlock(Float32Products, nn.Module):
+class BasicTransformerBlock(nn.Module):
     """Run self-attention, cross-attention over `context`, then feed-forward.
 
     Each is pre-normed with a residual. `use_cross_only` drops the
@@ -2357,7 +2362,7 @@ class BasicTransformerBlock(Float32Products, nn.Module):
             query_dim=self.query_dim,
             heads=self.heads,
             dim_head=self.dim_head,
-            precision=self.products,
+            precision=self.precision,
             use_bias=self.use_bias,
             dtype=self.dtype,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
@@ -2366,7 +2371,7 @@ class BasicTransformerBlock(Float32Products, nn.Module):
         self.attention1 = attention(name='Attention1')
         self.attention2 = attention(name='Attention2')
 
-        self.ff = FlaxFeedForward(dim=self.query_dim, dtype=self.dtype, precision=self.products)
+        self.ff = FlaxFeedForward(dim=self.query_dim, dtype=self.dtype, precision=self.precision)
         self.norm1 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
         self.norm2 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
         self.norm3 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
@@ -2425,7 +2430,7 @@ def stage_attention(stage: Stage, channels: int, attention_impl: str, dtype: Dty
         name=name)
 
 
-class TransformerBlock(Float32Products, nn.Module):
+class TransformerBlock(nn.Module):
     """Run a `BasicTransformerBlock`, optionally at its own head width.
 
     `use_projection` puts a dense projection into and out of
@@ -2465,8 +2470,8 @@ class TransformerBlock(Float32Products, nn.Module):
             x = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(x)
 
         def project(features: int, name: str):
-            return nn.Dense(features=features, use_bias=False, precision=self.products,
-                            dtype=self.dtype, name=name)
+            return nn.Dense(features=features, use_bias=False, precision=self.precision,
+                            dtype=self.dtype, name=name, dot_general=float32_dot_general)
 
         if self.use_projection:
             inner_dim = self.heads * self.dim_head
@@ -2478,7 +2483,7 @@ class TransformerBlock(Float32Products, nn.Module):
             heads=self.heads,
             dim_head=self.dim_head,
             name='Attention',
-            precision=self.products,
+            precision=self.precision,
             use_bias=False,
             dtype=self.dtype,
             use_cross_only=(not self.use_self_and_cross),

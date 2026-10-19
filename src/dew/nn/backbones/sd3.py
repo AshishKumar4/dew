@@ -26,7 +26,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
-from dew.nn.precision import Float32Products, at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.scan_orders import unpatchify
 from dew.nn.sharding import logical_axes
 
@@ -67,7 +67,7 @@ def sincos_position(channels: int, grid: int, *, base_size: int):
 
 @logical_axes({("context_embedder",): (None, "embed"), ("proj_out",): ("embed", None),
                **embedding_axes("timestep_embedder", "text_embedder")})
-class SD3Transformer(TextStream, Float32Products, nn.Module):
+class SD3Transformer(TextStream, nn.Module):
     """Runs Diffusers 0.34.0's `SD3Transformer2DModel` behind Dew's model interface.
 
     `__call__` takes NHWC latents, the model time and a `DenoisingCondition`,
@@ -139,7 +139,7 @@ class SD3Transformer(TextStream, Float32Products, nn.Module):
 
     @nn.nowrap
     def _output_modulation(self):
-        return Modulation(self.features, 2, dtype=self.dtype, precision=self.products, name="norm_out")
+        return Modulation(self.features, 2, dtype=self.dtype, precision=self.precision, name="norm_out")
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
@@ -162,7 +162,7 @@ class SD3Transformer(TextStream, Float32Products, nn.Module):
             raise ValueError("SD3 conditioning needs the pooled text vector")
         if self.qk_norm not in (None, "rms_norm"):
             raise ValueError(f"Native SD3 implements qk_norm 'rms_norm', not {self.qk_norm!r}")
-        dense = {"dtype": self.dtype, "precision": self.products}
+        dense = {"dtype": self.dtype, "precision": self.precision}
         image = Conv(self.features, (patch, patch), strides=(patch, patch), padding="VALID",
                      name="pos_embed_proj", **dense)(x)
         image = image.reshape(image.shape[0], rows * columns, self.features)
@@ -173,7 +173,8 @@ class SD3Transformer(TextStream, Float32Products, nn.Module):
         conditioned = (embedding(times, self.features, "timestep_embedder", **dense)
                        + embedding(conditioning.pooled, self.features, "text_embedder", **dense))
 
-        context = nn.Dense(self.caption_projection_dim, name="context_embedder", **dense)(
+        context = nn.Dense(self.caption_projection_dim, name="context_embedder", **dense,
+                           dot_general=float32_dot_general)(
             conditioning.context)
         dual = set(self.dual_attention_layers)
         for index in range(self.num_layers):
@@ -185,7 +186,8 @@ class SD3Transformer(TextStream, Float32Products, nn.Module):
 
         scale, shift = self._output_modulation()(conditioned)
         image = modulate(layer_norm(self.dtype)(image), shift, scale)
-        image = nn.Dense(patch * patch * self.out_channels, name="proj_out", **dense)(image)
+        image = nn.Dense(patch * patch * self.out_channels, name="proj_out", **dense,
+                         dot_general=float32_dot_general)(image)
         return unpatchify(image, patch, rows * patch, columns * patch, self.out_channels)
 
 

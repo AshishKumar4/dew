@@ -12,7 +12,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew.nn.activations import HIDDEN_ACT
 from dew.nn.attention import RMSNorm
-from dew.nn.precision import Float32Products
+from dew.nn.precision import float32_dot_general
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.registry import Record
 
@@ -84,7 +84,7 @@ class MuseGlimmerVision(TowerBase):
         return TowerGeometry(patch_size=self.patch_size, block_size=self.merge_size, channels=3)
 
 
-class MuseGlimmerProjectorModule(Float32Products, nn.Module):
+class MuseGlimmerProjectorModule(nn.Module):
     """The merged image tokens as the decoder reads them (MuseGlimmerModel.get_image_features): each
     merge block's features channel by channel through the adapter's two bias-free maps, each followed
     by the activation (`MergeProjector`), a bias-free map to the decoder width, and a scale-free RMS
@@ -104,10 +104,10 @@ class MuseGlimmerProjectorModule(Float32Products, nn.Module):
         adapted = MergeProjector(hidden_size=self.vision_width, spatial_merge_size=self.merge_size,
                                  width=self.adapter_width, out_width=self.adapter_width, norm=False,
                                  channel_major=True, bias=False, activation=self.activation,
-                                 activation_after=True, dtype=self.dtype, precision=self.products,
+                                 activation_after=True, dtype=self.dtype, precision=self.precision,
                                  name="adapter")(image_features)
-        projected = nn.Dense(self.text_width, use_bias=False, dtype=self.dtype, precision=self.products,
-                             name="projection")(adapted)
+        projected = nn.Dense(self.text_width, use_bias=False, dtype=self.dtype, precision=self.precision,
+                             name="projection", dot_general=float32_dot_general)(adapted)
         return RMSNorm(epsilon=self.norm_eps, with_scale=False, dtype=self.dtype, name="norm")(projected)
 
 
