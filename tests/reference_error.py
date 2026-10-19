@@ -716,17 +716,18 @@ def assert_rows_as_exact_over_orders(dew, reference, label: str, sizes=None) -> 
         f"the reference's {their_worst:.3e} (ratio {worst / their_worst:.2f}, allowed {ROW_FACTOR:g})")
 
 
-def element_factor(elements: int, spread: float | np.ndarray = np.pi / 2) -> float | np.ndarray:
+def element_factor(elements: int, spread: float | np.ndarray = np.pi / 2,
+                   orders: int = ORDERS) -> float | np.ndarray:
     """The factor `assert_elements_as_exact_over_orders` allows each of `elements` elements: the ratio
     of two mean absolute errors over ORDERS orders that a port as exact as its reference passes at
     every element but for FALSE_FAILURE of the time (Bonferroni over the elements), at least FACTOR.
-    A mean of ORDERS absolute errors varies by (spread - 1) / ORDERS of its square, `spread` the
+    A mean of `orders` absolute errors varies by (spread - 1) / ORDERS of its square, `spread` the
     errors' E[e^2] / E[|e|]^2 (pi / 2 for a Gaussian's, 2 for a Laplace's), so the log of the ratio
-    of two is normal with variance 2 (spread - 1) / ORDERS (the delta method): 3.06 at 43.5M
-    Gaussian elements."""
+    of two is normal with variance 2 (spread - 1) / orders (the delta method): 3.06 at 43.5M
+    Gaussian elements over ORDERS."""
     from scipy import stats
 
-    deviation = np.sqrt(2 * (np.asarray(spread, np.float64) - 1) / ORDERS)
+    deviation = np.sqrt(2 * (np.asarray(spread, np.float64) - 1) / orders)
     return np.maximum(FACTOR, np.exp(stats.norm.isf(FALSE_FAILURE / max(elements, 1)) * deviation))
 
 
@@ -744,11 +745,12 @@ def error_spread(absolutes, squares, orders: int = 2 * ORDERS) -> np.ndarray:
 
 
 def assert_elements_as_exact_over_orders(dew_absolutes, reference_absolutes, label: str, *, dew_squares,
-                                         reference_squares) -> None:
+                                         reference_squares, orders: int = ORDERS) -> None:
     """Every element held over ORDERS rounding orders where the orders cannot all be kept:
     `dew_absolutes` and `reference_absolutes` `[rows, ...]` each element's absolute distance from
     float64 summed over the ORDERS orders, and `dew_squares` and `reference_squares` its squares so
-    summed. Each element's mean absolute error over the orders within its row's `element_factor` of
+    summed (over ORDERS orders, or `orders` a side where a run holds one half of its orders to the
+    other). Each element's mean absolute error over the orders within its row's `element_factor` of
     the reference's own at that element, and nothing else: no element borrows its row's error or a
     rounding model's, and where the reference is exactly float64 in every order, Dew must be too.
     The mean absolute error, not the RMS: a bf16 rounding's flips give errors heavier-tailed than a
@@ -766,16 +768,16 @@ def assert_elements_as_exact_over_orders(dew_absolutes, reference_absolutes, lab
     rows = sides[0].shape[0]
     dew_absolutes, reference_absolutes, dew_squares, reference_squares = (
         side.reshape(rows, -1) for side in sides)
-    mine, theirs = dew_absolutes / ORDERS, reference_absolutes / ORDERS
-    spread = error_spread(dew_absolutes + reference_absolutes, dew_squares + reference_squares)
-    factor = element_factor(mine.size, spread)[:, None]
+    mine, theirs = dew_absolutes / orders, reference_absolutes / orders
+    spread = error_spread(dew_absolutes + reference_absolutes, dew_squares + reference_squares, 2 * orders)
+    factor = element_factor(mine.size, spread, orders)[:, None]
     failing = mine > factor * theirs
     if np.any(failing):
         ratios = np.where(theirs > 0, mine / np.where(theirs > 0, theirs, 1), np.inf)
         at = np.unravel_index(int(np.argmax(np.where(failing, ratios / factor, 0.0))), ratios.shape)
         raise AssertionError(
             f"{label}: {int(np.count_nonzero(failing))} of {mine.size} elements past the reference; the "
-            f"worst, row {at[0]} element {at[1]}, is {mine[at]:.3e} from float64 (mean over {ORDERS} "
+            f"worst, row {at[0]} element {at[1]}, is {mine[at]:.3e} from float64 (mean over {orders} "
             f"orders), the reference {theirs[at]:.3e} (allowed {factor[at[0], 0]:.2f} times it, its row's "
             f"errors of spread {spread[at[0]]:.2f})")
 
