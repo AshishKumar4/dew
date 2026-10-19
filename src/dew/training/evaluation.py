@@ -136,7 +136,7 @@ class Evaluation:
         key = request_key(key)
         started = time.perf_counter()
         root = jax.process_index() == 0
-        _agree_configuration(metrics, batches, split, loss=loss, training=training is not None)
+        _agree_configuration(metrics, batches, split, loss=loss, training=training is not None, warm=warm)
         preview_enabled = bool(broadcast_from_process_zero(root and preview))
         event_step, context, event_words, training_scores = _event(
             key, step, schedule_step, averaged, training)
@@ -213,13 +213,14 @@ class _Accumulators:
 
 
 def _agree_configuration(
-    metrics: Sequence[Metric], batches, split: str, *, loss: bool = False, training: bool = False
+    metrics: Sequence[Metric], batches, split: str, *, loss: bool = False, training: bool = False,
+    warm: bool = False,
 ) -> None:
     """Check this rank's evaluation settings, then agree they match root's.
 
-    Ranks that disagree about the split, the metrics or whether there is a
-    validation stream would walk different phases below, and hang at a
-    collective one of them never reaches.
+    Ranks that disagree about the split, the metrics, whether there is a
+    validation stream or whether the pass warms would walk different phases
+    below, and hang at a collective one of them never reaches.
     """
     def checked() -> list[bool | str | list[list[str]]]:
         names = [metric.name for metric in metrics]
@@ -231,8 +232,8 @@ def _agree_configuration(
         return [batches is not None, split,
                 [[metric.name, metric.reads.__module__, metric.reads.__qualname__] for metric in metrics]]
 
-    agreed_same("validation availability, split, ordered metric names and types, and loss",
-                lambda: [checked(), loss, training])
+    agreed_same("validation availability, split, ordered metric names and types, loss and warming",
+                lambda: [checked(), loss, training, warm])
 
 
 def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array | None,
