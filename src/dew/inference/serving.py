@@ -110,8 +110,8 @@ from dew.inference.tasks import (
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
 from dew.nn.kernels.options import compiler_options
-from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, Layered, is_paged, leaf_name
-from dew.nn.protocols import ProjectionGroup
+from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, is_paged, leaf_name
+from dew.nn.protocols import Layered, ProjectionGroup
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
 from dew.objectives.base import Variables
 from dew.sampling.decoding import LogitsTransform, Stopping

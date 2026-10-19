@@ -212,6 +212,10 @@ class DiffusionGemma(nn.Module):
         return self.clone(text=self.text.with_cache_capacity(capacity))
 
     @nn.nowrap
+    def generation_refusal(self) -> str | None:
+        return self.text.generation_refusal()
+
+    @nn.nowrap
     def with_remat(self, policy: RematPolicy | None) -> Self:
         """Choose the shared text decoder's layer policy."""
         return self.clone(text=self.text.with_remat(policy))
