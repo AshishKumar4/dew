@@ -318,6 +318,30 @@ def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers()
     )
 
 
+def test_a_reindex_layer_reads_its_full_layers_publications_with_no_reuse_layer():
+    """A stack whose CSA2 layers are a Full layer and the Reindex layers after it,
+    with no Reuse layer and so no shared keys and values, still threads the store
+    the Full layer publishes its entries in: the Reindex layers read them, unrolled
+    and scanned alike, to within twice the fixture logits' fp32 rounding."""
+    config = json.loads((TINY / "config.json").read_text())
+    text = config["text_config"]
+    ratios = text["compress_ratios"][:4] + [2] * 2 + text["compress_ratios"][text["num_hidden_layers"]:]
+    config = {**config, "text_config": {
+        **text, "num_hidden_layers": 6, "compress_ratios": ratios, "kv_source_layer_ids": [2],
+        "index_source_layer_ids": [2, 3, 4, 5], "candidate_source_layer_id": 2,
+        "engram_layer_ids": [1], "engram_num_embeddings": text["engram_num_embeddings"][:1],
+        "dspark_target_layer_ids": [3, 4, 5]}}
+    fields = {**translate_config(config), "dtype": "float32", "attention_impl": "reference"}
+    assert not fields.get("kv_shared_layers")
+    ids = jnp.asarray(np.load(TINY / "reference.npz")["input_ids"])
+    unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
+                         for scan in (False, True))
+    variables = unrolled.init(jax.random.key(0), ids)
+    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * FACTOR * rounding(
+        "logits"
+    )
+
+
 def test_a_family_that_reads_its_media_bundle_plugs_in_through_its_entry(monkeypatch):
     """The wrapper dispatch and the routing of a bundle's tensors read the
     family's own entry, so a bundled family under another name loads with

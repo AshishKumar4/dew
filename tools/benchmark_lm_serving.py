@@ -14,8 +14,10 @@ client's. TTFT is then from the request's arrival, and the token gaps are
 per token: each decoding row's time between consecutive tokens.
 
 Start vLLM in its own environment with bf16, --generation-config vllm and
---gpu-memory-utilization 0.90. Pass the same snapshot and --vocab-limit to
-all runs. Warmup uses disjoint prompts and the full measured output length.
+--gpu-memory-utilization 0.90. sglang-engine runs SGLang's engine in-process,
+in its own environment, the same way (bf16, 0.90 of the GPU, no prefix cache).
+Pass the same snapshot and --vocab-limit to all runs. Warmup uses disjoint
+prompts and the full measured output length.
 
 `--mesh` places Dew's weights on a mesh of those MeshSpec fields before the
 server is built, as `dew.pipeline(mesh=...)` does, to time sharded decode;
@@ -193,6 +195,7 @@ def dew_points(args):
     import dew
     from dew.inference.serving import Server
     from dew.nn.kv_cache import KVCache
+    from dew.nn.protocols import Layered
     from dew.sampling import Sampling
     from dew.training import MeshSpec
 
@@ -214,6 +217,11 @@ def dew_points(args):
                 "load_seconds": load_seconds,
                 "weights": {"split_over": sorted(split),
                             "devices": len({device for sharding in shardings for device in sharding.device_set})}}
+    # The layout asked for, replacing the model's own only where it differs (as `Server.from_task` reads
+    # it): a model that declares no layout to replace, a multimodal one's wrapper, serves its own dense one
+    # (until the wrapper takes a layout for its text decoder, ledger 637).
+    requested = KVCache(page_size=16 if args.kv == "paged" else None)
+    own = task.model.kv_cache if isinstance(task.model, Layered) else KVCache()
     points = []
     for slots in args.slots:
         count = args.requests or max(64, 2 * slots)
@@ -222,7 +230,7 @@ def dew_points(args):
         began = time.perf_counter()
         server = Server.from_task(task, slots=slots, capacity=capacity,
                                   admission=args.admission or None, decode_steps=args.decode_steps,
-                                  kv_cache=KVCache(page_size=16 if args.kv == "paged" else None))
+                                  kv_cache=None if requested == own else requested)
         print(f"slots {slots}: built in {time.perf_counter() - began:.2f}s", flush=True)
         dew_run(server, warm, args.output)
         # Each power-of-two admission width is its own program (`admission_share`).
@@ -325,8 +333,23 @@ async def vllm_points(args):
     return {"label": args.hardware}, points
 
 
+def closed_loop(streamed):
+    """A closed-loop request over `streamed(prompt, output)`, the time each of a request's tokens reached
+    the client: the in-process engines' one set of clocks."""
+    async def request(prompt, output, gate, queued):
+        async with gate:
+            sent = time.perf_counter()
+            stamps = await streamed(prompt, output)
+            assert len(stamps) == output, (len(stamps), output)
+            return {"tokens": output, "ttft": stamps[0] - sent,
+                    "itl": (stamps[-1] - stamps[0]) / max(output - 1, 1),
+                    "latency": stamps[-1] - sent, "client_queue": sent - queued}
+    return request
+
+
 async def engine_points(args):
-    """The same scheduler/stream clocks, without HTTP serialization."""
+    """The same scheduler/stream clocks, without HTTP serialization. Output stays token ids, not text, as
+    Dew's and SGLang's do (`detokenize=False`)."""
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.inputs import TokensPrompt
@@ -337,28 +360,10 @@ async def engine_points(args):
         max_num_seqs=max(args.slots), gpu_memory_utilization=0.90,
         generation_config="vllm", enable_prefix_caching=False, disable_log_stats=True))
 
-    async def request(prompt, output, gate, queued):
-        async with gate:
-            sent = time.perf_counter()
-            policy = SamplingParams(temperature=0, top_p=1, top_k=-1, min_p=0,
-                                    repetition_penalty=1, max_tokens=output, ignore_eos=True)
-            stream = engine.generate(TokensPrompt(prompt_token_ids=prompt.tolist()), policy, uuid.uuid4().hex)
-            first = last = None
-            tokens = 0
-            async for result in stream:
-                count = len(result.outputs[0].token_ids)
-                if count > tokens:
-                    last = time.perf_counter()
-                    first = last if first is None else first
-                    tokens = count
-            assert first is not None and last is not None and tokens == output, (tokens, output)
-            return {"tokens": tokens, "ttft": first - sent, "itl": (last - first) / max(tokens - 1, 1),
-                    "latency": last - sent, "client_queue": sent - queued}
-
     async def streamed(prompt, output):
         """The time each of a request's tokens reached the client."""
-        policy = SamplingParams(temperature=0, top_p=1, top_k=-1, min_p=0,
-                                repetition_penalty=1, max_tokens=output, ignore_eos=True)
+        policy = SamplingParams(temperature=0, top_p=1, top_k=-1, min_p=0, repetition_penalty=1,
+                                max_tokens=output, ignore_eos=True, detokenize=False)
         stamps: list[float] = []
         async for result in engine.generate(TokensPrompt(prompt_token_ids=prompt.tolist()), policy,
                                             uuid.uuid4().hex):
@@ -367,7 +372,33 @@ async def engine_points(args):
         return stamps
 
     try:
-        points = await async_sweep(args, request, streamed)
+        points = await async_sweep(args, closed_loop(streamed), streamed)
+    finally:
+        engine.shutdown()
+    return {"label": args.hardware}, points
+
+
+async def sglang_points(args):
+    """SGLang's engine in-process, on the same clocks as vllm-engine, its output token ids."""
+    import sglang
+
+    engine = sglang.Engine(model_path=args.model, dtype="bfloat16", context_length=args.prompt + args.output,
+                           max_running_requests=max(args.slots), mem_fraction_static=0.90,
+                           disable_radix_cache=True, skip_tokenizer_init=True, log_level="error")
+    policy = {"temperature": 0, "top_p": 1, "top_k": -1, "min_p": 0, "repetition_penalty": 1,
+              "ignore_eos": True}
+
+    async def streamed(prompt, output):
+        """The time each of a request's tokens reached the client, from SGLang's stream of growing output."""
+        stamps: list[float] = []
+        async for chunk in await engine.async_generate(input_ids=prompt.tolist(), stream=True,
+                                                       sampling_params={**policy, "max_new_tokens": output}):
+            arrived = chunk["meta_info"]["completion_tokens"] - len(stamps)
+            stamps.extend([time.perf_counter()] * arrived)
+        return stamps
+
+    try:
+        points = await async_sweep(args, closed_loop(streamed), streamed)
     finally:
         engine.shutdown()
     return {"label": args.hardware}, points
@@ -375,7 +406,7 @@ async def engine_points(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("dew", "vllm", "vllm-engine"), required=True)
+    parser.add_argument("--backend", choices=("dew", "vllm", "vllm-engine", "sglang-engine"), required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--url", default="http://127.0.0.1:8100/v1")
     parser.add_argument("--hardware", default="")
@@ -399,15 +430,15 @@ def main():
     args.slots = [int(value) for value in args.slots.split(",")]
     args.rate = [float(value) for value in args.rate.split(",") if value]
     if args.rate and args.backend == "vllm":
-        parser.error("--rate runs Dew and vllm-engine in-process")
+        parser.error("--rate runs Dew and the in-process engines")
     if args.mesh is not None and args.backend != "dew":
         parser.error("--mesh places Dew's weights; vLLM takes its own parallelism flags")
     if (min(args.slots) < 1 or min(args.prompt, args.output, args.repeats, args.profile_steps) < 1
             or args.requests < 0 or args.vocab_limit <= 100):
         parser.error("counts must be positive; --requests=0 chooses the default")
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    run = engine_points if args.backend == "vllm-engine" else vllm_points
-    hardware, points = dew_points(args) if args.backend == "dew" else asyncio.run(run(args))
+    engines = {"vllm": vllm_points, "vllm-engine": engine_points, "sglang-engine": sglang_points}
+    hardware, points = dew_points(args) if args.backend == "dew" else asyncio.run(engines[args.backend](args))
     record = {"backend": args.backend, "model": args.model, "hardware": hardware,
               "prompt": args.prompt, "output": args.output, "vocab_limit": args.vocab_limit,
               "sampling": {"temperature": 0, "ignore_eos": True}, "warm_output": args.output,
