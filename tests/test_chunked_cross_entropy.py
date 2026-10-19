@@ -737,14 +737,17 @@ def test_a_target_at_the_excluded_column_scores_infinity_and_moves_no_logit(path
         if path == "fused":
             total, (losses, _, _) = fused_head_loss(states, table, targets, jnp.ones(targets.shape),
                                                     z_loss=1.0, tile=RAGGED, excluded=excluded)
-            return total, losses
+            return total, (losses, total)
         losses, _, log_z = chunked_cross_entropy(states, table, targets, 4,
                                                  tile=RAGGED if path == "tiled" else None, excluded=excluded)
         # The sum is +inf; each token's loss, the excluded target's included, takes a cotangent of 1.
-        return jnp.sum(losses + log_z), losses
+        total = jnp.sum(losses + log_z)
+        return total, (losses, total)
 
-    (_, losses), (_, d_matrix) = jax.value_and_grad(scored, argnums=(0, 1), has_aux=True)(hidden, head)
+    (_, (losses, total)), (_, d_matrix) = jax.value_and_grad(scored, argnums=(0, 1), has_aux=True)(
+        hidden, head)
     assert jnp.isinf(losses[0, 0]) and losses[0, 0] > 0
+    assert jnp.isinf(total) and total > 0
     assert jnp.all(jnp.isfinite(d_matrix))
     assert jnp.all(d_matrix[:, excluded] == 0)
 
