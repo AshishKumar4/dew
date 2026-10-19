@@ -7,19 +7,20 @@ sampled ids (vLLM's `return_tokens_as_token_ids` renders them into the
 logprob tokens, SGLang's `return_token_ids` lists them on the choice) and one
 reported log-probability per sampled token. The safetensors reload writes a
 real Qwen2 export that `Pretrained.load` reads back, and posts the reload
-calls to a real local HTTP endpoint in order. The NCCL push posts its calls
-to the same endpoints and drives a recording stand-in for its NCCL library.
+calls to a real local HTTP endpoint in order. The NCCL push runs on GPUs: a real
+group to a replica worker on a second GPU, and a replica that refuses its join.
 """
 
 import base64
+import ctypes
 import itertools
 import json
 import math
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from importlib import import_module
 from pathlib import Path
-from types import SimpleNamespace
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -27,6 +28,7 @@ import numpy as np
 import pytest
 
 from dew.inference import NCCLPush, OpenAICompletion, OpenAIRolloutServer, SafetensorsReload
+from dew.inference.nccl import _DTYPES
 from dew.interop import Pretrained
 from dew.sampling import Sampling
 
@@ -312,73 +314,143 @@ def test_a_vllm_replica_that_fails_a_step_holds_every_replica_paused(refused, tm
         assert paths(server) == steps[:steps.index(refused) + 1]
 
 
-class Collectives:
-    """A recording stand-in for the NCCL library a push drives, which `NCCLPush` builds only when it
-    holds none: each open makes the next numbered group, and each call is logged with its `ORDER`
-    tick, group, element count and dtype, moving no data."""
+class UniqueId(ctypes.Structure):
+    """`ncclUniqueId` (nccl.h)."""
 
-    def __init__(self):
-        self.calls, self.groups = [], 0
-
-    def unique_id(self):
-        return SimpleNamespace(internal=bytes(128))
-
-    def open(self, uid, rank, world):
-        self.groups += 1
-        self.calls.append((next(ORDER), "open", self.groups, rank, world))
-        return self.groups
-
-    def all_reduce(self, comm, pointer, count, dtype):
-        self.calls.append((next(ORDER), "all_reduce", comm, count, dtype))
-
-    def broadcast(self, comm, pointer, count, dtype):
-        self.calls.append((next(ORDER), "broadcast", comm, count, dtype))
-
-    def settled(self, comms, failed):
-        self.calls.append((next(ORDER), "settled", tuple(comms), None, None))
-
-    def abort(self, comm):
-        self.calls.append((next(ORDER), "abort", comm, None, None))
+    _fields_: ClassVar = [("internal", ctypes.c_byte * 128)]
 
 
-def test_an_nccl_push_makes_the_calls_its_replicas_and_groups_expect(replicas):
-    """Two one-worker vLLM replicas behind a recording NCCL library. Each
-    replica is asked its world size and joins its group once, then pauses,
-    starts the update, takes the listing of every tensor, finishes the update
-    under the version, resets its prefix cache and resumes. Each group opens
-    with the sender at rank 0 of two and warms up with one float32, then
-    receives every listed tensor in the listing's order. Every broadcast
-    comes after every replica started the update and before any finished it,
-    and no group is aborted."""
+class Worker:
+    """A vLLM worker's side of the weight-transfer group on CUDA device `ordinal`, as vLLM's NCCL
+    engine runs it (checked against v0.30.0): a blocking communicator at the rank its join names,
+    which matches the sender's one-float32 all-reduce as it opens and receives each listed tensor
+    by broadcast from rank 0 into device memory of its own, kept by name."""
+
+    def __init__(self, library, ordinal):
+        from dew.telemetry.devices import primary_context
+
+        self.nccl = ctypes.CDLL(str(library))
+        self.cuda, self.context, _ = primary_context(ordinal)
+        collective = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+                      ctypes.c_void_p, ctypes.c_void_p]
+        self.nccl.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, UniqueId,
+                                               ctypes.c_int]
+        self.nccl.ncclAllReduce.argtypes = collective
+        self.nccl.ncclBroadcast.argtypes = collective
+        self.nccl.ncclCommAbort.argtypes = [ctypes.c_void_p]
+        self.cuda.cuMemAlloc_v2.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
+        self.cuda.cuMemcpyDtoH_v2.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t]
+        self.cuda.cuMemFree_v2.argtypes = [ctypes.c_uint64]
+        self.comm = ctypes.c_void_p()
+        self.received = {}
+
+    @staticmethod
+    def checked(status):
+        if status != 0:
+            raise RuntimeError(f"NCCL or CUDA error {status}")
+
+    def receive(self, shape, dtype, collective):
+        """A tensor of `shape` and `dtype` that `collective` writes into device memory, on the host."""
+        dtype = np.dtype(jnp.dtype(dtype))
+        size, pointer = math.prod(shape) * dtype.itemsize, ctypes.c_uint64()
+        self.checked(self.cuda.cuCtxSetCurrent(self.context))
+        self.checked(self.cuda.cuMemAlloc_v2(ctypes.byref(pointer), max(size, 1)))
+        try:
+            self.checked(collective(pointer.value, math.prod(shape), _DTYPES[dtype.name]))
+            self.checked(self.cuda.cuStreamSynchronize(None))
+            host = np.empty(shape, dtype)
+            self.checked(self.cuda.cuMemcpyDtoH_v2(host.ctypes.data, pointer.value, size))
+        finally:
+            self.checked(self.cuda.cuMemFree_v2(pointer.value))
+        return host
+
+    def join(self, init):
+        uid = UniqueId.from_buffer_copy(base64.b64decode(init["nccl_unique_id_b64"]))
+        self.checked(self.cuda.cuCtxSetCurrent(self.context))
+        self.checked(self.nccl.ncclCommInitRank(ctypes.byref(self.comm), init["world_size"], uid,
+                                                init["rank_offset"]))
+        self.receive((1,), "float32", lambda pointer, count, dtype: self.nccl.ncclAllReduce(
+            pointer, pointer, count, dtype, 0, self.comm, None))
+
+    def update(self, info):
+        for name, dtype, shape in zip(info["names"], info["dtype_names"], info["shapes"], strict=True):
+            self.received[name] = self.receive(tuple(shape), dtype, lambda pointer, count, code:
+                                               self.nccl.ncclBroadcast(pointer, pointer, count, code, 0,
+                                                                       self.comm, None))
+
+    def close(self):
+        if self.comm.value is not None:
+            self.checked(self.nccl.ncclCommAbort(self.comm))
+
+
+@pytest.mark.gpu(reason="an NCCL group joins two cuda devices")
+@pytest.mark.mesh(devices=2)
+def test_an_nccl_push_delivers_every_tensor_to_a_replica_on_another_gpu():
+    """A push over a real NCCL group from the trainer's GPU to a one-worker replica on a second GPU,
+    the replica standing in for vLLM's weight-transfer endpoints with a worker that receives as
+    vLLM's does. The replica is asked its world size and joins its group once, then pauses, starts
+    the update, takes the listing of every tensor, finishes the update under the version, resets
+    its prefix cache and resumes. Its group opens with the sender at rank 0 of two, and the tensors
+    go one after another on that one nonblocking communicator, in chunks smaller than the policy:
+    the worker holds every listed tensor, each the trainer's export of the pushed policy."""
+    import importlib.util
+
+    locations = importlib.util.find_spec("nvidia.nccl").submodule_search_locations
+    library = Path(next(iter(locations))) / "lib" / "libnccl.so.2"
+    worker = Worker(library, jax.devices()[1].local_hardware_id)
+
+    class Replica(BaseHTTPRequestHandler):
+        def answer(self, body):
+            encoded = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def do_GET(self):
+            self.server.seen.append((self.path.partition("?")[0], None))
+            self.answer({"world_size": 1})
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            path, body = self.path.partition("?")[0], json.loads(raw) if raw else None
+            self.server.seen.append((path, body))
+            if path == "/init_weight_transfer_engine":
+                worker.join(body["init_info"])
+            elif path == "/update_weights":
+                worker.update(body["update_info"])
+            elif path in ("/pause", "/resume"):
+                return self.answer({"status": "paused" if path == "/pause" else "resumed"})
+            return self.answer({"success": True})
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Replica)
+    server.seen = []
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     source = Pretrained.load(FIXTURE, dtype="float32")
-    engines = replicas(2)
-    collectives = Collectives()
-    push = NCCLPush(source, tuple(server.url for server in engines), library=__file__)
-    push._library = collectives
-    push(doubled(source), 3)
-
-    listings = []
-    for server in engines:
-        assert paths(server) == ["/get_world_size", "/init_weight_transfer_engine", "/pause",
-                                 "/start_weight_update", "/update_weights", "/finish_weight_update",
-                                 "/reset_prefix_cache", "/resume"]
-        world, joined, paused, _, update, finished, _, _ = server.seen
-        assert world[1] == "include_dp=true" and paused[1] == "mode=wait"
-        assert joined[2] == {"init_info": {"nccl_unique_id_b64": base64.b64encode(bytes(128)).decode(),
-                                           "rank_offset": 1, "world_size": 2, "packed": False}}
-        assert finished[2] == {"weight_version": "3"}
-        listings.append(update[2]["update_info"])
-    listing = listings[0]
-    assert listings[1] == listing and listing["names"] == sorted(listing["names"])
-    assert [call[1:] for call in collectives.calls if call[1] in ("open", "all_reduce")] == [
-        ("open", 1, 0, 2), ("all_reduce", 1, 1, "float32"),
-        ("open", 2, 0, 2), ("all_reduce", 2, 1, "float32")]
-    assert [call[2:] for call in collectives.calls if call[1] == "broadcast"] == [
-        (group, math.prod(shape), dtype)
-        for shape, dtype in zip(listing["shapes"], listing["dtype_names"], strict=True) for group in (1, 2)]
-    sent = [call[0] for call in collectives.calls if call[1] == "broadcast"]
-    assert all(server.order[3] < min(sent) and max(sent) < server.order[5] for server in engines)
-    assert not [call for call in collectives.calls if call[1] == "abort"]
+    changed = doubled(source)
+    push = NCCLPush(source, (f"http://127.0.0.1:{server.server_port}",), str(library), chunk=4096,
+                    timeout=120)
+    try:
+        push(changed, 3)
+    finally:
+        push.close()
+        server.shutdown()
+        worker.close()
+    assert [path for path, _ in server.seen] == [
+        "/get_world_size", "/init_weight_transfer_engine", "/pause", "/start_weight_update",
+        "/update_weights", "/finish_weight_update", "/reset_prefix_cache", "/resume"]
+    assert server.seen[1][1]["init_info"]["world_size"] == 2 and server.seen[5][1] == {"weight_version": "3"}
+    sent = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating)
+                        else leaf, changed)
+    exported = source.export(sent)
+    assert len(exported) > 1 and sum(np.asarray(tensor).nbytes for tensor in exported.values()) > 4096
+    assert sorted(worker.received) == sorted(exported)
+    for name, tensor in exported.items():
+        np.testing.assert_array_equal(worker.received[name], np.asarray(tensor))
 
 
 @pytest.mark.gpu(reason="an NCCL group opens on a cuda device")

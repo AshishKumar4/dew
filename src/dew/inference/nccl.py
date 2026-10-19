@@ -155,24 +155,37 @@ class _Library:
         self.current()
         self._issued(self.nccl.ncclBroadcast(pointer, pointer, count, _DTYPES[dtype], 0, comm, None))
 
+    def ready(self, comms: Sequence[ctypes.c_void_p], peers: Sequence[Future[httpx.Response]]) -> None:
+        """Wait until none of `comms` is still issuing a call, as `settled` waits, leaving its
+        collectives running on the stream. A nonblocking communicator takes no call while its last
+        is in progress (NCCL's `ncclCommEnsureReady` refuses it), so each collective waits here
+        before the next goes to the same communicator."""
+        self._waited(comms, peers, stream=False)
+
     def settled(self, comms: Sequence[ctypes.c_void_p], peers: Sequence[Future[httpx.Response]]) -> None:
         """Wait until every one of `comms` has finished its calls and the default stream its
         collectives (not the trainer's own streams), polling NCCL between waits on `peers`, the
         replicas' HTTP calls that run meanwhile. A call that fails raises; the caller aborts the
         comms."""
+        self._waited(comms, peers, stream=True)
+
+    def _waited(self, comms: Sequence[ctypes.c_void_p], peers: Sequence[Future[httpx.Response]], *,
+                stream: bool) -> None:
+        """Poll `comms`, and with `stream` the default stream, until no call is in progress, watching
+        `peers` between polls (`settled`)."""
         state = ctypes.c_int()
         while True:
             self.current()
-            opening = False
+            issuing = False
             for comm in comms:
                 self._checked(self.nccl.ncclCommGetAsyncError(comm, ctypes.byref(state)))
                 if state.value != _IN_PROGRESS:
                     self._checked(state.value)
-                opening = opening or state.value == _IN_PROGRESS
-            running = self.cuda.cuStreamQuery(None)
+                issuing = issuing or state.value == _IN_PROGRESS
+            running = self.cuda.cuStreamQuery(None) if stream else 0
             if running != _NOT_READY:
                 self._driver(running)
-            if not opening and running == 0:
+            if not issuing and running == 0:
                 return
             answered, _ = wait(peers, timeout=0.001, return_when=FIRST_EXCEPTION)
             failure = next((peer.exception() for peer in answered if peer.exception() is not None), None)
@@ -359,7 +372,8 @@ class NCCLPush:
         The next chunk's copies are issued before the current chunk broadcasts,
         so the host-to-device copies overlap the transfers; a chunk is released
         only after the default stream has finished with it, or a replica's
-        receive (`receives`) has failed.
+        receive (`receives`) has failed. Each tensor goes to every group, and
+        the next waits until each group has issued it (`_Library.ready`).
         """
         chunks: list[list[np.ndarray]] = [[]]
         size = 0
@@ -369,13 +383,15 @@ class NCCLPush:
                 size = 0
             chunks[-1].append(tensor)
             size += tensor.nbytes
+        groups = list(self._groups.values())
         placed = jax.device_put(chunks[0], target)
         for index in range(len(chunks)):
             following = jax.device_put(chunks[index + 1], target) if index + 1 < len(chunks) else None
             for buffer in jax.block_until_ready(placed):
-                for comm in self._groups.values():
+                for comm in groups:
                     library.broadcast(comm, buffer.unsafe_buffer_pointer(), buffer.size, str(buffer.dtype))
-            library.settled(list(self._groups.values()), receives)
+                library.ready(groups, receives)
+            library.settled(groups, receives)
             if following is not None:
                 placed = following
 
