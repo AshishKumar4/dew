@@ -260,6 +260,35 @@ def test_tiny_checkpoint_image_embeddings_match_the_reference():
     assert np.max(np.abs(np.asarray(baseline.pooler_output) - np.asarray(moved.pooler_output))) > 0.1
 
 
+@pytest.mark.parametrize("hidden_act", ["quick_gelu", "gelu", "gelu_pytorch_tanh"])
+def test_a_vision_tower_runs_the_activation_its_config_names(hidden_act, tmp_path):
+    """The vision tower's MLP runs the `hidden_act` its config names, as the text tower's does
+    (`tower_activation`): the tiny checkpoint's image embeddings under each activation are as
+    exact as transformers' own float32 ones, both from transformers' in float64."""
+    import torch
+    from transformers import CLIPModel as ReferenceCLIP
+
+    from tools.diffusers_wan_reference import float64
+
+    copy = tmp_path / "tiny"
+    shutil.copytree(TINY, copy)
+    config = fixture_config(copy)
+    config["vision_config"]["hidden_act"] = hidden_act
+    (copy / "config.json").write_text(json.dumps(config))
+    pixel_values = reference(TINY)["pixel_values"]
+    ours = np.asarray(CLIPModel.from_pretrained(str(copy)).get_image_features(pixel_values), np.float64)
+
+    def theirs(dtype):
+        with float64() if dtype == torch.float64 else torch.no_grad():
+            model = ReferenceCLIP.from_pretrained(str(copy), attn_implementation="eager").to(dtype).eval()
+            with torch.no_grad():
+                features = model.get_image_features(torch.from_numpy(pixel_values).to(dtype)).pooler_output
+                return features.double().numpy()
+
+    assert_as_exact_as_the_reference(ours, theirs(torch.float32), theirs(torch.float64),
+                                     f"image embeddings under {hidden_act}")
+
+
 SAFETY_CROP = {"size": {"shortest_edge": 224}, "crop_size": {"height": 224, "width": 224}}
 SMALL_CROP = {"crop_size": {"height": 8, "width": 8}, "do_resize": False}
 
