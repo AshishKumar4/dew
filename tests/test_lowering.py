@@ -181,9 +181,12 @@ def _experts_lowered(generation: str, implementation: str):
 @pytest.mark.parametrize("generation", GPUS)
 def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generation_chooses(generation):
     """'auto' takes the generation's grouped matmul: its forward and both backward products lower to
-    the Pallas kernels where the row names them, and to none where it does not."""
+    the Pallas kernels where the row names them, and to none where it does not. The experts' SiLU
+    product takes the fused SwiGLU where the row names it, forward and backward, as every fused kernel
+    is differentiated through its portable arithmetic (`generation.linear_tangent`)."""
     expected = set().union(*(FAMILIES[key][1] for key in chosen(generation, "experts")
                              if key[0] == 'grouped_matmul'))
+    expected |= set().union(*(FAMILIES[key][1] for key in chosen(generation, "step") if key[0] == 'swiglu'))
     assert set(triton_kernels(_experts_lowered(generation, 'auto'))) == expected
 
 
