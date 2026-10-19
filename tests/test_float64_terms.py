@@ -1,6 +1,5 @@
 """What `reference_error.float64_terms` takes for a leaf's terms: the root sum
-of squares of the terms its final sums add, carried into it, each at its
-operands' sizes, their own terms where sums behind them made them."""
+of squares of the terms its final sums add, carried into it, and nothing behind them."""
 
 import jax
 import jax.numpy as jnp
@@ -19,21 +18,17 @@ def loss_of(keys, query, values):
 def test_a_key_bias_gradient_sums_terms_that_cancel():
     """A key bias shifts every logit of a query's softmax alike, so its
     gradient is zero in exact arithmetic, while the cotangents it sums are
-    not: its terms are the root sum of squares over the rows and keys of the
-    keys' cotangent's sizes, as the bias's gradient sums them, each the
-    cotangent's own terms where the softmax's backward sums made them larger
-    than it, and so at least the cotangents' own root sum of squares."""
+    not: its terms are their root sum of squares over the rows and keys, as
+    the bias's gradient sums them."""
     rng = np.random.default_rng(0)
     query, keys, values = (rng.normal(size=shape) for shape in ((2, 4), (2, 6, 4), (2, 6, 3)))
 
     with jax.enable_x64(new_val=True):
         gradient, terms = float64_terms(jax.grad(lambda bias: loss_of(keys + bias, query, values)),
                                         jnp.zeros(4))
-        cotangent, cotangent_terms = float64_terms(jax.grad(loss_of), jnp.asarray(keys), query, values)
-    sizes = np.maximum(np.asarray(cotangent_terms), np.abs(np.asarray(cotangent)))
+        cotangent = np.asarray(jax.grad(loss_of)(jnp.asarray(keys), query, values))
     np.testing.assert_allclose(gradient, 0, atol=1e-15)
-    np.testing.assert_allclose(terms, np.sqrt(np.sum(sizes**2, axis=(0, 1))), rtol=1e-12)
-    assert np.all(terms >= np.sqrt(np.sum(np.asarray(cotangent)**2, axis=(0, 1))))
+    np.testing.assert_allclose(terms, np.sqrt(np.sum(cotangent**2, axis=(0, 1))), rtol=1e-12)
     assert np.all(terms > 1e-3)
 
 
@@ -100,27 +95,6 @@ def test_a_named_sum_carries_its_terms_through_a_residual_add():
         value, terms = float64_terms(block, stream, x, weight)
     np.testing.assert_allclose(terms, np.sqrt(np.square(x) @ np.square(weight)), rtol=1e-12)
     assert abs(float(value[0, 0])) < 1e-8 < float(terms[0, 0])
-
-
-def test_a_sum_of_sums_that_cancel_is_sized_by_the_terms_behind_it():
-    """A sum whose operand is a sum that cancels, scaled element by element
-    between them, as a deep gradient's cotangent is, takes that operand's
-    terms for its size, not its zero value: its terms are the root sum of
-    squares of the terms behind it. Without them a wrong entry of the outer
-    sum would be held to its own rounding of zero."""
-    rng = np.random.default_rng(4)
-    x, a, b = rng.normal(size=(4, 6)), rng.normal(size=(6, 5)), rng.normal(size=(5, 3))
-    scale = rng.normal(size=5)
-
-    def chained(x, a, b):
-        inner = x @ a + x @ -a
-        return (inner * scale) @ b
-
-    with jax.enable_x64(new_val=True):
-        value, terms = float64_terms(chained, x, a, b)
-    np.testing.assert_array_equal(value, 0)
-    inner = 2 * np.square(x) @ np.square(a)
-    np.testing.assert_allclose(terms, np.sqrt((inner * scale**2) @ np.square(b)), rtol=1e-12)
 
 
 def test_a_grouped_matmul_sums_each_groups_terms_as_a_dot_does():
