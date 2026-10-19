@@ -37,7 +37,7 @@ class Fields(grain.MapTransform):
 
         held = {name: value for name, value in element.items()
                 if name.startswith("_dew_") and name not in projected}
-        return {**projected, **rebound(element, held, kept, renamed)}
+        return {**projected, **held, **rebound(element, kept, renamed)}
 
 
 @dataclasses.dataclass(frozen=True)
