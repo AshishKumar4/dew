@@ -629,6 +629,10 @@ class AnsweringDecoder(UserDecoder):
     def mixed_admission_refusal(self):
         return self.decoder.mixed_admission_refusal()
 
+    @nn.nowrap
+    def split_prefill_refusal(self):
+        return self.decoder.split_prefill_refusal()
+
     @property
     def cache_rebuild_position(self):
         return self.decoder.cache_rebuild_position
