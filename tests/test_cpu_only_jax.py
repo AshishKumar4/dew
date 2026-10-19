@@ -36,7 +36,6 @@ REFUSED = 3
 READIED = f"""
 import logging
 import sys
-import traceback
 
 import dew
 assert not logging.getLogger("dew").handlers, "import dew configured Dew's logger"
@@ -57,12 +56,11 @@ def run():
         Loader(lambda partition: batches(), None, None, 8), steps=1, log_every=1)
 
 
+from dew.telemetry.devices import CPUOnlyJax
+
 try:
     run()
-except RuntimeError as refused:
-    # Dew's refusal, and no other failure of the run's setup.
-    if traceback.extract_tb(refused.__traceback__)[-1].name != "refuse_cpu_only_jax":
-        raise
+except CPUOnlyJax as refused:
     print(refused, file=sys.stderr)
     sys.exit({REFUSED})
 finally:
@@ -73,16 +71,17 @@ finally:
 @pytest.mark.parametrize("platforms", [None, "cpu"])
 @pytest.mark.parametrize("entry", ["prepare", "fit"])
 def test_a_run_stops_where_the_gpu_would_sit_idle_and_import_dew_does_not(tmp_path, platforms, entry):
-    """A stand-in nvidia-smi reports driver 580 and two GPUs beside a JAX that opens on the CPU, no
-    GPU being visible to it:
+    """A stand-in nvidia-smi reports driver 580 and two GPUs beside a JAX that opens on the CPU, the
+    one device it is shown being none a host has:
     `import dew` leaves the process alone, its logger and its hardware, and a run's setup,
     `prepare_process` or a `Trainer.fit` no `prepare_process` came before, stops with what
     `cpu_only_refusal` says of this environment's JAX, the plain refusal where it finds an install
     that should run. Either way the run gives Dew's logger its handler. JAX_PLATFORMS=cpu runs."""
     env = {key: value for key, value in os.environ.items() if key != "JAX_PLATFORMS"}
     env["PATH"] = stand_in(tmp_path, "580.82.07, 8.9\\n580.82.07, 8.6\\n")
-    # No GPU this process can open, on a host with GPUs too: JAX opens on the CPU.
-    env["CUDA_VISIBLE_DEVICES"] = ""
+    # A device that no host has, which leaves the GPUs to JAX by name: its CUDA plugin opens
+    # none, on a host with GPUs too, and JAX falls back to the CPU.
+    env["CUDA_VISIBLE_DEVICES"] = "999"
     if platforms is not None:
         env["JAX_PLATFORMS"] = platforms
     done = subprocess.run([sys.executable, "-c", READIED, entry], capture_output=True, text=True, env=env,
