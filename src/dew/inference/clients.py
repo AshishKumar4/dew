@@ -20,7 +20,16 @@ from typing import TYPE_CHECKING, Literal, Protocol
 import jax
 import numpy as np
 
-from dew.inference.continuation import AsyncChecked, Call, Checked, OwnStops, driven, driven_async
+from dew.inference.continuation import (
+    TRANSPORT,
+    AsyncChecked,
+    Call,
+    Checked,
+    OwnStops,
+    chat_refusal,
+    driven,
+    driven_async,
+)
 from dew.nn.inputs import key_seed, token_id
 from dew.records import JSON
 from dew.sampling.text import Sampling
@@ -464,6 +473,18 @@ def _engine_stops(sampling: Sampling, provider: Literal["vllm", "sglang"]) -> Ma
     return {"stop_token_ids": stops} if stops else {"ignore_eos": True}
 
 
+def _transport(request: Mapping[str, object]) -> Mapping[str, object]:
+    """A request's per-request transport options (`continuation.TRANSPORT`) as the SDK's request
+    options name them, for a call to an engine route the SDK does not name."""
+    names = {"extra_headers": "headers", "extra_query": "params", "timeout": "timeout"}
+    return {names[name]: request[name] for name in TRANSPORT if name in request}
+
+
+def _untransported(request: Mapping[str, object]) -> Mapping[str, object]:
+    """A request's body without its transport options (`_transport`)."""
+    return {name: value for name, value in request.items() if name not in TRANSPORT}
+
+
 def _returning_ids(fields: Mapping[str, object], *flags: str) -> Mapping[str, object]:
     """`fields` with SGLang's `flags` set in `extra_body`, so its choices report the token ids a
     continuation reads (`dew.inference.continuation`)."""
@@ -576,7 +597,8 @@ class OpenAICompletion:
         def answered(call: Call) -> JSON:
             route, body = call
             if route == "detokenize":
-                return client.post("/detokenize", cast_to=httpx2.Response, body=body).json()
+                return client.post("/detokenize", cast_to=httpx2.Response, body=_untransported(body),
+                                   options=_transport(body)).json()
             raw = _invoke(client.completions.with_raw_response.create, body)
             parsed = raw.parse()
             if not isinstance(parsed, SDKCompletion):
@@ -596,7 +618,8 @@ class OpenAICompletion:
         async def answered(call: Call) -> JSON:
             route, body = call
             if route == "detokenize":
-                return (await client.post("/detokenize", cast_to=httpx2.Response, body=body)).json()
+                return (await client.post("/detokenize", cast_to=httpx2.Response, body=_untransported(body),
+                                          options=_transport(body))).json()
             raw = await _invoke(client.completions.with_raw_response.create, body)
             parsed = raw.parse()
             if not isinstance(parsed, SDKCompletion):
@@ -676,17 +699,12 @@ class OpenAICompletion:
             return _invoke(create, fields)
         from openai import Stream
 
-        if stream:
-            # SGLang's chat route refuses the token-id flags on a stream (serving_chat.py).
-            answer = _invoke(create, fields)
-            if not isinstance(answer, Stream):
-                raise ValueError("a streaming chat request returned a whole response")
-            return Checked(answer, own)
-        fields = _returning_ids(fields, "return_prompt_token_ids", "return_token_ids")
         answer = _invoke(create, fields)
         if isinstance(answer, Stream):
-            raise ValueError("a non-streaming chat request returned a stream")
-        return driven(own.chat_completed(answer, fields), self._answered([]))
+            return Checked(answer, own)
+        if (refusal := chat_refusal(answer, own)) is not None:
+            raise ValueError(refusal)
+        return answer
 
     async def acall(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *,
                     key: int | jax.Array | None = None, **parameters: RequestField) -> Completion:
@@ -740,14 +758,9 @@ class OpenAICompletion:
             return await _invoke(create, fields)
         from openai import AsyncStream
 
-        if stream:
-            # SGLang's chat route refuses the token-id flags on a stream (serving_chat.py).
-            answer = await _invoke(create, fields)
-            if not isinstance(answer, AsyncStream):
-                raise ValueError("a streaming chat request returned a whole response")
-            return AsyncChecked(answer, own)
-        fields = _returning_ids(fields, "return_prompt_token_ids", "return_token_ids")
         answer = await _invoke(create, fields)
         if isinstance(answer, AsyncStream):
-            raise ValueError("a non-streaming chat request returned a stream")
-        return await driven_async(own.chat_completed(answer, fields), self._answered_async([]))
+            return AsyncChecked(answer, own)
+        if (refusal := chat_refusal(answer, own)) is not None:
+            raise ValueError(refusal)
+        return answer
