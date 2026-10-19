@@ -48,7 +48,7 @@ SPACE = frozenset(Columns(block, warps) for block in (16, 32, 64) for warps in (
 recurrence's gate (tests/test_linear_attention.py)."""
 
 
-def fits(state: jax.Array) -> bool:
+def fits(state: jax.Array | jax.ShapeDtypeStruct) -> bool:
     """Whether the kernel takes this `[rows, heads, Dk, Dv]` state: a GPU Dew's
     Triton kernels run on (`triton_runs`), held in fp32 or bf16, and
     power-of-two widths with Dv a multiple of `COLUMNS`' block (Triton's blocks)."""
