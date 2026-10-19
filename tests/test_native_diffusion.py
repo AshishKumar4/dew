@@ -266,6 +266,7 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     from dew.registry import from_record, to_record
     from dew.sampling import sample
     from dew.sampling.pipelines import ImageSettings
+    from reference_error import assert_as_exact_as_the_reference, widened
 
     directory = tmp_path / "sd"
     shutil.copytree(saved_pipelines / "sd", directory)
@@ -291,15 +292,27 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     key = jax.random.PRNGKey(4)
     step = Step(jnp.asarray(0), key, None)
 
-    process, times = source.task.grid(3)
-    denoise = objective.denoiser(variables, objective.encoded_conditions(variables, batch), None, process)
-    noise_key, sample_key = jax.random.split(key)
-    x_T = process.noise(noise_key, (batch["image"].shape[0], *objective.latent_shape))
-    walked = sample(denoise, x_T, solver=source.schedule.solver, key=sample_key, times=np.asarray(times),
-                    final_denoise=False)
-    expected = jnp.clip(source.autoencoder.decode(variables["autoencoder"], walked), -1.0, 1.0)
-    for built in (objective, retrained, configured):
-        np.testing.assert_array_equal(built.evaluate(variables, batch, step).images, expected)
+    def walked(source, objective, variables, x_T):
+        """The pipeline's solver over its own grid from `x_T`, with no closing denoise, decoded."""
+        process, times = source.task.grid(3)
+        denoise = objective.denoiser(variables, objective.encoded_conditions(variables, batch), None, process)
+        latents = sample(denoise, x_T, solver=source.schedule.solver, key=jax.random.split(key)[1],
+                         times=np.asarray(times), final_denoise=False)
+        return jnp.clip(source.autoencoder.decode(variables["autoencoder"], latents), -1.0, 1.0)
+
+    # The noise the evaluation draws from its step's key, which the float64 walk starts from too.
+    rows = batch["image"].shape[0]
+    x_T = source.task.grid(3)[0].noise(jax.random.split(key)[0], (rows, *objective.latent_shape))
+    reference = walked(source, objective, variables, x_T)
+    with jax.enable_x64(True):
+        wide = load_diffusion_source(str(directory), dtype="float64", attention_impl="xla")
+        truth = walked(wide, DiffusionObjective(wide, **settings), widened(variables),
+                       jnp.asarray(x_T, jnp.float64))
+    evaluated = objective.evaluate(variables, batch, step).images
+    assert_as_exact_as_the_reference(np.asarray(evaluated), np.asarray(reference), np.asarray(truth),
+                                     "an evaluation on the pipeline's grid")
+    for built in (retrained, configured):
+        np.testing.assert_array_equal(built.evaluate(variables, batch, step).images, evaluated)
 
     own = source.text_to_image()(PROMPTS, steps=3, guidance=None, key=0).host().images
     task = objective.build_task(variables)
