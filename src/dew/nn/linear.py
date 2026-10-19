@@ -42,8 +42,8 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import linear_call
 from jax.interpreters.ad import JVPTracer
 
-from dew.nn.kernels import delta_rule, fla_gdn, fla_kda, short_conv
-from dew.nn.kernels.delta_rule import L2NORM_EPS
+from dew.nn.kernels import fla_gdn, fla_kda, recurrence, short_conv
+from dew.nn.kernels.recurrence import L2NORM_EPS
 
 from .attention import FORWARD_MODE, gated_rms_normalized, repeat_kv_heads
 from .blocks import normal_kernel
@@ -930,8 +930,8 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None)
 
 def decode_gated_delta_rule(query, key, value, g, beta, state, active=None):
     """`recurrent_gated_delta_rule` for one decode token `[B, 1, H, D]`
-    through `dew.nn.kernels.delta_rule.step`, which reads and writes the
-    state once (CUDA, where `delta_rule.fits` the state). A row `active`
+    through the recurrence's decode step (`dew.nn.kernels.recurrence.step`), which reads and writes
+    the state once (CUDA, where `recurrence.fits` the state). A row `active`
     `[B]` marks False keeps its state untouched and outputs zeros. On a mesh
     the step runs per shard (`manual_map`), each shard's rows and heads with
     their state, as `fla_rule` runs: the kernel has no partitioning rule, and
@@ -948,10 +948,14 @@ def _decoded(query, key, value, g, beta, state, active):
     """`decode_gated_delta_rule` on arrays a shard holds."""
     work = jnp.float32
     query, key, value = (x[:, 0].astype(work) for x in (query, key, value))
-    decay = jnp.broadcast_to(jnp.exp(g[:, 0].astype(work))[..., None], key.shape)
-    final, out = delta_rule.step(state, query * key.shape[-1] ** -0.5, key, value, decay,
-                                 beta[:, 0].astype(work), active)
+    out, _, final = recurrence.step(
+        STEP, recurrence.Step(state, query=query * key.shape[-1] ** -0.5, key=key, value=value,
+                              log_decay=g[:, 0].astype(work), beta=beta[:, 0].astype(work), active=active))
     return out[:, None], final
+
+
+STEP = recurrence.Hooks(decay='scalar')
+"""The decode step between the layer's own conv and norm: the delta rule with one decay a head."""
 
 
 def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
@@ -982,7 +986,7 @@ class GatedDeltaNet(nn.Module):
     The decode state is `recurrent_state` [B, H, Dk, Dv] and `conv_state`
     [B, K-1, D] in the `cache` collection. A bfloat16 model holds its
     recurrent state in bfloat16, as vLLM does, rounded stochastically after
-    each decode token (`delta_rule.round_to_bf16`): rounding to nearest
+    each decode token (`recurrence.round_to_bf16`): rounding to nearest
     holds a slowly decaying state where it is, and its error grew tenfold
     over 1024 tokens. Any other model holds fp32, as does one asked for more
     than the default matmul precision (`matmul_precision` "highest", as its
@@ -1134,7 +1138,8 @@ class GatedDeltaNet(nn.Module):
 
     def _decode_kernel(self, x, operand) -> str:
         """The kernel a decode token runs on the target, reported as its route ('delta_decode'): the
-        fused step (`delta_rule.fused_step`), the step kernel (`delta_rule.step`) between the layer's
+        fused step (`recurrence.step` with the layer's conv, gates and norm, `_fused_token`), the step
+        (`recurrence.step` alone, `decode_gated_delta_rule`) between the layer's
         own conv and norm, or the portable recurrence ('xla'). Its row's choice, else the step
         kernel where the rule's own row names the port and the portable recurrence where it names
         the math, so a caller choosing the rule's math (`generation.chosen`) decodes unfused; a kernel
@@ -1154,14 +1159,14 @@ class GatedDeltaNet(nn.Module):
         if preferred == 'fused':
             refusal = refused(
                 (triton_runs(), 'capability', "the fused step needs a GPU of sm80 or later"),
-                (delta_rule.fused_fits(state), 'widths',
+                (recurrence.fits(self._fused_hooks(), state), 'widths',
                  "the state's widths are not powers of two the fused step's blocks take"),
             )
             if refusal is None:
                 return route('delta_decode', kernel='fused', preferred=preferred).kernel
         if preferred in ('fused', 'step'):
             stepping = refused(
-                (delta_rule.fits(state), 'step_widths',
+                (recurrence.fits(STEP, state), 'step_widths',
                  "the step kernel takes a state of power-of-two widths in fp32 or bf16 on a GPU of sm80 "
                  "or later"),
             )
@@ -1170,8 +1175,15 @@ class GatedDeltaNet(nn.Module):
             refusal = refusal or stepping
         return route('delta_decode', kernel='xla', preferred=preferred, refusal=refusal).kernel
 
+    def _fused_hooks(self) -> recurrence.Hooks:
+        """The decode token whole in the recurrence's step: the conv and its silu, the queries' and
+        keys' l2 norm, the gates from their pre-activations, the delta rule and the gated norm."""
+        return recurrence.Hooks(conv=recurrence.Conv('silu'), l2norm=True, decay='scalar',
+                                gates=recurrence.Gates(),
+                                output=recurrence.OutputNorm(self.norm_eps, self.gate_activation))
+
     def _fused_token(self, z, b, a, valid):
-        """A decode token's conv, gates, update and gated norm in one launch (`delta_rule.fused_step`),
+        """A decode token's conv, gates, update and gated norm in one launch (`recurrence.step`),
         `held_scan`'s `token`, each shard's rows and heads on their own (`manual_map`), as
         `decode_gated_delta_rule` places them. The conv's channels are queries, keys and values in
         turn, which a mesh splitting the heads holds by shard: there they are reordered so each
@@ -1196,10 +1208,11 @@ class GatedDeltaNet(nn.Module):
             weight = self.norm.variables['params']['weight']
             dtype = self.norm.dtype if self.norm.dtype is not None else at_least_fp32(mixed.dtype)
 
-            def local(token, history, taps, gate, beta, log_decay, bias, z, weight, state, active):
-                return delta_rule.fused_step(token, history, taps, gate, beta, log_decay, bias, z, weight,
-                                             state, epsilon=self.norm_eps, activation=self.gate_activation,
-                                             dtype=dtype, active=active)
+            def local(token, history, taps, gate, beta, log_a, bias, z, weight, state, active):
+                out, history, state = recurrence.step(self._fused_hooks(), recurrence.Step(
+                    state, token=token, held=history, taps=taps, gate=gate, beta=beta, log_a=log_a, bias=bias,
+                    z=z, weight=weight, active=active), dtype=dtype)
+                return out, history, state
 
             def ordered(x, axis):
                 return x if shards == 1 else jnp.take(x, order, axis=axis)
@@ -1263,7 +1276,7 @@ class GatedDeltaNet(nn.Module):
                                                None if valid is None else valid[:, 0])
             out, final = recurrent_gated_delta_rule(query, key, value, g, beta, state)
             if held is not None and held.dtype == jnp.bfloat16:
-                final = delta_rule.round_to_bf16(final, key[:, 0].astype(wide), value[:, 0].astype(wide))
+                final = recurrence.round_to_bf16(final, key[:, 0].astype(wide), value[:, 0].astype(wide))
             return out, final
 
         # The conv state holds the projections' own values, so it is held in
@@ -1281,7 +1294,7 @@ class GatedDeltaNet(nn.Module):
         if out is None:
             return self.out_proj(jnp.zeros((B, S, self.value_features), self.dtype))
         if token is not None:
-            # The fused step gated and normalized its output (`delta_rule.fused_step`).
+            # The fused step gated and normalized its output (`_fused_hooks`).
             return self.out_proj(out)
 
         gate = z.reshape(B, S, -1, self.head_v_dim)

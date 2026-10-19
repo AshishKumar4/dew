@@ -156,7 +156,8 @@ def _pieces(hooks: Hooks, value_heads: int, key_width: int, value_width: int, ch
     """The key heads a conv token holds, from its channels: queries and keys `Hk Dk` each, values
     `Hv Dv`."""
     key_heads = (channels - value_heads * value_width) // (2 * key_width)
-    if key_heads <= 0 or value_heads % key_heads or 2 * key_heads * key_width + value_heads * value_width != channels:
+    whole = 2 * key_heads * key_width + value_heads * value_width
+    if key_heads <= 0 or value_heads % key_heads or whole != channels:
         raise ValueError(f'{channels} conv channels are not queries and keys of {key_width} and values of '
                          f'{value_width} over {value_heads} value heads')
     return key_heads
@@ -182,9 +183,10 @@ def _prologue(hooks: Hooks, operands: Step, work):
         value = value.reshape(rows, value_heads, value_width)
         history = jnp.concatenate([held[:, 1:], token[:, None].astype(held.dtype)], axis=1)
     else:
-        query, key, value = (operands.query.astype(work), operands.key.astype(work), operands.value.astype(work))
+        query, key, value = (x.astype(work) for x in (operands.query, operands.key, operands.value))
     if hooks.l2norm:
-        query, key = (x * jax.lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + L2NORM_EPS) for x in (query, key))
+        query, key = (x * jax.lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + L2NORM_EPS)
+                      for x in (query, key))
         query = query * key_width ** -0.5
     group = value_heads // query.shape[1]
     query, key = (jnp.repeat(x, group, axis=1) for x in (query, key))
@@ -204,7 +206,8 @@ def _gates(hooks: Hooks, operands: Step, work, key_width: int):
         decay = jnp.ones((rows, heads, key_width), work)
     else:
         decay = jnp.exp(g)
-        decay = jnp.broadcast_to(decay[..., None] if hooks.decay == 'scalar' else decay, (rows, heads, key_width))
+        decay = decay[..., None] if hooks.decay == 'scalar' else decay
+        decay = jnp.broadcast_to(decay, (rows, heads, key_width))
     write = jnp.ones((rows, heads), work) if beta is None else beta
     return decay, write
 
@@ -216,7 +219,7 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     state = operands.state
     operand = (operands.token if hooks.conv is not None else operands.value).dtype
     work = jnp.promote_types(jnp.promote_types(operand, state.dtype), jnp.float32)
-    value_heads, key_width, value_width = state.shape[1:]
+    key_width = state.shape[2]
     query, key, value, history = _prologue(hooks, operands, work)
     decay, write = _gates(hooks, operands, work, key_width)
     out, updated = update(state.astype(work), query, key, value, decay, write[..., None], delta=hooks.delta)
@@ -275,7 +278,8 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
             dtype, as the layer's conv reads it, then the token."""
             channels = pl.ds(first, width)
             operand = token_ref.dtype
-            held = [history_ref[j, channels][None, :].astype(operand).astype(jnp.float32) for j in range(count - 1)]
+            held = [history_ref[j, channels][None, :].astype(operand).astype(jnp.float32)
+                    for j in range(count - 1)]
             return [*held, token_ref[channels][None, :].astype(jnp.float32)]
 
         def write(moved):
@@ -307,7 +311,8 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
             query, key, value = (inputs[name][...].astype(jnp.float32) for name in ('query', 'key', 'value'))
         if hooks.l2norm:
             query, key = (x[None] for x in (query, key))
-            query = query * short_conv._inverse_norm(query, L2NORM_EPS, interpret=interpret) * key_width ** -0.5
+            query = query * short_conv._inverse_norm(query, L2NORM_EPS, interpret=interpret)
+            query = query * key_width ** -0.5
             key = key * short_conv._inverse_norm(key, L2NORM_EPS, interpret=interpret)
             query, key = query[0], key[0]
         if hooks.gates is not None:
@@ -323,8 +328,8 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
         if hooks.skip:
             out = out + scalar('skip') * value
         if hooks.output is not None:
-            out = gated_rms(out, inputs['z'][...].astype(jnp.float32), inputs['weight'][...].astype(jnp.float32),
-                            hooks.output)
+            gate, weight = (inputs[name][...].astype(jnp.float32) for name in ('z', 'weight'))
+            out = gated_rms(out, gate, weight, hooks.output)
         state_out[...] = _held(updated, key, value, state_out.dtype)
         out_ref[...] = out.astype(out_ref.dtype)
         if hooks.conv is not None:
@@ -358,17 +363,17 @@ class StepLaunch(tuning.KernelOp):
     it interprets."""
 
     config_cls: ClassVar[type[Launch]] = Launch
-    ROWS: ClassVar[tuple[str, ...]] = ('active', 'query', 'key', 'value', 'token', 'held', 'log_decay', 'gate',
-                                       'beta', 'z', 'state')
+    ROWS: ClassVar[tuple[str, ...]] = ('active', 'query', 'key', 'value', 'token', 'held', 'log_decay',
+                                       'gate', 'beta', 'z', 'state')
 
     def _fwd(self, active, state, query=None, key=None, value=None, token=None, held=None, taps=None,
              log_decay=None, gate=None, beta=None, log_a=None, bias=None, skip=None, z=None, weight=None, *,
              hooks: Hooks, dtype: str, interpret: bool, config: Launch, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
-        arrays = dict(state=state, query=query, key=key, value=value, token=token, held=held, taps=taps,
-                      log_decay=log_decay, gate=gate, beta=beta, log_a=log_a, bias=bias, skip=skip, z=z,
-                      weight=weight)
+        arrays = {'state': state, 'query': query, 'key': key, 'value': value, 'token': token, 'held': held,
+                  'taps': taps, 'log_decay': log_decay, 'gate': gate, 'beta': beta, 'log_a': log_a,
+                  'bias': bias, 'skip': skip, 'z': z, 'weight': weight}
         given = {name: arrays[name] for name in _names(hooks)}
         rows, value_heads, key_width, value_width = state.shape
         key_heads = (_pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
@@ -413,7 +418,8 @@ class StepLaunch(tuning.KernelOp):
             'skip': functools.partial(one, rows=False),
             'log_decay': keyed_by_value if hooks.decay == 'vector' else functools.partial(one, rows=True),
         }
-        in_specs = [pl.BlockSpec((None, 1), lambda r, h, c: (r, 0)), *(specs[name](given[name]) for name in given)]
+        flags = pl.BlockSpec((None, 1), lambda r, h, c: (r, 0))
+        in_specs = [flags, *(specs[name](given[name]) for name in given)]
         out_specs = [held_state]
         out_shape = [jax.ShapeDtypeStruct(state.shape, state.dtype)]
         if hooks.conv is not None:
@@ -431,14 +437,17 @@ class StepLaunch(tuning.KernelOp):
         )(active, *given.values())), None
 
     def _get_heuristics_config(self, ba) -> Launch:
-        return WARPS if _whole(ba.kwargs['hooks']) else COLUMNS
+        if _whole(ba.kwargs['hooks']):
+            return WARPS
+        return dataclasses.replace(COLUMNS, block=min(COLUMNS.block, ba.arguments['state'].shape[-1]))
 
     def _get_autotuning_configs(self, ba) -> set[Launch]:
         whole = {Launch(None, warps) for warps in (4, 8, 16)}
         if _whole(ba.kwargs['hooks']):
             return whole
         width = ba.arguments['state'].shape[-1]
-        return whole | {Launch(block, warps) for block in (16, 32, 64) for warps in (4, 8) if width % block == 0}
+        return whole | {Launch(block, warps) for block in (16, 32, 64) for warps in (4, 8)
+                        if width % block == 0}
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Normal floats and every row active, so a timed launch steps each row's state and history."""
