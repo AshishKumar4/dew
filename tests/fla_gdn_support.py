@@ -50,7 +50,7 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
     gated = jax.ShapeDtypeStruct((batch, length, value_heads), jnp.float32)
     beta = jax.ShapeDtypeStruct(gated.shape, narrow)
     inverse = jax.ShapeDtypeStruct((batch, length, value_heads, chunk), narrow)
-    entered = jax.ShapeDtypeStruct((batch * (length // chunk - 1), value_heads, width, columns), narrow)
+    entered = jax.ShapeDtypeStruct((max(1, batch * (length // chunk - 1)), value_heads, width, columns), narrow)
     state = jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32)
     operands = {
         "chunk_local_cumsum": (gated,),
@@ -96,21 +96,24 @@ def pairwise(g):
     return g[..., :, None] - g[..., None, :]
 
 
+def _stored(passing):
+    """Memories passing between chunks `[B, C - 1, ...]` as the port stores them, `[max(1, B (C - 1)),
+    ...]` (`fla_gdn.stored`): rows of one chunk store none, and keep one unread slot."""
+    flat = passing.reshape(-1, *passing.shape[2:])
+    return flat if flat.shape[0] else jnp.zeros((1, *passing.shape[2:]), passing.dtype)
+
+
 def entered_states(per_chunk):
     """Per-chunk memories `[B, C, HV, K, V]` as the port keeps them (`fla_gdn.Sequences`): those each
     chunk but a row's first enters, `[B * (C - 1), HV, K, V]`, and each row's first, fp32."""
-    batch, chunks = per_chunk.shape[:2]
-    return (per_chunk[:, 1:].reshape(batch * (chunks - 1), *per_chunk.shape[2:]),
-            per_chunk[:, 0].astype(jnp.float32))
+    return _stored(per_chunk[:, 1:]), per_chunk[:, 0].astype(jnp.float32)
 
 
 def left_grads(per_chunk):
     """Per-chunk memory gradients `[B, C, HV, K, V]`, each of the memory a chunk leaves, as the port
     keeps them: those each chunk but a row's last leaves, `[B * (C - 1), HV, K, V]`, at the slot of
     the chunk after it, and each row's last, fp32."""
-    batch, chunks = per_chunk.shape[:2]
-    return (per_chunk[:, :-1].reshape(batch * (chunks - 1), *per_chunk.shape[2:]),
-            per_chunk[:, -1].astype(jnp.float32))
+    return _stored(per_chunk[:, :-1]), per_chunk[:, -1].astype(jnp.float32)
 
 
 def reference_o(q, k, v, h, g, *, scale: float, chunk: int = 64):
