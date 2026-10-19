@@ -257,15 +257,16 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
 
     options = {"oversample": 1, "admit": 3 * tasks // 5, "max_attempts": 2, "max_lag": 1, "ahead": 1}
     checkpoints = str(tmp_path / "run")
-    try:
-        with rig(faulty, fives, tasks=tasks, log=admissions.log, **options) as (_, fit, watched, _):
+    with rig(faulty, fives, tasks=tasks, log=admissions.log, **options) as (_, fit, watched, _):
+        # The stragglers of batches drawn ahead are released before the source closes, which waits
+        # for its running sessions.
+        try:
             first = fit(1, Checkpoints(checkpoints))
             drawn_ahead = [future for task, futures in watched.submitted
                            if int(task) >= tasks for future in futures]
             resumed = fit(2, Checkpoints(checkpoints))
+        finally:
             admissions.release()
-    finally:
-        admissions.release()
     assert int(first.updates) == 1 and int(resumed.updates) == 2
     batches = tasks // 5
     for record in admissions.records:
