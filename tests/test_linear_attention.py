@@ -1014,3 +1014,25 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
     found = compile_kernels(cases, target)
     assert len(found) == len(cases)
     assert not failures(found), "\n".join(failures(found))
+
+
+def test_a_decode_token_reports_the_fused_step_as_its_route_where_its_target_takes_it():
+    """A gated delta net's decode token traced for an A100 on this CPU, the generation's choice
+    'delta_decode' set to 'fused', reports the fused step as its route; at widths the kernel's blocks do
+    not take, the step with the refusal's code; with no choice, the step its row prefers."""
+    from dew.nn.kernels.generation import assumed, chosen, routes
+
+    def decode_routes(width):
+        module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=width,
+                               head_v_dim=width, dtype=jnp.bfloat16)
+        x = jnp.zeros((2, 1, 64), jnp.bfloat16)
+        variables = jax.eval_shape(lambda: module.init(jax.random.key(0), x, MixerCall(decode=True)))
+        with assumed("sm80"), routes() as found:
+            jax.eval_shape(lambda v: module.apply(v, x, MixerCall(decode=True), mutable=["cache"]), variables)
+        return [(found_route.kernel, found_route.preferred, found_route.refusal and found_route.refusal.code)
+                for found_route in found if found_route.choice == "delta_decode"]
+
+    assert decode_routes(32)[-1] == ("step", "step", None)
+    with chosen(delta_decode="fused"):
+        assert decode_routes(32)[-1] == ("fused", "fused", None)
+        assert decode_routes(24)[-1] == ("step", "fused", "widths")

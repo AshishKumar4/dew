@@ -80,7 +80,7 @@ from jax.interpreters.ad import JVPTracer
 from ..precision import at_least_fp32, compensated_add, rounded_to, two_product
 from ..sharding import logical_spec, manual_map
 from . import generation, tuning
-from .generation import first_refusal
+from .generation import Refusal, refused
 
 IMPLEMENTATIONS = ('auto', 'xla', 'pallas')
 DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16))
@@ -192,20 +192,25 @@ def _product_parts(left, right, *, interpret: bool) -> tuple[jax.Array, jax.Arra
     return two_product(left, right, bit_split=True, rounding=jax.lax.optimization_barrier)
 
 
-def _selected(choice: str, implementation: str, refusal: str | None) -> str:
+def _selected(choice: str, implementation: str, refusal: Refusal | None) -> str:
+    """The kernel `implementation` resolves to for `choice`, reported as the target's route
+    (`generation.route`): the row's or `chosen` one under 'auto', a named one as it is, and XLA where
+    the Pallas kernel turns the call down for `refusal` or for the target's own facts."""
     from ..attention import FORWARD_MODE
 
     if implementation not in IMPLEMENTATIONS:
         raise ValueError(f"implementation must be one of {IMPLEMENTATIONS}, got {implementation!r}")
     chosen = generation.measured_kernel(choice, 'xla') if implementation == 'auto' else implementation
     if chosen != 'pallas':
-        return chosen
+        return generation.route(choice, kernel=chosen, preferred=chosen).kernel
     placed = generation.triton_runs() or (implementation == 'pallas' and generation.backend() == 'cpu')
-    reason = first_refusal(
-        (placed, "the Pallas kernels need a GPU of sm80 or later"),
-        (not FORWARD_MODE.get(), "forward_mode_attention needs a JVP; these kernels implement VJPs"),
+    reason = refused(
+        (placed, 'capability', "the Pallas kernels need a GPU of sm80 or later"),
+        (not FORWARD_MODE.get(), 'forward_mode',
+         "forward_mode_attention needs a JVP; these kernels implement VJPs"),
     ) or refusal
-    return 'pallas' if reason is None else generation.ran_kernel(choice, 'xla', reason)
+    return generation.route(choice, kernel='pallas' if reason is None else 'xla', preferred='pallas',
+                            refusal=reason).kernel
 
 
 def _split() -> bool:
@@ -240,22 +245,23 @@ def _per_shard(local, axes, operands, replicated):
     return manual_map(local, specs, spec)(*operands)
 
 
-def _norm_refusal(x, scale, dtype, axes, operands) -> str | None:
+def _norm_refusal(x, scale, dtype, axes, operands) -> Refusal | None:
     """Why the norm kernels cannot take `x` (and its weight `scale`, and the
     other `operands`), or None: what every fused norm variant needs."""
-    return first_refusal(
-        (not any(isinstance(operand, JVPTracer) for operand in (x, scale, *operands)),
+    return refused(
+        (not any(isinstance(operand, JVPTracer) for operand in (x, scale, *operands)), 'jvp',
          "a JVP trace needs forward-mode derivatives; the RMSNorm kernel implements a VJP"),
-        (x.dtype in DTYPES and jnp.dtype(dtype) in DTYPES,
+        (x.dtype in DTYPES and jnp.dtype(dtype) in DTYPES, 'dtype',
          f"RMSNorm input {x.dtype} and output {dtype}; the kernel supports float32 and bfloat16"),
-        (bool(x.shape) and x.size > 0, "RMSNorm needs nonempty rows with a feature axis"),
-        (bool(x.shape) and 0 < x.shape[-1] <= 8192, "RMSNorm's register tile holds at most 8192 features"),
-        (scale is None or (scale.shape == x.shape[-1:] and scale.dtype in DTYPES),
+        (bool(x.shape) and x.size > 0, 'empty', "RMSNorm needs nonempty rows with a feature axis"),
+        (bool(x.shape) and 0 < x.shape[-1] <= 8192, 'width',
+         "RMSNorm's register tile holds at most 8192 features"),
+        (scale is None or (scale.shape == x.shape[-1:] and scale.dtype in DTYPES), 'scale',
          "the kernel takes a float32 or bfloat16 vector scale, not a broadcast affine tensor"),
         (all(operand is None or (operand.shape == x.shape and operand.dtype == x.dtype)
-             for operand in operands),
+             for operand in operands), 'operands',
          "a residual branch or a gate must match the normalized input's shape and dtype"),
-        (_placed(axes, (x, scale, *operands), whole_last=True),
+        (_placed(axes, (x, scale, *operands), whole_last=True), 'placement',
          "a mesh splits RMSNorm's operands by axes the caller does not name or across its features, or "
          "a shard_map that checks varying axes holds them, and a Pallas call states no varying type"),
     )
@@ -268,27 +274,31 @@ def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
     do a residual `branch` the stream's own add would broadcast or cast and
     an activation after the norm. `axes`, `x`'s logical axes, places the
     kernel on a mesh (`_placed`)."""
-    return _selected('rms_norm', implementation, first_refusal(
-        (not inverse_after_cast, "unweighted_rmsnorm rounds the inverse, not the normalized activation"),
-        (not activated, "the norm is followed by an activation, which the kernel does not apply"),
-        (fp32_statistics, "input-dtype statistics round each reduction step; the kernel reduces in fp32"),
+    return _selected('rms_norm', implementation, refused(
+        (not inverse_after_cast, 'inverse_rounding',
+         "unweighted_rmsnorm rounds the inverse, not the normalized activation"),
+        (not activated, 'activation',
+         "the norm is followed by an activation, which the kernel does not apply"),
+        (fp32_statistics, 'statistics',
+         "input-dtype statistics round each reduction step; the kernel reduces in fp32"),
     ) or _norm_refusal(x, scale, dtype, axes, (branch,)))
 
 
 def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str, *, axes=None) -> str:
     """Resolve the gated RMSNorm (`gated_rms_norm`), the one kernel family
     `KERNELS` names 'rms_norm'; other gates keep their XLA arithmetic."""
-    return _selected('rms_norm', implementation, first_refusal(
-        (activation in ('silu', 'sigmoid'), f"the gated kernel gates by silu or sigmoid, not {activation!r}"),
+    return _selected('rms_norm', implementation, refused(
+        (activation in ('silu', 'sigmoid'), 'gate_activation',
+         f"the gated kernel gates by silu or sigmoid, not {activation!r}"),
     ) or _norm_refusal(x, scale, dtype, axes, (gate,)))
 
 
-def _swiglu_refusal(operands, axes) -> str | None:
+def _swiglu_refusal(operands, axes) -> Refusal | None:
     """Why the SwiGLU kernels cannot take `operands`, or None."""
-    return first_refusal(
-        (not any(isinstance(operand, JVPTracer) for operand in operands),
+    return refused(
+        (not any(isinstance(operand, JVPTracer) for operand in operands), 'jvp',
          "a JVP trace needs forward-mode derivatives; the SwiGLU kernel implements a VJP"),
-        (_placed(axes, operands, whole_last=False),
+        (_placed(axes, operands, whole_last=False), 'placement',
          "a mesh splits SwiGLU's operands by axes the caller does not name, or a shard_map that checks "
          "varying axes holds them, and a Pallas call states no varying type"),
     )
@@ -298,10 +308,10 @@ def swiglu_kernel(implementation: str, gate, up, *, axes=None) -> str:
     """Resolve the SiLU product only. GeGLU and SiTU keep their own XLA
     arithmetic; broadcasting or mixed operand dtypes also stay there.
     `axes`, the operands' logical axes, places the kernel on a mesh (`_placed`)."""
-    return _selected('swiglu', implementation, first_refusal(
-        (gate.dtype in DTYPES and gate.dtype == up.dtype,
+    return _selected('swiglu', implementation, refused(
+        (gate.dtype in DTYPES and gate.dtype == up.dtype, 'dtype',
          "SwiGLU needs matching float32 or bfloat16 operands"),
-        (gate.shape == up.shape and bool(gate.shape) and gate.size > 0,
+        (gate.shape == up.shape and bool(gate.shape) and gate.size > 0, 'shape',
          "SwiGLU needs nonempty equal shapes, not broadcasting"),
     ) or _swiglu_refusal((gate, up), axes))
 
@@ -310,9 +320,9 @@ def packed_swiglu_kernel(implementation: str, gate_up, *, axes=None) -> str:
     """Resolve the SiLU product of one packed projection's `[..., 2, H]` output (`packed_swiglu`),
     the kernel `KERNELS` names 'swiglu', which reads the halves where the projection wrote them.
     `axes` are the product's logical axes, `[..., H]`'s."""
-    return _selected('swiglu', implementation, first_refusal(
-        (gate_up.dtype in DTYPES, "SwiGLU needs float32 or bfloat16 operands"),
-        (gate_up.ndim >= 2 and gate_up.shape[-2] == 2 and gate_up.size > 0,
+    return _selected('swiglu', implementation, refused(
+        (gate_up.dtype in DTYPES, 'dtype', "SwiGLU needs float32 or bfloat16 operands"),
+        (gate_up.ndim >= 2 and gate_up.shape[-2] == 2 and gate_up.size > 0, 'shape',
          "a packed SwiGLU takes a nonempty [..., 2, H] gate and up"),
     ) or _swiglu_refusal((gate_up,), None if axes is None else (*axes[:-1], None, axes[-1])))
 
