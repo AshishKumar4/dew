@@ -41,17 +41,19 @@ def block(name: str, addresses: Sequence[str], user: str) -> str:
 
 
 def _without(text: str, name: str) -> str:
-    """`text` without the TPU's block. A start marker without its end marker leaves the block's
-    extent unknown, so it is refused rather than taking every entry after it."""
-    start, end = _markers(name)
-    if start not in text:
+    """`text` without the TPU's block, from its start marker's line through its end marker's, the
+    last line of a file ending in it or not. A start marker without its end marker leaves the
+    block's extent unknown, so it is refused rather than taking every entry after it."""
+    start, end = (marker.rstrip("\n") for marker in _markers(name))
+    lines = text.splitlines(keepends=True)
+    names = [line.rstrip("\n") for line in lines]
+    if start not in names:
         return text
-    head, _, rest = text.partition(start)
-    if end not in rest:
-        raise ValueError(f"{path()} holds {start.strip()!r} without {end.strip()!r}; restore the end "
+    first = names.index(start)
+    if end not in names[first + 1:]:
+        raise ValueError(f"{path()} holds {start!r} without {end!r}; restore the end "
                          "marker or remove the block by hand")
-    _, _, tail = rest.partition(end)
-    return head + tail
+    return "".join(lines[:first] + lines[names.index(end, first + 1) + 1:])
 
 
 def write(name: str, entry: str) -> None:
@@ -70,5 +72,7 @@ def write(name: str, entry: str) -> None:
 def forget(name: str) -> None:
     """Remove the TPU's block, when the file has one."""
     target = path()
-    if target.is_file() and _markers(name)[0] in target.read_text():
-        write(name, "")
+    if target.is_file():
+        current = target.read_text()
+        if _without(current, name) != current:
+            write(name, "")
