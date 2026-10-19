@@ -63,45 +63,55 @@ def test_a_decoder_is_as_exact_as_its_reference(name, dtype):
 @pytest.mark.parametrize("name", ["qwen2-tiny", "llama-tiny"])
 def test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torch_does(name):
     """A bfloat16 model's projection biases sum their gradients over every token of the batch.
-    Over 8192 tokens Dew's land as near float64 as transformers' own bfloat16 gradients,
-    which accumulate those sums at float32; a bfloat16 sum, which JAX gives a broadcast's
-    transpose (jax-ml/jax#30310), lands several times further."""
+    Over four batches of 8192 tokens Dew's land as near float64 as transformers' own bfloat16
+    gradients, which accumulate those sums at float32; a bfloat16 sum, which JAX gives a
+    broadcast's transpose (jax-ml/jax#30310), lands several times further. Each leaf is held
+    to the reference over the four batches at once, every bias leaf of the model: one batch's
+    key bias, whose gradient nearly cancels by the softmax's shift invariance, is a draw of a
+    few dozen rounded terms: over 24 seeds one batch put Dew's at 0.4 to 3.2 times torch's
+    distance, and four drawn from them pooled past twice in under one draw in a thousand."""
     import torch
     from transformers import AutoModelForCausalLM
 
     directory = FIXTURES / name
-    ids = np.random.default_rng(0).integers(0, 256, (64, 128))
+    batches = np.random.default_rng(0).integers(0, 256, (4, 64, 128))
 
-    def torch_gradients(dtype):
-        model = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.float32).bfloat16().to(dtype)
+    def torch_gradients(dtype, ids):
+        # Loaded in bfloat16 as transformers loads it, its rotary frequencies kept in float32;
+        # `.bfloat16()` would round that buffer too, and the float64 truth would rotate by them.
+        model = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.bfloat16)
+        model = model if dtype == torch.bfloat16 else model.to(dtype)
         tokens = torch.from_numpy(ids)
         model(tokens, labels=tokens).loss.backward()
         return {name: parameter.grad.double().numpy() for name, parameter in model.named_parameters()
                 if parameter.grad is not None}
 
-    truth, reference = torch_gradients(torch.float64), torch_gradients(torch.bfloat16)
     loaded = Pretrained.load(str(directory), dtype="bfloat16", param_dtype="bfloat16",
                              attention_impl="reference", max_seq_len=128)
 
-    def loss(variables):
-        logits = jnp.asarray(loaded.model.apply(variables, jnp.asarray(ids, jnp.int32)), jnp.float32)
-        targets = jnp.asarray(ids[:, 1:])[..., None]
+    def loss(variables, ids):
+        logits = jnp.asarray(loaded.model.apply(variables, ids), jnp.float32)
+        targets = ids[:, 1:, None]
         chosen = jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), targets, -1)
         return -jnp.mean(chosen)
 
-    gradients = jax.grad(loss)(loaded.variables)
-    # Llama's key bias sums gradients that cancel by the softmax's shift invariance, which RoPE
-    # breaks only in part, so its error measures the attention backward's key cotangents rather
-    # than this sum; that is held apart (findings ledger 621).
-    biases = [layout for layout in loaded.weight_layouts if layout.name.endswith(".bias")
-              and not (name == "llama-tiny" and layout.name.endswith("k_proj.bias"))]
+    gradient = jax.jit(jax.grad(loss))
+    biases = [layout for layout in loaded.weight_layouts if layout.name.endswith(".bias")]
     assert biases
+    truth, reference, dew = ({layout.name: [] for layout in biases} for _ in range(3))
+    for ids in batches:
+        exact, rounded = torch_gradients(torch.float64, ids), torch_gradients(torch.bfloat16, ids)
+        ours = gradient(loaded.variables, jnp.asarray(ids, jnp.int32))
+        for layout in biases:
+            shape = exact[layout.name].shape
+            truth[layout.name].append(exact[layout.name])
+            reference[layout.name].append(rounded[layout.name])
+            dew[layout.name].append(np.asarray(layout.export(ours), np.float64).reshape(shape))
     over = []
     for layout in biases:
-        exact = truth[layout.name]
-        dew = np.asarray(layout.export(gradients), np.float64).reshape(exact.shape)
         try:
-            assert_as_exact_as_the_reference(dew, reference[layout.name], exact, f"{name} {layout.name}")
+            assert_as_exact_as_the_reference(np.stack(dew[layout.name]), np.stack(reference[layout.name]),
+                                             np.stack(truth[layout.name]), f"{name} {layout.name}")
         except AssertionError as failure:
             over.append(str(failure))
     assert not over, "\n".join(over)
