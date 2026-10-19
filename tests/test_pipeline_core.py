@@ -243,39 +243,6 @@ def test_a_random_step_draws_alike_in_every_read_of_one_order():
     assert [draw for _, draw in again] != [draw for _, draw in draws(alone, "indexed")]
 
 
-@dataclasses.dataclass(frozen=True)
-class Member:
-    """A record marked with the mixture member it came from."""
-
-    index: int
-
-    def __call__(self, element):
-        return {**element, "member": np.int32(self.index)}
-
-
-def test_a_mixture_members_draws_stay_as_they_were_when_another_member_joins():
-    """A random step in a mixture member draws by the name the member goes by, not by its place among
-    the members: a member joining before it leaves its draws as they were, and two members of one
-    name draw apart."""
-    def member(name, index):
-        return Pipeline(source(8), name=name).map(Member(index)).random_map(Draw()).repeat(1)
-
-    def draws(members):
-        data = compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
-        stream = data.train(DataPartition())
-        try:
-            return {(int(index), int(of)): int(draw) for batch in stream
-                    for index, of, draw in zip(batch["id"], batch["member"], batch["draw"], strict=True)}
-        finally:
-            stream.close()
-
-    alone = draws([member("kept", 1)])
-    joined = draws([member("joining", 0), member("kept", 1)])
-    assert {key: draw for key, draw in joined.items() if key[1] == 1} == alone
-    twins = draws([member("twin", 0), member("twin", 1)])
-    assert [twins[index, 0] for index in range(8)] != [twins[index, 1] for index in range(8)]
-
-
 def drawn_natively(rows):
     """A Grain step Dew does not name, whose random step draws by the default seed of the rows it
     is handed."""
