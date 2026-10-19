@@ -107,18 +107,20 @@ def test_vllms_engine_streams_token_ids_as_the_other_engines_do(tmp_path):
     assert record["sweep"][0]["repeats"][0]["output_tokens"] == 4 * 5
 
 
-@pytest.mark.parametrize("kv", ["dense", "paged"])
-def test_a_multimodal_model_serves_over_either_layout(tmp_path, kv):
+@pytest.mark.parametrize(("fixture", "kv"), [("qwen35-tiny-mm", "dense"), ("gemma3-tiny-mm", "dense"),
+                                           ("gemma3-tiny-mm", "paged")])
+def test_a_multimodal_model_serves_the_layout_asked_for(tmp_path, fixture, kv):
     """A multimodal model's wrapper hands the layout asked for to its text decoder, which holds the
-    cache: `--kv dense` and `--kv paged` both serve every requested token."""
-    model = ROOT / "tests" / "fixtures" / "hf" / "qwen35-tiny-mm"
+    cache: `--kv dense` serves a Qwen3.5 wrapper, and `--kv dense` and `--kv paged` a Gemma 3 one,
+    every requested token."""
     env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"),
            "XLA_FLAGS": "--xla_force_host_platform_device_count=1"}
     done = subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_lm_serving.py"),
-                           "--backend", "dew", "--model", str(model), "--slots", "2", "--requests", "4",
-                           "--prompt", "8", "--output", "8", "--vocab-limit", "200", "--repeats", "1",
-                           "--kv", kv, "--out", str(tmp_path / f"{kv}.json")],
+                           "--backend", "dew", "--model", str(ROOT / "tests" / "fixtures" / "hf" / fixture),
+                           "--slots", "2", "--requests", "4", "--prompt", "8", "--output", "8",
+                           "--vocab-limit", "200", "--repeats", "1", "--kv", kv,
+                           "--out", str(tmp_path / "out.json")],
                           env=env, cwd=ROOT, capture_output=True, text=True)
     assert done.returncode == 0, done.stderr[-3000:]
-    record = json.loads((tmp_path / f"{kv}.json").read_text())
+    record = json.loads((tmp_path / "out.json").read_text())
     assert record["sweep"][0]["repeats"][0]["output_tokens"] == 4 * 8
