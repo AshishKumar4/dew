@@ -20,7 +20,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 import pytest
-from hub_support import stated_shards
+from hub_support import native_builder, stated_shards
 from reader_support import assert_a_rewrite_moves_the_identity
 
 from dew.data.dataset import DataPartition, Loading
@@ -115,15 +115,10 @@ def moving_hub_conversion(monkeypatch, tmp_path, request):
     monkeypatch.setattr(HfApi, "list_repo_refs", refs)
     monkeypatch.setattr(HfFileSystem, "info", header)
     monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, **kwargs: io.BytesIO(payloads[path]))
-    (tmp_path / "dataset_info.json").write_text("{}")
-    prepared = datasets.Dataset.from_dict(columns(0))
-    builder = SimpleNamespace(
-        cache_dir=str(tmp_path),
-        config=SimpleNamespace(data_files=None, version="0.0.0"),
-        config_id="default",
-        info=SimpleNamespace(features=None, splits={"train": SimpleNamespace(num_examples=32)}),
-        as_dataset=lambda **kwargs: prepared,
-    )
+    # The real builder of the split, prepared: the Arrow a pinned revision without a conversion reads.
+    builder = native_builder({"train": datasets.Dataset.from_dict(columns(0))}, tmp_path / "files",
+                             tmp_path / "arrow")
+    builder.download_and_prepare()
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     return converted
 
@@ -1082,12 +1077,9 @@ def test_snapshot_reads_a_prepared_hub_without_physical_shards(tmp_path, monkeyp
 
     from dew.data import Hub
 
-    (tmp_path / "dataset_info.json").write_text("{}")
-    prepared = datasets.Dataset.from_dict({"id": [4, 5, 6]})
-    builder = SimpleNamespace(cache_dir=str(tmp_path), config_id="default",
-                              config=SimpleNamespace(data_files=None, version="0.0.0"),
-                              info=SimpleNamespace(features=None, splits=None),
-                              as_dataset=lambda **kwargs: prepared)
+    builder = native_builder({"train": datasets.Dataset.from_dict({"id": [4, 5, 6]})}, tmp_path / "files",
+                             tmp_path / "arrow")
+    builder.download_and_prepare()
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     monkeypatch.setattr(HfApi, "dataset_info", lambda *args, **kwargs: SimpleNamespace(sha="pinned"))
     monkeypatch.setattr(HfApi, "list_repo_files", lambda *args, **kwargs: ["train.tar"])
