@@ -759,15 +759,32 @@ def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, round
     computation itself of an independent float64 oracle: FACTOR times
     `roundings` (the longest chain of roundings an output goes through, its
     reductions' lengths summed along the way) float64 unit roundoffs of the
-    truth's RMS scale. Two float64 runs of one function part by that much at
-    most; any difference in the function moves the twin by many orders of
-    magnitude more. The fp32 error is no measure of it: a near-exact fp32 path
-    leaves the float64 runs a few ulps apart all the same."""
+    truth's RMS scale, and each entry within that of its row's RMS scale (a
+    row every axis but the last), or of its own size where it is larger, so a
+    wrong small entry is not diluted by its leaf's others. Two float64 runs of
+    one function part by that much at most; any difference in the function
+    moves the twin by many orders of magnitude more. The fp32 error is no
+    measure of it: a near-exact fp32 path leaves the float64 runs a few ulps
+    apart all the same."""
     eps = float(np.finfo(np.float64).eps)
+    bound = FACTOR * roundings * eps
     apart, scale = distance(reference_in_float64, truth), float(np.sqrt(np.mean(np.square(truth))))
-    assert within(apart, FACTOR * roundings * eps * scale), (
+    assert within(apart, bound * scale), (
         f"{label}: the reference in float64 is {apart:.3e} from the oracle (rms), more than float64 "
         f"rounding over {roundings} steps of its scale {scale:.3e}")
+    truth = np.asarray(truth, np.float64)
+    rows = truth.reshape(-1, truth.shape[-1]) if truth.ndim else truth.reshape(1, 1)
+    twin = np.asarray(reference_in_float64, np.float64).reshape(rows.shape)
+    sizes = np.maximum(np.sqrt(np.mean(np.square(rows), axis=1, keepdims=True)), np.abs(rows))
+    entries = np.abs(twin - rows)
+    over = ~(entries <= bound * sizes)
+    if np.any(over):
+        ratios = np.where(sizes > 0, entries / np.where(sizes > 0, sizes, 1), np.inf)
+        at = np.unravel_index(int(np.argmax(ratios)), rows.shape)
+        raise AssertionError(
+            f"{label}: {int(np.count_nonzero(over))} of {rows.size} entries of the reference in float64 are "
+            f"past float64 rounding over {roundings} steps; the worst, row {at[0]} entry {at[1]}, is "
+            f"{entries[at]:.3e} from the oracle, of size {sizes[at]:.3e}")
 
 
 def chain_roundings(closed_jaxpr) -> int:

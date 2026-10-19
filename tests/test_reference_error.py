@@ -11,6 +11,7 @@ from reference_error import (
     ORDERS_DIR,
     ORDERS_REQUESTED,
     assert_as_exact_as_the_reference,
+    assert_computes_the_oracle,
     assert_elements_as_exact_over_orders,
     assert_leaves_as_exact,
     assert_leaves_as_exact_in_two_stages,
@@ -225,3 +226,20 @@ def test_the_rule_reduces_a_directory_of_recorded_orders_from_its_command_line(t
     found = subprocess.run([sys.executable, str(Path(__file__).parent / "reference_error.py"), "reduce",
                             str(tmp_path)], capture_output=True, text=True, check=False, timeout=120)
     assert found.returncode == 0, found.stderr
+
+
+def test_the_oracle_check_finds_a_wrong_small_entry_its_rms_dilutes():
+    """A float64 twin of 8 rows of 131072 logits a few ulps from the oracle passes; one entry of size
+    1e-3 wrong by 1e-11, which the global RMS bound passes (it moves the twin's RMS by 1e-14 of its
+    scale), fails entry by entry (`assert_computes_the_oracle`)."""
+    rng = np.random.default_rng(8)
+    truth = rng.standard_normal((8, 131072))
+    eps = float(np.finfo(np.float64).eps)
+    twin = truth * (1 + 4 * eps * rng.standard_normal(truth.shape))
+    assert_computes_the_oracle(twin, truth, "a few ulps", roundings=64)
+    truth[2, 5] = 1e-3
+    twin = truth * (1 + 4 * eps * rng.standard_normal(truth.shape))
+    wrong = twin.copy()
+    wrong[2, 5] = truth[2, 5] + 1e-11
+    with pytest.raises(AssertionError, match="entries"):
+        assert_computes_the_oracle(wrong, truth, "one entry", roundings=64)
