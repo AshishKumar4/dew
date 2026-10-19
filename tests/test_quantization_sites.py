@@ -109,6 +109,36 @@ def test_layers_quantized_apart_that_one_bank_holds_are_refused(case):
         scanned.apply({**variables, "params": params}, ids)
 
 
+def test_a_store_that_banks_layers_quantized_apart_reads_as_the_runs_it_banks(case):
+    """Four like layers, the last two quantized apart from the first two, are two runs, which a
+    store places as one bank each (`HeldBanks.place`): the model reading that store runs the same
+    two runs, and its logits are held to the rule the plain loop of the same weights is, against
+    their own float64 forward."""
+    from dew.inference.banks import HeldBanks
+
+    _, loaded, reference = case
+    ids = reference["ids"].astype(np.int32)
+    model = loaded.model
+    four = model.clone(num_layers=4, layer_types=None if model.layer_types is None else model.layer_types * 2)
+    variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
+    for tree in variables.values():
+        for index in range(2):
+            if f"layers_{index}" in tree:
+                tree[f"layers_{index + 2}"] = jax.tree.map(lambda leaf: leaf, tree[f"layers_{index}"])
+    for index in (2, 3):
+        layer = variables[QUANTIZATION][f"layers_{index}"]
+        mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
+        layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
+    scanned = four.clone(scan_layers=True)
+    bound = scanned.bind(variables)
+    assert bound.groups == ((0, 2), (2, 2))
+    store = HeldBanks(variables).place(bound, layout=Layout(min_shard=1, tolerance=1.0))
+    plain = np.asarray(four.apply(variables, ids))
+    truth, terms = float64_forward(four, variables, ids)
+    assert_as_exact_as_the_reference(np.asarray(scanned.apply(store, ids)), plain, truth,
+                                     "banked runs quantized apart", terms=terms)
+
+
 @pytest.mark.mesh(devices=2)
 def test_the_pipeline_stages_quantize_each_layer_with_its_own_scales(case):
     """Two stages of one layer each, two microbatches of one row: the stage
