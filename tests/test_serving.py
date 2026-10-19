@@ -475,8 +475,9 @@ def test_a_multimodal_model_serves_over_its_language_models_cache(options):
         served = ticket.result()
         assert_same_generation(served, lone)
         ids = np.asarray([Digits().encode(prompt)], np.int32)
-        walked = greedy_walk(model, params, ids, budget)[:, ids.shape[1]:]
-        np.testing.assert_array_equal(served.host().tokens[:, :budget], walked)
+        # A generation's tokens are the prompt and its continuation.
+        walked = greedy_walk(model, params, ids, budget)
+        np.testing.assert_array_equal(served.host().tokens[:, :walked.shape[1]], walked)
 
 
 def served_alongside(bound, slots=4, admission=2, **options):
