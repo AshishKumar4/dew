@@ -405,7 +405,9 @@ def test_a_streamed_mix_refuses_a_resume_whose_kept_rows_changed(edit):
 def test_a_streamed_mix_beneath_a_shuffle_refuses_a_member_joining():
     """A shuffle above a mix holds the mix's rows in its window across a saved position, which a
     member joining would change beneath it: that resume is refused rather than replaying rows."""
-    shuffled = lambda chain: chain.shuffle(42, window=10)  # noqa: E731
+    def shuffled(chain):
+        return chain.shuffle(42, window=10)
+
     _, saved = member_rows([corpus("a", 0)], above=shuffled)
     with pytest.raises(ValueError):
         member_rows([corpus("a", 0), corpus("b", 1)], above=shuffled, saved=saved)
