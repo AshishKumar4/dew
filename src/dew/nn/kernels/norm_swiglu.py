@@ -246,9 +246,11 @@ def _per_shard(local, axes, operands, replicated):
     return manual_map(local, specs, spec)(*operands)
 
 
-def _norm_refusal(x, scale, dtype, axes, operands) -> str | None:
-    """Why the norm kernels cannot take `x` (and its weight `scale`, and the
-    other `operands`), or None: what every fused norm variant needs."""
+def _norm_refusal(x, scale, dtype, axes, branch=None, gate=None) -> str | None:
+    """Why the norm kernels cannot take `x` (and its weight `scale`, a residual `branch` and a `gate`),
+    or None: what every fused norm variant needs. A branch adds in `x`'s dtype, as the stream's own
+    add does; a gate is read in fp32 whatever its float dtype, as the XLA arithmetic widens it."""
+    operands = (branch, gate)
     return first_refusal(
         (not any(isinstance(operand, JVPTracer) for operand in (x, scale, *operands)),
          "a JVP trace needs forward-mode derivatives; the RMSNorm kernel implements a VJP"),
@@ -258,9 +260,10 @@ def _norm_refusal(x, scale, dtype, axes, operands) -> str | None:
         (bool(x.shape) and 0 < x.shape[-1] <= 8192, "RMSNorm's register tile holds at most 8192 features"),
         (scale is None or (scale.shape == x.shape[-1:] and scale.dtype in DTYPES),
          "the kernel takes a float32 or bfloat16 vector scale, not a broadcast affine tensor"),
-        (all(operand is None or (operand.shape == x.shape and operand.dtype == x.dtype)
-             for operand in operands),
-         "a residual branch or a gate must match the normalized input's shape and dtype"),
+        (branch is None or (branch.shape == x.shape and branch.dtype == x.dtype),
+         "a residual branch must match the normalized input's shape and dtype"),
+        (gate is None or (gate.shape == x.shape and gate.dtype in DTYPES),
+         "a gate must match the normalized input's shape, in float32 or bfloat16"),
         (_placed(axes, (x, scale, *operands), whole_last=True),
          "a mesh splits RMSNorm's operands by axes the caller does not name or across its features, or "
          "a shard_map that checks varying axes holds them, and a Pallas call states no varying type"),
@@ -277,7 +280,7 @@ def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
     return _selected('rms_norm', implementation, first_refusal(
         (not activated, "the norm is followed by an activation, which the kernel does not apply"),
         (fp32_statistics, "input-dtype statistics round each reduction step; the kernel reduces in fp32"),
-    ) or _norm_refusal(x, scale, dtype, axes, (branch,)))
+    ) or _norm_refusal(x, scale, dtype, axes, branch=branch))
 
 
 def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str, *, axes=None) -> str:
@@ -285,7 +288,7 @@ def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str
     `KERNELS` names 'rms_norm'; other gates keep their XLA arithmetic."""
     return _selected('rms_norm', implementation, first_refusal(
         (activation in ('silu', 'sigmoid'), f"the gated kernel gates by silu or sigmoid, not {activation!r}"),
-    ) or _norm_refusal(x, scale, dtype, axes, (gate,)))
+    ) or _norm_refusal(x, scale, dtype, axes, gate=gate))
 
 
 def _swiglu_refusal(operands, axes) -> str | None:
