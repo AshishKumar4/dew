@@ -29,11 +29,13 @@ value head.
 import contextlib
 import contextvars
 import functools
+import math
 from collections.abc import Sequence
 from typing import ClassVar, overload
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
@@ -1155,38 +1157,44 @@ class GatedDeltaNet(nn.Module):
 
     def _fused_token(self, z, b, a, valid):
         """A decode token's conv, gates, update and gated norm in one launch (`delta_rule.fused_step`),
-        `held_scan`'s `token`: the conv's input, history and taps split by piece and head, each shard's
-        rows and heads on their own (`manual_map`), as `decode_gated_delta_rule` places them."""
+        `held_scan`'s `token`, each shard's rows and heads on their own (`manual_map`), as
+        `decode_gated_delta_rule` places them. The conv's channels are queries, keys and values in
+        turn, which a mesh splitting the heads holds by shard: there they are reordered so each
+        shard's slice of them is its heads' queries, keys and values in turn, and back after."""
         B = z.shape[0]
-        key_dim = self.key_features
-        taps = self.conv1d()[0]
-        weight = self.norm.variables['params']['weight']
-        dtype = self.norm.dtype if self.norm.dtype is not None else at_least_fp32(z.dtype)
-        active = jnp.ones((B,), bool) if valid is None else jnp.asarray(valid, bool)[:, 0]
         widths = (self.head_k_dim, self.head_k_dim, self.head_v_dim)
-        rows, heads = grouped_heads((B, 1, self.num_v_heads, self.head_v_dim), self.num_k_heads)
+        heads = (self.num_k_heads, self.num_k_heads, self.num_v_heads)
+        rows, split = grouped_heads((B, 1, self.num_v_heads, self.head_v_dim), self.num_k_heads)
+        mesh = jax.sharding.get_abstract_mesh()
+        shards = math.prod(mesh.shape[axis] for axis in mesh_axes(split))
+        # Each channel's place in the shards' order: by shard, then piece, then the piece's heads there.
+        first = np.cumsum([0, *(h * w for h, w in zip(heads, widths, strict=True))])
+        order = np.concatenate([first[i] + np.arange(shard * h * w // shards, (shard + 1) * h * w // shards)
+                                for shard in range(shards)
+                                for i, (h, w) in enumerate(zip(heads, widths, strict=True))])
+        inverse = np.argsort(order)
         P = jax.sharding.PartitionSpec
-
-        def pieces(x):
-            """`x` `[..., C]` by piece, its channels as heads `[..., H, D]`."""
-            return tuple(part.reshape(*part.shape[:-1], -1, width) for part, width in
-                         zip(jnp.split(x, [key_dim, 2 * key_dim], axis=-1), widths, strict=True))
-
-        def local(token, held, taps, gate, beta, log_decay, bias, z, weight, state, active):
-            return delta_rule.fused_step(token, held, taps, gate, beta, log_decay, bias, z, weight, state,
-                                         epsilon=self.norm_eps, activation=self.gate_activation, dtype=dtype,
-                                         active=active)
+        active = jnp.ones((B,), bool) if valid is None else jnp.asarray(valid, bool)[:, 0]
 
         def token(mixed, history, held):
-            three, four = P(rows, heads, None), P(rows, None, heads, None)
-            specs = ((three,) * 3, (four,) * 3, (P(heads, None, None),) * 3, P(rows, heads), P(rows, heads),
-                     P(heads), P(heads), three, P(), P(rows, heads, None, None), P(rows))
-            tapped = tuple(part.reshape(-1, width, taps.shape[-1]) for part, width in
-                           zip(jnp.split(taps, [key_dim, 2 * key_dim], axis=0), widths, strict=True))
-            out, history, state = manual_map(local, specs, (three, (four,) * 3, specs[9]))(
-                pieces(mixed[:, 0]), pieces(history), tapped, a[:, 0], b[:, 0], self.A_log, self.dt_bias,
-                z[:, 0].reshape(B, self.num_v_heads, -1), weight, held, active)
-            history = jnp.concatenate([part.reshape(*part.shape[:2], -1) for part in history], axis=-1)
+            taps = self.conv1d()[0]
+            weight = self.norm.variables['params']['weight']
+            dtype = self.norm.dtype if self.norm.dtype is not None else at_least_fp32(mixed.dtype)
+
+            def local(token, history, taps, gate, beta, log_decay, bias, z, weight, state, active):
+                return delta_rule.fused_step(token, history, taps, gate, beta, log_decay, bias, z, weight,
+                                             state, epsilon=self.norm_eps, activation=self.gate_activation,
+                                             dtype=dtype, active=active)
+
+            def ordered(x, axis):
+                return x if shards == 1 else jnp.take(x, order, axis=axis)
+
+            specs = (P(rows, split), P(rows, None, split), P(split, None), P(rows, split), P(rows, split),
+                     P(split), P(split), P(rows, split, None), P(), P(rows, split, None, None), P(rows))
+            out, history, state = manual_map(local, specs, (specs[7], specs[1], specs[9]))(
+                ordered(mixed[:, 0], 1), ordered(history, 2), ordered(taps, 0), a[:, 0], b[:, 0], self.A_log,
+                self.dt_bias, z[:, 0].reshape(B, self.num_v_heads, -1), weight, held, active)
+            history = history if shards == 1 else jnp.take(history, inverse, axis=2)
             return out.reshape(B, 1, -1), history, state
 
         return token

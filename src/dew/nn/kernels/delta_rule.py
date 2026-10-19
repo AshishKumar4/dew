@@ -58,15 +58,6 @@ def fits(state: jax.Array) -> bool:
             and dv % COLUMNS.block == 0 and (dv // COLUMNS.block) & (dv // COLUMNS.block - 1) == 0)
 
 
-def fused_fits(state) -> bool:
-    """Whether `fused_step` takes this `[rows, heads, Dk, Dv]` state: a GPU Dew's Triton kernels run
-    on (`triton_runs`), held in fp32 or bf16, its widths powers of two (Triton's blocks); a program
-    holds a head's whole state, with no column blocks to divide."""
-    dk, dv = state.shape[-2:]
-    return (triton_runs() and state.dtype in (jnp.float32, jnp.bfloat16)
-            and all(width > 0 and width & (width - 1) == 0 for width in (dk, dv)))
-
-
 def round_to_bf16(state, key, value):
     """`state` `[..., Dk, Dv]` fp32 rounded to bf16 stochastically: up in
     magnitude with the probability of the dropped low 16 bits, so a decay
@@ -184,52 +175,56 @@ L2NORM_EPS = 1e-6
 """The queries' and keys' l2 norm's epsilon under the root, the FLA library's (`dew.nn.linear.l2norm`)."""
 
 
-def _fused_kernel(active_ref, q_ref, k_ref, v_ref, held_q_ref, held_k_ref, held_v_ref, taps_q_ref, taps_k_ref,
-                  taps_v_ref, gate_ref, beta_ref, log_decay_ref, bias_ref, z_ref, weight_ref, state_ref,
-                  state_out, held_q_out, held_k_out, held_v_out, out_ref, *, group: int, epsilon: float,
-                  activation: str, interpret: bool):
+def _fused_kernel(active_ref, token_ref, held_ref, taps_ref, gate_ref, beta_ref, log_decay_ref, bias_ref,
+                  z_ref, weight_ref, state_ref, state_out, held_out, out_ref, *, group: int, key_heads: int,
+                  epsilon: float, activation: str, interpret: bool):
     """One row and one value head of a gated delta net's decode token (`fused_step`): the conv of its
     key head's queries and keys and of its own values, the gates, the update and the gated norm, each
     piece of arithmetic its kernel's own (`short_conv`'s conv, sigmoid and l2 norm, `_update`,
-    `norm_swiglu`'s gated norm). The history the next token reads is written apart, its key head's
-    queries and keys by the head's first value head, so no program reads a history another moved on;
-    an idle row's as it was."""
+    `norm_swiglu`'s gated norm). The conv's channels are read where the row holds them, `[K - 1, C]`
+    history and `[C]` token, queries, keys and values in turn; the history the next token reads is
+    written apart, its key head's queries and keys by the head's first value head, so no program
+    reads a history another moved on; an idle row's as it was."""
     head = pl.program_id(1)
     active = active_ref[0] != 0
-    pieces = ((q_ref, held_q_ref, taps_q_ref, held_q_out), (k_ref, held_k_ref, taps_k_ref, held_k_out),
-              (v_ref, held_v_ref, taps_v_ref, held_v_out))
+    key_width, value_width = state_ref.shape
+    key_head = head // group
+    pieces = ((key_head * key_width, key_width), ((key_heads + key_head) * key_width, key_width),
+              (2 * key_heads * key_width + head * value_width, value_width))
+    count = taps_ref.shape[-1]
 
-    def window(token_ref, held_ref):
-        """The conv's window `[K, 1, D]` fp32: the held history as the layer's conv reads it, rounded to
-        the token's dtype (`held_scan`), then the token."""
+    def window(first, width):
+        """A piece's conv window `[K, 1, D]` fp32: the held history as the layer's conv reads it,
+        rounded to the token's dtype (`held_scan`), then the token."""
+        channels = pl.ds(first, width)
         operand = token_ref.dtype
-        return [*(held_ref[j][None, :].astype(operand).astype(jnp.float32) for j in range(held_ref.shape[0])),
-                token_ref[...][None, :].astype(jnp.float32)]
+        held = [held_ref[j, channels][None, :].astype(operand).astype(jnp.float32) for j in range(count - 1)]
+        return [*held, token_ref[channels][None, :].astype(jnp.float32)]
 
     def write(moved):
-        """Each piece's moved history, a row of it at a time."""
-        def store(held_out, rows):
+        """Each piece's moved history, a row of it at a time: the values, and the queries and keys
+        where the program is its key head's first."""
+        def store(piece, rows):
             for j, row in enumerate(rows):
-                held_out[j] = row.reshape(held_out.shape[1:]).astype(held_out.dtype)
+                held_out[j, pl.ds(*piece)] = row[0].astype(held_out.dtype)
 
-        store(held_v_out, moved[2])
+        store(pieces[2], moved[2])
 
         @pl.when(head % group == 0)
         def _():
-            for (_, _, _, held_out), rows in zip(pieces[:2], moved[:2], strict=True):
-                store(held_out, rows)
+            store(pieces[0], moved[0])
+            store(pieces[1], moved[1])
 
     @pl.when(active)
     def _():
-        windows = [window(token_ref, held_ref) for token_ref, held_ref, _, _ in pieces]
+        windows = [window(*piece) for piece in pieces]
         convolved = []
-        for stream, (_, _, taps_ref, _) in zip(windows, pieces, strict=True):
-            taps = [taps_ref[:, j].astype(jnp.float32) for j in range(taps_ref.shape[-1])]
+        for stream, (first, width) in zip(windows, pieces, strict=True):
+            taps = [taps_ref[pl.ds(first, width), j].astype(jnp.float32) for j in range(count)]
             pre = short_conv._preactivation(stream, taps, None)
             convolved.append(pre * short_conv._sigmoid(pre, interpret=interpret))
         query, key, value = convolved
-        width = query.shape[-1]
-        query = query * short_conv._inverse_norm(query, L2NORM_EPS, interpret=interpret) * width ** -0.5
+        query = query * short_conv._inverse_norm(query, L2NORM_EPS, interpret=interpret) * key_width ** -0.5
         key = key * short_conv._inverse_norm(key, L2NORM_EPS, interpret=interpret)
         # The head's gates as one-entry vectors, which the rounded sigmoid's inline assembly takes.
         gate = gate_ref[...].astype(jnp.float32) + bias_ref[...].astype(jnp.float32)
@@ -248,7 +243,7 @@ def _fused_kernel(active_ref, q_ref, k_ref, v_ref, held_q_ref, held_k_ref, held_
     @pl.when(jnp.logical_not(active))
     def _():
         out_ref[...] = jnp.zeros(out_ref.shape, out_ref.dtype)
-        write([[held_ref[j][None, :] for j in range(held_ref.shape[0])] for _, held_ref, _, _ in pieces])
+        write([[held_ref[j, pl.ds(*piece)][None, :] for j in range(count - 1)] for piece in pieces])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -267,59 +262,45 @@ class FusedStep(tuning.KernelOp):
     conv over the held history, the gates, the update and the gated norm. Off a GPU it interprets."""
 
     config_cls: ClassVar[type[Warps]] = Warps
-    ROWS: ClassVar[tuple[str, ...]] = ('active', 'query', 'key', 'value', 'held_query', 'held_key',
-                                       'held_value', 'gate', 'beta', 'z', 'state')
+    ROWS: ClassVar[tuple[str, ...]] = ('active', 'token', 'held', 'gate', 'beta', 'z', 'state')
 
-    def _fwd(self, active: jax.Array, query: jax.Array, key: jax.Array, value: jax.Array,
-             held_query: jax.Array, held_key: jax.Array, held_value: jax.Array, taps_query: jax.Array,
-             taps_key: jax.Array,
-             taps_value: jax.Array, gate: jax.Array, beta: jax.Array, log_decay: jax.Array, bias: jax.Array,
-             z: jax.Array, weight: jax.Array, state: jax.Array, *, epsilon: float, activation: str,
-             dtype: str, interpret: bool, config: Warps, return_residuals: bool = False):
+    def _fwd(self, active: jax.Array, token: jax.Array, held: jax.Array, taps: jax.Array, gate: jax.Array,
+             beta: jax.Array, log_decay: jax.Array, bias: jax.Array, z: jax.Array, weight: jax.Array,
+             state: jax.Array, *, epsilon: float, activation: str, dtype: str, interpret: bool, config: Warps,
+             return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         rows, value_heads, key_width, value_width = state.shape
-        key_heads, count = query.shape[1], taps_query.shape[-1]
-        group = value_heads // key_heads
+        channels = token.shape[-1]
+        key_heads = (channels - value_heads * value_width) // (2 * key_width)
 
-        def keyed(*shape):
-            """A block of the program's key head, its row first where `row`."""
-            return pl.BlockSpec((None, *shape[:-1], None, shape[-1]),
-                                lambda r, h: (r, *(0,) * (len(shape) - 1), h // group, 0))
-
-        def valued(*shape):
-            return pl.BlockSpec((None, *shape[:-1], None, shape[-1]),
-                                lambda r, h: (r, *(0,) * (len(shape) - 1), h, 0))
-
-        def tapped(width, of):
-            return pl.BlockSpec((None, width, count), lambda r, h: (of(h), 0, 0))
+        def row(*shape):
+            """A row's whole block."""
+            return pl.BlockSpec((None, *shape), lambda r, h: (r, *(0,) * len(shape)))
 
         def scalar(per_row):
             """The program's head's one entry, `[1]`, of each row's where `per_row`."""
             return (pl.BlockSpec((None, 1), lambda r, h: (r, h)) if per_row
                     else pl.BlockSpec((1,), lambda r, h: (h,)))
 
-        held_shape = (count - 1,)
-        in_specs = [pl.BlockSpec((None, 1), lambda r, h: (r, 0)), keyed(key_width), keyed(key_width),
-                    valued(value_width), keyed(*held_shape, key_width), keyed(*held_shape, key_width),
-                    valued(*held_shape, value_width), tapped(key_width, lambda h: h // group),
-                    tapped(key_width, lambda h: h // group), tapped(value_width, lambda h: h),
-                    scalar(True), scalar(True), scalar(False), scalar(False), valued(value_width),
-                    pl.BlockSpec((value_width,), lambda r, h: (0,)),
-                    pl.BlockSpec((None, None, key_width, value_width), lambda r, h: (r, h, 0, 0))]
-        out_specs = [in_specs[-1], in_specs[4], in_specs[5], in_specs[6], valued(value_width)]
-        kernel = functools.partial(_fused_kernel, group=group, epsilon=epsilon, activation=activation,
-                                   interpret=interpret)
+        headed = pl.BlockSpec((None, None, value_width), lambda r, h: (r, h, 0))
+        held_spec = row(*held.shape[1:])
+        state_spec = pl.BlockSpec((None, None, key_width, value_width), lambda r, h: (r, h, 0, 0))
+        kernel = functools.partial(_fused_kernel, group=value_heads // key_heads, key_heads=key_heads,
+                                   epsilon=epsilon, activation=activation, interpret=interpret)
         return tuple(pl.pallas_call(
-            kernel, grid=(rows, value_heads), in_specs=in_specs, out_specs=out_specs,
+            kernel, grid=(rows, value_heads),
+            in_specs=[row(1), row(channels), held_spec, pl.BlockSpec(taps.shape, lambda r, h: (0, 0)),
+                      scalar(True), scalar(True), scalar(False), scalar(False), headed,
+                      pl.BlockSpec((value_width,), lambda r, h: (0,)), state_spec],
+            out_specs=[state_spec, held_spec, headed],
             out_shape=[jax.ShapeDtypeStruct(state.shape, state.dtype),
-                       *(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (held_query, held_key, held_value)),
-                       jax.ShapeDtypeStruct(value.shape, jnp.dtype(dtype))],
-            input_output_aliases={16: 0},
+                       jax.ShapeDtypeStruct(held.shape, held.dtype),
+                       jax.ShapeDtypeStruct(z.shape, jnp.dtype(dtype))],
+            input_output_aliases={10: 0},
             compiler_params=plgpu.CompilerParams(num_warps=config.warps),
             interpret=interpret, name="gated_delta_decode",
-        )(active, query, key, value, held_query, held_key, held_value, taps_query, taps_key, taps_value,
-          gate, beta, log_decay, bias, z, weight, state)), None
+        )(active, token, held, taps, gate, beta, log_decay, bias, z, weight, state)), None
 
     def _get_heuristics_config(self, ba) -> Warps:
         return FUSED
@@ -344,21 +325,20 @@ def fused_fits(state) -> bool:
 
 def fused_step(token, held, taps, gate, beta, log_decay, bias, z, weight, state, *, epsilon: float,
                activation: str, dtype, active=None):
-    """`(output, history', state')` of a gated delta net's decode token in one launch. `token`,
-    `held` and `taps` are the conv's input, history and taps by piece, its queries, keys and values:
-    `[rows, H, D]` (H the key heads for the queries and keys, the value heads for the values),
-    `[rows, K - 1, H, D]` and `[H, D, K]`. `gate` and `beta` `[rows, Hv]` are the token's decay and
-    write gates before their activations, `log_decay` (A_log) and `bias` (dt_bias) `[Hv]`, `z`
-    `[rows, Hv, Dv]` the output gate, `weight` `[Dv]` the gated norm's, of `epsilon` and gate
-    `activation`, and `state` `[rows, Hv, Dk, Dv]` held as `step`'s is. The output `[rows, Hv, Dv]`
-    is in `dtype`; the history comes back by piece, in its dtype; the state is updated in place where
-    the caller lets it go. A row `active` `[rows]` marks False keeps its history and state, its
-    output zeros. The arithmetic is the unfused layer's (the conv and its silu in fp32 over the
-    history rounded to the token's dtype, the queries and keys l2-normalized, `step`, then the gated
-    norm in fp32), its sums in another order and its quotients and roots rounded once."""
+    """`(output, history', state')` of a gated delta net's decode token in one launch: `token` `[rows,
+    C]` the conv's input, its queries, keys and values head by head in turn, `held` `[rows, K - 1, C]`
+    its history and `taps` `[C, K]`, `gate` and `beta` `[rows, Hv]` the token's decay and write gates
+    before their activations, `log_decay` (A_log) and `bias` (dt_bias) `[Hv]`, `z` `[rows, Hv, Dv]`
+    the output gate, `weight` `[Dv]` the gated norm's, of `epsilon` and gate `activation`, and
+    `state` `[rows, Hv, Dk, Dv]` held as `step`'s is. The output `[rows, Hv, Dv]` is in `dtype`, the
+    history in its dtype; the state is updated in place where the caller lets it go. A row `active`
+    `[rows]` marks False keeps its history and state, its output zeros. The arithmetic is the unfused
+    layer's (the conv and its silu in fp32 over the history rounded to the token's dtype, the queries
+    and keys l2-normalized, `step`, then the gated norm in fp32), its sums in another order and its
+    quotients and roots rounded once."""
     rows = state.shape[0]
     flags = (jnp.ones(rows, jnp.int32) if active is None else active.astype(jnp.int32))[:, None]
-    state, *history, out = FusedStep()(flags, *token, *held, *taps, gate, beta, log_decay, bias, z, weight,
-                                       state, epsilon=epsilon, activation=activation,
-                                       dtype=jnp.dtype(dtype).name, interpret=not triton_runs())
-    return out, tuple(history), state
+    state, history, out = FusedStep()(flags, token, held, taps, gate, beta, log_decay, bias, z, weight, state,
+                                      epsilon=epsilon, activation=activation, dtype=jnp.dtype(dtype).name,
+                                      interpret=not triton_runs())
+    return out, history, state
