@@ -88,7 +88,8 @@ class Loop:
 
     `layers` is the block, layers [first, end): the layers before it (the
     prelude) and after it (the coda) run once, as Huginn's do, and a
-    pretrained decoder gains a loop by repeating a block of its own. None
+    pretrained decoder gains a loop by repeating a block of its own. An
+    empty block's passes run no layer, so the loop is its norms alone. None
     loops the whole stack. Every pass reads the same positions and masks.
     With `step_norm`, the decoder's final norm is applied between passes, as
     Ouro applies its shared `model.norm` after each one; the last pass's
@@ -148,8 +149,8 @@ class Loop:
         if self.layers is not None:
             first, end = (int(index) for index in self.layers)
             object.__setattr__(self, "layers", (first, end))
-            if not 0 <= first < end:
-                raise ValueError(f"a loop's block is layers [first, end), first < end, not {self.layers}")
+            if not 0 <= first <= end:
+                raise ValueError(f"a loop's block is layers [first, end), first <= end, not {self.layers}")
             if self.exit_gate:
                 raise ValueError("the exit gate reads the whole stack's output; its loop is the whole stack")
 

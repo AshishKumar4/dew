@@ -235,12 +235,12 @@ def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_rea
 
     (whole, uncut), (cut, truncated) = run(None), run(1)
     assert whole == cut
-    np.testing.assert_array_equal(truncated['layers_3']['mlp']['down_proj']['kernel'],
-                                  uncut['layers_3']['mlp']['down_proj']['kernel'])
+    np.testing.assert_array_equal(truncated['layers_7']['self_attn']['down_proj']['kernel'],
+                                  uncut['layers_7']['self_attn']['down_proj']['kernel'])
     assert np.any(truncated['embed_tokens']['embedding'])
-    assert np.any(truncated['layers_0']['mlp']['down_proj']['kernel'])
-    assert not np.array_equal(truncated['layers_0']['mlp']['down_proj']['kernel'],
-                              uncut['layers_0']['mlp']['down_proj']['kernel'])
+    assert np.any(truncated['layers_1']['self_attn']['down_proj']['kernel'])
+    assert not np.array_equal(truncated['layers_1']['self_attn']['down_proj']['kernel'],
+                              uncut['layers_1']['self_attn']['down_proj']['kernel'])
 
 
 PROJECTIONS = ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'g_proj', 'gate_proj', 'up_proj', 'down_proj')
@@ -269,10 +269,11 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     loaded = load()
     adapted = loaded.adapt(LoRA(rank=2, modules=PROJECTIONS), key=0)
     targets = {'/'.join(module[1:]) for module in adapted.adapter.targets}
-    blocks = range(loaded.model.num_layers)
-    assert targets == {f'layers_{block}/{site}' for block in blocks for site in (
-        'self_attn/q_proj', 'self_attn/k_proj', 'self_attn/v_proj', 'self_attn/o_proj', 'self_attn/gate_proj',
-        'mlp/gate_proj', 'mlp/up_proj', 'mlp/down_proj')}
+    sites = {'mlp': ('gate_proj', 'up_proj', 'down_proj'),
+             'attention': ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj')}
+    assert targets == {f'layers_{layer}/self_attn/{site}'
+                       for layer, kind in enumerate(loaded.model.per_layer_types)
+                       for site in sites['mlp' if kind == 'mlp' else 'attention']}
 
     def objective():
         return LMObjective(adapted.model, 8, variables=adapted.variables)
@@ -341,13 +342,14 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
 
 
 def test_a_dory_config_loads_as_its_looped_ngpt():
-    """The released config's fields land where Dory computes them: its pairs as blocks, the loop
-    over the recurrent ones, reinjecting, and the cache mode."""
+    """The config's fields land where Dory computes them: a block a layer, an attention alone or
+    an MLP in the mixer's slot, the loop over the recurrent ones, reinjecting, and the cache mode."""
     model = load().model
-    assert model.num_layers == 4 and model.ngpt is not None and not model.pre_norms
-    assert model.loop is not None and model.loop.layers == (1, 3) and model.loop.steps == 2
+    assert model.num_layers == 8 and model.ngpt is not None and not model.pre_norms and not model.mlp_features
+    assert model.loop is not None and model.loop.layers == (2, 6) and model.loop.steps == 2
     assert model.loop.reinject and not model.loop.shared_cache
-    assert model.per_layer_types == ('sliding_attention', 'full_attention') * 2
+    assert model.per_layer_types == ('sliding_attention', 'mlp', 'full_attention', 'mlp') * 2
+    assert isinstance(model.kind_of('mlp').mixer, MLPMixer)
 
 
 DORY_FIELDS = ('vocab_size', 'hidden_size', 'num_hidden_layers', 'intermediate_size', 'num_attention_heads',
@@ -359,14 +361,15 @@ DORY_FIELDS = ('vocab_size', 'hidden_size', 'num_hidden_layers', 'intermediate_s
 
 
 def test_the_released_config_round_trips_through_dews_fields():
-    """NVIDIA-Nemotron-Labs-Dory1.0-4B's config: 8 input, 20 looped and 8 output blocks run twice.
+    """NVIDIA-Nemotron-Labs-Dory1.0-4B's config: 16 input, 40 looped and 16 output layers, the
+    looped ones run twice.
     It translates into Dew's fields, the model built from them writes back every field
     DoryConfig reads as the release states it (a null by leaving it out, which DoryConfig reads as
     its default null), and that config translates to the same fields."""
     released = json.loads((RELEASED / 'config.json').read_text())
     fields = hf_decoders.translate_config(released)
     model = models.build('causal_transformer', fields)
-    assert model.num_layers == 36 and model.loop is not None and model.loop.layers == (8, 28)
+    assert model.num_layers == 72 and model.loop is not None and model.loop.layers == (16, 56)
     assert model.loop.steps == 2 and model.ngpt is not None
     written = hf_decoders.export_config(model)
     for field in DORY_FIELDS:
@@ -377,13 +380,15 @@ def test_the_released_config_round_trips_through_dews_fields():
 @pytest.mark.parametrize('change', [
     {'tie_word_embeddings': True}, {'mlp_bias': True}, {'n_input_layers': 1},
     {'recurrent_kv_cache_mode': 'each'}, {'initializer_range': 0.0},
-    {'n_input_layers': 4, 'n_recurrent_layers': 0},
+    {'n_input_layers': 4, 'n_recurrent_layers': 0}, {'n_recurrent_loops': 0},
+    {'layer_types': ['sliding_attention', 'mlp'] * 3 + ['linear_attention', 'mlp']},
     {'rope_parameters': {'sliding_attention': {'rope_type': 'default', 'rope_theta': 10000}}},
     {'rope_parameters': {kind: {'rope_type': 'linear', 'rope_theta': 10000, 'factor': 2.0}
                          for kind in ('sliding_attention', 'full_attention')}}])
 def test_a_config_dory_refuses_is_refused(tmp_path, change):
-    """What DoryConfig refuses (configs/dory.py:39-133), and a partition that splits an attention
-    from its MLP or loops no layer, which Dew's loop cannot run, are refused."""
+    """What DoryConfig refuses (configs/dory.py:39-133) is refused: a partition that does not
+    cover the layers, a layer kind it does not run, no loop, a tied head, biases, an unknown cache
+    mode, a zero initializer range and a rope it does not compute."""
     with pytest.raises(ValueError):
         Pretrained.load(changed(tmp_path / 'changed', change), dtype='float32', attention_impl='xla')
 
@@ -391,8 +396,9 @@ def test_a_config_dory_refuses_is_refused(tmp_path, change):
 @pytest.mark.parametrize('variant', sorted(TOOL.VARIANTS))
 def test_a_config_the_release_does_not_take_computes_vllms_logits(tmp_path, variant):
     """Configs DoryConfig accepts over the tiny tensors that the release does not take: a partial
-    rotary per kind, which vLLM's get_rope reads as Dew's 'default' partial rotary, and an nGPT
-    step or gate logit scale of zero, whose gains start without dividing by it."""
+    rotary per kind, which vLLM's get_rope reads as Dew's 'default' partial rotary, an nGPT step
+    or gate logit scale of zero, whose gains start without dividing by it, a loop whose block
+    starts at an MLP and ends at an attention, and a loop over no layer."""
     loaded = Pretrained.load(changed(tmp_path / variant, TOOL.VARIANTS[variant]), dtype='float32',
                              attention_impl='xla')
     logits = loaded.model.apply(loaded.variables, REFERENCE['input_ids'])
