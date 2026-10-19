@@ -9,12 +9,9 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import assert_as_exact_as_the_reference, float64_forward
-from tool_support import load
 
-from dew.interop import Pretrained
 from dew.interop.pretrained import PretrainedDecoder
-from dew.nn.backbones import CausalTransformer
+from dew.nn.backbones.causal_transformer import CausalTransformer
 
 ROOT = Path(__file__).resolve().parents[1]
 WIDTH, MLP, VOCABULARY = 256, 512, 512
@@ -45,30 +42,17 @@ def served(model: Path, out: Path, *options: str) -> tuple[dict, dict]:
         return json.loads(out.read_text()), dict(generations)
 
 
-def raw_truth(model: Path, prompts: np.ndarray, tokens: np.ndarray) -> np.ndarray:
-    """Each generated token's log-probability under the model's own distribution, in float64."""
-    loaded = Pretrained.load(model, dtype="float32", attention_impl="reference")
-    logits, _ = float64_forward(loaded.model, loaded.variables, np.concatenate([prompts, tokens], 1))
-    logits = np.asarray(logits, np.float64)[:, prompts.shape[1] - 1:-1]
-    shifted = logits - logits.max(-1, keepdims=True)
-    log_probs = shifted - np.log(np.exp(shifted).sum(-1, keepdims=True))
-    return np.take_along_axis(log_probs, tokens[..., None].astype(np.int64), -1)[..., 0]
-
-
 def test_a_model_served_over_a_mesh_decodes_what_it_decodes_with_its_weights_whole(tmp_path):
     """`--mesh` places the weights on that mesh before the server is built: the record names the
     mesh and the axis that splits them, which the default placement over the same two devices
-    (data parallelism) leaves whole. Served either way in bf16, the greedy tokens agree, and the
-    split run's log-probabilities are as near float64 as the whole run's."""
+    (data parallelism) leaves whole. FSDP gathers each weight before its product, and splits the
+    requests over the devices as data parallelism does, so each device computes what it computes
+    with the weights whole: the same tokens and log-probabilities, bit for bit."""
     model = checkpoint(tmp_path / "decoder")
     whole, generated = served(model, tmp_path / "whole.json")
-    record, split = served(model, tmp_path / "split.json", "--mesh", '{"tensor": 2}')
-    assert (whole["mesh"], whole["hardware"]["weights"]["split_over"]) == (None, [])
-    assert (record["mesh"], record["hardware"]["weights"]) == ({"tensor": 2},
-                                                               {"split_over": ["tensor"], "devices": 2})
-    np.testing.assert_array_equal(split["tokens"], generated["tokens"])
-    # Greedy decoding draws each token with certainty: both runs' behavior log-probabilities are zero.
-    np.testing.assert_array_equal(split["behavior"], generated["behavior"])
-    prompts = load("benchmark_lm_serving").prompts_for(SLOTS, REQUESTS, PROMPT, VOCABULARY)
-    truth = raw_truth(model, prompts, generated["tokens"])
-    assert_as_exact_as_the_reference(split["raw"], generated["raw"], truth, "raw log-probabilities")
+    record, split = served(model, tmp_path / "split.json", "--mesh", '{"fsdp": 2}')
+    assert (whole["mesh"], whole["hardware"]["weights"]) == (None, {"split_over": [], "devices": 2})
+    assert (record["mesh"], record["hardware"]["weights"]) == ({"fsdp": 2},
+                                                               {"split_over": ["fsdp"], "devices": 2})
+    for name in ("tokens", "raw", "behavior"):
+        np.testing.assert_array_equal(split[name], generated[name], err_msg=name)
