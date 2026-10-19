@@ -226,12 +226,13 @@ def _fused_kernel(active_ref, q_ref, k_ref, v_ref, held_q_ref, held_k_ref, held_
         width = query.shape[-1]
         query = query * short_conv._inverse_norm(query, L2NORM_EPS, interpret=interpret) * width ** -0.5
         key = key * short_conv._inverse_norm(key, L2NORM_EPS, interpret=interpret)
-        gate = gate_ref[0].astype(jnp.float32) + bias_ref[0].astype(jnp.float32)
-        decay = jnp.exp(-jnp.exp(log_decay_ref[0].astype(jnp.float32)) * jax.nn.softplus(gate))
-        beta = short_conv._sigmoid(beta_ref[0].astype(jnp.float32), interpret=interpret)
+        # The head's gates as one-entry vectors, which the rounded sigmoid's inline assembly takes.
+        gate = gate_ref[...].astype(jnp.float32) + bias_ref[...].astype(jnp.float32)
+        decay = jnp.exp(-jnp.exp(log_decay_ref[...].astype(jnp.float32)) * jax.nn.softplus(gate))
+        beta = short_conv._sigmoid(beta_ref[...].astype(jnp.float32), interpret=interpret)
         query, key, value = query[0], key[0], value[0]
         out, updated = _update(state_ref[...].astype(jnp.float32), query, key, value,
-                               jnp.full(key.shape, decay), beta)
+                               jnp.broadcast_to(decay, key.shape), beta)
         state_out[...] = _held(updated, key, value, state_out.dtype)
         # `gated_rms_normalized`: the norm in fp32, its mean a product by the reciprocal as XLA's.
         inverse = jax.lax.rsqrt(jnp.sum(out * out) * (1.0 / out.shape[-1]) + epsilon)
