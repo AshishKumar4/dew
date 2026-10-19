@@ -12,12 +12,13 @@ from __future__ import annotations
 import dataclasses
 import os
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Annotated, ClassVar
 
 import jax
 
-from dew.config import ModelConfig, ObjectiveConfig, Prepared, RunConfig
+from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, Prepared, RunConfig
 from dew.config.data import Augment, HoldOut, ImageData, VideoData
+from dew.data.dataset import record_argument
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
@@ -216,12 +217,14 @@ class DiffusionRunConfig(RunConfig):
     """
     pretrained_param_dtype: DtypeName = "float32"
     """The dtype `pretrained`'s parameters are stored and trained in."""
-    val_metrics: tuple[str, ...] | None = None
-    """Metric aliases or import paths, scored on every validation pass. None is the run's default:
-    CLIP where an image run's data holds a validation split, and nothing otherwise. A name given
-    is asked for whatever the data holds, so data with no validation split refuses it.
-
-    `__post_init__` refuses an alias that names no metric.
+    val_metrics: (Annotated[tuple[MetricConfig, ...], record_argument(tuple[MetricConfig, ...])]
+                  | None) = None
+    """The metrics scored on every validation pass, each with the arguments the run gives it (a
+    CLIP metric's model, an FID's weights), one JSON list on the command line:
+    `--val-metrics '[{"name": "clip", "fields": {"modelname": "openai/clip-vit-base-patch32"}}]'`.
+    None is the run's default: CLIP where an image run's data holds a validation split, and
+    nothing otherwise. A metric given is asked for whatever the data holds, so data with no
+    validation split refuses it.
     """
 
     def __post_init__(self) -> None:
@@ -229,6 +232,10 @@ class DiffusionRunConfig(RunConfig):
         # writes one too; the field is a tuple, so the value is one.
         if self.val_metrics is not None:
             object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
+            stray = [metric for metric in self.val_metrics if not isinstance(metric, MetricConfig)]
+            if stray:
+                raise TypeError(f"val_metrics holds metrics' records, {{'name': ..., 'fields': {{...}}}}, "
+                                f"not {stray!r}")
         if not issubclass(objectives[self.objective.name], DiffusionObjective):
             raise ValueError(f"--objective {self.objective.name} trains no diffusion model")
         if self.pretrained is None and self.pretrained_param_dtype != "float32":
@@ -268,10 +275,6 @@ class DiffusionRunConfig(RunConfig):
             height, width = self.sample_field().shape[-3:-1]
             object.__setattr__(self, "preset", dataclasses.replace(
                 self.preset, resolution_shift=self.preset.resolution_shift.at(height, width)))
-        unknown = [name for name in self.val_metrics or () if ":" not in name and name not in metrics]
-        if unknown:
-            raise ValueError(f"val_metrics names {unknown}, which no metric alias names; the aliases are "
-                             f"{sorted(metrics)}, or name a metric by its import path")
         if self.audio is not None and self.text is not None:
             raise ValueError(
                 "the models take one context under textcontext, and this run names both "
@@ -490,30 +493,28 @@ class DiffusionRunConfig(RunConfig):
         return process
 
     def build_eval_metrics(self, validates: bool = True) -> list:
-        """Build the validation metrics `val_metrics` names, each loading its own weights, or by
+        """Build the validation metrics `val_metrics` holds, each loading its own weights, or by
         default CLIP for an image run whose data `validates`.
 
-        A video run scores a `VideoGrid` against its `video` field, so `psnr` and
-        `ssim` read that grid there, and an image-only metric raises a ValueError
+        A video run scores a `VideoGrid` against its `video` field, which a PSNR or SSIM that
+        states no field of its own reads there, and an image-only metric raises a ValueError
         naming it here, before the trainer starts.
         """
         from dew.artifacts import ImageGrid, VideoGrid
 
         video = len(self.sample_field().shape) == 4
-        names = self.val_metrics if self.val_metrics is not None else (
-            ("clip",) if validates and not video else ())
+        configs = self.val_metrics if self.val_metrics is not None else (
+            (MetricConfig("clip"),) if validates and not video else ())
         built = []
-        for name in names:
-            if video and name in ("fid", "clip", "clip_score"):
+        for config in configs:
+            member = metrics[config.name]
+            if video and member in (metrics["fid"], metrics["clip"], metrics["clip_score"]):
                 raise ValueError(
-                    f"metric {name!r} reads an ImageGrid and this run samples video; "
+                    f"metric {config.name!r} reads an ImageGrid and this run samples video; "
                     "validate a video run with psnr or ssim")
-            if name in ("psnr", "ssim"):
-                factory = metrics[name]
-                built.append(factory(field="video" if video else "image",
-                                     reads=VideoGrid if video else ImageGrid))
-            else:
-                built.append(metrics[name]())
+            grids = member in (metrics["psnr"], metrics["ssim"])
+            built.append(config.build(**({"field": "video" if video else "image",
+                                          "reads": VideoGrid if video else ImageGrid} if grids else {})))
         return built
 
 
