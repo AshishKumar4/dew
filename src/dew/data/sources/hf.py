@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import grain.python as grain
 import numpy as np
@@ -47,11 +47,13 @@ class HF(Dataset):
     These parts resume exactly at the same topology, but their cache fill
     cannot publish: publication needs the store's own shards."""
 
-    dataset: Any
+    dataset: datasets.Dataset | datasets.IterableDataset
     name: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.streamed:
+        from datasets import IterableDataset
+
+        if not isinstance(self.dataset, IterableDataset):
             return
         if self.name is None:
             raise ValueError("an IterableDataset has no fingerprint of its content; name it, with its "
@@ -81,22 +83,17 @@ class HF(Dataset):
     def supports(self, read: Read) -> bool:
         return read == "streamed" or not self.streamed
 
-    def _undecoded(self):
-        from datasets import Image
-
-        dataset = self.dataset
-        for name, feature in (dataset.features or {}).items():
-            if isinstance(feature, Image) and feature.decode:
-                dataset = dataset.cast_column(name, Image(decode=False))
-        return dataset
-
     def records(self, read: Read) -> Records:
-        if self.streamed:
+        from datasets import Dataset as Arrow
+
+        if not isinstance(self.dataset, Arrow):
             raise ValueError(f"{self.describe()} is an IterableDataset, read only as a stream")
-        return grain.MapDataset.source(self._undecoded()).map(_record)
+        return grain.MapDataset.source(_undecoded(self.dataset)).map(_record)
 
     def manifest(self) -> ShardManifest:
-        if not self.streamed:
+        from datasets import Dataset as Arrow
+
+        if isinstance(self.dataset, Arrow):
             rows = len(self.dataset)
             return ShardManifest((Shard(self.describe(), self.describe(), 0, rows, rows),), self._read_shard)
         return ShardManifest(self._shards(self.dataset.n_shards), self._read_shard, self._shards)
@@ -107,20 +104,34 @@ class HF(Dataset):
                      for index in range(count))
 
     def _read_shard(self, shard: Shard) -> grain.IterDataset:
-        if not self.streamed:
-            return grain.MapDataset.source(self._undecoded()).map(_record).to_iter_dataset()
+        from datasets import Dataset as Arrow
+
+        if isinstance(self.dataset, Arrow):
+            return grain.MapDataset.source(_undecoded(self.dataset)).map(_record).to_iter_dataset()
         if not isinstance(shard, _HFShard):
             raise ValueError("a Hugging Face stream needs its own shard descriptor")
-        return _Streamed(self._undecoded(), shard)
+        return _Streamed(_undecoded(self.dataset), shard)
 
     def metadata(self) -> Mapping[str, object]:
         """Its class names (`class_names`), as Hub states a prepared dataset's, and
         its rows where the dataset is indexed."""
-        rows = {} if self.streamed else {"rows": len(self.dataset)}
+        from datasets import Dataset as Arrow
+
+        rows = {"rows": len(self.dataset)} if isinstance(self.dataset, Arrow) else {}
         return {"class_names": class_names(self.dataset.features), **rows}
 
     def lengths(self) -> np.ndarray | None:
         return None
+
+
+def _undecoded[D: (datasets.Dataset, datasets.IterableDataset)](dataset: D) -> D:
+    """`dataset` with its decoding image columns left as bytes, which Dew's own steps decode."""
+    from datasets import Image
+
+    for name, feature in (dataset.features or {}).items():
+        if isinstance(feature, Image) and feature.decode:
+            dataset = dataset.cast_column(name, Image(decode=False))
+    return dataset
 
 
 def class_names(features: Mapping[str, object] | None) -> dict[str, tuple[str, ...]]:
@@ -138,7 +149,7 @@ class _Streamed(grain.IterDataset):
     an IterableDataset keeps the position of the iterator it made last, and
     the position `load_state_dict` gave it for every later one."""
 
-    def __init__(self, dataset, shard: _HFShard):
+    def __init__(self, dataset: datasets.IterableDataset, shard: _HFShard):
         super().__init__()
         self._dataset = dataset
         self._shard = shard
@@ -156,7 +167,7 @@ class _Streamed(grain.IterDataset):
 
 
 class _StreamedIterator(grain.DatasetIterator):
-    def __init__(self, dataset):
+    def __init__(self, dataset: datasets.IterableDataset):
         super().__init__()
         self._dataset = dataset
         self._rows = iter(dataset)

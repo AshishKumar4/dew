@@ -18,7 +18,7 @@ import numpy as np
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Record, Rejected
 from dew.data.retention import LocalRetention
-from dew.data.sources.base import Read, ShardManifest, Source, _indexed_manifest
+from dew.data.sources.base import Read, ShardManifest, Source, _indexed_manifest, _uncounted
 from dew.data.sources.codec import decode, fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords
@@ -482,14 +482,8 @@ class _GenerationSource:
 
     def metadata(self) -> Mapping[str, object]:
         metadata = self.generation.manifest["metadata"]
-        original = self.generation.manifest["source_metadata"]
-        stable = {
-            name: value
-            for name, value in original.items()
-            if name not in ("rows", "accepted_rows", "windows", "valid_targets", "zero_target_windows")
-        }
         return {
-            **stable,
+            **_uncounted(self.generation.manifest["source_metadata"]),
             "rows": len(self.generation),
             "accepted_rows": len(self.generation),
             **(
