@@ -187,7 +187,7 @@ def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(d
     unweighted norms round it, and its reverse rounded where XLA's is; its output and input gradient
     within the float64 gate of XLA's, random rows, a row of 1.5 under a cotangent of ones, whose two
     gradient contributions cancel, and rows of 0.5 under cotangents of 1.5 * 2**119, finite through
-    XLA's transposes, and of 2**-140, which they do not halve."""
+    XLA's transposes, and of a subnormal (2**-140 in fp32, 2**-130 in bf16), which they do not halve."""
     def unweighted(x):
         return attention.unweighted_rmsnorm(x, 1e-6, implementation="xla")
 
@@ -200,7 +200,7 @@ def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(d
     if kind == "aligned":
         x, seed = jnp.full(shape, 1.5, dtype), jnp.ones(shape, dtype)
     elif kind in ("large", "small"):
-        cotangent = 1.5 * 2.0 ** 119 if kind == "large" else 2.0 ** -140
+        cotangent = 1.5 * 2.0 ** 119 if kind == "large" else 2.0 ** (-140 if dtype == jnp.float32 else -130)
         x, seed = jnp.full(shape, 0.5, dtype), jnp.full(shape, cotangent, dtype)
     else:
         x = jax.random.normal(jax.random.key(26), shape).astype(dtype)
@@ -688,7 +688,11 @@ def test_a_fused_kernel_differentiates_at_every_order_through_its_portable_arith
         truth = jax.tree.map(np.asarray, composed("xla")(*wide))
     for mine, theirs, want in zip(jax.tree.leaves(found), jax.tree.leaves(reference), jax.tree.leaves(truth),
                                   strict=True):
-        assert_as_exact_as_the_reference(mine, theirs, want, f"{name} {composition}")
+        if np.array_equal(theirs, want):
+            # Exact by construction (a stream's tangent is its addends'): Dew must be exact too.
+            np.testing.assert_array_equal(mine, want)
+        else:
+            assert_as_exact_as_the_reference(mine, theirs, want, f"{name} {composition}")
 
 
 def test_a_fused_norms_jvp_is_its_kernels_value_and_the_portable_tangent():
