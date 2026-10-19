@@ -32,14 +32,13 @@ from PIL import Image
 
 import dew
 from dew.artifacts import uint8_pixels
-from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
+from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
 from dew.config.data import Augment, HoldOut, ImageData, loader
 from dew.coordination import collective_host
 from dew.data import TFDS, Files, Loading
 from dew.data.images import EncodeCaptions
 from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
-from dew.eval import FID, CLIPScore
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG
@@ -118,7 +117,8 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
         objective=ObjectiveConfig("diffusion", {"solver": Heun(), "guidance": CFG(2.0), "steps": 2,
                                                 "ema_decay": 0.9}),
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
-        val_metrics=("fid", "clip_score"),
+        val_metrics=(MetricConfig("fid", {"weights": config.inception_weights}),
+                     MetricConfig("clip_score", {"modelname": config.clip_model})),
         optim=OptimConfig(learning_rate=1e-3),
         trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), batch_size=4, steps=3,
                               log_every=1, eval_every=3, checkpoint_every=3,
@@ -144,7 +144,8 @@ def slice_config(config: Config) -> DiffusionRunConfig:
         objective=ObjectiveConfig("diffusion", {"solver": Heun(), "guidance": CFG(config.guidance),
                                                 "steps": config.sampling_steps, "ema_decay": 0.9999}),
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
-        val_metrics=("fid", "clip_score"),
+        val_metrics=(MetricConfig("fid", {"weights": config.inception_weights}),
+                     MetricConfig("clip_score", {"modelname": config.clip_model})),
         optim=OptimConfig(weight_decay=0.01, schedule=Cosine(
             peak=config.learning_rate, warmup_steps=2000, init=config.learning_rate,
             end=2e-4)),
@@ -180,10 +181,9 @@ def main(config: Config) -> Path:
                 validation_records=run.validation_records, host=(EncodeCaptions(objective.inputs.tokenize),))
     name = "smoke" if config.smoke else f"flowers-{config.image_size}"
     # The run scores FID and CLIPScore over the held-out split at its end, on every process's
-    # share at once, with the extractor and the CLIP the flags name, and logs them under its
-    # last step.
-    state = run.train(objective, data, name=name,
-                      metrics=(FID(weights=config.inception_weights), CLIPScore(config.clip_model)),
+    # share at once, with the extractor and the CLIP the flags name (`val_metrics`), and logs
+    # them under its last step.
+    state = run.train(objective, data, name=name, metrics=run.build_eval_metrics(),
                       summary={"prompts": list(PROMPTS)})
 
     # The run directory read back as a pipeline, which draws over every process's
