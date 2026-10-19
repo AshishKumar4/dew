@@ -15,12 +15,12 @@ from dew.telemetry.devices import xla_flag
 if TYPE_CHECKING:
     from flax import linen as nn
 
-    from dew.training.quantization import Quantization
+    from dew.quantization import Quantization
 
 
 @runtime_checkable
 class QuantizedClass(Protocol):
-    """A model class Qwix made for a `Quantization` (`dew.training.quantization`), which
+    """A model class Qwix made for a `Quantization` (`dew.quantization`), which
     `_dew_quantization` names for the programs that run it (`compiler_options`); a wrapper's class
     over it inherits it."""
 

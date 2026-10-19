@@ -105,13 +105,13 @@ from dew.inference.tasks import (
     decoded_rows,
     generation_budget,
     prepared_inputs,
+    resident,
     shape_bucket,
 )
-from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
 from dew.nn.kernels.options import compiler_options
-from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, Layered, is_paged, leaf_name
-from dew.nn.protocols import ProjectionGroup, Serving
+from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, is_paged, leaf_name
+from dew.nn.protocols import Layered, ProjectionGroup, Serving
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
 from dew.objectives.base import Variables
 from dew.sampling.decoding import LogitsTransform, Stopping
@@ -445,7 +445,7 @@ class Server:
             mixed=rows.placement.mixed)
         if type(decode_steps) is not int or decode_steps < 1:
             raise ValueError("decode_steps must be a positive number of iterations per device call")
-        variables = decoding_storage(model, variables)
+        variables = resident(model, variables)
         self.mesh = mesh_of(variables)
         self.groups = _row_groups(self.mesh)
         if slots % self.groups or admission % self.groups:
@@ -617,7 +617,7 @@ class Server:
                               for _ in range(groups)], chunk, rounded // layout.page_size)
         return cls(
             model,
-            task.variables,
+            task.placed,
             task.processor,
             sampling=policy,
             transforms=transforms,
