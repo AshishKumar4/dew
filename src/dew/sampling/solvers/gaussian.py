@@ -17,9 +17,12 @@ def transition_variance(rates_t, rates_s):
     x_t = alpha_t x_0 + sigma_t eps, for s before t: sigma_t^2 - (alpha_t / alpha_s)^2 sigma_s^2, the
     noise the step from s to t adds. It holds for any schedule, variance preserving, exploding or a
     rectified flow alike, and is the forward step's beta, 1 - alpha_t^2 / alpha_s^2, only where
-    alpha^2 + sigma^2 = 1."""
+    alpha^2 + sigma^2 = 1. Taken as the product of the difference and the sum, it is exactly 0 where
+    the two levels coincide, as a step of no length adds no noise; a difference of rounded
+    squares need not be, once a compiler fuses one square into the subtraction."""
     (alpha_t, sigma_t), (alpha_s, sigma_s) = rates_t, rates_s
-    return jnp.maximum(sigma_t ** 2 - (alpha_t / alpha_s) ** 2 * sigma_s ** 2, 0.0)
+    forwarded = alpha_t / alpha_s * sigma_s
+    return jnp.maximum((sigma_t - forwarded) * (sigma_t + forwarded), 0.0)
 
 
 def posterior_std(rates_t, rates_s):
@@ -251,11 +254,8 @@ class TCD:
             return noised, state
         ratio = alpha_s / alpha_mid
         noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
-        # The forward process's q(x_s | x_mid). The reference's 1 - ratio^2 is
-        # its variance on a variance-preserving table only: with alpha 1 it adds
-        # no noise, and a variance-exploding walk collapsed to zero. As a
-        # product of the difference and the sum it is exactly 0 where the two
-        # rates coincide (the last step to t 0), as the reference's draw-free
-        # last step is; a difference of rounded squares need not be.
-        spread = jnp.sqrt(jnp.maximum((sigma_s - ratio * sigma_mid) * (sigma_s + ratio * sigma_mid), 0.0))
+        # The forward process's q(x_s | x_mid) (`transition_variance`). The reference's 1 - ratio^2
+        # is its variance on a variance-preserving table only: with alpha 1 it adds no noise, and a
+        # variance-exploding walk collapsed to zero.
+        spread = jnp.sqrt(transition_variance((alpha_s, sigma_s), (alpha_mid, sigma_mid)))
         return ratio * noised + spread * noise, state
