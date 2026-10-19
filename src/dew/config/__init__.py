@@ -64,6 +64,7 @@ from dew.registry import (
     datasets,
     declared_type,
     from_record,
+    metrics,
     models,
     objectives,
     parameter_type,
@@ -237,6 +238,39 @@ class ObjectiveConfig:
         if stated:
             raise ValueError(f"the run derives {stated} for {self.name}; leave them out of its arguments")
         return objectives.build(self.name, self.arguments, **derived)
+
+
+@dataclasses.dataclass(frozen=True)
+class MetricConfig:
+    """A metric's class and the arguments the run gives it.
+
+    `name` is an alias of `dew.registry.metrics` or an import path, held as
+    the path. `fields` are the constructor arguments the run states, as
+    `ObjectiveConfig` holds an objective's: a CLIP metric's `modelname`, an
+    FID's `weights`. `defaults` holds every other argument the class defaults,
+    so a metric whose default model changes later scores a recorded run as it
+    did.
+    """
+
+    name: str
+    fields: JsonDict = dataclasses.field(default_factory=dict)
+    defaults: JsonDict = dataclasses.field(default_factory=dict)
+    """Each argument the class defaults and `fields` leaves out, as a record holds it;
+    one a record lacks takes the class's default now."""
+
+    def __post_init__(self) -> None:
+        member = metrics[self.name]
+        object.__setattr__(self, "name", registry.import_path(member))
+        object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
+        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
+
+    def build(self, **derived) -> Metric:
+        """Build the metric from its arguments and those the run `derived`
+        where it states none of its own (the field a video run's sample
+        is read from, say)."""
+        unstated = {name: value for name, value in derived.items() if name not in self.fields}
+        arguments = _arguments(metrics[self.name], self.fields, self.defaults)
+        return metrics.build(self.name, arguments, **unstated)
 
 
 def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
@@ -1359,5 +1393,5 @@ class RunConfig:
         return finished
 
 
-__all__ = ["JsonDict", "ModelConfig", "ObjectiveConfig", "OptimConfig", "Prepared", "RunConfig",
-           "ScheduleSpec", "TrainerConfig", "Wandb"]
+__all__ = ["JsonDict", "MetricConfig", "ModelConfig", "ObjectiveConfig", "OptimConfig", "Prepared",
+           "RunConfig", "ScheduleSpec", "TrainerConfig", "Wandb"]
