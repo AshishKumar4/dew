@@ -52,7 +52,8 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     """
     used.update((
         'hidden_size', 'num_attention_heads', 'num_hidden_layers', 'vocab_size', 'intermediate_size',
-        'hidden_activation', 'norm_eps', 'norm_bias', 'attention_bias', 'max_position_embeddings',
+        'hidden_activation', 'norm_eps', 'norm_bias', 'attention_bias', 'mlp_bias',
+        'max_position_embeddings',
         'tie_word_embeddings', 'local_attention', 'global_attn_every_n_layers', 'layer_types',
         'global_rope_theta', 'local_rope_theta', 'embedding_dropout', 'attention_dropout',
         'mlp_dropout', 'classifier_activation', 'classifier_bias', 'decoder_bias', 'architectures',
@@ -65,12 +66,9 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         # Pre-5.0 releases carry these, which ModernBertConfig no longer reads:
         # the model norms at norm_eps and always rotates.
         'layer_norm_eps', 'position_embedding_type',
-        # Ettin's encoders state that they attend both ways, which
-        # ModernBertAttention does whatever they say (is_causal = False).
+        # Ettin's encoders state which way they attend, which ModernBertAttention
+        # never reads: it attends both ways whatever they say (is_causal = False).
         'causal_mask', 'is_causal'))
-    for causal in ('causal_mask', 'is_causal'):
-        if hf.get(causal):
-            refuse(causal, "ModernBERT attends both ways; a causal checkpoint is a different model")
     for dropout in ('attention_dropout', 'mlp_dropout'):
         if records.number(hf.get(dropout, 0.0), dropout):
             refuse(dropout, "ModernBERT drops inside its attention and MLP where the blocks here do not")
@@ -120,7 +118,8 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         norm_type='layer', norm_bias=bool(hf.get('norm_bias', False)),
         norm_eps=records.number(hf.get('norm_eps', 1e-5), 'norm_eps'),
         embedding_norm=True, first_attention_norm=False, qk_norm=False,
-        attention_bias=bool(hf.get('attention_bias', False)), causal=False,
+        attention_bias=bool(hf.get('attention_bias', False)), mlp_bias=bool(hf.get('mlp_bias', False)),
+        causal=False,
         tie_embeddings=bool(hf.get('tie_word_embeddings', True)),
         embedding_dropout_rate=records.number(hf.get('embedding_dropout', 0.0), 'embedding_dropout'),
     )
@@ -145,7 +144,8 @@ _MODERNBERT_NAMES: Renames = (
 _MODERNBERT_PACKED = (
     Packed('.attn.Wqkv.weight',
            ('.self_attn.q_proj.weight', '.self_attn.k_proj.weight', '.self_attn.v_proj.weight'), 0),
-    Packed('.mlp.Wi.weight', ('.mlp.gate_proj.weight', '.mlp.up_proj.weight'), 0))
+    Packed('.mlp.Wi.weight', ('.mlp.gate_proj.weight', '.mlp.up_proj.weight'), 0),
+    Packed('.mlp.Wi.bias', ('.mlp.gate_proj.bias', '.mlp.up_proj.bias'), 0))
 
 _HEAD: Mapping[str, tuple[str, ...]] = {
     'head.dense.weight': ('head_dense', 'kernel'), 'head.norm.weight': ('head_norm', 'scale'),
@@ -168,7 +168,7 @@ def _modernbert_path(name: str, config: Mapping[str, object]) -> tuple[str, ...]
     if name in _HEAD:
         return ('params', *_HEAD[name])
     # Alias inspection sees the raw names before preparation splits them.
-    if name.endswith(('.attn.Wqkv.weight', '.mlp.Wi.weight')):
+    if name.endswith(('.attn.Wqkv.weight', '.mlp.Wi.weight', '.mlp.Wi.bias')):
         return None
     return renamed_path(_MODERNBERT_NAMES, name, config)
 
@@ -186,7 +186,7 @@ def _modernbert_export(model: CausalTransformer) -> Mapping[str, object]:
     fields: dict[str, object] = {
         'architectures': [_ENCODER if model.head_transform is None else _MASKED_LM],
         'hidden_activation': hf_activation(model.mlp), 'norm_eps': model.norm_eps,
-        'norm_bias': model.norm_bias, 'mlp_bias': False, 'layer_types': list(types),
+        'norm_bias': model.norm_bias, 'mlp_bias': model.mlp_bias, 'layer_types': list(types),
         'rope_parameters': {
             'full_attention': {'rope_type': 'default', 'rope_theta': model.rope_theta},
             'sliding_attention': {'rope_type': 'default', 'rope_theta': local_theta}},
