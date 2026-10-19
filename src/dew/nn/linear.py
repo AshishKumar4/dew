@@ -41,6 +41,7 @@ from jax.custom_derivatives import linear_call
 from jax.interpreters.ad import JVPTracer
 
 from dew.nn.kernels import delta_rule, fla_gdn, fla_kda, short_conv
+from dew.nn.kernels.delta_rule import L2NORM_EPS
 
 from .attention import FORWARD_MODE, gated_rms_normalized
 from .blocks import normal_kernel
@@ -70,10 +71,6 @@ CHUNK_SIZE = 64
 (`torch_chunk_gated_delta_rule(..., chunk_size=64)`). The chunked and the
 recurrent form agree at any size; the size only trades memory for
 parallelism, and 64 is what the reference's kernels assume."""
-
-
-L2NORM_EPS = 1e-6
-"""`l2norm`'s epsilon under the root, the FLA library's."""
 
 
 def l2norm(x, eps: float = L2NORM_EPS):
@@ -1129,6 +1126,58 @@ class GatedDeltaNet(nn.Module):
                                 axis=-1)
         return mixed, z.reshape(B, S, -1), b.reshape(B, S, -1), a.reshape(B, S, -1)
 
+    def _stored(self, operand):
+        """The decode caches' dtypes: the recurrent state's as the docstring says, the conv history's
+        the projections' or wider (`held_scan`)."""
+        wide = at_least_fp32(operand)
+        stored = (jnp.promote_types(self.dtype, jnp.bfloat16)
+                  if self.dtype is not None and asks_default_precision(self.precision, configured=True)
+                  else wide)
+        return stored, jnp.promote_types(operand, stored)
+
+    def _fused_refusal(self, x, operand, tokens: Coordinates) -> str | None:
+        """Why a decode token does not run in one launch (`delta_rule.fused_step`) here, or None where it
+        does: a GPU the kernel compiles for, a cache the first call allocated, no packed documents, rows
+        a mesh splits at most, and the widths Triton's blocks take."""
+        state = (x.shape[0], self.num_v_heads, self.head_k_dim, self.head_v_dim)
+        return first_refusal(
+            (triton_runs(), "the fused step needs a GPU of sm80 or later"),
+            (self.has_variable('cache', 'recurrent_state'), "the cache's first call allocates it"),
+            (tokens.segments is None, "a decode token continues one document"),
+            (grouped_heads((*x.shape[:2], self.num_v_heads, self.head_v_dim), self.num_k_heads)[1] is None,
+             "a mesh axis splits the heads"),
+            (delta_rule.fits(jax.ShapeDtypeStruct(state, self._stored(operand)[0])),
+             "the state's widths are not powers of two the kernel's blocks take"),
+        )
+
+    def _fused_decode(self, mixed, z, b, a, tokens: Coordinates):
+        """A decode token's conv, gates, update and gated norm in one launch (`delta_rule.fused_step`),
+        each row on its shard (`manual_map`), and the output projection."""
+        B = mixed.shape[0]
+        stored, conv = self._stored(mixed.dtype)
+        taps, _ = self.conv1d()
+        history = self.variable('cache', 'conv_state', jnp.zeros,
+                                (B, self.conv_kernel - 1, self.conv_features), conv)
+        held = self.variable('cache', 'recurrent_state', jnp.zeros,
+                             (B, self.num_v_heads, self.head_k_dim, self.head_v_dim), stored)
+        weight = self.norm.variables['params']['weight']
+        dtype = self.norm.dtype if self.norm.dtype is not None else at_least_fp32(mixed.dtype)
+        active = jnp.ones((B,), bool) if tokens.valid is None else jnp.asarray(tokens.valid, bool)[:, 0]
+        rows = grouped_heads((B, 1, self.num_v_heads, self.head_v_dim), self.num_k_heads)[0]
+        P = jax.sharding.PartitionSpec
+
+        def local(mixed, held_history, z, b, a, state, active):
+            return delta_rule.fused_step(mixed, held_history, taps, a, b, self.A_log, self.dt_bias, z,
+                                         weight, state, key_heads=self.num_k_heads, epsilon=self.norm_eps,
+                                         activation=self.gate_activation, dtype=dtype, active=active)
+
+        per_row, history_rows, state_rows = P(rows, None), P(rows, None, None), P(rows, None, None, None)
+        out, history.value, held.value = manual_map(
+            local, (per_row, history_rows, per_row, per_row, per_row, state_rows, P(rows)),
+            (per_row, history_rows, state_rows))(
+                mixed[:, 0], history.value, z[:, 0], b[:, 0], a[:, 0], held.value, active)
+        return self.out_proj(out[:, None])
+
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
         decode, attention_metadata = call.decode, call.metadata
@@ -1138,6 +1187,11 @@ class GatedDeltaNet(nn.Module):
         mixed, z, b, a = self._project(x)
         key_dim = self.key_features
         operand = mixed.dtype
+        if decode and S == 1 and measured_kernel('delta_decode', 'step') == 'fused':
+            refusal = self._fused_refusal(x, operand, tokens)
+            if refusal is None:
+                return self._fused_decode(mixed, z, b, a, tokens)
+            ran_kernel('delta_decode', 'step', refusal)
 
         # fp32 on purpose, as the reference notes: an fp16 A can make exp
         # underflow to -inf (modeling_qwen3_next.py:652-653); at least fp32,

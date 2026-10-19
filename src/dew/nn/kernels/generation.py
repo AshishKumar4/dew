@@ -39,8 +39,8 @@ def assumed(generation: str | None) -> Iterator[None]:
 
 
 CHOICES = frozenset({'attention', 'attention_narrow', 'attention_packed', 'attention_sinks',
-                     'attention_window', 'delta_gates', 'gate_up', 'gated_delta_rule', 'grouped_matmul',
-                     'narrow_copies', 'rms_norm', 'ssd', 'swiglu'})
+                     'attention_window', 'delta_decode', 'delta_gates', 'gate_up', 'gated_delta_rule',
+                     'grouped_matmul', 'narrow_copies', 'rms_norm', 'ssd', 'swiglu'})
 """The choices `measured_kernel` answers, and so the ones `chosen` may name."""
 
 

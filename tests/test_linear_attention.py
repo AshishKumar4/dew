@@ -807,3 +807,93 @@ def test_the_decode_kernel_leaves_an_idle_row_alone():
     np.testing.assert_array_equal(np.asarray(got_state)[drawing], np.asarray(every_state)[drawing])
     np.testing.assert_array_equal(np.asarray(got)[~drawing], 0)
     np.testing.assert_array_equal(np.asarray(got_state)[~drawing], np.asarray(state)[~drawing])
+
+
+def fused_case(heads, width, rows, dtype, held):
+    """A gated delta net of `heads` value heads over half as many key heads, `width` wide, and its
+    cache after a 5-token prefill of `rows` rows in `dtype` with its recurrent state `held`, and the
+    next token: the layer's own conv, gates, update and gated norm unfused, and the decode token's
+    inputs as the fused step takes them (`delta_rule.fused_step`)."""
+    layer = GatedDeltaNet(emb_features=64, num_k_heads=heads // 2, num_v_heads=heads, head_k_dim=width,
+                          head_v_dim=width, dtype=dtype)
+    hidden = jax.random.normal(jax.random.key(7), (rows, 6, 64), jnp.float32).astype(dtype)
+    variables = layer.init(jax.random.key(8), hidden[:, :1])
+    variables = {**variables, "params": {**variables["params"], "A_log": jnp.linspace(-1.0, 1.0, heads),
+                                         "dt_bias": jnp.linspace(0.5, 1.5, heads)}}
+    step = MixerCall(decode=True)
+    allocated = layer.apply(variables, hidden[:, :1], step, mutable=["cache"])[1]
+    cache = layer.apply({**variables, **allocated}, hidden[:, :5], step, mutable=["cache"])[1]["cache"]
+    cache = {**cache, "recurrent_state": cache["recurrent_state"].astype(held)}
+    return layer, variables, cache, hidden[:, 5:6]
+
+
+def fused_inputs(layer, variables, cache, token):
+    """The fused step's operands for `token` over `cache`, from the layer's own projections."""
+    mixed, z, b, a = layer.apply(variables, token, method=GatedDeltaNet._project)
+    params = variables["params"]
+    return (mixed[:, 0], cache["conv_state"], params["conv1d"]["weight"][:, 0, :], a[:, 0], b[:, 0],
+            params["A_log"], params["dt_bias"], z[:, 0], params["norm"]["weight"], cache["recurrent_state"])
+
+
+@pytest.mark.parametrize("held", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("heads, width, rows", [
+    pytest.param(4, 32, 3, id="small"),
+    pytest.param(16, 128, 4, marks=pytest.mark.gpu(reason="the 0.8B's widths are a GPU's"), id="0.8b"),
+])
+def test_the_fused_decode_step_computes_the_layers_token(heads, width, rows, held):
+    """A gated delta net's decode token in one launch (`delta_rule.fused_step`: the conv over the
+    held history, the gates, the update and the gated norm) at every config of its space: its output
+    through the layer's projection, its history and an fp32 state within tests/reference_error.py's
+    rule of the layer's own unfused token against the float64 layer's; a bf16 state within one bf16
+    step of the unfused fp32 state, rounded once as `step` rounds it. Compiled on a GPU, interpreted
+    elsewhere."""
+    from dew.nn.kernels import delta_rule
+
+    layer, variables, cache, token = fused_case(heads, width, rows, jnp.float32, held)
+    step = MixerCall(decode=True)
+    fp32 = {**cache, "recurrent_state": cache["recurrent_state"].astype(jnp.float32)}
+    want, after = layer.apply({**variables, "cache": fp32}, token, step, mutable=["cache"])
+    with jax.enable_x64(new_val=True):
+        wide = layer.clone(dtype=jnp.float64)
+        exact, exact_after = wide.apply({**widened(variables), "cache": widened(fp32)}, widened(token),
+                                        step, mutable=["cache"])
+
+    def fused(*operands):
+        out, history, state = delta_rule.fused_step(*operands, key_heads=heads // 2, epsilon=layer.norm_eps,
+                                                    activation=layer.gate_activation, dtype=jnp.float32)
+        projected = layer.apply(variables, out[:, None], method=lambda module, out: module.out_proj(out))
+        return projected, history, state
+
+    operands = fused_inputs(layer, variables, cache, token)
+    found = each_config(delta_rule.FusedStep, fused, *operands)
+    assert len(found) > 1
+    for config in found:
+        with tuning.pinned({delta_rule.FusedStep: config}):
+            out, history, state = jax.jit(fused)(*operands)
+        assert_as_exact_as_the_reference(np.asarray(out), np.asarray(want), np.asarray(exact), f"{config} out")
+        np.testing.assert_array_equal(np.asarray(history), np.asarray(after["cache"]["conv_state"]))
+        assert state.dtype == held
+        unfused = after["cache"]["recurrent_state"]
+        if held == jnp.float32:
+            assert_as_exact_as_the_reference(np.asarray(state), np.asarray(unfused),
+                                             np.asarray(exact_after["cache"]["recurrent_state"]),
+                                             f"{config} state")
+        else:
+            np.testing.assert_allclose(np.asarray(state, np.float32), unfused, atol=2e-6, rtol=2 ** -7)
+
+
+def test_the_fused_decode_step_leaves_an_idle_row_alone():
+    """A row the fused step marks idle: its history and state as they were, bitwise, and its output
+    zeros, beside an active row that moves."""
+    from dew.nn.kernels import delta_rule
+
+    layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
+    operands = fused_inputs(layer, variables, cache, token)
+    out, history, state = jax.jit(functools.partial(
+        delta_rule.fused_step, key_heads=2, epsilon=layer.norm_eps, activation=layer.gate_activation,
+        dtype=jnp.float32, active=jnp.asarray([False, True])))(*operands)
+    np.testing.assert_array_equal(np.asarray(out[0]), 0)
+    np.testing.assert_array_equal(np.asarray(history[0]), np.asarray(cache["conv_state"][0]))
+    np.testing.assert_array_equal(np.asarray(state[0]), np.asarray(cache["recurrent_state"][0]))
+    assert np.any(np.asarray(state[1]) != np.asarray(cache["recurrent_state"][1]))
+    assert np.any(np.asarray(history[1]) != np.asarray(cache["conv_state"][1]))

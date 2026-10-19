@@ -21,6 +21,7 @@ serving step's mixed call (`dew.nn.inputs.Admitted`) rather than this one.
 """
 
 import dataclasses
+import functools
 from typing import ClassVar
 
 import jax
@@ -157,3 +158,151 @@ class DeltaStep(tuning.KernelOp):
         """Normal floats and every row active, so a timed launch steps each row-head's state."""
         return [jnp.ones(spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.integer) else array
                 for spec, array in zip(specs, super().operands(specs, seed), strict=True)]
+
+
+
+L2NORM_EPS = 1e-6
+"""The queries' and keys' l2 norm's epsilon under the root, the FLA library's (`dew.nn.linear.l2norm`)."""
+
+
+def _fused_kernel(active_ref, mixed_ref, held_ref, taps_ref, gate_ref, beta_ref, log_decay_ref, bias_ref,
+                  z_ref, weight_ref, state_ref, state_out, conv_out, out_ref, *, group: int, key_heads: int,
+                  key_width: int, value_width: int, epsilon: float, activation: str):
+    """One row and one value head of a gated delta net's decode token (`fused_step`): its conv, gates,
+    update and gated norm. The conv's channels are read where the row holds them, `[K - 1, C]` history
+    and `[C]` token; its key head's query and key history is written by the head's first value head."""
+    head = pl.program_id(1)
+    key_head = head // group
+    active = active_ref[0] != 0
+    count = taps_ref.shape[-1]
+
+    def convolved(first: int | jax.Array, width: int):
+        """The silu of a channel range's conv, and its history moved on by the token."""
+        channels = pl.ds(first, width)
+        stream = [held_ref[j, channels].astype(jnp.float32) for j in range(count - 1)]
+        stream.append(mixed_ref[channels].astype(jnp.float32))
+        out = stream[0] * taps_ref[channels, 0].astype(jnp.float32)
+        for j in range(1, count):
+            out = out + stream[j] * taps_ref[channels, j].astype(jnp.float32)
+        return out * jax.nn.sigmoid(out), stream[1:]
+
+    def unit(x):
+        return x * jax.lax.rsqrt(jnp.sum(x * x) + L2NORM_EPS)
+
+    @pl.when(active)
+    def _():
+        query, query_moved = convolved(key_head * key_width, key_width)
+        key, key_moved = convolved((key_heads + key_head) * key_width, key_width)
+        value, value_moved = convolved(2 * key_heads * key_width + head * value_width, value_width)
+        query, key = unit(query) * key_width ** -0.5, unit(key)
+        gate = gate_ref[head].astype(jnp.float32) + bias_ref[head].astype(jnp.float32)
+        decay = jnp.exp(-jnp.exp(log_decay_ref[head].astype(jnp.float32)) * jax.nn.softplus(gate))
+        beta = jax.nn.sigmoid(beta_ref[head].astype(jnp.float32))
+        state = state_ref[...].astype(jnp.float32)                 # [Dk, Dv]
+        read_key = jnp.sum((key * decay)[:, None] * state, axis=0)
+        read_query = jnp.sum((query * decay)[:, None] * state, axis=0)
+        delta = (value - read_key) * beta
+        out = read_query + jnp.sum(query * key) * delta
+        updated = state * decay + key[:, None] * delta[None, :]
+        state_out[...] = (round_to_bf16(updated, key, value) if state_out.dtype == jnp.bfloat16
+                          else updated.astype(state_out.dtype))
+        normed = out * jax.lax.rsqrt(jnp.mean(out * out) + epsilon) * weight_ref[...].astype(jnp.float32)
+        z = z_ref[pl.ds(head * value_width, value_width)].astype(jnp.float32)
+        gated = normed * (z * jax.nn.sigmoid(z) if activation == 'silu' else jax.nn.sigmoid(z))
+        out_ref[pl.ds(head * value_width, value_width)] = gated.astype(out_ref.dtype)
+        for j, row in enumerate(value_moved):
+            conv_out[j, pl.ds(2 * key_heads * key_width + head * value_width, value_width)] = (
+                row.astype(conv_out.dtype))
+
+        @pl.when(head % group == 0)
+        def _():
+            for first, moved in ((key_head * key_width, query_moved),
+                                 ((key_heads + key_head) * key_width, key_moved)):
+                for j, row in enumerate(moved):
+                    conv_out[j, pl.ds(first, key_width)] = row.astype(conv_out.dtype)
+
+    @pl.when(jnp.logical_not(active))
+    def _():
+        out_ref[pl.ds(head * value_width, value_width)] = jnp.zeros((value_width,), out_ref.dtype)
+
+
+@dataclasses.dataclass(frozen=True)
+class Warps:
+    """A fused decode launch's warps: a program holds a value head's whole `[Dk, Dv]` state."""
+    warps: int
+
+
+FUSED = Warps(8)
+"""The fused launch without a measurement."""
+
+
+@dataclasses.dataclass(frozen=True)
+class FusedStep(tuning.KernelOp):
+    """A gated delta net's decode token in one launch over rows and value heads (`_fused_kernel`): the
+    conv over the held history, the gates, the update and the gated norm. Off a GPU it interprets."""
+
+    config_cls: ClassVar[type[Warps]] = Warps
+    ROWS: ClassVar[tuple[str, ...]] = ('active', 'mixed', 'held', 'gate', 'beta', 'z', 'state')
+
+    def _fwd(self, active, mixed, held, taps, gate, beta, log_decay, bias, z, weight, state, *,
+             key_heads: int, epsilon: float, activation: str, dtype: str, interpret: bool, config: Warps,
+             return_residuals: bool = False):
+        from jax.experimental.pallas import triton as plgpu
+
+        rows, value_heads, key_width, value_width = state.shape
+        channels, history = mixed.shape[-1], held.shape[1]
+
+        def whole(*shape):
+            return pl.BlockSpec(shape, lambda r, h: (0,) * len(shape))
+
+        def row(*shape):
+            return pl.BlockSpec((None, *shape), lambda r, h: (r,) + (0,) * len(shape))
+
+        held_spec = row(history, channels)
+        state_spec = pl.BlockSpec((None, None, key_width, value_width), lambda r, h: (r, h, 0, 0))
+        kernel = functools.partial(_fused_kernel, group=value_heads // key_heads, key_heads=key_heads,
+                                   key_width=key_width, value_width=value_width, epsilon=epsilon,
+                                   activation=activation)
+        return tuple(pl.pallas_call(
+            kernel, grid=(rows, value_heads),
+            in_specs=[row(1), row(channels), held_spec, whole(*taps.shape), row(value_heads),
+                      row(value_heads), whole(value_heads), whole(value_heads),
+                      row(value_heads * value_width), whole(value_width), state_spec],
+            out_specs=[state_spec, held_spec, row(value_heads * value_width)],
+            out_shape=[jax.ShapeDtypeStruct(state.shape, state.dtype),
+                       jax.ShapeDtypeStruct(held.shape, held.dtype),
+                       jax.ShapeDtypeStruct((rows, value_heads * value_width), jnp.dtype(dtype))],
+            input_output_aliases={10: 0, 2: 1},
+            compiler_params=plgpu.CompilerParams(num_warps=config.warps),
+            interpret=interpret, name="gated_delta_decode",
+        )(active, mixed, held, taps, gate, beta, log_decay, bias, z, weight, state)), None
+
+    def _get_heuristics_config(self, ba) -> Warps:
+        return FUSED
+
+    def _get_autotuning_configs(self, ba) -> set[Warps]:
+        return {Warps(warps) for warps in (4, 8, 16)}
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        """Normal floats and every row active, so a timed launch steps each row's state and history."""
+        return [jnp.ones(spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.integer) else array
+                for spec, array in zip(specs, super().operands(specs, seed), strict=True)]
+
+
+def fused_step(mixed, held, taps, gate, beta, log_decay, bias, z, weight, state, *, key_heads: int,
+               epsilon: float, activation: str, dtype, active=None):
+    """`(output, history', state')` of a gated delta net's decode token in one launch: `mixed` `[rows,
+    C]` the token's conv input (its queries, keys and values, head-major), `held` `[rows, K - 1, C]` the
+    conv's history and `taps` `[C, K]`, `gate` and `beta` `[rows, Hv]` the token's decay and write
+    gates before their activations, `log_decay` (A_log) and `bias` (dt_bias) `[Hv]`, `z` `[rows, Hv *
+    Dv]` the output gate, `weight` `[Dv]` the gated norm's, of `epsilon` and gate `activation`, and
+    `state` `[rows, Hv, Dk, Dv]` held as `step`'s is. The output `[rows, Hv * Dv]` is in `dtype`; the
+    history and the state are updated in place where the caller lets them go. A row `active` `[rows]`
+    marks False is untouched, its output zeros. The arithmetic is the unfused layer's (the conv and
+    its silu in fp32, the queries and keys l2-normalized, `step`, then the gated norm in fp32), its
+    sums in another order."""
+    rows = state.shape[0]
+    flags = (jnp.ones(rows, jnp.int32) if active is None else active.astype(jnp.int32))[:, None]
+    return FusedStep()(flags, mixed, held, taps, gate, beta, log_decay, bias, z, weight, state,
+                       key_heads=key_heads, epsilon=epsilon, activation=activation,
+                       dtype=jnp.dtype(dtype).name, interpret=not triton_runs())[::-1]
