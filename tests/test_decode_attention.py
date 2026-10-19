@@ -479,7 +479,8 @@ def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask
     documents = cache_documents(positions, filled)
 
     def pulled(attend, *operands):
-        out, pull = jax.vjp(lambda *operands: attend(*operands).astype(jnp.float32), *operands)
+        wide = jnp.promote_types(operands[0].dtype, jnp.float32)
+        out, pull = jax.vjp(lambda *operands: attend(*operands).astype(wide), *operands)
         return out, *pull(cotangent.astype(out.dtype))
 
     def flash(query, key, value):
