@@ -185,12 +185,13 @@ def _orders(path: tuple[str, ...], rank: int) -> tuple[tuple[int, ...] | None, t
 def source_layouts(component: str, shapes: Mapping[str, tuple[int, ...]], path_of: TensorPath,
                    prefix: tuple[str, ...]) -> tuple[WeightLayout, ...]:
     """`record_layouts`' layouts, from the stored tensors' shapes alone: each
-    tensor's leaf under `prefix` and the transpose that writes it back, for a tree
-    bound from saved variables rather than read (`components.bind_component`)."""
+    tensor's leaf under `prefix` and the transpose that writes it back, named under
+    `component` (as stored where it is empty), for a tree bound from saved variables
+    rather than read (`components.bind_component`)."""
     from dew.interop.streaming import WeightLayout
 
-    return tuple(WeightLayout(f"{component}/{name}", ((*prefix, *path),), tuple(shape),
-                              _orders(path, len(shape))[1])
+    return tuple(WeightLayout(f"{component}/{name}" if component else name, ((*prefix, *path),),
+                              tuple(shape), _orders(path, len(shape))[1])
                  for name, shape in shapes.items() if (path := path_of(name)) is not None)
 
 
@@ -206,15 +207,31 @@ def translate_parameters(tensors: Mapping[str, np.ndarray], path_of: TensorPath,
 def placed(tensors: Mapping[str, np.ndarray], path_of: TensorPath, param_dtype: str = "float32"
            ) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
     """`translate_parameters`' tree, with the layout that writes each tensor it placed back
-    under its own name from its path in that tree; a tensor `path_of` leaves out has none."""
-    from dew.interop.streaming import WeightLayout
-
+    under its own name from its path in that tree; a tensor `path_of` leaves out has none.
+    Each tensor binds as `record_layouts` binds it, read whole: source aliases share the leaf of
+    the first (`_aliased`), and the layouts are `source_layouts`' under no component."""
     parameters: ParamTree = {}
-    layouts = []
-    for name, path, leaf, transpose in _leaves(tensors, path_of, param_dtype, _copy):
-        insert(parameters, path, leaf, name)
-        layouts.append(WeightLayout(name, (path,), tuple(np.shape(tensors[name])), transpose))
-    return parameters, tuple(layouts)
+    owners, locate = _aliased(tensors, path_of)
+    for name, path, leaf, _ in _leaves(tensors, locate, param_dtype, _copy):
+        if owners[path] == name:
+            insert(parameters, path, leaf, name)
+    return parameters, source_layouts("", {name: np.shape(tensor) for name, tensor in tensors.items()},
+                                      path_of, ())
+
+
+def _aliased(tensors: Mapping[str, np.ndarray], path_of: TensorPath
+             ) -> tuple[dict[tuple[str, ...], str], TensorPath]:
+    """The first tensor each path holds, filled as the returned `path_of` is asked, which
+    compares each later alias with it before any cast (`source_alias`)."""
+    owners: dict[tuple[str, ...], str] = {}
+
+    def locate(name: str) -> tuple[str, ...] | None:
+        path = path_of(name)
+        if path is not None:
+            source_alias(tensors, owners, path, name)
+        return path
+
+    return owners, locate
 
 
 def nested(layouts: tuple[WeightLayout, ...], depth: int, *keys: str) -> tuple[WeightLayout, ...]:
@@ -239,13 +256,7 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray], path_of: T
     from dew.interop.streaming import SourceLeaf, materialize
 
     parameters: LazyTree = {}
-    owners: dict[tuple[str, ...], str] = {}
-
-    def locate(name: str) -> tuple[str, ...] | None:
-        path = path_of(name)
-        if path is not None:
-            source_alias(tensors, owners, path, name)
-        return path
+    owners, locate = _aliased(tensors, path_of)
 
     def mapped(stored: np.ndarray, dtype: np.dtype, order: tuple[int, ...] | None) -> np.ndarray | SourceLeaf:
         return (_copy(stored, dtype, order) if order is not None and stored.ndim != 2
