@@ -74,7 +74,10 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
     key = jnp.asarray(rng.normal(size=(rows, capacity, 2, 256)) * 0.3, dtype)
     value = jnp.asarray(rng.normal(size=(rows, capacity, 2, 256)), dtype)
     assert decode_attention.fits(query, key)
-    out = jax.jit(decode_attention.attend)(query, key, value, lengths)
+    # The kernel at the default precision, which the GPU lane otherwise sets to the highest
+    # (tests/lane_environment.py): its fp32 products must be fp32 ones whatever the default.
+    with jax.default_matmul_precision("default"):
+        out = jax.jit(decode_attention.attend)(query, key, value, lengths)
     with jax.default_matmul_precision("float32"):
         plain = jax.nn.dot_product_attention(query, key, value, key_value_seq_lengths=lengths,
                                              implementation='xla')
