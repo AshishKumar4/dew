@@ -294,12 +294,14 @@ def _name(pipeline: Pipeline) -> str:
 
 def _members(pipelines: Sequence[Pipeline]) -> list[str]:
     """The names a mixture's members go by, for their draws and in its plan: the one each was given
-    (`Pipeline.named`), else its place among the members given none (`#0`, `#1`, ...), which no
-    mount, read or preparation of its source changes. A member keeps its draws and its place across
-    a member joining or leaving by its name; one without keeps them while no other unnamed member
-    joins or leaves ahead of it."""
+    (`Pipeline.named`, as `name:<name>`), else its place among the members given none (`place:0`,
+    `place:1`, ...), which no mount, read or preparation of its source changes; the two kinds never
+    meet, whatever a name holds. A member keeps its draws and its place across a member joining or
+    leaving by its name; one without keeps them while no other unnamed member joins or leaves ahead
+    of it."""
     unnamed = itertools.count()
-    return [pipeline.name if pipeline.name is not None else f"#{next(unnamed)}" for pipeline in pipelines]
+    return [f"name:{pipeline.name}" if pipeline.name is not None else f"place:{next(unnamed)}"
+            for pipeline in pipelines]
 
 
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
