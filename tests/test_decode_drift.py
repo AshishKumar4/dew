@@ -27,8 +27,8 @@ def test_the_gate_measures_the_server_against_the_references_own_noise(tmp_path)
     done = subprocess.run([sys.executable, str(ROOT / "tools" / "decode_drift.py"),
                            "--model", str(tmp_path / "decoder"), "--steps", "24", "--prompt", "8",
                            "--vocab-limit", "200", "--out", str(out)],
-                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src")},
-                          cwd=ROOT)
+                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"),
+                               "XLA_FLAGS": "--xla_force_host_platform_device_count=1"}, cwd=ROOT)
     record = json.loads(out.read_text())
     assert done.returncode == (0 if record["passes"] else 1)
     assert record["reference_embedding_ulp"]["rms"] > 0
