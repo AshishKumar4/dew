@@ -56,7 +56,7 @@ from dew.data.pipeline import (
     Windows,
     Workers,
 )
-from dew.data.plan import Manifest, StepIdentity
+from dew.data.plan import Manifest, StepIdentity, fingerprint
 from dew.data.sources.base import READS, Read, Source
 from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
@@ -289,6 +289,18 @@ def _name(pipeline: Pipeline) -> str:
     if pipeline.name is not None:
         return pipeline.name
     return "mixture" if isinstance(pipeline.source, (Mixture, Phases)) else pipeline.source.describe()
+
+
+def _member(pipeline: Pipeline) -> str:
+    """The name a mixture member goes by for its draws and in its plan: the one it was given
+    (`Pipeline.named`), else its source's content, which no host's mount of it changes, a mixture's
+    its own members' names."""
+    if pipeline.name is not None:
+        return pipeline.name
+    source = pipeline.source
+    if isinstance(source, (Mixture, Phases)):
+        return f"mixture:{fingerprint([_member(child) for child in source.pipelines])[:16]}"
+    return f"content:{fingerprint(source.fingerprint())[:16]}"
 
 
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
@@ -536,6 +548,7 @@ def _analyzed(
     if isinstance(source, Phases):
         order: Mapping[str, object] = {
             "phases": [child.order for child in children],
+            "members": [_member(child) for child in source.pipelines],
             "until_steps": list(source.until_steps),
         }
     else:
@@ -544,6 +557,7 @@ def _analyzed(
             **(
                 {
                     "corpora": [child.order for child in children],
+                    "members": [_member(child) for child in source.pipelines],
                     "weights": list(source.weights),
                     "shares": "tokens" if source.tokens is not None else "accepted rows",
                 }

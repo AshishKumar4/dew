@@ -276,6 +276,49 @@ def test_a_mixture_members_draws_stay_as_they_were_when_another_member_joins():
     assert [twins[index, 0] for index in range(8)] != [twins[index, 1] for index in range(8)]
 
 
+def test_an_unnamed_member_draws_by_its_content_wherever_a_host_mounts_it(tmp_path):
+    """A member given no name goes by its source's content, not its description: one dataset mounted
+    at two paths, as two hosts mount it, draws alike in a mixture, whose plans agree."""
+    def mounted(directory):
+        directory.mkdir()
+        (directory / "rows.jsonl").write_text("".join(json.dumps({"id": i}) + "\n" for i in range(8)))
+        chain = Pipeline(Files(str(directory / "rows.jsonl"))).map(Member(0)).random_map(Draw())
+        return compile(mix([chain.repeat(1), Pipeline(source(4)).map(Member(1)).repeat(1)]).batch(4),
+                       read="memory", loading=READ, seed=5)
+
+    here, there = mounted(tmp_path / "here"), mounted(tmp_path / "there")
+    assert here.plan.identity() == there.plan.identity()
+    draws = []
+    for data in (here, there):
+        stream = data.train(DataPartition())
+        try:
+            draws.append([int(draw) for batch in stream for draw in batch["draw"]])
+        finally:
+            stream.close()
+    assert draws[0] == draws[1]
+
+
+def test_a_position_is_refused_where_a_mixture_member_was_renamed():
+    """A mixture's plan names its members, whose draws their names key: a position saved under one
+    name is refused by the mixture that renamed it, which would draw other rows."""
+    def mixed(name):
+        members = [Pipeline(source(8), name=name).random_map(Draw()).repeat(), Pipeline(source(4)).repeat()]
+        return compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
+
+    stream = mixed("first").train(DataPartition())
+    try:
+        next(stream)
+        saved = stream.get_state()
+    finally:
+        stream.close()
+    resumed = mixed("second").train(DataPartition())
+    try:
+        with pytest.raises(ValueError):
+            resumed.set_state(saved)
+    finally:
+        resumed.close()
+
+
 def drawn_natively(rows):
     """A Grain step Dew does not name, whose random step draws by the default seed of the rows it
     is handed."""

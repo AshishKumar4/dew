@@ -36,6 +36,7 @@ from dew.data.analysis import (
     _identity,
     _in_memory,
     _Lowering,
+    _member,
     _name,
     _until,
 )
@@ -615,11 +616,11 @@ batches, so a resume cuts the batches before them (`_Build.batched`)."""
 
 
 def _member_key(pipelines: Sequence[Pipeline], index: int) -> int:
-    """A mixture member's key for its random draws: the name it checkpoints under
-    (`Dataset.named`), so adding or removing another member leaves its draws as they were, and among
-    members of one name its place among them, so two such members draw apart."""
-    name = _name(pipelines[index])
-    alike = sum(_name(pipeline) == name for pipeline in pipelines[:index])
+    """A mixture member's key for its random draws: the name it goes by (`_member`), so adding or
+    removing another member leaves its draws as they were, and among members of one name its place
+    among them, so two such members draw apart."""
+    name = _member(pipelines[index])
+    alike = sum(_member(pipeline) == name for pipeline in pipelines[:index])
     return int.from_bytes(hashlib.blake2b(f"{alike}:{name}".encode(), digest_size=8).digest(), "big")
 
 
