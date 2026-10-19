@@ -43,12 +43,7 @@ from .kernels.generation import (
     ran_kernel,
 )
 from .kv_cache import Append, KVCache, KVStore, filled_slots
-from .precision import (
-    asks_default_precision,
-    at_default_precision,
-    at_least_fp32,
-    rounded_to,
-)
+from .precision import asks_default_precision, at_default_precision, at_least_fp32, rounded_to
 from .rope import rotate
 from .sharding import (
     HEADS,
