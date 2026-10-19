@@ -185,7 +185,7 @@ def location(directory: str) -> epath.Path:
     return path if is_uri(directory) else path.resolve()
 
 
-def _attempted(steps: Sequence[tuple[str, Callable[[], object]]], *,
+def _attempted(steps: Sequence[tuple[str, Callable[[], None]]], *,
                primary: BaseException | None = None) -> None:
     """Run every step, even after one fails. Each failure is noted on `primary`, the error its
     caller is already raising, which stays the one raised; without one the first failure is raised
@@ -1849,13 +1849,13 @@ class Checkpoints:
         """`close`, with a failure noted on the error the body raised, which stays the one raised."""
         _attempted(self._closing(), primary=raised)
 
-    def _closing(self) -> list[tuple[str, Callable[[], object]]]:
+    def _closing(self) -> list[tuple[str, Callable[[], None]]]:
         """The steps that close the open managers, which this forgets: each one's wait, then each
         one's close."""
-        opened = [manager for manager in (self._manager, self._local_manager) if manager is not None]
+        opened = [writer for writer in (self._manager, self._local_manager) if writer is not None]
         self._manager, self._local_manager, self._pending = None, None, None
-        return [*(("Checkpoint wait", manager.wait_until_finished) for manager in opened),
-                *(("Checkpoint close", manager.close) for manager in opened)]
+        return [*(("Checkpoint wait", writer.wait_until_finished) for writer in opened),
+                *(("Checkpoint close", writer.close) for writer in opened)]
 
     def wait(self) -> None:
         """Block until pending async writes have landed on disk.
@@ -1864,6 +1864,6 @@ class Checkpoints:
         anything that reads a checkpoint back has to call this first.
         """
         with region("checkpoint.wait"):
-            _attempted([("Checkpoint wait", manager.wait_until_finished)
-                        for manager in (self._manager, self._local_manager) if manager is not None])
+            _attempted([("Checkpoint wait", writer.wait_until_finished)
+                        for writer in (self._manager, self._local_manager) if writer is not None])
             self._pending = None
