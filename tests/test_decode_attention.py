@@ -92,8 +92,9 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
 
 
 def decode_step(lengths):
-    """fp32 attention of a decode step's grouped query (`attention._grouped`) over key lengths on 'xla', which the decode kernel takes on a GPU (`decode_attention.fits`), and the
-    folded attention it stands in for over the prefix those lengths mean."""
+    """fp32 attention of a decode step's grouped query (`attention._grouped`) over key lengths on
+    'xla', which the decode kernel takes on a GPU (`decode_attention.fits`), and the folded attention
+    it stands in for over the prefix those lengths mean."""
     def attended(query, key, value):
         return scaled_dot_product_attention(query, key, value, implementation='xla',
                                             key_value_seq_lengths=lengths)
