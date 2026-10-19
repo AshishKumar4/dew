@@ -37,14 +37,14 @@ float64's next best; and at `positions` the whole vocabulary.
 
 One run is a coin flip at a few positions of every bf16 run, vLLM's too: a rounding there moves
 the continuation's log-probabilities by whole units. So the release is held to vLLM over
-`ORDERS` residual orders (tests/reference_error.py's K-order rule): `draw` draws them
-(tests/residual_orders.py) and `orders` permutes the engine's weights in place to each
+`ORDERS` residual orders (tests/reference_error.py's K-order rule), in `STAGES` sets: `draw`
+draws them (tests/residual_orders.py) and `orders` permutes the engine's weights in place to each
 (`LLM.apply_model`), decoding the identity run's tokens again through a logits processor that
 draws them (tools/dory_vllm_forcing.py) beside the same raw log-probabilities. It keeps each
-order's rows on their columns, and over every row's whole vocabulary each entry's absolute and
-squared distance from float64 summed over the orders; `model_orders` does the same with the model code at the
-engine's precision on a last-loop run's rows past the window (`SHARED`). Order zero reproduces
-the probe's rows bit for bit. `publish` puts the probe and the orders in `DATASET`, at a revision
+order's rows on their columns and each entry of every row's whole vocabulary's absolute distance
+from float64 (`errors`); `model_orders` writes the model code's at the engine's precision on a
+last-loop run's rows past the window (`SHARED`) in their place. Order zero reproduces the probe's
+rows bit for bit. `publish` puts the probe and the orders in `DATASET`, at a revision
 source.json pins with each file's sha256 (`fetched`).
 """
 
@@ -83,6 +83,9 @@ COLUMNS = 64
 RANDOM = 32
 TOP = 16
 ORDERS_SEED = 11
+STAGES = 2
+"""The order sets a run is recorded under, `ORDERS` orders each: the first holds the identity, the
+second fresh orders a test reads only to confirm a failure of the first."""
 DATASET = 'dewml/dory-1.0-4b-vllm-reference'
 """Where the probe and its orders live: source.json pins its revision and each file's sha256."""
 
@@ -425,8 +428,8 @@ SHARED = tuple(run for run in RUNS if run[1] == 'last_loop')
 def model_orders(directory: Path) -> None:
     """For each `SHARED` run, the model code at the engine's precision (`model_code`: bf16
     throughout, or float32 with TF32 attention products) on the window's rows under every order of
-    `directory/orders.npy`: each order's rows on their columns and each entry's absolute and squared
-    distance from `upstream`'s summed over the orders, `directory/model-{run}.npz`."""
+    `directory/orders.npy`, in the engine's place in the run's files: each order's rows on their
+    columns and each entry's error (`errors`)."""
     import torch
 
     config, tensors = release()
@@ -440,35 +443,50 @@ def model_orders(directory: Path) -> None:
         model, rows = model_code(config, tensors, loops, mode, getattr(torch, dtype), tf32=dtype == 'float32')
         truth = np.load(directory / f'upstream-{tag(key)}.npy')[window]
         columns = columns_of(probe, key)[window]
-        current, kept = np.arange(hidden), []
-        absolutes, squares = np.zeros(truth.shape), np.zeros(truth.shape)
-        for index, order in enumerate(drawn):
-            seen = permute(model, torch.as_tensor(np.argsort(current)[order]), hidden)
-            current = order
-            if index == 0:
-                unpermuted = seen
-            assert np.array_equal(seen, unpermuted[order]), f'{key}: the model holds no order {index}'
-            found = rows(probe['window'], probe[f'{key}/window_generated'], prompt_rows=False)
-            kept.append(np.take_along_axis(found, columns, axis=1))
-            absolutes += np.abs(found - truth)
-            squares += np.square(found - truth)
-            print(f'{key} model code, order {index}: {np.sqrt(np.mean(np.square(found - truth))):.4f}',
-                  flush=True)
-        np.savez(directory / f'model-{tag(key)}.npz', columns=np.stack(kept),
-                 absolutes=absolutes.astype(np.float32), squares=squares.astype(np.float32))
+        current, unpermuted = np.arange(hidden), None
+        for stage, orders_of in enumerate(drawn):
+            kept = np.load(directory / f'columns-{tag(key)}-{stage}.npy', mmap_mode='r+')
+            held = errors(directory, key, stage)
+            for index, order in enumerate(orders_of):
+                seen = permute(model, torch.as_tensor(np.argsort(current)[order]), hidden)
+                current = order
+                if unpermuted is None:
+                    unpermuted = seen
+                assert np.array_equal(seen, unpermuted[order]), (
+                    f'{key}: the model holds no order {stage}/{index}')
+                found = rows(probe['window'], probe[f'{key}/window_generated'], prompt_rows=False)
+                kept[index, window] = np.take_along_axis(found, columns, axis=1)
+                held[index, window] = np.abs(found - truth)
+                print(f'{key} model code, order {stage}/{index}: '
+                      f'{np.sqrt(np.mean(np.square(found - truth))):.4f}', flush=True)
+            kept.flush()
+            held.flush()
         del model, rows
         gc.collect()
         torch.cuda.empty_cache()
 
 
 def draw(directory: Path) -> None:
-    """`ORDERS` residual orders of the release's width, the first the identity, under Dew's
-    environment (tests/residual_orders.py, tests/reference_error.py's ORDERS)."""
+    """`STAGES` sets of `ORDERS` residual orders of the release's width, under Dew's environment
+    (tests/residual_orders.py, tests/reference_error.py's ORDERS): the first set's first order the
+    identity, the second set's all fresh."""
     from reference_error import ORDERS
     from residual_orders import orders
 
     width = json.loads((FIXTURE / 'config.json').read_text())['hidden_size']
-    np.save(directory / 'orders.npy', orders(width, ORDERS, ORDERS_SEED).astype(np.int16))
+    drawn = [orders(width, ORDERS, ORDERS_SEED),
+             *(orders(width, ORDERS + 1, ORDERS_SEED + stage)[1:] for stage in range(1, STAGES))]
+    np.save(directory / 'orders.npy', np.stack(drawn).astype(np.int16))
+
+
+def errors(directory: Path, key: str, stage: int, shape: tuple[int, ...] | None = None) -> np.ndarray:
+    """Run `key`'s per-order errors in order set `stage`, `[ORDERS, rows, vocab]` float32 on disk:
+    each entry's absolute distance from float64 (`upstream`'s rows) under each order. With `shape`,
+    created for writing; else opened for reading and writing."""
+    path = directory / f'errors-{tag(key)}-{stage}.npy'
+    if shape is not None:
+        return np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=shape)
+    return np.load(path, mmap_mode='r+')
 
 
 def permute(model, order, hidden: int) -> np.ndarray:
@@ -491,9 +509,8 @@ def permute(model, order, hidden: int) -> np.ndarray:
 
 def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
     """One run under every order of `directory/orders.npy`, the engine's weights permuted in place
-    to each and the identity run's tokens drawn again (`Forced`): each order's rows on their
-    columns, and over every row's whole vocabulary the sums over the orders of each entry's absolute
-    and squared distance from float64 (`upstream`'s rows), `directory/orders-{run}.npz`."""
+    to each and the identity run's tokens drawn again (`Forced`): for each order set, each order's
+    rows on their columns (`columns-{run}-{stage}.npy`) and each entry's error (`errors`)."""
     import functools
 
     import torch
@@ -515,34 +532,36 @@ def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
         return np.concatenate(found)
 
     drawn = np.load(directory / 'orders.npy').astype(np.int64)
-    current, kept = np.arange(hidden), []
-    absolutes, squares = np.zeros(truth.shape), np.zeros(truth.shape)
-    for index, order in enumerate(drawn):
-        # From the order the weights hold to this one.
-        step = torch.as_tensor(np.argsort(current)[order])
-        (seen,) = llm.apply_model(functools.partial(permute, order=step, hidden=hidden))
-        current = order
-        if index == 0:
-            unpermuted = seen
-        assert np.array_equal(seen, unpermuted[order]), f'{key}: the engine holds no order {index}'
-        found = rows()
-        on_columns = np.take_along_axis(found, columns, axis=1)
-        if index == 0:
-            assert np.array_equal(on_columns, probe[f'{key}/vllm']), f'{key}: order 0 is not the probe'
-            assert np.array_equal(found[positions(probe)], probe[f'{key}/vllm_full']), (
-                f'{key}: order 0 is not the probe')
-        kept.append(on_columns)
-        error = found - truth
-        absolutes += np.abs(error)
-        squares += np.square(error)
-        print(f'{key} order {index}: {np.sqrt(np.mean(np.square(error))):.4f}', flush=True)
-    np.savez(directory / f'orders-{tag(key)}.npz', columns=np.stack(kept),
-             absolutes=absolutes.astype(np.float32), squares=squares.astype(np.float32))
+    current, unpermuted = np.arange(hidden), None
+    for stage, orders_of in enumerate(drawn):
+        kept = np.lib.format.open_memmap(directory / f'columns-{tag(key)}-{stage}.npy', mode='w+',
+                                         dtype=np.float32, shape=(len(orders_of), *columns.shape))
+        held = errors(directory, key, stage, (len(orders_of), *truth.shape))
+        for index, order in enumerate(orders_of):
+            # From the order the weights hold to this one.
+            step = torch.as_tensor(np.argsort(current)[order])
+            (seen,) = llm.apply_model(functools.partial(permute, order=step, hidden=hidden))
+            current = order
+            if unpermuted is None:
+                unpermuted = seen
+            assert np.array_equal(seen, unpermuted[order]), (
+                f'{key}: the engine holds no order {stage}/{index}')
+            found = rows()
+            kept[index] = np.take_along_axis(found, columns, axis=1)
+            if stage == index == 0:
+                assert np.array_equal(kept[index], probe[f'{key}/vllm']), f'{key}: order 0 is not the probe'
+                assert np.array_equal(found[positions(probe)], probe[f'{key}/vllm_full']), (
+                    f'{key}: order 0 is not the probe')
+            held[index] = np.abs(found - truth)
+            apart = np.sqrt(np.mean(np.square(found - truth)))
+            print(f'{key} order {stage}/{index}: {apart:.4f}', flush=True)
+        kept.flush()
+        held.flush()
 
 
 def orders(directory: Path) -> None:
-    """Every run under every order, each in a process of its own: `directory/orders-{run}.npz`,
-    which `publish` puts beside the probe."""
+    """Every run under every order, each in a process of its own: `orders_run`'s files, which
+    `publish` puts beside the probe."""
     import os
 
     for loops, mode, dtype in RUNS:
@@ -568,16 +587,19 @@ Runs (loop count / cache mode / dtype): {runs}. Each decodes a sentence greedily
 - `probe.npz`: the prompts, each run's drawn tokens, each row's probe columns with vLLM's and the
   float64 truth's log-probabilities on them, four rows over the whole vocabulary, and vLLM's own
   model code run in float64 on the same tokens.
-- `orders.npy`: 52 permutations of the residual stream, the first the identity.
+- `orders.npy`: two sets of 52 permutations of the residual stream, the first set's first the
+  identity, the second all fresh.
 - `upstream-<run>.npy`: every row over the whole vocabulary from vLLM's own model code in float64 on
   the run's tokens, the truth.
-- `orders-<run>.npz`: under each permutation, vLLM's rows on the probe columns, and over every row's
-  whole vocabulary each entry's absolute and squared distance from the float64 truth summed over the
-  52.
-- `model-<run>.npz`: the same for a last-loop run's rows past the window from the pull request's
-  model code at the engine's precision (bf16, or fp32 with TF32 attention products), the reference
-  there: the engine's last-loop cache parts from the model code past the window
-  (https://github.com/vllm-project/vllm/pull/60149#issuecomment-6270937659).
+- `columns-<run>-<set>.npy`: under each permutation of a set, vLLM's rows on the probe columns,
+  `[52, rows, 64]` float32.
+- `errors-<run>-<set>.npy`: under each permutation of a set, every entry's absolute distance from
+  the float64 truth, `[52, rows, vocabulary]` float32.
+
+On a last-loop run's rows past the window both files hold the pull request's model code at the
+engine's precision (bf16, or fp32 with TF32 attention products) instead of the engine, the reference
+there: the engine's last-loop cache parts from the model code past the window
+(https://github.com/vllm-project/vllm/pull/60149#issuecomment-6270937659).
 
 Dew's `tests/fixtures/hf/dory-1.0-4b/source.json` pins this repository's revision and each file's
 sha256.
@@ -587,17 +609,15 @@ sha256.
 
 def files(directory: Path) -> dict[str, Path]:
     """The probe's files by their names in `DATASET`."""
-    return {'probe.npz': FIXTURE / 'probe.npz', 'orders.npy': directory / 'orders.npy',
-            **{f'{stage}-{tag(name(*run))}.{suffix}': directory / f'{stage}-{tag(name(*run))}.{suffix}'
-               for run in RUNS for stage, suffix in (('orders', 'npz'), ('upstream', 'npy'))},
-            **{f'model-{tag(name(*run))}.npz': directory / f'model-{tag(name(*run))}.npz' for run in SHARED}}
+    names = ['orders.npy', *(f'upstream-{tag(name(*run))}.npy' for run in RUNS),
+             *(f'{kind}-{tag(name(*run))}-{stage}.npy' for run in RUNS for kind in ('columns', 'errors')
+               for stage in range(STAGES))]
+    return {'probe.npz': FIXTURE / 'probe.npz', **{file: directory / file for file in names}}
 
 
 def publish(directory: Path) -> None:
     """The probe and its orders in one commit of `DATASET`, and source.json pinning that commit and
     each file's sha256 (`fetched`)."""
-    import hashlib
-
     from huggingface_hub import CommitOperationAdd, HfApi
 
     api, kept = HfApi(), files(directory)
@@ -612,24 +632,33 @@ def publish(directory: Path) -> None:
     source['probe'].update(
         dataset=DATASET, revision=commit.oid,
         truth="the pull request's model code in float64 (upstream), tools/dory_reference.py held to it",
-        files={file: hashlib.sha256(path.read_bytes()).hexdigest() for file, path in kept.items()})
+        files={file: digest(path) for file, path in kept.items()})
     (FIXTURE / 'source.json').write_text(json.dumps(source, indent=2) + '\n')
     print(f'{DATASET}@{commit.oid}: {len(kept)} files')
 
 
 def fetched(file: str) -> Path:
     """`file` of the probe, from `DATASET` at the revision source.json pins, its sha256 checked."""
-    import hashlib
-
     from huggingface_hub import hf_hub_download
 
     probe = json.loads((FIXTURE / 'source.json').read_text())['probe']
     path = Path(hf_hub_download(probe['dataset'], file, repo_type='dataset', revision=probe['revision']))
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    if digest != probe['files'][file]:
-        raise ValueError(f"{file} at {probe['revision']} hashes to {digest}, "
+    found = digest(path)
+    if found != probe['files'][file]:
+        raise ValueError(f"{file} at {probe['revision']} hashes to {found}, "
                          f"source.json pins {probe['files'][file]}")
     return path
+
+
+def digest(path: Path) -> str:
+    """`path`'s sha256, read a block at a time."""
+    import hashlib
+
+    hashed = hashlib.sha256()
+    with path.open('rb') as file:
+        for block in iter(lambda: file.read(1 << 24), b''):
+            hashed.update(block)
+    return hashed.hexdigest()
 
 
 if __name__ == '__main__':
