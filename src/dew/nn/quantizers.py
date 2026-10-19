@@ -12,7 +12,10 @@ from collections.abc import Sequence
 import jax
 import jax.numpy as jnp
 
+from .precision import unquantized
 
+
+@unquantized("quantizer")
 def nearest_codewords(x, codebook) -> jax.Array:
     """Each row of `x` `[..., width]`'s nearest codeword index in `codebook` `[size, width]`: the
     largest `-(|x|^2 - 2 x.e + |e|^2)`, as the reference's EuclideanCodebook.quantize forms it."""
