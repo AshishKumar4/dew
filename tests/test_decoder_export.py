@@ -81,6 +81,7 @@ not established by the tiny untied-cutoff fixtures.
 """
 
 import dataclasses
+import functools
 import json
 from pathlib import Path
 
@@ -88,7 +89,7 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
-from interop_support import assert_restores
+from interop_support import assert_restores, assert_same_stored_tensors
 from model_support import flat_tree
 from reference_error import (
     FACTOR,
@@ -248,6 +249,28 @@ def test_transformers_reads_the_trained_export(trip, tmp_path):
             assert_computes_the_oracle(tool.reference_logits(trip.case, export, trip.ids, wide=True),
                                        trip.truth, f"{label} in order 1", roundings=roundings)
     assert_as_exact_over_orders(mine, theirs, label)
+
+
+def test_a_bfloat16_source_exports_its_trained_float32_masters(tmp_path):
+    """A bfloat16 checkpoint loads into float32 masters, and one training
+    step leaves them between bfloat16 values. The export writes each weight
+    at its leaf's float32 width, so the reload holds the trained masters bit
+    for bit; only the int64 token-to-expert tables keep their stored width."""
+    fixture = FIXTURES / "deepseek-v4-tiny"
+    directory = tmp_path / "bfloat16"
+    save_hf_layout({name: tensor.astype(ml_dtypes.bfloat16) if tensor.dtype == np.float32 else tensor
+                    for name, tensor in tool.source_tensors(fixture).items()},
+                   json.loads((fixture / "config.json").read_text()), directory)
+    (directory / "input_ids.npy").write_bytes((fixture / "input_ids.npy").read_bytes())
+    source, ids, trained, reloaded = tool.trained_export(
+        directory, tmp_path / "export", functools.partial(tool.train, CASES["deepseek_v4"]))
+
+    assert source.weight_layouts, "deepseek_v4 writes its export through the source layout"
+    stored = tool.source_tensors(directory)
+    for name, tensor in tool.source_tensors(tmp_path / "export").items():
+        assert tensor.dtype == (np.float32 if stored[name].dtype == ml_dtypes.bfloat16
+                                else stored[name].dtype), name
+    assert_restores(source.model, trained, reloaded, ids)
 
 
 def test_a_rotated_expert_index_writes_a_model_that_disagrees(indexed, tmp_path):
@@ -592,6 +615,67 @@ def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_p
         without_provenance.save(tmp_path / "refused", variables=state.variables)
 
 
+PREPARED = {"gpt2": ("gpt2-tiny", "transformer.h.0.attn.c_attn.weight", ""),
+            "gpt2-bare": ("gpt2-tiny", "h.0.attn.c_attn.weight", "transformer."),
+            "gptj": ("gptj-tiny", "transformer.h.0.attn.q_proj.weight", ""),
+            "gpt-neox": ("gpt-neox-tiny", "gpt_neox.layers.0.attention.query_key_value.weight", ""),
+            "modernbert": ("modernbert-tiny", "model.layers.0.attn.Wqkv.weight", "")}
+"""Families whose `prepare` rewrites a tensor before it binds, the one each
+checkpoint ships in FP8 here, and the prefix its names leave out: GPT-2's
+Conv1D qkv, also as the bare GPT2Model stores it without `transformer.`,
+GPT-J's query rows in rotary order, GPT-NeoX's and ModernBERT's fused qkv."""
+
+
+@pytest.mark.parametrize("case", list(PREPARED), ids=list(PREPARED))
+def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its_format(case, tmp_path):
+    """The family's encoder undoes its preparation (GPT-J's reverse rotary
+    order, GPT-2's transpose, fused qkv and nested names) and the format
+    encodes the weights it shipped quantized again: the export holds the
+    source's own tensor names, each the dense export of the same weights
+    with that one tensor in FP8, under the source's config, and Dew reads
+    back the weights its decoded export holds. A source placed on a mesh as
+    it streams, and one loaded as shapes alone for a resume to fill, write
+    the same export of the same weights."""
+    from dew.interop.codecs import source_quantization
+    from dew.training import MeshSpec
+
+    fixture, name, bare = PREPARED[case]
+    tensors = {stored.removeprefix(bare): tensor
+               for stored, tensor in tool.source_tensors(FIXTURES / fixture).items()}
+    config = json.loads((FIXTURES / fixture / "config.json").read_text())
+    plain = dict(config)
+    config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
+    quantization = source_quantization(config)
+    assert quantization is not None
+    source = quantization.requantize(tensors, (name,))
+    save_hf_layout(source, config, tmp_path / "fp8")
+    loaded = Pretrained.load(tmp_path / "fp8", dtype="float32", attention_impl="reference")
+    assert loaded.quantized_tensors == (name,)
+    updated = jax.tree.map(
+        lambda leaf: leaf * 1.03 + 1e-3 if np.issubdtype(leaf.dtype, np.floating) else leaf, loaded.variables)
+
+    loaded.save(tmp_path / "export", variables=updated)
+    for placement, options in (("placed", {"mesh": MeshSpec(fsdp=1)}), ("shapes", {"weights": False})):
+        again = Pretrained.load(tmp_path / "fp8", dtype="float32", attention_impl="reference", **options)
+        assert jax.tree.structure(again.variables) == jax.tree.structure(loaded.variables)
+        again.save(tmp_path / placement, variables=updated)
+        assert_same_stored_tensors(tool.source_tensors(tmp_path / placement),
+                                   tool.source_tensors(tmp_path / "export"))
+    dense = {stored.removeprefix(bare): tensor for stored, tensor in
+             dataclasses.replace(loaded, config=plain, quantized_tensors=()).export(updated).items()}
+    expected = quantization.requantize(dense, (name,))
+    exported = tool.source_tensors(tmp_path / "export")
+    assert json.loads((tmp_path / "export" / "config.json").read_text()) == config
+    assert set(exported) == set(expected) == set(source)
+    for tensor, value in expected.items():
+        assert exported[tensor].dtype == value.dtype, tensor
+        np.testing.assert_array_equal(exported[tensor], value, err_msg=tensor)
+    save_hf_layout({**dense, name: quantization.decode(exported, name)}, plain, tmp_path / "decoded")
+    reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    decoded = Pretrained.load(tmp_path / "decoded", dtype="float32", attention_impl="reference")
+    assert_restores(decoded.model, decoded.variables, reloaded, np.load(FIXTURES / fixture / "input_ids.npy"))
+
+
 def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(tmp_path):
     """A GPT OSS source shipped MXFP4 writes its trained experts back as
     blocks and scales the released reader decodes, and every float tensor
@@ -728,24 +812,32 @@ def test_public_quantized_load_obeys_parameter_storage(tmp_path, kind):
     assert_parameter_storage(masters.variables, native.variables, lambda path: path[0] == "params")
 
 
+@pytest.mark.parametrize("fixture", ["deepseek-v3-tiny", "kimi-k25-tiny"])
 @pytest.mark.parametrize(
     "same_values", [True, False], ids=["equal-before-rounding", "different-before-rounding"]
 )
-def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, same_values):
+def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, fixture, same_values):
+    """An FP8 tied head and its float32 embedding are one tensor only if
+    they hold equal values before narrowing to bfloat16 storage, under the
+    names the source's own family gives them. Kimi K2.5 computes what
+    DeepSeek V3 does and names its head and embedding under
+    `language_model.`."""
     from dew.interop.codecs import E4M3
+    from dew.interop.hf_decoders import families
 
-    fixture = FIXTURES / "deepseek-v3-tiny"
-    tensors = tool.source_tensors(fixture)
-    config = json.loads((fixture / "config.json").read_text())
-    config["tie_word_embeddings"] = True
+    tensors = tool.source_tensors(FIXTURES / fixture)
+    config = json.loads((FIXTURES / fixture / "config.json").read_text())
+    head, embedding = families()[config["model_type"]].tied_head_names
+    for tied in (config, config.get("text_config", {})):
+        tied["tie_word_embeddings"] = True
     config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3",
                                      "weight_block_size": [128, 128]}
-    shape = tensors["model.embed_tokens.weight"].shape
+    shape = tensors[embedding].shape
     decoded = np.float32(1. + 1. / 1024)
     unquantized = decoded if same_values else np.float32(1. + 2. / 1024)
-    tensors["model.embed_tokens.weight"] = np.full(shape, unquantized, np.float32)
-    tensors["lm_head.weight"] = np.ones(shape, dtype=E4M3)
-    tensors["lm_head.weight_scale_inv"] = np.full(
+    tensors[embedding] = np.full(shape, unquantized, np.float32)
+    tensors[head] = np.ones(shape, dtype=E4M3)
+    tensors[f"{head}_scale_inv"] = np.full(
         ((shape[0] + 127) // 128, (shape[1] + 127) // 128), decoded, np.float32)
     for name in tensors:
         if name.startswith("model.layers.") and name.endswith(".embed_tokens.weight"):

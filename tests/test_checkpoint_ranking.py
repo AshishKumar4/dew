@@ -76,15 +76,17 @@ def trainer(path, keep=1):
 
 def test_a_score_object_names_one_recorded_score_live_and_in_a_checkpoint():
     """`best=` and `stop=` read a run's live scores, and a predicate a checkpoint's kept ones, by one
-    rule: a metric is its validation split's, `(split, metric)` that split's and a training scalar
-    the training split's. A metric with no validation score, recorded under another split alone, is
-    refused in both until its split is named, never resolved by guessing which split was meant."""
+    rule: a metric is its validation split's, `(split, metric)` that split's, a training scalar the
+    training split's and a recorded name itself. A metric with no validation score, recorded under
+    another split alone, is refused in both until its split is named, never resolved by guessing
+    which split was meant."""
     objective = Overfit()
     metric, other = Value('value', Shown(better='lower')), Value('other', Shown(better='lower'))
     scores = {'val/value': 1.0, 'test/value': 2.0, 'test/other': 3.0, 'train/loss': 4.0}
     live, kept = MetricScores([metric, other], scores, objective), Metrics(scores)
     for read in (live, kept):
         assert read[metric] == 1.0 and read[('test', metric)] == 2.0 and read[('test', other)] == 3.0
+        assert read['val/value'] == 1.0 and read['test/other'] == 3.0
         assert read[objective.scalars.loss] == 4.0
         with pytest.raises(KeyError):
             read[other]
@@ -107,11 +109,14 @@ def test_default_retains_the_weights_with_lowest_validation_loss(tmp_path):
     assert float(restored['variables']['params']['w']) == pytest.approx(0.488)
 
 
-def test_multiple_directions_and_threshold(tmp_path):
+@pytest.mark.parametrize('by_name', [False, True], ids=['object', 'name'])
+def test_multiple_directions_and_threshold(tmp_path, by_name):
+    """An aggregate score reads a metric by its object or by the name its score is recorded under."""
     metric = Value('accuracy', Shown(better='higher'))
+    key = 'val/accuracy' if by_name else metric
     run = trainer(tmp_path / 'run')
     run.fit(data(), steps=6, log_every=1, eval_every=1, checkpoint_every=6,
-            metrics=[metric], best=[Best(metric, top=2), Best(lambda m: abs(m[metric] - .5), threshold=.1)])
+            metrics=[metric], best=[Best(metric, top=2), Best(lambda m: abs(m[key] - .5), threshold=.1)])
     run.checkpoints.wait()
     assert run.checkpoints.resolve('best:val/accuracy') == 6
     assert run.checkpoints.resolve('best:aggregate:1') == 3
@@ -157,17 +162,54 @@ def test_each_suites_best_policy_ranks_that_suites_instance_of_a_metric_two_suit
     assert run.checkpoints.resolve('best:rare/value') == 1
 
 
-def test_restore_best_without_checkpoints_is_refused_before_training():
-    """The best state restore_best returns is a checkpoint, restored: a trainer that writes none is
-    refused before it trains, rather than handing back its final weights as the best. A best policy
-    alone ranks checkpoints, of which there are none to rank, and the run trains as asked."""
-    metric = Value('value', Shown(better='higher'))
-    unsaved = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0))
-    with pytest.raises(ValueError):
-        unsaved.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric], restore_best=True)
-    state = unsaved.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric], best=metric)
-    assert int(state.step) == 2
+def leaf_values(leaf) -> np.ndarray:
+    """A state leaf's values, a random key's as its key data."""
+    return np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
 
+
+def test_restore_best_without_checkpoints_returns_the_best_state_it_held(tmp_path):
+    """A trainer that writes no checkpoints keeps its best state in host memory as it evaluates, so
+    restore_best returns the state a checkpointed run restores as its best, every leaf of it: by the
+    validation loss, an earlier state than the last, and by a best policy in its own direction."""
+    metric = Value('value', Shown(better='higher'))
+    for name, policy in (('loss', {}), ('value', {'metrics': [metric], 'best': metric})):
+        saved = trainer(tmp_path / name).fit(data(), steps=8, log_every=1, eval_every=1, checkpoint_every=4,
+                                             restore_best=True, **policy)
+        unsaved = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0)).fit(
+            data(), steps=8, log_every=1, eval_every=1, restore_best=True, **policy)
+        assert int(unsaved.step) == int(saved.step) == (3 if name == 'loss' else 8)
+        for left, right in zip(jax.tree.leaves(unsaved), jax.tree.leaves(saved), strict=True):
+            np.testing.assert_array_equal(leaf_values(left), leaf_values(right))
+
+
+def test_restore_best_without_checkpoints_ranks_by_the_training_loss_without_validation(tmp_path):
+    """Without validation a run ranks its states by the training loss, as a checkpointed run's best
+    does, and returns the state that ranked best though a later step ended the run."""
+    stream = dataclasses.replace(data(), val=None)
+    saved = trainer(tmp_path / 'run').fit(stream, steps=8, log_every=1, eval_every=1, checkpoint_every=1,
+                                         restore_best=True)
+    unsaved = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0)).fit(
+        stream, steps=8, log_every=1, eval_every=1, restore_best=True)
+    assert int(unsaved.step) == int(saved.step)
+    for left, right in zip(jax.tree.leaves(unsaved), jax.tree.leaves(saved), strict=True):
+        np.testing.assert_array_equal(leaf_values(left), leaf_values(right))
+
+
+def test_a_held_best_no_evaluation_ranks_ends_the_run_failed():
+    """Without checkpoints, a restore_best whose every evaluation its threshold leaves unranked has
+    no state to return: the trackers hear a failed run, as a checkpointed one's do, not the final
+    state handed back as the best. A validation cadence a training-scalar best reads nothing of is
+    refused, as without restore_best."""
+    metric = Value('value', Shown(better='lower'))
+    tracker = Outcomes()
+    run = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker)
+    with pytest.raises(ValueError):
+        run.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric],
+                best=Best(metric, threshold=-1.0), restore_best=True)
+    assert tracker.ended == ['failed']
+    unread = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0))
+    with pytest.raises(ValueError):
+        unread.fit(data(), steps=2, log_every=1, eval_every=1, best=unread.objective.loss, restore_best=True)
 
 def test_ranked_loss_and_periodic_retention(tmp_path):
     run = trainer(tmp_path / 'run', keep=Keep(latest=1, every=2))

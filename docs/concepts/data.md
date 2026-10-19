@@ -172,7 +172,7 @@ Use a fresh output directory: exports commit immutable shards and a manifest, an
 
 ## Mixtures, objectives and order
 
-`mix(datasets, weights=..., by="records" | "tokens")` mixes accepted records before sharding and ends at its first exhausted member, as Grain's mix does; a member that repeats never ends. A text recipe can name a mapping of token-store URLs to weights; its shares count valid targets, not padding. `Text(phases=(DataPhase(...), ...))` changes mixtures at step boundaries and continues each corpus where its earlier phase stopped.
+`mix(datasets, weights=..., by="records" | "tokens")` mixes accepted records before sharding and ends at its first exhausted member, as Grain's mix does; a member that repeats never ends. A text recipe can name a mapping of token-store URLs to weights; its shares count valid targets, not padding. `TextData(phases=(DataPhase(...), ...))` changes mixtures at step boundaries and continues each corpus where its earlier phase stopped.
 
 ## Token-budget batches
 

@@ -43,8 +43,9 @@ def _ancestral_noise(key: jax.Array, x: jax.Array) -> jax.Array:
 def _ancestral(sigma_t, sigma_s):
     """k-diffusion's `get_ancestral_step` at eta 1: `(sigma_down, sigma_up)`,
     the level a deterministic step goes down to and the fresh noise that
-    brings the marginal back to sigma_s."""
-    sigma_up = (sigma_s ** 2 * (sigma_t ** 2 - sigma_s ** 2) / sigma_t ** 2) ** 0.5
+    brings the marginal back to sigma_s, sigma_up capped at sigma_s as the
+    source caps it."""
+    sigma_up = jnp.minimum(sigma_s, (sigma_s ** 2 * (sigma_t ** 2 - sigma_s ** 2) / sigma_t ** 2) ** 0.5)
     return (sigma_s ** 2 - sigma_up ** 2) ** 0.5, sigma_up
 
 @struct.dataclass

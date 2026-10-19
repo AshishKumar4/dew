@@ -14,7 +14,6 @@ measurement (`measured_fp8_sites`), recorded with the generation it was
 taken on.
 """
 
-import os
 
 import jax
 import jax.numpy as jnp
@@ -26,9 +25,9 @@ from flax import linen as nn
 from flax.traverse_util import flatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
+from process_support import READ_ONLY, fresh, keeping_picks
 from reference_error import assert_leaves_as_exact, float64_terms
 
-from dew import cache
 from dew.data.dataset import Loader
 from dew.interop.codecs import dequantize_fp8_blocks, quantize_fp8_blocks
 from dew.lora import LoRA, unadapted
@@ -79,13 +78,18 @@ def sites(adapter) -> tuple[str, ...]:
     return adapter.model._dew_wrapped._dew_wrapper().frozen_fp8
 
 
-def adapters(model=None):
-    """One adapter over a bf16 base and one over the same base in FP8."""
+def adapters(model=None, generation=None):
+    """One adapter over a bf16 base and one over the same base in FP8, its record measured on
+    `generation` (this process's own by default)."""
     model = decoder() if model is None else model
     variables = model.init(jax.random.key(0), ids())
     spec = LoRA(rank=4, modules=("q_proj", "v_proj"))
     return (spec.apply(model, variables, key=1),
-            spec.apply(model, variables, key=1, fp8_base=record(variables)))
+            spec.apply(model, variables, key=1, fp8_base=record(variables, generation)))
+
+
+ELSEWHERE = "sm90" if device_generation() == "sm80" else "sm80"
+"""A generation other than this process's: an A100's record runs on an H100, anything else's on an A100."""
 
 
 def calls(model, variables, inputs):
@@ -160,11 +164,14 @@ def test_split_over_fsdp_the_frozen_product_is_one_devices():
     assert_products_exact(x, leaves, cotangent, output, pullback(cotangent)[0])
 
 
-def test_every_named_site_computes_from_its_packed_kernel_inside_the_branch():
+@pytest.mark.parametrize("measured_on", [None, ELSEWHERE], ids=["here", "elsewhere"])
+def test_every_named_site_computes_from_its_packed_kernel_inside_the_branch(measured_on):
     """A fresh adapter's branch adds zero (B starts at 0), so each named
     site's output is the frozen product of its own input, the adapted ones
-    included, and every other Dense computes as the bf16 base's does."""
-    plain, fp8 = adapters()
+    included, and every other Dense computes as the bf16 base's does. Where
+    the record's sites were measured is provenance: one measured on another
+    generation computes the same products here."""
+    plain, fp8 = adapters(generation=measured_on)
     seen, base = calls(fp8.model, fp8.variables, ids()), calls(plain.model, plain.variables, ids())
     named = set(sites(fp8))
     assert named and named <= set(seen)
@@ -285,15 +292,6 @@ def test_a_checkpoints_input_quantization_and_an_fp8_base_share_one_wrapper():
     np.testing.assert_array_equal(np.asarray(output), np.asarray(expected.reshape(output.shape)))
 
 
-def test_a_record_runs_on_the_generation_it_was_measured_on_alone():
-    """A record measured on this process's generation runs here, and is refused by name on any
-    other: an A100's record on an H100, anything else's on an A100."""
-    _, fp8 = adapters()
-    jax.eval_shape(lambda: fp8.model.apply(fp8.variables, ids()))
-    with assumed("sm90" if device_generation() == "sm80" else "sm80"), pytest.raises(ValueError):
-        jax.eval_shape(lambda: fp8.model.apply(fp8.variables, ids()))
-
-
 FP8_CORES = gpu_target(device_generation()).fp8_peak is not None
 
 
@@ -314,42 +312,62 @@ def test_a_process_sharing_its_gpu_measures_no_site(monkeypatch):
     from dew import cache
 
     variables = decoder().init(jax.random.key(0), ids())
-    read_only = "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ"
-    flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
-                     if not flag.startswith(("--xla_gpu_experimental_autotune_cache_mode",
-                                             "--xla_gpu_deterministic_ops")))
+    flags = " ".join(flag for flag in keeping_picks().split()
+                     if not flag.startswith(READ_ONLY.split("=")[0]))
     monkeypatch.setenv("XLA_FLAGS", flags)
     assert cache.measures_picks()
-    monkeypatch.setenv("XLA_FLAGS", f"{flags} {read_only}")
+    monkeypatch.setenv("XLA_FLAGS", f"{flags} {READ_ONLY}")
     assert not cache.measures_picks()
     with assumed("sm90"), pytest.raises(ValueError):
         measured_fp8_sites(variables, record(variables).frozen_fp8, 8192)
 
 
+QUALIFY = """
+import json
+import jax
+import jax.numpy as jnp
+import numpy as np
+from dew import cache
+from dew.nn.kernels.generation import device_generation
+from dew.training.quantization import frozen_fp8_leaves, frozen_fp8_product, measured_fp8_sites
+
+if not cache.measures_picks():
+    print(json.dumps(None))
+    raise SystemExit
+variables = {"params": {"wide": {"kernel": jnp.zeros((4096, 12288), jnp.float32)},
+                        "narrow": {"kernel": jnp.zeros((1024, 1024), jnp.float32)}}}
+measured = measured_fp8_sites(variables, ("wide", "narrow"), 8192)
+rng = np.random.default_rng(3)
+leaves = [jnp.asarray(value) for value in
+          frozen_fp8_leaves(rng.standard_normal((4096, 12288)).astype(np.float32) * 0.02).values()]
+
+def step(x, cotangent, *leaves):
+    output, pull = jax.vjp(lambda x: frozen_fp8_product(x, *leaves), x)
+    return output, pull(cotangent.astype(output.dtype))[0]
+
+x = jnp.asarray(rng.standard_normal((8192, 4096)), jnp.bfloat16)
+cotangent = jnp.asarray(rng.standard_normal((8192, 12288)), jnp.bfloat16)
+text = jax.jit(step).lower(x, cotangent, *leaves).compile().as_text()
+print(json.dumps({"sites": list(measured.frozen_fp8), "measured_on": measured.measured_on,
+                  "generation": device_generation(), "fp8_gemms": text.count("__cublas$lt$matmul$f8")}))
+"""
+"""The qualification, run by a process of its own (`fresh`): the suite's deterministic ops keep its
+own process from measuring (`dew.cache.keeps_picks`)."""
+
+
 @pytest.mark.gpu(reason="FP8 tensor cores and cuBLASLt's FP8 GEMM")
 @pytest.mark.skipif(not FP8_CORES, reason="this GPU has no FP8 tensor cores")
-def test_a_wide_site_measures_faster_in_fp8_and_compiles_to_an_fp8_gemm():
+def test_a_wide_site_measures_faster_in_fp8_and_compiles_to_an_fp8_gemm(tmp_path):
     """On a GPU with FP8 tensor cores the wide projection measures faster in
     FP8 and the narrow one does not (H100: 1.47x and 0.70x), and the frozen
     product's forward and input gradient compile to cuBLASLt FP8 GEMMs at
     that width. The packed leaves and the gradient are the step's arguments,
     as a train state's are: XLA folds widened constant codes into a float32
-    GEMM."""
-    if not cache.measures_picks():
-        pytest.skip("measuring and cuBLASLt's FP8 GEMM need the GPU to itself: gpu-run without -n")
-    variables = {"params": {"wide": {"kernel": jnp.zeros((4096, 12288), jnp.float32)},
-                            "narrow": {"kernel": jnp.zeros((1024, 1024), jnp.float32)}}}
-    measured = measured_fp8_sites(variables, ("wide", "narrow"), 8192)
-    assert measured.frozen_fp8 == ("wide",) and measured.measured_on == device_generation()
-    rng = np.random.default_rng(3)
-    leaves = [jnp.asarray(value) for value in
-              frozen_fp8_leaves(rng.standard_normal((4096, 12288)).astype(np.float32) * 0.02).values()]
-
-    def step(x, cotangent, *leaves):
-        output, pull = jax.vjp(lambda x: frozen_fp8_product(x, *leaves), x)
-        return output, pull(cotangent.astype(output.dtype))[0]
-
-    x = jnp.asarray(rng.standard_normal((8192, 4096)), jnp.bfloat16)
-    cotangent = jnp.asarray(rng.standard_normal((8192, 12288)), jnp.bfloat16)
-    text = jax.jit(step).lower(x, cotangent, *leaves).compile().as_text()
-    assert text.count("__cublas$lt$matmul$f8") == 2
+    GEMM. It runs in a process without the suite's deterministic ops, as a
+    run that measures does; a GPU shared with other work (`READ_ONLY`)
+    measures nothing, fairly, and skips."""
+    found = fresh(QUALIFY, cache_dir=tmp_path, flags=keeping_picks())
+    if found is None:
+        pytest.skip("this GPU is shared with other work (gpu-run -n 0.5), where no process measures")
+    assert found["sites"] == ["wide"] and found["measured_on"] == found["generation"]
+    assert found["fp8_gemms"] == 2

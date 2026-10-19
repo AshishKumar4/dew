@@ -15,35 +15,49 @@ set either flag yourself in XLA_FLAGS, your value is kept. If the JAX
 backend has already opened, the flags cannot take effect, and Dew logs a
 warning.
 
-On a machine with an NVIDIA GPU, `import dew` stops with the install that
-fixes it where JAX would run on the CPU: no CUDA build of JAX installed, or
-none this driver runs (docs/installation.md, "Which CUDA build").
-`JAX_PLATFORMS=cpu` asks for the CPU and is not stopped.
-
 `import dew` also makes the JAX user contexts the kernel autotuner and kernel
 choices key traces on (`dew.cache.KERNEL_TUNES`, `KERNEL_PINS`,
 `KERNEL_CHOICES`): JAX makes one only beside no other JAX call, so before any
 thread starts.
+
+`import dew` leaves the process's loggers alone and asks nothing of its
+hardware. Dew's log handler, and the refusal of a machine with an NVIDIA GPU
+whose JAX opened on the CPU, come with the process's setup: `prepare_process`,
+or the first `Trainer.fit` of a program that never called it
+(`dew.training.runtime.ready_process`).
+
+`import dew` marks absl's flags parsed when nothing has parsed them, as
+`absl.app` would: Grain's worker processes read absl flags as they start, and
+a program that never ran `absl.app` would stop them there. A program that
+parses its flags itself, through `absl.app` or `FLAGS(argv)`, still does.
 """
 
 from collections.abc import Callable
 from importlib import import_module
 from typing import TYPE_CHECKING
 
+from absl import flags as _flags
+
 from dew import cache as cache
-from dew.logging import configure as _configure_logging
 from dew.telemetry.devices import (
     divide_exactly as _divide_exactly,
     keep_roundings as _keep_roundings,
-    refuse_cpu_only_jax as _refuse_cpu_only_jax,
     unpartition_gpu_pool as _unpartition_gpu_pool,
 )
 
-_configure_logging()
-_refuse_cpu_only_jax()
 _keep_roundings()
 _divide_exactly()
 _unpartition_gpu_pool()
+
+
+def _parse_absl_flags() -> None:
+    """Mark absl's flags parsed where nothing has parsed them, as `absl.app` would, for Grain,
+    which reads its own flags as it starts worker processes."""
+    if not _flags.FLAGS.is_parsed():
+        _flags.FLAGS.mark_as_parsed()
+
+
+_parse_absl_flags()
 
 if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid

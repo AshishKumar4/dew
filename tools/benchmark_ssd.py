@@ -67,14 +67,13 @@ class BenchmarkConfig:
 
 
 def operands(sequence_length: int, config: BenchmarkConfig):
-    """The scan's operands as `chunk_ssd` chunks them, with the groups already
-    expanded: `x` `[NC, B, C, H, P]` carrying its step, `B` and `C`
-    `[NC, B, C, H, N]`, `A dt` `[NC, B, H, C]` and the state `[B, H, P, N]`."""
-    chunks = sequence_length // config.chunk_size
-    rows = (chunks, config.batch_size, config.chunk_size, config.heads)
+    """The scan's operands as `chunk_ssd` hands them over, with the groups
+    already expanded: `x` `[B, T, H, P]` carrying its step, `B` and `C`
+    `[B, T, H, N]`, `A dt` `[B, T, H]` and the state `[B, H, P, N]`."""
+    rows = (config.batch_size, sequence_length, config.heads)
     keys = jax.random.split(jax.random.key(0), 5)
-    step = jax.nn.softplus(jax.random.normal(keys[3], (*rows[:2], config.heads, rows[2])))
-    decay = -jnp.exp(jax.random.normal(keys[4], (config.heads, 1))) * step
+    step = jax.nn.softplus(jax.random.normal(keys[3], rows))
+    decay = -jnp.exp(jax.random.normal(keys[4], (config.heads,))) * step
     return (jax.random.normal(keys[0], (*rows, config.head_dim), jnp.float32),
             jax.random.normal(keys[1], (*rows, config.state_size), jnp.float32),
             jax.random.normal(keys[2], (*rows, config.state_size), jnp.float32),
@@ -94,10 +93,10 @@ def kernel_platform(config: BenchmarkConfig) -> str:
     return platform
 
 
-def scan_fn(implementation: str, platform: str):
+def scan_fn(implementation: str, platform: str, chunk_size: int):
     if implementation == 'kernel':
-        return lambda *args: ssd_chunk_scan(*args, platform)
-    return xla_chunk_scan
+        return lambda *args: ssd_chunk_scan(*args, chunk_size, platform)
+    return lambda *args: xla_chunk_scan(*args, chunk_size)
 
 
 def failure(error: BaseException) -> str:
@@ -122,7 +121,7 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
     cotangents = tuple(jax.random.normal(key, shape, jnp.float32)
                        for key, shape in zip(jax.random.split(jax.random.key(1)),
                                              (built[0].shape, built[4].shape), strict=True))
-    scan = scan_fn(case['implementation'], platform)
+    scan = scan_fn(case['implementation'], platform, config.chunk_size)
     row = {**case, 'platform': platform,
            'selected': ssd_kernel_runs(config.chunk_size, config.head_dim,
                                        config.state_size, platform, dtype=jnp.float32)}
@@ -153,13 +152,14 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
         if gradients is not None:
             row['forward_backward_ms'] = time_call(gradient)
     if config.parity and case['implementation'] == 'kernel':
-        expected = jax.jit(xla_chunk_scan)(*built)
+        reference = scan_fn('xla', platform, config.chunk_size)
+        expected = jax.jit(reference)(*built)
         row['forward_error'] = largest(scanned, expected)
         row['forward_scale'] = float(jnp.max(jnp.abs(expected[0])))
         if gradients is not None:
             wanted = jax.jit(jax.grad(
-                lambda *a: (jnp.sum(xla_chunk_scan(*a)[0] * cotangents[0])
-                            + jnp.sum(xla_chunk_scan(*a)[1] * cotangents[1])),
+                lambda *a: (jnp.sum(reference(*a)[0] * cotangents[0])
+                            + jnp.sum(reference(*a)[1] * cotangents[1])),
                 argnums=(0, 1, 2, 3, 4)))(*built)
             row['gradient_error'] = largest(gradients, wanted)
             row['gradient_scale'] = float(max(jnp.max(jnp.abs(g)) for g in wanted))

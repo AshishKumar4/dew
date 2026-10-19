@@ -657,6 +657,15 @@ def _neutral(hf_config: Mapping[str, object], field: str) -> bool:
     return value is None or value is False
 
 
+def context_lengths(hf_config: Mapping[str, object]) -> tuple[int, int | None]:
+    """The decode cache's capacity (`CausalTransformer.max_seq_len`), capped at
+    `DEFAULT_MAX_SEQ_LEN`, and the stated context (`max_position_embeddings`, its `context_length`),
+    None where the config states none."""
+    stated = hf_config.get('max_position_embeddings')
+    context = None if stated is None else records.integer(stated, 'max_position_embeddings')
+    return min(context or DEFAULT_MAX_SEQ_LEN, DEFAULT_MAX_SEQ_LEN), context
+
+
 def base_config(hf_config: Mapping[str, object], used: set[str], *,
                  layer_types: tuple[str, ...] | None = None,
                  rope: Ropes | None = None,
@@ -712,6 +721,7 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
                       if 'sliding_attention' in layer_types else None)
 
     kinds = decoder_kinds(layer_types, sliding_window, rope_local_theta, None, None)
+    capacity, context = context_lengths(hf_config)
     config: DecoderFields = native_fields(CausalTransformer)(
         vocab_size=records.integer(hf_config['vocab_size'], 'vocab_size'),
         emb_features=hidden,
@@ -721,9 +731,8 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
         head_dim=head_dim,
         mlp=mapped,
         mlp_features=_mlp_features(hf_config),
-        max_seq_len=min(records.integer(hf_config.get('max_position_embeddings',
-                                             DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
-                           DEFAULT_MAX_SEQ_LEN),
+        max_seq_len=capacity,
+        context_length=context,
         rope_theta=rope_theta,
         layer_types=layer_types,
         kinds={},
@@ -939,6 +948,17 @@ _TRUNK: Mapping[str, tuple[str, ...]] = {
     'model.per_layer_projection_norm.weight': ('per_layer_projection_norm', 'scale'),
 }
 _TRUNK_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in _TRUNK.items()}
+
+
+def dense_modules(layers: int) -> tuple[str, ...]:
+    """The modules of the HF dense decoder schema this codec maps, by name: the
+    trunk's (`_TRUNK`), the head, and in each of `layers` layers the attention and
+    MLP projections, the head norms and the block's norms. A dense HF decoder's
+    state dict holds these modules' tensors."""
+    block = (*(f'{module}.{part}' for module, parts in _PROJECTIONS.items() for part in parts),
+             *(f'self_attn.{norm}' for norm in _HEAD_NORMS), *_PRE_NORMS)
+    return (*dict.fromkeys(name.rsplit('.', 1)[0] for name in _TRUNK), 'lm_head',
+            *(f'model.layers.{layer}.{name}' for layer in range(layers) for name in block))
 # Gemma 4's per-layer residual. Gate and projection are kernels, the post
 # norm is a scale. The values norm carries no weight, so it maps nothing.
 _PER_LAYER_INPUTS = {'per_layer_input_gate': 'kernel', 'per_layer_projection': 'kernel',
@@ -1565,6 +1585,11 @@ class DecoderFamily:
     DeepSeek V4's grouped output projection. A quantized format is undone
     before this, by `Pretrained.load`, which records what it undid for the
     export."""
+    spelling: Callable[[str], str] = field(default=lambda name: name)
+    """The name the family reads a stored tensor under and its encoder writes it
+    under, where a checkpoint may store it as another: a bare GPT2Model leaves
+    out GPT-2's `transformer.`. `prepare` renames by it, and a quantized source
+    is written back under its own names (`Pretrained.export`)."""
     packed: tuple[Packed, ...] = ()
     """Source tensors that hold several the path map reads, split on load and
     packed again on export: fused experts and GPT-2's Conv1D projections."""

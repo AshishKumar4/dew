@@ -28,10 +28,12 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.objectives import Step
-from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig, TextCondition
+from dew.objectives.diffusion import Alignment, DiffusionObjective, DiffusionRunConfig, TextCondition
+from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, TUNED_WEIGHTS, EndToEnd
 from dew.objectives.rl.flow import FlowGRPOObjective
 from dew.registry import to_record
-from dew.sampling import Euler
+from dew.sampling import Euler, TextToImage
+from dew.sampling.pipelines import ImageSettings
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -63,7 +65,11 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
     """The run trains the pipeline's own transformer under its own text
     conditioning, and a saved tree rebuilds over the directory's metadata
     alone: the rebuilt objective scores the trained weights exactly, from a
-    copy of the pipeline with every weight file deleted."""
+    copy of the pipeline with every weight file deleted. Rebound over the
+    published pipeline, the tree exports through the layouts its source's
+    headers give, which are the loaded source's own, and reloads leaf for
+    leaf; the copy without weight files has none to export through, and its
+    save writes nothing."""
     directory = pipelines / family / "pipeline"
     size = 16 if family != "qwen_image" else 32
     config = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
@@ -88,6 +94,221 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
     rebuilt = dataclasses.replace(config, pretrained=str(metadata)).build(variables=state.variables)
     assert value(rebuilt, state.variables, batch) == trained
 
+    # The saved tree rebound over the published pipeline writes its trained
+    # weights back by the layouts the source's headers give, and the tensors
+    # no leaf holds (Qwen-Image's vision tower) as the source stores them.
+    from dew.interop.pretrained import load_diffusion_source
+    from dew.interop.safetensors_io import read_weights
+
+    def rebound(source: Path):
+        return load_diffusion_source(str(source), dtype="float32", attention_impl="xla", size=(size, size),
+                                     variables=state.variables)
+
+    with pytest.raises(ValueError):
+        rebound(metadata).save(tmp_path / "refused")
+    assert not (tmp_path / "refused").exists()
+    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla",
+                                      size=(size, size))
+    pipeline = rebound(directory)
+    assert sorted(pipeline.weight_layouts, key=lambda layout: layout.name) == sorted(
+        published.weight_layouts, key=lambda layout: layout.name)
+    pipeline.save(tmp_path / "export")
+    again = load_diffusion_source(str(tmp_path / "export"), dtype="float32", attention_impl="xla",
+                                  size=(size, size))
+    assert jax.tree.structure(again.variables) == jax.tree.structure(pipeline.variables)
+    for ours, theirs in zip(jax.tree.leaves(again.variables), jax.tree.leaves(pipeline.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    assert set(pipeline.retained_tensors) == set(published.retained_tensors)
+    for name in published.retained_tensors:
+        component, _, stored = name.partition("/")
+        written, source = (read_weights(root / component)[stored]
+                           for root in (tmp_path / "export", directory))
+        assert written.dtype == source.dtype and written.tobytes() == source.tobytes(), name
+
+
+_OFFLINE_REBIND = """
+import json, sys
+from dew.interop.pretrained import load_diffusion_source
+
+published = load_diffusion_source(sys.argv[1], dtype="float32", attention_impl="xla", size=(16, 16))
+pipeline = load_diffusion_source("dew/flux-tiny", dtype="float32", attention_impl="xla", size=(16, 16),
+                                 variables=published.variables)
+try:
+    pipeline.save(sys.argv[2])
+except ValueError as refused:
+    print(json.dumps({"saved": False, "refused": str(refused)}))
+else:
+    print(json.dumps({"saved": True}))
+"""
+
+
+@pytest.mark.parametrize("cached", ["whole", "metadata"])
+def test_a_pipeline_rebinds_saved_variables_offline_and_exports_them_by_the_headers_it_holds(
+        pipelines, tmp_path, cached):
+    """A saved tree rebound over a Hub pipeline needs no Hub request: offline, over a cache
+    holding the whole pipeline at one commit, it binds and exports by the headers of the files
+    the cache holds, and the export reloads leaf for leaf; over a cache holding the commit's
+    listing and configs but no weight file, it binds, and its export, which has no header to
+    write by, refuses and writes nothing."""
+    import os
+    import subprocess
+    import sys
+
+    from interop_support import hub_cache
+
+    from dew.interop.pretrained import load_diffusion_source
+
+    directory = pipelines / "flux" / "pipeline"
+    commit = hub_cache(tmp_path / "hub", "dew/flux-tiny", directory)
+    snapshot = tmp_path / "hub" / "models--dew--flux-tiny" / "snapshots" / commit
+    if cached == "metadata":
+        for weights in snapshot.rglob("*.safetensors"):
+            weights.unlink()
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1",
+           "DEW_HUB_ANSWERS": str(tmp_path / "answers"),
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    done = subprocess.run([sys.executable, "-c", _OFFLINE_REBIND, str(directory), str(tmp_path / "export")],
+                          env=env, check=False, capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr[-3000:]
+    [outcome] = [json.loads(line) for line in done.stdout.split("\n") if line.startswith("{")]
+    assert outcome["saved"] == (cached == "whole"), outcome
+    if cached == "metadata":
+        assert not (tmp_path / "export").exists()
+        return
+    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(16, 16))
+    again = load_diffusion_source(str(tmp_path / "export"), dtype="float32", attention_impl="xla",
+                                  size=(16, 16))
+    assert jax.tree.structure(again.variables) == jax.tree.structure(published.variables)
+    for ours, theirs in zip(jax.tree.leaves(again.variables), jax.tree.leaves(published.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
+def test_a_pipeline_rebinds_over_a_sharded_copy_without_its_shards(pipelines, tmp_path):
+    """A local copy of a pipeline whose transformer is sharded behind its index, with the shards
+    deleted, rebinds a saved tree from its metadata alone, as it does unsharded, and its save,
+    with no header to write by, refuses and writes nothing."""
+    from dew.interop.pretrained import load_diffusion_source
+    from dew.interop.safetensors_io import read_weights, save_sharded
+
+    copy = tmp_path / "sharded"
+    shutil.copytree(pipelines / "flux" / "pipeline", copy)
+    weights = read_weights(copy / "transformer")
+    for stored in (copy / "transformer").glob("*.safetensors"):
+        stored.unlink()
+    save_sharded(weights, copy / "transformer", "20KB", stem="diffusion_pytorch_model")
+    assert len(list((copy / "transformer").glob("*.safetensors"))) > 1
+    published = load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16))
+    for stored in copy.rglob("*.safetensors"):
+        stored.unlink()
+    rebound = load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16),
+                                    variables=published.variables)
+    for ours, theirs in zip(jax.tree.leaves(rebound.variables), jax.tree.leaves(published.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    with pytest.raises(ValueError):
+        rebound.save(tmp_path / "refused")
+    assert not (tmp_path / "refused").exists()
+
+
+_HUB_PIPELINE = ("hf-internal-testing/tiny-flux-pipe", "a98bc4ec6a80c47c477ed22d7e81c79872d9c723")
+
+_ONLINE_PUBLISHED = """
+import sys
+import jax, numpy as np
+from flax import serialization
+from dew.interop.pretrained import load_diffusion_source
+
+published = load_diffusion_source(sys.argv[1], revision=sys.argv[2], dtype="float32", attention_impl="xla",
+                                  size=(16, 16))
+open(sys.argv[3], "wb").write(serialization.msgpack_serialize(jax.tree.map(np.asarray, published.variables)))
+"""
+
+_REBOUND = """
+import json, sys
+from flax import serialization
+from dew.interop.pretrained import load_diffusion_source
+
+variables = serialization.msgpack_restore(open(sys.argv[3], "rb").read())
+pipeline = load_diffusion_source(sys.argv[1], revision=sys.argv[2], dtype="float32", attention_impl="xla",
+                                 size=(16, 16), variables=variables)
+pipeline.save(sys.argv[4])
+print(json.dumps({"saved": True}))
+"""
+
+
+@pytest.mark.network
+def test_a_hub_pipeline_rebound_online_exports_offline_from_its_recorded_headers(tmp_path):
+    """A saved tree rebound over a Hub pipeline whose weights it never downloads reads the
+    export's headers and file listing over HTTP and records them (`hub_answer`); an offline
+    process over a cache of the same commit's metadata alone then rebinds and exports by those
+    records, and the export reloads leaf for leaf as the published pipeline."""
+    import os
+    import subprocess
+    import sys
+
+    from dew.interop.pretrained import load_diffusion_source
+
+    repo, revision = _HUB_PIPELINE
+    src = str(Path(__file__).resolve().parents[1] / "src")
+
+    def run(script, cache, *arguments, offline=False):
+        env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / cache), "PYTHONPATH": src,
+               "DEW_HUB_ANSWERS": str(tmp_path / "answers"), "HF_HUB_OFFLINE": "1" if offline else "0"}
+        done = subprocess.run([sys.executable, "-c", script, repo, revision, *map(str, arguments)], env=env,
+                              check=False, capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr[-3000:]
+
+    run(_ONLINE_PUBLISHED, "whole", tmp_path / "variables.msgpack")
+    run(_REBOUND, "metadata", tmp_path / "variables.msgpack", tmp_path / "online")
+    assert not list((tmp_path / "metadata").rglob("*.safetensors"))
+    run(_REBOUND, "metadata", tmp_path / "variables.msgpack", tmp_path / "offline", offline=True)
+    published = load_diffusion_source(repo, revision=revision, dtype="float32", attention_impl="xla",
+                                      size=(16, 16))
+    again = load_diffusion_source(str(tmp_path / "offline"), dtype="float32", attention_impl="xla",
+                                  size=(16, 16))
+    assert jax.tree.structure(again.variables) == jax.tree.structure(published.variables)
+    for ours, theirs in zip(jax.tree.leaves(again.variables), jax.tree.leaves(published.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
+def test_a_pretrained_pipeline_trains_its_autoencoder_end_to_end(pipelines, tmp_path):
+    """A recipe trains the loaded KL posterior and denoiser and publishes the tuned autoencoder,
+    and the trained tree rebuilds over the pipeline's metadata alone, scoring as the run did."""
+    with tarfile.open(FIXTURES / "rae.tar.xz") as archive:
+        archive.extractall(tmp_path / "representation", filter="data")
+    alignment = Alignment("proj_out", source=str(tmp_path / "representation" / "dinov2_plain"),
+                          resolution=56, width=8)
+    config = DiffusionRunConfig(
+        pretrained=str(pipelines / "sd3" / "pipeline"), preset=None, model=precision(), val_metrics=(),
+        data=ImageData(source="tfds://oxford_flowers102", image_size=16),
+        objective=ObjectiveConfig("diffusion", {
+            "solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None,
+            "alignment": alignment, "end_to_end": EndToEnd(perceptual_weight=0., discriminator_weight=0.)}))
+    objective = config.build()
+    batch = batch_for(objective, 16)
+    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(3))
+    initial = trainer.initial_state()
+    before = jax.tree.map(np.asarray, initial.variables)
+    trained, _, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
+    assert bool(accepted) and int(trained.updates) == 1
+    for name in (AUTOENCODER, "proj_out"):
+        assert any(not np.array_equal(start, end) for start, end in zip(
+            jax.tree.leaves(before["params"][name]),
+            jax.tree.leaves(trained.variables["params"][name]), strict=True))
+    assert not np.array_equal(before[LATENT_STATS]["mean"], trained.variables[LATENT_STATS]["mean"])
+    task = TextToImage.from_objective(objective, trained.variables)
+    for actual, expected in zip(jax.tree.leaves(task.variables["autoencoder"][TUNED_WEIGHTS]),
+                                 jax.tree.leaves(trained.variables["params"][AUTOENCODER]), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+    metadata = tmp_path / "metadata"
+    shutil.copytree(pipelines / "sd3" / "pipeline", metadata, ignore=shutil.ignore_patterns("*.safetensors"))
+    rebuilt = dataclasses.replace(config, pretrained=str(metadata)).build(variables=trained.variables)
+    assert value(rebuilt, trained.variables, batch) == value(objective, trained.variables, batch)
+
 
 @pytest.mark.parametrize("family", ["sd3", "flux", "qwen_image"])
 def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelines):
@@ -99,7 +320,8 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     same initial variables, so both score a batch alike, through the VAE
     and the text towers. The loss the two share is held to Diffusers'
     train_dreambooth_flux.py statements on matched draws in
-    tests/test_flow_matching.py (ad63cc6a)."""
+    tests/test_flow_matching.py (ad63cc6a). Both sample by the same policy, the
+    pipeline's own grid and finish too."""
     from dew.interop.pretrained import load_diffusion_source
 
     directory = pipelines / family / "pipeline"
@@ -114,6 +336,9 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     written = DiffusionObjective(source, solver=Euler(), steps=2, **settings)
     assert configured.model == written.model
     assert to_record(configured.process, Process) == to_record(written.process, Process)
+    # The sampling policy a saved run records: the pipeline's grid and finish among it.
+    assert (to_record(configured.task_settings(), ImageSettings)
+            == to_record(written.task_settings(), ImageSettings))
     assert type(configured.autoencoder) is type(written.autoencoder)
     assert configured.inputs.sample == written.inputs.sample
     assert configured.inputs.conditions.keys() == written.inputs.conditions.keys()
@@ -331,3 +556,24 @@ def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     assert any(not np.array_equal(np.asarray(got), before)
                for got, before in zip(restored, started, strict=True))
+
+
+def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipelines):
+    """Flow-GRPO built over a loaded flow pipeline directly, its solver, steps and guidance given and
+    its grid left out, samples its evaluation and published task on the pipeline's own grid, as the
+    denoising objective over it does; `grid=None` asks for the training process's times."""
+    from dew.interop.pretrained import load_diffusion_source
+
+    source = load_diffusion_source(str(pipelines / "sd3" / "pipeline"), dtype="float32",
+                                   attention_impl="xla", size=(16, 16))
+    settings = {"reward": "psnr", "groups": 2, "rollout_steps": 3, "solver": Euler(), "guidance": None,
+                "steps": 2}
+    grpo = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
+                             variables=source.variables, **settings)
+    plain = DiffusionObjective(source, solver=Euler(), guidance=None, steps=2)
+    assert grpo.grid is not None and plain.grid is not None
+    assert to_record(grpo.grid, type(grpo.grid)) == to_record(plain.grid, type(plain.grid))
+    assert grpo.final_denoise is False
+    unset = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
+                              variables=source.variables, grid=None, **settings)
+    assert unset.grid is None and unset.final_denoise is True

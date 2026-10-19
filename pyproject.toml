@@ -30,6 +30,8 @@ dependencies = [
     # take the build through constraints.txt. A bump runs the GPU checks
     # docs/installation.md lists under "Bumping JAX" first: CI is CPU-only.
     "jax>=0.11.2,<0.11.3",
+    # dew.training.runtime reads whether jax is that build, a post-release.
+    "packaging",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
@@ -37,8 +39,8 @@ dependencies = [
     # dew.data.images decodes, resizes and jitters every image record with it.
     "opencv-python-headless",
     "einops",
-    # dew.data.dataset reads grain's private _PROCESS_KILL_TIMEOUT_S for its
-    # close budget; 0.2.18 is the release that was tested.
+    # dew.data.dataset's close budget holds grain's worker kill timeout
+    # (GRAIN_KILL_SECONDS); 0.2.18 is the release that was tested.
     "grain>=0.2.18,<0.3",
     # dew.training.display: the live training display. flax already depends
     # on rich, so this names a package every install has; 13 has the
@@ -93,9 +95,9 @@ dew = "dew.cli.main:main"
 # FlashAttention-2 (kernels/flash_attn), which attention_impl 'auto' runs on an
 # A100 or an Ada GPU; its wheels are built for Linux x86_64 alone.
 cuda12 = ["jax[cuda12]",
-          "dew-flash-attn-cu12~=0.3.3; sys_platform == 'linux' and platform_machine == 'x86_64'"]
+          "dew-flash-attn-cu12~=0.3.4; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 cuda13 = ["jax[cuda13]",
-          "dew-flash-attn-cu13~=0.3.3; sys_platform == 'linux' and platform_machine == 'x86_64'"]
+          "dew-flash-attn-cu13~=0.3.4; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 tpu = ["libtpu==0.0.48.*", "requests"]
 # dew.telemetry.profile reads XProf's native converters, the same in 2.23.1
 # and 2.23.2. xprof 2.23.2 declares setuptools<70.0.0, which torch>=2.13's
@@ -184,8 +186,10 @@ mlflow = ["mlflow"]
 tensorboard = ["tensorboard"]
 # optuna_search: the sampler behind dew.config.sweep's Optuna backend.
 hpo = ["optuna"]
-# Online URL-streaming loader (HF datasets-backed)
-streaming = ["datasets"]
+# Online URL-streaming loader (HF datasets-backed). 5.0.1 is the release the suite passes on; 4.8.5,
+# Colab's, caps fsspec at 2026.2, below the 2026.6 the base needs, and unbounded pip backtracks from
+# it to datasets 1.6.2, whose metadata it can't read.
+streaming = ["datasets>=5.0.1"]
 # The live site's container (site/live/container/setup-managed.sh), beside the streaming and profile
 # extras: its bridge's WebSocket release, the kernel gateway and IPython kernel its contexts run, and
 # ipywidgets, without which tqdm warns in a kernel that it falls back to text bars. The test extra
