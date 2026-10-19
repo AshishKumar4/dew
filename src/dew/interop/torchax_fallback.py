@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import fnmatch
+import functools
 import importlib.metadata
 import json
 import warnings
@@ -49,6 +50,7 @@ from dew.training.distributed import Layout
 
 if TYPE_CHECKING:
     import torch
+    from jax.extend.core import ClosedJaxpr
     from torchax.interop import JittableModule
     from transformers import PreTrainedModel
 
@@ -137,18 +139,28 @@ class TorchGraph:
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None
                  ) -> tuple[jax.Array, jax.Array]:
-        """The logits and the output head's input states for `tokens`."""
+        """The logits and the output head's input states for `tokens`. Each
+        broadcast of a value narrower than fp32 sums its gradient in fp32
+        (`_accumulating`), as torch's reduction of a broadcast's gradient does."""
         import torchax
 
         env = torchax.default_env()
         draws = _Draws()
-        arguments = env.j2t_iso((dict(params), dict(buffers), tokens))
-        self.module.train(train)
-        try:
-            with env, env.override_property(prng=key) if key is not None else contextlib.nullcontext(), draws:
-                outputs = self.module.functional_call(_forward, *arguments)
-        finally:
-            self.module.eval()
+
+        def forward(params, buffers, tokens, key):
+            arguments = env.j2t_iso((dict(params), dict(buffers), tokens))
+            self.module.train(train)
+            try:
+                with (env, env.override_property(prng=key) if key is not None else contextlib.nullcontext(),
+                      draws):
+                    return env.t2j_iso(self.module.functional_call(_forward, *arguments))
+            finally:
+                self.module.eval()
+
+        arguments = (dict(params), dict(buffers), tokens, key)
+        traced, shapes = jax.make_jaxpr(forward, return_shape=True)(*arguments)
+        logits, hidden = jax.tree.unflatten(jax.tree.structure(shapes),
+                                            _accumulating(traced, *jax.tree.leaves(arguments)))
         if draws.host:
             raise ValueError(
                 f"fallback='torchax' traces this model's training forward once, and it draws on the host "
@@ -156,7 +168,6 @@ class TorchGraph:
                 f"that rate to 0 in its config, or train a family Dew loads natively")
         if draws.device and key is None:
             raise ValueError("this model's training forward draws (dropout) and was given no 'dropout' rng")
-        logits, hidden = env.t2j_iso(outputs)
         return logits, hidden
 
     def export(self, model: nn.Module, variables: Mapping[str, object],
@@ -198,6 +209,66 @@ def _Draws():
             return tensor
 
     return Draws()
+
+
+def _accumulating(closed: ClosedJaxpr, *arguments: jax.Array) -> list[jax.Array]:
+    """`closed` evaluated on `arguments` with each broadcast of a floating
+    value narrower than fp32 summing its gradient in fp32 (`_accumulated`),
+    a jit's body inlined so its broadcasts are found too. jax transposes a
+    broadcast into a sum in the broadcast value's own dtype
+    (jax-ml/jax#30310), where torch's autograd reduces a bf16 gradient in
+    fp32 and rounds the sum once, so a norm weight's gradient summed in bf16
+    sat 2.3-2.8 times further from float64 than torch's."""
+    from jax.extend.core import Literal
+    from jax.extend.core.primitives import broadcast_in_dim_p, jit_p
+
+    def evaluate(jaxpr, consts, values):
+        held = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, values, strict=True))
+
+        def read(var):
+            return var.val if isinstance(var, Literal) else held[var]
+
+        for equation in jaxpr.eqns:
+            inputs = [read(var) for var in equation.invars]
+            if equation.primitive is jit_p:
+                inner = equation.params["jaxpr"]
+                outputs = evaluate(inner.jaxpr, inner.consts, inputs)
+            elif equation.primitive is broadcast_in_dim_p and _narrow_float(inputs[0]):
+                outputs = [_accumulated(inputs[0], tuple(equation.params["shape"]),
+                                        tuple(equation.params["broadcast_dimensions"]))]
+            else:
+                functions, params = equation.primitive.get_bind_params(equation.params)
+                outputs = equation.primitive.bind(*functions, *inputs, **params)
+                outputs = outputs if equation.primitive.multiple_results else [outputs]
+            held.update(zip(equation.outvars, outputs, strict=True))
+        return [read(var) for var in jaxpr.outvars]
+
+    return evaluate(closed.jaxpr, closed.consts, arguments)
+
+
+def _narrow_float(value) -> bool:
+    """Whether `value` is a floating array narrower than fp32."""
+    dtype = jnp.result_type(value)
+    return jnp.issubdtype(dtype, jnp.floating) and jnp.finfo(dtype).bits < 32
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2))
+def _accumulated(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...]) -> jax.Array:
+    """`jax.lax.broadcast_in_dim`, whose gradient sums in fp32 and rounds once to `value`'s dtype."""
+    return jax.lax.broadcast_in_dim(value, shape, dimensions)
+
+
+def _accumulated_forward(value, shape, dimensions):
+    return _accumulated(value, shape, dimensions), value
+
+
+def _accumulated_backward(shape, dimensions, value, cotangent):
+    _, transpose = jax.vjp(lambda wide: jax.lax.broadcast_in_dim(wide, shape, dimensions),
+                           value.astype(jnp.float32))
+    return (transpose(cotangent.astype(jnp.float32))[0].astype(value.dtype),)
+
+
+_accumulated.defvjp(_accumulated_forward, _accumulated_backward)
 
 
 def _forward(model: PreTrainedModel, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
