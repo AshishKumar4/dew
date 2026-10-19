@@ -225,8 +225,10 @@ def _compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     wide = values.astype(jnp.promote_types(values.dtype, jnp.float32))
     zero = jnp.zeros((), wide.dtype)
     hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), compensated_add, axes)
-    # A non-finite sum is the plain one, as `jnp.sum`'s is: an infinity's residual is inf - inf.
-    return jnp.where(jnp.isfinite(hi), hi + lo, hi).astype(values.dtype)
+    # A sum that reaches an infinity is the plain one, +-inf or NaN as `jnp.sum`'s is, where every
+    # residual past the infinity is inf - inf.
+    plain = jnp.sum(wide, axes)
+    return jnp.where(jnp.isfinite(plain), hi + lo, plain).astype(values.dtype)
 
 
 @_compensated_sum.defjvp
