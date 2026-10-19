@@ -106,6 +106,26 @@ def test_a_routed_mixer_replays_the_record_as_a_routed_feedforward_does():
     np.testing.assert_array_equal(replayed, recorded)
 
 
+def test_gpt_oss_experts_in_a_mixer_slot_replay_the_record():
+    """GPT OSS's experts, which a mixture builds under swigluoai (`Mixture.build`), replay a record
+    in a mixer's slot as in a feed-forward's: two records score the tokens differently, where a
+    slot that dropped the record would run the router's own experts for both."""
+    model = CausalTransformer(
+        vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=2, num_kv_heads=1, mlp_features=0,
+        max_seq_len=SEQ_LEN, layer_types=("moe", "full_attention"),
+        kinds={"moe": LayerKind(mixer=MLPMixer(intermediate_size=32, activation="swigluoai",
+                                               mixture=Mixture(experts=EXPERTS, top_k=TOP_K)))})
+    obj = LMObjective(model, SEQ_LEN)
+    params = obj.init(jax.random.key(0))
+    tokens = tokens_of(2)
+    first, second = (np.broadcast_to(np.asarray(experts, np.uint8), (2, SEQ_LEN, TOP_K))
+                     for experts in ((0, 1), (2, 3)))
+    first_scores, second_scores = (
+        np.asarray(replayed_log_probs(obj, params, tokens, (engine_layout({0: record}, 2)[:, :, :2], None)))
+        for record in (first, second))
+    assert not np.array_equal(first_scores, second_scores)
+
+
 def test_replaying_a_forwards_own_routing_changes_nothing():
     obj = objective(scan=True)
     params = obj.init(jax.random.key(0))
