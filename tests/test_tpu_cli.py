@@ -57,24 +57,9 @@ if group != ["compute", "tpus", "tpu-vm"]:
     die("the fake does not know " + " ".join(argv))
 
 if verb == "list":
-    print(json.dumps(state.get("listing", {}).get(flag("zone"), [])))
-    raise SystemExit(0)
-
-if verb == "describe":
-    node = state["nodes"].get(argv[4])
-    if node is None or node["zone"] != flag("zone"):
-        die("NOT_FOUND: the fake has no such node")
-    if "--format=json" not in argv:
-        print(argv[4])
-        raise SystemExit(0)
-    states = node.get("states")
-    if states:
-        # Each describe sees the next state, and stays on the last one.
-        node["payload"]["state"] = states[0]
-        if len(states) > 1:
-            node["states"] = states[1:]
-            json.dump(state, open(os.environ["DEW_FAKE_STATE"], "w"))
-    print(json.dumps(node["payload"]))
+    listed = state.get("listing", {}).get(flag("zone"), [])
+    listed += [node["payload"] for node in state["nodes"].values() if node["zone"] == flag("zone")]
+    print(json.dumps(listed))
     raise SystemExit(0)
 
 if verb == "ssh":
@@ -133,7 +118,7 @@ class Fake:
         self.state_path.write_text(json.dumps(self.state))
 
     def offer(self, name: str, zone: str, payload: dict = NODE, **extra) -> None:
-        """Tell the fake that a TPU exists, and what describe should answer."""
+        """Tell the fake that a TPU exists, and what its zone's listing should hold of it."""
         node = dict(zone=zone, payload=json.loads(json.dumps(payload)), **extra)
         node["payload"]["name"] = f"projects/my-project/locations/{zone}/nodes/{name}"
         self.state["nodes"][name] = node
@@ -242,10 +227,10 @@ def test_stop_then_start(fake):
         "compute", "tpus", "tpu-vm", "stop", "slice", "--zone=us-central2-b")]
     assert only(fake.gcloud_calls(), "start") == [gcloud(
         "compute", "tpus", "tpu-vm", "start", "slice", "--zone=us-central2-b")]
-    # Each command confirms where the TPU is with a describe, and start waits
-    # for READY afterwards.
+    # Each command confirms where the TPU is in its zone's listing, and start
+    # waits for READY afterwards.
     assert [call[3] for call in fake.gcloud_calls()] == [
-        "describe", "stop", "describe", "start", "describe"]
+        "list", "stop", "list", "start", "list"]
 
 
 # ------------------------------------------------------------------------ access
@@ -357,12 +342,12 @@ def test_a_worker_installs_dew_with_its_tpu_extra_in_one_resolution(tmp_path, so
 def test_zone_search_follows_the_configured_order_and_caches(fake):
     fake.offer("slice", "europe-west4-a")
     assert run("describe", "slice") == 0
-    assert zones_seen(fake.gcloud_calls(), "describe") == [
+    assert zones_seen(fake.gcloud_calls(), "list") == [
         "us-central2-b", "europe-west4-a", "europe-west4-a"]
     assert json.loads((config_dir() / "zones.json").read_text()) == {"slice": "europe-west4-a"}
     fake.calls_path.unlink()
     assert run("describe", "slice") == 0
-    assert zones_seen(fake.gcloud_calls(), "describe") == [
+    assert zones_seen(fake.gcloud_calls(), "list") == [
         "europe-west4-a", "europe-west4-a"]
 
 
@@ -373,16 +358,28 @@ def test_a_cached_zone_that_stopped_answering_is_replaced(fake):
     tpu_config.cache_zone("slice", "us-east1-d")
     fake.offer("slice", "europe-west4-a")
     assert run("describe", "slice") == 0
-    assert zones_seen(fake.gcloud_calls(), "describe") == [
+    assert zones_seen(fake.gcloud_calls(), "list") == [
         "us-east1-d", "us-central2-b", "europe-west4-a", "europe-west4-a"]
     assert json.loads((config_dir() / "zones.json").read_text()) == {
         "slice": "europe-west4-a"}
 
 
+@pytest.mark.parametrize("command", [("list",), ("describe", "slice"),
+                                     ("describe", "slice", "--zone", "us-east1-d")])
+def test_a_gcloud_that_fails_stops_the_command(fake, command):
+    """gcloud failing (an expired login, a missing permission) stops the command, not an answer of
+    nothing there: no TPUs listed and success, or a TPU in none of the zones, or one not yet READY."""
+    fake.offer("slice", "us-east1-d")
+    fake.fail_on("list")
+    with pytest.raises(SystemExit) as stopped:
+        run(*command)
+    assert stopped.value.code not in (0, None)
+
+
 def test_the_zone_flag_skips_the_search_and_is_not_cached(fake):
     fake.offer("slice", "us-east1-d")
     assert run("describe", "slice", "--zone", "us-east1-d") == 0
-    assert zones_seen(fake.gcloud_calls(), "describe") == ["us-east1-d"]
+    assert zones_seen(fake.gcloud_calls(), "list") == ["us-east1-d"]
     # An unverified flag must not decide where later commands look.
     assert not (config_dir() / "zones.json").exists()
 
@@ -460,3 +457,39 @@ def test_zone_cache_readers_never_observe_partial_writes(tmp_path, monkeypatch):
                 for worker in range(4) for index in range(24)}
     expected["stable"] = "us-east1-d"
     assert json.loads((directory / "zones.json").read_text()) == expected
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.parametrize("mounted", [True, False])
+def test_the_disk_script_opens_and_records_the_mount_once_the_disk_is_mounted(tmp_path, mounted, read_only):
+    """The attached disk's script (a VM's boot, and attach-disk on every worker) mounts the disk, then
+    opens the mount to every user and names it in fstab; a disk attached read-only, which several
+    workers share, it mounts read-only and leaves as it is. A disk that does not mount fails the
+    script before either, so nothing writes to the boot disk's directory as though it were the disk.
+    The system's tools are stood in for on PATH, as no test runs as a TPU VM's root."""
+    import shutil
+    import subprocess
+
+    from dew.cli import tpu_setup
+
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    calls = tmp_path / "calls"
+    answers = {"mkdir": 0, "mountpoint": 1, "mount": 0 if mounted else 32, "chmod": 0, "grep": 0}
+    for name, code in answers.items():
+        (tools / name).write_text(f'#!/bin/sh\necho "{name} $*" >> {calls}\nexit {code}\n')
+        (tools / name).chmod(0o755)
+    shell = shutil.which("bash")
+    assert shell is not None
+    done = subprocess.run([shell, "-c", tpu_setup.disk_startup_script(read_only)], env={"PATH": str(tools)},
+                          capture_output=True, text=True)
+    ran = calls.read_text().splitlines()
+    mount = "mount -o ro /dev/sdb /mnt/persist" if read_only else "mount /dev/sdb /mnt/persist"
+    if mounted:
+        assert done.returncode == 0, done.stderr
+        assert [line.split()[0] for line in ran] == ["mkdir", "mountpoint", "mount",
+                                                     *(() if read_only else ("chmod",)), "grep"]
+        assert mount in ran
+    else:
+        assert done.returncode == 32
+        assert [line.split()[0] for line in ran] == ["mkdir", "mountpoint", "mount"]

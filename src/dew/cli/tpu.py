@@ -26,9 +26,6 @@ from dew.cli import config, ssh_config, tpu_setup
 from dew.cli.gcloud import Gcloud, Node, Tpu, emit, exit_code
 
 #: States a create never recovers from.
-DEAD_STATES = frozenset({"TERMINATED", "PREEMPTED", "DELETING"})
-READY_TIMEOUT = 1800
-POLL_SECONDS = 10
 
 #: What a job name may contain: it is a directory under ~/dew-runs.
 JOB_NAME = re.compile(r"[A-Za-z0-9._-]+")
@@ -117,10 +114,7 @@ def _zone(gcloud: Gcloud, cfg: config.TpuConfig, name: str, wanted: str | None) 
         return cached or cfg.zones[0]
     order = cfg.zones if not cached else (cached, *(z for z in cfg.zones if z != cached))
     for zone in order:
-        found = gcloud.run(gcloud.argv(
-            "compute", "tpus", "tpu-vm", "describe", name,
-            f"--zone={zone}", "--format=value(name)"))
-        if found.ok:
+        if any(node.name == name for node in gcloud.nodes(zone)):
             config.cache_zone(name, zone)
             return zone
     config.forget_zone(name)
@@ -191,24 +185,6 @@ def _worker_table(node: Node | None) -> None:
         (str(index), internal, node.ips[index] if index < len(node.ips) else "-")
         for index, internal in enumerate(node.internal_ips)
     ])
-
-
-def _wait_ready(tpu: Tpu) -> Node | None:
-    """Poll until the TPU answers READY. Returns the node it saw."""
-    if tpu.gcloud.dry_run:
-        return None
-    deadline = time.monotonic() + READY_TIMEOUT
-    while True:
-        node = tpu.describe()
-        state = node.state if node else "PENDING"
-        if state == "READY":
-            return node
-        if state in DEAD_STATES:
-            raise SystemExit(f"{tpu.name} is {state}")
-        if time.monotonic() >= deadline:
-            raise SystemExit(f"{tpu.name} is still {state} after {READY_TIMEOUT}s")
-        emit(f"{tpu.name} is {state}")
-        time.sleep(POLL_SECONDS)
 
 
 def _git_root() -> Path:
@@ -378,7 +354,7 @@ class Create(Named):
 
         tpu = Tpu(gcloud, self.name, zone, cfg.ssh_user)
         emit(f"{self.name} in {zone}: {api_type} on {config.worker_count(kind)} worker(s)")
-        _worker_table(_wait_ready(tpu))
+        _worker_table(tpu.ready())
         return 0
 
 
@@ -403,7 +379,7 @@ class Delete(Named):
                                node.queued_resource, f"--zone={tpu.zone}", "--force", "--quiet")
         else:
             argv = tpu.vm("delete", self.name, f"--zone={tpu.zone}", "--quiet")
-        code = gcloud.run(argv, capture=False).code
+        code = gcloud.run(argv, capture=False).returncode
         if not code and not gcloud.dry_run:
             config.forget_zone(self.name)
             ssh_config.forget(self.name)
@@ -417,9 +393,9 @@ class Start(Named):
 
     def run(self, rest: list[str]) -> int:
         _, gcloud, tpu = self.opened()
-        code = gcloud.run(tpu.vm("start", self.name, f"--zone={tpu.zone}"), capture=False).code
+        code = gcloud.run(tpu.vm("start", self.name, f"--zone={tpu.zone}"), capture=False).returncode
         if not code:
-            _worker_table(_wait_ready(tpu))
+            _worker_table(tpu.ready())
         return code
 
 
@@ -430,7 +406,7 @@ class Stop(Named):
 
     def run(self, rest: list[str]) -> int:
         _, gcloud, tpu = self.opened()
-        return gcloud.run(tpu.vm("stop", self.name, f"--zone={tpu.zone}"), capture=False).code
+        return gcloud.run(tpu.vm("stop", self.name, f"--zone={tpu.zone}"), capture=False).returncode
 
 
 @dataclasses.dataclass
@@ -440,17 +416,9 @@ class List(Base):
     def run(self, rest: list[str]) -> int:
         cfg, gcloud = _open(self)
         zones = cfg.zones if self.zone in (None, "all") else (self.zone,)
-        rows = []
-        for zone in zones:
-            payload = gcloud.json("compute", "tpus", "tpu-vm", "list",
-                                  f"--zone={zone}", default=[])
-            for entry in payload if isinstance(payload, list) else ():
-                if not isinstance(entry, dict):
-                    raise ValueError(f"gcloud listed {entry!r}, which is not a TPU record")
-                node = Node.parse(entry)
-                rows.append((node.name, node.accelerator_type, node.state,
-                             node.health or "-", str(node.workers), zone,
-                             "yes" if node.spot else "-", next(iter(node.ips), "") or "-"))
+        rows = [(node.name, node.accelerator_type, node.state, node.health or "-", str(node.workers), zone,
+                 "yes" if node.spot else "-", next(iter(node.ips), "") or "-")
+                for zone in zones for node in gcloud.nodes(zone)]
         if not rows:
             emit(f"no TPUs in {', '.join(zones)}")
             return 0
@@ -504,7 +472,7 @@ class Ssh(Named):
         argv = tpu.ssh_argv(str(self.worker), ssh_flags=flags)
         if rest:
             argv += ["--", *rest]
-        return gcloud.run(argv, capture=False).code
+        return gcloud.run(argv, capture=False).returncode
 
 
 @dataclasses.dataclass
@@ -547,10 +515,10 @@ class AttachDisk(Named):
         mode = "read-only" if self.read_only else "read-write"
         attached = gcloud.run(tpu.vm("attach-disk", self.name, f"--zone={tpu.zone}",
                                      f"--disk={source}", f"--mode={mode}"), capture=False)
-        if not attached.ok:
-            return attached.code
+        if attached.returncode:
+            return attached.returncode
         count, _ = _slice(tpu, cfg)
-        mount = f"sudo -n bash -c {shlex.quote(tpu_setup.disk_startup_script())}"
+        mount = f"sudo -n bash -c {shlex.quote(tpu_setup.disk_startup_script(self.read_only))}"
         return exit_code(tpu.fanout([(index, mount) for index in range(count)]))
 
 
@@ -617,7 +585,7 @@ class Copy(Named):
         _, gcloud, tpu = self.opened()
         argv = tpu.scp_argv([self.src], f"{tpu.host}:{self.dst}", worker=self.worker,
                             recurse=Path(self.src).is_dir())
-        return gcloud.run(argv, capture=False).code
+        return gcloud.run(argv, capture=False).returncode
 
 
 @dataclasses.dataclass
@@ -689,13 +657,13 @@ class Setup(Named):
 
         copy = gcloud.run(tpu.scp_argv([str(path)], f"{tpu.host}:~/dew-setup.sh", worker="all"),
                           capture=False)
-        if not copy.ok:
-            return copy.code
+        if copy.returncode:
+            return copy.returncode
         if self.git_key is not None:
             copy = gcloud.run(tpu.scp_argv([str(self.git_key)], f"{tpu.host}:~/.ssh/id_ed25519",
                                            worker="all"), capture=False)
-            if not copy.ok:
-                return copy.code
+            if copy.returncode:
+                return copy.returncode
         code = exit_code(tpu.fanout([(index, "bash ~/dew-setup.sh") for index in range(count)]))
         if code:
             return code
@@ -710,7 +678,7 @@ def _verify_devices(tpu: Tpu, count: int, expected: int) -> int:
         return 0
     rows, failed = [], 0
     for index, outcome in enumerate(outcomes):
-        reported = outcome.out.split()
+        reported = outcome.stdout.split()
         devices = int(reported[0]) if reported else 0
         local = reported[1] if len(reported) > 1 else "-"
         good = devices == expected
@@ -767,7 +735,7 @@ class Status(Named):
             return 0
         rows = []
         for index, outcome in enumerate(outcomes):
-            fields = (outcome.out.strip().split("|") + ["-"] * 4)[:4]
+            fields = (outcome.stdout.strip().split("|") + ["-"] * 4)[:4]
             rows.append((str(index), fields[0] or "-", fields[1], fields[2], fields[3]))
         _table(("WORKER", "UPTIME", "DEW PROCS", "DEVICES BUSY", "DEVICES"), rows)
         return exit_code(outcomes)

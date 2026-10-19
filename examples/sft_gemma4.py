@@ -99,6 +99,9 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
     split = config.split if config.rows is None else f"{config.split}[:{config.rows}]"
     return LMRunConfig(
         data_read=config.data_read,
+        # A Hub split is downloaded and prepared where the run first reads it; a local file, as the
+        # smoke run's, reads as it is.
+        provision=True,
         data=ChatData(tokenizer=tokenizer, source=chat, validation=HoldOut(records=config.held_out),
                   column=config.column, split=split, seq_len=config.sequence_length, long="chunk"),
         validation_records=config.batch_size,

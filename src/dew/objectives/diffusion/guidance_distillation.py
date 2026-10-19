@@ -20,11 +20,12 @@ from flax import linen as nn
 
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import DenoisingCondition, Process
-from dew.diffusion.schedules import expand
-from dew.diffusion.transforms import broadcast_rates
+from dew.diffusion.schedules import NoiseScheduler, expand
+from dew.diffusion.transforms import PredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
 from dew.lora import unadapted
 from dew.objectives.base import TEACHER, Aux, ProgramModule, Step, Variables, model_rngs
+from dew.registry import to_record
 from dew.sampling.guidance import guide
 
 from .objective import DiffusionObjective, _own_loss, teacher_weights
@@ -69,10 +70,10 @@ class GuidanceDistillationObjective(DiffusionObjective):
             from .config import DiffusionRunConfig
 
             built = DiffusionRunConfig.load(teacher_run).build(variables=held)
-        if (type(built.process.schedule) is not type(self.process.schedule)
-                or type(built.process.prediction) is not type(self.process.prediction)):
+        if any(to_record(getattr(built.process, part), kind) != to_record(getattr(self.process, part), kind)
+               for part, kind in (("schedule", NoiseScheduler), ("prediction", PredictionTransform))):
             raise ValueError("guidance distillation regresses onto the teacher's raw output, so the "
-                             "two share the process's schedule and prediction")
+                             "two share the process's schedule and prediction, configured alike")
         if built.latent_shape != self.latent_shape:
             raise ValueError(f"the teacher denoises {built.latent_shape} and the student "
                              f"{self.latent_shape}; they share one latent geometry")

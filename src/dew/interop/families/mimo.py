@@ -284,8 +284,9 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         refuse('scoring_func and topk_method', "MiMoV2MoEGate implements sigmoid scores under 'noaux_tc'")
     theta, factor = plain_partial_rope(hf, default_factor=1.0, reference='MiMoV2RotaryEmbedding')
     used.update(_V2_FIELDS + _V2_UNREAD)
-    config = base_config({**hf, 'num_attention_heads': heads, 'num_key_value_heads': kv_heads,
-                          'head_dim': head_dim, 'rms_norm_eps': hf.get('layernorm_epsilon', 1e-6),
+    config = base_config({**hf, 'sliding_window': window, 'num_attention_heads': heads,
+                          'num_key_value_heads': kv_heads, 'head_dim': head_dim,
+                          'rms_norm_eps': hf.get('layernorm_epsilon', 1e-6),
                           'moe_intermediate_size': (hf.get('moe_intermediate_size')
                                                     or hf.get('intermediate_size'))},
                          used, layer_types=layers, rope=Ropes(theta), scale_after_cast=True,

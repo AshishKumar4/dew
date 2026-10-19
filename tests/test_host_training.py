@@ -304,6 +304,23 @@ def test_companion_coordinates_preserve_shards_under_device_permutation():
 
 
 @pytest.mark.mesh
+def test_a_companion_takes_the_partners_it_needs_from_more_cpus():
+    """A mesh of two accelerator devices pairs with the first two of six CPUs, and moves its values
+    there whole; three CPUs for a mesh of four are refused before anything is placed."""
+    devices = jax.devices("cpu")
+    assert len(devices) >= 8
+    accelerator = Mesh(np.asarray(devices[:2], dtype=object), ("fsdp",), axis_types=(AxisType.Auto,))
+    cpu = companion_mesh(accelerator, devices[2:])
+    assert list(cpu.devices.flat) == list(devices[2:4])
+    values = jax.device_put(np.arange(16, dtype=np.float32), NamedSharding(accelerator, P("fsdp")))
+    np.testing.assert_array_equal(np.asarray(transfer(values, NamedSharding(cpu, P("fsdp")))),
+                                  np.asarray(values))
+    four = Mesh(np.asarray(devices[:4], dtype=object), ("fsdp",), axis_types=(AxisType.Auto,))
+    with pytest.raises(ValueError):
+        companion_mesh(four, devices[4:7])
+
+
+@pytest.mark.mesh
 @pytest.mark.distributed
 def test_companion_pool_uses_one_global_optimizer_reduction(tmp_path):
     from test_multiprocess import run_pool, run_worker

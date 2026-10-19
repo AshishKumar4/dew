@@ -10,7 +10,7 @@ from typing import Annotated
 import pytest
 
 from dew.config import RunConfig, ScheduleSpec
-from dew.config.data import Augment, ImageData, TextData
+from dew.config.data import Augment, HoldOut, ImageData, TextData
 from dew.data import Files
 from dew.data.dataset import Loader, record_argument
 from dew.diffusion.presets import Flow
@@ -107,12 +107,30 @@ def test_the_cli_selects_a_token_budget_without_selecting_a_row_batch():
     assert RunConfig.from_dict(json.loads(json.dumps(config.to_dict()))) == config
 
 
-def test_a_jepa_run_without_probes_schedules_no_validation_pass():
-    """A JEPA validation pass scores the frozen-encoder probes, so a run that
-    names no probe classes yet schedules passes is refused where it is
-    configured, not at its first pass."""
-    with pytest.raises(ValueError):
-        JepaRunConfig()
+def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path):
+    """A checkpointed JEPA recipe validates without class probes or a representation preview."""
+    import numpy as np
+
+    from dew.config import ModelConfig, TrainerConfig
+    from dew.data import TFDS, Loading
+
+    run = JepaRunConfig(
+        model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
+                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
+                                           "attention_impl": "xla"}),
+        predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
+        data=ImageData(source=TFDS("dew_images", path=str(
+            REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"), split="all"),
+                       image_size=16, augment=None, validation=HoldOut(records=4)),
+        loading=Loading(workers=0), data_read="memory",
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=8, steps=1, log_every=1,
+                              eval_every=1, checkpoint_every=None))
+    trained = run.prepare().train("jepa-loss")
+    assert int(trained.updates) == 1
+    reports = [json.loads(line)["scalars"] for line in
+               (tmp_path / "jepa-loss" / "tracking" / "scalars.jsonl").read_text().splitlines()]
+    assert any("val/loss" in report and np.isfinite(report["val/loss"]) for report in reports)
+    assert not any("probe" in name for report in reports for name in report)
 
 
 def test_param_groups_on_the_command_line_read_their_schedules_as_records():
