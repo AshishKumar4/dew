@@ -35,7 +35,8 @@ from dew.artifacts import (
     VideoGrid,
     uint8_pixels,
 )
-from dew.telemetry.records import RECORD_TYPES, FitEnded, Record, RunRecord, json_value
+from dew.records import integer, record
+from dew.telemetry.records import RECORD_TYPES, FitEnded, Record, RunRecord, json_value, reported_number
 
 if TYPE_CHECKING:
     from mlflow.tracking import MlflowClient
@@ -327,6 +328,24 @@ class LocalTracker(_OwnedTracker):
         self._write('records.jsonl', {'type': type(value).__name__, 'step': step,
                                     'time': time.time(), 'files': [path.name for path in files]})
 
+    def scalars(self) -> list[tuple[int, dict[str, float]]]:
+        """The scalars the journal holds, each report's step and values in the order they were
+        logged, nonfinite values read back as floats. A tracker over a run's directory reads the
+        run's reports this way, its final validation's scores among them (`Trainer.fit` logs them
+        under the run's last step); a journal no report wrote yet holds none."""
+        self._check()
+        journal = self.directory / 'scalars.jsonl'
+        if not journal.exists():
+            return []
+        reports = []
+        with journal.open() as handle:
+            for line in handle:
+                row = record(json.loads(line), 'scalars journal row')
+                values = record(row['scalars'], 'scalars')
+                reports.append((integer(row['step'], 'step'),
+                                {name: reported_number(value, name) for name, value in values.items()}))
+        return reports
+
     def plot(self) -> list[Path]:
         """Plot each metric in the journal to `metric-<index>.png` with matplotlib's Agg backend, and
         return the paths. The journal is not changed."""
@@ -334,14 +353,9 @@ class LocalTracker(_OwnedTracker):
         from matplotlib.backends.backend_agg import FigureCanvasAgg
         from matplotlib.figure import Figure
         history: dict[str, list[tuple[int, float]]] = {}
-        journal = self.directory / 'scalars.jsonl'
-        if not journal.exists():
-            return []
-        with journal.open() as handle:
-            for line in handle:
-                row = json.loads(line)
-                for key, value in row['scalars'].items():
-                    history.setdefault(key, []).append((row['step'], float(value)))
+        for step, values in self.scalars():
+            for key, value in values.items():
+                history.setdefault(key, []).append((step, value))
         paths = []
         for index, (key, points) in enumerate(history.items()):
             figure = Figure(figsize=(7, 4))

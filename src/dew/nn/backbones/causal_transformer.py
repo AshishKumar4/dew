@@ -75,7 +75,8 @@ from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
 from ..moe import GatedActivation, Situ
-from ..precision import at_least_fp32, biased_logits, capped_logits, head_dot_general, head_product, scaled
+from ..ngpt import NGPT, gain, unit
+from ..precision import at_least_fp32, capped_logits, head_dot_general, head_product, scaled, scaled_logits
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
 from ..sharding import (
@@ -102,7 +103,16 @@ from .decoder_block import (
     remat_policy,
     remat_record,
 )
-from .decoder_stack import WRITTEN, DecoderBank, Loop, PassView, StackView, run_pipeline, run_stack
+from .decoder_stack import (
+    WRITTEN,
+    DecoderBank,
+    Loop,
+    PassView,
+    SharedPassView,
+    StackView,
+    run_pipeline,
+    run_stack,
+)
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
 _INTERMEDIATES = "intermediates"
@@ -182,6 +192,10 @@ class CausalTransformer(nn.Module):
     tuple gives one width per layer (Gemma 3n), and 0 means no feed-forward
     (Mamba-2)."""
     max_seq_len: int = 2048
+    context_length: int | None = None
+    """The context a checkpoint states (max_position_embeddings), which an export writes back;
+    None for `max_seq_len`. The model computes nothing from it: `max_seq_len` is its decode cache's
+    capacity, which a loader caps below a long context (`decoder_parts.DEFAULT_MAX_SEQ_LEN`)."""
     position_embedding: Literal['rotary', 'learned', 'alibi'] = 'rotary'
     position_embedding_size: int | None = None
     """The number of rows in the learned position table; None means `max_seq_len`.
@@ -192,6 +206,10 @@ class CausalTransformer(nn.Module):
     rope_scaling: RopeScaling | LongRopeScaling | None = None
     partial_rotary_factor: float | None = None  # None: every dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
+    narrow_rotary_tables: bool = False
+    """The rotary's cos and sin round to the activations' dtype before the fp32 rotation, as vLLM
+    casts its cos/sin cache to the query's dtype (`MixerContext.narrow_rotary_tables`); False keeps
+    them at the rotation's precision."""
     layer_types: tuple[str, ...] | None = None  # the pattern, one kind per layer
     kinds: Mapping[str, LayerKind] | None = None  # what each named kind does
     norm_eps: float = 1e-5
@@ -265,6 +283,12 @@ class CausalTransformer(nn.Module):
     residual stream (o_proj, out_proj, down_proj) divide their std by
     sqrt(2 * num_layers). This is lm-engine's `use_depth_scaled_init`."""
     final_logit_softcap: float | None = None
+    ngpt: NGPT | None = None
+    """The normalized transformer (`dew.nn.ngpt.NGPT`), NVIDIA's Dory: every hidden state on the
+    unit sphere, each block stepping its residual along it (`BlockWiring.ngpt`), the attention and
+    feed-forward unit-norming their products and scaling them by learned gains, no norm with a
+    weight anywhere, a unit norm between a loop's passes, no norm before the head, and the logits
+    times a learned per-token gain (`logit_scale`). None for none."""
     head_transform: Literal['gelu', 'gelu_exact'] | None = None
     """The activation of a BERT-style prediction head between the final norm
     and the vocabulary projection: a bias-free dense layer, this activation and
@@ -716,6 +740,24 @@ class CausalTransformer(nn.Module):
                     f"num_heads ({self.num_heads}) must be a multiple of the key/value "
                     f"heads of {layer_type!r} ({kind.num_kv_heads})")
 
+    def refuse_unbuildable_ngpt(self, kinds: Mapping[str, "ResolvedKind"]):
+        """Raise `ValueError` for what nGPT's arithmetic does not reach: its gains and unit norms
+        live in the attention and the dense gated feed-forward (an MLP mixer's too), so routed or
+        parallel experts, another mixer, prediction depths and the DSpark drafter, which would
+        compute without them, are refused."""
+        if self.ngpt is None:
+            return
+        if self.mixture is not None or self.num_nextn_predict_layers or self.dspark is not None:
+            raise ValueError("nGPT unit-norms the attention and the dense gated feed-forward; routed or "
+                             "parallel experts (mixture), prediction depths and the DSpark drafter take "
+                             "none of it")
+        for layer_type, kind in sorted(kinds.items()):
+            mixer = kind.mixer or self.mixer
+            dense = isinstance(mixer, MLPMixer) and mixer.mixture is None
+            if mixer is not None and not (isinstance(mixer, AttentionMixer) or dense):
+                raise ValueError(f"nGPT's gains and unit norms are the attention's and the dense gated "
+                                 f"feed-forward's; {layer_type!r} runs {mixer!r}")
+
     def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
         """Raise `ValueError` for a field, or a pair of fields, that this model cannot build.
 
@@ -725,6 +767,7 @@ class CausalTransformer(nn.Module):
         self.refuse_unbuildable_mup(kinds)
         self.refuse_unbuildable_dropout(kinds)
         self.refuse_unbuildable_classic_fields()
+        self.refuse_unbuildable_ngpt(kinds)
         mtp_hc = self.mtp_hyper_connections
         if mtp_hc is not None:
             if self.num_nextn_predict_layers != 1:
@@ -854,7 +897,7 @@ class CausalTransformer(nn.Module):
         # the dense feed-forwards, the shared branch and the routed experts.
         gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
                                       activation=self.mlp, use_bias=self.mlp_bias,
-                                      swiglu_limit=self.swiglu_limit,
+                                      swiglu_limit=self.swiglu_limit, ngpt=self.ngpt,
                                       init_std=init_std, output_init_std=output_init_std,
                                       dtype=self.dtype, precision=self.precision)
         mixture = self.mixture
@@ -1109,7 +1152,7 @@ class CausalTransformer(nn.Module):
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                              layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
-                             shared_parallel_norm=self.shared_parallel_norm)
+                             shared_parallel_norm=self.shared_parallel_norm, ngpt=self.ngpt)
 
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
@@ -1145,10 +1188,7 @@ class CausalTransformer(nn.Module):
         if self.engram is not None:
             self.engram_hashes = EngramHashes(spec=self.engram, vocab_size=self.vocab_size,
                                               name='engram_hashes')
-        self.norm = decoder_norm(
-            self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
-            scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype, specs=self.norms)(name='norm')
+        self._final_norm()
         if self.loop is not None and self.loop.exit_gate:
             self.early_exit_gate = nn.Dense(
                 projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
@@ -1447,8 +1487,13 @@ class CausalTransformer(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = logits.astype(at_least_fp32(logits.dtype))
-        return capped_logits(biased_logits(logits, self.head_bias_value if self.head_bias else None),
+        return capped_logits(scaled_logits(logits, self._token_gains(),
+                                           self.head_bias_value if self.head_bias else None),
                              self.final_logit_softcap)
+
+    def _token_gains(self) -> jax.Array | None:
+        """nGPT's fp32 per-token gain on the logits, past the head's product; None without one."""
+        return None if self.ngpt is None else gain(self.logit_scale, self.ngpt.logits)
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False,
                           positions=None, segment_ids=None, input_embeddings=None,
@@ -1770,7 +1815,7 @@ class CausalTransformer(nn.Module):
             # nothing unless a caller opens the collection.
             self.sow(_FINAL, 'states', residual, reduce_fn=lambda _, value: value, init_fn=lambda: None)
         streams, x = self._collapse(residual)
-        hidden = constrain(self.norm(x), RESIDUAL)
+        hidden = constrain(x if self.ngpt is not None else self.norm(x), RESIDUAL)
         self._gate_exit(hidden)
         if self.logits_scaling != 1.0:
             # (h W) / s is (h / s) W: dividing the states in fp32 scores every
@@ -1843,17 +1888,26 @@ class CausalTransformer(nn.Module):
         run_block = nn.remat(pass_block) if loop.remat and not decode else pass_block
         if first:
             x = self.stack(x, span=(0, first), **stack)
-        x = run_block(self, x, **dynamic)
+        injected = x
+        shared = SharedPassView() if loop.shared_cache else None
+        first_pass = run_block if shared is None else nn.map_variables(
+            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, trans_out_fn=shared.first_out,
+            mutable=True)
+        x = first_pass(self, self.norm(x + injected) if loop.reinject else x, **dynamic)
         for step in range(1, loop.steps):
             normed = self.norm(x)
             self._gate_exit(normed)
             x = normed if loop.step_norm else x
             if loop.backprop_steps is not None and step == loop.steps - loop.backprop_steps:
                 x = jax.lax.stop_gradient(x)
-            view = PassView(self.num_layers + (step - 1) * (end - first), first, end - first)
+            if loop.reinject:
+                x = self.norm(x + injected)
+            view = shared or PassView(self.num_layers + (step - 1) * (end - first), first, end - first)
             run = nn.map_variables(run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
                                    trans_out_fn=view.outside, mutable=True)
             x = run(self, x, **dynamic)
+        if loop.reinject:
+            x = self.norm(x)
         if end < self.num_layers:
             x = self.stack(x, span=(end, self.num_layers), **stack)
         return x
@@ -2175,20 +2229,37 @@ class CausalTransformer(nn.Module):
 
     def output_table(self) -> OutputTable | None:
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
-        the parameter itself, with `_logits`'s bias, softcap and precision, the compute dtype its
-        product follows and a checkpoint's quantizer of its input.
+        the parameter itself, with `_logits`'s scale, bias, softcap and precision, the compute dtype
+        its product follows and a checkpoint's quantizer of its input.
         None where no matrix alone is the head: past a `head_transform`, or where `lm_head`'s
         parameters are not its kernel alone: `dew.lora`'s factors beside it, which its interceptor
         adds, or no kernel at all, a frozen FP8 head's, whose codes its FP8 product reads instead."""
         head = None if self.tie_embeddings else self.lm_head.variables.get("params", {})
         if self.head_transform is not None or (head is not None and set(head) != {"kernel"}):
             return None
-        matrix = self.embed_tokens.embedding if head is None else head["kernel"]
+        return self._head_table()
+
+    def vocabulary_rows(self) -> jax.Array:
+        """Each vocabulary token's `[features]` row of the head (`OutputTable.rows`) where no exact
+        table is: past a `head_transform` the matrix's, which the transformed states meet, and with
+        an adapter on the head its rows as the adapter updates them (`applied_kernel`)."""
+        return self._head_table().rows()
+
+    def _head_table(self) -> OutputTable:
+        """The head's matrix, as `lm_head`'s call multiplies by it (`applied_kernel`) or the tied
+        embeddings, with `_logits`'s scale, bias, softcap and precision, the compute dtype its
+        product follows and a checkpoint's quantizer of its input."""
+        matrix = self.embed_tokens.embedding if self.tie_embeddings else self.applied_kernel("lm_head")
         quantizer = (self.input_quantizer(self.lm_head)
                      if isinstance(self, QuantizesInputs) and not self.tie_embeddings else None)
         return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
                            self.final_logit_softcap, self.precision, compute=self.dtype,
-                           input_quantizer=quantizer)
+                           input_quantizer=quantizer, scale=self._token_gains())
+
+    def applied_kernel(self, name: str) -> jax.Array:
+        """The kernel the submodule `name` multiplies its input by on this call: its own. A method
+        interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update."""
+        return getattr(self, name).get_variable("params", "kernel")
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.
@@ -2203,6 +2274,19 @@ class CausalTransformer(nn.Module):
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
 
     # The serving and training hooks (`dew.nn.protocols`).
+
+    def _final_norm(self):
+        """The norm before the head and between a loop's passes: under nGPT the unit norm itself,
+        its states being unit vectors, with the logits' per-token gain beside it."""
+        if self.ngpt is not None:
+            self.norm = unit
+            self.logit_scale = self.param('logit_scale', nn.initializers.constant(self.ngpt.start),
+                                          (self.vocab_size,), jnp.float32)
+        else:
+            self.norm = decoder_norm(
+                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+                dtype=self.dtype, specs=self.norms)(name='norm')
 
     @nn.nowrap
     def with_cache_capacity(self, capacity: int) -> Self:
@@ -2333,6 +2417,27 @@ class CausalTransformer(nn.Module):
                 self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared))
             if refusal is not None:
                 return f"layer {index}: {refusal}"
+        return None
+
+    @nn.nowrap
+    def split_prefill_refusal(self) -> str | None:
+        """A cache rebuilt per request from its whole prompt, or a loop's shared cache that a later
+        pass rewrites, whose earlier tokens hold the last pass's keys: a prompt's later piece would
+        read those where its whole prefill reads each pass's own. One pass, or a block whose layers
+        keep no cache (`MixerBase.keeps_cache`), rewrites nothing."""
+        position = self.cache_rebuild_position
+        if position is not None:
+            return (f'LongRoPE crossing position {position} rebuilds a request\'s cache from its whole '
+                    'prompt; serve it with whole-prompt dense admission')
+        loop = self.loop
+        first, end = (0, self.num_layers) if loop is None or loop.layers is None else loop.layers
+        rewritten = any((self.kind_of(kind).mixer or self.layer_mixer).keeps_cache
+                        for kind in self.per_layer_types[first:end])
+        if loop is not None and loop.shared_cache and loop.steps > 1 and rewritten:
+            return ("a loop's shared cache holds only the last pass's keys of the tokens before a "
+                    "call, where the whole prompt's prefill reads each pass's own; keep a cache a "
+                    "pass (Loop.shared_cache=False, Dory's recurrent_kv_cache_mode 'per_loop') for "
+                    "chunked prefill or prefix reuse")
         return None
 
     @property
