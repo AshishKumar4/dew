@@ -303,10 +303,12 @@ def test_a_joint_head_trains_on_the_rows_of_a_head_no_one_matrix_is(head, tmp_pa
                   objective=objective.data())
     trainer = Trainer(objective, optax.adam(1e-2), key=0, checkpoints=Checkpoints(str(tmp_path)))
     initial = trainer.initial_state()
-    state = trainer.fit(data, steps=1, log_every=100, state=jax.tree.map(lambda leaf: leaf, initial))
+    # The step donates the state it is handed; the host keeps what it started from.
+    started = jax.device_get(initial.variables)
+    state = trainer.fit(data, steps=1, log_every=100, state=initial)
     for path in (("params", "head"), moving):
         moved = [not np.array_equal(np.asarray(before), np.asarray(after)) for before, after in
-                 zip(leaves(initial.variables, *path), leaves(state.variables, *path), strict=True)]
+                 zip(leaves(started, *path), leaves(state.variables, *path), strict=True)]
         assert any(moved), path
 
 
