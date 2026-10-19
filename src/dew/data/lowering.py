@@ -97,7 +97,7 @@ from dew.data.steps.generic import Fields
 from dew.data.steps.text import ValidTargets
 from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
-from dew.records import integer, record
+from dew.records import integer, integers, record
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache
@@ -435,12 +435,45 @@ def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
     sizes = dict.fromkeys(stage.fields, stage.seq_len) | dict(stage.along)
     if stage.policy == "concat":
         cut = _OverlappedCuts(documents, stage) if stage.overlap else documents
-        return gx.ConcatThenSplitIterDataset(cut, length_struct=sizes)
+        return _Concatenated(gx.ConcatThenSplitIterDataset(cut, length_struct=sizes))
     packer = gx.FirstFitPackIterDataset if stage.policy == "first-fit" else gx.BestFitPackIterDataset
     # Fields cut alike with the first share its segments and positions, as the indexed planner's
     # windows do (`packed_window`), so Grain writes no copy of them for the rest.
     return packer(documents, length_struct=sizes, num_packing_bins=stage.bins, shuffle_bins=False,
                   max_sequences_per_bin=stage.segments, meta_features=stage.fields[1:])
+
+
+class _Concatenated(pygrain.IterDataset):
+    """Grain's concatenating packer, restored from a position read back from JSON, as every saved
+    position is. Its saved state marks a window's remainder by its slices and none by the tuple
+    (-1, -1), which JSON reads back as a list the packer does not take for that tuple, so a restore
+    reads the next document as a remainder cut to nothing and drops it (grain 0.2.18 to its main of
+    2026-10-18, `packing_concat_then_split._CtsState.has_remainder`). The slices go back as the
+    tuples the packer wrote."""
+
+    def __init__(self, parent: pygrain.IterDataset):
+        super().__init__(parent)
+        self._packed = parent
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        return _ConcatenatedIterator(self._packed.__iter__())
+
+
+class _ConcatenatedIterator(pygrain.DatasetIterator):
+    def __init__(self, parent: pygrain.DatasetIterator):
+        super().__init__(parent)
+        self._packed = parent
+
+    def __next__(self) -> Batch:
+        return next(self._packed)
+
+    def get_state(self) -> Mapping[str, object]:
+        return self._packed.get_state()
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        slices = record(state["remainder_slices"], "packed remainder")
+        self._packed.set_state({**state, "remainder_slices": {
+            name: integers(bounds, name) for name, bounds in slices.items()}})
 
 
 class _OverlappedCuts(pygrain.IterDataset):
