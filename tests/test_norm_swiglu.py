@@ -610,55 +610,103 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
         assert relative(mine, theirs) < 1e-6
 
 
+def fused_function(name, implementation):
+    """A fused kernel's public function by `name`, over (x, other, scale) or (gate, up), its operands
+    `fused_operands`: each of the norms, the inverse-rounded one among them, and both SiLU products."""
+    if name == "swiglu":
+        return gated_product("swiglu", implementation=implementation)
+    if name == "packed":
+        return lambda gate, up: packed_gated_product("swiglu", implementation=implementation)(
+            jnp.stack([gate, up], -2))
+    if name == "rms":
+        return lambda x, other, scale: rms_normalized(x, scale, 1e-5, x.dtype, True, True,
+                                                      fp32_statistics=True, implementation=implementation)
+    if name == "stream":
+        return lambda x, other, scale: stream_rms_normalized(
+            x, other, scale, 1e-5, x.dtype, False, False, fp32_statistics=True, implementation=implementation)
+    if name == "unweighted":
+        return lambda x, other, scale: attention.unweighted_rmsnorm(x, 1e-6, implementation=implementation)
+    return lambda x, other, scale: gated_rms_normalized(x, other, scale, 1e-6, x.dtype, "silu",
+                                                        implementation=implementation)
+
+
+def fused_operands(name, dtype):
+    """`fused_function(name)`'s operands at `dtype`, a bf16 weight where the norm takes one."""
+    first, second = (jax.random.normal(jax.random.key(index), (4, 96)).astype(dtype) for index in (76, 77))
+    if name in ("swiglu", "packed"):
+        return first, second
+    return first, second, (0.7 + 0.2 * jax.random.normal(jax.random.key(79), (96,))).astype(jnp.bfloat16)
+
+
 @pytest.mark.parametrize("composition", ["jvp_grad", "grad_jvp", "jvp_staged", "vmap_grad"])
-def test_the_fused_swiglu_differentiates_at_every_order_through_the_portable_product(composition):
-    """The fused SiLU product (`norm_swiglu.swiglu`, interpreted here) differentiated at a second
-    order, forward over reverse and reverse over forward, staged by a jit, and a gradient mapped over
-    rows: each is the portable product's own composition, within the float64 gate of it, while the
-    first level's value and backward run the kernels."""
-    gate, up, tangent = (jax.random.normal(jax.random.key(index), (4, 96)).astype(jnp.bfloat16)
-                         for index in (76, 77, 78))
+@pytest.mark.parametrize("name, dtype", [("swiglu", jnp.bfloat16), ("packed", jnp.float32),
+                                         ("rms", jnp.bfloat16), ("stream", jnp.float32),
+                                         ("unweighted", jnp.bfloat16), ("gated", jnp.float32)])
+def test_a_fused_kernel_differentiates_at_every_order_through_its_portable_arithmetic(name, dtype,
+                                                                                     composition):
+    """Each fused norm and SiLU product (interpreted here) differentiated at a second order, forward
+    over reverse and reverse over forward, staged by a jit, and a gradient mapped over rows, by the
+    first operand alone and under a score that squares the output, so the cotangent varies: each is the
+    portable arithmetic's own composition, within the float64 gate of it, while the first level's value
+    and, where the composition takes a gradient of the call, its backward run the kernels."""
+    operands = fused_operands(name, dtype)
+    tangent = jax.random.normal(jax.random.key(78), operands[0].shape).astype(dtype)
 
     def composed(implementation):
-        product = gated_product("swiglu", implementation=implementation)
+        fused = fused_function(name, implementation)
 
-        def score(gate, up):
-            return product(gate, up).astype(jnp.float32).sum()
+        def score(first, *rest):
+            out = fused(first, *rest)
+            return sum(jnp.square(leaf.astype(jnp.float32)).sum() for leaf in jax.tree.leaves(out))
 
-        def run(gate, up, tangent):
+        def run(first, tangent, *rest):
             if composition == "jvp_grad":
-                return jax.jvp(lambda gate: jax.grad(score)(gate, up), (gate,), (tangent,))[1]
+                return jax.jvp(lambda first: jax.grad(score)(first, *rest), (first,), (tangent,))[1]
             if composition == "grad_jvp":
-                def along(gate):
-                    return jax.jvp(lambda gate: score(gate, up), (gate,), (tangent,))[1]
+                def along(first):
+                    return jax.jvp(lambda first: score(first, *rest), (first,), (tangent,))[1]
 
-                return jax.grad(along)(gate)
+                return jax.grad(along)(first)
             if composition == "jvp_staged":
-                return jax.jvp(jax.jit(lambda gate: product(gate, up)), (gate,), (tangent,))[1]
-            return jax.vmap(jax.grad(score))(gate, up)
+                return jax.jvp(jax.jit(lambda first: fused(first, *rest)), (first,), (tangent,))[1]
+            # The rows map, a norm's weight is every row's.
+            return jax.vmap(jax.grad(score), in_axes=(0, 0, None)[:1 + len(rest)])(first, *rest)
 
         return run
 
-    launched = "swiglu_forward" if composition == "jvp_staged" else "swiglu_backward"
-    assert launched in kernels(composed("pallas"), gate, up, tangent)
-    found = np.asarray(jax.jit(composed("pallas"))(gate, up, tangent), np.float64)
-    reference = np.asarray(jax.jit(composed("xla"))(gate, up, tangent), np.float64)
+    forward = "swiglu_forward" if name in ("swiglu", "packed") else "rms_norm_forward"
+    launched = kernels(composed("pallas"), operands[0], tangent, *operands[1:])
+    assert forward in launched
+    if composition in ("jvp_grad", "vmap_grad"):
+        assert forward.replace("forward", "backward") in launched
+    found = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
+                         jax.jit(composed("pallas"))(operands[0], tangent, *operands[1:]))
+    reference = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
+                             jax.jit(composed("xla"))(operands[0], tangent, *operands[1:]))
     with jax.enable_x64(new_val=True):
-        wide = (jnp.asarray(np.asarray(x, np.float64)) for x in (gate, up, tangent))
-        truth = np.asarray(composed("xla")(*wide))
-    assert_as_exact_as_the_reference(found, reference, truth, composition)
+        wide = [jnp.asarray(np.asarray(leaf, np.float64)) for leaf in (operands[0], tangent, *operands[1:])]
+        truth = jax.tree.map(np.asarray, composed("xla")(*wide))
+    for mine, theirs, want in zip(jax.tree.leaves(found), jax.tree.leaves(reference), jax.tree.leaves(truth),
+                                  strict=True):
+        assert_as_exact_as_the_reference(mine, theirs, want, f"{name} {composition}")
 
 
 def test_a_fused_norms_jvp_is_its_kernels_value_and_the_portable_tangent():
     """`jax.jvp` through the fused norm, with no forward-mode context, staged by a jit or not: its
-    value is the kernel's own output, and its tangent the XLA norm's (`generation.linear_tangent`)."""
+    value is the kernel's own output, and its tangent within the float64 gate of the XLA norm's
+    (`generation.linear_tangent`)."""
     x = jax.random.normal(jax.random.key(75), (2, 31))
-    xla, pallas, _ = norm_functions(jnp.float32, offset=True, after_cast=True)
+    direction = jax.random.normal(jax.random.key(74), (2, 31))
+    xla, pallas, exact = norm_functions(jnp.float32, offset=True, after_cast=True)
     fused = jax.jit(lambda x: pallas(x, None))
+    want = jax.jit(lambda x: jax.jvp(lambda x: xla(x, None), (x,), (direction,))[1])(x)
+    with jax.enable_x64(new_val=True):
+        truth = np.asarray(jax.jvp(lambda x: exact(x, None), (jnp.asarray(np.asarray(x, np.float64)),),
+                                   (jnp.asarray(np.asarray(direction, np.float64)),))[1])
     for norm in (lambda x: pallas(x, None), fused):
-        value, tangent = jax.jvp(norm, (x,), (x,))
+        value, tangent = jax.jvp(norm, (x,), (direction,))
         np.testing.assert_array_equal(value, fused(x))
-        np.testing.assert_array_equal(tangent, jax.jvp(lambda x: xla(x, None), (x,), (x,))[1])
+        assert_as_exact_as_the_reference(np.asarray(tangent), np.asarray(want), truth, "jvp")
 
 
 # Same-session c53, A100-SXM4-40GB, Liger 0.8.4 / torch 2.11.0+cu130:

@@ -418,7 +418,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable) ->
     error for either."""
     import jax
     import jax.numpy as jnp
-    from jax.custom_derivatives import linear_call
+    from jax.custom_derivatives import SymbolicZero, linear_call
 
     @jax.custom_jvp
     def produced(*operands):
@@ -448,18 +448,32 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable) ->
     def bounded(*operands):
         return forward(*operands)[0]
 
-    @bounded.defjvp
-    def _(primals, tangents):
+    def bounded_jvp(primals, tangents):
         output, saved = produced(*primals)
+        # Only the perturbed operands are the linear call's: its transpose takes no known zero.
+        directions, tree = jax.tree.flatten(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
+        live = [index for index, direction in enumerate(directions)
+                if not isinstance(direction, SymbolicZero)]
+        if not live:
+            return output, jax.tree.map(jnp.zeros_like, output)
 
-        def tangent(residuals, directions):
-            return jax.jvp(portable, residuals[0], directions)[1]
+        def tangent(residuals, moving):
+            operands, _ = residuals
+            whole = [jnp.zeros(direction.aval.shape, direction.aval.dtype)
+                     if isinstance(direction, SymbolicZero) else None for direction in directions]
+            for index, value in zip(live, moving, strict=True):
+                whole[index] = value
+            return jax.jvp(portable, operands, jax.tree.unflatten(tree, whole))[1]
 
         def transposed(residuals, cotangent):
-            return pulled(residuals[1], residuals[0], cotangent)
+            operands, saved = residuals
+            pulled_back = jax.tree.leaves(pulled(saved, operands, cotangent))
+            return [pulled_back[index] for index in live]
 
-        return output, linear_call(tangent, transposed, (primals, saved), tangents)
+        moving = [directions[index] for index in live]
+        return output, linear_call(tangent, transposed, (primals, saved), moving)
 
+    bounded.defjvp(bounded_jvp, symbolic_zeros=True)
     return bounded
 
 
