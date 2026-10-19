@@ -1037,7 +1037,7 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, h0_ref, do_ref, 
     are a loop, not unrolled, so a program holds one head's accumulators at a time. The memory the
     chunk enters and its gradient where it leaves are read where they are (`_entered`, `_left`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    entering, leaving = chunk_ref[2], chunk_ref[3]
+    entered, left = chunk_ref[2], chunk_ref[3]
 
     @pl.when(taken > 0)
     def _():
@@ -1062,9 +1062,8 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, h0_ref, do_ref, 
                 columns = pl.ds(block * bv, bv)
                 value, out_grad = read(v_ref, head, columns), read(do_ref, head, columns)
                 local = read(dv_ref, head, columns)
-                memory = _entered(h_ref, h0_ref, entering, start, length, head, slice(None), columns)
-                memory_grad = _left(dh_ref, dht_ref, leaving, start + taken, length, head, slice(None),
-                                    columns)
+                memory = _entered(h_ref, h0_ref, entered, start, length, head, slice(None), columns)
+                memory_grad = _left(dh_ref, dht_ref, left, start + taken, length, head, slice(None), columns)
                 dg_last += _state_inner_product(memory, memory_grad)
                 ds += _dot(out_grad, value.T, exact=exact)
                 dq += _dot(out_grad, memory.T.astype(out_grad.dtype), exact=exact)
