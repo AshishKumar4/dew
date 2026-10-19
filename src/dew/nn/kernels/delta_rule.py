@@ -207,12 +207,17 @@ def _fused_kernel(active_ref, q_ref, k_ref, v_ref, held_q_ref, held_k_ref, held_
                 token_ref[...][None, :].astype(jnp.float32)]
 
     def write(moved):
-        held_v_out[...] = jnp.concatenate(moved[2], axis=0).astype(held_v_out.dtype)
+        """Each piece's moved history, a row of it at a time."""
+        def store(held_out, rows):
+            for j, row in enumerate(rows):
+                held_out[j] = row.reshape(held_out.shape[1:]).astype(held_out.dtype)
+
+        store(held_v_out, moved[2])
 
         @pl.when(head % group == 0)
         def _():
             for (_, _, _, held_out), rows in zip(pieces[:2], moved[:2], strict=True):
-                held_out[...] = jnp.concatenate(rows, axis=0).astype(held_out.dtype)
+                store(held_out, rows)
 
     @pl.when(active)
     def _():
