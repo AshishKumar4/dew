@@ -284,7 +284,8 @@ def test_an_unnamed_member_draws_alike_wherever_a_host_mounts_it_and_when_a_name
         directory.mkdir(exist_ok=True)
         (directory / "rows.jsonl").write_text("".join(json.dumps({"id": i}) + "\n" for i in range(8)))
         chain = Pipeline(Files(str(directory / "rows.jsonl"))).map(Member(0)).random_map(Draw())
-        joined = [Pipeline(source(4), name="joining").map(Member(1)).random_map(Draw())] if joining else []
+        named = Pipeline(source(8), name="joining").map(Member(1)).random_map(Draw()).repeat(1)
+        joined = [named] if joining else []
         return compile(mix([*joined, chain.repeat(1)]).batch(4), read="memory", loading=READ, seed=5)
 
     here, there = mounted(tmp_path / "here"), mounted(tmp_path / "there")
@@ -298,7 +299,9 @@ def test_an_unnamed_member_draws_alike_wherever_a_host_mounts_it_and_when_a_name
                           if of == 0})
         finally:
             stream.close()
-    assert draws[0] == draws[1] == draws[2]
+    assert draws[0] == draws[1]
+    # The mixture may end once a member runs out; every row it read draws as it did alone.
+    assert draws[2] and all(draws[0][index] == draw for index, draw in draws[2].items())
 
 
 def test_a_position_is_refused_where_a_mixture_member_was_renamed():
