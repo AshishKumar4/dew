@@ -36,6 +36,7 @@ from dew.data.analysis import (
     _identity,
     _in_memory,
     _Lowering,
+    _member_keys,
     _name,
     _until,
 )
@@ -615,12 +616,9 @@ batches, so a resume cuts the batches before them (`_Build.batched`)."""
 
 
 def _member_key(members: Sequence[str], index: int) -> int:
-    """A mixture member's key for its random draws: the name it goes by (`_members`), as the plan's
-    order records it for every read alike, so adding or removing another member leaves its draws as
-    they were, and among members of one name its place among them, so two such members draw apart."""
-    name = members[index]
-    alike = sum(member == name for member in members[:index])
-    return int.from_bytes(hashlib.blake2b(f"{alike}:{name}".encode(), digest_size=8).digest(), "big")
+    """A mixture member's key for its random draws (`_member_keys`), as a seed."""
+    key = _member_keys(members)[index]
+    return int.from_bytes(hashlib.blake2b(key.encode(), digest_size=8).digest(), "big")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -671,15 +669,19 @@ class _Build:
             Accepted(_as_iter(parent, self.loading), _name(child), budget=self.budget)
             for parent, child in zip(parents, source.pipelines, strict=True)
         ]
+        # A streamed mix saves each member's position under its key, so a member that joins starts
+        # and one that left is dropped while the others resume (`Plan.check`).
+        keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
         if source.tokens is not None:
             return TokenDeficit(
                 streams,
                 source.weights,
                 tokens=source.tokens,
                 names=[_name(child) for child in source.pipelines],
+                keys=keys,
                 budget=self.budget,
             )
-        return PrimedMix(streams, source.weights)
+        return PrimedMix(streams, source.weights, keys)
 
     def indexed(
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int
