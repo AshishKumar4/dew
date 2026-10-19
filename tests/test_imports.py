@@ -101,7 +101,8 @@ def test_a_models_quantization_imports_no_training():
 import json
 import sys
 from dew.quantization import InputQuantization, Quantization
-print(json.dumps(sorted(name for name in sys.modules if name == "dew.training" or name.startswith("dew.training."))))
+training = [name for name in sys.modules if name == "dew.training" or name.startswith("dew.training.")]
+print(json.dumps(sorted(training)))
 '''
     run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
