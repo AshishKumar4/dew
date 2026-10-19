@@ -43,7 +43,7 @@ if TYPE_CHECKING:
         Message as OllamaMessage,
         Options as OllamaOptions,
     )
-    from openai import AsyncOpenAI, AsyncStream, OpenAI, Stream
+    from openai import AsyncOpenAI, AsyncStream, OpenAI, RequestOptions, Stream
     from openai.types import Completion as OpenAIResponse
     from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
@@ -473,11 +473,22 @@ def _engine_stops(sampling: Sampling, provider: Literal["vllm", "sglang"]) -> Ma
     return {"stop_token_ids": stops} if stops else {"ignore_eos": True}
 
 
-def _transport(request: Mapping[str, object]) -> Mapping[str, object]:
+def _transport(request: Mapping[str, object]) -> RequestOptions:
     """A request's per-request transport options (`continuation.TRANSPORT`) as the SDK's request
     options name them, for a call to an engine route the SDK does not name."""
-    names = {"extra_headers": "headers", "extra_query": "params", "timeout": "timeout"}
-    return {names[name]: request[name] for name in TRANSPORT if name in request}
+    from openai import RequestOptions
+
+    options = RequestOptions()
+    if (headers := request.get("extra_headers")) is not None:
+        given = _object(headers, "extra_headers")
+        options["headers"] = {name: str(value) for name, value in given.items()}
+    if (query := request.get("extra_query")) is not None:
+        options["params"] = dict(_object(query, "extra_query"))
+    if (timeout := request.get("timeout")) is not None:
+        if isinstance(timeout, bool) or not isinstance(timeout, int | float):
+            raise ValueError("a request's timeout must be a number of seconds")
+        options["timeout"] = float(timeout)
+    return options
 
 
 def _untransported(request: Mapping[str, object]) -> Mapping[str, object]:

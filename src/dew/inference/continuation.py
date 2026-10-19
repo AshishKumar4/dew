@@ -235,9 +235,10 @@ class OwnStops:
         for choice in _listed(response.get("choices"), "completion choices"):
             entry = _record(choice, "completion choice")
             index = entry.get("index")
-            prompt = _ids(entry.get("prompt_token_ids"), "prompt_token_ids")
+            prompt: list[int] = []
             redrawn = False
             while self.ended_outside(entry.get("finish_reason"), entry.get("matched_stop")):
+                prompt = prompt if redrawn else _ids(entry.get("prompt_token_ids"), "prompt_token_ids")
                 redrawn = True
                 drawn = _ids(entry.get("token_ids"), "token_ids")
                 if len(drawn) >= self.budget:
@@ -261,7 +262,8 @@ class OwnStops:
         return {**response, "choices": choices, "usage": usage}
 
 
-def chat_refusal(response: ChatCompletion | ChatCompletionChunk, own: OwnStops) -> str | None:
+def chat_refusal(response: ChatCompletion | ChatCompletionChunk | OpenAIResponse,
+                 own: OwnStops) -> str | None:
     """Why a chat response, or a streamed chunk of either route, cannot stand as the policy's draw:
     SGLang ended a choice of it on an id of its own outside the policy's stops, which only the
     completions route carries on. None where every choice in it is the policy's."""

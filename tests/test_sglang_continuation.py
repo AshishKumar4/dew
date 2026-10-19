@@ -162,7 +162,7 @@ class SGLang:
     def stream(self, choices, chat, body):
         records = []
         for choice in choices:
-            for at, token in enumerate(choice["ids"]):
+            for at in range(len(choice["ids"])):
                 last = at == len(choice["ids"]) - 1
                 reason, matched = (choice["reason"], choice["matched"]) if last else (None, None)
                 piece = generated(choice["prompt"], choice["ids"][:at + 1])[len(
