@@ -263,14 +263,13 @@ def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, np.ndarray]:
     return dict(zip(FROZEN_FP8, (forward, forward_scale, dgrad, dgrad_scale), strict=True))
 
 
-def frozen_fp8_kernel(leaves: Mapping[str, jax.typing.ArrayLike]) -> np.ndarray:
+def frozen_fp8_kernel(leaves: Mapping[str, jax.typing.ArrayLike]) -> jax.Array:
     """The `[in, out]` kernel a frozen FP8 site's `leaves` hold, in float32:
-    the forward codes decoded under their row scales (`frozen_fp8_leaves`),
-    for a merge or an export, which read the kernel the products ran on."""
-    from dew.interop.codecs import dequantize_fp8_blocks
-
-    forward = np.asarray(leaves[FROZEN_FP8[0]])
-    return dequantize_fp8_blocks(forward, np.asarray(leaves[FROZEN_FP8[1]]), (1, forward.shape[1])).T
+    each forward code widened times its row's scale (`frozen_fp8_leaves`), the
+    rows the forward product multiplies by, for a merge, an export or a head's
+    vocabulary rows (`CausalTransformer.applied_kernel`), traced or not."""
+    forward = jnp.asarray(leaves[FROZEN_FP8[0]])
+    return (forward.astype(jnp.float32) * jnp.asarray(leaves[FROZEN_FP8[1]], jnp.float32)).T
 
 
 def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
@@ -376,7 +375,7 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     """
     from dew.nn.fake_quant import straight_through
 
-    qarray = _qwix("qwix._src.core.qarray")
+    qwix = _qwix()
     values = jax.lax.stop_gradient(x).astype(jnp.float32)
     amax = jnp.asarray(spec.scale, jnp.float32) * jnp.float32(448)
     safe = jnp.where(amax <= jnp.float32(2 ** -24), 1, amax)
@@ -386,11 +385,21 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     # The composed GPU forward must round this product before the FP8 cast.
     quotients = jax.lax.optimization_barrier(values * multiplier)
     broadcast_shape = (1,) * values.ndim
-    quantized = qarray.quantize_with_scale_zero_point(
-        quotients, jnp.float8_e4m3fn, jnp.ones(broadcast_shape, jnp.float32), None)
+    quantized = _cast(qwix, quotients, jnp.float8_e4m3fn)
     quantized = quantized.replace(scale=scale.reshape(broadcast_shape))
-    rounded = qarray.dequantize(quantized)
+    rounded = qwix.dequantize(quantized)
     return straight_through(x, rounded)
+
+
+def _cast(qwix: ModuleType, quotients: jax.Array, qtype: jax.typing.DTypeLike):
+    """`quotients`, already divided by their scales, cast to `qtype` as a Qwix QArray of unit scale:
+    a fixed range of the type's own bound gives a scale of exactly one (448 over E4M3's 448, 6 over
+    E2M1's 6), so the cast is the type's rounding alone and the caller sets the real scale. NVFP4
+    names its 16-wide blocks along the last axis, which Qwix requires of it and a fixed range,
+    always per tensor, leaves unread."""
+    if qtype == jnp.float8_e4m3fn:
+        return qwix.quantize(quotients, qtype, calibration_method="fixed,448")
+    return qwix.quantize(quotients, qtype, tiled_axes={quotients.ndim - 1: 16}, calibration_method="fixed,6")
 
 
 def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
@@ -416,13 +425,13 @@ def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     from dew.nn.fake_quant import straight_through
     from dew.nn.precision import rounded_operand
 
-    qarray = _qwix("qwix._src.core.qarray")
+    qwix = _qwix()
     if x.shape[-1] % 16:
         raise ValueError(f"NVFP4 input width must be divisible by 16, got {x.shape}")
     values = jax.lax.stop_gradient(x)
     groups = values.reshape(*x.shape[:-1], -1, 16)
     if spec.format == 'modelopt':
-        return _modelopt_input_qdq(x, spec, qarray)
+        return _modelopt_input_qdq(x, spec, qwix)
     largest = jnp.max(jnp.abs(groups), -1)
     divisor = jnp.full(largest.shape, 6, jnp.float32)
     # CT's local division must round before global scaling, including its bf16 cast.
@@ -437,15 +446,14 @@ def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     scale = correctly_rounded_divide(scale, overall)
     expanded = jnp.broadcast_to(scale[..., None], groups.shape).reshape(x.shape)
     quotients = correctly_rounded_divide(values.astype(jnp.float32), expanded)
-    quantized = qarray.quantize_with_scale_zero_point(quotients, 'nvfp4', jnp.ones_like(expanded), None)
-    quantized = quantized.replace(scale=expanded)
-    rounded = qarray.dequantize(quantized)
+    quantized = _cast(qwix, quotients, 'nvfp4').replace(scale=expanded)
+    rounded = qwix.dequantize(quantized)
     # CT adds its symmetric zero point before casting, so exact -0 is +0.
     rounded = jnp.where(values == 0, jnp.zeros_like(rounded), rounded)
     return straight_through(x, rounded)
 
 
-def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qarray: ModuleType) -> jax.Array:
+def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qwix: ModuleType) -> jax.Array:
     """ModelOpt's direct-RN E4M3 scale rule, with Qwix's E2M1 representation.
 
     fp4_kernel_hopper.py:76-99 widens before amax, rounds amax/(6*g) to
@@ -475,8 +483,7 @@ def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qarray: ModuleType) 
     scales = jnp.where(scales >= 1e-5, scales, 1)
     spread = jnp.broadcast_to(scales[..., None], groups.shape).reshape(x.shape)
     quotients = values * correctly_rounded_divide(jnp.ones_like(values), spread)
-    quantized = qarray.quantize_with_scale_zero_point(quotients, 'nvfp4', jnp.ones_like(spread), None)
-    rounded = qarray.dequantize(quantized.replace(scale=spread))
+    rounded = qwix.dequantize(_cast(qwix, quotients, 'nvfp4').replace(scale=spread))
     return straight_through(x, jnp.where(rounded == 0, jnp.zeros_like(rounded), rounded))
 
 
@@ -513,8 +520,11 @@ class InputQuantization:
     (`measured_fp8_sites`). LoRA packs their kernels from the base it
     freezes, the one place a kernel is known never to train."""
     measured_on: str | None = None
-    """The GPU generation `frozen_fp8` was measured on (`sm90`); a site runs
-    its FP8 product on that generation alone."""
+    """The GPU generation `frozen_fp8` was measured on (`sm90`): where its
+    sites measured faster in FP8, which another generation may not repeat.
+    The product is ordinary arithmetic on the stored codes and scales and
+    runs on any generation; measure that GPU's sites for its own speed
+    (LoRA.fp8_base)."""
 
     def __post_init__(self) -> None:
         if self.format == "modelopt" and not self.e4m3_scale:
@@ -571,16 +581,6 @@ class InputQuantization:
         return unflatten_dict({(*site.split("/"), leaf): value for site in self.frozen_fp8
                                for leaf, value in frozen_fp8_leaves(_site_kernel(frozen, site)).items()})
 
-    def refuse_other_fp8_generation(self, module: nn.Module) -> None:
-        """Refuse a frozen FP8 product on a GPU other than the one its sites
-        were measured on, by name: where FP8 pays differs by generation."""
-        from dew.nn.kernels.generation import device_generation
-
-        if device_generation() != self.measured_on:
-            raise ValueError(f"{'/'.join(module.path)} multiplies its frozen kernel in FP8 as measured on "
-                             f"{self.measured_on}, and this is {device_generation()}; measure this GPU's "
-                             "sites (LoRA.fp8_base)")
-
     def apply(self, model: nn.Module) -> nn.Module:
         """Return `model` quantizing each Linear's input to its declared format
         and back with its scales, before the layer's dot, and computing each
@@ -598,6 +598,15 @@ class InputQuantization:
 
         def quantize_inputs(next_fun, args, kwargs, context):
             module = context.module
+            if context.method_name == "applied_kernel":
+                # A model reads the kernel its submodule multiplies by
+                # (`CausalTransformer.applied_kernel`): a frozen FP8 site's
+                # is its codes decoded, which an adapter's branch updates.
+                child = getattr(module, args[0] if args else kwargs["name"])
+                if not child.has_variable(QUANTIZATION, FROZEN_FP8[0]):
+                    return next_fun(*args, **kwargs)
+                return frozen_fp8_kernel({leaf: child.get_variable(QUANTIZATION, leaf)
+                                          for leaf in FROZEN_FP8})
             if context.method_name == "nonlinear_input":
                 # A layer asks whether its submodule is linear in its input
                 # (`MultiHeadLatentAttention.nonlinear_input`): one that
@@ -619,7 +628,6 @@ class InputQuantization:
             if quantizer is not None:
                 inputs = quantizer.qdq(inputs)
             if frozen:
-                record.refuse_other_fp8_generation(module)
                 return frozen_fp8_dense(module, inputs)
             if args:
                 return next_fun(inputs, *args[1:], **kwargs)
@@ -844,17 +852,24 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
     (`GroupScaledConvolution`); its matmuls keep Qwix's scaling, and whether
     a bf16 fp8 run on a TPU turns NaN the way the served fp8 model did is not
     measured."""
-    qarray = _qwix("qwix._src.core.qarray")
+    qwix = _qwix()
+
+    def quantized(arg) -> bool:
+        return isinstance(arg, qwix.QArray)
 
     def scaled(*args: P.args, **kwargs: P.kwargs) -> jax.Array:
-        operands = [arg for arg in args if isinstance(arg, qarray.QArray)]
+        operands = [arg for arg in jax.tree.leaves(args, is_leaf=quantized) if quantized(arg)]
         if len(operands) < 2:
             return op(*args, **kwargs)
-        _, dtype = qarray.get_accumulator_and_result_type(*operands, preferred_element_type=None)
+        # The product's dtype as Qwix's rule gives it (qarray.get_accumulator_and_result_type): its
+        # operands' scales', an 8-bit or narrower one read as bfloat16, an integer one as int32.
+        dtype = jnp.result_type(*(
+            (jnp.int32 if "int" in operand.scale.dtype.name else jnp.bfloat16)
+            if operand.scale.dtype.itemsize <= 1 else operand.scale.dtype for operand in operands))
         rescaled = jax.tree.map(
-            lambda arg: arg.astype(jnp.float32) if isinstance(arg, qarray.QArray) else arg,
+            lambda arg: arg.astype(jnp.float32) if quantized(arg) else arg,
             args,
-            is_leaf=lambda arg: isinstance(arg, qarray.QArray),
+            is_leaf=quantized,
         )
         return op(*rescaled, **kwargs).astype(dtype)
 
@@ -867,7 +882,6 @@ def _grouped_convolution_gradient() -> type:
     convolution; importing Qwix here keeps it optional."""
     qwix = _qwix()
     conv_general_qt = _qwix("qwix._src.core.conv_general_qt")
-    qarray = _qwix("qwix._src.core.qarray")
 
     @functools.partial(jax.custom_vjp, nondiff_argnums=tuple(range(2, 11)))
     def grouped_conv_qt(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation,
@@ -878,7 +892,7 @@ def _grouped_convolution_gradient() -> type:
 
     def straight_through(config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
                          feature_group_count, batch_group_count, out_sharding, residuals, g):
-        operands = [qarray.dequantize(operand) if isinstance(operand, qarray.QArray) else operand
+        operands = [qwix.dequantize(operand) if isinstance(operand, qwix.QArray) else operand
                     for operand in residuals]
 
         def convolve(lhs, rhs):
@@ -1074,10 +1088,6 @@ def _providers() -> tuple[type, type]:
     scales two quantized operands' product in float32
     (`_scaled_in_float32`)."""
     qwix = _qwix()
-    conv_general = _qwix("qwix._src.core.conv_general")
-    dot_general = _qwix("qwix._src.core.dot_general")
-    einsum = _qwix("qwix._src.core.einsum")
-    quantized = _qwix("qwix._src.providers.ptq").WithAux
     group_scaled = _group_scaled_convolution()
 
     class ComplexInFloat(qwix.QuantizationProvider):
@@ -1136,19 +1146,24 @@ def _providers() -> tuple[type, type]:
 
         def __init__(self, rules: Sequence[object]) -> None:
             super().__init__(
-                rules, _dot_general_fn=_scaled_in_float32(dot_general.dot_general),
-                _einsum_fn=_scaled_in_float32(einsum.einsum),
-                _conv_general_dilated_fn=_scaled_in_float32(conv_general.conv_general_dilated))
+                rules, _dot_general_fn=_scaled_in_float32(qwix.dot_general),
+                _einsum_fn=_scaled_in_float32(qwix.einsum),
+                _conv_general_dilated_fn=_scaled_in_float32(qwix.conv_general_dilated))
 
         def promote_dtype(self, *args, **kwargs):
-            # `WithAux.astype` itself raises on a QArray in Qwix 0.1.8
-            # (`flax_util.update_boxed` accepts boxes and arrays only).
+            # Qwix 0.1.8 passes a quantized kernel through, and its wrapper's own `astype` raises on
+            # the QArray inside it (`flax_util.update_boxed` accepts boxes and arrays only): the
+            # QArray's scales take the dtype, wherever the wrapper holds it.
             promoted = super().promote_dtype(*args, **kwargs)
             dtype = kwargs.get("dtype")
             if dtype is None:
                 return promoted
-            return [value.replace(array=nn.unbox(value.array).astype(dtype))
-                    if isinstance(value, quantized) else value for value in promoted]
+
+            def quantized(value) -> bool:
+                return isinstance(value, qwix.QArray)
+
+            return jax.tree.map(lambda value: value.astype(dtype) if quantized(value) else value,
+                                promoted, is_leaf=quantized)
 
     return QtProvider, PtqProvider
 

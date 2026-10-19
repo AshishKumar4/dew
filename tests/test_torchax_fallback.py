@@ -144,6 +144,50 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     assert moved["gpt_neox.embed_in.weight"].sharding.spec == P(("fsdp", "tensor"))
 
 
+def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placement(loaded, tokens):
+    """`Layout.frozen_whole` reaches a torch-named tree: TorchLayout's name table picks each
+    tensor's axes, and the one placement keeps the frozen tensors whole over fsdp, split over the
+    tensor axis as the table splits them, while the trained ones, their moments and one step's
+    update lie as the split layout lays them."""
+    from dew.nn.sharding import mesh_axes
+    from dew.objectives.base import FROZEN, freeze
+    from dew.training.distributed import shard_batch
+
+    variables = freeze(loaded.variables, lambda path: ".layers.1." in path[1])
+    mesh = MeshSpec(fsdp=2, tensor=2)
+    rows = math.lcm(ROWS, jax.device_count())
+    batch = {"text": tokens[np.arange(rows) % ROWS]}
+
+    def stepped(frozen_whole: bool):
+        objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None, variables=variables)
+        trainer = Trainer(objective, optax.adamw(1e-2), key=jax.random.key(0), mesh=mesh, checkpoints=None,
+                          tracker=None, layout=TorchLayout(min_shard=1, frozen_whole=frozen_whole))
+        trainer.device_mesh = mesh.build(jax.devices()[:4])
+        state, shardings, _ = trainer.place()
+        placed = shard_batch(trainer.device_mesh, batch)
+        trained, *_ = trainer.compile(state, placed)(state, placed)
+        return shardings, jax.device_get(trained.variables["params"])
+
+    def unsplit(entry):
+        kept = [axis for axis in mesh_axes(entry) if axis != "fsdp"]
+        return tuple(kept) if kept else None
+
+    split, split_trained = stepped(frozen_whole=False)
+    whole, whole_trained = stepped(frozen_whole=True)
+    split_frozen = {name: sharding.spec for name, sharding in split.variables[FROZEN].items()}
+    whole_frozen = {name: sharding.spec for name, sharding in whole.variables[FROZEN].items()}
+    assert any("fsdp" in mesh_axes(entry) for spec in split_frozen.values() for entry in spec)
+    assert whole_frozen == {name: P(*map(unsplit, spec)) for name, spec in split_frozen.items()}
+    assert whole_frozen["gpt_neox.layers.0.attention.query_key_value.weight"] == P("tensor", None)
+    for field in ("params", "opt_state"):
+        tree = (lambda placement: placement.variables["params"]) if field == "params" else (
+            lambda placement: placement.opt_state)
+        assert [sharding.spec for sharding in jax.tree.leaves(tree(whole))] == [
+            sharding.spec for sharding in jax.tree.leaves(tree(split))]
+    for got, want in zip(jax.tree.leaves(whole_trained), jax.tree.leaves(split_trained), strict=True):
+        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
+
+
 GEMMA2 = {**TINY, "intermediate_size": 128, "num_key_value_heads": 2, "head_dim": 16, "sliding_window": 32,
           "final_logit_softcapping": 2.0, "query_pre_attn_scalar": 16}
 LLAMA = {**TINY, "num_key_value_heads": 2, "tie_word_embeddings": True}
@@ -234,6 +278,38 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
     assert_leaves_as_exact(dew, reference, truth, reductions=ROWS * SEQ, terms=terms)
     if head in ("zero bias", "bias"):
         assert np.abs(dew["lm_head.bias"]).max() > 0
+
+
+@pytest.mark.parametrize("family", ["llama", "neox"])
+def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_path):
+    """A bf16 checkpoint computing in bf16: LMObjective's gradient of every parameter is as exact
+    as torch autograd's bf16 one over the same weights, both measured from torch in float64
+    (tests/reference_error.py). A norm weight's and a bias's gradient is the sum over the tokens
+    of a broadcast's cotangent, which jax sums in the broadcast value's dtype (jax-ml/jax#30310)
+    and torch in fp32; summed in bf16 they sat 2.5-3 and 3.7-4.7 times torch's distance."""
+    torch.manual_seed(0)
+    if family == "llama":
+        model = transformers.LlamaForCausalLM(transformers.LlamaConfig(**LLAMA))
+    else:
+        model = transformers.GPTNeoXForCausalLM(transformers.GPTNeoXConfig(**TINY))
+    model = model.eval().to(torch.bfloat16)
+    model.save_pretrained(tmp_path)
+    with pytest.warns(UserWarning):
+        loaded = Pretrained.load(tmp_path, fallback="torchax", dtype="bfloat16", param_dtype="bfloat16")
+    objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
+    names = [name for name, _ in model.named_parameters()]
+    grads = jax.grad(lambda params: objective_loss(objective, {**loaded.variables, "params": params}, tokens,
+                                                   scalar=True))(loaded.variables["params"])
+    dew = {name: np.asarray(grads[name], np.float64) for name in names}
+    stepped = torch_step(copy.deepcopy(model), tokens, torch.bfloat16)
+    reference = {name: stepped[name] for name in names}
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+        stepped = torch_step(wide, tokens, torch.float64)
+    truth = {name: stepped[name] for name in names}
+    assert_leaves_as_exact(dew, reference, truth, reductions=ROWS * SEQ)
 
 
 def test_save_writes_the_source_names_back(source, loaded, tokens, tmp_path):

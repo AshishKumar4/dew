@@ -217,6 +217,6 @@ MODERNBERT = DecoderFamily(
     lambda fields: not fields.causal and fields.embedding_norm and not fields.first_attention_norm,
     'modernbert', 'ModernBertForMaskedLM', _modernbert_export,
     weight_path=_modernbert_path, export_path=_modernbert_export_path,
-    prepare=_modernbert_prepare, packed=_MODERNBERT_PACKED, preserve_source_layout=False,
+    prepare=_modernbert_prepare, spelling=_nested, packed=_MODERNBERT_PACKED, preserve_source_layout=False,
     tied_head_names=('decoder.weight', 'model.embeddings.tok_embeddings.weight'),
 )

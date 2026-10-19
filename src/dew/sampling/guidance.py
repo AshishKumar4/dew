@@ -99,10 +99,9 @@ class Walk:
 _DENOMINATOR = 1 << 15
 
 
-def _scales(scale: float, interval: tuple[float, float],
-            steps: int | jax.Array) -> Callable[[Index], jax.Array]:
-    """Each step's scale over a walk of `steps` steps: `scale` on the steps i
-    with start <= i / steps <= stop, 1 on the rest.
+def _inside(interval: tuple[float, float], steps: int | jax.Array) -> Callable[[Index], jax.Array]:
+    """Whether each step of a walk of `steps` steps guides: the steps i with start <= i / steps <=
+    stop.
 
     The comparison is exact: i q >= p steps in integers against an edge p / q,
     so no rounding of a time or of i / steps moves an edge. `steps` may be
@@ -113,11 +112,18 @@ def _scales(scale: float, interval: tuple[float, float],
     steps = jnp.maximum(steps, 1)
 
     def at(index: Index) -> jax.Array:
-        inside = ((index * start.denominator >= start.numerator * steps)
-                  & (index * stop.denominator <= stop.numerator * steps))
-        return jnp.where(inside, scale, 1.0)
+        return ((index * start.denominator >= start.numerator * steps)
+                & (index * stop.denominator <= stop.numerator * steps))
 
     return at
+
+
+def _scales(scale: float, interval: tuple[float, float],
+            steps: int | jax.Array) -> Callable[[Index], jax.Array]:
+    """Each step's scale over a walk of `steps` steps: `scale` on the steps that guide (`_inside`),
+    1 on the rest."""
+    inside = _inside(interval, steps)
+    return lambda index: jnp.where(inside(index), scale, 1.0)
 
 
 def _interval(interval) -> tuple[float, float]:
@@ -212,18 +218,21 @@ class CFGPlusPlus:
             raise ValueError(f"CFG++ interpolates with a scale in [0, 1], got {self.scale}")
         object.__setattr__(self, "interval", _interval(self.interval))
 
-    def _guided(self, denoise: Denoiser, scale: jax.Array) -> Predict:
+    def _guided(self, denoise: Denoiser, active: jax.Array) -> Predict:
+        """The guided pair on a step that guides, and the conditional denoiser's own pair on one
+        outside the interval, where the unconditional noise would still steer the walk."""
         def guided(x, t):
             output, unconditional = denoise.raw_both(x, t)
-            clean, _ = denoise.convert(x, t, guide(output, unconditional, scale))
-            _, noise = denoise.convert(x, t, unconditional)
+            renoising = jnp.where(active, unconditional, output)
+            clean, _ = denoise.convert(x, t, guide(output, renoising, self.scale))
+            _, noise = denoise.convert(x, t, renoising)
             return clean, noise
 
         return guided
 
     def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk:
-        scales = _scales(self.scale, self.interval, steps)
-        return Walk.stateless(lambda index: self._guided(denoise, scales(index)))
+        inside = _inside(self.interval, steps)
+        return Walk.stateless(lambda index: self._guided(denoise, inside(index)))
 
 
 def _projected_components(direction, output):

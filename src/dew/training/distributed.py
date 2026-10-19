@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import contextlib
+import collections
 import dataclasses
 import fnmatch
 import functools
@@ -10,7 +10,6 @@ import hashlib
 import json
 import logging
 import math
-import queue
 import statistics
 import threading
 import time
@@ -60,9 +59,10 @@ from dew.nn.sharding import (
     microbatched,
     ruled_boxes,
 )
-from dew.objectives.base import Batch, Variables
+from dew.objectives.base import FROZEN, Batch, Variables
 from dew.records import JSON, number, record
 from dew.telemetry.profile import region
+from dew.training.state import VARIABLE_FIELDS
 
 # The role axes no parameter splits over: data holds a batch's replicas,
 # sequence its positions, and stage the pipeline's stages of the layer stack,
@@ -433,7 +433,7 @@ def check_batch(batch: int, mesh: Mesh, microbatches: int) -> None:
         f"microbatch's again; use {' or '.join(suggestions)}")
 
 
-def check_stream(source, mesh: Mesh, microbatches: int, batch: int, window: int, *, rows: bool,
+def check_stream(source, mesh: Mesh, microbatches: int, batch: int, *, rows: bool,
                  resumed: int | None) -> None:
     """Refuse a training stream a run cannot resume or cannot shard.
 
@@ -445,7 +445,8 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, window: int,
     traced (`check_batch`), unless the stream's rows are not the step's
     (`rows`; a rollout's are its own, checked where its step traces), and a
     ramp stage's, for a later stage, an hour in. A ramp reads each stage's
-    batch whole, never in a `window` of more than one microbatch.
+    batch whole; an accumulation window pools its stages' batches as it pools
+    any, but for a loss that replays its window's batches (`Trainer._prepared`).
     """
     if resumed:
         kept = isinstance(source, Checkpointable)
@@ -461,12 +462,6 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, window: int,
         if rows:
             check_batch(batch, mesh, microbatches)
         return
-    if window > 1:
-        raise ValueError(
-            f"a batch ramp grows the records a step reads, and an "
-            f"accumulation window of {window} pools "
-            f"microbatches of one shape into one update; ramp the "
-            f"batch or accumulate, not both")
     divisor = batch_divisor(mesh, microbatches)
     refused = [stage.batch for stage in source.stages if stage.batch % divisor]
     if refused:
@@ -583,12 +578,20 @@ class Layout:
     fetches each layer's parameters as it reaches that layer. When
     `host_parameters` is set, `check` refuses a placement that keeps every
     parameter on the device, so the patterns are never silently ignored.
+
+    `frozen_whole` keeps the frozen collection (`FROZEN`, a LoRA run's base)
+    whole over fsdp, split only over the other axes the rules give it (a
+    tensor split stays). A frozen leaf has no gradient and no optimizer
+    state, so an fsdp split saves only its memory, and the step gathers it
+    whole forward and again backward. `check` counts no leaf it keeps whole,
+    and a leaf `host_parameters` also names is kept so in pinned host memory.
     """
     rules: LogicalAxisRules | Mapping[str, MeshAxes] = DEFAULT_RULES
     min_shard: int = 2 ** 16
     tolerance: float = 0.02
     host: tuple[str, ...] = ()
     host_parameters: tuple[str, ...] = ()
+    frozen_whole: bool = False
     data_axes: tuple[str, ...] = ()
     """The axes a batch's rows split over, ahead of the rules' own
     `activation_batch` entries: a native mesh's names for its data-parallel
@@ -652,7 +655,7 @@ class Layout:
         declared = declarations(tree)
 
         def leaf_sharding(path, value):
-            axes = declared_axes(path, value.ndim, declared)
+            axes = self._axes(path, value.ndim, declared)
             size = int(np.prod(value.shape, dtype=np.int64))
             if axes is None:
                 spec = parameter_spec(value.shape, fsdp_size, self.min_shard)
@@ -660,6 +663,8 @@ class Layout:
                 spec = P()
             else:
                 spec = logical_spec(axes, value.shape, rules=self.axis_rules, mesh=mesh)
+            if self._kept_whole(path):
+                spec = P(*map(_without_fsdp, spec))
             placed = {axis for entry in spec for axis in mesh_axes(entry)}
             if outside := sorted(placed & set(UNSPLIT_AXES)):
                 raise ValueError(
@@ -679,15 +684,30 @@ class Layout:
         modules declared, as the rules place them."""
         return boxed(ruled_boxes({**current_boxes(), **boxed_axes(tree)}, self.axis_rules))
 
+    def _axes(self, path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
+        """The logical axes of the leaf at `path`: those its module declared, or None for the shape
+        heuristic. Placement, its minimum size, `frozen_whole` and its checks follow from them."""
+        return declared_axes(path, ndim, declared)
+
     def _splitting(self, path, value, declared: Mapping[Suffix, LogicalAxes]) -> set[str]:
         """The parameter axes the rules could split the leaf at `path` over:
         those its declared names' rules name, or fsdp, which the shape
         heuristic splits an undeclared leaf over."""
-        axes = declared_axes(path, value.ndim, declared)
+        axes = self._axes(path, value.ndim, declared)
         if axes is None:
             return {FSDP_AXIS}
         return set(parameter_axes(axis for name, assignment in self.axis_rules if name in axes
                                   for axis in mesh_axes(assignment)))
+
+    def _kept_whole(self, path) -> bool:
+        """Whether a leaf sits in the frozen collection `frozen_whole` keeps
+        whole: `FROZEN` heads a variables tree, the tree placed or one of a
+        train state's (`VARIABLE_FIELDS`). The optimizer's state mirrors the
+        trained parameters' paths, so a module or a group named so is none."""
+        head = list(path[:2])
+        if head and isinstance(head[0], jax.tree_util.GetAttrKey) and head[0].name in VARIABLE_FIELDS:
+            head = head[1:]
+        return self.frozen_whole and head[:1] == [jax.tree_util.DictKey(FROZEN)]
 
     def offloaded[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """Return `shardings`, with the memory kind each leaf's path asks for.
@@ -767,7 +787,7 @@ class Layout:
         for (path, param), sharding, has_rule in zip(
                 path_leaves, jax.tree.leaves(shardings), splittable, strict=True):
             elements = int(np.prod(param.shape, dtype=np.int64))
-            if elements < self.min_shard or not has_rule:
+            if elements < self.min_shard or not has_rule or self._kept_whole(path):
                 continue
             shardable_elements += elements
             if any(axis in mesh_axes(assignment)
@@ -1014,6 +1034,12 @@ def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str,
 PREFETCH_DEPTH = 2
 
 
+def _without_fsdp(entry: MeshAxes) -> MeshAxes:
+    """A spec entry with the fsdp axis dropped from it."""
+    kept = tuple(axis for axis in mesh_axes(entry) if axis != FSDP_AXIS)
+    return kept if kept else None
+
+
 def placed_bytes(tree) -> int:
     """The bytes a device holds of `tree`'s arrays, each laid out as its
     sharding places it (abstract arrays carry their sharding)."""
@@ -1125,7 +1151,11 @@ class DevicePrefetchIterator:
         self._iterator: Iterator | None = iter(iterator)
         self._source_name = type(self._iterator).__name__
         self._mesh: Mesh | None = mesh
-        self._queue: queue.Queue = queue.Queue(maxsize=depth)
+        # The placed batches waiting for the consumer, at most `depth`; `_ready` wakes whoever waits on
+        # them, on an enqueue, a dequeue, a stop and the worker's end, so neither side polls.
+        self._queued: collections.deque[tuple[Batch, bytes | None]] = collections.deque()
+        self._depth = depth
+        self._ready = threading.Condition()
         self._stop = threading.Event()
         self._done = threading.Event()
         self._start_lock = threading.Lock()
@@ -1172,6 +1202,8 @@ class DevicePrefetchIterator:
         """Ask the worker to stop between batches, and a stoppable source to stop its own work."""
         first = not self._stop.is_set()
         self._stop.set()
+        with self._ready:
+            self._ready.notify_all()
         if first:
             self._stop_source()
 
@@ -1198,7 +1230,7 @@ class DevicePrefetchIterator:
         iterator, mesh = self._iterator, self._mesh
         assert iterator is not None and mesh is not None
         source = iterator if isinstance(iterator, Checkpointable) else None
-        batch = state = placed = None
+        batch = state = read = placed = None
         try:
             if not self._stop.is_set() and self.source_state is not None:
                 if source is None:
@@ -1212,22 +1244,19 @@ class DevicePrefetchIterator:
                 if self._stop.is_set():
                     break
                 with region("data.position"):
-                    state = source.get_state() if source is not None else None
-                    if source is not None and not isinstance(state, bytes):
-                        state = json.dumps(state).encode()
+                    read = source.get_state() if source is not None else None
+                    state = read if read is None or isinstance(read, bytes) else json.dumps(read).encode()
                 with region("data.place"), nn.logical_axis_rules(self._rules):
                     if self._prepare is not None:
                         batch = self._prepare(batch)
                     placed = shard_batch(mesh, batch, self._reads)
                 batch = None
-                with region("data.enqueue"):
-                    while not self._stop.is_set():
-                        try:
-                            self._queue.put((placed, state), timeout=0.05)
-                            break
-                        except queue.Full:
-                            continue
-                placed = state = None
+                with region("data.enqueue"), self._ready:
+                    self._ready.wait_for(lambda: self._stop.is_set() or len(self._queued) < self._depth)
+                    if not self._stop.is_set():
+                        self._queued.append((placed, state))
+                        self._ready.notify_all()
+                placed = state = read = None
         except StopIteration:
             # A drained source is how a prefetch thread ends; the finally
             # below publishes the end, and no error goes with it.
@@ -1235,7 +1264,7 @@ class DevicePrefetchIterator:
         except BaseException as error:
             self._error = error
         finally:
-            batch = placed = state = None
+            batch = placed = state = read = None
             try:
                 close = iterator.close if isinstance(iterator, Closeable) else None
                 if close is not None:
@@ -1251,13 +1280,15 @@ class DevicePrefetchIterator:
                 iterator = source = mesh = close = None
                 if self._stop.is_set():
                     self._discard()
-                self._done.set()
+                with self._ready:
+                    self._done.set()
+                    self._ready.notify_all()
 
     def _discard(self) -> None:
         """Drop every batch already queued, without waiting for more."""
-        with contextlib.suppress(queue.Empty):
-            while True:
-                self._queue.get_nowait()
+        with self._ready:
+            self._queued.clear()
+            self._ready.notify_all()
 
     def close(self, *, timeout: float | None = None) -> None:
         """Stop the worker and wait for it, discarding unread batches but keeping `source_state`.
@@ -1321,29 +1352,24 @@ class DevicePrefetchIterator:
         if self._stop.is_set():
             raise StopIteration
         self._start()
-        while not self._stop.is_set():
-            try:
-                batch, position = self._queue.get(timeout=0.05)
-            except queue.Empty:
-                if not self._done.is_set():
-                    continue
-                # The final publication may race the timed-out get.
-                try:
-                    batch, position = self._queue.get_nowait()
-                except queue.Empty:
-                    error, self._error = self._error, None
-                    cleanup, self._cleanup_error = self._cleanup_error, None
-                    if error is not None:
-                        if cleanup is not None:
-                            error.add_note(f"Source cleanup failed: {cleanup!r}")
-                        raise error from None
-                    if cleanup is not None:
-                        raise cleanup from None
-                    raise StopIteration from None
+        with self._ready:
+            self._ready.wait_for(lambda: self._queued or self._done.is_set() or self._stop.is_set())
             if self._stop.is_set():
-                break
-            self.source_state = position
-            return batch
+                raise StopIteration
+            if self._queued:
+                batch, position = self._queued.popleft()
+                self._ready.notify_all()
+                self.source_state = position
+                return batch
+        # The worker ended, every batch it published read: with its error, if it had one.
+        error, self._error = self._error, None
+        cleanup, self._cleanup_error = self._cleanup_error, None
+        if error is not None:
+            if cleanup is not None:
+                error.add_note(f"Source cleanup failed: {cleanup!r}")
+            raise error from None
+        if cleanup is not None:
+            raise cleanup from None
         raise StopIteration
 
 

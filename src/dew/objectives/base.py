@@ -759,7 +759,23 @@ class Objective(ABC, Generic[Loss, Effects]):
         return self.loss(variables, batch, replace(step, training=False))
 
     def _check_validation_loss(self) -> None:
-        """Refuse a validation loss this objective cannot define, before fit places its state."""
+        """Refuse a validation loss this objective does not define (`validation_loss_refusal`),
+        before fit places its state."""
+        if (refusal := self.validation_loss_refusal) is not None:
+            raise ValueError(refusal)
+
+    @property
+    def validation_loss_refusal(self) -> str | None:
+        """Why this objective defines no validation loss, None where `validation_loss` scores
+        held-out rows, which a validation pass then records whatever else reads it: the one
+        policy of whether an objective has a validation loss, which an objective that scores
+        held-out rows otherwise overrides."""
+        return None
+
+    @property
+    def defines_validation_loss(self) -> bool:
+        """Whether `validation_loss` scores held-out rows (`validation_loss_refusal`)."""
+        return self.validation_loss_refusal is None
 
     @staticmethod
     def row_mean(values: jax.Array, batch: Batch, axis: int | tuple[int, ...] | None = None, *,
@@ -1015,9 +1031,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         from dew.checkpoints import Checkpoints
 
-        variables = Checkpoints(directory).variables(
-            step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
-            param_dtype=param_dtype, parameter_roots=parameter_roots)
+        with Checkpoints(directory) as checkpoints:
+            variables = checkpoints.variables(
+                step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
+                param_dtype=param_dtype, parameter_roots=parameter_roots)
         return cls._model_tree(variables)
 
     @classmethod

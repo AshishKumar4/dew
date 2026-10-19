@@ -10,6 +10,7 @@ from flax import struct
 from jax import lax
 
 from .common import _sigma_integrator
+from .sigma import _ancestral
 
 
 class _Brownian(NamedTuple):
@@ -160,19 +161,13 @@ class DPMSolverSDE:
         _, sigma_t = process.rates(t, like=x)
         _, sigma_s = process.rates(t_next, like=x)
 
-        def ancestral(target):
-            """The source's `sigma_up`, capped at the target level, and the
-            `sigma_down` a step actually reaches."""
-            up = jnp.minimum(target, (target ** 2 * (sigma_t ** 2 - target ** 2) / sigma_t ** 2) ** 0.5)
-            return (target ** 2 - up ** 2) ** 0.5, up
-
         def midpoint(_):
             sigma_mid = jnp.exp(0.5 * (jnp.log(sigma_t) + jnp.log(sigma_s)))
-            first_down, first_up = ancestral(sigma_mid)
+            first_down, first_up = _ancestral(sigma_t, sigma_mid)
             noise = self._noise(state, jnp.min(sigma_t), jnp.min(sigma_mid), x.shape)
             x_mid = _sde_step(x, denoised, sigma_t, first_down) + noise * first_up
             denoised_mid, _ = denoise(x_mid, schedule.t_of_sigma(sigma_mid.reshape(-1)))
-            down, up = ancestral(sigma_s)
+            down, up = _ancestral(sigma_t, sigma_s)
             noise = self._noise(state, jnp.min(sigma_t), jnp.min(sigma_s), x.shape)
             return _sde_step(x, denoised_mid, sigma_t, down) + noise * up
 

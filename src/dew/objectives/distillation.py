@@ -58,7 +58,10 @@ Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
 
 if TYPE_CHECKING:
+    from dew.data.pipeline import ObjectiveData
+    from dew.data.text import Tokenizer
     from dew.inference.tasks import Processor
+    from dew.records import JSON
 
 PROJECTIONS = "distillation"
 """The params subtree holding the feature pairs' width projections."""
@@ -126,6 +129,15 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         self.ema = None if averaged is None else EMASpec(
             decay=averaged.decay,
             select=lambda path: path[0] != TEACHER and averaged.select(path))
+
+    def data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData:
+        """The student's record and batch steps: the teacher scores the batch the student reads."""
+        return self.student.data(tokenizer)
+
+    def inference_record(self) -> JSON:
+        """The student's record: a saved distillation loads as the student it trained, on the
+        student's own tree."""
+        return self.student.inference_record()
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The student's modules, then the teacher's, which the step does not train."""

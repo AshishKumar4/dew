@@ -1849,6 +1849,46 @@ def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):
     assert {rows[index]["split"] for index in range(len(rows))} == {"train", "held"}
 
 
+def test_a_delta_run_resumes_with_its_version_pinned_and_refuses_another_predicate(tmp_path):
+    """A table's identity is its resolved version, files and read options: a run started on the
+    table's head resumes exactly with that version pinned, and a run reading it through another
+    predicate is refused."""
+    import pyarrow.dataset as ds
+    from deltalake import write_deltalake
+
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources.delta import Delta
+
+    root = str(tmp_path / "delta")
+    write_deltalake(root, pa.table({"value": list(range(8))}))
+    loading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
+
+    def opened(table):
+        data = compile(Pipeline(table).repeat().batch(2), read="streamed", loading=loading)
+        return data.train(DataPartition())
+
+    head = opened(Delta(root))
+    try:
+        first = [np.asarray(next(head)["value"]).tolist()]
+        saved = head.get_state()
+        expected = [np.asarray(next(head)["value"]).tolist() for _ in range(2)]
+    finally:
+        head.close()
+    pinned = opened(Delta(root, version=Delta(root).table.version()))
+    try:
+        pinned.set_state(saved)
+        assert first + [np.asarray(next(pinned)["value"]).tolist() for _ in range(2)] == first + expected
+    finally:
+        pinned.close()
+    filtered = opened(Delta(root, where=ds.field("value") >= 0))
+    try:
+        with pytest.raises(ValueError):
+            filtered.set_state(saved)
+    finally:
+        filtered.close()
+
+
 def test_artifact_codec_preserves_arrow_scalars_and_nested_arrays():
     import datetime
     from decimal import Decimal
@@ -2278,3 +2318,47 @@ def test_native_map_datasets_read_as_streams_and_mix_with_a_stream_only_member()
         finally:
             resumed.close()
 
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
+def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(read):
+    """Two stores read in turn (`dew.data.Concatenate`) are one store to a recipe and to the verbs:
+    a pass over it holds every record of both once, in their order, steps chain on it as on any
+    store, and a training run resumed after two batches reads the batches the uninterrupted run
+    reads."""
+    from dew.config.data import RecordsData, loader
+    from dew.data import Concatenate
+    from dew.data.compile import validation
+    from dew.data.pipeline import Pipeline
+
+    train = Memory([{"id": np.int32(index)} for index in range(6)])
+    held = Memory([{"id": np.int32(index)} for index in range(100, 104)])
+    joined = Concatenate((train, held))
+    assert joined.map(lambda record: {"id": record["id"] + 1}).chain().source is joined
+    loading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
+    passed = validation(Pipeline(joined).batch(2), batch=2, read=read, loading=loading)(DataPartition())
+    try:
+        assert [int(value) for batch in passed for value in batch["id"]] == [*range(6), *range(100, 104)]
+    finally:
+        passed.close()
+
+    def opened():
+        return loader(RecordsData(joined), batch=2, read=read, loading=loading, seed=3).train(DataPartition())
+
+    whole = opened()
+    try:
+        expected = [np.asarray(next(whole)["id"]).tolist() for _ in range(8)]
+    finally:
+        whole.close()
+    stopped = opened()
+    try:
+        head = [np.asarray(next(stopped)["id"]).tolist() for _ in range(2)]
+        saved = stopped.get_state()
+    finally:
+        stopped.close()
+    resumed = opened()
+    try:
+        resumed.set_state(saved)
+        assert head + [np.asarray(next(resumed)["id"]).tolist() for _ in range(6)] == expected
+    finally:
+        resumed.close()

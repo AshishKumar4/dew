@@ -289,17 +289,19 @@ def test_lm_step_parity_records_a_repeatable_fixed_batch_run():
 # tools/benchmark_lm_head.py
 # ---------------------------------------------------------------------------
 
-def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients():
+@pytest.mark.parametrize("states_dtype", ["float32", "bfloat16"])
+def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients(states_dtype):
     """stored and remat are the baseline head rearranged into vocabulary
     tiles, so on one small case all three agree on the loss, the top-1
-    accuracy and both gradients. The vocabulary of 12 does not split into
-    4 equal tiles, so the short last tile is on the path."""
+    accuracy and both gradients, in the states' own precision: bf16 states
+    take the bf16 head product in every variant. The vocabulary of 12 does
+    not split into 4 equal tiles, so the short last tile is on the path."""
     tool = load("benchmark_lm_head")
     key = jax.random.PRNGKey(0)
-    states = jax.random.normal(key, (2, 3, 8), jnp.float32)
+    states = jax.random.normal(key, (2, 3, 8), jnp.float32).astype(states_dtype)
     table = jax.random.normal(jax.random.fold_in(key, 1), (12, 8), jnp.float32)
     targets = jnp.array([[0, 5, 11], [3, 11, 4]], jnp.int32)
-    variant = tool.parse_variant("stored4-fp32")
+    variant = tool.parse_variant("stored4-fp32" if states_dtype == "float32" else "stored4")
 
     outputs = {}
     for name in ("baseline", "stored", "remat"):
@@ -309,11 +311,15 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients():
         outputs[name] = (float(loss), float(accuracy), np.asarray(d_states), np.asarray(d_table))
 
     reference = outputs["baseline"]
+    # The loop adds each tile's state gradient in the states' dtype, one rounding a tile, where the
+    # baseline's one product rounds once: in bf16 up to a 2^-8 of the largest entry each.
+    states_bound = 1e-5 if states_dtype == "float32" else 4 * 2**-8 * np.abs(reference[2]).max()
     for name in ("stored", "remat"):
         loss, accuracy, d_states, d_table = outputs[name]
         assert loss == pytest.approx(reference[0], abs=1e-5), name
         assert accuracy == reference[1], name
-        np.testing.assert_allclose(d_states, reference[2], atol=1e-5, err_msg=name)
+        np.testing.assert_allclose(np.asarray(d_states, np.float32), np.asarray(reference[2], np.float32),
+                                   atol=states_bound, err_msg=name)
         np.testing.assert_allclose(d_table, reference[3], atol=1e-5, err_msg=name)
 
 
@@ -951,6 +957,446 @@ def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_repor
         "    report['err'] = capsys.readouterr().err\n"
         "    assert 'tokens' in report\n")})
     assert found == [("tests/test_report.py", line, "SLOP011") for line in (3, 6, 9, 13)]
+
+
+def test_an_errors_or_a_processs_wording_is_reported_and_its_parsed_output_is_not(tmp_path):
+    """SLOP011: a sentence the test spells, looked for in a raised error's text (`str` or `repr` of
+    an `except` name or of `pytest.raises`'s value, imported under another name too) or in a
+    process's `stdout` or `stderr`, by `in`, `==`, `startswith`, `endswith` or `count`, proves
+    wording. A refusal's type, a process's exit code, a value the process prints and the test
+    parses, and an error's own attribute hold behaviour, as does a process's whole output compared
+    with the value it computes, and are not reported."""
+    found = _linted(tmp_path, {"tests/test_refusal.py": (
+        "import json\n"
+        "import subprocess\n"
+        "import pytest\n"
+        "def test_caught():\n"
+        "    try:\n"
+        "        int('x')\n"
+        "    except ValueError as error:\n"
+        "        assert 'invalid literal' in str(error)\n"
+        "def test_raised():\n"
+        "    with pytest.raises(ValueError) as raised:\n"
+        "        int('x')\n"
+        "    assert str(raised.value).startswith('invalid')\n"
+        "    assert repr(raised.value) == 'ValueError()'\n"
+        "def test_aliased():\n"
+        "    from pytest import raises as refused\n"
+        "    with refused(ValueError) as caught:\n"
+        "        int('x')\n"
+        "    assert str(caught.value).startswith('invalid')\n"
+        "def test_process():\n"
+        "    done = subprocess.run(['false'], capture_output=True, text=True)\n"
+        "    assert 'refused' in done.stderr\n"
+        "    assert done.stdout.count('saved')\n"
+        "def test_behaviour():\n"
+        "    with pytest.raises(ValueError) as raised:\n"
+        "        int('x')\n"
+        "    assert raised.type is ValueError\n"
+        "    done = subprocess.run(['true'], capture_output=True, text=True)\n"
+        "    assert done.returncode == 0\n"
+        "    assert json.loads(done.stdout) == {'refused': True}\n"
+        "    assert done.stdout.split()[-1] == 'Scalar'\n"
+        "    assert done.stdout == '42\\n'\n"
+        "    try:\n"
+        "        int('x')\n"
+        "    except ValueError as error:\n"
+        "        assert error.args\n")})
+    assert found == [("tests/test_refusal.py", line, "SLOP011") for line in (8, 12, 13, 18, 21, 22)]
+
+
+def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(tmp_path):
+    """SLOP018: in the package's source, a sleep, a timed wait round a loop (a poll) and a retry of
+    one piece of work are reported where the function deals with no subprocess, network, service or
+    other process, itself or through the module's functions and methods it calls. A timed wait made
+    once is a deadline, a future's wait is the deadline of work handed elsewhere, a loop over items
+    that skips the failed ones retries nothing, and a retry or a sleep beside a subprocess is at its
+    boundary. A method or a function named like another, a definition only defined, a parameter
+    or a local import called, a helper of an enclosing function, a class body run where it is
+    defined, and a nested loop's or a `match`'s exits are each read as what they are; a failure
+    that falls through to the loop's exit retries nothing."""
+    found = _linted(tmp_path, {"src/sparx/waits.py": (
+        "import concurrent.futures\n"
+        "import subprocess\n"
+        "import time\n"
+        "def poll(done):\n"
+        "    while not done.wait(0.1):\n"
+        "        pass\n"
+        "def nap():\n"
+        "    time.sleep(1)\n"
+        "def deadline(done):\n"
+        "    return done.wait(5)\n"
+        "def retry(work):\n"
+        "    for _ in range(3):\n"
+        "        try:\n"
+        "            return work()\n"
+        "        except OSError:\n"
+        "            continue\n"
+        "    return None\n"
+        "def each(steps):\n"
+        "    for step in steps:\n"
+        "        try:\n"
+        "            step()\n"
+        "        except OSError:\n"
+        "            continue\n"
+        "def run(command):\n"
+        "    return subprocess.run(command, check=True)\n"
+        "def external(command):\n"
+        "    for _ in range(3):\n"
+        "        try:\n"
+        "            return run(command)\n"
+        "        except subprocess.CalledProcessError:\n"
+        "            time.sleep(1)\n"
+        "    return None\n"
+        "def futures(pending):\n"
+        "    while pending:\n"
+        "        done, pending = concurrent.futures.wait(pending)\n"
+        "class Waiting:\n"
+        "    def run(self):\n"
+        "        time.sleep(1)\n"
+        "class Other:\n"
+        "    def run(self):\n"
+        "        return 1\n"
+        "def given(run):\n"
+        "    run()\n"
+        "    time.sleep(1)\n"
+        "def defined():\n"
+        "    def helper():\n"
+        "        subprocess.run(['true'])\n"
+        "    time.sleep(1)\n"
+        "def after(work):\n"
+        "    while True:\n"
+        "        try:\n"
+        "            work()\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "        break\n"
+        "def inner(rows):\n"
+        "    for index in range(len(rows)):\n"
+        "        try:\n"
+        "            for row in rows[index]:\n"
+        "                break\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "def counted():\n"
+        "    from math import factorial as run\n"
+        "    run(5)\n"
+        "    time.sleep(1)\n"
+        "def outer():\n"
+        "    def helper():\n"
+        "        subprocess.run(['true'])\n"
+        "    def enclosed():\n"
+        "        helper()\n"
+        "        time.sleep(1)\n"
+        "    enclosed()\n"
+        "def classy():\n"
+        "    class Probe:\n"
+        "        subprocess.run(['true'])\n"
+        "    time.sleep(1)\n"
+        "def once(work):\n"
+        "    for _ in range(3):\n"
+        "        try:\n"
+        "            work()\n"
+        "        except ValueError:\n"
+        "            failed = True\n"
+        "        break\n"
+        "def matched(work):\n"
+        "    while True:\n"
+        "        try:\n"
+        "            match work():\n"
+        "                case None:\n"
+        "                    break\n"
+        "        except ValueError:\n"
+        "            continue\n")})
+    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (5, 8, 12, 38, 44, 48, 50, 66, 86)]
+
+
+def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths(tmp_path):
+    """SLOP018 reads a loop over a range as attempts at one piece of work only where its body reads
+    the number it counts nowhere but in a handler: a scan by index, like one over the items,
+    retries nothing, and so, by the rule's stated boundary, does a retry that reads its attempt
+    number outside the handler; a name the work only binds is no read of it. A failure that
+    raises on its last attempt and goes round on the others retries; one that raises on every
+    attempt does not. A failure that runs on into the loop's tail retries where some path of the
+    tail goes round, and a `try` inside the loop's own `with`, branch or `match` case is read as
+    one in its body."""
+    found = _linted(tmp_path, {"src/sparx/retries.py": (
+        "def retry(work):\n"
+        "    for _ in range(3):\n"
+        "        try:\n"
+        "            return work()\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "def last_raises(work):\n"
+        "    for attempt in range(3):\n"
+        "        try:\n"
+        "            return work()\n"
+        "        except ValueError:\n"
+        "            if attempt == 2:\n"
+        "                raise\n"
+        "def raised(work):\n"
+        "    for _ in range(3):\n"
+        "        try:\n"
+        "            return work()\n"
+        "        except ValueError:\n"
+        "            raise\n"
+        "def direct(rows, parse):\n"
+        "    for row in rows:\n"
+        "        try:\n"
+        "            return parse(row)\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "def indexed(rows, parse):\n"
+        "    for index in range(len(rows)):\n"
+        "        try:\n"
+        "            return parse(rows[index])\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "def tail_returns(work):\n"
+        "    while True:\n"
+        "        try:\n"
+        "            parsed = work()\n"
+        "        except ValueError:\n"
+        "            parsed = None\n"
+        "        if parsed is not None:\n"
+        "            return parsed\n"
+        "def tail_once(work):\n"
+        "    while True:\n"
+        "        try:\n"
+        "            parsed = work()\n"
+        "        except ValueError:\n"
+        "            parsed = None\n"
+        "        return parsed\n"
+        "def mentioned(work):\n"
+        "    for attempt in range(3):\n"
+        "        try:\n"
+        "            return work(), attempt\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "def fed(work):\n"
+        "    for attempt in range(3):\n"
+        "        try:\n"
+        "            return work(attempt)\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "def locked(work, lock):\n"
+        "    for _ in range(3):\n"
+        "        with lock:\n"
+        "            try:\n"
+        "                return work()\n"
+        "            except ValueError:\n"
+        "                continue\n"
+        "def conditional(work, ready):\n"
+        "    while True:\n"
+        "        if ready():\n"
+        "            try:\n"
+        "                return work()\n"
+        "            except ValueError:\n"
+        "                failed = True\n"
+        "def cased(work, mode):\n"
+        "    while True:\n"
+        "        match mode:\n"
+        "            case 'fast':\n"
+        "                try:\n"
+        "                    return work()\n"
+        "                except ValueError:\n"
+        "                    continue\n"
+        "            case _:\n"
+        "                return None\n"
+        "def preread(rows, parse):\n"
+        "    for index in range(len(rows)):\n"
+        "        row = rows[index]\n"
+        "        try:\n"
+        "            return parse(row)\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "def unpacked(work):\n"
+        "    for _ in range(3):\n"
+        "        try:\n"
+        "            parsed, _ = work()\n"
+        "            return parsed\n"
+        "        except ValueError:\n"
+        "            continue\n")})
+    assert found == [("src/sparx/retries.py", line, "SLOP018") for line in (2, 8, 33, 60, 67, 74, 91)]
+
+
+def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_path):
+    """SLOP018 follows a call to the definition Python's names reach: `self.f` to the first class
+    that binds `f` in its method resolution order, from a method or a closure in one; a name to its
+    binding, which a comprehension's own variable does not make outside it but does inside, and a
+    pattern's capture, an exception's name or a class body's assignment does, and a receiver a
+    comprehension rebinds is another object's. A generator's element runs only as it is consumed,
+    at once where a loop iterates it, and a list's again and again, as a loop's body does. A sleep
+    beside a call that reaches a subprocess, a list built of them included, is at its boundary."""
+    found = _linted(tmp_path, {"src/sparx/waits.py": (
+        "import subprocess\n"
+        "import time\n"
+        "def run(command):\n"
+        "    return subprocess.run(command, check=True)\n"
+        "class Base:\n"
+        "    def work(self):\n"
+        "        subprocess.run(['true'])\n"
+        "class Running(Base):\n"
+        "    def spin(self):\n"
+        "        self.work()\n"
+        "        time.sleep(1)\n"
+        "    def launch(self):\n"
+        "        def poll():\n"
+        "            self.work()\n"
+        "            time.sleep(1)\n"
+        "        poll()\n"
+        "def comprehended():\n"
+        "    doubled = [run * 2 for run in range(3)]\n"
+        "    run(doubled)\n"
+        "    time.sleep(1)\n"
+        "def matching(value, callback):\n"
+        "    match callback:\n"
+        "        case run:\n"
+        "            run(value)\n"
+        "    time.sleep(1)\n"
+        "def namespaced():\n"
+        "    class Local:\n"
+        "        run = abs\n"
+        "        run(-1)\n"
+        "    time.sleep(1)\n"
+        "class Pure(Base):\n"
+        "    def work(self):\n"
+        "        return 1\n"
+        "class Left(Base):\n"
+        "    pass\n"
+        "class Diamond(Left, Pure):\n"
+        "    def spin(self):\n"
+        "        self.work()\n"
+        "        time.sleep(1)\n"
+        "class Plain(Base):\n"
+        "    work = staticmethod(abs)\n"
+        "    def spin(self):\n"
+        "        self.work()\n"
+        "        time.sleep(1)\n"
+        "def inline():\n"
+        "    [run(-1) for run in (abs,)]\n"
+        "    time.sleep(1)\n"
+        "def deferred():\n"
+        "    pending = (subprocess.run(['true']) for _ in range(3))\n"
+        "    time.sleep(1)\n"
+        "    return pending\n"
+        "def handled():\n"
+        "    try:\n"
+        "        int('x')\n"
+        "    except ValueError as subprocess:\n"
+        "        subprocess.add_note('local')\n"
+        "    time.sleep(1)\n"
+        "def eager():\n"
+        "    [subprocess.run(['true']) for _ in range(3)]\n"
+        "    time.sleep(1)\n"
+        "class Peers(Base):\n"
+        "    def spin(self, peers):\n"
+        "        [self.work() for self in peers]\n"
+        "        time.sleep(1)\n"
+        "def polled(done):\n"
+        "    return [done.wait(0.1) for _ in range(3)]\n"
+        "def consumed(commands):\n"
+        "    for finished in (subprocess.run(command) for command in commands):\n"
+        "        time.sleep(1)\n")})
+    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (25, 30, 39, 44, 47, 50, 57, 64, 66)]
+
+
+def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
+    """SLOP019: a handler of the ImportError, ModuleNotFoundError or AttributeError a missing feature
+    raises, by any name it is imported as, that carries on instead of raising, in the package's
+    source. One that raises, naming what to install, requires the feature and is not reported, as
+    is one whose class body raises where it is defined; a raise in a function the handler only
+    defines is no raise of its own, and one that raises on some paths carries on along the rest. A
+    `finally` that completes resumes the raise it interrupted, and a `match` whose last case
+    catches all, through `as` or `|`, leaves by its cases alone, unless a guard lets it through."""
+    found = _linted(tmp_path, {"src/sparx/features.py": (
+        "from builtins import ImportError as Missing\n"
+        "def optional():\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ImportError:\n"
+        "        yaml = None\n"
+        "    return yaml\n"
+        "def required():\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ModuleNotFoundError as error:\n"
+        "        raise RuntimeError('install sparx[yaml]') from error\n"
+        "    return yaml\n"
+        "def attribute(module):\n"
+        "    try:\n"
+        "        return module.fast\n"
+        "    except AttributeError:\n"
+        "        return module.slow\n"
+        "def aliased():\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except (ValueError, Missing):\n"
+        "        def later():\n"
+        "            raise RuntimeError('never')\n"
+        "        yaml = None\n"
+        "    return yaml\n"
+        "def strict():\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ImportError:\n"
+        "        class Missing:\n"
+        "            raise RuntimeError('install sparx[yaml]')\n"
+        "    return yaml\n"
+        "def unrelated():\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ImportError as error:\n"
+        "        if error.name != 'yaml':\n"
+        "            raise\n"
+        "        yaml = None\n"
+        "    return yaml\n"
+        "def released(lock):\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ImportError as error:\n"
+        "        try:\n"
+        "            raise RuntimeError('install sparx[yaml]') from error\n"
+        "        finally:\n"
+        "            lock.release()\n"
+        "    return yaml\n"
+        "def released_fallback(lock):\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ImportError:\n"
+        "        try:\n"
+        "            yaml = None\n"
+        "        finally:\n"
+        "            lock.release()\n"
+        "    return yaml\n"
+        "def aliased_catch_all(name):\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ImportError as error:\n"
+        "        match name:\n"
+        "            case 'yaml':\n"
+        "                raise RuntimeError('install sparx[yaml]') from error\n"
+        "            case _ as other:\n"
+        "                raise RuntimeError(f'install {other}') from error\n"
+        "    return yaml\n"
+        "def or_catch_all(name):\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ImportError as error:\n"
+        "        match name:\n"
+        "            case 'yaml' | _:\n"
+        "                raise RuntimeError('install sparx[yaml]') from error\n"
+        "    return yaml\n"
+        "def guarded_catch_all(name):\n"
+        "    try:\n"
+        "        import yaml\n"
+        "    except ImportError as error:\n"
+        "        match name:\n"
+        "            case _ if name:\n"
+        "                raise RuntimeError('install sparx[yaml]') from error\n"
+        "        yaml = None\n"
+        "    return yaml\n")})
+    assert found == [("src/sparx/features.py", line, "SLOP019") for line in (5, 17, 22, 37, 54, 81)]
 
 
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):

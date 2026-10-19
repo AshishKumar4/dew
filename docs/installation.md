@@ -1,6 +1,10 @@
 # Installation
 
-Dew's package name is `dewml` and its import name is `dew`. It needs Python 3.12 or newer; CI tests Python 3.12 and 3.14.
+Dew's package name is `dewml` and its import name is `dew`. CI tests Python 3.12 and 3.14.
+
+<!-- BEGIN least Python (site/scripts/gen_install.py) -->
+Dew needs Python 3.12 or newer.
+<!-- END least Python -->
 
 ## The install script
 
@@ -62,14 +66,16 @@ The `cuda13`, `cuda12` and `tpu` extras each install the accelerator build of JA
 
 The driver and the GPU decide the build, newest first:
 
-| Build | NVIDIA driver | GPU (SM) |
-|---|---|---|
-| `cuda13` | 580 or later | 7.5 or later |
-| `cuda12` | 525 or later | 5.2 or later |
+<!-- BEGIN CUDA builds (site/scripts/gen_install.py) -->
+| Build | CUDA | NVIDIA driver | GPU (SM) |
+|---|---|---|---|
+| `cuda13` | 13.0 or later | 580 or later, or an older one under NVIDIA's cuda-compat | 7.5 or later |
+| `cuda12` | 12.0 or later | 525 or later, or an older one under NVIDIA's cuda-compat | 5.2 or later |
+<!-- END CUDA builds -->
 
-`nvidia-smi --query-gpu=driver_version,compute_cap --format=csv,noheader` prints both; with several GPUs the oldest SM counts. These are the minimums in the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) and in Table 3 of NVIDIA's [CUDA release notes](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html). Neither build runs on an older driver or GPU. The [dewml.dev install script](https://dewml.dev/install.sh) applies the same rule.
+`nvidia-smi --query-gpu=driver_version,compute_cap --format=csv,noheader` prints both; with several GPUs the oldest SM counts. These are the minimums in the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) and in Table 3 of NVIDIA's [CUDA release notes](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html). The CUDA version is the one the driver library a process loads supports: a driver's own, or a newer one under NVIDIA's [forward-compatibility package](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html) (`cuda-compat`), which runs the `cuda13` build on a 570 driver; Dew reads it from the library (`cuDriverGetVersion`). Neither build runs on an older GPU. The [dewml.dev install script](https://dewml.dev/install.sh) chooses by the driver alone.
 
-`import dew` applies it too: on a machine with an NVIDIA GPU, it stops when JAX would run on the CPU, because no CUDA build is installed or the installed one can't run on this driver, and it prints the install that fixes it. `JAX_PLATFORMS` selects the backend before JAX is imported. `JAX_PLATFORMS=cpu python train.py` runs on the CPU on a GPU machine, and the check leaves it alone. On Colab the tutorials install `dewml[cuda13]`. [Cloud TPUs](tpu.md) covers TPU provisioning.
+A run applies it too: on a machine with an NVIDIA GPU, `prepare_process` and `Trainer.fit` stop when JAX opened on the CPU, and print the install that fixes it where no CUDA build is installed or the installed one can't run on this driver. `JAX_PLATFORMS` selects the backend before JAX is imported. `JAX_PLATFORMS=cpu python train.py` runs on the CPU on a GPU machine, and the check leaves it alone. On Colab the tutorials install `dewml[cuda13]`. [Cloud TPUs](tpu.md) covers TPU provisioning.
 
 ### Process pools across GPUs
 
@@ -151,7 +157,7 @@ The `ci` extra is the test suite's environment, every package a test file import
 
 CI runs on CPUs, so a JAX bump first runs these on a GPU, on Colab, in one session:
 
-- `tests/test_linear_attention.py::test_the_decode_kernel_steps_as_the_recurrence_does` and `tests/test_kernels.py::test_the_decode_kernel_reads_each_row_to_its_length`: the gated delta net's and the decode attention's kernels are on the Pallas Triton backend JAX 0.11 deprecates, and each one's `fits` is its off switch;
+- `tests/test_linear_attention.py::test_the_decode_kernel_steps_as_the_recurrence_does` and `tests/test_decode_attention.py::test_the_decode_kernel_reads_each_row_to_its_length`: the gated delta net's and the decode attention's kernels are on the Pallas Triton backend JAX 0.11 deprecates, and each one's `fits` is its off switch;
 - `python tools/gpu_profile_check.py --out out/profile-check`, about a minute: a warmed step captured under `dew.Profiler` with command buffers on and off. It fails unless the capture with them off attributes device time to HLO ops and every capture's device time a step is positive and within its wall time. It records whether the default capture attributes ops (none on 0.11.2) and whether XLA ran its command buffers op by op for the session, so a release that changes either shows. While the cause of the default capture's missing attribution is open, every Colab GPU session runs it first too.
 
 ## Compilation cache
