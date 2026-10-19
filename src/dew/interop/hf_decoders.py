@@ -840,10 +840,6 @@ def export_config(model) -> Mapping[str, object]:
                 "o_proj_bias differs from attention_bias, which only the qwen2 "
                 "and dream references build, so the model cannot be written as "
                 f"{family.export_model_type}")
-    # mlp_bias is stated where it is set: a family whose reference reads it (Llama) reads it
-    # back, and any other refuses it below (`refuse_lossy_export`).
-    if model.mlp_bias:
-        config['mlp_bias'] = True
     if model.attn_logit_softcap is not None and family.export_model_type != 'gemma2':
         raise ValueError(
             "attn_logit_softcap is applied by the gemma2 reference alone, so "
