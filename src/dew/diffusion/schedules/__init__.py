@@ -1,6 +1,6 @@
 """The noise schedules, one module per family."""
 
-from .common import ContinuousNoiseScheduler, GeneralizedNoiseScheduler, NoiseScheduler, expand
+from .common import ContinuousNoiseScheduler, GeneralizedNoiseScheduler, NoiseScheduler, divided, expand
 from .cosine import CosineNoiseScheduler, cosine_beta_schedule
 from .discrete import DiscreteNoiseScheduler
 from .flow import FlowMatchingScheduler, RectifiedFlow
@@ -11,4 +11,5 @@ from .sqrt import SqrtContinuousNoiseScheduler
 __all__ = ["ContinuousNoiseScheduler", "CosineNoiseScheduler", "DiscreteNoiseScheduler",
            "EDMNoiseScheduler", "FlowMatchingScheduler", "GeneralizedNoiseScheduler",
            "KarrasVENoiseScheduler", "LinearNoiseScheduler", "NoiseScheduler", "RectifiedFlow",
-           "SqrtContinuousNoiseScheduler", "cosine_beta_schedule", "expand", "linear_beta_schedule"]
+           "SqrtContinuousNoiseScheduler", "cosine_beta_schedule", "divided", "expand",
+           "linear_beta_schedule"]
