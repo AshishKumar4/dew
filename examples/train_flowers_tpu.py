@@ -34,8 +34,8 @@ import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
 from dew.config.data import Augment, HoldOut, ImageData, loader
+from dew.coordination import collective_host
 from dew.data import TFDS, Files, Loading
-from dew.data.dataset import DataPartition
 from dew.data.images import EncodeCaptions
 from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
@@ -44,7 +44,7 @@ from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
-from dew.training import MeshSpec, ProfileWindow, prepare_process
+from dew.training import Evaluation, MeshSpec, ProfileWindow, prepare_process
 from dew.training.optim import Cosine
 
 PROMPTS = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
@@ -159,17 +159,6 @@ def slice_config(config: Config) -> DiffusionRunConfig:
                               multi_host=True))
 
 
-def held_out(run: DiffusionRunConfig) -> np.ndarray:
-    """The uint8 images of the validation pass, which the run never trained on."""
-    data = loader(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading,
-                validation_records=run.validation_records)
-    if data.val is None:
-        raise ValueError("scoring FID needs an explicit validation source or HoldOut")
-    # This process's share of the pass on the run's plain data-parallel mesh.
-    share = DataPartition.of(run.trainer.mesh.build())
-    return np.concatenate([np.asarray(batch["image"], np.uint8) for batch in data.val(share)])
-
-
 def grid(images: np.ndarray, path: Path) -> None:
     """The sampled rows side by side as one PNG."""
     pixels = uint8_pixels(images)
@@ -192,21 +181,28 @@ def main(config: Config) -> Path:
     objective = run.build()
     data = loader(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading,
                 validation_records=run.validation_records, host=(EncodeCaptions(objective.inputs.tokenize),))
+    if data.val is None:
+        raise ValueError("scoring FID needs an explicit validation source or HoldOut")
     name = "smoke" if config.smoke else f"flowers-{config.image_size}"
-    run.train(objective, data, name=name, metrics=run.build_eval_metrics(),
-              summary={"prompts": list(PROMPTS)})
+    state = run.train(objective, data, name=name, metrics=run.build_eval_metrics(),
+                      summary={"prompts": list(PROMPTS)})
+    # The held-out split, which the run never trained on, scored once over the
+    # whole slice: each process samples its share and the metrics pool every
+    # share's statistics, so every process holds the same scores.
+    final = Evaluation.run(objective, state.variables, data.val, key=jax.random.key(1),
+                           metrics=(FID(weights=config.inception_weights), CLIPScore(config.clip_model)),
+                           step=int(state.step), averaged=state.averaged, mesh=run.trainer.mesh.build())
 
+    # The run directory read back as a pipeline, which draws over every process's
+    # devices; process 0 gathers the grid's rows and writes both files once.
     run_dir = Path(run.trainer.checkpoint_dir) / name
     pipe = dew.pipeline(str(run_dir))
-    drawn = pipe(list(PROMPTS), steps=objective.steps, guidance=config.guidance,
-                 solver=Heun(), key=1).host().images
-    grid(drawn, config.out / "samples.png")
-
-    generated = uint8_pixels(drawn)
-    report = {"clip_score": CLIPScore(config.clip_model).score(generated, list(PROMPTS)),
-              "fid": FID(weights=config.inception_weights).score(generated, held_out(run))}
-    (config.out / "eval.json").write_text(json.dumps(report, indent=2))
-    print(f"samples {config.out / 'samples.png'}  {report}")
+    drawn = pipe(list(PROMPTS), steps=objective.steps, guidance=config.guidance, solver=Heun(), key=1)
+    images = collective_host(drawn.images, phase="the sample grid", held_by="first")
+    if images is not None:
+        grid(images[:len(PROMPTS)], config.out / "samples.png")
+        (config.out / "eval.json").write_text(json.dumps(final.scores, indent=2))
+        print(f"samples {config.out / 'samples.png'}  {final.scores}")
     return run_dir
 
 
