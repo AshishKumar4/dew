@@ -304,6 +304,32 @@ def test_an_unnamed_member_draws_alike_wherever_a_host_mounts_it_and_when_a_name
     assert draws[2] and all(draws[0][index] == draw for index, draw in draws[2].items())
 
 
+def test_a_member_named_as_a_place_keeps_its_draws_when_an_unnamed_one_joins():
+    """A member's name and an unnamed member's place are kept apart, whatever the name spells: a
+    member named like a place keeps its draws when an unnamed member joins ahead of it, and an
+    unnamed member keeps its own when that named member joins ahead of it."""
+    def member(name, index):
+        return Pipeline(source(8), name=name).map(Member(index)).random_map(Draw()).repeat(1)
+
+    def draws(members, of):
+        data = compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
+        stream = data.train(DataPartition())
+        try:
+            return {int(index): int(draw) for batch in stream
+                    for index, at, draw in zip(batch["id"], batch["member"], batch["draw"], strict=True)
+                    if at == of}
+        finally:
+            stream.close()
+
+    for name in ("place:0", "#0", "0"):
+        alone = draws([member(name, 1)], 1)
+        joined = draws([member(None, 0), member(name, 1)], 1)
+        assert joined and all(alone[index] == draw for index, draw in joined.items())
+        unnamed = draws([member(None, 0)], 0)
+        ahead = draws([member(name, 1), member(None, 0)], 0)
+        assert ahead and all(unnamed[index] == draw for index, draw in ahead.items())
+
+
 def test_a_position_is_refused_where_a_mixture_member_was_renamed():
     """A mixture's plan names its members, whose draws their names key: a position saved under one
     name is refused by the mixture that renamed it, which would draw other rows."""
