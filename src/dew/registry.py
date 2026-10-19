@@ -246,7 +246,7 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         """
         member = self[name]
         given: Mapping[str, object] = {**record, **fields}
-        held = _record_class(member)
+        held = record_class(member)
         with _reading(given):
             given = (_declared(held, given, dtypes=True) if held is not None
                      else _arguments(member, given, dtypes=True))
@@ -780,7 +780,7 @@ def _member(name: str, held: tuple[type, ...]) -> Callable[..., Configured]:
 def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, dtypes: bool) -> Configured:
     """What `member` builds from a record of its fields: a dataclass's fields
     as it declares them, a function's or another class's as its parameters."""
-    held = _record_class(member)
+    held = record_class(member)
     if held is not None:
         return _construct(held, fields, dtypes=dtypes)
     built = member(**_arguments(member, fields, dtypes=dtypes))
@@ -840,7 +840,7 @@ def _owned(member: Callable[..., Configured], *, called: bool) -> bool:
             and (not called or any("__call__" in vars(base) for base in member.__mro__[:-1])))
 
 
-def _record_class(member: Callable[..., Configured]) -> type | None:
+def record_class(member: Callable[..., Configured]) -> type | None:
     """`member` when it is a dataclass built from its fields, whose fields a
     record names; None for a function, a plain class, or a dataclass whose own
     constructor takes other arguments (a metric over its base's fields), each
@@ -913,7 +913,7 @@ def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes:
     or one argument of the function or constructor `member`, a record or a
     JSON list read against its parameter's annotation and a dtype's name the
     dtype, any other value, a scalar or a value the caller built, as given."""
-    held = _record_class(member)
+    held = record_class(member)
     if held is not None:
         return _rebuilt(declared_type(held, name), configured(value), dtypes=dtypes, name=name)
     if not (isinstance(value, (Mapping, list)) or (dtypes and name == "dtype")):

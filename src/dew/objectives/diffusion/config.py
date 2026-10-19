@@ -232,6 +232,10 @@ class DiffusionRunConfig(RunConfig):
         # writes one too; the field is a tuple, so the value is one.
         if self.val_metrics is not None:
             object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
+            stray = [metric for metric in self.val_metrics if not isinstance(metric, MetricConfig)]
+            if stray:
+                raise TypeError(f"val_metrics holds metrics' records, {{'name': ..., 'fields': {{...}}}}, "
+                                f"not {stray!r}")
         if not issubclass(objectives[self.objective.name], DiffusionObjective):
             raise ValueError(f"--objective {self.objective.name} trains no diffusion model")
         if self.pretrained is None and self.pretrained_param_dtype != "float32":

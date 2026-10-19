@@ -39,7 +39,8 @@ from dew.objectives.base import VALID_ROWS, Step
 from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
-from dew.registry import metrics, models
+from dew.eval.images import DEFAULT_MODEL
+from dew.registry import from_record, metrics, models, to_record
 from dew.sampling import CFG, Euler
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training.model_flops import model_batch
@@ -672,3 +673,20 @@ def test_a_val_metric_no_registry_knows_is_refused():
     for name in sorted(metrics):
         (held,) = replace(unet_run(JSON_UNET), val_metrics=(MetricConfig(name),)).val_metrics
         assert metrics[held.name] is metrics[name]
+
+
+def test_a_val_metric_records_its_own_constructors_defaults():
+    """A metric whose class has a constructor of its own over its base's fields, as CLIP's has,
+    records that constructor's defaults, so a run holds the CLIP it scored with and reads it
+    back. A run's metrics are such records, so a bare alias in their place is refused where the
+    run is written: in its record, on its command line and in its fields."""
+    clip = MetricConfig("clip")
+    assert clip.defaults == {"modelname": DEFAULT_MODEL, "field": "text"}
+    assert from_record(MetricConfig, to_record(clip, MetricConfig)) == clip
+    run = unet_run(JSON_UNET)
+    with pytest.raises(TypeError):
+        DiffusionRunConfig.from_dict({**run.to_dict(), "val_metrics": ["psnr"]})
+    with pytest.raises(TypeError):
+        DiffusionRunConfig.cli(["--val-metrics", '["psnr"]'])
+    with pytest.raises(TypeError):
+        replace(run, val_metrics=("psnr",))
