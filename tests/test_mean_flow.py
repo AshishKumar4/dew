@@ -2,6 +2,7 @@
 (`tools/meanflow_reference.py`), and the objective and interval sampling
 built around it."""
 
+import functools
 import os
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, widened
 
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
@@ -103,43 +105,66 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     )
 
 
-def agrees_with_xla(kernel: str) -> None:
-    """A MeanFlow step through the fused attention `kernel` runs, and its loss and gradient agree
-    with the xla kernel's within bf16's rounding of the step's scale."""
-    def run(implementation):
-        model = SimpleDiT(patch_size=2, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=1,
-                          interval=True, attention_impl=implementation, dtype="bfloat16")
-        inputs = InputSpec(Field("image", (16, 16, 3)),
-                           {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
-        task = MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
-        params = task.init(jax.random.PRNGKey(0))
-        pixels = jax.random.randint(jax.random.PRNGKey(1), (8, 16, 16, 3), 0, 256)
-        batch = {"image": np.asarray(pixels, np.uint8), **task.inputs.tokenize(["a", "b", "c", "d"] * 2)}
-        step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
-        def loss_of(tree):
-            return task.scalar_loss({**params, "params": tree}, batch, step)[0]
+def meanflow_step(implementation: str, dtype, params=None):
+    """One MeanFlow step of a one-layer DiT at `dtype` through the attention `implementation`,
+    every row on an interval (r < t), so every target takes the JVP: its loss and its gradient in
+    every parameter, from `params` (`moved_parameters` where None) and the same batch and step key
+    each time, and the parameters it started from."""
+    model = SimpleDiT(patch_size=2, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=1,
+                      interval=True, attention_impl=implementation, dtype=dtype)
+    inputs = InputSpec(Field("image", (16, 16, 3)),
+                       {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
+    task = MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None, instantaneous=0.0)
+    params = moved_parameters(task.init(jax.random.PRNGKey(0))) if params is None else params
+    pixels = jax.random.randint(jax.random.PRNGKey(1), (8, 16, 16, 3), 0, 256)
+    batch = {"image": np.asarray(pixels, np.uint8), **task.inputs.tokenize(["a", "b", "c", "d"] * 2)}
+    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
 
-        loss, grads = jax.jit(jax.value_and_grad(loss_of))(params["params"])
-        return float(loss), jax.tree.leaves(grads)
+    def loss_of(tree):
+        return task.scalar_loss({**params, "params": tree}, batch, step)[0]
 
-    (fused, fused_grads), (xla, xla_grads) = run(kernel), run("xla")
-    assert fused == pytest.approx(xla, rel=2 ** -7)
-    for left, right in zip(fused_grads, xla_grads, strict=True):
-        scale = float(jnp.max(jnp.abs(right))) + 1e-12
-        assert float(jnp.max(jnp.abs(left - right))) <= 2 * 2 ** -7 * scale
+    loss, grads = jax.jit(jax.value_and_grad(loss_of))(params["params"])
+    widest = functools.partial(np.asarray, dtype=np.float64)
+    return widest(loss), jax.tree.map(widest, grads), params
+
+
+def moved_parameters(variables):
+    """`variables` with every parameter moved by a seeded normal of 0.05: a DiT starts with its
+    output zero, so its velocity's time derivative, the JVP MeanFlow's target takes, is zero there,
+    and away from it the target and every attention derivative are not."""
+    leaves, tree = jax.tree.flatten(variables["params"])
+    keys = jax.random.split(jax.random.PRNGKey(3), len(leaves))
+    moved = [leaf + 0.05 * jax.random.normal(key, leaf.shape, leaf.dtype)
+             for leaf, key in zip(leaves, keys, strict=True)]
+    return {**variables, "params": jax.tree.unflatten(tree, moved)}
+
+
+def as_exact_as_xla(kernel: str) -> None:
+    """A MeanFlow step in bfloat16 through the fused attention `kernel`, its loss and every
+    parameter's gradient, as near float64 as the same step through XLA's attention in bfloat16:
+    the truth is that step widened, the model at float64 from the same float32 parameters, and
+    the float64 rule holds each entry (tests/reference_error.py). Every row's target takes the
+    JVP, which the fused kernel's call traces from the reference path (`forward_mode_attention`),
+    so each gradient holds that tangent."""
+    fused_loss, fused, params = meanflow_step(kernel, "bfloat16")
+    xla_loss, xla, _ = meanflow_step("xla", "bfloat16")
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+        truth_loss, truth, _ = meanflow_step("xla", "float64", widened(params))
+    assert_as_exact_as_the_reference(fused_loss, xla_loss, truth_loss, f"{kernel} loss")
+    assert_leaves_as_exact(fused, xla, truth)
 
 
 @pytest.mark.gpu(reason="a fused attention kernel runs on a cuda device")
 def test_meanflow_trains_through_a_fused_attention_kernel():
     """A fused attention kernel defines only its reverse-mode derivative, so MeanFlow's target JVP
     traces for forward mode (`forward_mode_attention`): a step through Triton's kernel, which runs
-    under the cuda lane's --xla_gpu_deterministic_ops, agrees with the xla kernel's
-    (`agrees_with_xla`), and so does one through cuDNN's, which XLA cannot run under that flag
+    under the cuda lane's --xla_gpu_deterministic_ops, is as exact as the xla kernel's
+    (`as_exact_as_xla`), and so is one through cuDNN's, which XLA cannot run under that flag
     (openxla/xla#46500), in a process of its own whose XLA starts without it."""
-    agrees_with_xla("triton")
+    as_exact_as_xla("triton")
     flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
              if not flag.startswith("--xla_gpu_deterministic_ops")]
-    script = "import test_mean_flow; test_mean_flow.agrees_with_xla('cudnn')"
+    script = "import test_mean_flow; test_mean_flow.as_exact_as_xla('cudnn')"
     # This checkout's Dew, ahead of any the environment installs.
     source = str(Path(__file__).resolve().parents[1] / "src")
     path = os.pathsep.join(filter(None, (source, os.environ.get("PYTHONPATH"))))
