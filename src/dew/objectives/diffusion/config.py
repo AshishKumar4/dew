@@ -377,8 +377,13 @@ class DiffusionRunConfig(RunConfig):
             # The data's geometry, in the autoencoder's own pixel channels:
             # Qwen-Image 2.1's are RGBA.
             sample = source.inputs.sample
-            # The pipeline's own sampling grid, which its evaluation and task sample on.
-            sampling = {"grid": source.task.grid}
+            # The pipeline's own sampling policy, which its evaluation and task sample by, as
+            # `DiffusionObjective(pipeline)` takes it; what the run states is its own.
+            policy = {"solver": source.schedule.solver, "steps": source.task.steps,
+                      "guidance": source.task.guidance}
+            stated = self.objective.fields
+            sampling = {"grid": source.task.grid,
+                        **{name: value for name, value in policy.items() if name not in stated}}
         inputs = InputSpec(sample=sample, conditions=conditions)
         objective = self.objective.build(model=model, process=self._process(convention), inputs=inputs,
                                          autoencoder=autoencoder, variables=variables, **sampling)

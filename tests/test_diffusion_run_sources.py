@@ -33,6 +33,7 @@ from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, TUNED
 from dew.objectives.rl.flow import FlowGRPOObjective
 from dew.registry import to_record
 from dew.sampling import Euler, TextToImage
+from dew.sampling.pipelines import ImageSettings
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -136,7 +137,8 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     same initial variables, so both score a batch alike, through the VAE
     and the text towers. The loss the two share is held to Diffusers'
     train_dreambooth_flux.py statements on matched draws in
-    tests/test_flow_matching.py (ad63cc6a)."""
+    tests/test_flow_matching.py (ad63cc6a). Both sample by the same policy, the
+    pipeline's own grid and finish too."""
     from dew.interop.pretrained import load_diffusion_source
 
     directory = pipelines / family / "pipeline"
@@ -151,6 +153,9 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     written = DiffusionObjective(source, solver=Euler(), steps=2, **settings)
     assert configured.model == written.model
     assert to_record(configured.process, Process) == to_record(written.process, Process)
+    # The sampling policy a saved run records: the pipeline's grid and finish among it.
+    assert (to_record(configured.task_settings(), ImageSettings)
+            == to_record(written.task_settings(), ImageSettings))
     assert type(configured.autoencoder) is type(written.autoencoder)
     assert configured.inputs.sample == written.inputs.sample
     assert configured.inputs.conditions.keys() == written.inputs.conditions.keys()
