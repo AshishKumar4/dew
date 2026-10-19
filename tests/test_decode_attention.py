@@ -175,10 +175,10 @@ def test_a_grouped_query_attends_as_its_heads_do_alone(implementation):
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("kv_heads", [2, 1])
 def test_a_grouped_query_keeps_the_tensor_axis_split(kv_heads):
-    """Over a tensor axis of two, a lone query of 8 heads grouped over key heads the axis splits (2)
-    runs each shard on its own key head's group, and over one it cannot split stays ungrouped, its
-    query heads split and the key head repeated (`_per_shard`): each device's program does half the
-    work of the call off the mesh, by XLA's own count, and attends as that call does."""
+    """Over a tensor axis of two, a lone query of 8 heads over 2 key heads, or over 1 that the core
+    repeats to the axis's 2 as each shard would hold it, is grouped per shard: each device's program
+    does half the work of the call off the mesh, by XLA's own count on the reference path (no Pallas
+    call, whose work XLA does not count), and attends as that call does."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from dew.training import MeshSpec
@@ -189,7 +189,7 @@ def test_a_grouped_query_keeps_the_tensor_axis_split(kv_heads):
                          for shape in ((2, 1, 8, 32), (2, 32, kv_heads, 32), (2, 32, kv_heads, 32)))
 
     def attend(query, key, value):
-        return scaled_dot_product_attention(query, key, value, implementation="xla",
+        return scaled_dot_product_attention(query, key, value, implementation="reference",
                                             key_value_seq_lengths=lengths)
 
     def flops(compiled):
@@ -206,6 +206,28 @@ def test_a_grouped_query_keeps_the_tensor_axis_split(kv_heads):
         split = compiled(*placed)
     np.testing.assert_allclose(np.asarray(split), np.asarray(whole(query, key, value)), atol=1e-6, rtol=1e-6)
     assert flops(compiled) <= 0.6 * flops(whole), (flops(compiled), flops(whole))
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_grouped_query_over_one_key_head_reaches_the_decode_kernel_on_each_tensor_shard(generation):
+    """Lowered for the GPU over a tensor axis of two, a lone query of 8 heads over a single key head,
+    which the core repeats to the axis's two, reaches the decode kernel, which reads each row's keys
+    to its length alone, on each shard's group."""
+    from dew.nn.kernels.generation import assumed, gpu_mesh
+    from dew.training._lowering import triton_kernels
+
+    query = jax.ShapeDtypeStruct((2, 1, 8, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, 256, 1, 64), jnp.bfloat16)
+
+    def attend(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation='xla',
+                                            key_value_seq_lengths=jnp.asarray([1, 20], jnp.int32))
+
+    mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:2]), ("tensor",)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(attend).trace(query, key, key).lower(lowering_platforms=("cuda",))
+    assert triton_kernels(lowered) == {"decode_attention": 1}
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
