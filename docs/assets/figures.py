@@ -627,11 +627,56 @@ def rlvr_kl_figure():
     svg.save(HERE / "rlvr-kl.svg")
 
 
+def pretrained_round_trip_figure():
+    """The round trip of a pretrained decoder: load a Hugging Face checkpoint into Dew, check it against
+    transformers, train it, export it, and read the export back with transformers."""
+    width, height = 440, 300
+    svg = Figure(width, height, seconds=12, label="The round trip. A Hugging Face checkpoint loads into Dew, "
+                 "Dew's next-token probabilities match transformers', Dew trains it on Python code, and the "
+                 "export loads back into transformers with the same prediction.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+
+    def station(x, y, title, lines, stroke):
+        svg.rect(x, y, 150, 74, fill="raised", stroke=stroke, rx=8)
+        svg.text(x + 12, y + 24, title, size=14, weight=600)
+        for k, line in enumerate(lines):
+            svg.text(x + 12, y + 44 + 17 * k, line, size=12, mono=True, color="muted")
+
+    station(20, 30, "Hugging Face", ["config.json", "model.safetensors"], "rule")
+    with svg.group() as loaded:
+        svg.arrow(172, 67, 266, 67)
+        svg.text(219, 58, "load", size=13, color="muted", anchor="middle")
+        station(270, 30, "Dew", ["CausalTransformer", "params tree"], "accent")
+    svg.appear(loaded, 0.6)
+    with svg.group() as compared:
+        svg.text(345, 126, "same P(next token)", size=12, color="accent", anchor="middle")
+        svg.text(345, 142, "as transformers", size=12, color="accent", anchor="middle")
+    svg.appear(compared, 2.0)
+    with svg.group() as trained:
+        svg.arrow(345, 150, 345, 192)
+        svg.text(355, 176, "train on Python", size=13, color="muted")
+        station(270, 196, "Dew, trained", ["lower perplexity", "on held-out code"], "accent")
+    svg.appear(trained, 3.4)
+    with svg.group() as exported:
+        svg.arrow(268, 233, 174, 233)
+        svg.text(221, 224, "export", size=13, color="muted", anchor="middle")
+        station(20, 196, "Hugging Face", ["config.json", "model.safetensors"], "rule")
+    svg.appear(exported, 4.8)
+    with svg.group() as read:
+        svg.arrow(95, 192, 95, 108)
+        svg.text(105, 140, "transformers", size=13, color="muted")
+        svg.text(105, 156, "reads it back:", size=13, color="muted")
+        svg.text(105, 172, "same next token", size=13, color="accent", weight=600)
+    svg.appear(read, 6.2)
+    svg.save(HERE / "pretrained-round-trip.svg")
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
            "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
-           "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure}
+           "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure,
+           "pretrained-round-trip": pretrained_round_trip_figure}
 
 
 if __name__ == "__main__":
