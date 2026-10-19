@@ -463,26 +463,47 @@ def test_a_cache_call_read_as_documents_attends_as_its_mask(implementation, wind
 @pytest.mark.parametrize("window", [None, 4])
 def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask(without_deterministic_ops,
                                                                                  window):
-    """FlashAttention over a cache call's documents (its packed sequences, the queries put in id
-    order and back), as 'auto' routes it where the target row names flash for packed documents, is
-    within tests/reference_error.py's rule of jax.nn's xla attention over the cache's mask, against
-    float64, padding rows zero."""
+    """FlashAttention chosen for a cache call (`generation.chosen`) reads its documents as its packed
+    sequences, the queries put in id order and back: its output and its query, key and value
+    gradients are within tests/reference_error.py's rule of jax.nn's xla attention over the cache's
+    mask, against float64, padding rows zero."""
     from dew.nn.attention import flash_refusal
+    from dew.nn.kernels.generation import chosen
 
     positions, filled, mask = cache_call(window)
     rng = np.random.default_rng(8)
     query = jnp.asarray(rng.normal(size=(4, 6, 2, 64)), jnp.bfloat16)
     key, value = (jnp.asarray(rng.normal(size=(4, 16, 2, 64)), jnp.bfloat16) for _ in range(2))
+    cotangent = jnp.asarray(rng.normal(size=(4, 6, 2, 64)) * np.asarray(positions >= 0)[:, :, None, None],
+                            jnp.float32)
     documents = cache_documents(positions, filled)
-    assert flash_refusal(query, key, causal=True, sliding_window=window, segment_ids=documents, max_segments=1) is None
-    found = scaled_dot_product_attention(query, key, value, implementation="flash", causal=True,
-                                         sliding_window=window, segment_ids=documents, max_segments=1)
-    plain = jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")
-    q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
-    logits = np.where(np.asarray(mask), np.einsum("btnd,bsnd->bnts", q, k) / 8.0, -np.inf)
-    seen = np.isfinite(logits).any(-1, keepdims=True)
-    probs = np.where(seen, np.exp(logits - np.where(seen, logits.max(-1, keepdims=True), 0)), 0)
-    probs = probs / np.where(seen, probs.sum(-1, keepdims=True), 1)
-    truth = np.einsum("bnts,bsnd->btnd", probs, v)
-    plain = np.where(np.asarray(positions >= 0)[:, :, None, None], np.asarray(plain, np.float32), 0)
-    assert_as_exact_as_the_reference(np.asarray(found, np.float32), plain, truth, f"window {window}")
+
+    def pulled(attend, *operands):
+        out, pull = jax.vjp(lambda *operands: attend(*operands).astype(jnp.float32), *operands)
+        return out, *pull(cotangent.astype(out.dtype))
+
+    def flash(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation="flash", causal=True,
+                                            sliding_window=window, segment_ids=documents, max_segments=1)
+
+    def plain(query, key, value):
+        out = jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")
+        return out * jnp.asarray(positions >= 0, out.dtype)[:, :, None, None]
+
+    def truth(query, key, value):
+        logits = jnp.where(mask, jnp.einsum("btnd,bsnd->bnts", query, key) / 8.0, -jnp.inf)
+        seen = jnp.isfinite(logits).any(-1, keepdims=True)
+        probs = jnp.where(seen, jax.nn.softmax(jnp.where(seen, logits, 0.0), axis=-1), 0.0)
+        return jnp.einsum("bnts,bsnd->btnd", probs, value)
+
+    with chosen(attention="flash", attention_packed="flash", attention_window="flash"):
+        assert flash_refusal(query, key, causal=True, sliding_window=window, segment_ids=documents,
+                             max_segments=1) is None
+        found = pulled(flash, query, key, value)
+    reference = pulled(plain, query, key, value)
+    with jax.enable_x64(new_val=True):
+        exact = pulled(truth, *(jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value)))
+    for name, mine, theirs, true in zip(("out", "query", "key", "value"), found, reference, exact,
+                                        strict=True):
+        assert_as_exact_as_the_reference(np.asarray(mine, np.float64), np.asarray(theirs, np.float64),
+                                         np.asarray(true), f"window {window} {name}")

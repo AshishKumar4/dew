@@ -796,11 +796,11 @@ class CausalSelfAttention(nn.Module):
         elif self.ctx.kv_shared and decode:
             # No cache of its own: the provider's stashed keys carry the full history, read as
             # the provider's own cache is, a step's token by its mask and more by `_cached_call`.
-            last = jnp.max(jnp.asarray(positions).reshape(B, S), axis=-1, keepdims=True)
-            mask, causal = causal_attention_mask(positions, kv_len, self.ctx.sliding_window), False
-            if S > 1:
-                mask, (documents, causal, window) = None, self._cached_call(
-                    positions, jnp.arange(kv_len)[None, :] <= last)
+            if S == 1:
+                mask, causal = causal_attention_mask(positions, kv_len, self.ctx.sliding_window), False
+            else:
+                last = jnp.max(jnp.asarray(positions).reshape(B, S), axis=-1, keepdims=True)
+                documents, causal, window = self._cached_call(positions, jnp.arange(kv_len)[None, :] <= last)
             key_places = held_places
             # A quantized provider stashed its keys in the cache's rotation.
             rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
@@ -825,6 +825,9 @@ class CausalSelfAttention(nn.Module):
         # Over the keys the call reads, the cache's or the prefix's joined.
         masked = self._mask_kernel(query, key, decode)
         cached = isinstance(documents, CrossDocuments)
+        if cached and self.ctx.attention_impl != 'auto':
+            # A named kernel takes a cache call as it took the call's mask (`_mask_kernel`).
+            implementation = masked
         if prefix is None and self._restricts_visibility(attention_metadata, decode) and not (
                 cached and not self.bidirectional_images):
             # A decode step's cache mask already holds the rows' validity, and a

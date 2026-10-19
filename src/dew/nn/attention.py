@@ -36,6 +36,8 @@ from .documents import (
     cross_document_mask,
     document_ids,
     document_offsets,
+    held_keys,
+    query_order,
     with_documents,
 )
 from .flops import attention_flops, cross_attention_flops, projection_flops
@@ -230,11 +232,7 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
         # A query of another sequence's documents sees a key where its document holds one: the
         # keys' ids run in ascending order, padding after them, so each query's id is searched in
         # its row's keys rather than compared with every key.
-        queries, keys = document_ids(segment_ids)
-        ordered = jnp.where(keys == 0, jnp.iinfo(keys.dtype).max, keys)
-        held = jax.vmap(lambda row, wanted: jnp.searchsorted(row, wanted, side="right")
-                        - jnp.searchsorted(row, wanted, side="left"))(ordered, queries)
-        seen = (held > 0) & (queries != 0)
+        seen = (held_keys(segment_ids) > 0) & (document_ids(segment_ids)[0] != 0)
         # Aligned to its document's last keys, a query sees the key at its place, or without
         # causality the nearest one within the window.
         if causal:
@@ -244,9 +242,14 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
         return seen[:, :, None, None]
     if (mask is not None or isinstance(segment_ids, CrossDocuments)
             or (segment_ids is not None and key_value_seq_lengths is not None)):
-        visible = combined_attention_mask(query_length, key_length, causal, sliding_window, mask)
-        if segment_ids is not None:
-            visible = with_documents(visible, segment_ids)
+        if isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None):
+            # Aligned to each document's last keys, which the mask carries in their place.
+            visible = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
+            visible = visible if mask is None else jnp.logical_and(visible, mask)
+        else:
+            visible = combined_attention_mask(query_length, key_length, causal, sliding_window, mask)
+            if segment_ids is not None:
+                visible = with_documents(visible, segment_ids)
         if key_value_seq_lengths is not None:
             visible = with_key_lengths(visible, key_value_seq_lengths, key_length)
         assert visible is not None
@@ -1172,8 +1175,7 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
         if key_segment_ids is not None:
             # Another sequence's documents run as packed sequences in id order, padding after them:
             # the keys arrive so (a cache's), and the queries go so and come back in their own.
-            order = jnp.argsort(jnp.where(segment_ids == 0, max_segments + 1, segment_ids), axis=1,
-                                stable=True)
+            order = query_order(segment_ids)
             query = jnp.take_along_axis(query, order[:, :, None, None], axis=1)
             segment_ids = jnp.take_along_axis(segment_ids, order, axis=1)
         flat = (query.reshape(rows * length, *query.shape[2:]),
@@ -1195,7 +1197,8 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
         out = out.reshape(rows, length, *out.shape[1:])
         if order is None:
             return out
-        return jnp.take_along_axis(out, jnp.argsort(order, axis=1)[:, :, None, None], axis=1)
+        back = jnp.zeros_like(order).at[jnp.arange(rows)[:, None], order].set(jnp.arange(length)[None, :])
+        return jnp.take_along_axis(out, back[:, :, None, None], axis=1)
 
     queries, keys = (None, None) if segment_ids is None else document_ids(segment_ids)
     return _per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)),
