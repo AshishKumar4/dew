@@ -4,10 +4,12 @@
 instances with every parameter moved off its initialization, saves each with
 its real config and safetensors, and calls each as `ZImagePipeline` calls it
 - a list of latents, the time 1 - sigma, a list of prompt states of each
-prompt's own length - recording the output and the gradients of the latents
-and the prompt states, and for one case of every parameter, against a fixed
-cotangent. It also saves one tiny `ZImagePipeline` over the published
-configs and walks the unmodified call, guided at its default scale.
+prompt's own length - recording the output and the gradients of the latents,
+the prompt states and every parameter against a fixed cotangent, in float32
+and in float64. It also saves one tiny `ZImagePipeline` over the published
+configs and walks the unmodified call, guided at its default scale, the same
+two ways. Each native tensor is held to the source's own float32 distance
+from float64 (tests/reference_error.py).
 
 The native transformer takes Dew's model time, sigma times a thousand, and
 returns the flow, the negated source output; its prompt states arrive padded
@@ -22,7 +24,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap as relative_gap
+from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, read_transformer, z_image_fields, z_image_path
@@ -31,8 +34,6 @@ from dew.nn.backbones.z_image import ZImageTransformer
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("padded", "exact", "deep")
 BUDGET = 64
-FORWARD = 1e-5
-GRADIENT = 1e-4
 
 
 @pytest.fixture(scope="module")
@@ -86,7 +87,8 @@ def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
 @pytest.mark.parametrize("name", CASES)
 def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, name):
     """The native flow is the negated source output, its gradients the
-    negated source gradients, whatever the rows' prompt lengths."""
+    negated source gradients, every parameter's among them, whatever the
+    rows' prompt lengths: each as near float64 as the source's float32."""
     model, params, layouts = load(source, name)
     latents, time, context, mask = inputs(name, arrays, record)
     probe = nhwc(arrays[f"{name}.probe"])
@@ -96,24 +98,25 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
             model.apply({"params": params}, latents, time, DenoisingCondition(context, mask=mask)) * probe
         )
 
+    def held(value, key, layout=np.asarray):
+        assert_as_exact_as_the_reference(-np.asarray(value), layout(arrays[f"{name}.{key}"]),
+                                         layout(arrays[f"{name}.fp64.{key}"]), f"{name} {key}")
+
     flow = model.apply({"params": params}, latents, time, DenoisingCondition(jnp.asarray(context), mask=mask))
-    gaps = {"forward": relative_gap(-flow, nhwc(arrays[f"{name}.output"]))}
+    held(flow, "output", nhwc)
     grad_params, grad_latents, grad_context = jax.grad(objective, argnums=(0, 1, 2))(params, latents,
                                                                                      jnp.asarray(context))
-    gaps["latents"] = relative_gap(-grad_latents, nhwc(arrays[f"{name}.grad_latents"]))
+    held(grad_latents, "grad_latents", nhwc)
     for row, length in enumerate(record["cases"][name]["lengths"]):
-        gaps[f"prompt {row}"] = relative_gap(
-            -grad_context[row, :length], arrays[f"{name}.grad_caption.{row}"]
-        )
+        held(grad_context[row, :length], f"grad_caption.{row}")
         assert not np.asarray(grad_context[row, length:]).any()
-    for layout in layouts:
-        key = f"{name}.grad_param.{layout.name.removeprefix('transformer/')}"
-        if key in arrays:
-            gaps[layout.name] = relative_gap(-layout.export({"params": grad_params}), arrays[key])
-    worst = max(gaps, key=gaps.get)
-    print(f"{name}: forward {gaps['forward']:.3g}; worst {worst} {gaps[worst]:.3g}")
-    assert gaps["forward"] < FORWARD
-    assert gaps[worst] < GRADIENT, worst
+    tensors = {layout.name.removeprefix("transformer/"): layout for layout in layouts}
+    assert {key.removeprefix(f"{name}.grad_param.") for key in arrays
+            if key.startswith(f"{name}.grad_param.")} == set(tensors)
+    assert_leaves_as_exact(
+        {tensor: -np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()},
+        {tensor: arrays[f"{name}.grad_param.{tensor}"] for tensor in tensors},
+        {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors})
 
 
 @pytest.fixture(scope="module")
@@ -145,7 +148,8 @@ def test_prompt_encoding_matches_the_source_pipeline(pipeline, arrays, record):
         expected = arrays[f"pipeline.context.{row}"]
         length = expected.shape[0]
         np.testing.assert_array_equal(np.asarray(condition.mask[row]), np.arange(encoder.tokens) < length)
-        assert relative_gap(condition.context[row, :length], expected) < FORWARD, row
+        assert_as_exact_as_the_reference(condition.context[row, :length], expected,
+                                         arrays[f"pipeline.fp64.context.{row}"], f"prompt {row}")
 
 
 @pytest.mark.parametrize("load", ["pipeline", "streamed"])
@@ -164,6 +168,8 @@ def test_pipeline_walk_matches_the_source(load, arrays, record, request):
     images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
     latents = np.asarray(walked.latents)
     for row in range(len(recorded["prompts"])):
-        expected = arrays[f"pipeline.latents.{row}"].transpose(0, 2, 3, 1)[0]
-        assert relative_gap(latents[row], expected) < FORWARD, row
-        assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < FORWARD, row
+        expected, truth = (arrays[f"pipeline.{kind}latents.{row}"].transpose(0, 2, 3, 1)[0]
+                           for kind in ("", "fp64."))
+        assert_as_exact_as_the_reference(latents[row], expected, truth, f"latents {row}")
+        assert_as_exact_as_the_reference(images[row], arrays[f"pipeline.images.{row}"][0],
+                                         arrays[f"pipeline.fp64.images.{row}"][0], f"images {row}")

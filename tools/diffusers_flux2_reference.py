@@ -6,11 +6,10 @@ is run the way `Flux2Pipeline` runs it: the latent flattened one token per
 position, the four-axis ids the pipeline lays out for the text and the grid,
 the timestep it divides by a thousand, and the distilled guidance. Every case
 records the forward, the vector-Jacobian products against a fixed cotangent
-for the latent and the text states, and the gradient of every parameter, in
-float32, with the source's sinusoidal frequency table rounded from float64
-as `tools/diffusers_flux_reference.py` records Flux's (torch's float32 `exp`
-is one unit in the last place off at some entries, and one ulp of a frequency
-is one ulp of the 3500-radian angle a distilled guidance embeds).
+for the latent and the text states, and the gradient of every parameter,
+unmodified, in float32, the reference, and in float64, the truth
+(`diffusers_wan_reference.float64`: the source's float32 pins widened). Every
+other walk below is recorded the same two ways.
 
 Every parameter is moved off its initialization, so the RMS norms' scales
 are not all ones.
@@ -31,6 +30,7 @@ Run in the isolated reference environment (diffusers 0.40.0, transformers
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from dataclasses import dataclass, field
@@ -38,15 +38,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import (
-    rounded_frequency_table as rounded_frequency_table,
-    rounded_timestep_embedding as rounded_timestep_embedding,
-    perturb,
-    recording,
-    saved_pipeline,
-    tiny_qwen3_encoder,
-)
-from reference_releases import RELEASES, require
+from diffusers_reference_helpers import perturb, recording, saved_pipeline, tiny_qwen3_encoder
+from diffusers_wan_reference import float64
+from reference_releases import RELEASES
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
 BASE = {"patch_size": 1, "in_channels": 8, "num_layers": 2, "num_single_layers": 2, "attention_head_dim": 16,
@@ -82,7 +76,16 @@ def ids(rows: int, columns: int) -> tuple[torch.Tensor, torch.Tensor]:
     return text, image
 
 
+def twice(walk, model) -> dict[str, np.ndarray]:
+    """`walk(model, dtype)` in float32 and, `model` widened, in float64 (`fp64.`)."""
+    narrow = walk(model, torch.float32)
+    with float64():
+        wide = walk(copy.deepcopy(model).double(), torch.float64)
+    return {**narrow, **{f"fp64.{key}": value for key, value in wide.items()}}
+
+
 def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
+    """The case's saved transformer and its walk in float32 and in float64."""
     from diffusers import Flux2Transformer2DModel
 
     config = {**BASE, **case.config}
@@ -95,26 +98,30 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     model.save_pretrained(root / name / "transformer", safe_serialization=True)
     rows, columns = case.grid
     batch = len(case.guidance)
-    latent = torch.randn((batch, rows * columns, config["in_channels"]), generator=generator, requires_grad=True)
-    context = torch.randn((batch, TOKENS, config["joint_attention_dim"]), generator=generator, requires_grad=True)
+    latent = torch.randn((batch, rows * columns, config["in_channels"]), generator=generator)
+    context = torch.randn((batch, TOKENS, config["joint_attention_dim"]), generator=generator)
     times = torch.tensor([731.0, 42.0])
     guidance = torch.tensor(case.guidance) if config["guidance_embeds"] else None
     text_ids, image_ids = ids(rows, columns)
     probe = torch.randn((batch, rows * columns, config.get("out_channels") or config["in_channels"]),
                         generator=generator)
-    named = list(model.named_parameters())
-    with rounded_frequency_table():
-        output = model(hidden_states=latent, encoder_hidden_states=context, timestep=times / 1000,
-                       guidance=guidance, img_ids=image_ids, txt_ids=text_ids, return_dict=False)[0]
-        grads = torch.autograd.grad((output * probe).sum(), [latent, context] + [value for _, value in named])
-    arrays = {"latent": latent.detach().numpy(), "context": context.detach().numpy(), "times": times.numpy(),
+
+    def walk(model, dtype) -> dict[str, np.ndarray]:
+        inputs = [tensor.detach().to(dtype).requires_grad_() for tensor in (latent, context)]
+        named = list(model.named_parameters())
+        output = model(hidden_states=inputs[0], encoder_hidden_states=inputs[1],
+                       timestep=times.to(dtype) / 1000, guidance=None if guidance is None else guidance.to(dtype),
+                       img_ids=image_ids, txt_ids=text_ids, return_dict=False)[0]
+        grads = torch.autograd.grad((output * probe.to(dtype)).sum(), inputs + [value for _, value in named])
+        return {"output": output.detach().numpy(), "grad_latent": grads[0].numpy(),
+                "grad_context": grads[1].numpy(),
+                **{f"grad_param.{key}": gradient.numpy()
+                   for (key, _), gradient in zip(named, grads[2:], strict=True)}}
+
+    arrays = {"latent": latent.numpy(), "context": context.numpy(), "times": times.numpy(),
               "guidance": np.zeros(0, np.float32) if guidance is None else guidance.numpy(),
-              "output": output.detach().numpy(), "probe": probe.numpy(),
-              "grad_latent": grads[0].numpy(), "grad_context": grads[1].numpy()}
-    for (key, _), gradient in zip(named, grads[2:], strict=True):
-        arrays[f"grad_param.{key}"] = gradient.numpy()
-    print(f"{name}: grid {case.grid} tokens {TOKENS} |output| <= {float(output.abs().max()):.4g} "
-          f"parameters {len(named)}")
+              "probe": probe.numpy(), **twice(walk, model)}
+    print(f"{name}: grid {case.grid} tokens {TOKENS} |output| <= {float(np.abs(arrays['output']).max()):.4g}")
     return arrays
 
 
@@ -141,20 +148,30 @@ def build_vae(name: str, root: Path) -> dict[str, np.ndarray]:
         model.bn.running_mean.copy_(0.3 * torch.randn(model.bn.running_mean.shape, generator=generator))
         model.bn.running_var.copy_(torch.rand(model.bn.running_var.shape, generator=generator) + 0.2)
     model.save_pretrained(root / name / "vae", safe_serialization=True)
-    statistics = (model.bn.running_mean.view(1, -1, 1, 1),
-                  torch.sqrt(model.bn.running_var.view(1, -1, 1, 1) + model.config.batch_norm_eps))
-    image = (torch.rand((2, 3, 16, 24), generator=generator) * 2 - 1).requires_grad_()
-    latent = (Flux2Pipeline._patchify_latents(model.encode(image).latent_dist.mode()) - statistics[0]) / statistics[1]
-    probe_latent = torch.randn(latent.shape, generator=generator)
-    (grad_image,) = torch.autograd.grad((latent * probe_latent).sum(), [image])
-    code = torch.randn(latent.shape, generator=generator).requires_grad_()
-    pixels = model.decode(Flux2Pipeline._unpatchify_latents(code * statistics[1] + statistics[0])).sample
-    probe = torch.randn(pixels.shape, generator=generator)
-    (grad_code,) = torch.autograd.grad((pixels * probe).sum(), [code])
-    print(f"{name}: latent {tuple(latent.shape)} pixels {tuple(pixels.shape)}")
-    return {"image": image.detach().numpy(), "latent": latent.detach().numpy(), "probe_latent": probe_latent.numpy(),
-            "grad_image": grad_image.numpy(), "code": code.detach().numpy(), "pixels": pixels.detach().numpy(),
-            "probe": probe.numpy(), "grad_code": grad_code.numpy()}
+    image = torch.rand((2, 3, 16, 24), generator=generator) * 2 - 1
+    with torch.no_grad():
+        folded = Flux2Pipeline._patchify_latents(model.encode(image).latent_dist.mode()).shape
+    probe_latent, code = (torch.randn(folded, generator=generator) for _ in range(2))
+    probe = torch.randn(image.shape, generator=generator)
+
+    def walk(model, dtype) -> dict[str, np.ndarray]:
+        statistics = (model.bn.running_mean.view(1, -1, 1, 1),
+                      torch.sqrt(model.bn.running_var.view(1, -1, 1, 1) + model.config.batch_norm_eps))
+        pixels_in = image.to(dtype).requires_grad_()
+        latent = (Flux2Pipeline._patchify_latents(model.encode(pixels_in).latent_dist.mode())
+                  - statistics[0]) / statistics[1]
+        (grad_image,) = torch.autograd.grad((latent * probe_latent.to(dtype)).sum(), [pixels_in])
+        code_in = code.to(dtype).requires_grad_()
+        unfolded = Flux2Pipeline._unpatchify_latents(code_in * statistics[1] + statistics[0])
+        pixels = model.decode(unfolded).sample
+        (grad_code,) = torch.autograd.grad((pixels * probe.to(dtype)).sum(), [code_in])
+        return {"latent": latent.detach().numpy(), "grad_image": grad_image.numpy(),
+                "pixels": pixels.detach().numpy(), "grad_code": grad_code.numpy()}
+
+    arrays = {"image": image.numpy(), "probe_latent": probe_latent.numpy(), "code": code.numpy(),
+              "probe": probe.numpy(), **twice(walk, model)}
+    print(f"{name}: latent {arrays['latent'].shape} pixels {arrays['pixels'].shape}")
+    return arrays
 
 
 PUBLISHED_VAE = ("black-forest-labs/FLUX.2-klein-4B", "e7b7dc27f91deacad38e78976d1f2b499d76a294")
@@ -170,29 +187,23 @@ def smooth_image() -> np.ndarray:
 
 def published(destination: str) -> None:
     """The published VAE's pipeline latent of `smooth_image()` and its
-    decode's top-left `CROP` pixels, in float64, and how far the source's
-    own float32 run lands from each, for `tests/fixtures/flux2_published.npz`."""
+    decode's top-left `CROP` pixels, in float32 and in float64 (`.fp64`),
+    for `tests/fixtures/flux2_published.npz`."""
     from diffusers import AutoencoderKLFlux2, Flux2Pipeline
 
     model = AutoencoderKLFlux2.from_pretrained(PUBLISHED_VAE[0], subfolder="vae", revision=PUBLISHED_VAE[1]).eval()
 
-    def walk(dtype):
+    def walk(model, dtype) -> dict[str, np.ndarray]:
         with torch.no_grad():
-            mean = model.bn.running_mean.view(1, -1, 1, 1).to(dtype)
-            std = torch.sqrt(model.bn.running_var.view(1, -1, 1, 1).to(dtype) + model.config.batch_norm_eps)
+            mean = model.bn.running_mean.view(1, -1, 1, 1)
+            std = torch.sqrt(model.bn.running_var.view(1, -1, 1, 1) + model.config.batch_norm_eps)
             folded = Flux2Pipeline._patchify_latents(
                 model.encode(torch.from_numpy(smooth_image()).to(dtype)).latent_dist.mode())
             pixels = model.decode(Flux2Pipeline._unpatchify_latents(folded)).sample
-            return ((folded - mean) / std).numpy(), pixels.numpy()[:, :, :CROP, :CROP]
+            return {"vae.latent": ((folded - mean) / std).numpy(), "vae.pixels": pixels.numpy()[:, :, :CROP, :CROP]}
 
-    single = walk(torch.float32)
-    model.double()
-    exact = walk(torch.float64)
-    arrays = {}
-    for key, value, rounded in zip(("latent", "pixels"), exact, single, strict=True):
-        arrays[f"vae.{key}"] = value
-        arrays[f"vae.{key}.float32_gap"] = np.float64(np.abs(rounded - value).max() / max(1.0, np.abs(value).max()))
-    print({key: float(value) for key, value in arrays.items() if key.endswith("gap")})
+    arrays = {key.replace("fp64.vae.", "vae.") + (".fp64" if key.startswith("fp64.") else ""): value
+              for key, value in twice(walk, model).items()}
     np.savez_compressed(destination, **arrays)
     print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
 
@@ -248,26 +259,32 @@ def build_pipeline(root: Path):
 def pipeline_record(root: Path) -> dict[str, np.ndarray]:
     """The prompt states each prompt encodes to, and the unmodified call's
     walk from fixed latents at `STEPS` steps: the raw VAE latent it ends on
-    and the image it decodes."""
+    and the image it decodes; in float32 and, widened, in float64."""
     pipe = build_pipeline(root)
     rows, columns = HEIGHT // 4, WIDTH // 4
     generator = torch.Generator().manual_seed(SEED + 9)
     latents = torch.randn((len(PROMPTS), PIPELINE["in_channels"], rows, columns), generator=generator)
-    arrays: dict[str, np.ndarray] = {"pipeline.x_T": latents.numpy()}
-    for row, prompt in enumerate([*PROMPTS, ""]):
+
+    def walk(pipe, dtype) -> dict[str, np.ndarray]:
+        arrays = {}
         with torch.no_grad():
-            embeds, _ = pipe.encode_prompt(prompt=prompt, device=torch.device("cpu"))
-        arrays[f"pipeline.context.{row}"] = embeds.numpy()
-    for row, prompt in enumerate(PROMPTS):
-        with torch.no_grad():
-            walked = pipe(prompt=prompt, height=HEIGHT, width=WIDTH, num_inference_steps=STEPS,
-                          latents=latents[row:row + 1].clone(), output_type="latent").images
-            images = pipe(prompt=prompt, height=HEIGHT, width=WIDTH, num_inference_steps=STEPS,
-                          latents=latents[row:row + 1].clone(), output_type="np").images
-        arrays[f"pipeline.latents.{row}"] = walked.numpy()
-        arrays[f"pipeline.images.{row}"] = images
-        print(f"pipeline {prompt!r}: latents {tuple(walked.shape)} images {images.shape}")
-    return arrays
+            for row, prompt in enumerate([*PROMPTS, ""]):
+                states, _ = pipe.encode_prompt(prompt=prompt, device=torch.device("cpu"))
+                arrays[f"context.{row}"] = states.numpy()
+            for row, prompt in enumerate(PROMPTS):
+                call = {"prompt": prompt, "height": HEIGHT, "width": WIDTH, "num_inference_steps": STEPS}
+                start = latents[row:row + 1].to(dtype)
+                walked = pipe(**call, latents=start.clone(), output_type="latent").images
+                arrays[f"latents.{row}"] = walked.numpy()
+                arrays[f"images.{row}"] = pipe(**call, latents=start.clone(), output_type="np").images
+        return arrays
+
+    narrow = walk(pipe, torch.float32)
+    with float64():
+        wide = walk(copy.deepcopy(pipe).to(torch.float64), torch.float64)
+    print(f"pipeline: latents {narrow['latents.0'].shape} images {narrow['images.0'].shape}")
+    return {"pipeline.x_T": latents.numpy(), **{f"pipeline.{key}": value for key, value in narrow.items()},
+            **{f"pipeline.fp64.{key}": value for key, value in wide.items()}}
 
 
 # FLUX.2 [dev]'s Mistral-3 encoder: a tiny `Mistral3ForConditionalGeneration`
@@ -320,11 +337,15 @@ def build_mistral3(root: Path) -> dict[str, np.ndarray]:
             parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
     model.save_pretrained(root / "mistral3" / "text_encoder", safe_serialization=True)
     tok.save_pretrained(root / "mistral3" / "tokenizer")
-    with torch.no_grad():
-        embeds = Flux2Pipeline._get_mistral_3_small_prompt_embeds(model, tok, list(PROMPTS), dtype=torch.float32,
-                                                                  device=torch.device("cpu"))
-    print(f"mistral3: context {tuple(embeds.shape)}")
-    return {"mistral3.context": embeds.numpy()}
+
+    def walk(model, dtype) -> dict[str, np.ndarray]:
+        with torch.no_grad():
+            return {"context": Flux2Pipeline._get_mistral_3_small_prompt_embeds(
+                model, tok, list(PROMPTS), dtype=dtype, device=torch.device("cpu")).numpy()}
+
+    arrays = twice(walk, model)
+    print(f"mistral3: context {arrays['context'].shape}")
+    return {f"mistral3.{key}": value for key, value in arrays.items()}
 
 
 def main(destination: str) -> None:
