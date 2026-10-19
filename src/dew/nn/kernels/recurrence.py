@@ -18,7 +18,7 @@ also its CPU path and, on float64 operands, the float64 truth.
 
 import dataclasses
 import functools
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -166,18 +166,34 @@ def _pieces(hooks: Hooks, value_heads: int, key_width: int, value_width: int, ch
     return key_heads
 
 
-def _prologue(hooks: Hooks, operands: Step, work):
+def _names(hooks: Hooks) -> tuple[str, ...]:
+    """The `Step` operands a launch reads, in its order, after `active`; `state` last."""
+    streams = ('token', 'held', 'taps') if hooks.conv is not None else ('query', 'key', 'value')
+    gates = (('gate', 'beta', 'log_a', 'bias') if hooks.gates is not None
+             else ('log_decay',) * (hooks.decay != 'none') + ('beta',) * hooks.delta)
+    return (*streams, *gates, *('skip',) * hooks.skip, *('z', 'weight') * (hooks.output is not None), 'state')
+
+
+def _read(hooks: Hooks, operands: Step) -> dict:
+    """The operands `hooks` read (`_names`), by name, each held, else a ValueError naming those it lacks."""
+    given = {name: getattr(operands, name) for name in _names(hooks)}
+    missing = [name for name, array in given.items() if array is None]
+    if missing:
+        raise ValueError(f"{hooks} reads {', '.join(missing)}, which the step does not hold")
+    return given
+
+
+def _prologue(hooks: Hooks, given: dict, work):
     """The reference's queries `[rows, Hv, Dk]`, keys, values `[rows, Hv, Dv]`, each in `work`, and
     the moved history (None without a conv): the conv's sums in `work` over the history rounded to
     the token's dtype, the activation, the l2 norm, the key heads repeated over their value heads."""
-    state = operands.state
-    value_heads, key_width, value_width = state.shape[1:]
+    value_heads, key_width, value_width = given['state'].shape[1:]
     history = None
     if hooks.conv is not None:
-        token, held = operands.token, operands.held
+        token, held = given['token'], given['held']
         key_heads = _pieces(hooks, value_heads, key_width, value_width, token.shape[-1])
         window = jnp.concatenate([held.astype(token.dtype), token[:, None]], axis=1).astype(work)
-        pre = jnp.sum(window * jnp.swapaxes(operands.taps.astype(work), 0, 1)[None], axis=1)
+        pre = jnp.sum(window * jnp.swapaxes(given['taps'].astype(work), 0, 1)[None], axis=1)
         convolved = pre if hooks.conv.activation is None else pre * jax.nn.sigmoid(pre)
         rows = token.shape[0]
         split = [key_heads * key_width, 2 * key_heads * key_width]
@@ -186,7 +202,7 @@ def _prologue(hooks: Hooks, operands: Step, work):
         value = value.reshape(rows, value_heads, value_width)
         history = jnp.concatenate([held[:, 1:], token[:, None].astype(held.dtype)], axis=1)
     else:
-        query, key, value = (x.astype(work) for x in (operands.query, operands.key, operands.value))
+        query, key, value = (given[name].astype(work) for name in ('query', 'key', 'value'))
     if hooks.l2norm:
         query, key = (x * jax.lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + L2NORM_EPS)
                       for x in (query, key))
@@ -196,15 +212,15 @@ def _prologue(hooks: Hooks, operands: Step, work):
     return query, key, value, history
 
 
-def _gates(hooks: Hooks, operands: Step, work, key_width: int):
+def _gates(hooks: Hooks, given: dict, work, key_width: int):
     """The reference's decay per key dimension `[rows, Hv, Dk]` and write gate `[rows, Hv]`."""
     if hooks.gates is not None:
-        g = _gated_decay(operands.gate.astype(work), operands.log_a.astype(work), operands.bias.astype(work))
-        beta = jax.nn.sigmoid(operands.beta.astype(work))
+        g = _gated_decay(*(given[name].astype(work) for name in ('gate', 'log_a', 'bias')))
+        beta = jax.nn.sigmoid(given['beta'].astype(work))
     else:
-        g = None if hooks.decay == 'none' else operands.log_decay.astype(work)
-        beta = None if operands.beta is None else operands.beta.astype(work)
-    rows, heads = operands.state.shape[:2]
+        g = None if hooks.decay == 'none' else given['log_decay'].astype(work)
+        beta = given['beta'].astype(work) if hooks.delta else None
+    rows, heads = given['state'].shape[:2]
     if g is None:
         decay = jnp.ones((rows, heads, key_width), work)
     else:
@@ -219,33 +235,26 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     """`(output [rows, Hv, Dv], history' or None, state')` of a decode token, in XLA: each piece of
     arithmetic in at least fp32 (float64 operands in float64), the state held as it came (bf16
     rounded by `round_to_bf16`), the output in `dtype` (the value's or the token's without it)."""
-    state = operands.state
-    operand = (operands.token if hooks.conv is not None else operands.value).dtype
+    given = _read(hooks, operands)
+    state = given['state']
+    operand = given['token' if hooks.conv is not None else 'value'].dtype
     work = jnp.promote_types(jnp.promote_types(operand, state.dtype), jnp.float32)
     key_width = state.shape[2]
-    query, key, value, history = _prologue(hooks, operands, work)
-    decay, write = _gates(hooks, operands, work, key_width)
+    query, key, value, history = _prologue(hooks, given, work)
+    decay, write = _gates(hooks, given, work, key_width)
     out, updated = update(state.astype(work), query, key, value, decay, write[..., None], delta=hooks.delta)
     if hooks.skip:
-        out = out + operands.skip.astype(work)[None, :, None] * value
+        out = out + given['skip'].astype(work)[None, :, None] * value
     if hooks.output is not None:
-        out = gated_rms(out, operands.z.astype(work), operands.weight.astype(work), hooks.output)
+        out = gated_rms(out, given['z'].astype(work), given['weight'].astype(work), hooks.output)
     held = _held(updated, key, value, state.dtype)
     if operands.active is not None:
         active = jnp.asarray(operands.active, bool)
         held = jnp.where(active[:, None, None, None], held, state)
         out = jnp.where(active[:, None, None], out, 0.0)
         if history is not None:
-            history = jnp.where(active[:, None, None], history, operands.held)
+            history = jnp.where(active[:, None, None], history, given['held'])
     return out.astype(operand if dtype is None else dtype), history, held
-
-
-def _names(hooks: Hooks) -> tuple[str, ...]:
-    """The `Step` operands a launch reads, in its order, after `active`; `state` last."""
-    streams = ('token', 'held', 'taps') if hooks.conv is not None else ('query', 'key', 'value')
-    gates = (('gate', 'beta', 'log_a', 'bias') if hooks.gates is not None
-             else ('log_decay',) * (hooks.decay != 'none') + ('beta',) * hooks.delta)
-    return (*streams, *gates, *('skip',) * hooks.skip, *('z', 'weight') * (hooks.output is not None), 'state')
 
 
 def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
@@ -259,57 +268,23 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
     inputs = dict(zip(('active', *names), refs[:len(names) + 1], strict=True))
     outputs = refs[len(names) + 1:]
     state_out, out_ref = outputs[0], outputs[-1]
-    held_out = outputs[1] if hooks.conv is not None else None
     state_ref = inputs['state']
     head = pl.program_id(1)
     active = inputs['active'][0] != 0
     key_width, value_width = state_ref.shape
-    key_head = head // group
 
     def scalar(name):
         """A head's one entry of a `[1]` block, as a one-entry vector the arithmetic broadcasts."""
         return inputs[name][...].astype(jnp.float32)
 
-    if hooks.conv is not None:
-        token_ref, history_ref, taps_ref = inputs['token'], inputs['held'], inputs['taps']
-        pieces = ((key_head * key_width, key_width), ((key_heads + key_head) * key_width, key_width),
-                  (2 * key_heads * key_width + head * value_width, value_width))
-        count = taps_ref.shape[-1]
-
-        def window(first, width):
-            """A piece's conv window, `K` rows `[1, D]` fp32: the held history rounded to the token's
-            dtype, as the layer's conv reads it, then the token."""
-            channels = pl.ds(first, width)
-            operand = token_ref.dtype
-            held = [history_ref[j, channels][None, :].astype(operand).astype(jnp.float32)
-                    for j in range(count - 1)]
-            return [*held, token_ref[channels][None, :].astype(jnp.float32)]
-
-        def write(moved):
-            """Each piece's moved history, a row at a time: the values, and the queries and keys where
-            the program is its key head's first."""
-            def store(piece, rows):
-                for j, row in enumerate(rows):
-                    held_out[j, pl.ds(*piece)] = row[0].astype(held_out.dtype)
-
-            store(pieces[2], moved[2])
-
-            @pl.when(head % group == 0)
-            def _():
-                store(pieces[0], moved[0])
-                store(pieces[1], moved[1])
+    conv = (_ConvRefs(inputs['token'], inputs['held'], inputs['taps'], outputs[1], key_heads, key_width,
+                      value_width, head, group) if hooks.conv is not None else None)
 
     @pl.when(active)
     def _():
-        if hooks.conv is not None:
-            windows = [window(*piece) for piece in pieces]
-            streams = []
-            for stream, (first, width) in zip(windows, pieces, strict=True):
-                taps = [taps_ref[pl.ds(first, width), j].astype(jnp.float32) for j in range(count)]
-                pre = short_conv._preactivation(stream, taps, None)
-                streams.append(pre if hooks.conv.activation is None
-                               else pre * short_conv._sigmoid(pre, interpret=interpret))
-            query, key, value = (x[0] for x in streams)
+        windows = conv.windows() if conv is not None else None
+        if hooks.conv is not None and conv is not None and windows is not None:
+            query, key, value = conv.convolved(windows, hooks.conv, interpret)
         else:
             query, key, value = (inputs[name][...].astype(jnp.float32) for name in ('query', 'key', 'value'))
         if hooks.l2norm:
@@ -335,14 +310,81 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
             out = gated_rms(out, gate, weight, hooks.output)
         state_out[...] = _held(updated, key, value, state_out.dtype)
         out_ref[...] = out.astype(out_ref.dtype)
-        if hooks.conv is not None:
-            write([stream[1:] for stream in windows])
+        if conv is not None and windows is not None:
+            conv.write([stream[1:] for stream in windows])
 
     @pl.when(jnp.logical_not(active))
     def _():
         out_ref[...] = jnp.zeros(out_ref.shape, out_ref.dtype)
-        if hooks.conv is not None:
-            write([[history_ref[j, pl.ds(*piece)][None, :] for j in range(count - 1)] for piece in pieces])
+        if conv is not None:
+            conv.write(conv.held())
+
+
+@dataclasses.dataclass(frozen=True)
+class _ConvRefs:
+    """A decode program's view of the prologue's conv: the row's token `[C]` and history `[K - 1, C]`,
+    the taps `[C, K]` and the moved history it writes, its value head's queries, keys and values the
+    channels `pieces` names."""
+    token: Any
+    history: Any
+    taps: Any
+    moved: Any
+    key_heads: int
+    key_width: int
+    value_width: int
+    head: Any
+    group: int
+
+    @property
+    def pieces(self):
+        """Each stream's first channel and width: its key head's queries and keys, its own values."""
+        key_head = self.head // self.group
+        return ((key_head * self.key_width, self.key_width),
+                ((self.key_heads + key_head) * self.key_width, self.key_width),
+                (2 * self.key_heads * self.key_width + self.head * self.value_width, self.value_width))
+
+    def windows(self):
+        """Each stream's conv window, `K` rows `[1, D]` fp32: the held history rounded to the token's
+        dtype, as the layer's conv reads it, then the token."""
+        count = self.taps.shape[-1]
+
+        def window(first, width):
+            channels = pl.ds(first, width)
+            held = [self.history[j, channels][None, :].astype(self.token.dtype).astype(jnp.float32)
+                    for j in range(count - 1)]
+            return [*held, self.token[channels][None, :].astype(jnp.float32)]
+
+        return [window(*piece) for piece in self.pieces]
+
+    def convolved(self, windows, conv: Conv, interpret: bool):
+        """The queries, keys and values `[D]`: each stream's taps over its window, then the activation."""
+        streams = []
+        for stream, (first, width) in zip(windows, self.pieces, strict=True):
+            taps = [self.taps[pl.ds(first, width), j].astype(jnp.float32) for j in range(len(stream))]
+            pre = short_conv._preactivation(stream, taps, None)
+            streams.append(pre if conv.activation is None
+                           else pre * short_conv._sigmoid(pre, interpret=interpret))
+        return tuple(x[0] for x in streams)
+
+    def held(self):
+        """Each stream's history as it was, for an idle row."""
+        count = self.taps.shape[-1]
+        return [[self.history[j, pl.ds(*piece)][None, :] for j in range(count - 1)] for piece in self.pieces]
+
+    def write(self, moved):
+        """Each stream's moved history, a row at a time: the values, and the queries and keys where the
+        program is its key head's first."""
+        def store(piece, rows):
+            for j, row in enumerate(rows):
+                self.moved[j, pl.ds(*piece)] = row[0].astype(self.moved.dtype)
+
+        pieces = self.pieces
+        store(pieces[2], moved[2])
+
+        @pl.when(self.head % self.group == 0)
+        def _():
+            store(pieces[0], moved[0])
+            store(pieces[1], moved[1])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -477,16 +519,15 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     token's with a conv), the history in its dtype, the state as it is held and updated in place
     where the caller lets it go. A row `active` marks False keeps its history and state, its output
     zeros."""
-    given = {name: getattr(operands, name) for name in _names(hooks)}
-    rows = operands.state.shape[0]
+    given = _read(hooks, operands)
+    rows = given['state'].shape[0]
     flags = (jnp.ones(rows, jnp.int32) if operands.active is None
              else jnp.asarray(operands.active).astype(jnp.int32))[:, None]
-    operand = (operands.token if hooks.conv is not None else operands.value).dtype
-    if 'beta' in given and given['beta'] is not None:
+    operand = given['token' if hooks.conv is not None else 'value'].dtype
+    if 'beta' in given:
         given['beta'] = given['beta'].reshape(rows, -1)
     if hooks.decay == 'scalar' and hooks.gates is None:
         given['log_decay'] = given['log_decay'].reshape(rows, -1)
-    results = StepLaunch()(flags, hooks=hooks, dtype=jnp.dtype(operand if dtype is None else dtype).name,
-                           interpret=not triton_runs(), **given)
-    state, out = results[0], results[-1]
-    return out, results[1] if hooks.conv is not None else None, state
+    named = jnp.dtype(operand if dtype is None else dtype).name
+    state, *history, out = StepLaunch()(flags, hooks=hooks, dtype=named, interpret=not triton_runs(), **given)
+    return out, history[0] if history else None, state
