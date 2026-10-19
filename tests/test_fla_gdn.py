@@ -22,6 +22,7 @@ from tuned import each_config
 from dew.nn import kernels, linear
 from dew.nn.kernels import fla_gdn, fla_kda, generation, tuning
 from dew.nn.linear import GatedDeltaNet, fla_rule, l2norm
+from dew.training._lowering import triton_calls
 
 pytestmark = pytest.mark.kernel
 
@@ -781,9 +782,9 @@ def test_a_bf16_gated_delta_net_trains_with_no_copy_at_the_ports_edges():
     def loss(params, x):
         return jnp.sum(layer.apply(params, x).astype(jnp.float32) ** 2)
 
-    text = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(params, x).compile().as_text()
-    assert "__gpu$xla.gpu.triton" in text
-    assert boundary_copies(text) == []
+    lowered = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(params, x)
+    assert triton_calls(lowered)
+    assert boundary_copies(lowered.compile().as_text()) == []
 
 
 def _lowered_dot(product, default: str) -> list[str]:
@@ -796,7 +797,6 @@ def _lowered_dot(product, default: str) -> list[str]:
     from jaxlib.mlir import ir
 
     from dew.nn.kernels.generation import assumed, gpu_mesh
-    from dew.training._lowering import triton_calls
 
     def kernel(a_ref, b_ref, o_ref):
         o_ref[...] = product(a_ref[...], b_ref[...])
