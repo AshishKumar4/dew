@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, get_args, runtime_checkable
 
 import grain.python as pygrain
 
+from dew.data.dataset import Records
 from dew.data.pipeline import (
     Artifact,
     Batched,
@@ -66,7 +67,7 @@ from dew.data.plan import Manifest, StepIdentity, _changed, _semantic
 from dew.data.sources.base import READS, Read, Source, _consumed
 from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
-from dew.records import record
+from dew.records import json_value, record
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache
@@ -140,44 +141,57 @@ def _in_memory(source: Source) -> bool:
     return isinstance(_store(source), Memory)
 
 
+def _stated(source: Source, read: Read) -> tuple[Records | None, Mapping[str, object]]:
+    """The records a memory read of `source` holds, then its metadata, read
+    in that order: a source may measure a fact as it reads (a prompt's
+    reward bound), so its facts follow the read."""
+    held = source.records(read) if read == "memory" else None
+    return held, source.metadata()
+
+
 def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest:
     """The manifest of what a cache after `prefix` over `source` holds, as a
     publication records it (`dew.data.compile.publish`): the source as `read`
-    consumes it, and the configured steps bound to its facts."""
+    consumes it, and the configured steps bound to the facts it states."""
     consumed = _consumed(source, read)
     pipeline = Pipeline(consumed, tuple(prefix))
     if any(isinstance(stage, Configured) for stage in prefix):
-        pipeline = _configured(pipeline, consumed.metadata(), read)
+        pipeline = _configured(pipeline, _stated(consumed, read)[1], read)
     return _cache_manifest(consumed, pipeline.stages, read)
 
 
 def _in_place(generation: Generation, source: Source | Mixture | Phases,
               prefix: Sequence[Stage]) -> tuple[Source | None, tuple[str, ...]]:
     """The rows of `generation` in place of `prefix` over `source`, or None
-    and the fields of its manifest that differ: in place of `source` itself
-    where the generation holds what those steps make of it, read as it was
-    filled, or of the store under its holdouts where it holds what they make
-    of that store, whose selections then pick from its rows (`rebased`). Its
-    rows are its sources, steps, tokenizers and fill (`Manifest.semantic`);
-    the code and machine that filled it (`Manifest.environment`) do not
-    change them."""
-    from dew.data.holdout import rebased, selected
+    and the fields of its manifest that differ: in place of the source it
+    was published from, `source` itself or one its holdout selections select
+    from, read as it was filled, under the selections above that source
+    (`rebased`). Its rows are its source, steps, tokenizers and fill
+    (`Manifest.semantic`); the code and machine that filled it
+    (`Manifest.environment`) do not change them. A step bound to the whole
+    run's facts (scope='run') binds to another run's facts in a generation
+    than in this run, so no generation stands for one."""
+    from dew.data.holdout import rebased, selecting
 
     dependency = record(generation.manifest["dependency"], "generation dependency")
     fill = record(dependency.get("fill", {}), "generation fill")
     read = next((mode for mode in READS if mode == fill.get("read")), None)
     if read is None:
         return None, ("fill",)
-    published = _semantic(dependency)
-    store = selected(source)
-    changed: tuple[str, ...] = ()
-    for candidate in (source,) if store is source else (source, store):
-        if isinstance(candidate, (Mixture, Phases)):
-            return None, ("source",)
-        changed = _changed(published, _prefix_manifest(candidate, prefix, read).semantic())
-        if not changed:
-            return generation.source() if candidate is source else rebased(source, generation.source()), ()
-    return None, changed
+    published = dependency.get("source")
+    stored = next((candidate for candidate in selecting(source)
+                   if not isinstance(candidate, (Mixture, Phases))
+                   and json_value(_consumed(candidate, read).fingerprint(), "source") == published), None)
+    if stored is None:
+        return None, ("source",)
+    run = next((stage for stage in prefix if isinstance(stage, Configured) and stage.scope == "run"), None)
+    if run is not None:
+        raise ValueError(f"generation {generation.url} cannot stand for {_identity(run).name}, which binds "
+                         "to the whole run's facts (scope='run'); cache before it")
+    changed = _changed(_semantic(dependency), _prefix_manifest(stored, prefix, read).semantic())
+    if changed:
+        return None, changed
+    return rebased(source, generation.source(), under=stored), ()
 
 
 def _serves(cache: Cache | Generation | str, source: Source | Mixture | Phases,

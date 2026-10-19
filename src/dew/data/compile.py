@@ -37,6 +37,7 @@ from dew.data.analysis import (
     _preferred_read,
     _promoted,
     _Ran,
+    _stated,
     _steps,
     _until,
     _written,
@@ -192,9 +193,9 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
         if isinstance(source, _Facts):
             return source
         source = _consumed(source, read)
-        # A source may measure a fact as it reads (a prompt's reward bound), so the facts follow the read.
-        held = _PinnedRead(source.records(read)) if read == "memory" else None
-        return _Facts(source, read, source.fingerprint(), source.metadata(), held)
+        records, metadata = _stated(source, read)
+        held = None if records is None else _PinnedRead(records)
+        return _Facts(source, read, source.fingerprint(), metadata, held)
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
         pinned = dict(zip(sources, readers.map(pin, sources.values()), strict=True))
