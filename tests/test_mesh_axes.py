@@ -383,9 +383,10 @@ class Named(nn.Module):
 
     @nn.compact
     def __call__(self, x):
+        from dew.nn.dense import Dense
         from dew.objectives.base import FROZEN
 
-        return nn.Dense(16, name=FROZEN)(jax.nn.relu(nn.Dense(64, name="hidden")(x)))
+        return Dense(16, name=FROZEN)(jax.nn.relu(Dense(64, name="hidden")(x)))
 
 
 @pytest.mark.mesh(devices=2)
