@@ -9,6 +9,8 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
+from dew.diffusion.schedules import divided
+
 from .common import _check_endpoint_domain, _push
 
 
@@ -100,14 +102,16 @@ class DDIM:
 
 def _pndm_step(x, eps, variances_t, variances_s):
     """PNDM's transfer (Liu et al. 2022, eq. 9), DDIM from t to s in the
-    rationalized form Diffusers' `_get_prev_sample` evaluates, in its order,
-    from the squared rates (`Process.variances`): the transfer reads their
-    difference, which a beta table's cumulative products give more exactly
-    than the squares of their rounded roots."""
+    rationalized form Diffusers' `_get_prev_sample` evaluates, from the
+    squared rates (`Process.variances`): the transfer reads their difference,
+    which a beta table's cumulative products give more exactly than the
+    squares of their rounded roots. The denominator's root of three variances
+    is taken as a product of two roots, whose product of three would underflow
+    where the signal is small (2^-180 from variances of 2^-100 and 2^-80)."""
     (alpha2_t, sigma2_t), (alpha2_s, sigma2_s) = variances_t, variances_s
     sample_coeff = (alpha2_s / alpha2_t) ** 0.5
-    denominator = alpha2_t * sigma2_s ** 0.5 + (alpha2_t * sigma2_t * alpha2_s) ** 0.5
-    return sample_coeff * x - (alpha2_s - alpha2_t) * eps / denominator
+    denominator = alpha2_t * sigma2_s ** 0.5 + (alpha2_t * sigma2_t) ** 0.5 * alpha2_s ** 0.5
+    return sample_coeff * x - divided((alpha2_s - alpha2_t) * eps, denominator)
 
 
 @struct.dataclass

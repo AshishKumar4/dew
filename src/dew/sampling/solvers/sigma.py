@@ -27,12 +27,13 @@ def _euler_step(x, denoised, source, target):
     # Equal levels make the numerator 0 too; any finite coefficient is scaled by the zero interval.
     x_0_coeff = (alpha_t * sigma_s - alpha_s * sigma_t) / jnp.where(dt == 0, 1, dt)
     derivative = divided(x - x_0_coeff * denoised, sigma_t)
-    # The source's x + derivative dt, whose x is derivative sigma_t + x_0_coeff denoised: summed as
-    # that, a step down from a large sigma cancels two terms of x's size (x is 4e4 at a zero-SNR
-    # sigma of 4096) and keeps dt's rounding times the derivative; without x, a step to sigma 0
-    # lands on the clean prediction itself.
-    stepped = x_0_coeff * denoised + derivative * sigma_s
-    return stepped, derivative, x_0_coeff, dt
+    # The source's x + derivative dt, summed as alpha_s x_0 + sigma_s eps, DDIM's form of it: from a
+    # large sigma the source's sum cancels two terms of x's size (x is 4e4 at a zero-SNR sigma of
+    # 4096) and keeps dt's rounding times the derivative, and near pure noise on a VP schedule the
+    # secant coefficient is in the thousands; this form has neither, and a step to sigma 0 lands on
+    # the clean prediction itself. A step of no length leaves x exactly as it is.
+    stepped = alpha_s * denoised + divided(x - alpha_t * denoised, sigma_t) * sigma_s
+    return jnp.where(dt == 0, x, stepped), derivative, x_0_coeff, dt
 
 
 def _ancestral_noise(key: jax.Array, x: jax.Array) -> jax.Array:
