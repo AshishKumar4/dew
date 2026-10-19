@@ -56,3 +56,45 @@ def test_a_model_served_over_a_mesh_decodes_what_it_decodes_with_its_weights_who
                                                                {"split_over": ["fsdp"], "devices": 2})
     for name in ("tokens", "raw", "behavior"):
         np.testing.assert_array_equal(split[name], generated[name], err_msg=name)
+
+
+SGLANG = '''"""SGLang's in-process engine, standing in: a request streams its output ids, one chunk a token."""
+import asyncio, json, os
+
+class Engine:
+    def __init__(self, **settings):
+        json.dump(settings, open(os.environ["SETTINGS"], "w"))
+
+    async def async_generate(self, input_ids, sampling_params, stream):
+        assert stream and sampling_params["temperature"] == 0 and sampling_params["ignore_eos"]
+        async def chunks():
+            for count in range(1, sampling_params["max_new_tokens"] + 1):
+                await asyncio.sleep(0)
+                yield {"output_ids": [0] * count, "meta_info": {"completion_tokens": count}}
+        return chunks()
+
+    def shutdown(self):
+        pass
+'''
+
+
+def test_the_benchmark_serves_through_sglangs_engine_on_its_clocks(tmp_path):
+    """--backend sglang-engine builds SGLang's engine as the vLLM engine is built (bf16, the prompt and
+    output as its context, the most slots as its running requests, no prefix cache) and times each
+    request from SGLang's stream of growing output, every token counted."""
+    (tmp_path / "engine").mkdir()
+    (tmp_path / "engine" / "sglang.py").write_text(SGLANG)
+    settings = tmp_path / "settings.json"
+    env = {**os.environ, "PYTHONPATH": str(tmp_path / "engine"), "SETTINGS": str(settings)}
+    subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_lm_serving.py"),
+                    "--backend", "sglang-engine", "--model", "a/model", "--slots", "2,4", "--prompt", "8",
+                    "--output", "5", "--vocab-limit", "200", "--repeats", "2", "--requests", "6",
+                    "--out", str(tmp_path / "record.json")], check=True, env=env, cwd=ROOT)
+    record = json.loads((tmp_path / "record.json").read_text())
+    assert json.loads(settings.read_text()) == {
+        "model_path": "a/model", "dtype": "bfloat16", "context_length": 13, "max_running_requests": 4,
+        "mem_fraction_static": 0.9, "disable_radix_cache": True, "skip_tokenizer_init": True,
+        "log_level": "error"}
+    assert (record["backend"], record["transport"]) == ("sglang-engine", "in-process")
+    assert [point["slots"] for point in record["sweep"]] == [2, 4]
+    assert all(repeat["output_tokens"] == 6 * 5 for point in record["sweep"] for repeat in point["repeats"])
