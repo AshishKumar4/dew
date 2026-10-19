@@ -346,13 +346,15 @@ def test_the_real_checkpoint_embeddings_match_the_reference():
 def test_a_t5_tower_computes_in_its_compute_dtype_as_the_reference_does():
     """FP32 masters under `dtype=bfloat16`: the token and relative-bias tables
     are read in bfloat16, as transformers' T5 reads its own in the dtype the
-    model runs in, so the residual stream every block adds to is bfloat16.
+    model runs in, so the residual stream every block adds to is bfloat16, and
+    every site the forward calls returns bfloat16.
     Every position of the last hidden state the conditioner hands on, padded
     rows included (the mask holds keys out, not rows), is as exact as
     transformers' bfloat16 encoder, both from its float64 one built and run
     under `float64` (tests/reference_error.py's rule)."""
     import contextlib
 
+    import jax
     import jax.numpy as jnp
     import torch
     from transformers import T5EncoderModel
@@ -363,6 +365,15 @@ def test_a_t5_tower_computes_in_its_compute_dtype_as_the_reference_does():
     expected = reference(directory)
     ids, mask = expected["input_ids"], expected["attention_mask"]
     encoder = T5Text.from_pretrained(str(directory), dtype=jnp.bfloat16)
+    # Every site the forward calls returns bfloat16: the tables read at their FP32 storage had kept
+    # the residual stream FP32, which only beats the bfloat16 reference.
+    _, state = encoder.transformer.apply(encoder.params, jnp.asarray(ids), jnp.asarray(mask),
+                                         capture_intermediates=True, mutable=["intermediates"])
+    sites = {name: site for name, site in state["intermediates"].items() if name != "__call__"}
+    assert {"embed_tokens", "relative_attention_bias_0", "layers_0", "layers_1"} <= sites.keys()
+    for name, site in sites.items():
+        for output in jax.tree.leaves(site["__call__"]):
+            assert output.dtype == jnp.bfloat16, name
 
     def transformers(dtype):
         with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
