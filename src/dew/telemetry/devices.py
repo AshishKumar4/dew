@@ -218,17 +218,23 @@ def cpu_only_refusal(env: Mapping[str, str], gpus: tuple[str, tuple[int, int]] |
 
 
 def refuse_cpu_only_jax() -> None:
-    """Stop a process that would run on the CPU on a machine with an NVIDIA
-    GPU, with the install that fixes it (`cpu_only_refusal`). `import dew`
-    asks before the backend opens, as `keep_roundings` does, so it is asked
-    once for every entry point; once a backend is open, JAX has chosen."""
-    bridge = sys.modules.get("jax._src.xla_bridge")
-    if (bridge is not None and bridge.backends_are_initialized()) or not runs_on_gpu(os.environ):
+    """Stop a process whose JAX opened with no GPU on a machine with an NVIDIA GPU, with the
+    install that fixes it where one would (`cpu_only_refusal`). It reads the devices JAX opened,
+    so it asks once the process's XLA flags are set: `prepare_process` asks it, and `Trainer.fit`
+    for a program that never called that (`dew.training.runtime.ready_process`). JAX_PLATFORMS
+    naming no GPU asks for the CPU, and is not refused."""
+    import jax
+
+    if not runs_on_gpu(os.environ) or any(device.platform == "gpu" for device in jax.devices()):
         return
     gpus = nvidia_gpus()
-    if gpus is not None and (refusal := cpu_only_refusal(os.environ, gpus, cuda_builds(),
-                                                         cuda_driver_version())) is not None:
-        raise RuntimeError(refusal)
+    if gpus is None:
+        return
+    refusal = cpu_only_refusal(os.environ, gpus, cuda_builds(), cuda_driver_version())
+    raise RuntimeError(refusal or (
+        f"This machine has an NVIDIA GPU (driver {gpus[0]}), and JAX opened with no GPU beside a CUDA "
+        f"build that runs on it: {jax.devices()}. Read the CUDA plugin's warning above, or set "
+        "JAX_PLATFORMS=cuda to see why it failed; to run on the CPU instead, set JAX_PLATFORMS=cpu."))
 
 
 def deterministic_ops_requested() -> bool:
