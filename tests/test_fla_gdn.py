@@ -786,13 +786,17 @@ def test_a_bf16_gated_delta_net_trains_with_no_copy_at_the_ports_edges():
     assert boundary_copies(text) == []
 
 
-def _lowered_dot(product, default: str) -> str:
+def _lowered_dot(product, default: str) -> list[str]:
     """A one-dot Pallas kernel over fp32 operands lowered for an sm80 on this CPU, under the global
-    matmul precision `default`: the program's text, its Triton IR with it."""
+    matmul precision `default`: the input precision of each dot of its Triton IR."""
+    from jax._src.interpreters import mlir
+    from jax._src.lib.triton import dialect
     from jax.experimental import pallas as pl
     from jax.sharding import Mesh
+    from jaxlib.mlir import ir
 
     from dew.nn.kernels.generation import assumed, gpu_mesh
+    from dew.training._lowering import triton_calls
 
     def kernel(a_ref, b_ref, o_ref):
         o_ref[...] = product(a_ref[...], b_ref[...])
@@ -803,7 +807,21 @@ def _lowered_dot(product, default: str) -> str:
     operand = jax.ShapeDtypeStruct((32, 32), jnp.float32)
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
     with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh), jax.default_matmul_precision(default):
-        return jax.jit(call).trace(operand, operand).lower(lowering_platforms=("cuda",)).as_text()
+        lowered = jax.jit(call).trace(operand, operand).lower(lowering_platforms=("cuda",))
+
+    def operations(operation):
+        yield operation
+        for region in operation.regions:
+            for block in region.blocks:
+                for inner in block.operations:
+                    yield from operations(inner.operation)
+
+    # Triton IR parses only in a context with Triton's dialect, which JAX's own MLIR bindings register.
+    context = mlir.make_ir_context()
+    dialect.register_dialect(context)
+    with context:
+        return [str(operation.attributes["inputPrecision"]) for call in triton_calls(lowered)
+                for operation in operations(ir.Module.parse(call.ir).operation) if operation.name == "tt.dot"]
 
 
 def test_an_fp32_port_dot_names_its_products_whatever_the_global_precision():
@@ -812,7 +830,8 @@ def test_an_fp32_port_dot_names_its_products_whatever_the_global_precision():
     an IEEE kernel ptxas compiled for minutes). A dot that names nothing follows the setting."""
     for named in (False, True):
         product = functools.partial(fla_gdn._dot, exact=False, ieee=named)
-        assert _lowered_dot(product, "default") == _lowered_dot(product, "highest")
+        found = _lowered_dot(product, "default")
+        assert found and found == _lowered_dot(product, "highest")
     ieee = functools.partial(fla_gdn._dot, exact=False, ieee=True)
     tf32x3 = functools.partial(fla_gdn._dot, exact=False)
     assert _lowered_dot(tf32x3, "default") != _lowered_dot(ieee, "default")
