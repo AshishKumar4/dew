@@ -307,6 +307,7 @@ def test_one_tree_against_itself_under_a_setting_sets_it_in_the_heads_processes_
     from types import SimpleNamespace
 
     monkeypatch.setenv("XLA_FLAGS", "--xla_dump_to=/caller")
+    monkeypatch.setenv("JAX_COMPILATION_CACHE_DIR", str(tmp_path / "caller"))
     _, rows = standing_in_environments(gate, monkeypatch)
     tree = locked_tree(tmp_path / "main")
     out = tmp_path / "gate.json"
@@ -317,9 +318,11 @@ def test_one_tree_against_itself_under_a_setting_sets_it_in_the_heads_processes_
                            environments=str(tmp_path / "environments"), head_env=[f"XLA_FLAGS={off}"])
     assert gate.run(args) == 0
     sides: dict[str, set] = {}
-    for *_, env in rows:
-        # A row's process names its side's cache; the head's device-kind probe, for its hardware row, none.
-        side = Path(env["JAX_COMPILATION_CACHE_DIR"]).name if "JAX_COMPILATION_CACHE_DIR" in env else "probe"
+    for _, command, env in rows:
+        # A row's process names its side's cache; the head's device-kind probe, for its hardware row, is
+        # told by its command, as it keeps the caller's cache.
+        probe = command[1] == "-c" and "device_kind" in command[2]
+        side = "probe" if probe else Path(env["JAX_COMPILATION_CACHE_DIR"]).name
         sides.setdefault(side, set()).add(env["XLA_FLAGS"])
     assert sides == {"base": {"--xla_dump_to=/caller"}, "head": {off}, "probe": {off}}
     results = json.loads(out.read_text())
