@@ -535,6 +535,103 @@ def test_a_memory_read_weighs_a_token_mixture_by_the_targets_of_the_rows_it_hold
     assert abs(targets[0] - targets[1]) <= 19
 
 
+@dataclasses.dataclass(frozen=True)
+class Cropped:
+    """A step that keeps the first half of a token row and its roles, as a crop keeps a part."""
+
+    def __call__(self, row):
+        half = len(row["text"]) // 2
+        return {**row, "text": row["text"][:half], "text_roles": row["text_roles"][:half]}
+
+
+@dataclasses.dataclass(frozen=True)
+class Relabelled:
+    """A step that changes only a token row's id, leaving its tokens and roles as they were."""
+
+    def __call__(self, row):
+        return {**row, "id": row["id"] + 100}
+
+
+@dataclasses.dataclass(frozen=True)
+class Scored:
+    """A delivered row as its corpus and the targets the loss scores of it, by `role`'s rule."""
+
+    role: int | None
+
+    def __call__(self, row):
+        from dew.data.steps.text import ValidTargets
+
+        return {"source": row["source"],
+                "targets": np.int32(ValidTargets(role=self.role, measured=False)(row))}
+
+
+def roled(source, length, scored, count=4):
+    """`count` token rows of `length`, the first `scored` of each row's targets in role 1."""
+    roles = np.asarray([1] * (scored + 1) + [0] * (length - scored - 1), np.int32)
+    return Memory(tuple({"text": np.arange(length, dtype=np.int32), "text_roles": roles,
+                         "id": np.int32(index), "source": np.int32(source)} for index in range(count)))
+
+
+def delivered(corpora, role, read, batches=24):
+    """The targets each of two corpora mixed by tokens delivers, as the loss scores them by `role`."""
+    mixed = mix([corpus.repeat() for corpus in corpora], by="tokens")
+    data = compile(mixed.map(Scored(role)).batch(8), read=read, loading=READ)
+    stream = data.train(DataPartition())
+    targets = [0, 0]
+    try:
+        for batch in itertools.islice(stream, batches):
+            for source, count in zip(batch["source"], batch["targets"], strict=True):
+                targets[int(source)] += int(count)
+    finally:
+        stream.close()
+    return targets
+
+
+@pytest.mark.parametrize("role", [None, 1])
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_token_mixture_weighs_a_cropped_corpus_by_the_targets_left_after_the_crop(read, role):
+    """Targets counted on a row (`CountTargets`) a crop then halves are counted again by the rule
+    that counted them, its role included: the mixture weighs the cropped corpus by what its rows
+    deliver, so both corpora deliver equal targets, to within one row's."""
+    from dew.data.steps.text import CountTargets
+
+    long = Pipeline(roled(0, 24, 22), name="long").filter_map(CountTargets(role=role)).map(Cropped())
+    short = Pipeline(roled(1, 6, 4), name="short").filter_map(CountTargets(role=role))
+    left, right = delivered([long, short], role, read)
+    assert abs(left - right) <= 11
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_token_mixture_keeps_a_rows_count_through_a_step_over_its_other_fields(read):
+    """A step that changes only a row's other fields keeps the targets its count's own rule counted,
+    a role's here, which no other rule gives: two corpora whose rows score one and three role-1
+    targets deliver equal scored targets, to within one row's."""
+    from dew.data.steps.text import CountTargets
+
+    one = Pipeline(roled(0, 8, 1), name="one").filter_map(CountTargets(role=1)).map(Relabelled())
+    three = Pipeline(roled(1, 8, 3), name="three").filter_map(CountTargets(role=1))
+    left, right = delivered([one, three], 1, read)
+    assert abs(left - right) <= 3
+
+
+def test_a_counted_corpus_projected_after_its_count_keeps_it_in_memory():
+    """A corpus counted and then renamed or narrowed to other fields keeps its rows' counts, which
+    no field it still holds could give again."""
+    from dew.data.steps.text import CountTargets
+
+    for projected in (lambda chain: chain.rename_columns({"text": "tokens"}),
+                      lambda chain: chain.select_columns("id", "source")):
+        chains = [projected(Pipeline(roled(source, 8, 3), name=str(source)).filter_map(CountTargets(role=1)))
+                  for source in (0, 1)]
+        data = compile(mix([chain.repeat() for chain in chains], by="tokens").batch(4), read="memory",
+                       loading=READ)
+        stream = data.train(DataPartition())
+        try:
+            assert len(next(stream)["id"]) == 4
+        finally:
+            stream.close()
+
+
 @pytest.mark.parametrize("held", [False, True])
 def test_a_token_mixture_weighs_a_random_holdout_by_the_rows_it_keeps(held):
     """Mixed by tokens, two corpora whose stores state their counts deliver equal valid targets,

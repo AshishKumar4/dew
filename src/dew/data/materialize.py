@@ -42,7 +42,7 @@ from dew.data.pipeline import (
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, ShardManifest, Source, _uncounted
 from dew.data.steps.generic import Fields
-from dew.data.steps.text import CountTargets, ValidTargets
+from dew.data.steps.text import CountTargets, ValidTargets, targets_changed
 from dew.records import JSON, integer, json_value, record
 
 _log = logging.getLogger(__name__)
@@ -251,7 +251,12 @@ def _memory_stages(
                         if counts_targets:
                             expanded_counts[output_id] = ValidTargets()(record(output, "counted row"))
                         elif counted is not None:
-                            expanded_counts[output_id] = counted[identifier]
+                            # A row's count holds while the step left the fields it was counted from;
+                            # where it changed one, the row's own targets, as `recounted` carries them.
+                            given, made = record(value, "counted row"), record(output, "counted row")
+                            expanded_counts[output_id] = (ValidTargets()(made) if "text" in made
+                                                          and targets_changed(given, made)
+                                                          else counted[identifier])
             rows = expanded
             if counts_targets or counted is not None:
                 counted = expanded_counts
