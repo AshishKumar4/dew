@@ -292,8 +292,7 @@ def test_weights_only_best_is_smaller_and_not_a_resume_state(tmp_path):
 
 def test_restore_best_reads_a_weights_only_best_as_the_model_it_holds(tmp_path):
     """A weights-only best holds the model state of its step, which is what restore_best returns,
-    so a run whose best is one returns that step's counters and variables, where it once refused
-    the run."""
+    so a run whose best is one returns that step's counters and variables."""
     metric = Value('value', Shown(better='lower'))
     run = trainer(tmp_path / 'run')
     state = run.fit(data(), steps=4, log_every=1, eval_every=1, checkpoint_every=4, metrics=[metric],

@@ -1435,7 +1435,7 @@ class Trainer(Generic[Loss, Effects]):
         count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
         suites = _suites(loader, validation, metrics, eval_every)
-        selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every, restore_best)
+        selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every)
         self._preflight(loader, stop, suites, preview=preview,
                         loss=(self.checkpoints is not None or restore_best) and not selection)
         preview = preview and self.tracker is not None
@@ -1902,7 +1902,7 @@ class Trainer(Generic[Loss, Effects]):
         if checkpoints is not None:
             checkpoints.wait()
 
-    def _fit_policies(self, best, stop, metrics, suites, checkpoint_every, restore_best):
+    def _fit_policies(self, best, stop, metrics, suites, checkpoint_every):
         if isinstance(checkpoint_every, datetime.timedelta) and checkpoint_every.total_seconds() <= 0:
             raise ValueError("checkpoint_every duration must be positive")
         # Each split's own metrics: two suites may each hold their own instance of one metric.

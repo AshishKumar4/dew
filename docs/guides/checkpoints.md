@@ -182,7 +182,7 @@ for checkpoint in trainer.checkpoints.kept():
     print(checkpoint.step, checkpoint.kind, checkpoint.metrics, checkpoint.rankings)
 ```
 
-`restore_best=True` on `fit` returns the model the run ranked best: the final state with the best step's variables, EMA and counters (`step`, `microstep`, `updates`), while the optimizer state, RNG and the rest stay the final step's. It is the best model, not a point to resume training from; a resume reads the run's checkpoints. Without `Checkpoints`, the run holds a host copy of the best step's variables and EMA only (4 GB for a 1B fp32 model, where its Adam moments would add 8 GB). Without `restore_best`, `fit` returns the final state as usual.
+`restore_best=True` on `fit` returns the model the run ranked best: the final state with the best step's variables, EMA and counters (`step`, `microstep`, `updates`), while the optimizer state, RNG and the rest stay the final step's. It is the best model, not a point to resume training from; a resume reads the run's checkpoints. Without `Checkpoints`, the run holds a host copy of the best step's counters, variables and EMA, and no optimizer state: 4 GB for a 1B fp32 model, plus its EMA's leaves where it keeps one, where Adam's moments would add 8 GB. Without `restore_best`, `fit` returns the final state as usual.
 
 `Best(fid, weights_only=True)` writes only the parameters, the EMA and the counters for a winner that falls between checkpoint steps. Such a snapshot is for inference, and a full-state restore refuses it; `restore_best=True` reads it as the model state it holds. When a winner falls on a full-checkpoint step, the one full save also serves the best tracker, so nothing is written twice. Latest-N retention counts only full states, so a small inference snapshot cannot replace the state a run resumes from.
 
@@ -218,7 +218,7 @@ trainer.fit(data, steps=100_000, checkpoint_every=timedelta(minutes=15))
 
 The checkpointer keeps the union of these policies, the latest full states, all best-K sets and the post-hoc snapshots. Directory names stay step numbers. Scores are in the metadata and in `kept()`, so a reader never has to parse them out of a name.
 
-Ranking reads the finished evaluation scalars on the host and transfers no parameters. All trackers share the same evaluation, and a step that enters several best-K sets still requests one save. A weights-only winner is small because it leaves out the optimizer state, the clocks and the data position.
+Ranking reads the finished evaluation scalars on the host and transfers no parameters. All trackers share the same evaluation, and a step that enters several best-K sets still requests one save. A weights-only winner is small because it leaves out the optimizer state and the data position.
 
 ## The EMA copy on disk
 
