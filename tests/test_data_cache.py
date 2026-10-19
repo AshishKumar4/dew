@@ -369,7 +369,7 @@ def test_iterate_and_validation_read_a_published_generation_as_its_accepted_rows
 
     source = Memory([{"id": index} for index in range(8)])
     even = Pipeline(source).filter(lambda row: row["id"] % 2 == 0, identity="even@1")
-    warm = Pipeline(source).cache(publish(even, _cache(), read="memory"))
+    warm = even.cache(publish(even, _cache(), read="memory"))
     assert [int(row["id"]) for row in iterate(warm, read="indexed")] == [0, 2, 4, 6]
     scored = validation(warm.map(lambda row: {"id": row["id"] + 10}), batch=3)(DataPartition())
     try:

@@ -15,7 +15,7 @@ from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition, GlobalStream
 from dew.data.pipeline import Configured, ObjectiveData, Rejected
-from dew.data.plan import Manifest, StepIdentity
+from dew.data.plan import Manifest
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
@@ -265,10 +265,17 @@ class ConfigureFetch:
         return FetchLike()
 
 
-def fetched_generation(source, directory):
+def fetched_generation(chain, directory):
+    """The fetch outcomes of `chain`, sealed as the generation of its prefix: the keyed
+    manifest publication records, filled once through the cache."""
+    from dew.data.analysis import _cache_manifest
+    from dew.data.compile import _prepared
+
+    (prepared,) = _prepared((chain,), "indexed", provision=False)
+    source = prepared.source
     cache = Cache((directory / "fetched").as_uri())
     fetch = FetchLike()
-    manifest = Manifest(source.fingerprint(), (StepIdentity.of(fetch),))
+    manifest = _cache_manifest(source, prepared.stages, "indexed")
     stored = cache.mapped(grain.MapDataset.source(source.records("indexed")), manifest,
                           transform=lambda index, row: (fetch(row),))
     try:
@@ -298,7 +305,7 @@ def test_eager_fetch_keeps_a_memory_plan_volatile_until_its_generation_is_sealed
         reader.close()
     with pytest.raises(ValueError):
         data.train(DataPartition(readers=2))
-    generation = fetched_generation(source, tmp_path)
+    generation = fetched_generation(chain, tmp_path)
     sealed = compile(chain.cache(generation).batch(2), read="memory", loading=READ)
     assert not sealed.plan.volatile
     readers = [sealed.train(DataPartition(readers=2, reader=index)) for index in range(2)]
@@ -321,12 +328,12 @@ def test_a_sealed_generation_keeps_its_holdout_selection_in_training_and_validat
     from dew.data.holdout import HoldOut
 
     source = Memory(rows("fetched", 64))
-    generation = fetched_generation(source, tmp_path)
+    generation = fetched_generation(source.filter_map(FetchLike()), tmp_path)
     if selection == "random":
         holdout = HoldOut(records=5, by="random", seed=37)
-        train, held, _ = RecordsData(generation.source(), validation=holdout).pipelines()
-        data = loader(RecordsData(source, validation=holdout), cache=generation,
-                      batch=2, read=read, loading=READ)
+        recipe = RecordsData(generation.source(), validation=holdout)
+        train, held, _ = recipe.pipelines()
+        data = loader(recipe, batch=2, read=read, loading=READ)
     else:
         cached = source.filter_map(FetchLike()).cache(generation)
         train, held = (cached.holdout(0.25, key="i") if selection == "fraction"
@@ -667,7 +674,6 @@ def test_hugging_face_stream_shares_are_disjoint_and_resume_exactly(shard_count,
 def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, shares):
     """A native-shard fill publishes; a row-wise node split refuses without reopening the store."""
     from dew.data.cache import Cache
-    from dew.data.plan import Manifest
     from dew.data.shards import streamed
 
     datasets = pytest.importorskip("datasets")
