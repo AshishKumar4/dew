@@ -627,5 +627,5 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
                 draws.append((np.take_along_axis(found, columns, axis=1), theirs['columns'][index],
                               on_columns))
             assert_leaves_as_exact_over_orders(draws, f'Dory 4B {key}, its columns')
-            assert_elements_as_exact_over_orders(absolutes, theirs['absolutes'], f'Dory 4B {key}, every entry',
+            assert_elements_as_exact_over_orders(absolutes, theirs['absolutes'], f'Dory 4B {key}, entries',
                                                  dew_squares=squares, reference_squares=theirs['squares'])
