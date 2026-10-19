@@ -352,9 +352,9 @@ def plan_step[LossT, EffectsT](
 
     def found(split: int) -> Planned:
         assert fitted is not None
-        return Planned(split, *fitted, xla_defaults, rung_record(objective, xla_defaults),
-                       tuple(entry.module for entry in objective.program_key()), head_tile_of(objective),
-                       head_fused_of(objective))
+        modules = tuple(entry.module for entry in objective.program_key())
+        return Planned(split, *fitted, xla_defaults, rung_record(objective, xla_defaults), modules,
+                       head_tile_of(objective), head_fused_of(objective))
 
     split = planned(candidates, first, fits, climb)
     if split is None or fitted is None:
