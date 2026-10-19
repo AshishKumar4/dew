@@ -23,6 +23,8 @@ from ..attention import LayerNorm, RMSNorm
 from ..attention_residuals import DepthAttention, ResidualSite, sources
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock
+from ..gemma4_moe import Gemma4Experts
+from ..gpt_oss import GptOssMLP
 from ..hyper_connections import (
     Carried,
     HyperConnection,
@@ -208,6 +210,12 @@ class Mixture:
                 "score function, scaling, groups, balancing bias, input scaling "
                 "or shared branch to set")
 
+    @property
+    def beside_dense(self) -> bool:
+        """Whether its routed feed-forward runs beside a layer's dense one, on the same residual,
+        rather than in its place: Gemma 4's parallel branch (`build`)."""
+        return self.parallel
+
     def generation_refusal(self) -> str | None:
         """Why a generation loop cannot run the layers this mixture builds, or None.
 
@@ -225,16 +233,44 @@ class Mixture:
                 "generate with the mixture's dispatch='global', the same layer")
 
     def build(self, *, out_features: int, hidden_features: int, activation: GatedActivation,
-              dense: Callable[..., nn.Module], norm: Callable[..., nn.Module] | None = None,
-              swiglu_limit: float | None = None, init_std: float | None = None,
-              output_init_std: float | None = None, dtype: Dtype | None = None,
-              precision: PrecisionLike = None) -> Callable[..., SparseMLP]:
-        """Build the routed feed-forward used by decoder blocks and independent MLP mixers."""
+              dense: Callable[..., nn.Module], norm_eps: float, scale_offset: bool = False,
+              scale_after_cast: bool = False, swiglu_limit: float | None = None,
+              init_std: float | None = None, output_init_std: float | None = None,
+              dtype: Dtype | None = None, precision: PrecisionLike = None) -> Callable[..., nn.Module]:
+        """Build the routed feed-forward of decoder blocks and independent MLP mixers: GPT OSS's
+        experts and router under 'swigluoai' (`GptOssMLP`), Gemma 4's branch beside the dense
+        feed-forward where `parallel` (`Gemma4Experts`, `beside_dense`), else `SparseMLP`. The
+        experts are `expert_features` wide, else `hidden_features`, the dense width. `norm_eps`,
+        `scale_offset` and `scale_after_cast` are the block's RMS norm, which a latent mixture's
+        output and Gemma 4's branch take."""
+        width = hidden_features if self.expert_features is None else self.expert_features
+        if activation == 'swigluoai':
+            # GPT OSS's experts and router are its own: a knob they do not read is refused.
+            plain = Mixture(experts=self.experts, top_k=self.top_k)
+            ignored = [name for name in ('score_function', 'norm_topk_prob', 'scaling', 'groups',
+                                         'groups_per_token', 'group_score', 'bias', 'scale_inputs',
+                                         'parallel', 'expert_features', 'shared_features', 'hash_layers',
+                                         'latent_features', 'latent_norm', 'media_bias')
+                       if getattr(self, name) != getattr(plain, name)]
+            ignored += ['swiglu_limit'] if swiglu_limit is not None else []
+            if ignored:
+                raise ValueError(f"swigluoai's experts take no {', '.join(ignored)}: GPT OSS routes with its "
+                                 f"own biased softmax and clamps at 7.0")
+            return functools.partial(
+                GptOssMLP, hidden_size=out_features, intermediate_size=width,
+                num_local_experts=self.experts, num_experts_per_tok=self.top_k,
+                implementation=self.implementation, dispatch=self.dispatch,
+                capacity_factor=self.capacity_factor, dtype=dtype, precision=precision)
         if self.parallel:
-            raise ValueError('a parallel mixture uses Gemma4Experts beside a dense feed-forward')
+            return functools.partial(
+                Gemma4Experts, num_experts=self.experts, top_k=self.top_k, hidden_features=width,
+                out_features=out_features, activation=activation, implementation=self.implementation,
+                dispatch=self.dispatch, capacity_factor=self.capacity_factor, norm_eps=norm_eps,
+                scale_offset=scale_offset, scale_after_cast=scale_after_cast, dtype=dtype,
+                precision=precision)
         return functools.partial(
             SparseMLP, num_experts=self.experts, top_k=self.top_k,
-            hidden_features=hidden_features if self.expert_features is None else self.expert_features,
+            hidden_features=width,
             out_features=out_features, activation=activation,
             implementation=self.implementation, dispatch=self.dispatch, capacity_factor=self.capacity_factor,
             score_function=self.score_function, normalize_weights=self.norm_topk_prob,
@@ -245,7 +281,9 @@ class Mixture:
             shared=None if not self.shared_features else functools.partial(
                 dense, hidden_features=self.shared_features),
             shared_gate=self.shared_gate, init_std=init_std, output_init_std=output_init_std,
-            latent_features=self.latent_features, latent_norm=norm if self.latent_norm else None,
+            latent_features=self.latent_features, latent_norm=functools.partial(
+                RMSNorm, epsilon=norm_eps, scale_offset=scale_offset, scale_after_cast=scale_after_cast,
+                dtype=dtype) if self.latent_norm else None,
             dtype=dtype, precision=precision)
 
 
