@@ -39,8 +39,9 @@ def join_refusal(projections: Sequence[nn.Module]) -> str | None:
     return first_refusal(
         (all(type(projection) is nn.Dense for projection in projections),
          "a projection is not a plain nn.Dense, whose call the join reproduces"),
-        (all(projection.dot_general is None and projection.dot_general_cls is None
-             for projection in projections), "a projection takes its own dot_general"),
+        (all(projection.dot_general in (None, float32_dot_general) and projection.dot_general_cls is None
+             for projection in projections),
+         "a projection takes a dot_general other than the join's (`float32_dot_general`)"),
         (len({(projection.features, projection.use_bias, projection.dtype, projection.precision,
                projection.promote_dtype) for projection in projections}) == 1,
          "the projections differ in width, bias, dtype, precision or promotion"),
