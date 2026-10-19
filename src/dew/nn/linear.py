@@ -700,19 +700,22 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
-                           projected=None, starts=None, max_segments: int | None = None):
+                           ported: bool | None = None, starts=None, max_segments: int | None = None):
     """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
     log decay per head, `g` `[B, S, H]`, or `chunk_kimi_delta_attention`
     (modeling_glm5_next.py:482-578) with one per key dimension, `[B, S, H,
     Dk]`. Its queries and keys may sit on fewer heads than the values, each
     serving `Hv // Hk` of them, as fla takes them.
 
-    Where the port takes it (`port_refusal`), it is fla 0.5.2's chunked rule
-    on Dew's port of its kernels (`fla_rule`), on fla's numbers, its operands
-    and beta in `projected` where given, the dtype a layer's projections
-    hand fla's rule; elsewhere the portable math (`chunk_delta_rule`) on the
-    operands as they come, in `chunk_size` chunks, which the port's 64 need
-    not match: the rule's value does not depend on them.
+    On the port it is fla 0.5.2's chunked rule on Dew's port of its kernels
+    (`fla_rule`), on fla's numbers; elsewhere the portable math
+    (`chunk_delta_rule`), in `chunk_size` chunks, which the port's 64 need
+    not match: the rule's value does not depend on them. Both take the
+    operands as they come. `ported` is the caller's route (`on_the_port`),
+    which a layer decides once, before it rounds the operands for that route
+    (the projections' dtype for the port, as fla's layer hands them over, the
+    wide one for the math); None decides it here, where the port takes these
+    operands.
 
     `starts` `[B, S]` marks packed documents' first tokens, each starting
     from a zero memory (`state` continues a row's first document), at most
@@ -723,11 +726,10 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     if value.shape[2] % key.shape[2]:
         raise ValueError(f"{value.shape[2]} value heads over {key.shape[2]} key heads: each key head serves "
                          "a whole number of value heads")
-    rows, keys, values, gates = ((query, key, value, beta) if projected is None
-                                 else (x.astype(projected) for x in (query, key, value, beta)))
-    documents = None if starts is None else query.shape[1] if max_segments is None else max_segments
-    if on_the_port(rows, keys, values, documents):
-        return fla_rule(rows, keys, values, g, gates, state, starts=starts, max_segments=max_segments)
+    if ported is None:
+        ported = on_the_port(query, key, value, document_bound(starts, max_segments, query.shape[1]))
+    if ported:
+        return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments)
     group = value.shape[2] // key.shape[2]
     if group > 1:
         query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
@@ -771,10 +773,11 @@ def port_refusal(query, key, value, documents: int | None = None) -> str | None:
     )
 
 
-def document_bound(tokens: Coordinates) -> int | None:
-    """The packed documents a row of `tokens` may hold, which the port sizes itself by
-    (`port_refusal`), None for rows of one document."""
-    return None if tokens.starts is None else tokens.max_segments
+def document_bound(starts, max_segments: int | None, length: int) -> int | None:
+    """The packed documents a row of `length` tokens may hold, which the port sizes its grids and
+    memory by (`port_refusal`, `fla_rule`): None for rows of one document (no `starts`), else
+    `max_segments` (`Coordinates.max_segments`), the row's length where none is declared."""
+    return None if starts is None else length if max_segments is None else max_segments
 
 
 def on_the_port(query, key, value, documents: int | None = None) -> bool:
@@ -814,7 +817,7 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     B, _, Hv, Dv = value.shape
     state = (jnp.zeros((B, Hv, key.shape[-1], Dv), jnp.float32) if state is None
              else state.astype(jnp.float32))
-    documents = None if starts is None else query.shape[1] if max_segments is None else max_segments
+    documents = document_bound(starts, max_segments, query.shape[1])
     starts = jnp.zeros(query.shape[:2], bool) if starts is None else jnp.asarray(starts, bool)
     rows, heads = grouped_heads(value.shape, key.shape[2])
     P = jax.sharding.PartitionSpec
@@ -1166,7 +1169,8 @@ class GatedDeltaNet(nn.Module):
         widths = (self.head_k_dim, self.head_k_dim, self.head_v_dim)
         rows, keys, values = (self._split_heads(part, width) for part, width in
                               zip(jnp.split(mixed, [key_dim, 2 * key_dim], axis=-1), widths, strict=True))
-        ported = S > 1 and port_refusal(rows, keys, values, document_bound(tokens)) is None
+        ported = S > 1 and on_the_port(rows, keys, values,
+                                       document_bound(tokens.starts, tokens.max_segments, S))
 
         def scan(convolved, *, starts, valid, held):
             query, key, value = (self._split_heads(part, width)
@@ -1176,8 +1180,7 @@ class GatedDeltaNet(nn.Module):
                 # fla's layer hands its rule the projections' dtype, the
                 # queries and keys on their own heads and beta beside them.
                 return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size,
-                                              projected=operand, starts=starts,
-                                              max_segments=tokens.max_segments)
+                                              ported=ported, starts=starts, max_segments=tokens.max_segments)
             query, key = self._expand_kv(query), self._expand_kv(key)
             if S == 1 and held is not None and delta_rule.fits(held):
                 return decode_gated_delta_rule(query, key, value, g, beta, held,
