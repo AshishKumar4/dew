@@ -332,9 +332,10 @@ class Plan:
     (`dew.data.lowering._Build.stage_seed`), runs a global order's stages after its batch by index
     and resumes a count inside a batch past that batch's first rows, in the batches' final order.
     Version 3 keys a mixture member's draws by the name it goes by, or an unnamed one's place among
-    the unnamed, rather than its place among all the members (`dew.data.lowering._member_key`), so a member joining or leaving leaves the others'
-    draws as they were, and records those names in the order (`dew.data.analysis._members`), so a
-    position is refused where a member was renamed, joined or left."""
+    the unnamed, rather than its place among all the members (`dew.data.lowering._member_key`), so
+    a named member joining or leaving leaves the others' draws as they were, and records those
+    names in the order (`dew.data.analysis._members`), so a position is refused where a member was
+    renamed, joined or left."""
 
     lowering: Literal["global", "per-share"]
     manifest: Manifest
