@@ -10,7 +10,7 @@ import sys
 import pytest
 
 from dew.telemetry.builds import newest_build
-from dew.telemetry.devices import cpu_only_refusal, cuda_builds, cuda_driver_version, nvidia_gpus
+from dew.telemetry.devices import cpu_only_refusal, nvidia_gpus
 
 
 def stand_in(directory, printed: str, status: int = 0):
