@@ -6,6 +6,7 @@ whose diffusion transformers imported `dew.diffusion`, whose masked-token
 process imported `dew.nn.multimodal` again, half initialized. Imports from
 inside the suite never hit it, since `dew` is already loaded.
 """
+import json
 import os
 import subprocess
 import sys
@@ -73,19 +74,20 @@ from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
 from dew.data.sources import Memory
 from dew.data.storage import Store
+import json
 try:
     Store("memory://x").resolve()
 except Exception as error:
-    print("store refused:", type(error).__name__)
+    refused = type(error).__name__
 data = compile(Pipeline(Memory([{"id": np.int32(i)} for i in range(8)])).repeat(1).batch(2),
                read="memory", loading=Loading(workers=2, threads=1, read_buffer=0, worker_buffer=1))
 reader = data.train(DataPartition())
-print("ids:", sorted(int(v) for batch in reader for v in batch["id"]))
+print(json.dumps({"refused": refused, "ids": sorted(int(v) for batch in reader for v in batch["id"])}))
 reader.close()
 """
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=600,
                             env={**os.environ, "PYTHONPATH": str(SOURCE), "JAX_PLATFORMS": "cpu",
                                  "DEW_STORAGE_CONFIG": str(broken)})
     assert result.returncode == 0, result.stderr[-2000:]
-    assert "store refused: TOMLDecodeError" in result.stdout
-    assert "ids: [0, 1, 2, 3, 4, 5, 6, 7]" in result.stdout
+    reported = json.loads(result.stdout.splitlines()[-1])
+    assert reported == {"refused": "TOMLDecodeError", "ids": list(range(8))}
