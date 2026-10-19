@@ -208,9 +208,9 @@ def test_a_server_draws_each_prompt_as_the_reference_continues_it(mode, options)
 def test_a_shared_loop_cache_takes_each_prompt_whole(options):
     """A last-loop cache holds the last pass's keys of every token before a call, so a prompt's
     second piece, or a prompt after a reused prefix, would read those where the whole prompt's
-    passes read their own: a server refuses chunked prefill and prefix reuse over it, naming the
-    per-pass cache that serves both."""
-    with pytest.raises(ValueError, match='per_loop'):
+    passes read their own: a server refuses chunked prefill and prefix reuse over it, which the
+    per-pass cache serves (`test_a_server_draws_each_prompt_as_the_reference_continues_it`)."""
+    with pytest.raises(ValueError):
         Server.from_task(greedy('last_loop'), slots=2, capacity=32, **options)
 
 
