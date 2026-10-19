@@ -5,6 +5,12 @@ Run in an isolated reference environment:
   JAX_PLATFORMS=cpu USE_TF=0 python tools/diffusers_pipeline_reference.py DIR sd
 Repeat for xl, img2img, inpaint. DIR contains actual save_pretrained components,
 an authentic byte-level CLIP tokenizer and deterministic random parameters.
+
+`truth ROOT OUTPUT` reruns each saved task under ROOT (sd, xl, img2img, inpaint) in float64, the
+truth its float32 reference is measured from: jax's x64 on, every component built at float64 and its
+parameters widened, the float32 the pipeline and model modules name read as float64, and each
+posterior draw the float32 one widened, so the draws are the reference's own. It writes them as
+`{task}/{name}` in OUTPUT (tests/fixtures/tiny_diffusers_f64.npz).
 """
 import argparse
 import json
@@ -137,7 +143,116 @@ def bundle(root, destination):
             archive.add(directory, arcname=task, filter=native_files)
 
 
+class Float64Numpy:
+    """jax.numpy with its float32 read as float64, for a module that names float32."""
+
+    def __getattr__(self, name):
+        return getattr(jnp, "float64" if name == "float32" else name)
+
+
+def widened_modules():
+    """The pipeline, scheduler and model modules whose float32 the truth reads as float64."""
+    import importlib
+
+    names = ["diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion",
+             "diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_img2img",
+             "diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_inpaint",
+             "diffusers.pipelines.stable_diffusion_xl.pipeline_flax_stable_diffusion_xl",
+             "diffusers.schedulers.scheduling_ddim_flax", "diffusers.schedulers.scheduling_utils_flax",
+             "diffusers.models.embeddings_flax", "diffusers.models.attention_flax", "diffusers.models.resnet_flax",
+             "diffusers.models.vae_flax", "diffusers.models.unets.unet_2d_blocks_flax",
+             "diffusers.models.unets.unet_2d_condition_flax", "transformers.models.clip.modeling_flax_clip"]
+    return [importlib.import_module(name) for name in names]
+
+
+def truth(root, output):
+    """Each saved Flax task rerun in float64 (see the module docstring)."""
+    from unittest.mock import patch
+    from diffusers import FlaxDDIMScheduler
+    from diffusers.models.vae_flax import FlaxDiagonalGaussianDistribution
+
+    require("diffusers-pipelines")
+    jax.config.update("jax_enable_x64", True)
+    wide = jnp.float64
+
+    def sample(self, key):
+        return self.mean + self.std * jax.random.normal(key, self.mean.shape, jnp.float32).astype(self.mean.dtype)
+
+    def widened(tree):
+        return jax.tree.map(lambda x: jnp.asarray(x, wide) if jnp.issubdtype(jnp.asarray(x).dtype, jnp.floating)
+                            else x, tree)
+
+    arrays = {}
+    patches = [patch.object(module, "jnp", Float64Numpy()) for module in widened_modules()]
+    patches.append(patch.object(FlaxDiagonalGaussianDistribution, "sample", sample))
+    for item in patches:
+        item.start()
+    try:
+        for task in ("sd", "xl", "img2img", "inpaint"):
+            directory = Path(root) / task
+            reference = np.load(directory / "reference.npz")
+            xl = task == "xl"
+            cls = {"sd": FlaxStableDiffusionPipeline, "xl": FlaxStableDiffusionXLPipeline,
+                   "img2img": FlaxStableDiffusionImg2ImgPipeline,
+                   "inpaint": FlaxStableDiffusionInpaintPipeline}[task]
+            pipeline, params = cls.from_pretrained(
+                str(directory), local_files_only=True, dtype=wide,
+                **({} if xl else {"safety_checker": None, "feature_extractor": None}))
+            pipeline.text_encoder = type(pipeline.text_encoder).from_pretrained(
+                str(directory / "text_encoder"), dtype=wide)
+            if xl:
+                pipeline.text_encoder_2 = type(pipeline.text_encoder_2).from_pretrained(
+                    str(directory / "text_encoder_2"), dtype=wide)
+            scheduler = FlaxDDIMScheduler.from_pretrained(str(directory), subfolder="scheduler", dtype=wide)[0]
+            pipeline.scheduler = scheduler
+            params = widened(params)
+            params["scheduler"] = scheduler.create_state()
+            key = jax.random.PRNGKey(17)
+            tokens = reference["tokens"]
+            neg = pipeline.tokenizer(["dog"], padding="max_length", max_length=8, truncation=True,
+                                     return_tensors="np").input_ids
+            if xl:
+                neg = pipeline.prepare_inputs(["dog"])
+                hidden, pooled = pipeline.get_embeddings(tokens, params)
+                arrays[f"{task}/pooled"] = np.asarray(pooled)
+            else:
+                hidden = pipeline.text_encoder(tokens, params=params["text_encoder"])[0]
+            arrays[f"{task}/hidden"] = np.asarray(hidden)
+            common = dict(params=params, prng_seed=key, num_inference_steps=2, height=32, width=32,
+                          guidance_scale=3.0, neg_prompt_ids=neg)
+            noise = jnp.asarray(reference["noise"].transpose(0, 3, 1, 2), wide)
+            if task == "img2img":
+                output = pipeline(tokens, image=jnp.asarray(reference["processed"], wide), strength=1.0,
+                                  noise=noise, **common)
+            elif task == "inpaint":
+                output = pipeline(tokens, mask=jnp.asarray(reference["processed_mask"], wide),
+                                  masked_image=jnp.asarray(reference["processed"], wide), latents=noise, **common)
+            else:
+                output = pipeline(tokens, latents=noise, **common)
+            arrays[f"{task}/images"] = np.asarray(output.images)
+            raw = jnp.asarray(reference["pixels"][None], wide).transpose(0, 3, 1, 2) / 127.5 - 1
+            posterior = pipeline.vae.apply({"params": params["vae"]}, raw, method=pipeline.vae.encode).latent_dist
+            arrays[f"{task}/encoded"] = np.asarray(posterior.sample(key) * pipeline.vae.config.scaling_factor)
+            arrays[f"{task}/decoded"] = np.asarray(pipeline.vae.apply(
+                {"params": params["vae"]}, noise / pipeline.vae.config.scaling_factor,
+                method=pipeline.vae.decode).sample.transpose(0, 2, 3, 1))
+            gaps = {name.split("/")[1]: float(np.max(np.abs(np.asarray(arrays[name], np.float64)
+                                                            - np.asarray(reference[name.split("/")[1]], np.float64))))
+                    for name in arrays if name.startswith(task + "/")}
+            print(json.dumps({"task": task, "float32_from_float64": gaps,
+                              "dtypes": sorted({str(arrays[name].dtype) for name in arrays if name.startswith(task)})}))
+    finally:
+        for item in patches:
+            item.stop()
+    np.savez_compressed(output, **arrays)
+
+
 if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) == 4 and sys.argv[1] == "truth":
+        truth(sys.argv[2], sys.argv[3])
+        raise SystemExit
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory")
     parser.add_argument("task", choices=("sd", "xl", "img2img", "inpaint"))
