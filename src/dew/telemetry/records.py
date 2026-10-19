@@ -25,6 +25,20 @@ from dew.records import JSON
 _log = logging.getLogger(__name__)
 
 
+_NONFINITE = {'NaN': math.nan, '+Inf': math.inf, '-Inf': -math.inf}
+"""The spellings `json_value` writes a nonfinite number in, and the number each reads back as."""
+
+
+def reported_number(value: object, key: str) -> float:
+    """A number a report wrote through `json_value`: a JSON number, or the spelling of a nonfinite
+    one, read back as that float."""
+    if isinstance(value, str) and value in _NONFINITE:
+        return _NONFINITE[value]
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{key}={value!r}: a report's number is a JSON number, NaN, +Inf or -Inf")
+    return float(value)
+
+
 def json_value(value: object) -> JSON:
     """JSON values, with nonfinite numbers encoded as 'NaN', '+Inf', '-Inf'.
 
