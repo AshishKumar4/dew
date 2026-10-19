@@ -43,14 +43,16 @@ def refuse_overlong(lengths, pack: Pack, described: str) -> None:
         )
 
 
-def chunks_for(step: ExpandStep, pack: Pack) -> bool:
-    """Whether `step`, just before `pack`, cuts each document into the pieces a
-    plan of lengths cuts it into (`chunk_table`): consecutive pieces of the
-    window's length, the same cut in every field the pack places."""
+def chunks_for(step: ExpandStep, pack: Pack) -> int | None:
+    """How far apart the pieces overlap where `step`, just before `pack`, cuts
+    each document as a plan of lengths cuts it (`chunk_table`): pieces of the
+    window's length, the same cut in every field the pack places; None where
+    it cuts otherwise or is no chunk step."""
     from dew.data.text import Chunks
 
-    return (isinstance(step, Chunks) and step.length == pack.seq_len and step.overlap == 0
-            and set(pack.fields) <= set(step.fields))
+    if isinstance(step, Chunks) and step.length == pack.seq_len and set(pack.fields) <= set(step.fields):
+        return step.overlap
+    return None
 
 
 def most_documents(starts: np.ndarray, accepted: np.ndarray) -> int:
@@ -59,19 +61,20 @@ def most_documents(starts: np.ndarray, accepted: np.ndarray) -> int:
     return int(np.diff(np.asarray(starts))[np.asarray(accepted)].max(initial=0))
 
 
-def plan_windows(lengths: np.ndarray, pack: Pack) -> Mapping[str, np.ndarray]:
+def plan_windows(lengths: np.ndarray, pack: Pack, overlap: int = 0) -> Mapping[str, np.ndarray]:
     """The first-fit plan of documents of `lengths` into `pack.seq_len`-token
-    windows: each chunk's document, offset and size, the chunks in packing
-    order and where each window starts in it, each window's targets, and the
-    windows that hold one (`accepted`), with their total and the count left
-    out."""
+    windows, a document longer than a window cut into window-long pieces
+    `overlap` tokens apart: each chunk's document, offset and size, the chunks
+    in packing order and where each window starts in it, each window's
+    targets, and the windows that hold one (`accepted`), with their total and
+    the count left out."""
     if pack.policy != "first-fit":
         raise ValueError("indexed packing currently needs policy='first-fit'")
     if pack.along:
         raise ValueError("a plan of document lengths packs tokens alone; fields along other axes "
                          "pack as their rows arrive")
-    chunk_sizes = chunk_lengths(lengths, pack.seq_len)
-    documents, offsets = chunk_table(lengths, pack.seq_len)
+    chunk_sizes = chunk_lengths(lengths, pack.seq_len, overlap)
+    documents, offsets = chunk_table(lengths, pack.seq_len, overlap)
     order, starts = first_fit(chunk_sizes, pack.seq_len, pack.bins, pack.segments)
     targets = np.asarray(
         [
@@ -159,6 +162,8 @@ class _Held:
 
     source: Source
     pack: Pack
+    overlap: int = 0
+    """How many tokens the pieces of a cut document share (`Chunks.overlap`)."""
     kind: ClassVar[str] = "planned"
 
     @functools.cached_property
@@ -166,7 +171,7 @@ class _Held:
         lengths = self.source.lengths()
         if lengths is None:
             raise ValueError(f"{self.source.describe()} states no document lengths to plan its packing by")
-        return plan_windows(lengths, self.pack)
+        return plan_windows(lengths, self.pack, self.overlap)
 
     @property
     def location(self) -> str:
@@ -247,11 +252,12 @@ class PackedSource:
         return cls(source, plan)
 
     @classmethod
-    def planned(cls, source: Source, pack: Pack, *, chunked: bool = False) -> PackedSource:
+    def planned(cls, source: Source, pack: Pack, *, overlap: int | None = None) -> PackedSource:
         """`source` read by a plan of the lengths it states, cutting documents
-        only where a chunk step before the pack says to (`chunked`)."""
-        plan = _Held(source, pack)
-        if not chunked:
+        only where a chunk step before the pack says to, its pieces `overlap`
+        tokens apart; with None no step does."""
+        plan = _Held(source, pack, 0 if overlap is None else overlap)
+        if overlap is None:
             plan.refuse_cuts()
         return cls(source, plan)
 
