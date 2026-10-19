@@ -785,8 +785,9 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     (the row length where None). Each document runs as a sequence of its own
     (fla's varlen `cu_seqlens`), its chunks from its first token and its
     memory from zero, as it would alone; the row's first takes `state`, unless
-    its first token begins a document of its own. The kernels' grids are sized by that bound, a chunk more for each document and
-    the row's padding; the memories they keep are not (`fla_gdn.Sequences`).
+    its first token begins a document of its own. The kernels' grids are
+    sized by that bound, a chunk more for each document and the row's
+    padding; the memories they keep are not (`fla_gdn.Sequences`).
 
     The operands go to their common dtype, beta with them, as fla's layer
     holds them. On a mesh the rule runs per shard (`manual_map`): rows where
