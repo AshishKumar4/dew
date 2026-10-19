@@ -58,6 +58,7 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import Manifest, StepIdentity
 from dew.data.sources.base import READS, Read, Source
+from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
 from dew.records import record
 
@@ -84,12 +85,35 @@ class _RestrictedReads(Protocol):
     refusal: str
 
 
+@dataclasses.dataclass(frozen=True)
+class _Members:
+    """A concatenation's stores that cannot take a read, each prepared by its own preparer
+    (`_provisioner`), so the concatenation takes it once they have."""
+
+    concatenation: Concatenate
+    preparers: tuple[_Provisionable, ...]
+
+    def can_provision(self, read: Read) -> bool:
+        return True
+
+    def provision(self) -> Source:
+        for preparer in self.preparers:
+            preparer.provision()
+        return self.concatenation
+
+
 def _provisioner(source: Source, read: Read) -> _Provisionable | None:
-    """The source that can prepare `read`, through any split or slice wrapping it."""
+    """The source that can prepare `read`, through any split or slice wrapping it; for a
+    concatenation, each of its stores that cannot take `read` yet, all of which must prepare it."""
     while isinstance(source, _Wrapping) and not isinstance(source, _Provisionable):
         if isinstance(source, _RestrictedReads) and read not in source.reads:
             return None
         source = source.source
+    if isinstance(source, Concatenate):
+        preparers = [_provisioner(member, read) for member in source.sources if not member.supports(read)]
+        if not preparers or any(preparer is None for preparer in preparers):
+            return None
+        return _Members(source, tuple(preparer for preparer in preparers if preparer is not None))
     return source if isinstance(source, _Provisionable) and source.can_provision(read) else None
 
 
@@ -554,12 +578,20 @@ def _analyzed(
 def _states_its_targets(pipeline: Pipeline) -> bool:
     """Whether a corpus a mixture weighs by tokens delivers the rows its source's stated rows and
     valid targets count, so a weight from them holds its share of the targets (`token_weights`):
-    a source that states them, whose epoch reads every row alike: no slice, limit or token split
-    before its repeat takes a part of them. Any other corpus's targets are counted as its rows
-    arrive (`TokenDeficit`)."""
-    source, epoch = pipeline.source, pipeline.stages[: _until(pipeline.stages, (Repeat,))]
+    a source that states them, whose stages only order, repeat and place those rows
+    (`_KEEPS_TARGETS`), and after its repeat may take a window of the repeated rows, as a phase
+    does. A step still to run over them, a random crop or a filter, before its repeat or after
+    it, or a slice, limit or token split that takes a part of one epoch, delivers other rows than
+    the stated ones, so that corpus's targets are counted as its rows arrive (`TokenDeficit`)."""
+    source, at = pipeline.source, _until(pipeline.stages, (Repeat,))
     return (not isinstance(source, (Mixture, Phases)) and "valid_targets" in source.metadata()
-            and not any(isinstance(stage, (Slice, Limit, TokenSplit)) for stage in epoch))
+            and all(isinstance(stage, _KEEPS_TARGETS) for stage in pipeline.stages[:at])
+            and all(isinstance(stage, (*_KEEPS_TARGETS, Slice, Limit)) for stage in pipeline.stages[at:]))
+
+
+_KEEPS_TARGETS = (Shuffle, Repeat, Prefetch, Workers, Interleave, Artifact)
+"""The stages that order, repeat or place a corpus's rows, each row and its targets as they
+arrive; a mixture's members are not batched, so these are all a member's stages may be."""
 
 
 def _cut(lowering: _Lowering, per_share: bool) -> _Lowering:

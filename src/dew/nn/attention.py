@@ -27,6 +27,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.telemetry.devices import deterministic_ops_requested
 
+from .activations import gated_product
 from .attention_sinks import sink_softmax
 from .documents import CrossDocuments, document_ids, document_offsets, with_documents
 from .flops import attention_flops, cross_attention_flops, projection_flops
@@ -2246,7 +2247,7 @@ class FlaxGEGLU(nn.Module):
 
     The gate is GELU, the gated linear unit of Shazeer 2020
     (https://arxiv.org/abs/2002.05202), whose product a gated MLP takes
-    (`dew.nn.moe.gated_product`); diffusers stores the up half first. The
+    (`dew.nn.activations.gated_product`); diffusers stores the up half first. The
     hidden width is four times `dim`.
     """
 
@@ -2267,9 +2268,6 @@ class FlaxGEGLU(nn.Module):
         self.proj = nn.Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision)
 
     def __call__(self, hidden_states):
-        # Imported here: dew.nn.moe reaches this module through dew.nn.blocks.
-        from .moe import gated_product
-
         hidden_states = self.proj(hidden_states)
         hidden_linear, hidden_gelu = jnp.split(hidden_states, 2, axis=-1)
         return gated_product('geglu' if self.approximate else 'geglu_exact')(hidden_gelu, hidden_linear)

@@ -1015,7 +1015,7 @@ class Wrapper(Protocol):
     """A record that wraps a module in a class of its own and makes that
     class again over a base: a LoRA adapter (`dew.lora.AdapterRecord`), a
     run's quantized training or a checkpoint's input quantization
-    (`dew.training.quantization`)."""
+    (`dew.quantization`)."""
 
     def apply(self, model: nn.Module) -> nn.Module: ...
 
