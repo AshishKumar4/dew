@@ -75,8 +75,9 @@ WINDOW = 1100
 WINDOW_STEPS = 64
 CONTEXT = 2048
 """The engine's `max_model_len`, past both prompts and their continuations."""
-MEMORY = 0.9
-"""The share of the GPU the engine takes (`gpu_memory_utilization`)."""
+MEMORY = 0.75
+"""The share of the GPU the engine takes (`gpu_memory_utilization`): the rest holds the weights as
+loaded, which `permute` reorders from."""
 RUNS = (*((loops, mode, 'bfloat16') for loops in (1, 2, 4) for mode in ('per_loop', 'last_loop')),
         *((2, mode, 'float32') for mode in ('per_loop', 'last_loop')))
 """(loop count, cache mode, dtype): bf16, the release's, at one, two (its own) and four loops,
@@ -575,7 +576,8 @@ def errors(directory: Path, key: str, batch: int, shape: tuple[int, ...] | None 
 
 def permute(model, config: dict, drawn: dict[str, np.ndarray]) -> np.ndarray:
     """vLLM's `model` under the symmetries `drawn` (`symmetry`), each parameter set in place from the
-    model's own weights as it loaded them, which the first call keeps on the host: each attention's
+    model's own weights as it loaded them, which the first call keeps beside them on their device
+    (`MEMORY` leaves the engine room for them): each attention's
     fused query, key and value rows, output gate rows and gains, output columns; each feed-forward's
     fused gate and up rows, gains and down columns (`maps`); then every parameter's one axis of the
     residual width, as tests/residual_orders.py reorders Dew's. Returns the embeddings' first row, by
@@ -585,8 +587,7 @@ def permute(model, config: dict, drawn: dict[str, np.ndarray]) -> np.ndarray:
     import torch
 
     if not hasattr(model, 'dory_loaded'):
-        model.dory_loaded = {name: parameter.detach().cpu().clone()
-                             for name, parameter in model.named_parameters()}
+        model.dory_loaded = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
     loaded, found = model.dory_loaded, maps(config, drawn)
     hidden, residual = config['hidden_size'], torch.as_tensor(drawn['residual'])
     heads, kv, width = config['num_attention_heads'], config['num_key_value_heads'], config['head_dim']
@@ -614,14 +615,14 @@ def permute(model, config: dict, drawn: dict[str, np.ndarray]) -> np.ndarray:
             elif name.endswith('down_proj.weight'):
                 columns = found['mlp'][layer]
             if rows is not None:
-                value = value.index_select(0, torch.as_tensor(rows))
+                value = value.index_select(0, torch.as_tensor(rows, device=value.device))
             if columns is not None:
-                value = value.index_select(1, torch.as_tensor(columns))
+                value = value.index_select(1, torch.as_tensor(columns, device=value.device))
             axes = [axis for axis, size in enumerate(value.shape) if size == hidden]
             if axes:
                 (axis,) = axes
-                value = value.index_select(axis, residual)
-            parameter.copy_(value.to(parameter.device))
+                value = value.index_select(axis, residual.to(value.device))
+            parameter.copy_(value)
     return model.backbone.embeddings.weight[0].float().cpu().numpy()
 
 
