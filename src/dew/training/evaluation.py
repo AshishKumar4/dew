@@ -122,8 +122,9 @@ class Evaluation:
 
         `warm` scores at most `WARM_BATCHES` batches and finalizes no score, so
         the evaluation holds none: a pass over them runs every program a longer
-        pass does, which a run compiles this way before its first step
-        (`Trainer.fit`), and no score of a part of the split is checked or read.
+        pass does, the loss's reduction included, which a run compiles this way
+        before its first step (`Trainer.fit`), and no score of a part of the
+        split is checked or read.
 
         The scores are broadcast to every process. Previews stay on process 0, and
         there is at most one objective preview, however long the validation split
@@ -185,13 +186,20 @@ class _LossSums:
                        else jax.tree.map(lambda total, value: total + value, self._total, statistics))
 
     def value(self, objective: Objective[Loss, Effects]) -> float | None:
-        if self._total is None:
+        reduced = self.reduced(objective)
+        if reduced is None:
             return None
-        hosted = collective_host(self._total, phase="validation loss")
-        value, valid = jax.device_get(objective._validation_reduction(jax.device_put(hosted)))
+        value, valid = reduced
         if not bool(valid) or not np.isfinite(float(value)):
             raise ValueError("validation loss has no finite statistical support")
         return float(value)
+
+    def reduced(self, objective: Objective[Loss, Effects]) -> tuple[np.ndarray, np.ndarray] | None:
+        """The sums' loss and whether it has support, unchecked; None where nothing was summed."""
+        if self._total is None:
+            return None
+        hosted = collective_host(self._total, phase="validation loss")
+        return jax.device_get(objective._validation_reduction(jax.device_put(hosted)))
 
 
 class _Accumulators:
@@ -346,7 +354,10 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
         # read the same rows, so the pool counts each share once.
         shares = from_every_process([int(DataPartition.of(mesh).index), int(records)])
         records = sum(dict(shares).values())
-        if scored and not warm:
+        if scored and warm:
+            # The reduction compiles here; a part of the split's loss is no score to check.
+            loss_sums.reduced(objective)
+        elif scored:
             scores = _finalized(metrics, summaries, split=split, root=root)
             loss_value = loss_sums.value(objective)
             if loss_value is not None and f'{split}/loss' not in scores:
