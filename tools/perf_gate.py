@@ -269,7 +269,8 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
     def hardware() -> str:
         """This machine's device kind, read once and only when a row names hardware."""
         return subprocess.run([str(python), "-c", "import jax; print(jax.devices()[0].device_kind)"],
-                              capture_output=True, text=True, check=True).stdout.strip()
+                              env={**os.environ, **(settings or {})}, capture_output=True, text=True,
+                              check=True).stdout.strip()
 
     with tempfile.TemporaryDirectory() as scratch:
         out = Path(scratch) / "out.json"
