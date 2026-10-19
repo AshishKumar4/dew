@@ -535,7 +535,8 @@ class Store:
 
             async def read_s3() -> Versioned:
                 bucket, key, _ = fs.split_path(path)
-                response = await fs._call_s3("get_object", Bucket=bucket, Key=key)
+                client = await fs.set_session()
+                response = await client.get_object(Bucket=bucket, Key=key)
                 async with response["Body"] as body:
                     return Versioned(await body.read(), response["ETag"])
 
@@ -625,7 +626,9 @@ class Store:
             return version
         if isinstance(fs, GCSFileSystem):
             bucket, key, _ = fs.split_path(path)
-            endpoint = f"{fs._location}/upload/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/o"
+            # The JSON API's upload root beside the API root the filesystem reads (`base`).
+            location = fs.base.removesuffix("storage/v1/")
+            endpoint = f"{location}upload/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/o"
             try:
                 outcome = fs.call(
                     "POST",
