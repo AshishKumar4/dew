@@ -15,8 +15,14 @@ class CrossDocuments(NamedTuple):
     (cross-attention): `query` `[B, Q]` and `key` `[B, K]` ids, each query
     reading the keys of its own document, 0 as padding, which reads nothing
     and is read by nothing. FlashAttention runs each row's documents as its
-    packed sequences, which needs them in ascending id order in the queries
-    and in the keys alike, padding after them."""
+    packed sequences, which needs the keys in ascending id order, padding
+    after them; the queries it orders itself.
+
+    Under causality or a window, a document's queries are its last keys, in
+    order: the last query reads up to the document's last key, the one before
+    it one key less (FlashAttention's alignment of a sequence's queries to the
+    bottom right of its keys). A cache call is one: its tokens were appended
+    after the keys its row held (`cross_document_mask`)."""
 
     query: jax.Array
     key: jax.Array
@@ -58,3 +64,42 @@ def document_offsets(segment_ids, max_segments: int) -> jax.Array:
     ids = jnp.arange(1, max_segments + 2) % (max_segments + 1)
     counts = jnp.sum(segment_ids[:, None, :] == ids[None, :, None], axis=-1, dtype=jnp.int32)
     return jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(counts.reshape(-1), dtype=jnp.int32)])
+
+
+def document_ranks(ids: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Each token's rank among its row's tokens of its own id, and how many tokens that id holds in its
+    row, both `[B, N]` for `ids` `[B, N]` in any order."""
+    order = jnp.argsort(ids, axis=-1, stable=True)
+    ordered = jnp.take_along_axis(ids, order, axis=-1)
+    first, last = (jax.vmap(lambda row, side=side: jnp.searchsorted(row, row, side=side))(ordered)
+                   for side in ("left", "right"))
+    sorted_rank = jnp.arange(ids.shape[-1])[None, :] - first
+    rows = jnp.arange(ids.shape[0])[:, None]
+    return (jnp.zeros_like(sorted_rank).at[rows, order].set(sorted_rank),
+            jnp.zeros_like(sorted_rank).at[rows, order].set(last - first))
+
+
+def aligned_places(segment_ids: CrossDocuments) -> jax.Array:
+    """Each query's place among its document's keys under causality or a window, `[B, Q]`: a document's
+    query of rank r among its Q queries sits at rank K - Q + r among its K keys (`CrossDocuments`)."""
+    queries, keys = document_ids(segment_ids)
+    rank, count = document_ranks(queries)
+    held = jax.vmap(lambda row, wanted: jnp.searchsorted(row, wanted, side="right")
+                    - jnp.searchsorted(row, wanted, side="left"))(jnp.sort(keys, axis=-1), queries)
+    return held - count + rank
+
+
+def cross_document_mask(segment_ids: CrossDocuments, *, causal: bool,
+                        sliding_window: int | None) -> jax.Array:
+    """`[B, 1, Q, K]`: each query's document's keys (`document_mask`), under causality and a window
+    aligned to the document's last key (`aligned_places`); causality keeps the keys at or before a
+    query's place, a window of w the w - 1 before it, or without causality those within w - 1 of it
+    (`dew.nn.attention.window_sides`)."""
+    key_rank, _ = document_ranks(document_ids(segment_ids)[1])
+    distance = aligned_places(segment_ids)[:, :, None] - key_rank[:, None, :]
+    keep = document_mask(segment_ids)
+    if causal:
+        keep &= distance >= 0
+    if sliding_window is not None:
+        keep &= (distance < sliding_window) if causal else (jnp.abs(distance) < sliding_window)
+    return keep[:, None]

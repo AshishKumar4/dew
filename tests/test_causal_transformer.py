@@ -245,6 +245,36 @@ def test_decode_cache_matches_the_full_sequence(rng, attention_impl):
     assert jnp.allclose(full[:, 3:], incremental, atol=1e-4)
 
 
+@pytest.mark.gpu(reason="FlashAttention runs on CUDA")
+def test_a_cached_prompt_reads_its_cache_through_flash_where_its_row_names_it(rng, without_deterministic_ops):
+    """A bf16 prompt prefilled into the cache under 'auto' reads it as the documents its tokens end, no
+    mask, which FlashAttention takes where the GPU's row names it for packed documents: the compiled
+    prefill holds its kernel there, and its logits are within tests/reference_error.py's rule of the
+    xla kernel's uncached forward against the float64 forward."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    from dew.nn.kernels.generation import measured_kernel
+
+    model = tiny(dtype=jnp.bfloat16)
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+    prompt = ids[:, :6]
+    cache = model.apply(params, prompt.shape[0], method=CausalTransformer.init_cache,
+                        mutable=['cache'])[1]['cache']
+    prefill = jax.jit(lambda params, cache, prompt: model.apply(
+        {**params, 'cache': cache}, prompt, decode=True, mutable=['cache'])[0])
+    compiled = prefill.lower(params, cache, prompt).compile().as_text()
+    flash = (measured_kernel('attention_packed', 'xla') == 'flash'
+             and measured_kernel('attention', 'cudnn') == 'flash')
+    assert ('dew_flash_mha' in compiled) == flash
+    found = np.asarray(prefill(params, cache, prompt), np.float64)
+    plain = np.asarray(model.clone(attention_impl='xla').apply(params, prompt), np.float64)
+    with jax.enable_x64(True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf, np.float64)), params)
+        truth = np.asarray(model.clone(dtype=jnp.float64, attention_impl='reference').apply(wide, prompt))
+    assert_as_exact_as_the_reference(found, plain, truth, "cached prefill")
+
+
 def test_reference_and_xla_kernels_agree_when_causal(rng):
     model = tiny()
     ids = tokens(rng)

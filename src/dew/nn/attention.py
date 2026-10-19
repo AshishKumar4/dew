@@ -29,7 +29,14 @@ from dew.telemetry.devices import deterministic_ops_requested
 
 from .activations import gated_product
 from .attention_sinks import sink_softmax
-from .documents import CrossDocuments, document_ids, document_offsets, with_documents
+from .documents import (
+    CrossDocuments,
+    aligned_places,
+    cross_document_mask,
+    document_ids,
+    document_offsets,
+    with_documents,
+)
 from .flops import attention_flops, cross_attention_flops, projection_flops
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
@@ -232,7 +239,12 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
         ordered = jnp.where(keys == 0, jnp.iinfo(keys.dtype).max, keys)
         held = jax.vmap(lambda row, wanted: jnp.searchsorted(row, wanted, side="right")
                         - jnp.searchsorted(row, wanted, side="left"))(ordered, queries)
-        return ((held > 0) & (queries != 0))[:, :, None, None]
+        seen = (held > 0) & (queries != 0)
+        if causal or sliding_window is not None:
+            # Aligned to its document's last keys, a query sees the key at its place, or without
+            # causality the nearest one within the window.
+            seen &= aligned_places(segment_ids) >= (0 if causal else 1 - sliding_window)
+        return seen[:, :, None, None]
     if (mask is not None or isinstance(segment_ids, CrossDocuments)
             or (segment_ids is not None and key_value_seq_lengths is not None)):
         visible = combined_attention_mask(query_length, key_length, causal, sliding_window, mask)
@@ -1088,8 +1100,9 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
     packing declaring at most `FLASH_PACKED_SEGMENTS` documents a row, the query is bf16 or
     fp16 with heads a multiple of 8 up to 256 wide (192 on sm8x parts other
     than sm80, whose backward takes no wider), a causal or windowed call is square
-    (FlashAttention aligns both to the last key, `structural_mask` to the row), the
-    call has no mask, bias or softcap, no deterministic ops are asked for,
+    (FlashAttention aligns both to the last key, `structural_mask` to the row) or
+    reads another sequence's documents (`CrossDocuments`, aligned as FlashAttention
+    aligns them), the call has no mask, bias or softcap, no deterministic ops are asked for,
     which its backward's atomic sum of the query gradient would not keep, and
     the installed dew_flash_attn holds code for this GPU."""
     head_dim = query.shape[-1]
@@ -1113,7 +1126,8 @@ def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias
          "its empty sequences cost less than the document mask"),
         (query.dtype in CUDNN_DTYPES, f"the query is {query.dtype}"),
         (head_dim % 8 == 0 and head_dim <= widest, f"the heads are {head_dim} wide"),
-        (not (causal or sliding_window is not None) or query.shape[-3] == key.shape[-3],
+        (not (causal or sliding_window is not None) or query.shape[-3] == key.shape[-3]
+         or isinstance(segment_ids, CrossDocuments),
          "a causal or windowed call has another number of keys than of queries"),
         (mask is None, "the call has a mask"),
         (bias is None, "the call has a bias"),
@@ -1135,7 +1149,9 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
     `max_segments` documents a row, run as the kernel's varlen sequences: each
     document, and each row's padding after them, one sequence over the
     flattened tokens. Its causal mask is aligned to the last key, where
-    jax.nn's is aligned to the first, so a causal call is square. On a mesh it
+    jax.nn's is aligned to the first, so a causal call is square, or reads
+    another sequence's documents, each document's queries aligned to its last
+    keys (`CrossDocuments`), which it orders by id. On a mesh it
     runs per shard (`_per_shard`). It runs where the installed wheel holds
     code for the device (`flash_built_for`)."""
     generation = device_generation()
@@ -1155,6 +1171,14 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
         if segment_ids is None or max_segments is None:
             return flash.flash_mha(query, key, value, is_causal=causal, window_size=window, sinks=sinks)
         rows, length = segment_ids.shape
+        order = None
+        if key_segment_ids is not None:
+            # Another sequence's documents run as packed sequences in id order, padding after them:
+            # the keys arrive so (a cache's), and the queries go so and come back in their own.
+            order = jnp.argsort(jnp.where(segment_ids == 0, max_segments + 1, segment_ids), axis=1,
+                                stable=True)
+            query = jnp.take_along_axis(query, order[:, :, None, None], axis=1)
+            segment_ids = jnp.take_along_axis(segment_ids, order, axis=1)
         flat = (query.reshape(rows * length, *query.shape[2:]),
                 *(x.reshape(-1, *x.shape[2:]) for x in (key, value)))
         if key_segment_ids is None:
@@ -1171,7 +1195,10 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
             own_keys = {"key_cu_seqlens": key_offsets, "key_max_seqlen": max(1, key_segment_ids.shape[1])}
         out = flash.flash_mha_varlen(*flat, offsets, length, is_causal=causal, window_size=window,
                                      sinks=sinks, **own_keys)
-        return out.reshape(rows, length, *out.shape[1:])
+        out = out.reshape(rows, length, *out.shape[1:])
+        if order is None:
+            return out
+        return jnp.take_along_axis(out, jnp.argsort(order, axis=1)[:, :, None, None], axis=1)
 
     queries, keys = (None, None) if segment_ids is None else document_ids(segment_ids)
     return _per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)),
@@ -1324,8 +1351,9 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     `max_segments`, static, bounds the documents a row holds
     (`Coordinates.max_segments`), which flash's packed sequences need.
     `key_segment_ids` `[B, K]` are the keys' own where they are not the
-    queries (`CrossDocuments`): each query reads its document's keys, with
-    no causal mask or window, whose positions the two sides do not share.
+    queries (`CrossDocuments`): each query reads its document's keys, and
+    under causality or a window a document's queries are its last keys, in
+    order (a cache call's tokens, appended after the keys their row held).
     `key_value_seq_lengths` `[B]` ends each row's keys, which cuDNN skips; a
     mask that only ends rows early costs cuDNN a dense bias per head, so pass
     lengths for right padding.
@@ -1340,10 +1368,16 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     if not 0 <= dropout_rate < 1:
         raise ValueError(f"dropout_rate must be within [0, 1), got {dropout_rate}")
     if key_segment_ids is not None:
-        if segment_ids is None or causal or sliding_window is not None:
-            raise ValueError("key_segment_ids are the keys' documents beside the queries' segment_ids, and "
-                             "a call between two sequences' documents takes no causal mask or window")
+        if segment_ids is None:
+            raise ValueError("key_segment_ids are the keys' documents beside the queries' segment_ids")
         segment_ids = CrossDocuments(segment_ids, key_segment_ids)
+    if (isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
+            and ((dropout_rate and not deterministic) or shards > 1)):
+        # Only a single device's kernels read documents aligned to their last keys; elsewhere they
+        # are the mask they mean.
+        aligned = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
+        mask = aligned if mask is None else jnp.logical_and(aligned, mask)
+        causal, sliding_window, segment_ids = False, None, None
     if dropout_rate and not deterministic:
         out = _dropout_attention(
             query, key, value, dtype, precision, force_fp32_for_softmax, implementation,
@@ -1548,7 +1582,8 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                 "attention_impl 'cudnn' or 'xla' for this call.")
         if query.dtype not in CUDNN_DTYPES:
             raise ValueError(f"flash attention needs bf16 or fp16 inputs, the query is {query.dtype}")
-        if (causal or sliding_window is not None) and query.shape[-3] != key.shape[-3]:
+        if ((causal or sliding_window is not None) and query.shape[-3] != key.shape[-3]
+                and not isinstance(segment_ids, CrossDocuments)):
             raise ValueError("flash attention aligns its causal mask and its window to the last key, so a "
                              "causal or windowed call needs as many queries as keys, not "
                              f"{query.shape[-3]} and {key.shape[-3]}")
@@ -1684,14 +1719,23 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     they mean, which splash cannot describe, so 'auto' never picks 'tpu' for
     them.
     """
-    packed = implementation == 'tpu' or (implementation == 'flash' and max_segments is not None)
+    # Another sequence's documents under causality or a window align each document's queries with
+    # its last keys (`CrossDocuments`), which splash does not; elsewhere the mask carries them.
+    aligned = isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
+    packed = ((implementation == 'tpu' and not aligned)
+              or (implementation == 'flash' and max_segments is not None))
     if segment_ids is not None and not packed:
-        mask = with_documents(mask, segment_ids)
-        masked = with_documents(masked, segment_ids)
-        # cuDNN would take the document mask as an additive bias
-        # (`kernel_for_materialized_mask`), and the triton and flash routes
-        # take no mask, so a packed call runs on xla.
-        if implementation in ('cudnn', 'triton', 'flash'):
+        if aligned:
+            inside = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
+            mask, masked = (inside if m is None else jnp.logical_and(m, inside) for m in (mask, masked))
+            causal, sliding_window = False, None
+        else:
+            mask = with_documents(mask, segment_ids)
+            masked = with_documents(masked, segment_ids)
+        # cuDNN takes a cache's aligned documents as their mask, an additive bias
+        # (`kernel_for_materialized_mask`), as it took a cache's mask; it would take a call's own
+        # documents so too, and the triton and flash routes take no mask, so those run on xla.
+        if implementation in ('triton', 'flash') or (implementation == 'cudnn' and not aligned):
             implementation = 'xla'
     if implementation == 'reference' or (implementation == 'xla'
                                          and (sinks is not None or softcap is not None)):
@@ -1754,8 +1798,10 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     path when the call asks for arithmetic no fused kernel performs
     (`reference_only`), else triton where `triton_runs` and cudnn's kernel
     would take the call, flash where `flash_refusal` has no refusal, cudnn
-    where `cudnn_runs` and the call has no sinks and no bidirectional window,
-    the tpu kernel where `tpu_runs`, and xla anywhere else; a bf16 or fp16 call
+    where `cudnn_runs` and the call has no sinks and no bidirectional window
+    (another sequence's aligned documents reach it as their mask), the tpu
+    kernel where `tpu_runs` and no documents are aligned to their last keys,
+    and xla anywhere else; a bf16 or fp16 call
     off flash where it was measured fastest is logged (`ran_kernel`). Any other name is returned as it is,
     so an explicit kernel still refuses what it cannot honour by name.
     """
@@ -1781,9 +1827,12 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
                             max_segments)
     if refusal is None:
         return 'flash'
+    # Splash aligns causality to the first key, so another sequence's aligned documents pass it by.
+    aligned = isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
     if fused:
         chosen = 'cudnn'
-    elif tpu_runs(query, key, causal=causal, sliding_window=sliding_window, mask=mask, bias=bias):
+    elif not aligned and tpu_runs(query, key, causal=causal, sliding_window=sliding_window, mask=mask,
+                                  bias=bias):
         chosen = 'tpu'
     else:
         chosen = 'xla'
