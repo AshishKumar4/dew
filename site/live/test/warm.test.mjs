@@ -17,14 +17,11 @@ const PINNED = 'c'.repeat(40);
 const LAST = 'b'.repeat(40);
 const ORIGIN = 'https://dewml.dev';
 
-/**
- * One deploy of the Worker, `name`, its preparer the harness's, with `bindings` beside the deploy's; where `shared`
- * names another, the pool, the registry and the preparer are that one's, as the preview's are production's.
- */
-async function deploy(name, bindings = {}, shared = null) {
+/** One deploy of the Worker, `name`, its own objects and its preparer the harness's, with `bindings` beside the deploy's. */
+async function deploy(name, bindings = {}) {
 	const bundle = await build({ entryPoints: [here('warm-harness.ts')], bundle: true, format: 'esm', platform: 'neutral',
 		external: ['cloudflare:workers'], write: false });
-	const owned = (className) => ({ className, useSQLite: true, ...(shared ? { scriptName: shared } : {}) });
+	const owned = (className) => ({ className, useSQLite: true });
 	return {
 		name, modules: [{ type: 'ESModule', path: `${name}.mjs`, contents: bundle.outputFiles[0].text }],
 		compatibilityDate: config.compatibility_date,
@@ -58,16 +55,17 @@ async function warming(worker, first) {
 	assert.deepEqual(await visit(worker, first), Array(6).fill([503, 'warming']));
 }
 
-/** The commits the preparer has been asked for, once it has been asked `count` times, and a moment more. */
-async function asked(worker, count) {
+/** The commits the preparer of the deploy `host` routes to has been asked for, once it has been asked `count` times,
+ * and a moment more. */
+async function asked(worker, count, host = 'live') {
 	// The registry asks the preparer once its alarm, a second after the request that started it, fires.
 	let commits = [];
 	for (let waited = 0; waited < 100 && commits.length < count; waited++) {
 		await new Promise((resolve) => setTimeout(resolve, 100));
-		commits = await (await worker.dispatchFetch('https://live/asked')).json();
+		commits = await (await worker.dispatchFetch(`https://${host}/asked`)).json();
 	}
 	await new Promise((resolve) => setTimeout(resolve, 1500));
-	return (await worker.dispatchFetch('https://live/asked')).json();
+	return (await worker.dispatchFetch(`https://${host}/asked`)).json();
 }
 
 test('session requests that find no warm model start one leased preparation of the pinned commit', async () => {
@@ -132,14 +130,22 @@ test('the registry prepares the deploy\'s pinned commit over the last deploy\'s 
 	}
 });
 
-test('a preview pinned to another commit leaves production\'s registry on its own pin', async () => {
-	// The preview shares production's pool, registry and preparer (wrangler.jsonc), and pins its own commit.
+test('a preview\'s warm and its visitors reach its own registry, preparer and pool, never production\'s', async () => {
+	// Each deploy binds its own objects (wrangler.jsonc); the preview keeps no warm host until asked.
+	const PREVIEW = 'd'.repeat(40);
 	const worker = new Miniflare(convertV4MiniflareOptions({ workers: [await deploy('production'),
-		{ ...await deploy('preview', { SNAPSHOT_COMMIT: 'd'.repeat(40) }, 'production'), routes: ['preview.live/*'] }] }));
+		{ ...await deploy('preview', { SNAPSHOT_COMMIT: PREVIEW, MIN_HOSTS: '0' }), routes: ['preview.live/*'] }] }));
 	try {
 		await left(worker, false, PINNED);
-		assert.deepEqual(await visit(worker, 0, 'preview.live'), Array(6).fill([201, null]));
+		const warmed = await worker.dispatchFetch('https://preview.live/v1/operator/warm',
+			{ method: 'POST', headers: { Authorization: 'Bearer operator' } });
+		assert.equal(warmed.status, 200);
+		assert.deepEqual(await visit(worker, 0, 'preview.live'), Array(6).fill([503, 'warming']));
+		assert.deepEqual(await asked(worker, 0, 'preview.live'), [PREVIEW]);
+		// Production's registry was left serving its own pin and asked for nothing, and its pool kept its host.
 		assert.deepEqual(await asked(worker, 0), []);
+		const status = await worker.dispatchFetch('https://live/v1/operator/status', { headers: { Authorization: 'Bearer operator' } });
+		assert.equal((await status.json()).ready, 1);
 	} finally {
 		await worker.dispose();
 	}
