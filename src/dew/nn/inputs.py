@@ -392,6 +392,28 @@ def counted_places(segments=None, valid=None, positions=None) -> jax.Array | Non
     return jnp.take_along_axis(jnp.broadcast_to(given, shape), slots, axis=1) + count
 
 
+def document_reach(segments, valid, places) -> jax.Array:
+    """Each token's document's furthest place `[B, S]`: `places` at the document's last real token,
+    which LongRoPE picks its factors by, as the reference picks them by a sequence's largest position,
+    so a packed document reads the factors it reads alone. A padding slot reads the next document's,
+    or its row's last. Documents are where `document_starts` puts them."""
+    segments = rows_like(jnp.asarray(segments), jnp.asarray(segments))
+    shape = jnp.shape(segments)
+    places = rows_like(jnp.broadcast_to(places, shape), segments)
+    real = segments != 0
+    if valid is not None:
+        real = real & rows_like(jnp.asarray(valid, bool), segments)
+    index = jnp.broadcast_to(jnp.arange(shape[1]), shape)
+    # The slot of the next document's first real token after each slot, the row's length past the last.
+    following = jnp.where(document_starts(segments, real), index, shape[1])
+    following = jnp.flip(jax.lax.cummin(jnp.flip(following, axis=1), axis=1), axis=1)
+    following = jnp.concatenate([following[:, 1:], jnp.full((shape[0], 1), shape[1])], axis=1)
+    # The last real token before it, which ends the slot's document.
+    last = jax.lax.cummax(jnp.where(real, index, 0), axis=1)
+    ends = jnp.take_along_axis(last, following - 1, axis=1)
+    return jnp.take_along_axis(places, ends, axis=1)
+
+
 def document_starts(segments, valid, *, xp=jnp):
     """`[B, S]`: each real token whose segment differs from the previous real token's in its row, a
     row's first real token continuing what precedes the row and a padding slot starting nothing."""
