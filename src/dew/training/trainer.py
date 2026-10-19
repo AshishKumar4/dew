@@ -129,7 +129,7 @@ from dew.training.distributed import (
     step_reads,
     taking_over,
 )
-from dew.training.evaluation import EvalSuite, Evaluation, MetricScores
+from dew.training.evaluation import EvalSuite, Evaluation
 from dew.training.interval import Interval, Taken, held
 from dew.training.memory import (
     climb_to,
@@ -156,7 +156,7 @@ from dew.training.optim import learning_rate, with_rate_scales
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
-from dew.training.selection import Best
+from dew.training.selection import Best, HeldBest, rankings
 from dew.training.state import Accumulation, TrainState
 from dew.training.tracker import Tracker
 from dew.training.transaction import Committed, Transaction, compact_qk, outcome, with_ema
@@ -320,9 +320,7 @@ class _FitPlan:
     best: tuple[Best, ...] = ()
     stop: Plateau | None = None
     suites: Mapping[str, EvalSuite] = dataclasses.field(default_factory=dict)
-    held_best: bool = False
-    """Whether the run keeps its best state in host memory, for a `restore_best` without
-    `Checkpoints` to restore."""
+    held_best: bool = False  # a restore_best without Checkpoints (`HeldBest`)
     """Every validation split by name, its metrics and cadence resolved."""
 
     @property
@@ -376,9 +374,7 @@ class _FitRun:
     notice: PreemptionNotice | None = None
     endless: bool = False
     taken: Taken | None = None
-    best: tuple[float, Callable[[], TrainState]] | None = None
-    """The best ranking's score so far and what puts its state, held in host memory, back on the
-    devices (`_FitPlan.held_best`, `dew.training.host.snapshot`)."""
+    best: HeldBest = dataclasses.field(default_factory=HeldBest)
     """The log taken at the latest logging step and not yet read."""
     stepped: tuple[jax.Array, dict[str, jax.Array], jax.Array] | None = None
     """The latest step's loss, objective metrics and acceptance, which the log of the interval it
@@ -1399,10 +1395,8 @@ class Trainer(Generic[Loss, Effects]):
         several, each a Dataset, a reader scored as `dataset.val` would be or an
         `EvalSuite` with its own metrics and cadence, logged as `<name>/<metric>`.
 
-        `restore_best=True` returns the state the run ranked best (by `best`, else
-        the validation loss, else the training loss): its best checkpoint, or,
-        without `Checkpoints`, the state itself, which the run keeps in host memory
-        as it evaluates, one copy of it.
+        `restore_best=True` returns the state the run ranked best: its best
+        checkpoint, or without `Checkpoints` the state it held (`HeldBest`).
 
         Every `checkpoint_every` steps, the state and the data position are
         written; `checkpoint_final=True` also writes the final state, independently
@@ -1470,10 +1464,7 @@ class Trainer(Generic[Loss, Effects]):
                     step="best",
                 )
             elif restore_best and checkpoints is None and run.preempted is None:
-                if run.best is None:
-                    raise ValueError("restore_best found no evaluation of this run that its ranking ranks; "
-                                     "no state is the best to return")
-                trained = run.best[1]()
+                trained = run.best.state()
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
@@ -1822,9 +1813,10 @@ class Trainer(Generic[Loss, Effects]):
                scores: Mapping[str, float], *, evaluation_due: bool, final: bool = False) -> None:
         """Resolve cadence, ranking, stopping and unconditional final saves in one place."""
         checkpoints, current = self.checkpoints, run.current
-        ranking = self._ranking(plan, scores)
+        ranking = rankings(plan.best, scores, validation=next(iter(plan.suites)) if plan.validation else None,
+                           scored=plan.scored, objective=self.objective)
         if plan.held_best and evaluation_due:
-            self._hold_best(run, ranking, state)
+            run.best.offer(ranking, dataclasses.replace(state, compute=None))
         winners = checkpoints._candidates(ranking) if (
             evaluation_due and checkpoints is not None and (plan.checkpoint_every or plan.best)) else ()
         candidate = bool(winners)
@@ -1946,44 +1938,6 @@ class Trainer(Generic[Loss, Effects]):
                 choice.weights_only for choice in selection):
             raise ValueError("restore_best requires full checkpoints, not weights_only snapshots")
         return selection, stop
-
-    @staticmethod
-    def _hold_best(run: _FitRun, ranking: Sequence[Ranking], state: TrainState) -> None:
-        """Keep `state` in host memory where its first ranking, the one a checkpointed run's best
-        restores by, beats the state held, an earlier one winning a tie: one copy of the state,
-        replaced as the best moves."""
-        score = ranking[0].score if ranking else None
-        if score is not None and (run.best is None or score < run.best[0]):
-            from dew.training.host import snapshot
-            run.best = (score, snapshot(dataclasses.replace(state, compute=None)))
-
-    def _ranking(self, plan: _FitPlan, scores: Mapping[str, float]) -> tuple[Ranking, ...]:
-        if not plan.best:
-            name = (
-                next(iter(plan.suites)) + "/loss"
-                if plan.validation
-                else "train/loss"
-            )
-            return (Ranking(name, scores[name]),) if name in scores else ()
-        ranks = []
-        for index, selection in enumerate(plan.best):
-            metric = selection._source
-            assert metric is not None
-            if isinstance(metric, (Metric, TrainingScalar)):
-                name = f'{selection.split}/{metric.name}'
-                value = scores.get(name, float('nan'))
-            else:
-                name = f'aggregate:{index}'
-                try:
-                    value = float(metric(MetricScores(plan.scored, scores, self.objective)))
-                except KeyError:
-                    value = float('nan')
-            mode = selection.mode or 'min'
-            threshold = selection.threshold
-            if threshold is not None and (value >= threshold if mode == 'min' else value <= threshold):
-                value = float('nan')
-            ranks.append(Ranking(name, value, mode, selection.top, selection.weights_only))
-        return tuple(ranks)
 
     @staticmethod
     def _plateau(plan: _FitPlan, run: _FitRun, scores: Mapping[str, float]) -> bool:
