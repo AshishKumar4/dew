@@ -218,11 +218,8 @@ def dew_points(args):
                 "weights": {"split_over": sorted(split),
                             "devices": len({device for sharding in shardings for device in sharding.device_set})}}
     # The layout asked for, replacing the model's own only where it differs (as `Server.from_task` reads
-    # it): a model that declares no layout to replace, a multimodal one's wrapper, serves its own dense one.
-    requested = KVCache(page_size=16 if args.kv == "paged" else None)
-    own = task.model.kv_cache if isinstance(task.model, Layered) else KVCache()
-    # The layout asked for, replacing the model's own only where it differs (as `Server.from_task` reads
-    # it): a model that declares no layout to replace, a multimodal one's wrapper, serves its own dense one.
+    # it): a model that declares no layout to replace, a multimodal one's wrapper, serves its own dense one
+    # (until the wrapper takes a layout for its text decoder, ledger 637).
     requested = KVCache(page_size=16 if args.kv == "paged" else None)
     own = task.model.kv_cache if isinstance(task.model, Layered) else KVCache()
     points = []
