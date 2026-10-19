@@ -123,6 +123,11 @@ def _publish(
             f"cache coverage is incomplete: {len(missing)} missing, {len(extra)} unexpected "
             f"source IDs; example {sample}"
         )
+    if current is not None and plan is None:
+        # The committed generation covers every input already, which a fill can only repeat; a
+        # packing plan is what a new generation adds.
+        return Generation(root.child(f"generations/{json.loads(current.data)['generation']}").url,
+                          cache._mirror_options())
     generation = uuid.uuid4().hex
     target = root.child(f"generations/{generation}")
     opened = Generation(target.url, cache._mirror_options())

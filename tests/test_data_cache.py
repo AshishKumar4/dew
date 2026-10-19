@@ -452,7 +452,7 @@ def test_a_generation_of_one_holdout_part_reads_as_that_part():
     assert served == [ids(tagged(train)), ids(tagged(held))]
 
 
-@pytest.mark.parametrize("scored", ["source", "chain"])
+@pytest.mark.parametrize("scored", ["source", "chain", "same source"])
 def test_a_loader_reads_a_generation_where_it_holds_the_rows_and_each_other_source_itself(scored):
     """A recipe given the generation of its training branch trains on the generation and scores
     its validation source's own rows, through steps no cache could hold too; a recipe none of whose
@@ -463,9 +463,11 @@ def test_a_loader_reads_a_generation_where_it_holds_the_rows_and_each_other_sour
     from dew.data.pipeline import Pipeline
 
     read = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
+    trained = Memory([{"id": index} for index in range(8)])
     held = Memory([{"id": 100 + index} for index in range(4)])
-    recipe = RecordsData(Memory([{"id": index} for index in range(8)]), validation=held if scored == "source"
-                         else Pipeline(held).map(lambda row: {**row, "scored": 1}))
+    recipe = RecordsData(trained, validation={
+        "source": held, "chain": Pipeline(held).map(lambda row: {**row, "scored": 1}),
+        "same source": Pipeline(trained).map(lambda row: {**row, "scored": 1})}[scored])
     train, _, _ = recipe.pipelines()
     generation = publish(train, _cache(), read="indexed", loading=read)
     data = loader(recipe, batch=2, cache=generation, read="indexed", loading=read)
@@ -473,7 +475,8 @@ def test_a_loader_reads_a_generation_where_it_holds_the_rows_and_each_other_sour
     training, validation = data.train(DataPartition()), data.val(DataPartition())
     try:
         assert {int(index) for _ in range(4) for index in next(training)["id"]} == set(range(8))
-        assert sorted(int(index) for batch in validation for index in batch["id"]) == [100, 101, 102, 103]
+        scored_ids = sorted(int(index) for batch in validation for index in batch["id"])
+        assert scored_ids == (list(range(8)) if scored == "same source" else [100, 101, 102, 103])
     finally:
         training.close()
         validation.close()
@@ -634,24 +637,31 @@ def test_a_fill_whose_spool_drops_its_last_shard_reads_on_and_publishes_nothing(
 
 def test_a_streamed_generation_serves_its_files_at_another_mount(tmp_path):
     """A streamed generation names its inputs by the shards of the files where they were filled;
-    the same files mounted elsewhere are the same key, and fill their shards afresh rather than
-    reading inputs the generation names otherwise."""
+    the same files mounted elsewhere are the same key, whose shards run their steps and write
+    nothing, so the key holds its inputs under the first mount's names alone and a packing plan
+    publishes onto it there."""
     import shutil
 
     from dew.data.compile import iterate, publish
     from dew.data.pipeline import Pipeline
     from dew.data.sources import Files
+    from dew.data.text import Chunks, Tokenize
 
-    first = tmp_path / "first"
+    first, second = tmp_path / "first", tmp_path / "second"
     first.mkdir()
-    (first / "rows.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(4)))
-    shutil.copytree(first, tmp_path / "second")
+    (first / "rows.jsonl").write_text("".join(json.dumps({"text": "x" * size}) + "\n" for size in (2, 5, 7)))
+    shutil.copytree(first, second)
+
+    def chunked(mount):
+        return Pipeline(Files(str(mount / "rows.jsonl"))).map(Tokenize()).flat_map(Chunks(4))
+
+    def pieces(pipeline):
+        return sorted(row["text"].tolist() for row in iterate(pipeline, read="streamed"))
+
     cache = Cache(str(tmp_path / "cache"))
-    publish(Pipeline(Files(str(first / "rows.jsonl"))).map(Offset(1)), cache, read="streamed")
-    moved = Offset(1)
-    rows = iterate(Pipeline(Files(str(tmp_path / "second" / "rows.jsonl"))).map(moved).cache(cache),
-                   read="streamed")
-    assert sorted(int(row["value"]) for row in rows) == [1, 2, 3, 4]
+    generation = publish(chunked(first), cache, read="streamed")
+    assert pieces(chunked(second).cache(cache)) == pieces(chunked(second))
+    assert publish(chunked(first).pack(4, bins=2), cache, read="streamed").url != generation.url
 
 
 def test_an_empty_stream_publishes_an_empty_generation():
