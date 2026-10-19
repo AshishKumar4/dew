@@ -32,6 +32,7 @@ from .attention_kernels import (
     CUDNN_DTYPES,
     DECODE,
     SPLASH_BLOCK,
+    SPLASH_DTYPES,
     SPLASH_LANES,
     AttentionCase,
     cudnn_max_head_dim,
@@ -55,7 +56,7 @@ from .flops import attention_flops, cross_attention_flops, projection_flops
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, device_generation, gpu_placed
-from .kernels.selection import select
+from .kernels.selection import KernelRefused, forced, select
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import asks_default_precision, at_default_precision, at_least_fp32, rounded_to
 from .rope import rotate
@@ -1326,41 +1327,13 @@ def _dropout_attention(query, key, value, dtype, precision, force_fp32_for_softm
                                dropout_rate=dropout_rate, dropout_rng=dropout_rng)
 
 
-def refuse_reference_only_arguments(implementation, query, dtype, precision,
-                                    force_fp32_for_softmax):
-    """Raise for the arguments only the reference path reads.
-
-    A fused kernel accumulates the logits and runs the softmax in fp32 in
-    the inputs' own dtype, whatever the caller asked for. Each message names
-    the implementation and the reference path, so a caller can pick one.
-    """
-    if not asks_default_precision(precision):
-        raise ValueError(
-            f"attention implementation '{implementation}' cannot honor "
-            f"precision={precision}: fused attention accumulates the logits and "
-            "runs the softmax in fp32 regardless. Leave precision at DEFAULT, or "
-            "use the reference implementation (attention_impl 'reference').")
-    if not force_fp32_for_softmax:
-        raise ValueError(
-            f"attention implementation '{implementation}' cannot honor "
-            "force_fp32_for_softmax=False: fused attention runs the softmax in "
-            "fp32 regardless. Leave it True, or use the reference implementation "
-            "(attention_impl 'reference').")
-    if dtype is not None and jnp.dtype(dtype) != query.dtype:
-        raise ValueError(
-            f"attention implementation '{implementation}' cannot honor "
-            f"dtype={dtype}: fused attention computes in the inputs' dtype "
-            f"({query.dtype}). Pass dtype=None or leave the inputs in that dtype, or use "
-            "the reference implementation (attention_impl 'reference').")
-
-
 def fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
                     softcap, sinks, segment_ids, key_value_seq_lengths, max_segments=None):
     """Run the fused kernel `implementation` names, at the query's head width.
 
     A narrower value rides in padded and its columns come back out, at no
-    runtime branch. 'cudnn' refuses here what its kernel cannot take: sinks, a
-    softcap, deterministic ops, and dtypes and head widths outside its tiles.
+    runtime branch. A fused kernel refuses here what its requirements say it
+    cannot take (`attention_kernels.ATTENTION`, `KernelRefused`).
     `key_value_seq_lengths` reaches cudnn and xla as lengths and 'tpu' as the
     mask it means.
     """
@@ -1368,62 +1341,23 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
     if v_head_dim != query.shape[-1]:
         value = widen_value_heads(query, value)
 
+    if implementation in ('cudnn', 'triton', 'flash'):
+        # What the kernel cannot take raises as its requirements say (`attention_kernels.ATTENTION`),
+        # measured ones aside, for a caller that names it here directly as for the selector.
+        case = attention_case(query, key, causal=causal, sliding_window=sliding_window, mask=mask,
+                              bias=bias, softcap=softcap, sinks=sinks, segment_ids=segment_ids,
+                              max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths)
+        failed = [requirement for requirement in ATTENTION.kernel(implementation).failed(case, forced=True)
+                  if requirement.kind != 'handoff']
+        if failed:
+            raise KernelRefused('attention', implementation,
+                                [requirement.refusal(case) for requirement in failed])
     if implementation == 'cudnn':
-        if sinks is not None:
-            raise ValueError("attention implementation 'cudnn' cannot honor sinks")
-        if softcap is not None:
-            raise ValueError(
-                f"attention implementation 'cudnn' cannot apply an attention logit "
-                f"softcap of {softcap}: the fused kernel has no tanh between its "
-                "scaling and its softmax. Use attention_impl 'xla' or the reference "
-                "implementation (attention_impl 'reference').")
-        if deterministic_ops_requested():
-            raise ValueError(
-                "attention implementation 'cudnn' cannot run under "
-                "--xla_gpu_deterministic_ops: on this JAX and XLA its backward pass "
-                "is unusable, because an executable holding two identical fused "
-                "attention backward calls, which every multi-layer model has, fails "
-                "at execution time (openxla/xla#46500). Use attention_impl 'xla', "
-                "which is deterministic, or drop the flag.")
-        if query.dtype not in CUDNN_DTYPES:
-            raise ValueError(
-                "cudnn attention needs bf16 or fp16 inputs, the query is "
-                f"{query.dtype}. Set dtype bfloat16, or attention_impl 'xla' to "
-                "keep this precision.")
-        head_dim = query.shape[-1]
-        if head_dim % 8 or head_dim > cudnn_max_head_dim():
-            raise ValueError(
-                f"cudnn attention needs a head dimension that is a multiple of 8 "
-                f"and at most {cudnn_max_head_dim()} on {device_generation()}, got {head_dim}; use "
-                "attention_impl 'xla' for this shape.")
-        if sliding_window is not None and not causal:
-            raise ValueError(
-                "cudnn attention windows only the keys before a query, and this "
-                "bidirectional call windows both sides; use attention_impl 'xla'.")
         out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
                               key_value_seq_lengths)
     elif implementation == 'triton':
-        if any(x is not None for x in (sinks, softcap, bias, mask, sliding_window, key_value_seq_lengths)):
-            raise ValueError(
-                "attention implementation 'triton' takes no sinks, softcap, bias, mask, window or key "
-                "lengths; use attention_impl 'cudnn' or 'xla' for this call.")
         out = triton_attention(query, key, value, causal)
     elif implementation == 'flash':
-        if any(x is not None for x in (softcap, bias, mask, key_value_seq_lengths)):
-            raise ValueError(
-                "attention implementation 'flash' takes no softcap, bias, mask or key lengths; use "
-                "attention_impl 'cudnn' or 'xla' for this call.")
-        if query.dtype not in CUDNN_DTYPES:
-            raise ValueError(f"flash attention needs bf16 or fp16 inputs, the query is {query.dtype}")
-        if ((causal or sliding_window is not None) and query.shape[-3] != key.shape[-3]
-                and not isinstance(segment_ids, CrossDocuments)):
-            raise ValueError("flash attention aligns its causal mask and its window to the last key, so a "
-                             "causal or windowed call needs as many queries as keys, not "
-                             f"{query.shape[-3]} and {key.shape[-3]}")
-        if deterministic_ops_requested():
-            raise ValueError("attention implementation 'flash' cannot run under --xla_gpu_deterministic_ops: "
-                             "its backward sums the query gradient with atomics. "
-                             "Use attention_impl 'xla'.")
         out = flash_attention(query, key, value, causal, sliding_window, sinks, segment_ids, max_segments)
     elif implementation == 'decode':
         def decoded(query, key, value):
@@ -1556,8 +1490,8 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     softcap and packed segment ids itself, and flash takes the ids as its
     packed sequences given `max_segments`; elsewhere segment ids become the
     document mask, and sinks and a softcap run `reference_attention`, since
-    `jax.nn.dot_product_attention` has neither. The rest goes to
-    `fused_attention` once the arguments it cannot honour have raised. Key
+    `jax.nn.dot_product_attention` has neither (a fused route this host runs as xla
+    included, `_hosted`). The rest goes to `fused_attention`. Key
     lengths reach cudnn and xla as they are and every other path as the mask
     they mean, which splash cannot describe, so 'auto' never picks 'tpu' for
     them.
@@ -1575,11 +1509,8 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
         else:
             mask = with_documents(mask, segment_ids)
             masked = with_documents(masked, segment_ids)
-        # cuDNN takes a cache's aligned documents as their mask, an additive bias
-        # (`kernel_for_materialized_mask`), as it took a cache's mask; it would take a call's own
-        # documents so too, and the triton and flash routes take no mask, so those run on xla.
-        if implementation in ('triton', 'flash') or (implementation == 'cudnn' and not aligned):
-            implementation = 'xla'
+        # cuDNN takes the documents as their mask, an additive bias (`kernel_for_materialized_mask`):
+        # a cache's aligned ones as it took a cache's mask, a call's own where cuDNN is named.
     if implementation == 'reference' or (implementation == 'xla'
                                          and (sinks is not None or softcap is not None)):
         mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window, masked)
@@ -1587,8 +1518,6 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                                    dtype=dtype, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax)
 
-    refuse_reference_only_arguments(
-        implementation, query, dtype, precision, force_fp32_for_softmax)
     return fused_attention(query, key, value, bias, mask, causal, sliding_window,
                            implementation, softcap=softcap, sinks=sinks,
                            segment_ids=segment_ids, max_segments=max_segments,
@@ -1598,10 +1527,10 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
 def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
     """Whether a call asks for arithmetic only the reference path performs.
 
-    The three are what `refuse_reference_only_arguments` raises for: a
-    matmul precision other than DEFAULT (a higher one, a dot algorithm or
-    a preset of one), a softmax outside fp32, and a compute dtype other
-    than the inputs'. A fused kernel runs none of them.
+    The three are what every fused kernel's requirements refuse
+    (`attention_kernels`' arithmetic requirement): a matmul precision other
+    than DEFAULT (a higher one, a dot algorithm or a preset of one), a
+    softmax outside fp32, and a compute dtype other than the inputs'.
     """
     return (not asks_default_precision(precision)
             or not force_fp32_for_softmax
@@ -1646,26 +1575,43 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query) or _xla_kernel_chains(query, key),
         folds=folds(query, key, bias, mask, causal, sliding_window),
-        splash=(q_len % SPLASH_LANES == 0 and kv_len % SPLASH_LANES == 0
+        # Splash's descriptor reads a concrete mask on the host, so only a call splash could take
+        # builds it: a TPU's, of its dtypes, with no bias or sequence axis, at lengths it tiles.
+        splash=(generation.backend() == 'tpu' and jnp.dtype(query.dtype) in SPLASH_DTYPES
+                and bias is None and sequence_shards() == 1
+                and q_len % SPLASH_LANES == 0 and kv_len % SPLASH_LANES == 0
                 and min(q_len, kv_len) >= SPLASH_MIN_LENGTH
                 and splash_mask_descriptor(q_len, kv_len, shard_heads(query), causal, sliding_window,
                                            mask) is not None),
         shards=sequence_shards())
 
 
-def resolve_implementation(implementation, query, key, **call) -> str:
+def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
+                           force_fp32_for_softmax=True, softcap=None, sinks=None, causal=False,
+                           sliding_window=None, mask=None, bias=None, segment_ids=None, max_segments=None,
+                           key_value_seq_lengths=None) -> str:
     """The kernel an `AttentionImpl` names for this call on this host, as the attention selector
     reports it (`select`, over `attention_case`): 'auto' takes the kernel the target's row measured
     fastest for the call where it takes it, else the first that does; a named kernel is forced, and
     raises where it does not take the call (xla handing what it cannot honour to the reference path).
     A call of few positions over key lengths is the decode selector's (`DECODE`), whose decode kernel
-    runs as 'decode' (`fused_attention`). What runs is what this host runs (`_hosted`): xla for a CUDA
-    kernel a step traced for an assumed GPU on a CPU reports."""
+    runs as 'decode' (`fused_attention`); a named xla lowers it there too, as jax.nn's own lowering
+    of a decode step, unless `generation.chosen(decode='xla')` names the folded attention. What runs
+    is what this host runs (`_hosted`): xla for a CUDA kernel a step traced for an assumed GPU on a
+    CPU reports."""
     if implementation not in get_args(AttentionImpl):
         raise ValueError(f"Unknown attention implementation: {implementation}")
-    case = attention_case(query, key, **call)
-    op = DECODE if decodes(case) and implementation in ('auto', 'cudnn', 'xla') else ATTENTION
-    return select(op, case, None if implementation == 'auto' else implementation).ran
+    case = attention_case(query, key, dtype=dtype, precision=precision,
+                          force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
+                          causal=causal, sliding_window=sliding_window, mask=mask, bias=bias,
+                          segment_ids=segment_ids, max_segments=max_segments,
+                          key_value_seq_lengths=key_value_seq_lengths)
+    if not (decodes(case) and implementation in ('auto', 'cudnn', 'xla')):
+        return select(ATTENTION, case, None if implementation == 'auto' else implementation).ran
+    named = {'auto': None, 'cudnn': 'cudnn'}.get(implementation)
+    if implementation == 'xla':
+        named = 'xla' if forced(DECODE.choice) == 'xla' or DECODE.kernel('decode').failed(case) else 'decode'
+    return select(DECODE, case, named).ran
 
 
 def kernel_for_materialized_mask(implementation: str, query, key, *, dtype=None, precision=None,

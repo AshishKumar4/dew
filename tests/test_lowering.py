@@ -336,7 +336,7 @@ def test_a_route_records_the_targets_decision_where_its_dispatch_reports_it():
     assert refused((True, "dtype", "a bf16 call")) is None
 
 
-def test_a_dispatch_sending_a_call_off_its_preferred_kernel_reports_the_route():
+def test_a_dispatch_sending_a_call_off_its_preferred_kernel_reports_the_route(without_deterministic_ops):
     """The attention dispatch, sending a packed bf16 call with no bound on a row's documents off the
     flash kernel an A100 measured fastest, reports through the attention selector the target's route:
     xla, as cuDNN takes no segment ids, the refusal's code and its declaration (inherent), and xla as
@@ -352,6 +352,24 @@ def test_a_dispatch_sending_a_call_off_its_preferred_kernel_reports_the_route():
     assert (off.refusal.code, off.refusal.row) == ("document_bound", "inherent")
     assert off.site == "dew.nn.attention:resolve_implementation"
     assert (taken.kernel, taken.preferred, taken.refusal) == ("flash", "flash", None)
+
+
+def test_a_call_off_a_kernel_for_its_cost_is_a_tracked_gap_and_one_past_its_tiles_inherent(
+        without_deterministic_ops):
+    """A packed call past FlashAttention's measured document cap goes off it for its cost, which the route
+    report counts as a gap tracked by its measurement's row, not as a limit; heads wider than any fused
+    kernel tiles are a limit no implementation of flash lifts, inherent (`tools/kernel_routes.verdict`)."""
+    from dew.nn import attention
+    from tools.kernel_routes import verdict
+
+    packed, wide = jnp.zeros((1, 8, 2, 64), jnp.bfloat16), jnp.zeros((1, 8, 2, 512), jnp.bfloat16)
+    with assumed("sm80"), routes() as found:
+        attention.resolve_implementation("auto", packed, packed, segment_ids=jnp.ones((1, 8)),
+                                         max_segments=99)
+        attention.resolve_implementation("auto", wide, wide, causal=True)
+    capped, widest = [found_route for found_route in found if found_route.choice == "attention"]
+    assert capped.refusal.code == "packed_documents" and verdict(capped).startswith("gap: measured")
+    assert widest.refusal.code == "head_dim" and verdict(widest) == "inherent"
 
 
 def test_a_function_traced_before_a_routes_block_reports_its_routes_within_it():

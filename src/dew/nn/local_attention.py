@@ -121,9 +121,10 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     # A mask built here is at most `[S, 2W]` per head, so cudnn takes it as
     # its additive bias where cudnn runs (docs/performance.md: 16384 packed
     # tokens at window 4096 in 0.60 GiB of temporaries on an L4, where xla
-    # asked for 10.0 GiB at 8192). Flash takes no mask, so where 'auto' chose
-    # it for the window, a masked call still goes to cudnn.
-    on_cudnn = resolved == 'cudnn' or (implementation == 'auto' and resolved == 'flash'
+    # asked for 10.0 GiB at 8192). Flash takes no mask, and the whole call's
+    # packed documents keep cuDNN off it (they reach it only as this mask), so
+    # where 'auto' chose either for the window, a masked call still goes to cudnn.
+    on_cudnn = resolved == 'cudnn' or (implementation == 'auto' and resolved in ('flash', 'xla')
                                        and cudnn_takes_mask(implementation, query, softcap=softcap,
                                                             sinks=sinks is not None))
     masked = 'cudnn' if on_cudnn else kernel_for_materialized_mask(

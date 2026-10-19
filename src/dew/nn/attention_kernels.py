@@ -180,7 +180,7 @@ FLASH_SUPPORTS = (
                 or case.max_segments <= FLASH_PACKED_SEGMENTS,
                 lambda case: f"the call packs up to {case.max_segments} documents a row, past the "
                              f"{FLASH_PACKED_SEGMENTS} its empty sequences cost less than the document mask",
-                inherent=True, kind='measured'),
+                row='measured: flash packed-document cap (docs/performance.md)', kind='measured'),
     _Need('dtype', lambda case: case.dtype in CUDNN_DTYPES, lambda case: f"the query is {case.dtype}",
                 inherent=True),
     _Need('head_dim', lambda case: case.head_dim % 8 == 0 and case.head_dim <= _flash_widest(),
@@ -227,11 +227,13 @@ CUDNN_SUPPORTS = (
     _Need('bidirectional_window', lambda case: case.window is None or case.causal or case.aligned,
                 "cuDNN keeps a window behind the query only", inherent=True),
     _Need('documents', lambda case: case.documents is None or case.aligned,
-                "cuDNN takes no segment ids, a call's packed documents only as their mask", inherent=True),
+                "cuDNN takes no segment ids, a call's packed documents only as their mask, a dense bias "
+                "that costs more than the xla kernel's mask (`_attention_kernel` builds it where cuDNN is "
+                "named)", row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
     _Need('mask', lambda case: not case.mask,
                 "cuDNN takes an arbitrary mask as a dense bias, which costs more than the xla kernel's "
                 "mask but in a forward-only cache call (`kernel_for_materialized_mask`)",
-                inherent=True, kind='measured'),
+                row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
     _Need('deterministic', lambda case: not deterministic_ops_requested(),
                 "--xla_gpu_deterministic_ops is set, under which XLA's cuDNN attention backward crashes "
                 "(openxla/xla#46500)", inherent=True),
@@ -249,10 +251,11 @@ TRITON_SUPPORTS = (
                 inherent=True),
     _Need('dtype', lambda case: case.dtype in CUDNN_DTYPES,
                 lambda case: f"the query is {case.dtype}, where it was measured on bf16 and fp16 alone",
-                inherent=True, kind='measured'),
+                row='measured: tokamax Triton attention (docs/performance.md)', kind='measured'),
     _Need('narrow', lambda case: case.head_dim <= 64,
                 lambda case: f"the heads are {case.head_dim} wide, where it measured no faster than "
-                             "cuDNN (`attention_narrow`)", inherent=True, kind='measured'),
+                             "cuDNN (`attention_narrow`)",
+                row='measured: tokamax Triton attention (docs/performance.md)', kind='measured'),
     *(_Need(code, test, detail, inherent=True) for code, test, detail in (
         ('window', lambda case: case.window is None, "the call has a sliding window"),
         ('mask', lambda case: not case.mask, "the call has an arbitrary mask"),
@@ -261,8 +264,6 @@ TRITON_SUPPORTS = (
         ('softcap', lambda case: case.softcap is None, "the call has a logit softcap"),
         ('documents', lambda case: case.documents is None, "the call packs documents"),
         ('key_lengths', lambda case: not case.lengths, "the call ends its keys by lengths"),
-        ('deterministic', lambda case: not deterministic_ops_requested(),
-         "--xla_gpu_deterministic_ops is set"),
     )),
     _ARITHMETIC,
 )
@@ -316,9 +317,9 @@ the reference path."""
 def _attention_preferred(case: AttentionCase) -> str:
     """The kernel the target measured fastest for `case`: splash on a TPU and xla on a CPU; on a GPU
     xla for a query no fused kernel takes the dtype of, else its row's ('attention', cuDNN by
-    default), and the narrow heads' row's for heads at most 64 wide
-    with no window, mask, bias, documents or key lengths, by default tokamax's Triton kernel where
-    the row names cuDNN, which it was measured against, and the row's own where it names flash."""
+    default), and the narrow heads' row's ('attention_narrow') for heads at most 64 wide with no
+    window, mask, bias, documents or key lengths: by default tokamax's Triton kernel, measured faster
+    than cuDNN there on an L4 and an RTX 4080; the A100's and H100's rows name flash."""
     backend = generation.backend()
     if backend != 'gpu':
         return 'tpu' if backend == 'tpu' else 'xla'
@@ -328,7 +329,7 @@ def _attention_preferred(case: AttentionCase) -> str:
     row = measured_kernel('attention', 'cudnn')
     if (case.head_dim <= 64 and case.window is None and not (case.mask or case.bias or case.lengths)
             and case.documents is None):
-        return measured_kernel('attention_narrow', 'flash' if row == 'flash' else 'triton')
+        return measured_kernel('attention_narrow', 'triton')
     return row
 
 
@@ -373,8 +374,10 @@ kernel (`decode_attention.attend`) and the folded xla attention (`folded_attenti
 
 def decodes(case: AttentionCase) -> bool:
     """Whether a call is the decode selector's (`DECODE`): a few query positions of the keys' own heads
-    over key lengths, with no mask, bias, causality, window, documents, sinks or softcap."""
-    return (case.lengths and case.queries <= decode_attention.QUERIES and case.heads == case.kv_heads
+    over key lengths, one the folded attention reads (`decode_geometry.folds`), with no mask, bias,
+    causality, window, documents, sinks or softcap."""
+    return (case.lengths and case.folds and case.queries <= decode_attention.QUERIES
+            and case.heads == case.kv_heads
             and not (case.mask or case.bias or case.causal or case.sinks) and case.window is None
             and case.documents is None and case.softcap is None)
 
