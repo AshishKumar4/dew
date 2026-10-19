@@ -14,8 +14,13 @@ import numpy as np
 import pytest
 from delta_rule_support import NAMES, fla_decay_terms, fla_side, recurrence, rule_math, through
 from jax.core import ShapedArray
-from reference_error import (assert_as_exact_as_the_reference, assert_leaves_as_exact, equations,
-                             float64_terms, widened)
+from reference_error import (
+    assert_as_exact_as_the_reference,
+    assert_leaves_as_exact,
+    equations,
+    float64_terms,
+    widened,
+)
 from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
 
