@@ -173,6 +173,12 @@ def runs_on(build: str, driver: str, sm: tuple[int, int]) -> bool:
     return int(driver.split(".")[0]) >= least and sm >= least_sm
 
 
+def cuda_build(driver: str, sm: tuple[int, int]) -> str | None:
+    """The newest of JAX's CUDA builds that runs on a driver of version
+    `driver` and GPUs whose least SM is `sm`, or None where none does."""
+    return next((name for name, _, _ in CUDA_BUILDS if runs_on(name, driver, sm)), None)
+
+
 def nvidia_gpus() -> tuple[str, tuple[int, int]] | None:
     """The driver version and the least SM of the GPUs nvidia-smi lists, or
     None where none answers (`dew.pool.answered`): no nvidia-smi, no GPU, or
@@ -202,7 +208,7 @@ def cpu_only_refusal(env: Mapping[str, str], gpus: tuple[str, tuple[int, int]] |
         return None
     found = f"This machine has an NVIDIA GPU (driver {driver}, SM {sm[0]}.{sm[1]}), and JAX would use the CPU"
     on_cpu = "To run on the CPU instead, set JAX_PLATFORMS=cpu."
-    build = next((name for name, _, _ in CUDA_BUILDS if runs_on(name, driver, sm)), None)
+    build = cuda_build(driver, sm)
     if build is None:
         needs = ", ".join(f"{name} needs driver {major}+ and SM {least[0]}.{least[1]}+"
                           for name, major, least in CUDA_BUILDS)

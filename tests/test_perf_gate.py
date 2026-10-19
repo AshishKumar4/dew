@@ -81,12 +81,12 @@ def test_external_reference_subprocess_failure_keeps_its_measurement(gate, tmp_p
     args = SimpleNamespace(only=["reference"], claim=True, model="unused", flowers="unused",
                            torch_python="torch", out=tmp_path / "gate.json")
     name = next(row.name for row in gate.BATTERY if row.head_only)
-    sample = gate.measure(ROOT, args, ROOT / "tools", is_head=True)
+    sample = gate.measure(ROOT, Path(sys.executable), args, ROOT / "tools", is_head=True)
     assert sample[name] == {"exit_code": 1, "value": 720.0, "ratio": 0.72,
                             "tolerance": 0.01, "passed": False}
     assert Path(sample[f"evidence {name}"]).is_file()
     assert len(commands) == 2
-    assert gate.measure(ROOT, args, ROOT / "tools", is_head=False) == {}
+    assert gate.measure(ROOT, Path(sys.executable), args, ROOT / "tools", is_head=False) == {}
     assert len(commands) == 2
 
 
@@ -99,7 +99,7 @@ def test_a_head_reads_every_row_of_the_battery_from_the_tool_it_names(gate, tmp_
     standing_in(gate, monkeypatch, passed=True)
     args = SimpleNamespace(only=[], claim=False, model="unused", flowers="unused", torch_python="torch",
                            out=tmp_path / "gate.json")
-    sample = gate.measure(ROOT, args, ROOT / "tools", is_head=True)
+    sample = gate.measure(ROOT, Path(sys.executable), args, ROOT / "tools", is_head=True)
     for row in gate.BATTERY:
         value = sample[row.name]
         assert value["exit_code"] == 0 if row.head_only else gate.measured(value), (row.name, value)
