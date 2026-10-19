@@ -254,10 +254,16 @@ print(counts["/jax/compilation_cache/cache_hits"], counts["/jax/compilation_cach
 """A child that compiles one small program and prints JAX's own count of cache hits and misses."""
 
 
-def test_a_tree_compiles_once_into_its_own_cache_and_its_later_rounds_load_from_it(gate, tmp_path):
+def test_a_tree_compiles_once_into_its_own_cache_and_later_rounds_load_from_it(gate, tmp_path, monkeypatch):
     """Two real children of one tree with its cache: the first compiles and writes the program, though it
     compiles in well under JAX's default one-second threshold, the second loads it; a child of the other
-    tree, with its own cache, compiles again; a child run outside a gate run touches no cache."""
+    tree, with its own cache, compiles again; a child run outside a gate run keeps the caller's settings,
+    here JAX's cache turned off."""
+    for name in ("JAX_COMPILATION_CACHE_DIR", "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
+                 "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("JAX_ENABLE_COMPILATION_CACHE", "false")
+
     def child(cache):
         done = gate._run(ROOT, Path(sys.executable), "", ["-c", CACHED], ROOT / "tools", 600, cache)
         assert done.returncode == 0, done.stderr
@@ -283,6 +289,8 @@ def test_a_gate_keeps_each_trees_compiles_apart_and_judges_compile_rows_on_the_f
     caches = []
 
     def child(command, **kwargs):
+        if command[0] == "nvidia-smi":
+            return subprocess.CompletedProcess(command, 0, "580.82.07, 9.0\n", "")
         if command[0] == "uv":
             (Path(command[-1]) / "bin").mkdir(parents=True)
             return subprocess.CompletedProcess(command, 0, "", "")
