@@ -480,15 +480,17 @@ def _stack_leaves(*trees):
 
 
 def _refuse_unlike(collection: str, trees: Sequence, names: Sequence[str]) -> None:
-    """Refuse layers one scanned run or the stages' like positions read whose
-    `collection` differs in structure, as layers a checkpoint quantizes
-    differently do; the run reads one body for all of them."""
+    """Refuse layers one bank or the pipeline stages' like positions read
+    whose `collection` differs in structure, as layers a checkpoint quantizes
+    differently do: a bank is one array per leaf, and every stage runs stage
+    0's body. Layers held apart run as scanned runs of their own instead
+    (`StackView.layer_structures`)."""
     structures = [jax.tree.structure(tree) for tree in trees]
     unlike = [name for name, structure in zip(names, structures, strict=True) if structure != structures[0]]
     if unlike:
         raise ValueError(f"collection {collection!r} differs between {names[0]} and {', '.join(unlike)}, "
-                         "which one scanned run or pipeline stage reads as like layers; run these layers "
-                         "unscanned on one stage")
+                         "which one bank or pipeline stage reads as like layers; hold these layers "
+                         "unbanked, on one stage")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -531,6 +533,29 @@ class StackView:
         """The stored names of a run's layers, one list per stage."""
         return [[f'layers_{stage * self.per_stage + first + offset}' for offset in range(count)]
                 for stage in range(self.stages)]
+
+    @staticmethod
+    def layer_structures(variables: Mapping[str, Mapping], layers: int) -> tuple[tuple, ...]:
+        """What one scanned body has to share beyond its spec, for each of `layers`
+        stored layers: the runs a collection holds as one bank (`layers_3_7`) that
+        hold it, and the structure of its subtree in every collection that keeps
+        one per layer (`layers_N`), as layers a checkpoint quantizes differently,
+        or adapts in part, differ. A banked run stays the run its store holds
+        (`bank_sites`), each of its layers read as its first, so rows it holds
+        unlike are refused by name where they stack (`StackView.stack`). A
+        collection no layer is held in adds nothing."""
+        banks: list[tuple[str, ...]] = [()] * layers
+        read = list(range(layers))
+        for name in sorted({name for tree in variables.values() for name in tree}):
+            run = group_layers(name)
+            if run is not None and len(run) > 1:
+                for index in range(run.start, min(run.stop, layers)):
+                    banks[index] += (name,)
+                    read[index] = min(read[index], run.start)
+        own = [tuple((collection, jax.tree.structure(tree[f'layers_{index}']))
+                     for collection, tree in sorted(variables.items()) if f'layers_{index}' in tree)
+               for index in range(layers)]
+        return tuple((held, own[first]) for held, first in zip(banks, read, strict=True))
 
     def bank_names(self) -> list[str]:
         """Return every run's stored name, in order. A banked store uses these names as keys."""

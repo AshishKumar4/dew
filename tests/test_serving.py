@@ -113,6 +113,40 @@ def test_a_server_holds_its_weights_at_decoding_storage_and_reloads_into_it():
         assert_same_generation(actual, expected)
 
 
+def test_a_dropped_server_frees_its_weights_without_a_collection():
+    """A server and its task, once their last references go, free their weights, the packed copy
+    the server serves included, with the cyclic collector off: reading which projections the
+    model packs binds it over the weights' shapes, since flax's bound tree is cyclic and, bound
+    over the weights themselves, would keep them alive until a full collection."""
+    import gc
+    from collections import Counter
+
+    def live() -> Counter:
+        return Counter(tuple(array.shape) for array in jax.live_arrays())
+
+    def serve() -> Counter:
+        # Drawn under jit, as a run draws them: an eager `init` leaves its own cyclic scope
+        # holding what it drew, which is flax's to drop, not the server's.
+        model = decoder().clone(max_seq_len=128)
+        params = jax.jit(model.init)(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+        bound = TextGeneration(model, params, RunProcessor(Digits()),
+                               sampling=Sampling(temperature=0, eos_token_ids=None))
+        server = Server.from_task(bound, slots=2, capacity=128)
+        server(["12", "34"], 3, key=0)
+        return Counter(tuple(leaf.shape) for leaf in jax.tree.leaves(bound.variables))
+
+    gc.collect()
+    gc.disable()
+    try:
+        before = live()
+        weights = serve()
+        after = live()
+    finally:
+        gc.enable()
+    kept = {shape: after[shape] - before[shape] for shape in weights if after[shape] > before[shape]}
+    assert not kept, kept
+
+
 def _host_loaded(dtype="float32"):
     from pathlib import Path
 
