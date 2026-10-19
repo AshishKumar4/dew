@@ -18,9 +18,9 @@ import tokamax
 from process_support import REPO_ROOT, run_pool
 from reference_error import equations
 
+from dew.nn.activations import gated_product
 from dew.nn.attention import rms_normalized, stream_rms_normalized
 from dew.nn.kernels import generation, norm_swiglu, tuning
-from dew.nn.moe import gated_product
 
 READ_ONLY = "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ"
 """The flag `gpu-run -n 0.5` adds beside other work on a GPU, under which no process measures."""

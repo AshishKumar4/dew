@@ -15,10 +15,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from reference_error import assert_leaves_as_exact
 
-from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk
-from dew.nn.mlp import GatedMLP
+from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock
+from dew.nn.mlp import GatedMLP, gaussian_topk
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gemma3n"
 HIDDEN, COPIES = 32, 4
@@ -348,50 +348,85 @@ def test_the_sparse_mlp_trains_on_padded_rows_as_the_reference_does():
                            reductions=hidden.shape[0] * hidden.shape[1])
 
 
-@pytest.mark.parametrize("sparsity", [0.9, 0.95, 0.99])
-def test_gaussian_topk_is_as_exact_as_the_references(sparsity):
-    """Gemma 3n's sparse gate over 256 rows of 2048 normal activations: Dew's
-    fp32 is within tests/reference_error.py's rule of the reference's fp32
-    (Gemma3nTextMLP._gaussian_topk), both from the reference in float64, which
-    keeps the reference's fp32 cutoff multiplier. Dew's multiplier from jax's
-    fp32 erfinv, two ulps off at 0.95, was 3.77 and 6.33 times the reference's
-    distance at 0.95 and 0.9, and 1.10 and 1.15 once formed as the reference's."""
+def sparse_mlps(sparsity: float, width: int, rows: int, dtype, hidden: int = HIDDEN):
+    """The reference's public `Gemma3nTextMLP` and Dew's `GatedMLP` at `sparsity` over the
+    same random weights, `width` gate activations a row of `hidden` features, and `rows`
+    random inputs."""
     import torch
     from transformers import Gemma3nTextConfig
     from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextMLP
 
-    rows = np.random.default_rng(0).standard_normal((256, 2048)).astype(np.float32)
-    config = Gemma3nTextConfig(hidden_size=HIDDEN, intermediate_size=rows.shape[1], num_hidden_layers=1,
+    draws = np.random.default_rng(0)
+    names = ("gate_proj", "up_proj", "down_proj")
+    shapes = {"gate_proj": (width, hidden), "up_proj": (width, hidden), "down_proj": (hidden, width)}
+    weights = {name: (draws.standard_normal(shape) / np.sqrt(shape[1])).astype(np.float32)
+               for name, shape in shapes.items()}
+    inputs = draws.standard_normal((rows, hidden)).astype(np.float32)
+    config = Gemma3nTextConfig(hidden_size=hidden, intermediate_size=width, num_hidden_layers=1,
+                               num_attention_heads=1, num_key_value_heads=1, head_dim=max(hidden, 2),
                                activation_sparsity_pattern=[sparsity])
-    mlp = Gemma3nTextMLP(config, layer_idx=0)
 
-    def reference(dtype):
-        return mlp._gaussian_topk(torch.tensor(rows, dtype=dtype)).numpy()
+    def reference(torch_dtype, cotangent=None):
+        mlp = Gemma3nTextMLP(config, layer_idx=0).to(torch_dtype)
+        with torch.no_grad():
+            for name in names:
+                getattr(mlp, name).weight.copy_(torch.from_numpy(weights[name]))
+        x = torch.tensor(inputs).to(torch_dtype).requires_grad_()
+        output = mlp(x)
+        if cotangent is None:
+            return {"output": output.detach().float().numpy()}
+        (output * torch.tensor(cotangent, dtype=torch_dtype)).sum().backward()
+        return {"output": output.detach().numpy(), "input": x.grad.numpy(),
+                **{name: getattr(mlp, name).weight.grad.numpy().T for name in names}}
 
-    dew = jax.jit(lambda x: gaussian_topk(x, sparsity))(jnp.asarray(rows))
-    assert_as_exact_as_the_reference(np.asarray(dew), reference(torch.float32), reference(torch.float64),
-                                     f"the gate at sparsity {sparsity}")
+    model = GatedMLP(hidden_features=width, out_features=hidden, activation="geglu",
+                     activation_sparsity=sparsity, dtype=dtype)
+    params = {name: {"kernel": jnp.asarray(weights[name].T, dtype)} for name in names}
+    return reference, model, params, jnp.asarray(inputs, dtype)
+
+
+@pytest.mark.parametrize("sparsity", [0.9, 0.95, 0.99])
+def test_the_sparse_mlp_is_as_exact_as_the_reference_at_each_sparsity(sparsity):
+    """Gemma 3n's sparse MLP through the reference's public forward and backward, 256 rows of
+    2048 gate activations, at each sparsity a released pattern uses or bounds: Dew's fp32
+    output and gradients are within tests/reference_error.py's rule of the reference's fp32,
+    both from the reference in float64. The gate's cutoff multiplier is the reference's (its
+    fp32 icdf); jax's own fp32 erfinv lands two ulps from it at 0.95. Four features a row keep
+    the projections' own rounding below the cutoff's, which a wide row hides: that multiplier
+    put the down projection's gradient 3.4 and 2.4 times the reference's distance at 0.9 and
+    0.95, and the right one 1.0 and 1.1."""
+    import torch
+
+    reference, model, params, hidden = sparse_mlps(sparsity, 2048, 256, jnp.float32, hidden=4)
+    cotangent = np.random.default_rng(1).standard_normal((256, 4)).astype(np.float32)
+
+    def loss(params, x):
+        output = model.apply({"params": params}, x)
+        return jnp.sum(output * cotangent), output
+
+    (_, output), (kernels, inputs) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(params, hidden)
+    dew = {"output": output, "input": inputs, **{name: kernel["kernel"] for name, kernel in kernels.items()}}
+    ours, theirs, truth = (jax.tree.map(np.asarray, dew), reference(torch.float32, cotangent),
+                           reference(torch.float64, cotangent))
+    # The output and the input's gradient sum over the 2048 activations; a kernel's gradient over the rows.
+    for names, reductions in ((("output", "input"), 2048), (("gate_proj", "up_proj", "down_proj"), 256)):
+        assert_leaves_as_exact(*({name: tree[name] for name in names} for tree in (ours, theirs, truth)),
+                               reductions=reductions)
 
 
 @pytest.mark.parametrize("sparsity", [1e-9, 1 - 1e-9])
-def test_gaussian_topk_takes_the_references_cutoff_at_the_ends_of_its_domain(sparsity):
-    """A sparsity whose fp32 argument 2p - 1 rounds to -1 or 1 takes the
-    reference's infinite cutoff multiplier (torch's icdf there): every value
-    kept as infinity below, and none kept above, bit for bit as the
-    reference's gate in fp32 and bf16, which both take the fp32 argument. A
-    float64 model forms its own float64 argument, which these do not end."""
+def test_the_sparse_mlp_takes_the_references_cutoff_at_the_ends_of_its_domain(sparsity):
+    """A sparsity whose fp32 argument 2p - 1 rounds to -1 or 1 takes the reference's infinite
+    cutoff multiplier (torch's icdf there): above, the gate keeps nothing and the MLP outputs
+    zeros; below, it keeps every activation as infinity, which the down projection sums to
+    NaN. Dew's MLP outputs the reference's, bit for bit, in fp32 and bf16, which both take the
+    fp32 argument. A float64 model forms its own float64 argument, which these do not end."""
     import torch
-    from transformers import Gemma3nTextConfig
-    from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextMLP
 
-    rows = np.random.default_rng(0).standard_normal((4, 64)).astype(np.float32)
-    config = Gemma3nTextConfig(hidden_size=HIDDEN, intermediate_size=rows.shape[1], num_hidden_layers=1,
-                               activation_sparsity_pattern=[sparsity])
-    mlp = Gemma3nTextMLP(config, layer_idx=0)
     for torch_dtype, dtype in ((torch.float32, jnp.float32), (torch.bfloat16, jnp.bfloat16)):
-        dew = jax.jit(lambda x: gaussian_topk(x, sparsity))(jnp.asarray(rows, dtype))
-        theirs = mlp._gaussian_topk(torch.tensor(rows).to(torch_dtype)).float().numpy()
-        np.testing.assert_array_equal(np.asarray(dew, np.float32), theirs)
+        reference, model, params, hidden = sparse_mlps(sparsity, 64, 4, dtype)
+        dew = jax.jit(lambda params, x, model=model: model.apply({"params": params}, x))(params, hidden)
+        np.testing.assert_array_equal(np.asarray(dew, np.float32), reference(torch_dtype)["output"])
 
 
 @pytest.mark.parametrize("sparsity", [0.5, 0.95])
