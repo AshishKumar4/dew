@@ -21,9 +21,11 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import LayoutRefused
 from dew.objectives.lm import LMObjective
+from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers
 from dew.training import Trainer
 from dew.training.distributed import Layout, MeshSpec, microbatch
+from dew.training.memory import climb_to, recompute_more, rung_record
 from dew.training.planning import Timer, planned, splits
 
 ROWS, SEQ = 32, 16
@@ -60,6 +62,29 @@ def test_the_plan_takes_the_least_recomputation_then_the_fewest_microbatches(fit
     split = planned([1, 2, 4, 8], first, fits, climb)
     assert (None if split is None else (rung[0], split)) == plan
     assert compiled == asked
+
+
+def test_the_fit_ladder_tiles_the_head_fused_then_unfused_before_it_recomputes_more():
+    """At each remat rung the ladder keeps the whole logits, then tiles the head with its gradient in the
+    forward, the faster tiled head, then in its backward, whose tile holds less than the fused chunk's
+    whole vocabulary, before it recomputes more with the whole logits back; a resumed run climbs to a
+    recorded unfused rung alike."""
+    def objective():
+        model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                                  max_seq_len=SEQ)
+        return LMObjective(model, seq_len=SEQ)
+
+    climbing = objective()
+    rungs = [rung_record(climbing, xla_defaults=False)]
+    while len(rungs) < 5 and recompute_more(climbing):
+        rungs.append(rung_record(climbing, xla_defaults=False))
+    tile = list(chunked_tile())
+    assert [(rung["head_tile"], rung["head_fused"], rung["remat"]) for rung in rungs] == [
+        (None, False, None), (tile, True, None), (tile, False, None), (None, False, "minimal"),
+        (tile, True, "minimal")]
+    resumed = objective()
+    climb_to(resumed, rungs[2])
+    assert rung_record(resumed, xla_defaults=False) == rungs[2]
 
 
 def test_a_microbatch_is_every_splitth_row():

@@ -134,6 +134,7 @@ from dew.training.interval import Interval, Taken, held
 from dew.training.memory import (
     climb_to,
     device_tokens,
+    head_fused_of,
     head_tile_of,
     memory_record,
     peak_memory_gib,
@@ -531,10 +532,11 @@ class Trainer(Generic[Loss, Effects]):
         self._boxed: dict[tuple[str, ...], LogicalAxes] | None = None
         self._resumed_rung: JSON = None
         # The rung each newly met shape starts from, as the first compile found
-        # the objective: its modules, head tile, XLA option choice and record
+        # the objective: its modules, head tile and fusion, XLA option choice and record
         # (`_at_base_rung`); then the rung each shape compiled at, by layout,
         # and the rungs a resumed checkpoint recorded for its shapes.
-        self._base_rung: tuple[tuple[nn.Module, ...], tuple[int, int] | None, bool, dict[str, JSON]] | None
+        self._base_rung: tuple[tuple[nn.Module, ...], tuple[int, int] | None, bool, bool,
+                               dict[str, JSON]] | None
         self._base_rung = None
         self._shape_rungs: dict[str, JSON] = {}
         self._resumed_shapes: dict[str, JSON] = {}
@@ -796,7 +798,7 @@ class Trainer(Generic[Loss, Effects]):
         and under `shapes` the rung each shape compiled at, by its layout
         (`batch_layout`). The split is the state's (`window_size`), and its
         link figures by placement (`link_figures`), a resume's own there."""
-        base = self._rung() if self._base_rung is None else self._base_rung[3]
+        base = self._rung() if self._base_rung is None else self._base_rung[4]
         links = link_figures(self._bandwidths)
         return {**base, 'shapes': dict(self._shape_rungs), **({'links': links} if links else {})}
 
@@ -827,11 +829,12 @@ class Trainer(Generic[Loss, Effects]):
         compiles each shape as the run it continues did."""
         if self._base_rung is None:
             self._base_rung = (tuple(entry.module for entry in self.objective.program_key()),
-                               head_tile_of(self.objective), self._xla_defaults, self._rung())
+                               head_tile_of(self.objective), head_fused_of(self.objective),
+                               self._xla_defaults, self._rung())
         else:
-            modules, tile, defaults, _ = self._base_rung
+            modules, tile, fused, defaults, _ = self._base_rung
             self.objective.substitute(list(modules))
-            self.objective.restore_head_tile(tile)
+            self.objective.restore_head(tile, fused=fused)
             self._xla_defaults = defaults
         recorded = self._resumed_shapes.get(batch_layout(batch))
         if recorded is None:
@@ -1200,7 +1203,7 @@ class Trainer(Generic[Loss, Effects]):
         # Every process runs the plan process zero timed fastest.
         planned = plans[broadcast_from_process_zero(seconds.index(min(seconds)) if seconds else 0)]
         self.objective.substitute(list(planned.modules))
-        self.objective.restore_head_tile(planned.tile)
+        self.objective.restore_head(planned.tile, fused=planned.fused)
         self._xla_defaults = planned.xla_defaults
         chosen = {**self._rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)
