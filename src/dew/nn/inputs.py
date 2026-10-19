@@ -557,7 +557,7 @@ def with_validity(fields: Mapping[str, jax.Array | np.ndarray | Coordinates],
     validity field, else in the validity field."""
     laid = fields.get(COORDINATES_FIELD)
     if isinstance(laid, Coordinates):
-        return {**fields, COORDINATES_FIELD: laid.replace(valid=valid)}
+        return {**fields, COORDINATES_FIELD: replace(laid, valid=valid)}
     rest = {name: value for name, value in fields.items() if name != VALIDITY_FIELD}
     return rest if valid is None else {**rest, VALIDITY_FIELD: valid}
 
@@ -635,7 +635,8 @@ def _response_layout(value: Coordinates, valid: jax.Array, width: int) -> Coordi
     def continued(field, rule):
         return None if field is None else rule(field, valid, width)
 
-    return value.replace(
+    return replace(
+        value,
         valid=continued(value.valid, _response_validity),
         positions=continued(value.positions, _response_positions),
         segments=continued(value.segments, _response_document),
@@ -647,7 +648,7 @@ def _joined(prompt, response):
     prompt's padding, so a `Coordinates`' real tokens no longer all come first."""
     joined = jax.tree.map(lambda first, then: jnp.concatenate([first, then.astype(first.dtype)], axis=1),
                           prompt, response)
-    return joined.replace(right_padded=False) if isinstance(joined, Coordinates) else joined
+    return replace(joined, right_padded=False) if isinstance(joined, Coordinates) else joined
 
 
 RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
@@ -663,7 +664,7 @@ RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
 """How each token field Dew's processors write continues into a response."""
 
 
-def next_position(fields: Mapping[str, jax.Array | Coordinates], valid: jax.Array) -> jax.Array | None:
+def next_position(fields: Mapping[str, jax.Array], valid: jax.Array) -> jax.Array | None:
     """Each row's logical position after its last real token `[B]`, its
     response's first by `RESPONSE_FIELDS`: one past the largest coordinate a
     real token holds on any axis of its `rotary_positions`, else one past its
