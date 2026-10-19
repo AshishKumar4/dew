@@ -712,16 +712,25 @@ def test_a_ramped_stream_reads_the_records_the_flat_stream_reads():
         len(step) for step in ramp)]
 
 
-def test_a_ramped_stream_resumes_on_the_records_it_had_not_read():
+def batch_shuffled_data(records: int, batch: int) -> Loader:
+    """A dataset whose records say which they are, batched in order and its batches shuffled after
+    the batch, so a record count inside a batch names rows of a batch the order moved."""
+    return compile(Pipeline(Memory(Indexed(1, records))).repeat().batch(batch).shuffle(7, window=3),
+                   seed=0, loading=READ)
+
+
+@pytest.mark.parametrize("data", [indexed_data, batch_shuffled_data])
+def test_a_ramped_stream_resumes_on_the_records_it_had_not_read(data):
     """The rolling buffer holds records the run has not trained on, so they
-    are not in the position: a resume reads them, and reads them once."""
+    are not in the position: a resume reads them, and reads them once, in
+    the batches the order put them in, a shuffle after the batch's too."""
     schedule = Ramp(start=2, increment=1, samples=6)
-    stream = ramped(indexed_data(64, 4), schedule).train(DataPartition())
+    stream = ramped(data(64, 4), schedule).train(DataPartition())
     taken(stream, 4)
     state = stream.get_state()
     rest = taken(stream, 6)
 
-    resumed = ramped(indexed_data(64, 4), schedule).train(DataPartition())
+    resumed = ramped(data(64, 4), schedule).train(DataPartition())
     resumed.set_state(state)
 
     assert json.loads(state)["dew_global_position"]["records"] == 11
@@ -743,23 +752,25 @@ def test_a_ramped_stream_put_back_mid_read_forgets_its_buffer():
     assert taken(stream, 6) == rest
 
 
-def test_a_ramped_steps_position_counts_every_process():
+@pytest.mark.parametrize("data", [indexed_data, batch_shuffled_data])
+def test_a_ramped_steps_position_counts_every_process(data):
     """Each process cuts its own share of a stage's batch, and the position
-    is the records all of them handed over: two processes four steps into
-    a ramp of two, then four, have read eight records, and the pool's steps
-    are the single process's steps with the shares interleaved."""
+    is the records all of them handed over: two processes three and four
+    steps into a ramp of two, then four, have read six and eight records,
+    and the pool's steps are the single process's steps with the shares
+    interleaved, resumed inside a batch or after one."""
     schedule = Ramp(start=2, increment=2, samples=8)
 
-    build = ramped(indexed_data(64, 4), schedule).train
+    build = ramped(data(64, 4), schedule).train
 
     whole = pooled(build, 1, 6)
-    stopped = build(DataPartition(1, 2))
-    taken(stopped, 4)
-
     assert [len(step) for step in whole] == [2, 2, 2, 2, 4, 4]
-    assert json.loads(stopped.get_state())["dew_global_position"]["records"] == 8
     assert pooled(build, 2, 6) == whole
-    assert pooled(build, 2, 2, stopped.get_state()) == whole[4:]
+    for steps in (3, 4):
+        stopped = build(DataPartition(1, 2))
+        taken(stopped, steps)
+        assert json.loads(stopped.get_state())["dew_global_position"]["records"] == 2 * steps
+        assert pooled(build, 2, 6 - steps, stopped.get_state()) == whole[steps:]
 
 
 def test_a_ramp_reads_through_a_captioned_datasets_tokenized_stream():
