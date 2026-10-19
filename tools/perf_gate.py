@@ -37,6 +37,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -127,6 +128,9 @@ class Row:
     """Compare the head with an external reference, not with the base tree."""
     floor: float = FLOOR
     """The smallest band the row is gated by (`FLOOR`, a compile's `COMPILE_FLOOR`)."""
+    first_round: bool = False
+    """Measured in the first round alone: a compile, cold there, which later rounds load from the tree's
+    cache."""
 
 
 @dataclass(frozen=True)
@@ -181,7 +185,8 @@ def _qwen35_comparison(out: Path) -> tuple:
 PROBES = [
     # Each step's time, and the time its program took to compile in that process (`COMPILE_FLOOR`).
     *[Probe((Row(name, "ms", "benchmark_step.py"),
-             Row(f"compile {name.removeprefix('step ')}", "s", "benchmark_step.py", floor=COMPILE_FLOOR)),
+             Row(f"compile {name.removeprefix('step ')}", "s", "benchmark_step.py", floor=COMPILE_FLOOR,
+                 first_round=True)),
             lambda _, out, case=case: ["--cases", json.dumps([case]), "--warmup", "10", "--steps", "30",
                                        "--json-out", str(out)],
             lambda _, out: _stepped(out))
@@ -231,11 +236,13 @@ def _tools(tree: Path, tool: str, newer: Path) -> Path:
     return newer
 
 
-def _run(tree: Path, python: Path, tool: str, argv: list[str], newer: Path,
-         timeout: float) -> subprocess.CompletedProcess:
+def _run(tree: Path, python: Path, tool: str, argv: list[str], newer: Path, timeout: float,
+         cache: Path) -> subprocess.CompletedProcess:
     tools = _tools(tree, tool or "benchmark_step.py", newer)
-    # Every round compiles from scratch: a persistent cache's hit would read as a compile of nothing.
-    env = {**os.environ, "PYTHONPATH": f"{tree / 'src'}:{tools}", "JAX_ENABLE_COMPILATION_CACHE": "false"}
+    # The tree's own compile cache, empty at the gate's start: its first round compiles cold (the compile
+    # rows), its later rounds load what that round compiled, and neither tree loads the other's programs.
+    env = {**os.environ, "PYTHONPATH": f"{tree / 'src'}:{tools}", "JAX_ENABLE_COMPILATION_CACHE": "true",
+           "JAX_COMPILATION_CACHE_DIR": str(cache)}
     command = [str(python), *([str(tools / tool)] if tool else []), *argv]
     return subprocess.run(command, cwd=tree, env=env, capture_output=True, text=True, timeout=timeout)
 
@@ -247,7 +254,8 @@ def hardware_status(row: Row, device_kind: str) -> str | None:
     return None
 
 
-def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_head: bool = True) -> dict:
+def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_head: bool = True,
+            cache: Path | None = None, first: bool = True) -> dict:
     """One sample of every row in `tree`, run by `python`: a number, or why the row could not run there."""
     sample = {}
 
@@ -275,12 +283,15 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
                     sample.update({name: reason for name, reason in unsupported.items()
                                    if reason is not None})
                     continue
-                done = _run(tree, python, probe.tool, probe.arguments(args, out), newer, 3600)
+                done = _run(tree, python, probe.tool, probe.arguments(args, out), newer, 3600,
+                            cache or Path(tempfile.gettempdir()) / "perf-gate-cache")
                 if done.returncode != 0 and not external:
                     raise RuntimeError(f"{probe.tool} exited {done.returncode}: {done.stderr[-1500:]}")
                 values = probe.read(done.stdout, out)
+                # A later round's compile is a load from the tree's cache, not a compile: not a sample.
                 sample.update({row.name: {**value, "exit_code": done.returncode} if external
-                               else float(value) for row, value in zip(probe.rows, values, strict=True)})
+                               else float(value) for row, value in zip(probe.rows, values, strict=True)
+                               if first or not row.first_round})
             except Exception as error:  # a row that cannot run in this tree is reported, not gated
                 failure = ({"error": str(error)[-400:],
                             "exit_code": None if done is None else done.returncode}
@@ -314,15 +325,25 @@ def run(args: argparse.Namespace) -> int:
             or (claiming and row.hardware)]
     results = {"base": base, "head": head, "rounds": args.rounds, "rows": [row.__dict__ for row in rows],
                "samples": {base: [], head: []}, "claim": claiming,
-               "environments": {name: str(python.parent.parent) for name, python in pythons.items()}}
-    for round_ in range(args.rounds):
-        order = [(base, base_path), (head, head_path)]
-        for name, path in order if round_ % 2 == 0 else order[::-1]:
-            results["samples"][name].append(
-                dict.fromkeys((row.name for row in rows if not row.head_only or name == head), unbuilt[name])
-                if name in unbuilt else measure(path, pythons[name], args, head_path / "tools", name == head))
+               "environments": {name: str(python.parent.parent) for name, python in pythons.items()},
+               "seconds": {"first round": 0.0, "later rounds": 0.0}}
+    # Each tree's compile cache, for this run alone: removed at its end, so no run loads another's programs.
+    caching = tempfile.TemporaryDirectory(prefix="perf-gate-cache-", dir=Path(args.out).resolve().parent)
+    with caching as caches:
+        for round_ in range(args.rounds):
+            order = [(base, base_path), (head, head_path)]
+            began = time.perf_counter()
+            for name, path in order if round_ % 2 == 0 else order[::-1]:
+                kept = (row.name for row in rows if not row.head_only or name == head)
+                results["samples"][name].append(
+                    dict.fromkeys(kept, unbuilt[name]) if name in unbuilt
+                    else measure(path, pythons[name], args, head_path / "tools", name == head,
+                                 Path(caches) / name, first=round_ == 0))
+                write_atomically(args.out, json.dumps(results, indent=2))
+                print(f"round {round_ + 1}: {name} measured", flush=True)
+            spent = time.perf_counter() - began
+            results["seconds"]["first round" if round_ == 0 else "later rounds"] += spent
             write_atomically(args.out, json.dumps(results, indent=2))
-            print(f"round {round_ + 1}: {name} measured", flush=True)
     return report(argparse.Namespace(results=args.out, table=None, claim=True)) if claiming else 0
 
 
@@ -418,8 +439,9 @@ def report(args: argparse.Namespace) -> int:
                       if row.hardware and row.name not in included)
     for spec in results["rows"]:
         row = Row(**spec)
-        state, numbers = verdict(row, [s.get(row.name) for s in samples[base]],
-                                 [s.get(row.name) for s in samples[head]])
+        taken = 1 if row.first_round else rounds
+        state, numbers = verdict(row, [s.get(row.name) for s in samples[base][:taken]],
+                                 [s.get(row.name) for s in samples[head][:taken]])
         if (state in ("broken", "incomplete", "partial", "failed") or (state == "regressed" and row.gated)
                 or (claiming and row.hardware and state in
                     ("not measured on this hardware", "not compared"))):
@@ -438,6 +460,11 @@ def report(args: argparse.Namespace) -> int:
                      f"{numbers['ratio']:.3f}x reference" if "ratio" in numbers else "-",
                      f"{numbers['band']:.1%}" if "band" in numbers else "-"]
         lines.append(f"| {row.name} | {row.unit} | " + " | ".join(cells) + f" | {state} |")
+    if "seconds" in results:
+        # The two budgets apart: the first round's cold compiles, the later rounds' timing on cached programs.
+        lines.append("")
+        lines.append("Rounds: " + ", ".join(f"{part} {spent:.0f} s"
+                                            for part, spent in results["seconds"].items()))
     table = "\n".join(lines) + "\n"
     print(table)
     if args.table:

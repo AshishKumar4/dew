@@ -241,11 +241,44 @@ def test_a_head_that_grows_its_compile_by_more_than_a_quarter_regresses(gate):
     assert gate.verdict(step_row, [10.0, 10.0, 10.01], [10.5, 10.5, 10.51])[0] == "regressed"
 
 
-def test_every_row_compiles_from_scratch(gate, monkeypatch):
-    """No round reads another's compile from JAX's persistent cache, so a compile row times a compile."""
-    commands = []
-    monkeypatch.setattr(gate.subprocess, "run",
-                        lambda command, **kwargs: commands.append(kwargs["env"]) or
-                        subprocess.CompletedProcess(command, 0, "", ""))
-    gate._run(ROOT, Path(sys.executable), "benchmark_step.py", [], ROOT / "tools", 60)
-    assert commands[0]["JAX_ENABLE_COMPILATION_CACHE"] == "false"
+def test_each_tree_compiles_cold_once_and_its_later_rounds_load_its_own_cache(gate, tmp_path, monkeypatch):
+    """Each tree's probes keep their programs in a cache of their own, empty at the run's start, so the first
+    round's compile rows time cold compiles and the later rounds load (their compiles are not samples); the
+    compile rows are judged on the first round alone, the step rows on every round, and the run records
+    the first round's seconds and the later rounds' apart."""
+    from types import SimpleNamespace
+
+    standing_in(gate, monkeypatch, passed=True)
+    measured_row = gate.subprocess.run
+    caches = []
+
+    def child(command, **kwargs):
+        if "env" in kwargs and "JAX_COMPILATION_CACHE_DIR" in kwargs["env"]:
+            caches.append((Path(kwargs["cwd"]).name, kwargs["env"]["JAX_COMPILATION_CACHE_DIR"],
+                           kwargs["env"]["JAX_ENABLE_COMPILATION_CACHE"]))
+        return measured_row(command, **kwargs)
+
+    monkeypatch.setattr(gate.subprocess, "run", child)
+    monkeypatch.setattr(gate, "machine_lock", lambda: "cpu")
+    monkeypatch.setattr(gate, "environment", lambda tree, lock, cache: Path(sys.executable))
+    trees = {name: tmp_path / name for name in ("main", "head")}
+    for tree in trees.values():
+        tree.mkdir()
+    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=3,
+                           only=["lm-dense 4x1024"], claim=False, model="unused", flowers="unused",
+                           torch_python="", out=str(tmp_path / "gate.json"), environments="")
+    assert gate.run(args) == 0
+    by_tree = {tree: {cache for name, cache, _ in caches if name == tree} for tree in trees}
+    assert all(len(found) == 1 for found in by_tree.values()) and by_tree["main"] != by_tree["head"]
+    assert {enabled for _, _, enabled in caches} == {"true"}
+    assert not any(Path(cache).exists() for found in by_tree.values() for cache in found)
+    results = json.loads((tmp_path / "gate.json").read_text())
+    for tree in trees:
+        compiles = ["compile lm-dense 4x1024" in sample for sample in results["samples"][tree]]
+        assert compiles == [True, False, False], (tree, compiles)
+    assert set(results["seconds"]) == {"first round", "later rounds"}
+    state, _ = gate.verdict(next(row for row in gate.BATTERY if row.name == "compile lm-dense 4x1024"),
+                            [results["samples"]["main"][0]["compile lm-dense 4x1024"]],
+                            [results["samples"]["head"][0]["compile lm-dense 4x1024"]])
+    assert state == "level"
+    assert gate.report(SimpleNamespace(results=tmp_path / "gate.json", table=None, claim=False)) == 0
