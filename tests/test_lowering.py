@@ -214,8 +214,14 @@ def _mamba2_lowered(generation: str):
 def test_a_mamba2_layer_lowers_for_the_gpu_with_the_ssd_scan_its_generation_chooses(generation):
     """A Mamba-2 layer, its launches settled as the trainer settles them, lowers to the short conv's
     kernels and, where the row names the port for the scan, mamba_ssm's fourteen ported kernels; where
-    it does not, to none of them."""
+    it does not, to none of them. Its unweighted norm takes the fused RMSNorm the row names where this
+    jax composes the kernel's linear tangent (`generation.linear_tangents_compose`)."""
+    from dew.nn.kernels.generation import linear_tangents_compose
+
     expected = SHORT_CONV.union(*(FAMILIES[key][1] for key in chosen(generation, "mamba2")))
+    if linear_tangents_compose():
+        expected |= set().union(*(FAMILIES[key][1] for key in chosen(generation, "step")
+                                  if key[0] == "rms_norm"))
     assert set(triton_kernels(_mamba2_lowered(generation))) == expected
 
 
