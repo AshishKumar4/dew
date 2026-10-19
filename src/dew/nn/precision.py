@@ -85,13 +85,22 @@ def float32_products[P: jax.lax.PrecisionLike](dtype: Dtype | None, precision: P
     return jax.lax.Precision.HIGHEST
 
 
+def products_dtype(*operands) -> jnp.dtype | None:
+    """The dtype `operands` multiply in, by jax's implicit promotion; None where an 8-bit float
+    takes part, which jax promotes with nothing and whose product has no precision to resolve."""
+    dtypes = [jnp.dtype(operand.dtype) for operand in operands]
+    if any(jnp.issubdtype(dtype, jnp.floating) and jnp.finfo(dtype).bits < 16 for dtype in dtypes):
+        return None
+    return jnp.result_type(*dtypes)
+
+
 def float32_dot_general(lhs, rhs, dimension_numbers, precision: jax.lax.PrecisionLike = None,
                         preferred_element_type: DTypeLike | None = None, **kwargs) -> jax.Array:
     """`jax.lax.dot_general` at the precision its operands' own dtype takes (`float32_products`):
     the product a flax layer forms (`nn.Dense(dot_general=...)`), resolved where flax has
     promoted its operands, so a layer of any dtype, unset included, multiplies as it computes."""
     return jax.lax.dot_general(lhs, rhs, dimension_numbers,
-                               precision=float32_products(jnp.result_type(lhs, rhs), precision),
+                               precision=float32_products(products_dtype(lhs, rhs), precision),
                                preferred_element_type=preferred_element_type, **kwargs)
 
 
@@ -100,12 +109,12 @@ def float32_einsum(subscripts: str, *operands, precision: jax.lax.PrecisionLike 
     """`jnp.einsum` at the precision its operands' own dtype takes (`float32_products`), as
     `float32_dot_general` is a layer's."""
     return jnp.einsum(subscripts, *operands,
-                      precision=float32_products(jnp.result_type(*operands), precision), **kwargs)
+                      precision=float32_products(products_dtype(*operands), precision), **kwargs)
 
 
 def float32_matmul(lhs, rhs) -> jax.Array:
     """`lhs @ rhs` at the precision its operands' own dtype takes (`float32_products`)."""
-    return jnp.matmul(lhs, rhs, precision=float32_products(jnp.result_type(lhs, rhs)))
+    return jnp.matmul(lhs, rhs, precision=float32_products(products_dtype(lhs, rhs)))
 
 
 def float32_conv_general_dilated(lhs, rhs, *args, precision: jax.lax.PrecisionLike = None,
@@ -114,7 +123,7 @@ def float32_conv_general_dilated(lhs, rhs, *args, precision: jax.lax.PrecisionLi
     `float32_dot_general` is a product's: a flax convolution's
     (`nn.Conv(conv_general_dilated=...)`)."""
     return jax.lax.conv_general_dilated(
-        lhs, rhs, *args, precision=float32_products(jnp.result_type(lhs, rhs), precision), **kwargs)
+        lhs, rhs, *args, precision=float32_products(products_dtype(lhs, rhs), precision), **kwargs)
 
 
 def configurable_precision(precision: jax.lax.PrecisionLike) -> bool:

@@ -22,7 +22,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.interop.weights import ParamTree, placed
-from dew.nn.precision import float32_dot_general, float32_products
+from dew.nn.precision import float32_dot_general, float32_products, products_dtype
 from dew.registry import from_record
 
 from .activations import activation
@@ -271,7 +271,7 @@ def _relative_logits(query, key, positional, precision: PrecisionLike = None):
     batch, blocks, chunk, heads, dim = query.shape
     context = key.shape[2]
     q = query.transpose(0, 3, 1, 2, 4)
-    products = float32_products(jnp.result_type(q, key, positional), precision)
+    products = float32_products(products_dtype(q, key, positional), precision)
     content = jnp.matmul(q, key.transpose(0, 3, 1, 4, 2), precision=products)
     positions = positional.reshape(-1, heads, dim).transpose(1, 2, 0)
     relative = jnp.matmul(q.reshape(batch, heads, blocks * chunk, dim), positions, precision=products)

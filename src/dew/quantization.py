@@ -90,7 +90,6 @@ UNQUANTIZED = {
     "dew.nn.quantizers.nearest_codewords":
         "a vector quantizer's codeword distances, whose argmax a rounded product reorders",
     "dew.nn.kv_cache.rotated": "the rotation a quantized cache applies before it rounds keys and values",
-    "dew.nn.blocks.torch_bicubic_resize": "an image or a position table resampled as torch's bicubic does",
     "dew.lora._updated": "an adapter's factor product merged into the kernel it updates, a weight and not an "
                          "activation",
 }
@@ -1134,7 +1133,9 @@ def _providers() -> tuple[type, type]:
             return _honoured(out, preferred_element_type, None if kept is not None else out_sharding)
 
         def einsum(self, einsum_str, *operands, **kwargs):
-            if not _real(*(operand.dtype for operand in operands)):
+            # Qwix 0.1.8 quantizes a two-operand einsum alone and raises on any other
+            # (qwix/_src/providers/qt.py:119-121), which runs here as the unwrapped model runs it.
+            if len(operands) != 2 or not _real(*(operand.dtype for operand in operands)):
                 return jnp.einsum(einsum_str, *operands, **kwargs)
             if not self._matched("einsum"):
                 return super().einsum(einsum_str, *operands, **kwargs)
