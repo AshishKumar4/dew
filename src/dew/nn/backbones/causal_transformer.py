@@ -391,8 +391,9 @@ class CausalTransformer(nn.Module):
     scan_decode: bool = True
     """Whether a decode step scans the stack whatever `scan_layers` says. A scan over weights
     resident on the device runs each run of layers that repeat one period of specs as one body
-    (`scan_groups(periodic=True)`): Qwen3.5's `[linear, linear, linear, full]` x 6 is one body of
-    four layers, so a step's program grows with the period, not the depth. Training scans only
+    (`scan_groups(periodic=True)` over `scan_keys`, so a period repeats its layers' specs and
+    variable structures): Qwen3.5's `[linear, linear, linear, full]` x 6 is one body of four
+    layers, so a step's program grows with the period, not the depth. Training scans only
     under `scan_layers`."""
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is also how many layers its
@@ -1182,9 +1183,12 @@ class CausalTransformer(nn.Module):
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
         self.specs = specs
+        # What one scanned body shares: the layers' spec and how their variables are stored.
+        structures = StackView.layer_structures(self.variables, self.num_layers)
+        self.scan_keys = tuple(zip(specs, structures, strict=True))
         self.block = block
         self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
-        self.groups = scan_groups(specs, self.bank_layers) if self.scan_layers else tuple(
+        self.groups = scan_groups(self.scan_keys, self.bank_layers) if self.scan_layers else tuple(
             (index, 1) for index in range(self.num_layers))
         self.mtp = self._prediction_depths(types, kinds, mixer_spec, gated_mlp, routed, wiring)
         if self.dspark is not None:
@@ -1930,7 +1934,7 @@ class CausalTransformer(nn.Module):
             x = x.astype(at_least_fp32(x.dtype))
         stages = pipeline_stages()
         first, end = (0, self.num_layers) if span is None else span
-        spanned = tuple((first + start, count) for start, count in scan_groups(self.specs[first:end],
+        spanned = tuple((first + start, count) for start, count in scan_groups(self.scan_keys[first:end],
                                                                                self.bank_layers))
         # A seeded initialization (PTQ's abstract annotation pass) reads the
         # supplied layout; the scan's init=True pass would draw over it first.
@@ -1960,11 +1964,11 @@ class CausalTransformer(nn.Module):
                                     f"by run holds whole runs; {list(banked)} arrived banked")
             if periodic and self.scan_decode:
                 groups = tuple((first + start, count) for start, count in scan_groups(
-                    self.specs[first:end], self.bank_layers, periodic=True))
+                    self.scan_keys[first:end], self.bank_layers, periodic=True))
             else:
                 groups = self.groups if span is None else spanned
-            view = StackView(groups, banked=banked,
-                             periods=tuple(run_period(self.specs, start, count) for start, count in groups))
+            periods = tuple(run_period(self.scan_keys, start, count) for start, count in groups)
+            view = StackView(groups, banked=banked, periods=periods)
         else:
             if span is not None:
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, which a pipeline "
@@ -2007,7 +2011,7 @@ class CausalTransformer(nn.Module):
                     f"{rows // shards}, or a batch that is a multiple of "
                     f"{count_microbatches * shards} rows")
             view = StackView(
-                scan_groups(self.specs[:count], self.bank_layers) if self.scan_layers
+                scan_groups(self.scan_keys[:count], self.bank_layers) if self.scan_layers
                 else tuple((index, 1) for index in range(count)),
                 stages=stages, microbatches=count_microbatches,
                 # What enters the loop is read on every iteration; what the
@@ -2166,7 +2170,7 @@ class CausalTransformer(nn.Module):
                 self.layers, self.block, self.specs, view.groups, x,
                 train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
-                banked='params' in view.banked)
+                banked='params' in view.banked, periods=view.periods)
         return run_pipeline(
             self,
             view,
