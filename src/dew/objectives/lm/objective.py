@@ -622,10 +622,11 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     (`token_scores`' `z_loss`, `LMObjective`'s training loss): the fit ladder turns it off where the
     fused chunk does not fit (`LMObjective.unfuse_head`), and tiling the head turns it on."""
 
-    _head_matrix: bool = True
-    """Whether the head is one matrix (`chunked.head_table`), as the last trace of a fused loss found
-    it: past a nonlinear head transform, or with an adapter's factors beside its kernel, no matrix
-    is, and no head is fused."""
+    _head_matrix: tuple[object, bool] | None = None
+    """The decoder the last trace of a fused loss scored and whether its head was one matrix
+    (`chunked.head_table`): past a nonlinear head transform, or with an adapter's factors beside its
+    kernel, no matrix is, and no head is fused. Another decoder's head is taken to be one until
+    traced."""
 
     def __init__(self, model, seq_len: int, *, head_chunks: int = 4,
                  head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
@@ -869,7 +870,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         head = None
         if z_loss is not None and self.head_tile is not None and reads_states(self.model):
             head = head_table(self.model, params)
-            self._head_matrix = head is not None
+            self._head_matrix = (self.model, head is not None)
         table = head if self.head_fused else None
         dtype = jnp.promote_types(hidden.dtype, jnp.float32)
         weights = self._row_weights(prepared, roles, dtype)
@@ -1321,16 +1322,19 @@ class LMObjective(TokenScorer):
         forward: a tiled head the model holds as one matrix (`token_scores`' `z_loss`), outside an
         indexer's warm-up, which scores no head."""
         fused = (self.head_fused and self.head_tile is not None and reads_states(self.model)
-                 and isinstance(self.model, AffineHead) and self._head_matrix and not self._warmup)
+                 and isinstance(self.model, AffineHead) and not self._warmup
+                 and (self._head_matrix is None or self._head_matrix[0] is not self.model
+                      or self._head_matrix[1]))
         return (ProgramModule(self.model, self.head_tile, trained=True, head_fused=fused),)
 
     def unfuse_head(self) -> str | None:
-        """Move a fused head to the tiled head, which takes its gradient in the backward, and report
-        the move; None where the head is not fused."""
-        if not self.program_key()[0].head_fused:
-            return None
-        self.head_fused = False
-        return f"the head tiled {self.head_tile}, its gradient taken in the backward"
+        """Move a tiled head to take its gradient in the backward, and report the move; None where
+        the step's program does not change, a head no step fuses. A tiled head is unfused either
+        way, so a decoder traced later does not fuse a head its rung unfused."""
+        moved = self.program_key()[0].head_fused
+        if self.head_tile is not None:
+            self.head_fused = False
+        return f"the head tiled {self.head_tile}, its gradient taken in the backward" if moved else None
 
     def loss(self, variables, batch, step: Step) -> tuple[Ratio | LMStatistics, Aux[Variables]]:
         if self._warmup:

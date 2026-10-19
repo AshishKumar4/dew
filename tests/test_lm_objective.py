@@ -29,6 +29,7 @@ from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training.memory import climb_to
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -749,6 +750,26 @@ def test_a_head_that_is_no_matrix_is_never_fused():
     jax.make_jaxpr(lambda params: objective.scalar_loss(params, {TEXT_KEY: tokens}, step)[0])(params)
     assert not objective.program_key()[0].head_fused
     assert objective.unfuse_head() is None
+
+
+def test_a_head_put_back_unfused_stays_so_whatever_decoder_was_traced_before():
+    """A record's unfused rung, put back (`climb_to`) on a decoder the objective has not traced,
+    holds once the decoder's head turns out to be one matrix: a head whose transform was traced, then
+    the decoder replaced by one with a matrix head, as a run's substitution does."""
+    vocab = 61
+    model, tokens = head_scored(vocab, head_transform="gelu")
+    objective = LMObjective(model, 8, ema_decay=None, pad_id=0, head_tile=(4, 16))
+    step = Step(jnp.asarray(0), jax.random.key(1), None, training=True)
+
+    def trace():
+        params = objective.init(jax.random.key(0))
+        jax.make_jaxpr(lambda params: objective.scalar_loss(params, {TEXT_KEY: tokens}, step)[0])(params)
+
+    trace()
+    objective.substitute([model.clone(head_transform=None)])
+    climb_to(objective, {"head_tile": [4, 16], "head_fused": False, "remat": None})
+    trace()
+    assert not objective.program_key()[0].head_fused and objective.unfuse_head() is None
 
 
 def test_a_prediction_applies_the_head_once_and_scores_the_logits_it_returns():
