@@ -357,9 +357,12 @@ def projected_parts(params: Variables, owners: Mapping[str, object], *, updated:
     answers), where the tree holds that part and the owner declares one; the rest
     as they are. The projection of an objective that nests several networks'
     parameters under their names (`joined`)."""
-    return {name: owners[name].projected(tree, updated=updated)
-            if isinstance(owners.get(name), ProjectsParameters) else tree
-            for name, tree in params.items()}
+    projected = {}
+    for name, tree in params.items():
+        owner = owners.get(name)
+        projects = isinstance(owner, ProjectsParameters)
+        projected[name] = owner.projected(tree, updated=updated) if projects else tree
+    return projected
 
 
 def projected_draw(owner: object, variables: Variables) -> Variables:
