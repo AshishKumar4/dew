@@ -1571,7 +1571,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
     if (key_value_seq_lengths is not None and query.shape[-3] == 1 and not causal
             and sliding_window is None and mask is None and bias is None and sinks is None
-            and segment_ids is None and query.shape[-2] > key.shape[-2]):
+            and segment_ids is None and query.shape[-2] > key.shape[-2]
+            and query.shape[-2] % key.shape[-2] == 0):
         # The key heads repeated as each shard would hold them (`_per_shard`), so the tensor axes
         # split the groups as they split the query heads.
         key, value = split_with_queries(key, value, tensor_shards(query))

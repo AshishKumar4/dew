@@ -173,6 +173,16 @@ def test_a_grouped_query_attends_as_its_heads_do_alone(implementation):
                                      np.asarray(truth), f"grouped {implementation}")
 
 
+def test_a_lone_query_whose_heads_do_not_group_is_refused_by_name():
+    """A lone query of 5 heads over 3 key heads is no grouped query: the core leaves it as it is, and
+    the kernel refuses its head counts by name."""
+    query = jnp.zeros((1, 1, 5, 16), jnp.float32)
+    key = jnp.zeros((1, 8, 3, 16), jnp.float32)
+    with pytest.raises(ValueError, match="multiple of the key/value heads"):
+        scaled_dot_product_attention(query, key, key, implementation="reference",
+                                     key_value_seq_lengths=jnp.asarray([4], jnp.int32))
+
+
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("kv_heads", [2, 1])
 def test_a_grouped_query_keeps_the_tensor_axis_split(kv_heads):
