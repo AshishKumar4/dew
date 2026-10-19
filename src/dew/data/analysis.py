@@ -58,6 +58,7 @@ from dew.data.pipeline import (
     Shuffle,
     Slice,
     Stage,
+    Step,
     TokenBudget,
     TokenSplit,
     Windows,
@@ -478,9 +479,6 @@ def _configured(
     return dataclasses.replace(pipeline, source=source, stages=tuple(stages))
 
 
-type _Step = Callable[..., object] | pygrain.MapTransform | pygrain.RandomMapTransform | Expansion
-
-
 def _keyed(stage: Stage) -> bool:
     """Whether a cache can key what `stage` runs (`StepIdentity.keyable`):
     the steps `_identity` names it by, a configured one's factory included,
@@ -500,7 +498,7 @@ def _keyed(stage: Stage) -> bool:
     return True
 
 
-def _step_keyed(step: _Step, identity: str | None = None) -> bool:
+def _step_keyed(step: Step, identity: str | None = None) -> bool:
     function = inspect.isfunction(step)
     external = not (step if function else type(step)).__module__.startswith("dew.")
     return StepIdentity.of(step, identity).keyable(function=function, external=external)
