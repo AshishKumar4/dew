@@ -182,9 +182,9 @@ for checkpoint in trainer.checkpoints.kept():
     print(checkpoint.step, checkpoint.kind, checkpoint.metrics, checkpoint.rankings)
 ```
 
-`restore_best=True` on `fit` returns the whole training state of the best step, with that step's optimizer state, counters and RNG, so you do not get earlier weights paired with the final optimizer. Without it, `fit` returns the final state as usual.
+`restore_best=True` on `fit` returns the model the run ranked best: the final state with the best step's variables, EMA and counters (`step`, `microstep`, `updates`), while the optimizer state, RNG and the rest stay the final step's. It is the best model, not a point to resume training from; a resume reads the run's checkpoints. Without `Checkpoints`, the run holds a host copy of the best step's variables and EMA only (4 GB for a 1B fp32 model, where its Adam moments would add 8 GB). Without `restore_best`, `fit` returns the final state as usual.
 
-`Best(fid, weights_only=True)` writes only the parameters and EMA for a winner that falls between checkpoint steps. Such a snapshot is for inference only, and full-state restore and `restore_best=True` refuse it. When a winner falls on a full-checkpoint step, the one full save also serves the best tracker, so nothing is written twice. Latest-N retention counts only full states, so a small inference snapshot cannot replace the state a run resumes from.
+`Best(fid, weights_only=True)` writes only the parameters, the EMA and the counters for a winner that falls between checkpoint steps. Such a snapshot is for inference, and a full-state restore refuses it; `restore_best=True` reads it as the model state it holds. When a winner falls on a full-checkpoint step, the one full save also serves the best tracker, so nothing is written twice. Latest-N retention counts only full states, so a small inference snapshot cannot replace the state a run resumes from.
 
 With several validation splits, each split has an explicit reader name, given as its key in `validation`, and a metric selector has to name its split. A callable uses `(split, metric)` keys.
 

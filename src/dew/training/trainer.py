@@ -157,7 +157,7 @@ from dew.training.planning import Candidate, Planned, Timer, plan_step, settled,
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, HeldBest, rankings
-from dew.training.state import Accumulation, TrainState
+from dew.training.state import MODEL_STATE, Accumulation, TrainState
 from dew.training.tracker import Tracker
 from dew.training.transaction import Committed, Transaction, compact_qk, outcome, with_ema
 
@@ -1395,8 +1395,13 @@ class Trainer(Generic[Loss, Effects]):
         several, each a Dataset, a reader scored as `dataset.val` would be or an
         `EvalSuite` with its own metrics and cadence, logged as `<name>/<metric>`.
 
-        `restore_best=True` returns the state the run ranked best: its best
-        checkpoint, or without `Checkpoints` the state it held (`HeldBest`).
+        `restore_best=True` returns the model the run ranked best: the final
+        state with the counters, variables and EMA of the best step
+        (`MODEL_STATE`), read from its best checkpoint, a weights-only one
+        included, or without `Checkpoints` from the copy it held
+        (`HeldBest`). Its optimizer state and the rest stay the final step's,
+        so it is the best model, not a point to resume training from, which
+        the run's checkpoints are.
 
         Every `checkpoint_every` steps, the state and the data position are
         written; `checkpoint_final=True` also writes the final state, independently
@@ -1457,14 +1462,13 @@ class Trainer(Generic[Loss, Effects]):
             # the lifecycle, so a selection that fails is the run's outcome.
             if restore_best and checkpoints is not None and run.preempted is None:
                 checkpoints.wait()  # the best may be the last step's save, still in flight
-                trained, _ = checkpoints.restore(
-                    jax.tree.map(
-                        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding),
-                        trained),
-                    step="best",
-                )
+                model = {name: jax.tree.map(
+                    lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding),
+                    getattr(trained, name)) for name in MODEL_STATE if getattr(trained, name) is not None}
+                best, _ = checkpoints.restore(model, step="best")
+                trained = dataclasses.replace(trained, **best)
             elif restore_best and checkpoints is None and run.preempted is None:
-                trained = run.best.state()
+                trained = run.best.state(trained)
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
@@ -1934,9 +1938,6 @@ class Trainer(Generic[Loss, Effects]):
                 )
             stopping = Best(metric, mode=stop.mode, split=stop.split).resolved(scored)
             stop = dataclasses.replace(stop, metric=metric, mode=stopping.mode, split=stopping.split)
-        if restore_best and self.checkpoints is not None and any(
-                choice.weights_only for choice in selection):
-            raise ValueError("restore_best requires full checkpoints, not weights_only snapshots")
         return selection, stop
 
     @staticmethod
