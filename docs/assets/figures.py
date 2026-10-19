@@ -648,22 +648,18 @@ def edm_step_figure():
     label = ("One training step. A clean flower x0 gets noise at a random level sigma to make x_t; the model "
              "sees x_t and sigma and guesses x0; the loss is how far the guess is from x0, and the update "
              "makes the next guess closer.")
+    size = 80
     for narrow in (False, True):
-        width, height = (360, 540) if narrow else (720, 300)
-        size = 80
+        # The wide layout has the loss beside the guess; the narrow one has it under the second lane.
+        width, height = (360, 520) if narrow else (720, 350)
+        x_clean, x_noise, x_noisy = (24, 140, 256) if narrow else (34, 176, 318)
+        lane2 = 300 if narrow else 196
+        x_model, x_guess = (246, 40) if narrow else (308, 460)
+        top1, top2 = 56, lane2 + 22
         svg = Figure(width, height, seconds=11, label=label)
         svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
-        if narrow:
-            lane1, lane2 = (16, 34), (16, 300)
-            x_clean, x_noise, x_noisy = 24, 140, 256
-            x_model, x_guess = 24, 256
-        else:
-            lane1, lane2 = (20, 34), (20, 172)
-            x_clean, x_noise, x_noisy = 34, 176, 318
-            x_model, x_guess = 450, 600
-        top1, top2 = lane1[1] + 22, lane2[1] + 22
-        svg.text(lane1[0], lane1[1], "1  noise a clean image", size=14, weight=600)
-        svg.text(lane2[0], lane2[1], "2  guess it back", size=14, weight=600)
+        svg.text(16 if narrow else 20, 34, "1  noise a clean image", size=14, weight=600)
+        svg.text(16 if narrow else 20, lane2, "2  guess it back", size=14, weight=600)
         with svg.group() as clean:
             svg.image(x_clean, top1, size, pixels(x0), photo=True)
             svg.text(x_clean + size / 2, top1 + size + 20, "x₀", size=14, mono=True, anchor="middle")
@@ -679,39 +675,41 @@ def edm_step_figure():
             svg.image(x_noisy, top1, size, pixels(x0 + sigma * eps), photo=True)
             svg.text(x_noisy + size / 2, top1 + size + 20, "xₜ", size=14, mono=True, anchor="middle")
         svg.appear(noisy, 1.9)
-        # The noisy image goes to the model, in the second lane.
-        if narrow:
-            model_y = top2
-            feed = svg.polyline([(x_noisy + size / 2, top1 + size + 28), (x_noisy + size / 2, lane2[1] - 22),
-                                 (x_model + 50, lane2[1] - 22), (x_model + 50, model_y - 4)], color="muted",
-                                width=1.25)
-        else:
-            model_y = top2
-            feed = svg.polyline([(x_noisy + size + 6, top1 + size / 2), (x_model + 50, top1 + size / 2),
-                                 (x_model + 50, model_y - 4)], color="muted", width=1.25)
+        # The noisy image drops into the second lane, to the model straight below it.
+        middle = x_model + 50
+        feed = svg.polyline([(x_noisy + size / 2, top1 + size + 30), (x_noisy + size / 2, lane2 - 24),
+                             (middle, lane2 - 24), (middle, top2 - 4)], color="muted", width=1.25)
         svg.draw(feed, 2.6, 3.2)
         with svg.group() as model:
-            svg.rect(x_model, model_y, 100, size, fill="raised", stroke="accent", rx=8)
-            svg.text(x_model + 50, model_y + 34, "DiT", size=15, weight=600, anchor="middle")
-            svg.text(x_model + 50, model_y + 54, "(xₜ, σ)", size=13, mono=True, color="muted", anchor="middle")
+            svg.rect(x_model, top2, 100, size, fill="raised", stroke="accent", rx=8)
+            svg.text(middle, top2 + 34, "DiT", size=15, weight=600, anchor="middle")
+            svg.text(middle, top2 + 54, "(xₜ, σ)", size=13, mono=True, color="muted", anchor="middle")
         svg.appear(model, 3.0)
         with svg.group() as guessed:
-            svg.arrow(x_model + 104, model_y + size / 2, x_guess - 8, model_y + size / 2)
-            svg.image(x_guess, model_y, size, pixels(guess), photo=True)
-            svg.text(x_guess + size / 2, model_y + size + 20, "guess x̂₀", size=14, mono=True, anchor="middle")
+            if narrow:
+                svg.arrow(x_model - 4, top2 + size / 2, x_guess + size + 8, top2 + size / 2)
+            else:
+                svg.arrow(x_model + 104, top2 + size / 2, x_guess - 8, top2 + size / 2)
+            svg.image(x_guess, top2, size, pixels(guess), photo=True)
+            svg.text(x_guess + size / 2, top2 + size + 20, "guess x̂₀", size=14, mono=True, anchor="middle")
         svg.appear(guessed, 3.8)
-        # The loss compares the guess with the clean image from lane 1.
-        loss_y = model_y + size + 48
+        # The loss compares the guess with x0 from the first lane, and its gradient updates the model.
         with svg.group() as loss:
-            svg.text(width / 2, loss_y, "loss = w(σ) · ‖x̂₀ − x₀‖²", size=14, mono=True, anchor="middle",
-                     color="accent")
+            if narrow:
+                loss_x, loss_bottom = width / 2, top2 + size + 64
+                svg.text(loss_x, loss_bottom - 14, "loss = w(σ) · ‖x̂₀ − x₀‖²", size=14, mono=True,
+                         anchor="middle", color="accent")
+            else:
+                loss_x, loss_bottom = 630, top2 + 66
+                svg.text(566, top2 + 30, "loss =", size=14, mono=True, color="accent")
+                svg.text(566, top2 + 52, "w(σ) · ‖x̂₀ − x₀‖²", size=14, mono=True, color="accent")
         svg.appear(loss, 4.8)
-        back_y = loss_y + 16
-        update = svg.polyline([(width / 2, back_y), (width / 2, back_y + 10), (x_model + 50, back_y + 10),
-                               (x_model + 50, model_y + size + 4)], color="accent", width=1.5)
+        floor = height - 30
+        update = svg.polyline([(loss_x, loss_bottom), (loss_x, floor), (middle, floor), (middle, top2 + size + 4)],
+                              color="accent", width=1.5)
         svg.draw(update, 5.6, 6.4)
-        svg.appear(svg.text(x_model + 58, back_y + 28 if narrow else back_y + 26, "update the weights",
-                            size=13, color="accent"), 6.3)
+        svg.appear(svg.text((loss_x + middle) / 2, floor + 18, "update the weights", size=13, color="accent",
+                            anchor="middle"), 6.3)
         save_both(svg, "edm-step", narrow)
 
 
@@ -739,8 +737,10 @@ def edm_noise_figure():
                                  anchor="middle"))
     svg.show_in_turn(frames, times)
     svg.show_in_turn(captions, times)
+    axis_x, axis_w, axis_y = 224, 192, 196
+    svg.image(axis_x, 52, 64, pixels(x0), photo=True)
+    svg.text(axis_x + 76, 90, "x₀, the clean image", size=13, color="muted")
     # Where each level sits on a log scale, the current one filled.
-    axis_x, axis_w, axis_y = 224, 192, 150
     low, high = np.log10(sigmas[0]), np.log10(sigmas[-1])
 
     def at(sigma: float) -> float:
