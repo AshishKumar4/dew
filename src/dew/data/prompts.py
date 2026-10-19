@@ -18,7 +18,7 @@ when the row lacks them.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -49,6 +49,10 @@ TRUTH_KEY = "ground_truth"
 INFO_KEY = "extra_info"
 """Batch key holding the reward's extra context as UTF-8 bytes."""
 
+type RowValue = str | int | float | bool | None | Sequence[RowValue] | Mapping[str, RowValue]
+"""A reward column's value as a prompt row (or verl) gives it: text, nothing, or a JSON value."""
+
+
 @dataclass(frozen=True)
 class PromptRecord:
     """What a reward is told about the prompt it scores, read from the prompt's row.
@@ -64,7 +68,7 @@ class PromptRecord:
     extra_info: str = ""
 
     @classmethod
-    def of(cls, data_source: object, ground_truth: object, extra_info: object) -> PromptRecord:
+    def of(cls, data_source: RowValue, ground_truth: RowValue, extra_info: RowValue) -> PromptRecord:
         """The record of a row's three values as a prompt batch stores them: a string is itself,
         a missing one is empty, and any other value travels as its JSON (`_text`)."""
         return cls(_text(data_source), _text(ground_truth), _text(extra_info))
