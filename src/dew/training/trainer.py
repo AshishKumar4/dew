@@ -376,8 +376,9 @@ class _FitRun:
     notice: PreemptionNotice | None = None
     endless: bool = False
     taken: Taken | None = None
-    best: tuple[float, TrainState] | None = None
-    """The best ranking's score so far and its state, held in host memory (`_FitPlan.held_best`)."""
+    best: tuple[float, Callable[[], TrainState]] | None = None
+    """The best ranking's score so far and what puts its state, held in host memory, back on the
+    devices (`_FitPlan.held_best`, `dew.training.host.snapshot`)."""
     """The log taken at the latest logging step and not yet read."""
     reads: dict[Signature, tuple[bool, ...]] = dataclasses.field(default_factory=dict)
     """Which leaves of a batch of each signature its compiled step reads
@@ -1429,8 +1430,7 @@ class Trainer(Generic[Loss, Effects]):
         suites = _suites(loader, validation, metrics, eval_every)
         selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every, restore_best)
         self._preflight(loader, stop, suites, preview=preview,
-                        loss=(self.checkpoints is not None or restore_best) and not selection,
-                        restore_best=restore_best)
+                        loss=(self.checkpoints is not None or restore_best) and not selection)
         preview = preview and self.tracker is not None
         run = _FitRun(time.perf_counter())
         # A display of this fit's own: one before it may have run other steps.
@@ -1461,9 +1461,11 @@ class Trainer(Generic[Loss, Effects]):
                         trained),
                     step="best",
                 )
-            elif restore_best and run.best is not None and run.preempted is None:
-                from dew.training.host import place_held
-                trained = place_held(run.best[1], trained)
+            elif restore_best and checkpoints is None and run.preempted is None:
+                if run.best is None:
+                    raise ValueError("restore_best found no evaluation of this run that its ranking ranks; "
+                                     "no state is the best to return")
+                trained = run.best[1]()
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
@@ -1861,7 +1863,7 @@ class Trainer(Generic[Loss, Effects]):
             loss.block_until_ready()
         scores: Mapping[str, float] = {}
         if (
-            (plan.validation or plan.eval_every or plan.best or plan.stop)
+            (plan.validation or plan.eval_every or plan.best or plan.stop or plan.held_best)
             and run.preempted is None
             and not run.stopped
         ):
@@ -1923,14 +1925,12 @@ class Trainer(Generic[Loss, Effects]):
     @staticmethod
     def _hold_best(run: _FitRun, ranking: Sequence[Ranking], state: TrainState) -> None:
         """Keep `state` in host memory where its first ranking, the one a checkpointed run's best
-        restores by, beats the state held: one copy of the state, replaced as the best moves."""
-        rank = next(iter(ranking), None)
-        if rank is None or not math.isfinite(rank.value):
-            return
-        score = rank.value if rank.mode == 'min' else -rank.value
-        if run.best is None or score < run.best[0]:
-            from dew.training.host import hold_on_host
-            run.best = (score, hold_on_host(dataclasses.replace(state, compute=None)))
+        restores by, beats the state held, an earlier one winning a tie: one copy of the state,
+        replaced as the best moves."""
+        score = ranking[0].score if ranking else None
+        if score is not None and (run.best is None or score < run.best[0]):
+            from dew.training.host import snapshot
+            run.best = (score, snapshot(dataclasses.replace(state, compute=None)))
 
     def _ranking(self, plan: _FitPlan, scores: Mapping[str, float]) -> tuple[Ranking, ...]:
         if not plan.best:
@@ -1996,7 +1996,8 @@ class Trainer(Generic[Loss, Effects]):
 
         With no suite at all, the evaluation carries the training values a
         ranking or a stopping rule reads."""
-        reports = training if self.checkpoints is not None or plan.best or plan.stop else None
+        ranks = self.checkpoints is not None or plan.best or plan.stop or plan.held_best
+        reports = training if ranks else None
         chosen = list(plan.suites if names is None else names)
         if not chosen:
             return self._evaluate(state, shardings, None, (), plan.preview, split="val", training=reports)
@@ -2015,7 +2016,7 @@ class Trainer(Generic[Loss, Effects]):
         )
 
     def _preflight(self, dataset: Loader, stop, suites: Mapping[str, EvalSuite], *,
-                   preview: bool, loss: bool, restore_best: bool) -> None:
+                   preview: bool, loss: bool) -> None:
         """The refusals `fit` makes before it places anything: validation
         nothing reads, and a pipeline's batch, whose placement could take
         minutes or run out of memory before the error. Every other mesh's
@@ -2025,21 +2026,20 @@ class Trainer(Generic[Loss, Effects]):
             if loss and not any(metric.name == 'loss' for metric in suite.metrics):
                 self.objective._check_validation_loss()
             if (stop is None or not isinstance(stop.metric, TrainingScalar)) and suite.every:
-                self._check_validation_is_read(name, suite, preview=preview, restore_best=restore_best)
+                self._check_validation_is_read(name, suite, preview=preview, loss=loss)
         if self.device_mesh.shape.get(STAGE_AXIS, 1) > 1 and self.rollout is None:
             check_batch(dataset.batch, self.device_mesh, self.microbatches)
 
-    def _check_validation_is_read(self, name: str, suite: EvalSuite, *, preview: bool,
-                                  restore_best: bool) -> None:
+    def _check_validation_is_read(self, name: str, suite: EvalSuite, *, preview: bool, loss: bool) -> None:
         """Refuse a validation cadence whose batches nothing would read.
 
         A validation pass hands its batches to metrics, to the preview and,
-        under a checkpointer or a `restore_best`, to the loss that ranks the
-        run's steps. Scheduled with none of them, it would open nothing and
-        report nothing, so the contradiction is refused before the run does any
-        work.
+        under a checkpointer, or with `loss` where its loss ranks the state a
+        run holds (`_FitPlan.held_best`), to the loss that ranks the run's
+        steps. Scheduled with none of them, it would open nothing and report
+        nothing, so the contradiction is refused before the run does any work.
         """
-        ranked = self.checkpoints is not None or restore_best
+        ranked = self.checkpoints is not None or loss
         if not suite.metrics and not ranked and not (preview and self.tracker is not None):
             raise ValueError(
                 f"{name} is scored every {suite.every} steps and nothing consumes it: "

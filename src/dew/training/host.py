@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 import mmap
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Protocol, runtime_checkable
 
 import jax
@@ -167,34 +167,24 @@ class Held:
         """Keep the copy for the next placement."""
 
 
-@dataclasses.dataclass(frozen=True)
-class _HeldKey:
-    """A random key array held as its key data (`hold_on_host`), and the implementation that wraps it."""
-    data: Held
-    impl: object
+def snapshot[T](tree: T) -> Callable[[], T]:
+    """Copy `tree`'s arrays, this process's shards of each, to host memory
+    (`Held`), a random key as its key data, and return what puts a fresh copy
+    back where each was placed (`place_leaf`), its memory kind too: a timing
+    that steps a state leaves the run the state it started from, and a run
+    restores the best state it held."""
+    leaves, structure = jax.tree.flatten(tree)
+    keys = [jax.random.key_impl(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else None
+            for leaf in leaves]
+    bits = [leaf if impl is None else jax.random.key_data(leaf)
+            for leaf, impl in zip(leaves, keys, strict=True)]
+    held = [(Held.of(leaf), leaf.sharding) for leaf in bits]
 
+    def placed(source: Held, sharding, impl):
+        leaf = place_leaf(source, sharding)
+        return leaf if impl is None else jax.random.wrap_key_data(leaf, impl=impl)
 
-def hold_on_host[TreeT](tree: TreeT) -> TreeT:
-    """`tree`'s arrays copied to host memory, each process its own addressable shards (`Held`) and
-    a random key as its key data, so `place_held` puts the same values back after the arrays were
-    donated or released: one copy of the tree in host memory. Anything but an array is kept."""
-    def hold(leaf):
-        if not isinstance(leaf, jax.Array):
-            return leaf
-        if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key):
-            return _HeldKey(Held.of(jax.random.key_data(leaf)), jax.random.key_impl(leaf))
-        return Held.of(leaf)
-    return jax.tree.map(hold, tree)
-
-
-def place_held[TreeT](tree: TreeT, like: TreeT) -> TreeT:
-    """A tree `hold_on_host` held put back on the devices, each array where `like`'s matching one is."""
-    def place(value, target):
-        if isinstance(value, _HeldKey):
-            bits = place_leaf(value.data, jax.random.key_data(target).sharding)
-            return jax.random.wrap_key_data(bits, impl=value.impl)
-        return place_leaf(value, target.sharding) if isinstance(value, Held) else value
-    return jax.tree.map(place, tree, like, is_leaf=lambda leaf: isinstance(leaf, (Held, _HeldKey)))
+    return lambda: structure.unflatten([placed(*copy, impl) for copy, impl in zip(held, keys, strict=True)])
 
 
 def place_leaf(value, target: Sharding) -> jax.Array:

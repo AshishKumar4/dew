@@ -219,6 +219,13 @@ class Ranking:
     top: int = 1
     weights_only: bool = False
 
+    @property
+    def score(self) -> float | None:
+        """The value as a lower-is-better score, None where it ranks nothing (a nonfinite value)."""
+        if not math.isfinite(self.value):
+            return None
+        return self.value if self.mode == 'min' else -self.value
+
 
 def _recorded_rank(metrics):
     # Orbax records the metrics file only when best_fn is configured. The
@@ -900,7 +907,7 @@ class Checkpoints:
         self._frozen_pending: set[str] = set()
 
     def _candidates(self, rankings: Sequence[Ranking]) -> tuple[Ranking, ...]:
-        eligible = [rank for rank in rankings if math.isfinite(rank.value)]
+        eligible = [rank for rank in rankings if rank.score is not None]
         if not eligible:
             return ()
         self._open().check_for_errors()
@@ -912,7 +919,8 @@ class Checkpoints:
             self._pending = None
         candidates = []
         for rank in eligible:
-            score = rank.value if rank.mode == 'min' else -rank.value
+            score = rank.score
+            assert score is not None
             key = f'checkpoint/rank/{rank.metric}'
             held = sorted(scores[key] for scores in retained.values() if key in scores)
             if len(held) < rank.top or score < held[rank.top - 1]:
@@ -1232,8 +1240,8 @@ class Checkpoints:
                 raise ValueError(f"ranking direction for {rank.metric!r} differs from this run's checkpoints")
             self._rank_modes[rank.metric] = rank.mode
             self._rank_limits[rank.metric] = rank.top
-            if math.isfinite(rank.value):
-                scores[f'checkpoint/rank/{rank.metric}'] = rank.value if rank.mode == 'min' else -rank.value
+            if rank.score is not None:
+                scores[f'checkpoint/rank/{rank.metric}'] = rank.score
                 rules[rank.metric] = dataclasses.asdict(rank)
         custom = {
             "ema_deltas": deltas,

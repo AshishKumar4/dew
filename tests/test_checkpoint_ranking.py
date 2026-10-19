@@ -181,6 +181,36 @@ def test_restore_best_without_checkpoints_returns_the_best_state_it_held(tmp_pat
         for left, right in zip(jax.tree.leaves(unsaved), jax.tree.leaves(saved), strict=True):
             np.testing.assert_array_equal(leaf_values(left), leaf_values(right))
 
+
+def test_restore_best_without_checkpoints_ranks_by_the_training_loss_without_validation(tmp_path):
+    """Without validation a run ranks its states by the training loss, as a checkpointed run's best
+    does, and returns the state that ranked best though a later step ended the run."""
+    stream = dataclasses.replace(data(), val=None)
+    saved = trainer(tmp_path / 'run').fit(stream, steps=8, log_every=1, eval_every=1, checkpoint_every=1,
+                                         restore_best=True)
+    unsaved = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0)).fit(
+        stream, steps=8, log_every=1, eval_every=1, restore_best=True)
+    assert int(unsaved.step) == int(saved.step)
+    for left, right in zip(jax.tree.leaves(unsaved), jax.tree.leaves(saved), strict=True):
+        np.testing.assert_array_equal(leaf_values(left), leaf_values(right))
+
+
+def test_a_held_best_no_evaluation_ranks_ends_the_run_failed():
+    """Without checkpoints, a restore_best whose every evaluation its threshold leaves unranked has
+    no state to return: the trackers hear a failed run, as a checkpointed one's do, not the final
+    state handed back as the best. A validation cadence a training-scalar best reads nothing of is
+    refused, as without restore_best."""
+    metric = Value('value', Shown(better='lower'))
+    tracker = Outcomes()
+    run = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker)
+    with pytest.raises(ValueError):
+        run.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric],
+                best=Best(metric, threshold=-1.0), restore_best=True)
+    assert tracker.ended == ['failed']
+    with pytest.raises(ValueError):
+        Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0)).fit(
+            data(), steps=2, log_every=1, eval_every=1, best=run.objective.loss, restore_best=True)
+
 def test_ranked_loss_and_periodic_retention(tmp_path):
     run = trainer(tmp_path / 'run', keep=Keep(latest=1, every=2))
     state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
