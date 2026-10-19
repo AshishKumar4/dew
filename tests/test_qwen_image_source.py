@@ -14,6 +14,7 @@ The pipeline packs its latent as a plain row-major flatten of the grid, so
 these tests reshape between that and NHWC with numpy's own reshape.
 """
 
+import functools
 import json
 from pathlib import Path
 
@@ -22,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import extract_fixture, fixture_arrays
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms, widened
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, qwen_image_fields, qwen_image_path, read_transformer
@@ -62,7 +63,8 @@ def transformer_case(source, arrays, name: str):
 
 
 def qwen_walk(source, arrays, record, name: str):
-    """The native forward and every gradient of one case."""
+    """The native forward and every gradient of one case, and the terms each
+    entry's final sums add, from Dew's own path in float64 (`float64_terms`)."""
     model, params, layouts = transformer_case(source, arrays, name)
     rows, columns = record["cases"][name]["grid"]
     latent = jnp.asarray(nhwc(arrays[f"{name}.packed"], rows, columns))
@@ -71,35 +73,49 @@ def qwen_walk(source, arrays, record, name: str):
     times = jnp.asarray(arrays[f"{name}.times"])
     probe = jnp.asarray(nhwc(arrays[f"{name}.probe"], rows, columns))
 
-    def forward(params, latent, context):
-        return model.apply({"params": params}, latent, times, DenoisingCondition(context, mask=mask))
+    def walk(model, params, latent, context):
+        def forward(params, latent, context):
+            return model.apply({"params": params}, latent, times, DenoisingCondition(context, mask=mask))
 
-    output, pullback = jax.vjp(forward, params, latent, context)
-    return output, pullback(probe), {entry.name: entry for entry in layouts}
+        output, pullback = jax.vjp(forward, params, latent, context)
+        return output, pullback(probe.astype(output.dtype))
+
+    output, gradients = walk(model, params, latent, context)
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+        _, terms = float64_terms(functools.partial(walk, model.clone(dtype=jnp.float64)),
+                                 *widened((params, latent, context)))
+    return output, gradients, terms, {entry.name: entry for entry in layouts}
 
 
 @pytest.mark.parametrize("name", CASES)
 def test_native_qwen_image_matches_the_source_forward_and_every_gradient(
         name, source, arrays, record):
     """The prediction, the latent's and the prompt's gradients and every
-    parameter's, each as near float64 as the source's float32."""
+    parameter's, each as near float64 as the source's float32, an entry
+    whose sum cancels (the queries' and keys' path through the softmax) held
+    to its terms' rounding."""
     rows, columns = record["cases"][name]["grid"]
-    output, (grad_params, grad_latent, grad_context), layouts = qwen_walk(
+    output, (grad_params, grad_latent, grad_context), terms, layouts = qwen_walk(
         source, arrays, record, name)
-    for key, value, layout in (("output", output, True), ("grad_packed", grad_latent, True),
-                               ("grad_context", grad_context, False)):
+    output_terms, (param_terms, latent_terms, context_terms) = terms
+    for key, value, size, layout in (("output", output, output_terms, True),
+                                     ("grad_packed", grad_latent, latent_terms, True),
+                                     ("grad_context", grad_context, context_terms, False)):
         expected, truth = (arrays[f"{name}.{kind}{key}"] for kind in ("", "fp64."))
         if layout:
             expected, truth = nhwc(expected, rows, columns), nhwc(truth, rows, columns)
-        assert_as_exact_as_the_reference(value, expected, truth, f"{name} {key}")
+        assert_as_exact_as_the_reference(value, expected, truth, f"{name} {key}", terms=size)
     prefix = f"{name}.grad_param."
     tensors = [key.removeprefix(prefix) for key in arrays if key.startswith(prefix)]
     assert len(tensors) == len(layouts) == 27
-    assert_leaves_as_exact(
-        {tensor: np.asarray(layouts[f"transformer/{tensor}"].export({"params": grad_params}))
-         for tensor in tensors},
-        {tensor: arrays[f"{name}.grad_param.{tensor}"] for tensor in tensors},
-        {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors})
+
+    def exported(tree):
+        return {tensor: np.asarray(layouts[f"transformer/{tensor}"].export({"params": tree}), np.float64)
+                for tensor in tensors}
+
+    assert_leaves_as_exact(exported(grad_params), {tensor: arrays[prefix + tensor] for tensor in tensors},
+                           {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors},
+                           terms=exported(param_terms))
 
 
 def test_a_padded_row_is_its_own_prompt_alone(source, arrays, record):
