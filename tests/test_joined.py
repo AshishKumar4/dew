@@ -2,15 +2,15 @@
 layer's own projection calls, where a generation's kernel row measured it
 faster."""
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, equations, float64_terms
 
 from dew.nn.dense import Dense
+from dew.nn.joined import joined_dense
 from dew.nn.kernels import generation
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.mlp import GatedMLP
@@ -75,23 +75,36 @@ def test_gate_and_up_joined_are_as_exact_as_apart_from_float64(dtype, bias):
                            gradients(layer.clone(dtype=jnp.float64).apply))
 
 
-def test_gate_and_up_joined_keep_the_dtype_their_promotion_gives_a_wider_bias():
-    """Joined, gate and up add a bias their promotion leaves at fp32 to bf16 products in the fp32 the
-    addition promotes to, as each projection apart adds its own, and their output and gradients lie
-    within tests/reference_error.py's rule of the layer's with them apart."""
+def test_joined_projections_keep_the_dtype_their_promotion_gives_a_wider_bias():
+    """Joined, two projections whose promotion leaves the bias at fp32 add it to their bf16 products in
+    the fp32 the addition promotes to, as each projection apart adds its own: the stacked outputs
+    carry each projection's own dtype, within tests/reference_error.py's rule of the projections'
+    apart against float64."""
     def bias_kept(inputs, kernel, bias, dtype=None):
         return inputs.astype(jnp.bfloat16), kernel.astype(jnp.bfloat16), bias
 
+    class Pair(nn.Module):
+        wide: bool = False
+
+        @nn.compact
+        def __call__(self, x):
+            promotion = {} if self.wide else {"promote_dtype": bias_kept}
+            projections = [Dense(96, dtype=jnp.float64 if self.wide else jnp.bfloat16, name=name, **promotion)
+                           for name in ("gate", "up")]
+            if self.wide:
+                return jnp.stack([projection(x) for projection in projections], axis=-2)
+            apart = jnp.stack([projection(x) for projection in projections], axis=-2)
+            return apart, joined_dense(x, projections, axis=-2)
+
     x = jax.random.normal(jax.random.key(10), (2, 33, 64)).astype(jnp.bfloat16)
-    cotangent = jax.random.normal(jax.random.key(11), (2, 33, 64)).astype(jnp.float32)
-    layer = GatedMLP(hidden_features=96, out_features=64, use_bias=True, dtype=jnp.bfloat16,
-                     linear=functools.partial(Dense, promote_dtype=bias_kept))
     params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(jax.random.key(12), leaf.shape),
-                          layer.init(jax.random.key(13), x))
-    with row_joins("gate_up"):
-        assert dots(layer.apply, params, x) == 2
-    assert_joined_as_exact("gate_up", gradients(layer.apply), (params, x, cotangent),
-                           gradients(layer.clone(dtype=jnp.float64, linear=Dense).apply))
+                          Pair().init(jax.random.key(13), x))
+    apart, joined = Pair().apply(params, x)
+    assert joined.dtype == apart.dtype == jnp.float32
+    with jax.enable_x64(new_val=True):
+        truth = Pair(wide=True).apply(jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params),
+                                      jnp.asarray(x, jnp.float64))
+    assert_as_exact_as_the_reference(np.asarray(joined), np.asarray(apart), np.asarray(truth), "joined")
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
