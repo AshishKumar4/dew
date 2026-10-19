@@ -122,7 +122,7 @@ def drawn(spread: float, rounding: float = 1.0, *, unstable: bool = False):
         luck = 0.1 if unstable and order == 0 else 1.0
         reference = truth + luck * rounding * unit * rng.normal(size=truth.shape)
         dew = truth + spread * rounding * unit * rng.normal(size=truth.shape)
-        return {"leaf": dew}, {"leaf": reference}, {"leaf": truth}, None
+        return {"leaf": dew}, {"leaf": reference}, {"leaf": truth}
     return draw
 
 
@@ -159,9 +159,9 @@ def test_a_localized_defect_that_the_leaf_and_row_rules_pass_fails_element_by_el
         reference = truth + unit * rng.normal(size=truth.shape)
         error = unit * rng.normal(size=truth.shape)
         error[2, :4] *= 100
-        return {"leaf": truth + error}, {"leaf": reference}, {"leaf": truth}, None
+        return {"leaf": truth + error}, {"leaf": reference}, {"leaf": truth}
 
-    (dew,), (reference,), (truth,), _ = (jax.tree.leaves(tree) for tree in draw(0))
+    (dew,), (reference,), (truth,) = (jax.tree.leaves(tree) for tree in draw(0))
     assert distance(dew[2], truth[2]) < ROW_FACTOR * distance(reference[2], truth[2])
     calls = []
     with pytest.raises(AssertionError):
