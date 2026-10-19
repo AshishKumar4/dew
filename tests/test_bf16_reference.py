@@ -60,6 +60,53 @@ def test_a_decoder_is_as_exact_as_its_reference(name, dtype):
         assert_as_exact_as_the_reference(logits, reference, exact["f64"], f"{name} {dtype}")
 
 
+@pytest.mark.parametrize("name", ["qwen2-tiny", "llama-tiny"])
+def test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torch_does(name):
+    """A bfloat16 model's projection biases sum their gradients over every token of the batch.
+    Over 8192 tokens Dew's land as near float64 as transformers' own bfloat16 gradients,
+    which accumulate those sums at float32; a bfloat16 sum, which JAX gives a broadcast's
+    transpose (jax-ml/jax#30310), lands several times further."""
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    directory = FIXTURES / name
+    ids = np.random.default_rng(0).integers(0, 256, (64, 128))
+
+    def torch_gradients(dtype):
+        model = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.float32).bfloat16().to(dtype)
+        tokens = torch.from_numpy(ids)
+        model(tokens, labels=tokens).loss.backward()
+        return {name: parameter.grad.double().numpy() for name, parameter in model.named_parameters()
+                if parameter.grad is not None}
+
+    truth, reference = torch_gradients(torch.float64), torch_gradients(torch.bfloat16)
+    loaded = Pretrained.load(str(directory), dtype="bfloat16", param_dtype="bfloat16",
+                             attention_impl="reference", max_seq_len=128)
+
+    def loss(variables):
+        logits = jnp.asarray(loaded.model.apply(variables, jnp.asarray(ids, jnp.int32)), jnp.float32)
+        targets = jnp.asarray(ids[:, 1:])[..., None]
+        chosen = jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), targets, -1)
+        return -jnp.mean(chosen)
+
+    gradients = jax.grad(loss)(loaded.variables)
+    # Llama's key bias sums gradients that cancel by the softmax's shift invariance, which RoPE
+    # breaks only in part, so its error measures the attention backward's key cotangents rather
+    # than this sum; that is held apart (findings ledger 621).
+    biases = [layout for layout in loaded.weight_layouts if layout.name.endswith(".bias")
+              and not (name == "llama-tiny" and layout.name.endswith("k_proj.bias"))]
+    assert biases
+    over = []
+    for layout in biases:
+        exact = truth[layout.name]
+        dew = np.asarray(layout.export(gradients), np.float64).reshape(exact.shape)
+        try:
+            assert_as_exact_as_the_reference(dew, reference[layout.name], exact, f"{name} {layout.name}")
+        except AssertionError as failure:
+            over.append(str(failure))
+    assert not over, "\n".join(over)
+
+
 def denoise(model, variables, prompt, canvas, **conditioning):
     """One canvas scored over the prompt's cache: the prefill writes it, the
     canvas reads it."""

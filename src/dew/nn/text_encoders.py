@@ -46,6 +46,7 @@ from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.blocks import TokenEmbedding
 from dew.nn.conv import Conv
+from dew.nn.dense import Dense
 from dew.nn.flops import matching_lengths, patch_lengths
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixer_base import MixerContext
@@ -306,7 +307,7 @@ class CLIP(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        dense = functools.partial(nn.Dense, self.projection_dim, use_bias=False,
+        dense = functools.partial(Dense, self.projection_dim, use_bias=False,
                                   dtype=self.dtype, precision=self.precision)
         self.text_projection = dense(name="text_projection")
         self.visual_projection = dense(name="visual_projection")

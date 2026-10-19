@@ -11,6 +11,7 @@ from flax import linen as nn, struct
 
 from dew.coordination import agreed, from_every_process
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
+from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.nn.protocols import HiddenStates
 from dew.objectives.base import (
@@ -64,7 +65,7 @@ class ValueHead(nn.Module):
         hidden = self.backbone.hidden_states(
             tokens, train=False, segment_ids=segment_ids, positions=positions
         )
-        return nn.Dense(1, dtype=jnp.float32, name="value")(hidden)[..., 0]
+        return Dense(1, dtype=jnp.float32, name="value")(hidden)[..., 0]
 
 
 @dataclass(frozen=True)
