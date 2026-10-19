@@ -772,6 +772,26 @@ def test_a_head_put_back_unfused_stays_so_whatever_decoder_was_traced_before():
     assert not objective.program_key()[0].head_fused and objective.unfuse_head() is None
 
 
+def test_a_decoder_put_back_keeps_what_its_trace_found_of_its_head():
+    """Each decoder a loss traced keeps what that trace found of its head, so a decoder put back
+    after another was traced, as a half-rung probe that missed puts its decoder back, is still no
+    fused head where its head is no matrix."""
+    vocab = 61
+    model, tokens = head_scored(vocab, head_transform="gelu")
+    objective = LMObjective(model, 8, ema_decay=None, pad_id=0, head_tile=(4, 16))
+    step = Step(jnp.asarray(0), jax.random.key(1), None, training=True)
+    params = objective.init(jax.random.key(0))
+
+    def trace():
+        jax.make_jaxpr(lambda params: objective.scalar_loss(params, {TEXT_KEY: tokens}, step)[0])(params)
+
+    trace()
+    objective.substitute([model.clone(remat="full")])
+    trace()
+    objective.substitute([model])
+    assert not objective.program_key()[0].head_fused and objective.unfuse_head() is None
+
+
 def test_a_prediction_applies_the_head_once_and_scores_the_logits_it_returns():
     """A teacher's or a student's prediction (`LMObjective.predict`) holds the
     whole logits, and scores its losses from them: its forward contracts the

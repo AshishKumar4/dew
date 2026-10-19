@@ -622,11 +622,6 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     (`token_scores`' `z_loss`, `LMObjective`'s training loss): the fit ladder turns it off where the
     fused chunk does not fit (`LMObjective.unfuse_head`), and tiling the head turns it on."""
 
-    _head_matrix: tuple[object, bool] | None = None
-    """The decoder the last trace of a fused loss scored and whether its head was one matrix
-    (`chunked.head_table`): past a nonlinear head transform, or with an adapter's factors beside its
-    kernel, no matrix is, and no head is fused. Another decoder's head is taken to be one until
-    traced."""
 
     def __init__(self, model, seq_len: int, *, head_chunks: int = 4,
                  head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
@@ -639,6 +634,11 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         self.seq_len = seq_len
         self.head_chunks = head_chunks
         self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
+        # Each decoder a fused loss traced, by identity, and whether its head was one matrix
+        # (`chunked.head_table`): past a nonlinear head transform, beside an adapter's factors or
+        # in place of a frozen FP8 kernel no matrix is, and no head is fused. A decoder not yet
+        # traced is taken to have one.
+        self._head_matrices: dict[int, tuple[object, bool]] = {}
         self.samples = samples
         self.qk_stats = qk_stats
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
@@ -870,7 +870,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         head = None
         if z_loss is not None and self.head_tile is not None and reads_states(self.model):
             head = head_table(self.model, params)
-            self._head_matrix = (self.model, head is not None)
+            self._head_matrices[id(self.model)] = (self.model, head is not None)
         table = head if self.head_fused else None
         dtype = jnp.promote_types(hidden.dtype, jnp.float32)
         weights = self._row_weights(prepared, roles, dtype)
@@ -1323,8 +1323,7 @@ class LMObjective(TokenScorer):
         indexer's warm-up, which scores no head."""
         fused = (self.head_fused and self.head_tile is not None and reads_states(self.model)
                  and isinstance(self.model, AffineHead) and not self._warmup
-                 and (self._head_matrix is None or self._head_matrix[0] is not self.model
-                      or self._head_matrix[1]))
+                 and self._head_matrices.get(id(self.model), (None, True))[1])
         return (ProgramModule(self.model, self.head_tile, trained=True, head_fused=fused),)
 
     def unfuse_head(self) -> str | None:
