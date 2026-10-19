@@ -24,9 +24,9 @@ from dew.inference.projections import inference_projections, projection_groups
 from dew.interop import Pretrained
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.sharding import pipeline_microbatches
+from dew.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
 from dew.registry import wrapper_layers
 from dew.training import Layout, MeshSpec
-from dew.training.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
 
 
 @pytest.fixture(scope="module", params=NVFP4_QDQ_CASES)

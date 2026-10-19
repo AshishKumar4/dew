@@ -75,7 +75,7 @@ The driver and the GPU decide the build, newest first:
 
 `nvidia-smi --query-gpu=driver_version,compute_cap --format=csv,noheader` prints both; with several GPUs the oldest SM counts. These are the minimums in the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) and in Table 3 of NVIDIA's [CUDA release notes](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html). The CUDA version is the one the driver library a process loads supports: a driver's own, or a newer one under NVIDIA's [forward-compatibility package](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html) (`cuda-compat`), which runs the `cuda13` build on a 570 driver; Dew reads it from the library (`cuDriverGetVersion`). Neither build runs on an older GPU. The [dewml.dev install script](https://dewml.dev/install.sh) chooses by the driver alone.
 
-A run applies it too: on a machine with an NVIDIA GPU, `prepare_process` and `Trainer.fit` stop when JAX opened on the CPU, and print the install that fixes it where no CUDA build is installed or the installed one can't run on this driver. `JAX_PLATFORMS` selects the backend before JAX is imported. `JAX_PLATFORMS=cpu python train.py` runs on the CPU on a GPU machine, and the check leaves it alone. On Colab the tutorials install `dewml[cuda13]`. [Cloud TPUs](tpu.md) covers TPU provisioning.
+A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the first `Trainer.fit` of a program that never called it, raises `dew.telemetry.devices.CPUOnlyJax` when JAX opened on the CPU, naming the install that fixes it where no CUDA build is installed or the installed one can't run on this driver. `import dew` asks nothing of the hardware, so the check runs once the process's XLA flags are set. `JAX_PLATFORMS` selects the backend before JAX is imported. `JAX_PLATFORMS=cpu python train.py` runs on the CPU on a GPU machine, and the check leaves it alone. On Colab the tutorials install `dewml[cuda13]`. [Cloud TPUs](tpu.md) covers TPU provisioning.
 
 ### Process pools across GPUs
 
@@ -113,7 +113,7 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `hpo` | Optuna, for `dew.config.sweep` |
 | `eval-harness` | lm-evaluation-harness tasks through `dew.eval.harness.DewLM` |
 | `profile` | The xprof profiler |
-| `quantization` | Qwix, for quantized training and serving (`dew.training.quantization`) |
+| `quantization` | Qwix, for quantized training and serving (`dew.quantization`) |
 | `test` | The test suite's dependencies and pinned reference libraries |
 | `ci` | The test suite's whole environment: `test` and every extra a test file imports |
 

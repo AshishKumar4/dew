@@ -56,6 +56,7 @@ from dew.data.sources.base import Read
 from dew.files import write_atomically
 from dew.lora import AdapterRecord, LoRA
 from dew.objectives.base import Effects, Loss, Metric, Objective
+from dew.quantization import InputQuantization, Quantization
 from dew.records import JSON, duration, recorded_duration
 from dew.registry import (
     Annotation,
@@ -86,7 +87,7 @@ from dew.training.optim import (
     scaled_solver,
     weight_decay_mask,
 )
-from dew.training.quantization import InputQuantization, Quantization, quantize_trunk
+from dew.training.quantization import quantize_trunk
 from dew.training.selection import Best
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
@@ -704,7 +705,7 @@ class TrainerConfig:
     """The quantized-training spec, wrapped around the module the objective trains.
 
     The wrapper is applied before the run initializes the module. Unset trains in
-    the compute dtype. `dew.training.quantization` describes what the wrapper does
+    the compute dtype. `dew.quantization` describes what the wrapper does
     and what it keeps.
     """
     lower_for: str | None = None
