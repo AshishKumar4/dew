@@ -716,42 +716,70 @@ def assert_rows_as_exact_over_orders(dew, reference, label: str, sizes=None) -> 
         f"the reference's {their_worst:.3e} (ratio {worst / their_worst:.2f}, allowed {ROW_FACTOR:g})")
 
 
-def element_factor(elements: int) -> float:
-    """The factor `assert_elements_as_exact_over_orders` allows each of `elements` elements: the
-    square root of the F(ORDERS, ORDERS) quantile that a port as exact as its reference passes at
+def element_factor(elements: int, spread: float | np.ndarray = np.pi / 2,
+                   orders: int = ORDERS) -> float | np.ndarray:
+    """The factor `assert_elements_as_exact_over_orders` allows each of `elements` elements: the ratio
+    of two mean absolute errors over ORDERS orders that a port as exact as its reference passes at
     every element but for FALSE_FAILURE of the time (Bonferroni over the elements), at least FACTOR.
-    Each element's error over the orders is one Gaussian draw an order, a chi-square of ORDERS degrees
-    a side, so its squared RMS ratio is F(ORDERS, ORDERS): 3.16 at 43.5M elements."""
+    A mean of `orders` absolute errors varies by (spread - 1) / ORDERS of its square, `spread` the
+    errors' E[e^2] / E[|e|]^2 (pi / 2 for a Gaussian's, 2 for a Laplace's), so the log of the ratio
+    of two is normal with variance 2 (spread - 1) / orders (the delta method): 3.06 at 43.5M
+    Gaussian elements over ORDERS."""
     from scipy import stats
 
-    return max(FACTOR, float(np.sqrt(stats.f.isf(FALSE_FAILURE / max(elements, 1), ORDERS, ORDERS))))
+    deviation = np.sqrt(2 * (np.asarray(spread, np.float64) - 1) / orders)
+    return np.maximum(FACTOR, np.exp(stats.norm.isf(FALSE_FAILURE / max(elements, 1)) * deviation))
 
 
-def assert_elements_as_exact_over_orders(dew_squares, reference_squares, label: str) -> None:
+def error_spread(absolutes, squares, orders: int = 2 * ORDERS) -> np.ndarray:
+    """Each row's E[e^2] / E[|e|]^2 over its elements' errors: `absolutes` and `squares` `[rows,
+    elements]` each element's absolute and squared errors summed over `orders` orders, both sides'
+    together. Each element's own over its orders, averaged over the row's (its own draws too few to
+    tell; pooled over the row's raw errors, elements of unlike scales would read as heavy tails), a
+    Gaussian's pi / 2 where no element moves."""
+    first, second = np.asarray(absolutes, np.float64) / orders, np.asarray(squares, np.float64) / orders
+    moving = first > 0
+    spread = np.where(moving, second / np.where(moving, np.square(first), 1), 0.0)
+    counted = np.count_nonzero(moving, axis=1)
+    return np.where(counted > 0, spread.sum(axis=1) / np.maximum(counted, 1), np.pi / 2)
+
+
+def assert_elements_as_exact_over_orders(dew_absolutes, reference_absolutes, label: str, *, dew_squares,
+                                         reference_squares, orders: int = ORDERS) -> None:
     """Every element held over ORDERS rounding orders where the orders cannot all be kept:
-    `dew_squares` and `reference_squares` `[rows, ...]` each element's squared distance from float64
-    summed over the ORDERS orders. Each element's RMS over the orders within `element_factor` of the
-    reference's own at that element, and nothing else: no element borrows its row's error or a
-    rounding model's, and where the reference is exactly float64 in every order, Dew must be too. A
+    `dew_absolutes` and `reference_absolutes` `[rows, ...]` each element's absolute distance from
+    float64 summed over the ORDERS orders, and `dew_squares` and `reference_squares` its squares so
+    summed (over ORDERS orders, or `orders` a side where a run holds one half of its orders to the
+    other). Each element's mean absolute error over the orders within its row's `element_factor` of
+    the reference's own at that element, and nothing else: no element borrows its row's error or a
+    rounding model's, and where the reference is exactly float64 in every order, Dew must be too.
+    The mean absolute error, not the RMS: a bf16 rounding's flips give errors heavier-tailed than a
+    Gaussian's, whose squares' mean varies with their kurtosis, the absolute errors' mean with their
+    spread alone (`error_spread`), so the rule keeps its power there without a false failure. A
     non-finite element fails, on either side."""
-    dew_squares, reference_squares = (np.asarray(x, np.float64) for x in (dew_squares, reference_squares))
-    assert dew_squares.shape == reference_squares.shape and dew_squares.ndim >= 2, (
-        f"{label}: {dew_squares.shape} and {reference_squares.shape}, the rule takes [rows, ...] sums")
-    for side, squares in (("dew", dew_squares), ("the reference", reference_squares)):
-        broken = int(np.count_nonzero(~np.isfinite(squares)))
-        assert broken == 0, f"{label}: {broken} of {squares.size} of {side}'s elements are not finite"
-    rows = dew_squares.shape[0]
-    mine, theirs = (np.sqrt(squares.reshape(rows, -1) / ORDERS)
-                    for squares in (dew_squares, reference_squares))
-    factor = element_factor(mine.size)
+    sides = [np.asarray(x, np.float64) for x in (dew_absolutes, reference_absolutes, dew_squares,
+                                                 reference_squares)]
+    assert all(side.shape == sides[0].shape for side in sides) and sides[0].ndim >= 2, (
+        f"{label}: {[side.shape for side in sides]}, the rule takes [rows, ...] sums of one shape")
+    for name, side in zip(("dew's absolutes", "the reference's absolutes", "dew's squares",
+                           "the reference's squares"), sides, strict=True):
+        broken = int(np.count_nonzero(~np.isfinite(side)))
+        assert broken == 0, f"{label}: {broken} of {side.size} of {name} are not finite"
+    rows = sides[0].shape[0]
+    dew_absolutes, reference_absolutes, dew_squares, reference_squares = (
+        side.reshape(rows, -1) for side in sides)
+    mine, theirs = dew_absolutes / orders, reference_absolutes / orders
+    spread = error_spread(dew_absolutes + reference_absolutes, dew_squares + reference_squares, 2 * orders)
+    factor = element_factor(mine.size, spread, orders)[:, None]
     failing = mine > factor * theirs
     if np.any(failing):
         ratios = np.where(theirs > 0, mine / np.where(theirs > 0, theirs, 1), np.inf)
-        at = np.unravel_index(int(np.argmax(ratios)), ratios.shape)
+        at = np.unravel_index(int(np.argmax(np.where(failing, ratios / factor, 0.0))), ratios.shape)
         raise AssertionError(
             f"{label}: {int(np.count_nonzero(failing))} of {mine.size} elements past the reference; the "
-            f"worst, row {at[0]} element {at[1]}, is {mine[at]:.3e} from float64 (rms over {ORDERS} orders), "
-            f"the reference {theirs[at]:.3e} (allowed {factor:.2f} times it)")
+            f"worst, row {at[0]} element {at[1]}, is {mine[at]:.3e} from float64 (mean over {orders} "
+            f"orders), the reference {theirs[at]:.3e} (allowed {factor[at[0], 0]:.2f} times it, its row's "
+            f"errors of spread {spread[at[0]]:.2f})")
 
 
 def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, roundings: int) -> None:
@@ -759,15 +787,38 @@ def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, round
     computation itself of an independent float64 oracle: FACTOR times
     `roundings` (the longest chain of roundings an output goes through, its
     reductions' lengths summed along the way) float64 unit roundoffs of the
-    truth's RMS scale. Two float64 runs of one function part by that much at
-    most; any difference in the function moves the twin by many orders of
-    magnitude more. The fp32 error is no measure of it: a near-exact fp32 path
-    leaves the float64 runs a few ulps apart all the same."""
+    truth's RMS scale, and each entry within that of the largest of the truth's
+    RMS scale, its row's (a row every axis but the last) and its own size, so a
+    wrong small entry is not diluted by its leaf's others, while a sum that
+    cancels to zero keeps the rounding of what it summed. Two float64 runs of
+    one function part by that much at most; any difference in the function
+    moves the twin by many orders of magnitude more. The fp32 error is no
+    measure of it: a near-exact fp32 path leaves the float64 runs a few ulps
+    apart all the same."""
     eps = float(np.finfo(np.float64).eps)
+    bound = FACTOR * roundings * eps
     apart, scale = distance(reference_in_float64, truth), float(np.sqrt(np.mean(np.square(truth))))
-    assert within(apart, FACTOR * roundings * eps * scale), (
+    assert within(apart, bound * scale), (
         f"{label}: the reference in float64 is {apart:.3e} from the oracle (rms), more than float64 "
         f"rounding over {roundings} steps of its scale {scale:.3e}")
+    truth = np.asarray(truth, np.float64)
+    rows = truth.reshape(-1, truth.shape[-1]) if truth.ndim else truth.reshape(1, 1)
+    twin = np.asarray(reference_in_float64, np.float64).reshape(rows.shape)
+    row_scales = np.sqrt(np.mean(np.square(rows), axis=1, keepdims=True))
+    sizes = np.maximum(np.maximum(row_scales, np.abs(rows)), scale)
+    entries = np.abs(twin - rows)
+    over = ~(entries <= bound * sizes)
+    if np.any(over):
+        allowed = bound * sizes
+        ratios = np.where(over, np.where(allowed > 0, entries / np.where(allowed > 0, allowed, 1), np.inf),
+                          0.0)
+        at = np.unravel_index(int(np.argmax(ratios)), rows.shape)
+        raise AssertionError(
+            f"{label}: {int(np.count_nonzero(over))} of {rows.size} entries of the reference in float64 are "
+            f"past float64 rounding over {roundings} steps; the worst, row {at[0]} entry {at[1]}, is "
+            f"{entries[at]:.3e} from the oracle {rows[at]:.3e}, of size {sizes[at]:.3e} (its row's rms "
+            f"{float(row_scales[at[0], 0]):.3e}, the leaf's {scale:.3e}), "
+            f"{ratios[at]:.1f} times the bound")
 
 
 def chain_roundings(closed_jaxpr) -> int:
