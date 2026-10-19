@@ -177,7 +177,14 @@ def truth(root, destination):
                     got["images"] = pipe("cat", num_inference_steps=2, height=32, width=32, guidance_scale=3.0,
                                          latents=noise, negative_prompt="dog", output_type="np").images
                     pixels = np.rint(reference["images"] * 255).astype(np.uint8)
-                    features = pipe.feature_extractor(list(pixels), return_tensors="pt").pixel_values.to(wide)
+                    # The processor's resize and crop, then its rescale and normalize in float64.
+                    extractor = pipe.feature_extractor
+                    resized = extractor(list(pixels), do_rescale=False, do_normalize=False,
+                                        return_tensors="np").pixel_values.astype(np.float64)
+                    shape = (1, -1, 1, 1)
+                    features = torch.from_numpy(
+                        (resized * extractor.rescale_factor - np.reshape(extractor.image_mean, shape))
+                        / np.reshape(extractor.image_std, shape))
                     checker = pipe.safety_checker
                     got["checker_pixels"] = features.numpy()
                     got["checker_embeddings"] = checker.visual_projection(checker.vision_model(features)[1]).numpy()

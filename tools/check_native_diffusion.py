@@ -35,10 +35,21 @@ def bundle(directory, streamed: bool = False):
                            **({"mesh": MeshSpec()} if streamed else {}))
 
 
-def compare(errors, name, actual, expected, tolerance=5e-5):
-    actual, expected = np.asarray(actual, np.float32), np.asarray(expected, np.float32)
-    errors[name] = float(np.max(np.abs(actual - expected)))
-    np.testing.assert_allclose(actual, expected, atol=tolerance, rtol=tolerance)
+TRUTH = Path(__file__).resolve().parents[1] / "tests/fixtures/tiny_diffusers_f64.npz"
+"""Each saved task's references rerun in float64 (`truth` in tools/diffusers_pipeline_reference.py
+and tools/diffusers_extended_reference.py)."""
+
+
+def held(errors, directory.name, name, actual, reference, key):
+    """`actual` as near float64 as the source's float32 `reference`, the truth
+    the same saved pipeline computes in float64 (tests/reference_error.py)."""
+    from reference_error import assert_as_exact_as_the_reference, distance
+
+    with np.load(TRUTH) as truth:
+        wide = truth[f"{task}/{key}"]
+    actual = np.asarray(actual, np.float64)
+    errors[name] = {"dew": distance(actual, wide), "reference": distance(reference, wide)}
+    assert_as_exact_as_the_reference(actual, reference, wide, f"{task} {name}")
 
 
 def conditions(source, extended=False):
@@ -208,23 +219,26 @@ def check_pipeline(directory, streamed: bool = False):
     prepared = public_start(task, source, reference, meta, key, given, null, process, times)
     images, latents, given = trajectory(source, prepared, given, null, process, times, key)
     if "hidden" in reference:
-        compare(errors, "hidden", given["conditioning"].context, reference["hidden"])
+        held(errors, directory.name, "hidden", given["conditioning"].context, reference["hidden"], "hidden")
     if "pooled" in reference:
-        compare(errors, "pooled", given["conditioning"].pooled, reference["pooled"])
+        held(errors, directory.name, "pooled", given["conditioning"].pooled, reference["pooled"], "pooled")
     if "encoded" in reference:
         pixels = unit_range(jnp.asarray(reference["pixels"][None]))
-        compare(errors, "encode", source.autoencoder.encode(source.variables["autoencoder"], pixels, key), reference["encoded"])
-        compare(errors, "decode", source.autoencoder.decode(source.variables["autoencoder"], jnp.asarray(reference["noise"])), reference["decoded"])
+        held(errors, directory.name, "encode", source.autoencoder.encode(source.variables["autoencoder"], pixels, key),
+             reference["encoded"], "encoded")
+        held(errors, directory.name, "decode", source.autoencoder.decode(source.variables["autoencoder"],
+                                                               jnp.asarray(reference["noise"])),
+             reference["decoded"], "decoded")
     if "final_latents" in reference:
-        compare(errors, "latents", latents, reference["final_latents"])
-    compare(errors, "trajectory_images", (images + 1) / 2, reference["images"], 1e-4)
+        held(errors, directory.name, "latents", latents, reference["final_latents"], "final_latents")
+    held(errors, directory.name, "trajectory_images", (np.asarray(images, np.float64) + 1) / 2, reference["images"], "images")
     if source.finish is not None:
         raw = np.rint(reference["images"] * 255).astype(np.uint8)
         pixels = source.finish.transform(raw)
-        compare(errors, "checker_pixels", pixels, reference["checker_pixels"])
+        held(errors, directory.name, "checker_pixels", pixels, reference["checker_pixels"], "checker_pixels")
         features = source.finish.model.apply({"params": source.variables["encoders"]["safety"]}, pixels,
                                              method=source.finish.model.features)
-        compare(errors, "checker_features", features, reference["checker_embeddings"])
+        held(errors, directory.name, "checker_features", features, reference["checker_embeddings"], "checker_embeddings")
     # The same walk through the task facade: the same images.
     output = task(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key)
     np.testing.assert_array_equal(output.host().images, images)
