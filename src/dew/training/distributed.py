@@ -568,8 +568,10 @@ class Layout:
     gradient accumulation. The optimizer update then runs on a CPU companion of
     this mesh, and the parameter copies on the accelerators are read-only
     snapshots for running the step, never a second master copy. Every process
-    must have as many CPU devices as accelerators, set before JAX initializes;
-    neither this layout nor the trainer changes the count.
+    needs at least as many CPU devices as accelerators, set before JAX
+    initializes; neither this layout nor the trainer changes the count, and a
+    process's surplus CPUs, and the processes the mesh leaves out, stay out of
+    the companion (`companion_mesh`).
 
     `host_parameters` lists the variables an inference placement keeps in
     pinned host memory, as globs over their logical paths (`params/layers_*`).
