@@ -345,6 +345,10 @@ class Plan:
     rejections: Literal["drop", "mask"] = "drop"
     cache: tuple[str, ...] = ()
     volatile: bool = False
+    members: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    """A mixture's members, each what it reads and runs as one digest under its key, and its own
+    stages under the empty key (`dew.data.analysis._member_manifests`): what a streamed mix's
+    resume reads of a member that joined or left (`check`)."""
     version: ClassVar[int] = 3
 
     def record(self) -> dict[str, JSON]:
@@ -359,6 +363,7 @@ class Plan:
             "rejections": self.rejections,
             "cache": list(self.cache),
             "volatile": self.volatile,
+            "members": json_value(self.members, "members"),
             "exact": self.manifest.exact,
         }
 
@@ -408,8 +413,10 @@ class Plan:
         for name in ("lowering", "rejections", "cache", "volatile"):
             if current[name] != saved.get(name):
                 raise ValueError(f"saved data plan {name} changed: {saved.get(name)!r} -> {current[name]!r}")
+        edited = self._edited_members(saved)
         # An order is the same wherever its sources are mounted (`same_order`).
-        if _unplaced(json_value(saved.get("order"), "saved order")) != _unplaced(current["order"]):
+        saved_order = _unplaced(json_value(saved.get("order"), "saved order"))
+        if edited is None and saved_order != _unplaced(current["order"]):
             raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> {current['order']!r}")
         previous = record(saved.get("derived", {}), "saved derived order")
         for name in sorted(set(previous) | set(self.derived)):
@@ -418,6 +425,10 @@ class Plan:
         if self.lowering == "per-share" and current["topology"] != saved.get("topology"):
             raise ValueError("saved per-share data plan topology changed (shares, workers or cycle length)")
         changed = _changed(record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic())
+        if edited is not None:
+            # The members' sources and steps are each member's own digest, which `_edited_members`
+            # compared; the rest of the manifest is the mixture's.
+            changed = tuple(name for name in changed if name not in ("source", "steps"))
         if changed:
             raise ValueError(
                 f"saved data plan {', '.join(changed)} changed, so the records the saved position counts "
@@ -432,4 +443,33 @@ class Plan:
             _log.warning("data environment changed under an unchanged plan: %s", ", ".join(changes))
         if self.volatile:
             _log.warning("resuming volatile data; fetched outcomes may differ")
-        return changes
+        if edited:
+            _log.warning("resuming a mixture whose members changed: %s", ", ".join(edited))
+        return changes + (edited or ())
+
+    def _edited_members(self, saved: Mapping[str, object]) -> tuple[str, ...] | None:
+        """How a streamed mix's members changed from `saved`'s, which a resume takes: members that
+        joined, which start, members that left, which are dropped, and weights that changed; None
+        where the members and weights are as they were, or the plan is no streamed mix, whose order
+        is compared whole. Refused where a member kept by both changed what it reads or runs, or
+        where the mixture's own stages or order changed."""
+        members = record(saved.get("members", {}), "saved members")
+        before = {name: str(value) for name, value in members.items()}
+        order = json_value(saved.get("order"), "saved order")
+        if (self.lowering != "per-share" or not before or not self.members or not isinstance(order, dict)
+                or (before == dict(self.members) and order.get("weights") == self.order.get("weights"))):
+            return None
+        if before.get("") != self.members.get(""):
+            raise ValueError("saved data plan mixture stages changed")
+        kept = (set(before) & set(self.members)) - {""}
+        for key in sorted(kept):
+            if before[key] != self.members[key]:
+                raise ValueError(f"saved data plan member {key} changed what it reads or runs")
+        mixture = ("corpora", "members", "weights")
+        if (_unplaced({name: value for name, value in order.items() if name not in mixture})
+                != _unplaced({name: value for name, value in json_value(self.order, "order").items()
+                              if name not in mixture})):
+            raise ValueError(f"saved data plan order changed: {order!r} -> {self.order!r}")
+        return (*(f"member {key} joined" for key in sorted(set(self.members) - set(before))),
+                *(f"member {key} left" for key in sorted(set(before) - set(self.members))),
+                *(("weights changed",) if order.get("weights") != self.order.get("weights") else ()))

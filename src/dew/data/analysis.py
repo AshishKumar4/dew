@@ -57,7 +57,7 @@ from dew.data.pipeline import (
     Windows,
     Workers,
 )
-from dew.data.plan import Manifest, StepIdentity
+from dew.data.plan import Manifest, StepIdentity, fingerprint
 from dew.data.sources.base import READS, Read, Source
 from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
@@ -302,6 +302,35 @@ def _members(pipelines: Sequence[Pipeline]) -> list[str]:
     unnamed = itertools.count()
     return [f"name:{pipeline.name}" if pipeline.name is not None else f"place:{next(unnamed)}"
             for pipeline in pipelines]
+
+
+def _member_keys(members: Sequence[str]) -> list[str]:
+    """Each mixture member's key: the name it goes by (`_members`), as the plan's order records it
+    for every read alike, with its place among the members of that name, so two such members are
+    apart. A member's draws and its saved position are keyed by it, so adding or removing another
+    member leaves them as they were."""
+    return [f"{sum(earlier == name for earlier in members[:index])}:{name}"
+            for index, name in enumerate(members)]
+
+
+def _member_manifests(pipeline: Pipeline) -> dict[str, str]:
+    """What each member of a mixture reads and runs, its sources' content and its steps, as one digest
+    under its key (`_member_keys`), and under the empty key the mixture's own stages: what a saved
+    position of a streamed mix keeps of each member, so a resume takes its members' edits
+    (`dew.data.plan.Plan.check`). Nothing for a pipeline that mixes nothing."""
+    source = pipeline.source
+    if not isinstance(source, Mixture):
+        return {}
+
+    def digest(stages: Iterator[Stage], sources: Sequence[Source] = ()) -> str:
+        return fingerprint({"sources": [read.fingerprint() for read in sources],
+                            "steps": [_identity(stage).semantic() for stage in stages
+                                      if not isinstance(stage, (Workers, Prefetch))]})
+
+    keys = _member_keys(_members(source.pipelines))
+    return {"": digest(iter(pipeline.stages)),
+            **{key: digest(_steps(child), [read for _, read in _leaves(child)])
+               for key, child in zip(keys, source.pipelines, strict=True)}}
 
 
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:

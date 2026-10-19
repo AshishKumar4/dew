@@ -32,6 +32,7 @@ from dew.data.analysis import (
     _leaves,
     _Lowering,
     _manifest,
+    _member_manifests,
     _name,
     _preferred_read,
     _promoted,
@@ -545,6 +546,7 @@ def _compiled(
         {"read": read, "seed": seed, **build.lowering.order},
         _derived(train, build),
         cache=_cache_references(original, read),
+        members=_member_manifests(original),
         volatile=any(
             isinstance(stage.step, Volatile) and stage.step.volatile
             for stage in (*_steps(original), *(stage for source in sources for stage in _written(source, ())))

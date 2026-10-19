@@ -330,6 +330,83 @@ def test_a_member_named_as_a_place_keeps_its_draws_when_an_unnamed_one_joins():
         assert ahead and all(unnamed[index] == draw for index, draw in ahead.items())
 
 
+def member_rows(members, by, saved=None, batches=6):
+    """The (member, id) rows a streamed mix of `members` delivers over `batches` batches, and its
+    position after the first two, resumed from `saved` when given."""
+    data = compile(mix(members, by=by).batch(2), read="streamed", loading=READ, seed=5)
+    stream = data.train(DataPartition())
+    try:
+        if saved is not None:
+            stream.set_state(saved)
+        rows, position = [], None
+        for step in range(batches):
+            if step == 2 and saved is None:
+                position = stream.get_state()
+            batch = next(stream)
+            rows += [(int(of), int(index)) for of, index in zip(batch["source"], batch["id"], strict=True)]
+        return rows, position
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("by", ["records", "tokens"])
+@pytest.mark.parametrize("edit", ["joined", "left"])
+def test_a_streamed_mix_resumes_its_members_where_they_were_when_one_joins_or_leaves(by, edit):
+    """A streamed mix keeps each member's position under its key: resumed with a member joined, the
+    members it had read on from where they were and the new one from its first row; resumed with a
+    member gone, the others read on from where they were."""
+    def member(name, source):
+        return Pipeline(roled(source, 6, 2, count=8), name=name).repeat()
+
+    before = [member("a", 0), member("b", 1)] + ([] if edit == "joined" else [member("c", 2)])
+    after = [member("a", 0), member("b", 1)] + ([member("c", 2)] if edit == "joined" else [])
+    whole, saved = member_rows(before, by)
+    read = 2 * 2  # the rows of the two batches read before the position was saved
+    resumed, _ = member_rows(after, by, saved=saved)
+
+    def rows_of(rows, source):
+        return [index for of, index in rows if of == source]
+
+    for source in (0, 1):
+        ahead = rows_of(whole[read:], source)
+        again = rows_of(resumed, source)
+        assert again and again[:len(ahead)] == ahead[:len(again)]
+    if edit == "joined":
+        assert rows_of(resumed, 2)[:1] == [0]
+
+
+def test_a_streamed_mix_refuses_a_member_that_changed_what_it_reads():
+    """A member kept across a resume must read and run what it did: one whose steps changed is
+    refused by name, as its saved position counts other rows."""
+    _, saved = member_rows([Pipeline(roled(0, 6, 2), name="a").repeat(),
+                            Pipeline(roled(1, 6, 2), name="b").repeat()], "records")
+    changed = [Pipeline(roled(0, 6, 2), name="a").map(Relabelled()).repeat(),
+               Pipeline(roled(1, 6, 2), name="b").repeat()]
+    with pytest.raises(ValueError, match="member"):
+        member_rows(changed, "records", saved=saved)
+
+
+def test_an_indexed_mix_still_refuses_a_member_joining():
+    """An indexed mix reads by one global index over all its members, which a member joining moves:
+    its resume refuses the edit."""
+    def mixed(members):
+        return compile(mix(members).batch(2), read="indexed", loading=READ, seed=5)
+
+    members = [Pipeline(roled(0, 6, 2), name="a").repeat(), Pipeline(roled(1, 6, 2), name="b").repeat()]
+    stream = mixed(members).train(DataPartition())
+    try:
+        next(stream)
+        saved = stream.get_state()
+    finally:
+        stream.close()
+    resumed = mixed([*members, Pipeline(roled(2, 6, 2), name="c").repeat()]).train(DataPartition())
+    try:
+        with pytest.raises(ValueError):
+            resumed.set_state(saved)
+    finally:
+        resumed.close()
+
+
 def test_a_position_is_refused_where_a_mixture_member_was_renamed():
     """A mixture's plan names its members, whose draws their names key: a position saved under one
     name is refused by the mixture that renamed it, which would draw other rows."""
