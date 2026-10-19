@@ -33,6 +33,7 @@ from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, TUNED
 from dew.objectives.rl.flow import FlowGRPOObjective
 from dew.registry import to_record
 from dew.sampling import Euler, TextToImage
+from dew.sampling.pipelines import ImageSettings
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -136,7 +137,8 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     same initial variables, so both score a batch alike, through the VAE
     and the text towers. The loss the two share is held to Diffusers'
     train_dreambooth_flux.py statements on matched draws in
-    tests/test_flow_matching.py (ad63cc6a)."""
+    tests/test_flow_matching.py (ad63cc6a). Both sample by the same policy, the
+    pipeline's own grid and finish too."""
     from dew.interop.pretrained import load_diffusion_source
 
     directory = pipelines / family / "pipeline"
@@ -151,6 +153,9 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     written = DiffusionObjective(source, solver=Euler(), steps=2, **settings)
     assert configured.model == written.model
     assert to_record(configured.process, Process) == to_record(written.process, Process)
+    # The sampling policy a saved run records: the pipeline's grid and finish among it.
+    assert (to_record(configured.task_settings(), ImageSettings)
+            == to_record(written.task_settings(), ImageSettings))
     assert type(configured.autoencoder) is type(written.autoencoder)
     assert configured.inputs.sample == written.inputs.sample
     assert configured.inputs.conditions.keys() == written.inputs.conditions.keys()
@@ -368,3 +373,24 @@ def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     assert any(not np.array_equal(np.asarray(got), before)
                for got, before in zip(restored, started, strict=True))
+
+
+def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipelines):
+    """Flow-GRPO built over a loaded flow pipeline directly, its solver, steps and guidance given and
+    its grid left out, samples its evaluation and published task on the pipeline's own grid, as the
+    denoising objective over it does; `grid=None` asks for the training process's times."""
+    from dew.interop.pretrained import load_diffusion_source
+
+    source = load_diffusion_source(str(pipelines / "sd3" / "pipeline"), dtype="float32",
+                                   attention_impl="xla", size=(16, 16))
+    settings = {"reward": "psnr", "groups": 2, "rollout_steps": 3, "solver": Euler(), "guidance": None,
+                "steps": 2}
+    grpo = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
+                             variables=source.variables, **settings)
+    plain = DiffusionObjective(source, solver=Euler(), guidance=None, steps=2)
+    assert grpo.grid is not None and plain.grid is not None
+    assert to_record(grpo.grid, type(grpo.grid)) == to_record(plain.grid, type(plain.grid))
+    assert grpo.final_denoise is False
+    unset = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
+                              variables=source.variables, grid=None, **settings)
+    assert unset.grid is None and unset.final_denoise is True

@@ -239,15 +239,28 @@ def test_a_python_experiment_trains_and_its_record_trains_the_same_losses_in_a_n
 def test_train_flowers_tpu_smoke_samples_a_grid_and_scores_it(tmp_path):
     """The diffusion run's whole arc: synthetic ArrayRecords in, a run
     directory with its record and checkpoint, a samples grid out of
-    `dew.pipeline`, and the CLIPScore and FID of that grid, both scored
+    `dew.pipeline`, and the held-out split's CLIPScore and FID, both scored
     against a committed fixture rather than a download."""
     smoke("train_flowers_tpu", tmp_path)
 
     grid = np.asarray(__import__("PIL.Image").Image.open(tmp_path / "samples.png"))
     assert grid.shape == (16, 4 * 16, 3) and grid.dtype == np.uint8
     scored = json.loads((tmp_path / "eval.json").read_text())
-    assert "clip_score" in scored and scored["fid"] >= 0
+    assert "val/clip_score" in scored and scored["val/fid"] >= 0
     assert (tmp_path / "checkpoints" / "smoke" / "run.json").is_file()
+
+
+def test_sft_diffusion_gemma_images_smoke_trains_on_two_splits_and_captions_the_third(tmp_path):
+    """The image-reading run's arc: the train and validation splits train it,
+    with random crops and flips, and the run read back with `dew.pipeline`
+    captions every image of the test split it never trained on."""
+    smoke("sft_diffusion_gemma_images", tmp_path)
+
+    report = json.loads((tmp_path / "result.json").read_text())
+    assert (report["train_images"], report["test_images"], report["classes"]) == (16, 8, 2)
+    assert 0 <= report["caption_accuracy"] <= 1
+    captions = [json.loads(row) for row in (tmp_path / "captions.jsonl").read_text().splitlines()]
+    assert len(captions) == 8 and {row["label"] for row in captions} == {"pink rose", "yellow tulip"}
 
 
 def test_sft_diffusion_gemma_smoke_writes_an_adapter_and_generates_from_it(tmp_path):

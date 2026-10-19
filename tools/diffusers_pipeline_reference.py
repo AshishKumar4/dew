@@ -1,6 +1,6 @@
 """Generate saved tiny Flax pipelines and reference arrays, without downloads.
 
-Reference: diffusers==0.34.0, transformers==4.49.0, float32, CPU.
+Reference: the diffusers-pipelines cohort's releases (tools/reference_releases.py), float32, CPU.
 Run in an isolated reference environment:
   JAX_PLATFORMS=cpu USE_TF=0 python tools/diffusers_pipeline_reference.py DIR sd
 Repeat for xl, img2img, inpaint. DIR contains actual save_pretrained components,
@@ -10,11 +10,9 @@ import argparse
 import json
 from pathlib import Path
 
-import diffusers
 import jax
 import jax.numpy as jnp
 import numpy as np
-import transformers
 from diffusers import (
     FlaxAutoencoderKL, FlaxDDIMScheduler, FlaxUNet2DConditionModel,
     FlaxStableDiffusionPipeline, FlaxStableDiffusionXLPipeline,
@@ -24,10 +22,11 @@ from PIL import Image
 from transformers import CLIPTextConfig, CLIPTokenizer, FlaxCLIPTextModel, FlaxCLIPTextModelWithProjection
 from transformers.models.clip.tokenization_clip import bytes_to_unicode
 
+from reference_releases import require
+
 
 def build(directory, task):
-    if (diffusers.__version__, transformers.__version__) != ("0.34.0", "4.49.0"):
-        raise RuntimeError("Use the pinned isolated reference environment")
+    pins = require("diffusers-pipelines")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     vocabulary = list(bytes_to_unicode().values())
@@ -115,8 +114,8 @@ def build(directory, task):
         arrays["prediction"] = unet.apply({"params": params["unet"]}, noise, jnp.asarray([10]),
             encoder_hidden_states=arrays["hidden"], added_cond_kwargs=added).sample.transpose(0, 2, 3, 1)
     np.savez_compressed(directory / "reference.npz", **arrays)
-    print(json.dumps({"task": task, "directory": str(directory), "reference": diffusers.__version__,
-                      "transformers": transformers.__version__, "backend": jax.default_backend(),
+    print(json.dumps({"task": task, "directory": str(directory), "reference": pins["diffusers"],
+                      "transformers": pins["transformers"], "backend": jax.default_backend(),
                       "images_sum": float(np.asarray(output.images).sum())}))
 
 
