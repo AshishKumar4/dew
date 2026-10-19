@@ -263,14 +263,13 @@ def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, np.ndarray]:
     return dict(zip(FROZEN_FP8, (forward, forward_scale, dgrad, dgrad_scale), strict=True))
 
 
-def frozen_fp8_kernel(leaves: Mapping[str, jax.typing.ArrayLike]) -> np.ndarray:
+def frozen_fp8_kernel(leaves: Mapping[str, jax.typing.ArrayLike]) -> jax.Array:
     """The `[in, out]` kernel a frozen FP8 site's `leaves` hold, in float32:
-    the forward codes decoded under their row scales (`frozen_fp8_leaves`),
-    for a merge or an export, which read the kernel the products ran on."""
-    from dew.interop.codecs import dequantize_fp8_blocks
-
-    forward = np.asarray(leaves[FROZEN_FP8[0]])
-    return dequantize_fp8_blocks(forward, np.asarray(leaves[FROZEN_FP8[1]]), (1, forward.shape[1])).T
+    each forward code widened times its row's scale (`frozen_fp8_leaves`), the
+    rows the forward product multiplies by, for a merge, an export or a head's
+    vocabulary rows (`CausalTransformer.applied_kernel`), traced or not."""
+    forward = jnp.asarray(leaves[FROZEN_FP8[0]])
+    return (forward.astype(jnp.float32) * jnp.asarray(leaves[FROZEN_FP8[1]], jnp.float32)).T
 
 
 def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
@@ -599,6 +598,15 @@ class InputQuantization:
 
         def quantize_inputs(next_fun, args, kwargs, context):
             module = context.module
+            if context.method_name == "applied_kernel":
+                # A model reads the kernel its submodule multiplies by
+                # (`CausalTransformer.applied_kernel`): a frozen FP8 site's
+                # is its codes decoded, which an adapter's branch updates.
+                child = getattr(module, args[0] if args else kwargs["name"])
+                if not child.has_variable(QUANTIZATION, FROZEN_FP8[0]):
+                    return next_fun(*args, **kwargs)
+                return frozen_fp8_kernel({leaf: child.get_variable(QUANTIZATION, leaf)
+                                          for leaf in FROZEN_FP8})
             if context.method_name == "nonlinear_input":
                 # A layer asks whether its submodule is linear in its input
                 # (`MultiHeadLatentAttention.nonlinear_input`): one that
