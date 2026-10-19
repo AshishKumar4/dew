@@ -64,20 +64,27 @@ def test_the_scanned_stack_quantizes_each_layer_with_its_own_scales(case):
     assert_quantized(scanned.apply(loaded.variables, reference["ids"].astype(np.int32)), reference, "scanned")
 
 
-def test_layers_quantized_apart_refuse_one_scanned_run(case):
+def test_layers_quantized_apart_run_as_scanned_runs_of_their_own(case):
     """A checkpoint that quantizes two otherwise like layers differently, here
     one with a projection left unquantized, gives them different scale trees,
-    which one scanned body cannot read; the scan refuses them, and runs the
-    checkpoint whose layers are quantized alike."""
+    which one scanned body cannot read: the scan runs them as runs of their
+    own, each layer with its own scales, and its logits are held to the rule
+    the plain loop of the same weights is, against their own float64
+    forward. The stored tree stays one subtree per layer, so the scanned and
+    the plain model read and init the same tree."""
     _, loaded, reference = case
     scanned = loaded.model.clone(scan_layers=True)
-    scanned.apply(dict(loaded.variables), reference["ids"].astype(np.int32))
+    ids = reference["ids"].astype(np.int32)
     variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
     layer = variables[QUANTIZATION]["layers_1"]
     mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
     layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
-    with pytest.raises(ValueError):
-        scanned.apply(variables, reference["ids"].astype(np.int32))
+    plain = np.asarray(loaded.model.apply(variables, ids))
+    truth, terms = float64_forward(loaded.model, variables, ids)
+    assert_as_exact_as_the_reference(np.asarray(scanned.apply(variables, ids)), plain, truth,
+                                     "layers quantized apart, scanned", terms=terms)
+    initialized = [jax.eval_shape(model.init, jax.random.key(0), ids) for model in (scanned, loaded.model)]
+    assert jax.tree.structure(initialized[0]) == jax.tree.structure(initialized[1])
 
 
 @pytest.mark.mesh(devices=2)
