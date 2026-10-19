@@ -126,11 +126,12 @@ def test_each_tree_runs_in_the_environment_its_own_lock_installs(gate, tmp_path,
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(gate.subprocess, "run", child)
-    lock = gate.build()
+    locks = [path.name for path in (ROOT / "locks").glob("*.txt")]
     trees = {name: tmp_path / name for name in ("main", "head")}
     for tree, wheel in zip(trees.values(), ("0.3.3", "0.3.4"), strict=True):
         (tree / "locks").mkdir(parents=True)
-        (tree / "locks" / f"{lock}.txt").write_text(f"dew-flash-attn-cu13=={wheel}\n")
+        for lock in locks:
+            (tree / "locks" / lock).write_text(f"dew-flash-attn-cu13=={wheel}\n")
         (tree / "tools").mkdir()
         installer = (ROOT / "tools" / "install_environment.sh").read_bytes()
         (tree / "tools" / "install_environment.sh").write_bytes(installer)
@@ -151,7 +152,7 @@ def test_each_tree_runs_in_the_environment_its_own_lock_installs(gate, tmp_path,
     assert {tree for tree, _ in rows} == set(trees.values())
     assert all(python == environments[tree] / "bin" / "python" for tree, python in rows)
 
-    same = (trees["main"] / "locks" / f"{lock}.txt").read_bytes()
-    (trees["head"] / "locks" / f"{lock}.txt").write_bytes(same)
+    for lock in locks:
+        (trees["head"] / "locks" / lock).write_bytes((trees["main"] / "locks" / lock).read_bytes())
     (shared,) = gated(tmp_path / "shared").values()
     assert len(built) == 1 and {python for _, python in rows} == {shared / "bin" / "python"}
