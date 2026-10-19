@@ -654,7 +654,7 @@ def pretrained_round_trip_figure():
     svg.appear(compared, 2.0)
     with svg.group() as trained:
         svg.arrow(345, 150, 345, 192)
-        svg.text(355, 176, "train on Python", size=13, color="muted")
+        svg.text(335, 176, "train on Python", size=13, color="muted", anchor="end")
         station(270, 196, "Dew, trained", ["lower perplexity", "on held-out code"], "accent")
     svg.appear(trained, 3.4)
     with svg.group() as exported:
