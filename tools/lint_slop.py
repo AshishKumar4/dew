@@ -146,7 +146,7 @@ SOURCE_READERS = {"inspect.getsource", "inspect.getsourcelines", "inspect.getsou
 CALL_ARGUMENTS = {"decode", "kv_store", "attention_metadata", "call"}
 # Process-wide state a module must not change while it is imported.
 GLOBAL_WRITES = ("config.update", "environ.setdefault", "environ.update", "putenv", "basicConfig",
-                 "register_event_listener", "filterwarnings", "simplefilter")
+                 "mark_as_parsed", "register_event_listener", "filterwarnings", "simplefilter")
 
 
 @dataclass(frozen=True)
