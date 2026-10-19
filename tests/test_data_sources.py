@@ -20,7 +20,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 import pytest
-from hub_support import stated_shards
+from hub_support import native_builder, stated_shards
 from reader_support import assert_a_rewrite_moves_the_identity
 
 from dew.data.dataset import DataPartition, Loading
@@ -115,14 +115,10 @@ def moving_hub_conversion(monkeypatch, tmp_path, request):
     monkeypatch.setattr(HfApi, "list_repo_refs", refs)
     monkeypatch.setattr(HfFileSystem, "info", header)
     monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, **kwargs: io.BytesIO(payloads[path]))
-    (tmp_path / "dataset_info.json").write_text("{}")
-    prepared = datasets.Dataset.from_dict(columns(0))
-    builder = SimpleNamespace(
-        cache_dir=str(tmp_path),
-        config=SimpleNamespace(data_files=None),
-        info=SimpleNamespace(features=None, splits={"train": SimpleNamespace(num_examples=32)}),
-        as_dataset=lambda **kwargs: prepared,
-    )
+    # The real builder of the split, prepared: the Arrow a pinned revision without a conversion reads.
+    builder = native_builder({"train": datasets.Dataset.from_dict(columns(0))}, tmp_path / "files",
+                             tmp_path / "arrow")
+    builder.download_and_prepare()
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     return converted
 
@@ -1081,11 +1077,9 @@ def test_snapshot_reads_a_prepared_hub_without_physical_shards(tmp_path, monkeyp
 
     from dew.data import Hub
 
-    (tmp_path / "dataset_info.json").write_text("{}")
-    prepared = datasets.Dataset.from_dict({"id": [4, 5, 6]})
-    builder = SimpleNamespace(cache_dir=str(tmp_path), config=SimpleNamespace(data_files=None),
-                              info=SimpleNamespace(features=None, splits=None),
-                              as_dataset=lambda **kwargs: prepared)
+    builder = native_builder({"train": datasets.Dataset.from_dict({"id": [4, 5, 6]})}, tmp_path / "files",
+                             tmp_path / "arrow")
+    builder.download_and_prepare()
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     monkeypatch.setattr(HfApi, "dataset_info", lambda *args, **kwargs: SimpleNamespace(sha="pinned"))
     monkeypatch.setattr(HfApi, "list_repo_files", lambda *args, **kwargs: ["train.tar"])
@@ -1614,7 +1608,7 @@ def test_published_file_facts_avoid_metadata_probes_and_verify_the_index(monkeyp
     assert source.records("indexed")[1] == {"id": 1}
 
 
-def test_torch_source_refuses_streaming_and_cache_without_content_identity():
+def test_torch_source_reads_every_way_and_refuses_a_cache_without_content_identity():
     import torch
     from torch.utils.data import TensorDataset
 
@@ -1623,10 +1617,8 @@ def test_torch_source_refuses_streaming_and_cache_without_content_identity():
     from dew.data.sources import Torch
 
     rows = Torch(TensorDataset(torch.arange(4)), fields=("id",))
-    assert not rows.supports("streamed")
+    assert rows.supports("streamed")
     assert int(rows.records("indexed")[2]["id"]) == 2
-    with pytest.raises(ValueError):
-        rows.records("streamed")
     import grain.python as grain
 
     with pytest.raises(ValueError):
@@ -2362,3 +2354,52 @@ def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(re
         assert head + [np.asarray(next(resumed)["id"]).tolist() for _ in range(6)] == expected
     finally:
         resumed.close()
+
+
+def test_a_directory_of_arrow_files_reads_its_feather_files_too(tmp_path):
+    """Arrow IPC files carry `.arrow` or `.feather`, both of which a URL's format is inferred from:
+    a directory read as Arrow reads both kinds, every row of each."""
+    import pyarrow.feather as feather
+
+    feather.write_feather(pa.table({"id": [0, 1]}), tmp_path / "first.feather")
+    with pa.ipc.new_file(tmp_path / "second.arrow", pa.schema([("id", pa.int64())])) as writer:
+        writer.write_table(pa.table({"id": [2, 3]}))
+    source = Files(str(tmp_path), format="arrow")
+    rows = source.records("memory")
+    assert sorted(int(rows[index]["id"]) for index in range(len(rows))) == [0, 1, 2, 3]
+    assert Files(str(tmp_path / "first.feather")).kind == "arrow"
+
+
+def test_a_directory_named_for_its_format_declares_it_with_a_trailing_separator_too(tmp_path):
+    """A directory whose name carries a format's suffix declares that format, spelled with a
+    trailing separator or without: either spelling reads every file it holds."""
+    import pyarrow.parquet as pq
+
+    directory = tmp_path / "train.parquet"
+    directory.mkdir()
+    pq.write_table(pa.table({"id": [0, 1]}), directory / "part-0.parquet")
+    for url in (str(directory), f"{directory}/"):
+        rows = Files(url).records("memory")
+        assert [int(rows[index]["id"]) for index in range(len(rows))] == [0, 1]
+
+
+def test_a_concatenation_of_cold_stores_is_prepared_through_its_own_stores(tmp_path):
+    """A concatenation of two JSONL stores that hold no offset index yet takes an indexed read once
+    each of its stores prepares one: a pass asked to provision prepares both and reads every
+    record, the first store's then the second's, where it once refused the read."""
+    from dew.data.compile import validation
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Concatenate
+
+    for name, ids in (("first", range(5)), ("second", range(5, 9))):
+        (tmp_path / f"{name}.jsonl").write_text("".join(json.dumps({"id": i}) + "\n" for i in ids))
+    joined = Concatenate((Files(str(tmp_path / "first.jsonl")), Files(str(tmp_path / "second.jsonl"))))
+    assert not joined.supports("indexed")
+    reader = validation(Pipeline(joined).batch(3), batch=3, read="indexed", provision=True,
+                        loading=Loading(workers=0))(DataPartition())
+    try:
+        assert [int(value) for batch in reader for value in batch["id"]] == list(range(9))
+    finally:
+        reader.close()
+    assert joined.supports("indexed")

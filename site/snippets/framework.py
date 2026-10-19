@@ -223,7 +223,7 @@ def formats():
 
     from dew.interop import PretrainedDecoder
     from dew.sampling import Sampling
-    from dew.training.quantization import Quantization
+    from dew.quantization import Quantization
 
     bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", dtype=jnp.bfloat16, param_dtype=jnp.bfloat16,
                                     max_seq_len=128)
