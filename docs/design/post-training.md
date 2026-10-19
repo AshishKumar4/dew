@@ -1,224 +1,192 @@
 # Post-training in Dew: SFT, DPO and online RL on one trainer
 
-This is the binding design for post-training. The current Flow-GRPO usage is in [the post-training guide](../concepts/post_training.md#flow-grpo). The [data design](data.md) supersedes the older data-source sketches below. Implementation and qualification work lives in the [roadmap](../roadmap.md#rl-and-serving).
-
-Correction (2026-09-22): I checked this record against current source. The sketch below still matches the constructors (`src/dew/objectives/lm/objective.py:431-450`, `src/dew/objectives/rl/preference.py:39`, `src/dew/objectives/rl/grpo.py:58`, `src/dew/training/trainer.py:188-203`). Where a section no longer matches, a dated note at the end of that section says what changed.
+This is the binding design for post-training. It uses the [training](training.md) and [data](data.md) contracts and the shared [numerical gate](testing.md#numerical-accuracy). Implementation and qualification work lives in the [roadmap](../roadmap.md#rl-and-serving). Usage examples are in the [post-training guide](../concepts/post_training.md).
 
 A modality is an objective, so post-training adds objectives, and the user learns one pattern:
 
-```
-LMObjective(model, seq_len)                                  # pretraining, as today
-LMObjective(model, seq_len, loss_role=Role.ASSISTANT)        # SFT: the same class, a loss mask, a chat data path
+```python
+LMObjective(model, seq_len)
+LMObjective(model, seq_len, loss_role=Role.ASSISTANT)
 DPOObjective(model, seq_len, beta=0.1)
 GRPOObjective(model, seq_len, beta=0.0)
 Trainer(objective, optimizer, ..., rollout=SampledRollout(...))
 ```
 
-They run on the `Trainer` as it is (`dew.training.trainer`), with the same state, sharding, EMA clock, checkpoints and tracker keys. The design rests on three mechanisms. The reference is the EMA tree at unit decay (§3), sampling is one more trainer capability (§4), and rewards are plain callables (§5). `dew.rl` already has the surrogate math, built and parity-tested, so the online objectives only assemble it (§6). Staged runs chain these links in `recipes/chain.py` (§12).
+They run on the same Trainer, state, sharding, EMA clock, checkpoints and tracker keys. The reference is the EMA tree at unit decay (§3), sampling is a host-side trainer capability (§4), and rewards are plain callables (§5). The online objectives assemble the shared estimators and surrogates in `dew.rl`; staged runs compose them in `recipes/chain.py` (§12).
 
 ## 1. Data
 
-The paths are frozen Recipe values in the datasets registry: Chat, Preferences and Prompts alongside Text. Each constructs a Pipeline; load(recipe, batch=..., read=...) compiles it into the Dataset consumed by the trainer. Post-training therefore uses the same execution boundary as every other objective.
+Post-training uses the same `Dataset` chain as every other objective. `Files`, `Hub` or `Memory` reads records; chat, preference and prompt transforms prepare them; the shared packer and executor handle placement and resume. Run configurations use `ChatData`, `PreferenceData` and `PromptData` to build these same chains.
 
 ### 1.1 Chat and SFT: a role per token
 
-SFT needs one field beyond the pretraining contract: which role wrote each token. The loss must count assistant tokens only.
+SFT needs one field beyond the pretraining contract: which role wrote each token. The loss counts assistant targets only when `loss_role=Role.ASSISTANT`.
 
-`Chat`, registered as `chat`, is a Grain source over a parquet file whose `prompt` column holds verl-shaped conversations, plus a tokenizer whose chat template renders them. `Files`, `Hub` or `Memory` reads records. `RenderChat` renders each conversation and emits, per token, `text` and `text_roles` (int8: 0 pad, 1 system, 2 user, 3 assistant, 4 tool). The packer carries `text_roles` beside `text_segment_ids` and `text_positions`. Memory mode materializes deterministic rendering and packing explicitly. Indexed and streamed modes need producer metadata and do not add an implicit lengths scan.
+`RenderChat` applies the tokenizer's chat template to the messages and optional tool schemas. It writes int32 `text` ids and aligned int8 `text_roles`: 0 padding, 1 system, 2 user, 3 assistant, 4 tool and 5 developer. Text parts join in order; nontext parts require a processor.
 
-The assistant span comes from prefix rendering, not from template markers:
+The assistant span comes from prefix rendering:
 
 - For message *k*, render `messages[:k]` with `add_generation_prompt=True` to ids `p_k`, and `messages[:k+1]` without it to `f_k`.
-- Assert `f_k[:len(p_k)] == p_k`. Dew refuses a template whose rendering is not incremental in its prefix, and names it, instead of masking it wrong.
-- The assistant tokens are `f_k[len(p_k):]`, including the end-of-turn token, because the model has to learn to emit the stop token.
+- Both must be prefixes of the whole-conversation rendering, and `f_k[:len(p_k)]` must equal `p_k`. A template that rewrites the prefix fails at rendering.
+- The assistant targets are `f_k[len(p_k):]`, including the end-of-turn id. Its opening header carries no assistant loss.
 
-TRL's `assistant_only_loss` needs a template carrying `{% generation %}` markers. When the user's template lacks them, TRL swaps in a bundled template, which changes the rendered ids as well as the mask. verl tokenizes each message alone and concatenates the results, which equals whole-conversation tokenization only for templates that happen to be concatenation-safe. The prefix method is exact for any template and asserts it. TRL's mask is still the parity reference for the transform (§8).
+Other roles retain their spans in the same whole-conversation rendering. A turn that renders to nothing or rewrites an earlier turn fails with its message index. The template is never silently replaced to obtain a mask.
 
-Packing reuses the existing machinery. `text_roles` joins as one more per-token feature in `FirstFitPackIterDataset` with its own `length_struct` and `padding_struct` entries. A chunk step over both fields (`Chunks`) cuts every per-token field of a document longer than the window, so ids and roles stay aligned. A conversation that starts with the assistant is refused, because the template gives no way to separate its opening header from its completion. Segment ids still stop attention at a document boundary.
+Packing carries ids and roles through one document-coordinate plan. A chunking or truncation step cuts every aligned field together. The prepared batch is:
 
-| key | shape | dtype | content |
-| --- | --- | --- | --- |
-| `text` | `[B, S+1]` | int32 | packed conversation ids |
-| `text_coordinates` | `Coordinates`, `[B, S+1]` leaves | int32/bool | which document each token is in, 0 on pad, and its position inside it (`dew.nn.inputs.Coordinates`) |
-| `text_roles` | `[B, S+1]` | int8 | role per token, 0 on pad |
+| Key | Shape | Dtype | Content |
+|---|---|---|---|
+| `text` | `[B, S+1]` | int32 | Packed conversation ids |
+| `text_coordinates` | `Coordinates`, `[B, S+1]` leaves | int32/bool | Document membership, padding and positions |
+| `text_roles` | `[B, S+1]` | int8 | Role per id, 0 on padding |
 
-`loss_role` multiplies the objective's existing target weights by `(text_roles[:, 1:] == loss_role)`, together with the pad and segment-boundary weights it already computes. With no `loss_role`, every counted target counts, as in pretraining.
-
-Correction (2026-09-22): packing now goes through Pipeline.pack, which fixes its recipe and scope in the compiled plan; `FirstFitPackIterDataset` is gone from `src/`. A window carries one `text_segment_ids`/`text_positions` pair that serves `text` and `text_roles` alike. `Chat` reads a parquet file, a `.jsonl` file or a Hub dataset id; the conversation column defaults to `messages` and falls back to `prompt` (`src/dew/data/chat.py:672-704`). `Role` has a sixth value, `DEVELOPER = 5` (`src/dew/data/chat.py:65-80`).
+`loss_role` multiplies the objective's target weights by `text_roles[:, 1:] == loss_role`, together with the existing pad and document-boundary weights. With no `loss_role`, every valid target counts. A role-masked objective requires the roles column.
 
 ### 1.2 Preference pairs
 
-`Preferences`, registered as `preferences`, reads a parquet file or JSON rows of `chosen` and `rejected` token-id lists, with `chosen_mask` and `rejected_mask` marking the completion tokens. Absent masks default to all-completion. Every element is one `[2, seq_len]` pair, chosen at index 0, padded with `pad_id` and 0, so a grain batch is `[B, 2, seq_len]` and shuffling never separates a pair. A row longer than `seq_len` fails with its lengths. A pair cannot be chunked without cutting a completion, and a silent cut would train the wrong preference.
+`PreferencePair` reads `chosen` and `rejected` id lists with optional `chosen_mask` and `rejected_mask`. A missing mask marks the whole sequence as completion. The transform pads each pair together; choosing `seq_len=S+1` prepares the row width expected by `DPOObjective(..., seq_len=S)`.
 
-| key | shape | dtype | content |
-| --- | --- | --- | --- |
-| `input_ids` | `[B, 2, S]` | int32 | pairs, chosen at index 0 |
-| `completion_mask` | `[B, 2, S]` | int32 | 1 on completion tokens, including the stop token |
+| Key | Shape | Dtype | Content |
+|---|---|---|---|
+| `input_ids` | `[B, 2, S+1]` | int32 | Chosen at pair index 0, rejected at 1 |
+| `completion_mask` | `[B, 2, S+1]` | int32 | Completion marks aligned with the ids |
 
-The objective reads the pair index out explicitly. A reshape would interleave two pairs into the halves and compare across them.
+The objective reads the pair index explicitly and shifts the completion mask with the next-token targets. Shuffling never separates a pair. A row that exceeds the declared width fails; chunking a pair would cut the completion whose preference was scored.
 
-### 1.3 Prompts for online RL
+### 1.3 Prompts and packed rollouts
 
-`Prompts`, registered as `prompts`, reads a parquet file or JSON rows of `prompt` (messages, a string, or token ids) plus the reward columns `data_source`, `ground_truth` and `extra_info`, which default to empty when absent. Each row encodes to a left-padded `prompt` of `max_prompt_len` ids plus `prompt_length`. The reward columns become fixed-width UTF-8 byte arrays so every leaf survives the device transfer. Prompts longer than the window keep their tail; blank prompts fail. The source makes no masks, because the rollout produces them.
+`RenderPrompt` accepts a message conversation, string or id sequence. It left-pads ids to `max_prompt_len` and writes `prompt_length` plus `data_source`, `ground_truth` and `extra_info` as fixed-width UTF-8 byte values stored in int32 arrays. Missing reward fields become empty strings. Over-length prompts are dropped by default; `long="truncate"` explicitly keeps the tail.
 
-In: `prompt` `[B, P]` int32, left-padded, `prompt_length` `[B]` int32, and the three reward columns as UTF-8 bytes. Out of the rollout, and what `loss` consumes:
+`SampledRollout` generates a group of completions per prompt, scores each completion and builds one-call sessions through `sessions.pack`. The learner reads fixed-width packed chains; a prompt and completion must fit the objective's `seq_len+1`. The primary aligned columns are:
 
-| key | shape | dtype | content |
-| --- | --- | --- | --- |
-| `input_ids` | `[N, P+T]` | int32 | prompt and continuation, groups contiguous per prompt |
-| `response_mask` | `[N, T]` | float32 | 1 through the first stop token |
-| `old_log_probs` | `[N, T]` | float32 | raw policy likelihoods recorded during generation |
-| `behavior_log_probs` | `[N, T]` | float32 | actual temperature/top-k sampling likelihoods |
-| `response_length` | `[N]` | int32 | generated actions, including EOS |
-| `terminated` | `[N]` | bool | EOS termination instead of the token budget |
-| `advantages` | `[N, T]` | float32 | group or RLOO advantages broadcast over the width |
-| `rewards` | `[N]` | float32 | raw scores, for telemetry |
-| `prompt_length` | `[N]` | int32 | real tokens before padding |
+| Key | Shape | Content |
+|---|---|---|
+| `input_ids` | `[N, W]` | Prompt and completion chains |
+| `text_segment_ids`, `text_positions` | `[N, W]` | Chain identity and position, with segment 0 on padding |
+| `response_mask` | `[N, W]` | Trainable sampled actions, including EOS |
+| `old_log_probs` | `[N, W]` | Raw proximal-policy likelihoods |
+| `behavior_log_probs` | `[N, W]` | Likelihoods under the actual sampler |
+| `advantages` | `[N, W]` | The session's group or RLOO advantage on its actions |
+| `versions`, `session_index`, `call_index` | `[N, W]` | Policy version and ownership of each action |
+| `session_weights` | `[N, W]` | Weights for averaging each session's token mean equally |
 
-The rollout returns fixed-width arrays even when EOS ends a completion early. Response masks and lengths identify valid actions. `Prompts.prompt_length` stays data metadata; the adapter turns it into `ModelInputs.token_fields["attention_mask"]` before generation. One compiled padded prefill and decode scan serves different row lengths through native cache cursors and validity. The rollout reads each process's owned rows from the globally sharded batch and returns those rows. All ranks validate before collective execution, agree on input shapes and sampling controls, and run the same fixed scan. Different prompt lengths or EOS outcomes do not change the collective schedule.
+Here `W=seq_len+1`. Optional routing records and filtered sampling-support columns travel beside these arrays when an engine supplies them. Every likelihood refers to the same action as its mask and advantage. Prompt lengths remain input metadata; the loss uses packed coordinates. Rewards and completion lengths are reported as rollout metrics.
 
-Correction (2026-09-22): `SampledRollout` returns `input_ids`, `response_mask`, `old_log_probs`, `behavior_log_probs`, `advantages`, `rewards` and `prompt_length`. It returns no `response_length` or `terminated` key (`src/dew/objectives/rl/rollout.py:139-147`).
+EOS marks a completed session. Exhausting the generation budget marks it truncated; the explicit truncation policy decides its training mass and reward treatment. In `SampledRollout`, the text passed to the reward excludes EOS while the response mask includes it. Raw policy likelihoods and sampling likelihoods remain distinct.
 
-Correction (2026-09-22, packed layout): the table above is superseded. `SampledRollout` builds its batch with `sessions.pack`, one call per completion: every column is `[N, P+T]` and aligned with `input_ids`, with `text_segment_ids`, `text_positions`, `versions`, `session_index` and `call_index` beside the mask, likelihoods and advantages. No `rewards` or `prompt_length` column remains; GRPO reads only this layout.
+The rollout reads each process's owned prompts and validates them before collective generation. A fixed padded prefill and decode program handles different prompt lengths and stopping outcomes without changing the collective schedule. The trainer places the returned learner batch on the training mesh.
 
-### 1.4 verl's parquet schema, mapped
+### 1.4 verl's parquet schema
 
-| verl field | verl content | Dew |
-| --- | --- | --- |
-| `data_source` | dataset name, indexes the reward | `data_source`, passed to the reward (§5) |
-| `prompt` | chat messages | rendered by the chat transform into `text` and `text_roles`, or encoded by the prompt source |
-| `reward_model` | `{"style": "rule", "ground_truth": str}` | `ground_truth`, passed to the reward |
-| `extra_info` | bookkeeping | `extra_info`, passed to the reward |
-| `ability` | task category | carried in `extra_info`; Dew dispatches on nothing |
+| verl field | Content | Dew boundary |
+|---|---|---|
+| `data_source` | Dataset or reward-rule name | Prompt reward context |
+| `prompt` | Chat messages | Shared chat or prompt rendering |
+| `reward_model.ground_truth` | Reference answer | `ground_truth` |
+| `extra_info` | Additional task context | Preserved reward context |
 
-verl's `compute_score(data_source, solution_str, ground_truth, extra_info)` takes the same four things that Dew's callable takes as fields of one record.
+The adapter owns this mapping. A record that supplies the reference answer both at the top level and under `reward_model` is ambiguous and fails at that boundary.
 
-## 2. Why `loss_role` and not `mask=`
+## 2. The loss role
 
-A loss mask is not a property of the model, and the data has to know roles anyway.
-
-| option | cost | gives up |
-| --- | --- | --- |
-| `mask="assistant"` | a stringly-typed knob with a hidden coupling to the batch | nothing, but every caller learns which strings exist |
-| `loss_role=ASSISTANT` | one typed field compared against a column the batch already carries | an arbitrary ad-hoc boolean mask |
-
-Decision: `loss_role`. It keeps the same class and adds one field and one multiply. When `loss_role` is set, the objective refuses a batch with no `text_roles` and names the field.
+A loss mask belongs to the objective's targets. `loss_role` names one typed role already present in the batch rather than introducing a second mask configuration. The same `LMObjective` serves pretraining and SFT, and both use the shared scoring and head path.
 
 ## 3. The frozen reference
 
-Decision: the reference is the EMA tree at unit decay. A preference or RL objective sets `ema = EMASpec(decay=optax.constant_schedule(1.0))` and reads `step.ema` in `loss`. `Step.ema` is the variables tree with the averaged leaves in place of the live ones (`dew/objectives/base.py`), so the reference forward runs through the same code as the policy forward with a different tree.
+DPO keeps the starting policy in the existing EMA slot at unit decay; GRPO and FlowGRPO keep it when their positive KL weight reads it. The objective declares this through `EMASpec.constant`, and the loss reads the resulting variables through `step.ema`.
 
-Several properties come with this choice at no extra cost:
+- Only live parameters reach the optimizer. The frozen tree has no optimizer state or gradient updates.
+- The reference is checkpointed and placed with the training state.
+- The EMA clock advances on completed optimizer updates, not micro-steps or rejected updates.
+- At unit decay, `training/transaction.py::ema_update` returns the old average unchanged. It must remain bit-identical even if a live parameter is non-finite; multiplying that parameter by zero would not preserve it.
 
-- The reference stays out of the optimizer. Only the `params` collection is differentiated and only it reaches `tx.init`, so there is no masked optimizer and no zero-gradient tree.
-- It is checkpointed and sharded. `ema` is a field of `TrainState`, so `Trainer.shardings` shards it like params and a resumed run restores its reference with everything else.
-- Its clock is already right. The EMA runs on completed optimizer updates, not micro-steps, and a rejected mixed-precision step is not an update. A reference cannot drift under accumulation.
-- `select` scopes it. `EMASpec.select` is a `PathFilter`, so a reference over part of the tree, such as a frozen encoder beside a trained head, costs one filter.
-
-The design needed one small change. `ema_update` is `decay * average + (1 - decay) * live`. At decay 1.0 that is arithmetically the average, but `0.0 * NaN` is NaN, so a single non-finite parameter poisons a frozen reference on the step it appears. The `finite` gate only exists when `dynamic_scale` is on. The fix is one select per leaf: return the average unchanged where `decay >= 1.0` (`dew/training/trainer.py:134`). Its test forces a non-finite parameter and asserts the reference is bit-identical afterwards, with and without `dynamic_scale`.
-
-The cost of the decision is that a run cannot hold a moving policy EMA and a frozen reference at the same time. No objective in scope wants both. We rejected the alternative, a masked subtree inside `params`, because it costs one extra full copy in HBM, an optimizer wrapper, gradient and update trees for something that never moves, and a second checkpoint layout. The EMA slot is already allocated, sharded and checkpointed.
-
-The reference runs in the step; nothing is precomputed. `loss` runs the reference forward per batch. TRL precomputes reference log-probs to free a second model's memory. Here there is no second model to free, so precomputing would save one forward per step, roughly a third of forward plus backward, at the price of a cache that silently goes stale when the data path changes. We revisit this only if a measured run shows reference forwards dominating.
-
-Correction (2026-09-22): `ema_update` now lives in `src/dew/training/transaction.py:41-55`; the unit-decay select is at line 54. The preference and GRPO objectives set the unit decay through `ema_decay=1.0`, which `LMObjective` turns into `EMASpec(decay=optax.constant_schedule(1.0))` (`src/dew/objectives/rl/preference.py:50`, `src/dew/objectives/lm/objective.py:545-546`).
+The reference forward uses the same model and scoring code as the policy with a different variable tree. The EMA slot holds this frozen reference instead of a moving policy average. Reference likelihoods are computed from the current batch, so there is no second cache of scores to invalidate when the data path changes.
 
 ## 4. The rollout capability
 
-Sampling is effectful, host-side and sometimes remote, so it is a capability the trainer is given, beside the checkpointer, the tracker and the profiler, all of which are `X | None = None`:
+Sampling is effectful, host-side and sometimes remote, so the trainer receives it as a capability beside its other effects:
 
 ```python
 class Rollout(Protocol):
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
 ```
 
-`Trainer(..., rollout=None)` is the loop without a rollout. When one is given, the trainer calls it between `batch = next(train)` and the compiled step (`dew/training/trainer.py:477`) and reshards the result with `shard_batch(mesh, ...)`.
+`Trainer(..., rollout=None)` runs without a rollout. With one, it reads a batch, calls the rollout, places its output and invokes the compiled step. The compiled `step=` interface owns optimizer work; external generation belongs outside it. The objective's loss and evaluation stay pure functions of variables, batch and step.
 
-Why not the `step=` seam? `Trainer.step` replaces the compiled step's body and is documented as the one place for an update that is not one loss. It runs inside `jit` and owns the counter, the EMA and the write-back. A rollout is the opposite kind of work. It produces the batch the step then consumes, it may post to a vLLM server, and it cannot be traced. Putting it in the step body would either force generation inside `jit` or smuggle a host callback into a compiled function. The two seams hold two kinds of work, and the design keeps them apart.
+The rollout key folds the checkpointed run key with the step and a distinct rollout tag. Sampling and the update do not share draws. Each prompt's reward group stays together. Shapes are fixed for each compiled signature; EOS outcomes change validity, not array shapes.
 
-Why not a method on `Objective`? The objective's surface is pure and crosses `jit`: `loss` and `evaluate` are functions of variables, a batch and a `Step`. An objective that opens a socket breaks that, and every objective would carry an identity method it never uses.
-
-The rest follows from the capability design:
-
-- Shapes are fixed, so `compile` traces once and needs no shape polymorphism.
-- The rollout key is folded from `state.key` and `state.step`, the same stream the step key comes from, with one extra fold so a rollout and its step never share draws. Both are checkpointed, so a resumed run samples forward instead of replaying.
-- Accumulation runs one rollout per micro-batch. A group never straddles a micro-batch, so the group baseline is computed inside the batch it belongs to, which is the whole batch at the default `accumulation=1`.
-- The rollout runs per process on that process's slice, which is what `DevicePrefetchIterator` hands it, and `shard_batch` reassembles the global array. Groups are process-local by construction.
-- Telemetry goes through the existing channels. Reward means ride `Aux.metrics` out of `loss`, which the trainer logs under `train/`. Wall time cannot come from inside `jit`, so the trainer times the host-side call and folds `train/rollout_seconds` into the same log tick that carries throughput (`dew/training/trainer.py:526-531`). There is no second return channel.
-
-Correction (2026-09-22): the call site is now `src/dew/training/trainer.py:751-753`, through `_rollout` at lines 966-976, which folds the key at line 975 and reshards at line 976. `train/rollout_seconds` is logged at lines 1051-1052. The `Rollout` protocol is at lines 112-121.
+The trainer measures host rollout time as `train/rollout_seconds`. The rollout's metric mapping reports under `rollout/<name>`; objective statistics travel through `Aux.metrics`. A resumed run restores the key, training state and data position before collecting the next rollout.
 
 ## 5. Rewards
 
-A reward is a callable from one finished record to a float: `reward(data_source, completion, ground_truth, extra_info) -> float`, the verl signature with the four fields the batch already carries (§1.4). It runs host-side inside the rollout, so no Python callable and no external process is ever reachable from a compiled step. A rule-based verifier, a hosted judge and a scoring model are all the same shape, and a run composes several by summing weighted scores in its own function.
+The reward boundary is `reward(data_source, completion, ground_truth, extra_info) -> float`. It runs host-side inside collection. A rule-based verifier, hosted judge and scoring model use the same callable shape; a caller can combine them with weighted scores.
+
+The prompt's tokenizer decodes completions before scoring. The verl adapter owns verl's field names and `compute_score` signature. The [roadmap](../roadmap.md#rl-and-serving) records the completion-plus-prompt-record reward interface and per-member reward routing.
 
 ## 6. The language objectives
 
-The language objectives assemble pieces from `dew.rl`, whose estimators and surrogates are built, ported from Tunix and verl, and pinned against their fixtures (`dew/rl/advantage.py`, `dew/rl/surrogate.py`, `tests/fixtures/rl/*.npz`).
+The objectives assemble the estimators and surrogates in `dew.rl.advantage` and `dew.rl.surrogate`.
 
-- SFT is `LMObjective` with `loss_role` (§2).
-- DPO (`dew/objectives/rl/preference.py`) takes per-sequence log-probabilities as the negated per-token cross entropies the chunked head already returns, summed under the shifted `completion_mask`, for the policy and for `step.ema`. The loss is `preference_logsigmoid_terms` over the pair halves, `-logsigmoid(beta * ((pi_c - ref_c) - (pi_r - ref_r)))`, averaged over pairs as a `Ratio`. Validation scores the chosen responses' perplexity.
-- GRPO (`dew/objectives/rl/grpo.py`) reads `old_log_probs`, `advantages` and `response_mask` from the rolled-out batch and is one composition: the token mean of `clipped_surrogate_terms(token_log_ratio(...), advantages, response_mask)` plus `beta` times the token mean of `k3_kl(...)`, both over the response mask's token mass as one `Ratio`. The current log-probabilities are sliced out of the concatenation one before the prompt width; `beta=0.0` leaves the reference unread. The advantages come from `group_advantage` or `rloo_advantage` inside the rollout (`dew/rl/advantage.py:100, :121`), where the rewards are. Validation scores the prompts' own perplexity off `prompt_length`, since a validation pass never samples.
+- SFT is `LMObjective` with `loss_role`.
+- DPO computes policy and frozen-reference completion log-probabilities over the chosen and rejected halves. `preference_logsigmoid_terms` forms `-logsigmoid(beta * ((pi_c - ref_c) - (pi_r - ref_r)))`; the objective averages over pairs and validates on chosen-response perplexity.
+- GRPO scores each packed chain through `packed_log_probs`. Its default policy loss combines `clipped_surrogate_terms(token_log_ratio(...), advantages, response_mask)` with `beta * k3_kl(...)`. It returns additive `Ratio` statistics under the response mask and reads no reference when `beta=0`.
 
-Both compute per-token log-probabilities through `LMObjective.per_token_log_probs`, the negated chunked cross entropies, so the policy and the reference share one head path. None of these objectives derives new math, which is why `dew.rl` landed first.
+Policy and reference use the same `TokenScorer` and shared LM-head path. GRPO exposes asymmetric clipping, a dual-clip parameter, policy-loss selection and token-mean or session-mean aggregation. Its behavior correction compares detached proximal and sampling likelihoods: a TIS cap or IcePop band, with optional sequence or geometric rejection bands. Engine routing and sampling-support records are replayed when present, at the engine's sampling temperature.
 
-Correction (2026-09-22): the objectives now call the `_terms` forms and reduce by the mask mass themselves: GRPO uses `token_log_ratio`, `clipped_surrogate_terms` and `k3_kl` (`src/dew/objectives/rl/grpo.py:142-162`), and DPO uses `preference_logsigmoid_terms` (`src/dew/objectives/rl/preference.py:100`). GRPO also takes `epsilon_low`, `epsilon_high`, a `dual_clip` that defaults to 3.0, and an optional `behavior_importance_cap` (`grpo.py:58-60`). Current lines in `src/dew/rl/surrogate.py`: `token_mean` 59, `token_log_ratio` 72, `clipped_surrogate` 154, `k3_kl` 163, `preference_logsigmoid` 199. In `src/dew/rl/advantage.py`: `group_advantage` 99, `rloo_advantage` 120.
-
-Correction (2026-09-22, packed layout): GRPO no longer slices a concatenation through `per_token_log_probs`. It scores each packed chain with `GRPOObjective.packed_log_probs`, the policy and the reference alike, and the notes above are superseded where it says otherwise. `behavior_importance_cap` is now `behavior_importance`, which takes a TIS cap or an IcePop band.
+Group and RLOO advantages are formed from each prompt's own completion group. GRPO validation scores the prompts' perplexity; evaluation does not collect new completions.
 
 ## 7. Diffusion RL
 
-Built in `dew.sampling.flow` and `dew.objectives.rl.flow`. FlowSDE implements the Solver contract; FlowTrajectory records states, times, joint Gaussian log densities, and stochastic support. FlowRollout collects complete reward groups through the existing host capability. FlowGRPOObjective returns additive Ratio statistics for clipped per-coordinate policy ratios and conditional Gaussian transition KL. It excludes deterministic intervals. The policy loss has no dual clip. The reference is frozen only when beta is positive; evaluation uses live policy parameters.
+`FlowSDE` implements the solver contract. `FlowTrajectory` records states, times, joint Gaussian log densities and stochastic support. `FlowRollout` collects complete reward groups through the host rollout capability.
 
-## 8. Parity plan
+`FlowGRPOObjective` returns additive `Ratio` statistics for clipped per-coordinate policy ratios and conditional Gaussian transition KL. Deterministic intervals carry no policy mass. The policy loss has no dual clip. The reference is frozen only when beta is positive; evaluation uses live policy parameters.
 
-| check | reference | recorded |
-| --- | --- | --- |
-| chat rendering and the assistant mask | TRL 1.12's mask for the same template and conversation | ids exact, mask exact, difference 0 |
-| DPO loss and gradient | TRL 1.12 on fixed tensors | loss 5.96e-08, gradients exact |
-| GRPO loss and gradient | verl 0.9's PPO path on one fixed rollout | loss 7.45e-08, gradients exact |
-| group and RLOO advantages | verl on the same rewards | already pinned |
-| SDE transition and its log-probability | author code at `879042cf`, with conditional KL checked independently through Gaussian distributions | `tests/test_flow_grpo.py`; fixture generated by `tools/parity_flow_grpo.py` |
-| a rolled-out run's shapes | the tables in §1.3 | one trace of `compile` per run |
+## 8. Reference parity
 
-Each new test records the largest observed difference and tightens its tolerance to it. DPO carries a swapped-halves test guarding the pair order; GRPO carries one failing mutation per term: an unclipped ratio, a k1 penalty, and a flat mean.
+All numerical outputs and gradients use `tests/reference_error.py` and the [shared accuracy contract](testing.md#numerical-accuracy). The bound comes from each reference element's measured error against float64 truth over reduction orders, with fresh-order confirmation. No tolerance is fitted or tightened to a single observed difference.
 
-## 9. What fits
+| Behavior | Independent comparison |
+|---|---|
+| Chat rendering and assistant spans | The same tokenizer/template and conversations, with exact discrete ids and roles |
+| DPO loss and gradients | TRL on the same policy/reference scores and masks |
+| GRPO surrogates, corrections and gradients | verl on the same packed rollout and likelihoods |
+| Group and RLOO advantages | The reference estimator on the same grouped rewards |
+| Diffusion transitions and gradients | The algorithm's reference implementation and an independent conditional-Gaussian KL calculation |
 
-Per parameter, fp32 params plus Adam's two moments plus a frozen reference is 16 bytes, before activations. For Qwen3-0.6B (`tests/fixtures/hf/qwen3-0.6b/config.json`: hidden 1024, 28 layers, 16 heads, 8 KV heads, ffn 3072, vocab 151936), that is about 9.5 GiB of state. It fits a 16 GiB card with a small batch and bf16 activations, and the rollout's KV cache is the next thing to size. For a 7B the same arithmetic is about 112 GiB, so the first configuration that fits is FSDP across two 80 GiB devices. The fp32 optimizer state is what stops it fitting on one device; the reference is not.
+Reference versions, inputs and reproduction commands live with their fixture generators. Comparison includes every output and gradient the flow touches. A failure is investigated in Dew, the reference arm or the bound's derivation; it is never removed by fitting a tolerance, filtering positions or swapping the oracle.
 
-Correction (2026-09-22): the two totals above are in GB, not GiB. The fixture config has tied embeddings and gives about 596M parameters, so 16 bytes each is 9.5 GB (8.9 GiB). A 7B model at 16 bytes is 112 GB (104 GiB). The conclusions do not change.
+## 9. Memory
 
-## 10. Crossing over to verl and vLLM
+With fp32 parameters, Adam's two moments and a frozen fp32 reference, persistent state costs 16 bytes per parameter before activations and the generation cache. A roughly 596M-parameter decoder needs about 9.5 GB (8.9 GiB); a 7B model needs 112 GB (104 GiB). The planner must also account for activations, temporary buffers and rollout KV state. FSDP shards the persistent trees; a reduced-precision checkpoint does not remove the optimizer's fp32 state.
 
-Research scale uses Dew's own `generate` and its samplers. Beyond that, the crossover sits at the capability boundary. A `Rollout` that posts prompts to a vLLM server and returns token ids is one implementation of the protocol in §4, and the weights it serves come from `save_pretrained_decoder`, which writes the HF layout verl and vLLM already consume (`dew/interop/hf_decoders`). Neither reaches the trainer, the objective or the state.
+## 10. External generation engines
 
-## 11. Qualification contracts
+A remote `Rollout` posts generation requests and returns the same session layout the native collector produces. Export uses the engine's expected weight layout through the existing interop writer. Weight publication and generation do not change the trainer, objective or checkpoint schema. Each engine's adapter owns its EOS, truncation, likelihood and policy-version semantics.
 
-The shared [testing spec](testing.md) applies to every objective. SFT checks the rendered ids and assistant mask against TRL, including their alignment after packing. A unit-decay reference stays bit-identical after a non-finite live update and survives checkpoint and resume. The rollout path keeps compilation shape-stable, logs its host time and continues its recorded random stream on resume.
+## 11. End-to-end qualification
 
-DPO checks loss and gradients against TRL and catches swapped preference halves. GRPO checks the complete composition against verl and has a failing mutation for every term. Diffusion RL checks trajectory densities and gradients, conditional Gaussian KL, a real DiT update, and ownership and numerical parity across processes. These are behavioral obligations, independent of the order the objectives were implemented.
+The [testing spec](testing.md) applies to every objective. A lifecycle checks training, checkpoint, resume, evaluation, export and reload on the relevant model. SFT keeps roles aligned through packing; the unit-decay reference survives rejected and non-finite updates; resumed collection continues its recorded random stream.
+
+DPO includes a swapped-halves mutation. GRPO includes a failing mutation for each surrogate, clipping and KL term. Diffusion RL checks a real model update and ownership and numerical parity across processes. All continuous comparisons use section 8's shared gate.
 
 ## 12. Staged runs
 
-`recipes/chain.py` links the waves into one run. A `Recipe` is an ordered tuple of `Stage`s over one built decoder, each stage naming its data, its loss (`sft`, `dpo` or `grpo`), its step count and, for GRPO, its reward and sampling sizes. Every stage trains in its own checkpoint directory. Every stage after the first initializes from the previous stage's final parameters through the objective's `pretrained` mechanism, which also freezes the next stage's reference. The optimizer restarts each stage. A stage refuses mismatched data, and a GRPO stage refuses to run without a reward.
+`Recipe` is an ordered tuple of `Stage` values over one decoder. The data type selects the objective in `Recipe._build`: `TextData` pretraining, `ChatData` SFT, `PreferenceData` DPO, `PromptData` GRPO, and `RecordsData` with `Episodes` PPO. A `Teacher` distills a pretraining or SFT stage.
 
-`recipes/lm/train.py` stays the pretraining recipe. Its `--objective` flag stays `lm | masked_diffusion`, because its data path (a token directory), its `--pretrained` (a Hugging Face decoder, not a dew run) and its sampling setup assume pretraining from the start. Post-training stages need pair and prompt data, dew-checkpoint init and reward callables, and that command line has none of them, so they live in the chain instead of behind its flag.
+Each stage has its own checkpoint directory and a restarted optimizer. `Objective.model_variables` defines the handoff: PPO passes its policy without the critic; distillation passes the student without the teacher. The next stage initializes from those variables and freezes its own reference where required. `Recipe.run` builds all stages' objectives and rollouts before the first stage trains, so invalid data or settings fail before work begins.
 
-Correction (2026-09-22): a `Stage` no longer names its loss. The type of its data decides it: `Chat` trains SFT, `Preferences` DPO and `Prompts` GRPO (`recipes/chain.py:37-68`). The LM recipe's `--objective` accepts `lm`, `masked_diffusion` and `block_diffusion` (`src/dew/objectives/lm/config.py:33-35`, `:77-79`).
-
-Correction (2026-10-16): the chain also trains `TextData` as pretraining and `RecordsData` of `task_id` rows as PPO over a stage's `Episodes`, and a `Teacher` distills a pretraining or SFT stage (`Recipe._build`). A GRPO stage's reward reads text the prompts' tokenizer decodes, and its sampling stops at that tokenizer's EOS. Each stage hands the next the model's part of its final variables (`Objective.model_variables`), so PPO passes on its policy without the critic and distillation its student without the teacher. `Recipe.run` builds every stage's objective and rollout before the first stage trains. The user guide is [Stage chains](../concepts/post_training.md#stage-chains).
+A GRPO stage requires a reward and uses its prompts' tokenizer for decoding and EOS. PPO receives its environment, verifier and critic through `Episodes`. Full-control runs build a `Trainer` directly. The user guide is [Stage chains](../concepts/post_training.md#stage-chains).
 
 ## 13. External integrations
 
-External generation engines, agent tools and training frameworks enter through the existing rollout and session interfaces. Each integration uses the maintained system's public API. Dew does not add a second server, sandbox platform or scheduler to duplicate one.
+External generation engines, agent tools and training frameworks enter through existing rollout and session interfaces. Each integration uses the maintained system's public API.
 
 | Boundary | Contract |
 |---|---|
-| Generation and weight publication | `RolloutServer` owns requests and policy versions. Native generation and remote vLLM or SGLang adapters produce the same rollout records. `SafetensorsReload` and `NCCLPush` publish through that interface; the transport does not change the learner's batch contract. |
-| Asynchronous collection | `RolloutScheduler` owns look-ahead, lag, synchronization and admission. Session sources interleave turns through the engine batch. Restoring a learner must account for admitted and in-flight work explicitly. |
-| Agent environments | `Environment` and `EnvironmentFactory` enter through `EpisodeRollout` and `EnvironmentSource`. Harness commands use the gateway's recording interface. Process and sandbox lifecycles stay behind `Runner`; a provider adapter uses the provider's own API. |
-| verl interchange | `to_verl` and `from_verl` map sessions to `AgentLoopOutput`. The adapter owns verl's field names and reward-call signature. Interchange of records does not establish live transport, worker orchestration or learner integration. |
-| Diffusion RL interchange | `FlowGRPOObjective` and `FlowRollout` own the native algorithm. An external adapter first qualifies a shared loss and its gradients on fixed inputs, then maps rollout records through the same session boundary. |
+| Generation and weight publication | `RolloutServer` owns requests and policy versions. Native, vLLM and SGLang adapters produce the same rollout records; `SafetensorsReload` and `NCCLPush` publish through that interface. |
+| Asynchronous collection | `RolloutScheduler` owns look-ahead, lag, synchronization and admission. Session sources interleave turns through the engine batch. Restore accounts for admitted and in-flight work explicitly. |
+| Agent environments | `Environment` and `EnvironmentFactory` enter through `EpisodeRollout` and `EnvironmentSource`. Agent commands use the gateway's recording interface. Process and sandbox lifecycles stay behind `Runner`. |
+| verl interchange | `to_verl` and `from_verl` map sessions to `AgentLoopOutput`. Record interchange alone establishes no live transport, worker orchestration or learner integration. |
+| Diffusion RL interchange | An adapter first qualifies a shared loss and its gradients on fixed inputs, then maps rollout records through the same session boundary. |
 
-Every engine claim names the engine and the exercised flow. Qualification includes policy-version publication, EOS and truncation semantics, cancellation of a long decode, session restore and a real tool-using rollout. Record conversion, simulated engines and small-model runs establish only the behavior they exercise. The [roadmap](../roadmap.md#rl-and-serving) holds the remaining integration work.
+Every engine claim names the exercised flow. Qualification includes policy-version publication, EOS and truncation semantics, cancellation of a long decode, session restore and a real tool-using rollout. Record conversion, simulated engines and small-model runs establish only the behavior they exercise. Remaining work belongs in the [roadmap](../roadmap.md#rl-and-serving).
