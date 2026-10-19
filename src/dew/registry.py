@@ -848,8 +848,12 @@ def _record_class(member: Callable[..., Configured]) -> type | None:
     if not (isinstance(member, type) and dataclasses.is_dataclass(member)):
         return None
     # The generated constructor takes the init fields, InitVars among them, in any order
-    # keyword-only ones give it; a constructor of the class's own takes other names.
-    taken = {name for name in inspect.signature(member.__init__).parameters if name != "self"}
+    # keyword-only ones give it; a constructor of the class's own takes other names. The names
+    # are read from its code, not its signature, whose annotations may name a type not yet bound.
+    code = getattr(member.__init__, "__code__", None)
+    if code is None:
+        return None
+    taken = set(code.co_varnames[1:code.co_argcount + code.co_kwonlyargcount])
     fields = {f.name for f in dataclasses.fields(member) if f.init}
     return member if fields <= taken <= set(member.__dataclass_fields__) else None
 
