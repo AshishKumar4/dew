@@ -42,15 +42,15 @@ Without the index the install stops before it installs anything, at resolving ja
 ```
   × No solution found when resolving dependencies:
   ╰─▶ Because only jax<=0.12.0 is available and dewml==0.1.0 depends on
-      jax>=0.12.0.post5,<0.12.1, we can conclude that dewml==0.1.0 cannot
+      jax>=0.12.0.post6,<0.12.1, we can conclude that dewml==0.1.0 cannot
       be used.
 ```
 
 and pip:
 
 ```
-ERROR: Could not find a version that satisfies the requirement jax<0.12.1,>=0.12.0.post5 (from dewml) (from versions: ...)
-ERROR: No matching distribution found for jax<0.12.1,>=0.12.0.post5
+ERROR: Could not find a version that satisfies the requirement jax<0.12.1,>=0.12.0.post6 (from dewml) (from versions: ...)
+ERROR: No matching distribution found for jax<0.12.1,>=0.12.0.post6
 ```
 
 Add `--extra-index-url https://pypi.dewml.dev/simple` and run it again.
@@ -103,11 +103,11 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 
 ### Dew's JAX build
 
-Dew requires `jax>=0.12.0.post5,<0.12.1`: JAX 0.12.0 with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, `https://pypi.dewml.dev/simple`, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
+Dew requires `jax>=0.12.0.post6,<0.12.1`: JAX 0.12.0 with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, `https://pypi.dewml.dev/simple`, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
 
 - A computation that spans processes keys the persistent compilation cache alike on every process ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940), sent as [jax-ml/jax#41776](https://github.com/jax-ml/jax/pull/41776)). The 0.12.0 release keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links, so in a pool across GPUs linked differently some processes load a step from the cache while the others compile it, and that compile waits forever for every process to join.
 - A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502), sent as [jax-ml/jax#41777](https://github.com/jax-ml/jax/pull/41777)), so two checkouts share one compiled kernel.
-- `linear_call` batches, and differentiates in its residuals, which the experts' fused SwiGLU route needs.
+- `linear_call` batches (an all-unmapped call stays unmapped), and differentiates in its residuals, which the experts' fused SwiGLU route needs.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 

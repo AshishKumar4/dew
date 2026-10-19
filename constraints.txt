@@ -14,7 +14,7 @@
 # CI and development install takes this one build. Return to a release once
 # one ships the fixes.
 --extra-index-url https://pypi.dewml.dev/simple
-jax==0.12.0.post5
+jax==0.12.0.post6
 
 # tokamax, a dependency (dew.nn.kernels.tuning): 0.0.15 is the first release
 # without 0.0.13 and 0.0.14's typeguard==2.13.3, which tyro's typeguard>=4
