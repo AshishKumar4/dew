@@ -236,7 +236,7 @@ def _fused_kernel(active_ref, token_ref, held_ref, taps_ref, gate_ref, beta_ref,
         state_out[...] = _held(updated, key, value, state_out.dtype)
         # `gated_rms_normalized`: the norm in fp32, its mean a product by the reciprocal as XLA's.
         inverse = jax.lax.rsqrt(jnp.sum(out * out) * (1.0 / out.shape[-1]) + epsilon)
-        gated = norm_swiglu._activated(z_ref[...].astype(jnp.float32), activation)[0]
+        gated = norm_swiglu.activated(z_ref[...].astype(jnp.float32), activation)[0]
         out_ref[...] = (out * inverse * weight_ref[...].astype(jnp.float32) * gated).astype(out_ref.dtype)
         write([stream[1:] for stream in windows])
 
@@ -278,7 +278,7 @@ class FusedStep(tuning.KernelOp):
             """A row's whole block."""
             return pl.BlockSpec((None, *shape), lambda r, h: (r, *(0,) * len(shape)))
 
-        def scalar(per_row):
+        def scalar(*, per_row: bool):
             """The program's head's one entry, `[1]`, of each row's where `per_row`."""
             return (pl.BlockSpec((None, 1), lambda r, h: (r, h)) if per_row
                     else pl.BlockSpec((1,), lambda r, h: (h,)))
@@ -291,7 +291,8 @@ class FusedStep(tuning.KernelOp):
         return tuple(pl.pallas_call(
             kernel, grid=(rows, value_heads),
             in_specs=[row(1), row(channels), held_spec, pl.BlockSpec(taps.shape, lambda r, h: (0, 0)),
-                      scalar(True), scalar(True), scalar(False), scalar(False), headed,
+                      scalar(per_row=True), scalar(per_row=True), scalar(per_row=False), scalar(per_row=False),
+                      headed,
                       pl.BlockSpec((value_width,), lambda r, h: (0,)), state_spec],
             out_specs=[state_spec, held_spec, headed],
             out_shape=[jax.ShapeDtypeStruct(state.shape, state.dtype),

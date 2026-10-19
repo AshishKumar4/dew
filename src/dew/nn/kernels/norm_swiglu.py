@@ -323,7 +323,7 @@ def _weight(scale_ref, columns, width: int, offset: bool, stored, interpret: boo
     return _round(weight + 1.0, stored, interpret) if offset else weight
 
 
-def _activated(gate, activation: str) -> tuple[jax.Array, jax.Array]:
+def activated(gate, activation: str) -> tuple[jax.Array, jax.Array]:
     """An fp32 gate's `act(gate)` and its derivative, for 'silu' or 'sigmoid'.
 
     silu's derivative `s + g s (1 - s)`, with `s = sigmoid(g)`, cancels to
@@ -358,7 +358,7 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inve
         y = y * _weight(scale_ref, columns, width, offset, stored, interpret)[None, :]
     if gate_ref is not None:
         # The gate multiplies the weighted norm in fp32, before the one cast.
-        y = y * _activated(plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32), activation)[0]
+        y = y * activated(plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32), activation)[0]
     plgpu.store(y_ref.at[at], y.astype(y_ref.dtype), mask=mask)
     plgpu.store(inverse_ref.at[row], inverse, mask=row < rows)
 
@@ -403,7 +403,7 @@ def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, d
             normalized = _round(normalized, dy_ref.dtype, interpret)
         if gate_ref is not None:
             # The gate's cotangent reads the weighted norm; the norm's, the gated one.
-            activated, slope = _activated(streamed(gate_ref).astype(jnp.float32), activation)
+            activated, slope = activated(streamed(gate_ref).astype(jnp.float32), activation)
             dgate = dy * (normalized * weight) * slope
             plgpu.store(dgate_ref.at[at], dgate.astype(dgate_ref.dtype), mask=mask,
                         eviction_policy="evict_first")
@@ -677,7 +677,7 @@ def _product(gate, up, dtype, interpret: bool):
 
 def _gradients(gate, up, dy):
     """SwiGLU's fp32 gradients of its gate and up, SiLU recomputed from the gate (`_activated`)."""
-    activated, slope = _activated(gate, 'silu')
+    activated, slope = activated(gate, 'silu')
     return dy * slope * up, dy * activated
 
 
