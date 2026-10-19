@@ -451,6 +451,47 @@ def test_a_token_mixture_weighs_the_rows_each_corpus_delivers(sliced):
     assert data.plan is not None and data.plan.lowering == ("per-share" if sliced else "global")
 
 
+@dataclasses.dataclass(frozen=True)
+class Stated(Memory):
+    """Token rows in memory that state their rows and valid targets, as a published store does."""
+
+    def metadata(self):
+        rows = self.records("indexed")
+        return {"rows": len(rows), "valid_targets": sum(len(row["text"]) - 1 for row in rows)}
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_a_token_mixture_weighs_a_random_holdout_by_the_rows_it_keeps(held):
+    """Mixed by tokens, two corpora whose stores state their counts deliver equal valid targets,
+    in one global order weighed by those counts. A random holdout keeps some of its store's rows,
+    so the store's counts describe rows it does not read: its mixture counts targets as they
+    arrive instead."""
+    from dew.config.data import RecordsData
+    from dew.data.holdout import HoldOut
+    from dew.data.steps.text import CountTargets
+
+    def corpus(name, lengths):
+        return Stated([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
+                       for size in lengths])
+
+    long = corpus("long", (2, 10, 10, 10))
+    trained = (RecordsData(long, validation=HoldOut(records=3, by="random", seed=2)).pipelines()[0] if held
+               else Pipeline(long))
+    parts = [dataclasses.replace(trained, name="long"), Pipeline(corpus("short", (2, 2)), name="short")]
+    mixed = mix([part.filter_map(CountTargets()).repeat() for part in parts], by="tokens")
+    data = compile(mixed.map(Counted()).batch(8), read="indexed", loading=READ)
+    stream = data.train(DataPartition())
+    targets = [0, 0]
+    try:
+        for batch in itertools.islice(stream, 8):
+            for source, count in zip(batch["source"], batch["targets"], strict=True):
+                targets[int(source)] += int(count)
+    finally:
+        stream.close()
+    assert abs(targets[0] - targets[1]) <= 9
+    assert data.plan is not None and data.plan.lowering == ("per-share" if held else "global")
+
+
 def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation():
     parents = [grain.MapDataset.source([{"targets": count}]).repeat().to_iter_dataset()
                for count in (0, 4)]
