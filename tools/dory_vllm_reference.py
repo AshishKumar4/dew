@@ -252,10 +252,28 @@ def positions(probe) -> np.ndarray:
 
 
 @functools.cache
-def reference_attention():
+def reference_attention(tf32: bool = False):
     """The pull request's tests/models/test_dory.py ReferenceAttention: single-request causal GQA,
-    sliding-window and decode caching, its positions on its queries' device."""
+    sliding-window and decode caching, its positions on its queries' device. With `tf32`, a float32
+    model's attention multiplies in TF32 as the engine's Triton attention does (its tl.dot's), its
+    softmax in float32, while every other product stays at the engine's "highest"."""
     import torch
+
+    def attend(q, keys, values, mask, scale):
+        if not tf32:
+            return torch.nn.functional.scaled_dot_product_attention(
+                q, keys, values, attn_mask=mask, scale=scale, enable_gqa=True)
+        # scaled_dot_product_attention's own arithmetic, its two products in TF32 alone.
+        repeat = q.shape[0] // keys.shape[0]
+        keys, values = keys.repeat_interleave(repeat, dim=0), values.repeat_interleave(repeat, dim=0)
+        previous = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            scores = (q @ keys.transpose(-1, -2)) * scale
+            weights = scores.masked_fill(~mask, float('-inf')).softmax(dim=-1)
+            return weights @ values
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous
 
     class ReferenceAttention(torch.nn.Module):
         def __init__(self, num_heads, head_size, scale, num_kv_heads, **kwargs):
@@ -278,8 +296,7 @@ def reference_attention():
             mask = key_pos <= query_pos
             if self.window is not None:
                 mask &= key_pos > query_pos - self.window
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q, self.keys, self.values, attn_mask=mask, scale=self.scale, enable_gqa=True)
+            out = attend(q, self.keys, self.values, mask, self.scale)
             return out.transpose(0, 1).reshape(-1, self.num_heads * self.head_size)
 
     return ReferenceAttention
@@ -312,13 +329,14 @@ def widened_float():
     return widened()
 
 
-def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype):
+def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype, tf32: bool = False):
     """The pull request's DoryForCausalLM over the release in `dtype` (a torch dtype), built as its
     tests/models/test_dory.py builds it, with that test's reference attention in the engine's
     attention's place, under `dtype` as the engine's loader builds a model (its rotary tables take
     it), and a call that decodes: `rows(prompt, tokens, prompt_rows)` prefills `prompt` and decodes
     each of `tokens` but the last a step at a time, the log-probabilities of the prompt's rows (its
-    last alone where `prompt_rows` is False) and a row a token, in at least float32."""
+    last alone where `prompt_rows` is False) and a row a token, in at least float32. `tf32` takes
+    the engine's TF32 attention products (`reference_attention`)."""
     from types import SimpleNamespace
 
     import torch
@@ -328,7 +346,7 @@ def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype):
     from vllm.transformers_utils.configs.dory import DoryConfig
     from vllm.utils.torch_utils import set_default_torch_dtype
 
-    attention = reference_attention()
+    attention = reference_attention(tf32)
     parallel_state._TP = SimpleNamespace(world_size=1, rank_in_group=0)
     dory.Attention = attention
     vc = VllmConfig(device_config=DeviceConfig(device='cuda'),
@@ -403,10 +421,10 @@ SHARED = tuple(run for run in RUNS if run[1] == 'last_loop')
 
 
 def model_orders(directory: Path) -> None:
-    """For each `SHARED` run, the model code in the run's dtype (`model_code`, at the engine's
-    precision) on the window's rows under every order of `directory/orders.npy`: each order's rows
-    on their columns and each entry's squared distance from `upstream`'s summed over the orders,
-    `directory/model-{run}.npz`."""
+    """For each `SHARED` run, the model code at the engine's precision (`model_code`: bf16
+    throughout, or float32 with TF32 attention products) on the window's rows under every order of
+    `directory/orders.npy`: each order's rows on their columns and each entry's squared distance
+    from `upstream`'s summed over the orders, `directory/model-{run}.npz`."""
     import torch
 
     config, tensors = release()
@@ -416,7 +434,8 @@ def model_orders(directory: Path) -> None:
     for loops, mode, dtype in SHARED:
         key = name(loops, mode, dtype)
         window = slice(-len(probe[f'{key}/window_generated']), None)
-        model, rows = model_code(config, tensors, loops, mode, getattr(torch, dtype))
+        # The engine's precision: bf16 throughout, or float32 with its attention's products in TF32.
+        model, rows = model_code(config, tensors, loops, mode, getattr(torch, dtype), tf32=dtype == 'float32')
         truth = np.load(directory / f'upstream-{tag(key)}.npy')[window]
         columns = columns_of(probe, key)[window]
         current, kept, squares = np.arange(hidden), [], np.zeros(truth.shape)
