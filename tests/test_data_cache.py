@@ -477,6 +477,74 @@ def test_a_loader_reads_a_generation_where_it_holds_the_rows_and_each_other_sour
         loader(RecordsData(Memory([{"id": -1}])), batch=2, cache=generation, read="indexed", loading=read)
 
 
+@dataclass(frozen=True)
+class Offset:
+    """A deterministic step that notes each row it runs on, so a run shows whether its cache ran it."""
+
+    offset: int
+    calls: list = field(default_factory=list, compare=False, repr=False)
+    identity = "offset@1"
+
+    def __call__(self, row):
+        self.calls.append(int(row["id"]))
+        return {**row, "value": int(row["id"]) + self.offset}
+
+
+@pytest.mark.parametrize(("stored", "read"),
+                         [("memory", "memory"), ("memory", "indexed"), ("jsonl", "memory")])
+def test_a_cache_reads_the_fill_an_earlier_run_completed_and_fills_another_key_afresh(tmp_path, stored, read):
+    """A pass whose cache completes every input publishes it under its key, so a later run of the
+    same source and steps reads it without running them, in a pass and in training; a step
+    configured otherwise is another key, filled afresh."""
+    from dew.data.compile import compile, iterate
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Files
+
+    rows = [{"id": index} for index in range(6)]
+    if stored == "jsonl":
+        (tmp_path / "rows.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+        source = Files(str(tmp_path / "rows.jsonl"))
+    else:
+        source = Memory(rows)
+
+    def cached(step):
+        return Pipeline(source).map(step).cache(str(tmp_path / "cache"))
+
+    def values(step):
+        return [(int(row["id"]), int(row["value"])) for row in iterate(cached(step), read=read)]
+
+    first, again, trained, other = Offset(10), Offset(10), Offset(10), Offset(20)
+    assert values(first) == values(again) == [(index, index + 10) for index in range(6)]
+    assert sorted(first.calls) == list(range(6)) and again.calls == []
+    data = compile(cached(trained).batch(3), read=read, loading=Loading(workers=0, threads=1, read_buffer=1))
+    reader = data.train(DataPartition())
+    try:
+        assert sorted(int(value) for _ in range(2) for value in next(reader)["value"]) == list(range(10, 16))
+    finally:
+        reader.close()
+    assert trained.calls == []
+    assert values(other) == [(index, index + 20) for index in range(6)]
+    assert sorted(other.calls) == list(range(6))
+
+
+def test_a_streamed_cache_reads_the_generation_published_under_its_key(tmp_path):
+    """A streamed fill's shards are filled apart, so `publish` publishes them; a later streamed read
+    of the same source and steps then reads the generation, and `publish` returns it as it is."""
+    from dew.data.compile import iterate, publish
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(6)], shard_rows=2)
+    cache = Cache(str(tmp_path / "cache"))
+    filled, reading, republished = Offset(10), Offset(10), Offset(10)
+    generation = publish(Pipeline(source).map(filled), cache, read="streamed")
+    rows = sorted((int(row["id"]), int(row["value"]))
+                  for row in iterate(Pipeline(source).map(reading).cache(cache), read="streamed"))
+    assert rows == [(index, index + 10) for index in range(6)] and reading.calls == []
+    assert publish(Pipeline(source).map(republished), cache, read="streamed").url == generation.url
+    assert republished.calls == []
+
+
 def test_published_generation_exposes_only_declared_order_metadata_and_plan():
     import numpy as np
 
