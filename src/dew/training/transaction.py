@@ -372,13 +372,15 @@ class Transaction:
         norm = norm.astype(jnp.result_type(norm.dtype, jnp.float32))
 
         def apply(current):
+            # The update applies to the parameters the model's constraint projects
+            # (`Objective.projected`), and the step stores them projected again.
+            stored = self.objective.projected(current.variables["params"], updated=False)
             if isinstance(self.optimizer, optax.GradientTransformationExtraArgs):
-                update, opt_state = self.optimizer.update(
-                    native, current.opt_state, current.variables["params"], qk_stats=qk)
+                update, opt_state = self.optimizer.update(native, current.opt_state, stored, qk_stats=qk)
             else:
-                update, opt_state = self.optimizer.update(
-                    native, current.opt_state, current.variables["params"])
-            params = {**current.variables, "params": optax.apply_updates(current.variables["params"], update)}
+                update, opt_state = self.optimizer.update(native, current.opt_state, stored)
+            params = {**current.variables, "params": self.objective.projected(
+                optax.apply_updates(stored, update), updated=True)}
             if self.aux_shape.effects is not None:
                 params = write_back(params, self.objective.apply_effects(
                     params, self.effects_tree.unflatten(effects)))

@@ -19,6 +19,7 @@ import functools
 import math
 from statistics import NormalDist
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
@@ -162,11 +163,10 @@ class _Coefficients(nn.Module):
     lands on it unchanged.
 
     `stored` is the prediction map's clamp, which the reference applies to
-    the stored weight before its product: the forward reads the clamped
-    kernel and the gradient reaches every entry, as if to the clamped one.
-    The stored kernel is not projected back, so an entry a step pushes past
-    the clip keeps its excess until an update returns it; released weights
-    sit far inside the clip. The correction map clamps inside its product,
+    the stored weight in place before its product: the forward reads the
+    clamped kernel and the gradient reaches every entry, as if to the clamped
+    one, and a training step updates the clamped weight it stores
+    (`clamped_predictions`). The correction map clamps inside its product,
     which zeroes a clamped entry's gradient."""
     features: int
     clip: float | None
@@ -183,6 +183,19 @@ class _Coefficients(nn.Module):
             kernel = straight_through(kernel, clipped) if self.stored else clipped
         dtype = x.dtype if self.dtype is None else self.dtype
         return jnp.dot(x.astype(dtype), kernel.astype(dtype), precision=self.precision)
+
+
+def clamped_predictions(params, clip: float):
+    """`params` with every AltUp layer's stored prediction coefficients
+    clamped to +-`clip`, as the reference clamps `prediction_coefs.weight` in
+    place before a training forward (modeling_gemma3n.py:1027-1028), so the
+    optimizer updates the clamped weight. Any other leaf, and a tree holding
+    no AltUp layer, is returned as it is."""
+    def clamped(path, leaf):
+        names = tuple(getattr(key, 'key', None) for key in path[-3:])
+        return jnp.clip(leaf, -clip, clip) if names == ('altup', 'prediction_coefs', 'kernel') else leaf
+
+    return jax.tree_util.tree_map_with_path(clamped, params)
 
 
 @logical_axes({
@@ -286,6 +299,7 @@ __all__ = [
     'AltUp',
     'AltUpLayer',
     'LaurelBlock',
+    'clamped_predictions',
     'gaussian_topk',
     'rescale_to',
 ]

@@ -93,6 +93,7 @@ __all__ = [
     "ModelKwarg",
     "OutputTable",
     "ProjectionGroup",
+    "ProjectsParameters",
     "QuantizesInputs",
     "Recomputing",
     "RematChoosing",
@@ -421,6 +422,26 @@ class RematChoosing(Protocol):
     """
 
     def with_remat(self, policy: RematPolicy | None) -> Self: ...
+
+
+@runtime_checkable
+class ProjectsParameters(Protocol):
+    """A model whose training keeps a constraint on the parameters it stores.
+
+    `projected` returns the stored parameters a training step reads and
+    updates. The trainer calls it at each optimizer commit: first with
+    `updated=False` on the parameters the step's update applies to, which
+    the optimizer sees (Gemma 3n's AltUp clamps its prediction coefficients
+    there, as the reference clamps the stored weight in place before its
+    forward); then with `updated=True` on the updated parameters, which the
+    step stores (a normalized transformer puts its matrices back on the unit
+    sphere there). A freshly drawn tree is projected once with `updated=True`,
+    and a restored one is already projected. `params` is the trainable tree,
+    which may hold a part of the model's parameters (an adapter's frozen
+    base is absent): a model projects the leaves present and keeps the rest.
+    """
+
+    def projected(self, params: VariableDict, *, updated: bool) -> VariableDict: ...
 
 
 @runtime_checkable
