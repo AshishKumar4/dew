@@ -6,7 +6,9 @@ model_type is the family's) is built in bf16 without weights and traced on a CPU
 a 64-token prefill, and one decode step on the dense cache and on a paged one. Every dispatch reports its
 decision (`generation.route`), and `generation.routes` collects them, so the report shows per family,
 target and mode which kernel each choice runs and why a generic path ran where it did. A family's widths
-are its fixture's, so a refusal a shape rule makes reads the fixture's sizes.
+are its fixture's but for its head widths, which are the reference's: transformers' own config defaults for
+the model_type (its flagship sizes), the fixture's hidden width rescaled where the family derives its head
+width from it. A family transformers has no config for keeps its fixture's widths, and its cells say so.
 
 A route is generic where `kernel != preferred`. One whose refusal code its kernel's `SUPPORTS` declares is
 a tracked gap, named by its roadmap or ledger row; one whose code is `UNCLASSIFIED` comes from a site that
@@ -47,6 +49,40 @@ def fixtures() -> dict[str, Path]:
         if config.is_file():
             found.setdefault(json.loads(config.read_text()).get("model_type"), directory)
     return found
+
+
+WIDTHS = ("head_dim", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim", "kv_lora_rank",
+          "global_head_dim", "index_head_dim", "partial_rotary_factor")
+"""The head widths a family's reference config states, which kernels' shape rules read, and the rotary
+fraction of a head, which is stated against its width."""
+
+
+def published(config: dict) -> tuple[dict, bool]:
+    """`config` at its family's reference head widths (see the module docstring), and whether it had one."""
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    kind = config.get("model_type")
+    if kind not in CONFIG_MAPPING:
+        return config, False
+    reference = CONFIG_MAPPING[kind]().to_dict()
+    text = reference.get("text_config") or reference
+    names = getattr(CONFIG_MAPPING[kind], "attribute_map", {})
+    hidden_key = names.get("hidden_size", "hidden_size")
+    heads_key = names.get("num_attention_heads", "num_attention_heads")
+    nested = "text_config" in config
+    fixture = dict(config["text_config"]) if nested else dict(config)
+    for name in WIDTHS:
+        if text.get(name) and name in fixture:
+            fixture[name] = text[name]
+    if "head_dim" not in fixture and fixture.get(heads_key) and text.get(hidden_key) and text.get(heads_key):
+        width = text.get("head_dim") or text[hidden_key] // text[heads_key]
+        fixture[hidden_key] = fixture[heads_key] * width
+    # Widths a config states twice, derived from the ones above.
+    if "qk_head_dim" in fixture:
+        fixture["qk_head_dim"] = fixture.get("qk_nope_head_dim", 0) + fixture.get("qk_rope_head_dim", 0)
+    if "word_embed_proj_dim" in fixture:
+        fixture["word_embed_proj_dim"] = fixture[hidden_key]
+    return ({**config, "text_config": fixture} if nested else fixture), True
 
 
 def families() -> list[str]:
@@ -115,10 +151,11 @@ def cells(names: Iterable[str]) -> Iterator[dict]:
         if name not in present:
             yield {"family": name, "fixture": None, "error": "no committed tiny fixture"}
             continue
-        config = json.loads((present[name] / "config.json").read_text())
+        config, widened = published(json.loads((present[name] / "config.json").read_text()))
         for target in AUDITED:
             for mode in MODES:
-                cell = {"family": name, "fixture": present[name].name, "target": target, "mode": mode}
+                cell = {"family": name, "fixture": present[name].name, "target": target, "mode": mode,
+                        "widths": "reference" if widened else "fixture"}
                 try:
                     seen = traced(config, target, mode)
                 except ValueError as refusal:
@@ -154,12 +191,14 @@ def report(records: list[dict]) -> str:
     lines += ["", "## Not traced", "", "| Family | Target | Mode | Why |", "|---|---|---|---|"]
     lines += [f"| {c['family']} | {c.get('target', '')} | {c.get('mode', '')} | {c['error']} |"
               for c in records if "error" in c]
-    lines += ["", "## Every cell", "", "| Family | Target | Mode | Kernels |", "|---|---|---|---|"]
+    lines += ["", "## Every cell", "", "| Family | Widths | Target | Mode | Kernels |",
+              "|---|---|---|---|---|"]
     for cell in records:
         if "routes" in cell:
             kernels = ", ".join(sorted({f"{r['choice']}={r['kernel']}" for r in cell["routes"]}))
             kernels = kernels or "none reported"
-            lines.append(f"| {cell['family']} | {cell['target']} | {cell['mode']} | {kernels} |")
+            lines.append(f"| {cell['family']} | {cell['widths']} | {cell['target']} | {cell['mode']} | "
+                         f"{kernels} |")
     return "\n".join(lines) + "\n"
 
 
