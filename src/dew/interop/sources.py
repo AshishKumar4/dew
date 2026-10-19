@@ -218,6 +218,14 @@ def snapshot(name_or_dir: str, revision: str | None, *,
     return directory
 
 
+def _hub_header(name: str, revision: str, file: str) -> dict[str, tuple[list[int], str]]:
+    """Each tensor of a Hub file's safetensors header, its shape and dtype tag, read over HTTP."""
+    from huggingface_hub import HfApi
+
+    header = HfApi().parse_safetensors_file_metadata(name, file, revision=revision)
+    return {tensor_name: (list(tensor.shape), tensor.dtype) for tensor_name, tensor in header.tensors.items()}
+
+
 @dataclass(frozen=True)
 class StoredWeights:
     """A source's weight files, read by their headers and fetched by name: what a
@@ -235,21 +243,28 @@ class StoredWeights:
                     if path.is_file()} if local else repo_files(self.name_or_dir, self.directory))
         return weight_files(listing, folder, lambda name: json.loads((self.directory / name).read_text()))
 
-    def specs(self, folder: str) -> dict[str, tuple[str, jax.ShapeDtypeStruct]]:
+    def specs(self, folder: str) -> dict[str, tuple[str, jax.ShapeDtypeStruct]] | None:
         """Each of `folder`'s tensors, by its stored name: the file that holds it and
-        the array it reads as. A Hub source's headers are read over HTTP
-        (`HfApi.parse_safetensors_file_metadata`), its weights left on the Hub."""
+        the array it reads as, from the file's header. A file the snapshot holds is
+        read there; a Hub source's other headers are read over HTTP
+        (`HfApi.parse_safetensors_file_metadata`), its weights left on the Hub, and
+        recorded so an offline run reads the same answer (`hub_answer`). None offline
+        where a header was never read online: binding variables needs no header, and
+        only the export, which writes by them, goes without."""
+        from huggingface_hub.errors import OfflineModeIsEnabled
+
         held: dict[str, tuple[str, jax.ShapeDtypeStruct]] = {}
         for file in self.files(folder):
-            if os.path.isdir(self.name_or_dir):
+            if (self.directory / file).is_file():
                 specs = header_specs(self.directory / file)
             else:
-                from huggingface_hub import HfApi
-
-                header = HfApi().parse_safetensors_file_metadata(self.name_or_dir, file,
-                                                                 revision=self.directory.name)
-                specs = {name: stored_spec(name, tensor.shape, tensor.dtype, file)
-                         for name, tensor in header.tensors.items()}
+                try:
+                    header = hub_answer(("safetensors header", self.name_or_dir, self.directory.name, file),
+                                        functools.partial(_hub_header, self.name_or_dir, self.directory.name,
+                                                          file)).value
+                except OfflineModeIsEnabled:
+                    return None
+                specs = {name: stored_spec(name, shape, tag, file) for name, (shape, tag) in header.items()}
             held.update({name: (file, spec) for name, spec in specs.items()})
         return held
 
