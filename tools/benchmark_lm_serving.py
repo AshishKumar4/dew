@@ -203,14 +203,14 @@ def dew_points(args):
     capacity = args.prompt + args.output
     load_seconds = time.perf_counter() - began
     print(f"loaded in {load_seconds:.2f}s", flush=True)
-    leaves = jax.tree.leaves(task.variables)
+    # Where the weights sit: the devices they span, and the mesh axes that split some weight.
+    shardings = [leaf.sharding for leaf in jax.tree.leaves(task.variables)]
+    split = {axis for sharding in shardings for entry in sharding.spec
+             for axis in (entry if isinstance(entry, tuple) else (entry,)) if axis is not None}
     hardware = {"devices": [device.device_kind for device in jax.devices()], "jax": jax.__version__,
                 "load_seconds": load_seconds,
-                # Where the weights sit: the devices they span, and the mesh axes that split some weight.
-                "weights": {"devices": len({device for leaf in leaves for device in leaf.sharding.device_set}),
-                            "split_over": sorted({axis for leaf in leaves for entry in leaf.sharding.spec
-                                                  for axis in (entry if isinstance(entry, tuple) else (entry,))
-                                                  if axis is not None})}}
+                "weights": {"devices": len({device for sharding in shardings for device in sharding.device_set}),
+                            "split_over": sorted(split)}}
     points = []
     for slots in args.slots:
         count = args.requests or max(64, 2 * slots)
