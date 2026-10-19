@@ -47,6 +47,7 @@ from dew.data.dataset import (
     Records,
     record_batch,
     stacked,
+    take_batch,
 )
 from dew.data.mixing import (
     Accepted,
@@ -202,6 +203,17 @@ class _Placed:
         if isinstance(value, tuple):
             return tuple(_placed(output, position) for output in value)
         return _placed(value, position)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Rest:
+    """The first batch of a resumed read without its first `read` rows, which the run read before
+    it saved; the batches after it whole."""
+
+    read: int
+
+    def __call__(self, index: int, batch: Batch) -> Batch:
+        return take_batch(batch, slice(self.read, None)) if index == 0 else batch
 
 
 @dataclasses.dataclass(frozen=True)
@@ -851,9 +863,7 @@ class _Build:
         elif self.training and not self.lowering.endless and drop:
             rows = rows[: len(rows) // batch_stage.size * batch_stage.size]
         whole = rows
-        # A count of records that ends inside a batch, as a batch ramp saves, resumes past the rest
-        # of that batch's records; the batches after them are cut where the count's batch ends.
-        rows = rows[offset % batch_stage.size + partition.index :: partition.count]
+        rows = rows[partition.index :: partition.count]
         empty = not self.training and not len(rows) and bool(len(whole))
         if empty:
             rows = whole[:1]
@@ -870,7 +880,14 @@ class _Build:
                 raise ValueError(f"{type(stage).__name__} after the batch of {_name(pipeline)} has no "
                                  "place in a global order")
             batches = ordered
-        stream = _as_iter(batches[offset // batch_stage.size :], self.loading)
+        batches = batches[offset // batch_stage.size :]
+        # A count of records that ends inside a batch, as a batch ramp saves, resumes past the
+        # records of that batch the run read, in the order it read its batches: this share's rows
+        # among the batch's first `read`, which the shares hold in turn.
+        read = offset % batch_stage.size
+        if read > partition.index:
+            batches = batches.map_with_index(_Rest(-(-(read - partition.index) // partition.count)))
+        stream = _as_iter(batches, self.loading)
         for at, stage in enumerate(pipeline.stages[:batched_at]):
             if isinstance(stage, Prefetch):
                 stream = _as_iter(self.stage(stream, stage, pipeline, partition, at), self.loading)
