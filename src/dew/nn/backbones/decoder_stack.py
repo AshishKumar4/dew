@@ -492,16 +492,17 @@ class StackView:
         unlike are refused by name where they stack (`StackView.stack`). A
         collection no layer is held in adds nothing."""
         banks: list[tuple[str, ...]] = [()] * layers
+        read = list(range(layers))
         for name in sorted({name for tree in variables.values() for name in tree}):
             run = group_layers(name)
             if run is not None and len(run) > 1:
                 for index in range(run.start, min(run.stop, layers)):
                     banks[index] += (name,)
+                    read[index] = min(read[index], run.start)
         own = [tuple((collection, jax.tree.structure(tree[f'layers_{index}']))
                      for collection, tree in sorted(variables.items()) if f'layers_{index}' in tree)
                for index in range(layers)]
-        return tuple((held, own[group_layers(held[0]).start if held else index])
-                     for index, held in enumerate(banks))
+        return tuple((held, own[first]) for held, first in zip(banks, read, strict=True))
 
     def bank_names(self) -> list[str]:
         """Return every run's stored name, in order. A banked store uses these names as keys."""
