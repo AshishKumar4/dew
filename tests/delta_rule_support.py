@@ -335,3 +335,18 @@ def plain_prefix(g, chunk: int = CHUNKED):
     earlier = jnp.pad(prefix[:, :, :-1], ((0, 0), (0, 0), (1, 0), *((0, 0),) * (g.ndim - 2)))
     recut = ((prefix - earlier) / fla_gdn.RCP_LN2).reshape(padded.shape)[:, :length]
     return g + jax.lax.stop_gradient(recut - g)
+
+
+def fused_step(token, held, taps, gate, beta, log_a, bias, z, weight, state, *, epsilon: float,
+               activation: str, dtype, active=None):
+    """`(output, history', state')` of a gated delta net's decode token whole in the recurrence's step
+    (`dew.nn.kernels.recurrence.step`), the layer's operands in the order its fused token hands them:
+    the conv's token, history and taps, the gates before their activations, A_log and dt_bias, the
+    output gate and the gated norm's weight, and the state."""
+    from dew.nn.kernels import recurrence
+
+    hooks = recurrence.Hooks(conv=recurrence.Conv('silu'), l2norm=True, decay='scalar',
+                             gates=recurrence.Gates(), output=recurrence.OutputNorm(epsilon, activation))
+    operands = recurrence.Step(state, token=token, held=held, taps=taps, gate=gate, beta=beta, log_a=log_a,
+                               bias=bias, z=z, weight=weight, active=active)
+    return recurrence.step(hooks, operands, dtype=dtype)
