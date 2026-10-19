@@ -573,7 +573,9 @@ def roled(source, length, scored, count=4):
 
 
 def delivered(corpora, role, read, batches=24):
-    """The targets each of two corpora mixed by tokens delivers, as the loss scores them by `role`."""
+    """The targets each of two corpora mixed by tokens delivers, as the loss scores them by `role`.
+    A mix by tokens keeps each corpus within one of its own rows of its share, so the two differ by
+    at most one row of each."""
     mixed = mix([corpus.repeat() for corpus in corpora], by="tokens")
     data = compile(mixed.map(Scored(role)).batch(8), read=read, loading=READ)
     stream = data.train(DataPartition())
@@ -592,26 +594,27 @@ def delivered(corpora, role, read, batches=24):
 def test_a_token_mixture_weighs_a_cropped_corpus_by_the_targets_left_after_the_crop(read, role):
     """Targets counted on a row (`CountTargets`) a crop then halves are counted again by the rule
     that counted them, its role included: the mixture weighs the cropped corpus by what its rows
-    deliver, so both corpora deliver equal targets, to within one row's."""
+    deliver, so both corpora deliver equal targets, to within one row of each (`delivered`)."""
     from dew.data.steps.text import CountTargets
 
     long = Pipeline(roled(0, 24, 22), name="long").filter_map(CountTargets(role=role)).map(Cropped())
     short = Pipeline(roled(1, 6, 4), name="short").filter_map(CountTargets(role=role))
     left, right = delivered([long, short], role, read)
-    assert abs(left - right) <= 11
+    rows = (Cropped()(roled(0, 24, 22).records("memory")[0]), roled(1, 6, 4).records("memory")[0])
+    assert abs(left - right) <= sum(int(Scored(role)(row)["targets"]) for row in rows)
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_a_token_mixture_keeps_a_rows_count_through_a_step_over_its_other_fields(read):
     """A step that changes only a row's other fields keeps the targets its count's own rule counted,
     a role's here, which no other rule gives: two corpora whose rows score one and three role-1
-    targets deliver equal scored targets, to within one row's."""
+    targets deliver equal scored targets, to within one row of each (`delivered`)."""
     from dew.data.steps.text import CountTargets
 
     one = Pipeline(roled(0, 8, 1), name="one").filter_map(CountTargets(role=1)).map(Relabelled())
     three = Pipeline(roled(1, 8, 3), name="three").filter_map(CountTargets(role=1))
     left, right = delivered([one, three], 1, read)
-    assert abs(left - right) <= 3
+    assert abs(left - right) <= 1 + 3
 
 
 def test_a_counted_corpus_projected_after_its_count_keeps_it_in_memory():
