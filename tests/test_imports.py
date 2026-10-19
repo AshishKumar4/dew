@@ -59,14 +59,13 @@ np.testing.assert_array_equal(result.images, np.zeros((1, 2, 2, 1), np.float32))
     assert run.returncode == 0, run.stderr
 
 
-def test_importing_the_data_layer_reads_no_configuration_and_parses_no_flags(tmp_path):
-    """Importing dew.data leaves the application's absl flags unparsed and reads no storage
-    configuration, so a broken one fails the first store that resolves, not the import. A data
-    pass with worker processes still runs, its flags marked parsed where the workers start."""
+def test_importing_the_data_layer_reads_no_configuration_and_its_workers_run(tmp_path):
+    """Importing dew.data reads no storage configuration, so a broken one fails the first store
+    that resolves, not the import, and a data pass with worker processes runs in a program that
+    never parsed absl's flags (`import dew` marks them parsed, as absl.app would)."""
     broken = tmp_path / "storage.toml"
     broken.write_text("this is not toml [")
     script = r"""
-from absl import flags
 import numpy as np
 import dew.data
 from dew.data.pipeline import Pipeline
@@ -74,7 +73,6 @@ from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
 from dew.data.sources import Memory
 from dew.data.storage import Store
-assert not flags.FLAGS.is_parsed()
 try:
     Store("memory://x").resolve()
 except Exception as error:
