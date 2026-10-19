@@ -383,121 +383,151 @@ class Worker:
             self.checked(self.nccl.ncclCommAbort(self.comm))
 
 
-@pytest.mark.gpu(reason="an NCCL group joins two cuda devices")
-@pytest.mark.mesh(devices=2)
-def test_an_nccl_push_delivers_every_tensor_to_a_replica_on_another_gpu():
-    """A push over a real NCCL group from the trainer's GPU to a one-worker replica on a second GPU,
-    the replica standing in for vLLM's weight-transfer endpoints with a worker that receives as
-    vLLM's does. The replica is asked its world size and joins its group once, then pauses, starts
-    the update, takes the listing of every tensor, finishes the update under the version, resets
-    its prefix cache and resumes. Its group opens with the sender at rank 0 of two, and the tensors
-    go one after another on that one nonblocking communicator, in chunks smaller than the policy:
-    the worker holds every listed tensor, each the trainer's export of the pushed policy."""
+def nccl_library():
+    """The NCCL library JAX's CUDA wheels ship, which the push and a worker both load."""
     import importlib.util
 
     locations = importlib.util.find_spec("nvidia.nccl").submodule_search_locations
-    library = Path(next(iter(locations))) / "lib" / "libnccl.so.2"
-    worker = Worker(library, jax.devices()[1].local_hardware_id)
+    return Path(next(iter(locations))) / "lib" / "libnccl.so.2"
 
-    class Replica(BaseHTTPRequestHandler):
-        def answer(self, body):
-            encoded = json.dumps(body).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(encoded)))
-            self.end_headers()
-            self.wfile.write(encoded)
 
-        def do_GET(self):
-            self.server.seen.append((self.path.partition("?")[0], None))
-            self.answer({"world_size": 1})
+class NCCLReplica(BaseHTTPRequestHandler):
+    """A one-worker vLLM replica's weight-transfer endpoints over `server.worker`, logging each
+    request's `ORDER` tick as it arrives and as it is answered, its path, query and body. A replica
+    whose `server.refuses` names a path answers it 500 without acting on it."""
 
-        def do_POST(self):
-            raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-            path, body = self.path.partition("?")[0], json.loads(raw) if raw else None
-            self.server.seen.append((path, body))
+    def answer(self, status, body):
+        encoded = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def handle_one(self, body):
+        path, _, query = self.path.partition("?")
+        arrived = next(ORDER)
+        if path in self.server.refuses:
+            status, answer = 500, {}
+        elif path == "/get_world_size":
+            status, answer = 200, {"world_size": 1}
+        else:
             if path == "/init_weight_transfer_engine":
-                worker.join(body["init_info"])
+                self.server.worker.join(body["init_info"])
             elif path == "/update_weights":
-                worker.update(body["update_info"])
-            elif path in ("/pause", "/resume"):
-                return self.answer({"status": "paused" if path == "/pause" else "resumed"})
-            return self.answer({"success": True})
+                self.server.worker.update(body["update_info"])
+            status = 200
+            answer = {"status": "paused" if path == "/pause" else "resumed"} if path in ("/pause", "/resume") \
+                else {"success": True}
+        self.server.seen.append((arrived, next(ORDER), path, query, body))
+        self.answer(status, answer)
 
-        def log_message(self, *args):
-            pass
+    def do_GET(self):
+        self.handle_one(None)
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Replica)
-    server.seen = []
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.handle_one(json.loads(raw) if raw else None)
+
+    def log_message(self, *args):
+        pass
+
+
+def nccl_replicas(ordinal, count, refuses=()):
+    """`count` replicas, each with a worker of its own on CUDA device `ordinal`."""
+    started = []
+    for _ in range(count):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), NCCLReplica)
+        server.seen, server.refuses = [], refuses
+        server.worker = Worker(nccl_library(), ordinal)
+        server.url = f"http://127.0.0.1:{server.server_port}"
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        started.append(server)
+    return started
+
+
+@pytest.mark.gpu(reason="an NCCL group joins two cuda devices")
+@pytest.mark.mesh(devices=2)
+def test_an_nccl_push_delivers_every_tensor_to_each_replica_on_another_gpu():
+    """A push over real NCCL groups from the trainer's GPU to two one-worker replicas on a second
+    GPU, each standing in for vLLM's weight-transfer endpoints with a worker that receives as
+    vLLM's does, in a group of its own. Each replica is asked its world size and joins its group
+    once, then pauses, starts the update, takes the listing of every tensor, finishes the update
+    under the version, resets its prefix cache and resumes. Each group opens with the sender at
+    rank 0 of two. The tensors go one after another to both groups, in chunks smaller than the
+    policy: every replica receives the whole listing after every replica started the update and
+    before any finished it, and each worker holds every listed tensor, the trainer's export of the
+    pushed policy."""
+    engines = nccl_replicas(jax.devices()[1].local_hardware_id, 2)
     source = Pretrained.load(FIXTURE, dtype="float32")
     changed = doubled(source)
-    push = NCCLPush(source, (f"http://127.0.0.1:{server.server_port}",), str(library), chunk=4096,
+    push = NCCLPush(source, tuple(server.url for server in engines), str(nccl_library()), chunk=4096,
                     timeout=120)
     try:
         push(changed, 3)
     finally:
         push.close()
-        server.shutdown()
-        worker.close()
-    assert [path for path, _ in server.seen] == [
-        "/get_world_size", "/init_weight_transfer_engine", "/pause", "/start_weight_update",
-        "/update_weights", "/finish_weight_update", "/reset_prefix_cache", "/resume"]
-    assert server.seen[1][1]["init_info"]["world_size"] == 2 and server.seen[5][1] == {"weight_version": "3"}
+        for server in engines:
+            server.shutdown()
+            server.worker.close()
     sent = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating)
                         else leaf, changed)
     exported = source.export(sent)
     assert len(exported) > 1 and sum(np.asarray(tensor).nbytes for tensor in exported.values()) > 4096
-    assert sorted(worker.received) == sorted(exported)
-    for name, tensor in exported.items():
-        np.testing.assert_array_equal(worker.received[name], np.asarray(tensor))
+    listings = []
+    for server in engines:
+        assert [path for _, _, path, _, _ in server.seen] == [
+            "/get_world_size", "/init_weight_transfer_engine", "/pause", "/start_weight_update",
+            "/update_weights", "/finish_weight_update", "/reset_prefix_cache", "/resume"]
+        world, joined, paused, _, update, finished, _, _ = server.seen
+        assert world[3] == "include_dp=true" and paused[3] == "mode=wait"
+        assert joined[4]["init_info"]["rank_offset"] == 1 and joined[4]["init_info"]["world_size"] == 2
+        assert finished[4] == {"weight_version": "3"}
+        listings.append(update[4]["update_info"])
+        assert sorted(server.worker.received) == sorted(exported)
+        for name, tensor in exported.items():
+            np.testing.assert_array_equal(server.worker.received[name], np.asarray(tensor))
+    assert listings[1] == listings[0] and listings[0]["names"] == sorted(listings[0]["names"])
+    started = max(server.seen[3][1] for server in engines)
+    received = [(server.seen[4][0], server.seen[4][1]) for server in engines]
+    assert all(started < arrived and answered < min(server.seen[5][0] for server in engines)
+               for arrived, answered in received)
 
 
 @pytest.mark.gpu(reason="an NCCL group opens on a cuda device")
 def test_a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting():
     """The sender opens its NCCL group while the replica's HTTP join runs. A replica that refuses
-    the join never enters the rendezvous, so the push aborts the group and raises within seconds,
-    where a blocking open waited on that peer for ever."""
-    import http.server
-    import importlib.util
+    the join never enters the rendezvous, so the push aborts the group and raises the refusal
+    within seconds, where a blocking open waited on that peer for ever. The aborted group is not
+    kept: a second push asks the replica to join a new one."""
+    from dew.inference.rollouts import InfrastructureError
 
-    locations = importlib.util.find_spec("nvidia.nccl").submodule_search_locations
-    library = Path(next(iter(locations))) / "lib" / "libnccl.so.2"
-
-    class Replica(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            body = json.dumps({"world_size": 1}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_POST(self):
-            self.send_response(500)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-
-        def log_message(self, *args):
-            pass
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Replica)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    [server] = nccl_replicas(jax.devices()[0].local_hardware_id, 1, refuses=("/init_weight_transfer_engine",))
     source = Pretrained.load(FIXTURE, dtype="float32")
-    push = NCCLPush(source, (f"http://127.0.0.1:{server.server_port}",), str(library), timeout=30)
+    push = NCCLPush(source, (server.url,), str(nccl_library()), timeout=30)
     raised = []
 
-    def attempt():
-        try:
-            push(source.variables, 1)
-        except BaseException as error:
-            raised.append(error)
+    def attempts():
+        for _ in range(2):
+            try:
+                push(source.variables, 1)
+            except RuntimeError as error:
+                raised.append(error)
 
-    pushing = threading.Thread(target=attempt, daemon=True)
+    pushing = threading.Thread(target=attempts, daemon=True)
     pushing.start()
     pushing.join(120)
     server.shutdown()
-    assert not pushing.is_alive() and len(raised) == 1 and isinstance(raised[0], RuntimeError)
+    assert not pushing.is_alive() and len(raised) == 2
+
+    def causes(error):
+        while error is not None:
+            yield error
+            error = error.__cause__
+
+    assert all(any(isinstance(cause, InfrastructureError) for cause in causes(error)) for error in raised)
+    assert [path for _, _, path, _, _ in server.seen] == [
+        "/get_world_size", "/init_weight_transfer_engine"] * 2
 
 
 def test_an_sglang_push_loads_the_directory_stamps_and_flushes_in_one_call(tmp_path, replicas, monkeypatch):
