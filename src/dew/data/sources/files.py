@@ -56,8 +56,9 @@ directory's files of a format are found by."""
 
 
 def _inferred(url: str) -> Format | None:
-    """The record format a URL's suffix declares, or None where it declares none."""
-    name = url.lower()
+    """The record format a URL's suffix declares, or None where it declares none: a directory's too,
+    spelled with a trailing separator or without."""
+    name = PurePosixPath(url).name.lower()
     return next((kind for kind, suffixes in _SUFFIXES.items() if name.endswith(suffixes)), None)
 
 

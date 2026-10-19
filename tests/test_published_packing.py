@@ -60,18 +60,19 @@ def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tm
 
 
 def test_a_recipe_given_a_published_packing_reads_the_windows_its_memory_read_packs(tmp_path):
-    """A typed recipe given a generation with a published packing plan reads that plan, shuffled
-    as its default order: the same batches, leaf by leaf, as the recipe packing in memory, and a
-    resume at a saved position reads on as the uninterrupted run does."""
+    """A typed recipe given a generation published from its own windows and packing reads that
+    plan, shuffled as its default order: the same batches, leaf by leaf, as the recipe packing in
+    memory, and a resume at a saved position reads on as the uninterrupted run does."""
     from dew.config.data import TextData, loader
 
     source = Memory(tuple({"text": "x" * size} for size in SIZES))
-    published = publish(Pipeline(source).map(Tokenize()).flat_map(Chunks(9)).pack(9, bins=3),
-                        Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
     recipe = TextData(source=source, seq_len=8, pack="first-fit", packing_bins=3, eos=False,
                       token_holdout=None)
+    train, _, _ = recipe.pipelines()
+    published = publish(train, Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
     warm = loader(recipe, batch=2, seed=3, cache=published, read="indexed", loading=READ)
     cold = loader(recipe, batch=2, seed=3, read="memory", loading=READ)
+    assert "packing" in warm.plan.manifest.source["sources"][0]
     left, right = warm.train(DataPartition()), cold.train(DataPartition())
     try:
         for ours, packed in zip(itertools.islice(left, 4), itertools.islice(right, 4), strict=True):
