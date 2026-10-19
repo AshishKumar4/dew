@@ -169,15 +169,15 @@ class Harbor:
                      Path(self.trials) / name)
 
     def judge(self, task: Task, trial: Trial, log: str, returncode: int, recorded: Recorded) -> Judged:
-        result = trial.artifacts / "result.json"
-        if not result.is_file():
+        trial_result = trial.artifacts / "result.json"
+        if not trial_result.is_file():
             return Judged(Status.INFRA_ERROR,
                           detail=f"harbor exited {returncode} with no result: {log[-2000:]}")
         try:
             harness_exit = _harness_exit(trial.artifacts)
         except ValueError as error:
             return Judged(Status.INFRA_ERROR, detail=f"unreadable harness trajectory: {error}")
-        return outcome(json.loads(result.read_text()), recorded, harness_exit=harness_exit)
+        return outcome(json.loads(trial_result.read_text()), recorded, harness_exit=harness_exit)
 
 
 def _harness_exit(trial: Path) -> str | None:
