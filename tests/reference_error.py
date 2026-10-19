@@ -379,16 +379,6 @@ def reduce(directory: Path, *, stage1: bool) -> list[str]:
     return needed if stage1 else failures
 
 
-if __name__ == "__main__":
-    import sys
-
-    _, command, directory, *flags = sys.argv
-    assert command == "reduce", "usage: python tests/reference_error.py reduce <dir> [--stage1]"
-    found = reduce(Path(directory), stage1="--stage1" in flags)
-    print("\n".join(found))
-    sys.exit(0 if "--stage1" in flags or not found else 1)
-
-
 SUMS = frozenset({"dot_general", "ragged_dot_general", "reduce_sum", "conv_general_dilated", "cumsum",
                   "scatter-add"})
 """The operations that sum terms: a leaf's terms are those its own sums add,
@@ -725,14 +715,17 @@ def element_factor(elements: int) -> float:
     return max(FACTOR, float(np.sqrt(stats.f.isf(FALSE_FAILURE / max(elements, 1), ORDERS, ORDERS))))
 
 
-def assert_elements_as_exact_over_orders(dew_squares, reference_squares, sizes, label: str) -> None:
+def assert_elements_as_exact_over_orders(dew_squares, reference_squares, sizes, label: str, *,
+                                         reductions: int, dtype) -> None:
     """Every element held over ORDERS rounding orders where the orders cannot all be kept:
     `dew_squares` and `reference_squares` `[rows, ...]` each element's squared distance from float64
     summed over the ORDERS orders, and `sizes` `[rows]` each row's float64 size, which sizes its
     elements where no terms do (`row_errors`). Each element's RMS over the orders within
-    `element_factor` of the reference's, or of its row's RMS over the orders and the elements where
-    that is larger, so an element the reference happens to round exactly does not hold Dew to zero;
-    a row below float64's `RESOLUTION` of its size passes. A non-finite element fails, on either side."""
+    `element_factor` of the reference's own, never below the rounding its computation allows a
+    correct run: `reductions` terms summed in `dtype`, sqrt(reductions) of its units of the row's size
+    (`reduction_bound`'s chain), so an element the reference happens to round exactly holds Dew to
+    a correct rounding of it, not to zero, and no element borrows its row's error. A non-finite
+    element fails, on either side."""
     dew_squares, reference_squares = (np.asarray(x, np.float64) for x in (dew_squares, reference_squares))
     assert dew_squares.shape == reference_squares.shape and dew_squares.ndim >= 2, (
         f"{label}: {dew_squares.shape} and {reference_squares.shape}, the rule takes [rows, ...] sums")
@@ -742,9 +735,10 @@ def assert_elements_as_exact_over_orders(dew_squares, reference_squares, sizes, 
     rows = dew_squares.shape[0]
     mine, theirs = (np.sqrt(squares.reshape(rows, -1) / ORDERS)
                     for squares in (dew_squares, reference_squares))
-    row = np.sqrt(np.mean(np.square(theirs), axis=1, keepdims=True))
-    floor = np.maximum(row, RESOLUTION * np.asarray(sizes, np.float64).reshape(rows, 1))
-    bar = element_factor(mine.size) * np.maximum(theirs, floor)
+    unit = float(np.finfo(np.dtype(dtype)).eps)
+    floor = np.sqrt(reductions) * unit * np.asarray(sizes, np.float64).reshape(rows, 1)
+    factor = element_factor(mine.size)
+    bar = factor * np.maximum(theirs, floor)
     failing = mine > bar
     if np.any(failing):
         ratios = np.where(bar > 0, mine / np.where(bar > 0, bar, 1), np.inf)
@@ -752,8 +746,8 @@ def assert_elements_as_exact_over_orders(dew_squares, reference_squares, sizes, 
         raise AssertionError(
             f"{label}: {int(np.count_nonzero(failing))} of {mine.size} elements past the reference; the "
             f"worst, row {at[0]} element {at[1]}, is {mine[at]:.3e} from float64 (rms over {ORDERS} orders), "
-            f"the reference {theirs[at]:.3e} and its row {row[at[0], 0]:.3e} (allowed "
-            f"{element_factor(mine.size):.2f} times the larger)")
+            f"the reference {theirs[at]:.3e} and its rounding floor {floor[at[0], 0]:.3e} (allowed "
+            f"{factor:.2f} times the larger)")
 
 
 def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, roundings: int) -> None:
@@ -817,3 +811,13 @@ def assert_rounds_where_the_reference_does(dew, reference, truth, label: str) ->
     assert within(apart, theirs / 4), (
         f"{label}: dew is {apart:.3e} from the reference (rms), whose own error is {theirs:.3e} "
         f"(ratio {apart / theirs:.2f}, allowed 0.25)")
+
+
+if __name__ == "__main__":
+    import sys
+
+    _, command, directory, *flags = sys.argv
+    assert command == "reduce", "usage: python tests/reference_error.py reduce <dir> [--stage1]"
+    found = reduce(Path(directory), stage1="--stage1" in flags)
+    print("\n".join(found))
+    sys.exit(0 if "--stage1" in flags or not found else 1)

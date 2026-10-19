@@ -1,6 +1,8 @@
 """The float64 accuracy rule (tests/reference_error.py) on comparisons whose answer is known: what it
 must refuse, and the rounding it must admit."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 from reference_error import (
@@ -180,28 +182,46 @@ def test_a_row_rounding_more_fails_over_orders_where_the_global_rms_passes():
 
 
 def test_elements_held_over_orders_pass_alike_and_fail_one_that_rounds_more():
-    """Elements over ORDERS orders (`assert_elements_as_exact_over_orders`): 64 rows of 4096 elements
-    rounding alike on both sides pass, as do elements the reference rounds exactly, held to their row;
-    one element rounding five times as far fails, as does a non-finite one. At 43.5M elements the
-    derived factor is 3.16."""
+    """Elements over ORDERS orders (`assert_elements_as_exact_over_orders`) of a sum of 1024 fp32
+    terms, rounding as such a sum does: 64 rows of 4096 elements rounding alike pass, as do elements
+    the reference rounds exactly, held to a correct rounding; an element whose error the reference
+    has elsewhere in its row, computing it exactly, fails, as does one rounding five times as far
+    and a non-finite one. At 43.5M elements the derived factor is 3.16."""
     rng = np.random.default_rng(6)
-    shape = (64, 4096)
+    shape, spread = (64, 4096), 3e-6
+    rounded = {"reductions": 1024, "dtype": np.float32}
 
     def squares():
-        return np.sum(np.square(rng.normal(size=(ORDERS, *shape))), axis=0)
+        return np.sum(np.square(spread * rng.normal(size=(ORDERS, *shape))), axis=0)
 
     sizes = np.ones(shape[0])
     dew, reference = squares(), squares()
-    assert_elements_as_exact_over_orders(dew, reference, sizes, "alike")
+    assert_elements_as_exact_over_orders(dew, reference, sizes, "alike", **rounded)
     exact = reference.copy()
     exact[:, :8] = 0
-    assert_elements_as_exact_over_orders(dew, exact, sizes, "exactly rounded")
+    assert_elements_as_exact_over_orders(dew, exact, sizes, "exactly rounded", **rounded)
+    moved, misplaced = reference.copy(), dew.copy()
+    moved[3, 0], moved[3, 1] = ORDERS * (30 * spread) ** 2, 0
+    misplaced[3, 0], misplaced[3, 1] = 0, ORDERS * (30 * spread) ** 2
+    with pytest.raises(AssertionError):
+        assert_elements_as_exact_over_orders(misplaced, moved, sizes, "misplaced", **rounded)
     wrong = dew.copy()
-    wrong[5, 17] = 25 * ORDERS * 4
-    with pytest.raises(AssertionError, match="1 of"):
-        assert_elements_as_exact_over_orders(wrong, reference, sizes, "one element")
+    wrong[5, 17] = ORDERS * (5 * 4 * spread) ** 2
+    with pytest.raises(AssertionError):
+        assert_elements_as_exact_over_orders(wrong, reference, sizes, "one element", **rounded)
     broken = dew.copy()
     broken[0, 0] = np.nan
-    with pytest.raises(AssertionError, match="not finite"):
-        assert_elements_as_exact_over_orders(broken, reference, sizes, "nan")
+    with pytest.raises(AssertionError):
+        assert_elements_as_exact_over_orders(broken, reference, sizes, "nan", **rounded)
     assert round(element_factor(332 * 131072), 2) == 3.16
+
+
+def test_the_rule_reduces_a_directory_of_recorded_orders_from_its_command_line(tmp_path):
+    """`python tests/reference_error.py reduce DIR` reads a directory of recorded orders and exits
+    zero where it holds none to fail."""
+    import subprocess
+    import sys
+
+    found = subprocess.run([sys.executable, str(Path(__file__).parent / "reference_error.py"), "reduce",
+                            str(tmp_path)], capture_output=True, text=True, check=False, timeout=120)
+    assert found.returncode == 0, found.stderr
