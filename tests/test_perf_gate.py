@@ -142,8 +142,6 @@ def test_each_tree_runs_in_the_environment_its_own_lock_installs(gate, tmp_path,
         (tree / "tools").mkdir()
         shutil.copy(ROOT / "tools" / "install_environment.sh", tree / "tools")
         (tree / ".python-version").write_text("3.12\n")
-        (tree / "src" / "dew" / "telemetry").mkdir(parents=True)
-        shutil.copy(ROOT / "src" / "dew" / "telemetry" / "devices.py", tree / "src" / "dew" / "telemetry")
 
     def gated(environments):
         built.clear()

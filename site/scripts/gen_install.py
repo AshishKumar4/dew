@@ -1,4 +1,4 @@
-"""Generate the installer's CUDA minima from dew.telemetry.devices.CUDA_BUILDS."""
+"""Generate the installer's CUDA minima from dew.telemetry.builds.CUDA_BUILDS."""
 
 import argparse
 import ast
@@ -14,7 +14,7 @@ def main() -> None:
     parser.add_argument("--check", action="store_true", help="Check the generated block without writing it.")
     args = parser.parse_args()
     # Reading the literal keeps this standalone installer independent of Dew's runtime imports.
-    source = ast.parse((REPO / "src/dew/telemetry/devices.py").read_text())
+    source = ast.parse((REPO / "src/dew/telemetry/builds.py").read_text())
     builds = next(ast.literal_eval(node.value) for node in source.body
                   if isinstance(node, ast.Assign)
                   and any(isinstance(name, ast.Name) and name.id == "CUDA_BUILDS" for name in node.targets))

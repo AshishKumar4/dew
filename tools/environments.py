@@ -6,21 +6,18 @@
 prints the Python of TREE's environment: TREE's `locks/<lock>.txt` installed
 by TREE's own tools/install_environment.sh at TREE's .python-version, into
 CACHE/<lock>-<digest of those three files>. The lock defaults to the one this
-machine installs: the newest of JAX's CUDA builds its driver and GPUs run, by
-TREE's own table (`dew.telemetry.devices.CUDA_BUILDS`, read as its literal, as
-site/scripts/gen_install.py reads it, since no environment exists yet to
-import Dew from), or cpu where no NVIDIA GPU answers. Checkouts whose three
-files agree share one environment; a caller runs each checkout's own code
-with its `src` first on PYTHONPATH, ahead of the Dew the environment holds.
+machine installs (`machine_lock`). Checkouts whose three files agree share one
+environment; a caller runs each checkout's own code with its `src` first on
+PYTHONPATH, ahead of the Dew the environment holds.
 
 The standard library alone, so it runs on a machine that holds no environment
 yet: tools/perf_gate.py builds each tree's with it, and so do GPU sessions.
 """
 
 import argparse
-import ast
 import fcntl
 import hashlib
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -31,33 +28,31 @@ CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "dew"
 """Where the environments are kept by default, beside Dew's other caches (`dew.cache.dew_cache_dir`)."""
 
 
-def gpus() -> tuple[str, tuple[int, ...]] | None:
-    """The driver version and the least SM of this machine's NVIDIA GPUs, or
-    None where nvidia-smi is absent or answers none."""
+class Unlocked(Exception):
+    """A checkout without the files its environment is built from: one older than the locks."""
+
+
+def _builds():
+    """dew.telemetry.builds, this checkout's own, loaded by its path: Dew's
+    package imports JAX, which no environment holds yet."""
+    path = Path(__file__).resolve().parents[1] / "src" / "dew" / "telemetry" / "builds.py"
+    spec = importlib.util.spec_from_file_location("dew_telemetry_builds", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def machine_lock() -> str:
+    """The lock this machine installs: the newest of JAX's CUDA builds its
+    NVIDIA driver and GPUs run (`dew.telemetry.builds`), else cpu, where
+    Dew's own runtime check speaks for a GPU no build runs on
+    (`dew.telemetry.devices.cpu_only_refusal`)."""
+    builds = _builds()
     if shutil.which("nvidia-smi") is None:
-        return None
-    listed = subprocess.run(["nvidia-smi", "--query-gpu=driver_version,compute_cap", "--format=csv,noheader"],
-                            capture_output=True, text=True)
-    lines = [line for line in listed.stdout.splitlines() if line.strip()]
-    rows = [[field.strip() for field in line.split(",")] for line in lines]
-    if listed.returncode != 0 or not rows:
-        return None
-    return rows[0][0], min(tuple(int(part) for part in row[1].split(".")) for row in rows)
-
-
-def machine_lock(tree: Path) -> str:
-    """The lock of `tree` this machine installs (the module's docstring)."""
-    found = gpus()
-    if found is None:
         return "cpu"
-    source = ast.parse((tree / "src" / "dew" / "telemetry" / "devices.py").read_text())
-    builds = next(ast.literal_eval(node.value) for node in source.body if isinstance(node, ast.Assign)
-                  and any(isinstance(name, ast.Name) and name.id == "CUDA_BUILDS" for name in node.targets))
-    driver, sm = found
-    runs = [name for name, least, least_sm in builds if int(driver.split(".")[0]) >= least and sm >= least_sm]
-    if not runs:
-        raise SystemExit(f"no CUDA build of JAX runs on driver {driver} and SM {sm}: {builds}")
-    return runs[0]
+    answer = subprocess.run(builds.QUERY, capture_output=True, text=True)
+    return builds.newest_build(builds.listed_gpus(answer.stdout if answer.returncode == 0 else None)) or "cpu"
 
 
 def environment(tree: Path, lock: str, cache: Path = CACHE) -> Path:
@@ -67,6 +62,8 @@ def environment(tree: Path, lock: str, cache: Path = CACHE) -> Path:
     tree, cache = tree.resolve(), cache.resolve()
     files = [tree / "locks" / f"{lock}.txt", tree / "tools" / "install_environment.sh",
              tree / ".python-version"]
+    if missing := [str(path.relative_to(tree)) for path in files if not path.is_file()]:
+        raise Unlocked(f"{tree} has no {', '.join(missing)}")
     digest = hashlib.sha256(b"".join(path.read_bytes() for path in files)).hexdigest()[:12]
     venv = cache / f"{lock}-{digest}"
     python = venv / "bin" / "python"
@@ -91,7 +88,7 @@ def main() -> int:
     parser.add_argument("--lock", default=None, help="cpu, cuda12 or cuda13; by default this machine's")
     parser.add_argument("--cache", type=Path, default=CACHE)
     args = parser.parse_args()
-    print(environment(args.tree, args.lock or machine_lock(args.tree), args.cache))
+    print(environment(args.tree, args.lock or machine_lock(), args.cache))
     return 0
 
 
