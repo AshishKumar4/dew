@@ -112,12 +112,17 @@ class _OrderFacts(Protocol):
 
 
 def _cache_references(pipeline: Pipeline, read: Read) -> tuple[str, ...]:
-    return tuple(
-        stage.cache.reference(_cache_manifest(source, leaf.stages[:index], read))
-        for leaf, source in _leaves(pipeline)
-        for index, stage in enumerate(leaf.stages)
-        if isinstance(stage, Artifact)
-    )
+    """The caches each corpus of `pipeline` reads through, among its stages as its pipeline wrote
+    them (`_written`), the ones a memory read already ran included, each named against the source
+    it came from."""
+    references = []
+    for leaf, source in _leaves(pipeline):
+        stages, written = _written(source, leaf.stages), source
+        while isinstance(written, _Memory):
+            written = written.original
+        references += [stage.cache.reference(_cache_manifest(written, stages[:index], read))
+                       for index, stage in enumerate(stages) if isinstance(stage, Artifact)]
+    return tuple(references)
 
 
 @dataclasses.dataclass(eq=False)
@@ -347,14 +352,6 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) 
             read = read.original
         return read
 
-    def caches(child: Pipeline) -> list[str]:
-        references = []
-        for leaf, read in _leaves(child):
-            stages = _written(read, leaf.stages)
-            references += [stage.cache.reference(_cache_manifest(read_of(read), stages[:index], build.read))
-                           for index, stage in enumerate(stages) if isinstance(stage, Artifact)]
-        return references
-
     def steps(identities: Sequence[StepIdentity]) -> JSON:
         return [{**step.semantic(), "modules": list(step.modules)} for step in identities]
 
@@ -375,7 +372,7 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) 
             "sources": [read_of(read).fingerprint() for read in sources],
             "steps": steps(identities),
             "derived": dict(_derived(child, build.child(index))),
-            "cache": caches(child),
+            "cache": list(_cache_references(child, build.read)),
         })
     return members
 
