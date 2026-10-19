@@ -117,10 +117,6 @@ class KimiDeltaAttention(nn.Module):
                 + delta_flops(lengths, self.num_heads, self.head_dim, self.head_dim))
 
     def setup(self):
-        if self.conv_kernel < 2:
-            raise ValueError(
-                f"the causal conv needs a history, so a kernel of at least 2, got {self.conv_kernel}"
-            )
         dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
         self.q_proj = dense(self.qkv_features, name='q_proj')
         self.k_proj = dense(self.qkv_features, name='k_proj')

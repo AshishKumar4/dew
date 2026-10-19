@@ -48,21 +48,25 @@ from flax.typing import PrecisionLike, VariableDict
 from jax.typing import DTypeLike
 
 from dew.nn.inputs import ModelKwarg
-from dew.nn.precision import biased_logits, capped_logits, head_product
+from dew.nn.precision import capped_logits, head_product, scaled_logits
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
     from dew.inputs.encoders import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.dit import TextContext
+    from dew.nn.dspark import DSpark
     from dew.nn.hyper_connections import HyperConnections
+    from dew.nn.kv_cache import KVCache
     from dew.nn.mla import MLAMixer
+    from dew.quantization import InputQuantizer
     from dew.records import JSON
-    from dew.training.quantization import InputQuantizer
 
 __all__ = [
     "AffineHead",
     "BlockDenoiser",
+    "BlockDrafting",
+    "Bounded",
     "CacheCapacity",
     "Counted",
     "CountedCondition",
@@ -83,20 +87,26 @@ __all__ = [
     "CountedTraining",
     "CountedVideo",
     "DecoderTraining",
+    "Decoding",
     "DenoisingModel",
+    "Exposing",
+    "Generating",
     "HiddenStates",
     "IntervalModel",
     "LayerScalars",
+    "Layered",
     "Logits",
     "LogitsFromHidden",
     "Looping",
     "ModelKwarg",
     "OutputTable",
+    "Predicting",
     "ProjectionGroup",
     "QuantizesInputs",
     "Recomputing",
     "RematChoosing",
     "RequiresText",
+    "Selective",
     "Serving",
     "TimeScaled",
     "TokenModel",
@@ -108,17 +118,18 @@ __all__ = [
 class OutputTable:
     """A vocabulary head as a matrix a loss contracts: `matrix` as the tree
     stores it, `[vocab, features]` when `vocab_major` and `[features, vocab]`
-    otherwise, an optional fp32 `[vocab]` `bias` added after the product,
-    the `softcap` applied last, and the `precision` the product runs at.
-    `compute`, the model's compute dtype, decides the product's operands
+    otherwise, an optional fp32 `[vocab]` `scale` multiplying the product
+    (nGPT's per-token logit gain) and `bias` added after it, the `softcap`
+    applied last, and the `precision` the product runs at. `compute`, the
+    model's compute dtype, decides the product's operands
     (`dew.nn.precision.head_product`; the states' dtype where None), and an
     `input_quantizer` rounds the states first as a checkpoint's head input
     quantization does.
 
     Contracting the model's final states with it (`logits`) reproduces the
-    model's own logits, bias, softcap and any adapter on the head included.
-    Where no matrix does, `output_table` returns None, and the logits come
-    from `logits_from_hidden` or `logits` instead.
+    model's own logits, scale, bias, softcap and any adapter on the head
+    included. Where no matrix does, `output_table` returns None, and the
+    logits come from `logits_from_hidden` or `logits` instead.
     """
 
     matrix: jax.Array
@@ -128,6 +139,7 @@ class OutputTable:
     precision: PrecisionLike = struct.field(pytree_node=False, default=None)
     compute: DTypeLike | None = struct.field(pytree_node=False, default=None)
     input_quantizer: InputQuantizer | None = None
+    scale: jax.Array | None = None
 
     def states(self, hidden: jax.Array) -> jax.Array:
         """`hidden` as the product reads it: through the input quantizer's QDQ."""
@@ -135,12 +147,20 @@ class OutputTable:
 
     def logits(self, hidden: jax.Array, *, temperature: float = 1.0) -> jax.Array:
         """`hidden`'s `[..., vocab]` logits, at least fp32: the states through
-        the input quantizer, the product (`head_product`), the bias, the
-        softcap, then `temperature`, which a sampler applies to the head's
-        logits."""
+        the input quantizer, the product (`head_product`), the scale and the
+        bias (`scaled_logits`), the softcap, then `temperature`, which a
+        sampler applies to the head's logits."""
         logits = head_product('...d,vd->...v' if self.vocab_major else '...d,dv->...v',
                               self.states(hidden), self.matrix, self.precision, compute=self.compute)
-        return capped_logits(biased_logits(logits, self.bias), self.softcap, temperature)
+        return capped_logits(scaled_logits(logits, self.scale, self.bias), self.softcap, temperature)
+
+    def rows(self) -> jax.Array:
+        """Each vocabulary token's `[vocab, features]` row: the matrix's, times
+        the token's scale, whose dot product with a state is the token's logit
+        before its bias and softcap, in the wider of the two dtypes. A reader
+        of tokens' vectors (a decision head's lexical prior) takes these."""
+        rows = self.matrix if self.vocab_major else self.matrix.T
+        return rows if self.scale is None else rows * self.scale[:, None]
 
 
 @runtime_checkable
@@ -373,9 +393,20 @@ class AffineHead(Protocol):
 
 
 @runtime_checkable
+class VocabularyRows(Protocol):
+    """A model whose head scores its final states against one row per vocabulary token: each
+    token's `[vocab, features]` row as `OutputTable.rows` gives it, read from the bound variables,
+    where no matrix alone is the head too (an `AffineHead` returning None): past a nonlinear head
+    transform the matrix's rows, with an adapter on the head its rows as the adapter updates them.
+    A reader of tokens' vectors, a decision head's lexical prior, takes these."""
+
+    def vocabulary_rows(self) -> jax.Array: ...
+
+
+@runtime_checkable
 class QuantizesInputs(Protocol):
     """A model computing under a checkpoint's input quantization
-    (`dew.training.quantization.InputQuantization`): the quantizer a bound
+    (`dew.quantization.InputQuantization`): the quantizer a bound
     module's input takes, which a head read as a table (`OutputTable`) applies
     as the module's own call does."""
 
@@ -519,7 +550,10 @@ class Serving(Protocol):
     keys go stale and the prefix is recomputed (LongRoPE's long factors,
     Phi-3), or None. `mixed_admission_refusal` says why its layers would not
     run a mixed call (`dew.nn.inputs.Admitted`) as separate decode and
-    prefill calls would, or None."""
+    prefill calls would, or None. `split_prefill_refusal` says why it
+    prefills each prompt whole, a prompt taken in pieces or after a prefix
+    another request cached computing something its whole prefill does not,
+    and what serves those modes instead, or None."""
 
     def inference_projection_groups(self, variables: Mapping[str, Mapping]
                                     ) -> tuple[ProjectionGroup, ...]: ...
@@ -529,17 +563,93 @@ class Serving(Protocol):
 
     def mixed_admission_refusal(self) -> str | None: ...
 
+    def split_prefill_refusal(self) -> str | None: ...
+
 
 @runtime_checkable
-class DecoderTraining(Protocol):
-    """What a decoder trains beside its next token: its multi-token prediction
-    depths (arXiv 2412.19437, section 2.2; `apply`'s `method='mtp_hidden_states'`
-    and `'mtp_logits'`), which with `mtp_hyper_connections` set read the
-    residual streams a forward sows under `prediction_inputs/states`, and the
-    MLA mixers it declares with DeepSeek's lightning indexer."""
+class Bounded(Protocol):
+    """A model that declares its vocabulary and cache capacity, which the host
+    checks read to refuse an id outside the vocabulary or a request that would
+    overflow the cache; a model that declares neither is checked for neither."""
+
+    @property
+    def vocab_size(self) -> int: ...
+
+    @property
+    def max_seq_len(self) -> int | None: ...
+
+
+@runtime_checkable
+class Decoding(Protocol):
+    """A decoder that continues its rows token by token: `init_cache` opens the
+    cache its decode calls (`decode=True`) write, a position a call. A caller
+    that appends with those calls itself, past `generate`'s and the server's
+    host checks, reads `dew.nn.kv_cache.overflowed` after them."""
+
+    def init_cache(self, batch_size: int) -> None: ...
+
+
+@runtime_checkable
+class Layered(Protocol):
+    """A decoder that declares its decode cache's layout, as `CausalTransformer` does."""
+
+    @property
+    def kv_cache(self) -> KVCache: ...
+
+
+@runtime_checkable
+class Exposing(Protocol):
+    """A decoder that hands back its hidden states beside its logits, which a
+    drafting strategy seeds from; without them a model decodes but cannot draft."""
+
+    def states_and_logits(self, tokens: jax.Array, **kwargs: jax.Array | bool | None
+                          ) -> tuple[jax.Array, jax.Array]: ...
+
+
+@runtime_checkable
+class Selective(Protocol):
+    """A decoder that scores one position per row instead of them all, so its
+    prefill runs the head only on the slot the first draw reads."""
+
+    def states_and_logits_at(self, tokens: jax.Array, slots: jax.Array, **kwargs: jax.Array | bool | None
+                             ) -> tuple[jax.Array, jax.Array]: ...
+
+
+@runtime_checkable
+class Predicting(Protocol):
+    """A decoder that declares how many multi-token prediction depths it carries."""
 
     @property
     def num_nextn_predict_layers(self) -> int: ...
+
+
+@runtime_checkable
+class BlockDrafting(Protocol):
+    """A decoder that may carry a block drafter: DeepSeek's DSpark (V4.1, V4-Flash-0731),
+    which drafts a whole block per pass from the context its target layers
+    record instead of chaining prediction depths."""
+
+    @property
+    def dspark(self) -> DSpark | None: ...
+
+
+@runtime_checkable
+class Generating(Protocol):
+    """A decoder that says, after examining the layers it builds, why a
+    generation loop cannot continue its rows token by token, or None; a
+    sampler refuses with that reason without knowing where a family keeps
+    the layers that cause it."""
+
+    def generation_refusal(self) -> str | None: ...
+
+
+@runtime_checkable
+class DecoderTraining(Predicting, Protocol):
+    """What a decoder trains beside its next token: its multi-token prediction
+    depths (arXiv 2412.19437, section 2.2; `apply`'s `method='mtp_hidden_states'`
+    and `'mtp_logits'`, `Predicting`), which with `mtp_hyper_connections` set
+    read the residual streams a forward sows under `prediction_inputs/states`,
+    and the MLA mixers it declares with DeepSeek's lightning indexer."""
 
     @property
     def mtp_hyper_connections(self) -> HyperConnections | None: ...

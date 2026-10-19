@@ -40,8 +40,8 @@ if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
 
     from dew.objectives.diffusion import DiffusionObjective
+    from dew.quantization import Quantization
     from dew.training.distributed import Layout, MeshSpec
-    from dew.training.quantization import Quantization
 
 class _Default(Enum):
     """The sentinel that tells `guidance=None` from an omitted `guidance=`.
@@ -143,7 +143,9 @@ class ImageSettings:
     (`TextToImage.from_objective`, `TextToImage.from_run`): the process, the solver, the
     guidance and the step count, and the records of the input encoders
     (`InputSpec.to_json`), the autoencoder (`AutoEncoder.to_json`) and an end-to-end tuning
-    (`EndToEnd`), which a saved run rebuilds over its own weights at the dtype it asks for."""
+    (`EndToEnd`), which a saved run rebuilds over its own weights at the dtype it asks for.
+    A run trained from a loaded pipeline samples on that pipeline's own grid, recorded as `grid`
+    (`SourceGrid`), and ends as its solver does, with no closing denoise (`TextToImage.grid`)."""
 
     process: Process
     inputs: JSON
@@ -151,8 +153,9 @@ class ImageSettings:
     solver: Solver
     guidance: Guidance | None
     sampling_steps: int
-    # dewml/hybrid-dit-176m's published record predates the field.
+    # dewml/hybrid-dit-176m's published record predates the fields below.
     end_to_end: JSON = None
+    grid: JSON = None
 
     def __post_init__(self) -> None:
         from dew.records import integer
@@ -209,9 +212,9 @@ class TextToImage:
         """Return this task with its denoiser's weights quantized as `spec` says.
 
         The denoiser's matmuls then compute with the quantized weights
-        (`dew.training.quantization.quantize_for_serving`). The encoders and
+        (`dew.quantization.quantize_for_serving`). The encoders and
         the autoencoder keep their weights."""
-        from dew.training.quantization import quantize_for_serving
+        from dew.quantization import quantize_for_serving
 
         example = self.prepare("", key=0, steps=1)
         denoiser = {
@@ -232,7 +235,8 @@ class TextToImage:
         # The live encoders and autoencoder need no record (`task_settings` writes theirs for a save).
         return cls(objective.model, objective.process, objective.inputs,
                    without_loss_heads(variables), autoencoder,
-                   steps=objective.steps, guidance=objective.guidance, solver=objective.solver)
+                   steps=objective.steps, guidance=objective.guidance, solver=objective.solver,
+                   grid=objective.grid, final_denoise=objective.final_denoise)
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
@@ -257,6 +261,7 @@ class TextToImage:
         Dew the run's record may import (`TextGeneration.from_run`).
         """
         from dew.config import ModelConfig
+        from dew.diffusion.schedules.source import SourceGrid
         from dew.inference.tasks import run_record, saved_settings
         from dew.nn.autoencoders import AutoEncoder
         from dew.objectives.diffusion.objective import without_loss_heads
@@ -293,8 +298,10 @@ class TextToImage:
             autoencoder, params = tuning.tuned(frozen, params)
         elif autoencoder_record is not None:
             autoencoder = AutoEncoder.from_json(autoencoder_record, params=params['autoencoder'])
+        grid = None if settings.grid is None else from_record(SourceGrid, fields(settings.grid, 'grid'))
         return cls(config.build(), settings.process, inputs, without_loss_heads(params), autoencoder,
-                   steps=settings.sampling_steps, guidance=settings.guidance, solver=settings.solver)
+                   steps=settings.sampling_steps, guidance=settings.guidance, solver=settings.solver,
+                   grid=grid, final_denoise=grid is None)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,

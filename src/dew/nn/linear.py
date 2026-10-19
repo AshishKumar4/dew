@@ -43,7 +43,7 @@ from jax.interpreters.ad import JVPTracer
 from dew.nn.dense import Dense
 from dew.nn.kernels import delta_rule, fla_gdn, fla_kda, short_conv
 
-from .attention import FORWARD_MODE, gated_rms_normalized
+from .attention import FORWARD_MODE, gated_rms_normalized, repeat_kv_heads
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, Coordinates, MixerCall, coordinates_of, valid_order
@@ -1057,10 +1057,6 @@ class GatedDeltaNet(nn.Module):
             raise ValueError(
                 f"num_v_heads ({self.num_v_heads}) must be a multiple of "
                 f"num_k_heads ({self.num_k_heads})")
-        if self.conv_kernel < 2:
-            raise ValueError(
-                "the causal conv needs a history, so a kernel of at least 2, "
-                f"got {self.conv_kernel}")
         if self.gate_activation not in ('silu', 'sigmoid'):
             raise ValueError(
                 "gate_activation must be 'silu' or 'sigmoid' (the reference's "
@@ -1080,15 +1076,6 @@ class GatedDeltaNet(nn.Module):
 
     def _split_heads(self, mixed, last_dim: int):
         return mixed.reshape(*mixed.shape[:-1], -1, last_dim)  # [B, S, H, D]
-
-    def _expand_kv(self, x):
-        """One key head serves `per_v` value heads, the reference's
-        `repeat_interleave(num_v_heads // num_k_heads, dim=2)`."""
-        if self.per_v == 1:
-            return x
-        B, S, H, D = x.shape
-        return jnp.repeat(x.reshape(B, S, H, 1, D), self.per_v, axis=3).reshape(
-            B, S, H * self.per_v, D)
 
     def _project(self, x):
         """(mixed, z, b, a) of `x`: the conv's input `[B, S, 2K + V]`, the
@@ -1167,7 +1154,8 @@ class GatedDeltaNet(nn.Module):
                 # queries and keys on their own heads and beta beside them.
                 return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size,
                                               projected=operand, starts=starts)
-            query, key = self._expand_kv(query), self._expand_kv(key)
+            # One key head serves `per_v` value heads, the reference's `repeat_interleave`.
+            query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
             if S == 1 and held is not None and delta_rule.fits(held):
                 return decode_gated_delta_rule(query, key, value, g, beta, held,
                                                None if valid is None else valid[:, 0])
@@ -1219,6 +1207,8 @@ class DepthwiseConv1d(nn.Module):
 
     @nn.compact
     def __call__(self) -> tuple[jax.Array, jax.Array | None]:
+        if self.kernel < 1:
+            raise ValueError(f"a causal conv takes at least one tap, got {self.kernel}")
         weight = self.param('weight', normal_kernel(self.init_std, nn.initializers.lecun_normal())[
             'kernel_init'], (self.features, 1, self.kernel))
         bias = (self.param('bias', nn.initializers.zeros, (self.features,), jnp.float32)

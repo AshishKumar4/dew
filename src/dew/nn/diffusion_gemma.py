@@ -22,11 +22,11 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike, VariableDict
 
 from dew.interop.weights import ParamTree, translate_parameters
+from dew.nn.activations import gated_product
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.dense import Dense
-from dew.nn.moe import gated_product
 from dew.nn.multimodal import VisionConditioner
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import OutputTable
@@ -213,6 +213,10 @@ class DiffusionGemma(nn.Module):
         return self.clone(text=self.text.with_cache_capacity(capacity))
 
     @nn.nowrap
+    def generation_refusal(self) -> str | None:
+        return self.text.generation_refusal()
+
+    @nn.nowrap
     def with_remat(self, policy: RematPolicy | None) -> Self:
         """Choose the shared text decoder's layer policy."""
         return self.clone(text=self.text.with_remat(policy))
@@ -298,6 +302,10 @@ class DiffusionGemma(nn.Module):
         """Return the shared head as the matrix final states contract, or
         None where none does (`CausalTransformer.output_table`)."""
         return self.text.output_table()
+
+    def vocabulary_rows(self) -> jax.Array:
+        """The shared head's rows (`CausalTransformer.vocabulary_rows`)."""
+        return self.text.vocabulary_rows()
 
     def __call__(self, tokens, *, self_conditioning_logits=None,
                  self_conditioning_mask=None, train: bool = False, positions=None,

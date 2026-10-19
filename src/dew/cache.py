@@ -169,6 +169,11 @@ KERNEL_SEEN = jax.make_user_context(default_value=None)
 trace cached before traces, and records, again. The program is the same, and so
 is its key in the persistent cache, which reads no user context."""
 
+KERNEL_ROUTES = jax.make_user_context(())
+"""The collections each open `dew.nn.kernels.generation.routes` block records its dispatches' routes
+into: JAX keys its trace caches on their identities, as on `KERNEL_SEEN`'s, so a trace cached before
+traces, and reports its routes, again."""
+
 KERNEL_PINS = jax.make_user_context(())
 """The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this
 thread, keyed on as `KERNEL_TUNES` is."""
