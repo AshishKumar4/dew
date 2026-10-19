@@ -95,7 +95,7 @@ class Evaluation:
             step: int | jax.Array = 0, averaged: Variables | None = None,
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
             schedule_step: int | jax.Array | None = None, loss: bool = False,
-            training: Mapping[str, jax.Array] | None = None) -> Evaluation:
+            training: Mapping[str, jax.Array] | None = None, warm: bool = False) -> Evaluation:
         """Evaluate `variables` on the batches every process can read, without an optimizer or a tracker.
 
         Every process calls this with the same objective, metrics and numerical
@@ -119,6 +119,11 @@ class Evaluation:
         `step`. When training attempts were rejected, pass the number of accepted
         microbatches (`TrainState.microstep`, as `fit` does) so the schedule follows
         only the work training accepted.
+
+        `warm` scores at most `WARM_BATCHES` batches and finalizes no score, so
+        the evaluation holds none: a pass over them runs every program a longer
+        pass does, which a run compiles this way before its first step
+        (`Trainer.fit`), and no score of a part of the split is checked or read.
 
         The scores are broadcast to every process. Previews stay on process 0, and
         there is at most one objective preview, however long the validation split
@@ -144,7 +149,7 @@ class Evaluation:
             scores, previews, scored, records = _score_split(
                 objective, variables, batches, context, mesh, metrics=metrics, split=split,
                 root=root, preview_enabled=preview_enabled, score_key=score_key,
-                preview_key=preview_key, loss=loss)
+                preview_key=preview_key, loss=loss, warm=warm)
         scores.update(training_scores)
         elapsed = time.perf_counter() - started
         scores, elapsed = broadcast_from_process_zero((scores, elapsed))
@@ -276,8 +281,9 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                  context: Step, mesh: Mesh | None, *, metrics: Sequence[Metric],
                  split: str, root: bool, preview_enabled: bool,
                  score_key: jax.Array, preview_key: jax.Array, loss: bool = False,
-                 ) -> tuple[dict[str, float], tuple[Artifact, ...], int, int]:
-    """Score every record of a validation split.
+                 warm: bool = False) -> tuple[dict[str, float], tuple[Artifact, ...], int, int]:
+    """Score every record of a validation split, or its first `WARM_BATCHES`
+    batches unfinalized where `warm`.
 
     Returns the finalized scores, root's previews, and the two counts every
     rank agrees on: the batches scored and the real records they held.
@@ -333,13 +339,13 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                                       preview_key=preview_key, scored=produced, root=root)
             produced = batch = None
             scored += 1
-            if not metrics and not loss:
+            if (not metrics and not loss) or (warm and scored == WARM_BATCHES):
                 break
         # Processes on one data share (a replicated stage or sequence axis)
         # read the same rows, so the pool counts each share once.
         shares = from_every_process([int(DataPartition.of(mesh).index), int(records)])
         records = sum(dict(shares).values())
-        if scored:
+        if scored and not warm:
             scores = _finalized(metrics, summaries, split=split, root=root)
             loss_value = loss_sums.value(objective)
             if loss_value is not None and f'{split}/loss' not in scores:
@@ -347,6 +353,11 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
     finally:
         _close_source(iterator if iterator is not None else source)
     return scores, previews, scored, records
+
+
+WARM_BATCHES = 2
+"""The batches a warming pass scores (`Evaluation.run`'s `warm`): the first,
+then a later one, which the accumulators pool into it."""
 
 
 def _next_batch(iterator: Iterator, index: int) -> tuple[Batch | None, int]:
