@@ -76,7 +76,6 @@ def test_streamed_tfds_pins_one_fingerprint_for_all_virtual_shards(tmp_path, mon
         return TFDS("dew_images", path=None if location == "prepared" else str(directory),
                     split=name, shard_rows=2, decoders={"image": tfds.decode.SkipDecoding()})
 
-    whole = selected("all").fingerprint()["files"]
     source = selected(split)
     if location == "mirror":
         directory = Path(source.directory)
@@ -102,13 +101,13 @@ def test_streamed_tfds_pins_one_fingerprint_for_all_virtual_shards(tmp_path, mon
         if location != "local":
             source.provision()
         assert int(decode_image(source.records("indexed")[0]["image"])[0, 0, 0]) == 10
-        assert source.fingerprint()["files"] == whole
     finally:
         reader.close()
     assert opened["dataset_info.json"] == 2
     assert opened["features.json"] == opened["label.labels.txt"] == 1
     assert opened["dew_images-train.array_record-00000-of-00001"] == 1
     assert opened["dew_images-test.array_record-00000-of-00001"] == 1
+    assert source.fingerprint()["files"] == selected("all").fingerprint()["files"]
 
 
 @pytest.mark.parametrize("workers", [0, 2])
