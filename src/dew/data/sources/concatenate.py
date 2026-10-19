@@ -1,4 +1,4 @@
-"""Sources read in canonical source order, for finite validation passes."""
+"""Several stores read one after another as one store."""
 
 from __future__ import annotations
 
@@ -10,11 +10,20 @@ import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Records
+from dew.data.pipeline import Dataset
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
 
 
 @dataclasses.dataclass(frozen=True)
-class Concatenate:
+class Concatenate(Dataset):
+    """The records of `sources` one store after another, as one store: two splits of one Hub
+    dataset read as one (`Concatenate((hub.with_split("train"), hub.with_split("validation")))`),
+    or stores of any kinds. A record's position is its place in that order, every source's shards
+    are its shards, and its identity is its sources' in order, so a run resumes on it as on any
+    store and a changed source refuses the resume as it would alone. It is a store wherever one is
+    read, a recipe's source (`ImageData(source=...)`) among them; `concat` joins stores as a
+    dataset."""
+
     sources: tuple[Source, ...]
 
     def __post_init__(self) -> None:

@@ -4,6 +4,7 @@ and its batch, and a student stepped once and saved as a run."""
 import jax
 import jax.numpy as jnp
 import numpy as np
+from interop_support import scaled_gap
 
 from dew.sampling.sample import sample
 
@@ -21,10 +22,8 @@ def walk(solver, process, model, x_T, times, key=0):
 
 
 def relative_gap(actual, expected) -> float:
-    """The largest entry of |actual - expected| over the larger of 1 and the
-    largest entry of |expected|, per leading index."""
-    actual, expected = np.asarray(actual), np.asarray(expected)
-    return max(np.abs(a - e).max() / max(1.0, np.abs(e).max()) for a, e in zip(actual, expected, strict=True))
+    """The largest per leading index of `scaled_gap`, so a small row is held to its own magnitude."""
+    return max(scaled_gap(a, e) for a, e in zip(np.asarray(actual), np.asarray(expected), strict=True))
 
 
 def image_batch(loaded, prompts) -> dict:

@@ -10,13 +10,13 @@ from __future__ import annotations
 import dataclasses
 import mmap
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, Sharding, SingleDeviceSharding
 
 from dew.objectives.base import Variables
 from dew.training.distributed import Placement
@@ -167,7 +167,27 @@ class Held:
         """Keep the copy for the next placement."""
 
 
-def place_leaf(value, target: NamedSharding) -> jax.Array:
+def snapshot[T](tree: T) -> Callable[[], T]:
+    """Copy `tree`'s arrays, this process's shards of each, to host memory
+    (`Held`), a random key as its key data, and return what puts a fresh copy
+    back where each was placed (`place_leaf`), its memory kind too: a timing
+    that steps a state leaves the run the state it started from, and a run
+    restores the best state it held."""
+    leaves, structure = jax.tree.flatten(tree)
+    keys = [jax.random.key_impl(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else None
+            for leaf in leaves]
+    bits = [leaf if impl is None else jax.random.key_data(leaf)
+            for leaf, impl in zip(leaves, keys, strict=True)]
+    held = [(Held.of(leaf), leaf.sharding) for leaf in bits]
+
+    def placed(source: Held, sharding, impl):
+        leaf = place_leaf(source, sharding)
+        return leaf if impl is None else jax.random.wrap_key_data(leaf, impl=impl)
+
+    return lambda: structure.unflatten([placed(*copy, impl) for copy, impl in zip(held, keys, strict=True)])
+
+
+def place_leaf(value, target: Sharding) -> jax.Array:
     """Move one array into `target`, releasing the source once it lands.
 
     A host array or a single device's array is cut into shards by each
@@ -176,8 +196,8 @@ def place_leaf(value, target: NamedSharding) -> jax.Array:
     at a time. Memory-mapped
     source pages are given back to the kernel, which is what keeps a large
     checkpoint from being resident twice."""
-    if isinstance(value, jax.Array) and (isinstance(value.sharding, NamedSharding)
-                                         or jnp.issubdtype(value.dtype, jax.dtypes.prng_key)):
+    if isinstance(value, jax.Array) and isinstance(target, NamedSharding) and (
+            isinstance(value.sharding, NamedSharding) or jnp.issubdtype(value.dtype, jax.dtypes.prng_key)):
         return transfer(value, target)
     if isinstance(value, HostSource):
         # make_array_from_callback would hold every addressable shard on
