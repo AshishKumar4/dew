@@ -58,6 +58,15 @@ def fits(state: jax.Array) -> bool:
             and dv % COLUMNS.block == 0 and (dv // COLUMNS.block) & (dv // COLUMNS.block - 1) == 0)
 
 
+def fused_fits(state) -> bool:
+    """Whether `fused_step` takes this `[rows, heads, Dk, Dv]` state: a GPU Dew's Triton kernels run
+    on (`triton_runs`), held in fp32 or bf16, its widths powers of two (Triton's blocks); a program
+    holds a head's whole state, with no column blocks to divide."""
+    dk, dv = state.shape[-2:]
+    return (triton_runs() and state.dtype in (jnp.float32, jnp.bfloat16)
+            and all(width > 0 and width & (width - 1) == 0 for width in (dk, dv)))
+
+
 def round_to_bf16(state, key, value):
     """`state` `[..., Dk, Dv]` fp32 rounded to bf16 stochastically: up in
     magnitude with the probability of the dropped low 16 bits, so a decay

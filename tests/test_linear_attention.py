@@ -902,27 +902,31 @@ def test_the_fused_decode_step_leaves_an_idle_row_alone():
 
 @pytest.mark.gpu(reason="the fused step runs on CUDA")
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_a_layer_choosing_the_fused_step_decodes_as_the_unfused_one(reference, geometry, dtype):
-    """Qwen 3.5's gated delta net decoding 65 tokens after a 5-token prefill with its generation's
-    choice 'delta_decode' set to 'fused' (`generation.chosen`): the decode tokens run the fused step,
-    and the outputs are within tests/reference_error.py's rule of the unfused layer's against the fp32
-    parallel forward in float64."""
+def test_a_layer_choosing_the_fused_step_decodes_as_the_unfused_one(dtype):
+    """A gated delta net of 4 value heads over 2 key heads 32 wide decoding 65 tokens after a 5-token
+    prefill with its generation's choice 'delta_decode' set to 'fused' (`generation.chosen`): the
+    decode tokens run the fused step, and the outputs are within tests/reference_error.py's rule of
+    the unfused layer's against the float64 parallel forward."""
     from dew.nn.kernels.generation import chosen
     from dew.training._lowering import triton_kernels
 
-    module = layer(geometry).clone(dtype=dtype)
-    variables = layer_params(reference)
-    hidden = jnp.asarray(reference["layer.hidden"]).astype(dtype)
+    module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=32, head_v_dim=32,
+                           dtype=dtype)
+    hidden = jax.random.normal(jax.random.key(11), (2, 70, 64), jnp.float32)
+    variables = module.init(jax.random.key(12), hidden[:, :1])
+    variables = {**variables, "params": {**variables["params"], "A_log": jnp.linspace(-1.0, 1.0, 4),
+                                         "dt_bias": jnp.linspace(0.5, 1.5, 4)}}
     with jax.enable_x64(new_val=True):
-        wide = layer(geometry).clone(dtype=jnp.float64)
-        truth = np.asarray(wide.apply(widened(variables), widened(hidden)), np.float64)
+        truth = np.asarray(module.clone(dtype=jnp.float64).apply(widened(variables), widened(hidden)),
+                           np.float64)
+    hidden = hidden.astype(dtype)
     unfused = np.asarray(decode_through(module, variables, hidden, prefill=5)[0], np.float64)
     with chosen(delta_decode="fused"):
         fused = np.asarray(decode_through(module, variables, hidden, prefill=5)[0], np.float64)
-        _, cache, _ = decode_through(module, variables, hidden[:, :6], prefill=5)
+        _, _, cache = decode_through(module, variables, hidden[:, :6], prefill=5)
         step = jax.jit(lambda cache, token: module.apply({**variables, "cache": cache}, token,
                                                          MixerCall(decode=True), mutable=["cache"]))
-        assert "gated_delta_decode" in triton_kernels(step.trace(cache, hidden[:, 5:6]).lower())
+        assert "gated_delta_decode" in triton_kernels(step.trace(cache, hidden[:, 6:7]).lower())
     assert_as_exact_as_the_reference(fused, unfused, truth, f"{jnp.dtype(dtype).name} decode")
 
 
