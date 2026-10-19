@@ -177,8 +177,8 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
     """Llama's MLP, Nemotron-H's MLP layers and ModernBERT's GLU carry biases where their config
     states mlp_bias, which each reference reads (modeling_llama.py's LlamaMLP, NemotronHMLP,
     ModernBertMLP's packed Wi): a checkpoint with random biases loads to logits as exact as the
-    reference's float32 ones, both from its float64 ones, and saves to a checkpoint that reloads
-    to the same logits."""
+    reference's float32 ones, both from its float64 ones, and saves, from its source and from the
+    model and its variables alone, to a checkpoint that reloads to the same logits."""
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForMaskedLM
 
@@ -212,9 +212,12 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
     assert_as_exact_as_the_reference(ours, theirs(torch.float32), theirs(torch.float64),
                                      f"{name} logits with MLP biases")
     loaded.save(tmp_path / "export")
-    again = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
-    reloaded = np.asarray(again.model.apply(again.variables, ids))
-    np.testing.assert_array_equal(reloaded, ours.astype(np.float32))
+    # Written from the model and its variables alone too, as a trained run exports.
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "from_model")
+    for export in (tmp_path / "export", tmp_path / "from_model"):
+        again = Pretrained.load(export, dtype="float32", attention_impl="reference")
+        reloaded = np.asarray(again.model.apply(again.variables, ids))
+        np.testing.assert_array_equal(reloaded, ours.astype(np.float32))
 
 
 @pytest.mark.parametrize(("name", "stale"), [
