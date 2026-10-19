@@ -91,3 +91,20 @@ reader.close()
     assert result.returncode == 0, result.stderr[-2000:]
     reported = json.loads(result.stdout.splitlines()[-1])
     assert reported == {"refused": "TOMLDecodeError", "ids": list(range(8))}
+
+
+def test_a_models_quantization_imports_no_training():
+    """The model's quantization, which loading, adapters and serving read, imports nothing of
+    training: a checkpoint's input quantizer is the model's, and reading it starts no trainer,
+    runtime or checkpointer."""
+    script = r'''
+import json
+import sys
+from dew.quantization import InputQuantization, Quantization
+training = [name for name in sys.modules if name == "dew.training" or name.startswith("dew.training.")]
+print(json.dumps(sorted(training)))
+'''
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout.splitlines()[-1]) == []
