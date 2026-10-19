@@ -29,9 +29,9 @@ os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 import jax
 import jax.numpy as jnp
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
-from dew.diffusion.presets import Cosine, Flow
+from dew.diffusion.presets import EDM, Cosine, Flow
 from dew.figures import THEMES, Figure
 from dew.nn.backbones import CausalTransformer, Mixture
 from dew.rl import clipped_surrogate_terms, group_advantage, k3_kl
@@ -684,12 +684,142 @@ def lm_next_token_figure():
     svg.save(HERE / "lm-next-token.svg")
 
 
+# The flower of tutorials/02: a 64 x 64 sample from a model Dew trained on Oxford Flowers, in [-1, 1].
+def flower() -> np.ndarray:
+    tile = Image.open(HERE / "gallery/heun.png").convert("RGB").crop((267, 502, 463, 698))
+    return np.asarray(tile.resize((64, 64), Image.BILINEAR), np.float32) / 127.5 - 1
+
+
+def pixels(x: np.ndarray) -> np.ndarray:
+    return np.clip((x + 1) * 127.5, 0, 255).astype(np.uint8)
+
+
+def edm_step_figure():
+    """One training step in two lanes: noise a clean image to a random sigma, then have the model
+    guess the clean image back and score the guess against it."""
+    x0 = flower()
+    sigma = 0.5
+    eps = np.asarray(jax.random.normal(jax.random.key(0), x0.shape))
+    # A model's guess at this noise level is a smoothed version of the image; a blur stands in for it.
+    guess = np.asarray(Image.fromarray(pixels(x0)).filter(ImageFilter.GaussianBlur(2.2)), np.float32) / 127.5 - 1
+    label = ("One training step. A clean flower x0 gets noise at a random level sigma to make x_t; the model "
+             "sees x_t and sigma and guesses x0; the loss is how far the guess is from x0, and the update "
+             "makes the next guess closer.")
+    size = 80
+    for narrow in (False, True):
+        # The wide layout has the loss beside the guess; the narrow one has it under the second lane.
+        width, height = (360, 520) if narrow else (720, 350)
+        x_clean, x_noise, x_noisy = (24, 140, 256) if narrow else (34, 176, 318)
+        lane2 = 300 if narrow else 196
+        x_model, x_guess = (246, 40) if narrow else (308, 460)
+        top1, top2 = 56, lane2 + 22
+        svg = Figure(width, height, seconds=11, label=label)
+        svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+        svg.text(16 if narrow else 20, 34, "1  noise a clean image", size=14, weight=600)
+        svg.text(16 if narrow else 20, lane2, "2  guess it back", size=14, weight=600)
+        with svg.group() as clean:
+            svg.image(x_clean, top1, size, pixels(x0), photo=True)
+            svg.text(x_clean + size / 2, top1 + size + 20, "x₀", size=14, mono=True, anchor="middle")
+        svg.appear(clean, 0.3)
+        with svg.group() as noise:
+            svg.text((x_clean + size + x_noise) / 2, top1 + size / 2 + 6, "+", size=20, anchor="middle")
+            svg.image(x_noise, top1, size, pixels(eps / 3), photo=True)
+            svg.text(x_noise + size / 2, top1 + size + 20, f"σ ε, σ = {sigma:g}", size=13, mono=True,
+                     anchor="middle")
+        svg.appear(noise, 1.1)
+        with svg.group() as noisy:
+            svg.text((x_noise + size + x_noisy) / 2, top1 + size / 2 + 6, "=", size=20, anchor="middle")
+            svg.image(x_noisy, top1, size, pixels(x0 + sigma * eps), photo=True)
+            svg.text(x_noisy + size / 2, top1 + size + 20, "xₜ", size=14, mono=True, anchor="middle")
+        svg.appear(noisy, 1.9)
+        # The noisy image drops into the second lane, to the model straight below it.
+        middle = x_model + 50
+        feed = svg.polyline([(x_noisy + size / 2, top1 + size + 30), (x_noisy + size / 2, lane2 - 24),
+                             (middle, lane2 - 24), (middle, top2 - 4)], color="muted", width=1.25)
+        svg.draw(feed, 2.6, 3.2)
+        with svg.group() as model:
+            svg.rect(x_model, top2, 100, size, fill="raised", stroke="accent", rx=8)
+            svg.text(middle, top2 + 34, "DiT", size=15, weight=600, anchor="middle")
+            svg.text(middle, top2 + 54, "(xₜ, σ)", size=13, mono=True, color="muted", anchor="middle")
+        svg.appear(model, 3.0)
+        with svg.group() as guessed:
+            if narrow:
+                svg.arrow(x_model - 4, top2 + size / 2, x_guess + size + 8, top2 + size / 2)
+            else:
+                svg.arrow(x_model + 104, top2 + size / 2, x_guess - 8, top2 + size / 2)
+            svg.image(x_guess, top2, size, pixels(guess), photo=True)
+            svg.text(x_guess + size / 2, top2 + size + 20, "guess x̂₀", size=14, mono=True, anchor="middle")
+        svg.appear(guessed, 3.8)
+        # The loss compares the guess with x0 from the first lane, and its gradient updates the model.
+        with svg.group() as loss:
+            if narrow:
+                loss_x, loss_bottom = width / 2, top2 + size + 64
+                svg.text(loss_x, loss_bottom - 14, "loss = w(σ) · ‖x̂₀ − x₀‖²", size=14, mono=True,
+                         anchor="middle", color="accent")
+            else:
+                loss_x, loss_bottom = 630, top2 + 66
+                svg.text(566, top2 + 30, "loss =", size=14, mono=True, color="accent")
+                svg.text(566, top2 + 52, "w(σ) · ‖x̂₀ − x₀‖²", size=14, mono=True, color="accent")
+        svg.appear(loss, 4.8)
+        floor = height - 30
+        update = svg.polyline([(loss_x, loss_bottom), (loss_x, floor), (middle, floor), (middle, top2 + size + 4)],
+                              color="accent", width=1.5)
+        svg.draw(update, 5.6, 6.4)
+        svg.appear(svg.text((loss_x + middle) / 2, floor + 18, "update the weights", size=13, color="accent",
+                            anchor="middle"), 6.3)
+        save_both(svg, "edm-step", narrow)
+
+
+def edm_noise_figure():
+    """One flower at eight of EDM's noise levels, from the least noise to the most, at the rates the
+    preset's sampler uses."""
+    x0 = flower()
+    eps = np.asarray(jax.random.normal(jax.random.key(0), x0.shape))
+    process = EDM(regime="pixel")()
+    _, sigmas = (np.asarray(v) for v in process.sampler_schedule.rates(process.times(8)))
+    sigmas = sigmas[::-1]
+    width, height, size = 440, 272, 168
+    svg = Figure(width, height, seconds=10, label="One flower with more and more noise: x_t = x0 + sigma "
+                 "epsilon at eight of EDM's noise levels, from sigma 0.002, where it is clean, to sigma 80, "
+                 "where only noise is left.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    svg.text(24, 34, "xₜ = x₀ + σ ε", size=15, mono=True, weight=600)
+    times = [0.4 + 0.8 * i for i in range(len(sigmas))]
+    frames, captions = [], []
+    for sigma in sigmas:
+        with svg.group() as frame:
+            svg.image(24, 52, size, pixels(x0 + sigma * eps), photo=True)
+        frames.append(frame)
+        captions.append(svg.text(24 + size / 2, 52 + size + 24, f"σ = {sigma:.3g}", size=14, mono=True,
+                                 anchor="middle"))
+    svg.show_in_turn(frames, times)
+    svg.show_in_turn(captions, times)
+    axis_x, axis_w, axis_y = 224, 192, 196
+    svg.image(axis_x, 52, 64, pixels(x0), photo=True)
+    svg.text(axis_x + 76, 90, "x₀, the clean image", size=13, color="muted")
+    # Where each level sits on a log scale, the current one filled.
+    low, high = np.log10(sigmas[0]), np.log10(sigmas[-1])
+
+    def at(sigma: float) -> float:
+        return axis_x + axis_w * (np.log10(sigma) - low) / (high - low)
+
+    svg.line(axis_x, axis_y, axis_x + axis_w, axis_y, color="rule")
+    svg.text(axis_x, axis_y + 26, f"{sigmas[0]:.3g}", size=12, mono=True, color="muted", anchor="middle")
+    svg.text(axis_x + axis_w, axis_y + 26, f"{sigmas[-1]:.3g}", size=12, mono=True, color="muted",
+             anchor="middle")
+    svg.text(axis_x + axis_w / 2, axis_y - 40, "σ, log scale", size=13, color="muted", anchor="middle")
+    for sigma in sigmas:
+        svg.circle(at(sigma), axis_y, 4, fill="tint1")
+    svg.show_in_turn([svg.circle(at(sigma), axis_y, 7, fill="accent") for sigma in sigmas], times)
+    svg.save(HERE / "edm-noise.svg")
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
            "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
-           "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure,
-           "lm-next-token": lm_next_token_figure}
+           "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure, "edm-step": edm_step_figure,
+           "edm-noise": edm_noise_figure, "lm-next-token": lm_next_token_figure}
 
 
 if __name__ == "__main__":
