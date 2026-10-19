@@ -50,7 +50,7 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
     from jax.typing import DTypeLike
 
-    from dew.data.pipeline import ObjectiveData
+    from dew.data.pipeline import DeviceStep, ObjectiveData
     from dew.data.text import Tokenizer
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
     from dew.inputs import InputSpec
@@ -691,7 +691,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         return tree
 
     def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
-                holds: tuple[object, ...] = ()):
+                holds: tuple[DeviceStep, ...] = ()):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
 
