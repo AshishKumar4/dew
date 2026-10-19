@@ -338,13 +338,18 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
 
 
 @dataclasses.dataclass(frozen=True)
-class Warps:
-    """A decode launch's warps: a program holds a value head's whole `[Dk, Dv]` state."""
+class Launch:
+    """A decode launch's program: `block` value columns of a head's state (None for all of them, which a
+    conv or the epilogue's norm needs, each reading a whole head) and its warps."""
+    block: int | None
     warps: int
 
 
-WARPS = Warps(8)
-"""The launch without a measurement."""
+WARPS = Launch(None, 8)
+"""The launch without a measurement over a whole head."""
+COLUMNS = Launch(32, 8)
+"""The launch without a measurement over value columns: 32 a program, 16 to 64 measured within 3% on
+an RTX 4080."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -352,13 +357,13 @@ class StepLaunch(tuning.KernelOp):
     """A decode token in one launch over rows and value heads (`_kernel`), its `hooks` inlined. Off a GPU
     it interprets."""
 
-    config_cls: ClassVar[type[Warps]] = Warps
+    config_cls: ClassVar[type[Launch]] = Launch
     ROWS: ClassVar[tuple[str, ...]] = ('active', 'query', 'key', 'value', 'token', 'held', 'log_decay', 'gate',
                                        'beta', 'z', 'state')
 
     def _fwd(self, active, state, query=None, key=None, value=None, token=None, held=None, taps=None,
              log_decay=None, gate=None, beta=None, log_a=None, bias=None, skip=None, z=None, weight=None, *,
-             hooks: Hooks, dtype: str, interpret: bool, config: Warps, return_residuals: bool = False):
+             hooks: Hooks, dtype: str, interpret: bool, config: Launch, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         arrays = dict(state=state, query=query, key=key, value=value, token=token, held=held, taps=taps,
@@ -369,68 +374,79 @@ class StepLaunch(tuning.KernelOp):
         key_heads = (_pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
                      if hooks.conv is not None else given['query'].shape[1])
 
+        block = value_width if config.block is None else config.block
+        if block != value_width and _whole(hooks):
+            raise ValueError("a conv or the epilogue's norm reads a head's whole state")
+
         def whole(array):
             """An array every program reads whole."""
-            return pl.BlockSpec(array.shape, lambda r, h: (0,) * array.ndim)
+            return pl.BlockSpec(array.shape, lambda r, h, c: (0,) * array.ndim)
 
         def per_row(array):
             """A row's whole block."""
-            return pl.BlockSpec((None, *array.shape[1:]), lambda r, h: (r, *(0,) * (array.ndim - 1)))
+            return pl.BlockSpec((None, *array.shape[1:]), lambda r, h, c: (r, *(0,) * (array.ndim - 1)))
 
-        def per_head(array, *, rows: bool, key: bool = False):
-            """The program's head's block of a `[rows,] heads, ...` array, a key head's where `key`."""
+        def keyed(array):
+            """The program's key head's `[rows, Hk, Dk]` block, `[Dk]`."""
             group = value_heads // key_heads
-            index = (lambda h: h // group) if key else (lambda h: h)
-            if rows:
-                return pl.BlockSpec((None, None, *array.shape[2:]),
-                                    lambda r, h: (r, index(h), *(0,) * (array.ndim - 2)))
-            return pl.BlockSpec((None, *array.shape[1:]), lambda r, h: (index(h), *(0,) * (array.ndim - 1)))
+            return pl.BlockSpec((None, None, key_width), lambda r, h, c: (r, h // group, 0))
+
+        def valued(array):
+            """The program's head's and columns' block of a `[rows, Hv, Dv]` array, `[block]`."""
+            return pl.BlockSpec((None, None, block), lambda r, h, c: (r, h, c))
 
         def one(array, *, rows: bool):
             """The program's head's one entry, `[1]`."""
-            return (pl.BlockSpec((None, 1), lambda r, h: (r, h)) if rows
-                    else pl.BlockSpec((1,), lambda r, h: (h,)))
+            return (pl.BlockSpec((None, 1), lambda r, h, c: (r, h)) if rows
+                    else pl.BlockSpec((1,), lambda r, h, c: (h,)))
 
+        held_state = pl.BlockSpec((None, None, key_width, block), lambda r, h, c: (r, h, 0, c))
         specs = {
-            'token': per_row, 'held': per_row, 'taps': whole, 'weight': whole,
-            'query': functools.partial(per_head, rows=True, key=True),
-            'key': functools.partial(per_head, rows=True, key=True),
-            'value': functools.partial(per_head, rows=True), 'z': functools.partial(per_head, rows=True),
-            'state': functools.partial(per_head, rows=True),
+            'token': per_row, 'held': per_row, 'taps': whole, 'weight': whole, 'query': keyed, 'key': keyed,
+            'value': valued, 'z': valued, 'state': lambda array: held_state,
             'gate': functools.partial(one, rows=True), 'beta': functools.partial(one, rows=True),
             'log_a': functools.partial(one, rows=False), 'bias': functools.partial(one, rows=False),
             'skip': functools.partial(one, rows=False),
-            'log_decay': (functools.partial(per_head, rows=True) if hooks.decay == 'vector'
-                          else functools.partial(one, rows=True)),
+            'log_decay': (lambda array: pl.BlockSpec((None, None, key_width), lambda r, h, c: (r, h, 0))
+                          if hooks.decay == 'vector' else functools.partial(one, rows=True)),
         }
-        in_specs = [pl.BlockSpec((None, 1), lambda r, h: (r, 0)), *(specs[name](given[name]) for name in given)]
-        state_spec = specs['state'](state)
-        out_specs = [state_spec]
+        in_specs = [pl.BlockSpec((None, 1), lambda r, h, c: (r, 0)), *(specs[name](given[name]) for name in given)]
+        out_specs = [held_state]
         out_shape = [jax.ShapeDtypeStruct(state.shape, state.dtype)]
         if hooks.conv is not None:
-            out_specs.append(specs['held'](given['held']))
+            out_specs.append(per_row(given['held']))
             out_shape.append(jax.ShapeDtypeStruct(given['held'].shape, given['held'].dtype))
-        out_specs.append(pl.BlockSpec((None, None, value_width), lambda r, h: (r, h, 0)))
+        out_specs.append(valued(None))
         out_shape.append(jax.ShapeDtypeStruct((rows, value_heads, value_width), jnp.dtype(dtype)))
         kernel = functools.partial(_kernel, hooks=hooks, group=value_heads // key_heads, key_heads=key_heads,
                                    interpret=interpret)
         return tuple(pl.pallas_call(
-            kernel, grid=(rows, value_heads), in_specs=in_specs, out_specs=out_specs, out_shape=out_shape,
-            input_output_aliases={len(given): 0},
+            kernel, grid=(rows, value_heads, value_width // block), in_specs=in_specs, out_specs=out_specs,
+            out_shape=out_shape, input_output_aliases={len(given): 0},
             compiler_params=plgpu.CompilerParams(num_warps=config.warps),
             interpret=interpret, name="recurrence_step",
         )(active, *given.values())), None
 
-    def _get_heuristics_config(self, ba) -> Warps:
-        return WARPS
+    def _get_heuristics_config(self, ba) -> Launch:
+        return WARPS if _whole(ba.kwargs['hooks']) else COLUMNS
 
-    def _get_autotuning_configs(self, ba) -> set[Warps]:
-        return {Warps(warps) for warps in (4, 8, 16)}
+    def _get_autotuning_configs(self, ba) -> set[Launch]:
+        whole = {Launch(None, warps) for warps in (4, 8, 16)}
+        if _whole(ba.kwargs['hooks']):
+            return whole
+        width = ba.arguments['state'].shape[-1]
+        return whole | {Launch(block, warps) for block in (16, 32, 64) for warps in (4, 8) if width % block == 0}
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Normal floats and every row active, so a timed launch steps each row's state and history."""
         return [jnp.ones(spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.integer) else array
                 for spec, array in zip(specs, super().operands(specs, seed), strict=True)]
+
+
+def _whole(hooks: Hooks) -> bool:
+    """Whether a program needs a head's whole state: a conv reads all of a head's values, the epilogue's
+    norm all of its output."""
+    return hooks.conv is not None or hooks.output is not None
 
 
 def fits(hooks: Hooks, state) -> bool:
