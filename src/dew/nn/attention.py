@@ -1342,7 +1342,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     can save it instead of replaying the kernel (`remat_block` in dit.py).
     """
     shards = sequence_shards()
-    precision = float32_products(query.dtype if dtype is None else dtype, precision)
+    if implementation in ('auto', 'xla', 'reference'):  # a named fused kernel runs its own arithmetic
+        precision = float32_products(query.dtype if dtype is None else dtype, precision)
     if not 0 <= dropout_rate < 1:
         raise ValueError(f"dropout_rate must be within [0, 1), got {dropout_rate}")
     if key_segment_ids is not None:
@@ -1472,8 +1473,7 @@ def folded_attention(query, key, value, mask=None, precision=None):
     operands, the scale after, an fp32 softmax of logits masked to -0.7
     times the largest fp32, probabilities in the value's dtype). Six layers
     of Qwen3.5's decode took 1.21 against 2.48 ms at 128 rows and 0.33
-    against 0.47 at 32 on an RTX 4080 (docs/performance.md), at `precision`.
-    """
+    against 0.47 at 32 on an RTX 4080 (docs/performance.md), at `precision`."""
     batch, positions, heads, width = query.shape
     keys = key.shape[-3]
     wide = jnp.promote_types(query.dtype, jnp.float32)
