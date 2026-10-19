@@ -776,8 +776,9 @@ def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what
         rng, without_deterministic_ops):
     """A model whose layers name cudnn (`attention_impl`) forces it, so a call cudnn does not take
     raises, naming every requirement it fails (`dew.nn.kernels.selection.select`), as torch's
-    `sdpa_kernel` does, rather than running another kernel: here an fp32 model, packed or not, a
-    packed batch's documents among the reasons. 'auto' runs both."""
+    `sdpa_kernel` does, rather than running another kernel: here an fp32 model, packed or not. A
+    packed batch's documents are no reason, as a named cuDNN takes them as their mask. 'auto' runs
+    both."""
     model = tiny(attention_impl='cudnn')
     ids, segment_ids, positions = packed_pair(rng)
     params = tiny().init(rng, ids)
@@ -788,7 +789,8 @@ def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what
         model.apply(params, ids, positions=positions, segment_ids=segment_ids)
     assert plain.value.kernel == packed.value.kernel == "cudnn"
     assert "dtype" in {refusal.code for refusal in plain.value.refusals}
-    assert {"dtype", "documents"} <= {refusal.code for refusal in packed.value.refusals}
+    assert "dtype" in {refusal.code for refusal in packed.value.refusals}
+    assert "documents" not in {refusal.code for refusal in packed.value.refusals}
     tiny().apply(params, ids, positions=positions, segment_ids=segment_ids)
 
 
