@@ -8,12 +8,14 @@ variables that wandb and the tokenizers read. So the library does it in
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import resource
 import signal
 import threading
 import types
+import uuid
 from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -22,8 +24,14 @@ import jax
 from jax.experimental import multihost_utils
 from packaging.version import Version
 
-from dew.cache import enable_compilation_cache, persist_compilations
-from dew.coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
+from dew.cache import default_compilation_cache_dir, enable_compilation_cache, persist_compilations
+from dew.coordination import (
+    broadcast_from_process_zero,
+    end_pool_on_failure,
+    from_every_process,
+    pool_size,
+    preemption_service,
+)
 from dew.logging import configure as configure_logging
 from dew.pool import (
     COORDINATOR,
@@ -113,18 +121,38 @@ def prepare_process(wandb: Wandb | None = None,
 def ready_process() -> None:
     """What every Dew run needs of its process and `import dew` leaves alone: Dew's log handler
     (`dew.logging.configure`), the refusal of a machine with an NVIDIA GPU whose JAX opened with
-    none (`dew.telemetry.devices.refuse_cpu_only_jax`), and for a run of one process the persistent
-    compilation cache under the user's cache directory (`dew.cache.persist_compilations`), which a
-    run's own directory or JAX_ENABLE_COMPILATION_CACHE=false leaves alone. A pool's processes read
-    one cache only where it is on storage they share, as JAX requires (only process 0 writes it),
-    so a pool caches in the directory its run names. `prepare_process` readies the process once
-    its flags are set and its pool joined, and `Trainer.fit` readies one no `prepare_process` did;
-    each step is idempotent. JAX fixes whether a process caches at its first compile, so a process
-    that compiled before `fit` readied it keeps what it had."""
+    none (`dew.telemetry.devices.refuse_cpu_only_jax`), and the persistent compilation cache under
+    the user's cache directory (`dew.cache.persist_compilations`), which a run's own directory or
+    JAX_ENABLE_COMPILATION_CACHE=false leaves alone. A pool caches there only where every process
+    reads that directory as one (`_shares_cache`), as JAX requires of a cache whose entries
+    process 0 alone writes; a pool across hosts without shared storage names the directory it
+    shares. `prepare_process` readies the process once its flags are set and its pool joined, and
+    `Trainer.fit` readies one no `prepare_process` did; each step is idempotent. JAX fixes whether
+    a process caches at its first compile, so a process that compiled before `fit` readied it
+    keeps what it had."""
     configure_logging()
     refuse_cpu_only_jax()
-    if pool_size() == 1:
+    # The settings `persist_compilations` reads, read first so a pool asks its processes nothing it
+    # would not use.
+    if (not jax.config.jax_compilation_cache_dir and jax.config.jax_enable_compilation_cache
+            and (pool_size() == 1 or _shares_cache(default_compilation_cache_dir()))):
         persist_compilations()
+
+
+@functools.cache
+def _shares_cache(directory: str) -> bool:
+    """Whether every process of the pool reads `directory` as one: a mark process 0 writes there
+    is one each of them finds, over the coordination service (`from_every_process`)."""
+    mark = os.path.join(directory, f".dew-pool-{broadcast_from_process_zero(uuid.uuid4().hex)}")
+    if jax.process_index() == 0:
+        os.makedirs(directory, exist_ok=True)
+        with open(mark, "w"):
+            pass
+    from_every_process(None)  # every process looks once the mark is written
+    found = from_every_process(os.path.exists(mark))
+    if jax.process_index() == 0:
+        os.remove(mark)
+    return all(found)
 
 
 def _set_environment(wandb: Wandb | None, xla_flags: str | None,
