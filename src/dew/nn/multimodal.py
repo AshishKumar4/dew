@@ -23,6 +23,7 @@ from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
 if TYPE_CHECKING:
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.hyper_connections import HyperConnections
+    from dew.nn.kv_cache import KVCache
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
 
@@ -486,6 +487,14 @@ class MultimodalTransformer(nn.Module):
     @nn.nowrap
     def with_cache_capacity(self, capacity: int) -> Self:
         return self.clone(language_model=self.language_model.with_cache_capacity(capacity))
+
+    @property
+    def kv_cache(self) -> KVCache:
+        return self.language_model.kv_cache
+
+    @nn.nowrap
+    def with_kv_cache(self, layout: KVCache) -> Self:
+        return self.clone(language_model=self.language_model.with_kv_cache(layout))
 
     @nn.nowrap
     def generation_refusal(self) -> str | None:

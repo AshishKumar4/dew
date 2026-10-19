@@ -583,9 +583,9 @@ class Server:
             raise ValueError("capacity must be a positive number of cache slots per row")
         model = task.model
         if kv_cache is not None:
-            if not any(entry.name == "kv_cache" for entry in dataclasses.fields(model)):
+            if not isinstance(model, Layered):
                 raise ValueError(f"{type(model).__name__} declares no kv_cache layout to replace")
-            model = model.clone(kv_cache=kv_cache)
+            model = model.with_kv_cache(kv_cache)
         layout = model.kv_cache if isinstance(model, Layered) else KVCache()
         _refuse_longrope_modes(model, paged=layout.page_size is not None,
                                chunked=chunk is not None, prefix=prefix_cache)
@@ -608,7 +608,9 @@ class Server:
             rows = DenseRows(groups, chunk)
         else:
             count = slots * (rounded // layout.page_size) if layout.pages is None else layout.pages
-            model = model.clone(kv_cache=dataclasses.replace(layout, pages=count, groups=groups))
+            # Only a model that declares its layout has a paged one; the default pages nothing.
+            assert isinstance(model, Layered)
+            model = model.with_kv_cache(dataclasses.replace(layout, pages=count, groups=groups))
             rows = PagedRows([Pages(count // groups, layout.page_size, prefix_cache=prefix_cache)
                               for _ in range(groups)], chunk, rounded // layout.page_size)
         return cls(
