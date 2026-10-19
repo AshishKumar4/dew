@@ -82,6 +82,20 @@ def test_a_cache_write_moves_whole_words_with_the_same_bits(dtype):
     assert written.dtype == dtype and np.asarray(written).tobytes() == np.asarray(scattered).tobytes()
 
 
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.int8])
+def test_a_cache_leaf_with_no_elements_moves_as_words_and_back_whole(dtype):
+    """A leaf with no elements, a one-tap conv's empty history `[rows, 0, channels]`, packs into words
+    as a GPU admission moves it and comes back at its own shape (`as_words`, `from_words`), traced as on
+    an A100."""
+    from dew.nn.kernels.generation import assumed
+    from dew.nn.kv_cache import as_words, from_words
+
+    history = jax.ShapeDtypeStruct((4, 0, 8), dtype)
+    with assumed("sm80"):
+        back = jax.eval_shape(lambda leaf: from_words(as_words(leaf), dtype), history)
+    assert (back.shape, back.dtype) == (history.shape, history.dtype)
+
+
 @pytest.mark.gpu(reason="a CUDA bug, which the cuda lane's deterministic scatter reproduces")
 @pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
     "openxla/xla#49380, fixed by openxla/xla#49498 (merged 2026-09-28, after jaxlib 0.11.2 of "

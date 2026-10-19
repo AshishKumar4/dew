@@ -75,9 +75,8 @@ def _layer_written(tree, values, index):
 
 WRITTEN = ('cache', 'router', 'qk', INDEXER_COLLECTION)
 """The collections a decoder block writes: its decode cache, and what its
-router, its attention and its sparse indexer sow. A run whose parameters are
-fetched is applied in a scope of its own, so these are the names whose values
-the loop has to carry back out to the scope that asked for them."""
+router, its attention and its sparse indexer sow, which a looped pass keeps
+apart per pass (`PassView`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -313,11 +312,19 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     def read_only(run: DecoderBlock) -> list[str]:
         """List the collections a run reads and does not write.
 
-        These are its parameters and whatever else it was given, all of
-        which a bank holds per layer.
+        These are its parameters, which a forward never writes, and whatever
+        else the caller gave it and left immutable, all of which a bank holds
+        per layer.
         """
         return [name for name in run.variables
-                if name != 'streaming' and (not run.is_mutable_collection(name) or name not in WRITTEN)]
+                if name != 'streaming' and (name == 'params' or not run.is_mutable_collection(name))]
+
+    def held(run: DecoderBlock) -> dict:
+        """The values the caller holds in the collections it opened, but the
+        cache, which the loop carries apart: the run reads them as it writes
+        them, as a resident run does, one layer's slice at a time."""
+        return {name: tree for name, tree in run.variables.items()
+                if name not in ('params', 'streaming', 'cache') and run.is_mutable_collection(name)}
 
     def first_of(index: int, dependency):
         """Fetch run `index`'s first layer's read-only variables.
@@ -333,27 +340,29 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         held = {name: runs[index].variables[name] for name in read_only(runs[index])}
         return _fetched(held) if groups[index][1] == 1 else _fetched_layer(held, 0)
 
+    probed: list[tuple[LayerSpec, list[str]]] = []
     staged = first_of(0, x)
     for index, (run, (first, count)) in enumerate(zip(runs, groups, strict=True)):
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
         store = kv_store if count == 1 or specs[first].kv_shared else None
-        mutable = [name for name in WRITTEN if run.is_mutable_collection(name)]
+        state = held(run)
+        cached = (run.variables.get('cache') or None) if run.is_mutable_collection('cache') else None
+        first_slice = None if inputs is None else inputs.layer(0)
+        opened = _opened(run, specs[first], probed, staged, state if count == 1 else _layer_slice(state, 0),
+                         cached if count == 1 or cached is None else _layer_slice(cached, 0), x,
+                         first_slice, store=store, train=train, decode=decode,
+                         attention_metadata=attention_metadata)
 
-        def layer(read, cache, hidden, per_layer_slice, *, run=run, mutable=mutable, store=store):
-            variables = dict(read) if cache is None else {**read, 'cache': cache}
-            hidden, changed = run.apply(
-                variables, hidden, mutable=mutable, train=train, decode=decode, kv_store=store,
-                per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
-            return hidden, dict(changed)
+        layer = functools.partial(_applied, run, opened, store, train=train, decode=decode,
+                                  attention_metadata=attention_metadata)
 
-        cached = (run.variables.get('cache') or None) if 'cache' in mutable else None
         if count == 1:
             following = first_of(index + 1, x)
-            x, changed = layer(staged, cached, x, None if inputs is None else inputs.layer(0))
+            x, changed = layer(staged, state, cached, x, first_slice)
         else:
             banks = {name: run.variables[name] for name in read_only(run)}
             x, changed, following = _prefetched_run(
-                banks, staged, cached, x, inputs, layer, count,
+                banks, staged, state, cached, x, inputs, layer, count,
                 following=functools.partial(first_of, index + 1),
                 reader=run.variables.get('streaming', {}).get('bank'))
         staged = following
@@ -363,22 +372,65 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     return x
 
 
-def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, following, reader=None):
+def _applied[Hidden](run: DecoderBlock, opened: list[str], store, read, state, cache, hidden: Hidden,
+                     per_layer_slice, *, train: bool, decode: bool,
+                     attention_metadata) -> tuple[Hidden, dict]:
+    """One layer of `run` applied in a scope of its own: `read` its read-only variables, `state`
+    the caller's held collections and `cache` its cache slice, writing the `opened` collections.
+    The hidden state comes out as it went in, a residual stream or `Carried` streams."""
+    variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
+    hidden, changed = run.apply(
+        variables, hidden, mutable=opened, train=train, decode=decode, kv_store=store,
+        per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
+    return hidden, dict(changed)
+
+
+def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, list[str]]], read, state,
+            cache, hidden, per_layer_slice, *, store, train: bool, decode: bool,
+            attention_metadata) -> list[str]:
+    """The collections a run applied in a scope of its own opens: those its caller
+    opened that a layer of it writes, DSpark's `prediction_inputs` among them,
+    which a layer reads to choose what it records, and the ones the caller holds
+    (`state`), which it reads as it writes them; the loop carries them back out.
+
+    What a layer writes with every collection open is read off an abstract run of
+    the run's first layer. Layers of equal specs run the same program, so each
+    spec runs once, recorded in `probed`.
+    """
+    written = next((names for seen, names in probed if seen == spec), None)
+    if written is None:
+        variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
+        # A provider writes its keys and values into the store it is given: the
+        # abstract run writes into a copy, so nothing it traces leaves it.
+        _, changed = jax.eval_shape(lambda variables: run.apply(
+            variables, hidden, mutable=True, train=train, decode=decode,
+            kv_store=None if store is None else dict(store), per_layer_input=per_layer_slice,
+            attention_metadata=attention_metadata), variables)
+        written = list(changed)
+        probed.append((spec, written))
+    return sorted(name for name in {*written, *state} if name not in ('params', 'streaming')
+                  and run.is_mutable_collection(name))
+
+
+def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *, following, reader=None):
     """Run `count` layers under `jax.lax.scan`, read one layer at a time.
 
     `primed` is layer 0's read-only variables, already on the device. Iteration
     `i` issues layer `i + 1`'s copy, then computes layer `i`; the last layer is
     computed after the loop and `following` stages the next run's first layer in
-    place of its copy. The carry is the hidden state, the staged variables and
-    the cache, written in place one layer's slice per iteration so a decode step
-    holds one banked cache; a cache the layers create comes out stacked per
-    iteration, as flax's scan hands them out.
+    place of its copy. Each layer reads its slice of `state`, the caller's
+    opened collections, and their values come out stacked per iteration, as
+    flax's scan hands them out. The carry is the hidden state, the staged
+    variables and the cache, written in place one layer's slice per iteration
+    so a decode step holds one banked cache; a cache the layers create comes
+    out stacked like `state`.
     """
     def body(carry, index):
         hidden, current, held = carry
         staged = _fetched_layer(banks, index + 1) if reader is None else reader.fetch(index + 1, hidden)
         per_layer_slice = None if inputs is None else inputs.layer(index)
-        hidden, changed = layer(current, None if held is None else _layer_slice(held, index),
+        hidden, changed = layer(current, _layer_slice(state, index),
+                                None if held is None else _layer_slice(held, index),
                                 hidden, per_layer_slice)
         if held is not None:
             held = _layer_written(held, changed.pop('cache'), index)
@@ -387,7 +439,8 @@ def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, follo
     (x, current, cache), sown = jax.lax.scan(body, (x, primed, cache), jnp.arange(count - 1))
     last = count - 1
     staged = following(x)
-    x, changed = layer(current, None if cache is None else _layer_slice(cache, last), x,
+    x, changed = layer(current, _layer_slice(state, last),
+                       None if cache is None else _layer_slice(cache, last), x,
                        None if inputs is None else inputs.layer(last))
     if cache is not None:
         cache = _layer_written(cache, changed.pop('cache'), last)
