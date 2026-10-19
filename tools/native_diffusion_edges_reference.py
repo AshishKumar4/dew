@@ -35,7 +35,10 @@ def generate(root):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     common = dict(num_train_timesteps=20, beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear")
-    arrays = {}
+    # 256 independent rows, so each walk's distance from float64 is an RMS over many roundings
+    # rather than one draw.
+    initial = torch.randn((256, 3), generator=torch.Generator().manual_seed(61), dtype=torch.float64) * 8
+    arrays = {"initial": initial.to(torch.float32).numpy()}
     for name, cls, options in (
         ("ddim-linspace", DDIMScheduler, dict(timestep_spacing="linspace", clip_sample=False, set_alpha_to_one=False)),
         ("pndm-linspace", PNDMScheduler, dict(timestep_spacing="linspace", skip_prk_steps=True, set_alpha_to_one=False)),
@@ -46,7 +49,7 @@ def generate(root):
         def walk(dtype):
             scheduler = cls(**common, **options)
             scheduler.set_timesteps(4)
-            x = torch.tensor([[10.0, -8.0, 0.3]], dtype=dtype) * scheduler.init_noise_sigma
+            x = torch.from_numpy(arrays["initial"]).to(dtype) * scheduler.init_noise_sigma
             trajectory = []
             for time in scheduler.timesteps:
                 model_input = scheduler.scale_model_input(x, time)
