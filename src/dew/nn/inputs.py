@@ -7,7 +7,7 @@ import itertools
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 import jax
 import jax.numpy as jnp
@@ -40,7 +40,7 @@ type ModelKwarg = jax.Array | Mapping[str, jax.Array] | bool | None
 
 # A token field's `[B, W, ...]` response values from its `[B, S, ...]` prompt
 # values, the prompt's `[B, S]` real slots and the width (`ModelInputs.extended`).
-type FieldExtension = Callable[[Any, jax.Array, int], Any]
+type FieldExtension = Callable[[jax.Array, jax.Array, int], jax.Array]
 
 PredictionPhase = Literal["ordinary", "extend", "draft"]
 
@@ -257,16 +257,21 @@ class ModelInputs:
         if tokens.ndim != 2 or tokens.shape[0] != self.tokens.shape[0]:
             raise ValueError(f"a response is [{self.tokens.shape[0]}, W] token ids, got {tokens.shape}")
         known = {**RESPONSE_FIELDS, **(rules or {})}
-        unruled = sorted(set(self.token_fields) - set(known))
+        unruled = sorted(set(self.token_fields) - set(known) - {COORDINATES_FIELD})
         if unruled:
             raise ValueError(f"token fields {unruled} have no rule for a response's slots; "
                              "name one in `rules`")
         valid = real_slots(self.token_fields, self.tokens.shape)
         width = tokens.shape[1]
+
+        def continued(name: str, value: jax.Array | Coordinates) -> jax.Array | Coordinates:
+            if isinstance(value, Coordinates):
+                return _continued_layout(value, valid, width)
+            return jnp.concatenate([value, known[name](value, valid, width).astype(value.dtype)], axis=1)
+
         return replace(
             self, tokens=jnp.concatenate([self.tokens, tokens.astype(self.tokens.dtype)], axis=1),
-            token_fields={name: _joined(value, known[name](value, valid, width))
-                          for name, value in self.token_fields.items()})
+            token_fields={name: continued(name, value) for name, value in self.token_fields.items()})
 
 
 @struct.dataclass
@@ -635,26 +640,20 @@ def _response_text(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
     return jnp.full((value.shape[0], width, *value.shape[2:]), -1, value.dtype)
 
 
-def _response_layout(value: Coordinates, valid: jax.Array, width: int) -> Coordinates:
-    """A request's `Coordinates` over its response's slots: each field by its own field's rule, and
-    no document starting in the response."""
+def _continued_layout(value: Coordinates, valid: jax.Array, width: int) -> Coordinates:
+    """A request's `Coordinates` continued over its response's `width` slots: each field by its
+    own field's rule (`RESPONSE_FIELDS`), no document starting in the response, and its real
+    tokens no longer all first, since the response follows the prompt's padding."""
     def continued(field, rule):
-        return None if field is None else rule(field, valid, width)
+        return None if field is None else jnp.concatenate(
+            [field, rule(field, valid, width).astype(field.dtype)], axis=1)
 
-    return replace(
-        value,
-        valid=continued(value.valid, _response_validity),
-        positions=continued(value.positions, _response_positions),
-        segments=continued(value.segments, _response_document),
-        starts=None if value.starts is None else jnp.zeros((len(value.starts), width), value.starts.dtype))
-
-
-def _joined(prompt, response):
-    """A token field's prompt slots, then its response's, leaf by leaf. A response follows the
-    prompt's padding, so a `Coordinates`' real tokens no longer all come first."""
-    joined = jax.tree.map(lambda first, then: jnp.concatenate([first, then.astype(first.dtype)], axis=1),
-                          prompt, response)
-    return replace(joined, right_padded=False) if isinstance(joined, Coordinates) else joined
+    starts = None if value.starts is None else jnp.concatenate(
+        [value.starts, jnp.zeros((len(value.starts), width), value.starts.dtype)], axis=1)
+    return replace(value, valid=continued(value.valid, _response_validity),
+                   positions=continued(value.positions, _response_positions),
+                   segments=continued(value.segments, _response_document), starts=starts,
+                   right_padded=False)
 
 
 RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
@@ -665,7 +664,6 @@ RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
     "image_indices": _response_text,
     "audio_indices": _response_text,
     "image_groups": _response_text,
-    COORDINATES_FIELD: _response_layout,
 }
 """How each token field Dew's processors write continues into a response."""
 
