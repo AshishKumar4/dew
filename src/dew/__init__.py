@@ -24,11 +24,18 @@ none this driver runs (docs/installation.md, "Which CUDA build").
 choices key traces on (`dew.cache.KERNEL_TUNES`, `KERNEL_PINS`,
 `KERNEL_CHOICES`): JAX makes one only beside no other JAX call, so before any
 thread starts.
+
+`import dew` marks absl's flags parsed when nothing has parsed them, as
+`absl.app` would: Grain's worker processes read absl flags as they start, and
+a program that never ran `absl.app` would stop them there. A program that
+parses its flags itself, through `absl.app` or `FLAGS(argv)`, still does.
 """
 
 from collections.abc import Callable
 from importlib import import_module
 from typing import TYPE_CHECKING
+
+from absl import flags as _flags
 
 from dew import cache as cache
 from dew.logging import configure as _configure_logging
@@ -44,6 +51,16 @@ _refuse_cpu_only_jax()
 _keep_roundings()
 _divide_exactly()
 _unpartition_gpu_pool()
+
+
+def _parse_absl_flags() -> None:
+    """Mark absl's flags parsed where nothing has parsed them, as `absl.app` would, for Grain,
+    which reads its own flags as it starts worker processes."""
+    if not _flags.FLAGS.is_parsed():
+        _flags.FLAGS.mark_as_parsed()
+
+
+_parse_absl_flags()
 
 if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
