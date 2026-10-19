@@ -233,6 +233,35 @@ def test_the_scale_and_bias_gradients_match_full_logits_under_the_float64_rule(d
 
 
 @pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("tile", [None, (2, 2)], ids=["whole", "tiled"])
+def test_a_vocabulary_split_head_rounds_a_confident_targets_gradient_as_one_device_does(tile):
+    """Under bf16 compute a split head's gradient rounds the target's whole cotangent, its softmax
+    share and its one-hot together, once, as one device's head does: a target whose share rounds to
+    one in bf16 keeps a gradient, where rounding the share apart from the one-hot would cancel it."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from dew.training import MeshSpec
+
+    states = jnp.ones((2, 1), jnp.float32)
+    matrix = jnp.asarray([[8.0, 0.0, 0.0, 0.0]], jnp.float32)
+    targets = jnp.zeros((2,), jnp.int32)
+
+    def loss(states, matrix):
+        head = OutputTable(matrix, vocab_major=False, compute=jnp.bfloat16)
+        losses, _, _ = chunked_cross_entropy(states, head, targets, 1, tile=tile)
+        return jnp.sum(losses)
+
+    alone = jax.jit(jax.grad(loss, argnums=1))(states, matrix)
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        placed = (jax.device_put(states, NamedSharding(mesh, P("fsdp"))),
+                  jax.device_put(matrix, NamedSharding(mesh, P(None, "fsdp"))))
+        split = jax.jit(jax.grad(loss, argnums=1))(*placed)
+    assert float(alone[0, 0]) != 0
+    np.testing.assert_array_equal(np.asarray(split), np.asarray(alone))
+
+
+@pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize('tile', [None, (2, 64)], ids=['whole', 'tiled'])
 def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(tile):
     """Split over the vocabulary on a mesh, the head's loss and its gradients
@@ -691,6 +720,36 @@ def test_an_excluded_column_takes_no_mass_in_the_loss_the_prediction_or_the_grad
     for expected, actual in zip(want_grads, got_grads, strict=True):
         assert jnp.abs(actual - expected).max() <= 1e-5 * jnp.abs(expected).max()
     assert jnp.all(got_grads[1][:, excluded] == 0)
+
+
+@pytest.mark.parametrize("path", ["tiled", "whole", "fused"])
+def test_a_target_at_the_excluded_column_scores_infinity_and_moves_no_logit(path):
+    """A target at the excluded column scores +inf, a constant, in every head: its token's loss
+    moves no logit, so the head's excluded column takes no gradient from it, and the other
+    columns' gradient is the partition's alone."""
+    excluded = 41
+    hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=7, tokens=(1, RAGGED_TOKENS))
+    targets = targets.at[0, 0].set(excluded)
+    precision = jax.lax.Precision.HIGHEST
+
+    def scored(states, matrix):
+        table = OutputTable(matrix, vocab_major=False, precision=precision)
+        if path == "fused":
+            total, (losses, _, _) = fused_head_loss(states, table, targets, jnp.ones(targets.shape),
+                                                    z_loss=1.0, tile=RAGGED, excluded=excluded)
+            return total, (losses, total)
+        losses, _, log_z = chunked_cross_entropy(states, table, targets, 4,
+                                                 tile=RAGGED if path == "tiled" else None, excluded=excluded)
+        # The sum is +inf; each token's loss, the excluded target's included, takes a cotangent of 1.
+        total = jnp.sum(losses + log_z)
+        return total, (losses, total)
+
+    (_, (losses, total)), (_, d_matrix) = jax.value_and_grad(scored, argnums=(0, 1), has_aux=True)(
+        hidden, head)
+    assert jnp.isinf(losses[0, 0]) and losses[0, 0] > 0
+    assert jnp.isinf(total) and total > 0
+    assert jnp.all(jnp.isfinite(d_matrix))
+    assert jnp.all(d_matrix[:, excluded] == 0)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])

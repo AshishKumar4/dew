@@ -29,6 +29,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.activations import gated_product
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.flops import attention_flops, matching_lengths, patch_lengths, projection_flops
@@ -113,8 +114,8 @@ class Flux2SingleBlock(nn.Module):
             implementation=self.attention_impl, precision=self.precision)
         gated, value_half = jnp.split(projected[..., 3 * inner:], 2, axis=-1)
         joined = jnp.concatenate(
-            [attended.reshape(x.shape[0], x.shape[1], inner), nn.silu(gated) * value_half], axis=-1
-        )
+            [attended.reshape(x.shape[0], x.shape[1], inner), gated_product('swiglu')(gated, value_half)],
+            axis=-1)
         # The source's `attn.to_out`, named as Flux's single block names its
         # fused output map.
         return x + gate[:, None] * nn.Dense(maps['proj_fused'][1], use_bias=False, dtype=self.dtype,
