@@ -399,6 +399,57 @@ def test_a_hash_holdout_publishes_the_rows_its_stream_reads():
     assert sorted(published) == [(index, index * 10) for index in part] and 0 < len(part) < 20
 
 
+@pytest.mark.parametrize("changed", ["chunk overlap", "source", "fewer steps"])
+def test_a_generation_reads_in_place_of_the_steps_it_ran_and_of_no_others(changed):
+    """A published generation reads in place of the source and steps it was published from, as
+    the rows those steps make; cached after another source or other steps it would serve rows they
+    never make, so the run is refused before it reads."""
+    from dew.data.compile import iterate, publish
+    from dew.data.pipeline import Pipeline
+    from dew.data.text import Chunks, Tokenize
+
+    texts = [{"text": "x" * size} for size in (3, 7, 18, 2, 12)]
+    source = Memory(texts)
+    chunked = Pipeline(source).map(Tokenize()).flat_map(Chunks(9))
+    generation = publish(chunked, _cache(), read="indexed")
+
+    def pieces(pipeline):
+        return [row["text"].tolist() for row in iterate(pipeline, read="indexed")]
+
+    assert pieces(chunked.cache(generation)) == pieces(chunked)
+    other = {
+        "chunk overlap": Pipeline(source).map(Tokenize()).flat_map(Chunks(9, overlap=1)),
+        "source": Pipeline(Memory(texts[::-1])).map(Tokenize()).flat_map(Chunks(9)),
+        "fewer steps": Pipeline(source).map(Tokenize()),
+    }[changed]
+    with pytest.raises(ValueError):
+        iterate(other.cache(generation), read="indexed")
+
+
+def test_a_generation_of_one_holdout_part_reads_as_that_part():
+    """A generation published from a holdout part holds that part's rows, so it reads in place of
+    that part whole, and the other part, whose rows it does not hold, is refused it; one published
+    from the store the parts select from serves both (`rebased`)."""
+    from dew.data.compile import iterate, publish
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(12)])
+
+    def tagged(pipeline):
+        return pipeline.map(lambda row: {**row, "tag": row["id"] * 10}, identity="tag@1")
+
+    def ids(pipeline):
+        return [(int(row["id"]), int(row["tag"])) for row in iterate(pipeline, read="indexed")]
+
+    train, held = Pipeline(source).holdout(records=5)
+    part = publish(tagged(train), _cache(), read="indexed")
+    assert ids(tagged(train).cache(part)) == ids(tagged(train)) == [(index, index * 10) for index in range(5, 12)]
+    with pytest.raises(ValueError):
+        iterate(tagged(held).cache(part), read="indexed")
+    store = publish(tagged(Pipeline(source)), _cache(), read="indexed")
+    assert [ids(tagged(branch).cache(store)) for branch in (train, held)] == [ids(tagged(train)), ids(tagged(held))]
+
+
 def test_published_generation_exposes_only_declared_order_metadata_and_plan():
     import numpy as np
 
