@@ -27,7 +27,7 @@ from dew.nn.sharding import LayoutRefused
 from dew.objectives.base import Batch, Objective
 from dew.records import JSON
 from dew.training.distributed import Placement, batch_divisor
-from dew.training.host import Held, place_leaf
+from dew.training.host import snapshot
 from dew.training.memory import (
     compiled_if_it_fits,
     head_tile_of,
@@ -214,25 +214,6 @@ def step_seconds(step: Callable, state: TrainState, batch: Batch) -> float:
     return (time.perf_counter() - began) / TIMED_STEPS
 
 
-def on_host[T](tree: T) -> Callable[[], T]:
-    """Copy `tree`'s arrays, this process's shards of each, to host memory
-    (`Held`), and return what puts a fresh copy back where they were placed
-    (`place_leaf`): a timing that steps a state leaves the run the state it
-    started from."""
-    leaves, structure = jax.tree.flatten(tree)
-    keys = [jax.random.key_impl(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else None
-            for leaf in leaves]
-    bits = [leaf if impl is None else jax.random.key_data(leaf)
-            for leaf, impl in zip(leaves, keys, strict=True)]
-    held = [(Held.of(leaf), leaf.sharding) for leaf in bits]
-
-    def placed(source: Held, sharding, impl):
-        leaf = place_leaf(source, sharding)
-        return leaf if impl is None else jax.random.wrap_key_data(leaf, impl=impl)
-
-    return lambda: structure.unflatten([placed(*copy, impl) for copy, impl in zip(held, keys, strict=True)])
-
-
 @dataclasses.dataclass
 class Timer:
     """Times a frontier's steps on `batch` from `state` (`step_seconds`):
@@ -243,7 +224,7 @@ class Timer:
     batch: Batch
 
     def __call__(self, steps: Sequence[Callable]) -> list[float]:
-        restore = on_host(self.state)
+        restore = snapshot(self.state)
         seconds = [step_seconds(steps[0], self.state, self.batch)]
         # What the step did not donate is freed too, so the run holds no
         # reference to the state it handed over, on any backend.
