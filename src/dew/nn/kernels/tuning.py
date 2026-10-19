@@ -268,6 +268,21 @@ def _kernel_times(cupti, executable, *args) -> list[tuple[str, float]]:
     return kernels if isinstance(kernels, list) else []
 
 
+def _another_subscriber(error: RuntimeError) -> bool:
+    """Whether CUPTI refused the tuner's subscription for another subscriber's, a profile capture or
+    Nsight's: the launch keeps its heuristic until a later compile. Mosaic's profiler raises it as a
+    RuntimeError naming the other subscriber; every other failure is the tuner's to report."""
+    return "another subscriber" in str(error)
+
+
+def _resource_exhausted(error: jax.errors.JaxRuntimeError) -> bool:
+    """Whether a config's compile failed for a block past the GPU's shared memory, XLA's
+    "RESOURCE_EXHAUSTED: Shared memory size limit exceeded", the one failure a config of a launch's
+    space may meet on a GPU it was not declared for; any other failure, device memory's included, is
+    the kernel's or the tuner's, and propagates."""
+    return str(error).startswith("RESOURCE_EXHAUSTED: Shared memory size limit exceeded")
+
+
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
@@ -311,13 +326,17 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
     try:
         flushes = {name for name, _ in _kernel_times(cupti, evicting, flush)}
     except RuntimeError as error:
+        if not _another_subscriber(error):
+            raise
         return AutotuningData(dict.fromkeys(ba.autotuning_configs, error))
     try:
         for config, future in futures.items():
             try:
                 executable, lowering, compiling = future.result()
                 runs = [_kernel_times(cupti, executable, flush, arrays) for _ in range(REPEATS)]
-            except Exception as error:  # a config past the GPU's shared memory or registers
+            except jax.errors.JaxRuntimeError as error:
+                if not _resource_exhausted(error):
+                    raise
                 timings[config] = error
                 continue
             read[config] = runs, lowering, compiling

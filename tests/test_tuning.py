@@ -4,6 +4,7 @@ heuristic, stored and read back in a fresh process, and measured once on a
 GPU that a process has to itself (dew.nn.kernels.tuning)."""
 
 import ast
+import functools
 import json
 import os
 import shutil
@@ -356,6 +357,28 @@ def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_
     assert fresh(MEASURED, "2048", cache_dir=tmp_path / "cache", flags=inherited) == [path, measured, True, 1]
     assert fresh(MEASURED, "1024", cache_dir=tmp_path / "cache",
                  flags=f"{inherited} {READ_ONLY}".strip()) == [path, measured, False, 1]
+
+
+@pytest.mark.gpu(reason="the tuner measures on CUDA")
+def test_a_config_failing_for_more_than_its_shared_memory_stops_the_measurement(monkeypatch):
+    """A launch one of whose configs raises as it lowers, a kernel's bug and not its GPU's shared
+    memory: measuring the launch propagates the error, where the tuner had counted it one more
+    failed config and kept the others' fastest."""
+    with tuning.launches():
+        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+    [norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
+    broken_config = sorted(norm.autotuning_configs, key=repr)[0]
+    original = norm_swiglu.RmsForward._fwd
+
+    @functools.wraps(original)
+    def broken(self, *args, config, **kwargs):
+        if config == broken_config:
+            raise ValueError("a kernel's bug")
+        return original(self, *args, config=config, **kwargs)
+
+    monkeypatch.setattr(norm_swiglu.RmsForward, "_fwd", broken)
+    with pytest.raises(ValueError, match="a kernel's bug"):
+        tuning._measured(norm.op, norm)
 
 
 STORES = """
