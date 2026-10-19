@@ -1177,10 +1177,15 @@ class CausalTransformer(nn.Module):
 
         self.specs = specs
         # What one scanned body shares: the layers' spec and the structure of their variables, so
-        # layers quantized or adapted apart run as runs of their own; the stored tree stays per
-        # layer, so a grouping is only how this call reads it.
-        self.scan_keys = tuple(zip(specs, StackView.layer_structures(self.variables, self.num_layers),
-                                   strict=True))
+        # layers stored apart and quantized or adapted apart run as runs of their own; a per-layer
+        # tree reads either way, so a grouping is only how this call reads it.
+        structures = list(StackView.layer_structures(self.variables, self.num_layers))
+        # A run a collection already holds as one bank stays one run, as the store declared it
+        # (`bank_sites`): its rows must then be alike, which `StackView.stack` refuses by name.
+        for first, count in scan_groups(specs, self.bank_layers) if self.scan_layers else ():
+            if count > 1 and any(group_name(first, count) in tree for tree in self.variables.values()):
+                structures[first:first + count] = [structures[first]] * count
+        self.scan_keys = tuple(zip(specs, structures, strict=True))
         self.block = block
         self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
         self.groups = scan_groups(self.scan_keys, self.bank_layers) if self.scan_layers else tuple(
