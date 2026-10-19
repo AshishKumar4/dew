@@ -12,6 +12,24 @@ from jax import lax
 from .common import _check_endpoint_domain, _push
 
 
+def transition_variance(rates_t, rates_s):
+    """The variance of the forward transition q(x_t | x_s) of a Gaussian process
+    x_t = alpha_t x_0 + sigma_t eps, for s before t: sigma_t^2 - (alpha_t / alpha_s)^2 sigma_s^2, the
+    noise the step from s to t adds. It holds for any schedule, variance preserving, exploding or a
+    rectified flow alike, and is the forward step's beta, 1 - alpha_t^2 / alpha_s^2, only where
+    alpha^2 + sigma^2 = 1."""
+    (alpha_t, sigma_t), (alpha_s, sigma_s) = rates_t, rates_s
+    return jnp.maximum(sigma_t ** 2 - (alpha_t / alpha_s) ** 2 * sigma_s ** 2, 0.0)
+
+
+def posterior_std(rates_t, rates_s):
+    """The standard deviation of the forward posterior q(x_s | x_t, x_0) for s before t:
+    sigma_s sigma_{t|s} / sigma_t, with sigma_{t|s}^2 the transition's variance
+    (`transition_variance`), on any Gaussian process."""
+    sigma_t, sigma_s = rates_t[1], rates_s[1]
+    return sigma_s / sigma_t * jnp.sqrt(transition_variance(rates_t, rates_s))
+
+
 @struct.dataclass
 class DDPM:
     """Exact ancestral sampler for the reverse diffusion SDE.
@@ -24,11 +42,10 @@ class DDPM:
 
     `variance` selects which of Diffusers 0.34.0's fixed `DDPMScheduler`
     posterior variances the draw uses. `"small"` is the posterior's own
-    variance, written in rates so it is defined on any schedule. `"large"` is
-    the forward step's beta, 1 - alpha_t^2 / alpha_s^2, the wider choice from
-    `Glide`. That is a variance-preserving quantity and it is zero wherever
-    alpha is one, so a variance-exploding grid is refused rather than sampled
-    without noise.
+    variance (`posterior_std`). `"large"` is the forward step's own noise
+    (`transition_variance`), the wider choice from `Glide`, which Diffusers
+    writes as the beta 1 - alpha_t^2 / alpha_s^2 of a variance-preserving
+    table. Both are written in rates, so they are defined on any schedule.
 
     Neither choice adds noise on the step whose own time is the schedule's
     zero, where x_t is already the least noisy state the schedule holds; the
@@ -45,13 +62,6 @@ class DDPM:
             raise ValueError(f"DDPM's fixed variances are 'small' and 'large', not {self.variance}")
 
     def init(self, x, times, process, *, key):
-        if self.variance == "large":
-            with jax.ensure_compile_time_eval():
-                alpha, _ = process.sampler_schedule.rates(jnp.asarray(times, jnp.float32))
-                if bool(jnp.all(alpha == 1)):
-                    raise ValueError(
-                        "DDPM's wide posterior variance is the variance-preserving forward "
-                        "step's beta, which is zero on a schedule whose alpha is one")
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -60,9 +70,9 @@ class DDPM:
         noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
         eps_coeff = (sigma_s ** 2 * alpha_t) / (sigma_t * alpha_s)
         if self.variance == "large":
-            gamma = jnp.sqrt(1 - alpha_t ** 2 / alpha_s ** 2)
+            gamma = jnp.sqrt(transition_variance((alpha_t, sigma_t), (alpha_s, sigma_s)))
         else:
-            gamma = sigma_s * jnp.sqrt(1 - (alpha_t ** 2 / alpha_s ** 2) * (sigma_s ** 2 / sigma_t ** 2))
+            gamma = posterior_std((alpha_t, sigma_t), (alpha_s, sigma_s))
         gamma = jnp.where(jnp.reshape(jnp.asarray(t, jnp.float32),
                                       (-1,) + (1,) * (x.ndim - 1)) > 0, gamma, 0.0)
         return alpha_s * denoised + eps_coeff * eps + noise * gamma, state
@@ -89,10 +99,10 @@ class DDIM:
         alpha_t, sigma_t = process.rates(t, like=x)
         alpha_s, sigma_s = process.rates(target, like=x)
         if self.eta > 0:
-            # DDIM paper eq. 16: eta=0 is deterministic DDIM, eta=1.0 approaches DDPM.
-            # The direction term must shrink to keep the marginal variance right.
-            sigma_tilde = self.eta * (sigma_s / sigma_t) * jnp.sqrt(
-                jnp.maximum(1 - alpha_t ** 2 / alpha_s ** 2, 0.0))
+            # DDIM paper eq. 16: eta times the forward posterior's standard deviation, so eta=1 draws
+            # from the DDPM posterior on any process. The direction term shrinks to keep the
+            # marginal variance right.
+            sigma_tilde = self.eta * posterior_std((alpha_t, sigma_t), (alpha_s, sigma_s))
             noise = jax.random.normal(key, x.shape)
             direction = jnp.sqrt(jnp.maximum(sigma_s ** 2 - sigma_tilde ** 2, 0.0))
             return alpha_s * denoised + direction * eps + sigma_tilde * noise, state
