@@ -1138,11 +1138,18 @@ class GatedDeltaNet(nn.Module):
         own conv and norm, or the portable recurrence ('xla'). Its row's choice, else the step
         kernel where the rule's own row names the port and the portable recurrence where it names
         the math, so a caller choosing the rule's math (`generation.chosen`) decodes unfused; a kernel
-        the token's state does not fit hands it to the next."""
+        the token's state does not fit hands it to the next. Both kernels update the state in place, which
+        JAX's Pallas gives no tangent, so a token traced for `jax.jvp` (`FORWARD_MODE`) takes the
+        recurrence."""
         state = jax.ShapeDtypeStruct((x.shape[0], self.num_v_heads, self.head_k_dim, self.head_v_dim),
                                      self._stored(operand)[0])
         preferred = measured_kernel(
             'delta_decode', 'step' if measured_kernel('gated_delta_rule', 'xla') == 'fla' else 'xla')
+        if preferred in ('fused', 'step') and (refusal := refused(
+                (not FORWARD_MODE.get() and not isinstance(x, JVPTracer), 'forward_mode',
+                 "a JVP trace needs forward-mode derivatives; the decode kernels update their state in "
+                 "place, which takes none"))):
+            return route('delta_decode', kernel='xla', preferred=preferred, refusal=refusal).kernel
         refusal = None
         if preferred == 'fused':
             refusal = refused(

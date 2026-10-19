@@ -866,16 +866,16 @@ def fused_inputs(layer, variables, cache, token):
 def test_the_fused_decode_step_computes_the_layers_token(heads, width, rows, held):
     """A gated delta net's decode token in one launch (`delta_rule.fused_step`: the conv over the
     held history, the gates, the update and the gated norm) at every config of its space: its output
-    through the layer's projection, its history and an fp32 state within tests/reference_error.py's
-    rule of the layer's own unfused token against the float64 layer's; a bf16 state within one bf16
-    step of the unfused fp32 state, rounded once as `step` rounds it. Compiled on a GPU, interpreted
-    elsewhere."""
+    through the layer's projection, its history and its state, fp32 or bf16, within
+    tests/reference_error.py's rule of the layer's own unfused token, holding the same state, against
+    the float64 layer's. Compiled on a GPU, interpreted elsewhere."""
     from dew.nn.kernels import delta_rule
 
     layer, variables, cache, token = fused_case(heads, width, rows, jnp.float32, held)
     step = MixerCall(decode=True)
     fp32 = {**cache, "recurrent_state": cache["recurrent_state"].astype(jnp.float32)}
     want, after = layer.apply({**variables, "cache": fp32}, token, step, mutable=["cache"])
+    unfused = layer.apply({**variables, "cache": cache}, token, step, mutable=["cache"])[1]["cache"]
     with jax.enable_x64(new_val=True):
         wide = layer.clone(dtype=jnp.float64)
         exact, exact_after = wide.apply({**widened(variables), "cache": widened(fp32)}, widened(token),
@@ -898,13 +898,29 @@ def test_the_fused_decode_step_computes_the_layers_token(heads, width, rows, hel
                                          f"{config} out")
         np.testing.assert_array_equal(np.asarray(history), np.asarray(after["cache"]["conv_state"]))
         assert state.dtype == held
-        unfused = after["cache"]["recurrent_state"]
-        if held == jnp.float32:
-            assert_as_exact_as_the_reference(np.asarray(state), np.asarray(unfused),
-                                             np.asarray(exact_after["cache"]["recurrent_state"]),
-                                             f"{config} state")
-        else:
-            np.testing.assert_allclose(np.asarray(state, np.float32), unfused, atol=2e-6, rtol=2 ** -7)
+        assert_as_exact_as_the_reference(np.asarray(state), np.asarray(unfused["recurrent_state"]),
+                                         np.asarray(exact_after["cache"]["recurrent_state"]),
+                                         f"{config} state")
+
+
+def test_a_cached_layer_choosing_the_fused_step_takes_a_jvp_through_the_recurrence():
+    """A cached gated delta net whose A100 row chooses the fused step (`generation.chosen`), traced for
+    `jax.jvp` (`forward_mode_attention`, as MeanFlow and consistency training trace it), decodes its
+    token through the differentiable recurrence, which gives the tangent the in-place kernels do not,
+    and reports that route with its stable code."""
+    from dew.nn.attention import forward_mode_attention
+    from dew.nn.kernels.generation import assumed, chosen, routes
+
+    layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
+
+    def step(token):
+        return layer.apply({**variables, "cache": cache}, token, MixerCall(decode=True), mutable=["cache"])[0]
+
+    tangent = jax.random.normal(jax.random.key(9), token.shape)
+    with assumed("sm80"), chosen(delta_decode="fused"), forward_mode_attention(), routes() as found:
+        jax.make_jaxpr(lambda token, tangent: jax.jvp(step, (token,), (tangent,)))(token, tangent)
+    (decode,) = [route for route in found if route.choice == "delta_decode"]
+    assert (decode.kernel, decode.preferred, decode.refusal.code) == ("xla", "fused", "forward_mode")
 
 
 def test_the_fused_decode_step_leaves_an_idle_row_alone():
