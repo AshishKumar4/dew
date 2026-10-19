@@ -16,6 +16,7 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.inputs import counted_places
 from dew.nn.kernels import bf16_dot_runs
 from dew.nn.local_attention import local_attention
 
@@ -96,9 +97,10 @@ def test_packed_documents_restart_their_windows_and_chunks(span):
         keep = keep[None] & (places[:, :, None] // span["chunk"] == places[:, None, :] // span["chunk"])
     keep = keep & valid[:, None, :]
     expected = dense_reference(query, key, value, keep)
+    segment_ids = jnp.broadcast_to(segments, (2, length))
     actual = local_attention(
-        query, key, value, **span, segment_ids=jnp.broadcast_to(segments, (2, length)),
-        valid=jnp.asarray(valid), implementation="xla")
+        query, key, value, **span, places=counted_places(segment_ids, jnp.asarray(valid)),
+        segment_ids=segment_ids, valid=jnp.asarray(valid), implementation="xla")
     real = (segments != 0) & valid & keep.any(-1)
     np.testing.assert_allclose(np.asarray(actual)[real], expected[real], atol=2e-6, rtol=0)
 
@@ -107,7 +109,7 @@ def test_packed_documents_restart_their_windows_and_chunks(span):
 @pytest.mark.parametrize("length", [12, 8], ids=["banded", "dense"])
 def test_chunks_count_tokens_from_the_place_a_caller_gives_their_first(given, length):
     """A chunk is cut at each token's place counted from the place its
-    document's first token is given (`token_places`): places given from 2
+    document's first token is given (`counted_places`): places given from 2
     put the first boundary after two tokens, as a continuation's whole pass
     cuts it; places that do not count the tokens (every one 0, as tokens
     sharing a place give) still chunk the tokens by their count. The band (12
@@ -120,7 +122,8 @@ def test_chunks_count_tokens_from_the_place_a_caller_gives_their_first(given, le
     places = rows + 2 if given == "origin" else rows
     keep = (rows[None, :] <= rows[:, None]) & (places[:, None] // 4 == places[None, :] // 4)
     expected = dense_reference(query, key, value, np.broadcast_to(keep, (2, length, length)))
-    actual = local_attention(query, key, value, chunk=4, positions=positions, implementation="xla")
+    actual = local_attention(query, key, value, chunk=4, places=counted_places(positions=positions),
+                             implementation="xla")
     np.testing.assert_allclose(np.asarray(actual), expected, atol=2e-6, rtol=0)
 
 
@@ -164,6 +167,35 @@ def test_memory_grows_with_the_window_not_the_square_of_the_sequence():
     banded = temporaries(lambda q, k, v: local_attention(
         q, k, v, window=window, implementation="xla"))
     assert dense >= heads * length * length * 4
+    assert banded * 4 < dense
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_row_with_padding_among_its_tokens_bands_its_window_over_a_sequence_axis():
+    """Split over a sequence axis, a row with padding among its tokens still runs its window
+    banded, on its real tokens compacted: its temporaries a fraction of the dense windowed call's
+    `[H, S, S]` logits at 4096 tokens and a window of 128, both measured from the compiled
+    executables on the same mesh."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training import MeshSpec
+
+    length, window, heads = 4096, 128, 4
+    query, key, value = inputs(length, heads=heads, kv_heads=heads, batch=1)
+    valid = jnp.asarray(np.arange(length) % 7 != 3)[None]
+    mesh = MeshSpec(sequence=2).build(jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        placed = [jax.device_put(x, NamedSharding(mesh, PartitionSpec(None, "sequence")))
+                  for x in (query, key, value, valid)]
+
+        def temporaries(fn):
+            compiled = jax.jit(fn).lower(*placed).compile()
+            return compiled.memory_analysis().temp_size_in_bytes
+
+        dense = temporaries(lambda q, k, v, valid: scaled_dot_product_attention(
+            q, k, v, causal=True, sliding_window=window, mask=valid[:, None, None, :], implementation="xla"))
+        banded = temporaries(lambda q, k, v, valid: local_attention(
+            q, k, v, window=window, valid=valid, implementation="xla"))
     assert banded * 4 < dense
 
 
@@ -311,7 +343,8 @@ def test_a_row_with_padding_among_its_tokens_counts_its_tokens_over_a_sequence_a
     truth = dense_reference(query, key, value, keep)
 
     def attend(q, k, v, valid, segments):
-        return local_attention(q, k, v, **span, segment_ids=segments, valid=valid, implementation="xla")
+        return local_attention(q, k, v, **span, places=counted_places(segments, valid), segment_ids=segments,
+                               valid=valid, implementation="xla")
 
     alone = attend(query, key, value, valid, segments)
     mesh = MeshSpec(sequence=2, explicit=("sequence",) if explicit else ()).build(jax.devices()[:2])

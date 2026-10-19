@@ -36,10 +36,10 @@ from dew.nn.attention import (
 from dew.nn.blocks import normal_kernel
 from dew.nn.documents import with_documents
 from dew.nn.flops import attention_flops, projection_flops
-from dew.nn.inputs import PLAIN_CALL, Admitted, AttentionMetadata, MixerCall, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, Admitted, AttentionMetadata, MixerCall, coordinates_of, counted_places
 from dew.nn.kernels.generation import backend
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
-from dew.nn.local_attention import local_attention, token_places
+from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, scaled
 from dew.nn.protocols import ProjectionGroup
@@ -127,7 +127,7 @@ class _Masking(NamedTuple):
     implementation: str
     cursor: jax.Array | None
     key_places: jax.Array
-    """Each key's place counted over its document's tokens (`token_places`), which a chunk and ALiBi
+    """Each key's place counted over its document's tokens (`counted_places`), which a chunk and ALiBi
     read: a cached key's where the layer keeps them (`CausalSelfAttention._cached_places`), else
     its slot."""
 
@@ -426,7 +426,7 @@ class CausalSelfAttention(nn.Module):
                        batch: int, length: int, key_length: int, decode: bool):
         """Combine key validity, causality, image groups and the layer's window, which counts
         tokens: a cache's slots are its tokens, and an uncached call's are `counted`
-        (`token_places`), padding among them skipped."""
+        (`counted_places`), padding among them skipped."""
         query_slots = (slots if decode else jnp.broadcast_to(jnp.arange(length), (batch, length)))
         groups = (None if metadata is None else metadata.image_groups)
         if groups is None:
@@ -541,9 +541,9 @@ class CausalSelfAttention(nn.Module):
         # writes them at or their indices.
         places = positions if logical_positions is None else logical_positions
         # Windows, chunks and ALiBi count each document's tokens from its first place
-        # (`token_places`); rotation and NoPE's temperature read the places as given. A cached step
+        # (`counted_places`); rotation and NoPE's temperature read the places as given. A cached step
         # reads its own.
-        counted = places if decode or logical_positions is None else token_places(
+        counted = places if decode or logical_positions is None else counted_places(
             segment_ids, tokens.valid, logical_positions)
         rotary_positions = places
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
@@ -582,7 +582,7 @@ class CausalSelfAttention(nn.Module):
         if self._runs_local(attention_metadata, decode) and not (self.ctx.attention_dropout_rate and train):
             attention = checkpoint_name(local_attention(
                 query, key, value, window=self.ctx.sliding_window, chunk=self.ctx.attention_chunk,
-                positions=None if logical_positions is None else positions,
+                places=None if logical_positions is None else counted,
                 segment_ids=segment_ids,
                 max_segments=None if segment_ids is None else tokens.max_segments,
                 valid=tokens.valid, right_padded=tokens.right_padded,
@@ -695,7 +695,7 @@ class CausalSelfAttention(nn.Module):
         flag, window, mask, document ids, kernel and key places the layer's
         visibility comes to (the canvas prefix, a shared or cached decode step,
         packed documents, metadata, a pairwise mask, a chunk). `places` are the
-        queries' places counted over their documents' tokens (`token_places`),
+        queries' places counted over their documents' tokens (`counted_places`),
         and `held_places` a sharing layer's keys'."""
         B, S = query.shape[:2]
         causal, mask, documents = self.ctx.causal, None, None
@@ -814,7 +814,7 @@ class CausalSelfAttention(nn.Module):
     def _cached_places(self, places, slots) -> jax.Array:
         """Each cache slot's place `[rows, capacity]`, where a chunk and ALiBi
         read its key: the place the call that wrote the slot counted its token
-        at (`token_places`). A slot is that place only by default, so the
+        at (`counted_places`). A slot is that place only by default, so the
         cache keeps it beside the key, and this call's `places` go in at their
         `slots` as its keys do."""
         allocated = self.has_variable("cache", "cached_places")
