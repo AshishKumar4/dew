@@ -297,42 +297,44 @@ def _ticks(low: float, high: float, count: int = 4) -> np.ndarray:
 
 
 def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
-          y_range: tuple[float, float] | None = None, smooth: int = 1, width: float = WIDE,
-          height: float = 290, seconds: float = 8.0) -> Figure:
+          x: Sequence[float] | None = None, y_range: tuple[float, float] | None = None, smooth: int = 1,
+          width: float = WIDE, height: float = 290, seconds: float = 8.0) -> Figure:
     """Lines over steps that draw themselves, one per entry of `series`, the first in the accent color.
 
-    With `smooth` above 1 each line is drawn faint, and its running mean over `smooth` steps over it.
+    `x` holds each point's step, as a tracker logged it; without it the points are steps 0, 1, 2 and
+    on. With `smooth` above 1 each line is drawn faint, and its running mean over `smooth` points over it.
     """
     figure = Figure(width, height, seconds=seconds, label=f"{y_label} against {x_label}")
     left, right, bottom = 50, 20, 48
     values = {name: np.asarray(ys, float) for name, ys in series.items()}
     # With several series, a legend fills rows under the label, as many as the names need.
     legend: list[tuple[float, float]] = []
-    x, y = left, 42.0
+    at_x, at_y = left, 42.0
     for name in values if len(values) > 1 else ():
         span = 30 + 8 * (len(name) + 5)
-        if legend and x + span > width - right:
-            x, y = left, y + 22
-        legend.append((x, y))
-        x += span + 16
+        if legend and at_x + span > width - right:
+            at_x, at_y = left, at_y + 22
+        legend.append((at_x, at_y))
+        at_x += span + 16
     top = (legend[-1][1] if legend else 20) + 20
     every = np.concatenate(list(values.values()))
     low, high = y_range or (float(every.min()), float(every.max()))
     if high <= low:
         low, high = low - 0.5, high + 0.5
-    steps = max(len(ys) for ys in values.values())
+    xs = np.asarray(x if x is not None else range(max(len(ys) for ys in values.values())), float)
+    first, final = float(xs[0]), float(xs[-1])
 
     def at(step: float, y: float) -> tuple[float, float]:
-        return (left + (width - left - right) * step / max(steps - 1, 1),
+        return (left + (width - left - right) * (step - first) / max(final - first, 1),
                 height - bottom - (height - top - bottom) * (y - low) / (high - low))
 
     for tick in _ticks(low, high):
-        _, y = at(0, tick)
-        figure.line(left, y, width - right, y, color="rule", width=1)
-        figure.text(left - 8, y + 5, f"{tick:g}", size=SMALL, color="muted", anchor="end")
-    for tick in _ticks(0, steps - 1, 4):
-        x, _ = at(tick, low)
-        figure.text(x, height - bottom + 20, f"{tick:g}", size=SMALL, color="muted", anchor="middle")
+        _, tick_y = at(first, tick)
+        figure.line(left, tick_y, width - right, tick_y, color="rule", width=1)
+        figure.text(left - 8, tick_y + 5, f"{tick:g}", size=SMALL, color="muted", anchor="end")
+    for tick in _ticks(first, final, 4):
+        tick_x, _ = at(tick, low)
+        figure.text(tick_x, height - bottom + 20, f"{tick:g}", size=SMALL, color="muted", anchor="middle")
     figure.text((left + width - right) / 2, height - 6, x_label, size=TEXT, color="muted", anchor="middle")
     figure.text(left, 20, y_label, size=TEXT, color="muted")
     # Neutral colors only, since warm means wrong; past three series the lines are dashed.
@@ -346,7 +348,7 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
             mean = np.convolve(ys, np.ones(window) / window, mode="valid")
             lines = [(ys, 1.0), (np.concatenate([np.full(window - 1, np.nan), mean]), 2.5)]
         for drawn, stroke in lines:
-            points = [at(step, y) for step, y in enumerate(drawn) if np.isfinite(y)]
+            points = [at(step, y) for step, y in zip(xs, drawn) if np.isfinite(y)]
             line = figure.polyline(points, color=color, width=stroke, dash=dash)
             shade = 0.35 if window > 1 and stroke < 2 else 1
             if dash:
@@ -357,12 +359,12 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
         # The last value: beside the series' name in a legend, or else at the line's end.
         last = float(ys[-window:].mean())
         if legend:
-            x, y = legend[index]
-            figure.line(x, y - 5, x + 18, y - 5, color=color, width=2.5, dash=dash)
-            figure.text(x + 24, y, f"{name} {last:.2f}", size=TEXT, color=color)
+            at_x, at_y = legend[index]
+            figure.line(at_x, at_y - 5, at_x + 18, at_y - 5, color=color, width=2.5, dash=dash)
+            figure.text(at_x + 24, at_y, f"{name} {last:.2f}", size=TEXT, color=color)
         else:
-            x, y = at(steps - 1, last)
-            end = figure.text(x - 4, y - 10, f"{last:.2f}", size=TEXT, color=color, weight=600, anchor="end")
+            at_x, at_y = at(final, last)
+            end = figure.text(at_x - 4, at_y - 10, f"{last:.2f}", size=TEXT, color=color, weight=600, anchor="end")
             figure.appear(end, seconds * 0.55)
     return figure
 
