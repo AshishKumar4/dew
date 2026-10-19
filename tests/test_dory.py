@@ -742,10 +742,9 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
 
             def batch(index, key=key, programs=programs, columns=columns, truth=truth, placed=placed,
                       draws=draws):
-                """Batch `index`'s per-entry errors summed over its orders, Dew's and the reference's,
-                the worst over the reference's ensemble (`recorder.MEMBERS`: vLLM and Dew's same math
-                under each declared summation tree); batch 0's columns kept order by order for the
-                rows' rule."""
+                """Batch `index`'s per-entry errors summed over its orders, Dew's and each member's of the
+                reference's ensemble (`recorder.MEMBERS`: vLLM and Dew's same math under each declared
+                summation tree); batch 0's columns kept order by order for the rows' rule."""
                 theirs = np.load(recorder.fetched(f'columns-{recorder.tag(key)}-{index}.npy'))
                 absolutes = np.zeros(truth.shape)
                 for order, reference in enumerate(theirs):
@@ -756,11 +755,14 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
                     if index == 0:
                         draws.append((np.take_along_axis(found, columns, axis=1), reference,
                                       np.take_along_axis(truth, columns, axis=1)))
-                members = [np.load(recorder.fetched(f'absolutes-{recorder.tag(key)}-{member}-{index}.npy'))
-                           for member in recorder.MEMBERS]
-                return absolutes, np.max(members, axis=0)
+                return absolutes, {member: np.load(recorder.fetched(
+                    f'absolutes-{recorder.tag(key)}-{member}-{index}.npy')) for member in recorder.MEMBERS}
 
             first = batch(0)
             assert_leaves_as_exact_over_orders(draws, f'Dory 4B {key}, its columns')
+            # A member is admitted where its RMS over every order is no worse than vLLM's.
+            spread = {member: np.sqrt(np.mean(np.square(np.load(recorder.fetched(
+                f'rms-{recorder.tag(key)}-{member}.npy'))))) for member in recorder.MEMBERS}
+            admitted = {'': [member for member in recorder.MEMBERS if spread[member] <= spread['vllm']]}
             assert_elements_as_exact(lambda index, first=first, batch=batch: batch(index) if index else first,
-                                     f'Dory 4B {key}, every entry')
+                                     f'Dory 4B {key}, every entry', reference='vllm', admitted=admitted)

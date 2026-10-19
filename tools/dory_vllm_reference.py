@@ -574,9 +574,10 @@ MEMBERS = ('vllm', *TREES)
 def trees(directory: Path, runs=None, orders_of: int = ORDERS) -> None:
     """Each tree member's per-element errors on every run (`runs`, every one by default), summed over
     each batch's orders (`symmetry`, the same orbit as vLLM's), `absolutes-{run}-{member}-{batch}.npy`
-    `[rows, vocab]` float32: Dew's model at the run's dtype, its attention the XLA math every sum of
-    which the interpreter reaches, decoding the run's tokens as the release test does
-    (tests/test_dory.py `decoding`, `forced`), every sum under the member's tree. Under Dew's
+    `[rows, vocab]` float32, and each order's RMS, `rms-{run}-{member}.npy`: Dew's model at the run's
+    dtype, its attention the XLA math every sum of which the interpreter reaches, decoding the run's
+    tokens as the release test does (tests/test_dory.py `decoding`, `forced`), every sum under the
+    member's tree. Under Dew's
     environment, on its GPU; `orders_of` below ORDERS times a pilot."""
     import time
 
@@ -597,6 +598,7 @@ def trees(directory: Path, runs=None, orders_of: int = ORDERS) -> None:
         placed = jax.device_put(loaded.variables)
         for member in TREES:
             programs = test_dory.decoding(model, member)
+            spread = np.zeros((BATCHES, orders_of))
             for batch in range(BATCHES):
                 total, began = np.zeros(truth.shape), time.perf_counter()
                 for index in range(orders_of):
@@ -606,9 +608,11 @@ def trees(directory: Path, runs=None, orders_of: int = ORDERS) -> None:
                                                              prompt_rows=part == 'sentence')
                                             for part in ('sentence', 'window')])
                     total += np.abs(found - truth)
+                    spread[batch, index] = np.sqrt(np.mean(np.square(found - truth)))
                     print(f'{key} {member} order {batch}/{index}: {time.perf_counter() - began:.1f} s',
                           flush=True)
                 np.save(directory / f'absolutes-{tag(key)}-{member}-{batch}.npy', total.astype(np.float32))
+            np.save(directory / f'rms-{tag(key)}-{member}.npy', spread)
 
 
 def errors(directory: Path, key: str, batch: int, shape: tuple[int, ...] | None = None) -> np.ndarray:
@@ -723,16 +727,20 @@ def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
 
 def sums(directory: Path) -> None:
     """vLLM's per-element errors on each run summed over each batch's orders,
-    `absolutes-{run}-vllm-{batch}.npy` `[rows, vocab]` float32, which `publish` puts beside the probe
-    with the tree members' (`trees`): the element rule reads each entry's mean over a batch
-    (tests/reference_error.py)."""
+    `absolutes-{run}-vllm-{batch}.npy` `[rows, vocab]` float32, and each order's RMS over the run,
+    `rms-{run}-vllm.npy` `[BATCHES, ORDERS]`, which `publish` puts beside the probe with the tree
+    members' (`trees`): the element rule reads each entry's mean over a batch, and admits a member
+    where its RMS is no worse than vLLM's (tests/reference_error.py)."""
     for run in RUNS:
+        spread = np.zeros((BATCHES, ORDERS))
         for batch in range(BATCHES):
             held = errors(directory, name(*run), batch)
             total = np.zeros(held.shape[1:], np.float64)
-            for order in held:
+            for index, order in enumerate(held):
                 total += order
+                spread[batch, index] = np.sqrt(np.mean(np.square(order, dtype=np.float64)))
             np.save(directory / f'absolutes-{tag(name(*run))}-vllm-{batch}.npy', total.astype(np.float32))
+        np.save(directory / f'rms-{tag(name(*run))}-vllm.npy', spread)
 
 
 def orders(directory: Path) -> None:
@@ -789,7 +797,8 @@ def files(directory: Path) -> dict[str, Path]:
     names = [*(f'upstream-{tag(name(*run))}.npy' for run in RUNS),
              *(f'columns-{tag(name(*run))}-{batch}.npy' for run in RUNS for batch in range(BATCHES)),
              *(f'absolutes-{tag(name(*run))}-{member}-{batch}.npy' for run in RUNS for member in MEMBERS
-               for batch in range(BATCHES))]
+               for batch in range(BATCHES)),
+             *(f'rms-{tag(name(*run))}-{member}.npy' for run in RUNS for member in MEMBERS)]
     return {'probe.npz': FIXTURE / 'probe.npz', **{file: directory / file for file in names}}
 
 
