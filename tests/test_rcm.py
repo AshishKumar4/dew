@@ -267,7 +267,9 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
 def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_path):
     """`--pretrained <pipeline> --objective rcm` with no teacher run: the
     teacher is the model the run loads, its weights bitwise the source's,
-    and the student starts as it."""
+    and the student starts as it. The run samples by what the same objective
+    built over the pipeline directly samples by: rCM's own few steps, solver
+    and unguided draw, on the pipeline's grid."""
     import tarfile
     from pathlib import Path
 
@@ -278,8 +280,10 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
     from dew.diffusion.presets import Flow
     from dew.interop.pretrained import load_diffusion_source
     from dew.objectives.base import TEACHER
-    from dew.objectives.diffusion import DiffusionRunConfig
+    from dew.objectives.diffusion import ConsistencyDistillationObjective, DiffusionRunConfig
     from dew.objectives.diffusion.objective import model_part
+    from dew.registry import to_record
+    from dew.sampling.pipelines import ImageSettings
 
     with tarfile.open(Path(__file__).resolve().parent / "fixtures" / "flux_source.tar.xz") as archive:
         archive.extractall(tmp_path, filter="data")
@@ -289,6 +293,11 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
                                        val_metrics=(),
                                    objective=ObjectiveConfig("rcm", {"ema_decay": None})).build()
     source = load_diffusion_source(pipeline, dtype="float32", attention_impl="xla", size=(16, 16))
+    direct = ConsistencyDistillationObjective(source, objective.process, None, ema_decay=None)
+    assert (to_record(objective.task_settings(), ImageSettings)
+            == to_record(direct.task_settings(), ImageSettings))
+    assert objective.steps == direct.steps == 3 and objective.guidance is None
+    assert objective.grid is not None and objective.solver != source.schedule.solver
     expected = model_part(source.variables)
     held = objective.init(jax.random.PRNGKey(0))
     for tree in (objective.teacher_variables, held[TEACHER]):

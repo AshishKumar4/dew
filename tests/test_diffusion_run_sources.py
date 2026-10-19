@@ -373,3 +373,24 @@ def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     assert any(not np.array_equal(np.asarray(got), before)
                for got, before in zip(restored, started, strict=True))
+
+
+def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipelines):
+    """Flow-GRPO built over a loaded flow pipeline directly, its solver, steps and guidance given and
+    its grid left out, samples its evaluation and published task on the pipeline's own grid, as the
+    denoising objective over it does; `grid=None` asks for the training process's times."""
+    from dew.interop.pretrained import load_diffusion_source
+
+    source = load_diffusion_source(str(pipelines / "sd3" / "pipeline"), dtype="float32",
+                                   attention_impl="xla", size=(16, 16))
+    settings = {"reward": "psnr", "groups": 2, "rollout_steps": 3, "solver": Euler(), "guidance": None,
+                "steps": 2}
+    grpo = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
+                             variables=source.variables, **settings)
+    plain = DiffusionObjective(source, solver=Euler(), guidance=None, steps=2)
+    assert grpo.grid is not None and plain.grid is not None
+    assert to_record(grpo.grid, type(grpo.grid)) == to_record(plain.grid, type(plain.grid))
+    assert grpo.final_denoise is False
+    unset = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
+                              variables=source.variables, grid=None, **settings)
+    assert unset.grid is None and unset.final_denoise is True
