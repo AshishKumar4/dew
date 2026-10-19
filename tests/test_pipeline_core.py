@@ -825,6 +825,27 @@ def test_a_rows_count_and_its_rule_ride_through_the_steps_that_leave_its_targets
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_count_follows_its_tokens_through_a_rename_that_reuses_their_name(read):
+    """A rename that moves the counted tokens away and names another field as they were, and then
+    back again, leaves the count on the tokens: the padding the other field holds is no target."""
+    from dew.data.steps.text import CountTargets
+
+    def corpus(source):
+        rows = Memory(tuple({"text": np.asarray([1, 2, 3, 4], np.int32), "backup": np.zeros(4, np.int32),
+                             "source": np.int32(source)} for _ in range(4)))
+        return (Pipeline(rows, name=str(source)).filter_map(CountTargets(pad_id=0))
+                .rename_columns({"text": "tokens", "backup": "text"})
+                .rename_columns({"text": "backup", "tokens": "text"}))
+
+    mixed = mix([corpus(0).repeat(), corpus(1).repeat()], by="tokens")
+    stream = compile(mixed.batch(4), read=read, loading=READ).train(DataPartition())
+    try:
+        assert np.asarray(next(stream)["text"]).tolist()[0] == [1, 2, 3, 4]
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_tokenized_rows_pack_by_concatenation(read):
     """Rows a tokenizer made, which carry Dew's own record of their lengths, pack by concatenation
     into windows of the packed field alone."""
