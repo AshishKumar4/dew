@@ -615,8 +615,38 @@ class Scored:
     def __call__(self, row):
         from dew.data.steps.text import ValidTargets
 
+        # A row whose roles a projection renamed reads them under their new name.
+        scored = {"text": row["text"], "text_roles": row.get("text_roles", row.get("roles"))}
         return {"source": row["source"],
-                "targets": np.int32(ValidTargets(role=self.role, measured=False)(row))}
+                "targets": np.int32(ValidTargets(role=self.role, measured=False)(scored))}
+
+
+@dataclasses.dataclass(frozen=True)
+class Copied:
+    """A step that copies a token row's arrays, values unchanged, as a format conversion does."""
+
+    def __call__(self, row):
+        return {name: np.array(value) for name, value in row.items()}
+
+
+@dataclasses.dataclass(frozen=True)
+class Encoded(grain.MapTransform):
+    """A step that stores a record as the artifact codec's bytes, which `Restored` reads back."""
+
+    def map(self, element):
+        from dew.data.sources.codec import encode
+
+        return encode(element)
+
+
+@dataclasses.dataclass(frozen=True)
+class Restored(grain.MapTransform):
+    """A step that reads back the record `Encoded` stored."""
+
+    def map(self, element):
+        from dew.data.sources.codec import decode
+
+        return decode(element)
 
 
 def roled(source, length, scored, count=4):
@@ -669,6 +699,33 @@ def test_a_token_mixture_keeps_a_rows_count_through_a_step_over_its_other_fields
     three = Pipeline(roled(1, 8, 3), name="three").filter_map(CountTargets(role=1))
     left, right = delivered([one, three], 1, read)
     assert abs(left - right) <= 1 + 3
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+@pytest.mark.parametrize("after", ["renamed-roles", "selected-then-copied", "counted-again-then-copied",
+                                   "encoded-and-decoded"])
+def test_a_rows_count_and_its_rule_ride_through_the_steps_that_leave_its_targets(read, after):
+    """A row's count, by its role's rule, holds through steps that change no target: its roles
+    renamed, its fields narrowed and then copied, the bytes of an encoding and back; and a second
+    count, by the plain rule, replaces the first one's rule with its own, which a later copy keeps.
+    Two corpora whose rows score one and three role-1 targets, or seven plain ones each, deliver
+    equal targets by the rule last counted, to within one row of each (`delivered`)."""
+    from dew.data.steps.text import CountTargets
+
+    def corpus(source, scored):
+        chain = Pipeline(roled(source, 8, scored), name=str(source)).filter_map(CountTargets(role=1))
+        if after == "renamed-roles":
+            return chain.rename_columns({"text_roles": "roles"})
+        if after == "selected-then-copied":
+            return chain.select_columns("text", "text_roles", "source").map(Copied())
+        if after == "counted-again-then-copied":
+            return chain.filter_map(CountTargets()).map(Copied())
+        return chain.map(Encoded()).map(Restored())
+
+    role = None if after == "counted-again-then-copied" else 1
+    left, right = delivered([corpus(0, 1), corpus(1, 3)], role, read)
+    bound = 7 + 7 if role is None else 1 + 3
+    assert abs(left - right) <= bound
 
 
 def test_a_counted_corpus_projected_after_its_count_keeps_it_in_memory():

@@ -23,8 +23,12 @@ class Fields(grain.MapTransform):
         renamed = dict(self.rename)
         names = tuple(element) if self.names is None else self.names
         kept = {name: element[name] for name in names if name not in self.remove}
+        # Dew's own bookkeeping of the record (`_dew_*`), its counted targets among it, rides along
+        # whatever fields a projection keeps.
+        held = {name: value for name, value in element.items()
+                if name.startswith("_dew_") and name not in kept}
         return {**{name: value for name, value in kept.items() if name not in renamed},
-                **{new: kept[old] for old, new in self.rename}}
+                **{new: kept[old] for old, new in self.rename}, **held}
 
 
 @dataclasses.dataclass(frozen=True)
