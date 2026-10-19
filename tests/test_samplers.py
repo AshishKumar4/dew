@@ -740,3 +740,43 @@ def test_the_closing_denoise_is_edms_last_euler_step_onto_sigma_zero(name):
     closed = sample(edm_grid(steps).denoiser(EDMOracle(), {}, {}), x_T, solver=solver,
                     key=jax.random.PRNGKey(7), times=np.arange(steps, 0, -1, dtype=np.float32))
     assert_as_exact_as_the_reference(closed, EDM[f"{name}.result32"], EDM[f"{name}.result"], name)
+
+
+class UnitEpsilon(nn.Module):
+    """An epsilon prediction of one everywhere, so a transfer's eps term is its whole coefficient."""
+
+    @nn.compact
+    def __call__(self, x, temb):
+        return jnp.ones_like(x)
+
+
+def test_a_pndm_transfer_at_a_small_signal_stays_finite():
+    """PNDM's transfer between two levels of a schedule whose signal is small, alpha^2 of 2^-100 and
+    2^-80, here a beta table of halves, is DDIM's in float64 to float32's rounding: the root its
+    denominator takes of three variances is a product of roots, whose product of the three would
+    round to zero and blow the step up by six orders."""
+    from dew.diffusion.schedules import DiscreteNoiseScheduler
+
+    process = Process(DiscreteNoiseScheduler(np.full(100, 0.5)), EpsilonPredictionTransform())
+    x_T = jnp.ones((1, 3), jnp.float32)
+    stepped = np.asarray(walk(PNDM(skip_prk_steps=True), process, UnitEpsilon(), x_T, [99, 79]))[-1]
+    alpha2_t, alpha2_s = 0.5 ** 100, 0.5 ** 80
+    sigma2_t, sigma2_s = 1 - alpha2_t, 1 - alpha2_s
+    denominator = alpha2_t * np.sqrt(sigma2_s) + np.sqrt(alpha2_t * sigma2_t * alpha2_s)
+    expected = np.sqrt(alpha2_s / alpha2_t) - (alpha2_s - alpha2_t) / denominator
+    np.testing.assert_allclose(stepped, np.full((1, 3), expected), rtol=1e-5)
+
+
+def test_an_euler_step_near_pure_noise_on_a_variance_preserving_schedule_rounds_as_ddim():
+    """An Euler step from pure noise (alpha 0) to a level whose signal is 2^-11.5 and whose noise is
+    an ulp below one is DDIM's step, alpha_s x_0 + sigma_s (x - alpha_t x_0) / sigma_t, to float32's
+    rounding: the secant coefficient the source's x + derivative dt reads there is near 5800,
+    whose products lose the low bits of x that the step keeps."""
+    from dew.sampling.solvers.sigma import _euler_step
+
+    x, denoised = jnp.full((1, 1), np.float32(1.0001)), jnp.ones((1, 1), jnp.float32)
+    alpha_s, sigma_s = np.float32(np.sqrt(2.0 ** -23)), np.float32(1 - 2.0 ** -24)
+    stepped = np.asarray(_euler_step(x, denoised, (jnp.float32(0), jnp.float32(1)),
+                                     (jnp.asarray(alpha_s), jnp.asarray(sigma_s)))[0])
+    exact = float(alpha_s) + float(sigma_s) * float(np.float32(1.0001))
+    assert abs(float(stepped[0, 0]) - exact) <= np.spacing(np.float32(exact))
