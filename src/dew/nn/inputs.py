@@ -407,7 +407,7 @@ def document_reach(segments, valid, places) -> jax.Array:
     # The slot of the next document's first real token after each slot, the row's length past the last.
     following = jnp.where(document_starts(segments, real), index, shape[1])
     following = jnp.flip(jax.lax.cummin(jnp.flip(following, axis=1), axis=1), axis=1)
-    following = jnp.concatenate([following[:, 1:], jnp.full((shape[0], 1), shape[1])], axis=1)
+    following = jnp.pad(following[:, 1:], ((0, 0), (0, 1)), constant_values=shape[1])
     # The last real token before it, which ends the slot's document.
     ends = jnp.take_along_axis(_last_marked(real), following - 1, axis=1)
     return jnp.take_along_axis(places, ends, axis=1)

@@ -53,7 +53,15 @@ from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain, unit
 from dew.nn.precision import at_least_fp32, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
-from dew.nn.rope import axis_halves, axis_tables, mrope_tables, rotary_freqs, rotate, yarn_rope_freqs
+from dew.nn.rope import (
+    LongRopeScaling,
+    axis_halves,
+    axis_tables,
+    mrope_tables,
+    rotary_freqs,
+    rotate,
+    yarn_rope_freqs,
+)
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
 
 
@@ -430,10 +438,11 @@ class CausalSelfAttention(nn.Module):
         """Build the rotary cos and sin this layer rotates its heads by, in
         the arithmetic `rotate` rotates `heads` in, rounded to `heads`'
         dtype under `MixerContext.narrow_rotary_tables` (`rounded_to`, which
-        compilation keeps). An uncached call's packed `tokens` give each
-        document's furthest place (`document_reach` over `places`), which
-        LongRoPE picks its factors by, so a document rotates as it does alone."""
-        reach = (None if tokens is None or tokens.segments is None
+        compilation keeps). Under LongRoPE an uncached call's packed `tokens`
+        give each document's furthest place (`document_reach` over `places`),
+        which it picks its factors by, so a document rotates as it does alone."""
+        longrope = isinstance(self.ctx.rope_scaling, LongRopeScaling)
+        reach = (None if not longrope or tokens is None or tokens.segments is None
                  else document_reach(tokens.segments, tokens.valid, places))
         tables = self._rotary_tables(rotary_positions, at_least_fp32(heads.dtype), reach)
         if not self.ctx.narrow_rotary_tables:
