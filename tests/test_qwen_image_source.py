@@ -248,7 +248,7 @@ def test_a_looped_layer_is_read_at_its_last_pass():
     normed = model.apply(params, last, method=lambda decoder, x: decoder.norm(x))
     np.testing.assert_array_equal(normed, hidden)
     _, kept = model.apply(params, ids, method="hidden_states", capture_intermediates=model.capture_layers,
-                          mutable=["intermediates"])
+                          mutable=list(model.layer_collections))
     first = kept["intermediates"]["layers_1"]["__call__"][0]
     assert not np.array_equal(model.apply(params, first, method=lambda decoder, x: decoder.norm(x)), hidden)
 

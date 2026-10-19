@@ -358,7 +358,7 @@ def _layer_states(tower: nn.Module, params, ids, layers: Sequence[int], **fields
     if not isinstance(tower, LayerStates):
         raise TypeError(f"{type(tower).__name__} keeps no layer states (dew.nn.protocols.LayerStates)")
     _, kept = tower.apply(params, ids, method="hidden_states", capture_intermediates=tower.capture_layers,
-                          mutable=["intermediates"], **fields)
+                          mutable=list(tower.layer_collections), **fields)
     return [tower.layer_state(kept, layer) for layer in layers]
 
 

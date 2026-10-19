@@ -956,7 +956,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         when none was opened, and the model's layers' states (`LayerStates`)
         when `layers` asks for any.
         """
-        opened = [*collections, "intermediates"] if layers else collections
+        opened = [*collections, *self._layer_states().layer_collections] if layers else collections
         capture = self._layer_states().capture_layers if layers else False
         hidden = final_read(self.model, params, inputs, train=train, rngs=rngs, mutable=opened or False,
                             capture_intermediates=capture, **packing)
