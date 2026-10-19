@@ -263,7 +263,8 @@ def test_every_layer_reads_as_the_layer_returned_it_with_or_without_residual_cop
     from dew.inputs.diffusion import _layer_states
     from dew.nn.gemma3n import AltUp
 
-    model = decoder() if copies is None else decoder().clone(altup=AltUp(num_inputs=copies))
+    # Two layers, so the first is read from its capture and the last from the stack's output.
+    model = decoder().clone(num_layers=2, **({} if copies is None else {"altup": AltUp(num_inputs=copies)}))
     ids = jax.random.randint(jax.random.key(0), (2, 6), 0, model.vocab_size)
     params = model.init(jax.random.key(1), ids)
     first, last = _layer_states(model, params, ids, (0, -1))
