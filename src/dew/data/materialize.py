@@ -253,10 +253,11 @@ def _memory_stages(
                         elif counted is not None:
                             # A row's count holds while the step left the fields it was counted from;
                             # where it changed one, the row's own targets, as `recounted` carries them.
-                            changed = (value is not None and not isinstance(value, bytes)
-                                       and not isinstance(output, bytes) and targets_changed(value, output))
-                            expanded_counts[output_id] = (ValidTargets()(output) if changed
-                                                          else counted[identifier])
+                            if (isinstance(value, Mapping) and isinstance(output, Mapping)
+                                    and targets_changed(value, output)):
+                                expanded_counts[output_id] = ValidTargets()(output)
+                            else:
+                                expanded_counts[output_id] = counted[identifier]
             rows = expanded
             if counts_targets or counted is not None:
                 counted = expanded_counts
