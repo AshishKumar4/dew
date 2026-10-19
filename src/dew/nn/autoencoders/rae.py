@@ -36,7 +36,7 @@ from dew.nn.attention import LayerNorm, projected_heads, projected_output, scale
 from dew.nn.backbones.sd3 import sincos_position
 from dew.nn.blocks import torch_bicubic_resize
 from dew.nn.mlp import GatedMLP
-from dew.nn.precision import float32_products
+from dew.nn.precision import computes_in, float32_products
 from dew.objectives.base import Variables
 
 from ..conv import Conv
@@ -188,7 +188,7 @@ class _Decoder(nn.Module):
         if latents.shape[1:3] != (self.grid, self.grid):
             raise ValueError(f"an RAE decodes a {self.grid}x{self.grid} latent, not "
                              f"{latents.shape[1]}x{latents.shape[2]}")
-        products = float32_products(self.dtype)
+        products = float32_products(computes_in(self))
         tokens = nn.Dense(self.width, dtype=self.dtype, name="embed", precision=products)(
             latents.reshape(batch, -1, latents.shape[-1])
         )

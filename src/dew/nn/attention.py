@@ -48,9 +48,9 @@ from .precision import (
     asks_default_precision,
     at_default_precision,
     at_least_fp32,
-    configurable_precision,
     configured_precision,
     float32_products,
+    jax_attention_honors,
     operand_precision,
     rounded_to,
 )
@@ -1414,11 +1414,10 @@ def refuse_reference_only_arguments(implementation, query, dtype, precision,
     """Raise for the arguments only the reference path reads.
 
     A fused kernel accumulates the logits and runs the softmax in fp32 in
-    the inputs' own dtype, whatever the caller asked for; jax.nn's xla kernel
-    multiplies at any precision a config can name (`configurable_precision`). Each message names
-    the implementation and the reference path, so a caller can pick one.
+    the inputs' own dtype, whatever the caller asked for, but for 'xla' (`jax_attention_honors`).
+    Each message names the implementation and the reference path, so a caller can pick one.
     """
-    honored = implementation == 'xla' and configurable_precision(precision)
+    honored = implementation == 'xla' and jax_attention_honors(query.dtype, precision)
     if not asks_default_precision(precision) and not honored:
         raise ValueError(
             f"attention implementation '{implementation}' cannot honor "
@@ -1455,7 +1454,7 @@ def folds(query, key, bias, mask, causal, sliding_window) -> bool:
             and bias is None and not causal and sliding_window is None)
 
 
-def folded_attention(query, key, value, mask=None):
+def folded_attention(query, key, value, mask=None, precision=None):
     """jax.nn's xla attention for query `[B, T, N, D]` over keys and values
     `[B, S, N, D]` of the same heads, with every query head against every
     (key, head) pair, under a boolean `mask` `[B, 1, T | 1, S]` every head
@@ -1471,14 +1470,15 @@ def folded_attention(query, key, value, mask=None):
     operands, the scale after, an fp32 softmax of logits masked to -0.7
     times the largest fp32, probabilities in the value's dtype). Six layers
     of Qwen3.5's decode took 1.21 against 2.48 ms at 128 rows and 0.33
-    against 0.47 at 32 on an RTX 4080 (docs/performance.md).
+    against 0.47 at 32 on an RTX 4080 (docs/performance.md). Both products
+    multiply at `precision` where the caller states one (`jax_attention_honors`).
     """
     batch, positions, heads, width = query.shape
     keys = key.shape[-3]
     wide = jnp.promote_types(query.dtype, jnp.float32)
-    precision = operand_precision(query.dtype)
     logits = jnp.einsum('bxd,byd->bxy', query.reshape(batch, positions * heads, width),
-                        key.reshape(batch, keys * heads, width), precision=precision,
+                        key.reshape(batch, keys * heads, width),
+                        precision=operand_precision(query.dtype, precision),
                         preferred_element_type=wide)
     logits = jnp.diagonal(logits.reshape(batch, positions, heads, keys, heads), axis1=2, axis2=4)
     logits = logits * jnp.asarray(1 / math.sqrt(width), wide)  # [B, T, S, N]
@@ -1490,7 +1490,7 @@ def folded_attention(query, key, value, mask=None):
     spread = jnp.moveaxis(probs, 3, 2)[..., None] * jnp.eye(heads, dtype=probs.dtype)[:, None, :]
     out = jnp.einsum('bxy,byd->bxd', spread.reshape(batch, positions * heads, keys * heads),
                      value.reshape(batch, keys * heads, value.shape[-1]),
-                     precision=float32_products(value.dtype))
+                     precision=float32_products(value.dtype, precision))
     return out.reshape(batch, positions, heads, value.shape[-1])
 
 
@@ -1584,7 +1584,8 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
         # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
         # kernel takes the call the two forms agree bitwise.
         out = folded_attention(query, key, value, mask if key_value_seq_lengths is None
-                               else with_key_lengths(mask, key_value_seq_lengths, key.shape[-3]))
+                               else with_key_lengths(mask, key_value_seq_lengths, key.shape[-3]),
+                               precision=precision)
     elif implementation == 'xla':
         # A window of (l, r) keeps the l keys before the query and the r after
         # it on both the xla and the cudnn path, the sides `window_sides` counts.

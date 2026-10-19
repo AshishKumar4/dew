@@ -15,7 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from .conv import Conv
 from .flops import conv_flops, projection_flops
-from .precision import Float32Products, at_least_fp32, float32_products
+from .precision import Float32Products, at_least_fp32, computes_in, float32_products
 
 
 def hippo_a_imag_init(key, shape, dtype=jnp.float32):
@@ -273,7 +273,7 @@ class BidirectionalS5Layer(nn.Module):
         y_fwd, y_bwd = _directions(u, operators, (False, True), dtype)
         y_cat = jnp.concatenate([y_fwd, y_bwd], axis=-1)  # [B, S, 2F]
         return nn.Dense(features=self.features, dtype=self.dtype, name="out_proj",
-                        precision=float32_products(self.dtype))(y_cat)
+                        precision=float32_products(computes_in(self)))(y_cat)
 
 
 class SpatialFusionConv(Float32Products, nn.Module):

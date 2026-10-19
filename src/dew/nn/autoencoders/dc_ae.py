@@ -31,7 +31,7 @@ from dew.objectives.base import Variables
 from ..activations import gated_product
 from ..attention import rms_normalized
 from ..conv import Conv
-from ..precision import at_least_fp32, float32_products
+from ..precision import at_least_fp32, computes_in, float32_products
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
 from .api import ModuleAutoEncoder
 
@@ -132,7 +132,7 @@ class _LinearAttention(nn.Module):
         batch, height, width, _ = x.shape
         heads = self.features // self.head_dim
         inner = heads * self.head_dim
-        projections = float32_products(self.dtype)
+        projections = float32_products(computes_in(self))
         qkv = jnp.concatenate([nn.Dense(inner, use_bias=False, dtype=self.dtype, name=name,
                                         precision=projections)(x)
                                for name in ("to_q", "to_k", "to_v")], axis=-1)

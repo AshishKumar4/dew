@@ -25,7 +25,13 @@ import pytest
 import torch
 import transformers
 from jax.sharding import PartitionSpec as P
-from reference_error import assert_leaves_as_exact, float64_terms, widened
+from reference_error import (
+    assert_as_exact_as_the_reference,
+    assert_leaves_as_exact,
+    equations,
+    float64_terms,
+    widened,
+)
 
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
@@ -346,3 +352,46 @@ def test_the_output_table_scores_as_the_bf16_forward_whatever_dtype_the_states_a
     # A bf16 value is an fp32 one's upper 16 bits, so neighbours differ by one there.
     apart = (scored.view(np.int32) >> 16) - (logits.astype(np.float32).view(np.int32) >> 16)
     assert np.abs(apart).max() <= 1
+
+
+def tied_float32(tmp_path):
+    """Llama's tied head stored and computing in float32, as `TorchTableLM` loads it."""
+    head_model("tied").save_pretrained(tmp_path)
+    with pytest.warns(UserWarning):
+        loaded = Pretrained.load(tmp_path, fallback="torchax", dtype="float32")
+    assert type(loaded.model).__name__ == "TorchTableLM"
+    return loaded
+
+
+def test_a_float32_forward_and_its_output_table_multiply_float32_products(tokens, tmp_path):
+    """A float32 torchax model multiplies every product of its forward, torch's operators that
+    state no precision among them, at HIGHEST, as its output table does: the two reads of the
+    same logits take the same arithmetic, where the forward ran TF32 on a GPU and the table
+    float32 products."""
+    loaded = tied_float32(tmp_path)
+    ids = jnp.asarray(tokens[:, :SEQ])
+    highest = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
+    for read in (lambda variables: loaded.model.apply(variables, ids),
+                 lambda variables: loaded.model.apply(variables, method="output_table").logits(
+                     loaded.model.apply(variables, ids, method="hidden_states"))):
+        products = [equation.params["precision"] for equation in equations(jax.make_jaxpr(read)(
+            loaded.variables)) if equation.primitive.name == "dot_general"]
+        assert products and all(precision == highest for precision in products), products
+
+
+@pytest.mark.gpu(reason="TF32 is a GPU's default float32 product")
+def test_a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tokens, tmp_path):
+    """On a GPU, a float32 torchax model's own logits and its output table's over the same
+    states are each as exact as torch's float32 forward, from torch's in float64."""
+    loaded = tied_float32(tmp_path)
+    ids = tokens[:, :SEQ]
+    model = head_model("tied")
+    direct = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)), np.float64)
+    hidden = loaded.model.apply(loaded.variables, jnp.asarray(ids), method="hidden_states")
+    table = np.asarray(loaded.model.apply(loaded.variables, method="output_table").logits(hidden),
+                       np.float64)
+    reference = torch_logits(model, ids).astype(np.float64)
+    with torch.no_grad():
+        truth = model.double()(torch.from_numpy(np.asarray(ids, np.int64))).logits.numpy()
+    assert_as_exact_as_the_reference(direct, reference, truth, "the forward's logits")
+    assert_as_exact_as_the_reference(table, reference, truth, "the output table's logits")
