@@ -335,7 +335,8 @@ class Plan:
     the unnamed, rather than its place among all the members (`dew.data.lowering._member_key`), so
     a named member joining or leaving leaves the others' draws as they were, and records those
     names in the order (`dew.data.analysis._members`), so a position is refused where a member was
-    renamed, joined or left."""
+    renamed, joined or left. Version 4 keys a random step after the batch by the share it draws for
+    as well, where there is more than one, so shares no longer repeat each other's draws."""
 
     lowering: Literal["global", "per-share"]
     manifest: Manifest
@@ -349,7 +350,7 @@ class Plan:
     """A mixture's members, each what it reads and runs as one digest under its key, and its own
     stages under the empty key (`dew.data.analysis._member_manifests`): what a streamed mix's
     resume reads of a member that joined or left (`check`)."""
-    version: ClassVar[int] = 3
+    version: ClassVar[int] = 4
 
     def record(self) -> dict[str, JSON]:
         return {
