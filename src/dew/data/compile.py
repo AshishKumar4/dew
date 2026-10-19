@@ -324,8 +324,7 @@ members may be restored by key beneath them: a shuffle's window, a packer's rema
 expansion's tail holds rows of the mix that saved them."""
 
 
-def _member_manifests(original: Pipeline, train: Pipeline, build: _Build,
-                      host: Sequence[HostStep]) -> dict[str, str]:
+def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) -> dict[str, str]:
     """What each member of a streamed mix reads and makes, as one digest under its key
     (`_member_keys`): its order, sources, steps with their code and dependencies, the facts its
     order rests on and its caches; and under the empty key the same of the mixture's own stages
@@ -335,8 +334,9 @@ def _member_manifests(original: Pipeline, train: Pipeline, build: _Build,
     global order, or a mix beneath a stage that holds its rows (`_KEYED_ABOVE`).
 
     Each member is read in `train`, the tree the plan's lowering describes (`build`), which a
-    memory read made of `original` and which holds no member that accepted no row; its caches are
-    its counterpart's in `original`, found by the sources both read."""
+    memory read made of the written pipeline and which holds no member that accepted no row; its
+    caches are those of each of its corpora's stages as its pipeline wrote them (`_written`), the
+    ones a memory read already ran among them."""
     source = train.source
     if (not isinstance(source, Mixture) or build.global_order
             or not all(isinstance(stage, _KEYED_ABOVE) for stage in train.stages)):
@@ -347,14 +347,17 @@ def _member_manifests(original: Pipeline, train: Pipeline, build: _Build,
             read = read.original
         return read
 
-    def provenance(child: Pipeline) -> tuple[int, ...]:
-        return tuple(id(read_of(read)) for _, read in _leaves(child))
+    def caches(child: Pipeline) -> list[str]:
+        references = []
+        for leaf, read in _leaves(child):
+            stages = _written(read, leaf.stages)
+            references += [stage.cache.reference(_cache_manifest(read_of(read), stages[:index], build.read))
+                           for index, stage in enumerate(stages) if isinstance(stage, Artifact)]
+        return references
 
     def steps(identities: Sequence[StepIdentity]) -> JSON:
         return [{**step.semantic(), "modules": list(step.modules)} for step in identities]
 
-    written = original.source.pipelines if isinstance(original.source, Mixture) else ()
-    counterparts = {provenance(child): child for child in written}
     corpora = build.lowering.order["corpora"]
     if not isinstance(corpora, list):
         raise TypeError("a mixture's order holds its corpora's orders as a list")
@@ -372,7 +375,7 @@ def _member_manifests(original: Pipeline, train: Pipeline, build: _Build,
             "sources": [read_of(read).fingerprint() for read in sources],
             "steps": steps(identities),
             "derived": dict(_derived(child, build.child(index))),
-            "cache": list(_cache_references(counterparts.get(provenance(child), child), build.read)),
+            "cache": caches(child),
         })
     return members
 
@@ -606,7 +609,7 @@ def _compiled(
         {"read": read, "seed": seed, **build.lowering.order},
         _derived(train, build),
         cache=_cache_references(original, read),
-        members=_member_manifests(original, train, build, host),
+        members=_member_manifests(train, build, host),
         volatile=any(
             isinstance(stage.step, Volatile) and stage.step.volatile
             for stage in (*_steps(original), *(stage for source in sources for stage in _written(source, ())))
