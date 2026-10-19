@@ -16,6 +16,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import Coordinates, coordinates as build_coordinates, next_position
+from dew.nn.kv_cache import POSITION
 from dew.nn.protocols import OutputTable, ProjectionGroup
 from dew.nn.sharding import explicit_spec
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
@@ -398,8 +399,8 @@ class MultimodalTransformer(nn.Module):
             coordinates = build_coordinates(tokens.shape, segments=segment_ids, valid=attention_mask,
                                             positions=positions, right_padded=right_padded)
         if decode:
-            allocated = self.has_variable("cache", "next_position")
-            cursor = self.variable("cache", "next_position", jnp.zeros, (tokens.shape[0],), jnp.int32)
+            allocated = self.has_variable("cache", POSITION)
+            cursor = self.variable("cache", POSITION, jnp.zeros, (tokens.shape[0],), jnp.int32)
             valid = (jnp.ones(tokens.shape, bool) if coordinates is None or coordinates.valid is None
                      else coordinates.valid)
             positions = None if coordinates is None else coordinates.positions
@@ -478,7 +479,7 @@ class MultimodalTransformer(nn.Module):
     @nn.compact
     def init_cache(self, batch_size: int):
         """Allocate the language model's cache and the next-position counter, without running the towers."""
-        self.variable("cache", "next_position", jnp.zeros, (batch_size,), jnp.int32)
+        self.variable("cache", POSITION, jnp.zeros, (batch_size,), jnp.int32)
         self.language_model.init_cache(batch_size)
 
     # The serving and training hooks (`dew.nn.protocols`), its language
