@@ -73,7 +73,7 @@ def _padding_last(ids: jax.Array) -> jax.Array:
 
 def _searched(ordered: jax.Array, wanted: jax.Array, side: str) -> jax.Array:
     """Each of `wanted` `[B, N]`'s position in its row of `ordered` `[B, M]` (`jnp.searchsorted`)."""
-    return jax.vmap(lambda row, items: jnp.searchsorted(row, items, side=side))(ordered, wanted)
+    return jax.vmap(lambda row, ids: jnp.searchsorted(row, ids, side=side))(ordered, wanted)
 
 
 def query_order(ids: jax.Array) -> jax.Array:

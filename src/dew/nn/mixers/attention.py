@@ -794,8 +794,7 @@ class CausalSelfAttention(nn.Module):
                                            jnp.broadcast_to(places, (B, S))], axis=-1)
                           if keeps_places else jnp.arange(alloc + S))
         elif self.ctx.kv_shared and decode:
-            # No cache of its own: the provider's stashed keys carry the full history, read as
-            # the provider's own cache is, a step's token by its mask and more by `_cached_call`.
+            # The provider's stashed keys carry the full history, read as its own cache is.
             if S == 1:
                 mask, causal = causal_attention_mask(positions, kv_len, self.ctx.sliding_window), False
             else:
@@ -825,13 +824,11 @@ class CausalSelfAttention(nn.Module):
         # Over the keys the call reads, the cache's or the prefix's joined.
         masked = self._mask_kernel(query, key, decode)
         cached = isinstance(documents, CrossDocuments)
-        if cached and self.ctx.attention_impl != 'auto':
-            # A named kernel takes a cache call as it took the call's mask (`_mask_kernel`).
+        if cached and self.ctx.attention_impl != 'auto':  # a named kernel's handoff (`_mask_kernel`)
             implementation = masked
         if prefix is None and self._restricts_visibility(attention_metadata, decode) and not (
                 cached and not self.bidirectional_images):
-            # A decode step's cache mask already holds the rows' validity, and a
-            # cache call's documents too; only image groups add to it there.
+            # A cache's mask or a cache call's documents hold the rows' validity; image groups add to it.
             if not decode or self.bidirectional_images:
                 mask = self._metadata_mask(attention_metadata, positions, places, B, S, key.shape[-3], decode)
                 if segment_ids is not None and not decode:
