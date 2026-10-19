@@ -433,7 +433,7 @@ itsdangerous==2.2.0
     # via flask
 jaraco-functools==4.6.0
     # via cheroot
-jax @ https://github.com/AshishKumar4/jax/archive/7527048f5499b30e97c748d2d1b56056f62917ea.tar.gz
+jax @ https://github.com/AshishKumar4/jax/archive/65e190f3a4158f51efdbffc6f4864fc26d18a93b.tar.gz
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -443,11 +443,11 @@ jax @ https://github.com/AshishKumar4/jax/archive/7527048f5499b30e97c748d2d1b560
     #   orbax-checkpoint
     #   qwix
     #   tokamax
-jax-cuda13-pjrt==0.11.2
+jax-cuda13-pjrt==0.12.0
     # via jax-cuda13-plugin
-jax-cuda13-plugin==0.11.2
+jax-cuda13-plugin==0.12.0
     # via jax
-jaxlib==0.11.2
+jaxlib==0.12.0
     # via
     #   jax
     #   optax
