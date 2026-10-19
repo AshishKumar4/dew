@@ -296,15 +296,18 @@ class Files(Dataset):
             )
         return tuple(files)
 
+    @property
+    def _read_options(self) -> Mapping[str, object]:
+        """The options that decide which rows and shards a read of the files makes."""
+        return {"columns": self.columns, "where": str(self.where), "shard_bytes": self.shard_bytes}
+
     @cached_property
     def _snapshot(self) -> Mapping[str, object]:
         return {
             "store": self.kind,
             "files": [metadata for _, metadata in self._file_facts],
-            "columns": self.columns,
-            "where": str(self.where),
+            **self._read_options,
             "partitioning": self.partitioning,
-            "shard_bytes": self.shard_bytes,
             "manifest": None
             if self.committed is None
             else hashlib.sha256(
