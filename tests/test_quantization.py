@@ -989,7 +989,6 @@ def zone_cases(dtype) -> dict[str, tuple[Callable[..., jax.Array], tuple, dict]]
             depth_mixed, (normal(2, 3, 4, 8), normal(8), normal(2, 3, 4, 8)), {}),
         "dew.nn.quantizers.nearest_codewords": (nearest_codewords, (rows, codebook), {}),
         "dew.nn.kv_cache.rotated": (rotated, (normal(2, 4, 8), hadamard(8)), {}),
-        "dew.nn.blocks.torch_bicubic_resize": (torch_bicubic_resize, (normal(1, 4, 5, 3), 7, 9), {}),
         "dew.lora._updated": (lora_update, (normal(8, 6), normal(8, 2), normal(2, 6)), {"scale": 2.0}),
     }
 
@@ -1013,6 +1012,14 @@ def test_a_function_the_model_keeps_in_float_runs_unquantized(name, dtype):
     np.testing.assert_array_equal(ran(function, quantize=True), plain)
     np.testing.assert_array_equal(ran(copy, quantize=False), plain)
     assert not np.array_equal(ran(copy, quantize=True), plain)
+
+
+def test_an_einsum_of_three_operands_runs_as_the_unquantized_model_runs_it():
+    """Qwix quantizes a two-operand einsum alone and raises on any other, so the provider runs one
+    of three operands, torch's bicubic resampling among them, as the unquantized model does."""
+    x = jnp.asarray(np.random.default_rng(0).standard_normal((1, 4, 5, 3)), jnp.float32)
+    model = Calls(functools.partial(torch_bicubic_resize, height=7, width=9))
+    np.testing.assert_array_equal(Quantization().apply(model).apply({}, x), model.apply({}, x))
 
 
 def assert_computed_as_on_the_host(run, label: str) -> None:

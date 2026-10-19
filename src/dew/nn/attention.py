@@ -1342,7 +1342,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     can save it instead of replaying the kernel (`remat_block` in dit.py).
     """
     shards = sequence_shards()
-    precision = float32_products(jnp.result_type(query, key, value) if dtype is None else dtype, precision)
+    precision = float32_products(query.dtype if dtype is None else dtype, precision)
     if not 0 <= dropout_rate < 1:
         raise ValueError(f"dropout_rate must be within [0, 1), got {dropout_rate}")
     if key_segment_ids is not None:
