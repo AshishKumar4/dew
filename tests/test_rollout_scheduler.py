@@ -86,10 +86,10 @@ class Watched:
 
 
 @contextmanager
-def rig(environment, verifier, *, tasks, log, **options):
-    """A scheduler over `tasks` tasks a batch, two sessions a task, on Dew's own server: yields
-    the objective, its initial variables, a fit of `steps` updates (`fit(steps, checkpoints=)`),
-    the watched source and the server, and closes them after."""
+def rig(environment, verifier, *, tasks, log, workers=16, **options):
+    """A scheduler over `tasks` tasks a batch, two sessions a task, on Dew's own server, its
+    sessions on `workers` threads: yields the initial variables, a fit of `steps` updates
+    (`fit(steps, checkpoints=)`), the watched source and the server, and closes them after."""
     model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=64, dtype="float32")
     target = GRPOObjective(model, seq_len=WIDTH - 1, behavior_importance=2.0)
@@ -98,7 +98,7 @@ def rig(environment, verifier, *, tasks, log, **options):
     server = NativeRolloutServer(Server.from_task(TextGeneration(model, params, None, sampling=sampling),
                                                   slots=16, capacity=64))
     episodes = EnvironmentSource(server, environment, verifier, max_prompt_tokens=32, max_new_tokens=16,
-                                 max_turns=3, workers=16)
+                                 max_turns=3, workers=workers)
     watched = Watched(episodes)
     scheduler = RolloutScheduler(target, watched, server, width=WIDTH, rows=2 * tasks, groups=2,
                                  log=log, **options)
@@ -256,8 +256,12 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
         yield Tools(int(task.id))
 
     options = {"oversample": 1, "admit": 3 * tasks // 5, "max_attempts": 2, "max_lag": 1, "ahead": 1}
+    # A straggling session holds its worker until its batch is admitted, and up to three batches'
+    # stragglers wait at once (the first fit's batch drawn ahead, and the resumed fit's two): the
+    # workers are enough for every session of three batches.
     checkpoints = str(tmp_path / "run")
-    with rig(faulty, fives, tasks=tasks, log=admissions.log, **options) as (_, fit, watched, _):
+    with rig(faulty, fives, tasks=tasks, log=admissions.log, workers=9 * tasks, **options) as (
+            _, fit, watched, _):
         # The stragglers of batches drawn ahead are released before the source closes, which waits
         # for its running sessions.
         try:
