@@ -10,7 +10,6 @@ tokenizer on first use, so a host without the hub cache still imports
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -22,6 +21,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import grain.python as grain
 import numpy as np
+from filelock import FileLock
 
 from dew.data.tokens import chunk_table
 
@@ -331,9 +331,10 @@ def tokenizer_name(tokenizer: str | PreTrainedTokenizerBase) -> str:
         for path in sorted(path for path in staging.rglob("*") if path.is_file()):
             digest.update(str(path.relative_to(staging)).encode() + b"\0" + path.read_bytes())
         directory = root / digest.hexdigest()
-        if not directory.is_dir():
-            # Another process saving the same tokenizer writes the same files first.
-            with contextlib.suppress(OSError):
+        # One publisher at a time: another process saving the same tokenizer writes the same
+        # files, and whichever comes second finds the directory there.
+        with FileLock(str(directory) + ".lock"):
+            if not directory.is_dir():
                 staging.rename(directory)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
