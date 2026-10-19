@@ -1629,7 +1629,10 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
     if (key_value_seq_lengths is not None and query.shape[-3] == 1 and not causal
             and sliding_window is None and mask is None and bias is None and sinks is None
-            and segment_ids is None and _groups(query, key)):
+            and segment_ids is None and query.shape[-2] > key.shape[-2]):
+        # The key heads repeated as each shard would hold them (`_per_shard`), so the tensor axes
+        # split the groups as they split the query heads.
+        key, value = split_with_queries(key, value, tensor_shards(query))
         return _grouped(functools.partial(
             attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
             implementation=implementation, softcap=softcap, key_value_seq_lengths=key_value_seq_lengths),
@@ -1659,13 +1662,6 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     return _read_nothing(forward_differentiable(fused, reference, query, key, value, bias, sinks), live)
 
 
-def _groups(query, key) -> bool:
-    """Whether `query`'s heads come in groups over `key`'s heads that the mesh's tensor axes split
-    as they split the query heads (`tensor_shards`), each shard's groups its own."""
-    heads, kv_heads = query.shape[-2], key.shape[-2]
-    return heads > kv_heads and heads % kv_heads == 0 and kv_heads % tensor_shards(query) == 0
-
-
 def _grouped(attend, query, key, value):
     """`attend` over `query` `[B, T, N, D]` with each key head's `N // K` query heads as its query
     positions, `[B, T * N // K, K, D]` over the `K` key heads, and its output back in the query's
@@ -1677,6 +1673,8 @@ def _grouped(attend, query, key, value):
     batch, positions, heads, width = query.shape
     kv_heads = key.shape[-2]
     group = heads // kv_heads
+    if group == 1:
+        return attend(query, key, value)
     grouped = query.reshape(batch, positions, kv_heads, group, width).transpose(0, 1, 3, 2, 4)
     out = attend(grouped.reshape(batch, positions * group, kv_heads, width), key, value)
     out = out.reshape(batch, positions, group, kv_heads, out.shape[-1]).transpose(0, 1, 3, 2, 4)
