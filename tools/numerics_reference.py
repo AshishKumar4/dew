@@ -92,8 +92,7 @@ def eager(model):
     loop, the one routed kernel that runs in float64 on CPU (grouped_mm
     takes no double), so all three precisions run one order of operations."""
     model.set_attn_implementation("eager")
-    if model._can_set_experts_implementation():
-        model.set_experts_implementation("eager")
+    model.set_experts_implementation("eager")
     return model.eval()
 
 
