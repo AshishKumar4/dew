@@ -42,6 +42,7 @@ from typing_extensions import TypeIs, TypeVar
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import compensated_sum
+from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.records import JSON
 
 if TYPE_CHECKING:
@@ -348,6 +349,29 @@ def part(variables: Variables, name: str) -> Variables:
     collection, `params/policy` and `frozen/policy`, so an adapted module's
     base comes with its factors."""
     return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
+
+
+def projected_parts(params: Variables, owners: Mapping[str, ProjectsParameters | nn.Module | HiddenStates], *,
+                    updated: bool) -> Variables:
+    """`params` with each part `owners` names projected by its owner's constraint
+    (`dew.nn.protocols.ProjectsParameters`, which an objective's `projected` also
+    answers), where the tree holds that part and the owner declares one; the rest
+    as they are. The projection of an objective that nests several networks'
+    parameters under their names (`joined`)."""
+    projected = {}
+    for name, tree in params.items():
+        owner = owners.get(name)
+        projects = isinstance(owner, ProjectsParameters)
+        projected[name] = owner.projected(tree, updated=updated) if projects else tree
+    return projected
+
+
+def projected_draw(owner: nn.Module, variables: Variables) -> Variables:
+    """A module's freshly drawn tree as training stores it: its parameters projected
+    once by `owner`'s constraint (`updated=True`), as is where it declares none."""
+    if not isinstance(owner, ProjectsParameters) or "params" not in variables:
+        return variables
+    return {**variables, "params": owner.projected(variables["params"], updated=True)}
 
 
 def joined(parts: Mapping[str, Variables]) -> Variables:
@@ -664,7 +688,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         split or whole; otherwise `fresh_variables` draws one. A held tree
         without `params` is refused, unless the objective holds parts a draw
         goes beside. `complete_variables` then adds what the objective's own
-        modules need. An objective of several networks overrides this whole.
+        modules need, and the whole tree's parameters are projected once
+        (`projected`, `updated=True`), which leaves held parts that satisfy
+        the model's constraint as they are and brings drawn ones to it. An
+        objective of several networks overrides this whole.
         """
         held = self.held_variables() if variables is None else variables
         if held is not None and "params" in held:
@@ -674,7 +701,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         else:
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
-        return self.complete_variables(key, tree)
+        tree = self.complete_variables(key, tree)
+        return {**tree, "params": self.projected(tree["params"], updated=True)}
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         """Draw the tree training starts from when none is held.
@@ -915,6 +943,19 @@ class Objective(ABC, Generic[Loss, Effects]):
         with no such head has only None to restore."""
         if tile is not None:
             raise ValueError(f"{type(self).__name__} has no head to tile, so no tile {tile} to restore")
+
+    def projected(self, params: Variables, *, updated: bool) -> Variables:
+        """Return the stored parameters a training step reads and updates: the trainable `params`
+        projected by the model's constraint (`dew.nn.protocols.ProjectsParameters`), as is where the
+        model declares none.
+
+        A step's forward reads `projected(params, updated=False)`, and its update applies to them,
+        which the optimizer sees; the step stores the updated ones `projected(..., updated=True)`.
+        The tree a run starts from is projected once with `updated=True` (`init`). The default
+        projects the `model` this objective trains; an objective that trains several networks
+        projects each one's own tree (`projected_parts`)."""
+        model = vars(self).get("model")
+        return model.projected(params, updated=updated) if isinstance(model, ProjectsParameters) else params
 
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
         """Return replacement nonparameter collections computed from one accepted window's `effects`.
