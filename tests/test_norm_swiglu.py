@@ -24,13 +24,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh
-from reference_error import assert_as_exact_as_the_reference, distance, float64_terms, widened
+from reference_error import assert_as_exact_as_the_reference, distance, equations, float64_terms, widened
 from tuned import each_config
 
 from dew.nn import attention
+from dew.nn.activations import gated_product, packed_gated_product
 from dew.nn.attention import RMSNorm, gated_rms_normalized, rms_normalized, stream_rms_normalized
 from dew.nn.kernels import norm_swiglu, tuning
-from dew.nn.moe import gated_product, packed_gated_product
 
 pytestmark = pytest.mark.kernel
 
@@ -94,12 +94,22 @@ def assert_scale_accumulation(mine, reference, coefficient, seed):
         assert np.all(np.abs(np.asarray(mine, np.float64) - exact_sum) <= 2 * ulp), detail
 
 
+def traced(fn, *args):
+    """The equations of `fn`'s traced program, its sub-programs' in turn."""
+    return list(equations(jax.make_jaxpr(fn)(*args)))
+
+
+def kernels(fn, *args) -> set[str]:
+    """The Pallas kernels `fn`'s traced program launches, by name."""
+    return {str(equation.params["name"]) for equation in traced(fn, *args)
+            if equation.primitive.name == "pallas_call"}
+
+
 def compare(functions, operands, seed, labels, *, coefficient=None):
     pallas = functions[1]
-    graph = str(jax.make_jaxpr(pallas)(*operands))
-    assert "rms_norm_forward" in graph or "swiglu_forward" in graph
-    differentiated = str(jax.make_jaxpr(functools.partial(evaluated, pallas))(operands, seed))
-    assert "rms_norm_backward" in differentiated or "swiglu_backward" in differentiated
+    assert kernels(pallas, *operands) & {"rms_norm_forward", "swiglu_forward"}
+    differentiated = kernels(functools.partial(evaluated, pallas), operands, seed)
+    assert differentiated & {"rms_norm_backward", "swiglu_backward"}
     reference, (truth, terms) = oracles(functions, operands, seed)
     actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
     gated(labels, actual, reference, truth, terms, seed, coefficient)
@@ -293,8 +303,8 @@ def test_stream_seam_takes_the_add_and_the_stream_cotangent(joined, dtype, shape
     ds = jax.random.normal(jax.random.key(27), shape).astype(dtype)
     operands, seed = (x, branch, scale), (ds, dy)
     fused = stream_seam("pallas", dtype, joined)
-    assert "rms_norm_forward" in str(jax.make_jaxpr(fused)(*operands))
-    assert "rms_norm_backward" in str(jax.make_jaxpr(functools.partial(evaluated, fused))(operands, seed))
+    assert "rms_norm_forward" in kernels(fused, *operands)
+    assert "rms_norm_backward" in kernels(functools.partial(evaluated, fused), operands, seed)
     reference = jax.jit(functools.partial(evaluated, stream_seam("xla", dtype, joined)))(operands, seed)
     actual = jax.jit(functools.partial(evaluated, fused))(operands, seed)
     truth, terms = float64(stream_seam("xla", jnp.float64, joined), operands, seed)
@@ -330,8 +340,8 @@ def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, 
                                                            implementation=implementation)
 
     fused = gated("pallas", dtype)
-    assert "rms_norm_forward" in str(jax.make_jaxpr(fused)(*operands))
-    assert "rms_norm_backward" in str(jax.make_jaxpr(functools.partial(evaluated, fused))(operands, dy))
+    assert "rms_norm_forward" in kernels(fused, *operands)
+    assert "rms_norm_backward" in kernels(functools.partial(evaluated, fused), operands, dy)
     reference = jax.jit(functools.partial(evaluated, gated("xla", dtype)))(operands, dy)
     actual = jax.jit(functools.partial(evaluated, fused))(operands, dy)
     truth, terms = float64(gated("xla", jnp.float64), operands, dy)
@@ -363,7 +373,7 @@ def test_a_packed_projections_swiglu_is_the_apart_one_read_in_place(implementati
     seed = jax.random.normal(jax.random.key(35), shape).astype(dtype)
     packed = functools.partial(evaluated, packed_gated_product("swiglu", implementation=implementation))
     if implementation == "pallas":
-        assert "swiglu_backward" in str(jax.make_jaxpr(packed)((gate_up,), seed))
+        assert "swiglu_backward" in kernels(packed, (gate_up,), seed)
     output, dpacked = jax.jit(packed)((gate_up,), seed)
     apart = jax.jit(functools.partial(evaluated, gated_product("swiglu", implementation=implementation)))(
         (gate_up[..., 0, :], gate_up[..., 1, :]), seed)
@@ -384,7 +394,7 @@ def test_rms_module_uses_the_same_fused_vjp(offset, after_cast, with_scale):
                                        argnums=(0, 1)))(params, x)
     for actual, expected in zip(jax.tree.leaves(mine), jax.tree.leaves(theirs), strict=True):
         assert relative(actual, expected) < 1e-5
-    assert "rms_norm_forward" in str(jax.make_jaxpr(module.apply)(params, x))
+    assert "rms_norm_forward" in kernels(module.apply, params, x)
 
 
 def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
@@ -453,8 +463,10 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
 
     alone = jax.jit(functools.partial(run, RESIDUAL, MLP_HIDDEN))()
     with jax.set_mesh(MeshSpec(**{split: 2}).build(jax.devices()[:2])):
-        graph = str(jax.make_jaxpr(functools.partial(run, RESIDUAL, MLP_HIDDEN))())
-        assert graph.count("shard_map") >= 2 and "rms_norm_forward" in graph and "swiglu_forward" in graph
+        graph = traced(functools.partial(run, RESIDUAL, MLP_HIDDEN))
+        assert sum(equation.primitive.name == "shard_map" for equation in graph) >= 2
+        assert {"rms_norm_forward", "swiglu_forward"} <= {str(equation.params["name"]) for equation in graph
+                                                          if equation.primitive.name == "pallas_call"}
         meshed = jax.jit(functools.partial(run, RESIDUAL, MLP_HIDDEN))()
     for mine, theirs in zip(jax.tree.leaves(meshed), jax.tree.leaves(alone), strict=True):
         assert relative(mine, theirs) < 1e-6
