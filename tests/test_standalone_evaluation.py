@@ -41,9 +41,9 @@ class Recording:
 
 
 def test_a_run_compiles_its_evaluations_before_its_first_step(monkeypatch):
-    """A run that evaluates between steps scores each suite's first batch twice, its preview
-    included, beside its step's compile and before its first step, reporting nothing of it: the
-    evaluations it schedules then compile no program, and the tracker holds those alone."""
+    """A run that evaluates between steps warms each suite beside its step's compile, before its
+    first step, reporting nothing of it: two batches and the preview, so the evaluations it
+    schedules then compile no program, and the tracker holds those alone."""
     model = tiny_decoder()
     objective = LMObjective(model, seq_len=4, samples=Samples([1, 2], 2, sampling=Sampling(temperature=0)))
     batch = {"text": np.tile(np.array([1, 2, 3, 4, 1], np.int32), (8, 1))}
@@ -78,6 +78,20 @@ def test_a_run_compiles_its_evaluations_before_its_first_step(monkeypatch):
     assert [(step, records) for step, records, _ in scheduled] == [(2, 16), (4, 16)], scheduled
     assert [compiled for _, _, compiled in scheduled] == [[], []], scheduled
     assert sum(isinstance(artifact, TextSamples) for artifact in tracker.artifacts) == 2
+
+
+def test_a_run_warms_a_validation_whose_first_batch_counts_no_target():
+    """Warming a split scores no part of it, so a validation whose first batch is all padding,
+    its targets counted by a later batch, trains and evaluates."""
+    objective = LMObjective(tiny_decoder(), seq_len=4, pad_id=0)
+    batch = {"text": np.tile(np.array([1, 2, 3, 4, 1], np.int32), (8, 1))}
+    padding = {"text": np.zeros((8, 5), np.int32)}
+    data = Loader(lambda partition: iter([batch] * 2), lambda partition: iter([padding, padding, batch]),
+                  records=8, batch=8)
+    tracker = Recording()
+    Trainer(objective, optax.adam(.01), key=jax.random.key(1), tracker=tracker).fit(
+        data, steps=2, eval_every=1, log_every=1, metrics=(Perplexity(),))
+    assert sum("val/perplexity" in scalars for scalars in tracker.scalars) == 2
 
 
 def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
