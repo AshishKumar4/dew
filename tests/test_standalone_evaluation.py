@@ -1,5 +1,6 @@
 """Standalone evaluation uses the same variables, RNG and metrics as fit."""
 
+import logging
 import pickle
 
 import jax
@@ -37,6 +38,46 @@ class Recording:
 
     def artifact(self, artifact, step):
         self.artifacts.append(artifact)
+
+
+def test_a_run_compiles_its_evaluations_before_its_first_step(monkeypatch):
+    """A run that evaluates between steps scores each suite's first batch, its preview included,
+    beside its step's compile and before its first step, reporting nothing of it: the evaluations
+    it schedules then compile no program, and the tracker holds those alone."""
+    model = tiny_decoder()
+    objective = LMObjective(model, seq_len=4, samples=Samples([1, 2], 2, sampling=Sampling(temperature=0)))
+    batch = {"text": np.tile(np.array([1, 2, 3, 4, 1], np.int32), (8, 1))}
+    data = Loader(lambda partition: iter([batch] * 4), lambda partition: iter([batch, batch]), records=8,
+                  batch=8)
+    tracker = Recording()
+    compiles, evaluations = [], []
+    run = Evaluation.run
+
+    class Compiles(logging.Handler):
+        def emit(self, record):
+            if "Finished XLA compilation" in record.getMessage():
+                compiles.append(record.getMessage())
+
+    def counted(*args, **kwargs):
+        before = len(compiles)
+        result = run(*args, **kwargs)
+        evaluations.append((int(kwargs["step"]), result.records, compiles[before:]))
+        return result
+
+    monkeypatch.setattr(Evaluation, "run", counted)
+    handler, logger = Compiles(), logging.getLogger("jax")
+    logger.addHandler(handler)
+    try:
+        with jax.log_compiles():
+            Trainer(objective, optax.adam(.01), key=jax.random.key(1), tracker=tracker).fit(
+                data, steps=4, eval_every=2, log_every=2, metrics=(Perplexity(),), preview=True)
+    finally:
+        logger.removeHandler(handler)
+    warm, *scheduled = evaluations
+    assert warm[:2] == (0, 8), warm
+    assert [(step, records) for step, records, _ in scheduled] == [(2, 16), (4, 16)], scheduled
+    assert [compiled for _, _, compiled in scheduled] == [[], []], scheduled
+    assert len(tracker.artifacts) == 2
 
 
 def test_standalone_trained_variables_match_fit_and_return_hosted_previews():

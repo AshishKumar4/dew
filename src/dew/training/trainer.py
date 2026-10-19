@@ -289,6 +289,16 @@ def _split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, .
     return {name: tuple(suite.metrics) for name, suite in suites.items()}
 
 
+def _first_batch(reader: Reader) -> Reader:
+    """`reader`'s first batch alone, its iterator closed once that is read."""
+    def read(partition: DataPartition) -> Iterator[Batch]:
+        source = reader(partition)
+        with contextlib.closing(source) if isinstance(source, Closeable) else contextlib.nullcontext():
+            first = next(source, None)
+        return iter(() if first is None else (first,))
+    return read
+
+
 def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
             metrics: Sequence[Metric], eval_every: int | None) -> dict[str, EvalSuite]:
     """Every split `fit` validates, by name, with its metrics and cadence
@@ -354,6 +364,11 @@ class _FitPlan:
     def cadenced(self) -> bool:
         """Whether any evaluation runs before the end."""
         return bool(self.eval_every or any(suite.every for suite in self.suites.values()))
+
+    @property
+    def evaluates_midway(self) -> bool:
+        """Whether an evaluation can run between steps: on its cadence, or to rank a checkpoint."""
+        return self.cadenced or bool((self.validation or self.best or self.stop) and self.checkpoint_every)
 
     def due(self, step: int) -> tuple[str, ...]:
         """The suites whose own cadence falls on `step`."""
@@ -1560,6 +1575,7 @@ class Trainer(Generic[Loss, Effects]):
                     run.reads[signature] = step_reads(self.executable, signature)
                 interval.compiles = len(compiled)
                 if not known:
+                    self._warm_evaluations(plan, state, shardings)
                     # Rebound once the step is compiled, so the first tick
                     # measures steps, not the compile.
                     interval.last_log_time = time.time()
@@ -1987,17 +2003,34 @@ class Trainer(Generic[Loss, Effects]):
         held['step'] = run.current
         return held['bad'] >= stop.evals
 
+    def _warm_evaluations(self, plan: _FitPlan, state: TrainState, shardings: Placement[TrainState]) -> None:
+        """Compile the programs a run's evaluations run before its first step, where any runs between
+        steps (`_FitPlan.evaluates_midway`): every suite scores its first batch, its preview
+        included, and nothing is reported.
+
+        An evaluation's programs compile on their first call. Inside the run that call is an
+        evaluation's, whose seconds then hold the compile (7.5 s at the first of 45 records): the
+        goodput the run reports counts it against the run, and the evaluation reports the compile
+        as its own time. Compiled here, beside the step, the later calls reuse them: the same
+        modules, shapes and shardings."""
+        if plan.evaluates_midway:
+            with region("evaluate"):
+                self._evaluation(plan, state, shardings, {}, warm=True)
+
     def _evaluation(self, plan: _FitPlan, state: TrainState, shardings: Placement[TrainState],
-                    training: Mapping[str, jax.Array], names: Sequence[str] | None = None) -> Evaluation:
+                    training: Mapping[str, jax.Array], names: Sequence[str] | None = None, *,
+                    warm: bool = False) -> Evaluation:
         """Score the suites in `names`, every suite when None, as one evaluation.
 
         With no suite at all, the evaluation carries the training values a
-        ranking or a stopping rule reads."""
+        ranking or a stopping rule reads. `warm` scores each suite's first
+        batch alone and reports nothing (`_warm_evaluations`)."""
         ranks = self.checkpoints is not None or plan.best or plan.stop or plan.held_best
         reports = training if ranks else None
         chosen = list(plan.suites if names is None else names)
         if not chosen:
-            return self._evaluate(state, shardings, None, (), plan.preview, split="val", training=reports)
+            return self._evaluate(state, shardings, None, (), plan.preview, split="val", training=reports,
+                                  report=not warm)
         evaluations = []
         for split in chosen:
             suite = plan.suites[split]
@@ -2006,8 +2039,9 @@ class Trainer(Generic[Loss, Effects]):
             ranks = (self.checkpoints is not None or plan.held_best) and not plan.best
             loss = ((ranks or self.objective.defines_validation_loss)
                     and not any(metric.name == 'loss' for metric in suite.metrics))
-            evaluations.append(self._evaluate(state, shardings, suite.data, suite.metrics, plan.preview,
-                                              loss=loss, split=split, training=reports))
+            data = _first_batch(suite.data) if warm else suite.data
+            evaluations.append(self._evaluate(state, shardings, data, suite.metrics, plan.preview,
+                                              loss=loss, split=split, training=reports, report=not warm))
         return dataclasses.replace(
             evaluations[0],
             scores={name: value for report in evaluations for name, value in report.scores.items()},
@@ -2370,10 +2404,11 @@ class Trainer(Generic[Loss, Effects]):
         loss: bool = False,
         split: str = "val",
         training: Mapping[str, jax.Array] | None = None,
+        report: bool = True,
     ) -> Evaluation:
         """Score the validation split with this state's variables and report
-        it, returning the seconds it took: the run's, but not its steps',
-        which is what the goodput fraction is measured against.
+        it where `report`, returning the seconds it took: the run's, but not
+        its steps', which is what the goodput fraction is measured against.
 
         A CPU-owned run evaluates on the accelerator, over the same snapshot
         a step realizes, so validation reads the weights where the loss
@@ -2402,8 +2437,9 @@ class Trainer(Generic[Loss, Effects]):
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training)
         # The training values ride along for ranking (`_ranking`); the log
         # interval reports them, so the evaluation's own report leaves them out.
-        self._report_evaluation(dataclasses.replace(evaluation, scores={
-            name: value for name, value in evaluation.scores.items() if name not in (training or {})}))
+        if report:
+            self._report_evaluation(dataclasses.replace(evaluation, scores={
+                name: value for name, value in evaluation.scores.items() if name not in (training or {})}))
         return dataclasses.replace(evaluation, elapsed_seconds=time.perf_counter() - paused)
 
     def _report_evaluation(self, advanced: Evaluation) -> None:
