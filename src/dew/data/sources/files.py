@@ -42,22 +42,24 @@ def _format(url: str) -> Format:
     return inferred
 
 
+_SUFFIXES: dict[Format, tuple[str, ...]] = {
+    "jsonl": (".jsonl", ".jsonl.gz", ".jsonl.zst"),
+    "text": (".txt",),
+    "csv": (".csv",),
+    "parquet": (".parquet",),
+    "arrow": (".arrow", ".feather"),
+    "array_record": (".array_record",),
+    "webdataset": (".tar",),
+}
+"""The suffixes each record format's files carry, which a URL's format is inferred from and a
+directory's files of a format are found by."""
+
+
 def _inferred(url: str) -> Format | None:
-    """The record format a URL's suffix declares, or None where it declares none."""
-    if url.lower().endswith((".jsonl.gz", ".jsonl.zst")):
-        return "jsonl"
-    suffix = PurePosixPath(url).suffix.lower()
-    formats: dict[str, Format] = {
-        ".jsonl": "jsonl",
-        ".txt": "text",
-        ".csv": "csv",
-        ".parquet": "parquet",
-        ".arrow": "arrow",
-        ".feather": "arrow",
-        ".array_record": "array_record",
-        ".tar": "webdataset",
-    }
-    return formats.get(suffix)
+    """The record format a URL's suffix declares, or None where it declares none: a directory's too,
+    spelled with a trailing separator or without."""
+    name = PurePosixPath(url).name.lower()
+    return next((kind for kind, suffixes in _SUFFIXES.items() if name.endswith(suffixes)), None)
 
 
 def _arrow_filesystem(fs) -> pafs.FileSystem:
@@ -225,17 +227,8 @@ class Files(Dataset):
                     if self.kind not in ("parquet", "arrow")
                     or not any(part.startswith(("_", ".")) for part in PurePosixPath(name[len(path) :]).parts)
                 )
-                extensions = {
-                    "parquet": ".parquet",
-                    "arrow": ".arrow",
-                    "jsonl": (".jsonl", ".jsonl.gz", ".jsonl.zst"),
-                    "text": ".txt",
-                    "csv": ".csv",
-                    "array_record": ".array_record",
-                    "webdataset": ".tar",
-                }
                 if self.kind != "files":
-                    names = [name for name in names if name.lower().endswith(extensions[self.kind])]
+                    names = [name for name in names if name.lower().endswith(_SUFFIXES[self.kind])]
             else:
                 names = [path]
             found.extend(fs.unstrip_protocol(name) for name in names if fs.isfile(name))

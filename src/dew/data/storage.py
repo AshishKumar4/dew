@@ -533,16 +533,19 @@ class Store:
         if isinstance(fs, S3FileSystem):
             from fsspec.asyn import sync
 
-            async def read_s3() -> Versioned:
-                bucket, key, _ = fs.split_path(path)
-                response = await fs._call_s3("get_object", Bucket=bucket, Key=key)
-                async with response["Body"] as body:
-                    return Versioned(await body.read(), response["ETag"])
-
             loop = fs.loop
             if loop is None:
                 raise ValueError("Dew storage needs synchronous S3 filesystem options")
-            return sync(loop, read_s3)
+            bucket, key, _ = fs.split_path(path)
+            # The filesystem's own request: its configured request settings (an SSE-C key) and its
+            # error translation (a missing object raises FileNotFoundError) apply.
+            response = fs.call_s3("get_object", Bucket=bucket, Key=key)
+
+            async def read_body() -> bytes:
+                async with response["Body"] as body:
+                    return await body.read()
+
+            return Versioned(sync(loop, read_body), response["ETag"])
         if scheme in ("gs", "gcs"):
             metadata = fs.info(path)
             version = str(metadata["generation"])
@@ -625,7 +628,9 @@ class Store:
             return version
         if isinstance(fs, GCSFileSystem):
             bucket, key, _ = fs.split_path(path)
-            endpoint = f"{fs._location}/upload/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/o"
+            # The JSON API's upload root beside the API root the filesystem reads (`base`).
+            location = fs.base.removesuffix("storage/v1/")
+            endpoint = f"{location}upload/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/o"
             try:
                 outcome = fs.call(
                     "POST",
