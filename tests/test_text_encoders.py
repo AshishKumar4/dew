@@ -3,29 +3,13 @@
 The claim is parity, not plausibility: the same weights and the same token ids
 through the reference implementation and through dew have to produce the same
 hidden states and the same pooled row, and the same pixels the same projected
-image embedding. tools/clip_reference.py writes the fixtures under torch and
-transformers, including a tiny random-weight checkpoint whose outputs are
-committed, so the comparison runs in CI without a download.
-
-Tolerances and the differences actually observed, fp32 on CPU:
-
-- tiny checkpoint: max |hidden state difference| 1.4e-06, max |pooled
-  difference| 9.5e-07, tolerance 4e-6, on hidden states reaching 2.8. Through
-  the projection heads, max |text embedding difference| 7.2e-07 on values
-  reaching 2.5 and max |image embedding difference| 4.8e-07 on values
-  reaching 2.8, the pixel values bit-identical.
-- clip-vit-large-patch14: max |hidden state difference| 1.9e-04 (mean 1.0e-06,
-  median 6.0e-07), max |pooled difference| 4.8e-06, tolerance 1e-3, on hidden
-  states reaching 33.1. Through the heads, max |text embedding difference|
-  3.8e-06 on values reaching 14.2 and max |image embedding difference|
-  1.2e-05 (mean 1.1e-06) on values reaching 6.6.
-
-That last residue is fp32 rounding in CLIP's outlier channels, not a different
-computation, and the reference carries more of it than the gap between the two:
-transformers' own fp32 output differs from its fp64 output by 2.8e-04 on the
-same prompts, and run in fp64 on both sides the two agree to 2.8e-13
-(8.4e-15 relative). tools/clip_reference.py --fp64 writes that reference and
-its docstring carries the dew side of the comparison.
+image embedding. Every output is held to tests/reference_error.py's rule: as
+exact as transformers' own float32 output, both measured from transformers in
+float64 over the same weights (`transformers_clip`). tools/clip_reference.py
+writes the fixtures under torch and transformers, including a tiny
+random-weight checkpoint whose token ids, pixels and float32 outputs are
+committed; the float32 and float64 reference outputs are computed here, so the
+comparison runs in CI without a download.
 
 What rounds differently at all is one rearrangement: dew's attention kernel
 divides the query by sqrt(head_dim) before the logits, where the reference
@@ -46,12 +30,6 @@ from dew.nn.text_encoders import CLIPModel, translate_config
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "clip"
 TINY = FIXTURES / "tiny"
 REAL = FIXTURES / "large-patch14"
-TOLERANCE = 4e-6
-"""Under three times the tiny checkpoint's largest residue, and five times under
-what a final norm off by one part in 2^17 moves its states by."""
-# The real checkpoint's outlier channels reach 33, where an fp32 sum carries
-# more error than this whole test asks for.
-REAL_TOLERANCE = 1e-3
 
 
 def reference(directory):
@@ -78,8 +56,37 @@ def image_processor(directory_or_repo):
     return CLIPImageProcessorPil.from_pretrained(str(directory_or_repo))
 
 
-def largest_difference(actual, expected) -> float:
-    return float(np.max(np.abs(np.asarray(actual, np.float32) - expected)))
+def transformers_clip(source, inputs, dtype):
+    """transformers' CLIPModel over `source`'s weights at `dtype`, float64 built and run under
+    `float64`: its text tower's states and pooled row and both heads' embeddings for `inputs`'
+    token ids, mask and pixel values, as float64 arrays."""
+    import contextlib
+
+    import torch
+    from transformers import CLIPModel as ReferenceCLIP
+
+    from tools.diffusers_wan_reference import float64
+
+    with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
+        model = ReferenceCLIP.from_pretrained(str(source), attn_implementation="eager").to(dtype).eval()
+        ids, mask = (torch.from_numpy(np.asarray(inputs[name], np.int64))
+                     for name in ("input_ids", "attention_mask"))
+        text = model.text_model(input_ids=ids, attention_mask=mask)
+        outputs = {"last_hidden_state": text.last_hidden_state, "pooler_output": text.pooler_output,
+                   "text_embeds": model.get_text_features(input_ids=ids, attention_mask=mask).pooler_output}
+        if "pixel_values" in inputs:
+            pixels = torch.from_numpy(np.asarray(inputs["pixel_values"])).to(dtype)
+            outputs["image_embeds"] = model.get_image_features(pixel_values=pixels).pooler_output
+    return {name: value.double().numpy() for name, value in outputs.items()}
+
+
+def assert_as_exact_as_transformers(ours: dict, source, inputs) -> None:
+    """Each of `ours`' outputs as exact as transformers' float32 one, both from its float64 one."""
+    import torch
+
+    theirs, truth = (transformers_clip(source, inputs, dtype) for dtype in (torch.float32, torch.float64))
+    for name, value in ours.items():
+        assert_as_exact_as_the_reference(np.asarray(value, np.float64), theirs[name], truth[name], name)
 
 
 def hidden(encoder, ids, mask) -> np.ndarray:
@@ -117,12 +124,8 @@ def test_tiny_checkpoint_matches_the_reference():
 
     outputs = encoder.transformer.apply(encoder.params, expected["input_ids"], expected["attention_mask"])
 
-    hidden = float(np.max(np.abs(np.asarray(outputs.last_hidden_state, np.float32)
-                                 - expected["last_hidden_state"])))
-    pooled = float(np.max(np.abs(np.asarray(outputs.pooler_output, np.float32)
-                                 - expected["pooler_output"])))
-    assert hidden < TOLERANCE, f"max |hidden state difference| {hidden:.3e}"
-    assert pooled < TOLERANCE, f"max |pooled difference| {pooled:.3e}"
+    assert_as_exact_as_transformers({"last_hidden_state": outputs.last_hidden_state,
+                                     "pooler_output": outputs.pooler_output}, TINY, expected)
 
     ids = expected["input_ids"]
     rows = np.arange(ids.shape[0])
@@ -144,9 +147,7 @@ def test_the_encoder_loads_and_encodes():
 
     assert np.array_equal(tokens["input_ids"], expected["input_ids"])
     assert np.array_equal(np.asarray(context.mask), expected["attention_mask"])
-    difference = float(np.max(np.abs(np.asarray(context.hidden, np.float32)
-                                     - expected["last_hidden_state"])))
-    assert difference < TOLERANCE, f"max |hidden state difference| {difference:.3e}"
+    assert_as_exact_as_transformers({"last_hidden_state": context.hidden}, TINY, expected)
     assert encoder.captions(tokens)[0] == "a red bird"
 
 
@@ -232,8 +233,7 @@ def test_tiny_checkpoint_text_projection_matches_the_reference():
 
     embeds = model.get_text_features(expected["input_ids"], expected["attention_mask"])
 
-    difference = largest_difference(embeds, expected["text_embeds"])
-    assert difference < TOLERANCE, f"max |text embedding difference| {difference:.3e}"
+    assert_as_exact_as_transformers({"text_embeds": embeds}, TINY, expected)
 
 
 def test_tiny_checkpoint_image_embeddings_match_the_reference():
@@ -249,8 +249,7 @@ def test_tiny_checkpoint_image_embeddings_match_the_reference():
     assert np.array_equal(pixel_values, expected["pixel_values"])
     embeds = model.get_image_features(pixel_values)
 
-    difference = largest_difference(embeds, expected["image_embeds"])
-    assert difference < TOLERANCE, f"max |image embedding difference| {difference:.3e}"
+    assert_as_exact_as_transformers({"image_embeds": embeds}, TINY, expected)
 
     baseline = model.module.apply(
         model.variables, pixel_values, method=lambda clip, pixels: clip.vision_model(pixels))
@@ -289,7 +288,9 @@ def test_clip_image_transform_matches_the_reference_processor(config, height, wi
 def test_the_real_checkpoint_matches_the_reference():
     """The flagship: twelve layers of clip-vit-large-patch14, fp32, from the
     checkpoint's own safetensors, against what transformers computes for the
-    same prompts."""
+    same prompts. Its outlier channels reach 33, where an fp32 sum carries
+    errors of 2.8e-4: transformers' own float32 states lie that far from its
+    float64 ones, and the rule holds Dew to them."""
     expected = reference(REAL)
     repo = json.loads((REAL / "prompts.json").read_text())["repo"]
     encoder = CLIPText.from_pretrained(repo)
@@ -300,12 +301,8 @@ def test_the_real_checkpoint_matches_the_reference():
     outputs = encoder.transformer.apply(encoder.params, tokens["input_ids"],
                                         tokens["attention_mask"])
 
-    hidden = float(np.max(np.abs(np.asarray(outputs.last_hidden_state, np.float32)
-                                 - expected["last_hidden_state"])))
-    pooled = float(np.max(np.abs(np.asarray(outputs.pooler_output, np.float32)
-                                 - expected["pooler_output"])))
-    assert hidden < REAL_TOLERANCE, f"max |hidden state difference| {hidden:.3e}"
-    assert pooled < REAL_TOLERANCE, f"max |pooled difference| {pooled:.3e}"
+    assert_as_exact_as_transformers({"last_hidden_state": outputs.last_hidden_state,
+                                     "pooler_output": outputs.pooler_output}, repo, expected)
 
 
 @pytest.mark.network
@@ -322,10 +319,8 @@ def test_the_real_checkpoint_embeddings_match_the_reference():
     image_embeds = model.get_image_features(pixel_values)
     text_embeds = model.get_text_features(expected["input_ids"], expected["attention_mask"])
 
-    image = largest_difference(image_embeds, expected["image_embeds"])
-    text = largest_difference(text_embeds, expected["text_embeds"])
-    assert image < REAL_TOLERANCE, f"max |image embedding difference| {image:.3e}"
-    assert text < REAL_TOLERANCE, f"max |text embedding difference| {text:.3e}"
+    assert_as_exact_as_transformers({"image_embeds": image_embeds, "text_embeds": text_embeds}, repo,
+                                    {**expected, "pixel_values": pixel_values})
 
 
 def test_a_t5_tower_computes_in_its_compute_dtype_as_the_reference_does():

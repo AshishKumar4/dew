@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
+from reference_error import assert_as_exact_as_the_reference, float64_forward
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -1139,15 +1140,16 @@ def test_a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_de
     that mask sent Qwen3-0.6B's decode to xla's two dense dots over the whole
     cache on an RTX 4080 (1.00 against cuDNN's 0.30 ms a layer at 128 rows),
     and a small model to cuDNN's bias variant, which reads it per head. The
-    steps still decode what the full pass computes."""
+    steps decode as exactly as the full pass, both from the model in float64."""
     model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
     ids = tokens(rng)
     params = model.init(rng, ids)
     full = model.apply(params, ids)
     prompt, rest = ids[:, :4], ids[:, 4:]
     incremental = decode_logits(model, params, prompt, rest)
-    np.testing.assert_allclose(np.asarray(incremental, np.float32),
-                               np.asarray(full[:, 3:], np.float32), atol=0.05)
+    truth, terms = float64_forward(model, params, ids)
+    assert_as_exact_as_the_reference(np.asarray(incremental, np.float64), np.asarray(full[:, 3:], np.float64),
+                                     np.asarray(truth)[:, 3:], "decode steps", terms=np.asarray(terms)[:, 3:])
 
 
 
@@ -1157,7 +1159,8 @@ def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deter
     sends a training call to xla (`kernel_for_materialized_mask`); a prefill
     runs forward only, so cuDNN takes that mask as its bias (xla's dense dots
     took 6.2 against 4.0 ms over Qwen3-0.6B's 28 layers for 8 prompts of 256
-    on an RTX 4080). The prefill still scores what the full pass does."""
+    on an RTX 4080). The prefill scores as exactly as the full pass, both from
+    the model in float64."""
     model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
     ids = tokens(rng)
     params = model.init(rng, ids)
@@ -1170,8 +1173,11 @@ def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deter
         return jax.jit(lambda cache, ids, valid: model.apply(
             {**params, 'cache': cache}, ids, attention_mask=valid, decode=True, mutable=['cache'])[0])
 
-    np.testing.assert_allclose(np.asarray(prefill(model)(cache, ids, valid), np.float32)[valid],
-                               np.asarray(full, np.float32)[valid], atol=0.05)
+    truth, terms = float64_forward(model, params, ids, attention_mask=valid)
+    # A padded slot's logits are no contract: the real tokens' are held.
+    assert_as_exact_as_the_reference(np.asarray(prefill(model)(cache, ids, valid), np.float64)[valid],
+                                     np.asarray(full, np.float64)[valid], np.asarray(truth)[valid],
+                                     "padded prefill", terms=np.asarray(terms)[valid])
 
 
 
@@ -1231,7 +1237,6 @@ def test_the_rotary_rotates_the_halves_as_rotate_half_does(dtype, pairs, scale, 
     order not quite, so the forward and the input gradient are each within
     tests/reference_error.py's rule of rotate_half's against float64: full
     and partial rotary, a folded scale, and a packed batch's own angles."""
-    from reference_error import assert_as_exact_as_the_reference
 
     from dew.nn.rope import rotate
 
