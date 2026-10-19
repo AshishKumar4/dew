@@ -44,7 +44,7 @@ from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
-from dew.training import Evaluation, MeshSpec, ProfileWindow, prepare_process
+from dew.training import LocalTracker, MeshSpec, ProfileWindow, prepare_process
 from dew.training.optim import Cosine
 
 PROMPTS = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
@@ -118,10 +118,7 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
         objective=ObjectiveConfig("diffusion", {"solver": Heun(), "guidance": CFG(2.0), "steps": 2,
                                                 "ema_decay": 0.9}),
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
-        # A validation pass needs a consumer; a smoke that walks the
-        # validation path names a metric that downloads nothing (fid and
-        # clip_score pull their own weights).
-        val_metrics=("psnr",),
+        val_metrics=("fid", "clip_score"),
         optim=OptimConfig(learning_rate=1e-3),
         trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), batch_size=4, steps=3,
                               log_every=1, eval_every=3, checkpoint_every=3,
@@ -181,17 +178,13 @@ def main(config: Config) -> Path:
     objective = run.build()
     data = loader(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading,
                 validation_records=run.validation_records, host=(EncodeCaptions(objective.inputs.tokenize),))
-    if data.val is None:
-        raise ValueError("scoring FID needs an explicit validation source or HoldOut")
     name = "smoke" if config.smoke else f"flowers-{config.image_size}"
-    state = run.train(objective, data, name=name, metrics=run.build_eval_metrics(),
+    # The run scores FID and CLIPScore over the held-out split at its end, on every process's
+    # share at once, with the extractor and the CLIP the flags name, and logs them under its
+    # last step.
+    state = run.train(objective, data, name=name,
+                      metrics=(FID(weights=config.inception_weights), CLIPScore(config.clip_model)),
                       summary={"prompts": list(PROMPTS)})
-    # The held-out split, which the run never trained on, scored once over the
-    # whole slice: each process samples its share and the metrics pool every
-    # share's statistics, so every process holds the same scores.
-    final = Evaluation.run(objective, state.variables, data.val, key=jax.random.key(1),
-                           metrics=(FID(weights=config.inception_weights), CLIPScore(config.clip_model)),
-                           step=int(state.step), averaged=state.averaged, mesh=run.trainer.mesh.build())
 
     # The run directory read back as a pipeline, which draws over every process's
     # devices; process 0 gathers the grid's rows and writes both files once.
@@ -201,8 +194,11 @@ def main(config: Config) -> Path:
     images = collective_host(drawn.images, phase="the sample grid", held_by="first")
     if images is not None:
         grid(images[:len(PROMPTS)], config.out / "samples.png")
-        (config.out / "eval.json").write_text(json.dumps(final.scores, indent=2))
-        print(f"samples {config.out / 'samples.png'}  {final.scores}")
+        with LocalTracker(run_dir / "tracking") as journal:
+            final = {metric: value for step, scores in journal.scalars() if step == int(state.step)
+                     for metric, value in scores.items() if metric.startswith("val/")}
+        (config.out / "eval.json").write_text(json.dumps(final, indent=2))
+        print(f"samples {config.out / 'samples.png'}  {final}")
     return run_dir
 
 
