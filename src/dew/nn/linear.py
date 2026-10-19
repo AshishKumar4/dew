@@ -748,8 +748,9 @@ def port_refusal(query, key, value) -> str | None:
     over operands that vary, where a Pallas call, which states no varying
     type for its results, cannot run; float64 operands, whose rule is the
     reference math itself; and keys wider than the port takes in their
-    dtype. Packed documents take the port at any bound: it stores only the
-    memories passing between a document's chunks (`fla_gdn.Sequences`)."""
+    dtype. Packed documents take the port at any bound: it stores the
+    memories by where they pass, no more of them than an unpacked row's
+    (`fla_gdn.Sequences`)."""
     widest = fla_gdn.WIDEST_KEYS if jnp.result_type(query, key, value).itemsize == 2 else fla_gdn.WIDEST
     return first_refusal(
         (measured_kernel('gated_delta_rule', 'xla') == 'fla',
@@ -787,8 +788,7 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     (fla's varlen `cu_seqlens`), its chunks from its first token and its
     memory from zero, as it would alone; the row's first takes `state`. The
     kernels' grids are sized by that bound, a chunk more for each document and
-    the row's padding; the memories they keep, only those passing between a
-    document's chunks, are not (`fla_gdn.Sequences`).
+    the row's padding; the memories they keep are not (`fla_gdn.Sequences`).
 
     The operands go to their common dtype, beta with them, as fla's layer
     holds them. On a mesh the rule runs per shard (`manual_map`): rows where

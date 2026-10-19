@@ -11,9 +11,8 @@ numerics fla runs: bf16 operands into fp32 accumulation where fla stores bf16, t
 cumulated in base 2 (`g * log2(e)`, fla's RCP_LN2) and fp32 state. Each kernel names its fla origin.
 Every operand stays in Dew's activation layout: queries and keys `[B, T, H, K]`, values `[B, T, HV,
 V]`, per-token gates `[B, T, HV]`; a program reads its chunk of its head where it sits, as fla's
-pointer arithmetic does. Of the memories the chunks enter, only those passing between two chunks of
-a sequence are stored, `[stored, HV, K, V]` (`Sequences`), so packed documents cost no more memory
-than one row of them.
+pointer arithmetic does. The memories the chunks enter are stored where they pass, `[slots, HV, K, V]`
+(`Sequences`), so a row of packed documents stores no more of them than an unpacked row.
 
 Each kernel is a launch the tuner times (`dew.nn.kernels.tuning.KernelOp`) over the tiles fla's own
 autotuner lists for it that fit the GPU's block (its `SPACES`), fla's picks for 99 KB GPUs its
@@ -94,8 +93,8 @@ class _Launch(tuning.KernelOp):
         batch, length = specs[0].shape[:2]
         spans = {spec.shape[-1]: spec.shape[0] for spec in specs
                  if spec.dtype == jnp.int32 and spec.ndim == 2}
-        own = spans[4] == batch * -(-length // 64) and spans[3] == batch
-        even = jnp.linspace(0, batch * length, spans[3] + 1).astype(jnp.int32)
+        own = spans[4] == batch * -(-length // 64) and spans[5] == batch
+        even = jnp.linspace(0, batch * length, spans[5] + 1).astype(jnp.int32)
         drawn = sequences(batch, length, None if own else even)
         return [jnp.asarray(drawn.chunks if spec.shape[-1] == 4 else drawn.spans)
                 if spec.dtype == jnp.int32 and spec.ndim == 2 else array
@@ -149,26 +148,33 @@ class Sequences(NamedTuple):
     """The token spans fla's varlen kernels read (its `cu_seqlens`, `chunk_indices` and `chunk_offsets`,
     fla/ops/utils/index.py) over the `[B * T]` tokens of a call's rows. `chunks` `[NT, 4]` is each
     chunk's first token and count, in order, a chunk never crossing a sequence and those past the
-    last empty, then the slots among the stored memories (`stored`) of the memory it enters and the
-    one it leaves, -1 where its sequence begins or ends there; `spans` `[N, 3]` is each sequence's
-    first token, count and the slot of the memory its first chunk leaves less one. Sequences never
-    cross rows, so a row's first sequence takes its initial memory and its last gives its final one.
+    last empty, then the slots of the stored memories (`slots`) it enters and leaves; `spans` `[N, 5]`
+    is each sequence's first token and count, the slot its second chunk enters less one, and the
+    slots its first chunk enters and its last leaves. Sequences never cross rows, so a row's first
+    sequence takes its initial memory and its last gives its final one.
 
-    Only a memory that passes between two chunks of one sequence is stored: the one a sequence
-    begins with is its row's initial memory or none, and the one it ends with its row's final memory
-    or none, so the kernels read those where they are (`_entered`, `_left`). However many sequences a
-    row's documents make, the stored memories are fewer than its chunks, as an unpacked row's."""
+    The memories are stored by where they pass, not by chunk: one slot for each that passes between
+    two chunks of a sequence, then a slot a row for its initial memory, which its first chunk enters,
+    and its final one's gradient, which its last leaves; and, where documents are packed, one of
+    zeros, which every other document's first chunk enters and last leaves. However many documents a
+    row holds, the slots are no more than its chunks and the rows' and one (`slots`), as many as an
+    unpacked row's chunks."""
     chunks: jax.Array | np.ndarray
     spans: jax.Array | np.ndarray
 
 
-def stored(spans: Sequences, batch: int, length: int, chunk: int = 64) -> int:
-    """How many memories passing between a sequence's chunks `batch` rows of `length` tokens store
-    (`Sequences`): each row's chunks less its first where the sequences are the rows, else at most
-    every sequence's chunks less its first, fewer than the tokens' chunks."""
-    if spans.spans.shape[0] == batch:
-        return max(1, batch * (-(-length // chunk) - 1))
-    return max(1, -(-batch * length // chunk))
+def _passing(batch: int, length: int, chunk: int, packed: bool) -> int:
+    """The slots of the memories passing between two chunks of a sequence (`Sequences`): each row's
+    chunks less its first where the sequences are the rows, else at most every token's chunks."""
+    return -(-batch * length // chunk) if packed else batch * (-(-length // chunk) - 1)
+
+
+def slots(spans: Sequences, batch: int, length: int, chunk: int = 64) -> int:
+    """How many memories the kernels store for `spans` over `batch` rows of `length` tokens
+    (`Sequences`): those passing between chunks, a row's each, and a slot of zeros where documents are
+    packed, whose sequences take more chunks than the rows' own."""
+    packed = spans.chunks.shape[0] != batch * -(-length // chunk)
+    return _passing(batch, length, chunk, packed) + batch + packed
 
 
 def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> Sequences:
@@ -177,6 +183,7 @@ def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> S
     chunks its N sequences can split `batch * length` tokens into."""
     # The rows' own spans are constants; a traced `cu_seqlens` takes the same arithmetic in XLA.
     xp = np if cu_seqlens is None else jnp
+    packed = cu_seqlens is not None
     if cu_seqlens is None:
         cu_seqlens = np.arange(batch + 1, dtype=np.int32) * length
         count = batch * -(-length // chunk)
@@ -188,16 +195,21 @@ def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> S
     # A sequence's n-th chunk enters the memory stored at `base + n`, for n past its first: the chunks
     # before it, less each non-empty sequence's first.
     base = offsets[:-1] - xp.cumsum(lengths > 0)
+    # A row's own slots follow the passing ones, and the zeros theirs.
+    passing = _passing(batch, length, chunk, packed)
+    zeros = passing + batch
+    entered = xp.where(first % length == 0, passing + first // length, zeros)
+    left = xp.where((first + lengths) % length == 0, passing + (first + lengths - 1) // length, zeros)
     index = xp.arange(count, dtype=np.int32)
     owner = xp.clip(xp.searchsorted(offsets, index, side="right") - 1, 0, lengths.shape[0] - 1)
     within = index - offsets[owner]
     real = index < offsets[-1]
     start = first[owner] + within * chunk
     taken = xp.where(real, xp.minimum(chunk, first[owner] + lengths[owner] - start), 0)
-    entering = xp.where(real & (within > 0), base[owner] + within, -1)
-    leaving = xp.where(real & (within + 1 < sizes[owner]), base[owner] + within + 1, -1)
+    entering = xp.where(within > 0, base[owner] + within, entered[owner])
+    leaving = xp.where(within + 1 < sizes[owner], base[owner] + within + 1, left[owner])
     return Sequences(xp.stack([start, taken, entering, leaving], axis=1).astype(np.int32),
-                     xp.stack([first, lengths, base], axis=1).astype(np.int32))
+                     xp.stack([first, lengths, base, entered, left], axis=1).astype(np.int32))
 
 
 def _aligned(spans: Sequences, batch: int, length: int, chunk: int) -> bool:
@@ -268,7 +280,7 @@ def _write(view, count, value):
 
 
 _CHUNK = pl.BlockSpec((None, 4), lambda i_t, *_: (i_t, 0))
-"""A per-chunk kernel's own chunk: its first token and count, and its memories' slots (`Sequences.chunks`)."""
+"""A per-chunk kernel's own chunk: its first token and count, its memories' slots (`Sequences.chunks`)."""
 
 
 def _headed(tokens: int, size: int):
@@ -609,50 +621,24 @@ def recompute_w_u(k, v, beta, a, g, *, chunk: int = 64, spans: Sequences | None 
 
 
 def _span(span_ref, length: int, chunk: int, aligned: bool):
-    """A sequence's first token, count and stored memories' base slot (`Sequences.spans`), its row in a
-    call of rows `length` long, and whether it starts its row (taking the row's initial memory) and
-    ends it (giving the row's final memory). `aligned` as `_chunk_of`."""
-    start, count, base = span_ref[0], span_ref[1], span_ref[2]
+    """A sequence's first token, count, base slot and the slots its first chunk enters and its last
+    leaves (`Sequences.spans`), its row in a call of rows `length` long, and whether it starts its row
+    (taking the row's initial memory) and ends it (giving the row's final memory). `aligned` as
+    `_chunk_of`."""
+    start, count, base, entered, left = (span_ref[i] for i in range(5))
     if aligned:
         # The rows' own spans: each `length` long, whole chunks from a multiple of `chunk`.
         start, count = pl.multiple_of(start, chunk), length
-    return start, count, base, start // length, start % length == 0, (start + count) % length == 0
-
-
-def _entered(h_ref, h0_ref, slot, start, length: int, *index):
-    """The memory a chunk enters, its `index` in `h_ref`'s dtype: the stored one at `slot` where its
-    sequence goes on from an earlier chunk, its row's initial memory (`h0_ref`) where the chunk begins
-    its row, and none where it begins a sequence inside its row. One of them is loaded, a branch each,
-    so a program holds one tile of it."""
-    return _one_of(h_ref, slot, h0_ref, start // length, start % length == 0, index)
-
-
-def _left(dh_ref, dht_ref, slot, end, length: int, *index):
-    """The gradient of the memory a chunk ending at token `end` leaves, its `index` in `dh_ref`'s
-    dtype: the stored one at `slot` where its sequence goes on to a later chunk, its row's final
-    memory's (`dht_ref`) where the chunk ends its row, and none where it ends a sequence inside its
-    row, one of them loaded (`_entered`)."""
-    return _one_of(dh_ref, slot, dht_ref, (end - 1) // length, end % length == 0, index)
-
-
-def _one_of(stored_ref, slot, row_ref, row, at_row, index):
-    """`stored_ref` at `slot` where it is one (`slot >= 0`), else `row_ref` at `row` where `at_row`,
-    else zeros, each `index` in `stored_ref`'s dtype."""
-    view = stored_ref.at[(0, *index)]
-
-    def row_memory():
-        return jax.lax.cond(at_row, lambda: row_ref[(row, *index)].astype(view.dtype),
-                            lambda: jnp.zeros(view.shape, view.dtype))
-
-    return jax.lax.cond(slot >= 0, lambda: stored_ref[(jnp.maximum(slot, 0), *index)], row_memory)
+    return (start, count, base, entered, left, start // length, start % length == 0,
+            (start + count) % length == 0)
 
 
 def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref, ht_ref, *,
               chunk: int, aligned: bool, length: int, exact: bool, per_key: bool = False):
     """fla's `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` (fla/ops/common/chunk_delta_h.py:50-
     343) for one sequence's head and `BV` value columns, its chunks in order. The memory is fp32 in
-    64-key slices; each chunk but the first stores the memory it enters in `h`'s dtype at its slot
-    (`Sequences`), then the corrected values
+    64-key slices; each chunk stores the memory it enters in `h`'s dtype at its slot (`Sequences`),
+    then the corrected values
     `u - w h` (fla's `v_new`; `h` cast to `w`'s dtype for the product), gates them by
     `exp2(g_last - g)` and the memory by `exp2(g_last)`,
     casts the gated values to `k`'s dtype and adds `k^T v` to the memory: h remains fp32, and h and
@@ -660,7 +646,7 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref
     `per_key` is fla's USE_GK branch: `g_ref` holds a decay per key dimension `[T, K]`, which gates
     the memory's rows by `exp2(g_last)` and not the values, whose keys carry their own decay. A row's
     first sequence starts from its initial memory and its last stores the final one."""
-    start, count, base, row, first, last_in_row = _span(span_ref, length, chunk, aligned)
+    start, count, base, entered, _, row, first, last_in_row = _span(span_ref, length, chunk, aligned)
     slices = k_ref.shape[-1] // 64
 
     @pl.when(count > 0)
@@ -675,10 +661,9 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref
             def read(ref, *rest):
                 return _read(_rows(ref, begin, chunk, *rest), taken)
 
-            @pl.when(n > 0)
-            def _():
-                for i in range(slices):
-                    h_ref[base + n, pl.ds(i * 64, 64), :] = state[i].astype(h_ref.dtype)
+            slot = jnp.where(n > 0, base + n, entered)
+            for i in range(slices):
+                h_ref[slot, pl.ds(i * 64, 64), :] = state[i].astype(h_ref.dtype)
             predicted = sum(_dot(read(w_ref, pl.ds(i * 64, 64)), state[i].astype(w_ref.dtype), exact=exact)
                             for i in range(slices))
             corrected = read(u_ref).astype(jnp.float32) - predicted
@@ -736,12 +721,12 @@ class ChunkFwdH(_Launch):
         rows = pl.BlockSpec((batch, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
         gated = (pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)) if per_key
                  else pl.BlockSpec((tokens, None), lambda i_v, sh: (0, head(i_v, sh))))
-        held = stored(spans, batch, length, chunk)
+        held = slots(spans, batch, length, chunk)
         h, corrected, final = pl.pallas_call(
             functools.partial(_h_kernel, chunk=chunk, aligned=aligned, length=length, exact=interpret,
                               **({"per_key": True} if per_key else {})),
             grid=(columns // bv, spans.spans.shape[0] * value_heads),
-            in_specs=[pl.BlockSpec((None, 3), lambda i_v, sh: (sh // value_heads, 0)),
+            in_specs=[pl.BlockSpec((None, 5), lambda i_v, sh: (sh // value_heads, 0)),
                       pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh) // group, 0)),
                       pl.BlockSpec((tokens, None, bv), lambda i_v, sh: (0, head(i_v, sh), i_v)),
                       pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)),
@@ -763,11 +748,10 @@ _CHUNK_FWD_H = ChunkFwdH()
 
 def chunk_fwd_h(k, w, u, g, h0, *, chunk: int = 64, spans: Sequences | None = None,
                 interpret: bool = False):
-    """`(h, corrected, final)`: the memory each chunk enters from an earlier chunk of its sequence,
-    `[stored, HV, K, V]` at its slot (`Sequences`) in `k`'s dtype, the corrected values `[B, T, HV,
-    V]` in `u`'s and each row's final memory `[B, HV, K, V]` fp32: fla's
-    `chunk_gated_delta_rule_fwd_h` (chunk_delta_h.py:672-737) with an initial state. `k` `[B, T, H,
-    K]`, `w` `[B, T, HV, K]`, `u` `[B, T, HV, V]`, `g`
+    """`(h, corrected, final)`: the memory each chunk enters at its slot `[slots, HV, K, V]`
+    (`Sequences`) in `k`'s dtype, the corrected values `[B, T, HV, V]` in `u`'s and each row's final
+    memory `[B, HV, K, V]` fp32: fla's `chunk_gated_delta_rule_fwd_h` (chunk_delta_h.py:672-737)
+    with an initial state. `k` `[B, T, H, K]`, `w` `[B, T, HV, K]`, `u` `[B, T, HV, V]`, `g`
     the base-2 cumulated decay (`chunk_local_cumsum`) `[B, T, HV]`, or per key dimension `[B,
     T, HV, K]` (fla's `gk`, Kimi's delta attention), `h0` `[B, HV, K, V]` fp32, each row's. `K` a
     multiple of 64 (fla's blockdim64 kernel takes up to 256). On an A100 fla's autotuner chose BV 32,
@@ -781,8 +765,8 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
                 dv2_ref, *, chunk: int, aligned: bool, length: int, scale: float, exact: bool,
                 per_key: bool = False):
     """fla's `chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64` (chunk_delta_h.py:359-669) for one
-    sequence's head and `BV` value columns, chunks in reverse. Each but the last stores the gradient of
-    the memory it leaves into, `dh`, at the slot of the chunk after it (`Sequences`), then
+    sequence's head and `BV` value columns, chunks in reverse. Each stores the gradient of the memory
+    it leaves into, `dh`, at that memory's slot (`Sequences`), then
     `dv2 = dv + (k dh) exp2(g_last - g)` (dh cast to k's dtype), then
     `dh = dh exp2(g_last) + scale (q exp2(g))^T do - w^T dv2`: the gated queries fp32 as two parts
     of `do`'s dtype (`_split_dot`), where fla takes one TF32 product at the same cost, and dv2 cast
@@ -791,7 +775,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
     and neither `dv2` nor the queries, which carry their own decay, are gated; the query product
     stays in q's dtype. A row's last sequence starts from the final
     memory's gradient and its first stores the initial memory's."""
-    start, count, base, row, first, last_in_row = _span(span_ref, length, chunk, aligned)
+    start, count, base, _, left, row, first, last_in_row = _span(span_ref, length, chunk, aligned)
     slices = k_ref.shape[-1] // 64
     chunks = -(-count // chunk)
 
@@ -808,10 +792,9 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
             def read(ref, *rest):
                 return _read(_rows(ref, begin, chunk, *rest), taken)
 
-            @pl.when(r > 0)
-            def _():
-                for i in range(slices):
-                    dh_ref[base + n + 1, pl.ds(i * 64, 64), :] = grad[i].astype(dh_ref.dtype)
+            slot = jnp.where(r > 0, base + n + 1, left)
+            for i in range(slices):
+                dh_ref[slot, pl.ds(i * 64, 64), :] = grad[i].astype(dh_ref.dtype)
             out_grad = read(do_ref)
             dv = sum(_dot(read(k_ref, pl.ds(i * 64, 64)), grad[i].astype(k_ref.dtype), exact=exact)
                      for i in range(slices))
@@ -872,7 +855,7 @@ class ChunkBwdDhu(_Launch):
         group = value_heads // key_heads
         tokens = batch * length
         aligned = _aligned(spans, batch, length, chunk)
-        held = stored(spans, batch, length, chunk)
+        held = slots(spans, batch, length, chunk)
 
         def head(i_v, sh):
             return sh % value_heads
@@ -888,7 +871,7 @@ class ChunkBwdDhu(_Launch):
                               exact=interpret,
                               **({"per_key": True} if per_key else {})),
             grid=(columns // bv, spans.spans.shape[0] * value_heads),
-            in_specs=[pl.BlockSpec((None, 3), lambda i_v, sh: (sh // value_heads, 0)), keys, keys,
+            in_specs=[pl.BlockSpec((None, 5), lambda i_v, sh: (sh // value_heads, 0)), keys, keys,
                       pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)),
                       gated, rows, values, values],
             out_specs=[pl.BlockSpec((held, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v)),
@@ -908,10 +891,9 @@ _CHUNK_BWD_DHU = ChunkBwdDhu()
 
 def chunk_bwd_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64,
                   spans: Sequences | None = None, interpret: bool = False):
-    """`(dh, dh0, dv2)`: the gradient of the memory each chunk leaves into a later chunk of its sequence,
-    `[stored, HV, K, V]` at that chunk's slot (`Sequences`) in `q`'s dtype, of each row's initial
-    memory `[B, HV, K, V]`
-    fp32, and the corrected values' full gradient `[B, T, HV, V]` in `dv`'s: fla's
+    """`(dh, dh0, dv2)`: the gradient of the memory each chunk leaves into at its slot `[slots, HV, K,
+    V]` (`Sequences`) in `q`'s dtype, of each row's initial memory `[B, HV, K, V]` fp32, and the
+    corrected values' full gradient `[B, T, HV, V]` in `dv`'s: fla's
     `chunk_gated_delta_rule_bwd_dhu` (chunk_delta_h.py:740-794). `dht` `[B, HV, K, V]` fp32 is each
     row's final memory's gradient and `dv` the corrected values' from the output alone
     (`chunk_bwd_dv_local`); `g` the cumulated decay `[B, T, HV]`, or `[B, T, HV,
@@ -1022,9 +1004,8 @@ def _state_inner_product(memory, memory_grad):
     return jnp.sum((memory * memory_grad).astype(jnp.float32))
 
 
-def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, h0_ref, do_ref, dh_ref, dht_ref, dv_ref,
-                  dq_ref, dk_ref, dw_ref, dg_ref, *, chunk: int, aligned: bool, length: int, scale: float,
-                  bv: int, exact: bool):
+def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, dv_ref, dq_ref,
+                  dk_ref, dw_ref, dg_ref, *, chunk: int, aligned: bool, scale: float, bv: int, exact: bool):
     """fla's `chunk_bwd_kernel_dqkwg` (fla/ops/common/chunk_o.py:159-331) for one chunk of one key
     head and `BK` key columns, over the value heads it serves in turn: over the value columns `bv` at
     a time, `ds = do v^T`, `dq = do h^T`, `dk = v dh^T`, `dw = -dv h^T` and `sum(h dh)`; then the
@@ -1035,7 +1016,7 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, h0_ref, do_ref, 
     fla gives each cumulated decay's and sums them back. The value heads' `dq` and `dk` sum in fp32
     and round to their dtype once, where fla rounds each value head's and sums them after. The heads
     are a loop, not unrolled, so a program holds one head's accumulators at a time. The memory the
-    chunk enters and its gradient where it leaves are read where they are (`_entered`, `_left`)."""
+    chunk enters and its gradient where it leaves are read at their slots (`Sequences`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
     entered, left = chunk_ref[2], chunk_ref[3]
 
@@ -1062,8 +1043,7 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, h0_ref, do_ref, 
                 columns = pl.ds(block * bv, bv)
                 value, out_grad = read(v_ref, head, columns), read(do_ref, head, columns)
                 local = read(dv_ref, head, columns)
-                memory = _entered(h_ref, h0_ref, entered, start, length, head, slice(None), columns)
-                memory_grad = _left(dh_ref, dht_ref, left, start + taken, length, head, slice(None), columns)
+                memory, memory_grad = h_ref[entered, head, :, columns], dh_ref[left, head, :, columns]
                 dg_last += _state_inner_product(memory, memory_grad)
                 ds += _dot(out_grad, value.T, exact=exact)
                 dq += _dot(out_grad, memory.T.astype(out_grad.dtype), exact=exact)
@@ -1109,8 +1089,7 @@ class ChunkBwdDqkwg(_Launch):
     PICKS = _picks(Tiles(64, 64, 4, 1), wide_bf16=Tiles(128, 128, 8, 1))
 
     def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, w: jax.Array, g: jax.Array, h: jax.Array,
-             h0: jax.Array, dv: jax.Array, do: jax.Array, dh: jax.Array, dht: jax.Array,
-             chunk_spans: jax.Array,
+             dv: jax.Array, do: jax.Array, dh: jax.Array, chunk_spans: jax.Array,
              sequence_spans: jax.Array, *, scale: float, chunk: int, interpret: bool, config: Tiles,
              return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
@@ -1125,14 +1104,13 @@ class ChunkBwdDqkwg(_Launch):
         keys = pl.BlockSpec((tokens, None, bk), lambda i_k, i_h, i_t: (0, i_h, i_k))
         values = pl.BlockSpec((tokens, group, columns), lambda i_k, i_h, i_t: (0, i_h, 0))
         memory = pl.BlockSpec((h.shape[0], group, bk, columns), lambda i_k, i_h, i_t: (0, i_h, i_k, 0))
-        rows = pl.BlockSpec((batch, group, bk, columns), lambda i_k, i_h, i_t: (0, i_h, i_k, 0))
         dq, dk, dw, dg = pl.pallas_call(
-            functools.partial(_dqkwg_kernel, chunk=chunk, aligned=aligned, length=length, scale=scale, bv=bv,
+            functools.partial(_dqkwg_kernel, chunk=chunk, aligned=aligned, scale=scale, bv=bv,
                               exact=interpret),
             grid=(width // bk, key_heads, spans.chunks.shape[0]),
             in_specs=[pl.BlockSpec((None, 4), lambda i_k, i_h, i_t: (i_t, 0)), keys, keys, values,
-                      pl.BlockSpec((tokens, group), lambda i_k, i_h, i_t: (0, i_h)), memory, rows, values,
-                      memory, rows, values],
+                      pl.BlockSpec((tokens, group), lambda i_k, i_h, i_t: (0, i_h)), memory, values, memory,
+                      values],
             out_specs=[keys, keys, pl.BlockSpec((tokens, group, bk), lambda i_k, i_h, i_t: (0, i_h, i_k)),
                        pl.BlockSpec((None, tokens, group), lambda i_k, i_h, i_t: (i_k, 0, i_h))],
             out_shape=[jax.ShapeDtypeStruct((tokens, key_heads, width), q.dtype),
@@ -1141,7 +1119,7 @@ class ChunkBwdDqkwg(_Launch):
                        jax.ShapeDtypeStruct((width // bk, tokens, value_heads), jnp.float32)],
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_chunk_bwd_dqkwg",
-        )(spans.chunks, *_flat(q, k, v, g), h, h0, *_flat(do), dh, dht, *_flat(dv))
+        )(spans.chunks, *_flat(q, k, v, g), h, *_flat(do), dh, *_flat(dv))
         grads = dq.reshape(q.shape), dk.reshape(k.shape), dw.reshape(w.shape), dg.sum(0).reshape(g.shape)
         return grads, None
 
@@ -1149,20 +1127,19 @@ class ChunkBwdDqkwg(_Launch):
 _CHUNK_BWD_DQKWG = ChunkBwdDqkwg()
 
 
-def chunk_bwd_dqkwg(q, k, v, w, g, h, h0, dv, do, dh, dht, *, scale: float, chunk: int = 64,
+def chunk_bwd_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 64,
                     spans: Sequences | None = None, interpret: bool = False):
     """`(dq, dk, dw, dg)`: fla's `chunk_bwd_dqkwg` (chunk_o.py:696-743). `q`, `k` `[B, T, H, K]`, `v`
     the corrected values and `do` `[B, T, HV, V]`, `w` `[B, T, HV, K]` (its shape and dtype for `dw`),
-    `g` the base-2 cumulated decay, `h` and `dh` the stored memories and their gradients `[stored,
-    HV, K, V]` (`chunk_fwd_h`, `chunk_bwd_dhu`), `h0` and `dht` each row's initial memory and its
-    final memory's gradient `[B, HV, K, V]` fp32, `dv` the corrected values' full gradient. One
+    `g` the base-2 cumulated decay, `h` and `dh` the memories and their gradients at their slots
+    `[slots, HV, K, V]` (`chunk_fwd_h`, `chunk_bwd_dhu`), `dv` the corrected values' full gradient. One
     program per key head sums its value heads' `dq` and `dk` in fp32 and stores them once, `[B, T,
     H, K]` in `q`'s and `k`'s dtypes; `dw` per value
     head, and `dg` per key block, summed, as fla does. fla tiles `BK`, `BV` at 64 on an A100 and chose
     4 warps, 2 stages (c53)."""
     batch, length = q.shape[:2]
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _CHUNK_BWD_DQKWG(q, k, v, w, g, h, h0, dv, do, dh, dht, *spans, scale=scale, chunk=chunk,
+    return _CHUNK_BWD_DQKWG(q, k, v, w, g, h, dv, do, dh, *spans, scale=scale, chunk=chunk,
                             interpret=interpret)
 
 
@@ -1340,17 +1317,17 @@ def prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, dk=None, *, chunk: int = 64,
     return _PREPARE_WY_REPR_BWD(k, v, beta, g, a, dw, du, dk, *spans, chunk=chunk, interpret=interpret)
 
 
-def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, h0_ref, g_ref, o_ref, *, chunk: int, aligned: bool,
-              length: int, scale: float, bk: int, exact: bool):
+def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, o_ref, *, chunk: int, aligned: bool,
+              scale: float, bk: int, exact: bool):
     """fla's `chunk_fwd_kernel_o` (fla/ops/common/chunk_o.py:43-147) for one chunk of one head and
     `BV` value columns: `o = scale * ((q h) exp2(g) + tril((q k^T) exp2(g_s - g_t)) v)`, the key
     columns walked `bk` at a time into fp32 accumulators, `A` cast to the values' dtype for its
     product, as fla does. fp32 products are IEEE here (`_dot`'s `ieee`), where the other kernels take
     TF32x3: the output reads them directly, and at TF32x3 a Qwen3.5 hybrid's fp32 scores on an H100
     sat 2.03 times their fp32 reference's distance from float64, 1.17 at IEEE. The memory the chunk
-    enters is read where it is (`_entered`)."""
+    enters is read at its slot (`Sequences`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    entering = chunk_ref[2]
+    entered = chunk_ref[2]
 
     @pl.when(taken > 0)
     def _():
@@ -1362,8 +1339,7 @@ def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, h0_ref, g_ref, o_ref, *, ch
         for block in range(q_ref.shape[-1] // bk):
             columns = pl.ds(block * bk, bk)
             query = read(q_ref, columns)
-            memory = _entered(h_ref, h0_ref, entering, start, length, columns, slice(None))
-            out += _dot(query, memory, exact=exact, ieee=True)
+            out += _dot(query, h_ref[entered, columns, :], exact=exact, ieee=True)
             scores += _dot(query, read(k_ref, columns).T, exact=exact, ieee=True)
         gate = _gates(g_ref, start, taken, chunk)
         out = out * jnp.exp2(gate)[:, None]
@@ -1384,7 +1360,7 @@ class ChunkFwdO(_Launch):
     SPACES = _spaces(frozenset({Tiles(128, 128, 8, 3), Tiles(64, 64, 4, 3), Tiles(32, 32, 2, 3)}))
     PICKS = _picks(Tiles(128, 128, 8, 3))
 
-    def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, h: jax.Array, h0: jax.Array, g: jax.Array,
+    def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, h: jax.Array, g: jax.Array,
              chunk_spans: jax.Array, sequence_spans: jax.Array, *, scale: float, chunk: int,
              interpret: bool, config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
@@ -1399,37 +1375,35 @@ class ChunkFwdO(_Launch):
         keyed = pl.BlockSpec((tokens, None, width), lambda i_v, i_t, i_h: (0, i_h // group, 0))
         valued = pl.BlockSpec((tokens, None, bv), lambda i_v, i_t, i_h: (0, i_h, i_v))
         out = pl.pallas_call(
-            functools.partial(_o_kernel, chunk=chunk, aligned=aligned, length=length, scale=scale,
-                              bk=min(bk, width), exact=interpret),
+            functools.partial(_o_kernel, chunk=chunk, aligned=aligned, scale=scale, bk=min(bk, width),
+                              exact=interpret),
             grid=(columns // bv, spans.chunks.shape[0], value_heads),
             in_specs=[pl.BlockSpec((None, 4), lambda i_v, i_t, i_h: (i_t, 0)), keyed, keyed, valued,
                       pl.BlockSpec((h.shape[0], None, width, bv), lambda i_v, i_t, i_h: (0, i_h, 0, i_v)),
-                      pl.BlockSpec((batch, None, width, bv), lambda i_v, i_t, i_h: (0, i_h, 0, i_v)),
                       pl.BlockSpec((tokens, None), lambda i_v, i_t, i_h: (0, i_h))],
             out_specs=valued,
             out_shape=jax.ShapeDtypeStruct((tokens, value_heads, columns), v.dtype),
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_chunk_fwd_o",
-        )(spans.chunks, *_flat(q, k, v), h, h0, *_flat(g))
+        )(spans.chunks, *_flat(q, k, v), h, *_flat(g))
         return out.reshape(v.shape), None
 
 
 _CHUNK_FWD_O = ChunkFwdO()
 
 
-def chunk_fwd_o(q, k, v, h, h0, g, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
+def chunk_fwd_o(q, k, v, h, g, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
                 interpret: bool = False):
     """Each chunk's output, `[B, T, HV, V]` in `v`'s dtype: fla's `chunk_fwd_o` (chunk_o.py:529-575).
 
-    `q`, `k` `[B, T, H, K]`, `v` the corrected values `[B, T, HV, V]`, `h` the stored memories the
-    chunks enter `[stored, HV, K, V]` (`chunk_fwd_h`), `h0` each row's initial memory `[B, HV, K, V]`
-    fp32, `g` the base-2 log decay cumulated within each
+    `q`, `k` `[B, T, H, K]`, `v` the corrected values `[B, T, HV, V]`, `h` the memories the chunks
+    enter at their slots `[slots, HV, K, V]` (`chunk_fwd_h`), `g` the base-2 log decay cumulated within each
     chunk (`chunk_local_cumsum`) `[B, T, HV]` fp32. Grouped queries: value head `i` reads
     key head `i // (HV // H)`. `T` is a whole number of chunks; `bk`, `bv`, `warps` and `stages` are
     one of fla's configs (`BK, BV` 128/128 at 8 warps, 64/64 at 4, 32/32 at 2, all 3 stages)."""
     batch, length = q.shape[:2]
     spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _CHUNK_FWD_O(q, k, v, h, h0, g, *spans, scale=scale, chunk=chunk, interpret=interpret)
+    return _CHUNK_FWD_O(q, k, v, h, g, *spans, scale=scale, chunk=chunk, interpret=interpret)
 
 
 def _rule(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool, keep: bool = True):
@@ -1450,7 +1424,7 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     a = checkpoint_name(kkt_solve(k, g, beta, **kernels), 'delta_inverse')
     w, u = recompute_w_u(k, v, beta, a, g, **kernels)
     h, corrected, final = chunk_fwd_h(k, w, u, g, h0, **kernels)
-    o = chunk_fwd_o(q, k, corrected, h, h0, g, scale=scale, **kernels)
+    o = chunk_fwd_o(q, k, corrected, h, g, scale=scale, **kernels)
     memory = checkpoint_name((w, h, corrected), 'delta_memory') if keep else None
     return (o, final), (q, k, v, g, beta, a, h0, memory, spans)
 
@@ -1470,9 +1444,8 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, residual, c
         w, u = recompute_w_u(k, v, beta, a, g, **kernels)
         h, corrected, _ = chunk_fwd_h(k, w, u, g, h0, **kernels)
     dv = chunk_bwd_dv_local(q, k, g, do, scale=scale, **kernels)
-    dht = dht.astype(jnp.float32)
-    dh, dh0, dv = chunk_bwd_dhu(q, k, w, g, dht, do, dv, scale=scale, **kernels)
-    dq, dk, dw, dg = chunk_bwd_dqkwg(q, k, corrected, w, g, h, h0, dv, do, dh, dht, scale=scale, **kernels)
+    dh, dh0, dv = chunk_bwd_dhu(q, k, w, g, dht.astype(jnp.float32), do, dv, scale=scale, **kernels)
+    dq, dk, dw, dg = chunk_bwd_dqkwg(q, k, corrected, w, g, h, dv, do, dh, scale=scale, **kernels)
     dk, dv, db, dg2 = prepare_wy_repr_bwd(k, v, beta, g, a, dw, dv, dk, **kernels)
     return dq, dk, dv, (dg + dg2).astype(jnp.float32), db, dh0, None
 

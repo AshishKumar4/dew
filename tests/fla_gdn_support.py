@@ -50,19 +50,17 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
     gated = jax.ShapeDtypeStruct((batch, length, value_heads), jnp.float32)
     beta = jax.ShapeDtypeStruct(gated.shape, narrow)
     inverse = jax.ShapeDtypeStruct((batch, length, value_heads, chunk), narrow)
-    stored = max(1, batch * (length // chunk - 1))
-    entered = jax.ShapeDtypeStruct((stored, value_heads, width, columns), narrow)
+    entered = jax.ShapeDtypeStruct((batch * (length // chunk), value_heads, width, columns), narrow)
     state = jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32)
     operands = {
         "chunk_local_cumsum": (gated,),
         "kkt_solve": (keyed, gated, beta),
         "recompute_w_u": (keyed, valued, beta, inverse, gated),
         "chunk_fwd_h": (keyed, weighted, valued, gated, state),
-        "chunk_fwd_o": (keyed, keyed, valued, entered, state, gated),
+        "chunk_fwd_o": (keyed, keyed, valued, entered, gated),
         "chunk_bwd_dv_local": (keyed, keyed, gated, valued),
         "chunk_bwd_dhu": (keyed, keyed, weighted, gated, state, valued, valued),
-        "chunk_bwd_dqkwg": (keyed, keyed, valued, weighted, gated, entered, state, valued, valued, entered,
-                            state),
+        "chunk_bwd_dqkwg": (keyed, keyed, valued, weighted, gated, entered, valued, valued, entered),
         "prepare_wy_repr_bwd": (keyed, valued, beta, gated, inverse, weighted, valued, keyed),
     }
     kwargs = {"chunk": chunk, "interpret": False}
@@ -97,24 +95,22 @@ def pairwise(g):
     return g[..., :, None] - g[..., None, :]
 
 
-def _stored(passing):
-    """Memories passing between chunks `[B, C - 1, ...]` as the port stores them, `[max(1, B (C - 1)),
-    ...]` (`fla_gdn.stored`): rows of one chunk store none, and keep one unread slot."""
-    flat = passing.reshape(-1, *passing.shape[2:])
-    return flat if flat.shape[0] else jnp.zeros((1, *passing.shape[2:]), passing.dtype)
+def _slotted(passing, rows):
+    """Memories passing between a row's chunks `[B, C - 1, ...]` and a row's own `[B, ...]` at their
+    slots (`fla_gdn.Sequences`): the passing ones row by row, then the rows'."""
+    return jnp.concatenate([passing.reshape(-1, *passing.shape[2:]), rows])
 
 
 def entered_states(per_chunk):
-    """Per-chunk memories `[B, C, HV, K, V]` as the port keeps them (`fla_gdn.Sequences`): those each
-    chunk but a row's first enters, `[B * (C - 1), HV, K, V]`, and each row's first, fp32."""
-    return _stored(per_chunk[:, 1:]), per_chunk[:, 0].astype(jnp.float32)
+    """Per-chunk memories `[B, C, HV, K, V]`, each the one a chunk enters, at the slots the port
+    stores them in: each row's chunks' past its first, then each row's initial memory."""
+    return _slotted(per_chunk[:, 1:], per_chunk[:, 0])
 
 
 def left_grads(per_chunk):
-    """Per-chunk memory gradients `[B, C, HV, K, V]`, each of the memory a chunk leaves, as the port
-    keeps them: those each chunk but a row's last leaves, `[B * (C - 1), HV, K, V]`, at the slot of
-    the chunk after it, and each row's last, fp32."""
-    return _stored(per_chunk[:, :-1]), per_chunk[:, -1].astype(jnp.float32)
+    """Per-chunk memory gradients `[B, C, HV, K, V]`, each of the memory a chunk leaves, at the slots
+    the port stores them in: each row's chunks' but its last, then each row's final memory's."""
+    return _slotted(per_chunk[:, :-1], per_chunk[:, -1])
 
 
 def reference_o(q, k, v, h, g, *, scale: float, chunk: int = 64):

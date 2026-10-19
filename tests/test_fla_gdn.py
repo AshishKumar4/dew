@@ -78,7 +78,7 @@ def test_the_output_kernel_computes_flas_expression(dtype, shape, tiles):
     q, k, v, h, g = output_operands(*shape, dtype)
     scale = shape[4] ** -0.5
     launch = fla_gdn.ChunkFwdO(config=tiles)
-    got = launch(q, k, v, *support.entered_states(h), g, *fla_gdn.sequences(*shape[:2]), scale=scale,
+    got = launch(q, k, v, support.entered_states(h), g, *fla_gdn.sequences(*shape[:2]), scale=scale,
                  chunk=64, interpret=INTERPRETED)
     want = support.reference_o(q, k, v, h, g, scale=scale)
     assert got.shape == want.shape and got.dtype == want.dtype
@@ -161,8 +161,8 @@ def test_the_h_kernel_is_flas_recurrence(dtype, shape, per_key):
     g = cumulated_decay(keys[3], batch, length, value_heads, width if per_key else None)
     h0 = 0.1 * jax.random.normal(keys[4], (batch, value_heads, width, columns))
     h, corrected, final = support.reference_h(k, w, u, g, h0)
-    # The port keeps the memories that pass between chunks; each row's first is `h0`.
-    want = support.entered_states(h)[0], corrected, final
+    # The port stores each memory at its slot (`fla_gdn.Sequences`).
+    want = support.entered_states(h), corrected, final
     kernel = functools.partial(fla_gdn.chunk_fwd_h, interpret=INTERPRETED)
     for got in tiled(fla_gdn.ChunkFwdH, kernel, k, w, u, g, h0):
         for name, mine, theirs in zip(("h", "v_new", "final"), got, want, strict=True):
@@ -188,8 +188,8 @@ def test_the_dhu_kernel_is_flas_reverse_recurrence(dtype, shape, per_key):
     dv = jax.random.normal(keys[6], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
     dh, dh0, dv2 = support.reference_dhu(q, k, w, g, dht, do, dv, scale=scale)
-    # The port keeps the gradients that pass between chunks; each row's last is `dht`.
-    want = support.left_grads(dh)[0], dh0, dv2
+    # The port stores each memory's gradient at its slot (`fla_gdn.Sequences`).
+    want = support.left_grads(dh), dh0, dv2
     kernel = functools.partial(fla_gdn.chunk_bwd_dhu, scale=scale, interpret=INTERPRETED)
     for got in tiled(fla_gdn.ChunkBwdDhu, kernel, q, k, w, g, dht, do, dv):
         for name, mine, theirs in zip(("dh", "dh0", "dv2"), got, want, strict=True):
@@ -235,7 +235,7 @@ def test_the_dqkwg_kernel_is_flas(dtype, shape):
     scale = width ** -0.5
     want = support.reference_dqkwg(q, k, v, w, g, h, dv, do, dh, scale=scale)
     kernel = functools.partial(fla_gdn.chunk_bwd_dqkwg, scale=scale, interpret=INTERPRETED)
-    states = (*support.entered_states(h), dv, do, *support.left_grads(dh))
+    states = (support.entered_states(h), dv, do, support.left_grads(dh))
     for got in tiled(fla_gdn.ChunkBwdDqkwg, kernel, q, k, v, w, g, *states):
         for name, mine, theirs in zip(("dq", "dk", "dw", "dg"), got, want, strict=True):
             assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
