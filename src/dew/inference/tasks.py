@@ -426,13 +426,20 @@ def _saved_processor(settings: TextSettings | MaskedSettings | BlockSettings,
 def resident(model: nn.Module, variables: Variables) -> Variables:
     """`variables` as decoding reads them (`decoding_storage`), each leaf held in host memory, as
     `Pretrained.load` returns them without a mesh, cast on the host and then placed on the device
-    once: replicated on the mesh the tree's arrays sit on, or on this process's default device. A
-    jax.Array stays where it is, a pinned-host bank's among them. A task's generations and a
-    server's steps read their weights so, where a host leaf would be copied to the device again at
-    each call."""
+    once: replicated on the mesh the tree's arrays sit on, or committed to this process's default
+    device as it is now (`jax.default_device`), so a later call made elsewhere runs where the
+    weights are rather than moving them. A jax.Array stays where it is, a pinned-host bank's among
+    them. A task's generations and a server's steps read their weights so, where a host leaf
+    would be copied to the device again at each call."""
     stored = decoding_storage(model, variables)
     mesh = mesh_of(stored)
-    target = None if mesh is None else NamedSharding(mesh, P())
+    default = jax.config.jax_default_device
+    if mesh is not None:
+        target = NamedSharding(mesh, P())
+    elif default is None or isinstance(default, str):
+        target = jax.local_devices(backend=default)[0]
+    else:
+        target = default
 
     def placed(leaf):
         return jax.device_put(leaf, target) if isinstance(leaf, (np.ndarray, np.generic)) else leaf
