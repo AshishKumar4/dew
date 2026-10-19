@@ -16,6 +16,7 @@ build installs exactly its tree: the checkout over the precompiled wheel of its 
     PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py upstream DIR
     PYTHONPATH=src:tests .venv/bin/python tools/dory_vllm_reference.py draw DIR
     PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py orders DIR
+    PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py model_orders DIR
     HF_TOKEN=... PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py publish DIR
 
 `record` runs the engine once a `RUNS` entry, each in a process of its own: a loop count, a cache
@@ -41,7 +42,8 @@ the continuation's log-probabilities by whole units. So the release is held to v
 (`LLM.apply_model`), decoding the identity run's tokens again through a logits processor that
 draws them (tools/dory_vllm_forcing.py) beside the same raw log-probabilities. It keeps each
 order's rows on their columns, and over every row's whole vocabulary each entry's squared distance
-from float64 summed over the orders. Order zero reproduces the probe's rows bit for
+from float64 summed over the orders; `model_orders` does the same with the model code at the
+engine's precision on a last-loop run's rows past the window (`SHARED`). Order zero reproduces the probe's rows bit for
 bit. `publish` puts the probe and the orders in `DATASET`, at a revision source.json pins with each
 file's sha256 (`fetched`).
 """
@@ -567,6 +569,10 @@ Runs (loop count / cache mode / dtype): {runs}. Each decodes a sentence greedily
   the run's tokens, the truth.
 - `orders-<run>.npz`: under each permutation, vLLM's rows on the probe columns, and over every row's
   whole vocabulary each entry's squared distance from the float64 truth summed over the 52.
+- `model-<run>.npz`: the same for a last-loop run's rows past the window from the pull request's
+  model code at the engine's precision (bf16, or fp32 with TF32 attention products), the reference
+  there: the engine's last-loop cache parts from the model code past the window
+  (https://github.com/vllm-project/vllm/pull/60149#issuecomment-6270937659).
 
 Dew's `tests/fixtures/hf/dory-1.0-4b/source.json` pins this repository's revision and each file's
 sha256.
