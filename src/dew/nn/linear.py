@@ -42,7 +42,7 @@ from jax.interpreters.ad import JVPTracer
 
 from dew.nn.kernels import delta_rule, fla_gdn, fla_kda, short_conv
 
-from .attention import FORWARD_MODE, gated_rms_normalized
+from .attention import FORWARD_MODE, gated_rms_normalized, repeat_kv_heads
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, Coordinates, MixerCall, coordinates_of, valid_order
@@ -1076,15 +1076,6 @@ class GatedDeltaNet(nn.Module):
     def _split_heads(self, mixed, last_dim: int):
         return mixed.reshape(*mixed.shape[:-1], -1, last_dim)  # [B, S, H, D]
 
-    def _expand_kv(self, x):
-        """One key head serves `per_v` value heads, the reference's
-        `repeat_interleave(num_v_heads // num_k_heads, dim=2)`."""
-        if self.per_v == 1:
-            return x
-        B, S, H, D = x.shape
-        return jnp.repeat(x.reshape(B, S, H, 1, D), self.per_v, axis=3).reshape(
-            B, S, H * self.per_v, D)
-
     def _project(self, x):
         """(mixed, z, b, a) of `x`: the conv's input `[B, S, 2K + V]`, the
         queries, keys and values flat over heads in that order, z
@@ -1162,7 +1153,8 @@ class GatedDeltaNet(nn.Module):
                 # queries and keys on their own heads and beta beside them.
                 return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size,
                                               projected=operand, starts=starts)
-            query, key = self._expand_kv(query), self._expand_kv(key)
+            # One key head serves `per_v` value heads, the reference's `repeat_interleave`.
+            query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
             if S == 1 and held is not None and delta_rule.fits(held):
                 return decode_gated_delta_rule(query, key, value, g, beta, held,
                                                None if valid is None else valid[:, 0])
