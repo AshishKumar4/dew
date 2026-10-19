@@ -58,6 +58,7 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import Manifest, StepIdentity
 from dew.data.sources.base import READS, Read, Source
+from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
 from dew.records import record
 
@@ -84,12 +85,35 @@ class _RestrictedReads(Protocol):
     refusal: str
 
 
+@dataclasses.dataclass(frozen=True)
+class _Members:
+    """A concatenation's stores that cannot take a read, each prepared by its own preparer
+    (`_provisioner`), so the concatenation takes it once they have."""
+
+    concatenation: Concatenate
+    preparers: tuple[_Provisionable, ...]
+
+    def can_provision(self, read: Read) -> bool:
+        return True
+
+    def provision(self) -> Source:
+        for preparer in self.preparers:
+            preparer.provision()
+        return self.concatenation
+
+
 def _provisioner(source: Source, read: Read) -> _Provisionable | None:
-    """The source that can prepare `read`, through any split or slice wrapping it."""
+    """The source that can prepare `read`, through any split or slice wrapping it; for a
+    concatenation, each of its stores that cannot take `read` yet, all of which must prepare it."""
     while isinstance(source, _Wrapping) and not isinstance(source, _Provisionable):
         if isinstance(source, _RestrictedReads) and read not in source.reads:
             return None
         source = source.source
+    if isinstance(source, Concatenate):
+        preparers = [_provisioner(member, read) for member in source.sources if not member.supports(read)]
+        if not preparers or any(preparer is None for preparer in preparers):
+            return None
+        return _Members(source, tuple(preparer for preparer in preparers if preparer is not None))
     return source if isinstance(source, _Provisionable) and source.can_provision(read) else None
 
 

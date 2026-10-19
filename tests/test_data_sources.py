@@ -2362,3 +2362,25 @@ def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(re
         assert head + [np.asarray(next(resumed)["id"]).tolist() for _ in range(6)] == expected
     finally:
         resumed.close()
+
+
+def test_a_concatenation_of_cold_stores_is_prepared_through_its_own_stores(tmp_path):
+    """A concatenation of two JSONL stores that hold no offset index yet takes an indexed read once
+    each of its stores prepares one: a pass asked to provision prepares both and reads every
+    record, the first store's then the second's, where it once refused the read."""
+    from dew.data.compile import validation
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Concatenate
+
+    for name, ids in (("first", range(5)), ("second", range(5, 9))):
+        (tmp_path / f"{name}.jsonl").write_text("".join(json.dumps({"id": i}) + "\n" for i in ids))
+    joined = Concatenate((Files(str(tmp_path / "first.jsonl")), Files(str(tmp_path / "second.jsonl"))))
+    assert not joined.supports("indexed")
+    reader = validation(Pipeline(joined).batch(3), batch=3, read="indexed", provision=True,
+                        loading=Loading(workers=0))(DataPartition())
+    try:
+        assert [int(value) for batch in reader for value in batch["id"]] == list(range(9))
+    finally:
+        reader.close()
+    assert joined.supports("indexed")
