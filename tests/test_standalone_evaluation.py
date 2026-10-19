@@ -48,9 +48,10 @@ def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
     tracker = Recording()
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(1), tracker=tracker)
     state = trainer.fit(data, steps=2, eval_every=2, log_every=2, metrics=(Perplexity(),), preview=True)
+    # A fit's validation records the objective's loss beside its metrics, as this pass asks.
     result = Evaluation.run(objective, state.variables, data.val, key=state.key, step=state.step,
                       schedule_step=state.microstep, averaged=state.averaged,
-                      metrics=(Perplexity(),), preview=True, mesh=trainer.device_mesh)
+                      metrics=(Perplexity(),), preview=True, mesh=trainer.device_mesh, loss=True)
     logged = next(item for item in tracker.scalars if "val/perplexity" in item)
     assert result.scalars == logged
     previews = [artifact for artifact in tracker.artifacts if isinstance(artifact, TextSamples)]
