@@ -111,6 +111,9 @@ def test_a_build_runs_where_the_user_mode_driver_runs_its_cuda(driver, cuda, new
 ROUTED = """
 import logging
 
+import optax
+import jax
+
 received = []
 
 
@@ -120,17 +123,29 @@ class Received(logging.Handler):
 
 
 logging.getLogger().addHandler(Received())
+dew_logger = logging.getLogger("dew")
+dew_logger.addHandler(logging.NullHandler())
+from affine_run import Regression, batches
+
+from dew.data.dataset import Loader
+from dew.training import Trainer
 from dew.training.runtime import ready_process
 
-ready_process()
+for _ in range(2):
+    Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0)).fit(
+        Loader(lambda partition: batches(), None, None, 8), steps=1, log_every=1)
+    ready_process()
 logging.getLogger("dew.training").warning("through the application's handler")
-assert not logging.getLogger("dew").handlers and received == ["through the application's handler"], received
+assert [type(handler) for handler in dew_logger.handlers] == [logging.NullHandler], dew_logger.handlers
+assert "through the application's handler" in received, received
 """
 
 
-def test_an_application_that_configured_its_logging_receives_dews_records_through_it():
-    """Where the application's root logger has a handler, a run's setup attaches none of Dew's own,
-    so Dew's records reach the application's handler, as any library's do."""
+def test_an_application_that_routes_dews_records_receives_them_through_its_handler():
+    """An application that gives Dew's logger a handler of its own before a run's setup keeps it:
+    two fits and setups attach none of Dew's, and Dew's records reach the application's root
+    handler."""
     done = subprocess.run([sys.executable, "-c", ROUTED], capture_output=True, text=True, timeout=300,
+                          cwd=os.path.dirname(os.path.abspath(__file__)),
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert done.returncode == 0, done.stderr[-2000:]
