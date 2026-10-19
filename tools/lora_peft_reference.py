@@ -14,12 +14,14 @@ dropout in training, run by PEFT 0.20.0 on tests/fixtures/hf/llama-tiny.
   fixed to Dew's: `x * mask / (1 - p)`.
 
 Each case writes PEFT's adapter directory, the fixture's input ids, the
-base and adapted logits, and the mean next-token cross entropy and its
-gradient with respect to every adapter factor, in float32 and in float64.
+base and adapted logits, the mean next-token cross entropy and its
+gradient with respect to every adapter factor, and every factor after two
+torch AdamW steps (`ADAMW`) on that loss, in float32 and in float64.
 The dropout case reads its masks, one per target keyed by the target's
 PEFT module path, from `masks.npz` beside it, which Dew writes first over
 the committed adapter (`masks`, in Dew's environment); the PEFT run (the
-`peft` cohort of tools/reference_releases.py) follows:
+`peft` cohort of tools/reference_releases.py) follows, both steps on
+those masks:
 
     PYTHONPATH=src python tools/lora_peft_reference.py masks
     ~/.cache/dew/reference-venvs/peft/bin/python tools/lora_peft_reference.py
@@ -83,6 +85,21 @@ def adapter(case: str, settings: dict, out: Path):
 MASKS = "masks.npz"
 """The dropout case's keep masks, Dew's own (`dew_masks`), which the PEFT run reads."""
 
+ADAMW = {"lr": 1e-3, "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": 0.01}
+"""The optimizer of the two training steps each case records: torch's AdamW, its decay decoupled."""
+
+
+def branch_dropout(adapter, context) -> str | None:
+    """The PEFT module path of the target whose branch dropout a Flax method interception's
+    `context` calls, or None for any other call."""
+    from flax import linen as nn
+
+    module = context.module
+    if not (isinstance(module, nn.Dropout) and context.method_name == "__call__"
+            and ("params", *module.path[:-1]) in adapter.targets):
+        return None
+    return "model." + ".".join(module.path[:-1]).replace("layers_", "layers.")
+
 
 def dew_masks(adapter, tokens: np.ndarray) -> dict[str, np.ndarray]:
     """The keep mask each target's branch dropout draws in the LM objective's first training
@@ -102,12 +119,11 @@ def dew_masks(adapter, tokens: np.ndarray) -> dict[str, np.ndarray]:
 
     def capture(next_fun, args, kwargs, context):
         output = next_fun(*args, **kwargs)
-        if (isinstance(context.module, nn.Dropout) and context.method_name == "__call__"
-                and ("params", *context.module.path[:-1]) in adapter.targets):
+        owner = branch_dropout(adapter, context)
+        if owner is not None:
             if not np.all(np.asarray(args[0]) != 0):
                 raise ValueError("a zero in a branch's input hides whether the dropout kept it")
-            owner = ".".join(context.module.path[:-1]).replace("layers_", "layers.")
-            drawn[f"model.{owner}"] = np.asarray(output) != 0
+            drawn[owner] = np.asarray(output) != 0
         return output
 
     with nn.intercept_methods(capture):
@@ -154,7 +170,8 @@ def run(model, input_ids: torch.Tensor, dtype, drawn: dict[str, np.ndarray] | No
 
 
 def run_at(model, input_ids: torch.Tensor, dtype, drawn: dict[str, np.ndarray] | None, rate: float) -> dict:
-    """The adapted logits, the loss and every factor's gradient of `model` as it stands at `dtype`."""
+    """The adapted logits, the loss and every factor's gradient of `model` as it stands at `dtype`,
+    and every factor after two AdamW steps from there, which leave `model`'s factors as they were."""
     if drawn is None:
         model.eval()
     else:
@@ -167,17 +184,32 @@ def run_at(model, input_ids: torch.Tensor, dtype, drawn: dict[str, np.ndarray] |
                 mask[:, :drawn[key].shape[1]] = drawn[key]
                 module.lora_dropout["default"] = Masked(torch.as_tensor(mask), rate)
     model.zero_grad(set_to_none=True)
-    logits = model(input_ids).logits
-    loss = torch.nn.functional.cross_entropy(
-        logits[:, :-1].reshape(-1, logits.shape[-1]), input_ids[:, 1:].reshape(-1))
+    logits, loss = next_token_loss(model, input_ids)
     loss.backward()
     tail = "_f64" if dtype == torch.float64 else ""
     arrays = {f"adapted_logits{tail}": logits.detach().numpy(), f"loss{tail}": loss.detach().numpy()}
-    for name, parameter in model.named_parameters():
-        if parameter.requires_grad:
-            key = name.removeprefix(PREFIX).replace(".default", "")
-            arrays[f"grad/{key}{tail}"] = parameter.grad.numpy().copy()
+    factors = {name.removeprefix(PREFIX).replace(".default", ""): parameter
+               for name, parameter in model.named_parameters() if parameter.requires_grad}
+    for key, parameter in factors.items():
+        arrays[f"grad/{key}{tail}"] = parameter.grad.numpy().copy()
+    initial = {key: parameter.detach().clone() for key, parameter in factors.items()}
+    optimizer = torch.optim.AdamW(factors.values(), **ADAMW)
+    optimizer.step()
+    model.zero_grad(set_to_none=True)
+    next_token_loss(model, input_ids)[1].backward()
+    optimizer.step()
+    with torch.no_grad():
+        for key, parameter in factors.items():
+            arrays[f"stepped/{key}{tail}"] = parameter.detach().numpy().copy()
+            parameter.copy_(initial[key])
     return arrays
+
+
+def next_token_loss(model, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """`model`'s logits over `input_ids` and their mean next-token cross entropy."""
+    logits = model(input_ids).logits
+    return logits, torch.nn.functional.cross_entropy(
+        logits[:, :-1].reshape(-1, logits.shape[-1]), input_ids[:, 1:].reshape(-1))
 
 
 def main() -> None:
