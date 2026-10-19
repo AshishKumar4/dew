@@ -58,7 +58,7 @@ if TYPE_CHECKING:
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
-    from dew.training.quantization import InputQuantizer
+    from dew.quantization import InputQuantizer
 
 __all__ = [
     "AffineHead",
@@ -396,7 +396,7 @@ class VocabularyRows(Protocol):
 @runtime_checkable
 class QuantizesInputs(Protocol):
     """A model computing under a checkpoint's input quantization
-    (`dew.training.quantization.InputQuantization`): the quantizer a bound
+    (`dew.quantization.InputQuantization`): the quantizer a bound
     module's input takes, which a head read as a table (`OutputTable`) applies
     as the module's own call does."""
 

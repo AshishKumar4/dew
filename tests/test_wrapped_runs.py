@@ -21,7 +21,8 @@ from dew.lora import AdapterRecord, LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective, LMRunConfig
 from dew.training import Checkpoints, Trainer
-from dew.training.quantization import QUANTIZATION, InputQuantization, Quantization, quantize_trunk
+from dew.quantization import QUANTIZATION, InputQuantization, Quantization
+from dew.training.quantization import quantize_trunk
 
 pytestmark = pytest.mark.mesh
 

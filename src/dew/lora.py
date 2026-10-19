@@ -75,7 +75,7 @@ from dew.nn.protocols import (
 )
 from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
 from dew.registry import wrapper_layers
-from dew.training.quantization import (
+from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
     InputQuantization,

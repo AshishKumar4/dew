@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 
     from dew.config import ModelConfig
     from dew.training.distributed import Layout, MeshSpec
-    from dew.training.quantization import Quantization
+    from dew.quantization import Quantization
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Request = str | Sequence[str] | Rows
@@ -589,7 +589,7 @@ class TextGeneration(_NativeTextTask):
         then return to host storage. If one kernel will not fit on that
         device, load the weights onto the task's mesh before quantizing them.
         """
-        from dew.training.quantization import quantize_for_serving
+        from dew.quantization import quantize_for_serving
 
         inputs = prepared_inputs(None, example, images=None)
         model, variables = quantize_for_serving(self.model, self.variables, spec,

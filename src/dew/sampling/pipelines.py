@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training.distributed import Layout, MeshSpec
-    from dew.training.quantization import Quantization
+    from dew.quantization import Quantization
 
 class _Default(Enum):
     """The sentinel that tells `guidance=None` from an omitted `guidance=`.
@@ -212,9 +212,9 @@ class TextToImage:
         """Return this task with its denoiser's weights quantized as `spec` says.
 
         The denoiser's matmuls then compute with the quantized weights
-        (`dew.training.quantization.quantize_for_serving`). The encoders and
+        (`dew.quantization.quantize_for_serving`). The encoders and
         the autoencoder keep their weights."""
-        from dew.training.quantization import quantize_for_serving
+        from dew.quantization import quantize_for_serving
 
         example = self.prepare("", key=0, steps=1)
         denoiser = {
