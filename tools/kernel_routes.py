@@ -52,8 +52,9 @@ def fixtures() -> dict[str, Path]:
 
 
 WIDTHS = ("head_dim", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim", "kv_lora_rank",
-          "global_head_dim")
-"""The head widths a family's reference config states, which kernels' shape rules read."""
+          "global_head_dim", "index_head_dim", "partial_rotary_factor")
+"""The head widths a family's reference config states, which kernels' shape rules read, and the rotary
+fraction of a head, which is stated against its width."""
 
 
 def published(config: dict) -> tuple[dict, bool]:
@@ -76,6 +77,11 @@ def published(config: dict) -> tuple[dict, bool]:
     if "head_dim" not in fixture and fixture.get(heads_key) and text.get(hidden_key) and text.get(heads_key):
         width = text.get("head_dim") or text[hidden_key] // text[heads_key]
         fixture[hidden_key] = fixture[heads_key] * width
+    # Widths a config states twice, derived from the ones above.
+    if "qk_head_dim" in fixture:
+        fixture["qk_head_dim"] = fixture.get("qk_nope_head_dim", 0) + fixture.get("qk_rope_head_dim", 0)
+    if "word_embed_proj_dim" in fixture:
+        fixture["word_embed_proj_dim"] = fixture[hidden_key]
     return ({**config, "text_config": fixture} if nested else fixture), True
 
 
