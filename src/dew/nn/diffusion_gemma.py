@@ -212,6 +212,13 @@ class DiffusionGemma(nn.Module):
         return self.clone(text=self.text.with_cache_capacity(capacity))
 
     @nn.nowrap
+    def projected(self, params, *, updated: bool):
+        """The text decoder's projection of its own parameters (`ProjectsParameters`)."""
+        if 'text' not in params:
+            return params
+        return {**params, 'text': self.text.projected(params['text'], updated=updated)}
+
+    @nn.nowrap
     def generation_refusal(self) -> str | None:
         return self.text.generation_refusal()
 

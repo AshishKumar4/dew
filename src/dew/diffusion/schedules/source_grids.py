@@ -46,6 +46,7 @@ class TabulatedVP(DiscreteNoiseScheduler):
 
     def __init__(self, betas: np.ndarray, *, final_alpha_cumprod: float, stride: int | None):
         super().__init__(betas, p2_loss_weight_gamma=0)
+        self.final_variances = (np.float32(final_alpha_cumprod), np.float32(1 - final_alpha_cumprod))
         self.final_rates = tuple(np.float32(np.sqrt(value))
                                  for value in (final_alpha_cumprod, 1 - final_alpha_cumprod))
         self.stride = stride
@@ -55,6 +56,12 @@ class TabulatedVP(DiscreteNoiseScheduler):
         index = jnp.clip(t.astype(jnp.int32), 0, self.T - 1)
         return (jnp.where(t < 0, self.final_rates[0], self.sqrt_alpha_cumprod[index]),
                 jnp.where(t < 0, self.final_rates[1], self.sqrt_one_minus_alpha_cumprod[index]))
+
+    def variances(self, t):
+        t = jnp.asarray(t, jnp.float32)
+        index = jnp.clip(t.astype(jnp.int32), 0, self.T - 1)
+        return (jnp.where(t < 0, self.final_variances[0], self.alpha_cumprod[index]),
+                jnp.where(t < 0, self.final_variances[1], self.one_minus_alpha_cumprod[index]))
 
     def model_time(self, t):
         return jnp.maximum(jnp.asarray(t, jnp.float32), 0.0)
