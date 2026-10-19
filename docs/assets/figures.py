@@ -758,7 +758,7 @@ def edm_noise_figure():
 
 
 def samplers_paths_figure():
-    """Euler and Heun on the probability-flow ODE of a five-point data set, against its exact path.
+    """Euler and Heun on the probability-flow ODE of a five-point data set, against a fine-step reference path.
 
     The data are five points on a circle, like petals, so the denoiser D(x; sigma), the mean of the data
     under the posterior, has a closed form. Both solvers take three steps down EDM's Karras grid (rho = 7)
