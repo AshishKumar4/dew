@@ -727,17 +727,13 @@ def element_factor(elements: int) -> float:
     return max(FACTOR, float(np.sqrt(stats.f.isf(FALSE_FAILURE / max(elements, 1), ORDERS, ORDERS))))
 
 
-def assert_elements_as_exact_over_orders(dew_squares, reference_squares, sizes, label: str, *,
-                                         reductions: int, dtype) -> None:
+def assert_elements_as_exact_over_orders(dew_squares, reference_squares, label: str) -> None:
     """Every element held over ORDERS rounding orders where the orders cannot all be kept:
     `dew_squares` and `reference_squares` `[rows, ...]` each element's squared distance from float64
-    summed over the ORDERS orders, and `sizes` `[rows]` each row's float64 size, which sizes its
-    elements where no terms do (`row_errors`). Each element's RMS over the orders within
-    `element_factor` of the reference's own, never below the rounding its computation allows a
-    correct run: `reductions` terms summed in `dtype`, sqrt(reductions) of its units of the row's size
-    (`reduction_bound`'s chain), so an element the reference happens to round exactly holds Dew to
-    a correct rounding of it, not to zero, and no element borrows its row's error. A non-finite
-    element fails, on either side."""
+    summed over the ORDERS orders. Each element's RMS over the orders within `element_factor` of the
+    reference's own at that element, and nothing else: no element borrows its row's error or a
+    rounding model's, and where the reference is exactly float64 in every order, Dew must be too. A
+    non-finite element fails, on either side."""
     dew_squares, reference_squares = (np.asarray(x, np.float64) for x in (dew_squares, reference_squares))
     assert dew_squares.shape == reference_squares.shape and dew_squares.ndim >= 2, (
         f"{label}: {dew_squares.shape} and {reference_squares.shape}, the rule takes [rows, ...] sums")
@@ -747,19 +743,15 @@ def assert_elements_as_exact_over_orders(dew_squares, reference_squares, sizes, 
     rows = dew_squares.shape[0]
     mine, theirs = (np.sqrt(squares.reshape(rows, -1) / ORDERS)
                     for squares in (dew_squares, reference_squares))
-    unit = float(np.finfo(np.dtype(dtype)).eps)
-    floor = np.sqrt(reductions) * unit * np.asarray(sizes, np.float64).reshape(rows, 1)
     factor = element_factor(mine.size)
-    bar = factor * np.maximum(theirs, floor)
-    failing = mine > bar
+    failing = mine > factor * theirs
     if np.any(failing):
-        ratios = np.where(bar > 0, mine / np.where(bar > 0, bar, 1), np.inf)
+        ratios = np.where(theirs > 0, mine / np.where(theirs > 0, theirs, 1), np.inf)
         at = np.unravel_index(int(np.argmax(ratios)), ratios.shape)
         raise AssertionError(
             f"{label}: {int(np.count_nonzero(failing))} of {mine.size} elements past the reference; the "
             f"worst, row {at[0]} element {at[1]}, is {mine[at]:.3e} from float64 (rms over {ORDERS} orders), "
-            f"the reference {theirs[at]:.3e} and its rounding floor {floor[at[0], 0]:.3e} (allowed "
-            f"{factor:.2f} times the larger)")
+            f"the reference {theirs[at]:.3e} (allowed {factor:.2f} times it)")
 
 
 def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, roundings: int) -> None:
