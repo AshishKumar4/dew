@@ -27,6 +27,7 @@ from dew.data.analysis import (
     _at,
     _cache_manifest,
     _capabilities,
+    _configured,
     _cut,
     _identity,
     _leaves,
@@ -60,7 +61,6 @@ from dew.data.pipeline import (
     Artifact,
     Batched,
     BatchStage,
-    Bound,
     Configured,
     Dataset,
     DeviceStep,
@@ -86,7 +86,6 @@ from dew.data.pipeline import (
     Shuffle,
     SingleReader,
     Slice,
-    Stage,
     TokenBudget,
     TokenGeometry,
     Volatile,
@@ -227,46 +226,6 @@ def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
                         "mixed corpora must share the tokenizer contract"
                     )
                 declared[key] = value
-
-
-def _configured(
-    pipeline: Pipeline,
-    shared: Mapping[str, object],
-    read: Read,
-    scope: Literal["source", "run"] | None = None,
-) -> Pipeline:
-    source = pipeline.source
-    if isinstance(source, (Mixture, Phases)):
-        children = tuple(_configured(child, shared, read, scope) for child in source.pipelines)
-        source = dataclasses.replace(source, pipelines=children)
-        local = shared
-    else:
-        local = source.metadata()
-    stages: list[Stage] = []
-    for stage in pipeline.stages:
-        if not isinstance(stage, Configured) or (scope is not None and stage.scope != scope):
-            stages.append(stage)
-            continue
-        metadata = shared if stage.scope == "run" else local
-        missing = sorted(set(stage.needs) - metadata.keys())
-        if missing:
-            raise ValueError(
-                f"{_name(pipeline)} step {_identity(stage).name} needs metadata {missing}; "
-                "provide producer metadata, recipe fields or read='memory'"
-            )
-        binding = Bound(stage, {key: metadata[key] for key in stage.needs})
-        resolved = stage.factory(metadata)
-        if isinstance(resolved, pygrain.RandomMapTransform) != stage.random:
-            raise ValueError(
-                f"Configured {_identity(stage).name} random={stage.random} disagrees with its step"
-            )
-        if isinstance(resolved, Expansion):
-            stages.append(FlatMap(resolved, configured=binding))
-        elif isinstance(resolved, pygrain.RandomMapTransform):
-            stages.append(RandomMap(resolved, rejects=_declares_rejects(resolved), configured=binding))
-        else:
-            stages.append(Map(resolved, rejects=_declares_rejects(resolved), configured=binding))
-    return dataclasses.replace(pipeline, source=source, stages=tuple(stages))
 
 
 def _row_tokens(pipeline: Pipeline) -> int | None:

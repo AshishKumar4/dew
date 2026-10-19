@@ -333,9 +333,17 @@ class _RandomSource:
         raise ValueError(self.refusal)
 
 
+_SELECTIONS = (_HashSource, _SliceRecords, _RandomSource)
+
+
+def selected(source: Source | Mixture | Phases) -> Source | Mixture | Phases:
+    """The store the holdout selections of `source` select from, which `rebased` replaces."""
+    return selected(source.source) if isinstance(source, _SELECTIONS) else source
+
+
 def rebased(source: Source | Mixture | Phases, replacement: Source) -> Source:
     """The holdout selections of `source` around its replacement."""
-    if isinstance(source, (_HashSource, _SliceRecords, _RandomSource)):
+    if isinstance(source, _SELECTIONS):
         return dataclasses.replace(source, source=rebased(source.source, replacement))
     return replacement
 
