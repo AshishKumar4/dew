@@ -22,7 +22,7 @@ import jax
 from jax.experimental import multihost_utils
 from packaging.version import Version
 
-from dew.cache import enable_compilation_cache
+from dew.cache import enable_compilation_cache, persist_compilations
 from dew.coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew.logging import configure as configure_logging
 from dew.pool import (
@@ -78,8 +78,10 @@ def prepare_process(wandb: Wandb | None = None,
     tracker. Only its offline switch is read, and it has to be read before
     wandb opens a run. `multi_host=True` requires a pool, False never joins
     one, and None joins the pool the environment describes, if any.
-    `compilation_cache_dir`, when set, turns on JAX's persistent compilation
-    cache in that directory.
+    `compilation_cache_dir` names the directory of JAX's persistent
+    compilation cache; without one the process caches under the user's cache
+    directory (`dew.cache.default_compilation_cache_dir`), and
+    JAX_ENABLE_COMPILATION_CACHE=false turns the cache off.
 
     `xla_flags` reaches XLA through the environment, which XLA reads when it
     opens a backend. So this call has to come before the first JAX call in
@@ -109,12 +111,16 @@ def prepare_process(wandb: Wandb | None = None,
 
 def ready_process() -> None:
     """What every Dew run needs of its process and `import dew` leaves alone: Dew's log handler
-    (`dew.logging.configure`), and the refusal of a machine with an NVIDIA GPU whose JAX opened
-    with none (`dew.telemetry.devices.refuse_cpu_only_jax`). `prepare_process` readies the process
-    once its flags are set and its pool joined, and `Trainer.fit` readies one no `prepare_process`
-    did; each step is idempotent."""
+    (`dew.logging.configure`), the refusal of a machine with an NVIDIA GPU whose JAX opened with
+    none (`dew.telemetry.devices.refuse_cpu_only_jax`), and the persistent compilation cache under
+    the user's cache directory (`dew.cache.persist_compilations`), which a run's own directory or
+    JAX_ENABLE_COMPILATION_CACHE=false leaves alone. `prepare_process` readies the process once its
+    flags are set and its pool joined, and `Trainer.fit` readies one no `prepare_process` did; each
+    step is idempotent. JAX fixes whether a process caches at its first compile, so a process that
+    compiled before `fit` readied it keeps what it had."""
     configure_logging()
     refuse_cpu_only_jax()
+    persist_compilations()
 
 
 def _set_environment(wandb: Wandb | None, xla_flags: str | None,

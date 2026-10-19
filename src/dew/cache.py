@@ -200,15 +200,18 @@ def measures_picks() -> bool:
 
 
 def persist_compilations() -> None:
-    """Point XLA at the on-disk executable cache, unless a directory is set.
+    """Point XLA at the on-disk executable cache, unless a directory is set or JAX's cache is
+    turned off.
 
-    A loaded task compiles for seconds the first time its shapes are seen
-    (a minute for a text-to-image sample on an A100), and a serving process
-    restarts. Training turns the same cache on in `prepare_process`; a task
-    turns it on where it is loaded, `dew.pipeline` or a saved run's record
-    (`dew.inference.tasks.run_record`). Reading the setting is what makes it
-    idempotent and what leaves a trainer's own directory, or a caller's, alone.
+    A run compiles its step for seconds to minutes, a loaded task the first time its shapes are
+    seen (a minute for a text-to-image sample on an A100), and every restart compiles them again
+    without it. A process Dew readies for training turns it on (`dew.training.runtime.
+    ready_process`, from `prepare_process` or the first `fit`), and a task where it is loaded,
+    `dew.pipeline` or a saved run's record (`dew.inference.tasks.run_record`). JAX's own switch,
+    JAX_ENABLE_COMPILATION_CACHE=false (`jax_enable_compilation_cache`), turns it off, and a
+    process pool whose processes key a step apart turns it off the same way. Reading the settings
+    is what makes it idempotent and what leaves a trainer's own directory, or a caller's, alone.
     """
-    if jax.config.jax_compilation_cache_dir:
+    if jax.config.jax_compilation_cache_dir or not jax.config.jax_enable_compilation_cache:
         return
     enable_compilation_cache(default_compilation_cache_dir())
