@@ -4,14 +4,16 @@
 published checkpoints' controls - `conv` as SANA 1.1's (strided convolutions,
 interpolation, multiscale attention) and `shuffle` as the `in-1.0` family's
 (pixel shuffles, resampling input and output blocks, batch norms, ReLU) -
-saves them with `save_pretrained`, and records in float32 the latent of a
+saves them with `save_pretrained`, and records the latent of a
 rectangular batch, the decode of a fixed latent, their vector-Jacobian
 products against fixed probes for the input and every parameter, and the
 encode and decode of a batch small enough for the quadratic attention path.
 
 Arrays are recorded channel-first; the tests move channels last. Parameter
 gradients are written back into the source layout through the same
-`WeightLayout`s an export uses. Every gap is scaled by max(1, |reference|).
+`WeightLayout`s an export uses. The writer walks each model in float64 too,
+over the same inputs and probes, and every output and gradient is held as
+exact as the float32 source, both from that walk (tests/reference_error.py).
 """
 
 import shutil
@@ -22,19 +24,17 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import (
+    assert_as_exact_as_the_source,
     assert_autoencoder_vjp,
     assert_layout_tensors,
     extract_fixture,
     fixture_arrays,
-    scaled_gap,
 )
 from safetensors.numpy import load_file, save_file
 
 from dew.nn.autoencoders.dc_ae import DCAE, load_dc_ae
 
 ROOT = Path(__file__).resolve().parents[1]
-FORWARD = 1e-5
-GRADIENT = 1e-4
 VARIANTS = ("conv", "shuffle")
 
 
@@ -73,10 +73,8 @@ def test_the_quadratic_attention_matches_the_source(variant):
     model = autoencoder.model
     latent = model.apply({"params": params}, channels_last(reference["small"]), method=model.encode)
     pixels = model.apply({"params": params}, channels_last(reference["small_code"]), method=model.decode)
-    gaps = {"encode": scaled_gap(latent, channels_last(reference["small_latent"])),
-            "decode": scaled_gap(pixels, channels_last(reference["small_pixels"]))}
-    print(f"quadratic gaps {gaps}")
-    assert max(gaps.values()) < FORWARD, gaps
+    assert_as_exact_as_the_source(latent, reference, "small_latent", channels_last)
+    assert_as_exact_as_the_source(pixels, reference, "small_pixels", channels_last)
 
 
 def test_encoder_gradients_match_the_source(variant):
@@ -85,8 +83,8 @@ def test_encoder_gradients_match_the_source(variant):
     latent = assert_autoencoder_vjp(
         "encode", lambda params, image: model.apply({"params": params}, image, method=model.encode), params,
         channels_last(reference["image"]), [channels_last(reference["probe_latent"])], parameters(layouts),
-        reference, channels_last(reference["encode.grad_image"]), GRADIENT)
-    assert scaled_gap(latent, channels_last(reference["latent"])) < FORWARD
+        reference, "image", channels_last)
+    assert_as_exact_as_the_source(latent, reference, "latent", channels_last)
 
 
 def test_decoder_gradients_match_the_source(variant):
@@ -95,8 +93,8 @@ def test_decoder_gradients_match_the_source(variant):
     pixels = assert_autoencoder_vjp(
         "decode", lambda params, code: model.apply({"params": params}, code, method=model.decode), params,
         channels_last(reference["code"]), [channels_last(reference["probe"])], parameters(layouts), reference,
-        channels_last(reference["decode.grad_code"]), GRADIENT)
-    assert scaled_gap(pixels, channels_last(reference["pixels"])) < FORWARD
+        "code", channels_last)
+    assert_as_exact_as_the_source(pixels, reference, "pixels", channels_last)
 
 
 def test_the_autoencoder_scales_as_the_pipeline_does(variant):

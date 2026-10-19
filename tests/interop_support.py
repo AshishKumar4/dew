@@ -11,6 +11,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
 
 
 def extract_fixture(archive: Path, directory: Path) -> Path:
@@ -112,13 +113,21 @@ def scaled_gap(actual, expected) -> float:
     return float(difference / max(1.0, float(np.abs(expected).max())))
 
 
-def assert_autoencoder_vjp(walk: str, call, params, operand, probes, layouts, reference, operand_gradient,
-                           bound: float):
+def assert_as_exact_as_the_source(value, reference, key: str, layout=np.asarray) -> None:
+    """`value` as exact as a reference writer's float32 `reference[key]`, both from its float64
+    `reference["fp64." + key]` (`reference_vjp.twice`), each read through `layout`."""
+    assert_as_exact_as_the_reference(np.asarray(value, np.float64), layout(reference[key]),
+                                     layout(reference[f"fp64.{key}"]), key)
+
+
+def assert_autoencoder_vjp(walk: str, call, params, operand, probes, layouts, reference, operand_name: str,
+                           layout=np.asarray):
     """A source autoencoder's recorded vector-Jacobian product of one `walk`: `call(params, operand)`'s
     outputs dotted with `probes`, differentiated for the operand and the parameters. The operand's
-    gradient is held to the source's `operand_gradient`, and each of `layouts`' parameters' gradient,
-    written into its source tensor's layout as an export writes it, to the source's
-    `{walk}.grad.<tensor>`, each within `bound` (`scaled_gap`). Returns the outputs."""
+    gradient is as exact as the source's `{walk}.grad_{operand_name}` (read through `layout`), and
+    each of `layouts`' parameters' gradient, written into its source tensor's layout as an export
+    writes it, as the source's `{walk}.grad.<tensor>`, each from the source's float64 one
+    (`assert_as_exact_as_the_source`, tests/reference_error.py). Returns the outputs."""
     def objective(params, operand):
         outputs = call(params, operand)
         return sum(jnp.sum(output * probe) for output, probe in
@@ -126,14 +135,13 @@ def assert_autoencoder_vjp(walk: str, call, params, operand, probes, layouts, re
 
     (_, outputs), (grad_params, grad_operand) = jax.value_and_grad(objective, argnums=(0, 1), has_aux=True)(
         params, operand)
-    operand_gap = scaled_gap(grad_operand, operand_gradient)
-    gaps = {layout.name: scaled_gap(layout.export({"autoencoder": grad_params}),
-                                    reference[f"{walk}.grad.{layout.name.removeprefix('vae/')}"])
-            for layout in layouts}
-    worst = max(gaps, key=lambda name: gaps[name])
-    print(f"{walk}: input gradient gap {operand_gap:.3g}; worst parameter {worst} {gaps[worst]:.3g}")
-    assert operand_gap < bound
-    assert gaps[worst] < bound, worst
+    assert_as_exact_as_the_source(grad_operand, reference, f"{walk}.grad_{operand_name}", layout)
+    tensors = {layout.name.removeprefix("vae/"): layout for layout in layouts}
+    assert_leaves_as_exact(
+        {tensor: np.asarray(layout.export({"autoencoder": grad_params}), np.float64)
+         for tensor, layout in tensors.items()},
+        {tensor: reference[f"{walk}.grad.{tensor}"] for tensor in tensors},
+        {tensor: reference[f"fp64.{walk}.grad.{tensor}"] for tensor in tensors})
     return outputs
 
 

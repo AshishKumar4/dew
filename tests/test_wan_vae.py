@@ -5,14 +5,15 @@ published architecture's controls (four levels, time halved at the second
 and third downsampling, the mid-block attention), saves it with
 `save_pretrained`, and runs it as `WanPipeline` does: the encoder over a
 nine-frame video in the source's causal chunks, the decoder one latent frame
-at a time. It records in float32 the posterior of a rectangular batch, the
-decode of a fixed three-frame latent, the vector-Jacobian products of both
-against fixed probes for the input and every parameter, and the posterior
-of the first frame alone.
+at a time. It records in float32 and float64 the posterior of a rectangular
+batch, the decode of a fixed three-frame latent, the vector-Jacobian products
+of both against fixed probes for the input and every parameter, and the
+posterior of the first frame alone.
 
 Arrays are recorded `[B, C, T, H, W]`; the tests move channels last.
 Parameter gradients are written back into the source layout through the
-same `WeightLayout`s an export uses. Every gap is scaled by max(1, |reference|).
+same `WeightLayout`s an export uses. Every output and gradient is as exact as
+the float32 source, both from its float64 walk (tests/reference_error.py).
 """
 
 import json
@@ -24,11 +25,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import (
+    assert_as_exact_as_the_source,
     assert_autoencoder_vjp,
     assert_layout_tensors,
     extract_fixture,
     fixture_arrays,
-    scaled_gap,
 )
 from reference_error import assert_as_exact_as_the_reference
 
@@ -36,8 +37,6 @@ from dew.interop.diffusion import component_tensors
 from dew.nn.autoencoders.wan import chunked_decode, chunked_moments, load_wan_vae
 
 ROOT = Path(__file__).resolve().parents[1]
-FORWARD = 1e-5
-GRADIENT = 1e-4
 
 
 @pytest.fixture(scope="module")
@@ -88,10 +87,8 @@ def test_the_posterior_of_a_video_matches_the_source(loaded, reference):
     autoencoder, params, _, _ = loaded
     mean, std = posterior(autoencoder.model, params, channels_last(reference["video"]))
     assert mean.shape == (2, 3, 4, 6, 4)
-    gaps = {"mean": scaled_gap(mean, channels_last(reference["mean"])),
-            "std": scaled_gap(std, channels_last(reference["std"]))}
-    print(f"posterior gaps {gaps}")
-    assert max(gaps.values()) < FORWARD, gaps
+    assert_as_exact_as_the_source(mean, reference, "mean", channels_last)
+    assert_as_exact_as_the_source(std, reference, "std", channels_last)
 
 
 def test_an_image_is_the_one_frame_video(loaded, reference):
@@ -99,7 +96,7 @@ def test_an_image_is_the_one_frame_video(loaded, reference):
     model = autoencoder.model
     first = channels_last(reference["video"])[:, :1]
     latent = model.apply({"params": params}, first, method=model.encode)
-    assert scaled_gap(latent, channels_last(reference["image_mean"])) < FORWARD
+    assert_as_exact_as_the_source(latent, reference, "image_mean", channels_last)
     # The batch path runs the model jitted and the reference path op by op;
     # XLA fuses them differently, a float32 rounding apart.
     np.testing.assert_allclose(
@@ -114,9 +111,7 @@ def test_the_decode_matches_the_source(loaded, reference):
     model = autoencoder.model
     pixels = model.apply({"params": params}, channels_last(reference["latent"]), method=model.decode)
     assert pixels.shape == (2, 9, 32, 48, 3)
-    gap = scaled_gap(pixels, channels_last(reference["pixels"]))
-    print(f"decode gap {gap:.3g}")
-    assert gap < FORWARD
+    assert_as_exact_as_the_source(pixels, reference, "pixels", channels_last)
     assert float(jnp.abs(pixels).max()) <= 1.0
 
 
@@ -198,31 +193,37 @@ def test_the_autoencoder_walks_in_chunks_and_holds_one_chunk(loaded):
 def test_the_published_vae_matches_the_source():
     """`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`'s VAE, downloaded, encodes a smooth
     nine-frame 128x192 clip and decodes its posterior mean as diffusers'
-    `AutoencoderKLWan` does."""
-    torch = pytest.importorskip("torch")
-    diffusers = pytest.importorskip("diffusers")
+    `AutoencoderKLWan` does: each as exact as diffusers' float32 walk, both
+    from its float64 walk, which decodes the float64 mean."""
+    import contextlib
+
+    import diffusers
+    import torch
     from huggingface_hub import snapshot_download
+
+    from tools.diffusers_wan_reference import float64
 
     path = snapshot_download("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", allow_patterns=["vae/*"])
     t, y, x = np.mgrid[0:9, 0:128, 0:192] / np.array([4.0, 32.0, 32.0])[:, None, None, None]
     video = np.stack([np.sin(x + y + t), np.cos(2 * x - y - 0.5 * t), np.sin(3 * y + t) * np.cos(x)])[None]
     video = (0.8 * video + 0.05 * np.random.default_rng(0).standard_normal(video.shape)).astype(np.float32)
-    with torch.no_grad():
-        source = diffusers.AutoencoderKLWan.from_pretrained(path, subfolder="vae").eval()
-        expected_mean = source.encode(torch.from_numpy(video)).latent_dist.mean
-        expected_pixels = source.decode(expected_mean).sample.numpy()
-        expected_mean = expected_mean.numpy()
-    del source
 
+    def walked(dtype):
+        with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
+            source = diffusers.AutoencoderKLWan.from_pretrained(path, subfolder="vae").to(dtype).eval()
+            mean = source.encode(torch.from_numpy(video).to(dtype)).latent_dist.mean
+            return {"mean": mean.double().numpy(), "pixels": source.decode(mean).sample.double().numpy()}
+
+    expected, truth = walked(torch.float32), walked(torch.float64)
     autoencoder, params, _, _ = load_wan_vae(path, jnp.float32)
     model = autoencoder.model
     mean = model.apply({"params": params}, channels_last(video), method=model.encode)
-    pixels = model.apply({"params": params}, channels_last(expected_mean), method=model.decode)
-    gaps = {"mean": scaled_gap(mean, channels_last(expected_mean)),
-            "pixels": scaled_gap(pixels, channels_last(expected_pixels))}
-    print(f"published VAE gaps {gaps}")
+    pixels = model.apply({"params": params}, channels_last(expected["mean"].astype(np.float32)),
+                         method=model.decode)
     assert mean.shape == (1, 3, 16, 24, 16)
-    assert max(gaps.values()) < FORWARD, gaps
+    for name, value in (("mean", mean), ("pixels", pixels)):
+        assert_as_exact_as_the_reference(np.asarray(value, np.float64), channels_last(expected[name]),
+                                         channels_last(truth[name]), f"published {name}")
 
 
 def test_encoder_gradients_match_the_source(loaded, reference):
@@ -231,7 +232,7 @@ def test_encoder_gradients_match_the_source(loaded, reference):
         "encode", lambda params, video: posterior(autoencoder.model, params, video), params,
         channels_last(reference["video"]),
         [channels_last(reference[f"probe_{name}"]) for name in ("mean", "std")], layouts, reference,
-        channels_last(reference["encode.grad_video"]), GRADIENT)
+        "video", channels_last)
 
 
 def test_decoder_gradients_match_the_source(loaded, reference):
@@ -240,23 +241,19 @@ def test_decoder_gradients_match_the_source(loaded, reference):
     assert_autoencoder_vjp(
         "decode", lambda params, latent: model.apply({"params": params}, latent, method=model.decode), params,
         channels_last(reference["latent"]), [channels_last(reference["probe"])], layouts, reference,
-        channels_last(reference["decode.grad_latent"]), GRADIENT)
+        "latent", channels_last)
 
 
 def test_a_bfloat16_walk_matches_the_sources_bfloat16_walk(source):
     """The fixture VAE in bfloat16 against diffusers 0.34.0's own bfloat16
     walk of it (`wan_vae_bf16.npz`, the reference tool's `bfloat16` mode):
     the posterior and decode of one bfloat16 video and latent, and their
-    input gradients. Each differs from the source by less than one bfloat16
-    rounding of its scale on average, and by at most 2^-3 of it anywhere.
+    input gradients, each as exact as the source's bfloat16 one, both from
+    the source's float64 walk of the same inputs and probes.
 
-    The norm computes `F.normalize` in float32 and rounds once. Against this
-    record its mean gaps are mean 1.87e-3, std 8.8e-4, pixels 3.28e-3, video
-    gradient 7.6e-5 and latent gradient 1.28e-2, where the earlier bfloat16
-    reduction gave 1.99e-3, 9.8e-4, 3.40e-3, 8.0e-5 and 1.73e-2. Averaged
-    over four more seeds it is closer to both 0.34.0 and 0.40.0 (which
-    normalizes in float32 too) on every output and on the encoder's
-    parameter gradients.
+    The norm computes `F.normalize` in float32 and rounds once, as both
+    diffusers 0.34.0 and 0.40.0 do; the earlier bfloat16 reduction sat
+    further from the source on every output.
     """
     record = dict(np.load(ROOT / "tests/fixtures/wan_vae_bf16.npz"))
     autoencoder, params, _, _ = load_wan_vae(source, jnp.bfloat16)
@@ -281,17 +278,7 @@ def test_a_bfloat16_walk_matches_the_sources_bfloat16_walk(source):
             "encode.grad_video": jax.jit(jax.grad(objective))(walked("video")),
             "decode.grad_latent": jax.jit(jax.grad(decode_objective))(walked("latent"))}
     for name, value in ours.items():
-        expected = channels_last(record[name]).astype(np.float64)
-        difference = np.abs(np.asarray(value, np.float64) - expected)
-        scale = max(1.0, float(np.abs(expected).max()))
-        print(f"{name}: mean gap {difference.mean():.3g}, scaled max {difference.max() / scale:.3g}")
-        # 2^-8 is bfloat16's unit roundoff: within one rounding of the
-        # output's scale on average. 2^-3 is twice the largest scaled gap any
-        # output reached over four other seeds (6.1e-2, the latent gradient),
-        # rounded up to a power of two. Normalizing over another axis, or
-        # dropping the sqrt(C) scale, fails the first at every output.
-        assert difference.mean() / scale < 2.0 ** -8, name
-        assert difference.max() / scale < 2.0 ** -3, name
+        assert_as_exact_as_the_source(value, record, name, channels_last)
 
 
 def test_the_autoencoder_normalizes_as_the_pipeline_does(loaded, reference):

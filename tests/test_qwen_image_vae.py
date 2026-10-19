@@ -4,14 +4,15 @@
 published architecture's controls (residual stack, RGBA, four spatial
 halvings, the published temporal flags), saves it with `save_pretrained`, and
 walks it the way `QwenImage21Pipeline` walks one frame, recording in float32
-the posterior mean and standard deviation for a rectangular RGBA batch, the
+and float64 the posterior mean and standard deviation for a rectangular RGBA batch, the
 decode of a fixed latent, and the vector-Jacobian products of both against
 fixed probes for the input and every parameter.
 
 Arrays are recorded channel-first with the frame axis dropped; the tests move
 channels last. Parameter gradients are written back into the source layout
 through the same `WeightLayout`s an export uses, so each is compared against
-the source tensor it names. Every gap is scaled by max(1, |reference|).
+the source tensor it names. Every output and gradient is as exact as the
+float32 source, both from its float64 walk (tests/reference_error.py).
 """
 
 import json
@@ -23,19 +24,17 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import (
+    assert_as_exact_as_the_source,
     assert_autoencoder_vjp,
     assert_layout_tensors,
     extract_fixture,
     fixture_arrays,
-    scaled_gap,
 )
 
 from dew.interop.diffusion import component_tensors
 from dew.nn.autoencoders.qwen_image import load_qwen_image_vae
 
 ROOT = Path(__file__).resolve().parents[1]
-FORWARD = 1e-5
-GRADIENT = 1e-4
 
 
 @pytest.fixture(scope="module")
@@ -92,10 +91,8 @@ def test_the_posterior_matches_the_source(loaded, reference):
     image = channels_last(reference["image"])
     mean, std = posterior(model, params, image)
     assert mean.shape == (2, 2, 3, 8)
-    gaps = {"mean": scaled_gap(mean, channels_last(reference["mean"])),
-            "std": scaled_gap(std, channels_last(reference["std"]))}
-    print(f"posterior gaps {gaps}")
-    assert max(gaps.values()) < FORWARD, gaps
+    assert_as_exact_as_the_source(mean, reference, "mean", channels_last)
+    assert_as_exact_as_the_source(std, reference, "std", channels_last)
     latent = model.apply({"params": params}, image, method=model.encode)
     assert np.array_equal(np.asarray(latent), np.asarray(mean))
 
@@ -108,8 +105,8 @@ def test_a_sampled_latent_is_the_mean_plus_std_times_the_draw(loaded, reference)
     mean, std = posterior(model, params, image)
     sampled = model.apply({"params": params}, image, key, method=model.encode)
     expected = mean + std * jax.random.normal(key, mean.shape, mean.dtype)
-    assert scaled_gap(sampled, expected) < 1e-6
-    assert scaled_gap(sampled, mean) > 1e-2
+    np.testing.assert_array_equal(np.asarray(sampled), np.asarray(expected))
+    assert not np.array_equal(np.asarray(sampled), np.asarray(mean))
 
 
 def test_the_decode_matches_the_source(loaded, reference):
@@ -117,9 +114,7 @@ def test_the_decode_matches_the_source(loaded, reference):
     model = autoencoder.model
     pixels = model.apply({"params": params}, channels_last(reference["latent"]), method=model.decode)
     assert pixels.shape == (2, 32, 48, 4)
-    gap = scaled_gap(pixels, channels_last(reference["pixels"]))
-    print(f"decode gap {gap:.3g}")
-    assert gap < FORWARD
+    assert_as_exact_as_the_source(pixels, reference, "pixels", channels_last)
     assert float(jnp.abs(pixels).max()) <= 1.0
 
 
@@ -129,7 +124,7 @@ def test_encoder_gradients_match_the_source(loaded, reference):
         "encode", lambda params, image: posterior(autoencoder.model, params, image), params,
         channels_last(reference["image"]),
         [channels_last(reference[f"probe_{name}"]) for name in ("mean", "std")], layouts, reference,
-        channels_last(reference["encode.grad_image"]), GRADIENT)
+        "image", channels_last)
 
 
 def test_decoder_gradients_match_the_source(loaded, reference):
@@ -138,7 +133,7 @@ def test_decoder_gradients_match_the_source(loaded, reference):
     assert_autoencoder_vjp(
         "decode", lambda params, latent: model.apply({"params": params}, latent, method=model.decode), params,
         channels_last(reference["latent"]), [channels_last(reference["probe"])], layouts, reference,
-        channels_last(reference["decode.grad_latent"]), GRADIENT)
+        "latent", channels_last)
 
 
 def test_the_autoencoder_normalizes_as_the_pipeline_does(loaded, reference):
