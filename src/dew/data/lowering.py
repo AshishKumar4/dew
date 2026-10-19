@@ -434,12 +434,58 @@ def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
     """`documents` packed by Grain's own packer for the stage's policy."""
     sizes = dict.fromkeys(stage.fields, stage.seq_len) | dict(stage.along)
     if stage.policy == "concat":
-        return gx.ConcatThenSplitIterDataset(documents, length_struct=sizes)
+        cut = _OverlappedCuts(documents, stage) if stage.overlap else documents
+        return gx.ConcatThenSplitIterDataset(cut, length_struct=sizes)
     packer = gx.FirstFitPackIterDataset if stage.policy == "first-fit" else gx.BestFitPackIterDataset
     # Fields cut alike with the first share its segments and positions, as the indexed planner's
     # windows do (`packed_window`), so Grain writes no copy of them for the rest.
     return packer(documents, length_struct=sizes, num_packing_bins=stage.bins, shuffle_bins=False,
                   max_sequences_per_bin=stage.segments, meta_features=stage.fields[1:])
+
+
+class _OverlappedCuts(pygrain.IterDataset):
+    """Documents as a concatenating pack (`Pack.overlap`) reads them: the tokens before each cut
+    through a document written again after it, so the window the cut ends and the next both hold
+    them. Grain's concatenating packer cuts the documents it joins every `seq_len` tokens, so how
+    full this stream leaves its window places the next cut."""
+
+    def __init__(self, parent: pygrain.IterDataset, stage: Pack):
+        super().__init__(parent)
+        self._documents, self._stage = parent, stage
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        return _OverlappedCutsIterator(self._documents.__iter__(), self._stage)
+
+
+class _OverlappedCutsIterator(pygrain.DatasetIterator):
+    """Each document with its cuts overlapped, and where the last one left its window: the room
+    left in it, saved with the parent's position."""
+
+    def __init__(self, parent: pygrain.DatasetIterator, stage: Pack):
+        super().__init__(parent)
+        self._documents, self._stage = parent, stage
+        self._room = stage.seq_len
+
+    def __next__(self) -> Batch:
+        document = next(self._documents)
+        count = len(document[self._stage.fields[0]])
+        pieces, start, room = [], 0, self._room
+        while count - start > room:
+            pieces.append(slice(start, start + room))
+            start, room = max(start + room - self._stage.overlap, 0), self._stage.seq_len
+        pieces.append(slice(start, count))
+        self._room = room - (count - start) or self._stage.seq_len
+        if len(pieces) == 1:
+            return document
+        return {name: np.concatenate([value[piece] for piece in pieces]) if name in self._stage.fields
+                else value for name, value in document.items()}
+
+    def get_state(self) -> dict[str, object]:
+        return {"documents": self._documents.get_state(), "room": self._room}
+
+    def set_state(self, state: dict[str, object]) -> None:
+        self._documents.set_state(state["documents"])
+        self._room = integer(state["room"], "packed window room")
 
 
 @overload

@@ -2,6 +2,8 @@
 windows `grain.experimental.FirstFitPackIterDataset` packs, and a memory read
 packs by the stage's policy as an indexed read does."""
 
+import itertools
+
 import grain
 import jax
 import numpy as np
@@ -81,16 +83,17 @@ def test_planned_windows_are_grains_first_fit_windows(window, bins, segments):
     assert data.plan.derived["0/valid_targets"] == fingerprint(sum(targets))
 
 
-@pytest.mark.parametrize("policy", ["first-fit", "best-fit", "concat"])
-def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy):
+@pytest.mark.parametrize("policy, overlap", [("first-fit", 0), ("best-fit", 0), ("concat", 0), ("concat", 1)])
+def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy, overlap):
     """read='memory' packs the whole corpus before the order and an indexed
     read packs it as it streams. Both follow the stage's policy, so a pass
     over either is the same windows, segment ids and positions in the same
-    order; first-fit, which has its own plan, is the control."""
+    order, a concatenating pack whose cuts overlap too; first-fit, which has
+    its own plan, is the control."""
     lengths = (3, 7, 2, 5, 8, 4, 6, 2, 8, 3)
     documents = [{"text": (np.arange(length) + 100 * index).astype(np.int32)}
                  for index, length in enumerate(lengths)]
-    pipeline = Pipeline(Memory(documents)).pack(8, bins=3, policy=policy)
+    pipeline = Pipeline(Memory(documents)).pack(8, bins=3, policy=policy, overlap=overlap)
 
     def windows(read):
         reader = validation(pipeline, batch=2, read=read, loading=READ)(DataPartition())
@@ -104,6 +107,59 @@ def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy):
 
     memory = windows("memory")
     assert memory and memory == windows("indexed")
+
+
+def pairs(batch, field="text"):
+    """The next-token pairs of `field` inside one segment of each window of a packed batch."""
+    tokens, segments = np.asarray(batch[field]), np.asarray(batch["text_coordinates"].segments)
+    return [(int(row[at]), int(row[at + 1])) for row, segment in zip(tokens, segments, strict=True)
+            for at in range(row.size - 1) if segment[at] and segment[at] == segment[at + 1]]
+
+
+def leaves(stream, batches):
+    """The arrays of the next `batches` batches of `stream`, the windows' coordinates among them."""
+    return [[np.asarray(value).tolist() for value in jax.tree.leaves(batch)]
+            for batch in itertools.islice(stream, batches)]
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_concatenating_pack_that_overlaps_its_cuts_keeps_every_pair_and_resumes(read):
+    """A concatenating pack whose cuts overlap by a token (`Pack.overlap`) starts each window again
+    at the last token a cut through a document left behind, in every field alike: a pass holds
+    every next-token pair of every document once, each field's its own documents'. How full it
+    left its window is saved with its position, so a resumed run reads the windows the
+    uninterrupted one reads."""
+    lengths = (3, 7, 2, 5, 8, 4, 6, 2, 8, 3, 17)
+    documents = [{"text": (np.arange(length) + 100 * index).astype(np.int32),
+                  "text_roles": (np.arange(length) + 1000 * index).astype(np.int32)}
+                 for index, length in enumerate(lengths)]
+    pipeline = Pipeline(Memory(documents)).pack(8, fields=FIELDS, policy="concat", overlap=1)
+    reader = validation(pipeline, batch=2, read=read, loading=READ)(DataPartition())
+    try:
+        held = list(reader)
+    finally:
+        reader.close()
+    for field in FIELDS:
+        expected = [pair for document in documents for pair in itertools.pairwise(document[field].tolist())]
+        assert sorted(pair for batch in held for pair in pairs(batch, field)) == sorted(expected)
+    data = compile(pipeline.repeat().batch(2), read=read, loading=READ)
+    whole = data.train(DataPartition())
+    try:
+        expected = leaves(whole, 8)
+    finally:
+        whole.close()
+    stopped = data.train(DataPartition())
+    try:
+        head = leaves(stopped, 3)
+        saved = stopped.get_state()
+    finally:
+        stopped.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert head + leaves(resumed, 5) == expected
+    finally:
+        resumed.close()
 
 
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
