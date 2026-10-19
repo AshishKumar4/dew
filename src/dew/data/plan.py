@@ -163,6 +163,36 @@ def _changed(saved: Mapping[str, object], current: Mapping[str, object]) -> tupl
     return tuple(name for name in sorted(set(saved) | set(current)) if saved.get(name) != current.get(name))
 
 
+def _identities(value: object) -> list[dict[str, JSON]]:
+    if not isinstance(value, list):
+        raise ValueError(f"{value!r}: a manifest's steps are a list of step identities")
+    return [{name: json_value(entry, name) for name, entry in record(step, "step").items()} for step in value]
+
+
+def _semantic(recorded: Mapping[str, object]) -> dict[str, JSON]:
+    """What the rows a manifest's record (`Manifest.record`) names are, on
+    any host: the pinned sources, each step's identity and dependencies
+    (`StepIdentity.semantic`), the tokenizers and the fill."""
+    return {
+        name: [{key: entry for key, entry in step.items() if key != "modules"} for step in _identities(value)]
+        if name == "steps" else json_value(value, name)
+        for name, value in recorded.items()
+        if name not in (*_ENVIRONMENT, "ran")
+    }
+
+
+def _environment(recorded: Mapping[str, object]) -> dict[str, JSON]:
+    """The code and machine that ran a manifest's steps, from its record:
+    Dew's revision and lock, the interpreter, the platform and each external
+    module's bytes, for the steps a memory read ran and then the plan's own.
+    A step states a change to what it computes in its configuration or
+    declared identity; its modules' bytes change with any edit to their
+    files, as Dew's revision does with any edit to Dew."""
+    steps = (*_identities(recorded["ran"]), *_identities(recorded["steps"]))
+    return {**{name: json_value(recorded[name], name) for name in _ENVIRONMENT},
+            "modules": [step["modules"] for step in steps]}
+
+
 @dataclasses.dataclass(frozen=True)
 class Manifest:
     """The dependency manifest shared by an execution plan and its cache.
@@ -262,25 +292,10 @@ class Manifest:
         return recorded
 
     def semantic(self) -> dict[str, JSON]:
-        """What the rows are, on any host: the pinned sources, each step's
-        identity and dependencies (`StepIdentity.semantic`), the tokenizers
-        and the fill."""
-        recorded = self.record()
-        recorded["steps"] = [step.semantic() for step in self.steps]
-        return {name: value for name, value in recorded.items() if name not in (*_ENVIRONMENT, "ran")}
+        return _semantic(self.record())
 
     def environment(self) -> dict[str, JSON]:
-        """The code and machine that ran the steps: Dew's revision and lock,
-        the interpreter, the platform and each external module's bytes, for
-        the steps a memory read ran and then the plan's own. A step states a
-        change to what it computes in its configuration or declared identity;
-        its modules' bytes change with any edit to their files, as Dew's
-        revision does with any edit to Dew."""
-        recorded = self.record()
-        return {
-            **{name: recorded[name] for name in _ENVIRONMENT},
-            "modules": [list(step.modules) for step in (*self.ran, *self.steps)],
-        }
+        return _environment(self.record())
 
     @property
     def canonical(self) -> bytes:
