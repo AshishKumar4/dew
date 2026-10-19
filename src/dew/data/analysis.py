@@ -57,7 +57,7 @@ from dew.data.pipeline import (
     Windows,
     Workers,
 )
-from dew.data.plan import Manifest, StepIdentity, fingerprint
+from dew.data.plan import Manifest, StepIdentity
 from dew.data.sources.base import READS, Read, Source
 from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
@@ -311,30 +311,6 @@ def _member_keys(members: Sequence[str]) -> list[str]:
     member leaves them as they were."""
     return [f"{sum(earlier == name for earlier in members[:index])}:{name}"
             for index, name in enumerate(members)]
-
-
-def _member_manifests(pipeline: Pipeline) -> dict[str, str]:
-    """What each member of a mixture reads and runs, its sources' content and its steps, as one digest
-    under its key (`_member_keys`), and under the empty key the mixture's own stages: what a saved
-    position of a streamed mix keeps of each member, so a resume takes its members' edits
-    (`dew.data.plan.Plan.check`). Nothing for a pipeline that mixes nothing."""
-    source = pipeline.source
-    if not isinstance(source, Mixture):
-        return {}
-
-    def digest(stages: Iterator[Stage], sources: Sequence[Source] = ()) -> str:
-        # What the member computes and the code that computes it, whose bytes a resume of a
-        # per-share plan holds as it holds the plan's (`Plan.check`).
-        steps = [*(_identity(stage) for read in sources for stage in _written(read, ())),
-                 *(_identity(stage) for stage in stages if not isinstance(stage, (Workers, Prefetch)))]
-        return fingerprint({"sources": [read.fingerprint() for read in sources],
-                            "steps": [step.semantic() for step in steps],
-                            "modules": [list(step.modules) for step in steps]})
-
-    keys = _member_keys(_members(source.pipelines))
-    return {"": digest(iter(pipeline.stages)),
-            **{key: digest(_steps(child), [read for _, read in _leaves(child)])
-               for key, child in zip(keys, source.pipelines, strict=True)}}
 
 
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:

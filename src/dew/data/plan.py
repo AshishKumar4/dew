@@ -309,16 +309,16 @@ def same_order(saved: str, current: str) -> bool:
     """Whether two orders, as a saved position and a stream state them in JSON, are one order:
     compared without their sources' descriptions, which name where a host mounted them, as a
     pool compares its processes' orders (`Plan.identity`)."""
-    return _unplaced(json.loads(saved)) == _unplaced(json.loads(current))
+    return unplaced(json.loads(saved)) == unplaced(json.loads(current))
 
 
-def _unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
+def unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
     """`order` without its sources' descriptions, which name where a host
     mounted them, its corpora's and phases' included."""
     if isinstance(order, dict):
-        return {name: _unplaced(value) for name, value in order.items() if name != "source"}
+        return {name: unplaced(value) for name, value in order.items() if name != "source"}
     if isinstance(order, list):
-        return [_unplaced(value) for value in order]
+        return [unplaced(value) for value in order]
     return order
 
 
@@ -374,7 +374,7 @@ class Plan:
         which part differs. The order's sources are named by the manifest's
         content, not by their descriptions: hosts that mount one dataset at
         different paths read the same records."""
-        order = _unplaced(json_value(self.order, "order"))
+        order = unplaced(json_value(self.order, "order"))
         return f"{json.dumps(order, sort_keys=True)} under plan {json.dumps(self.parts(), sort_keys=True)}"
 
     def parts(self) -> dict[str, JSON]:
@@ -410,25 +410,27 @@ class Plan:
             raise ValueError(
                 "data plan contains a step without stable identity; resume='non-exact' is required"
             )
-        for name in ("lowering", "rejections", "cache", "volatile"):
-            if current[name] != saved.get(name):
-                raise ValueError(f"saved data plan {name} changed: {saved.get(name)!r} -> {current[name]!r}")
         edited = self._edited_members(saved)
+        # A mix whose members changed is compared member by member (`_edited_members`): each kept
+        # member's order, sources, steps, facts and caches are its digest's, and the rest is the
+        # mixture's.
+        member_scoped = () if edited is None else ("cache",)
+        for name in ("lowering", "rejections", "cache", "volatile"):
+            if name not in member_scoped and current[name] != saved.get(name):
+                raise ValueError(f"saved data plan {name} changed: {saved.get(name)!r} -> {current[name]!r}")
         # An order is the same wherever its sources are mounted (`same_order`).
-        saved_order = _unplaced(json_value(saved.get("order"), "saved order"))
-        if edited is None and saved_order != _unplaced(current["order"]):
+        saved_order = unplaced(json_value(saved.get("order"), "saved order"))
+        if edited is None and saved_order != unplaced(current["order"]):
             raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> {current['order']!r}")
         previous = record(saved.get("derived", {}), "saved derived order")
-        for name in sorted(set(previous) | set(self.derived)):
+        for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
             if previous.get(name) != self.derived.get(name):
                 raise ValueError(f"saved data plan derived order {name} changed")
         if self.lowering == "per-share" and current["topology"] != saved.get("topology"):
             raise ValueError("saved per-share data plan topology changed (shares, workers or cycle length)")
         changed = _changed(record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic())
         if edited is not None:
-            # The members' sources and steps are each member's own digest, which `_edited_members`
-            # compared; the rest of the manifest is the mixture's.
-            changed = tuple(name for name in changed if name not in ("source", "steps"))
+            changed = tuple(name for name in changed if name not in ("source", "steps", "tokenizer"))
         if changed:
             raise ValueError(
                 f"saved data plan {', '.join(changed)} changed, so the records the saved position counts "
@@ -437,7 +439,6 @@ class Plan:
         environment = self.manifest.environment()
         saved_environment = record(saved.get("environment"), "saved data environment")
         if edited is not None:
-            # Each kept member's modules are its own digest's, which `_edited_members` compared.
             environment = {name: value for name, value in environment.items() if name != "modules"}
             saved_environment = {name: value for name, value in saved_environment.items()
                                  if name != "modules"}
@@ -455,9 +456,10 @@ class Plan:
     def _edited_members(self, saved: Mapping[str, object]) -> tuple[str, ...] | None:
         """How a streamed mix's members changed from `saved`'s, which a resume takes: members that
         joined, which start, members that left, which are dropped, and weights that changed; None
-        where the members and weights are as they were, or the plan is no streamed mix, whose order
-        is compared whole. Refused where a member kept by both changed what it reads or runs, or
-        where the mixture's own stages or order changed."""
+        where the members and weights are as they were, or the plan keeps no members by key
+        (`dew.data.compile._member_manifests`), whose order is compared whole. Refused where a
+        member kept by both changed what it reads or makes, or where the mixture's own stages, the
+        compile's host steps or the rest of the order changed."""
         members = record(saved.get("members", {}), "saved members")
         before = {name: str(value) for name, value in members.items()}
         order = json_value(saved.get("order"), "saved order")
@@ -471,9 +473,9 @@ class Plan:
             if before[key] != self.members[key]:
                 raise ValueError(f"saved data plan member {key} changed what it reads or runs")
         mixture = ("corpora", "members", "weights")
-        current = record(json_value(self.order, "order"), "order")
-        if (_unplaced({name: value for name, value in order.items() if name not in mixture})
-                != _unplaced({name: value for name, value in current.items() if name not in mixture})):
+        current = {name: json_value(value, name) for name, value in self.order.items() if name not in mixture}
+        before_order = {name: value for name, value in order.items() if name not in mixture}
+        if unplaced(before_order) != unplaced(current):
             raise ValueError(f"saved data plan order changed: {order!r} -> {self.order!r}")
         return (*(f"member {key} joined" for key in sorted(set(self.members) - set(before))),
                 *(f"member {key} left" for key in sorted(set(before) - set(self.members))),
