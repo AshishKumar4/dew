@@ -35,6 +35,23 @@ def tokens(rng, batch=2, length=SEQ):
     return jax.random.randint(rng, (batch, length), 0, VOCAB)
 
 
+@pytest.mark.parametrize("position_embedding", ["learned", "alibi"])
+def test_a_named_mixer_places_its_own_tokens_beside_the_models_default(rng, position_embedding):
+    """The model's `position_embedding` is how a layer with no named mixer places its tokens; a
+    mixer a kind names places its own. The default's own mixer named on a kind computes the model
+    the default builds, bit for bit, and a kind naming rotary attention beside learned positions or
+    ALiBi builds and runs, its rotation changing the logits."""
+    default = AttentionMixer(nope=True, alibi=position_embedding == "alibi")
+    implicit = tiny(position_embedding=position_embedding, layer_types=("full_attention", "rotated"))
+    named = implicit.clone(kinds={"rotated": {"mixer": default}})
+    ids = tokens(rng)
+    params = implicit.init(rng, ids)
+    logits = np.asarray(implicit.apply(params, ids))
+    np.testing.assert_array_equal(np.asarray(named.apply(params, ids)), logits)
+    rotated = implicit.clone(kinds={"rotated": {"mixer": AttentionMixer()}})
+    assert not np.array_equal(np.asarray(rotated.apply(params, ids)), logits)
+
+
 @pytest.mark.parametrize("fields,causal,message", [
     ({"head_dim": 3}, True, "head dim"),
     ({"window": 0}, True, "window"),
