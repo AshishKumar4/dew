@@ -2208,7 +2208,8 @@ def _indexed_source(kind: str, root: Path):
         return Memory([{"id": index} for index in range(7)], shard_rows=3), [
             ("memory:0", "memory", 0, 3, 3), ("memory:3", "memory", 3, 6, 3), ("memory:6", "memory", 6, 7, 1)]
     if kind == "tfds":
-        tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
+        import tensorflow_datasets as tfds
+
         path = str(Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0")
         named = f"tfds:dew_images/None:None:all:{path}"
         return TFDS("dew_images", path=path, split="all", shard_rows=8,

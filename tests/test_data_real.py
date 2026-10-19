@@ -18,8 +18,6 @@ import os
 import numpy as np
 import pytest
 
-pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
-
 from dew.config.data import Augment, HoldOut, ImageData, loader
 from dew.data import TFDS, Loading
 from dew.data.dataset import DataPartition

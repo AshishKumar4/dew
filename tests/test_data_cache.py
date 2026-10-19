@@ -630,9 +630,7 @@ def test_training_close_abandons_a_stalled_upload_without_publishing_a_segment()
 
 @pytest.mark.network
 def test_real_r2_generation_publication_mirror_and_cleanup(tmp_path):
-    root = os.environ.get("DEW_DATA_TEST_URL")
-    if not root:
-        pytest.skip("DEW_DATA_TEST_URL names a writable remote smoke prefix")
+    root = os.environ["DEW_DATA_TEST_URL"]  # a writable remote smoke prefix
     source = Memory([{"id": index, "text": "remote"} for index in range(4)])
     key = Manifest(b'{"r2-smoke":"artifact-v1"}')
     cache = Cache(
