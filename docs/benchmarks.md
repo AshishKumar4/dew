@@ -47,7 +47,7 @@ From the table:
 - `unet` does the most arithmetic for its time of the image models. 646 GFLOP/step in 16 ms is 40.5% of peak, ahead of the transformers at the same resolution. With XLA's own `cost_analysis()` as the numerator, the same measurement shows 28.7 GFLOP/step, and the gap is convolution arithmetic that cost analysis cannot see.
 - `unet_3d` is the slowest diffusion step in the table (33.9 ms/step, 41.8% of peak). Its 3D convolutions do 1,384 GFLOP/step, 1.8 times the 760 of `video_dit` on the same (8, 64, 64, 3) samples, and `video_dit`'s step (17.3 ms) takes about half as long.
 - `hierarchical_mmdit` is the largest diffusion model here (55 M; the 67 M `causal_transformer` is a language model) and has the slowest image step (32.7 ms), which fits its 1024-token finest stage.
-- Compile time dominates a short run, at 9-47 s per architecture against 8-84 ms per step, so a real run should set `compilation_cache_dir`.
+- Compile time dominates a short run, at 9-47 s per architecture against 8-84 ms per step, which is why a run keeps the persistent compilation cache by default ([Compilation cache](installation.md#compilation-cache)); these compile times are cold compiles, with the cache off.
 
 ### Rerun, 2026-09-05
 

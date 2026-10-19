@@ -365,6 +365,31 @@ def test_the_gpu_autotuners_picks_persist_beside_the_executables_for_this_xla(tm
         jax.config.update("jax_compilation_cache_dir", previous)
 
 
+@pytest.mark.gpu
+def test_a_cached_gpu_compile_writes_its_picks_where_the_policy_puts_them(tmp_path):
+    """A GPU compile under the persistent cache writes the autotuner's picks to this jaxlib's own
+    directory beside the executables (`autotune_dir`), which its XLA_FLAGS name, and JAX puts
+    none of its own in the cache directory, whose picks would serve every jaxlib alike."""
+    import subprocess
+    import sys
+
+    program = (
+        "import jax, jax.numpy as jnp\n"
+        "from dew.cache import enable_compilation_cache\n"
+        f"enable_compilation_cache({str(tmp_path / 'cache')!r})\n"
+        "a = jnp.ones((512, 512), jnp.bfloat16)\n"
+        "jax.jit(lambda x: jax.nn.relu(x @ x.T) @ x)(a).block_until_ready()\n"
+    )
+    env = {key: value for key, value in os.environ.items() if key != "XLA_FLAGS"}
+    env["XLA_FLAGS"] = "--xla_gpu_autotune_level=4"
+    done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, env=env,
+                          timeout=600)
+    assert done.returncode == 0, done.stderr[-2000:]
+    picks = tmp_path / "cache" / "autotune" / f"jaxlib-{importlib.metadata.version('jaxlib')}"
+    assert any(path.is_file() for path in picks.rglob("*"))
+    assert not (tmp_path / "cache" / "xla_gpu_per_fusion_autotune_cache_dir").exists()
+
+
 @pytest.mark.mesh(devices=8)
 def test_the_collectives_of_a_compiled_step_are_counted_with_the_bytes_they_move():
     """A step over eight devices that gathers an f32 array whole and sums an int32 one across them:

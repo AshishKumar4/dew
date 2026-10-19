@@ -122,6 +122,10 @@ def enable_compilation_cache(path: str):
     """
     os.makedirs(path, exist_ok=True)
     jax.config.update('jax_compilation_cache_dir', path)
+    # The autotuner's picks follow the policy above, through XLA_FLAGS; JAX's own placement of them
+    # in the cache directory would name one directory for every jaxlib and write picks from a
+    # process this policy keeps to reading (`jax._src.compiler.get_compile_options`).
+    jax.config.update('jax_persistent_cache_enable_xla_caches', 'none')
     # Defaults skip small/fast compilations; a training step is neither, and
     # caching everything keeps startup predictable.
     jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
