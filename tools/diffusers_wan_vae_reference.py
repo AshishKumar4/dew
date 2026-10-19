@@ -29,6 +29,7 @@ compresses; they are still float32 tensors.
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from pathlib import Path
@@ -36,7 +37,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers_reference_helpers import drawn_wan_vae
-from reference_vjp import recorded_vjp
+from diffusers_wan_reference import float64
+from reference_vjp import Draws, recorded_vjp, twice
 from reference_releases import RELEASES, require
 
 DIFFUSERS = RELEASES["diffusers"]["diffusers"]
@@ -51,29 +53,29 @@ def build(root: Path) -> dict[str, np.ndarray]:
     from diffusers import AutoencoderKLWan
 
     model, generator = drawn_wan_vae(AutoencoderKLWan, CONFIG, SEED, root / "vae")
-    named = list(model.named_parameters())
+    draw = Draws(generator)
 
-    video = (torch.rand((BATCH, 3, FRAMES, HEIGHT, WIDTH), generator=generator) * 2 - 1).requires_grad_()
-    posterior = model.encode(video).latent_dist
-    mean, std = posterior.mean, posterior.std
-    encoded = recorded_vjp("encode", {"probe_mean": mean, "probe_std": std}, {"video": video}, named,
-                           generator)
+    def walk(model, dtype) -> dict[str, np.ndarray]:
+        named = list(model.named_parameters())
+        video = draw("video", (BATCH, 3, FRAMES, HEIGHT, WIDTH), dtype, uniform=True) * 2 - 1
+        video.requires_grad_()
+        posterior = model.encode(video).latent_dist
+        mean, std = posterior.mean, posterior.std
+        encoded = recorded_vjp("encode", {"probe_mean": mean, "probe_std": std}, {"video": video}, named,
+                               draw)
+        latent = draw("latent", mean.shape, dtype).requires_grad_()
+        pixels = model.decode(latent).sample
+        decoded = recorded_vjp("decode", {"probe": pixels}, {"latent": latent}, named, draw)
+        with torch.no_grad():
+            image_mean = model.encode(video[:, :, :1].detach()).latent_dist.mean
+        return {"video": video.detach().numpy(), "mean": mean.detach().numpy(), "std": std.detach().numpy(),
+                "latent": latent.detach().numpy(), "pixels": pixels.detach().numpy(),
+                "image_mean": image_mean.numpy(), **encoded, **decoded}
 
-    latent = torch.randn(mean.shape, generator=generator).requires_grad_()
-    pixels = model.decode(latent).sample
-    decoded = recorded_vjp("decode", {"probe": pixels}, {"latent": latent}, named, generator)
-
-    with torch.no_grad():
-        image_mean = model.encode(video[:, :, :1].detach()).latent_dist.mean
-
-    arrays = {
-        "video": video.detach().numpy(), "mean": mean.detach().numpy(), "std": std.detach().numpy(),
-        "latent": latent.detach().numpy(), "pixels": pixels.detach().numpy(),
-        "image_mean": image_mean.numpy(), **encoded, **decoded,
-    }
-    clamped = float((pixels.detach().abs() >= 1).float().mean())
-    print(f"parameters {len(named)} ({sum(value.numel() for _, value in named)} values); "
-          f"latent {tuple(mean.shape)}; pixels {tuple(pixels.shape)}; clamped pixels {clamped:.2%}")
+    arrays = twice(walk, model)
+    clamped = float((np.abs(arrays["pixels"]) >= 1).mean())
+    print(f"parameters {len(list(model.parameters()))}; latent {arrays['mean'].shape}; "
+          f"pixels {arrays['pixels'].shape}; clamped pixels {clamped:.2%}")
     return arrays
 
 
@@ -81,31 +83,42 @@ def bfloat16_walk(fixture: Path) -> dict[str, np.ndarray]:
     """The saved fixture VAE walked in bfloat16 as `WanPipeline` runs it under
     `torch_dtype=torch.bfloat16`: one nine-frame video's posterior and the
     decode of one latent, with the input gradients of both. Inputs and probes
-    are bfloat16 values; everything is recorded as float32."""
+    are bfloat16 values; everything is recorded as float32, and the same walk
+    in float64 under `fp64.` keys, the truth both are measured from."""
     from diffusers import AutoencoderKLWan
 
     model = AutoencoderKLWan.from_pretrained(fixture / "vae", torch_dtype=torch.bfloat16).eval()
     generator = torch.Generator().manual_seed(SEED + 1)
+    draw = Draws(generator)
 
-    def bfloat16(tensor):
-        return tensor.bfloat16().float()
+    def walk(model, dtype) -> dict[str, np.ndarray]:
+        # bfloat16 values throughout: the inputs at the walk's dtype, the probes and the probed
+        # sums in float32 over a bfloat16 walk, as the pipeline's loss would take them.
+        summed = torch.float32 if dtype == torch.bfloat16 else dtype
 
-    video = torch.rand((1, 3, FRAMES, HEIGHT, WIDTH), generator=generator) * 2 - 1
-    video = video.bfloat16().requires_grad_()
-    posterior = model.encode(video).latent_dist
-    mean, std = posterior.mean, posterior.std
-    probe_mean = bfloat16(torch.randn(mean.shape, generator=generator))
-    probe_std = bfloat16(torch.randn(std.shape, generator=generator))
-    ((mean.float() * probe_mean).sum() + (std.float() * probe_std).sum()).backward()
+        def drawn(name, shape, at, uniform=False):
+            return draw(name, shape, torch.bfloat16, uniform=uniform).to(at)
 
-    latent = torch.randn(mean.shape, generator=generator).bfloat16().requires_grad_()
-    pixels = model.decode(latent).sample
-    probe = bfloat16(torch.randn(pixels.shape, generator=generator))
-    (pixels.float() * probe).sum().backward()
-    tensors = {"video": video, "mean": mean, "std": std, "probe_mean": probe_mean, "probe_std": probe_std,
-               "encode.grad_video": video.grad, "latent": latent, "pixels": pixels, "probe": probe,
-               "decode.grad_latent": latent.grad}
-    return {name: tensor.detach().float().numpy() for name, tensor in tensors.items()}
+        video = drawn("video", (1, 3, FRAMES, HEIGHT, WIDTH), dtype, uniform=True) * 2 - 1
+        video.requires_grad_()
+        posterior = model.encode(video).latent_dist
+        mean, std = posterior.mean, posterior.std
+        probe_mean, probe_std = drawn("probe_mean", mean.shape, summed), drawn("probe_std", std.shape, summed)
+        ((mean.to(summed) * probe_mean).sum() + (std.to(summed) * probe_std).sum()).backward()
+        latent = drawn("latent", mean.shape, dtype).requires_grad_()
+        pixels = model.decode(latent).sample
+        probe = drawn("probe", pixels.shape, summed)
+        (pixels.to(summed) * probe).sum().backward()
+        tensors = {"video": video, "mean": mean, "std": std, "probe_mean": probe_mean, "probe_std": probe_std,
+                   "encode.grad_video": video.grad, "latent": latent, "pixels": pixels, "probe": probe,
+                   "decode.grad_latent": latent.grad}
+        return {name: tensor.detach().float().numpy() if dtype != torch.float64
+                else tensor.detach().double().numpy() for name, tensor in tensors.items()}
+
+    narrow = walk(model, torch.bfloat16)
+    with float64():
+        wide = walk(copy.deepcopy(model).double(), torch.float64)
+    return {**narrow, **{f"fp64.{key}": value for key, value in wide.items()}}
 
 
 def main(destination: str) -> None:

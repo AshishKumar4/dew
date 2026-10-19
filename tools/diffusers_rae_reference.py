@@ -18,7 +18,8 @@ transformers `Dinov2Model` (no registers; REPA's encoder), `dinov2_plain`:
   paint 8-pixel patches, so a 64x64 image is enlarged to the encoder's input.
 
 Each is saved with `save_pretrained` - its real config and safetensors - and
-recorded in float32, channel-first:
+recorded channel-first, in float32 and, over the same inputs and probes, in
+float64 under `fp64.` keys (`reference_vjp.twice`):
 
 - the latent of a fixed batch in [0, 1], and the gradient of
   `sum(latent * probe_latent)` with respect to the pixels;
@@ -62,6 +63,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from reference_releases import RELEASES, require
+from reference_vjp import Draws, twice
 
 DIFFUSERS, TRANSFORMERS = RELEASES["rae"]["diffusers"], RELEASES["rae"]["transformers"]
 DECODER = {"decoder_hidden_size": 64, "decoder_num_hidden_layers": 2, "decoder_num_attention_heads": 4,
@@ -100,31 +102,33 @@ def build(name: str, root: Path) -> dict[str, np.ndarray]:
                 parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
             parameter.copy_(parameter.to(torch.bfloat16).float())
     model.save_pretrained(root, safe_serialization=True)
-    decoder = [(key, value) for key, value in model.named_parameters() if key.startswith("decoder.")]
-    for _, value in decoder:
-        value.requires_grad_(requires_grad=True)
-
     size = grid * config["patch_size"]
-    image = torch.rand((BATCH[name], 3, size, size), generator=generator).requires_grad_()
-    latent = model.encode(image).latent
-    probe_latent = torch.randn(latent.shape, generator=generator)
-    (grad_image,) = torch.autograd.grad((latent * probe_latent).sum(), [image])
+    draw = Draws(generator)
 
-    code = torch.randn(latent.shape, generator=generator).requires_grad_()
-    pixels = model.decode(code).sample
-    probe = torch.randn(pixels.shape, generator=generator)
-    decoded = torch.autograd.grad((pixels * probe).sum(), [code] + [value for _, value in decoder])
+    def walk(model, dtype) -> dict[str, np.ndarray]:
+        decoder = [(key, value) for key, value in model.named_parameters() if key.startswith("decoder.")]
+        for _, value in decoder:
+            value.requires_grad_(requires_grad=True)
+        image = draw("image", (BATCH[name], 3, size, size), dtype, uniform=True).requires_grad_()
+        latent = model.encode(image).latent
+        probe_latent = draw("probe_latent", latent.shape, dtype)
+        (grad_image,) = torch.autograd.grad((latent * probe_latent).sum(), [image])
+        code = draw("code", latent.shape, dtype).requires_grad_()
+        pixels = model.decode(code).sample
+        probe = draw("probe", pixels.shape, dtype)
+        decoded = torch.autograd.grad((pixels * probe).sum(), [code] + [value for _, value in decoder])
+        arrays = {"image": image.detach().numpy(), "latent": latent.detach().numpy(),
+                  "probe_latent": probe_latent.numpy(), "encode.grad_image": grad_image.numpy(),
+                  "code": code.detach().numpy(), "pixels": pixels.detach().numpy(), "probe": probe.numpy(),
+                  "decode.grad_code": decoded[0].numpy()}
+        for (key, _), gradient in zip(decoder, decoded[1:], strict=True):
+            arrays[f"decode.grad.{key}"] = gradient.numpy()
+        return arrays
 
-    arrays = {
-        "image": image.detach().numpy(), "latent": latent.detach().numpy(),
-        "probe_latent": probe_latent.numpy(), "encode.grad_image": grad_image.numpy(),
-        "code": code.detach().numpy(), "pixels": pixels.detach().numpy(), "probe": probe.numpy(),
-        "decode.grad_code": decoded[0].numpy(),
-    }
-    for (key, _), gradient in zip(decoder, decoded[1:], strict=True):
-        arrays[f"decode.grad.{key}"] = gradient.numpy()
-    print(f"{name}: parameters {sum(value.numel() for value in model.parameters())}; latent {tuple(latent.shape)}; "
-          f"pixels {tuple(pixels.shape)}; |latent| <= {np.abs(arrays['latent']).max():.3g}")
+    arrays = twice(walk, model)
+    print(f"{name}: parameters {sum(value.numel() for value in model.parameters())}; "
+          f"latent {arrays['latent'].shape}; pixels {arrays['pixels'].shape}; "
+          f"|latent| <= {np.abs(arrays['latent']).max():.3g}")
     return arrays
 
 
@@ -225,12 +229,17 @@ def build_plain(root: Path) -> dict[str, np.ndarray]:
                 parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
             parameter.copy_(parameter.to(torch.bfloat16).float())
     model.save_pretrained(root, safe_serialization=True)
-    pixels = torch.randn((1, 3, PLAIN_INPUT, PLAIN_INPUT), generator=generator).requires_grad_()
-    tokens = model(pixels).last_hidden_state[:, 1:]
-    probe = torch.randn(tokens.shape, generator=generator)
-    (grad,) = torch.autograd.grad((tokens * probe).sum(), [pixels])
-    return {"pixels": pixels.detach().numpy(), "tokens": tokens.detach().numpy(), "probe": probe.numpy(),
-            "grad_pixels": grad.numpy()}
+    draw = Draws(generator)
+
+    def walk(model, dtype) -> dict[str, np.ndarray]:
+        pixels = draw("pixels", (1, 3, PLAIN_INPUT, PLAIN_INPUT), dtype).requires_grad_()
+        tokens = model(pixels).last_hidden_state[:, 1:]
+        probe = draw("probe", tokens.shape, dtype)
+        (grad,) = torch.autograd.grad((tokens * probe).sum(), [pixels])
+        return {"pixels": pixels.detach().numpy(), "tokens": tokens.detach().numpy(), "probe": probe.numpy(),
+                "grad_pixels": grad.numpy()}
+
+    return twice(walk, model)
 
 
 def main(destination: str) -> None:

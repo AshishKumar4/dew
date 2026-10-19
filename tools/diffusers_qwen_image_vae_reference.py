@@ -36,7 +36,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers_reference_helpers import drawn_wan_vae
-from reference_vjp import recorded_vjp
+from reference_vjp import Draws, recorded_vjp, twice
 
 DIFFUSERS_COMMIT = "6256aa7666cedd47443adc8f82da9a10e110b09c"
 CONFIG = {"base_dim": 4, "decoder_base_dim": 6, "z_dim": 8, "dim_mult": [1, 2, 2, 4, 4], "num_res_blocks": 1,
@@ -52,26 +52,26 @@ def build(root: Path) -> dict[str, np.ndarray]:
     from diffusers.models.autoencoders.autoencoder_kl_qwenimage21 import AutoencoderKLQwenImage21
 
     model, generator = drawn_wan_vae(AutoencoderKLQwenImage21, CONFIG, SEED, root / "vae")
-    named = list(model.named_parameters())
+    draw = Draws(generator)
 
-    image = (torch.rand((BATCH, CONFIG["in_channels"], HEIGHT, WIDTH), generator=generator) * 2 - 1
-             ).requires_grad_()
-    posterior = model.encode(image[:, :, None]).latent_dist
-    mean, std = posterior.mean[:, :, 0], posterior.std[:, :, 0]
-    encoded = recorded_vjp("encode", {"probe_mean": mean, "probe_std": std}, {"image": image}, named,
-                           generator)
+    def walk(model, dtype) -> dict[str, np.ndarray]:
+        named = list(model.named_parameters())
+        image = (draw("image", (BATCH, CONFIG["in_channels"], HEIGHT, WIDTH), dtype, uniform=True) * 2 - 1
+                 ).requires_grad_()
+        posterior = model.encode(image[:, :, None]).latent_dist
+        mean, std = posterior.mean[:, :, 0], posterior.std[:, :, 0]
+        encoded = recorded_vjp("encode", {"probe_mean": mean, "probe_std": std}, {"image": image}, named,
+                               draw)
+        latent = draw("latent", mean.shape, dtype).requires_grad_()
+        pixels = model.decode(latent[:, :, None], return_dict=False)[0][:, :, 0]
+        decoded = recorded_vjp("decode", {"probe": pixels}, {"latent": latent}, named, draw)
+        return {"image": image.detach().numpy(), "mean": mean.detach().numpy(), "std": std.detach().numpy(),
+                "latent": latent.detach().numpy(), "pixels": pixels.detach().numpy(), **encoded, **decoded}
 
-    latent = torch.randn(mean.shape, generator=generator).requires_grad_()
-    pixels = model.decode(latent[:, :, None], return_dict=False)[0][:, :, 0]
-    decoded = recorded_vjp("decode", {"probe": pixels}, {"latent": latent}, named, generator)
-
-    arrays = {
-        "image": image.detach().numpy(), "mean": mean.detach().numpy(), "std": std.detach().numpy(),
-        "latent": latent.detach().numpy(), "pixels": pixels.detach().numpy(), **encoded, **decoded,
-    }
-    clamped = float((pixels.detach().abs() >= 1).float().mean())
-    print(f"parameters {len(named)} ({sum(value.numel() for _, value in named)} values); "
-          f"latent {tuple(mean.shape)}; |mean| <= {np.abs(arrays['mean']).max():.3g}; "
+    arrays = twice(walk, model)
+    clamped = float((np.abs(arrays["pixels"]) >= 1).mean())
+    print(f"parameters {len(list(model.parameters()))}; latent {arrays['mean'].shape}; "
+          f"|mean| <= {np.abs(arrays['mean']).max():.3g}; "
           f"std in [{arrays['std'].min():.3g}, {arrays['std'].max():.3g}]; clamped pixels {clamped:.2%}")
     return arrays
 

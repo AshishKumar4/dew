@@ -13,8 +13,9 @@ controls the published checkpoints use, at narrow widths:
   and no multiscale branch.
 
 Each is saved with `save_pretrained` - its real config and its real
-safetensors - and recorded in float32, channel-first, as `vae.encode(x).latent`
-and `vae.decode(z).sample` compute them:
+safetensors - and recorded channel-first, as `vae.encode(x).latent` and
+`vae.decode(z).sample` compute them, in float32 and, over the same inputs and
+probes, in float64 under `fp64.` keys (`reference_vjp.twice`):
 
 - the latent of a fixed rectangular batch, and the gradient of
   `sum(latent * probe_latent)` with respect to the pixels and every parameter;
@@ -40,7 +41,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from reference_vjp import recorded_vjp
+from reference_vjp import Draws, recorded_vjp, twice
 from reference_releases import RELEASES, require
 
 DIFFUSERS = RELEASES["diffusers"]["diffusers"]
@@ -85,31 +86,30 @@ def build(config: dict, root: Path) -> dict[str, np.ndarray]:
                 parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
             parameter.copy_(parameter.to(torch.bfloat16).float())
     model.save_pretrained(root, safe_serialization=True)
-    named = list(model.named_parameters())
+    draw = Draws(generator)
 
-    image = (torch.rand((BATCH, config["in_channels"], HEIGHT, WIDTH), generator=generator) * 2 - 1
-             ).requires_grad_()
-    latent = model.encode(image).latent
-    encoded = recorded_vjp("encode", {"probe_latent": latent}, {"image": image}, named, generator)
+    def walk(model, dtype) -> dict[str, np.ndarray]:
+        named = list(model.named_parameters())
+        image = (draw("image", (BATCH, config["in_channels"], HEIGHT, WIDTH), dtype, uniform=True) * 2 - 1
+                 ).requires_grad_()
+        latent = model.encode(image).latent
+        encoded = recorded_vjp("encode", {"probe_latent": latent}, {"image": image}, named, draw)
+        code = draw("code", latent.shape, dtype).requires_grad_()
+        pixels = model.decode(code).sample
+        decoded = recorded_vjp("decode", {"probe": pixels}, {"code": code}, named, draw)
+        small = draw("small", (BATCH, config["in_channels"], *SMALL), dtype, uniform=True) * 2 - 1
+        with torch.no_grad():
+            small_latent = model.encode(small).latent
+            small_code = draw("small_code", small_latent.shape, dtype)
+            small_pixels = model.decode(small_code).sample
+        return {"image": image.detach().numpy(), "latent": latent.detach().numpy(),
+                "code": code.detach().numpy(), "pixels": pixels.detach().numpy(),
+                "small": small.numpy(), "small_latent": small_latent.numpy(),
+                "small_code": small_code.numpy(), "small_pixels": small_pixels.numpy(), **encoded, **decoded}
 
-    code = torch.randn(latent.shape, generator=generator).requires_grad_()
-    pixels = model.decode(code).sample
-    decoded = recorded_vjp("decode", {"probe": pixels}, {"code": code}, named, generator)
-
-    small = torch.rand((BATCH, config["in_channels"], *SMALL), generator=generator) * 2 - 1
-    with torch.no_grad():
-        small_latent = model.encode(small).latent
-        small_code = torch.randn(small_latent.shape, generator=generator)
-        small_pixels = model.decode(small_code).sample
-
-    arrays = {
-        "image": image.detach().numpy(), "latent": latent.detach().numpy(),
-        "code": code.detach().numpy(), "pixels": pixels.detach().numpy(),
-        "small": small.numpy(), "small_latent": small_latent.numpy(),
-        "small_code": small_code.numpy(), "small_pixels": small_pixels.numpy(), **encoded, **decoded,
-    }
-    print(f"{root.name}: parameters {len(named)} ({sum(value.numel() for _, value in named)} values); "
-          f"latent {tuple(latent.shape)}; |latent| <= {np.abs(arrays['latent']).max():.3g}; "
+    arrays = twice(walk, model)
+    print(f"{root.name}: parameters {len(list(model.parameters()))}; latent {arrays['latent'].shape}; "
+          f"|latent| <= {np.abs(arrays['latent']).max():.3g}; "
           f"|pixels| <= {np.abs(arrays['pixels']).max():.3g}")
     return arrays
 
