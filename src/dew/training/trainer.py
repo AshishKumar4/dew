@@ -157,7 +157,7 @@ from dew.training.planning import Candidate, Planned, Timer, plan_step, settled,
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, HeldBest, rankings
-from dew.training.state import Accumulation, TrainState
+from dew.training.state import MODEL_STATE, Accumulation, TrainState
 from dew.training.tracker import Tracker
 from dew.training.transaction import Committed, Transaction, compact_qk, outcome, with_ema
 
@@ -283,6 +283,12 @@ class Plateau:
             raise ValueError("Plateau needs evals >= 1 and min_delta >= 0")
 
 
+def _split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, ...]]:
+    """Each split's own metrics, by its name: two suites may each hold their own instance of one
+    metric."""
+    return {name: tuple(suite.metrics) for name, suite in suites.items()}
+
+
 def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
             metrics: Sequence[Metric], eval_every: int | None) -> dict[str, EvalSuite]:
     """Every split `fit` validates, by name, with its metrics and cadence
@@ -331,6 +337,11 @@ class _FitPlan:
         """Whether either run-length cap has been reached, after `real` tokens."""
         return ((self.steps is not None and step >= self.steps)
                 or (self.tokens is not None and real >= self.tokens))
+
+    @property
+    def declared(self) -> dict[str, tuple[Metric, ...]]:
+        """Each validation split's metrics, by the split's name (`_split_metrics`)."""
+        return _split_metrics(self.suites)
 
     @property
     def scored(self) -> tuple[Metric, ...]:
@@ -1395,8 +1406,13 @@ class Trainer(Generic[Loss, Effects]):
         several, each a Dataset, a reader scored as `dataset.val` would be or an
         `EvalSuite` with its own metrics and cadence, logged as `<name>/<metric>`.
 
-        `restore_best=True` returns the state the run ranked best: its best
-        checkpoint, or without `Checkpoints` the state it held (`HeldBest`).
+        `restore_best=True` returns the model the run ranked best: the final
+        state with the counters, variables and EMA of the best step
+        (`MODEL_STATE`), read from its best checkpoint, a weights-only one
+        included, or without `Checkpoints` from the copy it held
+        (`HeldBest`). Its optimizer state and the rest stay the final step's,
+        so it is the best model, not a point to resume training from, which
+        the run's checkpoints are.
 
         Every `checkpoint_every` steps, the state and the data position are
         written; `checkpoint_final=True` also writes the final state, independently
@@ -1430,7 +1446,7 @@ class Trainer(Generic[Loss, Effects]):
         count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
         suites = _suites(loader, validation, metrics, eval_every)
-        selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every, restore_best)
+        selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every)
         self._preflight(loader, stop, suites, preview=preview,
                         loss=(self.checkpoints is not None or restore_best) and not selection)
         preview = preview and self.tracker is not None
@@ -1455,16 +1471,8 @@ class Trainer(Generic[Loss, Effects]):
             trained = dataclasses.replace(trained, compute=None)
             # Whether this fit trained or found the run complete, and inside
             # the lifecycle, so a selection that fails is the run's outcome.
-            if restore_best and checkpoints is not None and run.preempted is None:
-                checkpoints.wait()  # the best may be the last step's save, still in flight
-                trained, _ = checkpoints.restore(
-                    jax.tree.map(
-                        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding),
-                        trained),
-                    step="best",
-                )
-            elif restore_best and checkpoints is None and run.preempted is None:
-                trained = run.best.state()
+            if restore_best and run.preempted is None:
+                trained = self._best_model(trained, run)
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
@@ -1792,6 +1800,20 @@ class Trainer(Generic[Loss, Effects]):
             return True
         return False
 
+    def _best_model(self, final: TrainState, run: _FitRun) -> TrainState:
+        """`final` with the model state of the step the run ranked best (`MODEL_STATE`): read from
+        its best checkpoint, a weights-only one included, or without `Checkpoints` from the copy the
+        run held (`HeldBest`)."""
+        checkpoints = self.checkpoints
+        if checkpoints is None:
+            return run.best.state(final)
+        checkpoints.wait()  # the best may be the last step's save, still in flight
+        template = {name: jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), value)
+            for name in MODEL_STATE if (value := getattr(final, name)) is not None}
+        model, _ = checkpoints.restore(template, step="best")
+        return dataclasses.replace(final, **{name: model[name] for name in template})
+
     def _take(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, *,
               unlogged: bool = False) -> None:
         """Take the log of the interval ending at the current step (`Interval.take`); with
@@ -1814,7 +1836,7 @@ class Trainer(Generic[Loss, Effects]):
         """Resolve cadence, ranking, stopping and unconditional final saves in one place."""
         checkpoints, current = self.checkpoints, run.current
         ranking = rankings(plan.best, scores, validation=next(iter(plan.suites)) if plan.validation else None,
-                           scored=plan.scored, objective=self.objective)
+                           declared=plan.declared, objective=self.objective)
         if plan.held_best and evaluation_due:
             run.best.offer(ranking, dataclasses.replace(state, compute=None))
         winners = checkpoints._candidates(ranking) if (
@@ -1891,11 +1913,10 @@ class Trainer(Generic[Loss, Effects]):
         if checkpoints is not None:
             checkpoints.wait()
 
-    def _fit_policies(self, best, stop, metrics, suites, checkpoint_every, restore_best):
+    def _fit_policies(self, best, stop, metrics, suites, checkpoint_every):
         if isinstance(checkpoint_every, datetime.timedelta) and checkpoint_every.total_seconds() <= 0:
             raise ValueError("checkpoint_every duration must be positive")
-        # Each split's own metrics: two suites may each hold their own instance of one metric.
-        scored = {name: tuple(suite.metrics) for name, suite in suites.items()} or {'val': tuple(metrics)}
+        scored = _split_metrics(suites) or {'val': tuple(metrics)}
         raw = (
             ()
             if best is None
@@ -1934,9 +1955,6 @@ class Trainer(Generic[Loss, Effects]):
                 )
             stopping = Best(metric, mode=stop.mode, split=stop.split).resolved(scored)
             stop = dataclasses.replace(stop, metric=metric, mode=stopping.mode, split=stopping.split)
-        if restore_best and self.checkpoints is not None and any(
-                choice.weights_only for choice in selection):
-            raise ValueError("restore_best requires full checkpoints, not weights_only snapshots")
         return selection, stop
 
     @staticmethod
@@ -1983,8 +2001,10 @@ class Trainer(Generic[Loss, Effects]):
         evaluations = []
         for split in chosen:
             suite = plan.suites[split]
-            # The loss is scored where it ranks the run's checkpoints, or the state it holds.
-            loss = ((self.checkpoints is not None or plan.held_best) and not plan.best
+            # The loss is recorded wherever the objective defines one, and is scored where it ranks
+            # the run's checkpoints or the state it holds, which preflight checks it can.
+            ranks = (self.checkpoints is not None or plan.held_best) and not plan.best
+            loss = ((ranks or self.objective.defines_validation_loss)
                     and not any(metric.name == 'loss' for metric in suite.metrics))
             evaluations.append(self._evaluate(state, shardings, suite.data, suite.metrics, plan.preview,
                                               loss=loss, split=split, training=reports))
@@ -2012,14 +2032,16 @@ class Trainer(Generic[Loss, Effects]):
     def _check_validation_is_read(self, name: str, suite: EvalSuite, *, preview: bool, loss: bool) -> None:
         """Refuse a validation cadence whose batches nothing would read.
 
-        A validation pass hands its batches to metrics, to the preview and,
+        A validation pass records the objective's validation loss where it
+        defines one, and hands its batches to metrics, to the preview and,
         under a checkpointer, or with `loss` where its loss ranks the state a
         run holds (`_FitPlan.held_best`), to the loss that ranks the run's
-        steps. Scheduled with none of them, it would open nothing and report
-        nothing, so the contradiction is refused before the run does any work.
+        steps. Only an objective with no validation loss (Flow-GRPO's) and
+        none of the rest would open nothing and report nothing, and that
+        contradiction is refused before the run does any work.
         """
-        ranked = self.checkpoints is not None or loss
-        if not suite.metrics and not ranked and not (preview and self.tracker is not None):
+        read = self.objective.defines_validation_loss or self.checkpoints is not None or loss
+        if not suite.metrics and not read and not (preview and self.tracker is not None):
             raise ValueError(
                 f"{name} is scored every {suite.every} steps and nothing consumes it: "
                 + ("preview=True needs a tracker to receive the samples; "

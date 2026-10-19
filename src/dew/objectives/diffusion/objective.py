@@ -552,11 +552,6 @@ class DiffusionObjective(Objective[Ratio]):
         return {keyword: condition.encoder.encode(encoders[keyword], tokens[keyword])
                 for keyword, condition in self.inputs.conditions.items()}
 
-    @property
-    def unconditional_conditions(self) -> dict:
-        """The configured unconditional conditions, encoded by the bound towers (`encode`)."""
-        return self.encode(self.encoder_params())
-
     def blank_conditions(self, params, like: dict) -> dict:
         """The configured unconditional conditions, encoded by `params`' own towers and cast to the
         conditional branch's dtypes in `like`: the one function a task over these weights encodes
@@ -669,7 +664,7 @@ class DiffusionObjective(Objective[Ratio]):
         the aligned layer and the encoder's feature width."""
         alignment = self.alignment
         assert alignment is not None
-        conditions = jax.tree.map(lambda value: value[:1], self.unconditional_conditions)
+        conditions = jax.tree.map(lambda value: value[:1], self.encode(state["encoders"]))
 
         def hidden(variables):
             _, captured = self.model.apply(

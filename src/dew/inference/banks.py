@@ -425,13 +425,6 @@ class SafetensorsBanks(LayerBanks):
         if any(sharding.memory_kind != "device" for sharding in jax.tree.leaves(placement)):
             raise ValueError(
                 "disk streaming uses its own bounded host cache; leave layout host placement empty")
-        try:
-            jax.devices("cpu")
-        except RuntimeError as error:
-            raise ValueError(
-                "disk streaming requires the CPU callback backend; configure "
-                "JAX_PLATFORMS=cuda,cpu (or your accelerator,cpu) before JAX initialization"
-            ) from error
         device = SingleDeviceSharding(device_mesh.devices.flat[0])
         handles: Variables = {}
         for site in sites:
