@@ -495,6 +495,30 @@ def test_an_iterator_resumes_through_its_own_state_or_by_replaying():
             resumed.close()
 
 
+def test_a_replayed_stream_checks_the_model_inputs_its_batch_holds():
+    """A replayed stream (`replayed`) is guarded at its position by a digest of the batch there,
+    which reads a Dew dataclass's fields as the codec does: a stream whose model inputs there
+    changed, and nothing else, is refused, and one that replays them resumes after them."""
+    from dew.data.dataset import Replayed
+    from dew.nn.inputs import ModelInputs
+
+    def opened(offset):
+        def batches():
+            return iter([{"inputs": ModelInputs(tokens=np.arange(4, dtype=np.int32) + offset + index,
+                                                conditioning={"mask": np.ones(4, bool)})}
+                         for index in range(3)])
+        return batches
+
+    stopped = Replayed(opened(0))
+    next(stopped), next(stopped)
+    saved = stopped.get_state()
+    with pytest.raises(ValueError):
+        Replayed(opened(10)).set_state(saved)
+    resumed = Replayed(opened(0))
+    resumed.set_state(saved)
+    np.testing.assert_array_equal(next(resumed)["inputs"].tokens, np.arange(4) + 2)
+
+
 def test_an_iterator_without_a_position_or_a_declared_replay_does_not_resume():
     """A stateless iterator that declares no replay reads and reports how far
     it read, but refuses to resume, where one that declares either resumes
