@@ -86,7 +86,8 @@ def test_a_run_stops_where_the_gpu_would_sit_idle_and_import_dew_does_not(tmp_pa
         env["JAX_PLATFORMS"] = platforms
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     # This checkout's Dew, ahead of any the environment installs.
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, (os.path.join(root, "src"), os.environ.get("PYTHONPATH"))))
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (os.path.join(root, "src"),
+                                                      os.environ.get("PYTHONPATH"))))
     done = subprocess.run([sys.executable, "-c", READIED, entry], capture_output=True, text=True, env=env,
                           timeout=300, cwd=root)
     assert done.returncode == (0 if platforms == "cpu" else REFUSED), done.stderr[-2000:]
