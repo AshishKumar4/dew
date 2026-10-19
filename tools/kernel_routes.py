@@ -35,6 +35,7 @@ AUDITED = ("sm80", "sm86", "sm89", "sm90", "sm120")
 """The GPU rows of `generation.TARGETS` the report audits: every one Dew measured a kernel on."""
 MODES = ("train", "prefill", "decode", "decode-paged")
 PROMPT, BATCH = 64, 2
+"""The prompt and batch each mode traces; a fixture whose positions are fewer takes all but its last."""
 
 
 def fixtures() -> dict[str, Path]:
@@ -86,7 +87,8 @@ def traced(config: dict, target: str, mode: str) -> list:
     if mode == "decode-paged":
         fields["kv_cache"] = KVCache(page_size=16)
     model = CausalTransformer(**fields)
-    tokens = jax.ShapeDtypeStruct((BATCH, PROMPT), jnp.int32)
+    prompt = min(PROMPT, model.max_seq_len - 1)
+    tokens = jax.ShapeDtypeStruct((BATCH, prompt), jnp.int32)
     with generation.assumed(target), generation.routes() as found:
         variables = jax.eval_shape(model.init, jax.random.key(0), tokens)
         if mode == "train":
@@ -99,7 +101,7 @@ def traced(config: dict, target: str, mode: str) -> list:
         else:
             cache = jax.eval_shape(lambda v: model.apply(v, BATCH, method="init_cache", mutable=["cache"])[1],
                                    variables)["cache"]
-            step = jax.ShapeDtypeStruct((BATCH, PROMPT if mode == "prefill" else 1), jnp.int32)
+            step = jax.ShapeDtypeStruct((BATCH, prompt if mode == "prefill" else 1), jnp.int32)
             jax.eval_shape(lambda v, c, t: model.apply({**v, "cache": c}, t, decode=True, mutable=["cache"]),
                            variables, cache, step)
     return found
