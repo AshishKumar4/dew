@@ -185,6 +185,8 @@ def _memory_stages(
         if isinstance(source, _Memory) and source.target_counts is not None
         else None
     )
+    # How a row's targets are counted: by the counting step's own rule once one ran.
+    measure = ValidTargets()
     for stage in pipeline.stages[consumed:eager]:
         if isinstance(stage, TokenSplit):
             split = _TokenSplit(pygrain.MapDataset.source([value for _, value in rows]), stage)
@@ -240,6 +242,8 @@ def _memory_stages(
             expanded: list[tuple[tuple[int, ...], Record]] = []
             expanded_counts: dict[tuple[int, ...], int] = {}
             counts_targets = isinstance(stage, Map) and isinstance(stage.step, CountTargets)
+            if counts_targets:
+                measure = ValidTargets(role=stage.step.role, pad_id=stage.step.pad_id)
             for identifier, value in rows:
                 outputs = _outputs(stage, identifier[0], value, counts=counter)
                 for child, output in enumerate(outputs):
@@ -251,7 +255,7 @@ def _memory_stages(
                         if counts_targets or counted is not None:
                             # The count a row carries while its values are as they were counted,
                             # else its own, as a step that changed them leaves it (`_recounted`).
-                            expanded_counts[output_id] = ValidTargets()(record(output, "counted row"))
+                            expanded_counts[output_id] = measure(record(output, "counted row"))
             rows = expanded
             if counts_targets or counted is not None:
                 counted = expanded_counts
