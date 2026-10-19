@@ -113,7 +113,7 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `hpo` | Optuna, for `dew.config.sweep` |
 | `eval-harness` | lm-evaluation-harness tasks through `dew.eval.harness.DewLM` |
 | `profile` | The xprof profiler |
-| `quantization` | Qwix, for quantized training and serving (`dew.training.quantization`) |
+| `quantization` | Qwix, for quantized training and serving (`dew.quantization`) |
 | `test` | The test suite's dependencies and pinned reference libraries |
 | `ci` | The test suite's whole environment: `test` and every extra a test file imports |
 

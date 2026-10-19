@@ -10,7 +10,6 @@ from dew.objectives.base import Aux, EMASpec, Metric, Objective, Step, everythin
 
 from .distributed import DEFAULT_RULES, Layout, MeshSpec
 from .evaluation import EvalSuite, Evaluation
-from .quantization import Quantization
 from .runtime import Preempted, prepare_process, run_timestamp
 from .selection import Best
 from .state import TrainState
@@ -20,6 +19,6 @@ from .transaction import ema_update
 
 __all__ = ["DEFAULT_RULES", "Aux", "Best", "Checkpoints", "EMASpec", "EvalSuite", "Evaluation", "Keep",
            "Layout", "LocalTracker", "MLflowTracker", "MeshSpec", "Metric", "Objective", "Plateau",
-           "Preempted", "ProfileWindow", "Quantization", "Rollout", "Step", "TensorBoardTracker",
+           "Preempted", "ProfileWindow", "Rollout", "Step", "TensorBoardTracker",
            "Tracker", "Trackers", "TrainState", "Trainer", "WandbTracker", "ema_update", "everything",
            "prepare_process", "run_timestamp", "under"]
