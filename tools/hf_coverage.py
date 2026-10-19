@@ -23,6 +23,10 @@ import json
 import sys
 from collections import defaultdict
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from dew.interop.verify import VerifiedMapping
 
 
 def census(out: Path, limit: int) -> None:
@@ -48,10 +52,10 @@ def census(out: Path, limit: int) -> None:
     (out / "census.json").write_text(json.dumps(rows))
 
 
-def _route(config: dict, *, probe: bool) -> tuple[str, str]:
+def _route(config: dict) -> tuple[str, str]:
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-    from dew.interop import decoder_parts, hf_decoders, verify
+    from dew.interop import decoder_parts, hf_decoders
     from dew.interop.codecs import source_quantization
 
     try:
@@ -83,43 +87,44 @@ def _route(config: dict, *, probe: bool) -> tuple[str, str]:
         return "refused", f"registered wrapper refuses this config: {wrapper_error}"[:300]
     if model_type not in CONFIG_MAPPING:
         return "remote code", "transformers has no class for it"
-    if not probe:
-        return "tier 2?", ""
-    try:
-        mapping = verify.verify_mapping(config)
-        return "tier 2", f"{mapping.family} {mapping.error:.2e} <= {mapping.bound:.2e}"
-    except (KeyError, ValueError, TypeError) as error:
-        return "refused", str(error).split(": ", 1)[-1][:300]
+    return "tier 2?", ""
 
 
-def _verified_config(config: dict, probed: tuple[str, str]) -> tuple[str, str]:
+def _probed(config: dict) -> "VerifiedMapping | str":
+    """The verified mapping of `config`'s model_type, or why it has none."""
     from dew.interop import verify
 
-    family = probed[1].split(" ", 1)[0]
     try:
-        verify._translate(config, family, dict(verify.CONVENTIONS)[family])
+        return verify.verify_mapping(config)
+    except (KeyError, ValueError, TypeError) as error:
+        return str(error).split(": ", 1)[-1][:300]
+
+
+def _verified(config: dict, mapping: "VerifiedMapping | str") -> tuple[str, str]:
+    """The route of `config` through its model_type's verified `mapping`, which reads each model's own
+    config as it was verified and refuses a field that one does not carry."""
+    if isinstance(mapping, str):
+        return "refused", mapping
+    try:
+        mapping.translate(config, ())
     except ValueError as error:
         return "refused", str(error)[:300]
-    return probed
+    return "tier 2", f"{mapping.family} {mapping.error:.2e} <= {mapping.bound:.2e}"
 
 
 def classify(out: Path) -> None:
     rows = [row for row in json.loads((out / "census.json").read_text())
             if "config" in row and isinstance(row.get("model_type"), str)]
-    probed: dict[str, tuple[str, str]] = {}
+    probed: dict[str, VerifiedMapping | str] = {}
     models = []
     for row in rows:
-        route, detail = _route(row["config"], probe=False)
-        if route == "tier 2?" and probed.get(row["model_type"], ("",))[0] == "tier 2":
-            # A verified type still reads each model's own config as it was
-            # verified, and refuses a field that one does not carry.
-            route, detail = _verified_config(row["config"], probed[row["model_type"]])
-        elif route == "tier 2?":
+        route, detail = _route(row["config"])
+        if route == "tier 2?":
             # The probe runs once per model_type, on its most downloaded
             # model that no registered family reads.
             if row["model_type"] not in probed:
-                probed[row["model_type"]] = _route(row["config"], probe=True)
-            route, detail = probed[row["model_type"]]
+                probed[row["model_type"]] = _probed(row["config"])
+            route, detail = _verified(row["config"], probed[row["model_type"]])
         models.append({"id": row["id"], "model_type": row["model_type"], "downloads": row["downloads"],
                        "route": route, "detail": detail})
     types: dict[str, dict] = defaultdict(lambda: {"downloads": 0, "models": 0, "routes": defaultdict(int)})
