@@ -127,7 +127,8 @@ def _outputs(
 ) -> tuple[Record, ...]:
     """What a record stage makes of one row, the single definition the cache
     fill, memory materialization and Grain lowering all apply: its outputs,
-    with a `Rejected` marker in place of each row it drops. A marker passes
+    with a `Rejected` marker in place of each row it drops, and without a
+    count of targets the step made stale (`_recounted`). A marker passes
     through and a missing row is rejected. `position` is the row's source
     position, as `Pipeline.map_with_index` defines it. When `counts` is given,
     a chunk expansion counts its document and fan-out as it runs.
@@ -144,7 +145,8 @@ def _outputs(
         outputs = tuple(outputs)
         if counts is not None and isinstance(stage.step, Chunks):
             counts.expanded(outputs)
-        return outputs or (Rejected("empty_expansion"),)
+        recounted = tuple(_recounted(output, element) for output in outputs)
+        return recounted or (Rejected("empty_expansion"),)
     if isinstance(stage, RandomMap):
         if rng is None:
             raise ValueError(f"random step {_identity(stage).name} needs a record rng")
@@ -163,7 +165,7 @@ def _outputs(
     if isinstance(output, Rejected) and not stage.rejects:
         raise ValueError(f"step {_identity(stage).name} dropped a record ({output.reason}) under map, which "
                          "keeps every record; apply a step that drops records with filter_map")
-    return (output,)
+    return (_recounted(output, value),)
 
 
 _POSITION = "_dew_position"
@@ -248,11 +250,9 @@ class _Rows(gx.FlatMapTransform):
     def flat_map(self, element: Record, rng: np.random.Generator | None = None) -> tuple[Record, ...]:
         position = _position(element)
         if position is None:
-            return tuple(_recounted(output, element)
-                         for output in _outputs(self.stage, None, element, rng, counts=self.counts))
-        given = _unplaced(element)
-        outputs = _outputs(self.stage, position, given, rng, counts=self.counts)
-        return tuple(_placed(_recounted(output, given), position) for output in outputs)
+            return _outputs(self.stage, None, element, rng, counts=self.counts)
+        outputs = _outputs(self.stage, position, _unplaced(element), rng, counts=self.counts)
+        return tuple(_placed(output, position) for output in outputs)
 
 
 def _recounted(output: Record, given: Record) -> Record:
