@@ -627,11 +627,59 @@ def rlvr_kl_figure():
     svg.save(HERE / "rlvr-kl.svg")
 
 
+def agent_episode_figure():
+    """A tool-using episode as one sequence: the question, the model's first action (code), the tool's
+    output, the model's answer, then the verifier's one reward, which flows back to the actions alone."""
+    width, height = 440, 290
+    svg = Figure(width, height, seconds=12, label="An agent episode. The model writes code, a tool runs it and "
+                 "answers, the model writes its answer, and the verifier scores the whole episode once; the "
+                 "reward reaches only the tokens the model wrote, not the question or the tool's output.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    segments = [("question", "Natalia sold 48…", "none", False), ("action", "```python\nprint(48+24)", "accent_fill", True),
+                ("tool", "Output: 72", "tint1", False), ("action", "So \\boxed{72}.", "accent_fill", True)]
+    x, y, h = 20, 70, 64
+    widths = [92, 112, 70, 100]
+    svg.text(20, 30, "one episode, read left to right", size=13, color="muted")
+    lefts = []
+    for k, ((who, text, fill, trained), w) in enumerate(zip(segments, widths)):
+        with svg.group() as part:
+            svg.rect(x, y, w, h, fill=fill, stroke="rule" if fill == "none" else "none", rx=6)
+            svg.text(x + 8, y + 22, who, size=12, weight=600, color="text" if trained else "muted")
+            for line_no, line in enumerate(text.split("\n")):
+                svg.text(x + 8, y + 42 + 14 * line_no, line, size=11, mono=True,
+                         color="text" if trained else "muted")
+        svg.appear(part, 0.4 + 0.8 * k)
+        lefts.append((x, w, trained))
+        x += w + 6
+    with svg.group() as verdict:
+        svg.arrow(x - 2, y + h / 2, x + 14, y + h / 2)
+        svg.rect(x + 16, y + 8, width - x - 36, h - 16, fill="raised", stroke="text", rx=6)
+        svg.text(x + 16 + (width - x - 36) / 2, y + 38, "R = 1", size=13, mono=True, weight=600, anchor="middle")
+    svg.appear(verdict, 3.8)
+    back_y = y + h + 46
+    flow = svg.polyline([(width - 32, y + h + 4), (width - 32, back_y), (28, back_y)], color="accent", width=1.5)
+    svg.draw(flow, 4.6, 5.6)
+    svg.appear(svg.text(width - 36, back_y - 8, "one reward for the episode", size=12, color="accent",
+                        anchor="end"), 4.8)
+    for k, (left, w, trained) in enumerate(lefts):
+        with svg.group() as credit:
+            if trained:
+                svg.rect(left, back_y + 14, w, 26, fill="accent", stroke="none", rx=4)
+                svg.text(left + w / 2, back_y + 32, "A, trained", size=12, color="surface", anchor="middle",
+                         weight=600)
+            else:
+                svg.rect(left, back_y + 14, w, 26, fill="none", stroke="rule", rx=4)
+                svg.text(left + w / 2, back_y + 32, "read only", size=12, color="muted", anchor="middle")
+        svg.appear(credit, 5.8 + 0.3 * k)
+    svg.save(HERE / "agent-episode.svg")
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
            "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
-           "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure}
+           "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure,
+           "agent-episode": agent_episode_figure}
 
 
 if __name__ == "__main__":
