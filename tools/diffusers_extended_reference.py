@@ -1,6 +1,7 @@
 """Tiny SDXL image/refiner and checker-bearing references, without downloads.
 
-Run with Diffusers 0.34.0 / Transformers 4.49.0 in the isolated reference env:
+Run with the diffusers-pipelines cohort's releases (tools/reference_releases.py) in the
+isolated reference env:
   python tools/diffusers_extended_reference.py BASE_XL OUTPUT TASK
 TASK: xl-img2img, xl-inpaint, refiner, safety. BASE_XL comes from
  diffusers_pipeline_reference.py (use its SD output for safety).
@@ -10,12 +11,10 @@ import json
 from pathlib import Path
 import tempfile
 
-import diffusers
 import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-import transformers
 from flax import serialization
 from flax.traverse_util import flatten_dict, unflatten_dict
 from PIL import Image
@@ -27,6 +26,8 @@ from transformers import (CLIPConfig, CLIPVisionConfig, CLIPImageProcessor,
                           CLIPTextModel, CLIPTextModelWithProjection)
 from diffusers import StableDiffusionPipeline
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
+
+from reference_releases import require
 
 
 def convert(model_class, config, parameters, *, vae=False):
@@ -42,8 +43,7 @@ def convert(model_class, config, parameters, *, vae=False):
 
 
 def build(base, directory, task):
-    if (diffusers.__version__, transformers.__version__) != ("0.34.0", "4.49.0"):
-        raise RuntimeError("Use the pinned isolated reference environment")
+    require("diffusers-pipelines")
     base, directory = Path(base), Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     if task == "safety":

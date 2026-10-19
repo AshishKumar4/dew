@@ -141,6 +141,12 @@ def _unscale(gradient: jax.Array, factor: jax.typing.ArrayLike) -> jax.Array:
     return gradient.astype(dtype) / jnp.asarray(factor, dtype)
 
 
+def _descending(gradient: jax.Array, parameter: jax.Array) -> jax.Array:
+    """`gradient` in its parameter's dtype, as optax descends along it. JAX's gradient of a real
+    loss in a complex parameter is the conjugate of its steepest ascent."""
+    return (jnp.conj(gradient) if jnp.iscomplexobj(gradient) else gradient).astype(parameter.dtype)
+
+
 def _all_finite(tree) -> jax.Array:
     finite = jnp.asarray(a=True)
     for leaf in jax.tree.leaves(tree):
@@ -375,7 +381,7 @@ class Transaction:
         Admission is decided by finish_attempt after checking the updated
         parameters and optimizer state as well.
         """
-        native = jax.tree.map(lambda g, p: g.astype(p.dtype), gradient, current.variables["params"])
+        native = jax.tree.map(_descending, gradient, current.variables["params"])
         native_finite = _all_finite(native)
         norm = optax.global_norm(native)
         norm = norm.astype(jnp.result_type(norm.dtype, jnp.float32))
