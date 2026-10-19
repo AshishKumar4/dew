@@ -28,9 +28,12 @@ def divided(numerator, rate):
     numerator times zero, a full-shape operand that no simplification folds back to the broadcast
     (folding would change an infinite numerator's NaN), so the division stays one, inside the
     fusion around it and with no buffer of its own. A finite numerator leaves the rate exact.
-    Remove this once XLA keeps such divisions IEEE.
+    Other backends keep the division as written (the rewrite is the CPU compiler's alone), so
+    there it is the plain one, at the plain one's cost. Remove this once XLA keeps such
+    divisions IEEE.
     """
-    return numerator / (rate + numerator * 0)
+    return jax.lax.platform_dependent(numerator, rate, cpu=lambda value, by: value / (by + value * 0),
+                                      default=lambda value, by: value / by)
 
 
 
