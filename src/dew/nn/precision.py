@@ -96,6 +96,29 @@ class Float32Products:
         return float32_products(self.dtype, self.precision)
 
 
+def configurable_precision(precision: PrecisionLike) -> bool:
+    """Whether `jax.default_matmul_precision` can name `precision`: one precision or dot algorithm
+    preset, unset or default included; not a pair of precisions or a dot algorithm."""
+    return len(precision_names(precision)) <= 1 and not isinstance(precision, jax.lax.DotAlgorithm)
+
+
+def configured_precision(precision: PrecisionLike):
+    """A context in which a product that takes no precision of its own (jax.nn's xla attention)
+    multiplies at `precision`, through `jax.default_matmul_precision`; an unset or default
+    precision changes nothing. A precision no config names (`configurable_precision`) is
+    refused."""
+    import contextlib
+
+    if not configurable_precision(precision):
+        raise ValueError(f"precision={precision} has no jax_default_matmul_precision name")
+    names = precision_names(precision)
+    if names <= {'DEFAULT'}:
+        return contextlib.nullcontext()
+    (name,) = names
+    preset = name in jax.lax.DotAlgorithmPreset.__members__
+    return jax.default_matmul_precision(name if preset else name.lower())
+
+
 def operand_precision(dtype: Dtype | None, precision: PrecisionLike = None) -> jax.lax.PrecisionLike:
     """The precision a product of `dtype` operands takes: float32 products for float32 operands
     where none is stated (`float32_products`), and for bf16 operands at the default precision the
