@@ -1044,8 +1044,12 @@ def publish(
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
 ):
-    """Fill and seal a deterministic prefix, then publish its certified generation."""
+    """Fill and seal a deterministic prefix, then publish its certified
+    generation, unless one is already published under its key (with the plan
+    of a terminal pack), which it returns."""
     from dew.data.cache import Cache
+    from dew.data.generation import Generation
+    from dew.data.packing import PackingPlan, plan_name
 
     if not isinstance(cache, Cache):
         raise TypeError("publish needs a Cache destination")
@@ -1054,8 +1058,6 @@ def publish(
     planned = _at(pipeline.stages, Pack)
     builder = None
     if planned is not None:
-        from dew.data.packing import PackingPlan
-
         packing = pipeline.stages[planned]
         if not isinstance(packing, Pack) or planned != len(pipeline.stages) - 1:
             raise ValueError("publication accepts one terminal packing stage after the cached prefix")
@@ -1065,12 +1067,23 @@ def publish(
     source = pipeline.source
     if isinstance(source, (Mixture, Phases)):
         raise ValueError("configured publication needs one physical source")
-    cached = pipeline.cache(cache)
     manifest = _cache_manifest(source, pipeline.stages, read)
-    iterator = iter(iterate(cached, read=read, loading=loading))
+
+    def published() -> Generation | None:
+        generation = cache.generation(manifest)
+        held = generation is not None and (
+            builder is None or plan_name(builder.pack, "accepted") in generation.manifest["plan"])
+        return generation if held else None
+
+    found = published()
+    if found is not None:
+        return found
+    iterator = iter(iterate(pipeline.cache(cache), read=read, loading=loading))
     try:
         for _ in iterator:
             pass
     finally:
         iterator.close()
-    return cache.publish(manifest, source, plan=builder)
+    # A fill one reader completed publishes itself (`Cache.mapped`).
+    found = published()
+    return cache.publish(manifest, source, plan=builder) if found is None else found

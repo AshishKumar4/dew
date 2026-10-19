@@ -85,11 +85,14 @@ class _Passthrough:
 class Cache:
     """Cache a deterministic prefix without changing a filling run's execution plan.
 
-    CURRENT is read only by an explicit generation open. Each process keeps
-    its own writes; it never discovers another filling writer's rows.
-    Volatile prefixes run on every read and produce no completions. A shard
-    upload to a remote store is tried `retry` more times; one to this host's
-    disk or memory fails at once.
+    A fill whose key a generation is published under (CURRENT) reads that
+    generation's completions in place of running its steps, so a later run
+    reuses an earlier one's complete fill. Otherwise each process keeps its
+    own writes; it never discovers another filling writer's rows, and a
+    writer that completes every input of the source it is given publishes
+    that source's generation. Volatile prefixes run on every read and produce
+    no completions. A shard upload to a remote store is tried `retry` more
+    times; one to this host's disk or memory fails at once.
     """
 
     url: str
@@ -156,11 +159,18 @@ class Cache:
         key: DependencyManifest,
         *,
         transform: Transform | None = None,
+        source: Source | None = None,
     ) -> _Mapped:
+        """The cached rows of `parent`, a source's records by index: a published
+        generation's, or filled as they are read. A fill that completes every
+        input publishes the generation of `source`, the source they are."""
         self._root(key)
         if transform is not None and _volatile(transform):
             return _Mapped(parent.map_with_index(_Passthrough(transform)))
-        return _CachedMap(parent, self, key, transform)
+        published = self.generation(key)
+        if published is not None:
+            return _Mapped(grain.MapDataset.range(len(parent)).map(_Published(published, transform)))
+        return _CachedMap(parent, self, key, transform, source)
 
     def streamed(
         self,
@@ -172,7 +182,9 @@ class Cache:
         self._root(key)
         if transform is not None and _volatile(transform):
             return _PassthroughReader(reader, _Passthrough(transform))
-        return _CachedReader(reader, self, key, transform)
+        published = self.generation(key)
+        return _CachedReader(reader, self, key, transform,
+                             None if published is None else _Published(published, transform))
 
     def generation(self, key: DependencyManifest) -> Generation | None:
         root = self._root(key)
@@ -205,9 +217,41 @@ class Cache:
             return _publish(self, key, source, plan, pins)
 
 
+@dataclass(frozen=True)
+class _Published:
+    """The completions a generation published under a fill's key holds, read
+    in place of running the fill's steps: a fill another run completed."""
+
+    generation: Generation
+    transform: Transform | None
+
+    def __call__(self, row_id: RowId) -> CachedValue:
+        outputs = self.generation.outputs(row_id)
+        return outputs if self.transform is not None else outputs[0]
+
+    def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
+        return self(row_id)
+
+    def finish(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def metrics(self) -> CacheStats:
+        return _READING
+
+
+_READING: CacheStats = {"admitting": False, "spool_bytes": 0, "uploaded_bytes": 0, "upload_seconds": 0.0,
+                        "abandoned": 0}
+"""What a read with no fill reports: a published generation's or a volatile prefix's."""
+
+
 class _Writer:
-    def __init__(self, cache: Cache, key: DependencyManifest, *, expected: int | None = None):
+    def __init__(self, cache: Cache, key: DependencyManifest, *, expected: int | None = None,
+                 source: Source | None = None):
         self.cache, self.root = cache, cache._root(key)
+        self.key, self.source = key, source
         self.writer = uuid.uuid4().hex
         _, root_path, scheme = self.root._backend()
         self.pin = LocalRetention.pin(Path(root_path) / "shards" / self.writer) if scheme == "file" else None
@@ -314,7 +358,7 @@ class _Writer:
                 self._flush()
             if self.expected is not None and self.index.total_changes + len(self.pending) == self.expected:
                 self._flush()
-                self.seal_future = self.pool.submit(self.seal)
+                self.seal_future = self.pool.submit(self.complete)
 
     def _flush(self) -> None:
         if not self.pending:
@@ -457,6 +501,18 @@ class _Writer:
             if self.root.child(f"segments/{self.writer}/seal.json").read() != payload:
                 raise
 
+    def complete(self) -> None:
+        """Seal a fill holding every input, and publish the generation of its
+        source where it was given one. Another writer that completed the same
+        fill may publish it first, which leaves it published."""
+        self.seal()
+        if self.source is None:
+            return
+        try:
+            self.cache.publish(self.key, self.source)
+        except PreconditionFailed:
+            _log.info("cache %s was published by another writer first", self.root.url)
+
     def finish(self) -> None:
         with self.lock:
             if self.closing:
@@ -546,8 +602,7 @@ class _Mapped(grain.MapDataset[CachedValue]):
         pass
 
     def metrics(self) -> CacheStats:
-        return {"admitting": False, "spool_bytes": 0, "uploaded_bytes": 0,
-                "upload_seconds": 0.0, "abandoned": 0}
+        return _READING
 
     def iterated(
         self, view: grain.MapDataset[CachedValue], read_options: grain.ReadOptions | None = None
@@ -563,20 +618,17 @@ class _CachedMap(_Mapped):
         cache: Cache,
         key: DependencyManifest,
         transform: Transform | None,
+        source: Source | None,
     ):
         super().__init__(parent)
-        self.cache, self.key, self.transform = cache, key, transform
+        self.cache, self.key, self.transform, self.source = cache, key, transform, source
         self.writer_lock = threading.RLock()
 
     @property
     def writer(self) -> _Writer:
         with self.writer_lock:
             if "_writer" not in self.__dict__:
-                writer = _Writer(
-                    self.cache,
-                    self.key,
-                    expected=len(self),
-                )
+                writer = _Writer(self.cache, self.key, expected=len(self), source=self.source)
                 finalizer = weakref.finalize(self, writer.close)
                 finalizer.atexit = False
                 self.__dict__["_writer"] = writer
@@ -665,9 +717,10 @@ class _CachedReader:
     cache: Cache
     key: DependencyManifest
     transform: Transform | None
+    published: _Published | None
 
     def __call__(self, shard: Shard) -> grain.IterDataset:
-        return _CachedIter(self.reader(shard), self.cache, self.key, shard, self.transform)
+        return _CachedIter(self.reader(shard), self.cache, self.key, shard, self.transform, self.published)
 
 
 class _CachedIter(grain.IterDataset):
@@ -678,13 +731,15 @@ class _CachedIter(grain.IterDataset):
         key: DependencyManifest,
         shard: Shard,
         transform: Transform | None,
+        published: _Published | None,
     ):
         super().__init__(parent)
         self.cache, self.key, self.shard, self.transform = cache, key, shard, transform
-        self.input_parent = parent
+        self.published, self.input_parent = published, parent
 
     def __iter__(self) -> grain.DatasetIterator:
-        return _CachedIterator(self.input_parent.__iter__(), self.cache, self.key, self.shard, self.transform)
+        return _CachedIterator(self.input_parent.__iter__(), self.cache, self.key, self.shard, self.transform,
+                               self.published)
 
 
 class _CachedIterator(grain.DatasetIterator):
@@ -695,10 +750,12 @@ class _CachedIterator(grain.DatasetIterator):
         key: DependencyManifest,
         shard: Shard,
         transform: Transform | None,
+        published: _Published | None,
     ):
         super().__init__(parent)
         self.parent, self.shard, self.transform = parent, shard, transform
-        self.writer = _Writer(cache, key)
+        # A shard keeps its iterator's state either way, so a fill resumes onto its published generation.
+        self.writer: _Writer | _Published = _Writer(cache, key) if published is None else published
         self.ordinal = 0
 
     def __next__(self):

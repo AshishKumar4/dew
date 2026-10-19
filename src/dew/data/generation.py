@@ -306,9 +306,10 @@ def _completion(entry: Mapping[str, object], encoded: Batch | bytes | None) -> N
 
 def _source_ids(source: Source, *, streamed: bool = False,
                 completed: Iterable[str] = ()) -> Iterator[RowId]:
-    """The store's input IDs, refusing subdivided fills before reopening it."""
-    if not streamed and source.supports("indexed"):
-        yield from range(len(source.records("indexed")))
+    """The store's input IDs, refusing subdivided fills before reopening it: a
+    fill keyed by place numbers the records a memory or indexed read holds."""
+    if not streamed:
+        yield from range(len(source.records("indexed" if source.supports("indexed") else "memory")))
         return
     manifest = source.manifest()
     if manifest.subdivide is not None:
