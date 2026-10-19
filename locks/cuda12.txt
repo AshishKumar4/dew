@@ -436,7 +436,7 @@ itsdangerous==2.2.0
     # via flask
 jaraco-functools==4.6.0
     # via cheroot
-jax==0.12.0.post5
+jax==0.12.0.post6
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
