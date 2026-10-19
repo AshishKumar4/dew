@@ -239,3 +239,88 @@ def test_a_bfloat16_safety_head_decides_as_its_checkpoint_states(saved_pipelines
                                      attention_impl="xla")
             blocked = np.all(np.asarray(loaded.finish(loaded.variables, images)) == -1, axis=(1, 2, 3))
             np.testing.assert_array_equal(blocked, expected, err_msg=f"the {name} checker at {storage}")
+
+
+@pytest.mark.parametrize("scheduler", ["shipped", "lms"])
+def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(saved_pipelines, tmp_path,
+                                                                              scheduler):
+    """A loaded pipeline samples on its scheduler's own grid and ends as its solver does, without a
+    closing denoise (`SourceTask.grid`), which its training process's times and finish do not give;
+    an LMS scheduler's solver runs on that grid alone. An objective trained from the pipeline, built
+    directly or by a run config, keeps both: its evaluation is the solver's walk over that grid from
+    the same noise, whatever process trains, its task draws the pipeline's own task's images, and the
+    grid a saved run records rebuilds a task that draws them too."""
+    import dataclasses
+    import shutil
+
+    import jax
+    import jax.numpy as jnp
+    from diffusion_stubs import PROMPTS, batch_for
+    from reference_error import assert_as_exact_as_the_reference, widened
+
+    from dew.config import ObjectiveConfig
+    from dew.config.data import ImageData
+    from dew.diffusion.schedules import DiscreteNoiseScheduler
+    from dew.interop.pretrained import load_diffusion_source
+    from dew.objectives import Step
+    from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
+    from dew.registry import from_record, to_record
+    from dew.sampling import sample
+    from dew.sampling.pipelines import ImageSettings
+
+    directory = tmp_path / "sd"
+    shutil.copytree(saved_pipelines / "sd", directory)
+    if scheduler == "lms":
+        with np.load(SCHEDULER_GRIDS) as grids:
+            (directory / "scheduler" / "scheduler_config.json").write_text(str(grids["lms.config"]))
+    source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    size = source.inputs.sample.shape[0]
+    settings = {"guidance": None, "steps": 3, "ema_decay": None}
+    objective = DiffusionObjective(source, **settings)
+    other = DiscreteNoiseScheduler(np.linspace(1e-3, 0.2, 20), p2_loss_weight_gamma=0)
+    retrained = DiffusionObjective(source, **settings,
+                                   process=dataclasses.replace(source.process, schedule=other))
+    model = DiffusionRunConfig().model
+    configured = DiffusionRunConfig(
+        pretrained=str(directory), preset=None,
+        model=dataclasses.replace(model, fields={**model.fields, "dtype": "float32",
+                                                 "attention_impl": "xla"}),
+        data=ImageData(source="tfds://oxford_flowers102", image_size=size), val_metrics=(),
+        objective=ObjectiveConfig("diffusion", {**settings, "unconditional_prob": 0.0})).build()
+    variables = source.variables
+    batch = batch_for(objective, size)
+    key = jax.random.PRNGKey(4)
+    step = Step(jnp.asarray(0), key, None)
+
+    def walked(source, objective, variables, x_T):
+        """The pipeline's solver over its own grid from `x_T`, with no closing denoise, decoded."""
+        process, times = source.task.grid(3)
+        denoise = objective.denoiser(variables, objective.encoded_conditions(variables, batch), None, process)
+        latents = sample(denoise, x_T, solver=source.schedule.solver, key=jax.random.split(key)[1],
+                         times=np.asarray(times), final_denoise=False)
+        return jnp.clip(source.autoencoder.decode(variables["autoencoder"], latents), -1.0, 1.0)
+
+    # The noise the evaluation draws from its step's key, which the float64 walk starts from too.
+    rows = batch["image"].shape[0]
+    x_T = source.task.grid(3)[0].noise(jax.random.split(key)[0], (rows, *objective.latent_shape))
+    reference = walked(source, objective, variables, x_T)
+    # The denoiser in float64 over its weights widened; the text encoder and the decoder, whose
+    # roundings the evaluation and the reference make alike, stay as they are.
+    with jax.enable_x64(new_val=True):
+        wide = dataclasses.replace(source, model=source.model.clone(dtype=jnp.float64))
+        truth = walked(wide, DiffusionObjective(wide, **settings), widened(variables),
+                       jnp.asarray(x_T, jnp.float64))
+    evaluated = objective.evaluate(variables, batch, step).images
+    assert_as_exact_as_the_reference(np.asarray(evaluated), np.asarray(reference), np.asarray(truth),
+                                     "an evaluation on the pipeline's grid")
+    for built in (retrained, configured):
+        np.testing.assert_array_equal(built.evaluate(variables, batch, step).images, evaluated)
+
+    own = source.text_to_image()(PROMPTS, steps=3, guidance=None, key=0).host().images
+    task = objective.build_task(variables)
+    np.testing.assert_array_equal(task(PROMPTS, steps=3, guidance=None, key=0).host().images, own)
+    from dew.diffusion.schedules.source import SourceGrid
+
+    recorded = from_record(ImageSettings, to_record(configured.task_settings(), ImageSettings))
+    rebuilt = dataclasses.replace(task, grid=from_record(SourceGrid, recorded.grid))
+    np.testing.assert_array_equal(rebuilt(PROMPTS, steps=3, guidance=None, key=0).host().images, own)

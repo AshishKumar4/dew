@@ -33,6 +33,7 @@ from ..hyper_connections import (
 from ..inputs import LayerInputs, MixerCall, PredictionPhase
 from ..linear import recomputing
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
+from ..ngpt import NGPT, stepped
 from ..precision import scaled
 from ..protocols import ProjectionGroup, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
@@ -238,8 +239,11 @@ class BlockWiring:
     `pre_norms` norms each sublayer's input and `output_norms` norms its
     output. The input norms alone give the plain pre-norm block, both give
     Gemma's sandwich block, and the output norms alone give OLMo 3's post-norm
-    block. The output norms are separate modules named for the sublayer
-    outputs, so the input norms keep their names, and a checkpoint without
+    block. `ngpt` gives the normalized transformer's block, which has neither:
+    each sublayer reads the unit residual and joins it by a learned step along
+    the sphere (`dew.nn.ngpt.stepped`), `attn_alpha` and `mlp_alpha` its rates.
+    The output norms are separate modules named for the sublayer outputs, so
+    the input norms keep their names, and a checkpoint without
     output norms loads with two fewer leaves per layer. `layer_scalar` selects
     the reference's frozen or trainable output scalar. One wiring applies to
     every layer, so it is not part of the per-layer specs that the scan
@@ -252,10 +256,15 @@ class BlockWiring:
     parallel_residual: bool = False
     shared_parallel_norm: bool = False
     layer_scalar: Literal["frozen", "trainable"] | None = None
+    ngpt: NGPT | None = None
 
     def __post_init__(self):
         if self.shared_parallel_norm and not self.parallel_residual:
             raise ValueError('shared_parallel_norm requires parallel_residual')
+        if self.ngpt is not None and (self.pre_norms or self.output_norms or self.parallel_residual
+                                      or self.layer_scalar is not None):
+            raise ValueError("an nGPT block normalizes its residual itself: it takes no pre- or output "
+                             "norms, parallel residual or layer scalar")
         if self.layer_scalar not in (None, "frozen", "trainable"):
             raise ValueError("layer_scalar must be None, frozen or trainable")
 
@@ -598,6 +607,8 @@ class DecoderBlock(nn.Module):
                 "routed one to sum with and no LAuReL residual to average")
         if self.parallel is not None:
             self.moe = self.parallel(name='moe')
+        if self.wiring.ngpt is not None:
+            self._ngpt_rates(self.wiring.ngpt)
         if self.wiring.layer_scalar == "frozen":
             self.output_scalar = self.variable("constants", "layer_scalar", jnp.ones, (1,), jnp.float32).value
         elif self.wiring.layer_scalar == "trainable":
@@ -864,8 +875,25 @@ class DecoderBlock(nn.Module):
                            state.finished + 1)
         return state, read, None
 
+    def _ngpt_rates(self, ngpt: NGPT):
+        """nGPT's per-feature step rates, one a sublayer, each stored from its initializer's scale
+        (`NGPT.start`), so the step starts at `alpha`."""
+        if (self.hyper_connections is not None or self.residual_site is not None or self.altup is not None
+                or self.laurel_rank is not None or self.per_layer_input_dim or self.parallel is not None):
+            raise ValueError("an nGPT block steps its one residual along the sphere: it takes no "
+                             "hyper-connections, depth mixture, altup, laurel, per-layer inputs or "
+                             "parallel branch")
+        start = nn.initializers.constant(ngpt.start)
+        self.attn_alpha = self.param('attn_alpha', start, (self.emb_features,), jnp.float32)
+        if self.feedforward is not None:
+            self.mlp_alpha = self.param('mlp_alpha', start, (self.emb_features,), jnp.float32)
+
     def _write(self, state: _BlockState, site: Literal["attention", "mlp"], output, mapping) -> _BlockState:
         """The state after the sublayer at `site` adds `output` to it."""
+        if isinstance(state, _Plain) and self.wiring.ngpt is not None:
+            alpha = self.attn_alpha if site == "attention" else self.mlp_alpha
+            stepped_x = stepped(state.x, output, alpha, self.wiring.ngpt.step)
+            return state._replace(x=constrain(stepped_x, RESIDUAL))
         if isinstance(state, _Plain):
             return state._replace(x=constrain(state.x + output, RESIDUAL))
         if isinstance(state, _Streams):
