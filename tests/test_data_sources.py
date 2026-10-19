@@ -2278,3 +2278,41 @@ def test_native_map_datasets_read_as_streams_and_mix_with_a_stream_only_member()
         finally:
             resumed.close()
 
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
+def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(read):
+    """Two stores read in turn (`dew.data.Concatenate`) are one store to a recipe and to the verbs:
+    an epoch of a run holds every record of both once, steps chain on it as on any store, and a run
+    resumed after two batches reads the batches the uninterrupted run reads."""
+    from dew.config.data import RecordsData, loader
+    from dew.data import Concatenate
+
+    train = Memory([{"id": np.int32(index)} for index in range(6)])
+    held = Memory([{"id": np.int32(index)} for index in range(100, 104)])
+    joined = Concatenate((train, held))
+    assert joined.map(lambda record: {"id": record["id"] + 1}).chain().source is joined
+
+    def opened():
+        data = loader(RecordsData(joined), batch=2, read=read,
+                      loading=Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1), seed=3)
+        return data.train(DataPartition())
+
+    whole = opened()
+    try:
+        expected = [np.asarray(next(whole)["id"]).tolist() for _ in range(5)]
+    finally:
+        whole.close()
+    assert sorted(value for batch in expected for value in batch) == [*range(6), *range(100, 104)]
+    stopped = opened()
+    try:
+        head = [np.asarray(next(stopped)["id"]).tolist() for _ in range(2)]
+        saved = stopped.get_state()
+    finally:
+        stopped.close()
+    resumed = opened()
+    try:
+        resumed.set_state(saved)
+        assert head + [np.asarray(next(resumed)["id"]).tolist() for _ in range(3)] == expected
+    finally:
+        resumed.close()
