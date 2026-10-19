@@ -274,8 +274,8 @@ def plan_step[LossT, EffectsT](
 
     Where that plan splits the batch and `frontier` asks, the frontier's
     other point follows, one compile more: the batch in `candidates[0]`
-    microbatches one remat rung up (`remat_more`) with the head tiled, the
-    most memory one rung frees, where that fits. Which runs faster is
+    microbatches one remat rung up (`remat_more`) with the head tiled and
+    unfused, the most memory one rung frees, where that fits. Which runs faster is
     measured, not ranked: on an A100-40, Qwen3.5-0.8B's full fine-tune at
     8 x 3072 ran 1205.6 ms a step in four microbatches without recomputing,
     1174.1 under 'minimal' whole, the head tiled. The objective is left at
@@ -362,10 +362,11 @@ def plan_step[LossT, EffectsT](
     plans = [found(split)]
     if frontier and split != candidates[0] and onward(lambda: remat_more(objective)):
         objective.tile_head()
+        objective.unfuse_head()
         xla_defaults = False
         lowered.clear()
         _log.warning("timing the plan against its batch whole at remat %r, %s", recompute_record(objective),
                      "the head tiled" if head_tile_of(objective) is not None else "the whole logits kept")
-        if fits(candidates[0]) or (objective.unfuse_head() is not None and fits(candidates[0])):
+        if fits(candidates[0]):
             plans.append(found(candidates[0]))
     return plans, tuple(probes)

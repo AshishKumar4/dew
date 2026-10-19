@@ -141,9 +141,9 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The student's modules, then the teacher's, which the step does not train. The step reads
-        the student's whole logits (`predict`), so no head of its is fused."""
-        return (*(program._replace(head_fused=False) for program in self.student.program_key()),
-                *(program._replace(trained=False) for program in self.teacher.program_key()))
+        both models' whole logits (`predict`), so no head of either is fused."""
+        teacher = (program._replace(trained=False) for program in self.teacher.program_key())
+        return tuple(program._replace(head_fused=False) for program in (*self.student.program_key(), *teacher))
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         count = len(self.student.program_key())
