@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+"""The released Dory as vLLM's own engine computes it, for tests/test_dory.py's release test.
+
+No transformers class computes Dory; vLLM's model does (vllm-project/vllm#60149, open, at
+55076950 of shan18/vllm). The pull request changes Python files alone, so vLLM's Python-only
+build installs exactly its tree: the checkout over the precompiled wheel of its base commit
+(`BASE`). On a GPU node, with Dew's environment in .venv:
+
+    git clone https://github.com/shan18/vllm vllm-pr
+    git -C vllm-pr checkout 55076950b6c155f384d6766d63563c3bc20a0e3f
+    uv venv -p 3.12 vllm-env
+    VIRTUAL_ENV=vllm-env VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_LOCATION=<WHEEL> \
+        uv pip install -e vllm-pr ninja
+    PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py record DIR
+    PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py truth DIR
+    PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py upstream DIR
+    PYTHONPATH=src:tests .venv/bin/python tools/dory_vllm_reference.py draw DIR
+    PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py orders DIR
+    HF_TOKEN=... PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py publish DIR
+
+`record` runs the engine once a `RUNS` entry, each in a process of its own: a loop count, a cache
+mode and a dtype, set through `hf_overrides` as the model card sets them, with no prefix caching,
+decoding greedily one request at a time with every step's log-probabilities over the whole
+vocabulary (`logprobs=-1`): the sentence `PROBE_TEXT` for `STEPS` tokens, its prompt's rows too
+(`prompt_logprobs=-1`), and `WINDOW` random ids, past the release's 1024-token sliding window,
+for `WINDOW_STEPS`. `truth` runs tools/dory_reference.py's transcription of the model in float64
+over the same tokens, prefilling the prompt and decoding each drawn token as the run's cache mode
+keeps them, and writes the probe and its provenance into source.json. `upstream` runs vLLM's own
+arithmetic on the same tokens, the pull request's model code in float64 as its own tests build it
+(`widened_float`): the truth every row and entry is measured against, which the transcription,
+the CPU tests' reference, is held to.
+
+A row of the probe is one position's log-probabilities on `COLUMNS` columns, `RANDOM` drawn once
+for every row, then the row's own, the union of vLLM's and float64's top `TOP` filled out by
+float64's next best; and at `positions` the whole vocabulary.
+
+One run is a coin flip at a few positions of every bf16 run, vLLM's too: a rounding there moves
+the continuation's log-probabilities by whole units. So the release is held to vLLM over
+`ORDERS` residual orders (tests/reference_error.py's K-order rule): `draw` draws them
+(tests/residual_orders.py) and `orders` permutes the engine's weights in place to each
+(`LLM.apply_model`), decoding the identity run's tokens again through a logits processor that
+draws them (tools/dory_vllm_forcing.py) beside the same raw log-probabilities. It keeps each
+order's rows on their columns, and over every row's whole vocabulary each entry's squared distance
+from float64 summed over the orders. Order zero reproduces the probe's rows bit for
+bit. `publish` puts the probe and the orders in `DATASET`, at a revision source.json pins with each
+file's sha256 (`fetched`).
+"""
+
+from __future__ import annotations
+
+import functools
+import gc
+import itertools
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+
+FIXTURE = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf' / 'dory-1.0-4b'
+PULL = 'vllm-project/vllm#60149 at shan18/vllm 55076950b6c155f384d6766d63563c3bc20a0e3f'
+BASE = '153a17166e5d07bc38184dedeea542d2e8885e55'
+WHEEL = (f'https://wheels.vllm.ai/{BASE}/vllm-0.32.0rc1.dev307%2Bg153a17166-cp38-abi3-'
+         'manylinux_2_28_x86_64.whl')
+"""The pull request's base and its precompiled wheel, which its Python-only build installs under
+the checkout's Python files."""
+PROBE_TEXT = 'The capital of France is Paris, and the capital of Japan is'
+STEPS = 256
+WINDOW = 1100
+WINDOW_STEPS = 64
+CONTEXT = 2048
+"""The engine's `max_model_len`, past both prompts and their continuations."""
+MEMORY = 0.9
+"""The share of the GPU the engine takes (`gpu_memory_utilization`)."""
+RUNS = (*((loops, mode, 'bfloat16') for loops in (1, 2, 4) for mode in ('per_loop', 'last_loop')),
+        *((2, mode, 'float32') for mode in ('per_loop', 'last_loop')))
+"""(loop count, cache mode, dtype): bf16, the release's, at one, two (its own) and four loops,
+and fp32 at its own count, whose per-pass cache qualifies the float64 truth as vLLM's function."""
+COLUMNS = 64
+RANDOM = 32
+TOP = 16
+ORDERS_SEED = 11
+DATASET = 'dewml/dory-1.0-4b-vllm-reference'
+"""Where the probe and its orders live: source.json pins its revision and each file's sha256."""
+
+
+def tag(key: str) -> str:
+    """A run's name as a file name."""
+    return key.replace('/', '-')
+
+
+def name(loops: int, mode: str, dtype: str) -> str:
+    return f'{loops}/{mode}/{dtype}'
+
+
+def prompts(tokenizer_ids: list[int], vocab: int) -> dict[str, np.ndarray]:
+    """The sentence's ids and `WINDOW` random ids."""
+    return {'sentence': np.asarray(tokenizer_ids, np.int32),
+            'window': np.random.default_rng(7).integers(1000, vocab, WINDOW).astype(np.int32)}
+
+
+def dense(flat, vocab: int) -> np.ndarray:
+    """vLLM's flat log-probabilities (`FlatLogprobs`), a `[positions, vocab]` float32 array."""
+    rows = np.full((len(flat.start_indices), vocab), -np.inf, np.float32)
+    ids, values = np.asarray(flat.token_ids), np.asarray(flat.logprobs, np.float32)
+    for row, (start, end) in enumerate(zip(flat.start_indices, flat.end_indices, strict=True)):
+        rows[row, ids[start:end]] = values[start:end]
+    return rows
+
+
+def engine(loops: int, mode: str, dtype: str, **options):
+    """vLLM's engine over the release at `source.json`'s revision, its loop count and cache mode set
+    as the model card sets them, without prefix caching."""
+    from vllm import LLM
+
+    source = json.loads((FIXTURE / 'source.json').read_text())
+    return LLM(model=source['repo'], revision=source['revision'], dtype=dtype, max_model_len=CONTEXT,
+               gpu_memory_utilization=MEMORY, max_logprobs=-1, enable_prefix_caching=False, seed=0,
+               hf_overrides={'n_recurrent_loops': loops, 'recurrent_kv_cache_mode': mode}, **options)
+
+
+def scored(llm, prompt: np.ndarray, steps: int, prompt_rows: bool, forced: np.ndarray | None = None):
+    """`steps` tokens after `prompt`, greedy or the `forced` ones (`Forced`), and the log-probabilities
+    over the whole vocabulary of each row: the prompt's but its first where `prompt_rows`, then a
+    row a step, each row the position's before its token."""
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    params = SamplingParams(
+        temperature=0.0, max_tokens=steps, ignore_eos=True, logprobs=-1, detokenize=False,
+        prompt_logprobs=-1 if prompt_rows else None, flat_logprobs=True,
+        extra_args=None if forced is None else {'forced': forced.tolist(), 'prompt': len(prompt)})
+    (output,) = llm.generate([TokensPrompt(prompt_token_ids=prompt.tolist())], params, use_tqdm=False)
+    drawn, vocab = output.outputs[0], llm.llm_engine.model_config.get_vocab_size()
+    rows = dense(drawn.logprobs, vocab)
+    if prompt_rows:
+        # prompt_logprobs[i] scores token i, the logits at position i - 1; the first is None.
+        rows = np.concatenate([dense(output.prompt_logprobs, vocab)[1:], rows])
+    return np.asarray(drawn.token_ids, np.int32), rows
+
+
+PARTS = (('sentence', STEPS, True), ('window', WINDOW_STEPS, False))
+"""Each prompt, the tokens drawn after it, and whether its own rows are kept."""
+
+
+def record_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
+    """One run's tokens and log-probabilities, as vLLM's engine computes them."""
+    import torch
+    import vllm
+
+    llm = engine(loops, mode, dtype)
+    ids = prompts(llm.get_tokenizer().encode(PROBE_TEXT), llm.llm_engine.model_config.get_vocab_size())
+    arrays: dict[str, np.ndarray] = dict(ids)
+    for part, steps, prompt_rows in PARTS:
+        arrays[f'{part}_generated'], arrays[f'{part}_logprobs'] = scored(llm, ids[part], steps, prompt_rows)
+    np.savez(directory / f'{tag(name(loops, mode, dtype))}.npz', **arrays)
+    (directory / 'provenance.json').write_text(json.dumps({
+        'reference': f"{PULL}, installed by vLLM's Python-only build over {WHEEL}",
+        'vllm': vllm.__version__, 'torch': torch.__version__, 'cuda': torch.version.cuda,
+        'gpu': torch.cuda.get_device_name()}, indent=2) + '\n')
+
+
+def record(directory: Path) -> None:
+    """Every run, each in a process of its own: an engine holds its GPU until its process ends."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for loops, mode, dtype in RUNS:
+        subprocess.run([sys.executable, __file__, 'run', str(directory), str(loops), mode, dtype], check=True)
+        print(f'recorded {name(loops, mode, dtype)}', flush=True)
+
+
+def log_softmax(logits: np.ndarray) -> np.ndarray:
+    top = logits.max(axis=-1, keepdims=True)
+    return logits - top - np.log(np.exp(logits - top).sum(axis=-1, keepdims=True))
+
+
+def own_columns(vllm_rows: np.ndarray, truth: np.ndarray, random: np.ndarray) -> np.ndarray:
+    """Each row's own columns: the union of vLLM's and float64's top `TOP` outside `random`, filled
+    out by float64's next best."""
+    width = COLUMNS - RANDOM
+    own = np.empty((len(truth), width), np.int32)
+    taken = set(random.tolist())
+    for row, (theirs, exact) in enumerate(zip(vllm_rows, truth, strict=True)):
+        ranked = np.argsort(-exact)
+        candidates = (*np.argsort(-theirs)[:TOP], *ranked[:TOP])
+        chosen = list(dict.fromkeys(int(column) for column in candidates if column not in taken))
+        chosen += [int(column) for column in ranked if column not in taken and column not in chosen][
+            :width - len(chosen)]
+        own[row] = chosen[:width]
+    return own
+
+
+def columns_of(probe, key: str) -> np.ndarray:
+    """Each row's `COLUMNS` columns of run `key`: the shared random ones, then its own."""
+    own = probe[f'{key}/columns']
+    return np.concatenate([np.broadcast_to(probe['random'], (len(own), RANDOM)), own], axis=1)
+
+
+def truth(directory: Path) -> None:
+    """The float64 truth on every run's tokens, each row's columns, and the probe."""
+    import torch
+    from dory_reference import DoryReference
+
+    config, tensors = release()
+    random = np.random.default_rng(9).choice(config['vocab_size'], RANDOM, replace=False).astype(np.int32)
+    probe: dict[str, np.ndarray] = {'random': random}
+    reference = DoryReference(config, tensors, torch.float64, device='cuda')
+    for loops, mode, dtype in RUNS:
+        run = np.load(directory / f'{tag(name(loops, mode, dtype))}.npz')
+        probe.update({key: run[key] for key in ('sentence', 'window')})
+        reference.c.update(n_recurrent_loops=loops, recurrent_kv_cache_mode=mode)
+        rows = log_softmax(np.concatenate([
+            reference.forced(run['sentence'], run['sentence_generated']),
+            reference.forced(run['window'], run['window_generated'], prompt_rows=False)]))
+        theirs = np.concatenate([run['sentence_logprobs'], run['window_logprobs']])
+        key = name(loops, mode, dtype)
+        probe.update({f'{key}/sentence_generated': run['sentence_generated'],
+                      f'{key}/window_generated': run['window_generated'],
+                      f'{key}/columns': own_columns(theirs, rows, random)})
+        columns, whole = columns_of(probe, key), positions(probe)
+        probe.update({f'{key}/vllm': np.take_along_axis(theirs, columns, axis=1),
+                      f'{key}/truth': np.take_along_axis(rows, columns, axis=1),
+                      f'{key}/vllm_full': theirs[whole], f'{key}/truth_full': rows[whole]})
+        print(f'{key}: {len(rows)} rows', flush=True)
+    np.savez_compressed(FIXTURE / 'probe.npz', **probe)
+    source = json.loads((FIXTURE / 'source.json').read_text())
+    provenance = json.loads((directory / 'provenance.json').read_text())
+    (FIXTURE / 'source.json').write_text(json.dumps({**source, 'probe': {
+        **provenance, 'truth': 'tools/dory_reference.py in float64 on the same GPU',
+        'recorder': 'tools/dory_vllm_reference.py'}}, indent=2) + '\n')
+    print(f'{FIXTURE / "probe.npz"}: {len(probe)} arrays')
+
+
+def release() -> tuple[dict, dict]:
+    """The release's config and its tensors, as torch tensors on the host."""
+    from huggingface_hub import snapshot_download
+    from safetensors.torch import load_file
+
+    source = json.loads((FIXTURE / 'source.json').read_text())
+    folder = Path(snapshot_download(source['repo'], revision=source['revision'],
+                                    allow_patterns=['config.json', '*.safetensors']))
+    tensors = {key: value for path in sorted(folder.glob('*.safetensors'))
+               for key, value in load_file(path).items()}
+    return json.loads((folder / 'config.json').read_text()), tensors
+
+
+def positions(probe) -> np.ndarray:
+    """The rows every run keeps over the whole vocabulary: the sentence prompt's last, two decode
+    steps after it (the first and the middle) and the last, past the window."""
+    prompt = len(probe['sentence'])
+    return np.asarray([prompt - 1, prompt, prompt + STEPS // 2, prompt + STEPS - 2 + WINDOW_STEPS])
+
+
+@functools.cache
+def reference_attention():
+    """The pull request's tests/models/test_dory.py ReferenceAttention: single-request causal GQA,
+    sliding-window and decode caching, its positions on its queries' device."""
+    import torch
+
+    class ReferenceAttention(torch.nn.Module):
+        def __init__(self, num_heads, head_size, scale, num_kv_heads, **kwargs):
+            super().__init__()
+            self.num_heads, self.num_kv_heads = num_heads, num_kv_heads
+            self.head_size, self.scale = head_size, scale
+            self.prefix = kwargs['prefix']
+            self.window = kwargs['per_layer_sliding_window']
+            self.keys = self.values = None
+
+        def forward(self, q, k, v):
+            q = q.view(-1, self.num_heads, self.head_size).transpose(0, 1)
+            k = k.view(-1, self.num_kv_heads, self.head_size).transpose(0, 1)
+            v = v.view(-1, self.num_kv_heads, self.head_size).transpose(0, 1)
+            offset = self.start_pos
+            self.keys = k if self.keys is None else torch.cat((self.keys[:, :offset], k), dim=1)
+            self.values = v if self.values is None else torch.cat((self.values[:, :offset], v), dim=1)
+            key_pos = torch.arange(self.keys.shape[1], device=q.device)
+            query_pos = torch.arange(offset, offset + q.shape[1], device=q.device)[:, None]
+            mask = key_pos <= query_pos
+            if self.window is not None:
+                mask &= key_pos > query_pos - self.window
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, self.keys, self.values, attn_mask=mask, scale=self.scale, enable_gqa=True)
+            return out.transpose(0, 1).reshape(-1, self.num_heads * self.head_size)
+
+    return ReferenceAttention
+
+
+def widened_float():
+    """vLLM's model code in float64 as Dew's float64 truth runs Dew: each of its casts to float32
+    (`Tensor.float`, a float32 `torch.arange`) keeps a float64 operand float64, a narrower one
+    rounding to float32 as it did."""
+    import contextlib
+
+    import torch
+
+    @contextlib.contextmanager
+    def widened():
+        cast, arange = torch.Tensor.float, torch.arange
+
+        def at_least_float32(tensor, *args, **kwargs):
+            return tensor if tensor.dtype == torch.float64 else cast(tensor, *args, **kwargs)
+
+        def wide_arange(*args, dtype=None, **kwargs):
+            return arange(*args, dtype=torch.float64 if dtype == torch.float32 else dtype, **kwargs)
+
+        torch.Tensor.float, torch.arange = at_least_float32, wide_arange
+        try:
+            yield
+        finally:
+            torch.Tensor.float, torch.arange = cast, arange
+
+    return widened()
+
+
+def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype):
+    """The pull request's DoryForCausalLM over the release in `dtype` (a torch dtype), built as its
+    tests/models/test_dory.py builds it, with that test's reference attention in the engine's
+    attention's place, under `dtype` as the engine's loader builds a model (its rotary tables take
+    it), and a call that decodes: `rows(prompt, tokens, prompt_rows)` prefills `prompt` and decodes
+    each of `tokens` but the last a step at a time, the log-probabilities of the prompt's rows (its
+    last alone where `prompt_rows` is False) and a row a token, in at least float32."""
+    from types import SimpleNamespace
+
+    import torch
+    from vllm.config import CompilationConfig, DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.distributed import parallel_state
+    from vllm.model_executor.models import dory
+    from vllm.transformers_utils.configs.dory import DoryConfig
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    attention = reference_attention()
+    parallel_state._TP = SimpleNamespace(world_size=1, rank_in_group=0)
+    dory.Attention = attention
+    vc = VllmConfig(device_config=DeviceConfig(device='cuda'),
+                    compilation_config=CompilationConfig(mode=0, custom_ops=['none']))
+    hf = DoryConfig(**{**config, 'n_recurrent_loops': loops, 'recurrent_kv_cache_mode': mode})
+    vc.model_config = SimpleNamespace(hf_config=hf, head_dtype=None, dtype=dtype)
+    with set_current_vllm_config(vc), set_default_torch_dtype(dtype), torch.device('cuda'):
+        model = dory.DoryForCausalLM(vllm_config=vc).to(dtype)
+        model.load_weights((key, value.to(dtype)) for key, value in tensors.items())
+    # One process holds the whole vocabulary, as the test's logits check takes it.
+    model.logits_processor._gather_logits = lambda logits: logits
+
+    def start(module, args):
+        # The runner's slot mapping for one request's contiguous tokens, as the test's.
+        for cache in module.modules():
+            if isinstance(cache, attention):
+                cache.start_pos = int(args[1][0])
+
+    model.register_forward_pre_hook(start)
+
+    def rows(prompt: np.ndarray, tokens: np.ndarray, prompt_rows: bool) -> np.ndarray:
+        for cache in model.modules():
+            if isinstance(cache, attention):
+                cache.keys = cache.values = None
+        ids = torch.as_tensor(np.concatenate([prompt, tokens]), device='cuda')
+        with set_current_vllm_config(vc), torch.inference_mode():
+            hidden = model(ids[:len(prompt)], torch.arange(len(prompt), device='cuda'))
+            found = [model.compute_logits(hidden if prompt_rows else hidden[-1:])]
+            for at in range(len(prompt), len(ids) - 1):
+                hidden = model(ids[at:at + 1], torch.arange(at, at + 1, device='cuda'))
+                found.append(model.compute_logits(hidden))
+            logits = torch.cat(found)
+            # The engine's sampler takes log-probabilities in float32 (Sampler.compute_logprobs).
+            wide = torch.promote_types(logits.dtype, torch.float32)
+            return logits.log_softmax(dim=-1, dtype=wide).cpu().numpy()
+
+    return model, rows
+
+
+def upstream(directory: Path) -> None:
+    """vLLM's own model code in float64 on every run's tokens, the truth every row and entry is
+    measured against: `model_code` under `widened_float`, prefilling each prompt and decoding each
+    drawn token as the run's cache mode keeps them. Each run's rows over the whole vocabulary
+    (`directory/upstream-{run}.npy`), on its columns (`{key}/upstream`) and at `positions`
+    (`{key}/upstream_full`)."""
+    import torch
+
+    config, tensors = release()
+    probe = dict(np.load(FIXTURE / 'probe.npz'))
+    with widened_float():
+        for (loops, mode), runs in itertools.groupby(sorted(RUNS), key=lambda run: run[:2]):
+            model, rows = model_code(config, tensors, loops, mode, torch.float64)
+            for run in runs:
+                key = name(*run)
+                found = np.concatenate([rows(probe[part], probe[f'{key}/{part}_generated'], prompt_rows)
+                                        for part, _, prompt_rows in PARTS])
+                np.save(directory / f'upstream-{tag(key)}.npy', found)
+                probe[f'{key}/upstream'] = np.take_along_axis(found, columns_of(probe, key), axis=1)
+                probe[f'{key}/upstream_full'] = found[positions(probe)]
+                print(f'{key}: upstream in float64', flush=True)
+            # This loop count's model leaves the device before the next one's is built.
+            del model, rows
+            gc.collect()
+            torch.cuda.empty_cache()
+    np.savez_compressed(FIXTURE / 'probe.npz', **probe)
+
+
+SHARED = tuple(run for run in RUNS if run[1] == 'last_loop')
+"""The runs whose rows past the window take the model code in the run's dtype as the reference
+(`model_orders`): there vLLM's engine parts from the model code's last-loop cache
+(vllm-project/vllm#60149, issuecomment-6270937659), which the model code computes as specified."""
+
+
+def model_orders(directory: Path) -> None:
+    """For each `SHARED` run, the model code in the run's dtype (`model_code`, at the engine's
+    precision) on the window's rows under every order of `directory/orders.npy`: each order's rows
+    on their columns and each entry's squared distance from `upstream`'s summed over the orders,
+    `directory/model-{run}.npz`."""
+    import functools
+
+    import torch
+
+    config, tensors = release()
+    probe = np.load(FIXTURE / 'probe.npz')
+    drawn = np.load(directory / 'orders.npy').astype(np.int64)
+    hidden = config['hidden_size']
+    for loops, mode, dtype in SHARED:
+        key = name(loops, mode, dtype)
+        window = slice(-len(probe[f'{key}/window_generated']), None)
+        model, rows = model_code(config, tensors, loops, mode, getattr(torch, dtype))
+        truth = np.load(directory / f'upstream-{tag(key)}.npy')[window]
+        columns = columns_of(probe, key)[window]
+        current, kept, squares = np.arange(hidden), [], np.zeros(truth.shape)
+        for index, order in enumerate(drawn):
+            seen = permute(model, torch.as_tensor(np.argsort(current)[order]), hidden)
+            current = order
+            if index == 0:
+                unpermuted = seen
+            assert np.array_equal(seen, unpermuted[order]), f'{key}: the model holds no order {index}'
+            found = rows(probe['window'], probe[f'{key}/window_generated'], prompt_rows=False)
+            kept.append(np.take_along_axis(found, columns, axis=1))
+            squares += np.square(found - truth)
+            print(f'{key} model code, order {index}: {np.sqrt(np.mean(np.square(found - truth))):.4f}',
+                  flush=True)
+        np.savez(directory / f'model-{tag(key)}.npz', columns=np.stack(kept),
+                 squares=squares.astype(np.float32))
+        del model, rows
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def draw(directory: Path) -> None:
+    """`ORDERS` residual orders of the release's width, the first the identity, under Dew's
+    environment (tests/residual_orders.py, tests/reference_error.py's ORDERS)."""
+    from reference_error import ORDERS
+    from residual_orders import orders
+
+    width = json.loads((FIXTURE / 'config.json').read_text())['hidden_size']
+    np.save(directory / 'orders.npy', orders(width, ORDERS, ORDERS_SEED).astype(np.int16))
+
+
+def permute(model, order, hidden: int) -> np.ndarray:
+    """Reorder the residual stream of vLLM's `model` in place: every parameter's one axis of the
+    hidden width, as tests/residual_orders.py reorders Dew's. Returns the first such parameter's
+    first slice along its hidden axis, by which a caller sees the order taken."""
+    import torch
+
+    seen = None
+    with torch.no_grad():
+        for parameter in model.parameters():
+            axes = [axis for axis, size in enumerate(parameter.shape) if size == hidden]
+            if axes:
+                (axis,) = axes
+                parameter.copy_(parameter.index_select(axis, order.to(parameter.device)))
+                if seen is None:
+                    seen = parameter.movedim(axis, -1).reshape(-1, hidden)[0].float().cpu().numpy()
+    return seen
+
+
+def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
+    """One run under every order of `directory/orders.npy`, the engine's weights permuted in place
+    to each and the identity run's tokens drawn again (`Forced`): each order's rows on their
+    columns, and over every row's whole vocabulary the sum over the orders of each entry's squared
+    distance from float64 (`upstream`'s rows), `directory/orders-{run}.npz`."""
+    import functools
+
+    import torch
+
+    probe = np.load(FIXTURE / 'probe.npz')
+    key = name(loops, mode, dtype)
+    truth = np.load(directory / f'upstream-{tag(key)}.npy')
+    llm = engine(loops, mode, dtype, logits_processors=['dory_vllm_forcing:Forced'])
+    hidden = llm.llm_engine.model_config.get_hidden_size()
+    columns = columns_of(probe, key)
+
+    def rows() -> np.ndarray:
+        found = []
+        for part, _, prompt_rows in PARTS:
+            tokens = probe[f'{key}/{part}_generated']
+            drawn, scores = scored(llm, probe[part], len(tokens), prompt_rows, forced=tokens)
+            assert np.array_equal(drawn, tokens), f'{key} {part} drew otherwise'
+            found.append(scores)
+        return np.concatenate(found)
+
+    drawn = np.load(directory / 'orders.npy').astype(np.int64)
+    current, kept = np.arange(hidden), []
+    squares = np.zeros(truth.shape)
+    for index, order in enumerate(drawn):
+        # From the order the weights hold to this one.
+        step = torch.as_tensor(np.argsort(current)[order])
+        (seen,) = llm.apply_model(functools.partial(permute, order=step, hidden=hidden))
+        current = order
+        if index == 0:
+            unpermuted = seen
+        assert np.array_equal(seen, unpermuted[order]), f'{key}: the engine holds no order {index}'
+        found = rows()
+        on_columns = np.take_along_axis(found, columns, axis=1)
+        if index == 0:
+            assert np.array_equal(on_columns, probe[f'{key}/vllm']), f'{key}: order 0 is not the probe'
+            assert np.array_equal(found[positions(probe)], probe[f'{key}/vllm_full']), (
+                f'{key}: order 0 is not the probe')
+        kept.append(on_columns)
+        error = found - truth
+        squares += np.square(error)
+        print(f'{key} order {index}: {np.sqrt(np.mean(np.square(error))):.4f}', flush=True)
+    np.savez(directory / f'orders-{tag(key)}.npz', columns=np.stack(kept), squares=squares.astype(np.float32))
+
+
+def orders(directory: Path) -> None:
+    """Every run under every order, each in a process of its own: `directory/orders-{run}.npz`,
+    which `publish` puts beside the probe."""
+    import os
+
+    for loops, mode, dtype in RUNS:
+        # The weights' permutation reaches the engine's process as a pickled function.
+        subprocess.run([sys.executable, __file__, 'order', str(directory), str(loops), mode, dtype],
+                       check=True, env={**os.environ, 'VLLM_ALLOW_INSECURE_SERIALIZATION': '1'})
+
+
+CARD = """---
+license: apache-2.0
+tags: [dew, dory, vllm, reference]
+---
+# Dory 1.0 4B as vLLM computes it
+
+Reference statistics for the release test of [Dew](https://github.com/AshishKumar4/dew)
+(`tests/test_dory.py`), recorded by `tools/dory_vllm_reference.py` from vLLM's own engine running
+nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16: {pull}, installed by vLLM's Python-only build over
+{wheel}.
+
+Runs (loop count / cache mode / dtype): {runs}. Each decodes a sentence greedily for 256 tokens and
+64 tokens after 1100 random ids, past the 1024-token sliding window.
+
+- `probe.npz`: the prompts, each run's drawn tokens, each row's probe columns with vLLM's and the
+  float64 truth's log-probabilities on them, four rows over the whole vocabulary, and vLLM's own
+  model code run in float64 on the same tokens.
+- `orders.npy`: 52 permutations of the residual stream, the first the identity.
+- `upstream-<run>.npy`: every row over the whole vocabulary from vLLM's own model code in float64 on
+  the run's tokens, the truth.
+- `orders-<run>.npz`: under each permutation, vLLM's rows on the probe columns, and over every row's
+  whole vocabulary each entry's squared distance from the float64 truth summed over the 52.
+
+Dew's `tests/fixtures/hf/dory-1.0-4b/source.json` pins this repository's revision and each file's
+sha256.
+"""
+"""The dataset card `publish` writes beside the files."""
+
+
+def files(directory: Path) -> dict[str, Path]:
+    """The probe's files by their names in `DATASET`."""
+    return {'probe.npz': FIXTURE / 'probe.npz', 'orders.npy': directory / 'orders.npy',
+            **{f'{stage}-{tag(name(*run))}.{suffix}': directory / f'{stage}-{tag(name(*run))}.{suffix}'
+               for run in RUNS for stage, suffix in (('orders', 'npz'), ('upstream', 'npy'))},
+            **{f'model-{tag(name(*run))}.npz': directory / f'model-{tag(name(*run))}.npz' for run in SHARED}}
+
+
+def publish(directory: Path) -> None:
+    """The probe and its orders in one commit of `DATASET`, and source.json pinning that commit and
+    each file's sha256 (`fetched`)."""
+    import hashlib
+
+    from huggingface_hub import CommitOperationAdd, HfApi
+
+    api, kept = HfApi(), files(directory)
+    api.create_repo(DATASET, repo_type='dataset', exist_ok=True)
+    card = CARD.format(pull=PULL, wheel=WHEEL, runs=', '.join(name(*run) for run in RUNS))
+    commit = api.create_commit(
+        DATASET, repo_type='dataset', commit_message='The released Dory 4B as vLLM#60149 computes it',
+        operations=[CommitOperationAdd(path_in_repo='README.md', path_or_fileobj=card.encode()),
+                    *(CommitOperationAdd(path_in_repo=file, path_or_fileobj=str(path))
+                      for file, path in kept.items())])
+    source = json.loads((FIXTURE / 'source.json').read_text())
+    source['probe'].update(dataset=DATASET, revision=commit.oid, files={
+        file: hashlib.sha256(path.read_bytes()).hexdigest() for file, path in kept.items()})
+    (FIXTURE / 'source.json').write_text(json.dumps(source, indent=2) + '\n')
+    print(f'{DATASET}@{commit.oid}: {len(kept)} files')
+
+
+def fetched(file: str) -> Path:
+    """`file` of the probe, from `DATASET` at the revision source.json pins, its sha256 checked."""
+    import hashlib
+
+    from huggingface_hub import hf_hub_download
+
+    probe = json.loads((FIXTURE / 'source.json').read_text())['probe']
+    path = Path(hf_hub_download(probe['dataset'], file, repo_type='dataset', revision=probe['revision']))
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != probe['files'][file]:
+        raise ValueError(f"{file} at {probe['revision']} hashes to {digest}, "
+                         f"source.json pins {probe['files'][file]}")
+    return path
+
+
+if __name__ == '__main__':
+    stage, where = sys.argv[1], Path(sys.argv[2])
+    if stage in ('run', 'order'):
+        (record_run if stage == 'run' else orders_run)(where, int(sys.argv[3]), sys.argv[4], sys.argv[5])
+    else:
+        {'record': record, 'truth': truth, 'upstream': upstream, 'draw': draw, 'orders': orders,
+         'model_orders': model_orders, 'publish': publish}[stage](where)
