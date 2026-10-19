@@ -109,10 +109,9 @@ def rig(environment, verifier, *, tasks, log, workers=16, weights=lambda server,
         read=task_ids, **options):
     """A scheduler over `tasks` tasks a batch, two sessions a task, on Dew's own server, its
     sessions on `workers` threads, its weights published through `weights(server, watched)` and its
-    batches read into tasks by `read`: yields the
-    initial variables, a fit of `steps` updates (`fit(steps, checkpoints=)`), the state a trainer
-    restores from `checkpoints` (`restored(checkpoints)`), the watched source and the server, and
-    closes them after."""
+    batches read into tasks by `read`: yields the initial variables, a fit of `steps` updates
+    (`fit(steps, checkpoints=)`), the state a trainer restores from `checkpoints`
+    (`restored(checkpoints)`), the watched source and the server, and closes them after."""
     model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=64, dtype="float32")
     target = GRPOObjective(model, seq_len=WIDTH - 1, behavior_importance=2.0)
