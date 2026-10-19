@@ -47,6 +47,8 @@ from dew.objectives.base import (
     joined,
     model_rngs,
     part,
+    projected_draw,
+    projected_parts,
     thaw,
     under,
 )
@@ -180,12 +182,18 @@ class JepaObjective(Objective[Ratio]):
 
         encoder = given.get(CONTEXT_ENCODER)
         if encoder is None:
-            encoder = self.encoder.init(encoder_key, sample, context_idx)
+            encoder = projected_draw(self.encoder, self.encoder.init(encoder_key, sample, context_idx))
         predictor = given.get(PREDICTOR)
         if predictor is None:
             context = self.encoder.apply(thaw(encoder), sample, context_idx)
-            predictor = self.predictor.init(predictor_key, context, context_idx, target_idx)
+            predictor = projected_draw(self.predictor,
+                                       self.predictor.init(predictor_key, context, context_idx, target_idx))
         return joined({CONTEXT_ENCODER: encoder, PREDICTOR: predictor})
+
+    def projected(self, params: Variables, *, updated: bool) -> Variables:
+        """The encoder's projection of its own tree, and the predictor's of its own."""
+        return projected_parts(params, {CONTEXT_ENCODER: self.encoder, PREDICTOR: self.predictor},
+                               updated=updated)
 
     def encode(self, encoder_variables, samples, token_idx=None, train=False, rngs=None) -> jax.Array:
         """The encoder over `encoder_variables`, its own tree in every collection,

@@ -204,7 +204,7 @@ class Decide:
         settings = saved_settings(record, DecideSettings)
         backbone = saved_model(record, dtype).build()
         width, head_dtype = DecisionModel.head_size(backbone)
-        head = Head.from_record(records.json_value(settings.head, "head"), width, dtype=head_dtype)
+        head = Head.from_record(records.json_value(settings.head, "head"), width)
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
@@ -216,7 +216,11 @@ class Decide:
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
         variables = objectives[records.text(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        averaged = Checkpoints(directory).stored(step).get("ema") is not None if ema is None else ema
+        if ema is None:
+            with Checkpoints(directory) as checkpoints:
+                averaged = checkpoints.stored(step).get("ema") is not None
+        else:
+            averaged = ema
         task = cls(model, variables, rows, tokenizer_for(settings.tokenizer), settings.specials,
                    name=str(epath.Path(directory).name), weights=Weights(step, averaged),
                    processor=processor)

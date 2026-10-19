@@ -15,16 +15,29 @@ from dew.records import record
 
 @dataclasses.dataclass(frozen=True)
 class Fields(grain.MapTransform):
+    """A record's fields `names` (every field where None), renamed by `rename`, without `remove`.
+    `bookkeeping` keeps Dew's own record of the record (`_dew_*`) whatever the projection keeps,
+    its counted targets among it (`dew.data.steps.text.rebound`), as a pipeline's column steps do;
+    a projection Dew reads for a packer keeps exactly the fields it names."""
+
     names: tuple[str, ...] | None = None
     rename: tuple[tuple[str, str], ...] = ()
     remove: tuple[str, ...] = ()
+    bookkeeping: bool = False
 
     def map(self, element: Batch) -> Batch:
         renamed = dict(self.rename)
         names = tuple(element) if self.names is None else self.names
         kept = {name: element[name] for name in names if name not in self.remove}
-        return {**{name: value for name, value in kept.items() if name not in renamed},
-                **{new: kept[old] for old, new in self.rename}}
+        projected = {**{name: value for name, value in kept.items() if name not in renamed},
+                     **{new: kept[old] for old, new in self.rename}}
+        if not self.bookkeeping:
+            return projected
+        from dew.data.steps.text import rebound
+
+        held = {name: value for name, value in element.items()
+                if name.startswith("_dew_") and name not in projected}
+        return {**projected, **held, **rebound(element, kept, renamed)}
 
 
 @dataclasses.dataclass(frozen=True)

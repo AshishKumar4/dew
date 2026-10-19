@@ -223,6 +223,95 @@ def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
         np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
 
 
+def test_closed_checkpoints_leave_no_writer_running_across_trials(tmp_path):
+    """Trials in one process each close their checkpoints, as RunConfig.train does, so Orbax's
+    managers and metadata stores leave no thread behind: two more trials run no more threads than
+    the first left, and a closed Checkpoints reopens to read what it wrote."""
+    import threading
+
+    def trial(index):
+        with Checkpoints(str(tmp_path / str(index))) as checkpoints:
+            Trainer(Regression(), optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+                dataset(), steps=2, checkpoint_every=1, log_every=1)
+        return checkpoints
+
+    trial(0)
+    settled = threading.active_count()
+    for index in (1, 2):
+        reopened = trial(index)
+        assert threading.active_count() == settled
+    assert reopened.latest == 2
+
+
+def failed_write(monkeypatch) -> OSError:
+    """The failure Orbax reports for an asynchronous write that failed, as a full disk fails one:
+    once, from the next wait on its manager, which then holds no error. Stood in for at that
+    boundary, since a test cannot fill a disk."""
+    failure, reported = OSError("async checkpoint write failed"), []
+    finished = ocp.CheckpointManager.wait_until_finished
+
+    def wait(manager):
+        finished(manager)
+        if not reported:
+            reported.append(manager)
+            raise failure
+
+    monkeypatch.setattr(ocp.CheckpointManager, "wait_until_finished", wait)
+    return failure
+
+
+@pytest.mark.parametrize("body_fails", [False, True])
+def test_checkpoints_whose_write_failed_close_and_keep_the_error_their_run_raised(tmp_path, monkeypatch,
+                                                                                  body_fails):
+    """A run whose last checkpoint write failed still closes its checkpoints' managers, each waited
+    on and closed after the failure, so no thread outlives the scope. A run that failed first raises
+    its own error with the write's failure noted on it; one that did not raises the write's."""
+    import threading
+
+    def trained(index):
+        checkpoints = Checkpoints(str(tmp_path / str(index)))
+        Trainer(Regression(), optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+            dataset(), steps=2, checkpoint_every=1, log_every=1)
+        return checkpoints
+
+    with trained(0):
+        pass
+    settled = threading.active_count()
+    primary = ValueError("training failed first")
+    with pytest.raises((ValueError, OSError)) as raised, trained(1):
+        failure = failed_write(monkeypatch)
+        if body_fails:
+            raise primary
+    assert raised.value is (primary if body_fails else failure)
+    assert bool(getattr(primary, "__notes__", ())) == body_fails
+    assert threading.active_count() == settled
+
+
+def test_a_run_that_fails_after_a_failed_write_raises_its_own_error_and_closes_its_checkpoints(
+        tmp_path, monkeypatch):
+    """RunConfig.train closes the run's tracker and checkpoints however it ends: a run whose step
+    after training fails, once its last checkpoint write failed, raises its own error with the
+    write's failure noted on it, and leaves no checkpoint thread behind."""
+    import threading
+
+    from dew.config import RunConfig, TrainerConfig
+
+    run = RunConfig(trainer=TrainerConfig(steps=2, batch_size=BATCH, checkpoint_dir=str(tmp_path),
+                                          eval_every=None, checkpoint_every=1))
+    run.train(Regression(), dataset(), name="settled")
+    settled = threading.active_count()
+    primary = ValueError("calibration failed")
+
+    def after(state, directory):
+        failed_write(monkeypatch)
+        raise primary
+
+    with pytest.raises(ValueError) as raised:
+        run.train(Regression(), dataset(), name="failed", after=after)
+    assert raised.value is primary and primary.__notes__
+    assert threading.active_count() == settled
+
+
 class Keyed(Regression):
     """Loss scaled by the step key, so the key stream is observable in the parameters.
 
@@ -1454,3 +1543,15 @@ def test_a_failing_metric_fails_the_validation_pass():
     with pytest.raises(ZeroDivisionError):
         make_trainer(objective=Features()).fit(dataset(val=val_batches(1)), steps=1,
                                                log_every=1, eval_every=1, metrics=(Broken(),))
+
+
+def test_a_mesh_without_stages_takes_its_one_microbatch_asked_for():
+    """A mesh with no stage axis feeds one microbatch a step through it, which a run may ask for by
+    name: it trains as the run that leaves it unset does, where asking once refused the run."""
+    def fit(**asked):
+        trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0), **asked)
+        return trainer.fit(dataset(), steps=2, log_every=1)
+
+    named, planned = fit(microbatches=1), fit()
+    for left, right in zip(jax.tree.leaves(named.variables), jax.tree.leaves(planned.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))

@@ -10,6 +10,7 @@ from typing import Protocol, runtime_checkable
 from dew.data.dataset import Batch
 
 from .base import Read, Shard, ShardManifest, Source
+from .concatenate import Concatenate
 from .files import Files, Format, _inferred
 from .grain import Grain, from_grain
 from .hf import HF, from_hf
@@ -74,6 +75,7 @@ def source(
 __all__ = [
     "HF",
     "TFDS",
+    "Concatenate",
     "Files",
     "Grain",
     "Hub",

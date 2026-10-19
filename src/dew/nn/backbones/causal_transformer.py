@@ -26,7 +26,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Mapping, Sequence
-from typing import Literal, Self
+from typing import ClassVar, Literal, Self
 
 import flax.core
 import jax
@@ -39,7 +39,7 @@ from dew.objectives.base import merge
 from dew.records import JSON
 from dew.registry import from_record, read_arguments
 
-from ..activations import ungated_activation
+from ..activations import GatedActivation, Situ, ungated_activation
 from ..attention import RMSNorm
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
@@ -48,9 +48,7 @@ from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
-from ..gemma3n import AltUp, AltUpLayer, rescale_to
-from ..gemma4_moe import Gemma4Experts
-from ..gpt_oss import GptOssMLP
+from ..gemma3n import AltUp, AltUpLayer, clamped_predictions, rescale_to
 from ..hyper_connections import (
     Carried,
     HyperConnections,
@@ -74,8 +72,8 @@ from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
-from ..moe import GatedActivation, Situ
-from ..precision import at_least_fp32, biased_logits, capped_logits, head_dot_general, head_product, scaled
+from ..ngpt import NGPT, gain, unit
+from ..precision import at_least_fp32, capped_logits, head_dot_general, head_product, scaled, scaled_logits
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
 from ..sharding import (
@@ -102,32 +100,22 @@ from .decoder_block import (
     remat_policy,
     remat_record,
 )
-from .decoder_stack import WRITTEN, DecoderBank, Loop, PassView, StackView, run_pipeline, run_stack
+from .decoder_stack import (
+    WRITTEN,
+    DecoderBank,
+    Loop,
+    PassView,
+    SharedPassView,
+    StackView,
+    run_pipeline,
+    run_stack,
+)
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
-INTERMEDIATES = "intermediates"
+_INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
-
-
-def layer_outputs(module: nn.Module, method: str) -> bool:
-    """The `capture_intermediates` filter that keeps every layer's output.
-
-    It matches the `__call__` of the stack's `layers_N` modules, a scanned
-    run's `layers_3_7` and a pipeline stage's `layers_j` included, and
-    `StackView.unstack` lays what those sow out per layer, as the plain loop
-    does; `layer_output` reads one layer back.
-    """
-    return method == "__call__" and (module.name or "").startswith("layers_")
-
-
-def layer_output(intermediates: Mapping[str, Mapping[str, Sequence[jax.Array]]], index: int) -> jax.Array:
-    """Layer `index`'s output out of the collection `layer_outputs` filled."""
-    kept = intermediates.get(f"layers_{index}")
-    if kept is None:
-        held = sorted(int(name[len("layers_"):]) for name in intermediates
-                      if name.startswith("layers_") and name[len("layers_"):].isdigit())
-        raise ValueError(f"the model kept no layer {index}; it has layers {held}")
-    return kept["__call__"][0]
+_FINAL = "final_residual"
+"""The collection the forward sows its stack's output into (`layer_state`)."""
 
 
 @logical_axes({
@@ -201,6 +189,10 @@ class CausalTransformer(nn.Module):
     tuple gives one width per layer (Gemma 3n), and 0 means no feed-forward
     (Mamba-2)."""
     max_seq_len: int = 2048
+    context_length: int | None = None
+    """The context a checkpoint states (max_position_embeddings), which an export writes back;
+    None for `max_seq_len`. The model computes nothing from it: `max_seq_len` is its decode cache's
+    capacity, which a loader caps below a long context (`decoder_parts.DEFAULT_MAX_SEQ_LEN`)."""
     position_embedding: Literal['rotary', 'learned', 'alibi'] = 'rotary'
     position_embedding_size: int | None = None
     """The number of rows in the learned position table; None means `max_seq_len`.
@@ -211,6 +203,10 @@ class CausalTransformer(nn.Module):
     rope_scaling: RopeScaling | LongRopeScaling | None = None
     partial_rotary_factor: float | None = None  # None: every dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
+    narrow_rotary_tables: bool = False
+    """The rotary's cos and sin round to the activations' dtype before the fp32 rotation, as vLLM
+    casts its cos/sin cache to the query's dtype (`MixerContext.narrow_rotary_tables`); False keeps
+    them at the rotation's precision."""
     layer_types: tuple[str, ...] | None = None  # the pattern, one kind per layer
     kinds: Mapping[str, LayerKind] | None = None  # what each named kind does
     norm_eps: float = 1e-5
@@ -284,6 +280,12 @@ class CausalTransformer(nn.Module):
     residual stream (o_proj, out_proj, down_proj) divide their std by
     sqrt(2 * num_layers). This is lm-engine's `use_depth_scaled_init`."""
     final_logit_softcap: float | None = None
+    ngpt: NGPT | None = None
+    """The normalized transformer (`dew.nn.ngpt.NGPT`), NVIDIA's Dory: every hidden state on the
+    unit sphere, each block stepping its residual along it (`BlockWiring.ngpt`), the attention and
+    feed-forward unit-norming their products and scaling them by learned gains, no norm with a
+    weight anywhere, a unit norm between a loop's passes, no norm before the head, and the logits
+    times a learned per-token gain (`logit_scale`). None for none."""
     head_transform: Literal['gelu', 'gelu_exact'] | None = None
     """The activation of a BERT-style prediction head between the final norm
     and the vocabulary projection: a bias-free dense layer, this activation and
@@ -735,6 +737,24 @@ class CausalTransformer(nn.Module):
                     f"num_heads ({self.num_heads}) must be a multiple of the key/value "
                     f"heads of {layer_type!r} ({kind.num_kv_heads})")
 
+    def refuse_unbuildable_ngpt(self, kinds: Mapping[str, "ResolvedKind"]):
+        """Raise `ValueError` for what nGPT's arithmetic does not reach: its gains and unit norms
+        live in the attention and the dense gated feed-forward (an MLP mixer's too), so routed or
+        parallel experts, another mixer, prediction depths and the DSpark drafter, which would
+        compute without them, are refused."""
+        if self.ngpt is None:
+            return
+        if self.mixture is not None or self.num_nextn_predict_layers or self.dspark is not None:
+            raise ValueError("nGPT unit-norms the attention and the dense gated feed-forward; routed or "
+                             "parallel experts (mixture), prediction depths and the DSpark drafter take "
+                             "none of it")
+        for layer_type, kind in sorted(kinds.items()):
+            mixer = kind.mixer or self.mixer
+            dense = isinstance(mixer, MLPMixer) and mixer.mixture is None
+            if mixer is not None and not (isinstance(mixer, AttentionMixer) or dense):
+                raise ValueError(f"nGPT's gains and unit norms are the attention's and the dense gated "
+                                 f"feed-forward's; {layer_type!r} runs {mixer!r}")
+
     def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
         """Raise `ValueError` for a field, or a pair of fields, that this model cannot build.
 
@@ -744,6 +764,7 @@ class CausalTransformer(nn.Module):
         self.refuse_unbuildable_mup(kinds)
         self.refuse_unbuildable_dropout(kinds)
         self.refuse_unbuildable_classic_fields()
+        self.refuse_unbuildable_ngpt(kinds)
         mtp_hc = self.mtp_hyper_connections
         if mtp_hc is not None:
             if self.num_nextn_predict_layers != 1:
@@ -864,74 +885,34 @@ class CausalTransformer(nn.Module):
     def feedforward_factories(self):
         """Build the three feed-forward factories a layer can use.
 
-        Returns the dense gated MLP, the routed experts and Gemma 4's parallel
-        branch, each a partial that the block calls with a name. A model with
-        no mixture gets only the first, and None for the other two.
+        Returns the dense gated MLP, the routed experts in its place and the
+        branch beside it, each a partial that the block calls with a name; the
+        mixture builds the routed one (`Mixture.build`) and places it
+        (`Mixture.beside_dense`). A model with no mixture gets only the first,
+        and None for the other two.
         """
         init_std, output_init_std = self.init_stds
         # Every gated MLP in the model shares the activation and the clamp:
         # the dense feed-forwards, the shared branch and the routed experts.
         gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
                                       activation=self.mlp, use_bias=self.mlp_bias,
-                                      swiglu_limit=self.swiglu_limit,
+                                      swiglu_limit=self.swiglu_limit, ngpt=self.ngpt,
                                       init_std=init_std, output_init_std=output_init_std,
                                       dtype=self.dtype, precision=self.precision)
         mixture = self.mixture
-        if self.mlp == 'swigluoai' and (mixture is None or mixture.shared_features
-                                        or len(self.sparse_layers) != self.num_layers):
-            raise ValueError('swigluoai requires routed experts on every layer and no shared experts')
+        if self.mlp == 'swigluoai' and (mixture is None or len(self.sparse_layers) != self.num_layers):
+            raise ValueError('swigluoai requires routed experts on every layer')
         if mixture is None:
             return gated_mlp, None, None
-        expert_features = (self.hidden_features if mixture.expert_features is None
-                           else mixture.expert_features)
-        parallel = None if not mixture.parallel else functools.partial(
-            Gemma4Experts,
-            num_experts=mixture.experts,
-            top_k=mixture.top_k,
-            hidden_features=expert_features,
-            out_features=self.emb_features,
-            activation=self.mlp,
-            implementation=mixture.implementation,
-            dispatch=mixture.dispatch,
-            capacity_factor=mixture.capacity_factor,
-            norm_eps=self.norm_eps,
-            scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype,
-            precision=self.precision)
-        if self.mlp == 'swigluoai':
-            # GPT OSS's experts and router are its own (`GptOssMLP`): a knob they do not read is refused.
-            plain = Mixture(experts=mixture.experts)
-            ignored = [name for name in ('score_function', 'norm_topk_prob', 'scaling', 'groups',
-                                         'groups_per_token', 'group_score', 'bias', 'scale_inputs',
-                                         'expert_features', 'hash_layers', 'latent_features', 'latent_norm',
-                                         'media_bias')
-                       if getattr(mixture, name) != getattr(plain, name)]
-            ignored += ['swiglu_limit'] if self.swiglu_limit is not None else []
-            if ignored:
-                raise ValueError(f"swigluoai's experts take no {', '.join(ignored)}: GPT OSS routes with its "
-                                 f"own biased softmax and clamps at 7.0")
-            routed = functools.partial(
-                GptOssMLP, hidden_size=self.emb_features,
-                intermediate_size=self.hidden_features,
-                num_local_experts=mixture.experts, num_experts_per_tok=mixture.top_k,
-                implementation=mixture.implementation,
-                dispatch=mixture.dispatch,
-                capacity_factor=mixture.capacity_factor,
-                dtype=self.dtype, precision=self.precision)
-        elif mixture.parallel:
-            # The branch rides beside every sparse layer's dense feed-forward.
-            routed = None
-        else:
-            routed = mixture.build(
-                out_features=self.emb_features, hidden_features=self.hidden_features, activation=self.mlp,
-                dense=gated_mlp, swiglu_limit=self.swiglu_limit,
-                init_std=init_std, output_init_std=output_init_std,
-                norm=functools.partial(
-                    RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
-                    scale_after_cast=self.scale_after_cast, dtype=self.dtype),
-                dtype=self.dtype,
-                precision=self.precision)
+        # The dense width is read only where the experts take it: layers that differ in it have none.
+        width = self.hidden_features if mixture.expert_features is None else mixture.expert_features
+        built = mixture.build(
+            out_features=self.emb_features, activation=self.mlp, dense=gated_mlp, hidden_features=width,
+            swiglu_limit=self.swiglu_limit, init_std=init_std, output_init_std=output_init_std,
+            norm_eps=self.norm_eps, scale_offset=self.scale_offset,
+            scale_after_cast=self.scale_after_cast, dtype=self.dtype, precision=self.precision)
+        # A branch beside the dense feed-forward rides every sparse layer's; one in its place replaces it.
+        routed, parallel = (None, built) if mixture.beside_dense else (built, None)
         return gated_mlp, routed, parallel
 
     @nn.nowrap
@@ -1128,14 +1109,17 @@ class CausalTransformer(nn.Module):
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                              layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
-                             shared_parallel_norm=self.shared_parallel_norm)
+                             shared_parallel_norm=self.shared_parallel_norm, ngpt=self.ngpt)
 
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
         self.specs = specs
+        # What one scanned body shares: the layers' spec and how their variables are stored.
+        structures = StackView.layer_structures(self.variables, self.num_layers)
+        self.scan_keys = tuple(zip(specs, structures, strict=True))
         self.block = block
         self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
-        self.groups = scan_groups(specs, self.bank_layers) if self.scan_layers else tuple(
+        self.groups = scan_groups(self.scan_keys, self.bank_layers) if self.scan_layers else tuple(
             (index, 1) for index in range(self.num_layers))
         self.mtp = self._prediction_depths(types, kinds, mixer_spec, gated_mlp, routed, wiring)
         if self.dspark is not None:
@@ -1164,10 +1148,7 @@ class CausalTransformer(nn.Module):
         if self.engram is not None:
             self.engram_hashes = EngramHashes(spec=self.engram, vocab_size=self.vocab_size,
                                               name='engram_hashes')
-        self.norm = decoder_norm(
-            self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
-            scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype, specs=self.norms)(name='norm')
+        self._final_norm()
         if self.loop is not None and self.loop.exit_gate:
             self.early_exit_gate = nn.Dense(
                 projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
@@ -1466,8 +1447,13 @@ class CausalTransformer(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = logits.astype(at_least_fp32(logits.dtype))
-        return capped_logits(biased_logits(logits, self.head_bias_value if self.head_bias else None),
+        return capped_logits(scaled_logits(logits, self._token_gains(),
+                                           self.head_bias_value if self.head_bias else None),
                              self.final_logit_softcap)
+
+    def _token_gains(self) -> jax.Array | None:
+        """nGPT's fp32 per-token gain on the logits, past the head's product; None without one."""
+        return None if self.ngpt is None else gain(self.logit_scale, self.ngpt.logits)
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False,
                           positions=None, segment_ids=None, input_embeddings=None,
@@ -1659,6 +1645,40 @@ class CausalTransformer(nn.Module):
         """Return the final normalized states, without the vocabulary projection."""
         return self.hidden_and_mtp_inputs(tokens, **kwargs)[0]
 
+    @nn.nowrap
+    def capture_layers(self, module: nn.Module, method: str) -> bool:
+        """The `capture_intermediates` filter that keeps every layer's output (`LayerStates`).
+
+        It matches the `__call__` of the stack's `layers_N` modules, a scanned
+        run's `layers_3_7` and a pipeline stage's `layers_j` included, and
+        `StackView.unstack` lays what those sow out per layer, as the plain loop
+        does; `layer_state` reads one layer back. Neither is a Flax method, so
+        the filter the capture calls on every module runs no module call.
+        """
+        return method == "__call__" and (module.name or "").startswith("layers_")
+
+    layer_collections: ClassVar[tuple[str, ...]] = (_INTERMEDIATES, _FINAL)
+    """The collections a reader of layer states opens (`LayerStates`)."""
+
+    @nn.nowrap
+    def layer_state(self, collections: Mapping[str, Mapping], index: int) -> jax.Array:
+        """Layer `index`'s output out of what the forward kept (`LayerStates`): the last layer's as
+        the stack returns it, and another's as `capture_layers` kept it, the last call's, a looped
+        layer's last pass; a model that carries several residual copies (AltUp's) returns them all
+        at every layer. `index` counts as a Python index does, -1 the last layer."""
+        if not -self.num_layers <= index < self.num_layers:
+            raise ValueError(f"a {self.num_layers}-layer model has no layer {index}")
+        layer = index % self.num_layers
+        final = collections.get(_FINAL, {}).get('states')
+        if layer == self.num_layers - 1 and final is not None:
+            return final
+        kept = collections.get(_INTERMEDIATES, {}).get(f"layers_{layer}")
+        if kept is None:
+            held = sorted(int(name[len("layers_"):]) for name in collections.get(_INTERMEDIATES, {})
+                          if name.startswith("layers_") and name[len("layers_"):].isdigit())
+            raise ValueError(f"the model kept no layer {layer}; it kept layers {held}")
+        return kept["__call__"][-1]
+
     def logits(self, tokens, *, train: bool = False, **fields):
         """Return `__call__`'s fp32 logits over `hidden_states(tokens, **fields)`, which
         write no cache unless `fields` ask to `decode`."""
@@ -1749,8 +1769,13 @@ class CausalTransformer(nn.Module):
             per_layer_input=ple,
             attention_metadata=attention_metadata,
         )
+        if not self.is_initializing() and self.is_mutable_collection(_FINAL):
+            # The last layer's output as the stack returns it whatever runs it (`layer_state`),
+            # before a model that carries several residual copies collapses them; it costs
+            # nothing unless a caller opens the collection.
+            self.sow(_FINAL, 'states', residual, reduce_fn=lambda _, value: value, init_fn=lambda: None)
         streams, x = self._collapse(residual)
-        hidden = constrain(self.norm(x), RESIDUAL)
+        hidden = constrain(x if self.ngpt is not None else self.norm(x), RESIDUAL)
         self._gate_exit(hidden)
         if self.logits_scaling != 1.0:
             # (h W) / s is (h / s) W: dividing the states in fp32 scores every
@@ -1823,17 +1848,26 @@ class CausalTransformer(nn.Module):
         run_block = nn.remat(pass_block) if loop.remat and not decode else pass_block
         if first:
             x = self.stack(x, span=(0, first), **stack)
-        x = run_block(self, x, **dynamic)
+        injected = x
+        shared = SharedPassView() if loop.shared_cache else None
+        first_pass = run_block if shared is None else nn.map_variables(
+            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, trans_out_fn=shared.first_out,
+            mutable=True)
+        x = first_pass(self, self.norm(x + injected) if loop.reinject else x, **dynamic)
         for step in range(1, loop.steps):
             normed = self.norm(x)
             self._gate_exit(normed)
             x = normed if loop.step_norm else x
             if loop.backprop_steps is not None and step == loop.steps - loop.backprop_steps:
                 x = jax.lax.stop_gradient(x)
-            view = PassView(self.num_layers + (step - 1) * (end - first), first, end - first)
+            if loop.reinject:
+                x = self.norm(x + injected)
+            view = shared or PassView(self.num_layers + (step - 1) * (end - first), first, end - first)
             run = nn.map_variables(run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
                                    trans_out_fn=view.outside, mutable=True)
             x = run(self, x, **dynamic)
+        if loop.reinject:
+            x = self.norm(x)
         if end < self.num_layers:
             x = self.stack(x, span=(end, self.num_layers), **stack)
         return x
@@ -1870,7 +1904,7 @@ class CausalTransformer(nn.Module):
             x = x.astype(at_least_fp32(x.dtype))
         stages = pipeline_stages()
         first, end = (0, self.num_layers) if span is None else span
-        spanned = tuple((first + start, count) for start, count in scan_groups(self.specs[first:end],
+        spanned = tuple((first + start, count) for start, count in scan_groups(self.scan_keys[first:end],
                                                                                self.bank_layers))
         # A seeded initialization (PTQ's abstract annotation pass) reads the
         # supplied layout; the scan's init=True pass would draw over it first.
@@ -1886,7 +1920,7 @@ class CausalTransformer(nn.Module):
             return run_stack(
                 self.layers, self.block, self.specs,
                 tuple((index, 1) for index in range(first, end)), x,
-                train=train, decode=decode, kv_store={} if self.sharing_layers else None,
+                train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         banked = self.banked_collections()
         if stages == 1:
@@ -1936,7 +1970,7 @@ class CausalTransformer(nn.Module):
                     f"{rows // shards}, or a batch that is a multiple of "
                     f"{count_microbatches * shards} rows")
             view = StackView(
-                scan_groups(self.specs[:count], self.bank_layers) if self.scan_layers
+                scan_groups(self.scan_keys[:count], self.bank_layers) if self.scan_layers
                 else tuple((index, 1) for index in range(count)),
                 stages=stages, microbatches=count_microbatches,
                 # What enters the loop is read on every iteration; what the
@@ -2005,16 +2039,15 @@ class CausalTransformer(nn.Module):
         dtype the stage before returns. Under a bf16 policy the dense
         feed-forward returns fp32, so the loops use fp32 from the start. The
         first layer runs abstractly in its own scope (no cache, nothing sown,
-        placeholder RNG keys), and a banked store answers from its first
-        bank's first row without fetching it.
+        a placeholder 'params' key, which flax draws any other stream from),
+        and a banked store answers from its first bank's first row without
+        fetching it.
         """
-        layer, scope = self.layers[0], self.layers[0].scope
-        assert scope is not None
-        rngs = {name: jax.random.key(0) for name in scope.rngs}
+        layer = self.layers[0]
         streams = x.streams if isinstance(x, Carried) else x
         output = jax.eval_shape(lambda held: layer.apply(
-            held, x, mutable=True, rngs=rngs,
-            train=train, decode=decode, kv_store={} if self.sharing_layers else None,
+            held, x, mutable=True, rngs={'params': jax.random.key(0)},
+            train=train, decode=decode, kv_store={} if self._provides else None,
             per_layer_input=None if per_layer_input is None else per_layer_input.layer(0),
             attention_metadata=attention_metadata)[0], self.first_layer_shapes())
         output = output.streams if isinstance(output, Carried) else output
@@ -2079,6 +2112,14 @@ class CausalTransformer(nn.Module):
                 f"mixture, a layer_types pattern and a K/V sharing that do")
         return count
 
+    @property
+    def _provides(self) -> bool:
+        """Whether a layer leaves what a later one reads (`LayerSpec.provider`): keys and
+        values a sharing layer takes, or a CSA2 layer's publications, which its Reindex
+        and Reuse layers read whether or not any layer shares keys. The stack then
+        threads a kv_store through its layers."""
+        return any(spec.provider is not None for spec in self.specs)
+
     @nn.compact
     def _stacked(self, view: StackView, x, train: bool, decode: bool, per_layer_input,
                  attention_metadata=None):
@@ -2086,7 +2127,7 @@ class CausalTransformer(nn.Module):
         if view.stages == 1:
             return run_stack(
                 self.layers, self.block, self.specs, view.groups, x,
-                train=train, decode=decode, kv_store={} if self.sharing_layers else None,
+                train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
                 banked='params' in view.banked)
         return run_pipeline(
@@ -2155,20 +2196,37 @@ class CausalTransformer(nn.Module):
 
     def output_table(self) -> OutputTable | None:
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
-        the parameter itself, with `_logits`'s bias, softcap and precision, the compute dtype its
-        product follows and a checkpoint's quantizer of its input.
+        the parameter itself, with `_logits`'s scale, bias, softcap and precision, the compute dtype
+        its product follows and a checkpoint's quantizer of its input.
         None where no matrix alone is the head: past a `head_transform`, or where `lm_head`'s
         parameters are not its kernel alone: `dew.lora`'s factors beside it, which its interceptor
         adds, or no kernel at all, a frozen FP8 head's, whose codes its FP8 product reads instead."""
         head = None if self.tie_embeddings else self.lm_head.variables.get("params", {})
         if self.head_transform is not None or (head is not None and set(head) != {"kernel"}):
             return None
-        matrix = self.embed_tokens.embedding if head is None else head["kernel"]
+        return self._head_table()
+
+    def vocabulary_rows(self) -> jax.Array:
+        """Each vocabulary token's `[features]` row of the head (`OutputTable.rows`) where no exact
+        table is: past a `head_transform` the matrix's, which the transformed states meet, and with
+        an adapter on the head its rows as the adapter updates them (`applied_kernel`)."""
+        return self._head_table().rows()
+
+    def _head_table(self) -> OutputTable:
+        """The head's matrix, as `lm_head`'s call multiplies by it (`applied_kernel`) or the tied
+        embeddings, with `_logits`'s scale, bias, softcap and precision, the compute dtype its
+        product follows and a checkpoint's quantizer of its input."""
+        matrix = self.embed_tokens.embedding if self.tie_embeddings else self.applied_kernel("lm_head")
         quantizer = (self.input_quantizer(self.lm_head)
                      if isinstance(self, QuantizesInputs) and not self.tie_embeddings else None)
         return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
                            self.final_logit_softcap, self.precision, compute=self.dtype,
-                           input_quantizer=quantizer)
+                           input_quantizer=quantizer, scale=self._token_gains())
+
+    def applied_kernel(self, name: str) -> jax.Array:
+        """The kernel the submodule `name` multiplies its input by on this call: its own. A method
+        interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update."""
+        return getattr(self, name).get_variable("params", "kernel")
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.
@@ -2183,6 +2241,19 @@ class CausalTransformer(nn.Module):
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
 
     # The serving and training hooks (`dew.nn.protocols`).
+
+    def _final_norm(self):
+        """The norm before the head and between a loop's passes: under nGPT the unit norm itself,
+        its states being unit vectors, with the logits' per-token gain beside it."""
+        if self.ngpt is not None:
+            self.norm = unit
+            self.logit_scale = self.param('logit_scale', nn.initializers.constant(self.ngpt.start),
+                                          (self.vocab_size,), jnp.float32)
+        else:
+            self.norm = decoder_norm(
+                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+                dtype=self.dtype, specs=self.norms)(name='norm')
 
     @nn.nowrap
     def with_cache_capacity(self, capacity: int) -> Self:
@@ -2214,6 +2285,15 @@ class CausalTransformer(nn.Module):
                                                                    if backprop_steps is None
                                                                    else backprop_steps),
                                                    remat=self.loop.remat if remat is None else remat))
+
+    @nn.nowrap
+    def projected(self, params, *, updated: bool):
+        """`ProjectsParameters`: before a training step's update, every AltUp layer's prediction
+        coefficients clamped to `altup.coef_clip`, as the reference clamps its stored weight before
+        a training forward (`clamped_predictions`); the updated parameters as they are."""
+        if updated or self.altup is None or self.altup.coef_clip is None:
+            return params
+        return clamped_predictions(params, self.altup.coef_clip)
 
     @nn.nowrap
     def with_remat(self, policy: RematPolicy | None) -> Self:
@@ -2283,10 +2363,15 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
         """Its layers', depths' and drafter's groups, bound without tracing a
-        forward; an encoder serves no decode step and names none."""
+        forward; an encoder serves no decode step and names none. The groups
+        read which parameters the layers hold, never their values, so the
+        layers are bound over the variables' shapes: flax's bound tree is
+        cyclic, and bound over the weights themselves it would keep them alive
+        after the caller drops them until a full collection."""
         if not self.causal:
             return ()
-        bound = self.bind(variables)
+        bound = self.bind(jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables))
         return declared_groups(*bound.layers, *bound.mtp,
                                *(bound.dspark_stages if self.dspark is not None else ()))
 
@@ -2313,6 +2398,39 @@ class CausalTransformer(nn.Module):
                 self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared))
             if refusal is not None:
                 return f"layer {index}: {refusal}"
+        return None
+
+    @nn.nowrap
+    def generation_refusal(self) -> str | None:
+        """Why a generation loop cannot continue this decoder's rows, or None
+        (`dew.nn.protocols.Generating`): its sparse layers' mixture, or a mixer it
+        names (`declared_mixers`: a layer kind's, a prediction depth's or the
+        drafter's), that refuses it (`Mixture.generation_refusal`,
+        `MixerBase.generation_refusal`)."""
+        refusal = None if self.mixture is None else self.mixture.generation_refusal()
+        for mixer in self.declared_mixers:
+            refusal = refusal or mixer.generation_refusal()
+        return refusal
+
+    @nn.nowrap
+    def split_prefill_refusal(self) -> str | None:
+        """A cache rebuilt per request from its whole prompt, or a loop's shared cache that a later
+        pass rewrites, whose earlier tokens hold the last pass's keys: a prompt's later piece would
+        read those where its whole prefill reads each pass's own. One pass, or a block whose layers
+        keep no cache (`MixerBase.keeps_cache`), rewrites nothing."""
+        position = self.cache_rebuild_position
+        if position is not None:
+            return (f'LongRoPE crossing position {position} rebuilds a request\'s cache from its whole '
+                    'prompt; serve it with whole-prompt dense admission')
+        loop = self.loop
+        first, end = (0, self.num_layers) if loop is None or loop.layers is None else loop.layers
+        rewritten = any((self.kind_of(kind).mixer or self.layer_mixer).keeps_cache
+                        for kind in self.per_layer_types[first:end])
+        if loop is not None and loop.shared_cache and loop.steps > 1 and rewritten:
+            return ("a loop's shared cache holds only the last pass's keys of the tokens before a "
+                    "call, where the whole prompt's prefill reads each pass's own; keep a cache a "
+                    "pass (Loop.shared_cache=False, Dory's recurrent_kv_cache_mode 'per_loop') for "
+                    "chunked prefill or prefix reuse")
         return None
 
     @property

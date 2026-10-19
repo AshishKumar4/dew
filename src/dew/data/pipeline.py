@@ -213,6 +213,12 @@ class Pack:
     and `segments` bounds the documents a window holds. A first-fit or
     best-fit window closes when any of them is full, as Grain's packer does
     with its `length_struct` and `max_sequences_per_bin`.
+
+    A concatenating pack cuts documents where its windows end; `overlap` is
+    how many tokens before a cut through a document the next window holds
+    again, so 1 keeps the next-token target at every cut. A fitting pack cuts
+    no document: one longer than a window is cut before it, into pieces that
+    overlap as `dew.data.text.Chunks` says.
     """
 
     seq_len: int
@@ -221,6 +227,7 @@ class Pack:
     policy: Literal["first-fit", "best-fit", "concat"] = "first-fit"
     segments: int | None = None
     along: tuple[tuple[str, int], ...] = ()
+    overlap: int = 0
 
     @property
     def packed(self) -> tuple[str, ...]:
@@ -231,6 +238,12 @@ class Pack:
         if self.policy == "concat" and (self.segments is not None or self.along):
             raise ValueError("concatenated packing cuts documents across windows; it takes no "
                              "segment bound or fields along other axes")
+        if self.policy != "concat" and self.overlap:
+            raise ValueError(f"a {self.policy} pack cuts no document, so no cut overlaps; cut a long "
+                             "document before it with Chunks(overlap=...)")
+        if not 0 <= self.overlap < self.seq_len:
+            raise ValueError(f"a cut overlaps by 0 to {self.seq_len - 1} tokens of a {self.seq_len}-token "
+                             f"window, not {self.overlap}")
         if self.segments is not None and self.segments < 1:
             raise ValueError(f"a window holds at least one document, not {self.segments}")
 
@@ -569,12 +582,15 @@ class Dataset:
         policy: Literal["first-fit", "best-fit", "concat"] = "first-fit",
         segments: int | None = None,
         along: tuple[tuple[str, int], ...] = (),
+        overlap: int = 0,
     ) -> Pipeline:
         """Records laid end to end in rows of `seq_len` tokens: each row holds
         the per-token `fields` of the records it packs, each `along` field on
         an axis of its own, and at most `segments` records; a field that is
-        one value a record has no place in a row of several and is left out."""
-        return self.then(Pack(seq_len, fields, bins, policy, segments, along))
+        one value a record has no place in a row of several and is left out.
+        A concatenating pack's row starts again `overlap` tokens before a cut
+        through a record (`Pack`)."""
+        return self.then(Pack(seq_len, fields, bins, policy, segments, along, overlap))
 
     def windows(
         self, seq_len: int, *, stride: int | None = None, fields: tuple[str, ...] = ("text",)
@@ -627,19 +643,20 @@ class Dataset:
         from dew.data.steps.generic import Fields
 
         moves = tuple(names.items())
-        return self.map(Fields(rename=moves), identity=f"dew.rename_columns:{sorted(moves)}")
+        return self.map(Fields(rename=moves, bookkeeping=True),
+                        identity=f"dew.rename_columns:{sorted(moves)}")
 
     def select_columns(self, *names: str) -> Pipeline:
         """Each record with the fields `names` alone."""
         from dew.data.steps.generic import Fields
 
-        return self.map(Fields(names), identity=f"dew.select_columns:{list(names)}")
+        return self.map(Fields(names, bookkeeping=True), identity=f"dew.select_columns:{list(names)}")
 
     def remove_columns(self, *names: str) -> Pipeline:
         """Each record without the fields `names`."""
         from dew.data.steps.generic import Fields
 
-        return self.map(Fields(remove=names), identity=f"dew.remove_columns:{list(names)}")
+        return self.map(Fields(remove=names, bookkeeping=True), identity=f"dew.remove_columns:{list(names)}")
 
     def grain(self, function: Callable[[pygrain.MapDataset | pygrain.IterDataset],
                                             pygrain.MapDataset | pygrain.IterDataset],

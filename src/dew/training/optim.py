@@ -22,6 +22,7 @@ import dataclasses
 import fnmatch
 import functools
 import inspect
+import math
 from collections.abc import Callable, Mapping, Sequence
 from typing import Literal, NamedTuple
 
@@ -357,9 +358,57 @@ def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
     return jnp.where(jnp.isnan(x), x, rounded).astype(jnp.bfloat16)
 
 
+def _bias_corrected(moment, decay, count):
+    """`optax.tree.bias_correction`, with the correction of a Python `decay` in (0, 1) formed as
+    -expm1(count log decay), its log taken in double before the trace.
+
+    Optax forms 1 - decay**count inside a jit, where a Python decay is already rounded to float32:
+    0.999 becomes 0.99900001, so the correction at count 1 is 1.3e-5 off (2.2e-4 at 0.9999), where
+    torch forms it in double. A decay given as an array, a schedule's (`scaled_solver`), takes
+    optax's own. google-deepmind/optax#1827 makes this optax's; delete this, and
+    `scale_by_adam` with it, once a release carries it.
+    """
+    if isinstance(decay, (int, float)) and 0 < decay < 1:
+        correction = -jnp.expm1(count * math.log(decay))
+        return jax.tree.map(lambda leaf: leaf / correction.astype(leaf.dtype), moment)
+    return optax.tree.bias_correction(moment, decay, count)
+
+
+def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
+                  nesterov: bool = False) -> optax.GradientTransformation:
+    """`optax.scale_by_adam` (optax 0.2.8) with its bias corrections formed in double
+    (`_bias_corrected`): optax's moments, state layout (`optax.ScaleByAdamState`) and update,
+    composed from optax's public tree math."""
+    mu_dtype = None if mu_dtype is None else jax.dtypes.canonicalize_dtype(mu_dtype)
+
+    def init_fn(params):
+        return optax.ScaleByAdamState(count=jnp.zeros([], jnp.int32),
+                                      mu=optax.tree.zeros_like(params, dtype=mu_dtype),
+                                      nu=optax.tree.zeros_like(params))
+
+    def update_fn(updates, state, params=None):
+        del params  # Adam reads only the gradients
+        mu = optax.tree.update_moment(updates, state.mu, b1, 1)
+        nu = optax.tree.update_moment_per_elem_norm(updates, state.nu, b2, 2)
+        count = optax.safe_increment(state.count)
+        if nesterov:
+            mu_hat = jax.tree.map(lambda m, g: b1 * m + (1 - b1) * g,
+                                  _bias_corrected(mu, b1, optax.safe_increment(count)),
+                                  _bias_corrected(updates, b1, count))
+        else:
+            mu_hat = _bias_corrected(mu, b1, count)
+        nu_hat = _bias_corrected(nu, b2, count)
+        scaled = jax.tree.map(lambda m, v: None if m is None else m / (jnp.sqrt(v + eps_root) + eps),
+                              mu_hat, nu_hat, is_leaf=lambda leaf: leaf is None)
+        return scaled, optax.ScaleByAdamState(count=count, mu=optax.tree.cast(mu, mu_dtype),
+                                              nu=optax.tree.cast_like(nu, state.nu))
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
 def bf16_moments(b1: float, b2: float, eps: float, eps_root: float,
                  nesterov: bool) -> optax.GradientTransformation:
-    """`optax.scale_by_adam` with both moments stored in bf16.
+    """`scale_by_adam` with both moments stored in bf16.
 
     Each update runs optax's own update one leaf at a time, on that leaf's
     moments widened to fp32, and writes the new moments back stochastically
@@ -373,7 +422,7 @@ def bf16_moments(b1: float, b2: float, eps: float, eps_root: float,
     expectation. The state keeps optax's `ScaleByAdamState` layout, so
     sharding and checkpoints read it as they read fp32 state.
     """
-    inner = optax.scale_by_adam(b1=b1, b2=b2, eps=eps, eps_root=eps_root, nesterov=nesterov)
+    inner = scale_by_adam(b1=b1, b2=b2, eps=eps, eps_root=eps_root, nesterov=nesterov)
 
     def init_fn(params):
         def zeros(leaf):
@@ -393,7 +442,7 @@ def bf16_moments(b1: float, b2: float, eps: float, eps_root: float,
             update, one = inner.update(gradient, optax.ScaleByAdamState(
                 count=state.count, mu=mu.astype(jnp.float32), nu=nu.astype(jnp.float32)))
             if not isinstance(one, optax.ScaleByAdamState):
-                raise TypeError(f"optax.scale_by_adam returned {type(one).__name__}")
+                raise TypeError(f"scale_by_adam returned {type(one).__name__}")
             count = one.count
             salt = fmix32(step + jnp.uint32(2 * index + 1) * jnp.uint32(0x165667B1))
             scaled.append(update)
@@ -423,9 +472,18 @@ def _coupled_decay(solver: optax.GradientTransformation, weight_decay: float,
 
 def _adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=0.0,
           mask=None, *, nesterov: bool = False):
-    """optax.adam, with torch's coupled weight decay (`_coupled_decay`)."""
-    return _coupled_decay(optax.adam(learning_rate, b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov),
-                         weight_decay, mask)
+    """optax.adam's chain over `scale_by_adam`, with torch's coupled weight decay (`_coupled_decay`)."""
+    adam = optax.chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov),
+                       optax.scale_by_learning_rate(learning_rate))
+    return _coupled_decay(adam, weight_decay, mask)
+
+
+def _adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=1e-4,
+           mask=None, *, nesterov: bool = False):
+    """optax.adamw's chain over `scale_by_adam`."""
+    return optax.chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov),
+                       optax.add_decayed_weights(weight_decay, mask),
+                       optax.scale_by_learning_rate(learning_rate))
 
 
 def _bf16_adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, weight_decay=0.0, mask=None, *,
@@ -508,7 +566,7 @@ BF16_STATE_OPTIMIZERS: dict[Optimizer, Callable[..., optax.GradientTransformatio
 
 OPTIMIZER_MAP: dict[Optimizer, Callable[..., optax.GradientTransformation]] = {
     'adam': _adam,
-    'adamw': optax.adamw,
+    'adamw': _adamw,
     'lamb': optax.lamb,
     'muon': _muon_groups,
     'muonclip': _muonclip_groups,
