@@ -108,7 +108,9 @@ def test_a_journal_reads_back_what_a_fit_logged_its_final_validation_and_nonfini
 
     held = next(batches())
     tracker = Recording(tmp_path / 'tracking')
-    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0), tracker=tracker)
+    # Checkpoints rank the run by its validation loss, which each evaluation scores.
+    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0), tracker=tracker,
+                      checkpoints=Checkpoints(str(tmp_path / 'checkpoint')))
     state = trainer.fit(Loader(lambda partition: batches(), lambda partition: iter([held]), None, 8),
                         steps=2, log_every=1, eval_every=1)
     tracker.log({'psnr': math.inf, 'loss': math.nan, 'floor': -math.inf}, 3)
