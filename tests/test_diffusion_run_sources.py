@@ -184,6 +184,95 @@ def test_a_pipeline_rebinds_saved_variables_offline_and_exports_them_by_the_head
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
+def test_a_pipeline_rebinds_over_a_sharded_copy_without_its_shards(pipelines, tmp_path):
+    """A local copy of a pipeline whose transformer is sharded behind its index, with the shards
+    deleted, rebinds a saved tree from its metadata alone, as it does unsharded, and its save,
+    with no header to write by, refuses and writes nothing."""
+    from dew.interop.pretrained import load_diffusion_source
+    from dew.interop.safetensors_io import read_weights, save_sharded
+
+    copy = tmp_path / "sharded"
+    shutil.copytree(pipelines / "flux" / "pipeline", copy)
+    weights = read_weights(copy / "transformer")
+    for stored in (copy / "transformer").glob("*.safetensors"):
+        stored.unlink()
+    save_sharded(weights, copy / "transformer", "20KB", stem="diffusion_pytorch_model")
+    assert len(list((copy / "transformer").glob("*.safetensors"))) > 1
+    published = load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16))
+    for stored in copy.rglob("*.safetensors"):
+        stored.unlink()
+    rebound = load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16),
+                                    variables=published.variables)
+    for ours, theirs in zip(jax.tree.leaves(rebound.variables), jax.tree.leaves(published.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    with pytest.raises(ValueError):
+        rebound.save(tmp_path / "refused")
+    assert not (tmp_path / "refused").exists()
+
+
+_HUB_PIPELINE = ("hf-internal-testing/tiny-flux-pipe", "a98bc4ec6a80c47c477ed22d7e81c79872d9c723")
+
+_ONLINE_PUBLISHED = """
+import sys
+import jax, numpy as np
+from flax import serialization
+from dew.interop.pretrained import load_diffusion_source
+
+published = load_diffusion_source(sys.argv[1], revision=sys.argv[2], dtype="float32", attention_impl="xla",
+                                  size=(16, 16))
+open(sys.argv[3], "wb").write(serialization.msgpack_serialize(jax.tree.map(np.asarray, published.variables)))
+"""
+
+_REBOUND = """
+import json, sys
+from flax import serialization
+from dew.interop.pretrained import load_diffusion_source
+
+variables = serialization.msgpack_restore(open(sys.argv[3], "rb").read())
+pipeline = load_diffusion_source(sys.argv[1], revision=sys.argv[2], dtype="float32", attention_impl="xla",
+                                 size=(16, 16), variables=variables)
+pipeline.save(sys.argv[4])
+print(json.dumps({"saved": True}))
+"""
+
+
+@pytest.mark.network
+def test_a_hub_pipeline_rebound_online_exports_offline_from_its_recorded_headers(tmp_path):
+    """A saved tree rebound over a Hub pipeline whose weights it never downloads reads the
+    export's headers and file listing over HTTP and records them (`hub_answer`); an offline
+    process over a cache of the same commit's metadata alone then rebinds and exports by those
+    records, and the export reloads leaf for leaf as the published pipeline."""
+    import os
+    import subprocess
+    import sys
+
+    from dew.interop.pretrained import load_diffusion_source
+
+    repo, revision = _HUB_PIPELINE
+    src = str(Path(__file__).resolve().parents[1] / "src")
+
+    def run(script, cache, *arguments, offline=False):
+        env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / cache), "PYTHONPATH": src,
+               "DEW_HUB_ANSWERS": str(tmp_path / "answers"), "HF_HUB_OFFLINE": "1" if offline else "0"}
+        done = subprocess.run([sys.executable, "-c", script, repo, revision, *map(str, arguments)], env=env,
+                              check=False, capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr[-3000:]
+
+    run(_ONLINE_PUBLISHED, "whole", tmp_path / "variables.msgpack")
+    run(_REBOUND, "metadata", tmp_path / "variables.msgpack", tmp_path / "online")
+    assert not list((tmp_path / "metadata").rglob("*.safetensors"))
+    run(_REBOUND, "metadata", tmp_path / "variables.msgpack", tmp_path / "offline", offline=True)
+    published = load_diffusion_source(repo, revision=revision, dtype="float32", attention_impl="xla",
+                                      size=(16, 16))
+    again = load_diffusion_source(str(tmp_path / "offline"), dtype="float32", attention_impl="xla",
+                                  size=(16, 16))
+    assert jax.tree.structure(again.variables) == jax.tree.structure(published.variables)
+    for ours, theirs in zip(jax.tree.leaves(again.variables), jax.tree.leaves(published.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
 def test_a_pretrained_pipeline_trains_its_autoencoder_end_to_end(pipelines, tmp_path):
     """A recipe trains the loaded KL posterior and denoiser and publishes the tuned autoencoder,
     and the trained tree rebuilds over the pipeline's metadata alone, scoring as the run did."""

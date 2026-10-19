@@ -218,6 +218,13 @@ def snapshot(name_or_dir: str, revision: str | None, *,
     return directory
 
 
+def _hub_files(name: str, revision: str) -> list[str]:
+    """Every file of a Hub repo's commit, by repo-relative name, listed over HTTP."""
+    from huggingface_hub import HfApi
+
+    return sorted(HfApi().list_repo_files(name, revision=revision))
+
+
 def _hub_header(name: str, revision: str, file: str) -> dict[str, tuple[list[int], str]]:
     """Each tensor of a Hub file's safetensors header, its shape and dtype tag, read over HTTP."""
     from huggingface_hub import HfApi
@@ -237,10 +244,22 @@ class StoredWeights:
     directory: Path
 
     def files(self, folder: str) -> tuple[str, ...]:
-        """The repo-relative files that hold `folder`'s weights (`weight_files`)."""
-        local = os.path.isdir(self.name_or_dir)
-        listing = ({path.relative_to(self.directory).as_posix() for path in self.directory.rglob("*")
-                    if path.is_file()} if local else repo_files(self.name_or_dir, self.directory))
+        """The repo-relative files that hold `folder`'s weights (`weight_files`): a directory's
+        own, or the commit's, as the Hub lists them (`_hub_files`), recorded so an offline run
+        reads the same listing (`hub_answer`); offline where it was never listed online, those
+        the cached snapshot holds (`repo_files`)."""
+        from huggingface_hub.errors import OfflineModeIsEnabled
+
+        if os.path.isdir(self.name_or_dir):
+            listing = {path.relative_to(self.directory).as_posix() for path in self.directory.rglob("*")
+                       if path.is_file()}
+        else:
+            try:
+                listing = set(hub_answer(("repo files", self.name_or_dir, self.directory.name),
+                                         functools.partial(_hub_files, self.name_or_dir,
+                                                           self.directory.name)).value)
+            except OfflineModeIsEnabled:
+                listing = repo_files(self.name_or_dir, self.directory)
         return weight_files(listing, folder, lambda name: json.loads((self.directory / name).read_text()))
 
     def specs(self, folder: str) -> dict[str, tuple[str, jax.ShapeDtypeStruct]] | None:
@@ -248,15 +267,20 @@ class StoredWeights:
         the array it reads as, from the file's header. A file the snapshot holds is
         read there; a Hub source's other headers are read over HTTP
         (`HfApi.parse_safetensors_file_metadata`), its weights left on the Hub, and
-        recorded so an offline run reads the same answer (`hub_answer`). None offline
-        where a header was never read online: binding variables needs no header, and
-        only the export, which writes by them, goes without."""
+        recorded so an offline run reads the same answer (`hub_answer`). None where a
+        header cannot be read: a directory's file that is not there, or offline a Hub
+        header never read online. Binding variables needs no header, and only the
+        export, which writes by them, goes without."""
         from huggingface_hub.errors import OfflineModeIsEnabled
 
         held: dict[str, tuple[str, jax.ShapeDtypeStruct]] = {}
         for file in self.files(folder):
             if (self.directory / file).is_file():
                 specs = header_specs(self.directory / file)
+            elif os.path.isdir(self.name_or_dir):
+                _log.warning("%s does not hold %s, so the pipeline binds without the layouts its export "
+                             "writes by", self.name_or_dir, file)
+                return None
             else:
                 try:
                     header = hub_answer(("safetensors header", self.name_or_dir, self.directory.name, file),
