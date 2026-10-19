@@ -158,6 +158,31 @@ def test_a_hybrid_language_model_step_lowers_for_the_gpu_with_every_kernel_its_g
     assert set(triton_kernels(_step_lowered(generation))) == expected
 
 
+@pytest.mark.parametrize("bound", [None, 64], ids=["undeclared", "declared"])
+def test_a_packed_delta_net_lowers_onto_the_port_whatever_documents_its_rows_declare(bound):
+    """A bf16 gated delta net over packed rows of 128 tokens in 8 documents, their bound undeclared
+    (so the row's length, 128, far more than its two chunks) or declared at 64, lowered for an A100 on
+    this CPU: its forward and backward run on the port's kernels, which keep only the memories passing
+    between a document's chunks, whatever the bound."""
+    from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
+    from dew.nn.linear import GatedDeltaNet
+
+    layer = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=2, head_k_dim=32, head_v_dim=32,
+                          dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((2, 128, 64), jnp.bfloat16)
+    segments = jnp.asarray(np.repeat(np.arange(1, 9), 16)[None].repeat(2, 0), jnp.int32)
+    call = MixerCall(AttentionMetadata(coordinates=coordinates(segments=segments, max_segments=bound)))
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(0), jnp.zeros(x.shape, x.dtype)))
+
+    def loss(variables, x):
+        return layer.apply(variables, x, call).astype(jnp.float32).sum()
+
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), "sm80")
+    with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=('cuda',))
+    assert FAMILIES[('gated_delta_rule', 'fla')][1] <= set(triton_kernels(lowered))
+
+
 def _experts_lowered(generation: str, implementation: str):
     """An expert layer's bf16 forward and backward, as a MoE step runs them, lowered for `generation`."""
     from dew.nn.moe import ExpertMLP
