@@ -269,8 +269,10 @@ class Coordinates:
     counted over real tokens: a packed batch's or the caller's own, None
     where none is given, each token's place then its rank among its row's
     real tokens (`places`) or, in a cached call, the slot its cache writes it
-    at. Rotation, NoPE's temperature, chunked attention and ALiBi read the
-    logical places; a cache addresses keys by slot. `segments` numbers each
+    at. Rotation and NoPE's temperature read the logical places; windows,
+    chunks and ALiBi count each document's real tokens from its first place
+    (`dew.nn.local_attention.token_places`), the logical places wherever
+    those count real tokens; a cache addresses keys by slot. `segments` numbers each
     row's packed documents from 1, 0 on the padding slots after them, which
     run as a document of their own, so no layer carries a real document's
     state or history into them or back; `valid` is the caller's mask of real
