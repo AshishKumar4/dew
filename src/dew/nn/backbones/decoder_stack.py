@@ -12,12 +12,13 @@ call takes is the model's choice (`CausalTransformer.stack`).
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping, Sequence
+from typing import cast
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.core.scope import subtract_filters
+from flax.core.scope import Scope, subtract_filters
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.objectives.base import merge
@@ -282,7 +283,8 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         # Applied in a scope of its own, a run writes exactly the collections
         # its caller opened (DSpark's `prediction_inputs` among them), which a
         # layer reads to choose what it records; the loop carries them back out.
-        opened = subtract_filters(run.scope.mutable, ('params', 'streaming'))
+        # A run is a bound child of the stack, so it has a scope.
+        opened = subtract_filters(cast(Scope, run.scope).mutable, ('params', 'streaming'))
 
         def layer(read, state, cache, hidden, per_layer_slice, *, run=run, opened=opened, store=store):
             variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
