@@ -94,15 +94,15 @@ def _bound(row: Batch) -> tuple[str, ...]:
     return tuple(row.get(_BOUND, _COUNTED))
 
 
-def rebound(element: Batch, held: Batch, kept: Batch, renamed: Mapping[str, str]) -> Batch:
-    """`held`, Dew's bookkeeping of `element` a projection carries (`Fields`), naming the fields its
-    count was counted from as the projection leaves them: renamed where it renames one, empty where
-    it drops one, which no step can count from again."""
-    if "_dew_valid_targets" not in held:
-        return held
+def rebound(element: Batch, kept: Batch, renamed: Mapping[str, str]) -> Batch:
+    """Where a projection of a counted `element` (`Fields`) leaves the fields its count was counted
+    from: renamed where it renames one, empty where it drops one, which no step can count from
+    again; nothing for a record no count rides on."""
+    if "_dew_valid_targets" not in element:
+        return {}
     names = tuple(renamed.get(name, name) if name in kept else "" if name in element else name
                   for name in _bound(element))
-    return {**held, _BOUND: names}
+    return {_BOUND: names}
 
 
 def targets_changed(given: Batch, output: Batch) -> bool:
