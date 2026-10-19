@@ -61,6 +61,45 @@ def test_biased_interleaved_experts_match_reference():
     assert float(jnp.max(jnp.abs(run(params) - arrays["output"]))) > 0.5
 
 
+def test_a_mixture_builds_gpt_oss_experts_wherever_a_layer_routes():
+    """A mixture owns which routed feed-forward it builds (`Mixture.build`), which a decoder's
+    feed-forward slot and a layer kind's mixer slot (`MLPMixer`) both take: under swigluoai,
+    GPT OSS's experts and router, matching the reference on the fixture. A routing knob GPT OSS
+    does not read, a shared branch or a branch beside a dense feed-forward is refused, and a mixer
+    slot, which holds no dense feed-forward, refuses a branch beside one."""
+    import functools
+
+    from flax import linen as nn
+
+    from dew.nn.attention import RMSNorm
+    from dew.nn.backbones.decoder_block import Mixture
+    from dew.nn.mixers.mlp import MLPMixer
+
+    with np.load(FIXTURES / "moe.npz") as fixture:
+        arrays = {name: jnp.asarray(value) for name, value in fixture.items()}
+    params = {
+        "router": {"kernel": arrays["router.weight"].T, "bias": arrays["router.bias"]},
+        "experts": {name.removeprefix("experts."): value for name, value in arrays.items()
+                    if name.startswith("experts.")},
+    }
+
+    def built(mixture, **fields):
+        return mixture.build(out_features=16, hidden_features=24, activation="swigluoai",
+                             dense=functools.partial(nn.Dense, 16), norm=RMSNorm, **fields)
+
+    module = built(Mixture(experts=4, top_k=2))(parent=None)
+    output = module.apply({"params": params}, arrays["hidden"])
+    np.testing.assert_allclose(np.asarray(output), arrays["output"], atol=1.6e-4, rtol=0)
+    for refused in (Mixture(experts=4, top_k=2, scaling=2.0), Mixture(experts=4, top_k=2, parallel=True),
+                    Mixture(experts=4, top_k=2, shared_features=8)):
+        with pytest.raises(ValueError):
+            built(refused)
+    with pytest.raises(ValueError):
+        built(Mixture(experts=4, top_k=2), swiglu_limit=7.0)
+    with pytest.raises(ValueError):
+        MLPMixer(intermediate_size=24, activation="geglu", mixture=Mixture(experts=4, top_k=2, parallel=True))
+
+
 def test_mxfp4_matches_reference_dequantization_exactly():
     """The fixture's bf16 output, atol 0; and every code at the two scale
     bytes that decode the smallest magnitudes to float32 subnormals, which
