@@ -218,7 +218,8 @@ blocks; the forward pass of the SigLIP-400M, Qwen3.5 and Gemma 4 vision towers
 and the SD VAE's decoder at their released sizes, with random weights;
 Qwen3-0.6B served at 32 and 128 slots; causal attention forward and backward
 (cudnn and xla, 2048 tokens, 128-wide heads); the Oxford Flowers input pipeline;
-and the save and restore of lm-dense's training state. Each row runs in a
+and the save and restore of lm-dense's training state, and each step's compile time (gated at a
+25% change: compile time is performance). Each row runs in a
 process of its own, in the tree's own environment (its `locks/<build>.txt` for
 this machine's CUDA build, built once per lock by `tools/environments.py`),
 with the tree's own copy of the tool where it has one. A row

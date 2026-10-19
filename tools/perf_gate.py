@@ -47,6 +47,10 @@ from environments import CACHE, Unlocked, environment, machine_lock
 
 FLOOR = 0.02
 """The smallest band a row is gated by, as a fraction of the base's median."""
+COMPILE_FLOOR = 0.25
+"""A step's compile time is gated by a change of a quarter: it moves more than a step's time from round
+to round, and a head that grows it that much holds a GPU idle where it used to compute (a decode module
+grown to compile for 48 minutes held a billed H100 at 0%)."""
 
 DIT = {"patch_size": 4, "emb_features": 768, "num_layers": 12, "num_heads": 12, "mlp_ratio": 4}
 # FLUX.2 and Wan 2.1 1.3B at their head width over a few of their blocks: the
@@ -111,7 +115,7 @@ print(json.dumps({"save_ms": 1e3 * sorted(saves)[1], "restore_ms": 1e3 * sorted(
 class Row:
     name: str
     unit: str
-    """'ms', lower is better, or 'items/s', higher is better."""
+    """'ms' or 's', lower is better, or 'items/s', higher is better."""
     tool: str
     """The tools/ file the row runs, or '' for a script of this file's."""
     gated: bool = True
@@ -120,6 +124,8 @@ class Row:
     """Device-kind substring required to measure this row; an absent device is not a pass."""
     head_only: bool = False
     """Compare the head with an external reference, not with the base tree."""
+    floor: float = FLOOR
+    """The smallest band the row is gated by (`FLOOR`, a compile's `COMPILE_FLOOR`)."""
 
 
 @dataclass(frozen=True)
@@ -166,10 +172,13 @@ def _qwen35_comparison(out: Path) -> tuple:
 
 
 PROBES = [
-    *[Probe((Row(name, "ms", "benchmark_step.py"),),
+    # Each step's time, and the time its program took to compile in that process (`COMPILE_FLOOR`).
+    *[Probe((Row(name, "ms", "benchmark_step.py"),
+             Row(f"compile {name.removeprefix('step ')}", "s", "benchmark_step.py", floor=COMPILE_FLOOR)),
             lambda _, out, case=case: ["--cases", json.dumps([case]), "--warmup", "10", "--steps", "30",
                                        "--json-out", str(out)],
-            lambda _, out: (json.loads(out.read_text())[0]["ms_per_step"],))
+            lambda _, out: (json.loads(out.read_text())[0]["ms_per_step"],
+                            json.loads(out.read_text())[0]["compile_seconds"]))
       for name, case in STEP_CASES.items()],
     # A process for each forward, so a module one tree lacks costs that row alone.
     *[Probe((Row(name, "ms", "benchmark_forward.py"),),
@@ -219,7 +228,8 @@ def _tools(tree: Path, tool: str, newer: Path) -> Path:
 def _run(tree: Path, python: Path, tool: str, argv: list[str], newer: Path,
          timeout: float) -> subprocess.CompletedProcess:
     tools = _tools(tree, tool or "benchmark_step.py", newer)
-    env = {**os.environ, "PYTHONPATH": f"{tree / 'src'}:{tools}"}
+    # Every round compiles from scratch: a persistent cache's hit would read as a compile of nothing.
+    env = {**os.environ, "PYTHONPATH": f"{tree / 'src'}:{tools}", "JAX_ENABLE_COMPILATION_CACHE": "false"}
     command = [str(python), *([str(tools / tool)] if tool else []), *argv]
     return subprocess.run(command, cwd=tree, env=env, capture_output=True, text=True, timeout=timeout)
 
@@ -373,11 +383,11 @@ def verdict(row: Row, base: list, head: list) -> tuple[str, dict]:
                for name, samples in (("base", base), ("head", head)) if not all(map(measured, samples))}
     if missing:
         return "partial", {"unmeasured rounds": missing}
-    worse = 1.0 if row.unit == "ms" else -1.0
+    worse = -1.0 if row.unit == "items/s" else 1.0
 
     def spread(xs):
         return (max(xs) - min(xs)) / statistics.median(xs)
-    band = max(spread(base), spread(head), FLOOR)
+    band = max(spread(base), spread(head), row.floor)
     change = worse * (statistics.median(head) - statistics.median(base)) / statistics.median(base)
     separated = (min(head) > max(base)) if worse > 0 else (max(head) < min(base))
     faster = (max(head) < min(base)) if worse > 0 else (min(head) > max(base))
