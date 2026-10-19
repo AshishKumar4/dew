@@ -394,10 +394,9 @@ def reduce(directory: Path, *, stage1: bool) -> list[str]:
 SUMS = frozenset({"dot_general", "ragged_dot_general", "reduce_sum", "conv_general_dilated", "cumsum",
                   "scatter-add"})
 """The operations that sum terms: a leaf's terms are those its own sums add,
-taken at their operands' sizes, the terms of the sums chained into them where
-there are any (`float64_terms`). A ragged dot, an expert layer's grouped
-matmul, sums as a dot does within each group, and its transpose, which the
-kernel's gradient runs, is one too."""
+taken at their float64 values (`float64_terms`). A ragged dot, an expert
+layer's grouped matmul, sums as a dot does within each group, and its
+transpose, which the kernel's gradient runs, is one too."""
 
 CARRIES = frozenset({"add", "add_any", "sub", "neg", "convert_element_type", "reshape", "transpose",
                      "broadcast_in_dim", "squeeze", "expand_dims", "copy", "copy_p", "reduce_precision",
@@ -410,7 +409,7 @@ added to a parameter, devices' partials) and moved, by a remat name
 (`checkpoint_name`) or a collective too.
 A product or quotient of a sum by a value that is none carries them too,
 scaled element by element (`_applied`), as `s_i sum_k x_ik` sums the terms
-`s_i x_ik`, and a product of two sums the products of their terms."""
+`s_i x_ik`; a product of two sums ends them."""
 
 CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "remat2", "checkpoint",
                    "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr"})
@@ -436,16 +435,14 @@ def float64_forward(module, variables, *args, **kwargs):
 def float64_terms(fn, *args):
     """`fn(*args)` evaluated op by op, as float64 as `args` are, and the tree of
     each output leaf's terms, alike: the root sum of squares of the terms its
-    final sums add (`SUMS`), carried into the leaf (`CARRIES`), each term at
-    its operands' sizes: an operand's own terms where sums chained into it
-    made them, at least its value. That is the size of the sum's partial
-    sums and of those behind it, which its rounding scales with in any
-    order: about the leaf's own size where the terms' signs are independent,
-    far above it where they cancel by design (a softmax's shift invariance),
-    upstream too, as a deep gradient's cotangent sums cancelling ones. A
-    value made by any other operation (a nonlinearity, a norm's root) is its
-    own size, and an input carries no terms, so a parameter's terms after an
-    update are the update's."""
+    final sums add (`SUMS`), at their operands' values, carried into the leaf
+    (`CARRIES`). That is the size of the sum's partial sums, which its
+    rounding scales with in any order: about the leaf's own size where the
+    terms' signs are independent, far above it where they cancel by design
+    (a softmax's shift invariance). A leaf made by any other operation is
+    its own size, and an input carries no terms, so a parameter's terms
+    after an update are the update's. Nothing propagates through the layers
+    behind a sum, which would bound the whole computation."""
     closed = jax.make_jaxpr(fn)(*args)
     values, energies = _evaluated(closed.jaxpr, closed.consts, jax.tree.leaves(args))
     tree = jax.tree.structure(jax.eval_shape(fn, *args))
@@ -493,16 +490,13 @@ def _evaluated(jaxpr, consts, args, given=None):
 
 
 def _carrying(jaxpr) -> set:
-    """The variables whose terms reach an output of `jaxpr`: those carried into it, and a sum's
-    operands, whose terms size its own."""
+    """The variables whose terms reach an output of `jaxpr`."""
     from jax.extend.core import Var
 
     wanted = {var for var in jaxpr.outvars if isinstance(var, Var)}
     for equation in reversed(jaxpr.eqns):
         if any(var in wanted for var in equation.outvars):
-            sized = ([index for index, var in enumerate(equation.invars) if _real(var)]
-                     if equation.primitive.name in SUMS else [])
-            wanted.update(equation.invars[index] for index in {*_carried(equation), *sized}
+            wanted.update(equation.invars[index] for index in _carried(equation)
                           if isinstance(equation.invars[index], Var))
     return wanted
 
@@ -564,23 +558,18 @@ def _applied(equation, inputs, given, wanted: bool):
         return outputs, [None] * len(outputs)
     carried = _carried(equation)
     if name in SUMS and not carried and all(_real(var) for var in equation.outvars):
-        # Each term at its operands' sizes: their own terms where sums made them (`_sized`).
-        squares = [_sized(energy, value) if _real(var) else
-                   _squared(value) if jnp.issubdtype(var.aval.dtype, jnp.complexfloating) else value
-                   for var, value, energy in zip(equation.invars, inputs, given, strict=True)]
+        squares = [_squared(value) if _real(var) or jnp.issubdtype(var.aval.dtype, jnp.complexfloating)
+                   else value for var, value in zip(equation.invars, inputs, strict=True)]
         return outputs, [equation.primitive.bind(*squares, **equation.primitive.get_bind_params(params))]
     if not carried:
         return outputs, [None] * len(outputs)
     if name in ("mul", "div"):
         summed = [index for index in carried if given[index] is not None]
-        if not summed or (name == "div" and summed != [0]):
+        if len(summed) != 1 or (name == "div" and summed != [0]):
             return outputs, [None] * len(outputs)
-        if len(summed) == 1:
-            (index,) = summed
-            scale = jnp.square(jnp.abs(inputs[1 - index]))
-            return outputs, [given[index] * scale if name == "mul" else given[index] / scale]
-        # A product of two sums sums the products of their terms.
-        return outputs, [_sized(given[0], inputs[0]) * _sized(given[1], inputs[1])]
+        (index,) = summed
+        scale = jnp.square(jnp.abs(inputs[1 - index]))
+        return outputs, [given[index] * scale if name == "mul" else given[index] / scale]
     if all(given[index] is None for index in carried):
         return outputs, [None] * len(outputs)
     operands = [_or_zero(given[index], value) if index in carried else value
@@ -643,13 +632,6 @@ def _mapped(params, inputs, given):
     return jax.shard_map(program, mesh=params["mesh"], in_specs=(specs, specs),
                          out_specs=(out_specs, out_specs), axis_names=params["newly_manual_axes"],
                          check_vma=params["check_vma"])(tuple(inputs), tuple(given))
-
-
-def _sized(energy, value):
-    """A sum's operand's square size: its own terms' energy where sums made it, at least its value's
-    square, else its value's square."""
-    squared = _squared(value)
-    return squared if energy is None else jnp.maximum(energy, squared)
 
 
 def _or_zero(energy, value):
