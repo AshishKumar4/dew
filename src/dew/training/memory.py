@@ -306,7 +306,7 @@ def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
     --xla_gpu_enable_allocator_spatial_partitioning left on, its default): a free
     block below a buffer serves every small allocation before the open space past
     it, so a batch prefetched past the temporaries lets the next step's outputs
-    take a few bytes of their block. `prepare_process` turns the partitioning off.
+    take a few bytes of their block. `import dew` turns the partitioning off.
     cuda_async can do the same inside a pool it does not report.
     """
     if 'pool_bytes' not in memory:
