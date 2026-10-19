@@ -276,26 +276,29 @@ def test_a_mixture_members_draws_stay_as_they_were_when_another_member_joins():
     assert [twins[index, 0] for index in range(8)] != [twins[index, 1] for index in range(8)]
 
 
-def test_an_unnamed_member_draws_by_its_content_wherever_a_host_mounts_it(tmp_path):
-    """A member given no name goes by its source's content, not its description: one dataset mounted
-    at two paths, as two hosts mount it, draws alike in a mixture, whose plans agree."""
-    def mounted(directory):
-        directory.mkdir()
+def test_an_unnamed_member_draws_alike_wherever_a_host_mounts_it_and_when_a_named_one_joins(tmp_path):
+    """A member given no name goes by its place among the members given none, never by where its
+    source sits: one dataset mounted at two paths draws alike in a mixture, whose plans agree, and a
+    named member joining the mixture leaves its draws as they were."""
+    def mounted(directory, joining=False):
+        directory.mkdir(exist_ok=True)
         (directory / "rows.jsonl").write_text("".join(json.dumps({"id": i}) + "\n" for i in range(8)))
         chain = Pipeline(Files(str(directory / "rows.jsonl"))).map(Member(0)).random_map(Draw())
-        other = Pipeline(source(4)).map(Member(1)).random_map(Draw())
-        return compile(mix([chain.repeat(1), other.repeat(1)]).batch(4), read="memory", loading=READ, seed=5)
+        joined = [Pipeline(source(4), name="joining").map(Member(1)).random_map(Draw())] if joining else []
+        return compile(mix([*joined, chain.repeat(1)]).batch(4), read="memory", loading=READ, seed=5)
 
     here, there = mounted(tmp_path / "here"), mounted(tmp_path / "there")
     assert here.plan.identity() == there.plan.identity()
     draws = []
-    for data in (here, there):
+    for data in (here, there, mounted(tmp_path / "here", joining=True)):
         stream = data.train(DataPartition())
         try:
-            draws.append([int(draw) for batch in stream for draw in batch["draw"]])
+            draws.append({int(index): int(draw) for batch in stream
+                          for index, of, draw in zip(batch["id"], batch["member"], batch["draw"], strict=True)
+                          if of == 0})
         finally:
             stream.close()
-    assert draws[0] == draws[1]
+    assert draws[0] == draws[1] == draws[2]
 
 
 def test_a_position_is_refused_where_a_mixture_member_was_renamed():

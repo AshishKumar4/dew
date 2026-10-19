@@ -22,6 +22,7 @@ support and which they prefer.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -56,7 +57,7 @@ from dew.data.pipeline import (
     Windows,
     Workers,
 )
-from dew.data.plan import Manifest, StepIdentity, fingerprint
+from dew.data.plan import Manifest, StepIdentity
 from dew.data.sources.base import READS, Read, Source
 from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
@@ -291,22 +292,14 @@ def _name(pipeline: Pipeline) -> str:
     return "mixture" if isinstance(pipeline.source, (Mixture, Phases)) else pipeline.source.describe()
 
 
-def _member(pipeline: Pipeline) -> str:
-    """The name a mixture member goes by for its draws and in its plan: the one it was given
-    (`Pipeline.named`), else its source's content, which no host's mount of it changes, a mixture's
-    its own members' names."""
-    if pipeline.name is not None:
-        return pipeline.name
-    from dew.data.materialize import _Memory
-
-    source = pipeline.source
-    if isinstance(source, (Mixture, Phases)):
-        return f"mixture:{fingerprint([_member(child) for child in source.pipelines])[:16]}"
-    # A memory read's rows are its source's, whichever steps it ran ahead of the lowering, and a
-    # memory read of one, as an objective's run-scoped step reads the run's rows again.
-    while isinstance(source, _Memory):
-        source = source.original
-    return f"content:{fingerprint(source.fingerprint())[:16]}"
+def _members(pipelines: Sequence[Pipeline]) -> list[str]:
+    """The names a mixture's members go by, for their draws and in its plan: the one each was given
+    (`Pipeline.named`), else its place among the members given none (`#0`, `#1`, ...), which no
+    mount, read or preparation of its source changes. A member keeps its draws and its place across
+    a member joining or leaving by its name; one without keeps them while no other unnamed member
+    joins or leaves ahead of it."""
+    unnamed = itertools.count()
+    return [pipeline.name if pipeline.name is not None else f"#{next(unnamed)}" for pipeline in pipelines]
 
 
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
@@ -554,7 +547,7 @@ def _analyzed(
     if isinstance(source, Phases):
         order: Mapping[str, object] = {
             "phases": [child.order for child in children],
-            "members": [_member(child) for child in source.pipelines],
+            "members": _members(source.pipelines),
             "until_steps": list(source.until_steps),
         }
     else:
@@ -563,7 +556,7 @@ def _analyzed(
             **(
                 {
                     "corpora": [child.order for child in children],
-                    "members": [_member(child) for child in source.pipelines],
+                    "members": _members(source.pipelines),
                     "weights": list(source.weights),
                     "shares": "tokens" if source.tokens is not None else "accepted rows",
                 }

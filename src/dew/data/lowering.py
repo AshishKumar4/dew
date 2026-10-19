@@ -615,7 +615,7 @@ batches, so a resume cuts the batches before them (`_Build.batched`)."""
 
 
 def _member_key(members: Sequence[str], index: int) -> int:
-    """A mixture member's key for its random draws: the name it goes by (`_member`), as the plan's
+    """A mixture member's key for its random draws: the name it goes by (`_members`), as the plan's
     order records it for every read alike, so adding or removing another member leaves its draws as
     they were, and among members of one name its place among them, so two such members draw apart."""
     name = members[index]
