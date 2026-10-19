@@ -20,15 +20,14 @@ def expand(coefficient, x):
 def divided(numerator, rate):
     """`numerator / rate`, rounded once, as a source written in PyTorch divides a state by a rate.
 
-    XLA's simplifier rewrites a division by a broadcast or a constant, a per-row rate against a
-    `[B, ...]` state among them, into a multiplication by its reciprocal, two roundings where
-    the division makes one (a third of float32 quotients come out an ulp off). Both operands,
-    the rate broadcast, pass a barrier: the simplifier sees no broadcast divisor to invert, and
-    the numerator arrives rounded as it was computed, so two programs that fuse the code around
-    it differently divide the same operands.
+    XLA's simplifier rewrites a division by a broadcast, a per-row rate against a `[B, ...]` state
+    among them, into a multiplication by its reciprocal, two roundings where the division makes one
+    (a third of float32 quotients come out an ulp off). The divisor here is the rate plus the
+    numerator times zero: a full-shape operand, which no simplification folds back to the
+    broadcast (it would change an infinite numerator's NaN), so the division stays one, inside the
+    fusion around it and holding no buffer of its own. A finite numerator leaves the rate exact.
     """
-    numerator, rate = jax.lax.optimization_barrier((numerator, jnp.broadcast_to(rate, jnp.shape(numerator))))
-    return numerator / rate
+    return numerator / (rate + numerator * 0)
 
 
 
