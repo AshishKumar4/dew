@@ -870,7 +870,8 @@ def test_the_fused_decode_step_computes_the_layers_token(heads, width, rows, hel
     for config in found:
         with tuning.pinned({delta_rule.FusedStep: config}):
             out, history, state = jax.jit(fused)(*operands)
-        assert_as_exact_as_the_reference(np.asarray(out), np.asarray(want), np.asarray(exact), f"{config} out")
+        assert_as_exact_as_the_reference(np.asarray(out), np.asarray(want), np.asarray(exact),
+                                         f"{config} out")
         np.testing.assert_array_equal(np.asarray(history), np.asarray(after["cache"]["conv_state"]))
         assert state.dtype == held
         unfused = after["cache"]["recurrent_state"]
