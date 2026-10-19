@@ -187,13 +187,16 @@ def test_chunks_from_a_shared_vector_of_places_split_over_an_explicit_sequence_a
     truth = dense_reference(query, key, value, keep[None])
 
     def attend(q, k, v, positions):
-        return local_attention(q, k, v, chunk=4, places=counted_places(positions=positions), implementation="xla")
+        return local_attention(q, k, v, chunk=4, places=counted_places(positions=positions),
+                               implementation="xla")
 
     alone = attend(query, key, value, positions)
     mesh = MeshSpec(sequence=2, explicit=("sequence",)).build(jax.devices()[:2])
     with jax.set_mesh(mesh):
-        placed = [jax.device_put(x, NamedSharding(mesh, PartitionSpec(None, "sequence"))) for x in (query, key, value)]
-        split = jax.jit(attend)(*placed, jax.device_put(positions, NamedSharding(mesh, PartitionSpec("sequence"))))
+        placed = [jax.device_put(x, NamedSharding(mesh, PartitionSpec(None, "sequence")))
+                  for x in (query, key, value)]
+        shared = jax.device_put(positions, NamedSharding(mesh, PartitionSpec("sequence")))
+        split = jax.jit(attend)(*placed, shared)
     assert_as_exact_as_the_reference(np.asarray(split), np.asarray(alone), truth, "shared places split")
 
 

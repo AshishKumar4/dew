@@ -376,8 +376,9 @@ def counted_places(segments=None, valid=None, positions=None) -> jax.Array | Non
     if segments is None and valid is None and positions is None:
         return None
     # A shared `[S]` vector of places is a row, its sequence the second dimension as the others'.
+    given = None if positions is None else jnp.atleast_2d(positions)
     segments, valid, given = (None if x is None else rows_like(jnp.asarray(x), jnp.asarray(x))
-                              for x in (segments, valid, None if positions is None else jnp.atleast_2d(positions)))
+                              for x in (segments, valid, given))
     shape = jnp.shape(next(x for x in (segments, valid, given) if x is not None))
     real = jnp.ones(shape, bool) if valid is None else jnp.asarray(valid, bool)
     if segments is not None:
