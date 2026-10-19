@@ -44,7 +44,7 @@ from etils import epath
 
 import dew.io
 from dew import registry
-from dew.cache import default_compilation_cache_dir, dew_cache_dir
+from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.data import Augment, HoldOut, ImageData, RunData, loader
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
@@ -674,11 +674,12 @@ class TrainerConfig:
 
     Unset traces nothing.
     """
-    compilation_cache_dir: str | None = dataclasses.field(
-        default_factory=default_compilation_cache_dir)
-    """The directory for a persistent XLA cache, so a restart skips recompiling the step.
+    compilation_cache_dir: str | None = None
+    """The directory of JAX's persistent compilation cache, so a restart skips recompiling the step.
 
-    None compiles from scratch every run.
+    None caches under the user's cache directory wherever the run's processes share it
+    (`dew.training.runtime.ready_process`); a pool across hosts without shared storage names one
+    they share. JAX_ENABLE_COMPILATION_CACHE=false compiles from scratch every run.
     """
     wandb: Wandb | None = None
     """An optional W&B telemetry sink, in addition to the local tracking journal.
