@@ -48,7 +48,7 @@ from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
-from ..gemma3n import AltUp, AltUpLayer, rescale_to
+from ..gemma3n import AltUp, AltUpLayer, clamped_predictions, rescale_to
 from ..hyper_connections import (
     Carried,
     HyperConnections,
@@ -2257,6 +2257,15 @@ class CausalTransformer(nn.Module):
                                                    remat=self.loop.remat if remat is None else remat))
 
     @nn.nowrap
+    def projected(self, params, *, updated: bool):
+        """`ProjectsParameters`: before a training step's update, every AltUp layer's prediction
+        coefficients clamped to `altup.coef_clip`, as the reference clamps its stored weight before
+        a training forward (`clamped_predictions`); the updated parameters as they are."""
+        if updated or self.altup is None or self.altup.coef_clip is None:
+            return params
+        return clamped_predictions(params, self.altup.coef_clip)
+
+    @nn.nowrap
     def with_remat(self, policy: RematPolicy | None) -> Self:
         """Start at `policy`, including policies outside `DECODER_REMAT`.
 
@@ -2355,6 +2364,18 @@ class CausalTransformer(nn.Module):
             if refusal is not None:
                 return f"layer {index}: {refusal}"
         return None
+
+    @nn.nowrap
+    def generation_refusal(self) -> str | None:
+        """Why a generation loop cannot continue this decoder's rows, or None
+        (`dew.nn.protocols.Generating`): its sparse layers' mixture, or a mixer it
+        names (`declared_mixers`: a layer kind's, a prediction depth's or the
+        drafter's), that refuses it (`Mixture.generation_refusal`,
+        `MixerBase.generation_refusal`)."""
+        refusal = None if self.mixture is None else self.mixture.generation_refusal()
+        for mixer in self.declared_mixers:
+            refusal = refusal or mixer.generation_refusal()
+        return refusal
 
     @nn.nowrap
     def split_prefill_refusal(self) -> str | None:
