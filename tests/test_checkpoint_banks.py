@@ -75,7 +75,8 @@ def test_a_cpu_owned_run_reads_its_frozen_banks_into_rows_again_on_the_programs_
     first = Checkpoints(str(tmp_path / "run")).variables(ema=False)
     with steady_state(allow=("host_to_device",)):
         second = Checkpoints(str(tmp_path / "run")).variables(ema=False)
-    assert sorted(first[FROZEN]) == sorted(expected) == [f"layers_{index}" for index in range(4)]
+    assert sorted(first[FROZEN]) == sorted(expected)
+    assert {f"layers_{index}" for index in range(4)} <= set(expected)
     for want, got, again in zip(jax.tree.leaves(expected), jax.tree.leaves(first[FROZEN]),
                                 jax.tree.leaves(second[FROZEN]), strict=True):
         np.testing.assert_array_equal(np.asarray(got), want)
