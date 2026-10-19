@@ -18,10 +18,11 @@ from reference_error import assert_as_exact_as_the_reference
 from scipy.special import erfc
 from tuned import each_config
 
+from dew.nn.activations import exact_gelu
 from dew.nn.gpt_oss import GptOssExperts
 from dew.nn.kernels import grouped_matmul, tuning
 from dew.nn.kernels.generation import triton_runs
-from dew.nn.moe import ExpertMLP, exact_gelu, expert_dispatch, expert_projection
+from dew.nn.moe import ExpertMLP, expert_dispatch, expert_projection
 from dew.training import MeshSpec
 
 pytestmark = pytest.mark.kernel

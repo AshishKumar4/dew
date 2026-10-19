@@ -23,12 +23,12 @@ from dew import records
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors
 from dew.interop.streaming import WeightLayout
+from dew.nn.activations import GatedActivation, Situ
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
-from dew.nn.moe import GatedActivation, Situ
 from dew.nn.rope import RopeScaling, YarnScaling
 from dew.nn.text_encoders import check_tree
 

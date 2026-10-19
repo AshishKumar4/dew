@@ -20,9 +20,10 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.activations import GatedActivation
 from dew.nn.attention import RMSNorm
 from dew.nn.flops import projection_flops
-from dew.nn.moe import ExpertMLP, GatedActivation, chosen_experts, renormalized_softmax
+from dew.nn.moe import ExpertMLP, chosen_experts, renormalized_softmax
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import Routes
 from dew.nn.sharding import logical_axes
