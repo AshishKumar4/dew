@@ -443,11 +443,38 @@ def test_a_generation_of_one_holdout_part_reads_as_that_part():
 
     train, held = Pipeline(source).holdout(records=5)
     part = publish(tagged(train), _cache(), read="indexed")
-    assert ids(tagged(train).cache(part)) == ids(tagged(train)) == [(index, index * 10) for index in range(5, 12)]
+    assert ids(tagged(train).cache(part)) == ids(tagged(train))
+    assert ids(tagged(train)) == [(index, index * 10) for index in range(5, 12)]
     with pytest.raises(ValueError):
         iterate(tagged(held).cache(part), read="indexed")
     store = publish(tagged(Pipeline(source)), _cache(), read="indexed")
-    assert [ids(tagged(branch).cache(store)) for branch in (train, held)] == [ids(tagged(train)), ids(tagged(held))]
+    served = [ids(tagged(branch).cache(store)) for branch in (train, held)]
+    assert served == [ids(tagged(train)), ids(tagged(held))]
+
+
+def test_a_loader_reads_a_generation_where_it_holds_the_rows_and_each_other_source_itself():
+    """A recipe given the generation of its training branch trains on the generation and scores
+    its validation source's own rows; a recipe none of whose rows the generation holds is refused."""
+    from dew.config.data import RecordsData, loader
+    from dew.data.compile import publish
+    from dew.data.dataset import DataPartition, Loading
+
+    read = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
+    recipe = RecordsData(Memory([{"id": index} for index in range(8)]),
+                         validation=Memory([{"id": 100 + index} for index in range(4)]))
+    train, _, _ = recipe.pipelines()
+    generation = publish(train, _cache(), read="indexed", loading=read)
+    data = loader(recipe, batch=2, cache=generation, read="indexed", loading=read)
+    assert data.plan.manifest.source["sources"][0]["store"] == "generation"
+    training, validation = data.train(DataPartition()), data.val(DataPartition())
+    try:
+        assert {int(index) for _ in range(4) for index in next(training)["id"]} == set(range(8))
+        assert sorted(int(index) for batch in validation for index in batch["id"]) == [100, 101, 102, 103]
+    finally:
+        training.close()
+        validation.close()
+    with pytest.raises(ValueError):
+        loader(RecordsData(Memory([{"id": -1}])), batch=2, cache=generation, read="indexed", loading=read)
 
 
 def test_published_generation_exposes_only_declared_order_metadata_and_plan():
