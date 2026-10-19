@@ -337,8 +337,8 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
 
 
 class _PrimeMap:
-    def __init__(self, parents: Sequence[pygrain.MapDataset[Batch]], names: Sequence[str]):
-        self.parents, self.names = tuple(parents), tuple(names)
+    def __init__(self, parents: Sequence[pygrain.MapDataset[Batch]]):
+        self.parents = tuple(parents)
         self.lock = threading.Lock()
         self.done = False
         self.pending: dict[int, Batch] = {}
@@ -347,12 +347,7 @@ class _PrimeMap:
         with self.lock:
             if not self.done:
                 for corpus, dataset in enumerate(self.parents):
-                    try:
-                        row = dataset[0]
-                    except (ValueError, TypeError, KeyError) as error:
-                        raise ValueError(
-                            f"corpus {self.names[corpus]} failed its first record: {error}"
-                        ) from error
+                    row = dataset[0]
                     if row is not None:
                         self.pending[corpus] = row
                 self.done = True
@@ -384,16 +379,14 @@ class PrimedMap(pygrain.MapDataset[Batch]):
         return self.slice(index) if isinstance(index, slice) else self._group.read(self._index, index)
 
 
-def primed_maps(
-    parents: Sequence[pygrain.MapDataset[Batch]], names: Sequence[str]
-) -> tuple[pygrain.MapDataset[Batch], ...]:
-    group = _PrimeMap(parents, names)
+def primed_maps(parents: Sequence[pygrain.MapDataset[Batch]]) -> tuple[pygrain.MapDataset[Batch], ...]:
+    group = _PrimeMap(parents)
     return tuple(PrimedMap(parent, group, index) for index, parent in enumerate(parents))
 
 
 class _PrimeReads:
-    def __init__(self, parents: Sequence[pygrain.DatasetIterator[Batch]], names: Sequence[str]):
-        self.parents, self.names = tuple(parents), tuple(names)
+    def __init__(self, parents: Sequence[pygrain.DatasetIterator[Batch]]):
+        self.parents = tuple(parents)
         self.pending: dict[int, Batch] = {}
         self.before: dict[int, Mapping[str, object]] = {}
         self.done = False
@@ -402,12 +395,7 @@ class _PrimeReads:
         if not self.done:
             for corpus, parent in enumerate(self.parents):
                 self.before[corpus] = parent.get_state()
-                try:
-                    self.pending[corpus] = next(parent)
-                except (ValueError, TypeError, KeyError) as error:
-                    raise ValueError(
-                        f"corpus {self.names[corpus]} failed its first record: {error}"
-                    ) from error
+                self.pending[corpus] = next(parent)
             self.done = True
         if index in self.pending:
             self.before.pop(index, None)
@@ -460,14 +448,12 @@ class _ReadDataset(pygrain.IterDataset[Batch]):
 
 
 class PrimedMix(pygrain.IterDataset[Batch]):
-    def __init__(
-        self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float], names: Sequence[str]
-    ):
+    def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float]):
         super().__init__(parents)
-        self._corpora, self._weights, self._names = tuple(parents), tuple(weights), tuple(names)
+        self._corpora, self._weights = tuple(parents), tuple(weights)
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        group = _PrimeReads([iter(parent) for parent in self._corpora], self._names)
+        group = _PrimeReads([iter(parent) for parent in self._corpora])
         parents = [_ReadDataset(parent, group, index) for index, parent in enumerate(self._corpora)]
         return iter(pygrain.IterDataset.mix(parents, self._weights))
 
