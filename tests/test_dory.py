@@ -354,14 +354,14 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
     rows times each token's logit gain, which contracted with the final states give Dory's logits.
     Over the release's own tokenizer it trains a step that moves the head and the backbone, and
     the saved run answers as the live one does."""
-    loaded = load(max_seq_len=2048)
+    loaded = load(max_seq_len=1024)
     ids = REFERENCE['input_ids']
     table = loaded.model.apply(loaded.variables, method='output_table')
     hidden = loaded.model.apply(loaded.variables, ids, method='hidden_states')
     assert_as_exact_as_the_reference(np.asarray(hidden @ table.rows().T), REFERENCE['logits_2'],
                                      REFERENCE['logits_2_f64'], "Dory's vocabulary rows")
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
-    objective = DecisionObjective(loaded, layout=JointLayout(max_len=2048), head=head)
+    objective = DecisionObjective(loaded, layout=JointLayout(max_len=1024), head=head)
     data = loader(Decisions(source=EXAMPLES, validation=EXAMPLES), batch=8, read='memory',
                   objective=objective.data())
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(str(tmp_path)))
