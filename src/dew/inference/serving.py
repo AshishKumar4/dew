@@ -215,9 +215,9 @@ def _seed(key: int | jax.Array | None) -> int | jax.Array:
         return int(key)
     typed = request_key(key)
     if typed.dtype != jax.random.key_dtype():
-        raise ValueError(f"a served request's key is {jax.random.key_impl(typed)}, and the server batches keys "
-                         f"of the default implementation, {jax.config.jax_default_prng_impl}; pass an integer "
-                         "seed or a key of that implementation")
+        raise ValueError(f"a served request's key is {jax.random.key_impl(typed)}, and the server batches "
+                         f"keys of the default implementation, {jax.config.jax_default_prng_impl}; pass an "
+                         "integer seed or a key of that implementation")
     return jax.random.key_data(typed)
 
 
