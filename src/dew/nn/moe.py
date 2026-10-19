@@ -18,7 +18,6 @@ embed, mlp]` and `mlp/experts/down_proj/kernel` `[exp, mlp, embed]`, the
 layout `jax.lax.ragged_dot` takes and the `expert` mesh axis shards.
 """
 
-import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
@@ -34,13 +33,12 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.dense import Dense
 
-from .activations import gelu_exact, gelu_tanh, relu2, silu
+from .activations import GatedActivation, gated_product, relu2
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
-from .kernels import norm_swiglu
 from .kernels.generation import backend, measured_kernel, ran_kernel, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_refusal, xla_ragged_dot
-from .precision import at_least_fp32, rounded_operand, rounded_to
+from .precision import at_least_fp32, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
 from .sharding import (
     EXPERT_AXIS,
@@ -457,135 +455,6 @@ def _projection_jvp(dtype: Dtype | None, precision: PrecisionLike,
 
 
 _projection.defjvp(_projection_jvp, symbolic_zeros=True)
-
-
-@jax.custom_jvp
-def exact_gelu(x: jax.Array) -> jax.Array:
-    """`dew.nn.activations.gelu_exact`, rounded once to `x`'s dtype in both
-    differentiation directions: a bf16 gate's activation rounds once, wherever
-    the compiler places it."""
-    return gelu_exact(jax.lax.optimization_barrier(x))
-
-
-@exact_gelu.defjvp
-def _exact_gelu_jvp(primals: tuple[jax.Array], tangents: tuple[jax.Array]
-                    ) -> tuple[jax.Array, jax.Array]:
-    x, = primals
-    dx, = tangents
-    output = exact_gelu(x)
-    work = x.astype(at_least_fp32(x.dtype))
-    _, derivative = jax.jvp(gelu_exact, (work,), (jnp.ones_like(work),))
-    tangent = derivative * jax.lax.optimization_barrier(dx).astype(work.dtype)
-    return output, jax.lax.optimization_barrier(tangent.astype(x.dtype))
-
-
-@dataclasses.dataclass(frozen=True)
-class Situ:
-    """Moonshot's SiTU gated product, `SituAndMul` (modeling_kimi_linear.py:64-82
-    of moonshotai/Kimi-K3 at f831ab6): `beta * tanh(gate / beta) * sigmoid(gate)`
-    times the up projection, which `linear_beta` soft-caps as `linear_beta *
-    tanh(up / linear_beta)` when set. Both halves run in fp32 and the product
-    returns in the gate's dtype, as the reference computes it. The released
-    text config names the two `activation_situ_beta` and
-    `activation_situ_linear_beta`. A gated MLP takes one of these as its
-    activation in place of a name, since it transforms the up projection too.
-    """
-    beta: float = 1.0
-    linear_beta: float | None = None
-
-    def __call__(self, gate: jax.Array, up: jax.Array) -> jax.Array:
-        wide = at_least_fp32(gate.dtype)
-        work_gate, work_up = gate.astype(wide), up.astype(wide)
-        activated = self.beta * jnp.tanh(work_gate / self.beta) * jax.nn.sigmoid(work_gate)
-        if self.linear_beta is not None:
-            work_up = self.linear_beta * jnp.tanh(work_up / self.linear_beta)
-        return (activated * work_up).astype(gate.dtype)
-
-
-GatedActivation = str | Situ
-"""A gated MLP's activation: 'swiglu', 'geglu' or 'geglu_exact' by name, or a `Situ`."""
-
-
-def _gate_function(activation: str, implementation: str) -> Callable[[jax.Array], jax.Array]:
-    """The gate's activation `activation` names, refusing an unknown name or implementation."""
-    if implementation not in norm_swiglu.IMPLEMENTATIONS:
-        raise ValueError(f"implementation must be one of {norm_swiglu.IMPLEMENTATIONS}, "
-                         f"got {implementation!r}")
-    gates = {"swiglu": silu, "geglu": gelu_tanh, "geglu_exact": exact_gelu}
-    if activation not in gates:
-        raise ValueError(f"mlp must be 'swiglu', 'geglu', 'geglu_exact' or a Situ, got {activation!r}")
-    return gates[activation]
-
-
-def _rounded(activate: Callable[[jax.Array], jax.Array]) -> Callable[[jax.Array, jax.Array], jax.Array]:
-    """`gated_product`'s rounded arithmetic over `activate`."""
-    def rounded(gate: jax.Array, up: jax.Array) -> jax.Array:
-        dtype = jnp.result_type(gate, up)
-        gate_fp32 = rounded_to(gate.astype(jnp.float32), gate.dtype)
-        up_fp32 = rounded_to(up.astype(jnp.float32), up.dtype)
-        activated = rounded_to(activate(gate_fp32), gate.dtype)
-        return rounded_to(activated * up_fp32, dtype).astype(dtype)
-
-    return rounded
-
-
-# Recomputed in the backward pass, as the norms are (`normalized_in_fp32`):
-# a scanned stack otherwise stores five fp32 copies of the MLP width per
-# token (TPU v6e, scanned 12-layer 512-wide decoder: 10.51 ms against 9.06
-# and 1.33x the memory).
-_recomputed = functools.partial(jax.checkpoint, policy=jax.checkpoint_policies.nothing_saveable)
-
-
-def gated_product(activation: GatedActivation, *, implementation: str = 'auto',
-                  axes=None) -> Callable[[jax.Array, jax.Array], jax.Array]:
-    """The product a gated MLP takes of its gate and up projections, rounded
-    where torch rounds `act_fn(gate) * up`: the activation (silu 'swiglu', tanh
-    gelu 'geglu', erf gelu 'geglu_exact') runs in fp32 and rounds to the gate's
-    dtype, and the product rounds again. Every rounding is explicit
-    (`rounded_to`), the inputs' included: left to XLA, a third of Qwen3-0.6B's
-    bf16 products differed from transformers' by up to 2 ulp. fp32 and wider
-    round nowhere. A `Situ` computes its own product. SwiGLU's
-    `implementation` defaults to the generation's measured kernel; explicit
-    'pallas' interprets on CPU. GeGLU and SiTU remain XLA products. `axes`,
-    the operands' logical axes, place the kernel on a mesh."""
-    if isinstance(activation, Situ):
-        return activation
-    activate = _gate_function(activation, implementation)
-    rounded_product = _recomputed(_rounded(activate))
-
-    def product(gate: jax.Array, up: jax.Array) -> jax.Array:
-        chosen = 'xla' if activation != 'swiglu' else norm_swiglu.swiglu_kernel(
-            implementation, gate, up, axes=axes)
-        if chosen == 'pallas':
-            return norm_swiglu.swiglu(gate, up, axes=axes)
-        if jnp.finfo(jnp.result_type(gate, up)).bits >= 32:
-            return activate(gate) * up
-        return rounded_product(gate, up)
-
-    return product
-
-
-def packed_gated_product(activation: str, *, implementation: str = 'auto',
-                         axes=None) -> Callable[[jax.Array], jax.Array]:
-    """`gated_product` of one packed projection's `[..., 2, H]` output, gate
-    then up, read where the projection wrote them: SwiGLU's kernel reads and
-    writes the packed layout (`norm_swiglu.packed_swiglu`), and XLA's product
-    recomputes from the packed output itself, so neither copies a half out.
-    `axes` are the product's logical axes, `[..., H]`'s."""
-    activate = _gate_function(activation, implementation)
-    rounded = _rounded(activate)
-    rounded_product = _recomputed(lambda gate_up: rounded(gate_up[..., 0, :], gate_up[..., 1, :]))
-
-    def product(gate_up: jax.Array) -> jax.Array:
-        chosen = 'xla' if activation != 'swiglu' else norm_swiglu.packed_swiglu_kernel(
-            implementation, gate_up, axes=axes)
-        if chosen == 'pallas':
-            return norm_swiglu.packed_swiglu(gate_up, axes=axes)
-        if jnp.finfo(gate_up.dtype).bits >= 32:
-            return activate(gate_up[..., 0, :]) * gate_up[..., 1, :]
-        return rounded_product(gate_up)
-
-    return product
 
 
 class ExpertLinear(nn.Module):
