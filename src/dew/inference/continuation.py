@@ -14,17 +14,18 @@ sglang/srt/layers/sampler.py), and gives every parallel sample of a request
 that seed, which the continuation keeps.
 
 A continuation carries what shapes the policy (`OwnStops.continuation`): its
-sampling controls and seed, its row's adapter and cache keys, the minimum
-output still owed, and a frequency penalty, whose counts of the ids drawn
+sampling controls and seed, its row's adapter and cache keys, and a frequency
+penalty, whose counts of the ids drawn
 before it go in as logit bias, which SGLang adds to the same logits. A
 continued choice's text is decoded again from the joined ids as SGLang's
 detokenizer decodes a draw, after its prompt's last ids (`OwnStops.decoding`).
 What a continuation cannot carry is refused where a draw needs one, by name
 (`_uncarried`): a presence or repetition penalty, which counts the ids before
 it once whichever segment draws them again; stop strings, a stop regex and
-constrained decoding, whose matching restarts; an echoed prompt; and special
-tokens decoded without spaces between them, which `/v1/detokenize` does not
-take.
+constrained decoding, whose matching restarts; and special tokens decoded
+without spaces between them, which `/v1/detokenize` does not take. An owed
+minimum output is refused before a draw (`OwnStops.refusal`): SGLang masks its
+own EOS ids too while one is owed, which the policy draws as ordinary ids.
 
 This carries the completions route (`OpenAICompletion.__call__` and
 `acall`). A chat, and a stream on either route, that SGLang ended on its own
@@ -148,8 +149,6 @@ def _uncarried(request: Request) -> str | None:
 def _undecodable(fields: Mapping[str, object]) -> str | None:
     """The control of a request's `fields` its joined draw's text cannot be decoded again under,
     named, or None where `/v1/detokenize` decodes it as the draw's own was."""
-    if _switch(fields, "echo", default=False):
-        return "echo, whose prompt text the joined draw's decoding does not hold"
     if not _switch(fields, "spaces_between_special_tokens", default=True):
         return "spaces_between_special_tokens=False, which SGLang's /v1/detokenize does not take"
     return None
@@ -162,6 +161,16 @@ class OwnStops:
     stops: frozenset[int]
     budget: int
 
+    def refusal(self, request: Request) -> str | None:
+        """Why `request` cannot draw the policy on SGLang whatever it draws, or None: an owed
+        minimum output, while which SGLang masks its model's own EOS ids beside the policy's
+        (penaltylib/min_new_tokens.py), ids the policy draws as any other."""
+        least = _effective(request).get("min_tokens")
+        if least in (None, 0):
+            return None
+        return (f"min_tokens={least!r} masks SGLang's model EOS ids as well as the policy's stops while "
+                "it is owed, and the policy draws those ids as any other; drop min_tokens or draw on vLLM")
+
     def ended_outside(self, reason: JSON, matched: JSON) -> bool:
         """Whether SGLang ended a choice on an id of its own the policy's stops leave out."""
         return reason == "stop" and type(matched) is int and matched not in self.stops
@@ -170,8 +179,8 @@ class OwnStops:
                      drawn: Sequence[int]) -> Request:
         """The completions request that draws on choice `index` of `request` from `prompt` and the ids
         it `drawn`, under the same policy on the rest of the budget: its own row's per-row controls,
-        the minimum output still owed, its logprob count, and a frequency penalty's counts of `drawn`
-        as logit bias. Raises `ValueError` for a control it cannot carry (`_uncarried`)."""
+        its logprob count, and a frequency penalty's counts of `drawn` as logit bias. Raises
+        `ValueError` for a control it cannot carry (`_uncarried`)."""
         if (uncarried := _uncarried(request)) is not None:
             raise ValueError(
                 f"SGLang ended choice {index} on its model's EOS id {drawn[-1]}, which the policy does not "
@@ -191,8 +200,6 @@ class OwnStops:
         for name in _ROWS:
             if isinstance(given := extra.get(name), list) and len(given) == rows:
                 extra[name] = given[row]
-        if isinstance(least := extra.get("min_tokens"), int):
-            extra["min_tokens"] = max(least - len(drawn), 0)
         body: dict[str, object] = {name: request[name] for name in _CARRIED if name in request}
         bias = {str(token): value for token, value in _fields(fields.get("logit_bias"), "logit_bias").items()}
         frequency = fields.get("frequency_penalty")
@@ -210,10 +217,11 @@ class OwnStops:
 
     def decoding(self, request: Request, prompt: Sequence[int], choice: Mapping[str, JSON]) -> Request:
         """The `/v1/detokenize` request that decodes a continued `choice` as SGLang's detokenizer
-        decodes a draw (detokenizer_manager.py `_decode_batch_token_id_output`): its ids after the
-        prompt's last `_CONTEXT` ids, and those ids alone, whose text the draw's text follows;
-        special tokens skipped as `request` asks, and a policy stop it ended on trimmed unless the
-        request keeps it (`trim_matched_stop`). It carries the request's transport options."""
+        decodes a draw (detokenizer_manager.py `_decode_batch_token_id_output`): the prompt's last
+        `_CONTEXT` ids, and those with the choice's ids after them, the draw's text being what the
+        second adds to the first; special tokens skipped as `request` asks, and a policy stop it
+        ended on trimmed unless the request keeps it (`trim_matched_stop`). It carries the
+        request's transport options."""
         fields = _effective(request)
         ids = _ids(choice.get("token_ids"), "token_ids")
         trimmed = (choice.get("finish_reason") == "stop" and type(choice.get("matched_stop")) is int
@@ -223,6 +231,26 @@ class OwnStops:
                 "model": request.get("model"),
                 "tokens": [context, [*context, *(ids[:-1] if trimmed else ids)]],
                 "skip_special_tokens": _switch(fields, "skip_special_tokens", default=True)}
+
+    def echoed(self, request: Request, index: int, prompt: Sequence[int]) -> Call | str | None:
+        """What a continued choice's text starts with where `request` echoes its prompt, as SGLang
+        writes it (serving_completions.py `_prepare_echo_prompts`): a text prompt's row itself, or
+        the request to decode a token row with special tokens skipped; None without echo."""
+        fields = _effective(request)
+        if not _switch(fields, "echo", default=False):
+            return None
+        prompts, samples = fields.get("prompt"), fields.get("n")
+        row = index // (samples if isinstance(samples, int) and samples > 0 else 1)
+        if isinstance(prompts, str):
+            return prompts
+        if isinstance(prompts, list) and prompts and isinstance(prompts[0], str):
+            text = prompts[row]
+            if not isinstance(text, str):
+                raise ValueError("a batch of text prompts must hold text")
+            return text
+        return "detokenize", {**{name: request[name] for name in TRANSPORT if name in request},
+                              "model": request.get("model"), "tokens": list(prompt),
+                              "skip_special_tokens": True}
 
     def completed(self, payload: JSON, request: Request) -> Plan[JSON]:
         """`payload`, a completions response to `request`, with each choice SGLang ended on an id
@@ -255,9 +283,17 @@ class OwnStops:
                                      f"does not stop on; its text cannot be decoded again with {undecodable}")
                 decoded = _record((yield "detokenize", self.decoding(request, prompt, entry)), "detokenized")
                 context, whole = _listed(decoded.get("text"), "detokenized text")
-                if not (isinstance(context, str) and isinstance(whole, str)) or not whole.startswith(context):
-                    raise ValueError("SGLang's detokenization of a draw does not follow its prompt's")
-                entry = {**entry, "text": whole[len(context):]}
+                if not (isinstance(context, str) and isinstance(whole, str)):
+                    raise ValueError("SGLang's detokenization must answer text")
+                # SGLang's own offset, not a prefix match: a prompt's broken UTF-8 tail can read
+                # otherwise once the draw completes it.
+                text = whole[len(context):]
+                echo = self.echoed(request, index if type(index) is int else 0, prompt)
+                if isinstance(echo, tuple):
+                    echo = _record((yield echo), "detokenized echo").get("text")
+                    if not isinstance(echo, str):
+                        raise ValueError("SGLang's detokenization must answer text")
+                entry = {**entry, "text": text if echo is None else echo + text}
             choices.append(entry)
         return {**response, "choices": choices, "usage": usage}
 

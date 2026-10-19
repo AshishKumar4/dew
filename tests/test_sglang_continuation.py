@@ -53,9 +53,22 @@ def logits(sequence, adapter):
     return scores
 
 
+FRAGMENT = 8
+"""An id that is the first byte of a character the next id completes, decoded alone as U+FFFD."""
+
+
 def decoded(ids, skip=True):
-    """A tokenizer's decoding of `ids`: each id a word, the first word's leading space dropped."""
-    return "".join(f" w{token}" for token in ids if not (skip and token in SPECIAL)).lstrip()
+    """A tokenizer's decoding of `ids`: each id a word, the first word's leading space dropped, as
+    SentencePiece drops it, and `FRAGMENT` joined to the id after it, as a byte-level tokenizer
+    joins a character's bytes, or read as U+FFFD where nothing completes it."""
+    kept = [token for token in ids if not (skip and token in SPECIAL)]
+    words = []
+    for at, token in enumerate(kept):
+        if at and kept[at - 1] == FRAGMENT:
+            continue
+        words.append(f" ü{kept[at + 1]}" if token == FRAGMENT and at + 1 < len(kept)
+                     else " \ufffd" if token == FRAGMENT else f" w{token}")
+    return "".join(words).lstrip()
 
 
 def generated(prompt, ids, skip=True):
@@ -124,7 +137,8 @@ class SGLang:
             for token, value in bias.items():
                 weights[token] += value
             if len(ids) < (body.get("min_tokens") or 0):
-                weights[sorted(stops)] = -np.inf
+                # SGLang's own EOS is masked too, whichever stops the request names.
+                weights[sorted(stops | {NATIVE})] = -np.inf
             probabilities = np.exp(weights - weights.max())
             probabilities /= probabilities.sum()
             rng = self.unseeded if seed is None else np.random.default_rng((seed, len(sequence)))
@@ -142,7 +156,8 @@ class SGLang:
         ids = choice["ids"]
         if choice["matched"] is not None and not body.get("no_stop_trim"):
             ids = ids[:-1]
-        return generated(choice["prompt"], ids, body.get("skip_special_tokens", True))
+        text = generated(choice["prompt"], ids, body.get("skip_special_tokens", True))
+        return decoded(choice["prompt"]) + text if body.get("echo") else text
 
     def rendered(self, choice, chat, body):
         if chat:
@@ -207,14 +222,15 @@ def test_a_continued_draw_is_the_policys_uninterrupted_draw_under_its_seed(polic
     drew on the rest of its budget, and under a seed it is the draw an engine without that EOS
     draws: the same ids, log-probabilities, text, finish and usage, for a frequency penalty beside
     a logit bias in extra_body, two samples of two rows on their own adapters, and special tokens
-    and the stop's text kept too. Most draws here go on at least once."""
+    and the stop's text kept too. A prompt ends on a character's first byte, which its draw's first
+    id completes, as SGLang decodes it. Most draws here go on at least once."""
     completion, engine = sglang()
     reference, _ = sglang(own_eos=False)
     continued = 0
     for key in range(12):
         engine.requests.clear()
-        done = completion([[1, 4, 6], [3]], 8, key=key, sampling=policy, logprobs=0, **fields)
-        expected = reference([[1, 4, 6], [3]], 8, key=key, sampling=policy, logprobs=0, **fields)
+        done = completion([[1, 4, FRAGMENT], [3]], 8, key=key, sampling=policy, logprobs=0, **fields)
+        expected = reference([[1, 4, FRAGMENT], [3]], 8, key=key, sampling=policy, logprobs=0, **fields)
         assert done.tokens == expected.tokens and done.texts == expected.texts
         assert done.finish_reasons == expected.finish_reasons and done.log_probs == expected.log_probs
         assert done.usage.completion_tokens == sum(len(row) for row in done.tokens)
@@ -223,15 +239,15 @@ def test_a_continued_draw_is_the_policys_uninterrupted_draw_under_its_seed(polic
 
 
 def test_a_continuation_sends_what_the_policy_draws_by():
-    """A continuation's request carries the policy and its seed, its own row's adapter, the minimum
-    output still owed, an empty suffix past any completion template, a frequency penalty's counts
-    of the ids drawn as logit bias where the SDK sends it, and the request's headers on every call."""
+    """A continuation's request carries the policy and its seed, its own row's adapter, an empty
+    suffix past any completion template, a frequency penalty's counts of the ids drawn as logit bias
+    where the SDK sends it, and the request's headers on every call."""
     completion, engine = sglang()
     policy = Sampling(eos_token_ids=EOS, frequency_penalty=0.5)
     for key in range(40):
         engine.requests.clear()
-        completion([[1], [3]], 8, key=key, sampling=policy, extra_headers={"x-tenant": "t"},
-                   extra_body={"lora_path": ["a", "b"], "min_tokens": 1, "suffix": "tail"})
+        completion([[1], [3]], 8, key=key, sampling=policy, extra_headers={"x-tenant": "t"}, timeout=None,
+                   extra_body={"lora_path": ["a", "b"], "suffix": "tail"})
         if len(completions(engine)) > 1:
             break
     first, then = completions(engine)[:2]
@@ -239,7 +255,7 @@ def test_a_continuation_sends_what_the_policy_draws_by():
     drawn = row[1:]
     assert then["seed"] == first["seed"] and then["n"] == 1 and then["suffix"] == ""
     assert then["max_tokens"] == 8 - len(drawn) and then["stop_token_ids"] == [EOS]
-    assert then["lora_path"] == ["a", "b"][row[0] != 1] and then["min_tokens"] == 0
+    assert then["lora_path"] == ["a", "b"][row[0] != 1]
     assert then["logit_bias"] == {str(token): -0.5 * count for token, count in Counter(drawn).items()}
     assert all(headers.get("x-tenant") == "t" for _, _, headers in engine.requests)
     assert any(path.endswith("/detokenize") for path, _, _ in engine.requests)
@@ -296,13 +312,12 @@ def test_a_continued_draw_has_the_policys_distribution():
     (Sampling(eos_token_ids=EOS, repetition_penalty=1.2), {}),
     (POLICY, {"extra_body": {"regex": "w3.*"}}),
     (POLICY, {"stop": ["w5"]}),
-    (POLICY, {"echo": True}),
 ])
 def test_a_control_a_continuation_cannot_carry_is_refused_where_a_draw_needs_one(sampling, fields):
-    """A presence or repetition penalty counts each id drawn before the cut once, stop strings,
-    patterns and constraints match from where a draw starts, and an echoed prompt is no part of the
-    decoded draw, none of which a continuation from the ids before it holds: a draw that needs one
-    is refused, and the same request whose draws all end on the policy's stop is drawn."""
+    """A presence or repetition penalty counts each id drawn before the cut once, and stop strings,
+    patterns and constraints match from where a draw starts, none of which a continuation from the
+    ids before it holds: a draw that needs one is refused, and the same request whose draws all end
+    on the policy's stop is drawn."""
     completion, _ = sglang()
     with pytest.raises(ValueError):
         for key in range(40):
@@ -310,6 +325,34 @@ def test_a_control_a_continuation_cannot_carry_is_refused_where_a_draw_needs_one
     stopping = Sampling(eos_token_ids=(NATIVE, EOS), presence_penalty=sampling.presence_penalty,
                         repetition_penalty=sampling.repetition_penalty)
     assert completion([[1]], 8, key=0, sampling=stopping, **fields).tokens
+
+
+def test_an_echoed_prompt_heads_the_continued_draw_as_sglang_writes_it():
+    """An echoed prompt heads each choice's text, a token row decoded with special tokens skipped:
+    a draw that goes on is the policy's own engine's, echo included."""
+    completion, engine = sglang()
+    reference, _ = sglang(own_eos=False)
+    continued = 0
+    for key in range(12):
+        engine.requests.clear()
+        done = completion([[1, 4, NATIVE], [3]], 8, key=key, sampling=POLICY, echo=True)
+        assert done.texts == reference([[1, 4, NATIVE], [3]], 8, key=key, sampling=POLICY, echo=True).texts
+        continued += len(completions(engine)) - 1
+    assert continued >= 3 and all("echo" not in body for body in completions(engine)[1:])
+
+
+def test_an_owed_minimum_output_is_refused_before_a_draw():
+    """SGLang masks its model's own EOS ids beside the requested stops while min_tokens is owed, ids
+    the policy draws as any other, so a request owing one is refused before it is sent, on every
+    route."""
+    completion, engine = sglang()
+    for draw in (lambda: completion([[1]], 8, key=0, sampling=POLICY, extra_body={"min_tokens": 2}),
+                 lambda: completion.chat([{"role": "user", "content": "hi"}], 8, key=0, sampling=POLICY,
+                                         extra_body={"min_tokens": 2})):
+        with pytest.raises(ValueError):
+            draw()
+    assert engine.requests == []
+    assert completion([[1]], 8, key=0, sampling=POLICY, extra_body={"min_tokens": 0}).tokens
 
 
 def test_a_chat_or_stream_sglang_ends_on_its_own_eos_is_refused_and_its_stream_closed():

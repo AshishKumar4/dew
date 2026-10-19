@@ -484,10 +484,12 @@ def _transport(request: Mapping[str, object]) -> RequestOptions:
         options["headers"] = {name: str(value) for name, value in given.items()}
     if (query := request.get("extra_query")) is not None:
         options["params"] = dict(_object(query, "extra_query"))
-    if (timeout := request.get("timeout")) is not None:
-        if isinstance(timeout, bool) or not isinstance(timeout, int | float):
-            raise ValueError("a request's timeout must be a number of seconds")
-        options["timeout"] = float(timeout)
+    if "timeout" in request:
+        # None is the SDK's own "no timeout", which the request named.
+        timeout = request["timeout"]
+        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, int | float)):
+            raise ValueError("a request's timeout must be a number of seconds or None")
+        options["timeout"] = None if timeout is None else float(timeout)
     return options
 
 
@@ -588,13 +590,18 @@ class OpenAICompletion:
             raise TypeError("async methods require AsyncOpenAI")
         return self.client
 
-    def _own_stops(self, parameters: Mapping[str, object], budget: int) -> OwnStops | None:
-        """How this request's policy stops on SGLang (`dew.inference.continuation`), where its stop ids
-        are not all a draw ends on; None on another engine or a policy without stop ids."""
+    def _own_stops(self, parameters: Mapping[str, object], budget: int,
+                   fields: Mapping[str, object]) -> OwnStops | None:
+        """How the request `fields` draw this policy on SGLang (`dew.inference.continuation`), where
+        its stop ids are not all a draw ends on; None on another engine or a policy without stop ids.
+        Raises `ValueError` for a request that cannot draw the policy there (`OwnStops.refusal`)."""
         sampling = parameters.get("sampling")
         if self.provider != "sglang" or not isinstance(sampling, Sampling) or not sampling.stops:
             return None
-        return OwnStops(frozenset(sampling.stops), budget)
+        own = OwnStops(frozenset(sampling.stops), budget)
+        if (refusal := own.refusal(fields)) is not None:
+            raise ValueError(refusal)
+        return own
 
     def _answered(self, responses: list[OpenAIResponse]) -> Callable[[Call], JSON]:
         """Each request a continuation sends (`continuation.Call`), answered on the sync client: a
@@ -646,7 +653,7 @@ class OpenAICompletion:
         fields, expected = _openai_fields(
             self.model, prompts, max_new_tokens, seed, self._parameters(parameters)
         )
-        own = self._own_stops(parameters, max_new_tokens)
+        own = self._own_stops(parameters, max_new_tokens, fields)
         if own is None:
             raw = _invoke(self._sync().completions.with_raw_response.create, fields)
             return _openai_result(raw.http_response.json(), (raw.parse(),), expected)
@@ -668,7 +675,7 @@ class OpenAICompletion:
         fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed,
                                    self._parameters(parameters), stream=True)
         create: Callable[..., Stream[OpenAIResponse]] = self._sync().completions.create
-        own = self._own_stops(parameters, max_new_tokens)
+        own = self._own_stops(parameters, max_new_tokens, fields)
         return _invoke(create, fields) if own is None else Checked(_invoke(create, fields), own)
 
     def _chat_body(self, messages: Sequence[ChatMessage], max_new_tokens: int,
@@ -705,7 +712,7 @@ class OpenAICompletion:
         create: Callable[..., ChatCompletion | Stream[ChatCompletionChunk]] = (
             self._sync().chat.completions.create
         )
-        own = self._own_stops(parameters, max_new_tokens)
+        own = self._own_stops(parameters, max_new_tokens, fields)
         if own is None:
             return _invoke(create, fields)
         from openai import Stream
@@ -723,7 +730,7 @@ class OpenAICompletion:
         fields, expected = _openai_fields(
             self.model, prompts, max_new_tokens, seed, self._parameters(parameters)
         )
-        own = self._own_stops(parameters, max_new_tokens)
+        own = self._own_stops(parameters, max_new_tokens, fields)
         if own is None:
             raw = await _invoke(self._async().completions.with_raw_response.create, fields)
             return _openai_result(raw.http_response.json(), (raw.parse(),), expected)
@@ -746,7 +753,7 @@ class OpenAICompletion:
                                    self._parameters(parameters), stream=True)
         from openai import AsyncStream
 
-        own = self._own_stops(parameters, max_new_tokens)
+        own = self._own_stops(parameters, max_new_tokens, fields)
         answer = await _invoke(self._async().completions.create, fields)
         if not isinstance(answer, AsyncStream):
             raise ValueError("a streaming completion request returned a whole response")
@@ -763,7 +770,7 @@ class OpenAICompletion:
     ) -> ChatCompletion | AsyncStream[ChatCompletionChunk] | AsyncChecked[ChatCompletionChunk]:
         seed = key_seed(key)
         fields = self._chat_body(messages, max_new_tokens, seed, stream, parameters)
-        own = self._own_stops(parameters, max_new_tokens)
+        own = self._own_stops(parameters, max_new_tokens, fields)
         create = self._async().chat.completions.create
         if own is None:
             return await _invoke(create, fields)
