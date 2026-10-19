@@ -40,8 +40,8 @@ if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
 
     from dew.objectives.diffusion import DiffusionObjective
-    from dew.training.distributed import Layout, MeshSpec
     from dew.quantization import Quantization
+    from dew.training.distributed import Layout, MeshSpec
 
 class _Default(Enum):
     """The sentinel that tells `guidance=None` from an omitted `guidance=`.

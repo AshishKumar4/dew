@@ -57,8 +57,8 @@ if TYPE_CHECKING:
     from dew.nn.dit import TextContext
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
-    from dew.records import JSON
     from dew.quantization import InputQuantizer
+    from dew.records import JSON
 
 __all__ = [
     "AffineHead",

@@ -48,8 +48,8 @@ import tyro
 from jax.typing import ArrayLike
 
 from dew.artifacts import uint8_pixels
-from dew.sampling import CFG, DPMSolverMultistep, TextToImage
 from dew.quantization import Quantization
+from dew.sampling import CFG, DPMSolverMultistep, TextToImage
 
 PROMPTS = (
     "a watercolor painting of a mountain lake at sunrise",
