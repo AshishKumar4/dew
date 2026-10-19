@@ -185,10 +185,6 @@ def _pooled_distance(stats: FIDStats, weights: str | None = None) -> float:
     """Return the distance between two pooled populations, logged with the counts and
     the features it holds for."""
     generated, real = stats.generated, stats.real
-    if generated.count < 2 or real.count < 2:
-        raise ValueError(
-            "fid generated and real populations require at least two rows each; "
-            f"got generated={generated.count}, real={real.count}")
     distance = frechet_distance(generated.mean, generated.covariance(population="generated"),
                                 real.mean, real.covariance(population="real"))
     _log.info("FID populations: generated=%d, real=%d; features=%s",

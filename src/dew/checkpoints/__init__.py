@@ -1242,7 +1242,8 @@ class Checkpoints:
             state_tree, frozen = self._frozen(self._item(state, saved, share))
             state_tree, deltas = _with_ema_deltas(state_tree)
             if weights_only:
-                state_tree = {name: state_tree[name] for name in ('variables', 'ema')}
+                from dew.training.state import MODEL_STATE
+                state_tree = {name: state_tree[name] for name in MODEL_STATE}
         profile_metadata = None if profiles is None else {
             'updates': int(profiles.updates), 'stds': [float(std) for std in np.asarray(profiles.stds)]}
         self._metadata = None
