@@ -12,7 +12,9 @@ from reference_error import assert_as_exact_as_the_reference, widened
 
 from dew.nn.kernels import recurrence, tuning
 
-ROWS, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, TAPS = 3, 2, 4, 16, 32, 4
+ROWS, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, TAPS = 16, 2, 4, 16, 32, 4
+"""Each row a draw of the operands, and a step's error measured over all of them: three rows' swung
+as far as 2.65x of the reference's over 12 seeds, while the twelve together sat within 1.34x."""
 
 NORMS = (None, recurrence.OutputNorm(1e-6, 'silu'), recurrence.OutputNorm(1e-6, 'sigmoid'))
 HOOKS = [recurrence.Hooks(conv=conv, l2norm=norm, decay='scalar' if decay == 'gates' else decay,
@@ -25,7 +27,7 @@ HOOKS = [recurrence.Hooks(conv=conv, l2norm=norm, decay='scalar' if decay == 'ga
 
 
 def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32) -> recurrence.Step:
-    """A decode token's operands for `hooks`, the middle row idle."""
+    """A decode token's operands for `hooks`, every third row from the second idle."""
     rng = np.random.default_rng(seed)
 
     def normal(*shape, scale=1.0):
@@ -33,7 +35,7 @@ def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32) ->
 
     channels = 2 * KEY_HEADS * KEY_WIDTH + VALUE_HEADS * VALUE_WIDTH
     given = {'state': normal(ROWS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, scale=0.3).astype(state_dtype),
-             'active': jnp.asarray([True, False, True])}
+             'active': jnp.asarray(np.arange(ROWS) % 3 != 1)}
     if hooks.conv is not None:
         given |= {'token': normal(ROWS, channels), 'held': normal(ROWS, TAPS - 1, channels),
                   'taps': normal(channels, TAPS, scale=0.5)}
