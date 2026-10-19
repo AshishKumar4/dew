@@ -838,12 +838,83 @@ def samplers_paths_figure():
     svg.save(HERE / "samplers-paths.svg")
 
 
+def jepa_step_figure():
+    """One I-JEPA step: the context encoder sees part of a flower, the predictor guesses the embeddings of
+    the hidden blocks, and the target encoder, an average of the context encoder's weights, supplies the
+    embeddings to compare with."""
+    x0 = flower()
+    grid, size = 8, 112
+    patch = size / grid
+    rng = np.random.default_rng(3)
+    target = [(r, c) for r in range(1, 4) for c in range(4, 7)]
+    context = [(r, c) for r in range(grid) for c in range(grid)
+               if (r, c) not in target and rng.random() < 0.45]
+    width, height = 440, 330
+    svg = Figure(width, height, seconds=12, label="One I-JEPA step on a flower. The context encoder sees the "
+                 "unmasked patches, the predictor guesses the embeddings of the hidden block, and the target "
+                 "encoder, an average of the context encoder's weights, gives the embeddings to match.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    ix, iy = 20, 40
+    svg.text(ix, 28, "the image", size=13, color="muted")
+    svg.image(ix, iy, size, pixels(x0), photo=True)
+    with svg.group() as hidden:
+        for r in range(grid):
+            for c in range(grid):
+                if (r, c) not in context and (r, c) not in target:
+                    svg.rect(ix + c * patch, iy + r * patch, patch, patch, fill="surface", stroke="none", rx=0)
+    svg.appear(hidden, 0.6)
+    with svg.group() as block:
+        top_r, left_c = target[0]
+        svg.rect(ix + left_c * patch, iy + top_r * patch, 3 * patch, 3 * patch, fill="none", stroke="accent",
+                 rx=2, width=2.5)
+    svg.appear(block, 1.2)
+    svg.appear(svg.text(ix, iy + size + 20, "context, and a hidden block", size=12, color="muted"), 1.2)
+
+    def chips(x, y, fill):
+        for k in range(4):
+            svg.rect(x + k * 16, y, 13, 13, fill=fill, stroke="none", rx=2)
+
+    def box(x, y, w, title, note, stroke):
+        svg.rect(x, y, w, 46, fill="raised", stroke=stroke, rx=7)
+        svg.text(x + w / 2, y + 20, title, size=13, weight=600, anchor="middle")
+        svg.text(x + w / 2, y + 37, note, size=11, color="muted", anchor="middle")
+
+    with svg.group() as encoded:
+        svg.arrow(ix + size + 6, iy + size * 0.7, 168, 228)
+        box(168, 210, 120, "context encoder", "sees the context", "accent")
+    svg.appear(encoded, 2.0)
+    with svg.group() as predicted:
+        svg.arrow(290, 233, 312, 233)
+        box(314, 210, 106, "predictor", "+ block's positions", "accent")
+        svg.arrow(367, 258, 367, 274)
+        chips(335, 280, "accent_fill")
+        svg.text(367, 314, "guess", size=12, color="accent", anchor="middle")
+    svg.appear(predicted, 3.0)
+    with svg.group() as targeted:
+        svg.arrow(ix + size + 6, iy + 30, 312, 64)
+        box(314, 46, 106, "target encoder", "sees everything", "rule")
+        svg.arrow(367, 94, 367, 110)
+        chips(335, 116, "tint1")
+        svg.text(367, 150, "target", size=12, color="muted", anchor="middle")
+    svg.appear(targeted, 4.2)
+    with svg.group() as loss:
+        svg.line(400, 135, 400, 287, color="accent", width=1.5, dash="4 4")
+        svg.text(408, 214, "loss", size=12, color="accent")
+    svg.appear(loss, 5.4)
+    with svg.group() as average:
+        svg.polyline([(228, 210), (228, 176), (300, 176), (300, 70), (312, 70)], color="muted", width=1.25,
+                     dash="2 4")
+        svg.text(236, 168, "average of weights", size=11, color="muted")
+    svg.appear(average, 6.4)
+    svg.save(HERE / "jepa-step.svg")
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
            "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
            "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure, "edm-step": edm_step_figure,
-           "edm-noise": edm_noise_figure, "samplers-paths": samplers_paths_figure}
+           "edm-noise": edm_noise_figure, "samplers-paths": samplers_paths_figure, "jepa-step": jepa_step_figure}
 
 
 if __name__ == "__main__":
