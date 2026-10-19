@@ -828,11 +828,28 @@ def fused_case(heads, width, rows, dtype, held):
 
 
 def fused_inputs(layer, variables, cache, token):
-    """The fused step's operands for `token` over `cache`, from the layer's own projections."""
+    """The fused step's operands for `token` over `cache`, from the layer's own projections, the conv's
+    input, history and taps by piece and head as the layer hands them over (`_fused_token`)."""
     mixed, z, b, a = layer.apply(variables, token, method=GatedDeltaNet._project)
     params = variables["params"]
-    return (mixed[:, 0], cache["conv_state"], params["conv1d"]["weight"][:, 0, :], a[:, 0], b[:, 0],
-            params["A_log"], params["dt_bias"], z[:, 0], params["norm"]["weight"], cache["recurrent_state"])
+    widths = (layer.head_k_dim, layer.head_k_dim, layer.head_v_dim)
+    cuts = [layer.key_features, 2 * layer.key_features]
+
+    def pieces(x):
+        return tuple(part.reshape(*part.shape[:-1], -1, width)
+                     for part, width in zip(jnp.split(x, cuts, axis=-1), widths, strict=True))
+
+    taps = params["conv1d"]["weight"][:, 0, :]
+    tapped = tuple(part.reshape(-1, width, taps.shape[-1]) for part, width in
+                   zip(jnp.split(taps, cuts, axis=0), widths, strict=True))
+    return (pieces(mixed[:, 0]), pieces(cache["conv_state"]), tapped, a[:, 0], b[:, 0], params["A_log"],
+            params["dt_bias"], z[:, 0].reshape(z.shape[0], layer.num_v_heads, -1), params["norm"]["weight"],
+            cache["recurrent_state"])
+
+
+def joined(history):
+    """The history by piece `[rows, K - 1, H, D]` as the layer holds it, `[rows, K - 1, C]`."""
+    return jnp.concatenate([part.reshape(*part.shape[:2], -1) for part in history], axis=-1)
 
 
 @pytest.mark.parametrize("held", [jnp.float32, jnp.bfloat16])
@@ -859,10 +876,11 @@ def test_the_fused_decode_step_computes_the_layers_token(heads, width, rows, hel
                                         step, mutable=["cache"])
 
     def fused(*operands):
-        out, history, state = delta_rule.fused_step(*operands, key_heads=heads // 2, epsilon=layer.norm_eps,
+        out, history, state = delta_rule.fused_step(*operands, epsilon=layer.norm_eps,
                                                     activation=layer.gate_activation, dtype=jnp.float32)
-        projected = layer.apply(variables, out[:, None], method=lambda module, out: module.out_proj(out))
-        return projected, history, state
+        flat = out.reshape(out.shape[0], 1, -1)
+        projected = layer.apply(variables, flat, method=lambda module, out: module.out_proj(out))
+        return projected, joined(history), state
 
     operands = fused_inputs(layer, variables, cache, token)
     found = each_config(delta_rule.FusedStep, fused, *operands)
@@ -891,8 +909,9 @@ def test_the_fused_decode_step_leaves_an_idle_row_alone():
     layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
     operands = fused_inputs(layer, variables, cache, token)
     out, history, state = jax.jit(functools.partial(
-        delta_rule.fused_step, key_heads=2, epsilon=layer.norm_eps, activation=layer.gate_activation,
+        delta_rule.fused_step, epsilon=layer.norm_eps, activation=layer.gate_activation,
         dtype=jnp.float32, active=jnp.asarray([False, True])))(*operands)
+    history = joined(history)
     np.testing.assert_array_equal(np.asarray(out[0]), 0)
     np.testing.assert_array_equal(np.asarray(history[0]), np.asarray(cache["conv_state"][0]))
     np.testing.assert_array_equal(np.asarray(state[0]), np.asarray(cache["recurrent_state"][0]))
@@ -933,9 +952,9 @@ def test_a_layer_choosing_the_fused_step_decodes_as_the_unfused_one(dtype):
 @pytest.mark.parametrize("target", ["sm80", "sm90", "sm120"])
 def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(target):
     """The fused decode step at Qwen3.5-0.8B's widths (16 value heads over 16 key heads of 128, a
-    conv of 4 taps over 6144 channels, a bf16 state) and at Qwen3.5-9B's value heads over half as many
-    key heads, at every config of its space, lowered for each GPU on this CPU and compiled by Triton
-    within its block's shared memory."""
+    conv of 4 taps over an fp32 history, a bf16 state) and at Qwen3.5-9B's value heads over half as
+    many key heads, at every config of its space, lowered for each GPU on this CPU and compiled by
+    Triton within its block's shared memory."""
     pytest.importorskip("triton")
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_kernels, failures
@@ -944,20 +963,19 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
 
     def case(key_heads, value_heads, warps):
         rows, width = 8, 128
-        channels = 2 * key_heads * width + value_heads * width
-        specs = (jax.ShapeDtypeStruct((rows, channels), jnp.bfloat16),
-                 jax.ShapeDtypeStruct((rows, 3, channels), jnp.bfloat16),
-                 jax.ShapeDtypeStruct((channels, 4), jnp.bfloat16),
-                 *(jax.ShapeDtypeStruct((rows, value_heads), jnp.bfloat16),) * 2,
+        heads = (key_heads, key_heads, value_heads)
+        token = tuple(jax.ShapeDtypeStruct((rows, h, width), jnp.bfloat16) for h in heads)
+        held = tuple(jax.ShapeDtypeStruct((rows, 3, h, width), jnp.float32) for h in heads)
+        taps = tuple(jax.ShapeDtypeStruct((h, width, 4), jnp.bfloat16) for h in heads)
+        specs = (token, held, taps, *(jax.ShapeDtypeStruct((rows, value_heads), jnp.bfloat16),) * 2,
                  *(jax.ShapeDtypeStruct((value_heads,), jnp.float32),) * 2,
-                 jax.ShapeDtypeStruct((rows, value_heads * width), jnp.bfloat16),
+                 jax.ShapeDtypeStruct((rows, value_heads, width), jnp.bfloat16),
                  jax.ShapeDtypeStruct((width,), jnp.float32),
                  jax.ShapeDtypeStruct((rows, value_heads, width, width), jnp.bfloat16))
 
         def run(*operands):
             with tuning.pinned({delta_rule.FusedStep: delta_rule.Warps(warps)}):
-                return delta_rule.fused_step(*operands, key_heads=key_heads, epsilon=1e-6, activation="silu",
-                                             dtype=jnp.bfloat16)
+                return delta_rule.fused_step(*operands, epsilon=1e-6, activation="silu", dtype=jnp.bfloat16)
         return run, specs
 
     cases = [KernelCase(f"fused/{key}x{value}/warps{warps}",
