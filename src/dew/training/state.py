@@ -11,7 +11,7 @@ from flax.training.dynamic_scale import DynamicScale
 
 from dew.objectives.base import Aux, Batch, Step, Variables, merge
 
-__all__ = ["CHECKPOINTED", "Accumulation", "Aux", "Step", "TrainState", "Variables"]
+__all__ = ["CHECKPOINTED", "MODEL_STATE", "Accumulation", "Aux", "Step", "TrainState", "Variables"]
 
 
 @struct.dataclass
@@ -93,6 +93,10 @@ CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)
                      if field.metadata.get('checkpointed', True))
 """The train-state fields a checkpoint holds, by their names; a field its
 declaration marks `checkpointed=False` is rebuilt on resume."""
+
+MODEL_STATE = ("step", "microstep", "updates", "variables", "ema")
+"""The train-state fields that say which model a step holds, its counters, variables and EMA:
+what `restore_best` returns of the best step and a weights-only snapshot keeps."""
 
 VARIABLE_FIELDS = tuple(field.name for field in dataclasses.fields(TrainState)
                         if field.metadata.get('variables'))

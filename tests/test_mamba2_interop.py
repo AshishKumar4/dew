@@ -49,7 +49,7 @@ def test_a_bf16_mamba2_sums_its_residual_stream_in_fp32(tmp_path, tensors):
     is held to the float64 port's by the float64 rule against transformers' own bf16 forward. A
     stream rounded to bf16 sat 27 and 34 times farther."""
     torch = pytest.importorskip("torch")
-    transformers = pytest.importorskip("transformers")
+    import transformers
     narrow = {name: np.asarray(jnp.asarray(value, jnp.bfloat16), np.float32)
               for name, value in tensors.items()}
     narrow["backbone.embeddings.weight"] = narrow["backbone.embeddings.weight"] * 256
@@ -120,7 +120,7 @@ def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
     (`assert_as_exact_as_the_reference`).
     """
     torch = pytest.importorskip("torch")
-    transformers = pytest.importorskip("transformers")
+    import transformers
     tokenizer = transformers.AutoTokenizer.from_pretrained("AntonV/mamba2-130m-hf", revision=MAMBA2_130M_HF)
     prompts = ["The capital of France is Paris, and the capital of Germany is",
                "def fibonacci(n):\n    if n < 2:\n        return n\n    return"]
