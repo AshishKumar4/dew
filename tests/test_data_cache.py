@@ -380,6 +380,25 @@ def test_iterate_and_validation_read_a_published_generation_as_its_accepted_rows
     assert batches[-1][VALID_ROWS].tolist() == [True, False, False]
 
 
+def test_a_hash_holdout_publishes_the_rows_its_stream_reads():
+    """A hash holdout's shard readers emit only the rows its hash keeps, so its streamed shards
+    state no row counts: a cache filled from the training part's stream publishes, and its
+    generation holds that part's rows, each once."""
+    import numpy as np
+
+    from dew.data.compile import iterate, publish
+    from dew.data.pipeline import Pipeline
+
+    stored = Memory([{"id": np.int32(index)} for index in range(20)], shard_rows=7)
+    train, _ = Pipeline(stored).holdout(0.5)
+    part = sorted(int(row["id"]) for row in iterate(train, read="streamed"))
+    tagged = train.map(lambda row: {**row, "tag": row["id"] * 10}, identity="tag@1")
+    generation = publish(tagged, _cache(), read="streamed")
+    published = [(int(row["id"]), int(row["tag"]))
+                 for row in iterate(Pipeline(generation.source()), read="indexed")]
+    assert sorted(published) == [(index, index * 10) for index in part] and 0 < len(part) < 20
+
+
 def test_published_generation_exposes_only_declared_order_metadata_and_plan():
     import numpy as np
 
