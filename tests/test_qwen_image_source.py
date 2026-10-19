@@ -248,6 +248,27 @@ def test_a_looped_layer_is_read_at_its_last_pass():
     assert not np.array_equal(model.apply(params, first, method=lambda decoder, x: decoder.norm(x)), hidden)
 
 
+def test_a_hidden_states_conditioner_reads_a_looped_tower_at_its_last_pass():
+    """FLUX.2's and Z-Image's conditioning (`HiddenStatesConditioner`) reads its tower's last layer
+    as the forward left it: a layer a loop runs twice gives its last pass, which the final norm
+    turns into the tower's hidden states, not its first."""
+    from dew.inputs.diffusion import HiddenStatesConditioner
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_stack import Loop
+
+    model = CausalTransformer(vocab_size=37, emb_features=32, num_layers=2, num_heads=4, mlp_features=64,
+                              max_seq_len=16, loop=Loop(steps=2))
+    ids = jax.random.randint(jax.random.key(0), (2, 12), 0, 37)
+    params = model.init(jax.random.key(1), ids)
+    conditioner = HiddenStatesConditioner(model, None, params, "tower", template="qwen3", layers=(2,))
+    mask = np.ones(ids.shape, bool)
+    condition = conditioner.encode({"text_encoder": params}, {"input_ids": ids, "attention_mask": mask})
+    positions = jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape)
+    hidden = model.apply(params, ids, method="hidden_states", attention_mask=mask, positions=positions)
+    normed = model.apply(params, condition.context, method=lambda decoder, x: decoder.norm(x))
+    np.testing.assert_array_equal(normed, hidden)
+
+
 @pytest.mark.parametrize("copies", [None, 2])
 def test_every_layer_reads_as_the_layer_returned_it_with_or_without_residual_copies(copies):
     """The last layer's state is the stack's own output and a middle one's the layer's own, each in
