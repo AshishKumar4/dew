@@ -6,9 +6,11 @@ importing the FLOP accounting.
 """
 
 import dataclasses
+import functools
 import importlib.metadata
 import os
 import sys
+import uuid
 from collections.abc import Callable
 
 import jax
@@ -213,9 +215,44 @@ def persist_compilations() -> None:
     ready_process`, from `prepare_process` or the first `fit`), and a task where it is loaded,
     `dew.pipeline` or a saved run's record (`dew.inference.tasks.run_record`). JAX's own switch,
     JAX_ENABLE_COMPILATION_CACHE=false (`jax_enable_compilation_cache`), turns it off, and a
-    process pool whose processes key a step apart turns it off the same way. Reading the settings
-    is what makes it idempotent and what leaves a trainer's own directory, or a caller's, alone.
+    process pool whose processes key a step apart turns it off the same way. JAX writes entries
+    from process 0 alone, so a pool takes the directory only where every process reads it as one
+    (`_shared_by_pool`): caches apart would find a step on one process and compile it on another,
+    which waits for ever for its peers. Reading the settings is what makes it idempotent and what
+    leaves a trainer's own directory, or a caller's, alone.
+
+    JAX settles whether a process uses the cache at its first compile: one that compiled with the
+    cache turned off keeps it off, and one that compiled before any directory was set takes this
+    one. XLA reads the autotuner's flags (`enable_compilation_cache`) as the backend opens, so a
+    process whose backend is open keeps its executables here and measures its picks again.
     """
     if jax.config.jax_compilation_cache_dir or not jax.config.jax_enable_compilation_cache:
         return
-    enable_compilation_cache(default_compilation_cache_dir())
+    directory = default_compilation_cache_dir()
+    if _pool_size() > 1 and not _shared_by_pool(directory):
+        return
+    enable_compilation_cache(directory)
+
+
+def _pool_size() -> int:
+    from dew.coordination import pool_size
+
+    return pool_size()
+
+
+@functools.cache
+def _shared_by_pool(directory: str) -> bool:
+    """Whether every process of the pool reads `directory` as one: a mark process 0 writes there
+    is one each of them finds, over the coordination service (`from_every_process`)."""
+    from dew.coordination import broadcast_from_process_zero, from_every_process
+
+    mark = os.path.join(directory, f".dew-pool-{broadcast_from_process_zero(uuid.uuid4().hex)}")
+    if jax.process_index() == 0:
+        os.makedirs(directory, exist_ok=True)
+        with open(mark, "w"):
+            pass
+    from_every_process(None)  # every process looks once the mark is written
+    found = from_every_process(os.path.exists(mark))
+    if jax.process_index() == 0:
+        os.remove(mark)
+    return all(found)
