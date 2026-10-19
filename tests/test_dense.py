@@ -1,8 +1,9 @@
-"""Dew's dense layers: flax's, with the bias's gradient summed at fp32.
+"""Dew's dense and convolution layers: flax's, with the bias's gradient summed at fp32.
 
 Every configuration a layer takes initializes and computes what flax's own
 layer does, bit for bit; only the gradient of a bias, summed over the
-positions it is broadcast over, is the fp32 sum torch's addmm takes.
+positions it is broadcast over, is the fp32 sum torch's addmm and
+convolution take.
 """
 
 import jax
@@ -12,6 +13,7 @@ import pytest
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
 
+from dew.nn.conv import Conv
 from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.precision import fp32_result_dot_general
 from dew.training.quantization import Quantization, quantize_for_serving
@@ -37,13 +39,36 @@ GENERAL = {
     "array-axes": (lambda general: general(np.array([2, 4]), axis=np.array([-1, -2])),
                    jnp.float32, (3, 5, 6)),
 }
+MASK = np.ones((3, 3, 6, 8), np.float32)
+MASK[1, 1] = 0
+CONVOLUTIONS = {
+    "fp32": (lambda conv: conv(8, (3, 3)), jnp.float32, (2, 7, 7, 6)),
+    "bf16": (lambda conv: conv(8, (3, 3), dtype=jnp.bfloat16, param_dtype=jnp.bfloat16), jnp.bfloat16,
+             (2, 7, 7, 6)),
+    "bf16-stored-under-fp32-declared": (lambda conv: conv(8, (3, 3)), jnp.bfloat16, (2, 7, 7, 6)),
+    "no-bias": (lambda conv: conv(8, (3, 3), use_bias=False, dtype=jnp.bfloat16), jnp.float32, (2, 7, 7, 6)),
+    "circular": (lambda conv: conv(8, (3, 3), padding="CIRCULAR"), jnp.float32, (2, 7, 7, 6)),
+    "reflect-dilated": (lambda conv: conv(8, (3, 3), padding="REFLECT", kernel_dilation=2),
+                        jnp.float32, (2, 7, 7, 6)),
+    "causal-depthwise": (lambda conv: conv(6, (4,), padding="CAUSAL", feature_group_count=6),
+                         jnp.float32, (2, 9, 6)),
+    "strided-input-dilated": (
+        lambda conv: conv(8, (3, 3), strides=2, input_dilation=2, padding=((1, 1), (1, 1))),
+        jnp.float32, (2, 7, 7, 6)),
+    "two-batch-dims": (lambda conv: conv(8, (3, 3)), jnp.float32, (2, 3, 7, 7, 6)),
+    "unbatched": (lambda conv: conv(8, (3, 3)), jnp.float32, (7, 7, 6)),
+    "masked": (lambda conv: conv(8, (3, 3), mask=MASK), jnp.float32, (2, 7, 7, 6)),
+    "partitioned": (lambda conv: conv(8, (3, 3), kernel_init=nn.with_partitioning(
+        nn.initializers.lecun_normal(), (None, None, None, None))), jnp.float32, (2, 7, 7, 6)),
+}
 CASES = ([(name, Dense, nn.Dense, *case) for name, case in LAYERS.items()]
-         + [(f"general-{name}", DenseGeneral, nn.DenseGeneral, *case) for name, case in GENERAL.items()])
+         + [(f"general-{name}", DenseGeneral, nn.DenseGeneral, *case) for name, case in GENERAL.items()]
+         + [(f"conv-{name}", Conv, nn.Conv, *case) for name, case in CONVOLUTIONS.items()])
 
 
 @pytest.mark.parametrize(("ours", "flaxs", "build", "dtype", "shape"), [case[1:] for case in CASES],
                          ids=[case[0] for case in CASES])
-def test_a_dense_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dtype, shape):
+def test_a_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dtype, shape):
     x = jnp.asarray(np.random.default_rng(0).standard_normal(shape), dtype)
     mine, theirs = build(ours), build(flaxs)
     variables = theirs.init(jax.random.key(0), x)
@@ -56,16 +81,20 @@ def test_a_dense_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, bui
     np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(expected, np.float32))
 
 
-@pytest.mark.parametrize("layer", [Dense(16, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16),
-                                   DenseGeneral((2, 8), dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)],
-                         ids=["dense", "general"])
-def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer):
+@pytest.mark.parametrize(("layer", "shape"), [
+    (Dense(16, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16), (8192, 12)),
+    (DenseGeneral((2, 8), dtype=jnp.bfloat16, param_dtype=jnp.bfloat16), (8192, 12)),
+    (Conv(16, (3, 3), dtype=jnp.bfloat16, param_dtype=jnp.bfloat16), (8, 32, 32, 8)),
+    (Conv(16, (4,), padding="CAUSAL", feature_group_count=16, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16),
+     (8, 1024, 16)),
+], ids=["dense", "general", "conv", "causal-depthwise-conv"])
+def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer, shape):
     """A bias broadcast over 8192 positions receives the sum of their cotangents; the sum is
-    taken at fp32 and rounded once into the bfloat16 bias, as torch's addmm sums it, where a
-    bfloat16 sum, which JAX gives a broadcast's transpose (jax-ml/jax#30310), lands several
-    times further from float64."""
+    taken at fp32 and rounded once into the bfloat16 bias, as torch's addmm and convolution sum
+    it, where a bfloat16 sum, which JAX gives a broadcast's transpose (jax-ml/jax#30310), lands
+    several times further from float64."""
     rng = np.random.default_rng(1)
-    x = jnp.asarray(rng.standard_normal((8192, 12)), jnp.bfloat16)
+    x = jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
     variables = layer.init(jax.random.key(0), x)
     shape = jax.eval_shape(layer.apply, variables, x).shape
     cotangent = jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
@@ -75,6 +104,7 @@ def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer):
 
     got = np.asarray(jax.grad(loss)(variables["params"])["bias"], np.float64)
     terms = np.asarray(cotangent, np.float64).reshape(8192, -1)
+    assert terms.shape[1] == got.size
     truth = terms.sum(0).reshape(got.shape)
     reference = np.asarray(jnp.asarray(terms.astype(np.float32).sum(0), jnp.bfloat16), np.float64)
     assert_as_exact_as_the_reference(got, reference.reshape(got.shape), truth, "bias gradient")
