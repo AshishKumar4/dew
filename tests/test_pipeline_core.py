@@ -14,6 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from dew import position
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, publish
 from dew.data.dataset import DataPartition, Loading
@@ -198,6 +199,78 @@ def test_a_random_step_draws_alike_in_every_read_of_one_order():
         assert draws(chain, "memory") == draws(chain, "indexed") == draws(chain, "streamed")
     again = draws(rows.random_map(Draw()).random_map(Draw()).repeat(1).batch(4), "indexed")
     assert [draw for _, draw in again] != [draw for _, draw in draws(alone, "indexed")]
+
+
+def drawn_natively(rows):
+    """A Grain step Dew does not name, whose random step draws by the default seed of the rows it
+    is handed."""
+    return rows.random_map(Draw())
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_native_step_draws_by_the_runs_seed_and_resumes(read):
+    """A native step (`Pipeline.grain`) is handed rows seeded by the run, as Grain's own pipelines
+    seed theirs, so a random step it adds without a seed draws: by the run's seed, apart from a
+    second native step's draws, and on in a resumed run as in the uninterrupted one."""
+    rows = Pipeline(source(8)).grain(drawn_natively)
+
+    def draws(chain, seed):
+        data = compile(chain.repeat().batch(2), read=read, loading=READ, seed=seed)
+        whole = data.train(DataPartition())
+        try:
+            expected = take(whole, 4)
+        finally:
+            whole.close()
+        stopped = data.train(DataPartition())
+        try:
+            head = take(stopped, 2)
+            saved = stopped.get_state()
+        finally:
+            stopped.close()
+        resumed = data.train(DataPartition())
+        try:
+            resumed.set_state(saved)
+            assert head + take(resumed, 2) == expected
+        finally:
+            resumed.close()
+        return [draw for batch in expected for draw in batch["draw"]]
+
+    assert draws(rows, 5) != draws(rows, 6)
+    assert draws(rows.grain(drawn_natively), 5) != draws(rows, 5)
+
+
+@pytest.mark.parametrize("order", ["global", "per-share"])
+def test_a_position_saved_under_another_plan_version_is_refused(order):
+    """A plan's version names how Dew makes rows from it, which its fields do not say: a position
+    an earlier version saved, whose random steps drew by another key, is refused rather than
+    resumed into other draws, in a global order and in one read per share; one this version saved
+    resumes."""
+    rows = Pipeline(source(8)).random_map(Draw())
+    chain = rows if order == "global" else rows.grain(drawn_natively)
+    data = compile(chain.repeat().batch(2), read="indexed", loading=READ, seed=7)
+    assert data.plan is not None and data.plan.lowering == order
+    stopped = data.train(DataPartition())
+    try:
+        take(stopped, 2)
+        saved = stopped.get_state()
+        expected = take(stopped, 2)
+    finally:
+        stopped.close()
+    if order == "global":
+        place = position.read(saved)
+        assert place.plan is not None
+        earlier = position.encode(dataclasses.replace(place, plan={**place.plan, "version": 1}))
+    else:
+        state = json.loads(saved)
+        earlier = json.dumps({**state, "dew_data_plan": {**state["dew_data_plan"], "version": 1}}).encode()
+    resumed = data.train(DataPartition())
+    try:
+        with pytest.raises(ValueError):
+            resumed.set_state(earlier)
+        resumed.set_state(saved)
+        assert take(resumed, 2) == expected
+    finally:
+        resumed.close()
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])

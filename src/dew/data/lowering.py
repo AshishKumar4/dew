@@ -595,8 +595,9 @@ class _Build:
         a read leaves out or runs ahead draws (a cache's prefix, a published generation's steps,
         the steps a memory read runs over the whole source), so this count is the same in every
         read. Grain's default seed counts the datasets between a step and the nearest seeded one
-        instead, which those reads and the wrappers a read adds change."""
-        drawn = sum(isinstance(stage, RandomMap) for stage in pipeline.stages[:at])
+        instead, which those reads and the wrappers a read adds change. A native step is a random
+        stage too: the dataset it is handed seeds the random steps it adds by that default."""
+        drawn = sum(isinstance(stage, (RandomMap, Native)) for stage in pipeline.stages[:at])
         return int(np.random.SeedSequence((self.seed, *self.corpus, drawn)).generate_state(1, np.uint32)[0])
 
     def mixed(self, pipeline: Pipeline, partition: DataPartition) -> Rows:
@@ -773,7 +774,7 @@ class _Build:
                 _as_iter(rows, self.loading), partition.rows(stage.size), drop_remainder=self.training
             )
         elif isinstance(stage, Native):
-            rows = stage.function(rows)
+            rows = stage.function(rows.seed(self.stage_seed(pipeline, at)))
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
             rows = gx.FlatMapIterDataset(groups, _Groups(stage))
