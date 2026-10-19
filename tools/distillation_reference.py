@@ -177,14 +177,12 @@ def distillation_loss(student_logits, teacher_logits, targets, mask, student_fea
 
 
 def dew_outputs(model, variables, ids, layers):
-    """The model's logits and the named layers' outputs under Dew's forward, in the model's own
-    dtype and differentiable; the fixture writes them as float32."""
-    from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
-
+    """The model's logits and the named layers' outputs under Dew's forward (`LayerStates`), in
+    the model's own dtype and differentiable; the fixture writes them as float32."""
     logits = model.apply(variables, ids)
     _, state = model.apply(variables, ids, method=type(model).hidden_states,
-                           capture_intermediates=layer_outputs, mutable=[INTERMEDIATES])
-    return logits, [layer_output(state[INTERMEDIATES], index) for index in layers]
+                           capture_intermediates=model.capture_layers, mutable=["intermediates"])
+    return logits, [model.layer_state(state, index) for index in layers]
 
 
 def flat(tree, prefix: str) -> dict[str, np.ndarray]:

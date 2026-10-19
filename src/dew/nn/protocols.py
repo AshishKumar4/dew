@@ -87,6 +87,7 @@ __all__ = [
     "HiddenStates",
     "IntervalModel",
     "LayerScalars",
+    "LayerStates",
     "Logits",
     "LogitsFromHidden",
     "Looping",
@@ -546,6 +547,21 @@ class DecoderTraining(Protocol):
 
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]: ...
+
+
+@runtime_checkable
+class LayerStates(Protocol):
+    """A model whose forward keeps its layers' residual states, each layer's output before the
+    final norm, for a reader of a middle layer's features: applied with
+    `capture_intermediates=model.capture_layers` and the `"intermediates"` collection mutable, as
+    Flax names the collection a capture fills, the collections it returns hold them, and
+    `model.layer_state(collections, index)` reads layer `index`'s (0-based; -1 is the last). A
+    layer a loop runs more than once is read at its last pass, the state the layers after it
+    read."""
+
+    def capture_layers(self, module: nn.Module, method: str) -> bool: ...
+
+    def layer_state(self, collections: Mapping[str, Mapping], index: int) -> jax.Array: ...
 
 
 @runtime_checkable
