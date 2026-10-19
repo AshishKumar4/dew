@@ -97,14 +97,16 @@ def _cast_once(var, jaxpr, weights: frozenset) -> jnp.dtype | None:
     if eqn.primitive.name in _STACKING and len(eqn.outvars) == 1:
         stacked = eqn.outvars[0]
         operands = [operand for operand in eqn.invars if isinstance(operand, core.Var)]
-        if len(operands) > 1 and not all(operand in weights and operand.aval.dtype == var.aval.dtype
-                                         and _read_once(operand, jaxpr) for operand in operands):
+        sized = [operand.aval for operand in operands if isinstance(operand.aval, ShapedArray)]
+        if not isinstance(stacked.aval, ShapedArray) or len(sized) != len(operands):
+            return None
+        if len(operands) > 1 and not all(operand in weights and aval.dtype == stacked.aval.dtype
+                                         and _read_once(operand, jaxpr)
+                                         for operand, aval in zip(operands, sized, strict=True)):
             return None
         # A broadcast that repeats elements would read one weight in many places, whose
         # cotangents it sums in the weight's dtype.
-        sized = [operand.aval for operand in operands if isinstance(operand.aval, ShapedArray)]
-        if (not isinstance(stacked.aval, ShapedArray) or len(sized) != len(operands)
-                or stacked.aval.size != sum(aval.size for aval in sized)):
+        if stacked.aval.size != sum(aval.size for aval in sized):
             return None
         return _cast_once(stacked, jaxpr, weights | {stacked})
     called = _inner(eqn, index)
