@@ -23,19 +23,30 @@ from dew.data.holdout import (
     source_argument,
 )
 from dew.data.load import RECORD_HOLDOUT, TEXT_HOLDOUT
-from dew.data.pipeline import Configured, HostStep, MapBatch, Mixture, ObjectiveData, Phases, Pipeline, mix
+from dew.data.pipeline import (
+    Configured,
+    HostStep,
+    MapBatch,
+    Mixture,
+    ObjectiveData,
+    Pack,
+    Phases,
+    Pipeline,
+    mix,
+)
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache
     from dew.data.generation import Generation
-from dew.data import audio, chat, images, video
+from dew.data import images
 from dew.data.chat import RenderChat
 from dew.data.images import ConfigureCaption, EncodeCaptions
 from dew.data.preferences import PreferencePair
+from dew.data.presets import _CHAT_FIELDS, _clips, _conversation_windows, _decoded_images, _next_token_windows
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
 from dew.data.steps.chat import ConfigurePrompt, ResponseCanvases
 from dew.data.steps.generic import Formatting
-from dew.data.text import Chunks, Tokenize
+from dew.data.text import Tokenize
 
 _DEFAULT_LOADING = Loading(workers="auto")
 
@@ -161,19 +172,12 @@ class TextData(_Loadable):
                 else held.windows(self.seq_len)
             )
         else:
-            train = train.flat_map(Chunks(self.seq_len + 1)).pack(
-                self.seq_len + 1, bins=self.packing_bins, policy=self.pack
-            )
+            packing = Pack(self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
+            train = _next_token_windows(train, packing)
             held = (
                 self.validation
                 if isinstance(self.validation, Pipeline)
-                else (
-                    None
-                    if held is None
-                    else held.flat_map(Chunks(self.seq_len + 1)).pack(
-                        self.seq_len + 1, bins=self.packing_bins, policy=self.pack
-                    )
-                )
+                else None if held is None else _next_token_windows(held, packing)
             )
         return train, held, ()
 
@@ -198,10 +202,10 @@ class TextData(_Loadable):
                 raise ValueError(
                     f"packed text needs producer document boundaries or EOS: {source.describe()}"
                 )
-            # A document longer than a window is cut into window-long pieces, which the
-            # source's plan of document lengths cuts alike (`PackedSource.planned`).
-            return Pipeline(source).flat_map(Chunks(self.seq_len + 1)).pack(
-                self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
+            # A document longer than a window is cut into pieces, which the source's plan of
+            # document lengths cuts alike (`PackedSource.planned`).
+            return _next_token_windows(Pipeline(source),
+                                       Pack(self.seq_len + 1, bins=self.packing_bins, policy=self.pack))
 
         return (
             windows(sources[0], self.seq_len if self.stride is None else self.stride),
@@ -230,11 +234,8 @@ class ChatData(_Loadable):
         train, held = _branches(self.source, self.validation, split=self.split, prefix=prefix)
 
         def policy(pipeline: Pipeline) -> Pipeline:
-            if self.long == "chunk":
-                pipeline = pipeline.flat_map(Chunks(self.seq_len + 1, fields=("text", "text_roles")))
-            else:
-                pipeline = pipeline.filter_map(chat.fit_length(self.seq_len + 1, long=self.long))
-            return pipeline.pack(self.seq_len + 1, fields=("text", "text_roles"), bins=self.packing_bins)
+            packing = Pack(self.seq_len + 1, _CHAT_FIELDS, bins=self.packing_bins)
+            return _conversation_windows(pipeline, packing, long=self.long)
 
         return (
             policy(train),
@@ -443,8 +444,8 @@ class ImageData(_Loadable):
         configured = Configured(ConfigureCaption(caption), needs=(), random=bool(self.caption_templates))
 
         def prepared(chain: Pipeline, staging: int) -> Pipeline:
-            return (chain.map(images.DecodeImage(self.field, at_least=staging, rejects=False))
-                    .map(images.Resize(staging)).map(configured))
+            decoded = _decoded_images(chain, staging, field=self.field, at_least=staging, rejects=False)
+            return decoded.map(configured)
 
         train = prepared(train, size)
         if augment is not None and augment.backend == "host":
@@ -509,10 +510,8 @@ class VideoData(_Loadable):
         def clips(chain: Pipeline) -> Pipeline:
             # A listed clip too short or that does not decode is an error, as it always was here, so the
             # run knows its count.
-            pick = video.PickClip(self.frames / FPS, margin=padding, rejects=False)
-            frames = video.DecodeVideo(self.frames, fps=FPS, size=self.frame_size, rejects=False)
-            sound = audio.DecodeAudio(rate, context=padding, rejects=False)
-            return chain.random_map(pick).map(frames, sound).remove_columns("mp4", "clip")
+            return _clips(chain, self.frames / FPS, frames=self.frames, fps=FPS, size=self.frame_size,
+                          margin=padding, sample_rate=rate, context=padding, missing="reject", rejects=False)
 
         return clips(train), None if held is None else clips(held), (EncodeCaptions(),)
 
