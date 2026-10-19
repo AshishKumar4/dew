@@ -34,7 +34,7 @@ def test_a_flash_wheel_holds_code_for_its_architectures_major_from_their_minor_u
     sm90 serves an A10, an L4 and an RTX 4080 with sm80's code and an H100 its own, and no Blackwell,
     no part below its minor, and no device that is not a GPU; sm86's code serves an L4 and sm120's
     any later 12.x part."""
-    from dew.nn.attention import flash_built_for
+    from dew.nn.attention_kernels import flash_built_for
 
     built = ("sm80", "sm90")
     assert [flash_built_for(device, built) for device in ("sm80", "sm86", "sm89", "sm90")] == [True] * 4
@@ -53,7 +53,7 @@ def flash_here():
     """dew_flash_attn where the installed wheel holds code for this GPU (the fact `flash_refusal` reads);
     a GPU it was not built for skips by name, where 'auto' runs another kernel."""
     flash = pytest.importorskip("dew_flash_attn")
-    from dew.nn.attention import flash_architectures, flash_built_for
+    from dew.nn.attention_kernels import flash_architectures, flash_built_for
     generation = kernels.device_generation()
     architectures = flash_architectures() or ()
     if not flash_built_for(generation, architectures):
