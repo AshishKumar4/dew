@@ -325,8 +325,9 @@ def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
     return tuple(trajectories)
 
 
-type ComputeScore = Callable[[str, str, str, str], float]
-"""verl's reward function: `(data_source, solution_str, ground_truth, extra_info) -> score`."""
+type ComputeScore = Callable[[str, str, object, object], float]
+"""verl's reward function: `(data_source, solution_str, ground_truth, extra_info) -> score`, where
+verl may pass a ground truth or extra info that is not a string."""
 
 
 def verl_reward(score: ComputeScore) -> Reward:
@@ -339,9 +340,10 @@ def verl_reward(score: ComputeScore) -> Reward:
 
 
 def compute_score(reward: Reward) -> ComputeScore:
-    """verl's `compute_score` for the Dew `reward`: verl's arguments, read back as the record."""
+    """verl's `compute_score` for the Dew `reward`: verl's arguments, read back as the record a
+    prompt batch would hold (`PromptRecord.of`)."""
 
-    def score(data_source: str, solution_str: str, ground_truth: str, extra_info: str) -> float:
-        return reward(solution_str, PromptRecord(data_source, ground_truth, extra_info))
+    def score(data_source: str, solution_str: str, ground_truth: object, extra_info: object) -> float:
+        return reward(solution_str, PromptRecord.of(data_source, ground_truth, extra_info))
 
     return score

@@ -176,5 +176,8 @@ def test_a_reward_crosses_the_verl_boundary_with_the_records_three_fields():
         return 0.5
 
     assert compute_score(reward)("gsm8k", "71", "72", "") == 0.5
-    assert seen == [("71", PromptRecord("gsm8k", "72", ""))]
+    # verl may pass extra info that is not text; the record holds it as a prompt batch would.
+    assert compute_score(reward)("gsm8k", "71", ["72"], {"split": "test", "index": 3}) == 0.5
+    assert seen == [("71", PromptRecord("gsm8k", "72", "")),
+                    ("71", PromptRecord("gsm8k", '["72"]', '{"index": 3, "split": "test"}'))]
 
