@@ -422,7 +422,8 @@ class DecisionObjective(Objective[Ratio]):
         return _rows(batch)[0]
 
     def model_flops(self, model, batch: Batch) -> float:
-        """One backbone pass plus the head's real question/option geometry."""
+        """One backbone pass plus the head's real question/option geometry. Forming the vocabulary
+        rows a head reads (an adapter's update merged into them) is execution, as recompute is."""
         model = self.model if model is None else model
         return counted_flops(model.backbone, self.real_lengths(batch)) + self._head_flops(model, batch)
 

@@ -202,6 +202,28 @@ def test_a_server_draws_each_prompt_as_the_reference_continues_it(mode, options)
     assert (server.prefix_hits > 0) == bool(options.get('prefix_cache'))
 
 
+@pytest.mark.parametrize('change', [
+    {'n_recurrent_loops': 1}, {'n_input_layers': 1, 'n_recurrent_layers': 1, 'n_output_layers': 6}],
+    ids=['one-pass', 'mlp-block'])
+def test_a_shared_cache_no_pass_rewrites_serves_prompts_in_pieces(tmp_path, change):
+    """A last-loop cache that no later pass rewrites, under one pass or over a block of MLPs alone,
+    which keep no cache, takes its prompts in pieces of two and reuses a cached prefix: each prompt
+    served continues as the model alone continues it."""
+    shared = changed(tmp_path / 'changed', {**change, 'recurrent_kv_cache_mode': 'last_loop'})
+    loaded = Pretrained.load(shared, dtype='float32', attention_impl='xla')
+    task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0.0))
+    server = Server.from_task(task, slots=2, capacity=32, kv_cache=KVCache(page_size=4, pages=40), chunk=2,
+                              prefix_cache=True)
+    prompts = [*ragged_prompts(), ragged_prompts()[1]]
+    tickets = [server.submit(prompt, 6, key=index) for index, prompt in enumerate(prompts)]
+    server.run()
+    for ticket, prompt in zip(tickets, prompts, strict=True):
+        served, alone = ticket.result().host(), task([prompt], 6, key=0).host()
+        np.testing.assert_array_equal(served.tokens[0, served.prompt_width:],
+                                      alone.tokens[0, alone.prompt_width:])
+    assert server.prefix_hits > 0
+
+
 @pytest.mark.parametrize('options', [
     {'chunk': 2}, {'kv_cache': KVCache(page_size=4, pages=40), 'prefix_cache': True}],
     ids=['chunked', 'prefix'])
@@ -344,10 +366,12 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
                   objective=objective.data())
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(str(tmp_path)))
     initial = trainer.initial_state()
-    state = trainer.fit(data, steps=1, log_every=1, state=jax.tree.map(lambda leaf: leaf, initial))
+    # The step donates the state it is handed; the host keeps what it started from.
+    started = jax.device_get(initial.variables)
+    state = trainer.fit(data, steps=1, log_every=1, state=initial)
     Checkpoints(str(tmp_path)).wait()
     for part in ('head', 'backbone'):
-        before, after = initial.variables['params'][part], state.variables['params'][part]
+        before, after = started['params'][part], state.variables['params'][part]
         moved = jax.tree.map(lambda old, new: not np.array_equal(old, new), before, after)
         assert any(jax.tree.leaves(moved)), part
     asked = {'team': INTENT}
@@ -399,6 +423,8 @@ def test_the_released_config_round_trips_through_dews_fields():
     {'n_input_layers': 4, 'n_recurrent_layers': 0}, {'n_recurrent_loops': 0},
     {'layer_types': ['sliding_attention', 'mlp'] * 3 + ['linear_attention', 'mlp']},
     {'rope_parameters': {'sliding_attention': {'rope_type': 'default', 'rope_theta': 10000}}},
+    {'rope_parameters': {kind: {'rope_type': 'default', 'rope_theta': 10000}
+                         for kind in ('sliding_attention', 'full_attention', 'mlp')}},
     {'rope_parameters': {kind: {'rope_type': 'linear', 'rope_theta': 10000, 'factor': 2.0}
                          for kind in ('sliding_attention', 'full_attention')}}])
 def test_a_config_dory_refuses_is_refused(tmp_path, change):
