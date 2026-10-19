@@ -28,7 +28,8 @@ from fsspec.implementations.cached import CachingFileSystem, WholeFileCacheFileS
 from fsspec.implementations.local import LocalFileSystem
 from fsspec.spec import AbstractFileSystem
 from gcsfs import GCSFileSystem
-from huggingface_hub import HfFileSystem
+from huggingface_hub import HfFileSystem, parse_hf_uri, try_to_load_from_cache
+from huggingface_hub.file_download import REGEX_COMMIT_HASH
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
@@ -389,6 +390,22 @@ class Store:
             if cache not in layers[:-1]:
                 options.pop(cache, None)
         return fsspec.core.url_to_fs(self.url, **options)
+
+    def readable(self) -> tuple[AbstractFileSystem, str]:
+        """Where this object's bytes are read: a Hub repository's file at a
+        commit is read from huggingface_hub's own cache where that holds it, as
+        huggingface_hub reads its files, so a downloaded revision reads offline
+        (HF_HUB_OFFLINE) and without a request online; any other object, and a
+        Hub file the cache lacks, where `resolve` places it."""
+        fs, path = self.resolve()
+        if isinstance(fs, HfFileSystem):
+            uri = parse_hf_uri(self.url)
+            if uri.revision is not None and REGEX_COMMIT_HASH.fullmatch(uri.revision):
+                held = try_to_load_from_cache(uri.id, uri.path_in_repo, revision=uri.revision,
+                                              repo_type=uri.type)
+                if isinstance(held, str):
+                    return LocalFileSystem(), held
+        return fs, path
 
     def cached(self) -> Store:
         if self.url.startswith("dewcache::"):

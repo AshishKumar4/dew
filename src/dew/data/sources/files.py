@@ -477,12 +477,25 @@ class Files(Dataset):
         return _ProjectedRows(rows, _Projection(self.columns, self.describe()))
 
     @cached_property
+    def _arrow_files(self) -> tuple[pafs.FileSystem, tuple[str, ...], Mapping[str, str]]:
+        """Where Arrow reads the files (`Store.readable`), one filesystem for all of them, and
+        each path Arrow reads's name where the file is: a Hub dataset's files read from
+        huggingface_hub's cache where it holds every one, and from the Hub otherwise."""
+        stores = [Store(url, self.storage_options) for url in self.paths]
+        named = [store.resolve() for store in stores]
+        located = [store.readable() for store in stores]
+        if any(fs.protocol != located[0][0].protocol for fs, _ in located):
+            located = named
+        filesystem = _arrow_filesystem(located[0][0])
+        paths = tuple(filesystem.normalize_path(path) for _, path in located)
+        return filesystem, paths, {path: name for path, (_, name) in zip(paths, named, strict=True)}
+
+    @cached_property
     def arrow(self) -> ds.Dataset:
-        fs, _ = Store(self.paths[0], self.storage_options).resolve()
-        paths = [Store(url, self.storage_options).resolve()[1] for url in self.paths]
+        filesystem, paths, _ = self._arrow_files
         return ds.dataset(
-            paths,
-            filesystem=_arrow_filesystem(fs),
+            list(paths),
+            filesystem=filesystem,
             format="ipc" if self.kind == "arrow" else "parquet",
             partitioning=self.partitioning,
         )
@@ -502,7 +515,9 @@ class Files(Dataset):
         if self.kind in ("parquet", "arrow"):
             for number, fragment in enumerate(self.fragments):
                 rows = None if self.where is not None else _fragment_rows(fragment)
-                shards.append(Shard(f"{fragment.path}:{number}", fragment.path, number, number + 1, rows))
+                # A shard is named where its file is, whichever copy Arrow reads it from.
+                name = self._arrow_files[2][fragment.path]
+                shards.append(Shard(f"{name}:{number}", name, number, number + 1, rows))
         elif self.kind == "array_record":
             shards.extend(Shard(url, url) for url in self.paths)
         else:
@@ -752,7 +767,7 @@ class _IndexedLines:
     def fieldnames(self) -> tuple[tuple[str, ...], ...]:
         headers = []
         for url in self.source.paths:
-            fs, path = Store(url, self.source.storage_options).resolve()
+            fs, path = Store(url, self.source.storage_options).readable()
             with _open_lines(fs, path) as file:
                 headers.append(tuple(next(csv.reader(_CsvLines(file)))))
         return tuple(headers)
@@ -766,7 +781,7 @@ class _IndexedLines:
         group = bisect.bisect_right(self.offsets, index) - 1
         entry = self.tables[group][index - int(self.offsets[group])]
         shard = int(entry["shard"]) if self.source.index else group
-        fs, path = Store(self.source.paths[shard], self.source.storage_options).resolve()
+        fs, path = Store(self.source.paths[shard], self.source.storage_options).readable()
         names = self.fieldnames[shard] if self.source.kind == "csv" else None
         offset = int(entry["offset"])
         compression = infer_compression(path.lower())
@@ -809,7 +824,7 @@ class _LineIterator(grain.DatasetIterator):
     def __init__(self, source: Files, shard: Shard):
         super().__init__()
         self.source, self.shard = source, shard
-        self.fs, self.path = Store(shard.uri, source.storage_options).resolve()
+        self.fs, self.path = Store(shard.uri, source.storage_options).readable()
         self.compression = infer_compression(self.path.lower())
         self.file = _open_lines(self.fs, self.path)
         self._opened = True
