@@ -7,9 +7,9 @@ pipeline lays out, the timestep it divides by a thousand, and the distilled
 guidance a guidance-embedded checkpoint takes. Every case records the
 forward, the vector-Jacobian products against a fixed cotangent for the
 latent, the text tokens and the pooled vector, and the gradient of every
-parameter, in float32, with the source's sinusoidal frequency table rounded
-from float64 (`rounded_timestep_embedding`); the pipeline walk is the
-unmodified source.
+parameter, unmodified, in float32, the reference, and in float64, the truth
+(`diffusers_wan_reference.float64`: the source's float32 pins widened). The
+pipeline half records the prompt states and the walk the same two ways.
 
 The variants are the ones whose wiring differs: the distilled checkpoint's
 guidance embedder against the schnell-style model without one, a rectangular
@@ -32,15 +32,10 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import (
-    frequency_exponent as frequency_exponent,
-    rounded_frequency_table as rounded_frequency_table,
-    rounded_timestep_embedding as rounded_timestep_embedding,
-    torch_exp_disagreements,
-)
 
 # The SD3 tool restores the transformers names diffusers 0.34.0 imports.
 from diffusers_sd3_reference import bundle, clip_tokenizers, t5_tokenizer
+from diffusers_wan_reference import float64
 
 BASE = dict(patch_size=1, in_channels=16, num_layers=2, num_single_layers=2,
             attention_head_dim=12, num_attention_heads=2, joint_attention_dim=16,
@@ -79,10 +74,9 @@ def image_ids(rows: int, columns: int) -> torch.Tensor:
     return ids.reshape(rows * columns, 3)
 
 
-def build(name: str, case: Case, root: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
-    """The case's saved transformer and recorded walk, and what the source's
-    own float32 `exp` costs it: the worst parameter gradient's scaled gap
-    between the unmodified walk and the recorded one."""
+def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
+    """The case's saved transformer and its walk in float32 and in float64
+    (`fp64.`), the same weights and inputs widened."""
     from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
 
     config = {**BASE, **case.config}
@@ -104,37 +98,36 @@ def build(name: str, case: Case, root: Path) -> tuple[dict[str, np.ndarray], dic
     guidance = (torch.tensor(case.guidance[: case.batch], dtype=torch.float32)
                 if config["guidance_embeds"] else None)
     probe = torch.randn(packed.shape, generator=generator, dtype=torch.float32)
-    named = [(key, value) for key, value in model.named_parameters()]
 
-    def walk():
-        output = model(hidden_states=packed, encoder_hidden_states=context,
-                       pooled_projections=pooled, timestep=times / 1000, guidance=guidance,
-                       txt_ids=torch.zeros(TOKENS, 3), img_ids=image_ids(rows, columns),
-                       return_dict=False)[0]
-        gradients = torch.autograd.grad((output * probe).sum(), [packed, context, pooled]
-                                        + [value for _, value in named])
-        return output.detach().numpy(), [gradient.numpy() for gradient in gradients]
+    def walk(model, dtype) -> dict[str, np.ndarray]:
+        inputs = [tensor.detach().to(dtype).requires_grad_() for tensor in (packed, context, pooled)]
+        named = list(model.named_parameters())
+        output = model(hidden_states=inputs[0], encoder_hidden_states=inputs[1],
+                       pooled_projections=inputs[2], timestep=times.to(dtype) / 1000,
+                       guidance=None if guidance is None else guidance.to(dtype),
+                       txt_ids=torch.zeros(TOKENS, 3, dtype=dtype),
+                       img_ids=image_ids(rows, columns).to(dtype), return_dict=False)[0]
+        gradients = torch.autograd.grad((output * probe.to(dtype)).sum(),
+                                        inputs + [value for _, value in named])
+        return {"output": output.detach().numpy(), "grad_packed": gradients[0].numpy(),
+                "grad_context": gradients[1].numpy(), "grad_pooled": gradients[2].numpy(),
+                **{f"grad_param.{key}": gradient.numpy()
+                   for (key, _), gradient in zip(named, gradients[3:], strict=True)}}
 
-    _, unmodified = walk()
-    with rounded_frequency_table():
-        output, grads = walk()
+    narrow = walk(model, torch.float32)
+    with float64():
+        wide = walk(FluxTransformer2DModel.from_pretrained(directory, torch_dtype=torch.float64).eval(),
+                    torch.float64)
     arrays = {
         "config": np.asarray(json.dumps(json.loads((directory / "config.json").read_text()))),
         "packed": packed.detach().numpy(), "context": context.detach().numpy(),
         "pooled": pooled.detach().numpy(), "times": times.numpy(),
         "guidance": np.zeros(0, np.float32) if guidance is None else guidance.numpy(),
-        "output": output, "probe": probe.numpy(),
-        "grad_packed": grads[0], "grad_context": grads[1], "grad_pooled": grads[2],
+        "probe": probe.numpy(), **narrow, **{f"fp64.{key}": value for key, value in wide.items()},
     }
-    gaps = {}
-    for (key, _), gradient, theirs in zip(named, grads[3:], unmodified[3:]):
-        arrays[f"grad_param.{key}"] = gradient
-        gaps[key] = float(np.abs(gradient - theirs).max() / max(1.0, float(np.abs(gradient).max())))
-    tensor, gap = max(gaps.items(), key=lambda item: item[1])
     print(f"{name}: packed {tuple(packed.shape)} grid {case.grid} tokens {TOKENS} "
-          f"|output| <= {float(np.abs(output).max()):.4g} parameters {len(named)}; "
-          f"torch's own exp moves {tensor} by {gap:.3g}")
-    return arrays, {"tensor": tensor, "gap": gap}
+          f"|output| <= {float(np.abs(narrow['output']).max()):.4g} parameters {len(narrow) - 4}")
+    return arrays
 
 
 def reload(directory: str, recorded: str) -> None:
@@ -180,18 +173,13 @@ def main(destination: str) -> None:
     root.mkdir(parents=True, exist_ok=True)
     arrays: dict[str, np.ndarray] = {}
     cases: dict[str, dict[str, object]] = {}
-    record: dict[str, object] = {
-        "diffusers": diffusers.__version__, "base": BASE, "tokens": TOKENS, "cases": cases,
-        # The transformer walks are recorded over the rounded frequency table;
-        # this is what the source's own float32 `exp` differs from it by.
-        "torch_exp_off_by_one_ulp": {"entries": 128, "count": torch_exp_disagreements(128)}}
+    record: dict[str, object] = {"diffusers": diffusers.__version__, "base": BASE, "tokens": TOKENS,
+                                 "cases": cases}
     for name, case in CASES.items():
-        built, unmodified = build(name, case, root)
-        for key, value in built.items():
+        for key, value in build(name, case, root).items():
             arrays[f"{name}.{key}"] = value
         cases[name] = {"config": {**BASE, **case.config}, "grid": list(case.grid),
-                       "batch": case.batch, "guidance": list(case.guidance[: case.batch]),
-                       "unmodified_exp_gap": unmodified}
+                       "batch": case.batch, "guidance": list(case.guidance[: case.batch])}
     import inspect
 
     from diffusers import FluxPipeline
@@ -264,29 +252,39 @@ def build_pipeline(root: Path):
 
 
 def pipeline_record(root: Path) -> dict[str, np.ndarray]:
-    pipe, _ = build_pipeline(root)
+    """The prompt states and the unmodified call's walk from fixed latents, in
+    float32 and, the saved pipeline loaded widened, in float64 (`fp64.`)."""
+    from diffusers import FluxPipeline
+
+    pipe, directory = build_pipeline(root)
     prompts = [row["text"] for row in PROMPTS]
     seconds = [row["second"] for row in PROMPTS]
-    with torch.no_grad():
-        embeds, pooled, ids = pipe.encode_prompt(prompt=prompts, prompt_2=seconds,
-                                                 device=torch.device("cpu"),
-                                                 num_images_per_prompt=1,
-                                                 max_sequence_length=SEQUENCE)
     generator = torch.Generator().manual_seed(SEED + 7)
     rows = PIPELINE_SIZE // 2 // 2
     latents = torch.randn((len(PROMPTS), rows * rows, PIPELINE["in_channels"]),
                           generator=generator, dtype=torch.float32)
-    with torch.no_grad():
-        walked = pipe(prompt=prompts, prompt_2=seconds, height=PIPELINE_SIZE,
-                      width=PIPELINE_SIZE, latents=latents.clone(),
-                      output_type="latent").images
-        images = pipe(prompt=prompts, prompt_2=seconds, height=PIPELINE_SIZE,
-                      width=PIPELINE_SIZE, latents=latents.clone(), output_type="np").images
-    print(f"pipeline: context {tuple(embeds.shape)} pooled {tuple(pooled.shape)} "
-          f"latents {tuple(walked.shape)} |image| <= {float(np.abs(images).max()):.4g}")
-    return {"pipeline.context": embeds.numpy(), "pipeline.pooled": pooled.numpy(),
-            "pipeline.text_ids": ids.numpy(), "pipeline.x_T": latents.numpy(),
-            "pipeline.latents": walked.numpy(), "pipeline.images": images}
+
+    def walk(pipe, dtype) -> dict[str, np.ndarray]:
+        with torch.no_grad():
+            embeds, pooled, ids = pipe.encode_prompt(prompt=prompts, prompt_2=seconds,
+                                                     device=torch.device("cpu"), num_images_per_prompt=1,
+                                                     max_sequence_length=SEQUENCE)
+            walked = pipe(prompt=prompts, prompt_2=seconds, height=PIPELINE_SIZE, width=PIPELINE_SIZE,
+                          latents=latents.to(dtype), output_type="latent").images
+            images = pipe(prompt=prompts, prompt_2=seconds, height=PIPELINE_SIZE, width=PIPELINE_SIZE,
+                          latents=latents.to(dtype), output_type="np").images
+        return {"context": embeds.numpy(), "pooled": pooled.numpy(), "text_ids": ids.numpy(),
+                "latents": walked.numpy(), "images": images}
+
+    narrow = walk(pipe, torch.float32)
+    with float64():
+        wide_pipe = FluxPipeline.from_pretrained(directory, torch_dtype=torch.float64, local_files_only=True)
+        wide_pipe.set_progress_bar_config(disable=True)
+        wide = walk(wide_pipe, torch.float64)
+    print(f"pipeline: context {narrow['context'].shape} pooled {narrow['pooled'].shape} "
+          f"latents {narrow['latents'].shape} |image| <= {float(np.abs(narrow['images']).max()):.4g}")
+    return {"pipeline.x_T": latents.numpy(), **{f"pipeline.{key}": value for key, value in narrow.items()},
+            **{f"pipeline.fp64.{key}": value for key, value in wide.items() if key != "text_ids"}}
 
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "bundle":
