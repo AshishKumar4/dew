@@ -64,20 +64,79 @@ def test_the_scanned_stack_quantizes_each_layer_with_its_own_scales(case):
     assert_quantized(scanned.apply(loaded.variables, reference["ids"].astype(np.int32)), reference, "scanned")
 
 
-def test_layers_quantized_apart_refuse_one_scanned_run(case):
+def test_layers_quantized_apart_run_as_scanned_runs_of_their_own(case):
     """A checkpoint that quantizes two otherwise like layers differently, here
     one with a projection left unquantized, gives them different scale trees,
-    which one scanned body cannot read; the scan refuses them, and runs the
-    checkpoint whose layers are quantized alike."""
+    which one scanned body cannot read: the scan runs them as runs of their
+    own, each layer with its own scales, and its logits are held to the rule
+    the plain loop of the same weights is, against their own float64
+    forward. The stored tree stays one subtree per layer, so the scanned and
+    the plain model read and init the same tree."""
     _, loaded, reference = case
     scanned = loaded.model.clone(scan_layers=True)
-    scanned.apply(dict(loaded.variables), reference["ids"].astype(np.int32))
+    ids = reference["ids"].astype(np.int32)
     variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
     layer = variables[QUANTIZATION]["layers_1"]
     mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
     layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
+    plain = np.asarray(loaded.model.apply(variables, ids))
+    truth, terms = float64_forward(loaded.model, variables, ids)
+    assert_as_exact_as_the_reference(np.asarray(scanned.apply(variables, ids)), plain, truth,
+                                     "layers quantized apart, scanned", terms=terms)
+    initialized = [jax.eval_shape(model.init, jax.random.key(0), ids) for model in (scanned, loaded.model)]
+    assert jax.tree.structure(initialized[0]) == jax.tree.structure(initialized[1])
+
+
+def test_layers_quantized_apart_that_one_bank_holds_are_refused(case):
+    """A store that banks a run of like layers holds one array per leaf for all of them, which
+    layers quantized apart cannot share: the run stays the one the store holds, and its unlike
+    rows are refused by name, rather than read as runs of their own the store does not hold."""
+    from dew.nn.backbones.layer_plan import group_name
+
+    _, loaded, reference = case
+    scanned = loaded.model.clone(scan_layers=True)
+    ids = reference["ids"].astype(np.int32)
+    variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
+    layer = variables[QUANTIZATION]["layers_1"]
+    mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
+    layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
+    params = dict(variables["params"])
+    for first, count in scanned.bind(loaded.variables).groups:
+        if count > 1:
+            rows = [params.pop(f"layers_{index}") for index in range(first, first + count)]
+            params[group_name(first, count)] = jax.tree.map(lambda *leaves: jnp.stack(leaves), *rows)
     with pytest.raises(ValueError):
-        scanned.apply(variables, reference["ids"].astype(np.int32))
+        scanned.apply({**variables, "params": params}, ids)
+
+
+def test_a_store_that_banks_layers_quantized_apart_reads_as_the_runs_it_banks(case):
+    """Four like layers, the last two quantized apart from the first two, are two runs, which a
+    store places as one bank each (`HeldBanks.place`): the model reading that store runs the same
+    two runs, and its logits are held to the rule the plain loop of the same weights is, against
+    their own float64 forward."""
+    from dew.inference.banks import HeldBanks
+
+    _, loaded, reference = case
+    ids = reference["ids"].astype(np.int32)
+    model = loaded.model
+    four = model.clone(num_layers=4, layer_types=None if model.layer_types is None else model.layer_types * 2)
+    variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
+    for tree in variables.values():
+        for index in range(2):
+            if f"layers_{index}" in tree:
+                tree[f"layers_{index + 2}"] = jax.tree.map(lambda leaf: leaf, tree[f"layers_{index}"])
+    for index in (2, 3):
+        layer = variables[QUANTIZATION][f"layers_{index}"]
+        mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
+        layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
+    scanned = four.clone(scan_layers=True)
+    bound = scanned.bind(variables)
+    assert bound.groups == ((0, 2), (2, 2))
+    store = HeldBanks(variables).place(bound, layout=Layout(min_shard=1, tolerance=1.0))
+    plain = np.asarray(four.apply(variables, ids))
+    truth, terms = float64_forward(four, variables, ids)
+    assert_as_exact_as_the_reference(np.asarray(scanned.apply(store, ids)), plain, truth,
+                                     "banked runs quantized apart", terms=terms)
 
 
 @pytest.mark.mesh(devices=2)
