@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 
-from dew.diffusion.schedules import NoiseScheduler, expand
+from dew.diffusion.schedules import NoiseScheduler, divided, expand
 
 
 def from_clean(x_t, prediction, rates) -> tuple[jax.Array, jax.Array]:
@@ -30,7 +30,7 @@ def from_clean(x_t, prediction, rates) -> tuple[jax.Array, jax.Array]:
     which is the reading every x_0-space parameterization shares.
     """
     signal_rate, noise_rate = rates
-    return prediction, (x_t - prediction * signal_rate) / noise_rate
+    return prediction, divided(x_t - prediction * signal_rate, noise_rate)
 
 
 class PredictionTransform:
@@ -106,7 +106,7 @@ class EpsilonPredictionTransform(PredictionTransform):
 
     def backward_diffusion(self, x_t, prediction, rates):
         signal_rates, noise_rates = rates
-        return (x_t - prediction * noise_rates) / signal_rates, prediction
+        return divided(x_t - prediction * noise_rates, signal_rates), prediction
 
     def get_target(self, x_0, epsilon, rates):
         return epsilon
@@ -287,7 +287,7 @@ class SourceLimitedPrediction(PredictionTransform):
         if not self.recompute_epsilon:
             return limited, epsilon
         signal_rate, noise_rate = rates
-        return limited, (x_t - signal_rate * limited) / noise_rate
+        return limited, divided(x_t - signal_rate * limited, noise_rate)
 
     def get_target(self, x_0, epsilon, rates):
         return self.inner.get_target(x_0, epsilon, rates)

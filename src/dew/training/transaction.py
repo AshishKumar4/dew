@@ -14,6 +14,7 @@ the same arrays step after step.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable
 from typing import Generic, overload
 
@@ -24,7 +25,7 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
-from dew.objectives.base import FROZEN, Aux, Batch, Ratio, Step, Variables, merge
+from dew.objectives.base import FROZEN, Aux, Batch, Ratio, Step, Variables, merge, with_projected
 from dew.training.model_flops import step_counts
 from dew.training.narrow import forward_variables, narrowed
 from dew.training.state import Accumulation, TrainState
@@ -351,7 +352,16 @@ class Transaction:
         step_info = Step((state.microstep - fill + index) // self.split,
                     jax.random.fold_in(state.key, previous.attempts[index]),
                     with_ema(variables, state.ema))
-        return forward_variables(variables, state.compute), batch, step_info
+        return self.read(variables, state.compute), batch, step_info
+
+    def read(self, variables, compute):
+        """The variables a step's forward reads: the narrow copies in place of
+        their parameters (`forward_variables`), projected as the step's update
+        reads them (`Objective.projected`), whether or not the objective's
+        forward trains the model, so the loss and its gradient are taken where
+        the update applies. The projection is not differentiated."""
+        return with_projected(forward_variables(variables, compute),
+                              functools.partial(self.objective.projected, updated=False))
 
     @staticmethod
     def unscaled(gradient, factor):
@@ -378,13 +388,15 @@ class Transaction:
         norm = norm.astype(jnp.result_type(norm.dtype, jnp.float32))
 
         def apply(current):
+            # The update applies to the parameters the model's constraint projects
+            # (`Objective.projected`), and the step stores them projected again.
+            stored = self.objective.projected(current.variables["params"], updated=False)
             if isinstance(self.optimizer, optax.GradientTransformationExtraArgs):
-                update, opt_state = self.optimizer.update(
-                    native, current.opt_state, current.variables["params"], qk_stats=qk)
+                update, opt_state = self.optimizer.update(native, current.opt_state, stored, qk_stats=qk)
             else:
-                update, opt_state = self.optimizer.update(
-                    native, current.opt_state, current.variables["params"])
-            params = {**current.variables, "params": optax.apply_updates(current.variables["params"], update)}
+                update, opt_state = self.optimizer.update(native, current.opt_state, stored)
+            params = {**current.variables, "params": self.objective.projected(
+                optax.apply_updates(stored, update), updated=True)}
             if self.aux_shape.effects is not None:
                 params = write_back(params, self.objective.apply_effects(
                     params, self.effects_tree.unflatten(effects)))
@@ -530,7 +542,7 @@ class Transaction:
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
                              with_ema(state.variables, state.ema))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
-            realized = realize(forward_variables(state.variables, state.compute), batch, step_info)
+            realized = realize(self.read(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
             gradient = realized.pullback(cotangent)
             if state.compute is None or self.size > 1:
