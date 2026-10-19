@@ -157,7 +157,8 @@ def test_a_multimodal_model_serves_its_own_dense_layout(tmp_path):
     model = ROOT / "tests" / "fixtures" / "hf" / "qwen35-tiny-mm"
 
     def benchmark(kv: str) -> subprocess.CompletedProcess:
-        env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src")}
+        env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"),
+               "XLA_FLAGS": "--xla_force_host_platform_device_count=1"}
         return subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_lm_serving.py"),
                                "--backend", "dew", "--model", str(model), "--slots", "2", "--requests", "4",
                                "--prompt", "8", "--output", "8", "--vocab-limit", "200", "--repeats", "1",
