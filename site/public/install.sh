@@ -188,8 +188,10 @@ fi
 extra=''
 [ "$build" = cpu ] || extra="[$build]"
 package="dewml$extra${version:+==$version}"
-if [ -n "$use_pip" ]; then set -- "$python" -m pip install "$package"
-else set -- uv pip install --python "$python" "$package"
+# Dew runs on its own JAX build, which only Dew's package index serves (docs/installation.md).
+index=https://pypi.dewml.dev/simple
+if [ -n "$use_pip" ]; then set -- "$python" -m pip install --extra-index-url "$index" "$package"
+else set -- uv pip install --python "$python" --extra-index-url "$index" "$package"
 fi
 shown=''
 for word in "$@"; do shown="$shown${shown:+ }$(quote "$word")"; done
