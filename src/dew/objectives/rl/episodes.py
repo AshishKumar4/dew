@@ -653,8 +653,6 @@ class EpisodeRollout:
             tasks = local_rows(batch["task_id"])
             if tasks.ndim != 1 or not tasks.size or not np.issubdtype(tasks.dtype, np.integer):
                 raise ValueError("task_id must be a nonempty vector of integer task identities")
-            if key.shape != ():
-                raise ValueError("episode key must be one PRNG key")
             policy = self.policy.bind(state.variables)
             signature = (tasks.size, self.groups, self.max_turns, self.max_prompt_tokens,
                          self.max_new_tokens, self.sampling, int(state.step), int(state.updates),
