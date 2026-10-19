@@ -1035,24 +1035,16 @@ class CausalSelfAttention(nn.Module):
         query is padding reads one key, so its (unused) output stays finite
         as the masked kernels leave it.
         """
-        rows = query.shape[0]
         reads = jnp.maximum(positions + 1, 1)
-        # Each group's query heads read the same keys, so they go in as
-        # that key head's query positions: one pass over the group's keys
-        # where cuDNN otherwise padded the lone query to two and ran each
-        # query head on its own, 4.7% less a layer at 64 rows and the
-        # same bits (docs/performance.md).
-        heads, kv_heads = query.shape[-2], key.shape[-2]
-        group = heads // kv_heads
-        grouped = query.reshape(rows, kv_heads, group, query.shape[-1]).transpose(0, 2, 1, 3)
+        # The core reads each key head's query heads as its query positions
+        # (`decode_geometry.grouped_query`).
         attention = scaled_dot_product_attention(
-            grouped, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
+            query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
             implementation=self.ctx.attention_impl, causal=False,
             softcap=self.ctx.attn_logit_softcap,
             key_value_seq_lengths=reads.astype(jnp.int32))
-        return checkpoint_name(
-            attention.transpose(0, 2, 1, 3).reshape(rows, 1, heads, attention.shape[-1]), 'context')
+        return checkpoint_name(attention, 'context')
 
     def _page_kernel_runs(self, query) -> bool:
         """Whether a decode step may read a paged pool through its device's
