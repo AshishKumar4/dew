@@ -123,6 +123,7 @@ def gated_rms(out, z, weight, norm: OutputNorm):
     return out * inverse * weight * norm_swiglu.activation_and_slope(z, norm.activation)[0]
 
 
+@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Step:
     """A decode token's operands, each `[rows, ...]`; a hook's are None where it is off.
@@ -133,7 +134,9 @@ class Step:
     the gates `gate` `[rows, Hv]`, `log_a` and `bias` `[Hv]`. `beta` `[rows, Hv]` is the write gate
     (a raw beta with the gates), `skip` `[Hv]` the skip's `D`, `z` `[rows, Hv, Dv]` and `weight`
     `[Dv]` the epilogue's. `state` is `[rows, Hv, Dk, Dv]`, fp32 or bf16 (rounded by
-    `round_to_bf16`), or wider for the reference. `active` `[rows]` marks the rows that draw."""
+    `round_to_bf16`), or wider for the reference. `active` `[rows]` marks the rows that draw. A pytree
+    of its arrays, so it crosses `jit` and a transformation as a token's operands do; the `Hooks` are
+    its static form."""
     state: jax.Array
     query: jax.Array | None = None
     key: jax.Array | None = None
@@ -379,9 +382,8 @@ class StepLaunch(tuning.KernelOp):
         key_heads = (_pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
                      if hooks.conv is not None else given['query'].shape[1])
 
+        # A hook that reads a whole head has only whole-head configs in its space (`_whole`).
         block = value_width if config.block is None else config.block
-        if block != value_width and _whole(hooks):
-            raise ValueError("a conv or the epilogue's norm reads a head's whole state")
 
         def whole(array):
             """An array every program reads whole."""
