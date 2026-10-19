@@ -484,14 +484,24 @@ class StackView:
     @staticmethod
     def layer_structures(variables: Mapping[str, Mapping], layers: int) -> tuple[tuple, ...]:
         """What one scanned body has to share beyond its spec, for each of `layers`
-        stored layers: the structure of its subtree in every collection that keeps
+        stored layers: the runs a collection holds as one bank (`layers_3_7`) that
+        hold it, and the structure of its subtree in every collection that keeps
         one per layer (`layers_N`), as layers a checkpoint quantizes differently,
-        or adapts in part, differ. A banked collection, stored by run, adds
-        nothing, and nor does a collection no layer holds."""
-        return tuple(tuple((collection, jax.tree.structure(tree[f'layers_{index}']))
-                           for collection, tree in sorted(variables.items())
-                           if f'layers_{index}' in tree)
-                     for index in range(layers))
+        or adapts in part, differ. A banked run stays the run its store holds
+        (`bank_sites`), each of its layers read as its first, so rows it holds
+        unlike are refused by name where they stack (`StackView.stack`). A
+        collection no layer is held in adds nothing."""
+        banks: list[tuple[str, ...]] = [()] * layers
+        for name in sorted({name for tree in variables.values() for name in tree}):
+            run = group_layers(name)
+            if run is not None and len(run) > 1:
+                for index in range(run.start, min(run.stop, layers)):
+                    banks[index] += (name,)
+        own = [tuple((collection, jax.tree.structure(tree[f'layers_{index}']))
+                     for collection, tree in sorted(variables.items()) if f'layers_{index}' in tree)
+               for index in range(layers)]
+        return tuple((held, own[group_layers(held[0]).start if held else index])
+                     for index, held in enumerate(banks))
 
     def bank_names(self) -> list[str]:
         """Return every run's stored name, in order. A banked store uses these names as keys."""
