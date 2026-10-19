@@ -1119,8 +1119,8 @@ def test_root_multipliers_scale_around_blocks_that_keep_their_own(extra):
 
 def test_a_decode_step_reads_each_key_head_once_for_its_group(rng):
     """A decode step's grouped query heads reach the kernel as their key
-    head's query positions, [rows, group, kv_heads, width] (`decode_geometry.grouped_query`), so a kernel reads
-    each key head once (cuDNN ran each query head on its own and padded the
+    head's query positions, [rows, group, kv_heads, width]
+    (`decode_geometry.grouped_query`), so a kernel reads each key head once (cuDNN ran each query head on its own and padded the
     lone query to two: 0.154 against 0.146 ms a layer of Qwen3-0.6B at 64
     rows on an RTX 4080). The steps decode what the full pass computes."""
     model = tiny(num_heads=4, num_kv_heads=2, head_dim=8)
