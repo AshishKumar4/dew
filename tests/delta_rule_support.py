@@ -21,8 +21,7 @@ from dew.nn import linear
 from dew.nn.kernels import fla_gdn
 
 CHUNKED = 64
-"""The terms a chunk sums in another order than the portable math: a port's fp32 floor over the
-math's distance (`assert_leaves_as_exact`'s `reductions`)."""
+"""The tokens a chunk of the port's rule sums, which fla's chunked decay terms follow."""
 
 
 def rule_math(q, k, v, g, beta, h0):

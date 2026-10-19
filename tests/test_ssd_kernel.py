@@ -103,7 +103,7 @@ def assert_kernel_parity(operands, chunk_size: int, *, compiled: bool, roundings
     host, the XLA path's fp32 run the reference; the XLA path's own arithmetic in float64 first held
     to the recurrence (`assert_computes_the_oracle`, `roundings` the steps and widths it sums). An
     entry sums a chunk's steps of products over the state or the head width, in another order than
-    the XLA path's, so each is held to the rounding of that many reductions."""
+    the XLA path's."""
     platform = jax.default_backend() if compiled else "tpu"
     if compiled:
         # pallas interprets only for a platform the process holds no device of
@@ -137,7 +137,6 @@ def assert_kernel_parity(operands, chunk_size: int, *, compiled: bool, roundings
     mine = jax.jit(kernel)(*operands)
     mine_gradients = jax.jit(lambda *o: jax.vjp(kernel, *o)[1](seeded))(*operands)
 
-    reductions = chunk_size * max(operands[0].shape[-1], operands[1].shape[-1])
     names = ("output", "final", "x", "B", "C", "A dt", "state")
     pairs = zip(names, (*mine, *mine_gradients), (*theirs, *theirs_gradients), twin, truth, terms,
                 strict=True)
@@ -145,7 +144,7 @@ def assert_kernel_parity(operands, chunk_size: int, *, compiled: bool, roundings
         assert np.all(np.isfinite(np.asarray(mine))), name
         assert_computes_the_oracle(wide, want, name, roundings=roundings)
         assert_leaves_as_exact({name: np.asarray(mine)}, {name: np.asarray(theirs)}, {name: want},
-                               reductions=reductions, terms={name: summed})
+                               terms={name: summed})
 
 
 def fixture_case(reference, chunk_size: int, resets: bool):

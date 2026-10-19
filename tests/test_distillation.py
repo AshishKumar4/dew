@@ -129,9 +129,8 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
     float32 run is (`assert_leaves_as_exact`): the truth runs the reference in
     float64 on the student's float64 forward, the reference in float32 on its
     float32 one. Each is one number reduced from every logit, which Dew sums
-    in another order, so the reference's distance counts as at least that
-    many float32 roundings (`reductions`). Padding sits in the batch, so the
-    mask is part of what agrees."""
+    in another order. Padding sits in the batch, so the mask is part of what
+    agrees."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, feature_loss=kind)
     ids = jnp.asarray(arrays["tokens"][:, :-1])
@@ -154,7 +153,7 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
 
     dew = {metric: np.float64(reported[metric]) for metric in named}
     assert_leaves_as_exact(dew, terms(rounded_terms), terms(truth_terms),
-                           reductions=int(np.size(arrays["student_logits"])), rows=False)
+                           rows=False)
 
 
 @pytest.mark.parametrize("kind", ["cosine", "l2"])

@@ -175,11 +175,10 @@ def row_errors(value, truth, terms=None, *, elements: bool = False) -> tuple[np.
     return sizes, rms(np.asarray(value, np.float64) - truth)
 
 
-def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str]:
+def rows_over(dew, reference, truth, terms=None) -> list[str]:
     """Where Dew's rows, and then its elements, are further from float64 than
     ROW_FACTOR times the reference's (`row_errors`): its worst over its own
-    size against the reference's worst, at least `floor` (an order floor in
-    those units), and each of size zero, a sum that cancels exactly before
+    size against the reference's worst, and each of size zero, a sum that cancels exactly before
     anything its terms see (a query that keeps one key), against the
     reference's distance on that same row, which is all the evidence it
     has: where the reference is exactly the float64 zero, Dew must be too.
@@ -197,9 +196,9 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str
         if sized.any():
             worst = float(np.max(mine[sized] / sizes[sized]))
             their_worst = float(np.max(theirs[sized] / sizes[sized]))
-            if not within(worst, ROW_FACTOR * max(their_worst, floor)):
+            if not within(worst, ROW_FACTOR * their_worst):
                 over.append(f"the worst {name} is {worst:.3e} from float64 over its size, the reference's "
-                            f"{their_worst:.3e}, allowed {ROW_FACTOR * max(their_worst, floor):.3e}")
+                            f"{their_worst:.3e}, allowed {ROW_FACTOR * their_worst:.3e}")
         unsized = theirs[~sized]
         zero = ~sized & ~(mine <= ROW_FACTOR * (np.max(unsized) if elements and unsized.size else theirs))
         if zero.any():
@@ -231,44 +230,50 @@ def assert_no_less_exact(dew, reference, truth, label: str) -> None:
         f"{label}: {mine:.3e} from float64 (rms), the unchanged source {theirs:.3e}")
 
 
-def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None,
-                           rows: bool = True) -> None:
+def assert_leaves_as_exact(dew, reference, truth, *, terms=None, rows: bool = True) -> None:
     """Each leaf of the tree `dew` within FACTOR times the matching leaf of
     `reference`'s RMS distance from float64 (`truth`), the three trees alike.
 
-    A port that sums `reductions` terms the reference sums in another order
-    rounds by up to sqrt(reductions) float32 units of what it sums in RMS,
-    so the reference's distance counts as at least that: one draw of
-    rounding below it is luck, not a bar, and a leaf that lost a term still
-    fails by orders of magnitude. What a leaf sums is its own float64 size,
-    or, where `terms` gives the tree of each leaf's terms (`float64_terms`),
-    the larger of that and their root sum of squares, the size of the
-    partial sums a reordered sum rounds. A leaf whose sum cancels, as a key
-    bias's gradient does under the softmax's shift invariance, is held to
-    its terms' rounding, not to its own near-zero size; one whose terms'
-    signs are independent keeps about its own. Each leaf's rows and elements
-    are held to the reference's too (`rows_over`), unless `rows` is false:
-    after a second training step a row inherits the first step's rounding
-    through the parameters it reads, which its own terms do not see, so
-    such a comparison holds each tensor alone and its first step holds the
-    rows and elements."""
-    unit = float(np.finfo(np.float32).eps)
-    spread = np.sqrt(reductions)
+    The reference's own distance is the bar and nothing else: one draw of
+    rounding is that, and where one draw is unstable the leaves are held over
+    orders (`assert_leaves_as_exact_over_orders`). Each leaf's rows and
+    elements are held to the reference's too (`rows_over`), sized by their
+    own float64 terms where `terms` gives the tree of each leaf's terms
+    (`float64_terms`): a row or element whose sum cancels, as a key bias's
+    gradient does under the softmax's shift invariance, is sized by what it
+    sums, not by its near-zero value. Unless `rows` is false: after a second
+    training step a row inherits the first step's rounding through the
+    parameters it reads, which its own terms do not see, so such a
+    comparison holds each tensor alone and its first step holds the rows."""
     sizes = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
     over = []
     leaves = zip(jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
                  sizes, strict=True)
     for (path, mine), theirs, true, summed in leaves:
-        scale = max(distance(true, 0), distance(summed, 0))
-        bar = FACTOR * max(distance(theirs, true), spread * unit * scale)
+        bar = FACTOR * distance(theirs, true)
         if not within(distance(mine, true), bar):
             over.append(f"{jax.tree_util.keystr(path)}: {distance(mine, true):.3e} from float64 (rms), "
                         f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
-        # Each row and element over its own terms where they are given, the order floor in those units.
-        over += [f"{jax.tree_util.keystr(path)}: {row}"
-                 for row in (rows_over(mine, theirs, true, None if terms is None else summed, spread * unit)
-                             if rows else ())]
+        held = rows_over(mine, theirs, true, None if terms is None else summed) if rows else ()
+        over += [f"{jax.tree_util.keystr(path)}: {row}" for row in held]
     assert not over, "\n".join(over)
+
+
+def assert_leaves_as_exact_over_orders(draws, label: str) -> None:
+    """Each leaf held over ORDERS rounding draws (`assert_as_exact_over_orders`): `draws` holds that many
+    `(dew, reference, truth)` triples of one tree structure, each an independent draw of the rounding,
+    another input or an exact symmetry of the computation (tests/residual_orders.py). Where one draw
+    of a comparison is unstable, a port as exact as its reference passes ORDERS of them but for
+    FALSE_FAILURE of the time, and one that rounds more fails."""
+    draws = list(draws)
+    assert len(draws) == ORDERS, f"{label}: {len(draws)} draws, the rule takes {ORDERS}"
+    paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(draws[0][0])]
+    distances = [[(distance(mine, true), distance(theirs, true))
+                  for mine, theirs, true in zip(*(jax.tree.leaves(tree) for tree in draw), strict=True)]
+                 for draw in draws]
+    for index, path in enumerate(paths):
+        mine, theirs = zip(*(per_draw[index] for per_draw in distances), strict=True)
+        assert_as_exact_over_orders(np.asarray(mine), np.asarray(theirs), f"{label} {path}")
 
 
 SUMS = frozenset({"dot_general", "ragged_dot_general", "reduce_sum", "conv_general_dilated", "cumsum",

@@ -275,7 +275,7 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
             loss, params = step(wide)
             _, (loss_terms, grad_terms) = float64_terms(loss, params)
     terms = {"loss": np.asarray([loss_terms])} | {name: np.asarray(grad_terms[name]) for name in names}
-    assert_leaves_as_exact(dew, reference, truth, reductions=ROWS * SEQ, terms=terms)
+    assert_leaves_as_exact(dew, reference, truth, terms=terms)
     if head in ("zero bias", "bias"):
         assert np.abs(dew["lm_head.bias"]).max() > 0
 
@@ -309,7 +309,7 @@ def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_
         wide.load_state_dict(model.state_dict())
         stepped = torch_step(wide, tokens, torch.float64)
     truth = {name: stepped[name] for name in names}
-    assert_leaves_as_exact(dew, reference, truth, reductions=ROWS * SEQ)
+    assert_leaves_as_exact(dew, reference, truth)
 
 
 def test_save_writes_the_source_names_back(source, loaded, tokens, tmp_path):
