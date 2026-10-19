@@ -174,7 +174,8 @@ def cuda_driver_version() -> int | None:
     major gives (`CUDA_BUILDS`)."""
     try:
         cuda = ctypes.CDLL("libcuda.so.1")
-    except OSError:  # ctypes' answer for a library the loader does not find
+    except OSError as error:  # ctypes' answer for a library the loader does not find
+        _log.debug("no CUDA driver library loads: %s", error)
         return None
     version = ctypes.c_int()
     return None if cuda.cuDriverGetVersion(ctypes.byref(version)) else version.value
