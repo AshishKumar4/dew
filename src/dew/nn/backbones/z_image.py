@@ -29,7 +29,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.attention import RMSNorm
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import Float32Products, at_least_fp32
 from dew.nn.rope import axis_tables
 from dew.nn.scan_orders import patchify, unpatchify
 from dew.nn.sharding import logical_axes
@@ -62,7 +62,7 @@ def _rotation(positions, axes: Sequence[int], lengths: Sequence[int], theta: flo
     return jnp.concatenate(cosines, axis=-1), jnp.concatenate(sines, axis=-1)
 
 
-class ZImageBlock(nn.Module):
+class ZImageBlock(Float32Products, nn.Module):
     """Runs one `ZImageTransformerBlock`.
 
     With `modulation`, one projection of the time embedding gives the input
@@ -82,12 +82,12 @@ class ZImageBlock(nn.Module):
     @nn.nowrap
     def _feed_forward(self, name=None):
         return GatedMLP(int(self.features / 3 * 8), self.features, dtype=self.dtype,
-                        precision=self.precision, name=name)
+                        precision=self.products, name=name)
 
     @nn.nowrap
     def _attention(self):
         return JointAttention(self.heads, self.features // self.heads, bias=False, epsilon=1e-5,
-                              dtype=self.dtype, precision=self.precision,
+                              dtype=self.dtype, precision=self.products,
                               attention_impl=self.attention_impl, name="attention")
 
     @property
@@ -121,7 +121,7 @@ class ZImageBlock(nn.Module):
         if not self.modulation:
             x = x + norm("attention_norm2")(attention(norm("attention_norm1")(x)))
             return x + norm("ffn_norm2")(feed_forward(norm("ffn_norm1")(x)))
-        modulated = nn.Dense(self.modulation_features, dtype=self.dtype, precision=self.precision,
+        modulated = nn.Dense(self.modulation_features, dtype=self.dtype, precision=self.products,
                              name="modulation")(embedded)[:, None]
         scale, gate, scale_mlp, gate_mlp = jnp.split(modulated, 4, axis=-1)
         attended = attention(norm("attention_norm1")(x) * (1 + scale))
@@ -134,7 +134,7 @@ class ZImageBlock(nn.Module):
 @logical_axes({("x_embedder",): (None, "embed"), ("cap_embedder",): (None, "embed"),
                ("final_linear",): ("embed", None), ("final_modulation",): (None, "embed"),
                ("t_embedder_1",): (None, "mlp"), ("t_embedder_2",): ("mlp", None)})
-class ZImageTransformer(nn.Module):
+class ZImageTransformer(Float32Products, nn.Module):
     """Runs Diffusers 0.40.0's `ZImageTransformer2DModel` behind Dew's model interface.
 
     `__call__` takes NHWC latents, the model time the schedule supplies (the
@@ -208,9 +208,9 @@ class ZImageTransformer(nn.Module):
         source_time = (1000.0 - jnp.asarray(time, width)) / 1000.0 * self.t_scale
         features = sinusoidal_time(source_time, FREQUENCIES, dtype=width).astype(dtype)
         maps = self.projections(0, 0)
-        hidden = nn.Dense(maps['t_embedder_1'][1], dtype=self.dtype, precision=self.precision,
+        hidden = nn.Dense(maps['t_embedder_1'][1], dtype=self.dtype, precision=self.products,
                           name="t_embedder_1")(features)
-        return nn.Dense(maps['t_embedder_2'][1], dtype=self.dtype, precision=self.precision,
+        return nn.Dense(maps['t_embedder_2'][1], dtype=self.dtype, precision=self.products,
                         name="t_embedder_2")(nn.silu(hidden))
 
     @nn.compact
@@ -243,13 +243,13 @@ class ZImageTransformer(nn.Module):
         pad_image = self.param("x_pad_token", nn.initializers.zeros, (1, self.dim))
         pad_caption = self.param("cap_pad_token", nn.initializers.zeros, (1, self.dim))
         maps = self.projections(x.shape[-1], conditioning.context.shape[-1])
-        image = nn.Dense(maps['x_embedder'][1], dtype=self.dtype, precision=self.precision,
+        image = nn.Dense(maps['x_embedder'][1], dtype=self.dtype, precision=self.products,
                          name="x_embedder")(patchify(x, 2))
         image = jnp.concatenate(
             [image, jnp.broadcast_to(pad_image.astype(image.dtype), (batch, image_span - count, self.dim))],
             axis=1,
         )
-        caption = nn.Dense(maps['cap_embedder'][1], dtype=self.dtype, precision=self.precision,
+        caption = nn.Dense(maps['cap_embedder'][1], dtype=self.dtype, precision=self.products,
                            name="cap_embedder")(
             RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="cap_norm")(context))
         caption = jnp.where(mask[..., None], caption, pad_caption.astype(caption.dtype))
@@ -266,7 +266,7 @@ class ZImageTransformer(nn.Module):
         image_rotation = _rotation(image_positions, *table, at_least_fp32(image.dtype))
         caption_rotation = _rotation(caption_positions, *table, at_least_fp32(image.dtype))
         whole_image = jnp.full((batch,), image_span, jnp.int32)
-        block = {"epsilon": self.norm_eps, "dtype": self.dtype, "precision": self.precision,
+        block = {"epsilon": self.norm_eps, "dtype": self.dtype, "precision": self.products,
                  "attention_impl": self.attention_impl}
 
         for index in range(self.n_refiner_layers):
@@ -283,9 +283,9 @@ class ZImageTransformer(nn.Module):
             joined = ZImageBlock(self.dim, self.n_heads, name=f"layers_{index}", **block)(
                 joined, rotation, image_span + spans, embedded)
 
-        scale = 1 + nn.Dense(maps['final_modulation'][1], dtype=self.dtype, precision=self.precision,
+        scale = 1 + nn.Dense(maps['final_modulation'][1], dtype=self.dtype, precision=self.products,
                              name="final_modulation")(nn.silu(embedded))[:, None]
-        out = nn.Dense(maps['final_linear'][1], dtype=self.dtype, precision=self.precision,
+        out = nn.Dense(maps['final_linear'][1], dtype=self.dtype, precision=self.products,
                        name="final_linear")(
             layer_norm(self.dtype)(joined[:, :count]) * scale)
         return -unpatchify(out, 2, *x.shape[1:])

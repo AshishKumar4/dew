@@ -72,7 +72,7 @@ from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
 from dew.nn.linear import DepthwiseConv1d, causal_conv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import Float32Products, at_least_fp32, float32_products
 from dew.nn.sharding import (
     SEQUENCE_AXIS,
     LayoutRefused,
@@ -125,7 +125,7 @@ def _chunk_writes(x_c, B_c, a_c):
     its magnitude."""
     suffix = jax.lax.cumsum(a_c, axis=a_c.ndim - 1, reverse=True)
     to_end = jnp.exp(jnp.pad(suffix[..., 1:], [(0, 0)] * (a_c.ndim - 1) + [(0, 1)]))
-    return jnp.einsum('nbjhs,nbhj,nbjhp->nbhps', B_c, to_end, x_c)
+    return jnp.einsum('nbjhs,nbhj,nbjhp->nbhps', B_c, to_end, x_c, precision=float32_products(x_c.dtype))
 
 
 def _carry(previous, step):
@@ -154,8 +154,9 @@ def xla_chunk_scan(x, B, C, a, carried, chunk_size: int):
     a_cumsum = jnp.cumsum(a_c, axis=-1)
     # 1. The intra-chunk output: L[i, j] = exp(segsum) masks C_i . B_j.
     L = jnp.exp(segment_sum(a_c))                           # [NC, B, H, C, C]
-    G = jnp.einsum('nbihs,nbjhs->nbhij', C_c, B_c)
-    y_diag = jnp.einsum('nbhij,nbjhp->nbihp', G * L, x_c)
+    products = float32_products(x_c.dtype)
+    G = jnp.einsum('nbihs,nbjhs->nbhij', C_c, B_c, precision=products)
+    y_diag = jnp.einsum('nbhij,nbjhp->nbihp', G * L, x_c, precision=products)
     # 2. Each chunk's own write into the state, decayed to the chunk's end.
     states = _chunk_writes(x_c, B_c, a_c)
     # 3. The state crossing the chunks: the reference's `decay_chunk @ states`
@@ -163,7 +164,7 @@ def xla_chunk_scan(x, B, C, a, carried, chunk_size: int):
     # chunk by chunk.
     final, previous = jax.lax.scan(_carry, carried, (states, a_cumsum[..., -1]))
     # 4. The state each chunk reads, decayed to every position of it.
-    y_off = jnp.einsum('nbihs,nbhps,nbhi->nbihp', C_c, previous, jnp.exp(a_cumsum))
+    y_off = jnp.einsum('nbihs,nbhps,nbhi->nbihp', C_c, previous, jnp.exp(a_cumsum), precision=products)
     return jnp.moveaxis(y_diag + y_off, 0, 1).reshape(batch, total, heads, head_dim), final
 
 
@@ -311,7 +312,8 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
         x_t, dt_t, B_t, C_t, start = step                   # [B, H, P], [B, H], [B, H, N], [B]
         decay = jnp.where(start[:, None], 0.0, jnp.exp(dt_t * A))
         s = s * decay[..., None, None] + (dt_t[..., None] * x_t)[..., None] * B_t[..., None, :]
-        return s, jnp.einsum('bhps,bhs->bhp', s, C_t) + x_t * D[None, :, None]
+        read = jnp.einsum('bhps,bhs->bhp', s, C_t, precision=float32_products(s.dtype))
+        return s, read + x_t * D[None, :, None]
 
     final, out = jax.lax.scan(
         one_token, jnp.asarray(state, work),
@@ -345,7 +347,7 @@ class MambaRMSNormGated(nn.Module):
     ("in_proj",): ("embed", "linear"),
     ("out_proj",): ("attention", "embed"),
 })
-class Mamba2(nn.Module):
+class Mamba2(Float32Products, nn.Module):
     """The token mixer of a Mamba-2 layer, `Mamba2Mixer` (modeling_mamba2.py:360-588).
 
     `intermediate = num_heads * head_dim` (the config's `expand *
@@ -418,7 +420,7 @@ class Mamba2(nn.Module):
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
         dense = functools.partial(
-            nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision
+            nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.products
         )
         self.in_proj = dense(
             2 * self.intermediate_size + 2 * self.n_groups * self.state_size + self.num_heads,
@@ -523,7 +525,8 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
         entering = entering.reshape(batch, n_groups, num_heads // n_groups, head_dim, state_size)
         decayed = jnp.exp(jnp.cumsum(log_decay, axis=1)).reshape(
             batch, length, n_groups, num_heads // n_groups)
-        carried = jnp.einsum('bsgn,bgkpn,bsgk->bsgkp', C, entering, decayed)
+        carried = jnp.einsum('bsgn,bgkpn,bsgk->bsgkp', C, entering, decayed,
+                             precision=float32_products(C.dtype))
         out = out + carried.reshape(batch, length, num_heads, head_dim)
     return out.reshape(batch, length, intermediate), final
 

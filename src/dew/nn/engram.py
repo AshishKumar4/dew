@@ -36,7 +36,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from .precision import at_least_fp32
+from .precision import Float32Products, at_least_fp32
 from .sharding import logical_axes
 
 _DEAD = -1
@@ -253,7 +253,7 @@ class EngramHashes(nn.Module):
     ("engram",): (None, "embed"),
     ("wkv",): (None, "embed"),
 })
-class EngramLayer(nn.Module):
+class EngramLayer(Float32Products, nn.Module):
     """One layer's lookup gated into the residual streams (model.py:328-365).
 
     `embed` `[rows, head_dim]` is the release's `engram.embed.weight`; `wkv`
@@ -277,7 +277,7 @@ class EngramLayer(nn.Module):
         dtype = streams.dtype if self.dtype is None else self.dtype
         looked = table(hash_ids).astype(dtype).reshape(*hash_ids.shape[:2], -1)
         kv = nn.Dense(self.emb_features * (self.hc_mult + 1), use_bias=False, dtype=self.dtype,
-                      precision=self.precision, name='wkv')(looked)
+                      precision=self.products, name='wkv')(looked)
         q_weight = self.param(
             "q_weight", nn.initializers.ones, (self.hc_mult, self.emb_features), jnp.float32
         )

@@ -18,7 +18,7 @@ from .blocks import normal_kernel
 from .flops import projection_flops
 from .joined import joined_dense, joins
 from .ngpt import NGPT, gain, unit
-from .precision import at_least_fp32, sqrt_or_zero
+from .precision import Float32Products, at_least_fp32, sqrt_or_zero
 from .protocols import ProjectionGroup
 from .sharding import MLP_HIDDEN, constrain, logical_axes
 
@@ -69,7 +69,7 @@ def _erfinv(value: float) -> float:
     ("up_proj",): ("embed", "mlp"),
     ("down_proj",): ("mlp", "embed"),
 })
-class GatedMLP(nn.Module):
+class GatedMLP(Float32Products, nn.Module):
     """Computes the gated feed-forward down_proj(act(gate_proj(x)) * up_proj(x)).
 
     `activation` picks act: swiglu is silu, geglu is the tanh approximation of
@@ -131,7 +131,7 @@ class GatedMLP(nn.Module):
     def setup(self):
         projections = self.projections()
         dense = functools.partial(
-            self.linear, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
+            self.linear, use_bias=self.use_bias, dtype=self.dtype, precision=self.products,
             **normal_kernel(self.init_std))
         if self._gated():
             if self._packed():

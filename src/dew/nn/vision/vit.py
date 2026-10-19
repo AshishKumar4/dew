@@ -31,6 +31,7 @@ from dew.nn.activations import activation as named_activation
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import DecoderBlock
 from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.precision import Float32Products
 from dew.nn.text_encoders import clip_layer
 
 if TYPE_CHECKING:
@@ -161,7 +162,7 @@ def _gather(x, index):
     return jnp.take_along_axis(x, index.reshape(*index.shape, *(1,) * (x.ndim - 2)), axis=1)
 
 
-class VisionTransformer(nn.Module):
+class VisionTransformer(Float32Products, nn.Module):
     """A family's trunk (`ViTLayout`): patches mapped and placed, the blocks, and the trunk sequence
     in merge-block order.
 
@@ -197,7 +198,7 @@ class VisionTransformer(nn.Module):
         frame = place // area
 
         hidden = nn.Dense(lay.hidden_size, use_bias=lay.patch_bias, dtype=self.dtype,
-                          precision=self.precision, name="patch_embed")(pixels)
+                          precision=self.products, name="patch_embed")(pixels)
         if lay.position_table:
             table = nn.Embed(lay.position_table, lay.hidden_size, dtype=self.dtype, name="position_table")
             hidden = hidden + resampled_positions(jnp.asarray(table.embedding, hidden.dtype), rows, columns,
@@ -253,7 +254,7 @@ class VisionTransformer(nn.Module):
                 bias = jnp.where(first[:, None, None, :], sinks[None, :, None, None], 0.0)
             metadata = AttentionMetadata(coordinates=_documents(segment),
                                          rotary_positions=_gather(rotary, order), position_bias=bias)
-            hidden = vit_block(lay, index, dtype=self.dtype, precision=self.precision)(
+            hidden = vit_block(lay, index, dtype=self.dtype, precision=self.products)(
                 hidden, attention_metadata=metadata)
         leaving = orders[current]
         if leaving is not None:
@@ -308,7 +309,7 @@ class VisionTransformer(nn.Module):
         return pixels, jnp.asarray(grid_thw), False
 
 
-class MergeProjector(nn.Module):
+class MergeProjector(Float32Products, nn.Module):
     """Each merge block's features as one vector, mapped to the decoder width.
 
     The trunk sequence comes in merge-block order (`VisionTransformer`). With `norm`, a layer norm
@@ -346,7 +347,7 @@ class MergeProjector(nn.Module):
             grouped = grouped.swapaxes(-1, -2)
         grouped = grouped.reshape(batch, count // block, block * self.hidden_size)
         act = named_activation(self.activation)
-        dense = functools.partial(nn.Dense, use_bias=self.bias, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(nn.Dense, use_bias=self.bias, dtype=self.dtype, precision=self.products)
         out = dense(self.out_width, name="fc2")(act(dense(self.width, name="fc1")(grouped)))
         return act(out) if self.activation_after else out
 

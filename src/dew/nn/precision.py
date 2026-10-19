@@ -70,18 +70,40 @@ def asks_default_precision(precision: jax.lax.PrecisionLike, *, configured: bool
     return names <= {'DEFAULT'}
 
 
-def bf16_operand_precision(dtype: Dtype | None,
-                           precision: PrecisionLike = None) -> jax.lax.PrecisionLike:
-    """The precision that keeps a bf16 dot bf16 in both directions.
-
-    A caller that asked for more than the default precision keeps what it
-    asked for, and compute in anything but bf16 is left alone. So is a GPU
-    older than sm80, which rejects the algorithm at run time
-    (`dew.nn.kernels.generation.BF16_GPU`).
-    """
-    if not asks_default_precision(precision) or dtype is None:
+def float32_products(dtype: Dtype | None, precision: PrecisionLike = None) -> PrecisionLike:
+    """The precision a model's products take where it states none: a float32 compute dtype, or an
+    unset one, which computes in the float32 its parameters hold, multiplies float32 products
+    (`Precision.HIGHEST`), as torch's float32 matmuls do by default; JAX's default runs them in
+    TF32 on a GPU, 2.9e-4 from float64 against 2.9e-7. A precision the model states is its own,
+    TF32 (`'tensorfloat32'`) its opt-in, and other compute dtypes keep theirs. A model's root
+    resolves its precision so once and hands it to its layers."""
+    if precision is not None or (dtype is not None and jnp.dtype(dtype) != jnp.float32):
         return precision
-    if jnp.dtype(dtype) != jnp.bfloat16:
+    return jax.lax.Precision.HIGHEST
+
+
+class Float32Products:
+    """A model root's precision as its layers take it (`float32_products`): what the root states,
+    or float32 products where it states none over float32 compute. The root hands `products` to
+    its layers in place of `precision`, which stays what the model was built with, so a record
+    rebuilds it and a clone to another dtype resolves anew."""
+
+    dtype: Dtype | None
+    precision: PrecisionLike
+
+    @property
+    def products(self) -> PrecisionLike:
+        return float32_products(self.dtype, self.precision)
+
+
+def operand_precision(dtype: Dtype | None, precision: PrecisionLike = None) -> jax.lax.PrecisionLike:
+    """The precision a product of `dtype` operands takes: float32 products for float32 operands
+    where none is stated (`float32_products`), and for bf16 operands at the default precision the
+    algorithm that keeps a bf16 dot bf16 in both directions. A caller that asked for more than the
+    default keeps what it asked for, and so does a GPU older than sm80, which rejects the algorithm
+    at run time (`dew.nn.kernels.generation.BF16_GPU`)."""
+    precision = float32_products(dtype, precision)
+    if dtype is None or jnp.dtype(dtype) != jnp.bfloat16 or not asks_default_precision(precision):
         return precision
     # Imported here: dew.nn.kernels imports this module.
     from .kernels.generation import bf16_dot_runs
@@ -106,7 +128,7 @@ def fp32_result_dot_general(precision: PrecisionLike = None):
         del precision, preferred_element_type  # this head's policy, not the layer's
         return jax.lax.dot_general(
             lhs, rhs, dimension_numbers,
-            precision=bf16_operand_precision(lhs.dtype, requested),
+            precision=operand_precision(lhs.dtype, requested),
             preferred_element_type=at_least_fp32(lhs.dtype))
 
     return dot_general
@@ -257,8 +279,8 @@ def _rounded_operand_jvp(dtype: Dtype, primals: tuple[jax.Array],
 
 def rounds_to_bf16(dtype: Dtype | None, precision: PrecisionLike = None) -> bool:
     """Whether an fp32-result product under this compute dtype and precision
-    multiplies bf16 operands (`bf16_operand_precision`)."""
-    return bf16_operand_precision(dtype, precision) is jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+    multiplies bf16 operands (`operand_precision`)."""
+    return operand_precision(dtype, precision) is jax.lax.DotAlgorithmPreset.BF16_BF16_F32
 
 
 def bf16_logits(logits: jax.Array) -> jax.Array:
@@ -296,7 +318,7 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
     (`head_product`); otherwise the product is the layer's own, in the
     operands' dtype.
     """
-    resolved = bf16_operand_precision(dtype, precision)
+    resolved = operand_precision(dtype, precision)
     rounds = rounds_to_bf16(dtype, precision)
 
     def dot_general(lhs, rhs, dimension_numbers, precision=None,

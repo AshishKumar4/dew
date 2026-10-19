@@ -43,7 +43,7 @@ class HybridSSMAttentionDiT(SimpleDiT):
                 mlp_ratio=self.mlp_ratio,
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype,
-                precision=self.precision,
+                precision=self.products,
                 norm_epsilon=self.norm_epsilon,
                 adaln_silu=self.adaln_silu,
                 **fields,

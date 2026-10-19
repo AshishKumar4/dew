@@ -20,13 +20,13 @@ from ..attention import NormalAttention, RMSNorm
 from ..blocks import TimeProjection
 from ..dit import ROPE_THETA
 from ..flops import MissingFlopsCount, patch_lengths, projection_flops
-from ..precision import at_least_fp32
+from ..precision import Float32Products, at_least_fp32
 from ..rope import rotary_freqs
 from .spatial import SpatialCount, SpatialShape
 from .unet import Unet, unet_body
 
 
-class TemporalBlock(nn.Module):
+class TemporalBlock(Float32Products, nn.Module):
     """Temporal self-attention over the frame axis at every spatial position.
 
     The output projection is zero-initialized, so the block is an exact
@@ -59,13 +59,13 @@ class TemporalBlock(nn.Module):
             heads=self.heads,
             dim_head=C // self.heads,
             dtype=self.dtype,
-            precision=self.precision,
+            precision=self.products,
             use_bias=True,
             name="temporal_attention",
         )(h, freqs_cis=freqs_cis)
         # zero-init gate: identity at init, so inflation preserves the 2D model
         h = nn.Dense(
-            features=C, dtype=self.dtype, precision=self.precision,
+            features=C, dtype=self.dtype, precision=self.products,
             kernel_init=nn.initializers.zeros, name="temporal_out")(h)
 
         h = h.reshape(B, H * W, frames, C).transpose(0, 2, 1, 3).reshape(BT, H, W, C)
@@ -108,7 +108,7 @@ class UNet3D(Unet):
 
     @nn.nowrap
     def temporal_block(self, name, **scope):
-        return TemporalBlock(heads=self.temporal_heads, dtype=self.dtype, precision=self.precision,
+        return TemporalBlock(heads=self.temporal_heads, dtype=self.dtype, precision=self.products,
                              name=name, **scope)
 
     @nn.compact

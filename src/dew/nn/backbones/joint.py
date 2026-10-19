@@ -29,6 +29,7 @@ from dew.nn.attention import (
 from dew.nn.blocks import Modulation
 from dew.nn.flops import MissingFlopsCount, attention_flops, matching_lengths, projection_flops
 from dew.nn.mlp import GatedMLP
+from dew.nn.precision import Float32Products
 from dew.nn.rope import rotate
 from dew.nn.sharding import logical_axes
 
@@ -129,7 +130,7 @@ def guided_time(embed: Callable[[jax.Array, str], jax.Array], time, guidance, *,
                      ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj")),
                    ("to_out_0", (None, "embed")),
                    ("to_add_out", (None, "embed")))})
-class JointAttention(nn.Module):
+class JointAttention(Float32Products, nn.Module):
     """Runs the source's `Attention` over an image stream and an optional context.
 
     Each stream projects its own queries, keys and values; the context uses
@@ -198,18 +199,18 @@ class JointAttention(nn.Module):
 
     def _heads(self, name: str, x, norm: str | None = None):
         return projected_heads(x, name, self.heads, self.head_dim, flat=True, bias=self.bias,
-                               dtype=self.dtype, precision=self.precision,
+                               dtype=self.dtype, precision=self.products,
                                norm=RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name=norm)
                                if norm and self.qk_norm else None)
 
     def _output(self, name: str, attended):
         return projected_output(attended, name, self.inner_features, flat=True, bias=self.bias,
-                                dtype=self.dtype, precision=self.precision)
+                                dtype=self.dtype, precision=self.products)
 
     def attend(self, query, key, value, lengths):
         """Return one softmax attention over the joined sequence, masking each row's keys past `lengths`."""
         return scaled_dot_product_attention(query, key, value, implementation=self.attention_impl,
-                                            precision=self.precision, key_value_seq_lengths=lengths,
+                                            precision=self.products, key_value_seq_lengths=lengths,
                                             force_fp32_for_softmax=self.force_fp32_for_softmax)
 
     @nn.compact
@@ -239,7 +240,7 @@ class JointAttention(nn.Module):
                 self._output("to_add_out", context_out) if self.context_out else None)
 
 
-class DoubleStreamBlock(nn.Module):
+class DoubleStreamBlock(Float32Products, nn.Module):
     """Runs one double-stream block of SD3, Flux, FLUX.2 or Dew's own MM-DiT.
 
     It matches SD3's `JointTransformerBlock`, Flux's `FluxTransformerBlock`
@@ -319,7 +320,7 @@ class DoubleStreamBlock(nn.Module):
     def _modulation(self, conditioning):
         def projected(pieces: int, name: str):
             return Modulation(self.features, pieces, zero_init=self.zero_modulation, dtype=self.dtype,
-                              precision=self.precision, name=name)(conditioning)
+                              precision=self.products, name=name)(conditioning)
 
         image, context = self.modulation_pieces
         return projected(image, "norm1"), projected(context, "norm1_context")
@@ -330,14 +331,14 @@ class DoubleStreamBlock(nn.Module):
         # the others' tanh GELU (`FeedForward(activation_fn="gelu-approximate")`) is biased.
         return GatedMLP(self.mlp_hidden or 4 * self.features, self.features,
                         activation="swiglu" if self.swiglu else "gelu", use_bias=not self.swiglu,
-                        packed=self.swiglu, dtype=self.dtype, precision=self.precision, name=name)
+                        packed=self.swiglu, dtype=self.dtype, precision=self.products, name=name)
 
     @nn.nowrap
     def _attention(self, name: str | None = None, *, context_out: bool = True):
         return JointAttention(self.heads, self.head_dim, bias=self.bias, qk_norm=self.qk_norm,
                               epsilon=self.epsilon if self.qk_epsilon is None else self.qk_epsilon,
                               context_first=self.context_first, context_out=context_out,
-                              rotary_pairs=self.rotary_pairs, dtype=self.dtype, precision=self.precision,
+                              rotary_pairs=self.rotary_pairs, dtype=self.dtype, precision=self.products,
                               attention_impl=self.attention_impl,
                               force_fp32_for_softmax=self.force_fp32_for_softmax, name=name)
 

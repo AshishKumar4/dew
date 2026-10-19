@@ -171,6 +171,32 @@ def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path
     np.testing.assert_allclose(np.asarray(actual), expected, atol=1e-4, rtol=0)
 
 
+@pytest.mark.gpu(reason="TF32 is a GPU's: a CPU multiplies float32 operands in float32 at any precision")
+def test_a_float32_decoder_multiplies_float32_products_on_a_gpu():
+    """A float32 decoder that states no precision multiplies float32 products, as torch's float32
+    matmuls do by default (`dew.nn.precision.float32_products`): its logits on a GPU are as exact
+    as transformers' float32 ones, both from transformers' float64 ones. JAX's default precision
+    multiplies float32 in TF32 there, 2.9e-4 from float64 against 2.9e-7."""
+    import contextlib
+
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    from tools.diffusers_wan_reference import float64
+
+    directory = FIXTURES / "qwen3-tiny"
+    ids = np.load(directory / "input_ids.npy")
+    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
+    ours = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, jnp.asarray(ids)), np.float64)
+
+    def theirs(dtype):
+        with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
+            model = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager")
+            return model.to(dtype).eval()(torch.from_numpy(ids).long()).logits.double().numpy()
+
+    assert_as_exact_as_the_reference(ours, theirs(torch.float32), theirs(torch.float64), "float32 logits")
+
+
 @pytest.mark.parametrize(("name", "stale"), [
     ("qwen2-tiny", {"use_mrope": True}),
     ("mamba2-tiny", {"rms_norm": False, "intermediate_size": 3, "norm_before_gate": True}),

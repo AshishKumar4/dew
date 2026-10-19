@@ -34,7 +34,7 @@ from ..inputs import LayerInputs, MixerCall, PredictionPhase
 from ..linear import recomputing
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
-from ..precision import scaled
+from ..precision import Float32Products, scaled
 from ..protocols import ProjectionGroup, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
 
@@ -464,7 +464,7 @@ class _Depth(NamedTuple):
 _BlockState = _Plain | _Streams | _Depth
 
 
-class DecoderBlock(nn.Module):
+class DecoderBlock(Float32Products, nn.Module):
     """Pre-norm decoder block: a token mixer, then a feed-forward, each added to the residual.
 
     `mixer` and `feedforward` are factories that take only a name. The mixer
@@ -631,7 +631,7 @@ class DecoderBlock(nn.Module):
             self.output_scalar = self.param("layer_scalar", nn.initializers.ones, (1,), jnp.float32)
         if self.per_layer_input_dim:
             dense = functools.partial(
-                nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+                nn.Dense, use_bias=False, dtype=self.dtype, precision=self.products)
             self.per_layer_input_gate = dense(projections['per_layer_input_gate'][1],
                                               name='per_layer_input_gate')
             self.per_layer_projection = dense(projections['per_layer_projection'][1],
@@ -644,7 +644,7 @@ class DecoderBlock(nn.Module):
                     "neither a parallel branch nor a layer scalar")
             self.altup_layer = AltUpLayer(
                 spec=self.altup, emb_features=self.emb_features, norm_eps=self.norm_eps,
-                dtype=self.dtype, precision=self.precision, name='altup')
+                dtype=self.dtype, precision=self.products, name='altup')
         if self.laurel_rank is not None:
             if self.laurel_rank < 1 or not self.wiring.pre_norms:
                 raise ValueError(
@@ -653,7 +653,7 @@ class DecoderBlock(nn.Module):
                 f"with {self.wiring}")
             self.laurel = LaurelBlock(
                 rank=self.laurel_rank, emb_features=self.emb_features,
-                norm_eps=self.norm_eps, dtype=self.dtype, precision=self.precision,
+                norm_eps=self.norm_eps, dtype=self.dtype, precision=self.products,
                 name='laurel')
         if self.hyper_connections is not None:
             if (not self.wiring.pre_norms or self.wiring.output_norms or self.wiring.layer_scalar
@@ -1036,7 +1036,7 @@ class DecoderBlock(nn.Module):
     ("e_proj",): (None, "embed"),
     ("h_proj",): (None, "embed"),
 })
-class MTPBlock(nn.Module):
+class MTPBlock(Float32Products, nn.Module):
     """Computes one multi-token-prediction depth: the hidden states of the next depth.
 
     `enorm` norms the token embeddings and `hnorm` norms the previous hidden
@@ -1091,7 +1091,7 @@ class MTPBlock(nn.Module):
             mixer=self.mixer, feedforward=self.feedforward, emb_features=self.emb_features,
             norm_eps=self.norm_eps, scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
             wiring=self.wiring, hyper_connections=self.hyper_connections, dropout_rate=self.dropout_rate,
-            remat=self.remat, dtype=self.dtype, precision=self.precision, **scope)
+            remat=self.remat, dtype=self.dtype, precision=self.products, **scope)
 
     def setup(self):
         norm = functools.partial(
@@ -1102,7 +1102,7 @@ class MTPBlock(nn.Module):
         maps = self.projections()
         def dense(name):
             return nn.Dense(maps[name][1], use_bias=False, dtype=self.dtype,
-                            precision=self.precision, name=name)
+                            precision=self.products, name=name)
         if self.hyper_connections is None:
             self.eh_proj = dense('eh_proj')
         else:

@@ -16,6 +16,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import Coordinates, coordinates as build_coordinates, next_position
+from dew.nn.precision import Float32Products
 from dew.nn.protocols import OutputTable, ProjectionGroup
 from dew.nn.sharding import explicit_spec
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
@@ -49,7 +50,7 @@ class Fusion:
     media: jax.Array | None
 
 
-class VisionConditioner(nn.Module):
+class VisionConditioner(Float32Products, nn.Module):
     """An image encoder and projector with row-aligned media inputs.
 
     Pixels have shape [batch, images, channels, height, width]. All images
@@ -65,8 +66,8 @@ class VisionConditioner(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        self.tower = self.vision.build().clone(dtype=self.dtype, precision=self.precision)
-        self.projector = self.projection.build().clone(dtype=self.dtype, precision=self.precision)
+        self.tower = self.vision.build().clone(dtype=self.dtype, precision=self.products)
+        self.projector = self.projection.build().clone(dtype=self.dtype, precision=self.products)
 
     def __call__(self, conditioning: Mapping[str, jax.Array], train: bool = False) -> jax.Array:
         pixels = conditioning["pixel_values"]
@@ -114,7 +115,7 @@ class VisionConditioner(nn.Module):
         return _place(embeddings, self(conditioning, train=train), image_indices)
 
 
-class AudioConditioner(nn.Module):
+class AudioConditioner(Float32Products, nn.Module):
     """An audio encoder and projector over row-aligned clips.
 
     Features have shape [batch, clips, frames, mel] with a True-for-valid
@@ -134,8 +135,8 @@ class AudioConditioner(nn.Module):
 
     def setup(self):
         # Named for the shared root scope beside the vision tower and projector.
-        self.audio_tower = self.audio.build().clone(dtype=self.dtype, precision=self.precision)
-        self.audio_projector = self.projection.build().clone(dtype=self.dtype, precision=self.precision)
+        self.audio_tower = self.audio.build().clone(dtype=self.dtype, precision=self.products)
+        self.audio_projector = self.projection.build().clone(dtype=self.dtype, precision=self.products)
 
     def __call__(self, conditioning: Mapping[str, jax.Array]) -> jax.Array:
         features = conditioning["input_features"]
@@ -180,7 +181,7 @@ def _place(embeddings: jax.Array, table: jax.Array, indices: jax.Array) -> jax.A
 
 
 
-class MultimodalTransformer(nn.Module):
+class MultimodalTransformer(Float32Products, nn.Module):
     """Conditions the shared decoder on images and audio, using the ordinary decoder cache and head.
 
     ``image_indices`` and ``audio_indices`` give, for each token slot, the
@@ -235,7 +236,7 @@ class MultimodalTransformer(nn.Module):
     def setup(self):
         self.conditioner = VisionConditioner(
             self.vision, self.projection,
-            dtype=self.dtype, precision=self.precision)
+            dtype=self.dtype, precision=self.products)
         nn.share_scope(self.conditioner, self)
         if (self.audio is None) != (self.audio_projection is None):
             raise ValueError("an audio tower and its projector arrive together")
@@ -243,7 +244,7 @@ class MultimodalTransformer(nn.Module):
             self.audio_conditioner = AudioConditioner(
                 self.audio, self.audio_projection, self.audio_soft_tokens,
                 self.vocab_size - 1 if self.family == "gemma3n" else None,
-                dtype=self.dtype, precision=self.precision)
+                dtype=self.dtype, precision=self.products)
             nn.share_scope(self.audio_conditioner, self)
 
     @property

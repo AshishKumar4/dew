@@ -46,7 +46,7 @@ from .attention import (
 from .inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of, valid_order
 from .mixer_base import MixerBase, MixerContext
 from .mla import INDEXER, MultiHeadLatentAttention, latent_refusals, open_mla_cache
-from .precision import at_least_fp32
+from .precision import Float32Products, at_least_fp32
 from .sharding import down_projection
 from .sparse_selection import index_scores, selection_mask, top_k_selection
 
@@ -66,7 +66,7 @@ def _real_slots(valid, count: int):
 # wq_b, wk, k_norm and weights_proj carry the V3.2 indexer's declarations
 # under the same names; the pool compression's two tables have no side worth
 # naming and take the shape heuristic.
-class KPoolIndexer(nn.Module):
+class KPoolIndexer(Float32Products, nn.Module):
     """The k-pool indexer: which keys each query attends, by pools
     (`Glm5NextTextIndexer`, modeling_glm5_next.py:736-1024).
 
@@ -96,7 +96,7 @@ class KPoolIndexer(nn.Module):
             raise ValueError(
                 f"the pool budget is index_topk // index_kpool whole pools, so index_topk "
                 f"({self.top_k}) must be divisible by index_kpool ({self.kpool})")
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.products)
         self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
         self.wk = dense(self.head_dim, name='wk')
         # A LayerNorm with weight and bias at a hardcoded 1e-6 (modeling_glm5_next.py:763).
@@ -117,7 +117,7 @@ class KPoolIndexer(nn.Module):
         x = jax.lax.stop_gradient(x)
         keys = self.k_norm(self.wk(x))
         x, gate = promote_dtype(x, self.index_kpool_compress_gate, dtype=self.dtype)
-        gate_scores = jnp.einsum('bsh,dh->bsd', x, gate, precision=self.precision)
+        gate_scores = jnp.einsum('bsh,dh->bsd', x, gate, precision=self.products)
         return jnp.concatenate(
             [keys, gate_scores.astype(keys.dtype), valid.astype(keys.dtype)[..., None]], axis=-1
         )
@@ -184,7 +184,7 @@ class KPoolIndexer(nn.Module):
         valid = packed[..., -1] > 0
         query = self.wq_b(q_resid).reshape(batch, length, self.n_heads, self.head_dim)
         pool_keys, pool_indices, pool_valid = self._pools(packed)
-        scores = index_scores(query, pool_keys, self.weights_proj(x), self.precision)
+        scores = index_scores(query, pool_keys, self.weights_proj(x), self.products)
         # A pool is a candidate iff the query sees its last token
         # (modeling_glm5_next.py:832-839); its indices are clamped only so
         # the gather is legal, the validity test excludes it on its own.

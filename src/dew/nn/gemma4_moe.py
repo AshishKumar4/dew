@@ -21,13 +21,13 @@ from dew.nn.activations import GatedActivation
 from dew.nn.attention import RMSNorm
 from dew.nn.flops import projection_flops
 from dew.nn.moe import ExpertMLP, chosen_experts, renormalized_softmax
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import Float32Products, at_least_fp32
 from dew.nn.protocols import Routes
 from dew.nn.sharding import logical_axes
 
 
 @logical_axes({("proj",): ("embed", "exp")})
-class Gemma4TextRouter(nn.Module):
+class Gemma4TextRouter(Float32Products, nn.Module):
     """Which experts a token takes and with what weight, `[..., k]` of each."""
 
     num_experts: int
@@ -48,7 +48,7 @@ class Gemma4TextRouter(nn.Module):
         scale = self.param('scale', nn.initializers.ones, (hidden,), jnp.float32)
         scaled = normed * (scale * (hidden ** -0.5)).astype(normed.dtype)
         logits = nn.Dense(self.num_experts, use_bias=False, dtype=self.dtype,
-                          precision=self.precision, name='proj')(scaled)
+                          precision=self.products, name='proj')(scaled)
         logits = logits.astype(at_least_fp32(logits.dtype))
         indices = chosen_experts(lambda: jax.lax.top_k(jax.nn.softmax(logits, axis=-1), self.top_k)[1],
                                  (*logits.shape[:-1], self.top_k), routes)
@@ -58,7 +58,7 @@ class Gemma4TextRouter(nn.Module):
         return weights * per_expert[indices], indices
 
 
-class Gemma4Experts(nn.Module):
+class Gemma4Experts(Float32Products, nn.Module):
     """The routed branch summed with the dense MLP's output.
 
     Takes the block's residual `x` and the dense MLP's output `mlp_out` and
@@ -99,13 +99,13 @@ class Gemma4Experts(nn.Module):
 
         weights, indices = Gemma4TextRouter(
             num_experts=self.num_experts, top_k=self.top_k, norm_eps=self.norm_eps,
-            dtype=self.dtype, precision=self.precision, name='router')(x, routes)
+            dtype=self.dtype, precision=self.products, name='router')(x, routes)
         routed = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
             out_features=self.out_features, activation=self.activation,
             implementation=self.implementation, dispatch=self.dispatch,
             capacity_factor=self.capacity_factor, dtype=self.dtype,
-            precision=self.precision, name='experts')(norm('experts_input_norm')(x), weights, indices)
+            precision=self.products, name='experts')(norm('experts_input_norm')(x), weights, indices)
         return norm('mlp_branch_norm')(mlp_out) + norm('experts_output_norm')(routed)
 
 

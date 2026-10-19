@@ -28,7 +28,7 @@ from .blocks import FourierEmbedding, TimeProjection, modulation
 from .conv import Conv
 from .flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
 from .mlp import GatedMLP
-from .precision import at_least_fp32, fp32_result_dot_general
+from .precision import Float32Products, at_least_fp32, fp32_result_dot_general
 from .rope import rotary_freqs
 from .scan_orders import (
     ScanOrder,
@@ -108,7 +108,7 @@ def build_block_pattern(num_layers: int, ssm_attention_ratio: str = "3:1",
     return (unit * (num_layers // len(unit) + 1))[:num_layers]
 
 
-class PatchEmbedding(nn.Module):
+class PatchEmbedding(Float32Products, nn.Module):
     """Non-overlapping `patch_size` patches through one convolution, as a
     row-major token sequence `[B, H_P * W_P, embedding_dim]`.
 
@@ -140,16 +140,16 @@ class PatchEmbedding(nn.Module):
                  strides=(self.patch_size, self.patch_size),
                  use_bias=self.bottleneck is None,
                  dtype=self.dtype,
-                 precision=self.precision)(x)
+                 precision=self.products)(x)
         if self.bottleneck is not None:
-            x = nn.Dense(self.embedding_dim, dtype=self.dtype, precision=self.precision)(x)
+            x = nn.Dense(self.embedding_dim, dtype=self.dtype, precision=self.products)(x)
         # The token count is named, not inferred: a reshape cannot infer it from a batch of no rows,
         # which a shortcut objective's bootstrap slice is below `bootstrap_every` rows.
         return jnp.reshape(x, (batch, x.shape[1] * x.shape[2], self.embedding_dim))
 
 
 @logical_axes({("ada_proj",): ("embed", "modulation")})
-class AdaLNParams(nn.Module):
+class AdaLNParams(Float32Products, nn.Module):
     """The six adaLN-Zero modulation vectors of one block, `[B, 1, 6 * features]`,
     from the conditioning vector.
 
@@ -169,11 +169,11 @@ class AdaLNParams(nn.Module):
         if conditioning.ndim == 2:
             conditioning = jnp.expand_dims(conditioning, axis=1)
         return modulation(conditioning, self.features, 6, name="ada_proj", silu=self.silu, zero_init=True,
-                          dtype=self.dtype, precision=self.precision)
+                          dtype=self.dtype, precision=self.products)
 
 
 @logical_axes({("patch_embed", "Conv_0"): (None, None, None, "embed")})
-class PatchSequenceEmbed(nn.Module):
+class PatchSequenceEmbed(Float32Products, nn.Module):
     """Patchify in raster/hilbert/zigzag order and add the 2D sincos signal.
 
     Returns `(tokens, inv_idx)`; `inv_idx` restores row-major order on the
@@ -199,7 +199,7 @@ class PatchSequenceEmbed(nn.Module):
                 patch_size=self.patch_size,
                 embedding_dim=self.emb_features,
                 dtype=self.dtype,
-                precision=self.precision,
+                precision=self.products,
                 bottleneck=self.bottleneck,
                 name="patch_embed",
             )
@@ -211,7 +211,7 @@ class PatchSequenceEmbed(nn.Module):
             self.scan_proj = nn.Dense(
                 features=self.emb_features,
                 dtype=self.dtype,
-                precision=self.precision,
+                precision=self.products,
                 name="hilbert_projection",
             )
 
@@ -236,7 +236,7 @@ class PatchSequenceEmbed(nn.Module):
 
 
 @logical_axes({("time_embed", "layers_2"): ("mlp", "embed")})
-class ConditioningEmbed(nn.Module):
+class ConditioningEmbed(Float32Products, nn.Module):
     """Fourier time embedding + the text projection mean-pooled over the real
     tokens, summed into the single conditioning vector the adaLN modulation
     consumes.
@@ -270,8 +270,8 @@ class ConditioningEmbed(nn.Module):
             return nn.Sequential([
                 FourierEmbedding(features=self.emb_features, scale=self.time_scale, dtype=self.dtype),
                 TimeProjection(features=self.emb_features * self.mlp_ratio,
-                               dtype=self.dtype, precision=self.precision),
-                nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision),
+                               dtype=self.dtype, precision=self.products),
+                nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.products),
             ], name=name)
 
         if self.interval:
@@ -279,7 +279,7 @@ class ConditioningEmbed(nn.Module):
         self.time_embed = time_embedding("time_embed")
         self.text_proj = nn.Dense(
             features=self.emb_features, dtype=self.dtype,
-            precision=self.precision, name="text_context_proj")
+            precision=self.products, name="text_context_proj")
 
     def __call__(self, temb, textcontext: TextContext | None = None, duration=None):
         cond_emb = self.time_embed(temb)
@@ -300,7 +300,7 @@ class ConditioningEmbed(nn.Module):
 
 @logical_axes({("final_ada_proj",): ("embed", "modulation"),
                ("final_proj",): ("embed", "output")})
-class PatchSequenceOutput(nn.Module):
+class PatchSequenceOutput(Float32Products, nn.Module):
     """Final norm + zero-init fp32 head + unpatchify for any scan order and
     any (non-square included) patch grid."""
     patch_size: int
@@ -329,17 +329,17 @@ class PatchSequenceOutput(nn.Module):
             if conditioning.ndim == 2:
                 conditioning = jnp.expand_dims(conditioning, axis=1)
             projected = modulation(conditioning, features, 2, name="final_ada_proj", zero_init=True,
-                                   dtype=self.dtype, precision=self.precision)
+                                   dtype=self.dtype, precision=self.products)
             shift, scale = jnp.split(projected, 2, axis=-1)
             x_out = x_out * (1 + scale) + shift
 
         x_out = nn.Dense(
             features=self.patch_size * self.patch_size * self.output_channels,
             dtype=self.dtype,
-            precision=self.precision,
+            precision=self.products,
             # The loss is computed in fp32, so the result and the accumulation
             # are fp32 while the operands stay in the compute dtype.
-            dot_general=fp32_result_dot_general(self.precision),
+            dot_general=fp32_result_dot_general(self.products),
             kernel_init=nn.initializers.zeros,
             name="final_proj",
         )(x_out)
@@ -471,7 +471,7 @@ class _ConditioningOptions(TypedDict, total=False):
     time_scale: float
 
 
-class _TransformerOptions(nn.Module, kw_only=True):
+class _TransformerOptions(Float32Products, nn.Module, kw_only=True):
     """Shared controls stay keyword-only so token stacks can require their widths."""
     mlp_ratio: int = 4
     dtype: Dtype | None = None
@@ -486,7 +486,7 @@ class _TransformerOptions(nn.Module, kw_only=True):
         return spans
 
     def _block_options(self) -> _BlockOptions:
-        return {'mlp_ratio': self.mlp_ratio, 'dtype': self.dtype, 'precision': self.precision,
+        return {'mlp_ratio': self.mlp_ratio, 'dtype': self.dtype, 'precision': self.products,
                 'force_fp32_for_softmax': self.force_fp32_for_softmax,
                 'norm_epsilon': self.norm_epsilon, 'attention_impl': self.attention_impl}
 
@@ -494,17 +494,17 @@ class _TransformerOptions(nn.Module, kw_only=True):
     def _embedding(self, patch_size: int, features: int, scan_order: str = 'raster',
                    *, bottleneck: int | None = None) -> PatchSequenceEmbed:
         return PatchSequenceEmbed(patch_size=patch_size, emb_features=features, scan_order=scan_order,
-                                  dtype=self.dtype, precision=self.precision, bottleneck=bottleneck)
+                                  dtype=self.dtype, precision=self.products, bottleneck=bottleneck)
 
     @nn.nowrap
     def _conditioning(self, features: int, **options: Unpack[_ConditioningOptions]) -> ConditioningEmbed:
         return ConditioningEmbed(emb_features=features, mlp_ratio=self.mlp_ratio,
-                                 dtype=self.dtype, precision=self.precision, **options)
+                                 dtype=self.dtype, precision=self.products, **options)
 
     @nn.nowrap
     def _output(self, patch_size: int, channels: int, *, modulated: bool = False) -> PatchSequenceOutput:
         return PatchSequenceOutput(patch_size=patch_size, output_channels=channels, modulated=modulated,
-                                   norm_epsilon=self.norm_epsilon, dtype=self.dtype, precision=self.precision)
+                                   norm_epsilon=self.norm_epsilon, dtype=self.dtype, precision=self.products)
 
 
 class _AttentionStackOptions(_TransformerOptions, kw_only=True):
@@ -562,7 +562,7 @@ def _exact_gelu(hidden: jax.Array) -> jax.Array:
     return gelu_exact_torch(hidden)
 
 
-class ModulatedBlock(nn.Module):
+class ModulatedBlock(Float32Products, nn.Module):
     """adaLN-Zero modulated residual block with a pluggable token mixer.
 
     mixer='attention' is the standard DiT block, rotated by `freqs_cis` (None
@@ -621,7 +621,7 @@ class ModulatedBlock(nn.Module):
 
         if self.modulated:
             self.ada_params_module = AdaLNParams(
-                self.features, dtype=self.dtype, precision=self.precision, silu=self.adaln_silu)
+                self.features, dtype=self.dtype, precision=self.products, silu=self.adaln_silu)
         # Without modulation the norms carry their own affine, since there is
         # no conditioning vector left to supply the shift and scale
         affine = not self.modulated
@@ -638,7 +638,7 @@ class ModulatedBlock(nn.Module):
                 heads=self.num_heads,
                 dim_head=self.features // self.num_heads,
                 dtype=self.dtype,
-                precision=self.precision,
+                precision=self.products,
                 use_bias=True,
                 qkv_bias=self.qkv_bias,
                 qk_norm=self.qk_norm,
@@ -657,14 +657,14 @@ class ModulatedBlock(nn.Module):
                     dilations=(1, 2, 3),
                     kernel_size=3,
                     dtype=self.dtype,
-                    precision=self.precision,
+                    precision=self.products,
                     name="spatial_fusion",
                 )
 
         # GELU runs in fp32 and rounds once, as torch's bf16 GELU does (docs/performance.md).
         self.mlp = GatedMLP(hidden_features, self.features,
                             activation=gelu_tanh if self.gelu_approximate else _exact_gelu, use_bias=True,
-                            dtype=self.dtype, precision=self.precision)
+                            dtype=self.dtype, precision=self.products)
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
     def _apply_2d_fusion(self, ssm_output):

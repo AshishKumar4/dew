@@ -36,7 +36,7 @@ from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels.generation import backend, measured_kernel, ran_kernel, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_refusal, xla_ragged_dot
-from .precision import at_least_fp32, rounded_operand
+from .precision import Float32Products, at_least_fp32, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
 from .sharding import (
     EXPERT_AXIS,
@@ -822,7 +822,7 @@ EXPERT_AXES: Mapping[str, LogicalAxes] = {
 """The stacked expert kernels' axes, in the order `ExpertMLP` projects through them."""
 
 
-class ExpertMLP(nn.Module):
+class ExpertMLP(Float32Products, nn.Module):
     """The routed experts of one layer: each token through the MLPs its
     router chose.
 
@@ -891,7 +891,7 @@ class ExpertMLP(nn.Module):
                  kernels: tuple[jax.Array, ...], *, dtype: Dtype) -> jax.Array:
         def linear(x: jax.Array, kernel: jax.Array) -> jax.Array:
             return jnp.asarray(expert_projection(
-                x, kernel, sizes, dtype, self.implementation, self.precision))
+                x, kernel, sizes, dtype, self.implementation, self.products))
 
         # The same residual names as the dense MLP's, so one remat policy
         # covers both (decoder_block.RESIDUALS).
@@ -911,7 +911,7 @@ class ExpertMLP(nn.Module):
         if self.scale_inputs:
             return jnp.sum(slots.astype(wide), axis=-2).astype(slots.dtype)
         return jnp.einsum('...ke,...k->...e', slots.astype(wide),
-                          weights.astype(wide), precision=self.precision).astype(slots.dtype)
+                          weights.astype(wide), precision=self.products).astype(slots.dtype)
 
     def __call__(self, x: jax.Array, weights: jax.Array, indices: jax.Array) -> jax.Array:
         if weights.shape != indices.shape:
@@ -947,7 +947,7 @@ class ExpertMLP(nn.Module):
     ("routed_expert_down_proj",): ("embed", None),
     ("routed_expert_up_proj",): (None, "embed"),
 })
-class SparseMLP(nn.Module):
+class SparseMLP(Float32Products, nn.Module):
     """A router over `num_experts` MLPs, `top_k` of them per token.
 
     Goes where `GatedMLP` goes and holds the submodules a Hugging Face sparse
@@ -1026,7 +1026,7 @@ class SparseMLP(nn.Module):
                            expert_bias=self.expert_bias,
                            media_bias=self.media_bias,
                            hash_vocab=self.hash_vocab, init_std=self.init_std,
-                           precision=self.precision, name='gate')
+                           precision=self.products, name='gate')
         width = self.out_features if self.latent_features is None else self.latent_features
         self.experts = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
@@ -1036,9 +1036,9 @@ class SparseMLP(nn.Module):
             swiglu_limit=self.swiglu_limit,
             scale_inputs=self.scale_inputs,
             init_std=self.init_std, output_init_std=self.output_init_std,
-            dtype=self.dtype, precision=self.precision, name='experts')
+            dtype=self.dtype, precision=self.products, name='experts')
         if self.latent_features is not None:
-            dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.products)
             self.routed_expert_down_proj = dense(self.latent_features, name='routed_expert_down_proj')
             self.routed_expert_up_proj = dense(self.out_features, name='routed_expert_up_proj')
             if self.latent_norm is not None:
@@ -1049,7 +1049,7 @@ class SparseMLP(nn.Module):
             self.shared_experts = self.shared(name='shared_experts')
             if self.shared_gate:
                 self.shared_expert_gate = nn.Dense(
-                    1, use_bias=False, dtype=self.dtype, precision=self.precision,
+                    1, use_bias=False, dtype=self.dtype, precision=self.products,
                     name='shared_expert_gate', **normal_kernel(self.init_std))
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:

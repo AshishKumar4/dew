@@ -39,7 +39,7 @@ from dew.nn.flops import (
     patch_lengths,
     projection_flops,
 )
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import Float32Products, at_least_fp32
 from dew.nn.rope import axis_tables
 from dew.nn.sharding import logical_axes
 
@@ -117,7 +117,7 @@ class _Attention(JointAttention):
                    key_value_seq_lengths=lengths)], axis=1)
 
 
-class _Block(nn.Module):
+class _Block(Float32Products, nn.Module):
     """One single-stream block, holding no modulation of its own: the
     model's shared projection hands every block the same scales and gates."""
 
@@ -133,13 +133,13 @@ class _Block(nn.Module):
     @nn.nowrap
     def _attention(self, image: int = 0):
         return _Attention(self.heads, self.head_dim, bias=False, epsilon=self.eps, image_tokens=image,
-                          dtype=self.dtype, precision=self.precision,
+                          dtype=self.dtype, precision=self.products,
                           attention_impl=self.attention_impl, name="attn")
 
     @nn.nowrap
     def _feed_forward(self):
         return GatedMLP(self.features * self.mlp_ratio, self.features, dtype=self.dtype,
-                        precision=self.precision, name="img_mlp")
+                        precision=self.products, name="img_mlp")
 
     @nn.nowrap
     def multisequence_flops(self, lengths, context_lengths) -> float:
@@ -173,7 +173,7 @@ class _Block(nn.Module):
                ("modulation",): (None, "embed"), ("norm_out_linear",): (None, "embed"),
                ("txt_in", "in_layer"): (None, "embed"), ("txt_in", "out_layer"): (None, "embed"),
                **embedding_axes("timestep_embedder")})
-class QwenImageTransformer(nn.Module):
+class QwenImageTransformer(Float32Products, nn.Module):
     """Runs `QwenImage21Transformer2DModel` behind Dew's model interface.
 
     `__call__` takes NHWC latents with one token per position, the model time
@@ -250,7 +250,7 @@ class QwenImageTransformer(nn.Module):
         bias-free linears with a SiLU between."""
         sinusoids = sinusoidal_time(time, TIME_FEATURES, dtype=at_least_fp32(self.dtype))
         return embedding(sinusoids.astype(self.dtype or jnp.float32), self.features, "timestep_embedder",
-                         bias=False, dtype=self.dtype, precision=self.precision)
+                         bias=False, dtype=self.dtype, precision=self.products)
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
@@ -269,9 +269,9 @@ class QwenImageTransformer(nn.Module):
                  else jnp.broadcast_to(jnp.asarray(conditioning.mask, bool), (batch, text)))
         lengths = jnp.sum(valid, axis=1, dtype=jnp.int32)
         maps = self.projections(x.shape[-1])
-        image = _dense(maps['img_in'][1], "img_in", self.dtype, self.precision)(
+        image = _dense(maps['img_in'][1], "img_in", self.dtype, self.products)(
             x.reshape(batch, image_tokens, x.shape[-1]))
-        context = _TextIn(self.features, self.eps, dtype=self.dtype, precision=self.precision,
+        context = _TextIn(self.features, self.eps, dtype=self.dtype, precision=self.products,
                           name="txt_in")(conditioning.context)
         joint = jnp.concatenate([image, context.astype(image.dtype)], axis=1)
 
@@ -281,7 +281,7 @@ class QwenImageTransformer(nn.Module):
         times = jnp.broadcast_to(jnp.asarray(time, wide).reshape(-1), (batch,))
         embedded = self._time(jnp.concatenate([times, jnp.zeros((1,), wide)]))
         embedded, zero = embedded[:batch], embedded[batch:]
-        projected = _dense(maps['modulation'][1], "modulation", self.dtype, self.precision)(
+        projected = _dense(maps['modulation'][1], "modulation", self.dtype, self.products)(
             nn.silu(jnp.concatenate([embedded, zero])))
         sampled = jnp.split(projected[:batch], 4, axis=-1)
         still = jnp.split(projected[batch:], 4, axis=-1) if self.causal_condition else sampled
@@ -292,21 +292,21 @@ class QwenImageTransformer(nn.Module):
         for index in range(self.num_layers):
             joint = _Block(
                 self.features, self.heads, self.head_dim, self.mlp_ratio, self.eps,
-                dtype=self.dtype, precision=self.precision, attention_impl=self.attention_impl,
+                dtype=self.dtype, precision=self.products, attention_impl=self.attention_impl,
                 name=f"transformer_blocks_{index}")(joint, modulation, rotation, lengths,
                                                      image_tokens)
 
         # Only the image's rows leave; the text's final norm and projection
         # are rows the source computes and its pipeline drops.
         image = joint[:, :image_tokens]
-        scale = _dense(maps['norm_out_linear'][1], "norm_out_linear", self.dtype, self.precision)(
+        scale = _dense(maps['norm_out_linear'][1], "norm_out_linear", self.dtype, self.products)(
             nn.silu(embedded))
         image = _scaled(layer_norm(self.dtype, self.eps)(image), scale[:, None])
-        output = _dense(maps['proj_out'][1], "proj_out", self.dtype, self.precision)(image)
+        output = _dense(maps['proj_out'][1], "proj_out", self.dtype, self.products)(image)
         return output.reshape(batch, rows, columns, self.out_channels)
 
 
-class _TextIn(nn.Module):
+class _TextIn(Float32Products, nn.Module):
     """`QwenImage21TextProjection`: a zero-centred RMS norm, then two
     bias-free linears with a tanh GELU between."""
 
@@ -322,8 +322,8 @@ class _TextIn(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = RMSNorm(epsilon=self.eps, scale_offset=True, dtype=self.dtype, name="text_norm")(x)
-        x = nn.gelu(_dense(self.features, "in_layer", self.dtype, self.precision)(x), approximate=True)
-        return _dense(self.features, "out_layer", self.dtype, self.precision)(x)
+        x = nn.gelu(_dense(self.features, "in_layer", self.dtype, self.products)(x), approximate=True)
+        return _dense(self.features, "out_layer", self.dtype, self.products)(x)
 
 
 __all__ = ["QwenImageTransformer"]
