@@ -465,12 +465,13 @@ def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
 
     The reduction runs in fp32 and the inverse deviation is cast back
     before it multiplies, which is what `DeepseekV4UnweightedRMSNorm`
-    (modeling_deepseek_v4.py:66-72) and its GLM twin do. The fused RMSNorm
-    rounds the normalized activation instead, so this variant refuses it
-    through the kernel table and retains XLA's input-dtype product and VJP.
+    (modeling_deepseek_v4.py:66-72) and its GLM twin do; the fused RMSNorm
+    takes it where the target's row names it, rounding the inverse as they do
+    (`norm_swiglu.rms_norm`'s `inverse_rounded`).
     """
-    norm_swiglu.rms_kernel(implementation, x, None, x.dtype, fp32_statistics=True,
-                           inverse_after_cast=True)
+    if norm_swiglu.rms_kernel(implementation, x, None, x.dtype, fp32_statistics=True) == 'pallas':
+        return norm_swiglu.rms_norm(x, None, eps, x.dtype, offset=False, after_cast=False,
+                                    inverse_rounded=True)
     fp32 = x.astype(at_least_fp32(x.dtype))
     inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
     return x * inverse.astype(x.dtype)

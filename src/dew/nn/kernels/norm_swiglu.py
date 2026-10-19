@@ -268,14 +268,13 @@ def _norm_refusal(x, scale, dtype, axes, operands) -> str | None:
 
 
 def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
-                inverse_after_cast: bool = False, branch=None, axes=None, activated: bool = False) -> str:
+                branch=None, axes=None, activated: bool = False) -> str:
     """Resolve RMSNorm without changing its arithmetic or collecting a split
     feature axis. Float64 and input-dtype statistics belong to XLA, and so
     do a residual `branch` the stream's own add would broadcast or cast and
     an activation after the norm. `axes`, `x`'s logical axes, places the
     kernel on a mesh (`_placed`)."""
     return _selected('rms_norm', implementation, first_refusal(
-        (not inverse_after_cast, "unweighted_rmsnorm rounds the inverse, not the normalized activation"),
         (not activated, "the norm is followed by an activation, which the kernel does not apply"),
         (fp32_statistics, "input-dtype statistics round each reduction step; the kernel reduces in fp32"),
     ) or _norm_refusal(x, scale, dtype, axes, (branch,)))
@@ -353,7 +352,8 @@ def _activated(gate, activation: str) -> tuple[jax.Array, jax.Array]:
 
 
 def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inverse_ref, *, row_block: int,
-                 epsilon: float, offset: bool, stored, after_cast: bool, activation: str, interpret: bool):
+                 epsilon: float, offset: bool, stored, after_cast: bool, inverse_rounded: bool,
+                 activation: str, interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
     row = pl.program_id(0) * row_block + jnp.arange(row_block)
@@ -367,7 +367,7 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inve
         plgpu.store(stream_ref.at[at], x.astype(stream_ref.dtype), mask=mask)
     # XLA's mean multiplies by the fp32 reciprocal, not an fp32 division.
     inverse = jax.lax.rsqrt(jnp.sum(x * x, axis=1) * (1.0 / width) + epsilon)
-    y = x * inverse[:, None]
+    y = x * _rounded_inverse(inverse, inverse_rounded, y_ref.dtype, interpret)[:, None]
     if scale_ref is not None:
         if after_cast:
             y = _round(y, y_ref.dtype, interpret)
@@ -377,6 +377,12 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inve
         y = y * _activated(plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32), activation)[0]
     plgpu.store(y_ref.at[at], y.astype(y_ref.dtype), mask=mask)
     plgpu.store(inverse_ref.at[row], inverse, mask=row < rows)
+
+
+def _rounded_inverse(inverse, rounded: bool, dtype, interpret: bool):
+    """The fp32 inverse RMS a row multiplies by: rounded to `dtype` first where the model rounds it
+    (`dew.nn.attention.unweighted_rmsnorm`), whose product with the input then rounds once."""
+    return _round(inverse, dtype, interpret) if rounded else inverse
 
 
 def _pairwise(values, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
@@ -391,8 +397,8 @@ def _pairwise(values, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
 
 
 def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, dx_ref, dgate_ref, partial_ref,
-                  correction_ref, *, row_block: int, offset: bool, stored, after_cast: bool, activation: str,
-                  interpret: bool):
+                  correction_ref, *, row_block: int, offset: bool, stored, after_cast: bool,
+                  inverse_rounded: bool, activation: str, interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
     groups = pl.num_programs(0)
@@ -414,7 +420,9 @@ def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, d
         dy = streamed(dy_ref).astype(jnp.float32)
         ds = None if stream_ref is None else streamed(stream_ref)
         inverse = plgpu.load(inverse_ref.at[row], mask=row < rows, other=0)
-        normalized = x * inverse[:, None]
+        # The rounded inverse multiplies the input; the rounding passes its cotangent on unchanged.
+        multiplier = _rounded_inverse(inverse, inverse_rounded, dy_ref.dtype, interpret)
+        normalized = x * multiplier[:, None]
         if after_cast:
             normalized = _round(normalized, dy_ref.dtype, interpret)
         if gate_ref is not None:
@@ -427,7 +435,7 @@ def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, d
         m = dy * weight
         # The two x contributions are kept separate, as XLA's square VJP is.
         correction = (-0.5 * jnp.sum(m * x, axis=1)) * (inverse * inverse * inverse) * (1.0 / width)
-        dx = m * inverse[:, None] + (2.0 * x) * correction[:, None]
+        dx = m * multiplier[:, None] + (2.0 * x) * correction[:, None]
         if ds is not None:
             # The stream's own cotangent joins in fp32, one rounding for the sum.
             dx = dx + ds.astype(jnp.float32)
@@ -470,6 +478,7 @@ class _Norm(NamedTuple):
     after_cast: bool
     activation: str
     interpret: bool
+    inverse_rounded: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -483,12 +492,12 @@ class RmsForward(tuning.KernelOp):
 
     def _fwd(self, x: jax.Array, branch: jax.Array | None, scale: jax.Array | None, gate: jax.Array | None, *,
              epsilon: float, dtype: str, offset: bool, stored: str, after_cast: bool, activation: str,
-             interpret: bool, config: RowsConfig, return_residuals: bool = False):
+             interpret: bool, inverse_rounded: bool, config: RowsConfig, return_residuals: bool = False):
         rows, width = x.shape
         return pl.pallas_call(
             functools.partial(_rms_forward, row_block=config.rows, epsilon=epsilon, offset=offset,
-                              stored=jnp.dtype(stored), after_cast=after_cast, activation=activation,
-                              interpret=interpret),
+                              stored=jnp.dtype(stored), after_cast=after_cast,
+                              inverse_rounded=inverse_rounded, activation=activation, interpret=interpret),
             grid=(pl.cdiv(rows, config.rows),),
             out_shape=(jax.ShapeDtypeStruct((rows, width), jnp.dtype(dtype)),
                        None if branch is None else jax.ShapeDtypeStruct((rows, width), x.dtype),
@@ -517,13 +526,15 @@ class RmsBackward(tuning.KernelOp):
 
     def _fwd(self, x: jax.Array, scale: jax.Array | None, gate: jax.Array | None, inverse: jax.Array,
              dy: jax.Array, ds: jax.Array | None, *, offset: bool, stored: str, after_cast: bool,
-             activation: str, interpret: bool, config: ReverseConfig, return_residuals: bool = False):
+             inverse_rounded: bool, activation: str, interpret: bool, config: ReverseConfig,
+             return_residuals: bool = False):
         rows, width = x.shape
         groups = max(1, min(config.programs, pl.cdiv(rows, config.rows)))
         partial = None if scale is None else jax.ShapeDtypeStruct((groups, width), jnp.float32)
         return pl.pallas_call(
             functools.partial(_rms_backward, row_block=config.rows, offset=offset, stored=jnp.dtype(stored),
-                              after_cast=after_cast, activation=activation, interpret=interpret),
+                              after_cast=after_cast, inverse_rounded=inverse_rounded, activation=activation,
+                              interpret=interpret),
             grid=(groups,),
             out_shape=(jax.ShapeDtypeStruct((rows, width), x.dtype),
                        None if gate is None else jax.ShapeDtypeStruct((rows, width), gate.dtype),
@@ -566,7 +577,8 @@ def _rms_backward_call(stream, scale, gate, inverse, dy, ds, norm: _Norm):
         return (zeros[0] if ds is None else ds), zeros[1], zeros[2]
     dx, dgate, partial, correction = _RMS_BACKWARD(
         _flat(stream), scale, _flat(gate), inverse, _flat(dy), _flat(ds), offset=norm.offset,
-        stored=norm.stored, after_cast=norm.after_cast, activation=norm.activation, interpret=norm.interpret)
+        stored=norm.stored, after_cast=norm.after_cast, inverse_rounded=norm.inverse_rounded,
+        activation=norm.activation, interpret=norm.interpret)
     dscale = None if scale is None else _scale_sum(partial, correction)
     return dx.reshape(stream.shape), None if gate is None else dgate.reshape(gate.shape), dscale
 
@@ -652,7 +664,8 @@ def _widened(scale):
     return None if scale is None else scale.astype(at_least_fp32(scale.dtype))
 
 
-def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after_cast: bool, *, axes=None):
+def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after_cast: bool, *, axes=None,
+                    inverse_rounded: bool = False):
     """The pre-norm seam fused: `(stream, y)`, the stream `x + branch` (or
     `x` itself for a None branch) and its RMSNorm. The forward reads both
     addends once and writes the sum beside the norm; the reverse takes the
@@ -660,8 +673,9 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
     gradients is never a separate pass over the stream. An unused stream
     output costs nothing in reverse. It interprets where no Triton GPU runs
     it (`generation.triton_runs`), as the CPU suite does, and lowers for the
-    assumed GPU within `generation.assumed`, as the GDN kernels decide."""
-    norm = _norm(epsilon, dtype, offset, after_cast, scale)
+    assumed GPU within `generation.assumed`, as the GDN kernels decide. With `inverse_rounded`
+    the inverse RMS rounds to `dtype` before it multiplies, as `unweighted_rmsnorm` rounds it."""
+    norm = _norm(epsilon, dtype, offset, after_cast, scale)._replace(inverse_rounded=inverse_rounded)
 
     def local(x, branch, scale):
         if branch is None:
@@ -671,9 +685,11 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
     return _per_shard(local, axes, (x, branch, _widened(scale)), (False, False, True))
 
 
-def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, *, axes=None):
+def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, *, axes=None,
+             inverse_rounded: bool = False):
     """The fused RMSNorm and its VJP alone: `stream_rms_norm`'s norm."""
-    return stream_rms_norm(x, None, scale, epsilon, dtype, offset, after_cast, axes=axes)[1]
+    return stream_rms_norm(x, None, scale, epsilon, dtype, offset, after_cast, axes=axes,
+                           inverse_rounded=inverse_rounded)[1]
 
 
 def gated_rms_norm(x, gate, scale, epsilon: float, dtype, activation: str, *, axes=None):
