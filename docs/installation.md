@@ -1,6 +1,10 @@
 # Installation
 
-Dew's package name is `dewml` and its import name is `dew`. It needs Python 3.12 or newer; CI tests Python 3.12 and 3.14.
+Dew's package name is `dewml` and its import name is `dew`. CI tests Python 3.12 and 3.14.
+
+<!-- BEGIN least Python (site/scripts/gen_install.py) -->
+Dew needs Python 3.12 or newer.
+<!-- END least Python -->
 
 ## The install script
 

@@ -1444,7 +1444,13 @@ The [recipe guide](https://github.com/AshishKumar4/dew/blob/main/docs/recipes.md
 curl -LsSf https://dewml.dev/install.sh | sh
 ```
 
-The script finds the hardware and the build it runs (an NVIDIA GPU and the CUDA version its driver supports, a TPU VM, or the CPU), asks where to install, installs [uv](https://docs.astral.sh/uv/) if it is missing, and installs Dew there. Dew requires Python 3.12 or later; I recommend 3.14, and CI tests both. To install it yourself, choose the extra for your hardware; each installs the accelerator build of the JAX version Dew requires:
+The script finds the hardware and the build it runs (an NVIDIA GPU and the CUDA version its driver supports, a TPU VM, or the CPU), asks where to install, installs [uv](https://docs.astral.sh/uv/) if it is missing, and installs Dew there.
+
+<!-- BEGIN least Python (site/scripts/gen_install.py) -->
+Dew needs Python 3.12 or newer.
+<!-- END least Python -->
+
+I recommend 3.14, and CI tests both. To install it yourself, choose the extra for your hardware; each installs the accelerator build of the JAX version Dew requires:
 
 | Hardware | uv | pip |
 |---|---|---|

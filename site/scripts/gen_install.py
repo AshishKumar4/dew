@@ -1,6 +1,7 @@
 """Generate the install facts other files repeat from their owners: the CUDA builds' minima
 (dew.telemetry.devices.CUDA_BUILDS) and Dew's least Python (pyproject.toml's requires-python),
-into the standalone installer and docs/installation.md's table."""
+into the standalone installer, docs/installation.md's table and the least Python the README and
+docs/installation.md state."""
 
 import argparse
 import ast
@@ -11,6 +12,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 SHELL = ("# BEGIN install facts (site/scripts/gen_install.py)", "# END install facts")
 TABLE = ("<!-- BEGIN CUDA builds (site/scripts/gen_install.py) -->", "<!-- END CUDA builds -->")
+LEAST = ("<!-- BEGIN least Python (site/scripts/gen_install.py) -->", "<!-- END least Python -->")
 
 
 def facts() -> tuple[list[tuple[str, int, tuple[int, int]]], str]:
@@ -44,11 +46,14 @@ def main() -> None:
     for build, driver, (major, minor) in builds:
         shell.extend((f"{build}_driver={driver}", f"{build}_sm={major}.{minor}"))
         table.append(f"| `{build}` | {driver} or later | {major}.{minor} or later |")
+    least = [f"Dew needs Python {python} or newer."]
     stale = []
-    for path, markers, lines in ((REPO / "site/public/install.sh", SHELL, shell),
-                                 (REPO / "docs/installation.md", TABLE, table)):
-        original = path.read_text()
-        generated = between(original, markers, lines)
+    for path, blocks in ((REPO / "site/public/install.sh", ((SHELL, shell),)),
+                         (REPO / "docs/installation.md", ((TABLE, table), (LEAST, least))),
+                         (REPO / "README.md", ((LEAST, least),))):
+        original = generated = path.read_text()
+        for markers, lines in blocks:
+            generated = between(generated, markers, lines)
         if generated != original:
             stale.append(str(path.relative_to(REPO)))
             if not args.check:
