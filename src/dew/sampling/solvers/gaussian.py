@@ -98,12 +98,16 @@ class DDIM:
             return alpha_s * denoised + direction * eps + sigma_tilde * noise, state
         return alpha_s * denoised + sigma_s * eps, state
 
-def _pndm_step(x, eps, rates_t, rates_s):
+def _pndm_step(x, eps, variances_t, variances_s):
     """PNDM's transfer (Liu et al. 2022, eq. 9), DDIM from t to s in the
-    rationalized form Diffusers' `_get_prev_sample` evaluates."""
-    (alpha_t, sigma_t), (alpha_s, sigma_s) = rates_t, rates_s
-    denominator = alpha_t ** 2 * sigma_s + alpha_t * sigma_t * alpha_s
-    return (alpha_s / alpha_t) * x - (alpha_s ** 2 - alpha_t ** 2) * eps / denominator
+    rationalized form Diffusers' `_get_prev_sample` evaluates, in its order,
+    from the squared rates (`Process.variances`): the transfer reads their
+    difference, which a beta table's cumulative products give more exactly
+    than the squares of their rounded roots."""
+    (alpha2_t, sigma2_t), (alpha2_s, sigma2_s) = variances_t, variances_s
+    sample_coeff = (alpha2_s / alpha2_t) ** 0.5
+    denominator = alpha2_t * sigma2_s ** 0.5 + (alpha2_t * sigma2_t * alpha2_s) ** 0.5
+    return sample_coeff * x - (alpha2_s - alpha2_t) * eps / denominator
 
 
 @struct.dataclass
@@ -139,10 +143,10 @@ class PNDM:
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         schedule = process.sampler_schedule
-        rates_t = process.rates(t, like=x)
-        rates_s = process.rates(t_next, like=x)
+        rates_t = process.variances(t, like=x)
+        rates_s = process.variances(t_next, like=x)
         interval = schedule.step_interval(t, t_next)
-        rates_step = process.rates(t - interval, like=x)
+        rates_step = process.variances(t - interval, like=x)
         outputs, count = state
         outputs = _push(outputs, eps)
         e0, e1, e2, e3 = outputs[-1], outputs[-2], outputs[-3], outputs[-4]
@@ -153,8 +157,8 @@ class PNDM:
             # schedule rounds its interval (Diffusers' integer stride // 2).
             half = schedule.half_interval(t, t_next)
             t_low, t_eval = t - half, t_next + half
-            rates_low = process.rates(t_low, like=x)
-            rates_eval = process.rates(t_eval, like=x)
+            rates_low = process.variances(t_low, like=x)
+            rates_eval = process.variances(t_eval, like=x)
             k2 = denoise(_pndm_step(x, eps, rates_t, rates_low), t_eval)[1]
             k3 = denoise(_pndm_step(x, k2, rates_t, rates_eval), t_eval)[1]
             k4 = denoise(_pndm_step(x, k3, rates_t, rates_s), t_next)[1]
@@ -162,7 +166,7 @@ class PNDM:
 
         def predictor_corrector(_):
             eps_next = denoise(_pndm_step(x, eps, rates_t, rates_step), t_next)[1]
-            correction_source = process.rates(t_next + interval, like=x)
+            correction_source = process.variances(t_next + interval, like=x)
             return _pndm_step(x, (eps_next + eps) / 2, correction_source, rates_s)
 
         def adams(k: int):

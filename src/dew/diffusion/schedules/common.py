@@ -74,6 +74,14 @@ class NoiseScheduler(ABC):
         """Return half a grid interval, where a Runge-Kutta stage places its intermediate points."""
         return (times(t) - times(t_next)) / 2
 
+    def variances(self, t) -> tuple[jax.Array, jax.Array]:
+        """Return `(alpha^2, sigma^2)` at `t`, shaped like `t`: the rates squared, unless the
+        schedule holds the squares themselves, as a beta table's cumulative products are, whose
+        differences a transfer between two of them reads more exactly than the squares of its
+        rounded roots (`DiscreteNoiseScheduler`)."""
+        alpha, sigma = self.rates(t)
+        return alpha ** 2, sigma ** 2
+
     def snr(self, t) -> jax.Array:
         alpha, sigma = self.rates(t)
         return (alpha / sigma) ** 2
