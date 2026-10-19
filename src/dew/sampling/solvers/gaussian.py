@@ -9,8 +9,6 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
-from dew.diffusion.schedules import divided
-
 from .common import _check_endpoint_domain, _push
 
 
@@ -111,7 +109,7 @@ def _pndm_step(x, eps, variances_t, variances_s):
     (alpha2_t, sigma2_t), (alpha2_s, sigma2_s) = variances_t, variances_s
     sample_coeff = (alpha2_s / alpha2_t) ** 0.5
     denominator = alpha2_t * sigma2_s ** 0.5 + (alpha2_t * sigma2_t) ** 0.5 * alpha2_s ** 0.5
-    return sample_coeff * x - divided((alpha2_s - alpha2_t) * eps, denominator)
+    return sample_coeff * x - (alpha2_s - alpha2_t) * eps / denominator
 
 
 @struct.dataclass

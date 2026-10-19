@@ -10,8 +10,6 @@ import numpy as np
 from flax import struct
 from jax import lax
 
-from dew.diffusion.schedules import divided
-
 from .common import (
     Multistep,
     _check_endpoint_domain,
@@ -418,7 +416,7 @@ class DEIS:
         def second(_):
             coef1 = _deis_second(rho_t, rho_s0, rho_s1) - _deis_second(rho_s0, rho_s0, rho_s1)
             coef2 = _deis_second(rho_t, rho_s1, rho_s0) - _deis_second(rho_s0, rho_s1, rho_s0)
-            return alpha_t * (divided(x, alpha_s0) + coef1 * m0 + coef2 * m1)
+            return alpha_t * (x / alpha_s0 + coef1 * m0 + coef2 * m1)
 
         def third(_):
             rho_s2, m2 = rhos[-3], history.outputs[-3]
@@ -428,7 +426,7 @@ class DEIS:
                      - _deis_third(rho_s0, rho_s1, rho_s2, rho_s0))
             coef3 = (_deis_third(rho_t, rho_s2, rho_s0, rho_s1)
                      - _deis_third(rho_s0, rho_s2, rho_s0, rho_s1))
-            return alpha_t * (divided(x, alpha_s0) + coef1 * m0 + coef2 * m1 + coef3 * m2)
+            return alpha_t * (x / alpha_s0 + coef1 * m0 + coef2 * m1 + coef3 * m2)
 
         order = _tapered_order(self.order, history.taken, history.steps, self.lower_order_final,
                                euler_at_final=False)
