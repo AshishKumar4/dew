@@ -29,6 +29,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from affine_run import Replaying
 from interop_support import extract_fixture, hub_cache
 from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
@@ -767,7 +768,10 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
             return Ratio(jnp.sum(outputs.astype(jnp.float32) ** 2), jnp.asarray(outputs.size, jnp.float32))
 
     def data():
-        return Loader(train=lambda partition: iter([{"x": inputs}] * 4), val=None, records=rows, batch=rows)
+        # A stream that keeps its position, so a resume continues where the checkpoint left it;
+        # each step's batch is its own, so a resume that restarted the data would diverge.
+        return Loader(train=lambda partition: Replaying(lambda step: {"x": inputs * (1 + step)}), val=None,
+                      records=rows, batch=rows)
 
     def trainer(objective, directory):
         return Trainer(objective, optax.adam(1e-2), key=jax.random.key(3), mesh=MeshSpec(),
