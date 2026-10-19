@@ -9,6 +9,7 @@ trainer has just written.
 
 import dataclasses
 import json
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -22,7 +23,7 @@ from steady_state import steady_state
 import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
-from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, TrainerConfig
 from dew.config.data import ImageData as ImageRecipe, VideoData
 from dew.data import ByteTokenizer
 from dew.data.dataset import Loader
@@ -33,7 +34,7 @@ from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG, DPMSolverSDE, Euler, Heun, TextToImage
 from dew.sampling.pipelines import Images
-from dew.training import Checkpoints, Trainer
+from dew.training import Checkpoints, LocalTracker, Trainer
 
 RES = 8
 MODEL = {"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1}
@@ -237,30 +238,77 @@ def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
 
 
 def test_build_eval_metrics_follows_the_sample_field(tmp_path):
-    """A video run scores its `VideoGrid` against its `video` field: the
-    factories read that grid there, and an image-only metric raises a
-    ValueError naming it in `build_eval_metrics`, before the trainer."""
+    """A video run scores its `VideoGrid` against its `video` field: a PSNR stating no field reads
+    that grid there, and an image-only metric raises a ValueError naming it in
+    `build_eval_metrics`, before the trainer."""
     video = dataclasses.replace(run_config(tmp_path),
                                 data=VideoData(source="clips", frame_size=8, frames=2),
-                                val_metrics=("psnr",))
+                                val_metrics=(MetricConfig("psnr"),))
     (metric,) = video.build_eval_metrics()
     images = np.zeros((2, 2, 8, 8, 3), np.uint8)
     assert np.isinf(metric.finalize(metric(VideoGrid(unit_range(images)), {"video": images})))
     with pytest.raises(ValueError):
-        dataclasses.replace(video, val_metrics=("clip",)).build_eval_metrics()
+        dataclasses.replace(video, val_metrics=(MetricConfig("clip"),)).build_eval_metrics()
 
 
-def test_a_diffusion_runs_default_metric_asks_for_validation_and_a_named_one_always(tmp_path):
-    """With no val_metrics named, an image run scores CLIP where its data validates and nothing where
-    it holds no validation split, and a video run nothing; a metric named is asked for either way,
-    so a run whose data holds no validation split refuses it (`Trainer.fit`)."""
-    images = run_config(tmp_path)
-    assert images.val_metrics is None
-    assert [type(metric).__name__ for metric in images.build_eval_metrics(validates=True)] == ["CLIPDistance"]
-    assert images.build_eval_metrics(validates=False) == []
-    video = dataclasses.replace(images, data=VideoData(source="clips", frame_size=8, frames=2))
-    assert video.build_eval_metrics(validates=True) == []
-    assert len(dataclasses.replace(video, val_metrics=("psnr",)).build_eval_metrics(validates=False)) == 1
+TINY_CLIP = str(Path(__file__).parent / "fixtures" / "clip" / "tiny")
+
+
+def validated_run(directory, *, validates: bool, **fields):
+    """Two steps of the tiny conditional DiT on a real tiny CLIP's text, `fields` replacing the run's
+    own, scored by the metrics the run builds for data that `validates` or does not, and validated at
+    its end on one held-out batch where it does: the scalars its tracker logged, and its last
+    checkpointed step."""
+    config = dataclasses.replace(run_config(directory, encoder="clip_text", checkpoint=TINY_CLIP), **fields)
+    objective = config.build()
+    encoder = objective.inputs.conditions["textcontext"].encoder
+    images = np.tile(np.linspace(0, 255, RES, dtype=np.float32)[None, :, None, None],
+                     (8, 1, RES, 3)).astype(np.uint8)
+    batch = {"image": images, "text": encoder.tokenize(["a", "b", "c", "d", "e", "f", "g", "h"])}
+    data = Loader(train=lambda partition: Replaying(lambda position: batch),
+                  val=(lambda partition: iter([batch])) if validates else None, records=None, batch=8)
+    checkpoints = Checkpoints(str(directory / "checkpoints"), keep=1)
+    with LocalTracker(directory / "tracking") as tracker:
+        trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0),
+                          checkpoints=checkpoints, tracker=tracker)
+        try:
+            trainer.fit(data, steps=2, log_every=100, checkpoint_every=2,
+                        metrics=config.build_eval_metrics(data.val is not None))
+        finally:
+            checkpoints.wait()
+    with LocalTracker(directory / "tracking") as journal:
+        return journal.scalars(), checkpoints.latest
+
+
+def test_an_image_run_validates_on_clip_by_default_with_the_model_its_metric_names(tmp_path, monkeypatch):
+    """An image run's default metric is CLIP's distance where its data validates: the run trains,
+    validates and logs `val/clip_similarity` from the CLIP its metric names, here the committed tiny
+    one, given on the command line (`MetricConfig("clip", {"modelname": ...})`, what the default
+    holds with the published model, which only a download reads). Data with no validation split
+    builds no default metric and trains."""
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    # Named as a command line names it: one JSON list of the metrics' records.
+    named = DiffusionRunConfig.cli(["--val-metrics", json.dumps([{"name": "clip",
+                                                                  "fields": {"modelname": TINY_CLIP}}])])
+    assert named.val_metrics == (MetricConfig("clip", {"modelname": TINY_CLIP}),)
+    scalars, _ = validated_run(tmp_path / "named", validates=True, val_metrics=named.val_metrics)
+    final = {name: value for step, values in scalars if step == 2 for name, value in values.items()}
+    assert 0.0 <= final["val/clip_similarity"] <= 2.0
+    assert run_config(tmp_path).build_eval_metrics(validates=True)[0].name == "clip_similarity"
+    scalars, latest = validated_run(tmp_path / "unvalidated", validates=False)
+    assert latest == 2 and not any(name.startswith("val/") for _, values in scalars for name in values)
+
+
+def test_a_metric_a_run_names_without_a_validation_split_refuses_before_an_update(tmp_path):
+    """A run that names a metric asks for it whatever its data holds, so data with no validation
+    split refuses the run in `Trainer.fit`, before its first update writes a checkpoint."""
+    named = (MetricConfig("psnr"),)
+    # The metric builds for data that does not validate; the run is what refuses it.
+    run = dataclasses.replace(run_config(tmp_path), val_metrics=named)
+    assert len(run.build_eval_metrics(validates=False)) == 1
+    with pytest.raises(ValueError):
+        validated_run(tmp_path, validates=False, val_metrics=named)
+    assert Checkpoints(str(tmp_path / "checkpoints"), keep=1).latest is None
 
 
 def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
