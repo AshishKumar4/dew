@@ -237,7 +237,10 @@ def test_a_step_from_coefficients_past_the_clip_is_the_step_from_the_clamped_one
             task = LMObjective(model, SEQ_LEN, head_chunks=1, variables=variables)
             batch = {"text": np.tile(np.arange(1, SEQ_LEN + 2, dtype=np.int32), (jax.device_count(), 1))}
         else:
-            task, batch = packed(lambda seq_len: GRPOObjective(model, seq_len, variables=variables))
+            task, rows = packed(lambda seq_len: GRPOObjective(model, seq_len, variables=variables))
+            # Every device takes a row: the packed rows repeat, as a loader cycles them.
+            every = np.arange(jax.device_count())
+            batch = jax.tree.map(lambda leaf: np.asarray(leaf)[every % len(leaf)], rows)
         trainer = Trainer(task, optax.sgd(0.1), key=jax.random.key(0))
         state, _, _ = trainer.place()
         state, *_ = trainer.compile(state, batch)(state, batch)
