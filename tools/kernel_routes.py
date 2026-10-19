@@ -11,7 +11,8 @@ A route is generic where `kernel != preferred`. One whose refusal code its kerne
 gap, named by its roadmap or ledger row; one whose code is `UNCLASSIFIED` comes from a site that gives its refusal as
 text alone; any other is undeclared. The markdown lists those three first.
 
-    python tools/kernel_routes.py trace --families qwen3,llama OUT.json    # one shard of families
+    python tools/kernel_routes.py trace --families qwen3,llama OUT.json    # named families
+    python tools/kernel_routes.py trace --shard 3/16 OUT.json              # every 16th from the 4th
     python tools/kernel_routes.py report OUT.json... docs/reference/kernel-routes.md
 """
 
@@ -161,6 +162,7 @@ def main(argv: list[str]) -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     trace = commands.add_parser("trace")
     trace.add_argument("--families", help="comma-separated model_types (default: every registered one)")
+    trace.add_argument("--shard", help="I/N: the registered families from the I-th, every N-th")
     trace.add_argument("output")
     merge = commands.add_parser("report")
     merge.add_argument("inputs", nargs="+")
@@ -168,6 +170,9 @@ def main(argv: list[str]) -> None:
     args = parser.parse_args(argv)
     if args.command == "trace":
         names = args.families.split(",") if args.families else families()
+        if args.shard:
+            index, count = map(int, args.shard.split("/"))
+            names = names[index::count]
         Path(args.output).write_text(json.dumps(list(cells(names)), indent=1) + "\n")
     else:
         records = [cell for path in args.inputs for cell in json.loads(Path(path).read_text())]
