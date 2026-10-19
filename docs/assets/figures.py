@@ -865,8 +865,10 @@ def jepa_step_figure():
     svg.appear(hidden, 0.6)
     with svg.group() as block:
         top_r, left_c = target[0]
-        svg.rect(ix + left_c * patch, iy + top_r * patch, 3 * patch, 3 * patch, fill="none", stroke="accent",
+        svg.rect(ix + left_c * patch, iy + top_r * patch, 3 * patch, 3 * patch, fill="surface", stroke="accent",
                  rx=2, width=2.5)
+        svg.text(ix + (left_c + 1.5) * patch, iy + (top_r + 1.5) * patch + 5, "?", size=16, weight=600,
+                 color="accent", anchor="middle")
     svg.appear(block, 1.2)
     svg.appear(svg.text(ix, iy + size + 20, "context, and a hidden block", size=12, color="muted"), 1.2)
 
@@ -891,18 +893,18 @@ def jepa_step_figure():
         svg.text(367, 314, "guess", size=12, color="accent", anchor="middle")
     svg.appear(predicted, 3.0)
     with svg.group() as targeted:
-        svg.arrow(ix + size + 6, iy + 30, 312, 64)
+        svg.arrow(ix + size + 6, iy + 24, 312, 58)
         box(314, 46, 106, "target encoder", "sees everything", "rule")
         svg.arrow(367, 94, 367, 110)
         chips(335, 116, "tint1")
         svg.text(367, 150, "target", size=12, color="muted", anchor="middle")
     svg.appear(targeted, 4.2)
     with svg.group() as loss:
-        svg.line(400, 135, 400, 287, color="accent", width=1.5, dash="4 4")
-        svg.text(408, 214, "loss", size=12, color="accent")
+        svg.polyline([(401, 122), (428, 122), (428, 286), (401, 286)], color="accent", width=1.5, dash="4 4")
+        svg.text(424, 190, "loss", size=12, color="accent", anchor="end")
     svg.appear(loss, 5.4)
     with svg.group() as average:
-        svg.polyline([(228, 210), (228, 176), (300, 176), (300, 70), (312, 70)], color="muted", width=1.25,
+        svg.polyline([(228, 210), (228, 176), (296, 176), (296, 84), (312, 84)], color="muted", width=1.25,
                      dash="2 4")
         svg.text(236, 168, "average of weights", size=11, color="muted")
     svg.appear(average, 6.4)
