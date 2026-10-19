@@ -574,7 +574,6 @@ def _voxceleb_tree(root, split="train", identities=("id00012", "id00015")):
 
 
 def test_local_videos_lists_every_file_under_the_directory(tmp_path):
-    pytest.importorskip("moviepy.config", reason="needs the av extra")
     clips = _voxceleb_tree(tmp_path)
     (tmp_path / "extra.webm").write_bytes(b"")
 
@@ -601,7 +600,6 @@ def test_a_video_recipe_reads_frames_and_the_sound_around_them_at_its_audio_mode
     side, at the rate the audio model's extractor reads: a 48 kHz model's record holds 1920 samples
     a frame where a 16 kHz one holds 640. The audio model featurizes the sound when a run encodes
     it, so the record holds the waveform."""
-    pytest.importorskip("moviepy.config", reason="needs the av extra")
     from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
 
     clips = _voxceleb_tree(tmp_path)
@@ -629,7 +627,6 @@ def test_a_video_recipe_reads_the_same_batches_at_any_worker_count_and_after_a_r
     """Clips whose frames and sound count up, so every drawn window shows: two workers give the
     batches the main process gives, and a reader resumed from a saved position continues with the
     batches an uninterrupted one reads, windows included."""
-    pytest.importorskip("moviepy.config", reason="needs the av extra")
     from test_data_av import _mux
     from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
 

@@ -581,7 +581,8 @@ def test_a_hugging_face_stream_resumes_exactly_and_its_own_shuffle_is_refused():
     opening at its own position; a stream that shuffles through Hugging Face's buffer, whose
     rows that state leaves out, is refused, also under a later map, and so is one with no name
     to tell it from another stream."""
-    datasets = pytest.importorskip("datasets")
+    import datasets
+
     stream = datasets.IterableDataset.from_generator(lambda: ({"i": i} for i in range(40)))
     source = from_hf(stream, name="counting@1")
     reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
@@ -623,7 +624,8 @@ def hf_file_rows(shards: list[str]):
 def test_hugging_face_stream_shares_are_disjoint_and_resume_exactly(shard_count, workers):
     """Physical shards and undersharded streams cover every record once across two shares,
     with independent openings and exact per-share resumes, also through real workers."""
-    datasets = pytest.importorskip("datasets")
+    import datasets
+
     stream = datasets.IterableDataset.from_generator(hf_rows, gen_kwargs={"shards": list(range(shard_count))})
     source = from_hf(stream, name=f"sharded-{shard_count}@1")
     chain = (source.map(lambda row: {**row, "twice": 2 * row["i"]}, identity="twice@1")
@@ -666,11 +668,12 @@ def test_hugging_face_stream_shares_are_disjoint_and_resume_exactly(shard_count,
 @pytest.mark.parametrize("shares", [1, 2])
 def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, shares):
     """A native-shard fill publishes; a row-wise node split refuses without reopening the store."""
+    import datasets
+
     from dew.data.cache import Cache
     from dew.data.plan import Manifest
     from dew.data.shards import streamed
 
-    datasets = pytest.importorskip("datasets")
     path = tmp_path / "records.jsonl"
     path.write_text("".join(json.dumps({"i": index}) + "\n" for index in range(12)))
     stream = datasets.IterableDataset.from_generator(hf_file_rows, gen_kwargs={"shards": [str(path)]})
