@@ -1078,13 +1078,7 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
     member, which this per-Linear binding cannot compute, so they are refused
     before returning a model with the wrong activation forward.
     """
-    from dew.training.quantization import (
-        INPUT_SCALES,
-        QUANTIZATION,
-        InputKind,
-        InputQuantization,
-        InputQuantizer,
-    )
+    from dew.quantization import INPUT_SCALES, QUANTIZATION, InputKind, InputQuantization, InputQuantizer
 
     codec = source_quantization(config)
     if codec is None or codec.input_scale_dtype is None:

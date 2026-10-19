@@ -781,7 +781,7 @@ def mode_fp8_sites(args) -> dict:
     import jax
 
     from dew import coordination
-    from dew.training.quantization import measured_fp8_sites
+    from dew.quantization import measured_fp8_sites
 
     full = {"params": {"wide": {"kernel": np.zeros((64, 96), np.float32)},
                        "narrow": {"kernel": np.zeros((32, 32), np.float32)}}}

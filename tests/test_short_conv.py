@@ -200,8 +200,8 @@ def test_a_gpu_runs_the_kernels_both_ways():
         return sum(jnp.sum(piece.astype(jnp.float32)) for piece in causal_conv1d(x, weights, parts=DELTA))
 
     def kernels(fn, *args):
-        text = str(jax.make_jaxpr(fn)(*args))
-        return {name for name in ("short_conv_forward", "short_conv_backward") if name in text}
+        return {str(equation.params["name"]) for equation in equations(jax.make_jaxpr(fn)(*args))
+                if equation.primitive.name == "pallas_call"}
 
     with generation.assumed("sm80"):
         assert kernels(jax.grad(loss), x) == {"short_conv_forward", "short_conv_backward"}
