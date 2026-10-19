@@ -11,6 +11,7 @@ scheduler file into the source's training process and its sampling policy
 
 from __future__ import annotations
 
+import functools
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
