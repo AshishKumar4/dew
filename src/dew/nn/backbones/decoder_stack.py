@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.core.scope import subtract_filters
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.objectives.base import merge
@@ -73,9 +74,8 @@ def _layer_written(tree, values, index):
 
 WRITTEN = ('cache', 'router', 'qk', INDEXER_COLLECTION)
 """The collections a decoder block writes: its decode cache, and what its
-router, its attention and its sparse indexer sow. A run whose parameters are
-fetched is applied in a scope of its own, so these are the names whose values
-the loop has to carry back out to the scope that asked for them."""
+router, its attention and its sparse indexer sow, which a looped pass keeps
+apart per pass (`PassView`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -247,11 +247,19 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     def read_only(run: DecoderBlock) -> list[str]:
         """List the collections a run reads and does not write.
 
-        These are its parameters and whatever else it was given, all of
-        which a bank holds per layer.
+        These are its parameters, which a forward never writes, and whatever
+        else the caller gave it and left immutable, all of which a bank holds
+        per layer.
         """
         return [name for name in run.variables
-                if name != 'streaming' and (not run.is_mutable_collection(name) or name not in WRITTEN)]
+                if name != 'streaming' and (name == 'params' or not run.is_mutable_collection(name))]
+
+    def held(run: DecoderBlock) -> dict:
+        """The values the caller holds in the collections it opened, but the
+        cache, which the loop carries apart: the run reads them as it writes
+        them, as a resident run does, one layer's slice at a time."""
+        return {name: tree for name, tree in run.variables.items()
+                if name not in ('params', 'streaming', 'cache') and run.is_mutable_collection(name)}
 
     def first_of(index: int, dependency):
         """Fetch run `index`'s first layer's read-only variables.
@@ -271,23 +279,26 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     for index, (run, (first, count)) in enumerate(zip(runs, groups, strict=True)):
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
         store = kv_store if count == 1 or specs[first].kv_shared else None
-        mutable = [name for name in WRITTEN if run.is_mutable_collection(name)]
+        # Applied in a scope of its own, a run writes exactly the collections
+        # its caller opened (DSpark's `prediction_inputs` among them), which a
+        # layer reads to choose what it records; the loop carries them back out.
+        opened = subtract_filters(run.scope.mutable, ('params', 'streaming'))
 
-        def layer(read, cache, hidden, per_layer_slice, *, run=run, mutable=mutable, store=store):
-            variables = dict(read) if cache is None else {**read, 'cache': cache}
+        def layer(read, state, cache, hidden, per_layer_slice, *, run=run, opened=opened, store=store):
+            variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
             hidden, changed = run.apply(
-                variables, hidden, mutable=mutable, train=train, decode=decode, kv_store=store,
+                variables, hidden, mutable=opened, train=train, decode=decode, kv_store=store,
                 per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
             return hidden, dict(changed)
 
-        cached = (run.variables.get('cache') or None) if 'cache' in mutable else None
+        cached = (run.variables.get('cache') or None) if run.is_mutable_collection('cache') else None
         if count == 1:
             following = first_of(index + 1, x)
-            x, changed = layer(staged, cached, x, None if inputs is None else inputs.layer(0))
+            x, changed = layer(staged, held(run), cached, x, None if inputs is None else inputs.layer(0))
         else:
             banks = {name: run.variables[name] for name in read_only(run)}
             x, changed, following = _prefetched_run(
-                banks, staged, cached, x, inputs, layer, count,
+                banks, staged, held(run), cached, x, inputs, layer, count,
                 following=functools.partial(first_of, index + 1),
                 reader=run.variables.get('streaming', {}).get('bank'))
         staged = following
@@ -297,22 +308,25 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     return x
 
 
-def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, following, reader=None):
+def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *, following, reader=None):
     """Run `count` layers under `jax.lax.scan`, read one layer at a time.
 
     `primed` is layer 0's read-only variables, already on the device. Iteration
     `i` issues layer `i + 1`'s copy, then computes layer `i`; the last layer is
     computed after the loop and `following` stages the next run's first layer in
-    place of its copy. The carry is the hidden state, the staged variables and
-    the cache, written in place one layer's slice per iteration so a decode step
-    holds one banked cache; a cache the layers create comes out stacked per
-    iteration, as flax's scan hands them out.
+    place of its copy. Each layer reads its slice of `state`, the caller's
+    opened collections, and their values come out stacked per iteration, as
+    flax's scan hands them out. The carry is the hidden state, the staged
+    variables and the cache, written in place one layer's slice per iteration
+    so a decode step holds one banked cache; a cache the layers create comes
+    out stacked like `state`.
     """
     def body(carry, index):
         hidden, current, held = carry
         staged = _fetched_layer(banks, index + 1) if reader is None else reader.fetch(index + 1, hidden)
         per_layer_slice = None if inputs is None else inputs.layer(index)
-        hidden, changed = layer(current, None if held is None else _layer_slice(held, index),
+        hidden, changed = layer(current, _layer_slice(state, index),
+                                None if held is None else _layer_slice(held, index),
                                 hidden, per_layer_slice)
         if held is not None:
             held = _layer_written(held, changed.pop('cache'), index)
@@ -321,7 +335,8 @@ def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, follo
     (x, current, cache), sown = jax.lax.scan(body, (x, primed, cache), jnp.arange(count - 1))
     last = count - 1
     staged = following(x)
-    x, changed = layer(current, None if cache is None else _layer_slice(cache, last), x,
+    x, changed = layer(current, _layer_slice(state, last),
+                       None if cache is None else _layer_slice(cache, last), x,
                        None if inputs is None else inputs.layer(last))
     if cache is not None:
         cache = _layer_written(cache, changed.pop('cache'), last)
