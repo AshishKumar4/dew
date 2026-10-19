@@ -240,7 +240,9 @@ def from_words(words: jax.Array, dtype: jnp.dtype) -> jax.Array:
     """The `dtype` elements `as_words` packed into `words`."""
     if words.dtype == jnp.dtype(dtype):
         return words
-    return jax.lax.bitcast_convert_type(words, dtype).reshape(*words.shape[:-1], -1)
+    unpacked = jax.lax.bitcast_convert_type(words, dtype)
+    # The last axis named, not inferred, so a leaf with no elements (a one-tap conv's history) keeps it.
+    return unpacked.reshape(*words.shape[:-1], words.shape[-1] * unpacked.shape[-1])
 
 
 def filled_slots(cursor: jax.Array, capacity: int) -> jax.Array:

@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import extract_fixture, fixture_arrays
+from interop_support import extract_fixture, fixture_arrays, scaled_gap as relative_gap
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, qwen_image_fields, qwen_image_path, read_transformer
@@ -45,11 +45,6 @@ def record(source):
 @pytest.fixture(scope="module")
 def arrays(source):
     return fixture_arrays(source / "qwen_image.npz")
-
-
-def relative_gap(actual, expected) -> float:
-    actual, expected = np.asarray(actual, np.float32), np.asarray(expected, np.float32)
-    return float(np.abs(actual - expected).max() / max(1.0, float(np.abs(expected).max())))
 
 
 def nhwc(packed: np.ndarray, rows: int, columns: int) -> np.ndarray:
@@ -213,24 +208,89 @@ def test_published_qwen_image_prompt_encoding_matches_the_source_pipeline(loaded
 
 
 def test_the_prompt_states_are_the_decoders_own_last_layer_output():
-    """The conditioner embeds through the decoder's own path, so a decoder
-    that scales its embeddings, by Gemma's sqrt(d) or a muP multiplier,
-    gives the conditioner the last layer's output of its own forward."""
-    from dew.inputs.diffusion import _residual_states
-    from dew.nn.backbones.causal_transformer import (
-        INTERMEDIATES,
-        CausalTransformer,
-        layer_output,
-        layer_outputs,
-    )
+    """The conditioner reads the decoder's layers through its own forward (`LayerStates`), so a
+    decoder that scales its embeddings, by Gemma's sqrt(d) or a muP multiplier, gives the
+    conditioner the last layer's output: the decoder's layers over its own scaled embeddings."""
+    from dew.inputs.diffusion import _layer_states
+    from dew.nn.backbones.causal_transformer import CausalTransformer
 
     model = CausalTransformer(vocab_size=37, emb_features=32, num_layers=2, num_heads=4, mlp_features=64,
                               max_seq_len=16, embedding_scale=True, embedding_multiplier=12.0)
     ids = jax.random.randint(jax.random.key(0), (2, 12), 0, 37)
     params = model.init(jax.random.key(1), ids)
-    _, state = model.apply(params, ids, capture_intermediates=layer_outputs, mutable=[INTERMEDIATES])
-    np.testing.assert_array_equal(model.apply(params, ids, method=_residual_states),
-                                  layer_output(state[INTERMEDIATES], 1))
+
+    def layers(decoder, ids):
+        embedded = decoder.scaled_embeddings(decoder.token_embeddings(ids))
+        return decoder.stack(embedded, train=False, decode=False, per_layer_input=None)
+
+    (last,) = _layer_states(model, params, ids, (-1,))
+    np.testing.assert_array_equal(last, model.apply(params, ids, method=layers))
+
+
+def test_a_looped_layer_is_read_at_its_last_pass():
+    """A layer a loop runs twice is read at its last pass, which the final norm reads: the looped
+    stack's last layer, normed, is the model's hidden states, and its first pass is not."""
+    from dew.inputs.diffusion import _layer_states
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_stack import Loop
+
+    model = CausalTransformer(vocab_size=37, emb_features=32, num_layers=2, num_heads=4, mlp_features=64,
+                              max_seq_len=16, loop=Loop(steps=2))
+    ids = jax.random.randint(jax.random.key(0), (2, 12), 0, 37)
+    params = model.init(jax.random.key(1), ids)
+    (last,) = _layer_states(model, params, ids, (-1,))
+    hidden = model.apply(params, ids, method="hidden_states")
+    normed = model.apply(params, last, method=lambda decoder, x: decoder.norm(x))
+    np.testing.assert_array_equal(normed, hidden)
+    _, kept = model.apply(params, ids, method="hidden_states", capture_intermediates=model.capture_layers,
+                          mutable=list(model.layer_collections))
+    first = kept["intermediates"]["layers_1"]["__call__"][0]
+    assert not np.array_equal(model.apply(params, first, method=lambda decoder, x: decoder.norm(x)), hidden)
+
+
+def test_a_hidden_states_conditioner_reads_a_looped_tower_at_its_last_pass():
+    """FLUX.2's and Z-Image's conditioning (`HiddenStatesConditioner`) reads its tower's last layer
+    as the forward left it: a layer a loop runs twice gives its last pass, which the final norm
+    turns into the tower's hidden states, not its first."""
+    from dew.inputs.diffusion import HiddenStatesConditioner
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_stack import Loop
+
+    model = CausalTransformer(vocab_size=37, emb_features=32, num_layers=2, num_heads=4, mlp_features=64,
+                              max_seq_len=16, loop=Loop(steps=2))
+    ids = jax.random.randint(jax.random.key(0), (2, 12), 0, 37)
+    params = model.init(jax.random.key(1), ids)
+    conditioner = HiddenStatesConditioner(model, None, params, "tower", template="qwen3", layers=(2,))
+    mask = np.ones(ids.shape, bool)
+    condition = conditioner.encode({"text_encoder": params}, {"input_ids": ids, "attention_mask": mask})
+    positions = jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape)
+    hidden = model.apply(params, ids, method="hidden_states", attention_mask=mask, positions=positions)
+    normed = model.apply(params, condition.context, method=lambda decoder, x: decoder.norm(x))
+    np.testing.assert_array_equal(normed, hidden)
+
+
+@pytest.mark.parametrize("copies", [None, 2])
+def test_every_layer_reads_as_the_layer_returned_it_with_or_without_residual_copies(copies):
+    """The last layer's state is the stack's own output and a middle one's the layer's own, each in
+    the layout the layer returned it: with AltUp's residual copies, all of them, before the model
+    collapses them for its final norm; the last layer's is what its capture kept too."""
+    from model_support import decoder
+
+    from dew.inputs.diffusion import _layer_states
+    from dew.nn.gemma3n import AltUp
+
+    # Two layers, so the first is read from its capture and the last from the stack's output.
+    model = decoder().clone(num_layers=2, **({} if copies is None else {"altup": AltUp(num_inputs=copies)}))
+    ids = jax.random.randint(jax.random.key(0), (2, 6), 0, model.vocab_size)
+    params = model.init(jax.random.key(1), ids)
+    first, last = _layer_states(model, params, ids, (0, -1))
+    _, kept = model.apply(params, ids, method="hidden_states", capture_intermediates=model.capture_layers,
+                          mutable=list(model.layer_collections))
+    captured = kept["intermediates"]
+    np.testing.assert_array_equal(first, captured["layers_0"]["__call__"][-1])
+    np.testing.assert_array_equal(last, captured[f"layers_{model.num_layers - 1}"]["__call__"][-1])
+    assert first.shape == last.shape == ((2, 6, model.emb_features) if copies is None
+                                         else (copies, 2, 6, model.emb_features))
 
 
 def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, arrays, record):

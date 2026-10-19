@@ -23,6 +23,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.kv_cache import KVCache
+from dew.nn.ngpt import NGPT
 from dew.nn.rope import LongRopeScaling, RopeScaling, YarnScaling
 
 
@@ -93,12 +94,21 @@ class MixerContext:
     partial_rotary_type: str = 'proportional'
     """Which convention the partial rotary follows, 'proportional' (Gemma 4)
     or 'default' (Qwen3.5); `dew.nn.rope.rotary_freqs` cites both."""
+    narrow_rotary_tables: bool = False
+    """Whether the rotary's cos and sin round to the activations' dtype before the rotation, which
+    stays fp32: vLLM's rotary casts its cos/sin cache to the query's dtype
+    (rotary_embedding/base.py, `_match_cos_sin_cache_dtype`) and its kernel rotates in fp32
+    (csrc/pos_encoding_kernels.cu, `apply_token_rotary_embedding`)."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
     force_fp32_for_softmax: bool = True
     kv_cache: KVCache = dataclasses.field(default_factory=KVCache)
     """The decode cache's storage layout (`dew.nn.kv_cache`)."""
+    ngpt: NGPT | None = None
+    """The normalized transformer's gains (`dew.nn.ngpt.NGPT`): the attention unit-norms each
+    rotated query and key head, scales the query by its learned gain, scales the output gate's
+    logits by theirs and unit-norms its gated output; None for none."""
     output_gate: bool = False
     """The attention's output gate (Qwen3.5's attn_output_gate), where the
     kind's projection doubles its query and a sigmoid of the second half
@@ -123,6 +133,8 @@ class MixerContext:
             "value_scale": self.value_scale is not None,
             "o_proj_bias": bool(self.o_proj_bias),
             "attention_dropout_rate": bool(self.attention_dropout_rate),
+            "narrow_rotary_tables": self.narrow_rotary_tables,
+            "ngpt": self.ngpt is not None,
         }
 
     def refuse(self, kind: str, asked: Mapping[str, object], why: str) -> None:
@@ -153,6 +165,10 @@ class MixerBase:
     builds marks for a remat policy to keep, or every name where None: a
     decoder skips a remat rung that keeps nothing more of its layers' names
     than the next (`CausalTransformer.recompute_more`)."""
+
+    keeps_cache = True
+    """Whether the mixer this kind builds keeps a decode cache, which a loop's
+    shared cache has every pass rewrite (`CausalTransformer.split_prefill_refusal`)."""
 
     mixed_step = False
     """Whether the mixer this kind builds runs a server's mixed call

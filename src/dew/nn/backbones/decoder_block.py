@@ -17,10 +17,13 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.records import JSON
 
+from ..activations import GatedActivation, gated_product
 from ..attention import LayerNorm, RMSNorm
 from ..attention_residuals import DepthAttention, ResidualSite, sources
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock
+from ..gemma4_moe import Gemma4Experts
+from ..gpt_oss import GptOssMLP
 from ..hyper_connections import (
     Carried,
     HyperConnection,
@@ -31,7 +34,8 @@ from ..hyper_connections import (
 )
 from ..inputs import LayerInputs, MixerCall, PredictionPhase
 from ..linear import recomputing
-from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, SparseMLP, gated_product
+from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
+from ..ngpt import NGPT, stepped
 from ..precision import scaled
 from ..protocols import ProjectionGroup, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
@@ -205,6 +209,12 @@ class Mixture:
                 "score function, scaling, groups, balancing bias, input scaling "
                 "or shared branch to set")
 
+    @property
+    def beside_dense(self) -> bool:
+        """Whether its routed feed-forward runs beside a layer's dense one, on the same residual,
+        rather than in its place: Gemma 4's parallel branch (`build`)."""
+        return self.parallel
+
     def generation_refusal(self) -> str | None:
         """Why a generation loop cannot run the layers this mixture builds, or None.
 
@@ -222,16 +232,44 @@ class Mixture:
                 "generate with the mixture's dispatch='global', the same layer")
 
     def build(self, *, out_features: int, hidden_features: int, activation: GatedActivation,
-              dense: Callable[..., nn.Module], norm: Callable[..., nn.Module] | None = None,
-              swiglu_limit: float | None = None, init_std: float | None = None,
-              output_init_std: float | None = None, dtype: Dtype | None = None,
-              precision: PrecisionLike = None) -> Callable[..., SparseMLP]:
-        """Build the routed feed-forward used by decoder blocks and independent MLP mixers."""
+              dense: Callable[..., nn.Module], norm_eps: float, scale_offset: bool = False,
+              scale_after_cast: bool = False, swiglu_limit: float | None = None,
+              init_std: float | None = None, output_init_std: float | None = None,
+              dtype: Dtype | None = None, precision: PrecisionLike = None) -> Callable[..., nn.Module]:
+        """Build the routed feed-forward of decoder blocks and independent MLP mixers: GPT OSS's
+        experts and router under 'swigluoai' (`GptOssMLP`), Gemma 4's branch beside the dense
+        feed-forward where `parallel` (`Gemma4Experts`, `beside_dense`), else `SparseMLP`. The
+        experts are `expert_features` wide, else `hidden_features`, the dense width. `norm_eps`,
+        `scale_offset` and `scale_after_cast` are the block's RMS norm, which a latent mixture's
+        output and Gemma 4's branch take."""
+        width = hidden_features if self.expert_features is None else self.expert_features
+        if activation == 'swigluoai':
+            # GPT OSS's experts and router are its own: a knob they do not read is refused.
+            plain = Mixture(experts=self.experts, top_k=self.top_k)
+            ignored = [name for name in ('score_function', 'norm_topk_prob', 'scaling', 'groups',
+                                         'groups_per_token', 'group_score', 'bias', 'scale_inputs',
+                                         'parallel', 'expert_features', 'shared_features', 'hash_layers',
+                                         'latent_features', 'latent_norm', 'media_bias')
+                       if getattr(self, name) != getattr(plain, name)]
+            ignored += ['swiglu_limit'] if swiglu_limit is not None else []
+            if ignored:
+                raise ValueError(f"swigluoai's experts take no {', '.join(ignored)}: GPT OSS routes with its "
+                                 f"own biased softmax and clamps at 7.0")
+            return functools.partial(
+                GptOssMLP, hidden_size=out_features, intermediate_size=width,
+                num_local_experts=self.experts, num_experts_per_tok=self.top_k,
+                implementation=self.implementation, dispatch=self.dispatch,
+                capacity_factor=self.capacity_factor, dtype=dtype, precision=precision)
         if self.parallel:
-            raise ValueError('a parallel mixture uses Gemma4Experts beside a dense feed-forward')
+            return functools.partial(
+                Gemma4Experts, num_experts=self.experts, top_k=self.top_k, hidden_features=width,
+                out_features=out_features, activation=activation, implementation=self.implementation,
+                dispatch=self.dispatch, capacity_factor=self.capacity_factor, norm_eps=norm_eps,
+                scale_offset=scale_offset, scale_after_cast=scale_after_cast, dtype=dtype,
+                precision=precision)
         return functools.partial(
             SparseMLP, num_experts=self.experts, top_k=self.top_k,
-            hidden_features=hidden_features if self.expert_features is None else self.expert_features,
+            hidden_features=width,
             out_features=out_features, activation=activation,
             implementation=self.implementation, dispatch=self.dispatch, capacity_factor=self.capacity_factor,
             score_function=self.score_function, normalize_weights=self.norm_topk_prob,
@@ -242,7 +280,9 @@ class Mixture:
             shared=None if not self.shared_features else functools.partial(
                 dense, hidden_features=self.shared_features),
             shared_gate=self.shared_gate, init_std=init_std, output_init_std=output_init_std,
-            latent_features=self.latent_features, latent_norm=norm if self.latent_norm else None,
+            latent_features=self.latent_features, latent_norm=functools.partial(
+                RMSNorm, epsilon=norm_eps, scale_offset=scale_offset, scale_after_cast=scale_after_cast,
+                dtype=dtype) if self.latent_norm else None,
             dtype=dtype, precision=precision)
 
 
@@ -253,8 +293,11 @@ class BlockWiring:
     `pre_norms` norms each sublayer's input and `output_norms` norms its
     output. The input norms alone give the plain pre-norm block, both give
     Gemma's sandwich block, and the output norms alone give OLMo 3's post-norm
-    block. The output norms are separate modules named for the sublayer
-    outputs, so the input norms keep their names, and a checkpoint without
+    block. `ngpt` gives the normalized transformer's block, which has neither:
+    each sublayer reads the unit residual and joins it by a learned step along
+    the sphere (`dew.nn.ngpt.stepped`), `attn_alpha` and `mlp_alpha` its rates.
+    The output norms are separate modules named for the sublayer outputs, so
+    the input norms keep their names, and a checkpoint without
     output norms loads with two fewer leaves per layer. `layer_scalar` selects
     the reference's frozen or trainable output scalar. One wiring applies to
     every layer, so it is not part of the per-layer specs that the scan
@@ -267,10 +310,15 @@ class BlockWiring:
     parallel_residual: bool = False
     shared_parallel_norm: bool = False
     layer_scalar: Literal["frozen", "trainable"] | None = None
+    ngpt: NGPT | None = None
 
     def __post_init__(self):
         if self.shared_parallel_norm and not self.parallel_residual:
             raise ValueError('shared_parallel_norm requires parallel_residual')
+        if self.ngpt is not None and (self.pre_norms or self.output_norms or self.parallel_residual
+                                      or self.layer_scalar is not None):
+            raise ValueError("an nGPT block normalizes its residual itself: it takes no pre- or output "
+                             "norms, parallel residual or layer scalar")
         if self.layer_scalar not in (None, "frozen", "trainable"):
             raise ValueError("layer_scalar must be None, frozen or trainable")
 
@@ -613,6 +661,8 @@ class DecoderBlock(nn.Module):
                 "routed one to sum with and no LAuReL residual to average")
         if self.parallel is not None:
             self.moe = self.parallel(name='moe')
+        if self.wiring.ngpt is not None:
+            self._ngpt_rates(self.wiring.ngpt)
         if self.wiring.layer_scalar == "frozen":
             self.output_scalar = self.variable("constants", "layer_scalar", jnp.ones, (1,), jnp.float32).value
         elif self.wiring.layer_scalar == "trainable":
@@ -879,8 +929,25 @@ class DecoderBlock(nn.Module):
                            state.finished + 1)
         return state, read, None
 
+    def _ngpt_rates(self, ngpt: NGPT):
+        """nGPT's per-feature step rates, one a sublayer, each stored from its initializer's scale
+        (`NGPT.start`), so the step starts at `alpha`."""
+        if (self.hyper_connections is not None or self.residual_site is not None or self.altup is not None
+                or self.laurel_rank is not None or self.per_layer_input_dim or self.parallel is not None):
+            raise ValueError("an nGPT block steps its one residual along the sphere: it takes no "
+                             "hyper-connections, depth mixture, altup, laurel, per-layer inputs or "
+                             "parallel branch")
+        start = nn.initializers.constant(ngpt.start)
+        self.attn_alpha = self.param('attn_alpha', start, (self.emb_features,), jnp.float32)
+        if self.feedforward is not None:
+            self.mlp_alpha = self.param('mlp_alpha', start, (self.emb_features,), jnp.float32)
+
     def _write(self, state: _BlockState, site: Literal["attention", "mlp"], output, mapping) -> _BlockState:
         """The state after the sublayer at `site` adds `output` to it."""
+        if isinstance(state, _Plain) and self.wiring.ngpt is not None:
+            alpha = self.attn_alpha if site == "attention" else self.mlp_alpha
+            stepped_x = stepped(state.x, output, alpha, self.wiring.ngpt.step)
+            return state._replace(x=constrain(stepped_x, RESIDUAL))
         if isinstance(state, _Plain):
             return state._replace(x=constrain(state.x + output, RESIDUAL))
         if isinstance(state, _Streams):

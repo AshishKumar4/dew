@@ -13,7 +13,7 @@ import re
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -324,7 +324,18 @@ def _unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | N
 
 @dataclasses.dataclass(frozen=True)
 class Plan:
-    """Order-defining fields checked before a restored iterator opens readers."""
+    """Order-defining fields checked before a restored iterator opens readers.
+
+    `version` names how Dew reads a plan into rows, which its fields do not say: a change that
+    makes other rows or draws from the same plan raises it, so a position saved before the change
+    is refused. Version 2 keys each random step by its place in what the run wrote
+    (`dew.data.lowering._Build.stage_seed`), runs a global order's stages after its batch by index
+    and resumes a count inside a batch past that batch's first rows, in the batches' final order.
+    Version 3 keys a mixture member's draws by the name it goes by, or an unnamed one's place among
+    the unnamed, rather than its place among all the members (`dew.data.lowering._member_key`), so
+    a named member joining or leaving leaves the others' draws as they were, and records those
+    names in the order (`dew.data.analysis._members`), so a position is refused where a member was
+    renamed, joined or left."""
 
     lowering: Literal["global", "per-share"]
     manifest: Manifest
@@ -334,7 +345,7 @@ class Plan:
     rejections: Literal["drop", "mask"] = "drop"
     cache: tuple[str, ...] = ()
     volatile: bool = False
-    version: int = 1
+    version: ClassVar[int] = 3
 
     def record(self) -> dict[str, JSON]:
         return {
@@ -379,15 +390,22 @@ class Plan:
         self, saved: Mapping[str, object], *, resume: Literal["exact", "non-exact"] = "exact"
     ) -> tuple[str, ...]:
         """Refuse a saved plan whose rows this plan does not make again: another
-        order, derived order fact, per-share topology or semantic manifest
-        (`Manifest.semantic`). A changed environment (`Manifest.environment`)
-        is returned and warned of, and refused for a per-share plan."""
+        version, order, derived order fact, per-share topology or semantic
+        manifest (`Manifest.semantic`). A changed environment
+        (`Manifest.environment`) is returned and warned of, and refused for a
+        per-share plan."""
         current = self.record()
+        if current["version"] != saved.get("version"):
+            raise ValueError(
+                f"the saved data position was written under data plan version {saved.get('version')!r}, "
+                f"and this Dew reads plans by version {current['version']!r}, which makes other rows or "
+                "draws from the same plan; resume with the Dew that wrote it"
+            )
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
             raise ValueError(
                 "data plan contains a step without stable identity; resume='non-exact' is required"
             )
-        for name in ("version", "lowering", "rejections", "cache", "volatile"):
+        for name in ("lowering", "rejections", "cache", "volatile"):
             if current[name] != saved.get(name):
                 raise ValueError(f"saved data plan {name} changed: {saved.get(name)!r} -> {current[name]!r}")
         # An order is the same wherever its sources are mounted (`same_order`).

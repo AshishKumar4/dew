@@ -225,7 +225,10 @@ def _compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     wide = values.astype(jnp.promote_types(values.dtype, jnp.float32))
     zero = jnp.zeros((), wide.dtype)
     hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), compensated_add, axes)
-    return (hi + lo).astype(values.dtype)
+    # A sum that reaches an infinity is the plain one, +-inf or NaN as `jnp.sum`'s is, where every
+    # residual past the infinity is inf - inf.
+    plain = jnp.sum(wide, axes)
+    return jnp.where(jnp.isfinite(plain), hi + lo, plain).astype(values.dtype)
 
 
 @_compensated_sum.defjvp
@@ -311,8 +314,11 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
     return dot_general
 
 
-def biased_logits(logits: jax.Array, bias: jax.Array | None) -> jax.Array:
-    """The vocabulary bias after the product's rounding, in fp32 or wider."""
+def scaled_logits(logits: jax.Array, scale: jax.Array | None, bias: jax.Array | None) -> jax.Array:
+    """A vocabulary head's per-column terms after its product's rounding, in fp32 or wider: each
+    column times its `scale` (nGPT's per-token logit gain), then plus its `bias`."""
+    if scale is not None:
+        logits = logits * jnp.asarray(scale, logits.dtype)
     return logits if bias is None else logits + jnp.asarray(bias, logits.dtype)
 
 
@@ -377,3 +383,11 @@ def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Out
 
     run.defvjp(forward, backward)
     return run
+
+
+def sqrt_or_zero(square):
+    """`sqrt(square)`, and zero with a zero gradient where `square` is zero:
+    sqrt's infinite derivative there would turn a masked row's zero upstream
+    gradient into NaN for every parameter it touches."""
+    positive = square > 0
+    return jnp.where(positive, jnp.sqrt(jnp.where(positive, square, 1.0)), 0.0)
