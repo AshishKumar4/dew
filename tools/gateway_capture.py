@@ -75,9 +75,11 @@ def engine(name: str, bin: Path) -> list[str]:
 
 
 @contextlib.contextmanager
-def served(name: str, bin: Path) -> Iterator[None]:
-    """The engine `name` started from `bin`, healthy and warm, stopped after."""
-    server = subprocess.Popen(engine(name, bin), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def served(name: str, bin: Path, out: Path) -> Iterator[None]:
+    """The engine `name` started from `bin`, healthy and warm, stopped after; its output goes to
+    `{name}_engine.log` in `out`."""
+    log = (out / f"{name}_engine.log").open("w")
+    server = subprocess.Popen(engine(name, bin), stdout=log, stderr=subprocess.STDOUT)
     try:
         deadline = time.monotonic() + 1200
         while not _answers(f"{ENGINE}/health"):
@@ -90,6 +92,7 @@ def served(name: str, bin: Path) -> Iterator[None]:
     finally:
         server.terminate()
         server.wait(60)
+        log.close()
 
 
 def compact(trace: dict) -> dict:
@@ -115,7 +118,7 @@ def capture_gateway(name: str, bin: Path, gateway_bin: Path, venvs: Path, out: P
     config.write_text(json.dumps({"host": "127.0.0.1", "port": 9090, "store_worker": "memory", "sync_traces": True,
                                   "health_check_interval": 60,
                                   "workers": [{"url": f"{ENGINE}/v1", "model_name": MODEL}]}))
-    with served(name, bin):
+    with served(name, bin, out):
         gateway = subprocess.Popen([str(gateway_bin / "rllm-model-gateway"), "--config", str(config)],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
@@ -201,7 +204,7 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
             server.close()
         return {"eos": eos, "seed": seed, "exchanges": list(proxy.exchanges), **outcome}
 
-    with served(name, bin):
+    with served(name, bin, out):
         try:
             # The first seed whose unstopped draw ends its answer on the model's EOS and goes on to a
             # token that is no EOS, which the third policy stops at.
