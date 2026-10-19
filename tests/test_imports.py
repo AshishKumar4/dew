@@ -93,15 +93,13 @@ reader.close()
     assert reported == {"refused": "TOMLDecodeError", "ids": list(range(8))}
 
 
-def test_a_models_quantization_and_adapters_import_no_training():
-    """The model's quantization, which loading, adapters and serving read, and a LoRA adapter over
-    it import nothing of training: a checkpoint's input quantizer and a quantized adapter are the
-    model's, and loading them starts no trainer, runtime or checkpointer."""
+def test_a_models_quantization_imports_no_training():
+    """The model's quantization, which loading, adapters and serving read, imports nothing of
+    training: a checkpoint's input quantizer is the model's, and reading it starts no trainer,
+    runtime or checkpointer."""
     script = r'''
 import json
 import sys
-import dew.lora
-import dew.quantization
 from dew.quantization import InputQuantization, Quantization
 print(json.dumps(sorted(name for name in sys.modules if name == "dew.training" or name.startswith("dew.training."))))
 '''

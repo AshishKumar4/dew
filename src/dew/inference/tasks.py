@@ -45,8 +45,8 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from dew.config import ModelConfig
-    from dew.training.distributed import Layout, MeshSpec
     from dew.quantization import Quantization
+    from dew.training.distributed import Layout, MeshSpec
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Request = str | Sequence[str] | Rows

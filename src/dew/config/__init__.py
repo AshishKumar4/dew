@@ -56,6 +56,7 @@ from dew.data.sources.base import Read
 from dew.files import write_atomically
 from dew.lora import AdapterRecord, LoRA
 from dew.objectives.base import Effects, Loss, Metric, Objective
+from dew.quantization import InputQuantization, Quantization
 from dew.records import JSON, duration, recorded_duration
 from dew.registry import (
     Annotation,
@@ -86,7 +87,6 @@ from dew.training.optim import (
     scaled_solver,
     weight_decay_mask,
 )
-from dew.quantization import InputQuantization, Quantization
 from dew.training.quantization import quantize_trunk
 from dew.training.selection import Best
 from dew.training.state import TrainState
