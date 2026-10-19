@@ -80,6 +80,14 @@ def test_a_contraction_too_large_for_one_piece_is_taken_a_chunk_of_columns_at_a_
     np.testing.assert_array_equal(np.asarray(chunked), np.asarray(whole))
 
 
+def test_an_integer_cumulative_sum_binds_as_it_is_and_a_floating_one_is_refused():
+    """A count cumulated over integers is exact in any order and runs as it is; a floating one's
+    order the tree does not set, so the interpreter refuses it."""
+    counts = jnp.arange(8, dtype=jnp.int32)
+    found = evaluated(jnp.cumsum, "pairwise")(counts)
+    np.testing.assert_array_equal(np.asarray(found), np.cumsum(np.arange(8)))
+
+
 def test_a_primitive_whose_order_the_tree_does_not_set_is_refused():
     with pytest.raises(NotImplementedError, match="cumsum"):
         evaluated(jnp.cumsum, "pairwise")(jnp.ones(8))

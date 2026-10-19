@@ -146,9 +146,13 @@ def _apply(equation, values, tree):
     """One equation under `tree`: a reduction as the tree sums it, a jaxpr-holding one evaluated
     within, any other bound as it is."""
     name, params = equation.primitive.name, equation.params
-    if name in ORDERED:
+    # Integers and booleans sum exactly in any order: a position's cumulative count binds as it is.
+    exact = not any(jnp.issubdtype(value.dtype, jnp.inexact) for value in values if hasattr(value, "dtype"))
+    if name in ORDERED and not exact:
         raise NotImplementedError(f"{name} sums or calls in an order the tree does not set; evaluate a "
                                   "reference without it (an XLA attention, no fused kernel)")
+    if exact and name in (*ORDERED, "dot_general", "reduce_sum"):
+        return equation.primitive.bind(*values, **params)
     if name == "dot_general":
         return _contract(*values, params["dimension_numbers"], params.get("preferred_element_type"), tree)
     if name == "reduce_sum":
