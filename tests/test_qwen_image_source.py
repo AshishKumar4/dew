@@ -253,6 +253,29 @@ def test_a_looped_layer_is_read_at_its_last_pass():
     assert not np.array_equal(model.apply(params, first, method=lambda decoder, x: decoder.norm(x)), hidden)
 
 
+@pytest.mark.parametrize("copies", [None, 2])
+def test_every_layer_reads_as_the_layer_returned_it_with_or_without_residual_copies(copies):
+    """The last layer's state is the stack's own output and a middle one's the layer's own, each in
+    the layout the layer returned it: with AltUp's residual copies, all of them, before the model
+    collapses them for its final norm; the last layer's is what its capture kept too."""
+    from model_support import decoder
+
+    from dew.inputs.diffusion import _layer_states
+    from dew.nn.gemma3n import AltUp
+
+    model = decoder() if copies is None else decoder().clone(altup=AltUp(num_inputs=copies))
+    ids = jax.random.randint(jax.random.key(0), (2, 6), 0, model.vocab_size)
+    params = model.init(jax.random.key(1), ids)
+    first, last = _layer_states(model, params, ids, (0, -1))
+    _, kept = model.apply(params, ids, method="hidden_states", capture_intermediates=model.capture_layers,
+                          mutable=list(model.layer_collections))
+    captured = kept["intermediates"]
+    np.testing.assert_array_equal(first, captured["layers_0"]["__call__"][-1])
+    np.testing.assert_array_equal(last, captured[f"layers_{model.num_layers - 1}"]["__call__"][-1])
+    assert first.shape == last.shape == ((2, 6, model.emb_features) if copies is None
+                                         else (copies, 2, 6, model.emb_features))
+
+
 def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, arrays, record):
     """`Pretrained.load().text_to_image()` reproduces the source's own call:
     its 40 default steps, no guidance, the sigmas its call lays out shifted
