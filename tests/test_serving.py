@@ -113,22 +113,27 @@ def test_a_server_holds_its_weights_at_decoding_storage_and_reloads_into_it():
         assert_same_generation(actual, expected)
 
 
-def test_a_server_over_loaded_weights_places_them_once():
-    """`Pretrained.load` returns its weights in host memory, which a task and a server place on the
-    device once, as they are built: the task's leaves and the server's are device arrays, decode
-    steps after a request's admission move nothing from the host, and the server draws the task's
-    tokens. A host leaf was once copied to the device again at every step."""
+def _host_loaded(dtype="float32"):
     from pathlib import Path
 
     from dew.interop import Pretrained
 
-    loaded = Pretrained.load(Path(__file__).parent / "fixtures/hf/phi-tiny", dtype="float32",
+    loaded = Pretrained.load(Path(__file__).parent / "fixtures/hf/phi-tiny", dtype=dtype,
                              attention_impl="xla", max_seq_len=64)
-    assert any(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(loaded.variables))
-    bound = loaded.text_generation(sampling=Sampling(temperature=0, eos_token_ids=None))
+    assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(loaded.variables["params"]))
+    return loaded.text_generation(sampling=Sampling(temperature=0, eos_token_ids=None))
+
+
+def test_a_server_over_loaded_weights_places_them_once():
+    """`Pretrained.load` returns its weights in host memory, which a task keeps as given and places
+    on the device once, at its first generation, as decoding reads them (`resident`); a server over
+    the task serves that same device copy. Decode steps after a request's admission move nothing
+    from the host, and the server draws the task's tokens."""
+    bound = _host_loaded()
     server = Server.from_task(bound, slots=2, capacity=32)
-    for held in (bound.variables, server.variables):
-        assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(held))
+    assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(bound.variables["params"]))
+    for placed, served in zip(jax.tree.leaves(bound.placed), jax.tree.leaves(server.variables), strict=True):
+        assert isinstance(placed, jax.Array) and placed is served
     prompt = np.asarray([1, 2, 3], np.int32)
     ticket = server.submit(prompt, 8, key=0)
     server.step()  # admits the request, whose rows move to the device
@@ -137,6 +142,24 @@ def test_a_server_over_loaded_weights_places_them_once():
         server.step()
     server.run()
     assert_same_generation(ticket.result(), bound(prompt[None], 8, key=0))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_task_places_loaded_weights_on_the_default_device_as_its_compute_reads_them():
+    """A task over host weights places them where JAX's default device is, as its requests are, and
+    in the storage decoding reads (`decoding_storage`), cast on the host: a bfloat16 load's float32
+    masters reach the device as the host's own bfloat16 rounding of them, no float32 copy."""
+    from dew.interop.weights import decoding_storage
+
+    with jax.default_device(jax.devices()[1]):
+        bound = _host_loaded("bfloat16")
+        placed = bound.placed
+    assert {leaf.devices().pop() for leaf in jax.tree.leaves(placed)} == {jax.devices()[1]}
+    cast = decoding_storage(bound.model, bound.variables)
+    for leaf, host in zip(jax.tree.leaves(placed), jax.tree.leaves(cast), strict=True):
+        assert leaf.dtype == host.dtype
+        np.testing.assert_array_equal(np.asarray(leaf), host)
+    assert jnp.dtype(jnp.bfloat16) in {leaf.dtype for leaf in jax.tree.leaves(placed)}
 
 
 def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():

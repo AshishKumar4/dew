@@ -31,6 +31,7 @@ from dew.cache import persist_compilations
 from dew.coordination import agreed
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
+from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key, token_id
 from dew.nn.protocols import CacheCapacity, TokenModel
 from dew.objectives.base import Variables, thaw
@@ -422,18 +423,21 @@ def _saved_processor(settings: TextSettings | MaskedSettings | BlockSettings,
     return None if settings.tokenizer is None else RunProcessor(tokenizer_for(settings.tokenizer))
 
 
-def resident(variables: Variables) -> Variables:
-    """`variables` with each leaf held in host memory as a NumPy array, as `Pretrained.load`
-    returns them without a mesh, placed on the device once: replicated on the mesh the tree's
-    arrays sit on, or on the default device. A jax.Array stays where it is, a pinned-host bank's
-    among them. A task and a server hold their weights so, and every call they make reads them
-    where they are, where a host leaf would be copied to the device again at each call."""
-    mesh = mesh_of(variables)
-    target = jax.devices()[0] if mesh is None else NamedSharding(mesh, P())
+def resident(model: nn.Module, variables: Variables) -> Variables:
+    """`variables` as decoding reads them (`decoding_storage`), each leaf held in host memory, as
+    `Pretrained.load` returns them without a mesh, cast on the host and then placed on the device
+    once: replicated on the mesh the tree's arrays sit on, or on this process's default device. A
+    jax.Array stays where it is, a pinned-host bank's among them. A task's generations and a
+    server's steps read their weights so, where a host leaf would be copied to the device again at
+    each call."""
+    stored = decoding_storage(model, variables)
+    mesh = mesh_of(stored)
+    target = None if mesh is None else NamedSharding(mesh, P())
+
     def placed(leaf):
         return jax.device_put(leaf, target) if isinstance(leaf, (np.ndarray, np.generic)) else leaf
 
-    return jax.tree.map(placed, variables)
+    return jax.tree.map(placed, stored)
 
 
 class _NativeTextTask:
@@ -448,7 +452,14 @@ class _NativeTextTask:
     def __post_init__(self) -> None:
         # A tree split for training, an adapter's or `dew.objectives.base.freeze`'s,
         # is read whole; a frozen dataclass's field is written through `object.__setattr__`.
-        object.__setattr__(self, "variables", resident(freeze(dict(thaw(self.variables)))))
+        object.__setattr__(self, "variables", freeze(dict(thaw(self.variables))))
+
+    @functools.cached_property
+    def placed(self) -> Variables:
+        """The weights this task's generations read, placed on the device at the first of them
+        (`resident`): `variables` stay as given, so host weights quantize on the host
+        (`quantized`)."""
+        return resident(self.model, self.variables)
 
     def bind(self, variables: Variables) -> Self:
         """Return the same task over other weights, such as a policy snapshot."""
@@ -661,7 +672,7 @@ class TextGeneration(_NativeTextTask):
                                           max_length=self.max_length, key=key)
             shaped, trips, capacity = _bucketed(inputs, budget, cache_ceiling(self.model))
             policy, chain, criteria = self._controls(sampling, logits, stopping)
-            generated = generate(cache_sized(self.model, capacity), self.variables, shaped, budget,
+            generated = generate(cache_sized(self.model, capacity), self.placed, shaped, budget,
                                  key=random_key, sampling=policy, n=self.n if n is None else n, logits=chain,
                                  stopping=criteria, strategy=self.strategy if strategy is None else strategy,
                                  trips=trips)
@@ -741,7 +752,7 @@ class BlockGeneration(_NativeTextTask):
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                           max_length=self.max_length, key=key)
             generated = (self.process if process is None else process).generate(
-                self.model, self.variables, inputs, budget, key=random_key,
+                self.model, self.placed, inputs, budget, key=random_key,
                 n=self.n if n is None else n,
                 eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
             return self._decoded(generated)
@@ -826,7 +837,7 @@ class MaskedGeneration(_NativeTextTask):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
                 max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                 max_length=self.max_length, key=key)
-            generated = self.process.generate(self.model, self.variables, inputs, budget, key=random_key,
+            generated = self.process.generate(self.model, self.placed, inputs, budget, key=random_key,
                 solver=self.solver, steps=self.steps if steps is None else steps,
                 n=self.n if n is None else n,
                 eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
