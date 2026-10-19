@@ -282,8 +282,9 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
 
 @pytest.mark.parametrize("family", ["llama", "neox"])
 def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_path):
-    """A bf16 checkpoint computing in bf16: LMObjective's gradient of every parameter is as exact
-    as torch autograd's bf16 one over the same weights, both measured from torch in float64
+    """A bf16 checkpoint computing in bf16: LMObjective's loss and its gradient of every parameter
+    are as exact as transformers' bf16 loss and torch autograd's gradient over the same weights,
+    each measured from torch in float64
     (tests/reference_error.py). A norm weight's and a bias's gradient is the sum over the tokens
     of a broadcast's cotangent, which jax sums in the broadcast value's dtype (jax-ml/jax#30310)
     and torch in fp32; summed in bf16 they sat 2.5-3 and 3.7-4.7 times torch's distance."""
@@ -297,18 +298,16 @@ def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_
     with pytest.warns(UserWarning):
         loaded = Pretrained.load(tmp_path, fallback="torchax", dtype="bfloat16", param_dtype="bfloat16")
     objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
-    names = [name for name, _ in model.named_parameters()]
-    grads = jax.grad(lambda params: objective_loss(objective, {**loaded.variables, "params": params}, tokens,
-                                                   scalar=True))(loaded.variables["params"])
-    dew = {name: np.asarray(grads[name], np.float64) for name in names}
-    stepped = torch_step(copy.deepcopy(model), tokens, torch.bfloat16)
-    reference = {name: stepped[name] for name in names}
+    loss, grads = jax.value_and_grad(lambda params: objective_loss(
+        objective, {**loaded.variables, "params": params}, tokens, scalar=True))(loaded.variables["params"])
+    dew = {"loss": np.asarray([loss], np.float64)} | {
+        name: np.asarray(grads[name], np.float64) for name, _ in model.named_parameters()}
+    reference = torch_step(copy.deepcopy(model), tokens, torch.bfloat16)
     with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
                                                              attn_implementation="eager").eval()
         wide.load_state_dict(model.state_dict())
-        stepped = torch_step(wide, tokens, torch.float64)
-    truth = {name: stepped[name] for name in names}
+        truth = torch_step(wide, tokens, torch.float64)
     assert_leaves_as_exact(dew, reference, truth, reductions=ROWS * SEQ)
 
 
