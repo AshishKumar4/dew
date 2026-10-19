@@ -195,6 +195,7 @@ def dew_points(args):
     import dew
     from dew.inference.serving import Server
     from dew.nn.kv_cache import KVCache
+    from dew.nn.protocols import Layered
     from dew.sampling import Sampling
     from dew.training import MeshSpec
 
@@ -216,6 +217,14 @@ def dew_points(args):
                 "load_seconds": load_seconds,
                 "weights": {"split_over": sorted(split),
                             "devices": len({device for sharding in shardings for device in sharding.device_set})}}
+    # The layout asked for, replacing the model's own only where it differs (as `Server.from_task` reads
+    # it): a model that declares no layout to replace, a multimodal one's wrapper, serves its own dense one.
+    requested = KVCache(page_size=16 if args.kv == "paged" else None)
+    own = task.model.kv_cache if isinstance(task.model, Layered) else KVCache()
+    # The layout asked for, replacing the model's own only where it differs (as `Server.from_task` reads
+    # it): a model that declares no layout to replace, a multimodal one's wrapper, serves its own dense one.
+    requested = KVCache(page_size=16 if args.kv == "paged" else None)
+    own = task.model.kv_cache if isinstance(task.model, Layered) else KVCache()
     points = []
     for slots in args.slots:
         count = args.requests or max(64, 2 * slots)
@@ -224,7 +233,7 @@ def dew_points(args):
         began = time.perf_counter()
         server = Server.from_task(task, slots=slots, capacity=capacity,
                                   admission=args.admission or None, decode_steps=args.decode_steps,
-                                  kv_cache=KVCache(page_size=16 if args.kv == "paged" else None))
+                                  kv_cache=None if requested == own else requested)
         print(f"slots {slots}: built in {time.perf_counter() - began:.2f}s", flush=True)
         dew_run(server, warm, args.output)
         # Each power-of-two admission width is its own program (`admission_share`).
