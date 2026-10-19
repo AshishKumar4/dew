@@ -31,7 +31,9 @@ def test_a_quantized_checkpoint_computes_its_reference_and_saves_its_own_bytes(n
     files, held to float64 rounding. Float64 widens the weights the author's
     reader decodes exactly (weight-only NVFP4 rounds them to bf16, FP8 to
     its stored scale's dtype), so the format's quantization is common to
-    both forwards and the bound measures only their rounding."""
+    both forwards and the bound measures only their rounding. The checkpoint
+    held in its own storage (`param_dtype='auto'`) saves its own bytes; float32
+    masters would save at their width (test_decoder_export)."""
     directory = CODECS / name
     with np.load(directory / "reference.npz") as reference:
         ids, expected, truth = reference["ids"].astype(np.int32), reference["logits"], reference["logits_f64"]
@@ -40,7 +42,7 @@ def test_a_quantized_checkpoint_computes_its_reference_and_saves_its_own_bytes(n
     _, terms = float64_forward(loaded.model, loaded.variables, ids)
     assert_as_exact_as_the_reference(actual, expected, truth, f"{name} logits", terms=terms)
     np.testing.assert_array_equal(np.argmax(actual, -1), np.argmax(expected, -1))
-    loaded.save(tmp_path)
+    Pretrained.load(directory, dtype="float32", param_dtype="auto", attention_impl="reference").save(tmp_path)
     assert_same_stored_tensors(read_weights(tmp_path), read_weights(directory))
     reloaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     np.testing.assert_array_equal(reloaded.model.apply(reloaded.variables, ids), actual)
