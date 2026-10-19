@@ -229,8 +229,9 @@ def test_the_rule_reduces_a_directory_of_recorded_orders_from_its_command_line(t
 
 
 def test_the_oracle_check_finds_a_wrong_small_entry_its_rms_dilutes():
-    """A float64 twin of 8 rows of 131072 logits a few ulps from the oracle passes; one entry of size
-    1e-3 wrong by 1e-11, which the global RMS bound passes (it moves the twin's RMS by 1e-14 of its
+    """A float64 twin of 8 rows of 131072 logits a few ulps from the oracle passes, a row the oracle
+    computes as exact zeros a few ulps of the logits' scale off them too; one entry of size 1e-3
+    wrong by 1e-11, which the global RMS bound passes (it moves the twin's RMS by 1e-14 of its
     scale), fails entry by entry (`assert_computes_the_oracle`)."""
     rng = np.random.default_rng(8)
     truth = rng.standard_normal((8, 131072))
@@ -238,7 +239,10 @@ def test_the_oracle_check_finds_a_wrong_small_entry_its_rms_dilutes():
     twin = truth * (1 + 4 * eps * rng.standard_normal(truth.shape))
     assert_computes_the_oracle(twin, truth, "a few ulps", roundings=64)
     truth[2, 5] = 1e-3
+    truth[3] = 0
     twin = truth * (1 + 4 * eps * rng.standard_normal(truth.shape))
+    twin[3] = 4 * eps * rng.standard_normal(truth.shape[1])
+    assert_computes_the_oracle(twin, truth, "a cancelled row", roundings=64)
     wrong = twin.copy()
     wrong[2, 5] = truth[2, 5] + 1e-11
     with pytest.raises(AssertionError, match="entries"):

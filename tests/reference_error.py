@@ -759,9 +759,10 @@ def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, round
     computation itself of an independent float64 oracle: FACTOR times
     `roundings` (the longest chain of roundings an output goes through, its
     reductions' lengths summed along the way) float64 unit roundoffs of the
-    truth's RMS scale, and each entry within that of its row's RMS scale (a
-    row every axis but the last), or of its own size where it is larger, so a
-    wrong small entry is not diluted by its leaf's others. Two float64 runs of
+    truth's RMS scale, and each entry within that of the largest of the truth's
+    RMS scale, its row's (a row every axis but the last) and its own size, so a
+    wrong small entry is not diluted by its leaf's others, while a sum that
+    cancels to zero keeps the rounding of what it summed. Two float64 runs of
     one function part by that much at most; any difference in the function
     moves the twin by many orders of magnitude more. The fp32 error is no
     measure of it: a near-exact fp32 path leaves the float64 runs a few ulps
@@ -775,18 +776,20 @@ def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, round
     truth = np.asarray(truth, np.float64)
     rows = truth.reshape(-1, truth.shape[-1]) if truth.ndim else truth.reshape(1, 1)
     twin = np.asarray(reference_in_float64, np.float64).reshape(rows.shape)
-    sizes = np.maximum(np.sqrt(np.mean(np.square(rows), axis=1, keepdims=True)), np.abs(rows))
+    row_scales = np.sqrt(np.mean(np.square(rows), axis=1, keepdims=True))
+    sizes = np.maximum(np.maximum(row_scales, np.abs(rows)), scale)
     entries = np.abs(twin - rows)
     over = ~(entries <= bound * sizes)
     if np.any(over):
         allowed = bound * sizes
-        ratios = np.where(over, np.where(allowed > 0, entries / np.where(allowed > 0, allowed, 1), np.inf), 0.0)
+        ratios = np.where(over, np.where(allowed > 0, entries / np.where(allowed > 0, allowed, 1), np.inf),
+                          0.0)
         at = np.unravel_index(int(np.argmax(ratios)), rows.shape)
         raise AssertionError(
             f"{label}: {int(np.count_nonzero(over))} of {rows.size} entries of the reference in float64 are "
             f"past float64 rounding over {roundings} steps; the worst, row {at[0]} entry {at[1]}, is "
             f"{entries[at]:.3e} from the oracle {rows[at]:.3e}, of size {sizes[at]:.3e} (its row's rms "
-            f"{float(np.sqrt(np.mean(np.square(rows[at[0]])))):.3e}, the leaf's {scale:.3e}), "
+            f"{float(row_scales[at[0], 0]):.3e}, the leaf's {scale:.3e}), "
             f"{ratios[at]:.1f} times the bound")
 
 
