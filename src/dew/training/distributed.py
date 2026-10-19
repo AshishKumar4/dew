@@ -59,9 +59,10 @@ from dew.nn.sharding import (
     microbatched,
     ruled_boxes,
 )
-from dew.objectives.base import Batch, Variables
+from dew.objectives.base import FROZEN, Batch, Variables
 from dew.records import JSON, number, record
 from dew.telemetry.profile import region
+from dew.training.state import VARIABLE_FIELDS
 
 # The role axes no parameter splits over: data holds a batch's replicas,
 # sequence its positions, and stage the pipeline's stages of the layer stack,
@@ -577,12 +578,20 @@ class Layout:
     fetches each layer's parameters as it reaches that layer. When
     `host_parameters` is set, `check` refuses a placement that keeps every
     parameter on the device, so the patterns are never silently ignored.
+
+    `frozen_whole` keeps the frozen collection (`FROZEN`, a LoRA run's base)
+    whole over fsdp, split only over the other axes the rules give it (a
+    tensor split stays). A frozen leaf has no gradient and no optimizer
+    state, so an fsdp split saves only its memory, and the step gathers it
+    whole forward and again backward. `check` counts no leaf it keeps whole,
+    and a leaf `host_parameters` also names is kept so in pinned host memory.
     """
     rules: LogicalAxisRules | Mapping[str, MeshAxes] = DEFAULT_RULES
     min_shard: int = 2 ** 16
     tolerance: float = 0.02
     host: tuple[str, ...] = ()
     host_parameters: tuple[str, ...] = ()
+    frozen_whole: bool = False
     data_axes: tuple[str, ...] = ()
     """The axes a batch's rows split over, ahead of the rules' own
     `activation_batch` entries: a native mesh's names for its data-parallel
@@ -646,7 +655,7 @@ class Layout:
         declared = declarations(tree)
 
         def leaf_sharding(path, value):
-            axes = declared_axes(path, value.ndim, declared)
+            axes = self._axes(path, value.ndim, declared)
             size = int(np.prod(value.shape, dtype=np.int64))
             if axes is None:
                 spec = parameter_spec(value.shape, fsdp_size, self.min_shard)
@@ -654,6 +663,8 @@ class Layout:
                 spec = P()
             else:
                 spec = logical_spec(axes, value.shape, rules=self.axis_rules, mesh=mesh)
+            if self._kept_whole(path):
+                spec = P(*map(_without_fsdp, spec))
             placed = {axis for entry in spec for axis in mesh_axes(entry)}
             if outside := sorted(placed & set(UNSPLIT_AXES)):
                 raise ValueError(
@@ -673,15 +684,30 @@ class Layout:
         modules declared, as the rules place them."""
         return boxed(ruled_boxes({**current_boxes(), **boxed_axes(tree)}, self.axis_rules))
 
+    def _axes(self, path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
+        """The logical axes of the leaf at `path`: those its module declared, or None for the shape
+        heuristic. Placement, its minimum size, `frozen_whole` and its checks follow from them."""
+        return declared_axes(path, ndim, declared)
+
     def _splitting(self, path, value, declared: Mapping[Suffix, LogicalAxes]) -> set[str]:
         """The parameter axes the rules could split the leaf at `path` over:
         those its declared names' rules name, or fsdp, which the shape
         heuristic splits an undeclared leaf over."""
-        axes = declared_axes(path, value.ndim, declared)
+        axes = self._axes(path, value.ndim, declared)
         if axes is None:
             return {FSDP_AXIS}
         return set(parameter_axes(axis for name, assignment in self.axis_rules if name in axes
                                   for axis in mesh_axes(assignment)))
+
+    def _kept_whole(self, path) -> bool:
+        """Whether a leaf sits in the frozen collection `frozen_whole` keeps
+        whole: `FROZEN` heads a variables tree, the tree placed or one of a
+        train state's (`VARIABLE_FIELDS`). The optimizer's state mirrors the
+        trained parameters' paths, so a module or a group named so is none."""
+        head = list(path[:2])
+        if head and isinstance(head[0], jax.tree_util.GetAttrKey) and head[0].name in VARIABLE_FIELDS:
+            head = head[1:]
+        return self.frozen_whole and head[:1] == [jax.tree_util.DictKey(FROZEN)]
 
     def offloaded[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """Return `shardings`, with the memory kind each leaf's path asks for.
@@ -761,7 +787,7 @@ class Layout:
         for (path, param), sharding, has_rule in zip(
                 path_leaves, jax.tree.leaves(shardings), splittable, strict=True):
             elements = int(np.prod(param.shape, dtype=np.int64))
-            if elements < self.min_shard or not has_rule:
+            if elements < self.min_shard or not has_rule or self._kept_whole(path):
                 continue
             shardable_elements += elements
             if any(axis in mesh_axes(assignment)
@@ -1006,6 +1032,12 @@ def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str,
 
 # The batches a `DevicePrefetchIterator` queues ahead of the step by default.
 PREFETCH_DEPTH = 2
+
+
+def _without_fsdp(entry: MeshAxes) -> MeshAxes:
+    """A spec entry with the fsdp axis dropped from it."""
+    kept = tuple(axis for axis in mesh_axes(entry) if axis != FSDP_AXIS)
+    return kept if kept else None
 
 
 def placed_bytes(tree) -> int:

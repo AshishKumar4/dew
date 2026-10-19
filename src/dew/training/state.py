@@ -60,14 +60,15 @@ class TrainState:
     step: jax.Array
     microstep: jax.Array
     updates: jax.Array
-    variables: Variables
+    variables: Variables = struct.field(metadata={'variables': True})
     opt_state: optax.OptState
-    ema: Variables | None
+    ema: Variables | None = struct.field(metadata={'variables': True})
     key: jax.Array
     scale: DynamicScale | None
     window_size: jax.Array
     accumulation: Accumulation | None = None
-    compute: Variables | None = struct.field(default=None, metadata={'checkpointed': False})
+    compute: Variables | None = struct.field(default=None,
+                                             metadata={'checkpointed': False, 'variables': True})
     """The lower-precision copies of the parameters that the forward pass reads, such as bf16 copies
     of fp32 weights, written by the update (`dew.training.narrow`).
 
@@ -92,3 +93,9 @@ CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)
                      if field.metadata.get('checkpointed', True))
 """The train-state fields a checkpoint holds, by their names; a field its
 declaration marks `checkpointed=False` is rebuilt on resume."""
+
+VARIABLE_FIELDS = tuple(field.name for field in dataclasses.fields(TrainState)
+                        if field.metadata.get('variables'))
+"""The train-state fields that each hold a variables tree, keyed by collection (`params`,
+`FROZEN`, ...), as their declarations mark them; the optimizer's state mirrors the trained
+parameters' paths instead."""
