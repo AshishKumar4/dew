@@ -286,10 +286,10 @@ class _Same:
 
     __slots__ = ("value",)
 
-    def __init__(self, value: object):
+    def __init__(self, value: DeviceStep):
         self.value = value
 
-    def __eq__(self, other: object) -> bool:
+    def __eq__(self, other) -> bool:
         return isinstance(other, _Same) and other.value is self.value
 
     def __hash__(self) -> int:

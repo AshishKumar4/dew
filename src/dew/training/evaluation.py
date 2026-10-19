@@ -588,12 +588,13 @@ class MetricScores[Statistics, Additions](Mapping):
             and metric.__name__ == "loss"
             and metric.__self__ is self.objective
         ):
-            return self.scores['train/loss']
+            return self.scores.get('train/loss', float("nan"))
         if isinstance(metric, str):
             return self.scores[metric]
         named = metric[1] if isinstance(metric, tuple) and len(metric) == 2 else metric
         if not isinstance(named, TrainingScalar) and not any(declared is named for declared in self.metrics):
             raise KeyError("the score refers to a metric not passed to fit")
+        assert isinstance(named, (Metric, TrainingScalar))
         prefix = "train/" if isinstance(named, TrainingScalar) else ""
         if not any(name.startswith(prefix) and name.rpartition("/")[2] == named.name for name in self.scores):
             return float("nan")
