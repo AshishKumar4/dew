@@ -181,7 +181,7 @@ def dew_outputs(model, variables, ids, layers):
     the model's own dtype and differentiable; the fixture writes them as float32."""
     logits = model.apply(variables, ids)
     _, state = model.apply(variables, ids, method=type(model).hidden_states,
-                           capture_intermediates=model.capture_layers, mutable=["intermediates"])
+                           capture_intermediates=model.capture_layers, mutable=list(model.layer_collections))
     return logits, [model.layer_state(state, index) for index in layers]
 
 
