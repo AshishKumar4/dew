@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import functools
 import hashlib
 import io
 import json
@@ -377,6 +378,7 @@ class Store:
     retention: LocalRetention | None = field(default=None, repr=False)
 
     def resolve(self) -> tuple[AbstractFileSystem, str]:
+        _registered()
         options = dict(self.storage_options or {})
         layers = self.url.split("::")
         for cache in ("dewcache", "filecache", "simplecache", "blockcache"):
@@ -673,7 +675,11 @@ class Store:
         return outcome.oid
 
 
-def _register() -> None:
+@functools.cache
+def _registered() -> None:
+    """Register Dew's filesystems with fsspec, once, as the first store resolves: the bounded cache
+    (`dewcache`) and the profiles the storage config names (DEW_STORAGE_CONFIG, else
+    ~/.config/dew/storage.toml)."""
     fsspec.register_implementation("dewcache", BoundedFileCache, clobber=True)
     config = Path(os.environ.get("DEW_STORAGE_CONFIG", "~/.config/dew/storage.toml")).expanduser()
     if config.is_file():
@@ -681,6 +687,3 @@ def _register() -> None:
             options = dict(values)
             base = options.pop("base")
             _profile(name, base, options)
-
-
-_register()
