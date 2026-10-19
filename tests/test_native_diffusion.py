@@ -258,7 +258,6 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     from diffusion_stubs import PROMPTS, batch_for
 
     from dew.diffusion.schedules import DiscreteNoiseScheduler
-    from dew.diffusion.schedules.source import SourceGrid
     from dew.interop.pretrained import load_diffusion_source
     from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective
@@ -284,6 +283,8 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     own = source.text_to_image()(PROMPTS, steps=3, guidance=None, key=0).host().images
     np.testing.assert_array_equal(objective.build_task(variables)(PROMPTS, steps=3, guidance=None,
                                                                   key=0).host().images, own)
+    from dew.diffusion.schedules.source import SourceGrid
+
     settings = from_record(ImageSettings, to_record(objective.task_settings(), ImageSettings))
     assert settings.final_denoise is False and settings.grid is not None
     rebuilt, grid = from_record(SourceGrid, settings.grid)(3), source.task.grid(3)
