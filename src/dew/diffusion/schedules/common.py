@@ -23,8 +23,9 @@ def divided(numerator, rate):
     XLA's simplifier rewrites a division by a broadcast or a constant, a per-row rate against a
     `[B, ...]` state among them, into a multiplication by its reciprocal, two roundings where
     the division makes one (a third of float32 quotients come out an ulp off). Both operands,
-    the rate broadcast, pass a barrier: the rate stays a divisor, and the division is a kernel of
-    its own, rounded alike in every program it is compiled into, whatever the code around it.
+    the rate broadcast, pass a barrier: the simplifier sees no broadcast divisor to invert, and
+    the numerator arrives rounded as it was computed, so two programs that fuse the code around
+    it differently divide the same operands.
     """
     numerator, rate = jax.lax.optimization_barrier((numerator, jnp.broadcast_to(rate, jnp.shape(numerator))))
     return numerator / rate
