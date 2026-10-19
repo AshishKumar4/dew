@@ -390,13 +390,14 @@ class CausalSelfAttention(nn.Module):
             value = self.values_norm(value)
         return constrain(key, KV_HEADS), constrain(value, KV_HEADS)
 
-    def _rotary_angles(self, rotary_positions, heads: jax.Array):
+    def _rotary_angles(self, rotary_positions, heads: jax.Array, documents=None):
         """Build the rotary cos and sin this layer rotates its heads by, in
         the arithmetic `rotate` rotates `heads` in.
 
         Interleaved mRoPE, YaRN and the plain rope each build their own
         angles; YaRN rotates whole heads at its own frequencies, so it
-        takes neither a partial rotary nor a Llama 3.1 ramp.
+        takes neither a partial rotary nor a Llama 3.1 ramp. `documents`
+        (`Coordinates.segments`) lets LongRoPE pick each packed document's factors.
         """
         dtype = at_least_fp32(heads.dtype)
         if self.rotary_axes is not None:
@@ -413,7 +414,7 @@ class CausalSelfAttention(nn.Module):
             return rotary_freqs(
                 rotary_positions, self.ctx.head_dim, self.ctx.rope_theta, rot_dim=self._rot_dim(),
                 partial_rotary_type=self.ctx.partial_rotary_type, rope_scaling=self.ctx.rope_scaling,
-                dtype=dtype)
+                dtype=dtype, documents=documents)
         if self.ctx.partial_rotary_factor is not None or self.ctx.rope_scaling is not None:
             raise ValueError(
                 "yarn rotates whole heads at its own frequencies, so it takes "
@@ -549,7 +550,7 @@ class CausalSelfAttention(nn.Module):
                 query = query * (scale[..., None, None] if scale.ndim == 2
                                  else scale[None, :, None, None]).astype(query.dtype)
         else:
-            freqs_cos, freqs_sin = self._rotary_angles(rotary_positions, query)
+            freqs_cos, freqs_sin = self._rotary_angles(rotary_positions, query, segment_ids)
             # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
             # query carries the ratio to the scale the checkpoint asks for.
             query = rotate(
