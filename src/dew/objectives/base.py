@@ -688,18 +688,21 @@ class Objective(ABC, Generic[Loss, Effects]):
         split or whole; otherwise `fresh_variables` draws one. A held tree
         without `params` is refused, unless the objective holds parts a draw
         goes beside. `complete_variables` then adds what the objective's own
-        modules need. An objective of several networks overrides this whole.
+        modules need, and the whole tree's parameters are projected once
+        (`projected`, `updated=True`), which leaves held parts that satisfy
+        the model's constraint as they are and brings drawn ones to it. An
+        objective of several networks overrides this whole.
         """
         held = self.held_variables() if variables is None else variables
         if held is not None and "params" in held:
             tree = held
         elif held is None or self._held_parts:
             tree = self.fresh_variables(key, held)
-            tree = {**tree, "params": self.projected(tree["params"], updated=True)}
         else:
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
-        return self.complete_variables(key, tree)
+        tree = self.complete_variables(key, tree)
+        return {**tree, "params": self.projected(tree["params"], updated=True)}
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         """Draw the tree training starts from when none is held.
@@ -948,7 +951,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
         A step's forward reads `projected(params, updated=False)`, and its update applies to them,
         which the optimizer sees; the step stores the updated ones `projected(..., updated=True)`.
-        A freshly drawn tree is projected once with `updated=True`. The default
+        The tree a run starts from is projected once with `updated=True` (`init`). The default
         projects the `model` this objective trains; an objective that trains several networks
         projects each one's own tree (`projected_parts`)."""
         model = vars(self).get("model")
