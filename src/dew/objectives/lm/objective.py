@@ -1328,9 +1328,10 @@ class LMObjective(TokenScorer):
         """The decoder, its head fused where its training loss takes the head's gradient in the
         forward: a tiled head the model holds as one matrix (`token_scores`' `z_loss`), outside an
         indexer's warm-up, which scores no head."""
-        fused = (self.head_fused and self.head_tile is not None and reads_states(self.model)
-                 and isinstance(self.model, AffineHead) and not self._warmup
-                 and self._head_matrices.get(id(self.model), (None, True))[1])
+        model = self.model
+        fused = (self.head_fused and self.head_tile is not None and reads_states(model)
+                 and isinstance(model, AffineHead) and not self._warmup
+                 and self._head_matrices.get(id(model), (None, True))[1])
         return (ProgramModule(self.model, self.head_tile, trained=True, head_fused=fused),)
 
     def unfuse_head(self) -> str | None:

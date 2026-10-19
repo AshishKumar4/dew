@@ -275,12 +275,11 @@ def plan_step[LossT, EffectsT](
     Where that plan splits the batch and `frontier` asks, the frontier's
     other point follows, one compile more: the batch in `candidates[0]`
     microbatches one remat rung up (`remat_more`) with the head tiled and
-    unfused, the most memory one rung frees, where that fits. Which runs faster is
-    measured, not ranked: on an A100-40, Qwen3.5-0.8B's full fine-tune at
-    8 x 3072 ran 1205.6 ms a step in four microbatches without recomputing,
-    1174.1 under 'minimal' whole, the head tiled. The objective is left at
-    the last plan's rung, each plan holding its own (`Planned.modules`,
-    `tile`)."""
+    unfused, the most memory one rung frees, where that fits. Which runs
+    faster is measured, not ranked: on an A100-40, Qwen3.5-0.8B's full
+    fine-tune at 8 x 3072 ran 1205.6 ms a step in four microbatches without
+    recomputing, 1174.1 under 'minimal' whole, the head tiled. The objective
+    is left at the last plan's rung, each plan holding its own (`Planned`)."""
     probes: list[Probe] = []
     refusals: list[RuntimeError] = []
     lowered: dict[tuple[int, str], Candidate] = {}
