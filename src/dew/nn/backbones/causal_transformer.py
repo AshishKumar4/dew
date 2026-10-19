@@ -2406,6 +2406,18 @@ class CausalTransformer(nn.Module):
         return None
 
     @nn.nowrap
+    def generation_refusal(self) -> str | None:
+        """Why a generation loop cannot continue this decoder's rows, or None
+        (`dew.nn.protocols.Generating`): its sparse layers' mixture, or a mixer it
+        names (`declared_mixers`: a layer kind's, a prediction depth's or the
+        drafter's), that refuses it (`Mixture.generation_refusal`,
+        `MixerBase.generation_refusal`)."""
+        refusal = None if self.mixture is None else self.mixture.generation_refusal()
+        for mixer in self.declared_mixers:
+            refusal = refusal or mixer.generation_refusal()
+        return refusal
+
+    @nn.nowrap
     def split_prefill_refusal(self) -> str | None:
         """A cache rebuilt per request from its whole prompt, or a loop's shared cache that a later
         pass rewrites, whose earlier tokens hold the last pass's keys: a prompt's later piece would
