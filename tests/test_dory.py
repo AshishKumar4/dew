@@ -26,6 +26,7 @@ from reference_error import (
     float64_forward,
     widened,
 )
+from reference_trees import evaluated
 from tool_support import load as load_tool
 
 from dew.checkpoints import Checkpoints
@@ -632,15 +633,21 @@ def symmetric(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse:
     return permuted({**variables, 'params': params}, residual)
 
 
-def decoding(model: CausalTransformer):
-    """`model`'s empty cache of one row and its call over a cache, prefilling a prompt or decoding a
-    token, each compiled once for every set of weights of its shapes, and neither binding the
-    weights it is given past its call."""
-    opened = jax.jit(lambda variables: model.apply(variables, 1, method=CausalTransformer.init_cache,
-                                                   mutable=['cache'])[1]['cache'])
-    step = jax.jit(lambda variables, cache, ids: model.apply({**variables, 'cache': cache}, ids, decode=True,
-                                                             mutable=['cache']))
-    return opened, step
+def decoding(model: CausalTransformer, tree: str | None = None, *, block: int = 0):
+    """`model`'s empty cache of one row, its call over a cache, prefilling a prompt or decoding a
+    token, and its log-probabilities from logits, each compiled once for every set of weights of its
+    shapes and binding no weights past its call; with `tree`, every sum each makes under it
+    (tests/reference_trees.py), the same math summed in another order."""
+    def staged(function):
+        return jax.jit(function if tree is None else evaluated(function, tree, block=block))
+
+    opened = staged(lambda variables: model.apply(variables, 1, method=CausalTransformer.init_cache,
+                                                  mutable=['cache'])[1]['cache'])
+    step = staged(lambda variables, cache, ids: model.apply({**variables, 'cache': cache}, ids, decode=True,
+                                                            mutable=['cache']))
+    scored = staged(lambda logits: jax.nn.log_softmax(logits.astype(jnp.promote_types(logits.dtype,
+                                                                                         jnp.float32))))
+    return opened, step, scored
 
 
 def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> np.ndarray:
@@ -648,14 +655,13 @@ def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> np.ndar
     prefilled and each token but the last decoded a step at a time through the cache (`programs`,
     `decoding`'s), as a run that drew `tokens` computes them: the prompt's rows (its last alone
     where `prompt_rows` is False), then a row a token."""
-    opened, step = programs
+    opened, step, scored = programs
     logits, written = step(variables, opened(variables), jnp.asarray(prompt[None]))
     rows = [logits[0] if prompt_rows else logits[0, -1:]]
     for token in tokens[:-1]:
         logits, written = step(variables, written['cache'], jnp.asarray([[token]]))
         rows.append(logits[0])
-    logits = jnp.concatenate(rows)
-    return np.asarray(jax.nn.log_softmax(logits.astype(jnp.promote_types(logits.dtype, jnp.float32))))
+    return np.asarray(scored(jnp.concatenate(rows)))
 
 
 @pytest.mark.network
@@ -736,8 +742,10 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
 
             def batch(index, key=key, programs=programs, columns=columns, truth=truth, placed=placed,
                       draws=draws):
-                """Batch `index`'s per-entry errors summed over its orders, Dew's and the reference's;
-                batch 0's columns kept order by order for the rows' rule."""
+                """Batch `index`'s per-entry errors summed over its orders, Dew's and the reference's,
+                the worst over the reference's ensemble (`recorder.MEMBERS`: vLLM and Dew's same math
+                under each declared summation tree); batch 0's columns kept order by order for the
+                rows' rule."""
                 theirs = np.load(recorder.fetched(f'columns-{recorder.tag(key)}-{index}.npy'))
                 absolutes = np.zeros(truth.shape)
                 for order, reference in enumerate(theirs):
@@ -748,7 +756,9 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
                     if index == 0:
                         draws.append((np.take_along_axis(found, columns, axis=1), reference,
                                       np.take_along_axis(truth, columns, axis=1)))
-                return absolutes, np.load(recorder.fetched(f'absolutes-{recorder.tag(key)}-{index}.npy'))
+                members = [np.load(recorder.fetched(f'absolutes-{recorder.tag(key)}-{member}-{index}.npy'))
+                           for member in recorder.MEMBERS]
+                return absolutes, np.max(members, axis=0)
 
             first = batch(0)
             assert_leaves_as_exact_over_orders(draws, f'Dory 4B {key}, its columns')

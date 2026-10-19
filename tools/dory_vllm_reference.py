@@ -563,6 +563,54 @@ def dew_traces(directory: Path) -> None:
             held.flush()
 
 
+TREES = {'pairwise': ('pairwise', 0), 'blocked-32': ('blocked', 32), 'blocked-128': ('blocked', 128)}
+"""The ensemble's members besides vLLM, each Dew's same math with every sum under a declared tree
+(tests/reference_trees.py): vLLM's key order is fixed, so the trees are what vary its key sums."""
+
+MEMBERS = ('vllm', *TREES)
+"""The reference's ensemble: an element's reference error is the worst over them."""
+
+
+def trees(directory: Path, runs=None, orders_of: int = ORDERS) -> None:
+    """Each tree member's per-element errors on every run (`runs`, every one by default), summed over
+    each batch's orders (`symmetry`, the same orbit as vLLM's), `absolutes-{run}-{member}-{batch}.npy`
+    `[rows, vocab]` float32: Dew's model at the run's dtype, its attention the XLA math every sum of
+    which the interpreter reaches, decoding the run's tokens as the release test does
+    (tests/test_dory.py `decoding`, `forced`), every sum under the member's tree. Under Dew's
+    environment, on its GPU; `orders_of` below ORDERS times a pilot."""
+    import time
+
+    import jax
+    import test_dory
+
+    from dew.interop import Pretrained
+
+    source = json.loads((FIXTURE / 'source.json').read_text())
+    probe = np.load(FIXTURE / 'probe.npz')
+    config = json.loads((FIXTURE / 'config.json').read_text())
+    for loops, mode, dtype in runs or RUNS:
+        key = name(loops, mode, dtype)
+        truth = np.load(directory / f'upstream-{tag(key)}.npy')
+        loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype=dtype,
+                                 attention_impl='xla')
+        model = test_dory.with_cache(loaded.model.with_passes(loops), mode).with_cache_capacity(CONTEXT)
+        placed = jax.device_put(loaded.variables)
+        for member, (tree, block) in TREES.items():
+            programs = test_dory.decoding(model, tree, block=block)
+            for batch in range(BATCHES):
+                total, began = np.zeros(truth.shape), time.perf_counter()
+                for index in range(orders_of):
+                    ordered = test_dory.symmetric(placed, config, symmetry(config, batch, index))
+                    found = np.concatenate([test_dory.forced(programs, ordered, probe[part],
+                                                             probe[f'{key}/{part}_generated'],
+                                                             prompt_rows=part == 'sentence')
+                                            for part in ('sentence', 'window')])
+                    total += np.abs(found - truth)
+                    print(f'{key} {member} order {batch}/{index}: {time.perf_counter() - began:.1f} s',
+                          flush=True)
+                np.save(directory / f'absolutes-{tag(key)}-{member}-{batch}.npy', total.astype(np.float32))
+
+
 def errors(directory: Path, key: str, batch: int, shape: tuple[int, ...] | None = None) -> np.ndarray:
     """Run `key`'s per-order errors in `batch`, `[ORDERS, rows, vocab]` float32 on disk: each entry's
     absolute distance from float64 (`upstream`'s rows) under each order, kept where they are recorded
@@ -674,16 +722,17 @@ def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
 
 
 def sums(directory: Path) -> None:
-    """Each run's per-element errors summed over each batch's orders, `absolutes-{run}-{batch}.npy`
-    `[rows, vocab]` float32, which `publish` puts beside the probe: the element rule reads each entry's
-    mean over a batch (tests/reference_error.py)."""
+    """vLLM's per-element errors on each run summed over each batch's orders,
+    `absolutes-{run}-vllm-{batch}.npy` `[rows, vocab]` float32, which `publish` puts beside the probe
+    with the tree members' (`trees`): the element rule reads each entry's mean over a batch
+    (tests/reference_error.py)."""
     for run in RUNS:
         for batch in range(BATCHES):
             held = errors(directory, name(*run), batch)
             total = np.zeros(held.shape[1:], np.float64)
             for order in held:
                 total += order
-            np.save(directory / f'absolutes-{tag(name(*run))}-{batch}.npy', total.astype(np.float32))
+            np.save(directory / f'absolutes-{tag(name(*run))}-vllm-{batch}.npy', total.astype(np.float32))
 
 
 def orders(directory: Path) -> None:
@@ -738,7 +787,8 @@ sha256.
 def files(directory: Path) -> dict[str, Path]:
     """The probe's files by their names in `DATASET`."""
     names = [*(f'upstream-{tag(name(*run))}.npy' for run in RUNS),
-             *(f'{kind}-{tag(name(*run))}-{batch}.npy' for run in RUNS for kind in ('columns', 'absolutes')
+             *(f'columns-{tag(name(*run))}-{batch}.npy' for run in RUNS for batch in range(BATCHES)),
+             *(f'absolutes-{tag(name(*run))}-{member}-{batch}.npy' for run in RUNS for member in MEMBERS
                for batch in range(BATCHES))]
     return {'probe.npz': FIXTURE / 'probe.npz', **{file: directory / file for file in names}}
 
@@ -795,5 +845,5 @@ if __name__ == '__main__':
         (record_run if stage == 'run' else orders_run)(where, int(sys.argv[3]), sys.argv[4], sys.argv[5])
     else:
         {'record': record, 'truth': truth, 'upstream': upstream, 'orders': orders,
-         'model_orders': model_orders, 'sums': sums, 'dew_traces': dew_traces,
+         'model_orders': model_orders, 'sums': sums, 'trees': trees, 'dew_traces': dew_traces,
          'publish': publish}[stage](where)
