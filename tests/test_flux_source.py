@@ -6,7 +6,9 @@ way its pipeline runs it - packed latents, the ids the pipeline lays out, the
 timestep it has divided by the training count and the distilled guidance a
 guidance-embedded checkpoint takes - recording the forward, the
 vector-Jacobian products of the latent, the text tokens and the pooled
-vector, and the gradient of every parameter.
+vector, and the gradient of every parameter, in float32 and in float64. Each
+native tensor is held to the source's own float32 distance from float64
+(tests/reference_error.py).
 
 The native model owns its pipeline's 2x2 packing, so it works in latents.
 These tests convert between the two layouts with the source's own permutation
@@ -20,7 +22,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import extract_fixture, packed, scaled_gap as relative_gap, unpacked
+from interop_support import extract_fixture, packed, unpacked
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux_fields, flux_path, read_transformer
@@ -69,27 +72,10 @@ def flux_walk(source, arrays, name: str, grid: tuple[int, int]):
     return output, gradients, {entry.name: entry for entry in layouts}
 
 
-def parameter_gaps(arrays, gradients, layout, prefix: str) -> dict[str, float]:
-    """Every recorded parameter gradient's scaled error against the native one."""
-    gaps = {}
-    for key in arrays.files:
-        if not key.startswith(prefix):
-            continue
-        value = np.asarray(layout["transformer/" + key[len(prefix):]].export({"params": gradients[0]}))
-        gaps[key[len(prefix):]] = relative_gap(value, arrays[key])
-    assert gaps, prefix
-    return gaps
-
-
 @pytest.mark.parametrize("name", CASES)
 def test_native_flux_matches_the_source_forward_and_every_gradient(name, source):
-    """The source at the suite's fixed 1e-4 scaled-error bound, for every
-    tensor, with one thing controlled on the source side: its sinusoidal
-    frequency table is the float64 exponential rounded to float32, which is
-    the table Dew builds on the host. The reference generator records the
-    unmodified source's own cost of its float32 `exp` beside each case, and
-    that is the whole difference between the two, so a walk over the
-    unmodified record is not asserted and nothing here is a fitted tolerance.
+    """The forward, the three input gradients and every parameter's, each
+    as near float64 as the unmodified source's float32 walk.
 
     The variants are the ones whose wiring differs - the schnell-style model
     with no guidance embedder, the distilled one with it, a rectangular packed
@@ -101,13 +87,19 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
     grid = tuple(record["cases"][name]["grid"])
     with np.load(source / "flux_transformer.npz") as arrays:
         output, gradients, layout = flux_walk(source, arrays, name, grid)
-        assert relative_gap(packed(np.asarray(output)), arrays[f"{name}.output"]) < 1e-5
-        assert relative_gap(packed(np.asarray(gradients[1])), arrays[f"{name}.grad_packed"]) < 1e-5
-        assert relative_gap(gradients[2], arrays[f"{name}.grad_context"]) < 1e-5
-        assert relative_gap(gradients[3], arrays[f"{name}.grad_pooled"]) < 1e-5
-        gaps = parameter_gaps(arrays, gradients, layout, f"{name}.grad_param.")
-        worst = max(gaps.items(), key=lambda item: item[1])
-        assert worst[1] < 1e-4, worst
+        native = {"output": packed(np.asarray(output)), "grad_packed": packed(np.asarray(gradients[1])),
+                  "grad_context": gradients[2], "grad_pooled": gradients[3]}
+        for key, value in native.items():
+            assert_as_exact_as_the_reference(value, arrays[f"{name}.{key}"], arrays[f"{name}.fp64.{key}"],
+                                             f"{name} {key}")
+        prefix = f"{name}.grad_param."
+        tensors = [key[len(prefix):] for key in arrays.files if key.startswith(prefix)]
+        assert tensors
+        assert_leaves_as_exact(
+            {tensor: np.asarray(layout["transformer/" + tensor].export({"params": gradients[0]}))
+             for tensor in tensors},
+            {tensor: arrays[prefix + tensor] for tensor in tensors},
+            {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors})
 
 
 @pytest.fixture(scope="module")
@@ -132,8 +124,9 @@ def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipe
         params = loaded.variables["encoders"]["conditioning"]
         condition = encoder.encode(params, encoder.tokenize(pipeline_record["prompts"]))
         assert condition.context.shape == arrays["pipeline.context"].shape
-        assert relative_gap(condition.context, arrays["pipeline.context"]) < 1e-5
-        assert relative_gap(condition.pooled, arrays["pipeline.pooled"]) < 1e-6
+        for key in ("context", "pooled"):
+            assert_as_exact_as_the_reference(getattr(condition, key), arrays[f"pipeline.{key}"],
+                                             arrays[f"pipeline.fp64.{key}"], key)
         # The distilled guidance rides in as a model input, at the value the
         # pipeline defaults to, and guidance is not two branches here.
         assert condition.guidance is not None
@@ -141,7 +134,9 @@ def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipe
                                    np.full(2, pipeline_record["default_guidance"]), atol=0)
         crossed = encoder.encode(params, encoder.tokenize(
             [{"text": row["second"], "second": row["text"]} for row in pipeline_record["prompts"]]))
-        assert relative_gap(crossed.context, arrays["pipeline.context"]) > 1e-3
+        with pytest.raises(AssertionError):
+            assert_as_exact_as_the_reference(crossed.context, arrays["pipeline.context"],
+                                             arrays["pipeline.fp64.context"], "crossed")
 
 
 @pytest.mark.parametrize("streamed", [False, True])
@@ -166,9 +161,10 @@ def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record
         initial = unpacked(arrays["pipeline.x_T"], rows, rows)
         prepared = task.prepare(pipeline_record["prompts"], initial=initial, key=0)
         walked = task(prepared, key=jax.random.PRNGKey(0)).host()
-        assert relative_gap(packed(np.asarray(walked.latents)), arrays["pipeline.latents"]) < 2e-5
         images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
-        assert relative_gap(images, arrays["pipeline.images"]) < 2e-5
+        for key, value in (("latents", packed(np.asarray(walked.latents))), ("images", images)):
+            assert_as_exact_as_the_reference(value, arrays[f"pipeline.{key}"], arrays[f"pipeline.fp64.{key}"],
+                                             key)
 
 
 def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_path):
@@ -212,8 +208,6 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     # Diffusers' own classes read the export: every component cleanly, the
     # pipeline whole, and its transformer recomputes the trained forward on
     # the packed latent with FluxPipeline's own position ids.
-    from reference_error import assert_as_exact_as_the_reference
-
     from tools import diffusers_consumer as consumer
 
     consumer.assert_components_load(export)
