@@ -214,16 +214,26 @@ def placed(tensors: Mapping[str, np.ndarray], path_of: TensorPath, param_dtype: 
            ) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
     """`translate_parameters`' tree, with the layout that writes each tensor it placed back
     under its own name from its path in that tree; a tensor `path_of` leaves out has none.
-    Each tensor binds as `record_layouts` binds it, read whole: source aliases share the leaf of
-    the first (`_aliased`), and each layout is `source_layouts`' under no component (`_layout`),
-    from the path the binding read, so `path_of` is asked once a tensor."""
-    parameters: ParamTree = {}
+    It is `record_layouts`' binding pass (`_bound`) with each tensor read whole, under no
+    component."""
+    return _bound("", tensors, path_of, (), param_dtype, _copy)
+
+
+def _bound[LeafT](component: str, tensors: Mapping[str, np.ndarray], path_of: TensorPath,
+                  prefix: tuple[str, ...], param_dtype: str,
+                  read: Callable[[np.ndarray, np.dtype, tuple[int, ...] | None], LeafT]
+                  ) -> tuple[dict, tuple[WeightLayout, ...]]:
+    """The one binding pass, eager (`placed`) or mapped (`record_layouts`): each tensor
+    `path_of` places, read by `read` into its leaf, source aliases sharing the leaf of the
+    first (`_aliased`), and the layout that writes each back from the path it was read at,
+    under `component` and `prefix` (`_layout`); `path_of` is asked once a tensor."""
+    parameters: dict = {}
     layouts = []
     owners, locate = _aliased(tensors, path_of)
-    for name, path, leaf, _ in _leaves(tensors, locate, param_dtype, _copy):
+    for name, path, leaf, _ in _leaves(tensors, locate, param_dtype, read):
         if owners[path] == name:
             insert(parameters, path, leaf, name)
-        layouts.append(_layout("", name, np.shape(tensors[name]), path, ()))
+        layouts.append(_layout(component, name, np.shape(tensors[name]), path, prefix))
     return parameters, tuple(layouts)
 
 
@@ -263,16 +273,9 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray], path_of: T
     """
     from dew.interop.streaming import SourceLeaf, materialize
 
-    parameters: LazyTree = {}
-    owners, locate = _aliased(tensors, path_of)
-
     def mapped(stored: np.ndarray, dtype: np.dtype, order: tuple[int, ...] | None) -> np.ndarray | SourceLeaf:
         return (_copy(stored, dtype, order) if order is not None and stored.ndim != 2
                 else SourceLeaf((stored,), dtype, transposed=order is not None))
 
-    for name, path, leaf, _ in _leaves(tensors, locate, param_dtype, mapped):
-        if owners[path] == name:
-            insert(parameters, path, leaf, name)
-    layouts = source_layouts(component, {name: tensor.shape for name, tensor in tensors.items()}, path_of,
-                             prefix)
+    parameters, layouts = _bound(component, tensors, path_of, prefix, param_dtype, mapped)
     return (parameters if lazy else materialize(parameters)), layouts
