@@ -349,6 +349,7 @@ class Conv(nn.Conv):
                      rhs_dilation=kernel_dilation, dimension_numbers=dimensions,
                      feature_group_count=self.feature_group_count, precision=self.precision)
         if bias is not None:
-            # The convolution rounds to its dtype, as flax's does; the bias adds in fp32 (`biased`).
-            y = biased(y, bias, jnp.result_type(y, bias))
+            # The convolution rounds to its dtype and the bias adds as flax's do; its gradient sums at
+            # fp32 (`biased`).
+            y = biased(y, bias)
         return y if batch_dims == 1 else jnp.reshape(y, (*batch_shape, *y.shape[1:]))

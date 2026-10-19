@@ -86,4 +86,4 @@ def joined_dense(x: jax.Array, projections: Sequence[nn.Module], *, axis: int) -
     if biases is None:
         return jax.lax.dot_general(inputs, kernel, dimensions, precision=precision)
     # Taken and biased as each Dense takes and biases its own (`dew.nn.dense`).
-    return biased(jax.lax.dot_general(inputs, kernel, dimensions, precision=precision), biases, inputs.dtype)
+    return biased(jax.lax.dot_general(inputs, kernel, dimensions, precision=precision), biases)

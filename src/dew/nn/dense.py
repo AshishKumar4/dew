@@ -3,16 +3,15 @@
 `Dense` and `DenseGeneral` are flax 0.12's layers, fields, parameter names,
 shapes, initializers, promotion and product hooks alike, so checkpoints,
 LoRA and Qwix see the layers they did. Their call is their own: the same
-product, taken unrounded where a bias follows, then the bias added by
-`biased`, which rounds product and bias once to the dtype flax's addition
-gives them, as torch's addmm does, and sums its gradient at fp32. The bias is
+product, rounded to its dtype as flax's is, then the bias added by `biased`,
+which adds it in the dtype flax's addition gives them and broadcasts it at
+fp32, so its gradient sums at fp32 as torch's addmm sums it. The bias is
 added inside the layer's own managed call, so a method interceptor (an
 adapter, an input quantization) and an intermediate capture see the
-rounded output as they saw flax's.
+output as they saw flax's.
 
-flax's own calls add the bias in its storage dtype, after the product, and
-offer no step between the two; its Dense, DenseGeneral and Conv carry no
-`preferred_element_type` (its Einsum and ConvTranspose do).
+flax's own calls broadcast the bias in its storage dtype, where its gradient
+then sums, and offer no step to widen it.
 """
 
 from collections.abc import Iterable
@@ -42,7 +41,7 @@ def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dim
     product = _product(layer)(inputs, kernel, dimensions, precision=layer.precision)
     if bias is None:
         return product
-    return biased(product, shaped(bias), jnp.result_type(product, bias))
+    return biased(product, shaped(bias))
 
 
 def _reshaped(init, flat_shape):
