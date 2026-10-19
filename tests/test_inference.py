@@ -727,8 +727,15 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
     assert isinstance(restored, TextToImage)
     encoder = restored.inputs.conditions["textcontext"].encoder
     assert isinstance(encoder, CharTable)
+    from dew.interop.weights import checkpoint_dtype
+
     stored = merge(state.variables, state.ema)
-    expected_vars = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), stored)
+    # Stored as the load stores them at bfloat16: every floating leaf but those the storage rule
+    # keeps in float32, the `constants` a schedule or embedding holds among them.
+    expected_vars = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf.astype(checkpoint_dtype(
+            leaf.dtype, "bfloat16", path=tuple(jax.tree_util.keystr((key,), simple=True) for key in path))),
+        stored)
     table = restored.variables["encoders"]["textcontext"]["table"]
     assert table.dtype == jnp.bfloat16
     assert encoder.params["table"].dtype == table.dtype
