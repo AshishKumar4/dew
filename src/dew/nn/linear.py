@@ -48,7 +48,7 @@ from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, Coordinates, MixerCall, coordinates_of, cu_seqlens, valid_order
 from .joined import joined_dense, joins
 from .kernels import generation
-from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
+from .kernels.generation import Refusal, first_refusal, measured_kernel, refused, route, triton_runs
 from .precision import asks_default_precision, at_least_fp32, compensated_add, compensated_difference
 from .sharding import (
     HEADS,
@@ -738,11 +738,10 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
                             starts=starts)
 
 
-def port_refusal(query, key, value) -> str | None:
+def port_refusal(query, key, value) -> Refusal | None:
     """Why a rule over these operands runs the portable math rather than the
-    port (`fla_rule`), or None where the port takes it: on every GPU whose
-    target row names it (`measured_kernel`, the table qualification reads)
-    and every shape, dtype, chunk size and mesh, except
+    port (`fla_rule`) on a target whose row names the port, or None where the
+    port takes it: every shape, dtype, chunk size and mesh, except
     inside `jax.jvp`'s traces (`FORWARD_MODE`), which the port's custom VJP
     gives no tangent; inside a caller's `shard_map` that checks varying axes
     over operands that vary, where a Pallas call, which states no varying
@@ -752,29 +751,28 @@ def port_refusal(query, key, value) -> str | None:
     memories by where they pass, as many as the tokens' chunks, a row's and
     one, whatever the bound (`fla_gdn.Sequences`)."""
     widest = fla_gdn.WIDEST_KEYS if jnp.result_type(query, key, value).itemsize == 2 else fla_gdn.WIDEST
-    return first_refusal(
-        (measured_kernel('gated_delta_rule', 'xla') == 'fla',
-         "the device's target row (generation.TARGETS) does not name the port"),
-        (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the port's custom VJP "
-                                 "gives no tangent"),
-        (not jax.typeof(value).mat.varying,
+    return refused(
+        (not FORWARD_MODE.get(), 'forward_mode',
+         "forward_mode_attention traces for jax.jvp, which the port's custom VJP gives no tangent"),
+        (not jax.typeof(value).mat.varying, 'varying',
          "a shard_map that checks varying axes holds the operands, and a Pallas call states no "
          "varying type for its results"),
-        (all(jnp.dtype(x.dtype) != jnp.float64 for x in (query, key, value)),
+        (all(jnp.dtype(x.dtype) != jnp.float64 for x in (query, key, value)), 'float64',
          "float64 operands, whose rule is the reference math itself"),
-        (key.shape[-1] <= widest,
+        (key.shape[-1] <= widest, 'key_width',
          f"keys {key.shape[-1]} wide; the port takes at most {widest} in "
          f"{jnp.result_type(query, key, value).name}"),
     )
 
 
 def on_the_port(query, key, value) -> bool:
-    """Whether the rule runs on the port (`port_refusal`); a GPU whose row names it that runs
-    the rule elsewhere logs why the first time (`ran_kernel`)."""
-    refusal = port_refusal(query, key, value)
-    if refusal is not None:
-        ran_kernel('gated_delta_rule', 'xla', refusal)
-    return refusal is None
+    """Whether the rule runs on the port: where the target's row names it (`measured_kernel`, the table
+    qualification reads) and the call has no refusal (`port_refusal`), reported as the target's route
+    (`generation.route`), which logs a call the row's port turns down the first time."""
+    preferred = measured_kernel('gated_delta_rule', 'xla')
+    refusal = port_refusal(query, key, value) if preferred == 'fla' else None
+    kernel = 'fla' if preferred == 'fla' and refusal is None else 'xla'
+    return route('gated_delta_rule', kernel=kernel, refusal=refusal).kernel == 'fla'
 
 
 def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segments: int | None = None):
