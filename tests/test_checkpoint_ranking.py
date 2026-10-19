@@ -348,22 +348,46 @@ def test_weights_only_best_is_smaller_and_not_a_resume_state(tmp_path):
             metrics=[metric], best=Best(metric, weights_only=True))
     assert run.checkpoints.best == 1
     assert run.checkpoints.latest == 4
-    assert set(run.checkpoints.stored('best')) == {'variables', 'ema'}
+    model = {'step', 'microstep', 'updates', 'variables', 'ema'}
+    assert set(run.checkpoints.stored('best')) == model
     saved, _ = run.checkpoints.restore(None, 'best')
-    assert set(saved) == {'variables', 'ema'}
+    assert set(saved) == model
     with pytest.raises(ValueError):
         run.checkpoints.restore(run.initial_state(), 'best')
-    with pytest.raises(ValueError):
-        trainer(tmp_path / 'bad').fit(data(), steps=2, metrics=[metric],
-                                    best=Best(metric, weights_only=True), restore_best=True)
 
 
-def test_restore_best_returns_the_whole_earlier_state(tmp_path):
+def test_restore_best_reads_a_weights_only_best_as_the_model_it_holds(tmp_path):
+    """A weights-only best holds the model state of its step, which is what restore_best returns,
+    so a run whose best is one returns that step's counters and variables."""
+    metric = Value('value', Shown(better='lower'))
     run = trainer(tmp_path / 'run')
-    state = run.fit(data(), steps=8, log_every=1, eval_every=1, checkpoint_every=4, restore_best=True)
-    assert int(state.step) == 3
-    assert int(state.updates) == 3
-    assert float(state.variables['params']['w']) == pytest.approx(.488)
+    state = run.fit(data(), steps=4, log_every=1, eval_every=1, checkpoint_every=4, metrics=[metric],
+                    best=Best(metric, weights_only=True), restore_best=True)
+    saved, _ = run.checkpoints.restore(None, 'best')
+    assert int(state.step) == int(saved['step']) == run.checkpoints.best == 1
+    np.testing.assert_array_equal(np.asarray(state.variables['params']['w']),
+                                  np.asarray(saved['variables']['params']['w']))
+
+
+def test_restore_best_returns_the_best_steps_model_and_the_final_optimizer_state(tmp_path):
+    """restore_best returns the model the run ranked best, the counters and variables of its best
+    step, and the final step's optimizer state, in both its paths: it is the best model, not a
+    point to resume from, and a run without checkpoints holds no optimizer state for it."""
+    def fit(path, **options):
+        checkpoints = None if path is None else Checkpoints(str(path))
+        return Trainer(Overfit(), optax.adam(0.1), key=jax.random.key(0), checkpoints=checkpoints).fit(
+            data(), steps=8, log_every=1, eval_every=1, checkpoint_every=4 if path else None, **options)
+
+    models = []
+    for path in (tmp_path / 'run', None):
+        # A checkpointed run fit again to the step it reached trains nothing and returns its best.
+        final, best = fit(path), fit(path, restore_best=True)
+        assert int(best.step) == int(best.updates) < int(final.step) == 8
+        assert float(best.variables['params']['w']) != float(final.variables['params']['w'])
+        for kept, last in zip(jax.tree.leaves(best.opt_state), jax.tree.leaves(final.opt_state), strict=True):
+            np.testing.assert_array_equal(np.asarray(kept), np.asarray(last))
+        models.append((int(best.step), float(best.variables['params']['w'])))
+    assert models[0] == models[1] and models[0][0] == Checkpoints(str(tmp_path / 'run')).best
 
 
 def test_a_finished_run_fit_again_returns_its_best_state(tmp_path):
