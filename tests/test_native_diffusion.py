@@ -239,3 +239,52 @@ def test_a_bfloat16_safety_head_decides_as_its_checkpoint_states(saved_pipelines
                                      attention_impl="xla")
             blocked = np.all(np.asarray(loaded.finish(loaded.variables, images)) == -1, axis=(1, 2, 3))
             np.testing.assert_array_equal(blocked, expected, err_msg=f"the {name} checker at {storage}")
+
+
+@pytest.mark.parametrize("scheduler", ["shipped", "lms"])
+def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(saved_pipelines, tmp_path,
+                                                                              scheduler):
+    """A loaded pipeline samples on its scheduler's own grid and ends as its solver does, without a
+    closing denoise (`SourceTask.grid`), which its training process's times and finish do not give;
+    an LMS scheduler's solver runs on that grid alone. An objective trained from the pipeline keeps
+    both: its evaluation draws on that grid whatever process it trains on, its task draws the
+    pipeline's own task's images, and the settings a saved run records rebuild that grid and
+    finish."""
+    import dataclasses
+    import shutil
+
+    import jax
+    import jax.numpy as jnp
+    from diffusion_stubs import PROMPTS, batch_for
+
+    from dew.diffusion.schedules import DiscreteNoiseScheduler
+    from dew.interop.pretrained import load_diffusion_source
+    from dew.objectives import Step
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.registry import from_record, to_record
+    from dew.sampling.pipelines import ImageSettings
+
+    directory = tmp_path / "sd"
+    shutil.copytree(saved_pipelines / "sd", directory)
+    if scheduler == "lms":
+        with np.load(SCHEDULER_GRIDS) as grids:
+            (directory / "scheduler" / "scheduler_config.json").write_text(str(grids["lms.config"]))
+    source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    objective = DiffusionObjective(source, guidance=None, steps=3, ema_decay=None)
+    other = DiscreteNoiseScheduler(np.linspace(1e-3, 0.2, 20), p2_loss_weight_gamma=0)
+    retrained = DiffusionObjective(source, guidance=None, steps=3, ema_decay=None,
+                                   process=dataclasses.replace(source.process, schedule=other))
+    variables = source.variables
+    batch = batch_for(objective, source.inputs.sample.shape[0])
+    step = Step(jnp.asarray(0), jax.random.PRNGKey(4), None)
+    np.testing.assert_array_equal(objective.evaluate(variables, batch, step).images,
+                                  retrained.evaluate(variables, batch, step).images)
+
+    own = source.text_to_image()(PROMPTS, steps=3, guidance=None, key=0).host().images
+    np.testing.assert_array_equal(objective.build_task(variables)(PROMPTS, steps=3, guidance=None,
+                                                                  key=0).host().images, own)
+    settings = from_record(ImageSettings, to_record(objective.task_settings(), ImageSettings))
+    assert settings.final_denoise is False and settings.grid is not None
+    rebuilt, grid = settings.grid(3), source.task.grid(3)
+    np.testing.assert_array_equal(np.asarray(rebuilt[1]), np.asarray(grid[1]))
+    assert type(rebuilt[0].schedule) is type(grid[0].schedule)

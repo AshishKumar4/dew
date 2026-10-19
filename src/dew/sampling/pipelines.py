@@ -21,6 +21,7 @@ from typing_extensions import TypeVar
 from dew.artifacts import uint8_pixels
 from dew.coordination import agreed
 from dew.diffusion.process import Conditioning, Process
+from dew.diffusion.schedules.source import SourceGrid
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
@@ -143,7 +144,9 @@ class ImageSettings:
     (`TextToImage.from_objective`, `TextToImage.from_run`): the process, the solver, the
     guidance and the step count, and the records of the input encoders
     (`InputSpec.to_json`), the autoencoder (`AutoEncoder.to_json`) and an end-to-end tuning
-    (`EndToEnd`), which a saved run rebuilds over its own weights at the dtype it asks for."""
+    (`EndToEnd`), which a saved run rebuilds over its own weights at the dtype it asks for.
+    A run trained from a loaded pipeline samples on that pipeline's own `grid` and ends as its
+    solver does (`final_denoise` False), as `TextToImage`'s fields of those names say."""
 
     process: Process
     inputs: JSON
@@ -151,8 +154,10 @@ class ImageSettings:
     solver: Solver
     guidance: Guidance | None
     sampling_steps: int
-    # dewml/hybrid-dit-176m's published record predates the field.
+    # dewml/hybrid-dit-176m's published record predates the fields below.
     end_to_end: JSON = None
+    grid: SourceGrid | None = None
+    final_denoise: bool = True
 
     def __post_init__(self) -> None:
         from dew.records import integer
@@ -232,7 +237,8 @@ class TextToImage:
         # The live encoders and autoencoder need no record (`task_settings` writes theirs for a save).
         return cls(objective.model, objective.process, objective.inputs,
                    without_loss_heads(variables), autoencoder,
-                   steps=objective.steps, guidance=objective.guidance, solver=objective.solver)
+                   steps=objective.steps, guidance=objective.guidance, solver=objective.solver,
+                   grid=objective.grid, final_denoise=objective.final_denoise)
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
@@ -294,7 +300,8 @@ class TextToImage:
         elif autoencoder_record is not None:
             autoencoder = AutoEncoder.from_json(autoencoder_record, params=params['autoencoder'])
         return cls(config.build(), settings.process, inputs, without_loss_heads(params), autoencoder,
-                   steps=settings.sampling_steps, guidance=settings.guidance, solver=settings.solver)
+                   steps=settings.sampling_steps, guidance=settings.guidance, solver=settings.solver,
+                   grid=settings.grid, final_denoise=settings.final_denoise)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,

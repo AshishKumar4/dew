@@ -31,6 +31,7 @@ from dew.artifacts import ImageGrid, VideoGrid
 from dew.coordination import agreed, collective_host
 from dew.diffusion.presets import Preset, build_process
 from dew.diffusion.process import Process, aligned_conditions
+from dew.diffusion.schedules.source import SourceGrid
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec, unit_range
@@ -149,13 +150,19 @@ def model_part(tree: Variables) -> Variables:
                                 if name not in ("encoders", "autoencoder")})
 
 
-def check_solver(process, solver, steps: int) -> None:
-    """Trace a solver step on the objective's actual sampling grid."""
+def sampling_grid(process: Process, steps: int, grid: SourceGrid | None = None) -> tuple[Process, jax.Array]:
+    """The process and the concrete descending times `steps` steps sample on: a loaded pipeline's
+    own (`grid`, `SourceTask.grid`), else `process`'s grid."""
+    with jax.ensure_compile_time_eval():
+        return (process, process.times(steps)) if grid is None else grid(steps)
+
+
+def check_solver(process, solver, steps: int, grid: SourceGrid | None = None) -> None:
+    """Trace a solver step on the objective's actual sampling grid (`sampling_grid`)."""
     if isinstance(solver, str):
         raise TypeError(f"solver={solver!r} names a solver; pass the solver itself, as Euler()")
     x = jnp.zeros((1, 1), jnp.float32)
-    with jax.ensure_compile_time_eval():
-        times = process.times(steps)
+    process, times = sampling_grid(process, steps, grid)
     state = solver.init(x, times, process, key=jax.random.PRNGKey(0))
     if times.shape[0] < 2:
         return
@@ -385,7 +392,9 @@ class DiffusionObjective(Objective[Ratio]):
         `variables`, `process`, `inputs`, `autoencoder` and its own sampling policy,
         and any of them passed here overrides the pipeline's, an explicit None
         included (`autoencoder=None` trains in pixel space, `variables=None` draws
-        the denoiser). The pipeline's text encoder trains nothing but encodes every
+        the denoiser). Evaluation and the published task sample on the pipeline's
+        own grid and end as its solver does (`SourceTask.grid`), whatever process
+        trains. The pipeline's text encoder trains nothing but encodes every
         caption, so a pipeline loaded without it is refused.
 
         `ema_decay` is the EMA's decay, either a number or a schedule over the number
@@ -415,9 +424,12 @@ class DiffusionObjective(Objective[Ratio]):
         collection. A published task includes the tuned autoencoder, with those
         statistics as its latent normalization.
         """
+        grid, final_denoise = None, True
         if isinstance(model, PipelineSource):
             source = model
             model = source.model
+            # The pipeline samples on its own grid and ends as its solver does (`text_to_image`).
+            grid, final_denoise = source.task.grid, False
             process = source.process if process is None else process
             inputs = source.inputs if inputs is None else inputs
             autoencoder = source.autoencoder if autoencoder is OMITTED else autoencoder
@@ -451,7 +463,7 @@ class DiffusionObjective(Objective[Ratio]):
             jax.eval_shape(autoencoder.moments, autoencoder.params, jnp.zeros((1, *inputs.sample.shape)))
         if inputs.mask is not None and autoencoder is None:
             raise ValueError("Masked-image conditioning requires an autoencoder")
-        check_solver(self.process, solver, steps)
+        check_solver(self.process, solver, steps, grid)
         # Refusals come first: resolving the alignment's encoder may download its weights.
         self.alignment, self.representation = (None, None) if alignment is None else alignment.network(
             None if variables is None else variables.get(REPRESENTATION))
@@ -460,6 +472,8 @@ class DiffusionObjective(Objective[Ratio]):
         self.solver = solver
         self.guidance = guidance
         self.steps = steps
+        self.grid = grid
+        self.final_denoise = final_denoise
         self.ema = (None if ema_decay is None else EMASpec(
             decay=ema_decay if callable(ema_decay) else optax.constant_schedule(ema_decay),
             select=under("params")))
@@ -476,7 +490,8 @@ class DiffusionObjective(Objective[Ratio]):
                              None if self.autoencoder is None else self.autoencoder.to_json(),
                              self.solver, self.guidance, self.steps,
                              # A tuned autoencoder's weights and statistics sit in the run's own tree.
-                             None if self.end_to_end is None else to_record(self.end_to_end, EndToEnd))
+                             None if self.end_to_end is None else to_record(self.end_to_end, EndToEnd),
+                             grid=self.grid, final_denoise=self.final_denoise)
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> TextToImage:
@@ -673,14 +688,15 @@ class DiffusionObjective(Objective[Ratio]):
             return samples
         return self.autoencoder.encode(variables["autoencoder"], samples, key)
 
-    def denoiser(self, params, given, unconditional):
-        """Build the process's denoiser over the model's own collections.
+    def denoiser(self, params, given, unconditional, process: Process | None = None):
+        """Build `process`'s denoiser, the training process's by default, over the model's own
+        collections.
 
         The unconditional branch is passed only when this objective is
         guided; without guidance the solver never evaluates it.
         """
-        return self.process.denoiser(self.model, self.model_variables(params), given,
-                                     None if self.guidance is None else unconditional)
+        return (self.process if process is None else process).denoiser(
+            self.model, self.model_variables(params), given, None if self.guidance is None else unconditional)
 
     def _conditions(self, params, batch, key):
         """The batch's conditions and the blank ones, the blank aligned to and
@@ -823,11 +839,12 @@ class DiffusionObjective(Objective[Ratio]):
 
     def _sample_impl(self, params, batch, key, *, count: int):
         given, unconditional = self._conditions(params, batch, key)
-        denoise = self.denoiser(params, given, unconditional)
+        process, times = sampling_grid(self.process, self.steps, self.grid)
+        denoise = self.denoiser(params, given, unconditional, process)
         noise_key, sample_key = jax.random.split(key)
-        x_T = self.process.noise(noise_key, (count, *self.latent_shape))
-        samples = sample(denoise, x_T, self.steps, solver=self.solver,
-                         guidance=self.guidance, key=sample_key)
+        x_T = process.noise(noise_key, (count, *self.latent_shape))
+        samples = sample(denoise, x_T, solver=self.solver, guidance=self.guidance, key=sample_key,
+                         times=np.asarray(times), final_denoise=self.final_denoise)
         autoencoder, params = self.published_autoencoder(params)
         if autoencoder is not None:
             samples = autoencoder.decode(params["autoencoder"], samples)
