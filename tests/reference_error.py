@@ -714,6 +714,48 @@ def assert_rows_as_exact_over_orders(dew, reference, label: str, sizes=None) -> 
         f"the reference's {their_worst:.3e} (ratio {worst / their_worst:.2f}, allowed {ROW_FACTOR:g})")
 
 
+def element_factor(elements: int) -> float:
+    """The factor `assert_elements_as_exact_over_orders` allows each of `elements` elements: the
+    square root of the F(ORDERS, ORDERS) quantile that a port as exact as its reference passes at
+    every element but for FALSE_FAILURE of the time (Bonferroni over the elements), at least FACTOR.
+    Each element's error over the orders is one Gaussian draw an order, a chi-square of ORDERS degrees
+    a side, so its squared RMS ratio is F(ORDERS, ORDERS): 3.16 at 43.5M elements."""
+    from scipy import stats
+
+    return max(FACTOR, float(np.sqrt(stats.f.isf(FALSE_FAILURE / max(elements, 1), ORDERS, ORDERS))))
+
+
+def assert_elements_as_exact_over_orders(dew_squares, reference_squares, sizes, label: str) -> None:
+    """Every element held over ORDERS rounding orders where the orders cannot all be kept:
+    `dew_squares` and `reference_squares` `[rows, ...]` each element's squared distance from float64
+    summed over the ORDERS orders, and `sizes` `[rows]` each row's float64 size, which sizes its
+    elements where no terms do (`row_errors`). Each element's RMS over the orders within
+    `element_factor` of the reference's, or of its row's RMS over the orders and the elements where
+    that is larger, so an element the reference happens to round exactly does not hold Dew to zero;
+    a row below float64's `RESOLUTION` of its size passes. A non-finite element fails, on either side."""
+    dew_squares, reference_squares = (np.asarray(x, np.float64) for x in (dew_squares, reference_squares))
+    assert dew_squares.shape == reference_squares.shape and dew_squares.ndim >= 2, (
+        f"{label}: {dew_squares.shape} and {reference_squares.shape}, the rule takes [rows, ...] sums")
+    for side, squares in (("dew", dew_squares), ("the reference", reference_squares)):
+        broken = int(np.count_nonzero(~np.isfinite(squares)))
+        assert broken == 0, f"{label}: {broken} of {squares.size} of {side}'s elements are not finite"
+    rows = dew_squares.shape[0]
+    mine, theirs = (np.sqrt(squares.reshape(rows, -1) / ORDERS)
+                    for squares in (dew_squares, reference_squares))
+    row = np.sqrt(np.mean(np.square(theirs), axis=1, keepdims=True))
+    floor = np.maximum(row, RESOLUTION * np.asarray(sizes, np.float64).reshape(rows, 1))
+    bar = element_factor(mine.size) * np.maximum(theirs, floor)
+    failing = mine > bar
+    if np.any(failing):
+        ratios = np.where(bar > 0, mine / np.where(bar > 0, bar, 1), np.inf)
+        at = np.unravel_index(int(np.argmax(ratios)), ratios.shape)
+        raise AssertionError(
+            f"{label}: {int(np.count_nonzero(failing))} of {mine.size} elements past the reference; the "
+            f"worst, row {at[0]} element {at[1]}, is {mine[at]:.3e} from float64 (rms over {ORDERS} orders), "
+            f"the reference {theirs[at]:.3e} and its row {row[at[0], 0]:.3e} (allowed "
+            f"{element_factor(mine.size):.2f} times the larger)")
+
+
 def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, roundings: int) -> None:
     """The reference run in float64 within the float64 rounding of the
     computation itself of an independent float64 oracle: FACTOR times

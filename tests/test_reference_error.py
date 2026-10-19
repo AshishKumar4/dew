@@ -11,7 +11,9 @@ from reference_error import (
     assert_as_exact_as_the_reference,
     assert_leaves_as_exact,
     assert_leaves_as_exact_in_two_stages,
+    assert_elements_as_exact_over_orders,
     assert_rows_as_exact_over_orders,
+    element_factor,
     distance,
     reduce,
 )
@@ -175,3 +177,31 @@ def test_a_row_rounding_more_fails_over_orders_where_the_global_rms_passes():
     assert np.sqrt(np.mean(dew ** 2)) <= FACTOR * np.sqrt(np.mean(reference ** 2))
     with pytest.raises(AssertionError):
         assert_rows_as_exact_over_orders(dew, reference, "one row")
+
+
+def test_elements_held_over_orders_pass_alike_and_fail_one_that_rounds_more():
+    """Elements over ORDERS orders (`assert_elements_as_exact_over_orders`): 64 rows of 4096 elements
+    rounding alike on both sides pass, as do elements the reference rounds exactly, held to their row;
+    one element rounding five times as far fails, as does a non-finite one. At 43.5M elements the
+    derived factor is 3.16."""
+    rng = np.random.default_rng(6)
+    shape = (64, 4096)
+
+    def squares():
+        return np.sum(np.square(rng.normal(size=(ORDERS, *shape))), axis=0)
+
+    sizes = np.ones(shape[0])
+    dew, reference = squares(), squares()
+    assert_elements_as_exact_over_orders(dew, reference, sizes, "alike")
+    exact = reference.copy()
+    exact[:, :8] = 0
+    assert_elements_as_exact_over_orders(dew, exact, sizes, "exactly rounded")
+    wrong = dew.copy()
+    wrong[5, 17] = 25 * ORDERS * 4
+    with pytest.raises(AssertionError, match="1 of"):
+        assert_elements_as_exact_over_orders(wrong, reference, sizes, "one element")
+    broken = dew.copy()
+    broken[0, 0] = np.nan
+    with pytest.raises(AssertionError, match="not finite"):
+        assert_elements_as_exact_over_orders(broken, reference, sizes, "nan")
+    assert round(element_factor(332 * 131072), 2) == 3.16
