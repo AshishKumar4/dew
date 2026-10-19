@@ -48,7 +48,8 @@ def engine(provider, answer):
         calls.append(json.loads(request.content))
         if request.url.path.endswith("/detokenize"):
             # SGLang's decoding of a continued draw's ids (`dew.inference.continuation`).
-            return httpx2.Response(200, json={"text": "".join(f"<{token}>" for token in calls[-1]["tokens"])})
+            return httpx2.Response(200, json={"text": ["".join(f"<{token}>" for token in row)
+                                                      for row in calls[-1]["tokens"]]})
         return httpx2.Response(200, json={"id": "fixture", "model": "tiny", "created": 1,
                                           "object": "text_completion", "choices": [answer(calls[-1])]})
 

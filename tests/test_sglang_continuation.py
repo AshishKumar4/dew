@@ -3,14 +3,16 @@
 v0.5.20's OpenAI routes at the HTTP transport.
 
 The stand-in draws as SGLang does where it matters here: each token from logits over the ids
-before it, a frequency penalty over the ids it drew and a logit bias added to them, under a seed
-keyed by the seed and the token's place in the sequence (`multinomial_with_seed`); it ends a draw
-on `stop_token_ids` and on its model's own EOS, `NATIVE`, unless the request ignores every token
-stop or still owes `min_tokens` (`Req._check_token_based_finish`); it trims the stop it ended on
-from the text unless told not to, reports every text offset as -1 and an empty top-logprob list
-for `logprobs=0` (openai/utils.py), and refuses the chat route's token-id flags on a stream. The
-same stand-in told its model has no EOS of its own is the policy's own engine, the reference a
-continued draw is held to."""
+before it, with a frequency penalty over the ids it drew, a logit bias, and its stop ids masked
+while `min_tokens` is still owed (`BatchedMinNewTokensPenalizer`), under a seed keyed by the seed
+and the token's place in the sequence (`multinomial_with_seed`), the same for every parallel
+sample of a request. It ends a draw on `stop_token_ids` and on its model's own EOS, `NATIVE`,
+unless the request ignores every token stop (`Req._check_token_based_finish`); answers a batch
+prompt by prompt; decodes a draw after its prompt's last ids, as SGLang's detokenizer does, with a
+tokenizer that drops the leading space of what it decodes, as SentencePiece does; trims the stop
+it ended on unless told not to; reports every text offset as -1 and an empty top-logprob list for
+`logprobs=0` (openai/utils.py); and streams a body read as it arrives. The same stand-in told its
+model has no EOS of its own is the policy's own engine, the reference a continued draw is held to."""
 
 import asyncio
 import json
@@ -32,67 +34,83 @@ NATIVE = 2
 EOS = 7
 """The policy's stop id."""
 SPECIAL = (NATIVE, EOS)
-"""The ids SGLang's text leaves out, as it skips special tokens."""
-TEMPLATE = [9, 9]
-"""The ids a chat request's messages render to."""
+"""The ids a decoding that skips special tokens leaves out."""
+CONTEXT = 5
+"""How many prompt ids SGLang decodes a draw after (`INIT_INCREMENTAL_DETOKENIZATION_OFFSET`)."""
 VOCABULARY = 10
+POLICY = Sampling(eos_token_ids=EOS)
 
 
 def logits(sequence, adapter):
     """A model whose next id depends on the last one: its own EOS likely after an odd id, the
     policy's stop rarely, and the adapter `b` leaning to 4."""
-    last = sequence[-1]
     scores = np.full(VOCABULARY, -1.0)
     scores[[0, 3, 5, 6]] = 0.5
-    scores[NATIVE] = 1.5 if last % 2 else -0.5
+    scores[NATIVE] = 1.5 if sequence[-1] % 2 else -0.5
     scores[EOS] = -0.3
     if adapter == "b":
         scores[4] = 1.0
     return scores
 
 
-def text(ids, skip=True):
-    return "".join(f"<{token}>" for token in ids if not (skip and token in SPECIAL))
+def decoded(ids, skip=True):
+    """A tokenizer's decoding of `ids`: each id a word, the first word's leading space dropped."""
+    return "".join(f" w{token}" for token in ids if not (skip and token in SPECIAL)).lstrip()
+
+
+def generated(prompt, ids, skip=True):
+    """A draw's text as SGLang decodes it: after the prompt's last `CONTEXT` ids."""
+    context = list(prompt[-CONTEXT:])
+    return decoded([*context, *ids], skip)[len(decoded(context, skip)):]
+
+
+def streamed_body(records, *, asynchronous):
+    """An SSE body the transport hands over as it is read, so the response stays open until then."""
+    lines = [*(f"data: {json.dumps(record)}\n\n".encode() for record in records), b"data: [DONE]\n\n"]
+
+    async def arriving():
+        for line in lines:
+            yield line
+
+    return arriving() if asynchronous else iter(lines)
 
 
 class SGLang:
-    """SGLang's `/v1/completions`, `/v1/chat/completions` and `/v1/detokenize` over `logits`, its
-    model ending a draw on `NATIVE` where `own_eos`; every request it answered is in `requests`."""
+    """SGLang's `/v1/completions`, `/v1/chat/completions` and `/detokenize` over `logits`, its
+    model ending a draw on `NATIVE` where `own_eos`; every request it answered is in `requests`
+    with its headers."""
 
-    def __init__(self, own_eos=True):
-        self.own_eos, self.requests = own_eos, []
+    def __init__(self, own_eos=True, asynchronous=False):
+        self.own_eos, self.asynchronous, self.requests = own_eos, asynchronous, []
         self.unseeded = np.random.default_rng(0)
 
     def __call__(self, request):
         body = json.loads(request.content)
         path = request.url.path
-        self.requests.append((path, body))
+        self.requests.append((path, body, dict(request.headers)))
         if path.endswith("/detokenize"):
-            decoded = text(body["tokens"], body.get("skip_special_tokens", True))
-            return httpx2.Response(200, json={"text": decoded})
+            return httpx2.Response(200, json={"text": [decoded(row, body.get("skip_special_tokens", True))
+                                                      for row in body["tokens"]]})
         chat = path.endswith("/chat/completions")
-        flagged = body.get("return_token_ids") or body.get("return_prompt_token_ids")
-        if chat and body.get("stream") and flagged:
-            return httpx2.Response(400, json={"error": {"message": "no token ids on a stream"}})
         budget = body.get("max_completion_tokens" if chat else "max_tokens")
-        if (body.get("min_tokens") or 0) > budget:
-            return httpx2.Response(400, json={"error": {"message": "min_tokens past max_tokens"}})
-        prompts = [list(TEMPLATE)] if chat else [list(row) for row in body["prompt"]]
+        prompts = [[9, 9]] if chat else [list(row) for row in body["prompt"]]
         adapters = body.get("lora_path")
         n = body.get("n", 1)
         choices = []
         for index in range(len(prompts) * n):
-            adapter = adapters[index % len(prompts)] if isinstance(adapters, list) else adapters
-            choices.append(self.draw(index, prompts[index % len(prompts)], adapter, body, budget))
+            row = index // n
+            adapter = adapters[row] if isinstance(adapters, list) else adapters
+            choices.append(self.draw(index, prompts[row], adapter, body, budget))
         if body.get("stream"):
-            return self.stream(choices, chat)
-        generated = sum(len(choice["ids"]) for choice in choices)
+            return self.stream(choices, chat, body)
+        produced = sum(len(choice["ids"]) for choice in choices)
+        prompt_tokens = sum(len(prompts[index // n]) for index in range(len(prompts) * n))
         return httpx2.Response(200, json={
             "id": "sglang", "model": "tiny", "created": 1,
             "object": "chat.completion" if chat else "text_completion",
             "choices": [self.rendered(choice, chat, body) for choice in choices],
-            "usage": {"prompt_tokens": sum(len(row) for row in prompts), "completion_tokens": generated,
-                      "total_tokens": sum(len(row) for row in prompts) + generated}})
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": produced,
+                      "total_tokens": prompt_tokens + produced}})
 
     def draw(self, index, prompt, adapter, body, budget):
         stops = set() if body.get("ignore_eos") else set(body.get("stop_token_ids") or ()) | (
@@ -105,13 +123,15 @@ class SGLang:
                 ids, minlength=VOCABULARY)
             for token, value in bias.items():
                 weights[token] += value
+            if len(ids) < (body.get("min_tokens") or 0):
+                weights[sorted(stops)] = -np.inf
             probabilities = np.exp(weights - weights.max())
             probabilities /= probabilities.sum()
             rng = self.unseeded if seed is None else np.random.default_rng((seed, len(sequence)))
             token = int(rng.choice(VOCABULARY, p=probabilities))
             ids.append(token)
             scores.append(float(np.log(probabilities[token])))
-            if token in stops and len(ids) >= (body.get("min_tokens") or 0):
+            if token in stops:
                 return {"index": index, "ids": ids, "scores": scores, "prompt": prompt, "reason": "stop",
                         "matched": token}
         return {"index": index, "ids": ids, "scores": scores, "prompt": prompt, "reason": "length",
@@ -122,106 +142,107 @@ class SGLang:
         ids = choice["ids"]
         if choice["matched"] is not None and not body.get("no_stop_trim"):
             ids = ids[:-1]
-        return text(ids, body.get("skip_special_tokens", True))
+        return generated(choice["prompt"], ids, body.get("skip_special_tokens", True))
 
     def rendered(self, choice, chat, body):
         if chat:
-            entry = {"index": choice["index"], "finish_reason": choice["reason"],
-                     "matched_stop": choice["matched"],
-                     "message": {"role": "assistant", "content": self.shown(choice, body)}}
-            if body.get("return_prompt_token_ids"):
-                entry["prompt_token_ids"] = choice["prompt"]
-            if body.get("return_token_ids"):
-                entry["response_token_ids"] = choice["ids"]
-            if body.get("logprobs"):
-                entry["logprobs"] = {"content": [
-                    {"token": f"<{token}>", "logprob": score, "bytes": list(f"<{token}>".encode()),
-                     "top_logprobs": []}
-                    for token, score in zip(choice["ids"], choice["scores"], strict=True)]}
-            return entry
+            return {"index": choice["index"], "finish_reason": choice["reason"],
+                    "matched_stop": choice["matched"],
+                    "message": {"role": "assistant", "content": self.shown(choice, body)}}
         entry = {"index": choice["index"], "text": self.shown(choice, body),
                  "finish_reason": choice["reason"], "matched_stop": choice["matched"]}
         if body.get("return_token_ids"):
             entry.update(token_ids=choice["ids"], prompt_token_ids=choice["prompt"])
         if body.get("logprobs") is not None:
-            entry["logprobs"] = {"tokens": [f"<{token}>" for token in choice["ids"]],
+            entry["logprobs"] = {"tokens": [f"w{token}" for token in choice["ids"]],
                                  "token_logprobs": choice["scores"], "top_logprobs": [],
                                  "text_offset": [-1] * len(choice["ids"])}
         return entry
 
-    def stream(self, choices, chat):
+    def stream(self, choices, chat, body):
         records = []
         for choice in choices:
             for at, token in enumerate(choice["ids"]):
                 last = at == len(choice["ids"]) - 1
                 reason, matched = (choice["reason"], choice["matched"]) if last else (None, None)
-                part = ({"index": choice["index"], "delta": {"content": text([token])}} if chat
-                        else {"index": choice["index"], "text": text([token])})
+                piece = generated(choice["prompt"], choice["ids"][:at + 1])[len(
+                    generated(choice["prompt"], choice["ids"][:at])):]
+                part = ({"index": choice["index"], "delta": {"content": piece}} if chat
+                        else {"index": choice["index"], "text": piece})
                 records.append({"id": "sglang", "model": "tiny", "created": 1,
                                 "object": "chat.completion.chunk" if chat else "text_completion",
                                 "choices": [{**part, "finish_reason": reason, "matched_stop": matched}]})
-        content = "".join(f"data: {json.dumps(record)}\n\n" for record in records) + "data: [DONE]\n\n"
-        return httpx2.Response(200, content=content, headers={"Content-Type": "text/event-stream"})
+        return httpx2.Response(200, content=streamed_body(records, asynchronous=self.asynchronous),
+                               headers={"Content-Type": "text/event-stream"})
 
 
 def sglang(own_eos=True, asynchronous=False):
-    engine = SGLang(own_eos)
+    engine = SGLang(own_eos, asynchronous)
     if asynchronous:
+        async def answer(request):
+            await request.aread()
+            return engine(request)
+
         client = openai.AsyncOpenAI(base_url="http://sglang/v1", api_key="fixture", max_retries=0,
-                                   http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(engine)))
+                                   http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(answer)))
     else:
         client = openai.OpenAI(base_url="http://sglang/v1", api_key="fixture", max_retries=0,
                                http_client=httpx2.Client(transport=httpx2.MockTransport(engine)))
     return OpenAICompletion("tiny", client, provider="sglang"), engine
 
 
+def completions(engine):
+    return [body for path, body, _ in engine.requests if path.endswith("/completions")]
+
+
 @pytest.mark.parametrize("policy, fields", [
-    (Sampling(eos_token_ids=EOS), {}),
+    (POLICY, {}),
     (Sampling(eos_token_ids=EOS, frequency_penalty=0.7), {}),
-    (Sampling(eos_token_ids=EOS), {"extra_body": {"lora_path": ["a", "b"]}}),
-    (Sampling(eos_token_ids=EOS), {"extra_body": {"min_tokens": 3}}),
-    (Sampling(eos_token_ids=EOS), {"extra_body": {"no_stop_trim": True, "skip_special_tokens": False}}),
+    (Sampling(eos_token_ids=EOS, frequency_penalty=0.7), {"extra_body": {"logit_bias": {"5": 0.4}}}),
+    (POLICY, {"n": 2, "extra_body": {"lora_path": ["a", "b"]}}),
+    (POLICY, {"extra_body": {"no_stop_trim": True, "skip_special_tokens": False}}),
 ])
 def test_a_continued_draw_is_the_policys_uninterrupted_draw_under_its_seed(policy, fields):
     """Where SGLang ends a draw on its model's own EOS, the draw goes on from its prompt and the ids it
     drew on the rest of its budget, and under a seed it is the draw an engine without that EOS
-    draws: the same ids, log-probabilities, text, finish and usage, for a frequency penalty, per-row
-    adapters, a minimum output and the stop's text kept too. Most draws here go on at least once."""
+    draws: the same ids, log-probabilities, text, finish and usage, for a frequency penalty beside
+    a logit bias in extra_body, two samples of two rows on their own adapters, and special tokens
+    and the stop's text kept too. Most draws here go on at least once."""
     completion, engine = sglang()
     reference, _ = sglang(own_eos=False)
     continued = 0
     for key in range(12):
         engine.requests.clear()
-        done = completion([[1], [3]], 8, key=key, sampling=policy, logprobs=0, **fields)
-        expected = reference([[1], [3]], 8, key=key, sampling=policy, logprobs=0, **fields)
+        done = completion([[1, 4, 6], [3]], 8, key=key, sampling=policy, logprobs=0, **fields)
+        expected = reference([[1, 4, 6], [3]], 8, key=key, sampling=policy, logprobs=0, **fields)
         assert done.tokens == expected.tokens and done.texts == expected.texts
         assert done.finish_reasons == expected.finish_reasons and done.log_probs == expected.log_probs
         assert done.usage.completion_tokens == sum(len(row) for row in done.tokens)
-        continued += sum(path.endswith("/completions") for path, _ in engine.requests) - 1
+        continued += len(completions(engine)) - 1
     assert continued >= 6
 
 
 def test_a_continuation_sends_what_the_policy_draws_by():
     """A continuation's request carries the policy and its seed, its own row's adapter, the minimum
-    output still owed, an empty suffix past any completion template, and a frequency penalty's
-    counts of the ids drawn as logit bias."""
+    output still owed, an empty suffix past any completion template, a frequency penalty's counts
+    of the ids drawn as logit bias where the SDK sends it, and the request's headers on every call."""
     completion, engine = sglang()
     policy = Sampling(eos_token_ids=EOS, frequency_penalty=0.5)
     for key in range(40):
         engine.requests.clear()
-        completion([[1], [3]], 8, key=key, sampling=policy,
-                   extra_body={"lora_path": ["a", "b"], "min_tokens": 1})
-        follow = [(body, engine.requests[0][1]) for path, body in engine.requests[1:]
-                  if path.endswith("/completions")]
-        if follow:
+        completion([[1], [3]], 8, key=key, sampling=policy, extra_headers={"x-tenant": "t"},
+                   extra_body={"lora_path": ["a", "b"], "min_tokens": 1, "suffix": "tail"})
+        if len(completions(engine)) > 1:
             break
-    (then, first), *_ = follow
+    first, then = completions(engine)[:2]
     (row,) = then["prompt"]
     drawn = row[1:]
     assert then["seed"] == first["seed"] and then["n"] == 1 and then["suffix"] == ""
     assert then["max_tokens"] == 8 - len(drawn) and then["stop_token_ids"] == [EOS]
     assert then["lora_path"] == ["a", "b"][row[0] != 1] and then["min_tokens"] == 0
     assert then["logit_bias"] == {str(token): -0.5 * count for token, count in Counter(drawn).items()}
+    assert all(headers.get("x-tenant") == "t" for _, _, headers in engine.requests)
+    assert any(path.endswith("/detokenize") for path, _, _ in engine.requests)
 
 
 PROBABILITIES = {0: 0.25, NATIVE: 0.5, EOS: 0.25}
@@ -254,8 +275,7 @@ def test_a_continued_draw_has_the_policys_distribution():
                            http_client=httpx2.Client(transport=httpx2.MockTransport(engine)))
     completion = OpenAICompletion("tiny", client, provider="sglang")
     count = 4000
-    outcomes = Counter(completion([[1]], 3, key=key, sampling=Sampling(eos_token_ids=EOS)).tokens[0]
-                       for key in range(count))
+    outcomes = Counter(completion([[1]], 3, key=key, sampling=POLICY).tokens[0] for key in range(count))
     exact = {}
     for length in (1, 2, 3):
         for head in np.ndindex(*(2,) * (length - 1)):
@@ -271,107 +291,74 @@ def test_a_continued_draw_has_the_policys_distribution():
         assert abs(outcomes[ids] / count - probability) <= 5 * spread, ids
 
 
-@pytest.mark.parametrize("control", [{"presence_penalty": 0.5}, {"repetition_penalty": 1.2},
-                                     {"extra_body": {"regex": "<3>.*"}}, {"stop": ["<5>"]}])
-def test_a_control_a_continuation_cannot_carry_is_refused_where_a_draw_needs_one(control):
-    """A presence or repetition penalty counts each id drawn before the cut once, and stop strings,
-    patterns and constraints match from where a draw starts, none of which a continuation from the
-    ids before it can hold: a draw that needs one is refused, and the same request whose draws all
-    end on the policy's stop is drawn."""
+@pytest.mark.parametrize("sampling, fields", [
+    (Sampling(eos_token_ids=EOS, presence_penalty=0.5), {}),
+    (Sampling(eos_token_ids=EOS, repetition_penalty=1.2), {}),
+    (POLICY, {"extra_body": {"regex": "w3.*"}}),
+    (POLICY, {"stop": ["w5"]}),
+    (POLICY, {"echo": True}),
+])
+def test_a_control_a_continuation_cannot_carry_is_refused_where_a_draw_needs_one(sampling, fields):
+    """A presence or repetition penalty counts each id drawn before the cut once, stop strings,
+    patterns and constraints match from where a draw starts, and an echoed prompt is no part of the
+    decoded draw, none of which a continuation from the ids before it holds: a draw that needs one
+    is refused, and the same request whose draws all end on the policy's stop is drawn."""
     completion, _ = sglang()
-    policy = (Sampling(eos_token_ids=EOS, presence_penalty=0.5) if "presence_penalty" in control
-              else Sampling(eos_token_ids=EOS, repetition_penalty=1.2) if "repetition_penalty" in control
-              else Sampling(eos_token_ids=EOS))
-    fields = {name: value for name, value in control.items()
-              if name not in ("presence_penalty", "repetition_penalty")}
     with pytest.raises(ValueError):
         for key in range(40):
-            completion([[1]], 8, key=key, sampling=policy, **fields)
-    stopping = Sampling(eos_token_ids=(NATIVE, EOS), presence_penalty=policy.presence_penalty,
-                        repetition_penalty=policy.repetition_penalty)
+            completion([[1]], 8, key=key, sampling=sampling, **fields)
+    stopping = Sampling(eos_token_ids=(NATIVE, EOS), presence_penalty=sampling.presence_penalty,
+                        repetition_penalty=sampling.repetition_penalty)
     assert completion([[1]], 8, key=0, sampling=stopping, **fields).tokens
 
 
-def test_a_stream_is_refused_where_sglang_ends_on_its_own_eos_and_closes_its_response():
-    """A stream's text deltas would start their decoding again at a continuation's cut, so a stream
-    SGLang ends on its own EOS is refused at that chunk, after the chunks before it, and its
-    response is closed; one that ends on the policy's stop streams whole, and a stream closed before
-    its first read closes its response."""
+def test_a_chat_or_stream_sglang_ends_on_its_own_eos_is_refused_and_its_stream_closed():
+    """Only a whole completion goes on past SGLang's own EOS, so a chat or a stream it ends there is
+    refused, a stream at that chunk after the chunks before it and its response closed; one whose
+    draws end on the policy's stop is the engine's own, and a stream closed before its first read
+    closes its open response."""
     completion, _ = sglang()
-    for key in range(40):
-        stream = completion.stream([[1]], 8, key=key, sampling=Sampling(eos_token_ids=EOS))
-        chunks = []
+    messages = [{"role": "user", "content": "hi"}]
+    refusals = Counter()
+    for key in range(20):
+        stream = completion.stream([[1]], 8, key=key, sampling=POLICY)
+        assert not stream.response.is_closed
         try:
-            chunks.extend(stream)
+            chunks = list(stream)
         except ValueError:
+            refusals["stream"] += 1
             assert stream.response.is_closed
-            break
-        assert chunks[-1].choices[0].finish_reason in ("stop", "length")
-    else:
-        pytest.fail("no stream ended on SGLang's own EOS")
-    unread = completion.stream([[1]], 8, key=0, sampling=Sampling(eos_token_ids=EOS))
+        else:
+            assert chunks[-1].choices[0].finish_reason in ("stop", "length")
+        try:
+            completion.chat(messages, 8, key=key, sampling=POLICY)
+        except ValueError:
+            refusals["chat"] += 1
+    assert 0 < refusals["stream"] < 20 and 0 < refusals["chat"] < 20
+    unread = completion.stream([[1]], 8, key=0, sampling=POLICY)
     unread.close()
     assert unread.response.is_closed
 
 
-def test_a_chat_goes_on_as_the_policys_chat_and_a_chat_stream_asks_for_no_ids():
-    """A chat SGLang ended on its own EOS goes on from its rendered prompt on the completions route:
-    its message and token ids are the policy's own chat's under the same seed. A chat stream sends
-    none of the token-id flags SGLang's stream refuses, and a chat with media is refused where its
-    draw would go on, as the completions route takes none."""
-    completion, engine = sglang()
-    reference, _ = sglang(own_eos=False)
-    messages = [{"role": "user", "content": "hi"}]
-    policy = Sampling(eos_token_ids=EOS)
-    continued = 0
-    for key in range(12):
-        engine.requests.clear()
-        (choice,) = completion.chat(messages, 8, key=key, sampling=policy, logprobs=True).choices
-        (expected,) = reference.chat(messages, 8, key=key, sampling=policy, logprobs=True).choices
-        assert choice.message.content == expected.message.content
-        assert choice.model_extra["response_token_ids"] == expected.model_extra["response_token_ids"]
-        assert [entry.logprob for entry in choice.logprobs.content] == [
-            entry.logprob for entry in expected.logprobs.content]
-        assert choice.finish_reason == expected.finish_reason
-        continued += len(engine.requests) > 1
-    assert continued >= 3
-    refused = 0
-    for key in range(3):
-        try:
-            list(completion.chat(messages, 8, key=key, sampling=policy, stream=True))
-        except ValueError:
-            refused += 1
-    assert refused < 3 and all("return_token_ids" not in body for path, body in engine.requests
-               if path.endswith("/chat/completions") and body.get("stream"))
-    pictured = [{"role": "user", "content": [{"type": "text", "text": "hi"},
-                                             {"type": "image_url", "image_url": {"url": "data:,"}}]}]
-    with pytest.raises(ValueError):
-        for key in range(40):
-            completion.chat(pictured, 8, key=key, sampling=policy)
-
-
 def test_the_async_client_goes_on_as_the_sync_one_does():
-    """`acall` and `achat` go on as `__call__` and `chat` do, and `astream` is checked as `stream` is."""
+    """`acall` goes on as `__call__` does, and `astream` is checked as `stream` is, closed by
+    `aclose` before its first read too."""
     async def run():
         completion, _ = sglang(asynchronous=True)
         try:
-            done = [await completion.acall([[1]], 8, key=key, sampling=Sampling(eos_token_ids=EOS))
-                    for key in range(6)]
-            chats = [await completion.achat([{"role": "user", "content": "hi"}], 8, key=key,
-                                            sampling=Sampling(eos_token_ids=EOS)) for key in range(6)]
-            stream = await completion.astream([[1]], 8, key=0,
-                                              sampling=Sampling(eos_token_ids=(NATIVE, EOS)))
+            done = [await completion.acall([[1]], 8, key=key, sampling=POLICY) for key in range(6)]
+            stream = await completion.astream([[1]], 8, key=0, sampling=Sampling(eos_token_ids=(NATIVE, EOS)))
             chunks = [chunk async for chunk in stream]
+            unread = await completion.astream([[1]], 8, key=0, sampling=POLICY)
+            open_before = not unread.response.is_closed
+            await unread.aclose()
+            closed = unread.response.is_closed
         finally:
             await completion.client.close()
-        return done, chats, chunks
+        return done, chunks, open_before and closed
 
-    done, chats, chunks = asyncio.run(run())
+    done, chunks, closed = asyncio.run(run())
     completion, _ = sglang()
-    assert [draw.tokens for draw in done] == [
-        completion([[1]], 8, key=key, sampling=Sampling(eos_token_ids=EOS)).tokens for key in range(6)]
-    assert [chat.choices[0].model_extra["response_token_ids"] for chat in chats] == [
-        completion.chat([{"role": "user", "content": "hi"}], 8, key=key,
-                        sampling=Sampling(eos_token_ids=EOS)).choices[0].model_extra["response_token_ids"]
-        for key in range(6)]
-    assert chunks and chunks[-1].choices[0].finish_reason in ("stop", "length")
+    assert [draw.tokens for draw in done] == [completion([[1]], 8, key=key, sampling=POLICY).tokens
+                                              for key in range(6)]
+    assert chunks and chunks[-1].choices[0].finish_reason in ("stop", "length") and closed
