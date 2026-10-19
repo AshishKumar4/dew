@@ -303,7 +303,8 @@ def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes
                             devices=jax.devices()[:math.prod(axes.values())])
     mesh = gpu_mesh(devices, "sm80")
     model = CausalTransformer(vocab_size=32, emb_features=64, num_layers=1, num_heads=4, num_kv_heads=4,
-                              head_dim=64, mlp_features=64, max_seq_len=64, dtype="bfloat16")
+                              head_dim=64, mlp_features=64, max_seq_len=64, dtype="bfloat16",
+                              attention_impl="xla")
     tokens = jax.ShapeDtypeStruct((4, 1), jnp.int32)
     with assumed("sm80"):
         params = jax.eval_shape(model.init, jax.random.key(0), tokens)
@@ -317,7 +318,8 @@ def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes
     def step(params, cache, tokens):
         return model.apply({**params, "cache": cache}, tokens, decode=True, mutable=["cache"])
 
-    with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh), chosen(decode="decode"):
+    # A model naming xla lowers its decode step through the decode kernel, jax.nn's lowering of it.
+    with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(step).trace(placed(params), placed(cache), placed(tokens, "data" if "data" in axes
                                                                             else None))
         text = lowered.lower(lowering_platforms=("cuda",)).as_text(debug_info=False)

@@ -746,6 +746,32 @@ def test_padding_in_a_packed_row_reaches_no_query(rng):
     assert jnp.all(jnp.isfinite(changed))
 
 
+@pytest.mark.gpu(reason="cuDNN runs on CUDA")
+def test_a_layer_naming_cudnn_takes_a_packed_batch_as_its_document_mask(rng, without_deterministic_ops):
+    """A bf16 model whose layers name cudnn (`attention_impl`) runs a packed batch on cuDNN, its
+    documents reaching the kernel as their mask, an additive bias (`_attention_kernel`), which 'auto'
+    leaves for the cheaper xla kernel: the route says cudnn, and the logits are within
+    tests/reference_error.py's rule of the xla kernel's against the float64 model."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    from dew.nn.kernels.generation import routes
+
+    ids, segment_ids, positions = packed_pair(rng)
+    params = tiny().init(rng, ids)
+    named = tiny(attention_impl='cudnn', dtype=jnp.bfloat16)
+    with routes() as found:
+        logits = np.asarray(named.apply(params, ids, positions=positions, segment_ids=segment_ids),
+                            np.float64)
+    assert {route.kernel for route in found if route.choice == "attention"} == {"cudnn"}
+    plain = np.asarray(tiny(attention_impl='xla', dtype=jnp.bfloat16).apply(
+        params, ids, positions=positions, segment_ids=segment_ids), np.float64)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf, np.float64)), params)
+        truth = np.asarray(tiny(dtype=jnp.float64, attention_impl='reference').apply(
+            wide, ids, positions=positions, segment_ids=segment_ids))
+    assert_as_exact_as_the_reference(logits, plain, truth, "packed cudnn logits")
+
+
 def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what_it_fails(
         rng, without_deterministic_ops):
     """A model whose layers name cudnn (`attention_impl`) forces it, so a call cudnn does not take
