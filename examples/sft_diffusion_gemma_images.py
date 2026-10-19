@@ -41,7 +41,7 @@ from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import Perplexity
-from dew.records import strings
+from dew.records import record as read_record, strings
 from dew.training import MeshSpec, prepare_process
 from dew.training.optim import Cosine
 
@@ -206,8 +206,8 @@ def main(config: Config) -> Path:
                   image_size=config.image_size, staging_size=config.staging_size,
                   augment=Augment(flip=True, crop_scale=(0.6, 1.0)))
     # The label names the staged Parquet's Hugging Face schema records, as Files reads them.
-    labels = tuple(name.strip() for name in strings(source.metadata()["class_names"].get("label"),
-                                                    "the label's class names"))
+    names = read_record(source.metadata().get("class_names", {}), "class names").get("label")
+    labels = tuple(name.strip() for name in strings(names, "class_names.label"))
     record = model_config(config)
     model = build(record, dtype="float32" if config.smoke else "bfloat16")
     run = RunConfig(
