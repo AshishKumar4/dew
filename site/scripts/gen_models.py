@@ -39,6 +39,7 @@ DECODERS = {
     "qwen2": ("Qwen 2", "Dense decoders"),
     "qwen3": ("Qwen 3", "Dense decoders"),
     "ouro": ("Ouro (looped)", "Dense decoders"),
+    "dory": ("Dory (looped nGPT)", "Dense decoders"),
     "qwen3_5_text": ("Qwen 3.5, text", "Dense decoders"),
     "k2_horizon": ("K2 Horizon", "Dense decoders"),
     "muse_glimmer_text": ("Muse Glimmer, text", "Dense decoders"),

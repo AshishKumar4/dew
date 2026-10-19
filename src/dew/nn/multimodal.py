@@ -474,6 +474,10 @@ class MultimodalTransformer(nn.Module):
         or None where none does (`CausalTransformer.output_table`)."""
         return self.language_model.output_table()
 
+    def vocabulary_rows(self) -> jax.Array:
+        """The decoder's head rows (`CausalTransformer.vocabulary_rows`)."""
+        return self.language_model.vocabulary_rows()
+
     @nn.compact
     def init_cache(self, batch_size: int):
         """Allocate the language model's cache and the next-position counter, without running the towers."""
@@ -531,6 +535,9 @@ class MultimodalTransformer(nn.Module):
 
     def mixed_admission_refusal(self) -> str | None:
         return "media fuse into a prefill's embeddings, which a mixed call does not carry"
+
+    def split_prefill_refusal(self) -> str | None:
+        return self.language_model.split_prefill_refusal()
 
     @property
     def mtp_hyper_connections(self) -> HyperConnections | None:
