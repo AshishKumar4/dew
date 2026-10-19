@@ -112,10 +112,12 @@ def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy, over
 
 def pairs(batch, field="text"):
     """The next-token pairs of `field` inside one segment of each real window of a packed batch,
-    its repeats that fill the last batch (`VALID_ROWS`) left out."""
+    the repeats that fill a short last batch (`VALID_ROWS`, which a whole batch holds none of) left
+    out."""
     tokens, segments = np.asarray(batch[field]), np.asarray(batch["text_coordinates"].segments)
+    real = np.asarray(batch.get(VALID_ROWS, np.ones(len(tokens), bool)))
     return [(int(row[at]), int(row[at + 1]))
-            for row, segment, kept in zip(tokens, segments, np.asarray(batch[VALID_ROWS]), strict=True) if kept
+            for row, segment, kept in zip(tokens, segments, real, strict=True) if kept
             for at in range(row.size - 1) if segment[at] and segment[at] == segment[at + 1]]
 
 
