@@ -26,7 +26,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import os
-import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
@@ -281,9 +280,20 @@ def _after(device: tuple[DeviceStep, ...], loss, variables, batch, execution):
     return loss(variables, batch, execution)
 
 
-def _named(step: DeviceStep) -> str:
-    """A device step as its program's name keeps it: its repr, without a process's addresses."""
-    return re.sub(r" at 0x[0-9a-f]+", "", repr(step))
+class _Same:
+    """A value a program key holds as itself: equal only to the same object, so two device steps
+    whose reprs agree are two programs, and held, so its identity is not reused while keyed."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: object):
+        self.value = value
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Same) and other.value is self.value
+
+    def __hash__(self) -> int:
+        return id(self.value)
 
 
 def _forward(loss, primal, frozen, store, batch, execution, *, layout):
@@ -345,9 +355,9 @@ class HostExecution:
     def forward(self):
         """The loss and its pullback, compiled for the objective's modules as they are now: the
         objective owns the program, which its fit ladder replaces with its model. The dataset's
-        device steps run in it, on the accelerator, before the loss; its name says which they are."""
+        device steps run in it, on the accelerator, before the loss; its key holds the steps themselves."""
         return self.objective.program(
-            "host_forward" + "".join(f" then {_named(step)}" for step in self.device),
+            ("host_forward", *(_Same(step) for step in self.device)),
             functools.partial(_forward, functools.partial(_after, self.device, self.objective._loss)),
             static_argnames=("layout",))
 

@@ -17,7 +17,7 @@ import enum
 import functools
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
@@ -690,7 +690,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         add: a loss head, a projector, a phase's split. The default adds nothing."""
         return tree
 
-    def program(self, name: str, function: Callable, *, static_argnames: tuple[str, ...] = ()):
+    def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = ()):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
 
@@ -699,7 +699,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         change a tiled head, and `substitute` may quantize it at the same shapes. Argument shapes
         alone cannot identify those programs, nor can they the pipeline's microbatch count, the
         layout's rules or the links a model decides from. `name` names everything else the program
-        fixes. Keep only the current specialization, not a history of old models.
+        fixes, a string or a tuple of what it holds (the device steps a host step runs). Keep only
+        the current specialization, not a history of old models.
         """
         programs = tuple((program.module, program.head_tile) for program in self.program_key())
         cached = vars(self).get('_program_cache')
