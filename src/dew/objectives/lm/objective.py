@@ -44,7 +44,6 @@ from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
 from dew.nn.flops import MissingFlopsCount, counted_flops
 from dew.nn.inputs import (
     COORDINATES_FIELD,
@@ -62,6 +61,7 @@ from dew.nn.protocols import (
     CountedPredictions,
     CountedPredictionTraining,
     DecoderTraining,
+    LayerStates,
     TokenModel,
 )
 from dew.nn.sharding import LOGITS, constrain
@@ -852,7 +852,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         sown = gathered.get("router", {}) if routing else None
         qk = gathered.get("qk") if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
-        kept = tuple(layer_output(gathered[INTERMEDIATES], index) for index in layers)
+        kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
         head = (head_table(self.model, params) if z_loss is not None and self.head_tile is not None
                 and reads_states(self.model) else None)
@@ -940,18 +940,26 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     def restore_head_tile(self, tile: tuple[int, int] | None) -> None:
         self.head_tile = tile
 
+    def _layer_states(self) -> LayerStates:
+        """The model as the reader of its layers' states that a request for `layers` needs."""
+        if not isinstance(self.model, LayerStates):
+            raise TypeError(f"{type(self.model).__name__} keeps no layer states "
+                            "(dew.nn.protocols.LayerStates), which reading named layers needs")
+        return self.model
+
     def _hidden_states(self, params, inputs, train, rngs, collections: list[str],
                        packing: dict[str, jax.Array | Mapping[str, jax.Array]],
                        layers: Sequence[int] = ()):
         """Run the model over `inputs` and return what a loss scores (`chunked.final_read`).
 
         Beside them come whatever the open `collections` gathered, empty
-        when none was opened, and under `intermediates` the outputs of
-        every layer when `layers` asks for any.
+        when none was opened, and the model's layers' states (`LayerStates`)
+        when `layers` asks for any.
         """
-        opened = [*collections, INTERMEDIATES] if layers else collections
+        opened = [*collections, *self._layer_states().layer_collections] if layers else collections
+        capture = self._layer_states().capture_layers if layers else False
         hidden = final_read(self.model, params, inputs, train=train, rngs=rngs, mutable=opened or False,
-                            capture_intermediates=layer_outputs if layers else False, **packing)
+                            capture_intermediates=capture, **packing)
         if not opened:
             return hidden, {}
         return hidden

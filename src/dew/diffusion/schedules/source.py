@@ -6,6 +6,7 @@ keeps the public training and sampling contract and owns its grid cache.
 """
 from __future__ import annotations
 
+import functools
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -97,4 +98,26 @@ class SourceSchedule:
         return held
 
 
-__all__ = ["SourceSchedule", "published_betas"]
+@dataclass(frozen=True, eq=False)
+class SourceGrid:
+    """A published pipeline's sampling grid, prepared the way that pipeline prepares it: the
+    scheduler file `config` (`SourceSchedule.from_config`) sampled at the latent token count
+    `tokens` a resolution-dependent flow shift reads, its flow sigmas starting at `origin`
+    (`SourceSchedule.sampling`). Called with a step count, it returns the process and the explicit
+    descending grid that many steps sample on. Its fields are its record, so a run trained from
+    the pipeline saves the grid its samples are drawn on."""
+
+    config: Mapping[str, object]
+    tokens: int | None = None
+    origin: Origin = "scheduler"
+
+    @functools.cached_property
+    def schedule(self) -> SourceSchedule:
+        """The scheduler `config` names, read once, which keeps the grids it built."""
+        return SourceSchedule.from_config(self.config)
+
+    def __call__(self, steps: int) -> tuple[Process, jax.Array]:
+        return self.schedule.sampling(steps, tokens=self.tokens, origin=self.origin)
+
+
+__all__ = ["SourceGrid", "SourceSchedule", "published_betas"]

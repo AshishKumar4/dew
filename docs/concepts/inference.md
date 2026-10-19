@@ -119,7 +119,7 @@ For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` ask
 import jax.numpy as jnp
 
 import dew
-from dew.training.quantization import Quantization
+from dew.quantization import Quantization
 
 task = dew.pipeline("Qwen/Qwen3-0.6B", dtype=jnp.bfloat16)
 served = task.quantized(Quantization(dtype="int8", weight_only=True))
@@ -139,7 +139,7 @@ On the RTX 4080, the 176M text-to-image model then holds 183 MiB of denoiser wei
 import jax.numpy as jnp
 
 from dew.sampling import TextToImage
-from dew.training.quantization import Quantization
+from dew.quantization import Quantization
 
 pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
                                    revision="4b322022189373fd9086313241269aa5cea92b86")
@@ -312,6 +312,8 @@ Calling the server with a batch submits every prompt, steps until they all finis
 | `chunk` | Prefill a long prompt in pieces of at most this many tokens, one piece a step. Needs a paged cache. |
 | `prefix_cache` | Share the full prompt pages of an earlier request that began with the same tokens. Needs a paged cache. |
 | `decode_steps` | Decode iterations per device call (default 1). |
+
+A decoder tells the server what its layers allow through `dew.nn.protocols.Serving`: `inference_projection_groups` names the projection groups the variables hold packed, or as members the server packs for decoding (a model that does not decode autoregressively names none), `cache_rebuild_position` is where LongRoPE's cached keys go stale, which refuses paged and mixed serving, `mixed_admission_refusal` says why one mixed prefill-and-decode forward would compute differently, and `split_prefill_refusal` says why a prompt must be prefilled whole, which refuses `chunk` and `prefix_cache`. `CausalTransformer` implements it. A custom decoder that does not implement it packs no projections (`dew.inference.projections.projection_groups`) and runs prefill and decode as separate forwards (`dew.inference.serving_kernel.mixed_refusal`), and the server takes its prefill as safe to split (`dew.inference.serving`), so a decoder whose prefill depends on seeing the prompt whole implements `Serving` and says so in `split_prefill_refusal`.
 
 `KVCache` (`dew.nn.kv_cache`) sets the cache layout. It is passed as `kv_cache=` to `from_task`, or set as a `CausalTransformer`'s `kv_cache` field for `TextGeneration`:
 

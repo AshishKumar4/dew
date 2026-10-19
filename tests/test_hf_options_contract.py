@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,10 +17,9 @@ def test_hub_builder_uses_the_resolved_commit_and_named_configuration(tmp_path, 
     from huggingface_hub import HfApi
 
     requested = []
-    marker = tmp_path / "dataset_info.json"
-    marker.write_text("{}")
-    expected = SimpleNamespace(cache_dir=str(tmp_path), config=SimpleNamespace(data_files=None),
-                               as_dataset=lambda **kwargs: SimpleNamespace(cache_files=[]))
+    # The real builder `datasets` makes of one split, which Hub reads as the Hub's would be read.
+    expected = native_builder({"validation": datasets.Dataset.from_dict({"id": [0, 1]})},
+                              tmp_path / "files", tmp_path / "arrow")
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="frozen"))
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda repo, **kwargs:
                         requested.append((repo, kwargs)) or expected)
@@ -183,18 +183,17 @@ def test_an_unprepared_arrow_store_is_refused_without_preparation(tmp_path, monk
     import datasets
     from huggingface_hub import HfApi
 
-    prepared = []
-    builder = SimpleNamespace(cache_dir=str(tmp_path), config=SimpleNamespace(data_files=None),
-                              info=SimpleNamespace(download_size=None),
-                              download_and_prepare=lambda: prepared.append(True))
+    builder = native_builder({"train": datasets.Dataset.from_dict({"id": [0, 1, 2]})},
+                             tmp_path / "files", tmp_path / "arrow")
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="frozen"))
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     source = Hub("acme/records")
     with pytest.raises(FileNotFoundError):
         source.records("indexed")
-    assert prepared == []
+    assert not Path(builder.cache_dir, "dataset_info.json").exists()
     source.provision()
-    assert prepared == [True]
+    rows = source.records("indexed")
+    assert [int(rows[index]["id"]) for index in range(len(rows))] == [0, 1, 2]
 
 
 def test_an_unprepared_pinned_csv_split_selects_the_read_arrow_provisions(tmp_path, monkeypatch):

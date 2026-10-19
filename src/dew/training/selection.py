@@ -5,9 +5,13 @@ import dataclasses
 import math
 import types
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from dew.objectives.base import Metric, Shown, TrainingScalar
+
+if TYPE_CHECKING:
+    from dew.checkpoints import Ranking
+    from dew.training.state import TrainState
 
 
 @dataclasses.dataclass(frozen=True, init=False)
@@ -100,3 +104,61 @@ def _declared_shown(metric: Metric) -> Shown | None:
     """How `metric` itself declares it is shown, which the Metric protocol leaves optional, so it is
     read at this boundary."""
     return getattr(metric, "shown", None)
+
+
+def rankings(best: Sequence[Best], scores: Mapping[str, float], *, validation: str | None,
+             declared: Mapping[str, Sequence[Metric]], objective) -> tuple[Ranking, ...]:
+    """How an evaluation's `scores` rank its state: by each `best` policy, a threshold it misses
+    ranking nothing (a NaN), or without one by the `validation` split's loss, else the training
+    loss. A step no evaluation scored ranks nothing, and asks no aggregate. `declared` (each
+    split's metrics) and `objective` read an aggregate's scores (`MetricScores`)."""
+    from dew.checkpoints import Ranking
+    from dew.training.evaluation import MetricScores
+
+    if not scores:
+        return ()
+    if not best:
+        name = f"{validation}/loss" if validation is not None else "train/loss"
+        return (Ranking(name, scores[name]),) if name in scores else ()
+    ranks = []
+    for index, selection in enumerate(best):
+        metric = selection._source
+        assert metric is not None
+        if isinstance(metric, (Metric, TrainingScalar)):
+            name = f'{selection.split}/{metric.name}'
+            value = scores.get(name, float('nan'))
+        else:
+            name = f'aggregate:{index}'
+            value = float(metric(MetricScores(declared, scores, objective)))
+        mode = selection.mode or 'min'
+        threshold = selection.threshold
+        if threshold is not None and (value >= threshold if mode == 'min' else value <= threshold):
+            value = float('nan')
+        ranks.append(Ranking(name, value, mode, selection.top, selection.weights_only))
+    return tuple(ranks)
+
+
+@dataclasses.dataclass
+class HeldBest:
+    """The model state a run without Checkpoints ranks best, held in host memory for
+    `restore_best`: the counters, variables and EMA (`MODEL_STATE`) of the state whose first
+    ranking, the one a checkpointed run's best restores by, beats every earlier one, an earlier one
+    winning a tie; one copy, replaced as the best moves, and no optimizer state."""
+
+    score: float | None = None
+    restore: Callable[[], Mapping[str, object]] | None = None
+
+    def offer(self, ranking: Sequence[Ranking], state: TrainState) -> None:
+        """Hold `state`'s model state where its first ranking beats the held one (`Ranking.score`)."""
+        score = ranking[0].score if ranking else None
+        if score is not None and (self.score is None or score < self.score):
+            from dew.training.host import snapshot
+            from dew.training.state import MODEL_STATE
+            self.score, self.restore = score, snapshot({name: getattr(state, name) for name in MODEL_STATE})
+
+    def state(self, final: TrainState) -> TrainState:
+        """`final` with the held model state put back where it was placed."""
+        if self.restore is None:
+            raise ValueError("restore_best found no evaluation of this run that its ranking ranks; "
+                             "no state is the best to return")
+        return dataclasses.replace(final, **self.restore())

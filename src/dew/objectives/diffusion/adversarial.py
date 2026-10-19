@@ -228,7 +228,7 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
 
     def network_variables(self, key: jax.Array, state: Variables) -> Variables:
         """The heads, drawn on the teacher's token grids."""
-        given = jax.tree.map(lambda value: value[:1], self.unconditional_conditions)
+        given = jax.tree.map(lambda value: value[:1], self.encode(state["encoders"]))
         x = jnp.zeros((1, *self.latent_shape))
         features = jax.eval_shape(lambda: self._features(state[TEACHER], x, jnp.ones((1,)), given))
         condition = self._condition(jnp.ones((1,)), given)

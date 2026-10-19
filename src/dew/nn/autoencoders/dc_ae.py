@@ -28,6 +28,7 @@ from dew import records
 from dew.interop.components import bind_component, component_source
 from dew.objectives.base import Variables
 
+from ..activations import gated_product
 from ..attention import rms_normalized
 from ..conv import Conv
 from ..precision import at_least_fp32
@@ -177,7 +178,7 @@ class _GLUMBConv(nn.Module):
         y = nn.silu(_conv(2 * hidden, 1, self.dtype, "conv_inverted")(x))
         y = _conv(2 * hidden, 3, self.dtype, "conv_depth", groups=2 * hidden)(y)
         y, gate = jnp.split(y, 2, axis=-1)
-        y = _conv(self.features, 1, self.dtype, "conv_point", bias=False)(y * nn.silu(gate))
+        y = _conv(self.features, 1, self.dtype, "conv_point", bias=False)(gated_product('swiglu')(gate, y))
         return _RMSNorm(self.features, self.dtype, name="norm")(y) + x
 
 
@@ -504,7 +505,8 @@ class DCAutoencoder(ModuleAutoEncoder[DCAE]):
 
 def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                subfolder: str = "", param_dtype: str = "float32", params: Variables | None = None,
-               lazy: bool = False) -> tuple[DCAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
+               lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
+               ) -> tuple[DCAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published DC-AE, its parameters and their source layouts from
     `subfolder` of a directory or Hub repo holding its config.json and
     weights, such as `mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers` (the root)
@@ -524,4 +526,5 @@ def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | 
         directory, "vae", config, model, dc_ae_path,
         lambda bound: DCAutoencoder(model=model, params=bound,
                                     latent_scale=config.get("scaling_factor", 1.0)),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(frame,))
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(frame,),
+        shapes=shapes)

@@ -218,12 +218,12 @@ class CheckpointBanks(LayerBanks):
 
     def __post_init__(self):
         from dew.checkpoints import Checkpoints
-        checkpoints = Checkpoints(self.directory)
-        step = checkpoints.latest if self.step is None else self.step
-        if step is None:
-            raise FileNotFoundError(f"{self.directory} holds no checkpoint")
-        object.__setattr__(self, "step", step)
-        object.__setattr__(self, "stored", checkpoints.stored(step))
+        with Checkpoints(self.directory) as checkpoints:
+            step = checkpoints.latest if self.step is None else self.step
+            if step is None:
+                raise FileNotFoundError(f"{self.directory} holds no checkpoint")
+            object.__setattr__(self, "step", step)
+            object.__setattr__(self, "stored", checkpoints.stored(step))
 
     def shapes(self) -> Variables:
         if self.ema and self.stored.get("ema") is None:
@@ -254,7 +254,8 @@ class CheckpointBanks(LayerBanks):
             averaged = narrowed(self.stored["ema"], placement)
             if averaged:
                 template["ema"] = _typed(averaged, narrowed(placement, averaged))
-        values, _ = Checkpoints(self.directory).restore(template, step=self.step)
+        with Checkpoints(self.directory) as checkpoints:
+            values, _ = checkpoints.restore(template, step=self.step)
         return merge(values["variables"], values["ema"]) if "ema" in template else values["variables"]
 
 
@@ -424,13 +425,6 @@ class SafetensorsBanks(LayerBanks):
         if any(sharding.memory_kind != "device" for sharding in jax.tree.leaves(placement)):
             raise ValueError(
                 "disk streaming uses its own bounded host cache; leave layout host placement empty")
-        try:
-            jax.devices("cpu")
-        except RuntimeError as error:
-            raise ValueError(
-                "disk streaming requires the CPU callback backend; configure "
-                "JAX_PLATFORMS=cuda,cpu (or your accelerator,cpu) before JAX initialization"
-            ) from error
         device = SingleDeviceSharding(device_mesh.devices.flat[0])
         handles: Variables = {}
         for site in sites:
