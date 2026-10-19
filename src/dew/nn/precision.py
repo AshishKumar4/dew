@@ -31,8 +31,9 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
     return jnp.promote_types(jnp.float32 if dtype is None else dtype, jnp.float32)
 
 
-def biased(product: jax.Array, bias: jax.Array, dtype) -> jax.Array:
-    """`product` plus `bias` broadcast over its leading axes, in `dtype`, as flax's layer adds them.
+def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
+    """`product` plus `bias` broadcast over its leading axes, in the dtype their addition promotes
+    to, as flax's layer adds them.
     Rounding the product and the bias once together, as torch's addmm does, wrote an fp32 product
     and a pass of its own on every biased layer (a DiT-B step 17.5% slower on an A100), for a bf16
     output 1.37 times torch's rounding, which the parity rule holds already.
@@ -43,7 +44,7 @@ def biased(product: jax.Array, bias: jax.Array, dtype) -> jax.Array:
     came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
     at fp32, the gradient sums at fp32 and rounds once into the bias.
     """
-    wide = at_least_fp32(bias.dtype)
+    dtype, wide = jnp.result_type(product, bias), at_least_fp32(bias.dtype)
     # The bias takes the product's rank before the sum, as flax's layers reshape it, so no rank is
     # promoted implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds
     # the round trip, so the product and bias fuse as before) and its gradient sums at fp32.
