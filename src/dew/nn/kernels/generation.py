@@ -331,21 +331,25 @@ class Route:
     site: str
 
 
-_ROUTES: contextvars.ContextVar[tuple[list[Route], ...]] = contextvars.ContextVar("kernel_routes",
-                                                                                   default=())
+class _Routes:
+    """The routes a `routes` block collected; hashed by identity, as `dew.cache.KERNEL_ROUTES` keys
+    on it."""
+
+    def __init__(self) -> None:
+        self.found: list[Route] = []
 
 
 @contextlib.contextmanager
 def routes() -> Iterator[list[Route]]:
     """Collect every `Route` a dispatch reports while code runs or traces in the block, in order: what
-    a step's trace within `assumed(target)` on a CPU shows of that target's kernels. A block nested
-    in another reports to both."""
-    found: list[Route] = []
-    token = _ROUTES.set((*_ROUTES.get(), found))
-    try:
-        yield found
-    finally:
-        _ROUTES.reset(token)
+    a step's trace within `assumed(target)` on a CPU shows of that target's kernels. Each block is a
+    fresh collection JAX keys its traces on (`dew.cache.KERNEL_ROUTES`), so a function traced before
+    traces, and reports, again; a block nested in another reports to both."""
+    from dew import cache
+
+    collected = _Routes()
+    with cache.KERNEL_ROUTES((*cache.KERNEL_ROUTES.value, collected)):
+        yield collected.found
 
 
 def _site() -> str:
@@ -377,8 +381,8 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     if isinstance(refusal, str):
         refusal = Refusal(UNCLASSIFIED, refusal)
     found = Route(choice, kernel, measured or kernel, refusal, ran or kernel, generation, _site())
-    for collected in _ROUTES.get():
-        collected.append(found)
+    for collected in cache.KERNEL_ROUTES.value:
+        collected.found.append(found)
     detail = '' if refusal is None else refusal.detail
     if measured not in (None, kernel) and (choice, kernel, detail) not in _logged:
         _logged.add((choice, kernel, detail))

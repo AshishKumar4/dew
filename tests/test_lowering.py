@@ -347,3 +347,23 @@ def test_a_dispatch_sending_a_call_off_its_preferred_kernel_reports_the_route():
     [taken] = [found_route for found_route in found if found_route.choice == "attention"]
     assert (taken.kernel, taken.preferred, taken.target) == (selected, "flash", "sm80")
     assert taken.refusal is not None and taken.site == "dew.nn.attention:resolve_implementation"
+
+
+def test_a_function_traced_before_a_routes_block_reports_its_routes_within_it():
+    """A jitted function traced and cached before a `routes` block, warm in an inner jit too, reports
+    its routes again in each block: every block is a fresh collection JAX keys its traces on."""
+    @jax.jit
+    def inner(x):
+        route("ssd", kernel="xla")
+        return x + 1
+
+    @jax.jit
+    def outer(x):
+        return inner(x) * 2
+
+    x = jnp.zeros(3)
+    jax.block_until_ready(outer(x))
+    for _ in range(2):
+        with routes() as found:
+            jax.block_until_ready(outer(x))
+        assert [found_route.choice for found_route in found] == ["ssd"]
