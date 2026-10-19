@@ -176,11 +176,17 @@ def test_a_per_share_position_refuses_another_worker_topology(jsonl):
 
 @pytest.mark.parametrize("draw, seed", [(Draw(), 11), (WideDraw(), 7)])
 def test_per_record_rng_draws_agree_with_plain_grain(draw, seed):
+    """A random step draws each record as Grain's `random_map` does, from its seed and the record's
+    index, under the seed Dew keys the step by: the run's seed, the corpus's place in its mixtures
+    (none here) and the random steps before it (none), drawn as a SeedSequence
+    (`dew.data.lowering._Build.stage_seed`), so a read or a wrapper does not move it as Grain's
+    default seed would."""
     rows = [{"index": np.int32(index)} for index in range(24)]
     data = compile(Pipeline(Memory(rows)).shuffle(seed).repeat().random_map(draw).batch(4),
                    seed=seed, read="indexed", loading=READ)
-    oracle = iter(grain.MapDataset.source(rows).seed(seed).shuffle(seed).repeat().random_map(
-        draw).to_iter_dataset(
+    keyed = int(np.random.SeedSequence((seed, 0)).generate_state(1, np.uint32)[0])
+    oracle = iter(grain.MapDataset.source(rows).shuffle(seed).repeat().random_map(
+        draw, seed=keyed).to_iter_dataset(
         grain.ReadOptions(num_threads=1, prefetch_buffer_size=4)).batch(4))
     actual = data.train(DataPartition())
     try:
