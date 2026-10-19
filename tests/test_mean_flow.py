@@ -140,7 +140,10 @@ def test_meanflow_trains_through_a_fused_attention_kernel():
     flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
              if not flag.startswith("--xla_gpu_deterministic_ops")]
     script = "import test_mean_flow; test_mean_flow.agrees_with_xla('cudnn')"
+    # This checkout's Dew, ahead of any the environment installs.
+    source = str(Path(__file__).resolve().parents[1] / "src")
+    path = os.pathsep.join(filter(None, (source, os.environ.get("PYTHONPATH"))))
     done = subprocess.run([sys.executable, "-c", script], cwd=Path(__file__).resolve().parent,
                           capture_output=True, text=True, timeout=900,
-                          env={**os.environ, "XLA_FLAGS": " ".join(flags)})
+                          env={**os.environ, "XLA_FLAGS": " ".join(flags), "PYTHONPATH": path})
     assert done.returncode == 0, done.stderr[-4000:]
