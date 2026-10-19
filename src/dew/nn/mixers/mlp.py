@@ -98,7 +98,6 @@ class MLPMixer(MixerBase):
         decoder block's feed-forward slot takes as it is (a prediction
         depth's, `CausalTransformer.mtp_feedforward_type`)."""
         # decoder_block imports the mixer registry while its classes are being defined.
-        from dew.nn.attention import RMSNorm
         from dew.nn.mlp import GatedMLP
 
         dense = functools.partial(
@@ -109,8 +108,7 @@ class MLPMixer(MixerBase):
             return functools.partial(dense, hidden_features=self.intermediate_size)
         return self.mixture.build(out_features=ctx.emb_features, hidden_features=self.intermediate_size,
                                   activation=self.activation, dense=functools.partial(dense, parent=None),
-                                  norm=functools.partial(
-                                      RMSNorm, epsilon=ctx.norm_eps, scale_offset=ctx.scale_offset,
-                                      scale_after_cast=ctx.scale_after_cast, dtype=ctx.dtype),
-                                  init_std=ctx.init_std, output_init_std=ctx.output_init_std,
-                                  dtype=ctx.dtype, precision=ctx.precision)
+                                  norm_eps=ctx.norm_eps, scale_offset=ctx.scale_offset,
+                                  scale_after_cast=ctx.scale_after_cast, init_std=ctx.init_std,
+                                  output_init_std=ctx.output_init_std, dtype=ctx.dtype,
+                                  precision=ctx.precision)

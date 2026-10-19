@@ -100,6 +100,23 @@ def test_a_mixture_builds_gpt_oss_experts_wherever_a_layer_routes():
         MLPMixer(intermediate_size=24, activation="geglu", mixture=Mixture(experts=4, top_k=2, parallel=True))
 
 
+def test_a_parallel_mixture_of_its_own_width_rides_layers_of_different_dense_widths():
+    """Gemma 4's branch beside the dense feed-forward takes `expert_features` where the mixture
+    names it, so a decoder whose layers differ in their dense width, which has no single one,
+    builds it and runs its forward."""
+    import jax
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import Mixture
+
+    model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=2,
+                              head_dim=8, mlp_features=(32, 48), max_seq_len=16,
+                              mixture=Mixture(experts=4, top_k=2, parallel=True, expert_features=24))
+    tokens = jnp.zeros((1, 8), jnp.int32)
+    params = model.init(jax.random.key(0), tokens)["params"]
+    assert model.apply({"params": params}, tokens).shape == (1, 8, 32)
+
+
 def test_mxfp4_matches_reference_dequantization_exactly():
     """The fixture's bf16 output, atol 0; and every code at the two scale
     bytes that decode the smallest magnitudes to float32 subnormals, which
