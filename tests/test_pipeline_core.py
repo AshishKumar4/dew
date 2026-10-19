@@ -589,6 +589,219 @@ def test_a_token_mixture_counts_the_targets_a_corpus_delivers_after_its_repeat_c
     assert abs(targets[0] - targets[1]) <= 9
 
 
+@dataclasses.dataclass(frozen=True)
+class Cropped:
+    """A step that keeps the first half of a token row and its roles, as a crop keeps a part."""
+
+    def __call__(self, row):
+        half = len(row["text"]) // 2
+        return {**row, "text": row["text"][:half], "text_roles": row["text_roles"][:half]}
+
+
+@dataclasses.dataclass(frozen=True)
+class CroppedTokens:
+    """`Cropped` over a row whose tokens a projection named `tokens`."""
+
+    def __call__(self, row):
+        half = len(row["tokens"]) // 2
+        return {**row, "tokens": row["tokens"][:half], "text_roles": row["text_roles"][:half]}
+
+
+@dataclasses.dataclass(frozen=True)
+class Relabelled:
+    """A step that changes only a token row's id, leaving its tokens and roles as they were."""
+
+    def __call__(self, row):
+        return {**row, "id": row["id"] + 100}
+
+
+@dataclasses.dataclass(frozen=True)
+class Scored:
+    """A delivered row as its corpus and the targets the loss scores of it, by `role`'s rule."""
+
+    role: int | None
+
+    def __call__(self, row):
+        from dew.data.steps.text import ValidTargets
+
+        # A row whose roles a projection renamed reads them under their new name.
+        scored = {"text": row["text"], "text_roles": row.get("text_roles", row.get("roles"))}
+        return {"source": row["source"],
+                "targets": np.int32(ValidTargets(role=self.role, measured=False)(scored))}
+
+
+@dataclasses.dataclass(frozen=True)
+class Copied:
+    """A step that copies a token row's arrays, values unchanged, as a format conversion does."""
+
+    def __call__(self, row):
+        return {name: np.array(value) for name, value in row.items()}
+
+
+@dataclasses.dataclass(frozen=True)
+class Encoded(grain.MapTransform):
+    """A step that stores a record as the artifact codec's bytes, which `Restored` reads back."""
+
+    def map(self, element):
+        from dew.data.sources.codec import encode
+
+        return encode(element)
+
+
+@dataclasses.dataclass(frozen=True)
+class Restored(grain.MapTransform):
+    """A step that reads back the record `Encoded` stored."""
+
+    def map(self, element):
+        from dew.data.sources.codec import decode
+
+        return decode(element)
+
+
+def roled(source, length, scored, count=4):
+    """`count` token rows of `length`, the first `scored` of each row's targets in role 1."""
+    roles = np.asarray([1] * (scored + 1) + [0] * (length - scored - 1), np.int32)
+    return Memory(tuple({"text": np.arange(length, dtype=np.int32), "text_roles": roles,
+                         "id": np.int32(index), "source": np.int32(source)} for index in range(count)))
+
+
+def delivered(corpora, role, read, batches=24):
+    """The targets each of two corpora mixed by tokens delivers, as the loss scores them by `role`.
+    A mix by tokens keeps each corpus within one of its own rows of its share, so the two differ by
+    at most one row of each."""
+    mixed = mix([corpus.repeat() for corpus in corpora], by="tokens")
+    data = compile(mixed.map(Scored(role)).batch(8), read=read, loading=READ)
+    stream = data.train(DataPartition())
+    targets = [0, 0]
+    try:
+        for batch in itertools.islice(stream, batches):
+            for source, count in zip(batch["source"], batch["targets"], strict=True):
+                targets[int(source)] += int(count)
+    finally:
+        stream.close()
+    return targets
+
+
+@pytest.mark.parametrize("role", [None, 1])
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_token_mixture_weighs_a_cropped_corpus_by_the_targets_left_after_the_crop(read, role):
+    """Targets counted on a row (`CountTargets`) a crop then halves are counted again by the rule
+    that counted them, its role included: the mixture weighs the cropped corpus by what its rows
+    deliver, so both corpora deliver equal targets, to within one row of each (`delivered`)."""
+    from dew.data.steps.text import CountTargets
+
+    long = Pipeline(roled(0, 24, 22), name="long").filter_map(CountTargets(role=role)).map(Cropped())
+    short = Pipeline(roled(1, 6, 4), name="short").filter_map(CountTargets(role=role))
+    left, right = delivered([long, short], role, read)
+    rows = (Cropped()(roled(0, 24, 22).records("memory")[0]), roled(1, 6, 4).records("memory")[0])
+    assert abs(left - right) <= sum(int(Scored(role)(row)["targets"]) for row in rows)
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_token_mixture_keeps_a_rows_count_through_a_step_over_its_other_fields(read):
+    """A step that changes only a row's other fields keeps the targets its count's own rule counted,
+    a role's here, which no other rule gives: two corpora whose rows score one and three role-1
+    targets deliver equal scored targets, to within one row of each (`delivered`)."""
+    from dew.data.steps.text import CountTargets
+
+    one = Pipeline(roled(0, 8, 1), name="one").filter_map(CountTargets(role=1)).map(Relabelled())
+    three = Pipeline(roled(1, 8, 3), name="three").filter_map(CountTargets(role=1))
+    left, right = delivered([one, three], 1, read)
+    assert abs(left - right) <= 1 + 3
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+@pytest.mark.parametrize("after", ["renamed-roles", "renamed-roles-then-copied",
+                                   "renamed-text-then-cropped", "selected-then-copied",
+                                   "counted-again-then-copied", "encoded-and-decoded"])
+def test_a_rows_count_and_its_rule_ride_through_the_steps_that_leave_its_targets(read, after):
+    """A row's count, by its role's rule, holds through steps that change no target: its roles
+    renamed, and copied after, its fields narrowed and then copied, the bytes of an encoding and
+    back; a crop of tokens a projection renamed counts them again under their new name; and a
+    second count, by the plain rule, replaces the first one's rule with its own, which a later copy
+    keeps.
+    Two corpora whose rows score one and three role-1 targets, or seven plain ones each, deliver
+    equal targets by the rule last counted, to within one row of each (`delivered`)."""
+    from dew.data.steps.text import CountTargets
+
+    def corpus(source, scored):
+        chain = Pipeline(roled(source, 8, scored), name=str(source)).filter_map(CountTargets(role=1))
+        if after == "renamed-roles":
+            return chain.rename_columns({"text_roles": "roles"})
+        if after == "renamed-roles-then-copied":
+            return chain.rename_columns({"text_roles": "roles"}).map(Copied())
+        if after == "renamed-text-then-cropped":
+            return (chain.rename_columns({"text": "tokens"}).map(CroppedTokens())
+                    .rename_columns({"tokens": "text"}))
+        if after == "selected-then-copied":
+            return chain.select_columns("text", "text_roles", "source").map(Copied())
+        if after == "counted-again-then-copied":
+            return chain.filter_map(CountTargets()).map(Copied())
+        return chain.map(Encoded()).map(Restored())
+
+    role = None if after == "counted-again-then-copied" else 1
+    # A crop halves a row's six role-1 targets to three and leaves the other's two as they were.
+    scored = (6, 2) if after == "renamed-text-then-cropped" else (1, 3)
+    left, right = delivered([corpus(0, scored[0]), corpus(1, scored[1])], role, read)
+    bound = {None: 7 + 7, 1: 3 + 2 if after == "renamed-text-then-cropped" else 1 + 3}[role]
+    assert abs(left - right) <= bound
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_count_follows_its_tokens_through_a_rename_that_reuses_their_name(read):
+    """A rename that moves the counted tokens away and names another field as they were, and then
+    back again, leaves the count on the tokens: the padding the other field holds is no target."""
+    from dew.data.steps.text import CountTargets
+
+    def corpus(source):
+        rows = Memory(tuple({"text": np.asarray([1, 2, 3, 4], np.int32), "backup": np.zeros(4, np.int32),
+                             "source": np.int32(source)} for _ in range(4)))
+        return (Pipeline(rows, name=str(source)).filter_map(CountTargets(pad_id=0))
+                .rename_columns({"text": "tokens", "backup": "text"})
+                .rename_columns({"text": "backup", "tokens": "text"}))
+
+    mixed = mix([corpus(0).repeat(), corpus(1).repeat()], by="tokens")
+    stream = compile(mixed.batch(4), read=read, loading=READ).train(DataPartition())
+    try:
+        assert np.asarray(next(stream)["text"]).tolist()[0] == [1, 2, 3, 4]
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_tokenized_rows_pack_by_concatenation(read):
+    """Rows a tokenizer made, which carry Dew's own record of their lengths, pack by concatenation
+    into windows of the packed field alone."""
+    from dew.data.text import Tokenize
+
+    rows = Memory(tuple({"text": "abcdefgh"[: 3 + index % 5]} for index in range(12)))
+    chain = Pipeline(rows).map(Tokenize()).pack(4, policy="concat").batch(2)
+    stream = compile(chain, read=read, loading=READ).train(DataPartition())
+    try:
+        batch = next(stream)
+    finally:
+        stream.close()
+    assert np.asarray(batch["text"]).shape == (2, 4)
+
+
+def test_a_counted_corpus_projected_after_its_count_keeps_it_in_memory():
+    """A corpus counted and then renamed or narrowed to other fields keeps its rows' counts, which
+    no field it still holds could give again."""
+    from dew.data.steps.text import CountTargets
+
+    for projected in (lambda chain: chain.rename_columns({"text": "tokens"}),
+                      lambda chain: chain.select_columns("id", "source")):
+        chains = [projected(Pipeline(roled(source, 8, 3), name=str(source)).filter_map(CountTargets(role=1)))
+                  for source in (0, 1)]
+        data = compile(mix([chain.repeat() for chain in chains], by="tokens").batch(4), read="memory",
+                       loading=READ)
+        stream = data.train(DataPartition())
+        try:
+            assert len(next(stream)["id"]) == 4
+        finally:
+            stream.close()
+
+
 @pytest.mark.parametrize("held", [False, True])
 def test_a_token_mixture_weighs_a_random_holdout_by_the_rows_it_keeps(held):
     """Mixed by tokens, two corpora whose stores state their counts deliver equal valid targets,
