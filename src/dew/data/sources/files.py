@@ -780,7 +780,7 @@ class _IndexedLines:
     def fieldnames(self) -> tuple[tuple[str, ...], ...]:
         headers = []
         for url in self.source.paths:
-            fs, path = Store(url, self.source.storage_options).readable()
+            fs, path, _ = Store(url, self.source.storage_options).readable()
             with _open_lines(fs, path) as file:
                 headers.append(tuple(next(csv.reader(_CsvLines(file)))))
         return tuple(headers)
@@ -794,7 +794,7 @@ class _IndexedLines:
         group = bisect.bisect_right(self.offsets, index) - 1
         entry = self.tables[group][index - int(self.offsets[group])]
         shard = int(entry["shard"]) if self.source.index else group
-        fs, path = Store(self.source.paths[shard], self.source.storage_options).readable()
+        fs, path, _ = Store(self.source.paths[shard], self.source.storage_options).readable()
         names = self.fieldnames[shard] if self.source.kind == "csv" else None
         offset = int(entry["offset"])
         compression = infer_compression(path.lower())
@@ -837,7 +837,7 @@ class _LineIterator(grain.DatasetIterator):
     def __init__(self, source: Files, shard: Shard):
         super().__init__()
         self.source, self.shard = source, shard
-        self.fs, self.path = Store(shard.uri, source.storage_options).readable()
+        self.fs, self.path, _ = Store(shard.uri, source.storage_options).readable()
         self.compression = infer_compression(self.path.lower())
         self.file = _open_lines(self.fs, self.path)
         self._opened = True
