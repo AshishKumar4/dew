@@ -19,7 +19,7 @@ def main() -> None:
                   if isinstance(node, ast.Assign)
                   and any(isinstance(name, ast.Name) and name.id == "CUDA_BUILDS" for name in node.targets))
     lines = [BEGIN]
-    for build, driver, (major, minor) in builds:
+    for build, driver, (major, minor), _ in builds:
         lines.extend((f"{build}_driver={driver}", f"{build}_sm={major}.{minor}"))
     lines.append(END)
     path = REPO / "site/public/install.sh"
