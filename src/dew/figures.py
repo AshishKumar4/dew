@@ -337,10 +337,10 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
     for tick in _ticks(low, high):
         _, tick_y = at(first, tick)
         figure.line(left, tick_y, width - right, tick_y, color="rule", width=1)
-        figure.text(left - 8, tick_y + 5, f"{tick:g}", size=SMALL, color="muted", anchor="end")
+        figure.text(left - 8, tick_y + 5, f"{tick + 0:g}", size=SMALL, color="muted", anchor="end")
     for tick in _ticks(first, final, 4):
         tick_x, _ = at(tick, low)
-        figure.text(tick_x, height - bottom + 20, f"{tick:g}", size=SMALL, color="muted", anchor="middle")
+        figure.text(tick_x, height - bottom + 20, f"{tick + 0:g}", size=SMALL, color="muted", anchor="middle")
     figure.text((left + width - right) / 2, height - 6, x_label, size=TEXT, color="muted", anchor="middle")
     figure.text(left, 20, y_label, size=TEXT, color="muted")
     # Neutral colors only, since warm means wrong; past three series the lines are dashed.
@@ -524,10 +524,10 @@ def points(series: Mapping[str, Sequence[tuple[float, float]]], *, x_label: str,
     for tick in ticks(1):
         _, tick_y = at(every[0, 0], tick)
         figure.line(left, tick_y, width - right, tick_y, color="rule", width=1)
-        figure.text(left - 8, tick_y + 5, f"{tick:g}", size=SMALL, color="muted", anchor="end")
+        figure.text(left - 8, tick_y + 5, f"{tick + 0:g}", size=SMALL, color="muted", anchor="end")
     for tick in ticks(0):
         tick_x, _ = at(tick, every[0, 1])
-        figure.text(tick_x, height - bottom + 20, f"{tick:g}", size=SMALL, color="muted", anchor="middle")
+        figure.text(tick_x, height - bottom + 20, f"{tick + 0:g}", size=SMALL, color="muted", anchor="middle")
     figure.text((left + width - right) / 2, height - 6, x_label, size=TEXT, color="muted", anchor="middle")
     figure.text(left, 20, y_label, size=TEXT, color="muted")
     colors: tuple[Role, ...] = ("accent", "text", "muted")
