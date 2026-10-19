@@ -564,7 +564,7 @@ class OpenAICompletion:
             return None
         return OwnStops(frozenset(sampling.stops), budget)
 
-    def _answered(self, responses: list[object]) -> Callable[[Call], JSON]:
+    def _answered(self, responses: list[OpenAIResponse]) -> Callable[[Call], JSON]:
         """Each request a continuation sends (`continuation.Call`), answered on the sync client: a
         completions request's SDK response kept in `responses`, and a detokenization through the
         SDK's call to an engine route it does not name."""
@@ -582,7 +582,7 @@ class OpenAICompletion:
 
         return answered
 
-    def _answered_async(self, responses: list[object]) -> Callable[[Call], Awaitable[JSON]]:
+    def _answered_async(self, responses: list[OpenAIResponse]) -> Callable[[Call], Awaitable[JSON]]:
         """`_answered` on the async client."""
         import httpx2
 
@@ -609,7 +609,7 @@ class OpenAICompletion:
             raw = _invoke(self._sync().completions.with_raw_response.create, fields)
             return _openai_result(raw.http_response.json(), (raw.parse(),), expected)
         fields = _returning_ids(fields, "return_token_ids")
-        responses: list[object] = []
+        responses: list[OpenAIResponse] = []
         answered = self._answered(responses)
         payload = driven(own.completed(answered(("completions", fields)), fields), answered)
         return _openai_result(payload, responses, expected)
@@ -691,7 +691,7 @@ class OpenAICompletion:
             raw = await _invoke(self._async().completions.with_raw_response.create, fields)
             return _openai_result(raw.http_response.json(), (raw.parse(),), expected)
         fields = _returning_ids(fields, "return_token_ids")
-        responses: list[object] = []
+        responses: list[OpenAIResponse] = []
         answered = self._answered_async(responses)
         payload = await driven_async(own.completed(await answered(("completions", fields)), fields), answered)
         return _openai_result(payload, responses, expected)
@@ -707,8 +707,9 @@ class OpenAICompletion:
         seed = key_seed(key)
         fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed,
                                    self._parameters(parameters), stream=True)
+        create: Callable[..., Awaitable[AsyncStream[OpenAIResponse]]] = self._async().completions.create
         own = self._own_stops(parameters, max_new_tokens)
-        answer = await _invoke(self._async().completions.create, fields)
+        answer = await _invoke(create, fields)
         return answer if own is None else AsyncChecked(answer, own)
 
     async def achat(

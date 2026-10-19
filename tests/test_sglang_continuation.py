@@ -335,12 +335,13 @@ def test_a_chat_goes_on_as_the_policys_chat_and_a_chat_stream_asks_for_no_ids():
         assert choice.finish_reason == expected.finish_reason
         continued += len(engine.requests) > 1
     assert continued >= 3
+    refused = 0
     for key in range(3):
         try:
             list(completion.chat(messages, 8, key=key, sampling=policy, stream=True))
         except ValueError:
-            pass
-    assert all("return_token_ids" not in body for path, body in engine.requests
+            refused += 1
+    assert refused < 3 and all("return_token_ids" not in body for path, body in engine.requests
                if path.endswith("/chat/completions") and body.get("stream"))
     pictured = [{"role": "user", "content": [{"type": "text", "text": "hi"},
                                              {"type": "image_url", "image_url": {"url": "data:,"}}]}]

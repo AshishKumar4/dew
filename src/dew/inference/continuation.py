@@ -103,7 +103,7 @@ def _given(request: Request, name: str, *neutral: JSON) -> bool:
     return value is not None and value not in neutral
 
 
-def _switch(request: Request, name: str, default: bool) -> bool:
+def _switch(request: Request, name: str, *, default: bool) -> bool:
     """What the request sets the switch `name` to, at its top level or in `extra_body`, `default`
     where it is unset."""
     value = request.get(name)
@@ -124,7 +124,7 @@ def _uncarried(request: Request) -> str | None:
     for name, neutral in (("presence_penalty", 0), ("repetition_penalty", 1)):
         if _given(request, name, neutral):
             return f"{name}, which counts each id drawn before the cut once whichever segment draws it again"
-    if not _switch(request, "spaces_between_special_tokens", True):
+    if not _switch(request, "spaces_between_special_tokens", default=True):
         return "spaces_between_special_tokens=False, which SGLang's /v1/detokenize does not take"
     messages = request.get("messages")
     for message in messages if isinstance(messages, list) else ():
@@ -193,9 +193,9 @@ class OwnStops:
         unless `request` keeps it (`no_stop_trim`, detokenizer_manager.py `trim_matched_stop`)."""
         ids = _ids(choice.get("token_ids"), "token_ids")
         trimmed = (choice.get("finish_reason") == "stop" and type(choice.get("matched_stop")) is int
-                   and not _switch(request, "no_stop_trim", False))
+                   and not _switch(request, "no_stop_trim", default=False))
         return {"model": request.get("model"), "tokens": ids[:-1] if trimmed else ids,
-                "skip_special_tokens": _switch(request, "skip_special_tokens", True)}
+                "skip_special_tokens": _switch(request, "skip_special_tokens", default=True)}
 
     def completed(self, payload: JSON, request: Request) -> Plan[JSON]:
         """`payload`, a completions response to `request`, with each choice SGLang ended on an id
@@ -297,8 +297,9 @@ def _number(value: object) -> float:
     return value
 
 
-def _bytes(token: JSON) -> list[int]:
-    """A log-probability's token as the bytes SGLang's chat route reports beside it."""
+def _bytes(token: object) -> list[int]:
+    """A log-probability's token, read at the engine's boundary, as the bytes SGLang's chat route
+    reports beside it."""
     if not isinstance(token, str):
         raise ValueError("a logprob token must be text")
     return list(token.encode("utf-8"))
