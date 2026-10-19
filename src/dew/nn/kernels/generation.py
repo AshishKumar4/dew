@@ -399,32 +399,66 @@ def ran_kernel(choice: str, kernel: str, refusal: str, fastest: str | None = Non
     return route(choice, kernel=kernel, preferred=fastest, refusal=refusal).kernel
 
 
-def linear_tangent(kernel: Callable, portable: Callable) -> Callable:
-    """`kernel`, a function of arrays with a custom VJP, differentiated as one custom JVP whose
-    tangent is `portable`'s, the same arithmetic in XLA, evaluated as a `linear_call` that transposes
-    to `kernel`'s own VJP: forward mode (`jax.jvp`, `jax.linearize`) takes the portable tangent
-    however a jit or a scan staged the call first, and reverse mode runs the kernel's backward. It
-    composes with `jax.vmap` of a gradient and with forward over reverse on Dew's jax build
-    (0.11.2.post5 on), whose `linear_call` batches and carries its residual tangents; a stock jax
-    raises its own error for either."""
+def linear_tangent(forward: Callable, backward: Callable, portable: Callable) -> Callable:
+    """A fused kernel as one function of its operands, differentiated at every order through
+    `portable`, the same arithmetic in XLA, while every level of it runs the kernels.
+    `forward(*operands)` gives the kernel's output and what its backward reads (`saved`, a tree of
+    arrays); `backward(saved, operands, cotangent)` gives the operands' cotangents, a tuple; and
+    `portable(*operands)` gives the output.
+
+    The output's derivative is one custom JVP whose tangent is `portable`'s, evaluated as a
+    `linear_call` that transposes to `backward`: forward mode (`jax.jvp`, `jax.linearize`) takes
+    the portable tangent however a jit or a scan staged the call, and reverse mode runs the
+    backward kernel. The forward and the backward are custom JVPs of their own whose tangents are
+    `portable`'s and its pullback's, so a higher order (`jax.jvp` of `jax.grad`, `jax.grad` of
+    `jax.jvp`) differentiates through XLA while each level's value comes from the kernels; what
+    `saved` holds is a function of the operands, whose tangents carry it. This composes with
+    `jax.vmap` of a gradient and with forward over reverse on Dew's jax build (0.11.2.post5 on),
+    whose `linear_call` batches and carries its residual tangents; a stock jax raises its own
+    error for either."""
     import jax
+    import jax.numpy as jnp
     from jax.custom_derivatives import linear_call
 
     @jax.custom_jvp
+    def produced(*operands):
+        return forward(*operands)
+
+    @produced.defjvp
+    def _(primals, tangents):
+        output, saved = produced(*primals)
+        # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
+        return (output, saved), (jax.jvp(portable, primals, tangents)[1], jax.tree.map(jnp.zeros_like, saved))
+
+    @jax.custom_jvp
+    def pulled(saved, operands, cotangent):
+        return backward(saved, operands, cotangent)
+
+    @pulled.defjvp
+    def _(primals, tangents):
+        _, operands, cotangent = primals
+        _, doperands, dcotangent = tangents
+
+        def pullback(operands, cotangent):
+            return jax.vjp(portable, *operands)[1](cotangent)
+
+        return pulled(*primals), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
+
+    @jax.custom_jvp
     def bounded(*operands):
-        return kernel(*operands)
+        return forward(*operands)[0]
 
     @bounded.defjvp
     def _(primals, tangents):
-        output, pullback = jax.vjp(kernel, *primals)
+        output, saved = produced(*primals)
 
         def tangent(residuals, directions):
             return jax.jvp(portable, residuals[0], directions)[1]
 
         def transposed(residuals, cotangent):
-            return residuals[1](cotangent)
+            return pulled(residuals[1], residuals[0], cotangent)
 
-        return output, linear_call(tangent, transposed, (primals, pullback), tangents)
+        return output, linear_call(tangent, transposed, (primals, saved), tangents)
 
     return bounded
 

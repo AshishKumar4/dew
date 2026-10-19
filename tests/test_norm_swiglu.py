@@ -193,7 +193,7 @@ def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(d
 
     def fused(x):
         return norm_swiglu.rms_norm(x, None, 1e-6, x.dtype, offset=False, after_cast=False,
-                                    inverse_rounded=True)
+                                    portable=lambda x, scale: unweighted(x), inverse_rounded=True)
 
     kind, shape = case.split("-")
     shape = tuple(int(size) for size in shape.split("x"))
@@ -610,12 +610,55 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
         assert relative(mine, theirs) < 1e-6
 
 
-def test_norm_jvp_without_a_context_uses_xla():
+@pytest.mark.parametrize("composition", ["jvp_grad", "grad_jvp", "jvp_staged", "vmap_grad"])
+def test_the_fused_swiglu_differentiates_at_every_order_through_the_portable_product(composition):
+    """The fused SiLU product (`norm_swiglu.swiglu`, interpreted here) differentiated at a second
+    order, forward over reverse and reverse over forward, staged by a jit, and a gradient mapped over
+    rows: each is the portable product's own composition, within the float64 gate of it, while the
+    first level's value and backward run the kernels."""
+    gate, up, tangent = (jax.random.normal(jax.random.key(index), (4, 96)).astype(jnp.bfloat16)
+                         for index in (76, 77, 78))
+
+    def composed(implementation):
+        product = gated_product("swiglu", implementation=implementation)
+
+        def score(gate, up):
+            return product(gate, up).astype(jnp.float32).sum()
+
+        def run(gate, up, tangent):
+            if composition == "jvp_grad":
+                return jax.jvp(lambda gate: jax.grad(score)(gate, up), (gate,), (tangent,))[1]
+            if composition == "grad_jvp":
+                def along(gate):
+                    return jax.jvp(lambda gate: score(gate, up), (gate,), (tangent,))[1]
+
+                return jax.grad(along)(gate)
+            if composition == "jvp_staged":
+                return jax.jvp(jax.jit(lambda gate: product(gate, up)), (gate,), (tangent,))[1]
+            return jax.vmap(jax.grad(score))(gate, up)
+
+        return run
+
+    launched = "swiglu_forward" if composition == "jvp_staged" else "swiglu_backward"
+    assert launched in kernels(composed("pallas"), gate, up, tangent)
+    found = np.asarray(jax.jit(composed("pallas"))(gate, up, tangent), np.float64)
+    reference = np.asarray(jax.jit(composed("xla"))(gate, up, tangent), np.float64)
+    with jax.enable_x64(new_val=True):
+        wide = (jnp.asarray(np.asarray(x, np.float64)) for x in (gate, up, tangent))
+        truth = np.asarray(composed("xla")(*wide))
+    assert_as_exact_as_the_reference(found, reference, truth, composition)
+
+
+def test_a_fused_norms_jvp_is_its_kernels_value_and_the_portable_tangent():
+    """`jax.jvp` through the fused norm, with no forward-mode context, staged by a jit or not: its
+    value is the kernel's own output, and its tangent the XLA norm's (`generation.linear_tangent`)."""
     x = jax.random.normal(jax.random.key(75), (2, 31))
     xla, pallas, _ = norm_functions(jnp.float32, offset=True, after_cast=True)
-    for mine, theirs in zip(jax.jvp(lambda x: pallas(x, None), (x,), (x,)),
-                            jax.jvp(lambda x: xla(x, None), (x,), (x,)), strict=True):
-        np.testing.assert_array_equal(mine, theirs)
+    fused = jax.jit(lambda x: pallas(x, None))
+    for norm in (lambda x: pallas(x, None), fused):
+        value, tangent = jax.jvp(norm, (x,), (x,))
+        np.testing.assert_array_equal(value, fused(x))
+        np.testing.assert_array_equal(tangent, jax.jvp(lambda x: xla(x, None), (x,), (x,))[1])
 
 
 # Same-session c53, A100-SXM4-40GB, Liger 0.8.4 / torch 2.11.0+cu130:
