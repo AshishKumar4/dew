@@ -142,16 +142,20 @@ class Command:
         return None
 
     def trial(self, task: Task, url: str, name: str) -> Trial:
-        directory = Path(self.workspace) / name
+        # Absolute, as the command runs in it: a path relative to the trainer would not resolve there.
+        directory = Path(self.workspace).resolve() / name
         directory.mkdir(parents=True)
         return Trial(tuple(os.fspath(part) for part in self.argv(task, directory)), directory,
                      {**self.environment, "OPENAI_BASE_URL": url}, cwd=directory)
 
     def judge(self, task: Task, trial: Trial, log: str, returncode: int, recorded: Recorded) -> Judged:
         failed = engine_failure(recorded)
-        reward = None if failed else self.verify(task, trial.artifacts, returncode)
         if failed:
             return Judged(Status.INFRA_ERROR, detail=failed)
+        reward = self.verify(task, trial.artifacts, returncode)
+        if reward is None:
+            return Judged(Status.INFRA_ERROR, detail=f"the verifier scored nothing; the command exited "
+                                                     f"{returncode}: {log[-2000:]}")
         truncated = refused_prompt(recorded) or (
             "the last call stopped at its length limit"
             if recorded.calls and recorded.calls[-1].finish_reason == "length" else None)
@@ -159,9 +163,6 @@ class Command:
             return Judged(Status.TRUNCATED, reward, detail=truncated)
         if not recorded.calls:
             return Judged(Status.INFRA_ERROR, reward, detail="no model call reached the gateway session")
-        if reward is None:
-            return Judged(Status.INFRA_ERROR, detail=f"the verifier scored nothing; the command exited "
-                                                     f"{returncode}: {log[-2000:]}")
         if returncode == 0:
             return Judged(Status.COMPLETED, reward)
         return Judged(Status.AGENT_ERROR, reward, detail=f"the command exited {returncode}: {log[-2000:]}")
@@ -382,16 +383,19 @@ class HarnessSource:
                     process.stdout.close()
                     process.wait()
                     record.closed.set()
+            import httpx
+
             try:
-                future.set_result(self._verdict(ended, task, trial, session, log, process.returncode,
-                                                cancelled, expired, version))
+                verdict = self._verdict(ended, task, trial, session, log, process.returncode, cancelled,
+                                        expired, version)
             finally:
-                # The session's traces leave the gateway on every exit path;
-                # the future already has its verdict.
+                # The session's traces leave the gateway on every exit path. A gateway that cannot
+                # delete them leaves a stale session behind, not a wrong verdict.
                 try:
                     self._gateway.forget(session)
-                except Exception as error:
+                except httpx.HTTPError as error:
                     _logger.warning("could not delete gateway session %s: %s", session, error)
+            future.set_result(verdict)
         except BaseException as error:
             if not future.done():
                 future.set_exception(error)
@@ -441,9 +445,12 @@ class HarnessSource:
 
     def _verdict(self, ended: Callable[..., Session], task: Task, trial: Trial, session: str, log: str,
                  returncode: int, cancelled: bool, expired: bool, version: int) -> Session:
+        import httpx
+
         try:
             recorded = calls(self._gateway.traces(session), unstamped=version)
-        except Exception as error:
+        except (httpx.HTTPError, ValueError) as error:
+            # The gateway could not be read, or answered traces no call can be read from.
             return ended(Status.CANCELLED if cancelled else Status.INFRA_ERROR,
                          detail=f"{trial.artifacts}: unusable gateway traces: {error}")
         records = recorded.calls
