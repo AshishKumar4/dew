@@ -106,9 +106,10 @@ class Watched:
 
 @contextmanager
 def rig(environment, verifier, *, tasks, log, workers=16, weights=lambda server, watched: server,
-        **options):
+        read=task_ids, **options):
     """A scheduler over `tasks` tasks a batch, two sessions a task, on Dew's own server, its
-    sessions on `workers` threads and its weights published through `weights(server, watched)`: yields the
+    sessions on `workers` threads, its weights published through `weights(server, watched)` and its
+    batches read into tasks by `read`: yields the
     initial variables, a fit of `steps` updates (`fit(steps, checkpoints=)`), the state a trainer
     restores from `checkpoints` (`restored(checkpoints)`), the watched source and the server, and
     closes them after."""
@@ -123,7 +124,7 @@ def rig(environment, verifier, *, tasks, log, workers=16, weights=lambda server,
                                  max_turns=3, workers=workers)
     watched = Watched(episodes)
     scheduler = RolloutScheduler(target, watched, weights(server, watched), width=WIDTH, rows=2 * tasks,
-                                 groups=2, log=log, **options)
+                                 tasks=read, groups=2, log=log, **options)
     stream = scheduler.tasks(
         Loader(
             train=replayed(lambda partition: (
@@ -306,7 +307,7 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
         yield Tools(index)
 
     options = {"oversample": 1, "admit": 3 * tasks // 5, "max_attempts": 2, "max_lag": 1, "ahead": 1,
-               "tasks": numbered}
+               "read": numbered}
     # A straggler holds its worker until it is cancelled, and up to three batches' sessions run at
     # once (the first fit's batch drawn ahead, and the resumed fit's two).
     checkpoints = str(tmp_path / "run")
