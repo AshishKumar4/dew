@@ -306,10 +306,10 @@ def fused_step(mixed, held, taps, gate, beta, log_decay, bias, z, weight, state,
     gates before their activations, `log_decay` (A_log) and `bias` (dt_bias) `[Hv]`, `z` `[rows, Hv *
     Dv]` the output gate, `weight` `[Dv]` the gated norm's, of `epsilon` and gate `activation`, and
     `state` `[rows, Hv, Dk, Dv]` held as `step`'s is. The output `[rows, Hv * Dv]` is in `dtype`; the
-    state is updated in place where the caller lets it go. A row `active` `[rows]`
-    marks False keeps its history and state, its output zeros. The arithmetic is the unfused layer's (the conv and
-    its silu in fp32, the queries and keys l2-normalized, `step`, then the gated norm in fp32), its
-    sums in another order."""
+    state is updated in place where the caller lets it go. A row `active` `[rows]` marks False keeps
+    its history and state, its output zeros. The arithmetic is the unfused layer's (the conv and its
+    silu in fp32, the queries and keys l2-normalized, `step`, then the gated norm in fp32), its sums
+    in another order."""
     rows = state.shape[0]
     flags = (jnp.ones(rows, jnp.int32) if active is None else active.astype(jnp.int32))[:, None]
     return FusedStep()(flags, mixed, held, taps, gate, beta, log_decay, bias, z, weight, state,
