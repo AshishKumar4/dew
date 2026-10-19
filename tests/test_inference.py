@@ -471,7 +471,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     order 1."""
     pytest.importorskip("qwix")
     from dew.objectives.lm import LMObjective, LMRunConfig
-    from dew.training.quantization import Quantization
+    from dew.quantization import Quantization
 
     batch, seq = 8, 8
     fields = {"vocab_size": 256, "emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,

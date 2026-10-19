@@ -2,7 +2,7 @@
 """Serve the pretrained text-to-image model with quantized weights, and measure it.
 
 `TextToImage.quantized` stores the denoiser's kernels as int8 or fp8 values
-with their scales (`dew.training.quantization.quantize_for_serving`). This
+with their scales (`dew.quantization.quantize_for_serving`). This
 tool loads a model once in a compute dtype, quantizes it as one precision
 says, and prints one JSON line:
 
@@ -48,8 +48,8 @@ import tyro
 from jax.typing import ArrayLike
 
 from dew.artifacts import uint8_pixels
+from dew.quantization import Quantization
 from dew.sampling import CFG, DPMSolverMultistep, TextToImage
-from dew.training.quantization import Quantization
 
 PROMPTS = (
     "a watercolor painting of a mountain lake at sunrise",

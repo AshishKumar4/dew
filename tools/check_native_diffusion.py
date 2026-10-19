@@ -19,8 +19,7 @@ import numpy as np
 
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import DenoisingInputs
-from dew.inputs import Condition, Field, unit_range
-from dew.inputs.diffusion import latent_image_conditions
+from dew.inputs import Field, unit_range
 from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
@@ -36,10 +35,21 @@ def bundle(directory, streamed: bool = False):
                            **({"mesh": MeshSpec()} if streamed else {}))
 
 
-def compare(errors, name, actual, expected, tolerance=5e-5):
-    actual, expected = np.asarray(actual, np.float32), np.asarray(expected, np.float32)
-    errors[name] = float(np.max(np.abs(actual - expected)))
-    np.testing.assert_allclose(actual, expected, atol=tolerance, rtol=tolerance)
+TRUTH = Path(__file__).resolve().parents[1] / "tests/fixtures/tiny_diffusers_f64.npz"
+"""Each saved task's references rerun in float64 (`truth` in tools/diffusers_pipeline_reference.py
+and tools/diffusers_extended_reference.py)."""
+
+
+def held(errors, task, name, actual, reference, key):
+    """`actual` as near float64 as the source's float32 `reference`, the truth
+    the same saved pipeline computes in float64 (tests/reference_error.py)."""
+    from reference_error import assert_as_exact_as_the_reference, distance
+
+    with np.load(TRUTH) as truth:
+        wide = truth[f"{task}/{key}"]
+    actual = np.asarray(actual, np.float64)
+    errors[name] = {"dew": distance(actual, wide), "reference": distance(reference, wide)}
+    assert_as_exact_as_the_reference(actual, reference, wide, f"{task} {name}")
 
 
 def conditions(source, extended=False):
@@ -58,41 +68,38 @@ def task_kind(source, meta):
     return "inpaint" if "Inpaint" in name else "img2img" if "Img2Img" in name else "text"
 
 
-def trajectory(source, reference, meta, key):
-    """Compose the native image initialization, conditions and single solver walk."""
+def selection(source, meta):
+    """The text conditions and the times the source's call walks: all of
+    them, or those its strength or the refiner's denoising_start selects,
+    which is the caller's conversion."""
     kind = task_kind(source, meta)
     given, null = conditions(source, kind.startswith("xl-") or kind == "refiner")
     steps = meta.get("steps", 2)
     process, times = source.schedule.sampling(steps)
-    noise = jnp.asarray(reference["noise"])
-    initial = noise * process.sampler_schedule.prior_scale()
-    pixels = unit_range(jnp.asarray(reference["pixels"][None])) if "pixels" in reference else None
-    if kind in ("img2img", "xl-img2img", "refiner"):
-        clean = source.autoencoder.encode(source.variables["autoencoder"], pixels,
-                                           key if kind == "img2img" else None)
-        if kind == "refiner":
-            model_times = np.asarray(process.sampler_schedule.model_time(times[:-1]))
-            cutoff = round(len(source.schedule.betas) * (1 - meta["denoising_start"]))
-            times = times[int(np.flatnonzero(model_times < cutoff)[0]):]
-            initial = clean
-        else:
-            start = steps - int(steps * meta.get("strength", 1.0))
-            times = times[start:]
-            alpha, sigma = process.sampler_schedule.rates(jnp.full((noise.shape[0],), times[0]))
-            shape = (-1,) + (1,) * (noise.ndim - 1)
-            initial = alpha.reshape(shape) * clean + sigma.reshape(shape) * noise
-    if kind in ("inpaint", "xl-inpaint"):
-        mask = (jnp.asarray(reference["mask"][None, ..., None]) >= 128).astype(jnp.float32)
-        encode_key = jax.random.split(key)[1] if kind == "inpaint" else None
-        spatial = latent_image_conditions(source.autoencoder, source.variables["autoencoder"], pixels, mask, encode_key)
-        given, null = {**given, **spatial}, {**null, **spatial}
+    if kind == "refiner":
+        model_times = np.asarray(process.sampler_schedule.model_time(times[:-1]))
+        cutoff = round(len(source.schedule.betas) * (1 - meta["denoising_start"]))
+        times = times[int(np.flatnonzero(model_times < cutoff)[0]):]
+    elif kind in ("img2img", "xl-img2img"):
+        times = times[steps - int(steps * meta.get("strength", 1.0)):]
+    return given, null, process, times
+
+
+def trajectory(source, prepared, given, null, process, times, key):
+    """The single solver walk from the public `prepare`'s start, the one
+    path every caller starts from, and the conditions it walks under: the
+    text ones and the spatial ones `prepare` built. Its real rows: on a mesh
+    the rows pad to fill the devices."""
+    spatial = {name: prepared.conditions[name][:prepared.rows] for name in ("mask", "masked_image")
+               if name in prepared.conditions}
+    given, null = {**given, **spatial}, {**null, **spatial}
     denoise = process.denoiser(source.model, source.variables, given, null)
-    latents = sample(denoise, initial, solver=source.schedule.solver, guidance=CFG(3.0), key=key,
-                     times=times, final_denoise=False)
+    latents = sample(denoise, prepared.noise[:prepared.rows], solver=source.schedule.solver, guidance=CFG(3.0),
+                     key=key, times=times, final_denoise=False)
     images = jnp.clip(source.autoencoder.decode(source.variables["autoencoder"], latents), -1, 1)
     if source.finish is not None:
         images = source.finish(source.variables, images)
-    return images, latents, given, null, process, times, initial
+    return images, latents, given
 
 
 def public_start(task, source, reference, meta, key, given, null, process, times):
@@ -117,9 +124,19 @@ def public_start(task, source, reference, meta, key, given, null, process, times
         return source.autoencoder.encode(source.variables["autoencoder"], pixels_in_range, None)
 
     if kind == "xl-img2img":
+        from reference_error import assert_as_exact_as_the_reference
+
         prepared = task.prepare(**shared, image=pixels, noise=noise)
         bypassed = task.prepare(**shared, image_latents=clean(), noise=noise)
-        np.testing.assert_allclose(bypassed.noise, prepared.noise, atol=1e-6, rtol=0)
+        # Both starts from Dew's own encoding (compiled in `prepare`, eager here), held to the
+        # start the source's float64 encoding makes under the same rates and noise.
+        alpha, sigma = (np.asarray(rate, np.float64).reshape(-1, 1, 1, 1)
+                        for rate in process.sampler_schedule.rates(jnp.full((1,), times[0])))
+        with np.load(TRUTH) as truth:
+            start = alpha * truth["xl-img2img/image_latents"] + sigma * np.asarray(noise, np.float64)
+        rows = prepared.rows
+        assert_as_exact_as_the_reference(np.asarray(bypassed.noise)[:rows], np.asarray(prepared.noise)[:rows],
+                                         start, "bypassed image latents")
         return prepared
     if kind == "refiner":
         return task.prepare(**shared, initial=clean())
@@ -206,44 +223,46 @@ def check_pipeline(directory, streamed: bool = False):
     reference = np.load(directory / "reference.npz")
     meta = json.loads((directory / "reference.json").read_text()) if (directory / "reference.json").exists() else {}
     errors, key = {}, jax.random.PRNGKey(17)
-    images, latents, given, null, process, times, initial = trajectory(source, reference, meta, key)
+    given, null, process, times = selection(source, meta)
+    # The start the public `prepare` makes from what the reference pipeline was handed.
+    task = source.text_to_image()
+    prepared = public_start(task, source, reference, meta, key, given, null, process, times)
+    images, latents, given = trajectory(source, prepared, given, null, process, times, key)
     if "hidden" in reference:
-        compare(errors, "hidden", given["conditioning"].context, reference["hidden"])
+        held(errors, directory.name, "hidden", given["conditioning"].context, reference["hidden"], "hidden")
     if "pooled" in reference:
-        compare(errors, "pooled", given["conditioning"].pooled, reference["pooled"])
+        held(errors, directory.name, "pooled", given["conditioning"].pooled, reference["pooled"], "pooled")
     if "encoded" in reference:
         pixels = unit_range(jnp.asarray(reference["pixels"][None]))
-        compare(errors, "encode", source.autoencoder.encode(source.variables["autoencoder"], pixels, key), reference["encoded"])
-        compare(errors, "decode", source.autoencoder.decode(source.variables["autoencoder"], jnp.asarray(reference["noise"])), reference["decoded"])
+        held(errors, directory.name, "encode", source.autoencoder.encode(source.variables["autoencoder"], pixels, key),
+             reference["encoded"], "encoded")
+        held(errors, directory.name, "decode", source.autoencoder.decode(source.variables["autoencoder"],
+                                                               jnp.asarray(reference["noise"])),
+             reference["decoded"], "decoded")
     if "final_latents" in reference:
-        compare(errors, "latents", latents, reference["final_latents"])
-    compare(errors, "trajectory_images", (images + 1) / 2, reference["images"], 1e-4)
+        held(errors, directory.name, "latents", latents, reference["final_latents"], "final_latents")
+    held(errors, directory.name, "trajectory_images", (np.asarray(images, np.float64) + 1) / 2, reference["images"], "images")
     if source.finish is not None:
         raw = np.rint(reference["images"] * 255).astype(np.uint8)
         pixels = source.finish.transform(raw)
-        compare(errors, "checker_pixels", pixels, reference["checker_pixels"])
-        features = source.finish.model.apply({"params": source.variables["encoders"]["safety"]}, pixels,
+        held(errors, directory.name, "checker_pixels", pixels, reference["checker_pixels"], "checker_pixels")
+        # The tower on the source's own pixels, each stage held on the input the source gave it:
+        # Dew's pixels carry their own float32 rounding, held above, which the tower amplifies.
+        features = source.finish.model.apply({"params": source.variables["encoders"]["safety"]},
+                                             jnp.asarray(reference["checker_pixels"]),
                                              method=source.finish.model.features)
-        compare(errors, "checker_features", features, reference["checker_embeddings"])
-    # The same trajectory through the task facade, its start prepared by the
-    # public `prepare` from the reference's own inputs.
-    task = source.text_to_image()
-    prepared = public_start(task, source, reference, meta, key, given, null, process, times)
-    # Its real rows: on a mesh the rows pad to fill the devices.
-    compare(errors, "prepared", np.asarray(prepared.noise)[:prepared.rows], initial, 1e-6)
-    for name in ("mask", "masked_image"):
-        if name in given:
-            compare(errors, f"prepared_{name}", np.asarray(prepared.conditions[name])[:prepared.rows],
-                    given[name], 1e-6)
+        held(errors, directory.name, "checker_features", features, reference["checker_embeddings"], "checker_embeddings")
+    # The same walk through the task facade: the same images.
     output = task(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key)
-    compare(errors, "task", output.host().images, images, 1e-5)
-    compare(errors, "task_reference", (output.host().images + 1) / 2, reference["images"], 1e-4)
+    np.testing.assert_array_equal(output.host().images, images)
     training = train_and_reload(source, reference, key, given, jnp.asarray(reference["noise"]))
     errors["reload"] = 0.0
     print(json.dumps({"directory": str(directory), "errors": errors, "training": training}))
 
 
 def check_grids(directory, grids, case=None):
+    from reference_error import assert_as_exact_as_the_reference, distance
+
     oracle = np.load(grids)
     source = bundle(directory)
     given, null = conditions(source)
@@ -255,9 +274,15 @@ def check_grids(directory, grids, case=None):
         process, times = schedule.sampling(4)
         noise = jnp.asarray(oracle["noise"]) * process.sampler_schedule.prior_scale()
         task = replace(source.text_to_image(), grid=lambda count: (process, times), solver=schedule.solver)
-        output = task(DenoisingInputs(noise, given, null, rows=1), steps=4, guidance=3.0, key=jax.random.PRNGKey(0))
-        expected = jnp.clip(source.autoencoder.decode(source.variables["autoencoder"], jnp.asarray(oracle[name + ".latents"])), -1, 1)
-        compare(errors, name, output.host().images, expected, 1e-4)
+        output = task(DenoisingInputs(noise, given, null, rows=1), steps=4, guidance=3.0, key=jax.random.PRNGKey(0),
+                      decode=False)
+        # The walk's latents, as near float64 as the source scheduler's float32 walk over the same
+        # predictions (tools/diffusers_scheduler_pipeline_reference.py --truth).
+        latents = np.asarray(output.host().latents, np.float64)
+        errors[name] = {"dew": distance(latents, oracle[name + ".latents.fp64"]),
+                        "reference": distance(oracle[name + ".latents"], oracle[name + ".latents.fp64"])}
+        assert_as_exact_as_the_reference(latents, oracle[name + ".latents"], oracle[name + ".latents.fp64"],
+                                         f"{name} grid")
     print(json.dumps({"grids": errors}))
 
 
@@ -360,8 +385,8 @@ def regress(directory, case):
             index = json.loads((Path(saved) / "model_index.json").read_text())
             index["force_zeros_for_empty_prompt"] = False
             (Path(saved) / "model_index.json").write_text(json.dumps(index))
-            np.testing.assert_allclose(bundle(saved).text_to_image()(["cat"], **options).host().images, expected, atol=1e-5, rtol=1e-5)
-        assert not np.allclose(task(["cat"], **options).host().images, expected, atol=1e-7)
+            np.testing.assert_array_equal(bundle(saved).text_to_image()(["cat"], **options).host().images, expected)
+        assert not np.array_equal(task(["cat"], **options).host().images, expected)
     elif case == "handoff":
         handoff(directory, source, task, key)
     elif case == "mask-levels":

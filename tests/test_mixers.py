@@ -241,10 +241,6 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     sums it adds: Kimi delta attention's second layer's A_log, its terms 2.7 times its size, rounds
     to 6.6e-06 packed under its floor of 7.3e-06, where the documents alone round to 5.6e-07 at their
     own chunk phase and 6.6e-06 at the packed one."""
-    if jax.default_backend() == "gpu":
-        pytest.skip("a GPU's XLA picks GEMM algorithms by shape, so a packed row and its documents "
-                    "alone sum in different orders and one draw of each measures luck; isolation on a "
-                    "GPU is test_no_token_reaches_another_document's, bitwise")
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
     model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=128, **overrides)
     tokens = jax.random.randint(jax.random.key(3), (1, sum(DOCUMENTS)), 0, VOCAB)
@@ -420,3 +416,38 @@ def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsy
     print_saved_residuals(jax.checkpoint(loss, policy=policy), variables)
     saved = capsys.readouterr().out
     assert [name for name in value.residuals if f"named '{name}'" not in saved] == []
+
+
+def one_tap(kind):
+    """A recurrent mixer of `kind` whose causal conv takes one tap, at small widths."""
+    from dew.nn.kda import KimiDeltaAttention
+    from dew.nn.mixers.mamba import Mamba
+    from dew.nn.mixers.mamba2 import Mamba2
+
+    return {"gated_delta_net": lambda: linear.GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4,
+                                                            head_k_dim=16, head_v_dim=16, conv_kernel=1),
+            "kimi_delta_attention": lambda: KimiDeltaAttention(emb_features=64, num_heads=2, head_dim=16,
+                                                               conv_kernel=1),
+            "mamba": lambda: Mamba(emb_features=16, intermediate_size=32, state_size=4, time_step_rank=2,
+                                   chunk_size=4, conv_kernel=1),
+            "mamba2": lambda: Mamba2(emb_features=64, num_heads=4, head_dim=16, state_size=16, chunk_size=8,
+                                     conv_kernel=1)}[kind]()
+
+
+@pytest.mark.parametrize("kind", ["gated_delta_net", "kimi_delta_attention", "mamba", "mamba2"])
+def test_a_recurrent_mixer_whose_conv_takes_one_tap_decodes_as_its_whole_pass(kind):
+    """A one-tap causal conv is a scale per channel with no history to hold: each recurrent mixer
+    builds with one, and its decode (a 3-token prefill, then one token a step) is within
+    tests/reference_error.py's rule of its whole pass against the float64 whole pass."""
+    from model_support import decode_through
+    from reference_error import assert_as_exact_as_the_reference
+
+    module = one_tap(kind)
+    hidden = jax.random.normal(jax.random.key(4), (2, 9, module.emb_features), jnp.float32)
+    variables = module.init(jax.random.key(5), hidden)
+    whole = np.asarray(module.apply(variables, hidden), np.float64)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
+        truth = np.asarray(module.clone(dtype=jnp.float64).apply(wide, jnp.asarray(hidden, jnp.float64)))
+    decoded = np.asarray(decode_through(module, variables, hidden, prefill=3)[0], np.float64)
+    assert_as_exact_as_the_reference(decoded, whole, truth, f"{kind} decode")
