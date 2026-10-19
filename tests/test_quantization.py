@@ -981,11 +981,15 @@ def zone_cases(dtype) -> dict[str, tuple[Callable[..., jax.Array], tuple, dict]]
         return jnp.asarray(rng.standard_normal(shape), jnp.float32).astype(dtype)
 
     pole = jnp.exp(jax.lax.complex(-jnp.linspace(0.05, 0.4, 4), jnp.linspace(0.3, 2.0, 4)))
+    # Each row sits between two codewords whose distances differ by a part in a thousand, a gap an
+    # int8 product's rounding reorders.
+    rows, offsets = normal(64, 32), normal(64, 32)
+    codebook = jnp.concatenate([rows + offsets, rows - 1.001 * offsets])
     return {
         "dew.nn.ssm.diagonal_recurrence": (diagonal_recurrence, (pole, normal(2, 12, 8)), {"chunk": 4}),
         "dew.nn.attention_residuals.depth_mixed": (
             depth_mixed, (normal(2, 3, 4, 8), normal(8), normal(2, 3, 4, 8)), {}),
-        "dew.nn.quantizers.nearest_codewords": (nearest_codewords, (normal(64, 32), normal(512, 32)), {}),
+        "dew.nn.quantizers.nearest_codewords": (nearest_codewords, (rows, codebook), {}),
         "dew.nn.kv_cache.rotated": (rotated, (normal(2, 4, 8), hadamard(8)), {}),
         "dew.nn.blocks.torch_bicubic_resize": (torch_bicubic_resize, (normal(1, 4, 5, 3), 7, 9), {}),
         "dew.lora._updated": (lora_update, (normal(8, 6), normal(8, 2), normal(2, 6)), {"scale": 2.0}),
@@ -1002,6 +1006,7 @@ def test_a_function_the_model_keeps_in_float_runs_unquantized(name, dtype):
     function, operands, keywords = zone_cases(dtype)[name]
     copy = types.FunctionType(function.__code__, function.__globals__, f"{function.__name__}_copy",
                               function.__defaults__, function.__closure__)
+    copy.__kwdefaults__ = function.__kwdefaults__
 
     def ran(function, quantize: bool) -> np.ndarray:
         model = Calls(functools.partial(function, **keywords))
