@@ -26,6 +26,8 @@ from dew.objectives.base import (
     Variables,
     joined,
     part,
+    projected_draw,
+    projected_parts,
 )
 from dew.rl.advantage import gae_advantages, masked_whiten
 from dew.rl.surrogate import clipped_value_loss_terms
@@ -57,6 +59,12 @@ class ValueHead(nn.Module):
     """
 
     backbone: HiddenStates
+
+    @nn.nowrap
+    def projected(self, params: Variables, *, updated: bool) -> Variables:
+        """The backbone's projection of its own parameters (`ProjectsParameters`); the value map's
+        as they are."""
+        return projected_parts(params, {"backbone": self.backbone}, updated=updated)
 
     @nn.compact
     def __call__(self, tokens: jax.Array, *, segment_ids: jax.Array | None = None,
@@ -137,6 +145,10 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         *actor, self.critic = modules
         self.actor.substitute(actor)
 
+    def projected(self, params: Variables, *, updated: bool) -> Variables:
+        """The actor's projection of the policy's tree, and the critic's of its own."""
+        return projected_parts(params, {"policy": self.actor, "critic": self.critic}, updated=updated)
+
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Tile the actor's head, the vocabulary head this objective trains."""
         return self.actor.tile_head(tile)
@@ -154,8 +166,8 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         return self.actor.held_variables()
 
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
-        critic = self.critic.init(jax.random.fold_in(key, 1),
-                                  jnp.zeros((1, self.seq_len), jnp.int32))
+        critic = projected_draw(self.critic, self.critic.init(jax.random.fold_in(key, 1),
+                                                              jnp.zeros((1, self.seq_len), jnp.int32)))
         return joined({"policy": self.actor.init(key, variables), "critic": critic})
 
     def policy(self, variables: Variables) -> EpisodeInference:
