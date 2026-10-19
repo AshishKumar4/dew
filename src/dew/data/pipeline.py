@@ -643,19 +643,20 @@ class Dataset:
         from dew.data.steps.generic import Fields
 
         moves = tuple(names.items())
-        return self.map(Fields(rename=moves), identity=f"dew.rename_columns:{sorted(moves)}")
+        return self.map(Fields(rename=moves, bookkeeping=True),
+                        identity=f"dew.rename_columns:{sorted(moves)}")
 
     def select_columns(self, *names: str) -> Pipeline:
         """Each record with the fields `names` alone."""
         from dew.data.steps.generic import Fields
 
-        return self.map(Fields(names), identity=f"dew.select_columns:{list(names)}")
+        return self.map(Fields(names, bookkeeping=True), identity=f"dew.select_columns:{list(names)}")
 
     def remove_columns(self, *names: str) -> Pipeline:
         """Each record without the fields `names`."""
         from dew.data.steps.generic import Fields
 
-        return self.map(Fields(remove=names), identity=f"dew.remove_columns:{list(names)}")
+        return self.map(Fields(remove=names, bookkeeping=True), identity=f"dew.remove_columns:{list(names)}")
 
     def grain(self, function: Callable[[pygrain.MapDataset | pygrain.IterDataset],
                                             pygrain.MapDataset | pygrain.IterDataset],
