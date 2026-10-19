@@ -184,8 +184,10 @@ mlflow = ["mlflow"]
 tensorboard = ["tensorboard"]
 # optuna_search: the sampler behind dew.config.sweep's Optuna backend.
 hpo = ["optuna"]
-# Online URL-streaming loader (HF datasets-backed)
-streaming = ["datasets"]
+# Online URL-streaming loader (HF datasets-backed). 5.0.1 is the release the suite passes on; 4.8.5,
+# Colab's, caps fsspec at 2026.2, below the 2026.6 the base needs, and unbounded pip backtracks from
+# it to datasets 1.6.2, whose metadata it can't read.
+streaming = ["datasets>=5.0.1"]
 # The live site's container (site/live/container/setup-managed.sh), beside the streaming and profile
 # extras: its bridge's WebSocket release, the kernel gateway and IPython kernel its contexts run, and
 # ipywidgets, without which tqdm warns in a kernel that it falls back to text bars. The test extra
