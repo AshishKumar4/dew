@@ -535,6 +535,60 @@ def test_a_memory_read_weighs_a_token_mixture_by_the_targets_of_the_rows_it_hold
     assert abs(targets[0] - targets[1]) <= 19
 
 
+@dataclasses.dataclass(frozen=True)
+class Halved:
+    """A random step that keeps the first half of a token row, as a random crop keeps a part, so the
+    rows a corpus delivers hold fewer targets than the rows its read holds."""
+
+    def __call__(self, row, rng):
+        return {**row, "text": row["text"][: len(row["text"]) // 2]}
+
+
+def test_a_token_mixture_weighs_a_corpus_by_the_targets_its_rows_deliver():
+    """A corpus whose rows a step still to run changes, here a random crop to half, delivers other
+    targets than the rows its read holds and its store states: the mixture by tokens counts them as
+    they arrive, so both corpora deliver equal targets, to within one row's."""
+    def corpus(name, lengths):
+        return Stated([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
+                       for size in lengths])
+
+    parts = [Pipeline(corpus("long", (20, 20, 20, 20)), name="long").random_map(Halved()),
+             Pipeline(corpus("short", (4, 4)), name="short")]
+    mixed = mix([part.repeat() for part in parts], by="tokens")
+    data = compile(mixed.map(Counted()).batch(8), read="memory", loading=READ)
+    stream = data.train(DataPartition())
+    targets = [0, 0]
+    try:
+        for batch in itertools.islice(stream, 16):
+            for source, count in zip(batch["source"], batch["targets"], strict=True):
+                targets[int(source)] += int(count)
+    finally:
+        stream.close()
+    assert abs(targets[0] - targets[1]) <= 9
+
+
+def test_a_token_mixture_counts_the_targets_a_corpus_delivers_after_its_repeat_changes_them():
+    """A corpus whose rows a random crop changes after its repeat delivers other targets than its
+    store states: the mixture by tokens weighs it by the targets its rows deliver, so both corpora
+    deliver equal targets, to within one row's."""
+    def corpus(name, lengths):
+        return Stated([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
+                       for size in lengths])
+
+    long = Pipeline(corpus("long", (20, 20, 20, 20)), name="long").repeat().random_map(Halved())
+    mixed = mix([long, Pipeline(corpus("short", (4, 4)), name="short").repeat()], by="tokens")
+    data = compile(mixed.map(Counted()).batch(8), read="memory", loading=READ)
+    stream = data.train(DataPartition())
+    targets = [0, 0]
+    try:
+        for batch in itertools.islice(stream, 16):
+            for source, count in zip(batch["source"], batch["targets"], strict=True):
+                targets[int(source)] += int(count)
+    finally:
+        stream.close()
+    assert abs(targets[0] - targets[1]) <= 9
+
+
 @pytest.mark.parametrize("held", [False, True])
 def test_a_token_mixture_weighs_a_random_holdout_by_the_rows_it_keeps(held):
     """Mixed by tokens, two corpora whose stores state their counts deliver equal valid targets,

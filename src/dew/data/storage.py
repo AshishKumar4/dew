@@ -306,6 +306,10 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         }
 
 
+# Registered as this module loads, which reads no configuration, so `dewcache::` URLs open through
+# fsspec itself from the moment the data layer is imported.
+fsspec.register_implementation("dewcache", BoundedFileCache, clobber=True)
+
 _MEMORY_LOCK = threading.RLock()
 
 
@@ -682,10 +686,9 @@ class Store:
 
 @functools.cache
 def _registered() -> None:
-    """Register Dew's filesystems with fsspec, once, as the first store resolves: the bounded cache
-    (`dewcache`) and the profiles the storage config names (DEW_STORAGE_CONFIG, else
-    ~/.config/dew/storage.toml)."""
-    fsspec.register_implementation("dewcache", BoundedFileCache, clobber=True)
+    """Register the profiles the storage config names (DEW_STORAGE_CONFIG, else
+    ~/.config/dew/storage.toml) with fsspec, once, as the first store resolves: the configuration is
+    read where it is first used, so a broken one fails that store, not the import."""
     config = Path(os.environ.get("DEW_STORAGE_CONFIG", "~/.config/dew/storage.toml")).expanduser()
     if config.is_file():
         for name, values in tomllib.loads(config.read_text()).items():
