@@ -42,55 +42,31 @@ def _format(url: str) -> Format:
     return inferred
 
 
+_SUFFIXES: dict[Format, tuple[str, ...]] = {
+    "jsonl": (".jsonl", ".jsonl.gz", ".jsonl.zst"),
+    "text": (".txt",),
+    "csv": (".csv",),
+    "parquet": (".parquet",),
+    "arrow": (".arrow", ".feather"),
+    "array_record": (".array_record",),
+    "webdataset": (".tar",),
+}
+"""The suffixes each record format's files carry, which a URL's format is inferred from and a
+directory's files of a format are found by."""
+
+
 def _inferred(url: str) -> Format | None:
     """The record format a URL's suffix declares, or None where it declares none."""
-    if url.lower().endswith((".jsonl.gz", ".jsonl.zst")):
-        return "jsonl"
-    suffix = PurePosixPath(url).suffix.lower()
-    formats: dict[str, Format] = {
-        ".jsonl": "jsonl",
-        ".txt": "text",
-        ".csv": "csv",
-        ".parquet": "parquet",
-        ".arrow": "arrow",
-        ".feather": "arrow",
-        ".array_record": "array_record",
-        ".tar": "webdataset",
-    }
-    return formats.get(suffix)
+    name = url.lower()
+    return next((kind for kind, suffixes in _SUFFIXES.items() if name.endswith(suffixes)), None)
 
 
 def _arrow_filesystem(fs) -> pafs.FileSystem:
+    """`fs` as Arrow reads it: the native local filesystem, or the fsspec filesystem itself, so a
+    remote store reads through the endpoint, credentials and session its paths were found with."""
     protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
     if "file" in protocols:
         return pafs.LocalFileSystem()
-    if "s3" in protocols:
-        from urllib.parse import urlsplit
-
-        endpoint = fs.client_kwargs.get("endpoint_url") or fs.endpoint_url
-        parsed = urlsplit(endpoint) if endpoint else None
-        return pafs.S3FileSystem(
-            access_key=fs.key,
-            secret_key=fs.secret,
-            session_token=fs.token,
-            anonymous=fs.anon,
-            region=fs.client_kwargs.get("region_name"),
-            endpoint_override=parsed.netloc if parsed else None,
-            scheme=parsed.scheme if parsed else "https",
-        )
-    if (
-        "gs" in protocols
-        and fs.credentials.method in ("google_default", "cloud", "anon")
-        and not fs.requester_pays
-    ):
-        from urllib.parse import urlsplit
-
-        endpoint = urlsplit(fs._location)
-        return pafs.GcsFileSystem(
-            anonymous=fs.credentials.method == "anon",
-            scheme=endpoint.scheme,
-            endpoint_override=endpoint.netloc,
-        )
     return pafs.PyFileSystem(pafs.FSSpecHandler(fs))
 
 
@@ -225,17 +201,8 @@ class Files(Dataset):
                     if self.kind not in ("parquet", "arrow")
                     or not any(part.startswith(("_", ".")) for part in PurePosixPath(name[len(path) :]).parts)
                 )
-                extensions = {
-                    "parquet": ".parquet",
-                    "arrow": ".arrow",
-                    "jsonl": (".jsonl", ".jsonl.gz", ".jsonl.zst"),
-                    "text": ".txt",
-                    "csv": ".csv",
-                    "array_record": ".array_record",
-                    "webdataset": ".tar",
-                }
                 if self.kind != "files":
-                    names = [name for name in names if name.lower().endswith(extensions[self.kind])]
+                    names = [name for name in names if name.lower().endswith(_SUFFIXES[self.kind])]
             else:
                 names = [path]
             found.extend(fs.unstrip_protocol(name) for name in names if fs.isfile(name))

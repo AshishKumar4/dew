@@ -85,7 +85,7 @@ def unpack_dict_of_byte_arrays(payload: bytes) -> dict[str, bytes]:
     return values
 
 
-def _tree(value: Value, leaves: dict[str, bytes], canonical: bool = False) -> JSON:
+def _tree(value: Value, leaves: dict[str, bytes], canonical: bool = False, opaque: bool = False) -> JSON:
     if isinstance(value, jax.Array):
         # A record a caller built with jax holds its values on a device; their host copy is the record.
         value = np.asarray(value)
@@ -115,32 +115,37 @@ def _tree(value: Value, leaves: dict[str, bytes], canonical: bool = False) -> JS
             return {"bytes": key}
         if value.dtype.hasobject:
             return {"object_array": {"shape": list(value.shape),
-                                     "values": _tree(value.tolist(), leaves, canonical)}}
+                                     "values": _tree(value.tolist(), leaves, canonical, opaque)}}
         file = io.BytesIO()
         dtype = _dtype(value)
         np.save(file, value.view(np.dtype(value.dtype.str)) if dtype else value, allow_pickle=False)
         leaves[key] = file.getvalue()
         return {"array": key, **dtype}
     if isinstance(value, Mapping):
+        if opaque and not all(isinstance(key, str) for key in value):
+            value = {repr(key): entry for key, entry in value.items()}
         if not all(isinstance(key, str) for key in value):
             raise TypeError("artifact mappings need string keys")
         keys = sorted(value) if canonical else value
-        return {"mapping": {key: _tree(value[key], leaves, canonical) for key in keys}}
+        return {"mapping": {key: _tree(value[key], leaves, canonical, opaque) for key in keys}}
     if isinstance(value, (list, tuple)):
         return {"tuple" if isinstance(value, tuple) else "list":
-                [_tree(entry, leaves, canonical) for entry in value]}
+                [_tree(entry, leaves, canonical, opaque) for entry in value]}
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         cls = type(value)
-        if not cls.__module__.startswith("dew."):
+        if not cls.__module__.startswith("dew.") and not opaque:
             raise TypeError(f"artifact codec has no schema for {cls.__module__}.{cls.__qualname__}")
         return {
             "dataclass": [cls.__module__, cls.__qualname__],
             "fields": {
-                field.name: _tree(getattr(value, field.name), leaves, canonical)
+                field.name: _tree(getattr(value, field.name), leaves, canonical, opaque)
                 for field in dataclasses.fields(value)
                 if field.init
             },
         }
+    if opaque:
+        # An object no schema reads, whose text may name its address: its type alone.
+        return {"opaque": f"{type(value).__module__}.{type(value).__qualname__}"}
     raise TypeError(f"artifact codec cannot encode {type(value).__name__}")
 
 
@@ -189,11 +194,15 @@ def _restore(node: object, leaves: Mapping[str, bytes]) -> Value:
     raise ValueError("unknown artifact record schema")
 
 
-def encode(value: Value, *, canonical: bool = False) -> bytes:
+def _encoded(value: Value, canonical: bool, opaque: bool) -> bytes:
     leaves: dict[str, bytes] = {}
-    tree = _tree(value, leaves, canonical)
+    tree = _tree(value, leaves, canonical, opaque)
     leaves["schema"] = json.dumps(tree, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
     return pack_dict_of_byte_arrays(leaves)
+
+
+def encode(value: Value, *, canonical: bool = False) -> bytes:
+    return _encoded(value, canonical, opaque=False)
 
 
 def decode(value: bytes) -> Value:
@@ -201,9 +210,11 @@ def decode(value: bytes) -> Value:
     return _restore(json.loads(leaves.pop("schema")), leaves)
 
 
-def content_fingerprint(value: Value) -> bytes:
-    """SHA256 of content with every mapping ordered by key."""
-    return hashlib.sha256(encode(value, canonical=True)).digest()
+def content_fingerprint(value: Value, *, opaque: bool = False) -> bytes:
+    """SHA256 of content with every mapping ordered by key. `opaque` reads what the codec has no
+    schema for by its type alone and mapping keys by their repr, for a digest that guards a stream
+    rather than an artifact anyone decodes (`dew.data.dataset.Replayed`)."""
+    return hashlib.sha256(_encoded(value, canonical=True, opaque=opaque)).digest()
 
 
 def fingerprint(values: Iterable[Value]) -> str:
