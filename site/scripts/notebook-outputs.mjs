@@ -31,12 +31,18 @@ async function writeImage(buffer, stem, name) {
 	return { src: `/tutorials/${stem}/${name}.webp`, width, height };
 }
 
+// The text of a display whose HTML is one <pre> block beside its plain text, or null.
+const preformatted = (data) =>
+	data?.['text/plain'] !== undefined && /^<pre[^>]*>[^<]*<\/pre>\s*$/.test(joined(data['text/html']))
+		? joined(data['text/plain'])
+		: null;
+
 export async function renderOutputs(cell, stem, index, allowErrors, images, record) {
 	const html = [];
-	// Consecutive stream outputs form one block in the order they were written, as in a
-	// terminal: a training loop that prints its epochs to stdout and draws its progress bars
-	// on stderr reads as one log. A block with only stderr folds away, and so does an install
-	// cell's log (download bars, build steps).
+	// Consecutive stream outputs, and displays of preformatted text, form one block in the order
+	// they were written, as in a terminal: a training loop that prints its epochs to stdout and
+	// draws its progress bars on stderr reads as one log. A block with only stderr folds away,
+	// and so does an install cell's log (download bars, build steps).
 	let stream = null;
 	const install = /^\s*[%!]pip\s/.test(joined(cell.source));
 	const flush = () => {
@@ -49,7 +55,7 @@ export async function renderOutputs(cell, stem, index, allowErrors, images, reco
 			html.push(
 				install
 					? `<details class="nb-output nb-install"><summary>install log</summary>${body}</details>`
-					: !stdout
+					: !stream.shown
 						? `<details class="nb-output nb-stderr"><summary>stderr</summary>${body}</details>`
 						: `<div class="nb-output nb-stdout">${body}</div>`,
 			);
@@ -58,10 +64,14 @@ export async function renderOutputs(cell, stem, index, allowErrors, images, reco
 	};
 	let figure = 0;
 	for (const output of cell.outputs ?? []) {
-		if (output.output_type === 'stream') {
-			stream ??= { text: '', stdout: '' };
-			stream.text += joined(output.text);
-			if (output.name === 'stdout') stream.stdout += joined(output.text);
+		// A display that is only preformatted text, such as each line a rich console prints in a
+		// notebook (Dew's training display), is one more line of the same log.
+		const text = output.output_type === 'stream' ? joined(output.text) : preformatted(output.data);
+		if (text !== null) {
+			stream ??= { text: '', stdout: '', shown: false };
+			stream.text += text;
+			if (output.name === 'stdout') stream.stdout += text;
+			stream.shown ||= output.name !== 'stderr';
 			continue;
 		}
 		flush();

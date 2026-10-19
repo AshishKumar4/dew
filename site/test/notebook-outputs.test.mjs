@@ -16,6 +16,19 @@ test('stdout and stderr written in turn read as one log, and its stdout is what 
 	assert.equal(record.stdout, 'epoch 1\nepoch 2');
 });
 
+test("a training display's lines join the log as text, and the page quotes only stdout", async () => {
+	const record = { images: [] };
+	const line = (text) => ({
+		output_type: 'display_data',
+		data: { 'text/html': `<pre style="white-space:pre">${text}</pre>`, 'text/plain': `${text}\n` },
+	});
+	const outputs = [line('step 5/200  loss 0.01'), stream('stderr', 'warning\n'), line('step 10/200  loss 0.02')];
+	const html = await renderOutputs({ source: 'trainer.fit(data)', outputs }, 'probe', 0, false, [], record);
+	assert.equal(html.match(/nb-output/g)?.length, 1);
+	assert.match(html, /<div class="nb-output nb-stdout"><pre class="nb-stream">step 5\/200  loss 0.01&#10;warning&#10;step 10/);
+	assert.equal(record.stdout, undefined);
+});
+
 test("an install cell's log folds away, and a widget's leftover text is left out", async () => {
 	const widget = { 'application/vnd.jupyter.widget-view+json': { model_id: 'bar' }, 'text/plain': 'widget 0%' };
 	const outputs = [stream('stdout', 'downloading\n'), { output_type: 'display_data', data: widget }];
