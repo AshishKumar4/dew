@@ -23,7 +23,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import tool_support
-from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap as relative_gap
+from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux2_fields, flux2_path, read_transformer
@@ -33,8 +34,6 @@ from dew.nn.scan_orders import pixel_shuffle
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("dev", "rect", "unguided", "narrow")
-FORWARD = 1e-5
-GRADIENT = 1e-4
 
 
 @pytest.fixture(scope="module")
@@ -86,20 +85,21 @@ def test_the_forward_and_every_gradient_match_the_source(source, arrays, record,
         conditioned = DenoisingCondition(context, guidance=condition.guidance)
         return jnp.sum(model.apply({"params": params}, latent, times, conditioned) * probe)
 
-    output = model.apply({"params": params}, latent, times, condition)
-    forward = relative_gap(output.reshape(arrays[f"{name}.output"].shape), arrays[f"{name}.output"])
+    def held(value, key):
+        reference = arrays[f"{name}.{key}"]
+        assert_as_exact_as_the_reference(np.asarray(value).reshape(reference.shape), reference,
+                                         arrays[f"{name}.fp64.{key}"], f"{name} {key}")
+
+    held(model.apply({"params": params}, latent, times, condition), "output")
     grad_params, grad_latent, grad_context = jax.grad(objective, argnums=(0, 1, 2))(
         params, latent, condition.context)
-    gaps = {"latent": relative_gap(grad_latent.reshape(arrays[f"{name}.grad_latent"].shape),
-                                   arrays[f"{name}.grad_latent"]),
-            "context": relative_gap(grad_context, arrays[f"{name}.grad_context"])}
-    gaps.update({layout.name: relative_gap(layout.export({"params": grad_params}),
-                                           arrays[f"{name}.grad_param.{layout.name.removeprefix('transformer/')}"])
-                 for layout in layouts})
-    worst = max(gaps, key=gaps.get)
-    print(f"{name}: forward {forward:.3g}; worst gradient {worst} {gaps[worst]:.3g}")
-    assert forward < FORWARD
-    assert gaps[worst] < GRADIENT, worst
+    held(grad_latent, "grad_latent")
+    held(grad_context, "grad_context")
+    tensors = {layout.name.removeprefix("transformer/"): layout for layout in layouts}
+    assert_leaves_as_exact(
+        {tensor: np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()},
+        {tensor: arrays[f"{name}.grad_param.{tensor}"] for tensor in tensors},
+        {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors})
 
 
 def nhwc(array):
@@ -122,35 +122,30 @@ def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, array
     pixels = autoencoder.decode(params, code)
     probe = nhwc(arrays[f"{name}.probe"])
     grad_code = jax.grad(lambda code: jnp.sum(autoencoder.decode(params, code) * probe))(code)
-    gaps = {"latent": relative_gap(latent, nhwc(arrays[f"{name}.latent"])),
-            "pixels": relative_gap(pixels, nhwc(arrays[f"{name}.pixels"])),
-            "grad_image": relative_gap(grad_image, nhwc(arrays[f"{name}.grad_image"])),
-            "grad_code": relative_gap(grad_code, nhwc(arrays[f"{name}.grad_code"]))}
-    print(f"{name} gaps {gaps}")
-    assert max(gaps["latent"], gaps["pixels"]) < FORWARD, gaps
-    assert max(gaps["grad_image"], gaps["grad_code"]) < GRADIENT, gaps
+    for key, value in (("latent", latent), ("pixels", pixels), ("grad_image", grad_image),
+                       ("grad_code", grad_code)):
+        assert_as_exact_as_the_reference(value, nhwc(arrays[f"{name}.{key}"]),
+                                         nhwc(arrays[f"{name}.fp64.{key}"]), f"{name} {key}")
 
 
 @pytest.mark.network
 def test_the_published_autoencoder_matches_the_source(monkeypatch):
     """FLUX.2's VAE as `FLUX.2-klein-4B` publishes it (the one FLUX.2 [dev]
     ships), downloaded, on a smooth 128x192 image, against the source run in
-    float64 (`flux2_published.npz`): the pipeline's folded, normalized latent
-    and a corner of its decode, each to within twice the source's own
-    float32 distance from that result, or 1e-5."""
+    float32 and float64 (`flux2_published.npz`): the pipeline's folded,
+    normalized latent and a corner of its decode, each as near float64 as the
+    source's float32."""
     monkeypatch.syspath_prepend(str(ROOT / "tools"))
     tool = tool_support.load("diffusers_flux2_reference")
     reference = np.load(ROOT / "tests/fixtures/flux2_published.npz")
     repo, revision = tool.PUBLISHED_VAE
     autoencoder, params, _, _ = load_flux2_vae(repo, revision=revision)
     latent = autoencoder.encode(params, nhwc(tool.smooth_image()))
-    pixels = autoencoder.decode(params, nhwc(reference["vae.latent"]))[:, :tool.CROP, :tool.CROP]
+    pixels = autoencoder.decode(params, nhwc(reference["vae.latent.fp64"]))[:, :tool.CROP, :tool.CROP]
     assert latent.shape == (1, 8, 12, 128)
-    gaps = {"latent": relative_gap(latent, nhwc(reference["vae.latent"])),
-            "pixels": relative_gap(pixels, nhwc(reference["vae.pixels"]))}
-    bounds = {key: max(FORWARD, 2 * float(reference[f"vae.{key}.float32_gap"])) for key in gaps}
-    print(f"published VAE gaps {gaps}, bounds {bounds}")
-    assert all(gaps[key] < bounds[key] for key in gaps), (gaps, bounds)
+    for key, value in (("latent", latent), ("pixels", pixels)):
+        assert_as_exact_as_the_reference(value, nhwc(reference[f"vae.{key}"]),
+                                         nhwc(reference[f"vae.{key}.fp64"]), f"published {key}")
 
 
 @pytest.fixture(scope="module")
@@ -171,7 +166,8 @@ def test_klein_prompt_encoding_matches_the_source_pipeline(klein, arrays, record
     assert condition.context.shape == (3, 512, record["pipeline"]["config"]["joint_attention_dim"])
     assert condition.guidance is None
     for row in range(len(prompts)):
-        assert relative_gap(condition.context[row], arrays[f"pipeline.context.{row}"][0]) < FORWARD, row
+        assert_as_exact_as_the_reference(condition.context[row], arrays[f"pipeline.context.{row}"][0],
+                                         arrays[f"pipeline.fp64.context.{row}"][0], f"prompt {row}")
     with pytest.raises(ValueError):
         encoder.tokenize(["x" * 513])
 
@@ -191,8 +187,10 @@ def test_klein_pipeline_walk_matches_the_source(klein, arrays, record):
     autoencoder = klein.autoencoder
     raw = pixel_shuffle(np.asarray(walked.latents) / autoencoder.latent_scale + autoencoder.latent_shift)
     for row in range(len(pipeline["prompts"])):
-        assert relative_gap(raw[row], nhwc(arrays[f"pipeline.latents.{row}"])[0]) < FORWARD, row
-        assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < FORWARD, row
+        assert_as_exact_as_the_reference(raw[row], nhwc(arrays[f"pipeline.latents.{row}"])[0],
+                                         nhwc(arrays[f"pipeline.fp64.latents.{row}"])[0], f"latents {row}")
+        assert_as_exact_as_the_reference(images[row], arrays[f"pipeline.images.{row}"][0],
+                                         arrays[f"pipeline.fp64.images.{row}"][0], f"images {row}")
 
 
 def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source, arrays, record):
@@ -213,7 +211,8 @@ def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source, arrays, record):
         param_dtype="float32", attention_impl="xla")
     assert (encoder.template, encoder.layers) == ("mistral3", (10, 20, 30))
     condition = encoder.encode(encoder.params, encoder.tokenize(record["pipeline"]["prompts"]))
-    assert relative_gap(condition.context, arrays["mistral3.context"]) < FORWARD
+    assert_as_exact_as_the_reference(condition.context, arrays["mistral3.context"],
+                                     arrays["mistral3.fp64.context"], "mistral3 context")
     np.testing.assert_array_equal(np.asarray(condition.guidance), [4.0, 4.0])
     tensors = component_tensors(directory, "text_encoder")
     assert set(flatten_dict(encoder.params)) == {layout.paths[0][2:] for layout in layouts}
