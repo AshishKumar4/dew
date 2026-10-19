@@ -16,7 +16,7 @@ from reference_error import assert_as_exact_as_the_reference
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.precision import fp32_result_dot_general
-from dew.training.quantization import Quantization, quantize_for_serving
+from dew.quantization import Quantization, quantize_for_serving
 
 PARTITIONED = nn.with_partitioning(nn.initializers.lecun_normal(), (None, None))
 LAYERS = {
