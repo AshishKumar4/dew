@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import hashlib
 import math
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
@@ -613,6 +614,15 @@ _UNPLACED = (Prefetch, Workers, MapBatch)
 batches, so a resume cuts the batches before them (`_Build.batched`)."""
 
 
+def _member_key(pipelines: Sequence[Pipeline], index: int) -> int:
+    """A mixture member's key for its random draws: the name it checkpoints under
+    (`Dataset.named`), so adding or removing another member leaves its draws as they were, and among
+    members of one name its place among them, so two such members draw apart."""
+    name = _name(pipelines[index])
+    alike = sum(_name(pipeline) == name for pipeline in pipelines[:index])
+    return int.from_bytes(hashlib.blake2b(f"{alike}:{name}".encode(), digest_size=8).digest(), "big")
+
+
 @dataclasses.dataclass(frozen=True)
 class _Build:
     read: Read
@@ -623,19 +633,21 @@ class _Build:
     lowering: _Lowering
     training: bool
     corpus: tuple[int, ...] = ()
-    """Where the corpus this builds sits in the mixtures above it, an index per mixture."""
+    """The key of the corpus this builds in each mixture above it (`_member_key`)."""
 
     @property
     def global_order(self) -> bool:
         return not self.lowering.per_share
 
-    def child(self, index: int) -> _Build:
-        """The build of the `index`th corpus a mixture or phases reads, by its own analysis."""
-        return dataclasses.replace(self, lowering=self.lowering.children[index], corpus=(*self.corpus, index))
+    def child(self, source: Mixture | Phases, index: int) -> _Build:
+        """The build of the `index`th corpus a mixture or phases reads, by its own analysis, keyed
+        by the name it goes by there (`_member_key`)."""
+        return dataclasses.replace(self, lowering=self.lowering.children[index],
+                                   corpus=(*self.corpus, _member_key(source.pipelines, index)))
 
     def stage_seed(self, pipeline: Pipeline, at: int) -> int:
         """The seed of the random stage written at `at` in `pipeline`: the run's seed, the corpus's
-        place in its mixtures and how many random stages its corpus wrote before this one. No stage
+        key in each of its mixtures and how many random stages its corpus wrote before this one. No stage
         a read leaves out or runs ahead draws (a cache's prefix, a published generation's steps,
         the steps a memory read runs over the whole source), so this count is the same in every
         read. Grain's default seed counts the datasets between a step and the nearest seeded one
@@ -648,7 +660,7 @@ class _Build:
         source = pipeline.source
         if not isinstance(source, Mixture):
             raise ValueError("phases need the global phased lowering")
-        parents = [self.child(index).records(child, partition)
+        parents = [self.child(source, index).records(child, partition)
                    for index, child in enumerate(source.pipelines)]
         if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
             mapped = [parent for parent in parents if isinstance(parent, pygrain.MapDataset)]
@@ -1017,7 +1029,8 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     def counted(pipeline: Pipeline, build: _Build) -> int | None:
         source = pipeline.source
         if isinstance(source, Mixture):
-            sizes = [counted(child, build.child(index)) for index, child in enumerate(source.pipelines)]
+            sizes = [counted(child, build.child(source, index))
+                     for index, child in enumerate(source.pipelines)]
             known = [size for size in sizes if size is not None]
             if len(known) != len(sizes):
                 return None
@@ -1039,7 +1052,7 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
     documents and token offsets a reader of the plan trains on."""
     if isinstance(pipeline.source, (Mixture, Phases)):
         for index, child in enumerate(pipeline.source.pipelines):
-            yield from _split_spans(child, build.child(index))
+            yield from _split_spans(child, build.child(pipeline.source, index))
     for at, split in enumerate(pipeline.stages):
         if at in build.lowering.splits and isinstance(split, TokenSplit):
             before = dataclasses.replace(pipeline, stages=pipeline.stages[:at])

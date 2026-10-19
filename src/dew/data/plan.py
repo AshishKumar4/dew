@@ -330,7 +330,10 @@ class Plan:
     makes other rows or draws from the same plan raises it, so a position saved before the change
     is refused. Version 2 keys each random step by its place in what the run wrote
     (`dew.data.lowering._Build.stage_seed`), runs a global order's stages after its batch by index
-    and resumes a count inside a batch past that batch's first rows, in the batches' final order."""
+    and resumes a count inside a batch past that batch's first rows, in the batches' final order.
+    Version 3 keys a mixture member's draws by the name it goes by rather than its place among the
+    members (`dew.data.lowering._member_key`), so a member joining or leaving leaves the others'
+    draws as they were."""
 
     lowering: Literal["global", "per-share"]
     manifest: Manifest
@@ -340,7 +343,7 @@ class Plan:
     rejections: Literal["drop", "mask"] = "drop"
     cache: tuple[str, ...] = ()
     volatile: bool = False
-    version: ClassVar[int] = 2
+    version: ClassVar[int] = 3
 
     def record(self) -> dict[str, JSON]:
         return {
