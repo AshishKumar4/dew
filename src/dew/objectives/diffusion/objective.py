@@ -491,7 +491,8 @@ class DiffusionObjective(Objective[Ratio]):
                              self.solver, self.guidance, self.steps,
                              # A tuned autoencoder's weights and statistics sit in the run's own tree.
                              None if self.end_to_end is None else to_record(self.end_to_end, EndToEnd),
-                             grid=self.grid, final_denoise=self.final_denoise)
+                             grid=None if self.grid is None else to_record(self.grid, SourceGrid),
+                             final_denoise=self.final_denoise)
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> TextToImage:

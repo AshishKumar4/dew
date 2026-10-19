@@ -21,7 +21,6 @@ from typing_extensions import TypeVar
 from dew.artifacts import uint8_pixels
 from dew.coordination import agreed
 from dew.diffusion.process import Conditioning, Process
-from dew.diffusion.schedules.source import SourceGrid
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
@@ -145,8 +144,9 @@ class ImageSettings:
     guidance and the step count, and the records of the input encoders
     (`InputSpec.to_json`), the autoencoder (`AutoEncoder.to_json`) and an end-to-end tuning
     (`EndToEnd`), which a saved run rebuilds over its own weights at the dtype it asks for.
-    A run trained from a loaded pipeline samples on that pipeline's own `grid` and ends as its
-    solver does (`final_denoise` False), as `TextToImage`'s fields of those names say."""
+    A run trained from a loaded pipeline samples on that pipeline's own grid, recorded as `grid`
+    (`SourceGrid`), and ends as its solver does (`final_denoise` False), as `TextToImage`'s fields
+    of those names say."""
 
     process: Process
     inputs: JSON
@@ -156,7 +156,7 @@ class ImageSettings:
     sampling_steps: int
     # dewml/hybrid-dit-176m's published record predates the fields below.
     end_to_end: JSON = None
-    grid: SourceGrid | None = None
+    grid: JSON = None
     final_denoise: bool = True
 
     def __post_init__(self) -> None:
@@ -263,6 +263,7 @@ class TextToImage:
         Dew the run's record may import (`TextGeneration.from_run`).
         """
         from dew.config import ModelConfig
+        from dew.diffusion.schedules.source import SourceGrid
         from dew.inference.tasks import run_record, saved_settings
         from dew.nn.autoencoders import AutoEncoder
         from dew.objectives.diffusion.objective import without_loss_heads
@@ -299,9 +300,10 @@ class TextToImage:
             autoencoder, params = tuning.tuned(frozen, params)
         elif autoencoder_record is not None:
             autoencoder = AutoEncoder.from_json(autoencoder_record, params=params['autoencoder'])
+        grid = None if settings.grid is None else from_record(SourceGrid, fields(settings.grid, 'grid'))
         return cls(config.build(), settings.process, inputs, without_loss_heads(params), autoencoder,
                    steps=settings.sampling_steps, guidance=settings.guidance, solver=settings.solver,
-                   grid=settings.grid, final_denoise=settings.final_denoise)
+                   grid=grid, final_denoise=settings.final_denoise)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
