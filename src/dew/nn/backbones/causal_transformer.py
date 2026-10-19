@@ -1638,16 +1638,19 @@ class CausalTransformer(nn.Module):
         """Return the final normalized states, without the vocabulary projection."""
         return self.hidden_and_mtp_inputs(tokens, **kwargs)[0]
 
+    @nn.nowrap
     def capture_layers(self, module: nn.Module, method: str) -> bool:
         """The `capture_intermediates` filter that keeps every layer's output (`LayerStates`).
 
         It matches the `__call__` of the stack's `layers_N` modules, a scanned
         run's `layers_3_7` and a pipeline stage's `layers_j` included, and
         `StackView.unstack` lays what those sow out per layer, as the plain loop
-        does; `layer_state` reads one layer back.
+        does; `layer_state` reads one layer back. Neither is a Flax method, so
+        the filter the capture calls on every module runs no module call.
         """
         return method == "__call__" and (module.name or "").startswith("layers_")
 
+    @nn.nowrap
     def layer_state(self, collections: Mapping[str, Mapping], index: int) -> jax.Array:
         """Layer `index`'s output out of what `capture_layers` kept (`LayerStates`): the last call's,
         a looped layer's last pass. `index` counts as a Python index does, -1 the last layer."""
