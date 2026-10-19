@@ -192,6 +192,20 @@ def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(
         np.testing.assert_allclose(np.asarray(planned_leaf), np.asarray(whole_leaf), rtol=1e-4, atol=1e-5)
 
 
+def test_each_shape_a_run_meets_starts_at_the_run_s_own_head_fusion():
+    """A run whose own rung tiles its head unfused, as the objective came or a checkpoint recorded,
+    compiles each later shape it meets unfused too: a new shape starts at the run's own rung, its
+    head put back as the first compile found it."""
+    trainer = lm()
+    assert trainer.objective.tile_head() is not None and trainer.objective.unfuse_head() is not None
+    state, _, _ = trainer.place()
+    trainer.compile(state, BATCH)
+    trainer.compile(state, {"text": BATCH["text"][: ROWS // 2]})
+    rung = trainer._checkpoint_rung()
+    assert [shaped["head_fused"] for shaped in rung["shapes"].values()] == [False, False], rung
+    assert rung["head_tile"] is not None and not rung["head_fused"]
+
+
 def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monkeypatch):
     """The plan is recorded beside the compilation cache, read before the step
     traces, so a restart compiles the recorded candidate first, from the
