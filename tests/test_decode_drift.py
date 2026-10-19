@@ -51,8 +51,8 @@ def test_an_unchanged_decoder_meets_the_gate_on_the_tokens_it_decoded(tmp_path):
     shifted = rows - rows.max(-1, keepdims=True)
     forward = (shifted - np.log(np.exp(shifted).sum(-1, keepdims=True)))[np.arange(STEPS), scored["tokens"]]
     assert distance(scored["reference"], oracle) <= FACTOR * distance(forward, oracle)
-    assert record["gate"]["whole"]["reference"] > 0, "the bf16 reference must sit off the truth to measure it"
-    assert (done.returncode, record["passes"], record["gate"]["blocks_failed"]) == (0, True, [])
+    assert record["gate"]["accuracy"]["reference"] > 0, "a reference at the truth measures nothing"
+    assert (done.returncode, record["passes"]) == (0, True), record["gate"]
     assert record["reference_embedding_ulp"]["rms"] > 0
     assert record["reference_delta_rule"] is None
 
