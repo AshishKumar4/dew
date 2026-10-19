@@ -8,6 +8,7 @@ import datetime
 import hashlib
 import json
 import shlex
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -39,7 +40,7 @@ TARGETS = {
         "tests/test_trainer.py::test_a_checkpoint_that_stores_the_ema_as_itself_still_restores",
         "tests/test_trainer.py::test_a_global_position_is_read_by_any_process_count"), nightly=True),
     "schedules": Target("src/dew/diffusion/schedules", (
-        "tests/test_schedule_contracts.py", "tests/test_schedulers.py", "tests/test_flow_matching.py",
+        "tests/test_schedulers.py", "tests/test_source_schedulers.py", "tests/test_flow_matching.py",
         "tests/test_native_diffusion_edges.py")),
     "attention": Target("src/dew/nn/attention.py", (
         "tests/test_causal_transformer.py", "tests/test_local_attention.py",
@@ -64,7 +65,7 @@ def plan(target: str | None, weekday: int) -> dict:
 # retain the complete target suite above.
 FILE_TESTS = {
     "src/dew/data/sources/hf.py": ("tests/test_hf_options_contract.py", "tests/test_hf_data.py"),
-    "src/dew/diffusion/schedules/common.py": ("tests/test_schedule_contracts.py", "tests/test_schedulers.py"),
+    "src/dew/diffusion/schedules/common.py": ("tests/test_schedulers.py", "tests/test_diffusion_process.py"),
 }
 
 
@@ -120,6 +121,16 @@ def report(database) -> dict:
                 mutation["path"], mutation["line"], mutation["operator"], mutation["occurrence"]))}
 
 
+def collected(tests: tuple[str, ...]) -> None:
+    """Refuse a selection pytest cannot collect, a deleted file or test among it, before the
+    baseline spends the session's budget on it."""
+    found = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", "-m", "not network",
+                            *tests], capture_output=True, text=True)
+    if found.returncode:
+        raise ValueError(f"pytest cannot collect {list(tests)}:\n{found.stdout[-2000:]}"
+                         f"{found.stderr[-2000:]}")
+
+
 def source_digest(paths: list[Path]) -> str:
     """Bind a resumed session to exactly the source population it mutated."""
     digest = hashlib.sha256()
@@ -162,6 +173,7 @@ def run(target: Target, directory: Path, shard: int, shards: int, timeout: float
     from cosmic_ray.work_db import use_db
     from cosmic_ray.work_item import WorkItem
 
+    collected(target.tests)
     command = shlex.join([sys.executable, "-m", "pytest", "-x", "-q", "--tb=short",
                           "-m", "not network", *target.tests])
     modules = list(find_modules([Path(target.path)]))
