@@ -121,12 +121,15 @@ The trainer calls `Objective.preview` once per evaluation event, and only if you
 ## Trackers
 
 Diagnostic messages go to a logger, separately from the scalar and record trackers. Dew logs
-through Python's `"dew"` logger at `WARNING` level by default, formatted by Rich on stderr.
-Redirected stderr gets plain text, and a live training panel shares its console with the log
-handler. Change verbosity with
-`logging.getLogger("dew").setLevel(logging.INFO)`. A handler configured on `"dew"` before importing
-Dew is left untouched. To use your application's root handlers instead, remove Dew's handlers
-and set `logging.getLogger("dew").propagate = True`.
+through Python's `"dew"` logger. `import dew` leaves the process's loggers alone: Dew's handler is
+attached by the process's setup, `dew.training.runtime.prepare_process`, or by the first
+`Trainer.fit` of a program that never called it (`ready_process`). It attaches once, and only to a
+`"dew"` logger that has no handler, at `WARNING` level unless a level is already set, formatted by
+Rich on stderr. Redirected stderr gets plain text, and a live training panel shares its console
+with the log handler. Change verbosity with `logging.getLogger("dew").setLevel(logging.INFO)`. A
+handler you configure on `"dew"` before that setup is kept, and Dew adds none. To use your
+application's root handlers instead, remove Dew's handler and set
+`logging.getLogger("dew").propagate = True`.
 
 `Tracker` has three methods: `log(scalars, step)`, `artifact(value, step)` and `close()`. `Trainer.fit` uses the tracker without closing it, so whoever created the tracker closes it. If a tracker used as a context manager fails to close while another exception is already being raised, you still see the original exception. The trackers are importable from `dew.training`:
 

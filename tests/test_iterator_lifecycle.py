@@ -828,3 +828,23 @@ def test_a_killed_program_leaves_no_loading_worker_running():
                 os.kill(pid, signal.SIGKILL)
         for name in _segments_marked(mark):
             Path("/dev/shm", name).unlink(missing_ok=True)
+
+
+def test_a_source_with_no_deadline_of_its_own_closes_when_its_finalization_ends():
+    """A source that sets no stop deadline (no `stop_seconds`) owns how long it takes to stop: a
+    close waits for its finalization, six seconds here, and the worker is gone after it, where a
+    five-second wait of the iterator's own once raised and left the worker holding the source."""
+    finished = threading.Event()
+
+    def slow():
+        try:
+            while True:
+                yield {"x": np.ones((jax.device_count(), 2), np.float32)}
+        finally:
+            time.sleep(6)
+            finished.set()
+
+    stream = DevicePrefetchIterator(slow(), MeshSpec().build())
+    next(stream)
+    stream.close()
+    assert finished.is_set()

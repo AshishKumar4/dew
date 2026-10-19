@@ -14,13 +14,20 @@ import numpy as np
 import pytest
 from delta_rule_support import NAMES, fla_decay_terms, fla_side, float64_truth, recurrence, rule_math, through
 from jax.core import ShapedArray
-from reference_error import assert_as_exact_as_the_reference, equations, float64_terms, widened
+from reference_error import (
+    assert_as_exact_as_the_reference,
+    assert_leaves_as_exact,
+    equations,
+    float64_terms,
+    widened,
+)
 from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
 
 from dew.nn import kernels, linear
 from dew.nn.kernels import fla_gdn, fla_kda, generation, tuning
 from dew.nn.linear import GatedDeltaNet, fla_rule, l2norm
+from dew.training._lowering import triton_calls
 
 pytestmark = pytest.mark.kernel
 
@@ -710,10 +717,11 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     three. Each is read from the kernels the gradient runs: the memory's (`fla_chunk_fwd_h`) once
     where it is saved and again in the backward where it is recomputed; the output's
     (`fla_chunk_fwd_o`) once, but where the policy recomputes the memory, whose recompute re-runs the
-    rule's forward, output and all. Off a GPU each computes the gradients the layer computes without
-    remat, bitwise. A GPU
-    compiles the remat step as another program, whose roundings differ: on an H100 even the XLA
-    math's A_log gradient moved by 5.4e-5 relative between the two, the remat one nearer float64."""
+    rule's forward, output and all. Each computes the gradients the layer computes without remat
+    within tests/reference_error.py's rule against the float64 layer's, each leaf sized by its own
+    float64 terms; off a GPU, bitwise. A GPU compiles the remat step as another program, whose
+    roundings differ: on an H100 even the XLA math's A_log gradient moved by 5.4e-5 relative between
+    the two, the remat one nearer float64."""
     from dew.nn.backbones.decoder_block import remat_policy
     from dew.nn.linear import recomputing
 
@@ -738,14 +746,18 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
                 if equation.primitive.name == "pallas_call"]
     counted = (launched.count("fla_chunk_fwd_h"), launched.count("fla_chunk_fwd_o"))
     assert counted == (memories, outputs), launched
-    if jax.default_backend() == "gpu":
-        return
     want = jax.jit(jax.grad(loss))(params)
     got = jax.jit(jax.grad(remat))(params)
-    for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(got), jax.tree.leaves(want),
-                                    strict=True):
-        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
-                                      err_msg=jax.tree_util.keystr(path))
+    with jax.enable_x64(new_val=True):
+        wide = layer.clone(dtype=jnp.float64)
+        truth, terms = float64_terms(jax.grad(lambda params: jnp.sum(wide.apply(params, x) ** 2)),
+                                     jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params))
+    assert_leaves_as_exact(got, want, truth, terms=terms)
+    if jax.default_backend() != "gpu":
+        for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(got), jax.tree.leaves(want),
+                                        strict=True):
+            np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
+                                          err_msg=jax.tree_util.keystr(path))
 
 
 @pytest.mark.parametrize("chunk_size", [32, 64])
@@ -811,16 +823,19 @@ def test_a_bf16_gated_delta_net_trains_with_no_copy_at_the_ports_edges():
     def loss(params, x):
         return jnp.sum(layer.apply(params, x).astype(jnp.float32) ** 2)
 
-    text = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(params, x).compile().as_text()
-    assert "__gpu$xla.gpu.triton" in text
-    assert boundary_copies(text) == []
+    lowered = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(params, x)
+    assert triton_calls(lowered)
+    assert boundary_copies(lowered.compile().as_text()) == []
 
 
-def _lowered_dot(product, default: str) -> str:
+def _lowered_dot(product, default: str) -> list:
     """A one-dot Pallas kernel over fp32 operands lowered for an sm80 on this CPU, under the global
-    matmul precision `default`: the program's text, its Triton IR with it."""
+    matmul precision `default`: the input precision of each dot of its Triton IR."""
     from jax.experimental import pallas as pl
+    from jax.interpreters import mlir
     from jax.sharding import Mesh
+    from jaxlib.mlir import ir
+    from jaxlib.triton import dialect
 
     from dew.nn.kernels.generation import assumed, gpu_mesh
 
@@ -833,19 +848,33 @@ def _lowered_dot(product, default: str) -> str:
     operand = jax.ShapeDtypeStruct((32, 32), jnp.float32)
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
     with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh), jax.default_matmul_precision(default):
-        return jax.jit(call).trace(operand, operand).lower(lowering_platforms=("cuda",)).as_text()
+        lowered = jax.jit(call).trace(operand, operand).lower(lowering_platforms=("cuda",))
+
+    def operations(operation):
+        yield operation
+        for region in operation.regions:
+            for block in region.blocks:
+                for inner in block.operations:
+                    yield from operations(inner.operation)
+
+    # Triton IR parses only in a context with Triton's dialect, which JAX's own MLIR bindings register.
+    context = mlir.make_ir_context()
+    dialect.register_dialect(context)
+    with context:
+        return [dialect.InputPrecision(ir.IntegerAttr(operation.attributes["inputPrecision"]).value)
+                for call in triton_calls(lowered)
+                for operation in operations(ir.Module.parse(call.ir).operation) if operation.name == "tt.dot"]
 
 
 def test_an_fp32_port_dot_names_its_products_whatever_the_global_precision():
     """The port's fp32 dots lower alike under a run's default precision and the suite's 'highest':
     TF32x3, or IEEE where fla asks for it, never the global setting's (which made the sm80 WY backward
     an IEEE kernel ptxas compiled for minutes). A dot that names nothing follows the setting."""
-    for named in (False, True):
-        product = functools.partial(fla_gdn._dot, exact=False, ieee=named)
-        assert _lowered_dot(product, "default") == _lowered_dot(product, "highest")
-    ieee = functools.partial(fla_gdn._dot, exact=False, ieee=True)
-    tf32x3 = functools.partial(fla_gdn._dot, exact=False)
-    assert _lowered_dot(tf32x3, "default") != _lowered_dot(ieee, "default")
+    from jaxlib.triton.dialect import InputPrecision
+
+    for ieee, named in ((False, InputPrecision.TF32x3), (True, InputPrecision.IEEE)):
+        product = functools.partial(fla_gdn._dot, exact=False, ieee=ieee)
+        assert _lowered_dot(product, "default") == _lowered_dot(product, "highest") == [named]
 
     def unnamed(a, b):
         return jnp.dot(a, b, preferred_element_type=jnp.float32)

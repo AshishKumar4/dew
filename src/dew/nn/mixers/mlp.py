@@ -92,6 +92,10 @@ class MLPMixer(MixerBase):
             raise ValueError('MLPMixer uses the layer-kind pattern; mixture layers, hash_layers and '
                              'media_bias need a decoder feed-forward slot')
 
+    def generation_refusal(self) -> str | None:
+        """Its mixture's (`Mixture.generation_refusal`), where the slot is routed."""
+        return None if self.mixture is None else self.mixture.generation_refusal()
+
     def build(self, ctx: MixerContext):
         return functools.partial(_MLP, feedforward=self.feedforward(ctx)(parent=None))
 

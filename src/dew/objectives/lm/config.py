@@ -79,8 +79,6 @@ class LMRunConfig(RunConfig):
         if self.objective.name == objectives.paths["block_diffusion"]:
             if self.pretrained is None:
                 raise ValueError("block_diffusion fine-tuning requires --pretrained")
-            if self.trainer.quantization is not None:
-                raise ValueError("block_diffusion has no quantized-training term")
             if self.tokens().pack:
                 raise ValueError("block_diffusion trains on spans of the stream, not packed documents")
 
