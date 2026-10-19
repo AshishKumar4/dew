@@ -427,15 +427,17 @@ def _stack_leaves(*trees):
 
 
 def _refuse_unlike(collection: str, trees: Sequence, names: Sequence[str]) -> None:
-    """Refuse the stages' like positions whose `collection` differs in
-    structure, as layers a checkpoint quantizes differently do: every stage
-    runs stage 0's body. A scanned run holds only layers alike
-    (`StackView.layer_structures`), so on one stage this never refuses."""
+    """Refuse layers one bank or the pipeline stages' like positions read
+    whose `collection` differs in structure, as layers a checkpoint quantizes
+    differently do: a bank is one array per leaf, and every stage runs stage
+    0's body. Layers held apart run as scanned runs of their own instead
+    (`StackView.layer_structures`)."""
     structures = [jax.tree.structure(tree) for tree in trees]
     unlike = [name for name, structure in zip(names, structures, strict=True) if structure != structures[0]]
     if unlike:
         raise ValueError(f"collection {collection!r} differs between {names[0]} and {', '.join(unlike)}, "
-                         "which the pipeline's stages read as like layers; run these layers on one stage")
+                         "which one bank or pipeline stage reads as like layers; hold these layers "
+                         "unbanked, on one stage")
 
 
 @dataclasses.dataclass(frozen=True)

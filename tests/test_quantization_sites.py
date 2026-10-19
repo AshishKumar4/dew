@@ -87,6 +87,28 @@ def test_layers_quantized_apart_run_as_scanned_runs_of_their_own(case):
     assert jax.tree.structure(initialized[0]) == jax.tree.structure(initialized[1])
 
 
+def test_layers_quantized_apart_that_one_bank_holds_are_refused(case):
+    """A store that banks a run of like layers holds one array per leaf for all of them, which
+    layers quantized apart cannot share: the run stays the one the store holds, and its unlike
+    rows are refused by name, rather than read as runs of their own the store does not hold."""
+    from dew.nn.backbones.layer_plan import group_name
+
+    _, loaded, reference = case
+    scanned = loaded.model.clone(scan_layers=True)
+    ids = reference["ids"].astype(np.int32)
+    variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
+    layer = variables[QUANTIZATION]["layers_1"]
+    mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
+    layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
+    params = dict(variables["params"])
+    for first, count in scanned.bind(loaded.variables).groups:
+        if count > 1:
+            rows = [params.pop(f"layers_{index}") for index in range(first, first + count)]
+            params[group_name(first, count)] = jax.tree.map(lambda *leaves: jnp.stack(leaves), *rows)
+    with pytest.raises(ValueError):
+        scanned.apply({**variables, "params": params}, ids)
+
+
 @pytest.mark.mesh(devices=2)
 def test_the_pipeline_stages_quantize_each_layer_with_its_own_scales(case):
     """Two stages of one layer each, two microbatches of one row: the stage
