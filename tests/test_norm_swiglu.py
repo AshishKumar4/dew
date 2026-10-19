@@ -180,14 +180,14 @@ def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast)
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("case", ["random-2x3x31", "random-3x257x17", "random-5x2x128", "aligned-1x128",
-                                  "large-1x128"])
+                                  "large-1x128", "small-1x128"])
 def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(dtype, case):
     """`attention.unweighted_rmsnorm` fused (`norm_swiglu.rms_norm`'s `inverse_rounded`): the inverse RMS
     reduced in fp32 and rounded to the input's dtype before it multiplies, as DeepSeek-V4's and GLM's
     unweighted norms round it, and its reverse rounded where XLA's is; its output and input gradient
     within the float64 gate of XLA's, random rows, a row of 1.5 under a cotangent of ones, whose two
-    gradient contributions cancel, and a row of 0.5 under a cotangent of 1.5 * 2**119, finite through
-    XLA's transposes."""
+    gradient contributions cancel, and rows of 0.5 under cotangents of 1.5 * 2**119, finite through
+    XLA's transposes, and of 2**-140, which they do not halve."""
     def unweighted(x):
         return attention.unweighted_rmsnorm(x, 1e-6, implementation="xla")
 
@@ -199,8 +199,9 @@ def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(d
     shape = tuple(int(size) for size in shape.split("x"))
     if kind == "aligned":
         x, seed = jnp.full(shape, 1.5, dtype), jnp.ones(shape, dtype)
-    elif kind == "large":
-        x, seed = jnp.full(shape, 0.5, dtype), jnp.full(shape, 1.5 * 2.0 ** 119, dtype)
+    elif kind in ("large", "small"):
+        cotangent = 1.5 * 2.0 ** 119 if kind == "large" else 2.0 ** -140
+        x, seed = jnp.full(shape, 0.5, dtype), jnp.full(shape, cotangent, dtype)
     else:
         x = jax.random.normal(jax.random.key(26), shape).astype(dtype)
         seed = jax.random.normal(jax.random.key(27), shape).astype(dtype)
