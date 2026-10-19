@@ -31,8 +31,8 @@ from dew.artifacts import ImageGrid, VideoGrid
 from dew.coordination import agreed, collective_host
 from dew.diffusion.presets import Preset, build_process
 from dew.diffusion.process import Process, aligned_conditions
-from dew.diffusion.schedules.source import SourceGrid
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
+from dew.diffusion.schedules.source import SourceGrid
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.lora import unadapted
@@ -174,6 +174,20 @@ def check_solver(process, solver, steps: int, grid: SourceGrid | None = None) ->
         x, key)
 
 
+def _check_end_to_end(end_to_end: EndToEnd | None, alignment: Alignment | None,
+                      autoencoder: AutoEncoder | None, inputs: InputSpec) -> None:
+    """Refuse an end-to-end tuning the objective cannot train, and masked-image inputs without the
+    autoencoder that encodes them."""
+    if end_to_end is not None:
+        if alignment is None or autoencoder is None or inputs.mask is not None:
+            raise ValueError("end-to-end tuning trains a KL autoencoder through REPA's loss; it "
+                             "needs `alignment`, a KL autoencoder and no masked-image input")
+        # An autoencoder without the posterior the step trains through refuses it by name.
+        jax.eval_shape(autoencoder.moments, autoencoder.params, jnp.zeros((1, *inputs.sample.shape)))
+    if inputs.mask is not None and autoencoder is None:
+        raise ValueError("Masked-image conditioning requires an autoencoder")
+
+
 class TunedLatents(NamedTuple):
     """An end-to-end step's latents: the autoencoder's raw draw, the
     normalized samples and the running statistics after the pass,
@@ -206,13 +220,16 @@ class _SourceCall(Protocol):
     @property
     def guidance(self) -> Guidance | None: ...
 
+    @property
+    def grid(self) -> SourceGrid: ...
+
 
 @runtime_checkable
 class PipelineSource(Protocol):
     """A loaded diffusion pipeline a `DiffusionObjective` can train in place
     of a bare denoiser: its denoiser `model`, starting `variables`, `process`,
     `inputs` and `autoencoder`, and how it samples, the solver of its
-    `schedule` and the steps and guidance of its `task`.
+    `schedule` and the steps, guidance and grid of its `task`.
     `dew.interop.PretrainedPipeline` is one; the protocol keeps
     `dew.objectives` from importing `dew.interop`."""
 
@@ -373,6 +390,7 @@ class DiffusionObjective(Objective[Ratio]):
         uncertainty: int | None = None,
         alignment: Alignment | None = None,
         end_to_end: EndToEnd | None = None,
+        grid: SourceGrid | None | Omitted = OMITTED,
     ):
         """Build a denoising objective over `model` for the `inputs` field.
 
@@ -394,7 +412,9 @@ class DiffusionObjective(Objective[Ratio]):
         included (`autoencoder=None` trains in pixel space, `variables=None` draws
         the denoiser). Evaluation and the published task sample on the pipeline's
         own grid and end as its solver does (`SourceTask.grid`), whatever process
-        trains. The pipeline's text encoder trains nothing but encodes every
+        trains. `grid` names that grid for a denoiser built apart from its
+        pipeline, as a run config builds one; None samples on the process's own
+        times with a closing denoise. The pipeline's text encoder trains nothing but encodes every
         caption, so a pipeline loaded without it is refused.
 
         `ema_decay` is the EMA's decay, either a number or a schedule over the number
@@ -424,12 +444,9 @@ class DiffusionObjective(Objective[Ratio]):
         collection. A published task includes the tuned autoencoder, with those
         statistics as its latent normalization.
         """
-        grid, final_denoise = None, True
         if isinstance(model, PipelineSource):
             source = model
             model = source.model
-            # The pipeline samples on its own grid and ends as its solver does (`text_to_image`).
-            grid, final_denoise = source.task.grid, False
             process = source.process if process is None else process
             inputs = source.inputs if inputs is None else inputs
             autoencoder = source.autoencoder if autoencoder is OMITTED else autoencoder
@@ -437,10 +454,12 @@ class DiffusionObjective(Objective[Ratio]):
             solver = source.schedule.solver if solver is _DEFAULT_SOLVER else solver
             guidance = source.task.guidance if guidance is _DEFAULT_GUIDANCE else guidance
             steps = source.task.steps if steps is None else steps
+            grid = source.task.grid if grid is OMITTED else grid
             held = source.variables.get("encoders", {})
             if any(keyword not in held for keyword in inputs.conditions):
                 raise ValueError("this pipeline was loaded without its text encoder (text=False), and "
                                  "training encodes its captions; load it with its text encoder")
+        grid = None if grid is OMITTED else grid
         if process is None or inputs is None:
             raise ValueError("a denoiser needs its `process` and `inputs`; a loaded pipeline carries both")
         if isinstance(model, RequiresText) and model.text_keyword not in inputs.conditions:
@@ -455,14 +474,7 @@ class DiffusionObjective(Objective[Ratio]):
         self.autoencoder = autoencoder
         self.variables = variables
         self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
-        if end_to_end is not None:
-            if alignment is None or autoencoder is None or inputs.mask is not None:
-                raise ValueError("end-to-end tuning trains a KL autoencoder through REPA's loss; it "
-                                 "needs `alignment`, a KL autoencoder and no masked-image input")
-            # An autoencoder without the posterior the step trains through refuses it by name.
-            jax.eval_shape(autoencoder.moments, autoencoder.params, jnp.zeros((1, *inputs.sample.shape)))
-        if inputs.mask is not None and autoencoder is None:
-            raise ValueError("Masked-image conditioning requires an autoencoder")
+        _check_end_to_end(end_to_end, alignment, autoencoder, inputs)
         check_solver(self.process, solver, steps, grid)
         # Refusals come first: resolving the alignment's encoder may download its weights.
         self.alignment, self.representation = (None, None) if alignment is None else alignment.network(
@@ -473,11 +485,16 @@ class DiffusionObjective(Objective[Ratio]):
         self.guidance = guidance
         self.steps = steps
         self.grid = grid
-        self.final_denoise = final_denoise
         self.ema = (None if ema_decay is None else EMASpec(
             decay=ema_decay if callable(ema_decay) else optax.constant_schedule(ema_decay),
             select=under("params")))
         self._grid = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
+
+    @property
+    def final_denoise(self) -> bool:
+        """Whether a sample ends on a closing denoise: on the process's own times, and not on a
+        pipeline's grid, whose solver ends the walk itself (`PretrainedPipeline.text_to_image`)."""
+        return self.grid is None
 
     @property
     def _sample(self):
@@ -491,8 +508,7 @@ class DiffusionObjective(Objective[Ratio]):
                              self.solver, self.guidance, self.steps,
                              # A tuned autoencoder's weights and statistics sit in the run's own tree.
                              None if self.end_to_end is None else to_record(self.end_to_end, EndToEnd),
-                             grid=None if self.grid is None else to_record(self.grid, SourceGrid),
-                             final_denoise=self.final_denoise)
+                             grid=None if self.grid is None else to_record(self.grid, SourceGrid))
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> TextToImage:
