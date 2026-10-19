@@ -36,7 +36,7 @@ import numpy as np
 import torch
 from diffusers_reference_helpers import perturb, recording, saved_pipeline, tiny_qwen3_encoder
 from diffusers_wan_reference import float64
-from reference_releases import RELEASES, require
+from reference_releases import RELEASES
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/z-image-source"
@@ -94,7 +94,8 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     def walk(model, dtype) -> dict[str, np.ndarray]:
         inputs = [tensor.to(dtype).requires_grad_() for tensor in (latents, *captions)]
         named = list(model.named_parameters())
-        output = torch.stack(model(list(inputs[0].unbind(0)), times.to(dtype), inputs[1:], return_dict=False)[0])
+        output = torch.stack(model(list(inputs[0].unbind(0)), times.to(dtype), inputs[1:],
+                                   return_dict=False)[0])
         grads = torch.autograd.grad((output * probe.to(dtype)).sum(), inputs + [value for _, value in named])
         return {"output": output.detach().numpy(), "grad_latents": grads[0].numpy(),
                 **{f"grad_caption.{row}": grads[1 + row].numpy() for row in range(batch)},
@@ -110,8 +111,8 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     arrays = {"latents": latents.numpy(), "times": times.numpy(), "probe": probe.numpy(),
               **{f"caption.{row}": caption.numpy() for row, caption in enumerate(captions)},
               **narrow, **{f"fp64.{key}": value for key, value in wide.items()}}
-    print(f"{name}: size {case.size} prompts {case.lengths} |output| <= {float(np.abs(narrow['output']).max()):.4g} "
-          f"parameters {len(narrow) - 1 - batch}")
+    print(f"{name}: size {case.size} prompts {case.lengths} "
+          f"|output| <= {float(np.abs(narrow['output']).max()):.4g} parameters {len(narrow) - 2 - batch}")
     return arrays
 
 
@@ -172,13 +173,12 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
                 (states,) = pipe._encode_prompt(prompt=prompt, device=torch.device("cpu"))
                 arrays[f"context.{row}"] = states.numpy()
             for row, prompt in enumerate(PROMPTS):
+                call = {"prompt": prompt, "height": HEIGHT, "width": WIDTH, "num_inference_steps": STEPS,
+                        "guidance_scale": GUIDANCE}
                 start = latents[row:row + 1].to(dtype)
-                arrays[f"latents.{row}"] = pipe(prompt=prompt, height=HEIGHT, width=WIDTH, num_inference_steps=STEPS,
-                                                guidance_scale=GUIDANCE, latents=start.clone(),
-                                                output_type="latent").images.numpy()
-                arrays[f"images.{row}"] = pipe(prompt=prompt, height=HEIGHT, width=WIDTH, num_inference_steps=STEPS,
-                                               guidance_scale=GUIDANCE, latents=start.clone(),
-                                               output_type="np").images
+                walked = pipe(**call, latents=start.clone(), output_type="latent").images
+                arrays[f"latents.{row}"] = walked.numpy()
+                arrays[f"images.{row}"] = pipe(**call, latents=start.clone(), output_type="np").images
         return arrays
 
     narrow = walk(pipe, torch.float32)
