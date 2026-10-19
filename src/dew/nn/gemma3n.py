@@ -17,12 +17,14 @@ gated MLP runs (`dew.nn.mlp.gaussian_topk`).
 
 import dataclasses
 import functools
+from collections.abc import Mapping
 
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
+from dew.nn.fake_quant import straight_through
 from dew.nn.flops import projection_flops
 from dew.nn.precision import at_least_fp32, sqrt_or_zero
 from dew.nn.sharding import logical_axes
@@ -111,9 +113,17 @@ class _Coefficients(nn.Module):
     training forward pass, as the reference clamps its AltUp coefficient
     weights (modeling_gemma3n.py, Gemma3nTextAltUp); the eval pass reads
     the kernel as stored. Same leaf as a Dense, so a checkpoint's Linear
-    lands on it unchanged."""
+    lands on it unchanged.
+
+    `stored` is the prediction map's clamp, which the reference applies to
+    the stored weight in place before its product: the forward reads the
+    clamped kernel and the gradient reaches every entry, as if to the clamped
+    one, and a training step updates the clamped weight it stores
+    (`clamped_predictions`). The correction map clamps inside its product,
+    which zeroes a clamped entry's gradient."""
     features: int
     clip: float | None
+    stored: bool = False
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -122,9 +132,28 @@ class _Coefficients(nn.Module):
         kernel = self.param('kernel', nn.initializers.lecun_normal(),
                             (x.shape[-1], self.features), jnp.float32)
         if train and self.clip is not None:
-            kernel = jnp.clip(kernel, -self.clip, self.clip)
+            clipped = jnp.clip(kernel, -self.clip, self.clip)
+            kernel = straight_through(kernel, clipped) if self.stored else clipped
         dtype = x.dtype if self.dtype is None else self.dtype
         return jnp.dot(x.astype(dtype), kernel.astype(dtype), precision=self.precision)
+
+
+def clamped_predictions(params, clip: float):
+    """`params` with every AltUp layer's stored prediction coefficients
+    clamped to +-`clip`, as the reference clamps `prediction_coefs.weight` in
+    place before a training forward (modeling_gemma3n.py:1027-1028), so the
+    optimizer updates the clamped weight. Any other leaf, and a tree holding
+    no AltUp layer, is returned as it is."""
+    def clamped(tree, name: str | None):
+        if not isinstance(tree, Mapping):
+            return tree
+        coefficients = tree.get('prediction_coefs') if name == 'altup' else None
+        if isinstance(coefficients, Mapping) and 'kernel' in coefficients:
+            return {**tree, 'prediction_coefs': {**coefficients,
+                                                 'kernel': jnp.clip(coefficients['kernel'], -clip, clip)}}
+        return {key: clamped(value, key) for key, value in tree.items()}
+
+    return clamped(params, None)
 
 
 @logical_axes({
@@ -146,7 +175,7 @@ class AltUpLayer(nn.Module):
     Each coefficient scales the block's innovation, which is the activated
     output minus the active prediction, and the scaled innovation is added to
     every prediction. `coef_clip` bounds both coefficient weights during
-    training, as the reference clamps them.
+    training, as the reference clamps them (`_Coefficients`).
     """
     # modeling_gemma3n.py, Gemma3nTextAltUp.
     spec: AltUp
@@ -187,7 +216,8 @@ class AltUpLayer(nn.Module):
         self.correct_output_scale = self.param(
             'correct_output_scale', nn.initializers.zeros, (self.emb_features,), jnp.float32)
         self.correction_coefs = coefficients(maps['correction_coefs'][1], name='correction_coefs')
-        self.prediction_coefs = coefficients(maps['prediction_coefs'][1], name='prediction_coefs')
+        self.prediction_coefs = coefficients(maps['prediction_coefs'][1], stored=True,
+                                             name='prediction_coefs')
         self.modality_router = nn.Dense(maps['modality_router'][1], use_bias=False, dtype=self.dtype,
                                         precision=self.precision, name='modality_router')
         self.router_norm = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name='router_norm')
@@ -227,5 +257,6 @@ __all__ = [
     'AltUp',
     'AltUpLayer',
     'LaurelBlock',
+    'clamped_predictions',
     'rescale_to',
 ]
