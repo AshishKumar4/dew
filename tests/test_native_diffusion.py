@@ -256,6 +256,7 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     import jax
     import jax.numpy as jnp
     from diffusion_stubs import PROMPTS, batch_for
+    from reference_error import assert_as_exact_as_the_reference, widened
 
     from dew.config import ObjectiveConfig
     from dew.config.data import ImageData
@@ -266,7 +267,6 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     from dew.registry import from_record, to_record
     from dew.sampling import sample
     from dew.sampling.pipelines import ImageSettings
-    from reference_error import assert_as_exact_as_the_reference, widened
 
     directory = tmp_path / "sd"
     shutil.copytree(saved_pipelines / "sd", directory)
@@ -304,8 +304,10 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     rows = batch["image"].shape[0]
     x_T = source.task.grid(3)[0].noise(jax.random.split(key)[0], (rows, *objective.latent_shape))
     reference = walked(source, objective, variables, x_T)
-    with jax.enable_x64(True):
-        wide = load_diffusion_source(str(directory), dtype="float64", attention_impl="xla")
+    # The denoiser in float64 over its weights widened; the text encoder and the decoder, whose
+    # roundings the evaluation and the reference make alike, stay as they are.
+    with jax.enable_x64(new_val=True):
+        wide = dataclasses.replace(source, model=source.model.clone(dtype=jnp.float64))
         truth = walked(wide, DiffusionObjective(wide, **settings), widened(variables),
                        jnp.asarray(x_T, jnp.float64))
     evaluated = objective.evaluate(variables, batch, step).images
