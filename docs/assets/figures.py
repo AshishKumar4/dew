@@ -635,44 +635,47 @@ def agent_episode_figure():
                  "answers, the model writes its answer, and the verifier scores the whole episode once; the "
                  "reward reaches only the tokens the model wrote, not the question or the tool's output.")
     svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
-    segments = [("question", "Natalia sold 48…", "none", False), ("action", "```python\nprint(48+24)", "accent_fill", True),
-                ("tool", "Output: 72", "tint1", False), ("action", "So \\boxed{72}.", "accent_fill", True)]
-    x, y, h = 20, 70, 64
-    widths = [92, 112, 70, 100]
-    svg.text(20, 30, "one episode, read left to right", size=13, color="muted")
-    lefts = []
-    for k, ((who, text, fill, trained), w) in enumerate(zip(segments, widths)):
+    segments = [("question", ["Natalia sold", "48 clips…"], "none", False),
+                ("action", ["```python", "print(48+24)"], "accent_fill", True),
+                ("tool", ["Output:", "72"], "tint1", False),
+                ("action", ["So the answer", "is \\boxed{72}."], "accent_fill", True)]
+    widths, y, h = [90, 108, 72, 116], 46, 64
+    svg.text(18, 30, "one episode, read left to right", size=13, color="muted")
+    x, lefts = 18, []
+    for k, ((who, lines, fill, trained), w) in enumerate(zip(segments, widths, strict=True)):
         with svg.group() as part:
             svg.rect(x, y, w, h, fill=fill, stroke="rule" if fill == "none" else "none", rx=6)
-            svg.text(x + 8, y + 22, who, size=12, weight=600, color="text" if trained else "muted")
-            for line_no, line in enumerate(text.split("\n")):
-                svg.text(x + 8, y + 42 + 14 * line_no, line, size=11, mono=True,
+            svg.text(x + 8, y + 20, who, size=12, weight=600, color="text" if trained else "muted")
+            for number, line in enumerate(lines):
+                svg.text(x + 8, y + 38 + 14 * number, line, size=11, mono=True,
                          color="text" if trained else "muted")
         svg.appear(part, 0.4 + 0.8 * k)
         lefts.append((x, w, trained))
         x += w + 6
+    last_x, last_w, _ = lefts[-1]
     with svg.group() as verdict:
-        svg.arrow(x - 2, y + h / 2, x + 14, y + h / 2)
-        svg.rect(x + 16, y + 8, width - x - 36, h - 16, fill="raised", stroke="text", rx=6)
-        svg.text(x + 16 + (width - x - 36) / 2, y + 38, "R = 1", size=13, mono=True, weight=600, anchor="middle")
+        svg.arrow(last_x + last_w / 2, y + h + 2, last_x + last_w / 2, 140)
+        svg.rect(last_x - 20, 142, last_w + 20, 40, fill="raised", stroke="text", rx=6)
+        svg.text(last_x - 10 + last_w / 2, 167, "verifier: R = 1", size=12, mono=True, weight=600,
+                 anchor="middle")
     svg.appear(verdict, 3.8)
-    back_y = y + h + 46
-    flow = svg.polyline([(width - 32, y + h + 4), (width - 32, back_y), (28, back_y)], color="accent", width=1.5)
+    back_y = 206
+    flow = svg.polyline([(last_x - 20, 162), (28, 162), (28, back_y)], color="accent", width=1.5)
     svg.draw(flow, 4.6, 5.6)
-    svg.appear(svg.text(width - 36, back_y - 8, "one reward for the episode", size=12, color="accent",
-                        anchor="end"), 4.8)
+    svg.appear(svg.text(36, 154, "one reward for the whole episode", size=12, color="accent"), 4.8)
     for k, (left, w, trained) in enumerate(lefts):
         with svg.group() as credit:
             if trained:
-                svg.rect(left, back_y + 14, w, 26, fill="accent", stroke="none", rx=4)
-                svg.text(left + w / 2, back_y + 32, "A, trained", size=12, color="surface", anchor="middle",
+                svg.rect(left, back_y + 10, w, 28, fill="accent", stroke="none", rx=4)
+                svg.text(left + w / 2, back_y + 29, "trained on A", size=12, color="surface", anchor="middle",
                          weight=600)
             else:
-                svg.rect(left, back_y + 14, w, 26, fill="none", stroke="rule", rx=4)
-                svg.text(left + w / 2, back_y + 32, "read only", size=12, color="muted", anchor="middle")
+                svg.rect(left, back_y + 10, w, 28, fill="none", stroke="rule", rx=4)
+                svg.text(left + w / 2, back_y + 29, "read only", size=12, color="muted", anchor="middle")
         svg.appear(credit, 5.8 + 0.3 * k)
+    svg.appear(svg.text(width - 18, height - 16, "the tool's words never get a gradient", size=12, color="muted",
+                        anchor="end"), 7.2)
     svg.save(HERE / "agent-episode.svg")
-
 
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
