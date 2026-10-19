@@ -531,9 +531,12 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
     """A scanned run of host-resident layers runs one layer at a time in a scope of its
     own (`decoder_stack.run_stack`, `_prefetched_run`), reading each layer's slice of
     every collection the caller opens and writing it back stacked: with the routers'
-    balancing biases off zero, the logits and the opened state are the resident
-    stack's over two calls, and a decode through the cache it allocates and then
-    reuses gives the resident stack's tokens' logits and cache."""
+    balancing biases off zero, two calls and a decode through the cache they allocate
+    and reuse give the resident stack's state, its routing exactly, and its logits, scores
+    and cache as exact as the resident's own, both measured from the resident stack in
+    float64 (tests/reference_error.py), the two paths compiling the same layers apart."""
+    from reference_error import assert_leaves_as_exact
+
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import Mixture
 
@@ -551,8 +554,8 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
               if name.startswith("layers_")}
     on_host = {**variables, "params": {**variables["params"], **layers}}
     opened = ["moe", "router"]
-    held = {}
-    for name, tree in (("resident", variables), ("host", on_host)):
+
+    def run(model, tree):
         calls = []
         for _ in range(2):
             logits, state = model.apply(tree, tokens, mutable=opened)
@@ -564,7 +567,19 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
                                         decode=True, mutable=["cache", *opened])
             calls.append((logits, state))
             cache = {"cache": state["cache"]}
-        held[name] = calls
-    assert jax.tree.structure(held["host"]) == jax.tree.structure(held["resident"])
-    for ours, theirs in zip(jax.tree.leaves(held["host"]), jax.tree.leaves(held["resident"]), strict=True):
-        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+        return jax.tree.map(np.asarray, calls)
+
+    resident, hosted = run(model, variables), run(model, on_host)
+    with jax.enable_x64(new_val=True):
+        truth = run(model.clone(dtype=jnp.float64), widened(variables))
+    assert jax.tree.structure(hosted) == jax.tree.structure(resident)
+    pairs = zip(jax.tree.leaves(hosted), jax.tree.leaves(resident), strict=True)
+    exact = [(ours, theirs) for ours, theirs in pairs if not np.issubdtype(theirs.dtype, np.floating)]
+    assert exact
+    for ours, theirs in exact:
+        np.testing.assert_array_equal(ours, theirs)
+
+    def floating(tree):
+        return [leaf for leaf in jax.tree.leaves(tree) if np.issubdtype(leaf.dtype, np.floating)]
+
+    assert_leaves_as_exact(floating(hosted), floating(resident), floating(truth))
