@@ -116,13 +116,13 @@ class OwnStops:
         usage = response.get("usage")
         for choice in _listed(response.get("choices"), "completion choices"):
             entry = _record(choice, "completion choice")
-            prompt = _ids(entry.get("prompt_token_ids"), "prompt_token_ids")
             index = entry.get("index")
             while self.ended_outside(entry.get("finish_reason"), entry.get("matched_stop")):
                 drawn = _ids(entry.get("token_ids"), "token_ids")
                 if len(drawn) >= self.budget:
                     entry = {**entry, "finish_reason": "length", "matched_stop": None}
                     break
+                prompt = _ids(entry.get("prompt_token_ids"), "prompt_token_ids")
                 answer = _record((yield self.continuation(request, index if type(index) is int else 0, prompt,
                                                           drawn)), "completion response")
                 (then,) = _listed(answer.get("choices"), "continued choices")
