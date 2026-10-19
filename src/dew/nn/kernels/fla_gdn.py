@@ -12,7 +12,8 @@ cumulated in base 2 (`g * log2(e)`, fla's RCP_LN2) and fp32 state. Each kernel n
 Every operand stays in Dew's activation layout: queries and keys `[B, T, H, K]`, values `[B, T, HV,
 V]`, per-token gates `[B, T, HV]`; a program reads its chunk of its head where it sits, as fla's
 pointer arithmetic does. The memories the chunks enter are stored where they pass, `[slots, HV, K, V]`
-(`Sequences`), so a row of packed documents stores no more of them than an unpacked row.
+(`Sequences`), so however many documents a row packs, they take no more slots than its chunks, a
+row's own and one of zeros.
 
 Each kernel is a launch the tuner times (`dew.nn.kernels.tuning.KernelOp`) over the tiles fla's own
 autotuner lists for it that fit the GPU's block (its `SPACES`), fla's picks for 99 KB GPUs its
@@ -157,8 +158,8 @@ class Sequences(NamedTuple):
     two chunks of a sequence, then a slot a row for its initial memory, which its first chunk enters,
     and its final one's gradient, which its last leaves; and, where documents are packed, one of
     zeros, which every other document's first chunk enters and last leaves. However many documents a
-    row holds, the slots are no more than its chunks and the rows' and one (`slots`), as many as an
-    unpacked row's chunks."""
+    row holds, the slots are no more than the tokens' chunks, a slot a row and one (`slots`); an
+    unpacked call's are its chunks, as many as main stored."""
     chunks: jax.Array | np.ndarray
     spans: jax.Array | np.ndarray
 

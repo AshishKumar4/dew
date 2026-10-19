@@ -749,8 +749,8 @@ def port_refusal(query, key, value) -> str | None:
     type for its results, cannot run; float64 operands, whose rule is the
     reference math itself; and keys wider than the port takes in their
     dtype. Packed documents take the port at any bound: it stores the
-    memories by where they pass, no more of them than an unpacked row's
-    (`fla_gdn.Sequences`)."""
+    memories by where they pass, as many as the tokens' chunks, a row's and
+    one, whatever the bound (`fla_gdn.Sequences`)."""
     widest = fla_gdn.WIDEST_KEYS if jnp.result_type(query, key, value).itemsize == 2 else fla_gdn.WIDEST
     return first_refusal(
         (measured_kernel('gated_delta_rule', 'xla') == 'fla',
