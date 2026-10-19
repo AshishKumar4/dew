@@ -706,7 +706,8 @@ def assert_rows_as_exact_over_orders(dew, reference, label: str, sizes=None) -> 
         f"{label}: {dew.shape} and {reference.shape} rows over orders, the rule takes {ORDERS} orders")
     sizes = np.ones(dew.shape[1]) if sizes is None else np.asarray(sizes, np.float64)
     sized = sizes > 0
-    mine, theirs = (np.sqrt(np.mean(np.square(rows), axis=0))[sized] / sizes[sized] for rows in (dew, reference))
+    mine, theirs = (np.sqrt(np.mean(np.square(rows), axis=0))[sized] / sizes[sized]
+                    for rows in (dew, reference))
     worst, their_worst = float(np.max(mine)), float(np.max(theirs))
     assert within(worst, ROW_FACTOR * their_worst), (
         f"{label}: dew's worst row is {worst:.3e} from float64 (rms over {ORDERS} orders, over its size), "
