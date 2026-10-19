@@ -67,8 +67,9 @@ def document_offsets(segment_ids, max_segments: int) -> jax.Array:
 
 
 def _padding_last(ids: jax.Array) -> jax.Array:
-    """`ids` with padding (0) ordered after every document."""
-    return jnp.where(ids == 0, jnp.iinfo(ids.dtype).max, ids)
+    """`ids` ordered with padding (0) after every document: each id less one as an unsigned word, so
+    padding wraps to the largest and no document's id meets it."""
+    return jnp.asarray(ids).astype(jnp.uint32) - jnp.uint32(1)
 
 
 def _searched(ordered: jax.Array, wanted: jax.Array, side: str) -> jax.Array:
@@ -87,8 +88,8 @@ def held_keys(segment_ids: CrossDocuments) -> jax.Array:
     """How many keys each query's document holds in its row, `[B, Q]`, searched in the keys'
     ascending order (`CrossDocuments`), which needs no sort."""
     queries, keys = document_ids(segment_ids)
-    ordered = _padding_last(keys)
-    return _searched(ordered, queries, "right") - _searched(ordered, queries, "left")
+    ordered, wanted = _padding_last(keys), _padding_last(queries)
+    return _searched(ordered, wanted, "right") - _searched(ordered, wanted, "left")
 
 
 def aligned_places(segment_ids: CrossDocuments) -> jax.Array:
