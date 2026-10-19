@@ -15,6 +15,7 @@ import optax
 import pytest
 from interop_support import assert_reloads, assert_same_stored_tensors
 from reference_error import (
+    ORDERS,
     STAGES,
     assert_as_exact_as_the_reference,
     assert_computes_the_oracle,
@@ -105,6 +106,31 @@ def test_dorys_float64_forward_computes_the_transcriptions_function(loops):
         roundings = chain_roundings(jax.make_jaxpr(wide.apply)(widened(loaded.variables), ids))
     assert_computes_the_oracle(np.asarray(truth), REFERENCE[f'logits_{loops}_f64'], f'{loops} loops',
                                roundings=roundings)
+
+
+def test_the_release_tests_symmetries_keep_dorys_function_and_redraw_its_sums():
+    """The orders the release is held to vLLM under (tools/dory_vllm_reference.py's `symmetry`: the
+    residual stream's units, each feed-forward's hidden units, each attention's heads and value
+    dimensions) on the tiny Dory: each taken back gives the weights' own bits; under each, Dew's float64
+    logits sit within float64 rounding of the identity's, so each is the same function; and the fp32
+    logits move, so each redraws the rounding."""
+    loaded, ids = load(), REFERENCE['input_ids']
+    config = json.loads((TINY / 'config.json').read_text())
+    recorder = load_tool('dory_vllm_reference')
+    exact, _ = float64_forward(loaded.model, loaded.variables, ids)
+    plain = np.asarray(loaded.model.apply(loaded.variables, ids))
+    with jax.enable_x64(new_val=True):
+        wide = loaded.model.clone(dtype=jnp.float64)
+        roundings = chain_roundings(jax.make_jaxpr(wide.apply)(widened(loaded.variables), ids))
+    for index in range(3):
+        drawn = recorder.symmetry(config, 1, index)
+        ordered = symmetric(loaded.variables, config, drawn)
+        jax.tree.map(np.testing.assert_array_equal,
+                     symmetric(ordered, config, drawn, inverse=True), loaded.variables)
+        found, _ = float64_forward(loaded.model, ordered, ids)
+        assert_computes_the_oracle(np.asarray(found), np.asarray(exact), f'order {index} in float64',
+                                   roundings=roundings)
+        assert not np.array_equal(np.asarray(loaded.model.apply(ordered, ids)), plain), index
 
 
 @pytest.mark.parametrize('loops', [1, 2, 4])
@@ -564,6 +590,48 @@ def test_a_saved_checkpoint_reloads_bit_for_bit(tmp_path):
     assert_reloads(loaded, tmp_path, REFERENCE['input_ids'])
 
 
+# Each parameter a symmetry reorders, by its name in an attention or a feed-forward layer: the map
+# (tools/dory_vllm_reference.py's `maps`) and the axis it reorders.
+SYMMETRIC = {'attention': {'q_proj': ('query', 1), 'k_proj': ('key', 1), 'v_proj': ('value', 1),
+                           'gate_proj': ('output', 1), 's_gate': ('output', 0), 'sqk': ('query', 0),
+                           'o_proj': ('output', 0)},
+             'mlp': {'gate_proj': ('mlp', 1), 'up_proj': ('mlp', 1), 'suv_gate': ('mlp', 0),
+                     'suv_up': ('mlp', 0), 'down_proj': ('mlp', 0)}}
+
+
+def symmetric(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse: bool = False):
+    """`variables` under the symmetries `drawn` (tools/dory_vllm_reference.py's `symmetry`), or taken
+    back from them where `inverse`: each attention's and feed-forward's parameters along the axes it
+    reorders (`SYMMETRIC`), then the residual stream's units (tests/residual_orders.py), each leaf
+    where it is, a device array on its device."""
+    from residual_orders import permuted
+
+    found = load_tool('dory_vllm_reference').maps(config, drawn)
+    if inverse:
+        found = {part: {layer: np.argsort(order) for layer, order in by.items()}
+                 for part, by in found.items()}
+    kinds = config['layer_types']
+
+    def reorder(path, leaf):
+        names = [getattr(entry, 'key', None) for entry in path]
+        if not names[0].startswith('layers_'):
+            return leaf
+        layer = int(names[0].removeprefix('layers_'))
+        parameter = names[-2] if names[-1] == 'kernel' else names[-1]
+        named = SYMMETRIC['mlp' if kinds[layer] == 'mlp' else 'attention'].get(parameter)
+        if named is None:
+            return leaf
+        part, axis = named
+        order = found[part][layer]
+        if isinstance(leaf, jax.Array):
+            return jnp.take(leaf, jnp.asarray(order), axis=axis)
+        return np.take(np.asarray(leaf), order, axis=axis)
+
+    params = jax.tree_util.tree_map_with_path(reorder, variables['params'])
+    residual = np.argsort(drawn['residual']) if inverse else drawn['residual']
+    return permuted({**variables, 'params': params}, residual)
+
+
 def decoding(model: CausalTransformer):
     """`model`'s empty cache of one row and its call over a cache, prefilling a prompt or decoding a
     token, each compiled once for every set of weights of its shapes, and neither binding the
@@ -619,12 +687,11 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
     Triton attention's products in TF32; the model-code arm takes the same, bf16 throughout or
     fp32 with TF32 attention products. Dew leaves each product to JAX's default, which on this GPU
     multiplies a float32 run's linears and attention alike in TF32."""
-    from residual_orders import permuted
-
     source = json.loads((RELEASED / 'source.json').read_text())
     recorder = load_tool('dory_vllm_reference')
     assert recorder.BATCHES >= STAGES, 'the probe holds fewer batches of orders than the element rule reads'
-    probe, drawn = np.load(recorder.fetched('probe.npz')), np.load(recorder.fetched('orders.npy'))
+    assert recorder.ORDERS == ORDERS, 'the probe holds batches of other than the rule\'s orders'
+    probe, config = np.load(recorder.fetched('probe.npz')), json.loads((RELEASED / 'config.json').read_text())
     keys = [recorder.name(*run) for run in recorder.RUNS]
     truths = {key: np.load(recorder.fetched(f'upstream-{recorder.tag(key)}.npy')) for key in keys}
 
@@ -664,9 +731,10 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
                 batch 0's columns kept order by order for the rows' rule."""
                 theirs = np.load(recorder.fetched(f'columns-{recorder.tag(key)}-{index}.npy'))
                 absolutes = np.zeros(truth.shape)
-                for order, reference in zip(drawn[index], theirs, strict=True):
+                for order, reference in enumerate(theirs):
                     # Each order's weights are reordered where they sit, on the device.
-                    found = rows(programs, permuted(placed, order), key)
+                    drawn = recorder.symmetry(config, index, order)
+                    found = rows(programs, symmetric(placed, config, drawn), key)
                     absolutes += np.abs(found - truth)
                     if index == 0:
                         draws.append((np.take_along_axis(found, columns, axis=1), reference,

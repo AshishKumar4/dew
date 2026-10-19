@@ -14,9 +14,9 @@ build installs exactly its tree: the checkout over the precompiled wheel of its 
     PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py record DIR
     PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py truth DIR
     PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py upstream DIR
-    PYTHONPATH=src:tests .venv/bin/python tools/dory_vllm_reference.py draw DIR
     PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py orders DIR
     PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py model_orders DIR
+    PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py sums DIR
     HF_TOKEN=... PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py publish DIR
 
 `record` runs the engine once a `RUNS` entry, each in a process of its own: a loop count, a cache
@@ -36,11 +36,13 @@ for every row, then the row's own, the union of vLLM's and float64's top `TOP` f
 float64's next best; and at `positions` the whole vocabulary.
 
 One run is a coin flip at a few positions of every bf16 run, vLLM's too: a rounding there moves
-the continuation's log-probabilities by whole units. So the release is held to vLLM over
-`ORDERS` residual orders (tests/reference_error.py's K-order rule), in `BATCHES` batches: `draw`
-draws them (tests/residual_orders.py) and `orders` permutes the engine's weights in place to each
-(`LLM.apply_model`), decoding the identity run's tokens again through a logits processor that
-draws them (tools/dory_vllm_forcing.py) beside the same raw log-probabilities. It keeps each
+the continuation's log-probabilities by whole units. So the release is held to vLLM over `ORDERS`
+orders a batch (tests/reference_error.py's K-order rule), in `BATCHES` batches, each order a draw
+of the exact symmetries both engines hold it under (`symmetry`: the residual stream's units, each
+feed-forward's hidden units, each attention's heads and value dimensions), on the same prompts:
+`orders` sets the engine's weights in place to each (`LLM.apply_model`), decoding the identity
+run's tokens again through a logits processor that draws them (tools/dory_vllm_forcing.py) beside
+the same raw log-probabilities. It keeps each
 order's rows on their columns and each entry of every row's whole vocabulary's absolute distance
 from float64 (`errors`); `model_orders` writes the model code's at the engine's precision on a
 last-loop run's rows past the window (`SHARED`) in their place, and `sums` sums each batch's
@@ -83,6 +85,8 @@ COLUMNS = 64
 RANDOM = 32
 TOP = 16
 ORDERS_SEED = 11
+ORDERS = 52
+"""The orders a batch holds: tests/reference_error.py's ORDERS, which the release test checks."""
 BATCHES = 4
 """The batches of `ORDERS` orders a run is recorded under, the first holding the identity, the rest
 fresh: the element rule judges each entry on one and re-measures a flagged one on the others."""
@@ -334,7 +338,8 @@ def widened_float():
     return widened()
 
 
-def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype, tf32: bool = False):
+def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype, tf32: bool = False,
+               device: str = 'cuda'):
     """The pull request's DoryForCausalLM over the release in `dtype` (a torch dtype), built as its
     tests/models/test_dory.py builds it, with that test's reference attention in the engine's
     attention's place, under `dtype` as the engine's loader builds a model (its rotary tables take
@@ -354,11 +359,11 @@ def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype, tf32: 
     attention = reference_attention(tf32)
     parallel_state._TP = SimpleNamespace(world_size=1, rank_in_group=0)
     dory.Attention = attention
-    vc = VllmConfig(device_config=DeviceConfig(device='cuda'),
+    vc = VllmConfig(device_config=DeviceConfig(device=device),
                     compilation_config=CompilationConfig(mode=0, custom_ops=['none']))
     hf = DoryConfig(**{**config, 'n_recurrent_loops': loops, 'recurrent_kv_cache_mode': mode})
     vc.model_config = SimpleNamespace(hf_config=hf, head_dtype=None, dtype=dtype)
-    with set_current_vllm_config(vc), set_default_torch_dtype(dtype), torch.device('cuda'):
+    with set_current_vllm_config(vc), set_default_torch_dtype(dtype), torch.device(device):
         model = dory.DoryForCausalLM(vllm_config=vc).to(dtype)
         model.load_weights((key, value.to(dtype)) for key, value in tensors.items())
     # One process holds the whole vocabulary, as the test's logits check takes it.
@@ -376,12 +381,12 @@ def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype, tf32: 
         for cache in model.modules():
             if isinstance(cache, attention):
                 cache.keys = cache.values = None
-        ids = torch.as_tensor(np.concatenate([prompt, tokens]), device='cuda')
+        ids = torch.as_tensor(np.concatenate([prompt, tokens]), device=device)
         with set_current_vllm_config(vc), torch.inference_mode():
-            hidden = model(ids[:len(prompt)], torch.arange(len(prompt), device='cuda'))
+            hidden = model(ids[:len(prompt)], torch.arange(len(prompt), device=device))
             found = [model.compute_logits(hidden if prompt_rows else hidden[-1:])]
             for at in range(len(prompt), len(ids) - 1):
-                hidden = model(ids[at:at + 1], torch.arange(at, at + 1, device='cuda'))
+                hidden = model(ids[at:at + 1], torch.arange(at, at + 1, device=device))
                 found.append(model.compute_logits(hidden))
             logits = torch.cat(found)
             # The engine's sampler takes log-probabilities in float32 (Sampler.compute_logprobs).
@@ -428,14 +433,12 @@ SHARED = tuple(run for run in RUNS if run[1] == 'last_loop')
 def model_orders(directory: Path) -> None:
     """For each `SHARED` run, the model code at the engine's precision (`model_code`: bf16
     throughout, or float32 with TF32 attention products) on the window's rows under every order of
-    `directory/orders.npy`, in the engine's place in the run's files: each order's rows on their
+    every batch (`symmetry`), in the engine's place in the run's files: each order's rows on their
     columns and each entry's error (`errors`)."""
     import torch
 
     config, tensors = release()
     probe = np.load(FIXTURE / 'probe.npz')
-    drawn = np.load(directory / 'orders.npy').astype(np.int64)
-    hidden = config['hidden_size']
     for loops, mode, dtype in SHARED:
         key = name(loops, mode, dtype)
         window = slice(-len(probe[f'{key}/window_generated']), None)
@@ -443,16 +446,16 @@ def model_orders(directory: Path) -> None:
         model, rows = model_code(config, tensors, loops, mode, getattr(torch, dtype), tf32=dtype == 'float32')
         truth = np.load(directory / f'upstream-{tag(key)}.npy')[window]
         columns = columns_of(probe, key)[window]
-        current, unpermuted = np.arange(hidden), None
-        for batch, orders_of in enumerate(drawn):
+        unpermuted = None
+        for batch in range(BATCHES):
             kept = np.load(directory / f'columns-{tag(key)}-{batch}.npy', mmap_mode='r+')
             held = errors(directory, key, batch)
-            for index, order in enumerate(orders_of):
-                seen = permute(model, torch.as_tensor(np.argsort(current)[order]), hidden)
-                current = order
+            for index in range(ORDERS):
+                drawn = symmetry(config, batch, index)
+                seen = permute(model, config, drawn)
                 if unpermuted is None:
                     unpermuted = seen
-                assert np.array_equal(seen, unpermuted[order]), (
+                assert np.array_equal(seen, unpermuted[drawn['residual']]), (
                     f'{key}: the model holds no order {batch}/{index}')
                 found = rows(probe['window'], probe[f'{key}/window_generated'], prompt_rows=False)
                 kept[index, window] = np.take_along_axis(found, columns, axis=1)
@@ -466,23 +469,58 @@ def model_orders(directory: Path) -> None:
         torch.cuda.empty_cache()
 
 
-def batch_orders(width: int, batch: int) -> np.ndarray:
-    """Batch `batch`'s `ORDERS` residual orders of `width` units (tests/residual_orders.py), from its
-    own seed, so batches append without redrawing the ones before: the first batch's first order the
-    identity, every other order fresh. Under Dew's environment (tests/reference_error.py's ORDERS)."""
-    from reference_error import ORDERS
-    from residual_orders import orders
+def symmetry(config: dict, batch: int, index: int) -> dict[str, np.ndarray]:
+    """Order `index` of `batch`: a draw of the exact symmetries both engines hold the release under, each
+    layer's its own. The residual stream's units (`residual` `[width]`); each MLP layer's hidden units
+    (`mlp` `[MLP layers, intermediate]`); each attention layer's key-value heads (`kv` `[attention
+    layers, kv heads]`, new slot i holding old head kv[i]), the query heads within each group (`within`
+    `[attention layers, kv heads, group]`) and each key-value head's value dimensions (`value`
+    `[attention layers, kv heads, head_dim]`). The first batch's first order is the identity. Seeded from
+    (`ORDERS_SEED`, batch, index), so both engines and every stage draw it alike.
 
-    if batch == 0:
-        return orders(width, ORDERS, ORDERS_SEED)
-    return orders(width, ORDERS + 1, ORDERS_SEED + batch)[1:]
+    Each reorders sums and nothing else: the residual every projection's and norm's over the width; the
+    hidden units the down projection's and the hidden norm's; the heads and value dimensions the output
+    projection's and the attention output's norm's. The queries' and keys' dimensions stay: their order
+    is RoPE's frequency pairs, which neither engine's frequencies follow."""
+    kinds = config['layer_types']
+    attention = sum(kind != 'mlp' for kind in kinds)
+    heads, kv, width = config['num_attention_heads'], config['num_key_value_heads'], config['head_dim']
+    shapes = {'residual': (config['hidden_size'],),
+              'mlp': (len(kinds) - attention, config['intermediate_size']),
+              'kv': (attention, kv), 'within': (attention, kv, heads // kv), 'value': (attention, kv, width)}
+    if batch == index == 0:
+        return {part: np.broadcast_to(np.arange(shape[-1]), shape).copy() for part, shape in shapes.items()}
+    rng = np.random.default_rng([ORDERS_SEED, batch, index])
+    return {part: rng.permuted(np.broadcast_to(np.arange(shape[-1]), shape), axis=-1)
+            for part, shape in shapes.items()}
 
 
-def draw(directory: Path) -> None:
-    """`BATCHES` batches of orders of the release's width (`batch_orders`)."""
-    width = json.loads((FIXTURE / 'config.json').read_text())['hidden_size']
-    np.save(directory / 'orders.npy',
-            np.stack([batch_orders(width, batch) for batch in range(BATCHES)]).astype(np.int16))
+def maps(config: dict, drawn: dict[str, np.ndarray]) -> dict[str, dict[int, np.ndarray]]:
+    """`drawn`'s index maps by layer, each new position's old position along its axis: `query` (a
+    query's own dimensions, heads moved), `output` (an attention output's, heads moved and dimensions
+    as their values'), `key` and `value` over the key-value heads, `mlp` over a feed-forward's hidden
+    units."""
+    kinds = config['layer_types']
+    heads, kv, width = config['num_attention_heads'], config['num_key_value_heads'], config['head_dim']
+    group = heads // kv
+    parts = ('query', 'output', 'key', 'value', 'mlp')
+    found: dict[str, dict[int, np.ndarray]] = {part: {} for part in parts}
+    attention = mlp = 0
+    for layer, kind in enumerate(kinds):
+        if kind == 'mlp':
+            found['mlp'][layer] = drawn['mlp'][mlp]
+            mlp += 1
+            continue
+        old_kv, within, value = drawn['kv'][attention], drawn['within'][attention], drawn['value'][attention]
+        # New query slot j, in group j // group, holds the old query head of its key-value head's group.
+        old_query = (old_kv[:, None] * group + within).reshape(-1)
+        dims = np.arange(width)
+        found['query'][layer] = (old_query[:, None] * width + dims).reshape(-1)
+        found['output'][layer] = (old_query[:, None] * width + np.repeat(value, group, axis=0)).reshape(-1)
+        found['key'][layer] = (old_kv[:, None] * width + dims).reshape(-1)
+        found['value'][layer] = (old_kv[:, None] * width + value).reshape(-1)
+        attention += 1
+    return found
 
 
 TRACED = ((1, 'per_loop', 'bfloat16'), (4, 'last_loop', 'bfloat16'))
@@ -492,19 +530,18 @@ TRACED_BATCHES = 8
 
 
 def dew_traces(directory: Path) -> None:
-    """Dew's per-order errors on each `TRACED` run, `TRACED_BATCHES` batches of `batch_orders`, as the
-    release test computes them (tests/test_dory.py), each `[ORDERS, rows, vocab]` float32 in
+    """Dew's per-order errors on each `TRACED` run, `TRACED_BATCHES` batches of `symmetry`'s orders,
+    as the release test computes them (tests/test_dory.py), each `[ORDERS, rows, vocab]` float32 in
     `directory/dew-errors-{run}-{batch}.npy`, kept where they are recorded for the element rule's
     calibration: a split of Dew's own batches is a null the rule must pass, under Dew's environment."""
     import jax
     import test_dory
-    from residual_orders import permuted
 
     from dew.interop import Pretrained
 
     source = json.loads((FIXTURE / 'source.json').read_text())
     probe = np.load(FIXTURE / 'probe.npz')
-    width = json.loads((FIXTURE / 'config.json').read_text())['hidden_size']
+    config = json.loads((FIXTURE / 'config.json').read_text())
     for loops, mode, dtype in TRACED:
         key = name(loops, mode, dtype)
         truth = np.load(directory / f'upstream-{tag(key)}.npy')
@@ -512,11 +549,11 @@ def dew_traces(directory: Path) -> None:
         model = test_dory.with_cache(loaded.model.with_passes(loops), mode).with_cache_capacity(CONTEXT)
         programs, placed = test_dory.decoding(model), jax.device_put(loaded.variables)
         for batch in range(TRACED_BATCHES):
-            drawn = batch_orders(width, batch)
             held = np.lib.format.open_memmap(directory / f'dew-errors-{tag(key)}-{batch}.npy', mode='w+',
-                                             dtype=np.float32, shape=(len(drawn), *truth.shape))
-            for index, order in enumerate(drawn):
-                found = np.concatenate([test_dory.forced(programs, permuted(placed, order), probe[part],
+                                             dtype=np.float32, shape=(ORDERS, *truth.shape))
+            for index in range(ORDERS):
+                ordered = test_dory.symmetric(placed, config, symmetry(config, batch, index))
+                found = np.concatenate([test_dory.forced(programs, ordered, probe[part],
                                                          probe[f'{key}/{part}_generated'],
                                                          prompt_rows=part == 'sentence')
                                         for part in ('sentence', 'window')])
@@ -536,37 +573,69 @@ def errors(directory: Path, key: str, batch: int, shape: tuple[int, ...] | None 
     return np.load(path, mmap_mode='r+')
 
 
-def permute(model, order, hidden: int) -> np.ndarray:
-    """Reorder the residual stream of vLLM's `model` in place: every parameter's one axis of the
-    hidden width, as tests/residual_orders.py reorders Dew's. Returns the first such parameter's
-    first slice along its hidden axis, by which a caller sees the order taken."""
+def permute(model, config: dict, drawn: dict[str, np.ndarray]) -> np.ndarray:
+    """vLLM's `model` under the symmetries `drawn` (`symmetry`), each parameter set in place from the
+    model's own weights as it loaded them, which the first call keeps on the host: each attention's
+    fused query, key and value rows, output gate rows and gains, output columns; each feed-forward's
+    fused gate and up rows, gains and down columns (`maps`); then every parameter's one axis of the
+    residual width, as tests/residual_orders.py reorders Dew's. Returns the embeddings' first row, by
+    which a caller sees the order taken."""
+    import re
+
     import torch
 
-    seen = None
+    if not hasattr(model, 'dory_loaded'):
+        model.dory_loaded = {name: parameter.detach().cpu().clone()
+                             for name, parameter in model.named_parameters()}
+    loaded, found = model.dory_loaded, maps(config, drawn)
+    hidden, residual = config['hidden_size'], torch.as_tensor(drawn['residual'])
+    heads, kv, width = config['num_attention_heads'], config['num_key_value_heads'], config['head_dim']
+    queries, keys = heads * width, kv * width
     with torch.no_grad():
-        for parameter in model.parameters():
-            axes = [axis for axis, size in enumerate(parameter.shape) if size == hidden]
+        for name, parameter in model.named_parameters():
+            value = loaded[name]
+            layer = re.search(r'\.layers\.(\d+)\.', name)
+            layer = None if layer is None else int(layer.group(1))
+            rows = columns = None
+            if name.endswith('qkv_proj.weight'):
+                rows = np.concatenate([found['query'][layer], queries + found['key'][layer],
+                                       queries + keys + found['value'][layer]])
+            elif name.endswith(('g_proj.weight', 's_gate')):
+                rows = found['output'][layer]
+            elif name.endswith('sqk'):
+                rows = found['query'][layer]
+            elif name.endswith('o_proj.weight'):
+                columns = found['output'][layer]
+            elif name.endswith('gate_up_proj.weight'):
+                rows = np.concatenate([found['mlp'][layer],
+                                       config['intermediate_size'] + found['mlp'][layer]])
+            elif name.endswith(('suv_gate', 'suv_up')):
+                rows = found['mlp'][layer]
+            elif name.endswith('down_proj.weight'):
+                columns = found['mlp'][layer]
+            if rows is not None:
+                value = value.index_select(0, torch.as_tensor(rows))
+            if columns is not None:
+                value = value.index_select(1, torch.as_tensor(columns))
+            axes = [axis for axis, size in enumerate(value.shape) if size == hidden]
             if axes:
                 (axis,) = axes
-                parameter.copy_(parameter.index_select(axis, order.to(parameter.device)))
-                if seen is None:
-                    seen = parameter.movedim(axis, -1).reshape(-1, hidden)[0].float().cpu().numpy()
-    return seen
+                value = value.index_select(axis, residual)
+            parameter.copy_(value.to(parameter.device))
+    return model.backbone.embeddings.weight[0].float().cpu().numpy()
 
 
 def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
-    """One run under every order of `directory/orders.npy`, the engine's weights permuted in place
-    to each and the identity run's tokens drawn again (`Forced`): for each order set, each order's
-    rows on their columns (`columns-{run}-{batch}.npy`) and each entry's error (`errors`)."""
+    """One run under every order of every batch (`symmetry`), the engine's weights set in place to
+    each and the identity run's tokens drawn again (`Forced`): for each batch, each order's rows on
+    their columns (`columns-{run}-{batch}.npy`) and each entry's error (`errors`)."""
     import functools
 
-    import torch
-
     probe = np.load(FIXTURE / 'probe.npz')
+    config = json.loads((FIXTURE / 'config.json').read_text())
     key = name(loops, mode, dtype)
     truth = np.load(directory / f'upstream-{tag(key)}.npy')
     llm = engine(loops, mode, dtype, logits_processors=['dory_vllm_forcing:Forced'])
-    hidden = llm.llm_engine.model_config.get_hidden_size()
     columns = columns_of(probe, key)
 
     def rows() -> np.ndarray:
@@ -578,20 +647,17 @@ def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
             found.append(scores)
         return np.concatenate(found)
 
-    drawn = np.load(directory / 'orders.npy').astype(np.int64)
-    current, unpermuted = np.arange(hidden), None
-    for batch, orders_of in enumerate(drawn):
+    unpermuted = None
+    for batch in range(BATCHES):
         kept = np.lib.format.open_memmap(directory / f'columns-{tag(key)}-{batch}.npy', mode='w+',
-                                         dtype=np.float32, shape=(len(orders_of), *columns.shape))
-        held = errors(directory, key, batch, (len(orders_of), *truth.shape))
-        for index, order in enumerate(orders_of):
-            # From the order the weights hold to this one.
-            step = torch.as_tensor(np.argsort(current)[order])
-            (seen,) = llm.apply_model(functools.partial(permute, order=step, hidden=hidden))
-            current = order
+                                         dtype=np.float32, shape=(ORDERS, *columns.shape))
+        held = errors(directory, key, batch, (ORDERS, *truth.shape))
+        for index in range(ORDERS):
+            drawn = symmetry(config, batch, index)
+            (seen,) = llm.apply_model(functools.partial(permute, config=config, drawn=drawn))
             if unpermuted is None:
                 unpermuted = seen
-            assert np.array_equal(seen, unpermuted[order]), (
+            assert np.array_equal(seen, unpermuted[drawn['residual']]), (
                 f'{key}: the engine holds no order {batch}/{index}')
             found = rows()
             kept[index] = np.take_along_axis(found, columns, axis=1)
@@ -647,14 +713,15 @@ Runs (loop count / cache mode / dtype): {runs}. Each decodes a sentence greedily
 - `probe.npz`: the prompts, each run's drawn tokens, each row's probe columns with vLLM's and the
   float64 truth's log-probabilities on them, four rows over the whole vocabulary, and vLLM's own
   model code run in float64 on the same tokens.
-- `orders.npy`: batches of 52 permutations of the residual stream, the first batch's first the
-  identity, the others all fresh.
+- The orders are tools/dory_vllm_reference.py's `symmetry`, drawn from their seeds: each a
+  permutation of the residual stream's units and of each layer's hidden units, heads and value
+  dimensions, the first batch's first the identity.
 - `upstream-<run>.npy`: every row over the whole vocabulary from vLLM's own model code in float64 on
   the run's tokens, the truth.
-- `columns-<run>-<batch>.npy`: under each permutation of a batch, vLLM's rows on the probe columns,
+- `columns-<run>-<batch>.npy`: under each order of a batch, vLLM's rows on the probe columns,
   `[52, rows, 64]` float32.
 - `absolutes-<run>-<batch>.npy`: every entry's absolute distance from the float64 truth summed over
-  a batch's 52 permutations, `[rows, vocabulary]` float32.
+  a batch's 52 orders, `[rows, vocabulary]` float32.
 
 On a last-loop run's rows past the window these files hold the pull request's model code at the
 engine's precision (bf16, or fp32 with TF32 attention products) instead of the engine, the reference
@@ -669,7 +736,7 @@ sha256.
 
 def files(directory: Path) -> dict[str, Path]:
     """The probe's files by their names in `DATASET`."""
-    names = ['orders.npy', *(f'upstream-{tag(name(*run))}.npy' for run in RUNS),
+    names = [*(f'upstream-{tag(name(*run))}.npy' for run in RUNS),
              *(f'{kind}-{tag(name(*run))}-{batch}.npy' for run in RUNS for kind in ('columns', 'absolutes')
                for batch in range(BATCHES))]
     return {'probe.npz': FIXTURE / 'probe.npz', **{file: directory / file for file in names}}
@@ -726,6 +793,6 @@ if __name__ == '__main__':
     if stage in ('run', 'order'):
         (record_run if stage == 'run' else orders_run)(where, int(sys.argv[3]), sys.argv[4], sys.argv[5])
     else:
-        {'record': record, 'truth': truth, 'upstream': upstream, 'draw': draw, 'orders': orders,
+        {'record': record, 'truth': truth, 'upstream': upstream, 'orders': orders,
          'model_orders': model_orders, 'sums': sums, 'dew_traces': dew_traces,
          'publish': publish}[stage](where)
