@@ -111,6 +111,7 @@ __all__ = [
     "TimeScaled",
     "TokenModel",
     "TritonGemm",
+    "VocabularyRows",
 ]
 
 
