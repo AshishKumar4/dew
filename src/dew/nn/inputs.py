@@ -16,7 +16,7 @@ from flax import struct
 from jax.core import Tracer
 
 from dew.coordination import agreed
-from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS
+from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, rows_like
 
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -271,7 +271,7 @@ class Coordinates:
     real tokens (`places`) or, in a cached call, the slot its cache writes it
     at. Rotation and NoPE's temperature read the logical places; windows,
     chunks and ALiBi count each document's real tokens from its first place
-    (`dew.nn.local_attention.token_places`), the logical places wherever
+    (`counted_places`), the logical places wherever
     those count real tokens; a cache addresses keys by slot. `segments` numbers each
     row's packed documents from 1, 0 on the padding slots after them, which
     run as a document of their own, so no layer carries a real document's
@@ -338,10 +338,7 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
     if positions is None and segments is not None:
         real = xp.ones(shape, bool) if valid is None else valid
         real = real & (segments != 0)
-        rank = xp.cumsum(real, axis=1, dtype=np.int32) - 1
-        begun = xp.where(starts, rank, 0)
-        first = np.maximum.accumulate(begun, axis=1) if xp is np else jax.lax.cummax(begun, axis=1)
-        positions = xp.where(real, rank - first, 0)
+        positions = xp.where(real, _ranks(real, starts, xp=xp), 0)
     positions = None if positions is None else xp.asarray(positions, np.int32)
     return Coordinates(positions, segments, valid, starts,
                        max_segments=(1 if segments is None else length) if max_segments is None
@@ -354,6 +351,44 @@ def coordinates_of(metadata: AttentionMetadata | None, batch: int, length: int) 
     if metadata is not None and metadata.coordinates is not None:
         return metadata.coordinates
     return coordinates((batch, length))
+
+
+def _ranks(real, starts, *, xp=jnp):
+    """Each slot's count of the real tokens before it in its document `[B, S]`, `starts` marking each
+    document's first real token but a row's first, a padding slot taking the count before it (0
+    before any)."""
+    rank = xp.cumsum(real, axis=1, dtype=np.int32) - 1
+    begun = xp.where(starts, rank, 0)
+    first = np.maximum.accumulate(begun, axis=1) if xp is np else jax.lax.cummax(begun, axis=1)
+    return xp.maximum(rank - first, 0)
+
+
+def counted_places(segments=None, valid=None, positions=None) -> jax.Array | None:
+    """Each token's place counted over its document's real tokens `[B, S]`, which windows, chunks and
+    ALiBi read (`Coordinates`): the place its document's first real token is given (`positions`
+    `[S]` or `[B, S]`, 0 where none are) plus the real tokens before it in its document, a padding
+    slot the place before it. Places that count a document's real tokens, as `Coordinates.positions`
+    does, come back as given, so a continuation or canvas origin cuts its chunks as its whole pass
+    does; any other places move the rotation alone. None where no field is given: each token's
+    place is its index. The counts run along the sequence, which JAX refuses over an Explicit axis
+    that splits it; these fields are small, so each device takes its rows of each whole
+    (`rows_like`)."""
+    if segments is None and valid is None and positions is None:
+        return None
+    segments, valid, given = (None if x is None else rows_like(jnp.asarray(x), jnp.asarray(x))
+                              for x in (segments, valid, positions))
+    fields = [x for x in (segments, valid) if x is not None]
+    shape = jnp.shape(fields[0]) if fields else jnp.shape(jnp.atleast_2d(given))
+    real = jnp.ones(shape, bool) if valid is None else jnp.asarray(valid, bool)
+    if segments is not None:
+        real = real & (segments != 0)
+    starts = jnp.zeros(shape, bool) if segments is None else document_starts(segments, real)
+    count = _ranks(real, starts)
+    if given is None:
+        return count
+    firsts = starts | (real & (jnp.cumsum(real, axis=1) == 1))
+    slots = jax.lax.cummax(jnp.where(firsts, jnp.arange(shape[1]), 0), axis=1)
+    return jnp.take_along_axis(jnp.broadcast_to(given, shape), slots, axis=1) + count
 
 
 def document_starts(segments, valid, *, xp=jnp):
