@@ -100,10 +100,17 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
 
 
 @pytest.mark.gpu(reason="a fused attention kernel runs on a cuda device")
-def test_meanflow_trains_through_a_fused_attention_kernel():
-    """cuDNN's attention defines only its reverse-mode derivative, so MeanFlow's target JVP traces
-    for forward mode: a MeanFlow step through it runs, and its loss and gradient agree with the xla
-    kernel's within bf16's rounding of the step's scale."""
+@pytest.mark.parametrize("kernel", ["triton", "cudnn"])
+def test_meanflow_trains_through_a_fused_attention_kernel(kernel, request):
+    """A fused attention kernel defines only its reverse-mode derivative, so MeanFlow's target JVP
+    traces for forward mode (`forward_mode_attention`): a MeanFlow step through Triton's kernel,
+    which runs under the cuda lane's --xla_gpu_deterministic_ops, and through cuDNN's, which Dew
+    refuses under that flag (openxla/xla#46500) and so runs with it taken out of the environment,
+    runs, and its loss and gradient agree with the xla kernel's within bf16's rounding of the step's
+    scale."""
+    if kernel == "cudnn":
+        request.getfixturevalue("without_deterministic_ops")
+
     def run(implementation):
         model = SimpleDiT(patch_size=2, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=1,
                           interval=True, attention_impl=implementation, dtype="bfloat16")
@@ -120,7 +127,7 @@ def test_meanflow_trains_through_a_fused_attention_kernel():
         loss, grads = jax.jit(jax.value_and_grad(loss_of))(params["params"])
         return float(loss), jax.tree.leaves(grads)
 
-    (fused, fused_grads), (xla, xla_grads) = run("cudnn"), run("xla")
+    (fused, fused_grads), (xla, xla_grads) = run(kernel), run("xla")
     assert fused == pytest.approx(xla, rel=2 ** -7)
     for left, right in zip(fused_grads, xla_grads, strict=True):
         scale = float(jnp.max(jnp.abs(right))) + 1e-12
