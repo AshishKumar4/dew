@@ -63,6 +63,12 @@ class PromptRecord:
     ground_truth: str = ""
     extra_info: str = ""
 
+    @classmethod
+    def of(cls, data_source: object, ground_truth: object, extra_info: object) -> PromptRecord:
+        """The record of a row's three values as a prompt batch stores them: a string is itself,
+        a missing one is empty, and any other value travels as its JSON (`_text`)."""
+        return cls(_text(data_source), _text(ground_truth), _text(extra_info))
+
 
 FIELDS = ("prompt", "data_source", "ground_truth", "extra_info", "tools", "reward_model")
 """The fields prompt encoding reads, leaving the others unchanged.
