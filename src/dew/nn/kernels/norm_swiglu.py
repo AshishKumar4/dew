@@ -389,13 +389,12 @@ def _rounded_inverse(inverse, rounded: bool, dtype, interpret: bool):
     return _round(inverse, dtype, interpret) if rounded else inverse
 
 
-def _rounded_inverse_cotangent(m, x, inverse, multiplier, narrow, interpret: bool):
+def _rounded_inverse_cotangent(m, x, inverse, multiplier, narrow, width: int, interpret: bool):
     """The input's cotangent, `[rows, width]` in fp32, of `x * inverse.astype(narrow)` for the
     cotangent `m`, where XLA and torch round it: the direct product and the inverse's cotangent, its
     products summed, each round to `narrow`, and the reduction's contribution rounds apart before the
     two join (the store rounds the join). A rounding the inverse took then recurs in both, so where
-    they cancel, it cancels too."""
-    width = x.shape[1]
+    they cancel, it cancels too. `width` is the row's own, not its padded block's."""
     direct = _round(m * multiplier[:, None], narrow, interpret)
     sensed = _round(jnp.sum(_round(m * x, narrow, interpret), axis=1), narrow, interpret)
     scaled = sensed * -(inverse * inverse * inverse) * (1.0 / width)
@@ -452,7 +451,7 @@ def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, d
             dy = dy * activated
         m = dy * weight
         if inverse_rounded:
-            dx = _rounded_inverse_cotangent(m, x, inverse, multiplier, dy_ref.dtype, interpret)
+            dx = _rounded_inverse_cotangent(m, x, inverse, multiplier, dy_ref.dtype, width, interpret)
         else:
             # The two x contributions are kept separate, as XLA's square VJP is.
             correction = (-0.5 * jnp.sum(m * x, axis=1)) * (inverse * inverse * inverse) * (1.0 / width)
