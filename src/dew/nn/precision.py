@@ -11,6 +11,8 @@ the transpose rules, so the backward follows; jax's own xla attention sets it
 for this reason (jax-ml/jax#24047).
 """
 
+from __future__ import annotations
+
 import contextlib
 import functools
 from collections.abc import Callable
