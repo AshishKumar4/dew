@@ -17,6 +17,17 @@ def expand(coefficient, x):
     return jnp.reshape(coefficient, (-1,) + (1,) * (x.ndim - 1))
 
 
+def divided(numerator, rate):
+    """`numerator / rate`, rounded once, as a source written in PyTorch divides a state by a rate.
+
+    XLA's simplifier rewrites a division by a broadcast or a constant, a per-row rate against a
+    `[B, ...]` state among them, into a multiplication by its reciprocal, two roundings where
+    the division makes one (a third of float32 quotients come out an ulp off). The rate
+    broadcast behind a barrier stays a divisor.
+    """
+    return numerator / jax.lax.optimization_barrier(jnp.broadcast_to(rate, jnp.shape(numerator)))
+
+
 
 def times(t) -> jax.Array:
     """`t` as an array of at least float32: a float64 run's times stay float64."""

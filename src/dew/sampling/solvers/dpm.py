@@ -10,6 +10,8 @@ import numpy as np
 from flax import struct
 from jax import lax
 
+from dew.diffusion.schedules import divided
+
 from .common import (
     Multistep,
     _check_endpoint_domain,
@@ -36,11 +38,10 @@ def _dpm_terms(algorithm: str, alpha_s, sigma_s, alpha_t, sigma_t, h):
     alpha_s = jnp.where(alpha_s == 0, 1.0, alpha_s)
     if algorithm == "dpmsolver++":
         phi = jnp.exp(-h) - 1.0
-        sample_scale = sigma_t / sigma_s
-        # exp(-h) = alpha_s / alpha_t * sigma_t / sigma_s. Use the
-        # rates directly rather than round them through logarithms and exp.
-        clean_scale = alpha_t - sample_scale * alpha_s
-        return (sample_scale, clean_scale, 0.5 * clean_scale,
+        # The source's -alpha_t (e^-h - 1). The same scale written from the rates,
+        # alpha_t - (sigma_t / sigma_s) alpha_s, cancels two terms of alpha_t's size.
+        clean_scale = -(alpha_t * phi)
+        return (sigma_t / sigma_s, clean_scale, 0.5 * clean_scale,
                 alpha_t * (phi / h + 1.0), -alpha_t * ((phi + h) / h ** 2 - 0.5), 0.0)
     if algorithm == "dpmsolver":
         psi = jnp.exp(h) - 1.0
@@ -417,7 +418,7 @@ class DEIS:
         def second(_):
             coef1 = _deis_second(rho_t, rho_s0, rho_s1) - _deis_second(rho_s0, rho_s0, rho_s1)
             coef2 = _deis_second(rho_t, rho_s1, rho_s0) - _deis_second(rho_s0, rho_s1, rho_s0)
-            return alpha_t * (x / alpha_s0 + coef1 * m0 + coef2 * m1)
+            return alpha_t * (divided(x, alpha_s0) + coef1 * m0 + coef2 * m1)
 
         def third(_):
             rho_s2, m2 = rhos[-3], history.outputs[-3]
@@ -427,7 +428,7 @@ class DEIS:
                      - _deis_third(rho_s0, rho_s1, rho_s2, rho_s0))
             coef3 = (_deis_third(rho_t, rho_s2, rho_s0, rho_s1)
                      - _deis_third(rho_s0, rho_s2, rho_s0, rho_s1))
-            return alpha_t * (x / alpha_s0 + coef1 * m0 + coef2 * m1 + coef3 * m2)
+            return alpha_t * (divided(x, alpha_s0) + coef1 * m0 + coef2 * m1 + coef3 * m2)
 
         order = _tapered_order(self.order, history.taken, history.steps, self.lower_order_final,
                                euler_at_final=False)

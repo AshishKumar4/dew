@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
-from dew.diffusion.schedules import expand
+from dew.diffusion.schedules import divided, expand
 
 from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator
 
@@ -26,7 +26,7 @@ def _euler_step(x, denoised, source, target):
     dt = sigma_s - sigma_t
     # Equal levels make the numerator 0 too; any finite coefficient is scaled by the zero interval.
     x_0_coeff = (alpha_t * sigma_s - alpha_s * sigma_t) / jnp.where(dt == 0, 1, dt)
-    derivative = (x - x_0_coeff * denoised) / sigma_t
+    derivative = divided(x - x_0_coeff * denoised, sigma_t)
     # The source's x + derivative dt, whose x is derivative sigma_t + x_0_coeff denoised: summed as
     # that, a step down from a large sigma cancels two terms of x's size (x is 4e4 at a zero-SNR
     # sigma of 4096) and keeps dt's rounding times the derivative; without x, a step to sigma 0
@@ -78,7 +78,7 @@ class EulerAncestral:
         _, sigma_t = process.rates(t, like=x)
         _, sigma_s = process.rates(t_next, like=x)
         sigma_down, sigma_up = _ancestral(sigma_t, sigma_s)
-        dx = (x - denoised) / sigma_t
+        dx = divided(x - denoised, sigma_t)
         dW = _ancestral_noise(key, x) * sigma_up
         return x + dx * (sigma_down - sigma_t) + dW, state
 
@@ -149,7 +149,7 @@ class Heun:
             # When sigma reaches 0 there is no derivative there, so a row
             # there takes the Euler step.
             safe_sigma_s = jnp.where(sigma_s > 0, sigma_s, 1.0)
-            dx_1 = (x_euler - x_0_coeff * denoised_next) / safe_sigma_s
+            dx_1 = divided(x_euler - x_0_coeff * denoised_next, safe_sigma_s)
             return jnp.where(sigma_s > 0, x + 0.5 * (dx_0 + dx_1) * dt, x_euler)
 
         # The last step of a trajectory to sigma 0 is the Euler one for every
@@ -219,10 +219,10 @@ class KDPM2:
             else:
                 target, sigma_up = following, 0.0
                 sigma_mid = jnp.exp(jnp.log(target) + 0.5 * (jnp.log(sigma_t) - jnp.log(target)))
-            dx = (x - denoised) / sigma_t
+            dx = divided(x - denoised, sigma_t)
             x_mid = x + dx * (sigma_mid - sigma_t)
             denoised_mid, _ = denoise(x_mid, schedule.t_of_sigma(sigma_mid.reshape(-1)))
-            stepped = x + (x_mid - denoised_mid) / sigma_mid * (target - sigma_t)
+            stepped = x + divided(x_mid - denoised_mid, sigma_mid) * (target - sigma_t)
             if self.ancestral:
                 stepped = stepped + _ancestral_noise(key, x) * sigma_up
             return jnp.where(positive, stepped, denoised)
@@ -312,7 +312,7 @@ class LMS:
         _, sigma_t = process.rates(t, like=x)
         _, sigma_s = process.rates(t_next, like=x)
         derivatives, sigmas, count = state
-        derivatives = _push(derivatives, (x - denoised) / sigma_t)
+        derivatives = _push(derivatives, divided(x - denoised, sigma_t))
         sigmas = _push(sigmas, sigma_t)
 
         def multistep(k: int):
