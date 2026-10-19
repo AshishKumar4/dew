@@ -289,8 +289,9 @@ class FusedStep(tuning.KernelOp):
             return pl.BlockSpec((None, width, count), lambda r, h: (of(h), 0, 0))
 
         def scalar(per_row):
-            return (pl.BlockSpec((None, None), lambda r, h: (r, h)) if per_row
-                    else pl.BlockSpec((None,), lambda r, h: (h,)))
+            """The program's head's one entry, `[1]`, of each row's where `per_row`."""
+            return (pl.BlockSpec((None, 1), lambda r, h: (r, h)) if per_row
+                    else pl.BlockSpec((1,), lambda r, h: (h,)))
 
         held_shape = (count - 1,)
         in_specs = [pl.BlockSpec((None, 1), lambda r, h: (r, 0)), keyed(key_width), keyed(key_width),
