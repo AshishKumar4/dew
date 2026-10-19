@@ -148,17 +148,20 @@ def clipped_gemma3n():
     return loaded, loaded.model.clone(altup=dataclasses.replace(loaded.model.altup, coef_clip=clip)), clip
 
 
-@pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
-def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference_does(optimizer):
+@pytest.mark.parametrize("decay", [0.0, 0.1])
+def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference_does(decay):
     """A training step of the gemma3n-tiny decoder through the Trainer, with half of every
     layer's AltUp prediction coefficients past `coef_clip`, against the reference's step from
     the same weights: torch's optimizer over Gemma3nForCausalLM in train mode, whose forward
     clamps the stored prediction weight in place, so its update, weight decay included, applies
     to the clamped weight (a coefficient at 2 under a clip of 1, gradient 1 and SGD at 0.1
     stores 0.9, not 1.9). Every stored parameter after the step is as exact as the reference's
-    float32 step, row by row, both measured from its float64 step. The steps after it read and
-    update the projected weights the same way, bit for bit
-    (`test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_ones`)."""
+    float32 step, row by row, both measured from its float64 step. The steps after it, under
+    SGD or AdamW, read and update the projected weights the same way, bit for bit
+    (`test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_ones`); an
+    AdamW step itself is not held to torch's here, since optax forms Adam's bias corrections
+    in float32 (`1 - 0.999 ** t`), 6.4e-6 off at the first step, where torch forms them in
+    float64."""
     import optax
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
@@ -171,8 +174,8 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
     directory = loaded.source
     ids = np.load(directory / "input_ids.npy").astype(np.int32)
     rows = ids[np.arange(jax.device_count()) % len(ids)]
-    rate, decay = (0.1, 0.0) if optimizer == "sgd" else (1e-2, 0.1)
-    tx = optax.sgd(rate) if optimizer == "sgd" else optax.adamw(rate, eps=1e-8, weight_decay=decay)
+    rate = 0.1
+    tx = optax.chain(optax.add_decayed_weights(decay), optax.sgd(rate))
     trainer = Trainer(LMObjective(model, rows.shape[1] - 1, head_chunks=1, variables=loaded.variables), tx,
                       key=jax.random.key(0))
     state, _, _ = trainer.place()
@@ -192,8 +195,7 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
                 wide.load_state_dict(reference.state_dict())
             reference = wide
         reference.train()
-        solver = (torch.optim.SGD(reference.parameters(), lr=rate) if optimizer == "sgd" else
-                  torch.optim.AdamW(reference.parameters(), lr=rate, eps=1e-8, weight_decay=decay))
+        solver = torch.optim.SGD(reference.parameters(), lr=rate, weight_decay=decay)
         tokens = torch.from_numpy(rows).long()
         with float64() if dtype == torch.float64 else torch.enable_grad():
             reference(input_ids=tokens, labels=tokens).loss.backward()
@@ -204,15 +206,16 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
     assert_leaves_as_exact(dew, reference(torch.float32), reference(torch.float64))
 
 
+@pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
 @pytest.mark.parametrize("objective", ["lm", "grpo", "ppo"])
-def test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_ones(objective):
+def test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_ones(objective, optimizer):
     """The reference clamps the stored prediction weight in place before each forward, so
     training steps from AltUp coefficients past `coef_clip` are the steps from the clamped ones,
-    every later step reading the clamp of what the step before it stored. Dew's two steps are,
-    bit for bit, under an LM loss, whose forward trains the model, under GRPO's, whose token
-    scores read it without training, and under PPO's, whose critic is a value head over its own
-    Gemma 3n: each step reads the coefficients and updates them as each network's constraint
-    projects them (`Objective.projected`)."""
+    every later step reading the clamp of what the step before it stored. Dew's two steps, SGD's
+    and AdamW's, its decay included, are, bit for bit, under an LM loss, whose forward trains
+    the model, under GRPO's, whose token scores read it without training, and under PPO's, whose
+    critic is a value head over its own Gemma 3n: each step reads the coefficients and updates
+    them as each network's constraint projects them (`Objective.projected`)."""
     import dataclasses
 
     import optax
@@ -238,7 +241,8 @@ def test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_on
             # Every device takes a row: the packed rows repeat, as a loader cycles them.
             every = np.arange(jax.device_count())
             batch = jax.tree.map(lambda leaf: np.asarray(leaf)[every % len(leaf)], rows)
-        trainer = Trainer(task, optax.sgd(0.1), key=jax.random.key(0))
+        tx = optax.sgd(0.1) if optimizer == "sgd" else optax.adamw(1e-2, weight_decay=0.1)
+        trainer = Trainer(task, tx, key=jax.random.key(0))
         state, _, _ = trainer.place()
 
         def started(path, leaf):
