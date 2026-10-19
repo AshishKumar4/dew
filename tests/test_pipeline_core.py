@@ -567,29 +567,15 @@ def test_a_token_mixture_weighs_a_corpus_by_the_targets_its_rows_deliver():
     assert abs(targets[0] - targets[1]) <= 9
 
 
-@dataclasses.dataclass(frozen=True)
-class Halving:
-    """A step that keeps the first half of a token row, a crop no draw decides."""
-
-    def __call__(self, row):
-        return {**row, "text": row["text"][: len(row["text"]) // 2]}
-
-
-@pytest.mark.parametrize("where", ["after-repeat", "after-count"])
-def test_a_token_mixture_counts_the_targets_a_corpus_delivers_wherever_its_rows_change(where):
-    """A corpus whose rows change after their targets were stated or counted delivers other targets
-    than those counts: a random crop after its repeat, or a crop after a step that counted its
-    targets (`CountTargets`). The mixture by tokens weighs it by the targets its rows deliver, so
-    both corpora deliver equal targets, to within one row's."""
-    from dew.data.steps.text import CountTargets
-
+def test_a_token_mixture_counts_the_targets_a_corpus_delivers_after_its_repeat_changes_them():
+    """A corpus whose rows a random crop changes after its repeat delivers other targets than its
+    store states: the mixture by tokens weighs it by the targets its rows deliver, so both corpora
+    deliver equal targets, to within one row's."""
     def corpus(name, lengths):
         return Stated([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
                        for size in lengths])
 
-    long = Pipeline(corpus("long", (20, 20, 20, 20)), name="long")
-    long = (long.repeat().random_map(Halved()) if where == "after-repeat"
-            else long.filter_map(CountTargets()).map(Halving()).repeat())
+    long = Pipeline(corpus("long", (20, 20, 20, 20)), name="long").repeat().random_map(Halved())
     mixed = mix([long, Pipeline(corpus("short", (4, 4)), name="short").repeat()], by="tokens")
     data = compile(mixed.map(Counted()).batch(8), read="memory", loading=READ)
     stream = data.train(DataPartition())

@@ -127,8 +127,7 @@ def _outputs(
 ) -> tuple[Record, ...]:
     """What a record stage makes of one row, the single definition the cache
     fill, memory materialization and Grain lowering all apply: its outputs,
-    with a `Rejected` marker in place of each row it drops, and without a
-    count of targets the step made stale (`_recounted`). A marker passes
+    with a `Rejected` marker in place of each row it drops. A marker passes
     through and a missing row is rejected. `position` is the row's source
     position, as `Pipeline.map_with_index` defines it. When `counts` is given,
     a chunk expansion counts its document and fan-out as it runs.
@@ -145,8 +144,7 @@ def _outputs(
         outputs = tuple(outputs)
         if counts is not None and isinstance(stage.step, Chunks):
             counts.expanded(outputs)
-        recounted = tuple(_recounted(output, element) for output in outputs)
-        return recounted or (Rejected("empty_expansion"),)
+        return outputs or (Rejected("empty_expansion"),)
     if isinstance(stage, RandomMap):
         if rng is None:
             raise ValueError(f"random step {_identity(stage).name} needs a record rng")
@@ -165,7 +163,7 @@ def _outputs(
     if isinstance(output, Rejected) and not stage.rejects:
         raise ValueError(f"step {_identity(stage).name} dropped a record ({output.reason}) under map, which "
                          "keeps every record; apply a step that drops records with filter_map")
-    return (_recounted(output, value),)
+    return (output,)
 
 
 _POSITION = "_dew_position"
@@ -253,21 +251,6 @@ class _Rows(gx.FlatMapTransform):
             return _outputs(self.stage, None, element, rng, counts=self.counts)
         outputs = _outputs(self.stage, position, _unplaced(element), rng, counts=self.counts)
         return tuple(_placed(output, position) for output in outputs)
-
-
-def _recounted(output: Record, given: Record) -> Record:
-    """`output` with the valid targets `CountTargets` counted on `given` kept only where the step
-    left every value they were counted from as it was. A step that changes one, as a crop changes
-    tokens or a chunk step cuts them, drops the count, and `ValidTargets` measures the row it
-    delivers instead of reading a count of the row it was."""
-    if (output is None or given is None or isinstance(output, (bytes, Rejected))
-            or isinstance(given, (bytes, Rejected))):
-        return output
-    if "_dew_valid_targets" not in given or "_dew_valid_targets" not in output:
-        return output
-    if all(output.get(name) is value for name, value in given.items() if not name.startswith("_dew_")):
-        return output
-    return {name: value for name, value in output.items() if name != "_dew_valid_targets"}
 
 
 def _expanded(rows: pygrain.IterDataset, stage: FlatMap, name: str) -> pygrain.IterDataset:
