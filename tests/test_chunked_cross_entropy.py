@@ -27,13 +27,13 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from sharded import collectives
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.precision import rounded_operand, rounded_to
 from dew.nn.protocols import OutputTable
 from dew.objectives.lm import chunked
 from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss, tile_columns, vocabulary_chunks
-from sharded import collectives
 
 EXERCISED = {jnp.float32: 'highest', jnp.bfloat16: 'default'}
 """The matmul precision each compute dtype's head is compared under: bf16's
