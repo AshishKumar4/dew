@@ -142,10 +142,9 @@ test('a preview\'s warm and its visitors reach its own registry, preparer and po
 		assert.equal(warmed.status, 200);
 		assert.deepEqual(await visit(worker, 0, 'preview.live'), Array(6).fill([503, 'warming']));
 		assert.deepEqual(await asked(worker, 0, 'preview.live'), [PREVIEW]);
-		// Production's registry was left serving its own pin and asked for nothing, and its pool kept its host.
+		// Production's registry, left serving its own pin, was asked for nothing, and its pool still seats its visitors.
 		assert.deepEqual(await asked(worker, 0), []);
-		const status = await worker.dispatchFetch('https://live/v1/operator/status', { headers: { Authorization: 'Bearer operator' } });
-		assert.equal((await status.json()).ready, 1);
+		assert.deepEqual(await visit(worker, 6), Array(6).fill([201, null]));
 	} finally {
 		await worker.dispose();
 	}
