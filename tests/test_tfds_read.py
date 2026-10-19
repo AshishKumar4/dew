@@ -54,6 +54,15 @@ def test_prepared_records_carry_encoded_pixels_labels_and_caption_names():
     ]
 
 
+def test_a_split_reads_the_files_tfds_resolves_its_expression_to():
+    """A split is any expression TFDS resolves, spaced as TFDS allows: `train + test` reads and
+    fingerprints the files `all` does, every record of each."""
+    whole = TFDS("dew_images", path=str(FIXTURE), split="all")
+    spaced = TFDS("dew_images", path=str(FIXTURE), split="train + test")
+    assert spaced.fingerprint()["files"] == whole.fingerprint()["files"]
+    assert len(spaced.records("indexed")) == len(whole.records("indexed")) == 20
+
+
 @pytest.mark.parametrize("location", ["local", "prepared", "mirror"])
 def test_streamed_tfds_pins_one_fingerprint_for_all_virtual_shards(tmp_path, monkeypatch, location):
     """Virtual shards reuse the prepared split's pinned physical snapshot."""
