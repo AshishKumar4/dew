@@ -36,6 +36,14 @@ class Draw(grain.RandomMapTransform):
 
 
 @dataclasses.dataclass(frozen=True)
+class RowDraws(grain.RandomMapTransform):
+    """A draw for each row of a batch."""
+
+    def random_map(self, element, rng):
+        return {**element, "draw": rng.integers(0, 2**32, size=len(element["id"]))}
+
+
+@dataclasses.dataclass(frozen=True)
 class Odd(grain.MapTransform):
     rejects = True
 
@@ -180,11 +188,11 @@ def test_a_global_order_resumes_through_the_stages_after_its_batch(read, after):
     """A global position counts the records of the batches the run read, in the order its batches
     come in after every stage written after the batch. A run resumed after two batches reads on as
     the uninterrupted run does through a limit, a window shuffle, a random step or a finite repeat
-    after the batch, and a stage that keeps whole rows reads on alike from two shares."""
+    after the batch, and reads on alike from two shares, every row's draws included."""
     rows = Pipeline(source(16))
     chain = {"take": rows.batch(2).take(5),
              "window shuffle": rows.repeat(1).batch(2).shuffle(7, window=3),
-             "random map": rows.repeat().batch(2).random_map(Draw()),
+             "random map": rows.repeat().batch(2).random_map(RowDraws()),
              "finite repeat": rows.take(6).batch(2).repeat(2)}[after]
     data = compile(chain, read=read, loading=READ, seed=3)
     whole = data.train(DataPartition())
@@ -204,8 +212,6 @@ def test_a_global_order_resumes_through_the_stages_after_its_batch(read, after):
         assert head + take(resumed, 6) == expected
     finally:
         resumed.close()
-    if after == "random map":
-        return
     shares = []
     for index in range(2):
         reader = data.train(DataPartition(index, 2))
@@ -214,8 +220,8 @@ def test_a_global_order_resumes_through_the_stages_after_its_batch(read, after):
             shares.append(take(reader, 6))
         finally:
             reader.close()
-    joined = [{"id": [value for pair in zip(left["id"], right["id"], strict=True) for value in pair]}
-              for left, right in zip(*shares, strict=True)]
+    joined = [{key: [value for pair in zip(left[key], right[key], strict=True) for value in pair]
+               for key in left} for left, right in zip(*shares, strict=True)]
     assert head + joined == expected
 
 
