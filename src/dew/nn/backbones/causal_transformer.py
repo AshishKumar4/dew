@@ -1117,6 +1117,18 @@ class CausalTransformer(nn.Module):
             passes *= site.projection_uses()['modality_router']
         return np.asarray(lengths) * passes
 
+    def _scan_keys(self, specs: Sequence[LayerSpec]) -> tuple[tuple[LayerSpec, tuple], ...]:
+        """What one scanned body shares: the layers' spec and the structure of their variables, so
+        layers stored apart and quantized or adapted apart run as runs of their own; a per-layer
+        tree reads either way, so a grouping is only how this call reads it. A run a collection
+        already holds as one bank stays one run, as the store declared it (`bank_sites`): its rows
+        must then be alike, which `StackView.stack` refuses by name."""
+        structures = list(StackView.layer_structures(self.variables, self.num_layers))
+        for first, count in scan_groups(specs, self.bank_layers) if self.scan_layers else ():
+            if count > 1 and any(group_name(first, count) in tree for tree in self.variables.values()):
+                structures[first:first + count] = [structures[first]] * count
+        return tuple(zip(specs, structures, strict=True))
+
     def setup(self):
         """Build the embeddings, the layers, the prediction depths `mtp`, the final
         `norm`, and `lm_head` when the embeddings are not tied.
@@ -1176,16 +1188,7 @@ class CausalTransformer(nn.Module):
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
         self.specs = specs
-        # What one scanned body shares: the layers' spec and the structure of their variables, so
-        # layers stored apart and quantized or adapted apart run as runs of their own; a per-layer
-        # tree reads either way, so a grouping is only how this call reads it.
-        structures = list(StackView.layer_structures(self.variables, self.num_layers))
-        # A run a collection already holds as one bank stays one run, as the store declared it
-        # (`bank_sites`): its rows must then be alike, which `StackView.stack` refuses by name.
-        for first, count in scan_groups(specs, self.bank_layers) if self.scan_layers else ():
-            if count > 1 and any(group_name(first, count) in tree for tree in self.variables.values()):
-                structures[first:first + count] = [structures[first]] * count
-        self.scan_keys = tuple(zip(specs, structures, strict=True))
+        self.scan_keys = self._scan_keys(specs)
         self.block = block
         self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
         self.groups = scan_groups(self.scan_keys, self.bank_layers) if self.scan_layers else tuple(
