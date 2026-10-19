@@ -468,7 +468,6 @@ def test_a_token_mixture_weighs_a_random_holdout_by_the_rows_it_keeps(held):
     arrive instead."""
     from dew.config.data import RecordsData
     from dew.data.holdout import HoldOut
-    from dew.data.steps.text import CountTargets
 
     def corpus(name, lengths):
         return Stated([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
@@ -478,7 +477,7 @@ def test_a_token_mixture_weighs_a_random_holdout_by_the_rows_it_keeps(held):
     trained = (RecordsData(long, validation=HoldOut(records=3, by="random", seed=2)).pipelines()[0] if held
                else Pipeline(long))
     parts = [dataclasses.replace(trained, name="long"), Pipeline(corpus("short", (2, 2)), name="short")]
-    mixed = mix([part.filter_map(CountTargets()).repeat() for part in parts], by="tokens")
+    mixed = mix([part.repeat() for part in parts], by="tokens")
     data = compile(mixed.map(Counted()).batch(8), read="indexed", loading=READ)
     stream = data.train(DataPartition())
     targets = [0, 0]
