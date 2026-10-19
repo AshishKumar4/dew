@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -47,20 +47,23 @@ _CARRIED = ("model", "temperature", "top_p", "frequency_penalty", "presence_pena
 the completions and chat routes; `extra_body` carries the engine's own controls."""
 
 
-def _listed(value: object, name: str) -> list[object]:
+def _listed(value: JSON, name: str) -> list[JSON]:
+    """`value`, read at the engine's boundary as the list its response holds at `name`."""
     if not isinstance(value, list):
         raise ValueError(f"{name} must be a list")
     return value
 
 
-def _ids(value: object, name: str) -> list[int]:
+def _ids(value: JSON, name: str) -> list[int]:
+    """`value`, read at the engine's boundary as the token ids its response holds at `name`."""
     listed = _listed(value, name)
     if any(type(token) is not int or token < 0 for token in listed):
         raise ValueError(f"{name} must hold nonnegative token ids")
     return [token for token in listed if isinstance(token, int)]
 
 
-def _record(value: object, name: str) -> dict[str, JSON]:
+def _record(value: JSON, name: str) -> dict[str, JSON]:
+    """`value`, read at the engine's boundary as the object its response holds at `name`."""
     if not isinstance(value, dict):
         raise ValueError(f"{name} must be an object")
     return value
@@ -77,7 +80,7 @@ class OwnStops:
     seed: int | None
     penalized: bool
 
-    def ended_outside(self, reason: object, matched: object) -> bool:
+    def ended_outside(self, reason: JSON, matched: JSON) -> bool:
         """Whether SGLang ended a choice on an id of its own the policy's stops leave out."""
         return reason == "stop" and type(matched) is int and matched not in self.stops
 
@@ -126,8 +129,8 @@ class OwnStops:
                 answer = _record((yield self.continuation(request, index if type(index) is int else 0, prompt,
                                                           drawn)), "completion response")
                 (then,) = _listed(answer.get("choices"), "continued choices")
-                entry = joined(entry, _record(then, "completion choice"))
-                usage = summed(usage, answer.get("usage"))
+                entry = _joined(entry, _record(then, "completion choice"))
+                usage = _summed(usage, answer.get("usage"))
             choices.append(entry)
         return {**response, "choices": choices, "usage": usage}
 
@@ -181,14 +184,14 @@ class OwnStops:
                     update={"content": [*(choice.logprobs.content or []), *content]})
             choices.append(choice.model_copy(update=update))
         changed: dict[str, object] = {"choices": choices}
-        if response.usage is not None and isinstance(usage, dict):
-            changed["usage"] = response.usage.model_copy(update=usage)
+        if response.usage is not None and usage is not None:
+            changed["usage"] = response.usage.model_copy(update=_record(usage, "usage"))
         return response.model_copy(update=changed)
 
 
-def joined(first: dict[str, JSON], then: dict[str, JSON]) -> dict[str, JSON]:
-    """A completions choice and its continuation as one choice: text, ids and log-probabilities end
-    to end, and the continuation's finish."""
+def _joined(first: dict[str, JSON], then: dict[str, JSON]) -> dict[str, JSON]:
+    """A completions choice and its continuation, as the engine's boundary reads them, as one
+    choice: text, ids and log-probabilities end to end, and the continuation's finish."""
     text = first.get("text")
     later = then.get("text")
     if not isinstance(text, str) or not isinstance(later, str):
@@ -211,8 +214,9 @@ def joined(first: dict[str, JSON], then: dict[str, JSON]) -> dict[str, JSON]:
     return merged
 
 
-def summed(first: JSON, then: JSON) -> JSON:
-    """Two requests' usage as one, each count summed where both report it."""
+def _summed(first: JSON, then: JSON) -> JSON:
+    """Two requests' usage, as the engine's boundary reads it, as one: each count summed where both
+    report it."""
     if not isinstance(first, dict) or not isinstance(then, dict):
         return first
     names = ("prompt_tokens", "completion_tokens", "total_tokens")
@@ -241,24 +245,21 @@ async def driven_async[Result](plan: Plan[Result], call: Callable[[Request], Awa
         return done.value
 
 
-type Chunk = OpenAIResponse | ChatCompletionChunk
-
-
 @dataclasses.dataclass
 class _Streamed:
-    """Each streamed choice's prompt and drawn ids, by the index the caller reads it under."""
+    """Each streamed completion choice's prompt and drawn ids, by the index the caller reads it
+    under."""
 
     own: OwnStops
     request: Request
-    route: Literal["completions", "chat"]
     prompts: dict[int, list[int]] = dataclasses.field(default_factory=dict)
     drawn: dict[int, list[int]] = dataclasses.field(default_factory=dict)
 
-    def fed(self, chunk: Chunk, index: int | None) -> list[Chunk | tuple[int, Request]]:
-        """What a chunk of the stream (`index` None), or of choice `index`'s continuation, becomes:
-        the chunk, each choice under the caller's index, and then for each choice SGLang ended on an
-        id of its own outside the policy's stops the continuation's request, that chunk carrying
-        no finish for it."""
+    def fed(self, chunk: OpenAIResponse,
+            index: int | None) -> tuple[OpenAIResponse, list[tuple[int, Request]]]:
+        """A chunk of the stream (`index` None), or of choice `index`'s continuation, with each choice
+        under the caller's index, and the continuation's request for each choice SGLang ended on an
+        id of its own outside the policy's stops, which that chunk then carries no finish for."""
         continued: list[tuple[int, Request]] = []
         choices = []
         for choice in chunk.choices:
@@ -269,13 +270,7 @@ class _Streamed:
                                                             "prompt_token_ids"))
             self.drawn.setdefault(at, []).extend(_ids(extra.get("token_ids") or [], "token_ids"))
             update: dict[str, object] = {"index": at}
-            matched = extra.get("matched_stop")
-            if self.own.ended_outside(choice.finish_reason, matched):
-                if self.route == "chat":
-                    raise ValueError(
-                        f"SGLang ended chat stream choice {at} on its model's EOS id {matched}, which the "
-                        "policy does not stop on, and a chat stream reports no token ids to continue it "
-                        "from; stream on the completions route or ask for the whole chat")
+            if self.own.ended_outside(choice.finish_reason, extra.get("matched_stop")):
                 if len(self.drawn[at]) >= self.own.budget:
                     update.update(finish_reason="length", matched_stop=None)
                 else:
@@ -283,47 +278,76 @@ class _Streamed:
                     continued.append((at, self.own.continuation(self.request, at, self.prompts[at],
                                                                   self.drawn[at], stream=True)))
             choices.append(choice.model_copy(update=update))
-        return [chunk.model_copy(update={"choices": choices}), *continued]
+        return chunk.model_copy(update={"choices": choices}), continued
 
 
-def streamed(stream: Stream[OpenAIResponse] | Stream[ChatCompletionChunk], own: OwnStops, request: Request,
-             route: Literal["completions", "chat"],
-             opened: Callable[[Request], Stream[OpenAIResponse]]) -> Iterator[Chunk]:
-    """`stream`'s chunks with each choice SGLang ended on an id of its own outside the policy's
-    stops continued by a completions stream of its own (`opened`), whose chunks follow under the
-    choice's index. Every stream it opens is closed when it ends or the reader stops."""
-    state = _Streamed(own, request, route)
+def streamed(stream: Stream[OpenAIResponse], own: OwnStops, request: Request,
+             opened: Callable[[Request], Stream[OpenAIResponse]]) -> Iterator[OpenAIResponse]:
+    """A completions `stream`'s chunks with each choice SGLang ended on an id of its own outside the
+    policy's stops continued by a completions stream of its own (`opened`), whose chunks follow
+    under the choice's index. Every stream it opens is closed when it ends or the reader stops."""
+    state = _Streamed(own, request)
 
-    def run(chunks: Stream[OpenAIResponse] | Stream[ChatCompletionChunk],
-            index: int | None) -> Iterator[Chunk]:
+    def run(chunks: Stream[OpenAIResponse], index: int | None) -> Iterator[OpenAIResponse]:
         with chunks:
             for chunk in chunks:
-                for out in state.fed(chunk, index):
-                    if isinstance(out, tuple):
-                        yield from run(opened(out[1]), out[0])
-                    else:
-                        yield out
+                out, continued = state.fed(chunk, index)
+                yield out
+                for at, follow in continued:
+                    yield from run(opened(follow), at)
 
     return run(stream, None)
 
 
-async def streamed_async(stream: AsyncStream[OpenAIResponse] | AsyncStream[ChatCompletionChunk],
-                         own: OwnStops, request: Request, route: Literal["completions", "chat"],
+async def streamed_async(stream: AsyncStream[OpenAIResponse], own: OwnStops, request: Request,
                          opened: Callable[[Request], Awaitable[AsyncStream[OpenAIResponse]]]
-                         ) -> AsyncIterator[Chunk]:
+                         ) -> AsyncIterator[OpenAIResponse]:
     """`streamed` over an async stream."""
-    state = _Streamed(own, request, route)
+    state = _Streamed(own, request)
 
-    async def run(chunks: AsyncStream[OpenAIResponse] | AsyncStream[ChatCompletionChunk],
-                  index: int | None) -> AsyncIterator[Chunk]:
+    async def run(chunks: AsyncStream[OpenAIResponse], index: int | None) -> AsyncIterator[OpenAIResponse]:
         async with chunks:
             async for chunk in chunks:
-                for out in state.fed(chunk, index):
-                    if isinstance(out, tuple):
-                        async for continued in run(await opened(out[1]), out[0]):
-                            yield continued
-                    else:
-                        yield out
+                out, continued = state.fed(chunk, index)
+                yield out
+                for at, follow in continued:
+                    async for later in run(await opened(follow), at):
+                        yield later
 
     async for chunk in run(stream, None):
         yield chunk
+
+
+def _chat_refusal(chunk: ChatCompletionChunk, own: OwnStops) -> str | None:
+    """Why a chat stream's `chunk` cannot go on as the policy's draw: SGLang ended a choice on an id
+    of its own outside the policy's stops, and a chat stream reports no token ids to continue it
+    from. None where every choice in it is the policy's."""
+    for choice in chunk.choices:
+        matched = (choice.model_extra or {}).get("matched_stop")
+        if own.ended_outside(choice.finish_reason, matched):
+            return (f"SGLang ended chat stream choice {choice.index} on its model's EOS id {matched}, which "
+                    "the policy does not stop on, and a chat stream reports no token ids to continue it "
+                    "from; stream on the completions route (OpenAICompletion.stream) or ask for the whole "
+                    "chat")
+    return None
+
+
+def chat_streamed(stream: Stream[ChatCompletionChunk], own: OwnStops) -> Iterator[ChatCompletionChunk]:
+    """A chat `stream`'s chunks, refused at a chunk SGLang ended a choice of on an id of its own
+    outside the policy's stops (`_chat_refusal`), the stream closed when it ends or the reader
+    stops."""
+    with stream:
+        for chunk in stream:
+            if (refusal := _chat_refusal(chunk, own)) is not None:
+                raise ValueError(refusal)
+            yield chunk
+
+
+async def chat_streamed_async(stream: AsyncStream[ChatCompletionChunk], own: OwnStops
+                              ) -> AsyncIterator[ChatCompletionChunk]:
+    """`chat_streamed` over an async stream."""
+    async with stream:
+        async for chunk in stream:
+            if (refusal := _chat_refusal(chunk, own)) is not None:
+                raise ValueError(refusal)
+            yield chunk

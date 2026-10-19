@@ -20,7 +20,15 @@ from typing import TYPE_CHECKING, Literal, Protocol
 import jax
 import numpy as np
 
-from dew.inference.continuation import OwnStops, driven, driven_async, streamed, streamed_async
+from dew.inference.continuation import (
+    OwnStops,
+    chat_streamed,
+    chat_streamed_async,
+    driven,
+    driven_async,
+    streamed,
+    streamed_async,
+)
 from dew.nn.inputs import key_seed, token_id
 from dew.records import JSON
 from dew.sampling.text import Sampling
@@ -373,7 +381,8 @@ def decode_routed_experts(encoded: object) -> np.ndarray:
 def _openai_result(raw: JSON, responses: Sequence[object], expected: int) -> Completion:
     """The completion `raw` holds, its SDK `responses` kept: the request's and any continuation's."""
     from openai.types import Completion as SDKCompletion
-    if not all(isinstance(response, SDKCompletion) for response in responses):
+    parsed = tuple(response for response in responses if isinstance(response, SDKCompletion))
+    if len(parsed) != len(responses):
         raise ValueError("a non-streaming completion request returned an incompatible response")
     fields = _object(raw, "completion response")
     choices = fields.get("choices")
@@ -399,7 +408,7 @@ def _openai_result(raw: JSON, responses: Sequence[object], expected: int) -> Com
     per_choice = (usage.completion_tokens,) if expected == 1 and usage is not None else (None,) * expected
     choice = [ordered[index] for index in range(expected)]
     return Completion(tuple(entry[0] for entry in choice), tuple(entry[1] for entry in choice),
-                      per_choice, usage, tuple(responses), tuple(entry[2] for entry in choice),
+                      per_choice, usage, parsed, tuple(entry[2] for entry in choice),
                       tuple(entry[3] for entry in choice), tuple(entry[4] for entry in choice))
 
 
@@ -603,8 +612,7 @@ class OpenAICompletion:
         if own is None:
             return _invoke(create, fields)
         fields = _returning_ids(fields, "return_token_ids")
-        return streamed(_invoke(create, fields), own, fields, "completions",
-                        lambda request: _invoke(create, request))
+        return streamed(_invoke(create, fields), own, fields, lambda request: _invoke(create, request))
 
     def _chat_body(self, messages: Sequence[ChatMessage], max_new_tokens: int,
                    seed: int | None, stream: bool,
@@ -643,11 +651,13 @@ class OpenAICompletion:
         own = self._own_stops(parameters, max_new_tokens, seed)
         if own is None:
             return _invoke(create, fields)
+        from openai import Stream
+
         fields = _returning_ids(fields, "return_prompt_token_ids", "return_token_ids")
         completions = self._sync().completions
         answer = _invoke(create, fields)
-        if stream:
-            return streamed(answer, own, fields, "chat", lambda request: _invoke(completions.create, request))
+        if isinstance(answer, Stream):
+            return chat_streamed(answer, own)
         return driven(own.chat_completed(answer, fields), lambda request: _invoke(
             completions.with_raw_response.create, request).http_response.json())
 
@@ -689,7 +699,7 @@ class OpenAICompletion:
         if own is None:
             return await _invoke(create, fields)
         fields = _returning_ids(fields, "return_token_ids")
-        return streamed_async(await _invoke(create, fields), own, fields, "completions",
+        return streamed_async(await _invoke(create, fields), own, fields,
                               lambda request: _invoke(create, request))
 
     async def achat(
@@ -706,12 +716,13 @@ class OpenAICompletion:
         own = self._own_stops(parameters, max_new_tokens, seed)
         if own is None:
             return await _invoke(self._async().chat.completions.create, fields)
+        from openai import AsyncStream
+
         fields = _returning_ids(fields, "return_prompt_token_ids", "return_token_ids")
         completions = self._async().completions
         answer = await _invoke(self._async().chat.completions.create, fields)
-        if stream:
-            return streamed_async(answer, own, fields, "chat",
-                                  lambda request: _invoke(completions.create, request))
+        if isinstance(answer, AsyncStream):
+            return chat_streamed_async(answer, own)
 
         async def answered(request: Mapping[str, object]) -> JSON:
             return (await _invoke(completions.with_raw_response.create, request)).http_response.json()
