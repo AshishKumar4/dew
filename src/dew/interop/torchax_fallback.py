@@ -140,12 +140,11 @@ class TorchGraph:
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None
                  ) -> tuple[jax.Array, jax.Array]:
-        """The logits and the output head's input states for `tokens`. Each
-        broadcast of a value narrower than fp32 sums its gradient in fp32
-        (`_accumulating`), as torch's reduction of a broadcast's gradient does."""
-        import torchax
-
-        env = torchax.default_env()
+        """The logits and the output head's input states for `tokens`, in Dew's torchax
+        environment (`_environment`). Each broadcast of a value narrower than fp32 sums
+        its gradient in fp32 (`_accumulating`), as torch's reduction of a broadcast's
+        gradient does."""
+        env = _environment()
         draws = _Draws()
 
         def forward(params, buffers, tokens, key):
@@ -210,6 +209,62 @@ def _Draws():
             return tensor
 
     return Draws()
+
+
+_OPMATH: Mapping[str, tuple[int, str] | None] = {
+    "gelu": None, "silu": None, "native_layer_norm": None, "native_group_norm": None,
+    "_softmax": (2, "half_to_float"), "_log_softmax": (2, "half_to_float")}
+"""The aten ops torchax lowers into several roundings of a narrow float (jax.nn's gelu, silu,
+softmax and log_softmax, and its layer and group norms' mean, variance and normalization),
+where torch's kernels compute a bf16 or fp16 operand in fp32 and round each output once; by
+the position and name of the argument that keeps the output fp32 (`half_to_float`), where the
+op has one. Left to torchax, a GPT-NeoX's LayerNorm took the variance of its bf16-rounded deviations,
+which scaled its logits by 1 - 8.9e-4 and put its bf16 loss 7.7 times torch's distance from
+float64."""
+
+
+@functools.cache
+def _environment():
+    """The torchax environment Dew's fallback runs transformers' forward in: torchax's own
+    lowerings, but the `_OPMATH` ops computed at torch's opmath (`_at_opmath`). Its own, so
+    the process's default environment keeps torchax's."""
+    import torch
+    from torchax.ops import ops_registry
+    from torchax.tensor import Environment
+
+    env = Environment()
+    for name, keeps_fp32 in _OPMATH.items():
+        packet = getattr(torch.ops.aten, name)
+        # Every key torchax registers the op under: its packet, or one of the packet's overloads.
+        registered = ops_registry.all_aten_ops
+        for op in (packet, *(getattr(packet, overload) for overload in packet.overloads())):
+            if op in registered:
+                env.override_op_definition(op, _at_opmath(env, registered[op].func, keeps_fp32))
+    return env
+
+
+def _at_opmath(env, lowering, keeps_fp32: tuple[int, str] | None):
+    """`lowering`, torchax's jax function for one aten op, run as torch's kernel runs a narrow
+    float: its floating operands narrower than fp32 widened to fp32, its floating outputs
+    rounded once to their dtype, unless the argument at `keeps_fp32` asks for fp32 outputs."""
+    def computed(*args, **kwargs):
+        args, kwargs = env.t2j_iso((args, kwargs))
+        narrow = [leaf.dtype for leaf in jax.tree.leaves((args, kwargs))
+                  if isinstance(leaf, jax.Array) and _narrow_float(leaf)]
+        if not narrow:
+            return env.j2t_iso(lowering(*args, **kwargs))
+        wide_args, wide_kwargs = jax.tree.map(
+            lambda leaf: leaf.astype(jnp.float32) if isinstance(leaf, jax.Array) and _narrow_float(leaf)
+            else leaf, (args, kwargs))
+        outputs = lowering(*wide_args, **wide_kwargs)
+        position, name = keeps_fp32 or (len(args), "")
+        kept = bool(args[position] if position < len(args) else kwargs.get(name, False))
+        if not kept:
+            outputs = jax.tree.map(lambda leaf: leaf.astype(narrow[0]) if isinstance(leaf, jax.Array)
+                                   and leaf.dtype == jnp.float32 else leaf, outputs)
+        return env.j2t_iso(outputs)
+
+    return computed
 
 
 def _accumulating(closed: ClosedJaxpr, *arguments: jax.Array) -> list[jax.Array]:
