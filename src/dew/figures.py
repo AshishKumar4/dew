@@ -9,7 +9,7 @@ SVG, so they play with no script, in an `<img>` too. Each one loops: it builds t
 holds it, and eases back to the start. With reduced motion asked for, only the held picture
 shows.
 
-`curve`, `bars`, `heatmap` and `tokens` draw the charts the tutorials make from their own runs.
+`curve`, `bars`, `heatmap`, `images` and `tokens` draw the charts the tutorials make from their own runs.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from typing import Literal
 
 import numpy as np
 
-__all__ = ["THEMES", "Figure", "Shape", "bars", "curve", "heatmap", "tokens"]
+__all__ = ["THEMES", "Figure", "Shape", "bars", "curve", "heatmap", "images", "tokens"]
 
 Role = Literal["text", "muted", "rule", "surface", "raised", "accent", "accent_fill", "warm",
                "warm_fill", "tint0", "tint1", "tint2", "tint3", "none"]
@@ -175,16 +175,21 @@ class Figure:
                                  "text-anchor": anchor},
                         {"fill": self.palette[color], "font-family": family}, words)
 
-    def image(self, x: float, y: float, size: float, pixels: np.ndarray) -> Shape:
-        """A uint8 image, [H, W] or [H, W, C], as a PNG drawn `size` wide, with its pixels kept sharp."""
+    def image(self, x: float, y: float, size: float, pixels: np.ndarray, *, photo: bool = False) -> Shape:
+        """A uint8 image, [H, W] or [H, W, C], drawn `size` wide: a PNG with its pixels kept sharp, or
+        with `photo` a WebP at quality 90 and smoothed, a fraction of a photograph's PNG."""
         from PIL import Image
 
         buffer = io.BytesIO()
-        Image.fromarray(pixels).save(buffer, format="PNG")
+        if photo:
+            Image.fromarray(pixels).save(buffer, format="WEBP", quality=90)
+        else:
+            Image.fromarray(pixels).save(buffer, format="PNG")
         encoded = base64.b64encode(buffer.getvalue()).decode()
+        kind = "webp" if photo else "png"
         return self.add("image", {"x": x, "y": y, "width": size, "height": size,
-                                  "href": f"data:image/png;base64,{encoded}"},
-                        {"image-rendering": "pixelated"})
+                                  "href": f"data:image/{kind};base64,{encoded}"},
+                        {} if photo else {"image-rendering": "pixelated"})
 
     @contextmanager
     def group(self, x: float = 0, y: float = 0) -> Iterator[Shape]:
@@ -348,7 +353,7 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
             mean = np.convolve(ys, np.ones(window) / window, mode="valid")
             lines = [(ys, 1.0), (np.concatenate([np.full(window - 1, np.nan), mean]), 2.5)]
         for drawn, stroke in lines:
-            points = [at(step, y) for step, y in zip(xs, drawn) if np.isfinite(y)]
+            points = [at(step, y) for step, y in zip(xs[:len(drawn)], drawn, strict=True) if np.isfinite(y)]
             line = figure.polyline(points, color=color, width=stroke, dash=dash)
             shade = 0.35 if window > 1 and stroke < 2 else 1
             if dash:
@@ -364,7 +369,8 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
             figure.text(at_x + 24, at_y, f"{name} {last:.2f}", size=TEXT, color=color)
         else:
             at_x, at_y = at(final, last)
-            end = figure.text(at_x - 4, at_y - 10, f"{last:.2f}", size=TEXT, color=color, weight=600, anchor="end")
+            end = figure.text(at_x - 4, at_y - 10, f"{last:.2f}", size=TEXT, color=color, weight=600,
+                              anchor="end")
             figure.appear(end, seconds * 0.55)
     return figure
 
@@ -444,6 +450,33 @@ def heatmap(frames: Sequence[Sequence[Sequence[float]]], *, rows: Sequence[str],
                     rx=3, width=1.75)
     if captions:
         _captions(figure, captions, times, width - 24, height - 12)
+    return figure
+
+
+def images(frames: Sequence[np.ndarray], *, captions: Sequence[str] = (), columns: int = 8, size: float = 64,
+           seconds: float = 8.0) -> Figure:
+    """A grid of photographs that changes from frame to frame: `frames[t]` is frame `t`'s images,
+    uint8 [N, H, W, C], drawn `size` wide in rows of `columns`. `captions[t]` names frame `t`. One
+    frame is a still grid."""
+    count, shown = len(frames), len(frames[0])
+    rows = -(-shown // columns)
+    gap, top = 4, 30 if captions else 4
+    width = columns * (size + gap) + gap
+    height = top + rows * (size + gap) + gap
+    figure = Figure(width, height, seconds=seconds if count > 1 else 0.0,
+                    label=f"{shown} images" + (f" at each of {count} points" if count > 1 else ""))
+    times = _frame_times(count, seconds)
+    grids = []
+    for batch in frames:
+        with figure.group() as grid:
+            for index, pixels in enumerate(np.asarray(batch)):
+                row, column = divmod(index, columns)
+                figure.image(gap + column * (size + gap), top + row * (size + gap), size, pixels, photo=True)
+        grids.append(grid)
+    if count > 1:
+        figure.show_in_turn(grids, times)
+    if captions:
+        _captions(figure, captions, times, width - gap, 20)
     return figure
 
 

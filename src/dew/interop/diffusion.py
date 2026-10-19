@@ -921,8 +921,9 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
         # headers were never read online for an offline run, has none.
         raise ValueError(f"{len(unwritten)} weights of this pipeline have no source layout to be written "
                          f"under, {unwritten[0]} first; a pipeline bound from saved variables writes its "
-                         f"weights by its source's weight files, which {source.source} does not hold, or "
-                         "whose headers an offline run cannot read until one online run has read them")
+                         f"weights by its source's weight headers, which {source.source} does not give: "
+                         "bind the variables over a copy that holds the weight files, or, for a Hub source "
+                         "read offline, bind it online once, which records the headers for offline runs")
     destination.mkdir(parents=True, exist_ok=True)
     config = dict(source.config)
     index = dict(config.pop("model_index"))
