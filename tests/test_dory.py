@@ -15,6 +15,7 @@ import optax
 import pytest
 from interop_support import assert_reloads, assert_same_stored_tensors
 from reference_error import (
+    STAGES,
     assert_as_exact_as_the_reference,
     assert_computes_the_oracle,
     assert_elements_as_exact,
@@ -622,6 +623,7 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
 
     source = json.loads((RELEASED / 'source.json').read_text())
     recorder = load_tool('dory_vllm_reference')
+    assert recorder.BATCHES >= STAGES, 'the probe holds fewer batches of orders than the element rule reads'
     probe, drawn = np.load(recorder.fetched('probe.npz')), np.load(recorder.fetched('orders.npy'))
     keys = [recorder.name(*run) for run in recorder.RUNS]
     truths = {key: np.load(recorder.fetched(f'upstream-{recorder.tag(key)}.npy')) for key in keys}
