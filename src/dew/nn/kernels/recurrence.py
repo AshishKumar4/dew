@@ -355,12 +355,15 @@ class StepLaunch(tuning.KernelOp):
     ROWS: ClassVar[tuple[str, ...]] = ('active', 'query', 'key', 'value', 'token', 'held', 'log_decay', 'gate',
                                        'beta', 'z', 'state')
 
-    def _fwd(self, active, *operands, hooks: Hooks, dtype: str, interpret: bool, config: Warps,
-             return_residuals: bool = False):
+    def _fwd(self, active, state, query=None, key=None, value=None, token=None, held=None, taps=None,
+             log_decay=None, gate=None, beta=None, log_a=None, bias=None, skip=None, z=None, weight=None, *,
+             hooks: Hooks, dtype: str, interpret: bool, config: Warps, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
-        given = dict(zip(_names(hooks), operands, strict=True))
-        state = given['state']
+        arrays = dict(state=state, query=query, key=key, value=value, token=token, held=held, taps=taps,
+                      log_decay=log_decay, gate=gate, beta=beta, log_a=log_a, bias=bias, skip=skip, z=z,
+                      weight=weight)
+        given = {name: arrays[name] for name in _names(hooks)}
         rows, value_heads, key_width, value_width = state.shape
         key_heads = (_pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
                      if hooks.conv is not None else given['query'].shape[1])
@@ -452,7 +455,7 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
         given['beta'] = given['beta'].reshape(rows, -1)
     if hooks.decay == 'scalar' and hooks.gates is None:
         given['log_decay'] = given['log_decay'].reshape(rows, -1)
-    results = StepLaunch()(flags, *given.values(), hooks=hooks,
-                           dtype=jnp.dtype(operand if dtype is None else dtype).name, interpret=not triton_runs())
+    results = StepLaunch()(flags, hooks=hooks, dtype=jnp.dtype(operand if dtype is None else dtype).name,
+                           interpret=not triton_runs(), **given)
     state, out = results[0], results[-1]
     return out, results[1] if hooks.conv is not None else None, state
