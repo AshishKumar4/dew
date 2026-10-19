@@ -209,8 +209,8 @@ def dew_points(args):
              for axis in (entry if isinstance(entry, tuple) else (entry,)) if axis is not None}
     hardware = {"devices": [device.device_kind for device in jax.devices()], "jax": jax.__version__,
                 "load_seconds": load_seconds,
-                "weights": {"devices": len({device for sharding in shardings for device in sharding.device_set}),
-                            "split_over": sorted(split)}}
+                "weights": {"split_over": sorted(split),
+                            "devices": len({device for sharding in shardings for device in sharding.device_set})}}
     points = []
     for slots in args.slots:
         count = args.requests or max(64, 2 * slots)
