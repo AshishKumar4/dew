@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from diffusion_support import relative_gap, walk
+from diffusion_support import SourceOracle, relative_gap, walk
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
 
@@ -827,13 +827,26 @@ def test_ddim_at_eta_one_steps_from_the_ddpm_posterior_on_every_gaussian_process
                                      f"DDIM at eta 1 on the {case} process")
 
 
-class DiffusersOracle(nn.Module):
-    """The model the source walks run on both sides (`tests/test_source_schedulers.py`), a bounded
-    function of the scaled input and the model time."""
+@pytest.mark.parametrize("solver", [DDIM(eta=1.0), DDPM("small"), DDPM("large")],
+                         ids=["ddim", "ddpm-small", "ddpm-large"])
+def test_a_step_between_equal_levels_draws_no_noise(solver):
+    """A step between two equal levels of a variance-exploding process, as a grid's plateau holds,
+    has a transition of no variance: its draw is multiplied by exactly zero, so two draws give one
+    result, compiled as a walk compiles it."""
+    process, model = karras_process()
+    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4)), jnp.ones((1,)))
+    denoise = process.denoiser(model, params, {})
+    x = jax.random.normal(jax.random.key(2), (8, 4), jnp.float32)
+    t = jnp.full((8,), 0.4, jnp.float32)
 
-    @nn.compact
-    def __call__(self, x, temb):
-        return jnp.sin(x) * 0.07 + jnp.reshape(temb, (-1,) + (1,) * (x.ndim - 1)) * 0.001
+    @jax.jit
+    def stepped(key):
+        denoised, eps = denoise(x, t)
+        return solver.step(x, t, t, denoised, eps, solver.init(x, jnp.asarray([0.4, 0.4]), process, key=key),
+                           key, process, denoise)[0]
+
+    first, second = (np.asarray(stepped(jax.random.key(seed))) for seed in (3, 4))
+    np.testing.assert_array_equal(first, second)
 
 
 def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
@@ -855,7 +868,7 @@ def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
     schedule = SourceSchedule.from_config(config)
     process, times = schedule.sampling(6)
     initial = np.random.default_rng(9).normal(size=(2, 3, 64)).astype(np.float32)
-    denoise = process.denoiser(DiffusersOracle(), {}, {})
+    denoise = process.denoiser(SourceOracle(), {}, {})
     _, walked = sample(denoise, jnp.asarray(initial), solver=DDIM(eta=1.0), key=3, times=times,
                        final_denoise=False, record=lambda x, _: x)
     draws = [np.asarray(jax.random.normal(jax.random.fold_in(request_key(3), index), initial.shape))
