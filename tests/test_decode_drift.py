@@ -9,7 +9,8 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import float64_forward
+from reference_error import FACTOR, distance, float64_forward
+from tool_support import load
 
 from dew.interop.pretrained import PretrainedDecoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -42,7 +43,35 @@ def test_an_unchanged_decoder_meets_the_gate_on_the_tokens_it_decoded(tmp_path):
     shifted = rows - rows.max(-1, keepdims=True)
     oracle = (shifted - np.log(np.exp(shifted).sum(-1, keepdims=True)))[np.arange(STEPS), scored["tokens"]]
     np.testing.assert_allclose(scored["truth"], oracle, rtol=1e-9, atol=1e-9)
+    # The cached reference replay, scored apart by one bf16 forward of the same weights over the same tokens:
+    # the replay no further from float64 than that forward, at every step from the first target to the last.
+    bf16 = model.clone(dtype=jnp.bfloat16)
+    narrow = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), variables)
+    rows = np.asarray(bf16.apply(narrow, jnp.asarray(sequence[:, :-1]))[0, PROMPT - 1:], np.float64)
+    shifted = rows - rows.max(-1, keepdims=True)
+    forward = (shifted - np.log(np.exp(shifted).sum(-1, keepdims=True)))[np.arange(STEPS), scored["tokens"]]
+    assert distance(scored["reference"], oracle) <= FACTOR * distance(forward, oracle)
     assert record["gate"]["whole"]["reference"] > 0, "the bf16 reference must sit off the truth to measure it"
     assert (done.returncode, record["passes"], record["gate"]["blocks_failed"]) == (0, True, [])
     assert record["reference_embedding_ulp"]["rms"] > 0
     assert record["reference_delta_rule"] is None
+
+
+def test_the_gate_fails_a_server_further_from_float64_or_from_the_reference_than_it_allows():
+    """The gate's two halves on arrays: a server twice as far from float64 as the reference fails the
+    accuracy half while it sits within the reference's noise; a server within accuracy but further from
+    the reference than the reference wavers fails the noise half; and a NaN fails both."""
+    gate = load("decode_drift").gate
+    rng = np.random.default_rng(0)
+    true = rng.normal(-3, 1, 256)
+    reference = true + rng.normal(0, 1e-3, 256)
+    noise = np.full(256, 1e-2)
+    assert gate(reference, reference, noise, true)["passes"]
+    far = true + 2.5 * (reference - true)
+    assert not gate(far, reference, noise, true)["accuracy"]["passes"]
+    assert gate(far, reference, noise, true)["noise"]["passes"]
+    quiet = np.full(256, 1e-4)
+    assert not gate(true - (reference - true), reference, quiet, true)["noise"]["passes"]
+    broken = reference.copy()
+    broken[100] = np.nan
+    assert not gate(broken, reference, noise, true)["passes"]

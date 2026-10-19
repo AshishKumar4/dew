@@ -15,11 +15,12 @@ thousands of decode steps.
 3. The truth: T scored by one float64 forward of the model over the prompt and T. The reference's and the
    server's bf16 prefills of the same are recorded beside it: decode against prefill.
 
-The gate: the server's per-step distance from the truth, in RMS over the decode and over every 64-step
-block, within the reference's own distance plus its noise over the same steps (`dew.accuracy.within`: a
-NaN or infinite anything fails). `passes` in the record, and the exit code. Qwen3.5's gated delta rule
-decodes through its fused step whatever `chosen` names (dew.nn.linear), so for it the reference shares the
-server's delta step until the decode honours the choice; the record says so (`reference_delta_rule`).
+The gate (`gate`) holds the server to the float64 truth as the accuracy rule holds a port, against the
+reference's own distance, over the decode and its worst 64-step block; and to the reference within the
+reference's own noise, as vLLM's K3 gate does. `passes` in the record, and the exit code. Qwen3.5's gated
+delta rule decodes through its fused step whatever `chosen` names (dew.nn.linear), so for it the reference
+shares the server's delta step until the decode honours the choice; the record says so
+(`reference_delta_rule`).
 """
 
 from __future__ import annotations
@@ -50,7 +51,10 @@ BATCH = 4
 DELTA_RULE_FAMILIES = ("qwen3_next", "qwen3_5_text", "qwen3_5_moe_text")
 """The families whose layers decode a gated delta rule (dew.interop.families.qwen)."""
 BLOCK = 64
-"""Steps a block of the gate covers, so error gathered in one stretch of the decode is not averaged away."""
+"""Steps a block of the accuracy gate covers (`gate`)."""
+FACTOR, BLOCK_FACTOR = 2.0, 4.0
+"""The accuracy rule's FACTOR and ROW_FACTOR (tests/reference_error.py), its whole RMS and its worst row,
+here the decode's RMS and its worst block."""
 
 
 def greedy(task):
@@ -137,16 +141,23 @@ def drift(first: np.ndarray, second: np.ndarray) -> dict:
 
 
 def gate(server: np.ndarray, reference: np.ndarray, noise: np.ndarray, true: np.ndarray) -> dict:
-    """The server's distance from the truth against the reference's plus its noise, over the whole decode
-    and each `BLOCK` steps of it (the module's docstring)."""
+    """Both halves of the module's gate, each `dew.accuracy.within` (a NaN or infinite anything fails).
+
+    Accuracy, the accuracy rule's (tests/reference_error.py): the server's RMS distance from float64 within
+    FACTOR times the reference's, and its worst `BLOCK`-step block within BLOCK_FACTOR times the
+    reference's worst, so error gathered in one stretch of the decode is not averaged away. Noise, vLLM's
+    K3 gate: the server's RMS distance from the reference within the RMS of what the reference itself
+    moves by in a batch of 4 or with its embedding one ulp up, step by step the larger."""
     blocks = [slice(start, start + BLOCK) for start in range(0, len(true), BLOCK)]
-    def measured(steps: slice) -> dict:
-        mine, theirs = rms(server[steps] - true[steps]), rms(reference[steps] - true[steps])
-        return {"server": mine, "reference": theirs, "noise": rms(noise[steps]),
-                "passes": within(mine, theirs + rms(noise[steps]))}
-    whole, parts = measured(slice(None)), [measured(steps) for steps in blocks]
-    failed = [index for index, part in enumerate(parts) if not part["passes"]]
-    return {"whole": whole, "blocks_failed": failed, "passes": whole["passes"] and not failed}
+    mine, theirs = rms(server - true), rms(reference - true)
+    worst = max(rms(server[steps] - true[steps]) for steps in blocks)
+    their_worst = max(rms(reference[steps] - true[steps]) for steps in blocks)
+    accuracy = {"server": mine, "reference": theirs, "server_worst_block": worst,
+                "reference_worst_block": their_worst,
+                "passes": within(mine, FACTOR * theirs) and within(worst, BLOCK_FACTOR * their_worst)}
+    drift, floor = rms(server - reference), rms(noise)
+    wavering = {"server_from_reference": drift, "reference_noise": floor, "passes": within(drift, floor)}
+    return {"accuracy": accuracy, "noise": wavering, "passes": accuracy["passes"] and wavering["passes"]}
 
 
 def main() -> int:
