@@ -471,9 +471,9 @@ class Plan:
             if before[key] != self.members[key]:
                 raise ValueError(f"saved data plan member {key} changed what it reads or runs")
         mixture = ("corpora", "members", "weights")
+        current = record(json_value(self.order, "order"), "order")
         if (_unplaced({name: value for name, value in order.items() if name not in mixture})
-                != _unplaced({name: value for name, value in json_value(self.order, "order").items()
-                              if name not in mixture})):
+                != _unplaced({name: value for name, value in current.items() if name not in mixture})):
             raise ValueError(f"saved data plan order changed: {order!r} -> {self.order!r}")
         return (*(f"member {key} joined" for key in sorted(set(self.members) - set(before))),
                 *(f"member {key} left" for key in sorted(set(before) - set(self.members))),

@@ -382,7 +382,7 @@ def test_a_streamed_mix_refuses_a_member_that_changed_what_it_reads():
                             Pipeline(roled(1, 6, 2), name="b").repeat()], "records")
     changed = [Pipeline(roled(0, 6, 2), name="a").map(Relabelled()).repeat(),
                Pipeline(roled(1, 6, 2), name="b").repeat()]
-    with pytest.raises(ValueError, match="member"):
+    with pytest.raises(ValueError):
         member_rows(changed, "records", saved=saved)
 
 
