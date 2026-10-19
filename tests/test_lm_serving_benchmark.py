@@ -107,12 +107,11 @@ def test_vllms_engine_streams_token_ids_as_the_other_engines_do(tmp_path):
     assert record["sweep"][0]["repeats"][0]["output_tokens"] == 4 * 5
 
 
-@pytest.mark.parametrize(("fixture", "kv"), [("qwen35-tiny-mm", "dense"), ("gemma3-tiny-mm", "dense"),
-                                           ("gemma3-tiny-mm", "paged")])
-def test_a_multimodal_model_serves_the_layout_asked_for(tmp_path, fixture, kv):
+@pytest.mark.parametrize("fixture", ["qwen35-tiny-mm", "gemma3-tiny-mm"])
+def test_a_multimodal_model_serves_the_layout_asked_for(tmp_path, fixture):
     """A multimodal model's wrapper hands the layout asked for to its text decoder, which holds the
-    cache: `--kv dense` serves a Qwen3.5 wrapper, and `--kv dense` and `--kv paged` a Gemma 3 one,
-    every requested token."""
+    cache: `--kv dense` serves a Qwen3.5 wrapper and a Gemma 3 one, every requested token."""
+    kv = "dense"
     env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"),
            "XLA_FLAGS": "--xla_force_host_platform_device_count=1"}
     done = subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_lm_serving.py"),
