@@ -138,7 +138,7 @@ ROUNDING_STREAM = 0x726F756E
 
 def training_rngs(key: jax.Array) -> dict[str, jax.Array]:
     """The RNG streams a model draws from `key` in a training pass: `dropout`,
-    and `stochastic_rounding`, which a `dew.training.Quantization` with
+    and `stochastic_rounding`, which a `dew.quantization.Quantization` with
     `bwd_stochastic_rounding` rounds its gradients from.
 
     The rounding stream is a fold of `key`, so its draws are not dropout's.
