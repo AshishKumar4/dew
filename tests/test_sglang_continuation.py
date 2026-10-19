@@ -102,8 +102,11 @@ class SGLang:
         path = request.url.path
         self.requests.append((path, body, dict(request.headers)))
         if path.endswith("/detokenize"):
-            return httpx2.Response(200, json={"text": [decoded(row, body.get("skip_special_tokens", True))
-                                                      for row in body["tokens"]]})
+            # One row of ids decodes to one text, a batch of rows to one text each (DetokenizeRequest).
+            skip, tokens = body.get("skip_special_tokens", True), body["tokens"]
+            batched = bool(tokens) and isinstance(tokens[0], list)
+            return httpx2.Response(200, json={"text": [decoded(row, skip) for row in tokens] if batched
+                                              else decoded(tokens, skip)})
         chat = path.endswith("/chat/completions")
         budget = body.get("max_completion_tokens" if chat else "max_tokens")
         prompts = [[9, 9]] if chat else [list(row) for row in body["prompt"]]
