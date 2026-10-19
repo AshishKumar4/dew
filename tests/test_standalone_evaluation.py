@@ -18,7 +18,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
-from dew.training import MeshSpec
+from dew.training import MeshSpec, evaluation
 
 
 def tiny_decoder(**fields):
@@ -42,8 +42,10 @@ class Recording:
 
 def test_a_run_compiles_its_evaluations_before_its_first_step(monkeypatch):
     """A run that evaluates between steps warms each suite beside its step's compile, before its
-    first step, reporting nothing of it: two batches and the preview, so the evaluations it
-    schedules then compile no program, and the tracker holds those alone."""
+    first step, reporting nothing of it: two batches and the preview. Every program the evaluations
+    it schedules then run to score a batch, pool it and preview, compiled there, and the tracker
+    holds those evaluations alone. Finalizing a pass's scores, which warming does not, is left to
+    the first."""
     model = tiny_decoder()
     objective = LMObjective(model, seq_len=4, samples=Samples([1, 2], 2, sampling=Sampling(temperature=0)))
     batch = {"text": np.tile(np.array([1, 2, 3, 4, 1], np.int32), (8, 1))}
@@ -51,20 +53,30 @@ def test_a_run_compiles_its_evaluations_before_its_first_step(monkeypatch):
                   batch=8)
     tracker = Recording()
     compiles, evaluations = [], []
-    run = Evaluation.run
 
     class Compiles(logging.Handler):
         def emit(self, record):
             if "Finished XLA compilation" in record.getMessage():
                 compiles.append(record.getMessage())
 
-    def counted(*args, **kwargs):
-        before = len(compiles)
-        result = run(*args, **kwargs)
-        evaluations.append((int(kwargs["step"]), result.records, compiles[before:]))
-        return result
+    def counted(function):
+        """`function`, its calls' compiles recorded beside the evaluation they fell in."""
+        def call(*args, **kwargs):
+            before = len(compiles)
+            result = function(*args, **kwargs)
+            evaluations[-1][2].extend(compiles[before:])
+            return result
+        return call
 
-    monkeypatch.setattr(Evaluation, "run", counted)
+    run = Evaluation.run
+
+    def evaluated(*args, **kwargs):
+        evaluations.append((int(kwargs["step"]), kwargs.get("warm", False), []))
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(Evaluation, "run", evaluated)
+    for name in ("_dispatched", "_merged", "_previewed"):
+        monkeypatch.setattr(evaluation, name, counted(getattr(evaluation, name)))
     handler, logger = Compiles(), logging.getLogger("jax")
     logger.addHandler(handler)
     try:
@@ -74,9 +86,9 @@ def test_a_run_compiles_its_evaluations_before_its_first_step(monkeypatch):
     finally:
         logger.removeHandler(handler)
     warm, *scheduled = evaluations
-    assert warm[:2] == (0, 16), warm
-    assert [(step, records) for step, records, _ in scheduled] == [(2, 16), (4, 16)], scheduled
-    assert [compiled for _, _, compiled in scheduled] == [[], []], scheduled
+    assert warm[:2] == (0, True) and warm[2], warm
+    assert [(step, warmed, compiled) for step, warmed, compiled in scheduled] == [
+        (2, False, []), (4, False, [])], scheduled
     assert sum(isinstance(artifact, TextSamples) for artifact in tracker.artifacts) == 2
 
 
