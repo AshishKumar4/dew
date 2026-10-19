@@ -155,7 +155,7 @@ from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.optim import learning_rate, with_rate_scales
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
-from dew.training.runtime import Preempted, PreemptionNotice
+from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best
 from dew.training.state import Accumulation, TrainState
 from dew.training.tracker import Tracker
@@ -1408,11 +1408,16 @@ class Trainer(Generic[Loss, Effects]):
 
         Previews are generated only when `preview=True` and a tracker receives them;
         scalar reporting never triggers preview work.
+
+        The process is readied first (`dew.training.runtime.ready_process`), as
+        `prepare_process` readies it: a program that never called that gets Dew's
+        log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
         """
         if steps is epochs is tokens is None or None not in (steps, epochs):
             raise ValueError("fit's run length is steps= or epochs=, or tokens=, which also caps either")
         if tokens is not None and not self.objective.counts_tokens:
             raise ValueError("tokens= needs an objective that counts real tokens")
+        ready_process()
         loader, validation = fitted(dataset, validation, objective=self.objective.data())
         self._device = loader.device
         if epochs is not None:

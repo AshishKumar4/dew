@@ -24,6 +24,7 @@ from packaging.version import Version
 
 from dew.cache import enable_compilation_cache
 from dew.coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
+from dew.logging import configure as configure_logging
 from dew.pool import (
     COORDINATOR,
     PREEMPTED_EXIT,
@@ -39,7 +40,7 @@ from dew.telemetry.devices import (
     apply_xla_flags,
     cuda_plugin,
     preallocate_gpu_pool,
-    unpartition_gpu_pool,
+    refuse_cpu_only_jax,
     xla_flag,
 )
 
@@ -98,11 +99,22 @@ def prepare_process(wandb: Wandb | None = None,
     _set_environment(wandb, xla_flags, compilation_cache_dir)
     _raise_limits()
     _join_process_pool(multi_host)
+    ready_process()
     if layout is not None and "variables" in layout.host:
         from dew.training.distributed import MeshSpec
         from dew.training.host import companion_mesh
         companion_mesh(MeshSpec().build())
     _log.info("Number of devices: %s", jax.device_count())
+
+
+def ready_process() -> None:
+    """What every Dew run needs of its process and `import dew` leaves alone: Dew's log handler
+    (`dew.logging.configure`), and the refusal of a machine with an NVIDIA GPU whose JAX opened
+    with none (`dew.telemetry.devices.refuse_cpu_only_jax`). `prepare_process` readies the process
+    once its flags are set and its pool joined, and `Trainer.fit` readies one no `prepare_process`
+    did; each step is idempotent."""
+    configure_logging()
+    refuse_cpu_only_jax()
 
 
 def _set_environment(wandb: Wandb | None, xla_flags: str | None,
@@ -115,7 +127,6 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
     # HF tokenizers fork a thread pool; grain's workers fork the process.
     os.environ['TOKENIZERS_PARALLELISM'] = "false"
     apply_xla_flags(xla_flags)
-    unpartition_gpu_pool()
     preallocate_gpu_pool()
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)
