@@ -122,10 +122,12 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     from dew.data.holdout import rebased
     from dew.data.packing import PackedSource, chunks_for, plan_name
 
-    def cut(stages: Sequence[Stage]) -> int:
-        """1 where a chunk step cuts documents as the pack after it plans them (`chunks_for`), else 0."""
-        return int(len(stages) > 1 and isinstance(stages[0], FlatMap) and isinstance(stages[1], Pack)
-                   and chunks_for(stages[0].step, stages[1]))
+    def cutting(stages: Sequence[Stage]) -> int | None:
+        """The overlap of a chunk step that cuts documents as the pack after it plans them
+        (`chunks_for`), or None where none comes first."""
+        if len(stages) > 1 and isinstance(stages[0], FlatMap) and isinstance(stages[1], Pack):
+            return chunks_for(stages[0].step, stages[1])
+        return None
 
     source, stages = pipeline.source, pipeline.stages
     if isinstance(source, (Mixture, Phases)):
@@ -135,13 +137,17 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
             generation = stage.cache.source()
             source, stages = rebased(source, generation), stages[index + 1 :]
             plans = record(stage.cache.manifest.get("plan", {}), "published plans")
-            at = cut(stages)
+            overlap = cutting(stages)
+            at = int(overlap is not None)
             packing = stages[at] if len(stages) > at else None
-            if source is generation and isinstance(packing, Pack) and plan_name(packing, "accepted") in plans:
-                source = PackedSource.published(source, stage.cache, packing, chunked=bool(at))
+            # A published plan cuts a document as a window-long chunk step without overlap does.
+            if (source is generation and isinstance(packing, Pack) and plan_name(packing, "accepted") in plans
+                    and overlap in (None, 0)):
+                source = PackedSource.published(source, stage.cache, packing, chunked=overlap is not None)
                 stages = stages[at + 1 :]
             break
-    at = cut(stages)
+    overlap = cutting(stages)
+    at = int(overlap is not None)
     pack = stages[at] if len(stages) > at else None
     if (
         isinstance(pack, Pack)
@@ -151,7 +157,7 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         and source.supports("indexed")
         and source.lengths() is not None
     ):
-        source, stages = PackedSource.planned(source, pack, chunked=bool(at)), stages[at + 1 :]
+        source, stages = PackedSource.planned(source, pack, overlap=overlap), stages[at + 1 :]
     return dataclasses.replace(pipeline, source=source, stages=stages)
 
 
@@ -486,10 +492,7 @@ def _analyzed(
         eager += 1
     per_share = _checked(pipeline, read, ancestry, eager, validation=validation, promotion=promotion)
     if isinstance(source, Mixture) and source.tokens is not None:
-        per_share = per_share or any(
-            isinstance(child.source, (Mixture, Phases)) or "valid_targets" not in child.source.metadata()
-            for child in nested
-        )
+        per_share = per_share or not all(_states_its_targets(child) for child in nested)
     per_share = per_share or any(child.per_share for child in children)
     children = tuple(_cut(child, per_share) for child in children)
     steps = (*ancestry, *stages)
@@ -546,6 +549,17 @@ def _analyzed(
     if per_share and lowering.split and not validation and not configured:
         raise ValueError(f"token split in {_name(pipeline)} needs a global record order, not one per share")
     return lowering
+
+
+def _states_its_targets(pipeline: Pipeline) -> bool:
+    """Whether a corpus a mixture weighs by tokens delivers the rows its source's stated rows and
+    valid targets count, so a weight from them holds its share of the targets (`token_weights`):
+    a source that states them, whose epoch reads every row alike: no slice, limit or token split
+    before its repeat takes a part of them. Any other corpus's targets are counted as its rows
+    arrive (`TokenDeficit`)."""
+    source, epoch = pipeline.source, pipeline.stages[: _until(pipeline.stages, (Repeat,))]
+    return (not isinstance(source, (Mixture, Phases)) and "valid_targets" in source.metadata()
+            and not any(isinstance(stage, (Slice, Limit, TokenSplit)) for stage in epoch))
 
 
 def _cut(lowering: _Lowering, per_share: bool) -> _Lowering:
