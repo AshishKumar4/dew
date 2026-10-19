@@ -24,7 +24,6 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
-
 from .activations import gated_product
 from .attention_kernels import (
     ATTENTION,
