@@ -721,7 +721,7 @@ def edm_noise_figure():
     process = EDM(regime="pixel")()
     _, sigmas = (np.asarray(v) for v in process.sampler_schedule.rates(process.times(8)))
     sigmas = sigmas[::-1]
-    width, height, size = 440, 300, 168
+    width, height, size = 440, 272, 168
     svg = Figure(width, height, seconds=10, label="One flower with more and more noise: x_t = x0 + sigma "
                  "epsilon at eight of EDM's noise levels, from sigma 0.002, where it is clean, to sigma 80, "
                  "where only noise is left.")
