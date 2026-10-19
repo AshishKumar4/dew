@@ -146,7 +146,7 @@ def test_a_server_over_loaded_weights_places_them_once():
 
 @pytest.mark.mesh(devices=2)
 def test_a_task_places_loaded_weights_on_the_default_device_as_its_compute_reads_them():
-    """A task over host weights places them where JAX's default device is, as its requests are, and
+    """A task over host weights places them where JAX's default device is, committed there, and
     in the storage decoding reads (`decoding_storage`), cast on the host: a bfloat16 load's float32
     masters reach the device as the host's own bfloat16 rounding of them, no float32 copy."""
     from dew.interop.weights import decoding_storage
@@ -155,6 +155,8 @@ def test_a_task_places_loaded_weights_on_the_default_device_as_its_compute_reads
         bound = _host_loaded("bfloat16")
         placed = bound.placed
     assert {leaf.devices().pop() for leaf in jax.tree.leaves(placed)} == {jax.devices()[1]}
+    # Committed there, so a call made outside the context runs on them rather than moving them.
+    assert all(leaf.committed for leaf in jax.tree.leaves(placed))
     cast = decoding_storage(bound.model, bound.variables)
     for leaf, host in zip(jax.tree.leaves(placed), jax.tree.leaves(cast), strict=True):
         assert leaf.dtype == host.dtype
