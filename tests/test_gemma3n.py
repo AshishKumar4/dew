@@ -223,6 +223,8 @@ def test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_on
 
     from dew.objectives.lm import LMObjective
     from dew.objectives.rl import GRPOObjective, PPOObjective, ValueHead
+    from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
+    from dew.objectives.rl.sessions import RESPONSE_MASK_KEY
     from dew.training import Trainer
 
     loaded, model, clip = clipped_gemma3n()
@@ -238,6 +240,10 @@ def test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_on
                 return PPOObjective(model, seq_len, critic=ValueHead(model), variables=loaded.variables)
 
             task, rows = packed(build)
+            if objective == "ppo":
+                # The rollout's critic values and returns, on the response tokens.
+                mask = np.asarray(rows[RESPONSE_MASK_KEY], np.float32)
+                rows = {**rows, OLD_VALUES_KEY: 0.5 * mask, RETURNS_KEY: mask}
             # Every device takes a row: the packed rows repeat, as a loader cycles them.
             every = np.arange(jax.device_count())
             batch = jax.tree.map(lambda leaf: np.asarray(leaf)[every % len(leaf)], rows)
