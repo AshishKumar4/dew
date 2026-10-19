@@ -170,11 +170,29 @@ def _fused_kernel(active_ref, mixed_ref, held_ref, taps_ref, gate_ref, beta_ref,
                   key_width: int, value_width: int, epsilon: float, activation: str):
     """One row and one value head of a gated delta net's decode token (`fused_step`): its conv, gates,
     update and gated norm. The conv's channels are read where the row holds them, `[K - 1, C]` history
-    and `[C]` token; its key head's query and key history is written by the head's first value head."""
+    and `[C]` token, and the history the next token reads is written apart (`conv_out`), so no head
+    reads a history another has moved on: its key head's query and key channels by the head's first
+    value head, its values by itself, an idle row's as they were."""
     head = pl.program_id(1)
     key_head = head // group
     active = active_ref[0] != 0
     count = taps_ref.shape[-1]
+    pieces = ((key_head * key_width, key_width), ((key_heads + key_head) * key_width, key_width),
+              (2 * key_heads * key_width + head * value_width, value_width))
+
+    def write(first, width, rows):
+        for j, row in enumerate(rows):
+            conv_out[j, pl.ds(first, width)] = row.astype(conv_out.dtype)
+
+    def written(moved):
+        """The head's channels of the history: its values, and its key head's query and key where it is
+        the key head's first value head."""
+        write(*pieces[2], moved[2])
+
+        @pl.when(head % group == 0)
+        def _():
+            write(*pieces[0], moved[0])
+            write(*pieces[1], moved[1])
 
     def convolved(first: int | jax.Array, width: int):
         """The silu of a channel range's conv, and its history moved on by the token."""
@@ -191,9 +209,7 @@ def _fused_kernel(active_ref, mixed_ref, held_ref, taps_ref, gate_ref, beta_ref,
 
     @pl.when(active)
     def _():
-        query, query_moved = convolved(key_head * key_width, key_width)
-        key, key_moved = convolved((key_heads + key_head) * key_width, key_width)
-        value, value_moved = convolved(2 * key_heads * key_width + head * value_width, value_width)
+        (query, query_moved), (key, key_moved), (value, value_moved) = (convolved(*piece) for piece in pieces)
         query, key = unit(query) * key_width ** -0.5, unit(key)
         gate = gate_ref[head].astype(jnp.float32) + bias_ref[head].astype(jnp.float32)
         decay = jnp.exp(-jnp.exp(log_decay_ref[head].astype(jnp.float32)) * jax.nn.softplus(gate))
@@ -210,20 +226,12 @@ def _fused_kernel(active_ref, mixed_ref, held_ref, taps_ref, gate_ref, beta_ref,
         z = z_ref[pl.ds(head * value_width, value_width)].astype(jnp.float32)
         gated = normed * (z * jax.nn.sigmoid(z) if activation == 'silu' else jax.nn.sigmoid(z))
         out_ref[pl.ds(head * value_width, value_width)] = gated.astype(out_ref.dtype)
-        for j, row in enumerate(value_moved):
-            conv_out[j, pl.ds(2 * key_heads * key_width + head * value_width, value_width)] = (
-                row.astype(conv_out.dtype))
-
-        @pl.when(head % group == 0)
-        def _():
-            for first, moved in ((key_head * key_width, query_moved),
-                                 ((key_heads + key_head) * key_width, key_moved)):
-                for j, row in enumerate(moved):
-                    conv_out[j, pl.ds(first, key_width)] = row.astype(conv_out.dtype)
+        written((query_moved, key_moved, value_moved))
 
     @pl.when(jnp.logical_not(active))
     def _():
         out_ref[pl.ds(head * value_width, value_width)] = jnp.zeros((value_width,), out_ref.dtype)
+        written([[held_ref[j, pl.ds(first, width)] for j in range(count - 1)] for first, width in pieces])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -273,7 +281,7 @@ class FusedStep(tuning.KernelOp):
             out_shape=[jax.ShapeDtypeStruct(state.shape, state.dtype),
                        jax.ShapeDtypeStruct(held.shape, held.dtype),
                        jax.ShapeDtypeStruct((rows, value_heads * value_width), jnp.dtype(dtype))],
-            input_output_aliases={10: 0, 2: 1},
+            input_output_aliases={10: 0},
             compiler_params=plgpu.CompilerParams(num_warps=config.warps),
             interpret=interpret, name="gated_delta_decode",
         )(active, mixed, held, taps, gate, beta, log_decay, bias, z, weight, state)), None
@@ -298,8 +306,8 @@ def fused_step(mixed, held, taps, gate, beta, log_decay, bias, z, weight, state,
     gates before their activations, `log_decay` (A_log) and `bias` (dt_bias) `[Hv]`, `z` `[rows, Hv *
     Dv]` the output gate, `weight` `[Dv]` the gated norm's, of `epsilon` and gate `activation`, and
     `state` `[rows, Hv, Dk, Dv]` held as `step`'s is. The output `[rows, Hv * Dv]` is in `dtype`; the
-    history and the state are updated in place where the caller lets them go. A row `active` `[rows]`
-    marks False is untouched, its output zeros. The arithmetic is the unfused layer's (the conv and
+    state is updated in place where the caller lets it go. A row `active` `[rows]`
+    marks False keeps its history and state, its output zeros. The arithmetic is the unfused layer's (the conv and
     its silu in fp32, the queries and keys l2-normalized, `step`, then the gated norm in fp32), its
     sums in another order."""
     rows = state.shape[0]
