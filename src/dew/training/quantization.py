@@ -62,7 +62,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.nn.fake_quant import correctly_rounded_divide
 from dew.nn.kernels.generation import backend
-from dew.nn.precision import asks_default_precision
+from dew.nn.precision import asks_default_arithmetic, asks_default_precision
 
 if TYPE_CHECKING:
     from qwix import QuantizationProvider
@@ -1108,7 +1108,7 @@ def _providers() -> tuple[type, type]:
             if not self._matched("dot_general"):
                 return super().dot_general(lhs, rhs, dimension_numbers, precision,
                                            preferred_element_type, out_sharding=out_sharding)
-            if not asks_default_precision(precision):
+            if not asks_default_arithmetic(precision, lhs.dtype):
                 return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
                                            preferred_element_type=preferred_element_type,
                                            out_sharding=out_sharding)
