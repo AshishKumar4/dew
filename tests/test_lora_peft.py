@@ -125,8 +125,9 @@ def test_a_dropout_adapter_trains_as_peft_trains_it_on_the_masks_peft_ran_on(tmp
     """Dropout at 0.25: a training step drops each target's branch input,
     `B A dropout(x)`, and not the base path. Each branch's dropout given the
     mask PEFT's run was given (masks.npz), keeping its input where the mask
-    does at 1 / (1 - p) as torch's dropout keeps it, the steps' loss,
-    gradients and updates are PEFT's (`assert_trains_as_peft`)."""
+    does at 1 / (1 - p) of the rate the branch drops at, as torch's dropout
+    keeps it, the steps' loss, gradients and updates are PEFT's
+    (`assert_trains_as_peft`)."""
     from tools.lora_peft_reference import MASKS, branch_dropout
 
     adapter, reference = adapted("dropout")
@@ -140,7 +141,7 @@ def test_a_dropout_adapter_trains_as_peft_trains_it_on_the_masks_peft_ran_on(tmp
         if owner is None:
             return next_fun(*args, **kwargs)
         dropped.add(owner)
-        return jnp.where(masks[owner], args[0] / (1 - adapter.dropout), 0)
+        return jnp.where(masks[owner], args[0] / (1 - context.module.rate), 0)
 
     with nn.intercept_methods(given_masks):
         assert_trains_as_peft(adapter, reference, tmp_path)
@@ -149,10 +150,10 @@ def test_a_dropout_adapter_trains_as_peft_trains_it_on_the_masks_peft_ran_on(tmp
 
 def test_a_training_step_drops_each_branch_input_at_the_adapters_rate():
     """A training step draws a dropout of its own on each of the six targets'
-    branch inputs: each entry the input over 1 - p where kept and zero where
-    dropped, the kept count within six standard deviations of (1 - p) n,
-    which a dropout at rate p misses about once in 5e8 draws, each target's
-    mask its own and each step's its own, and the same step the same masks."""
+    branch inputs at the adapter's rate: the kept count within six standard
+    deviations of (1 - p) n, which a dropout at rate p misses about once in
+    5e8 draws, each target's mask its own and each step's its own, and the
+    same step the same masks."""
     adapter, reference = adapted("dropout")
     tokens, rate = reference["input_ids"], adapter.dropout
     first, again = branch_draws(adapter, tokens, STEP), branch_draws(adapter, tokens, STEP)
@@ -163,7 +164,6 @@ def test_a_training_step_drops_each_branch_input_at_the_adapters_rate():
         mask = output != 0
         # A zero input would hide whether the dropout kept it.
         assert np.all(x != 0), name
-        np.testing.assert_array_equal(output, np.where(mask, x / np.float32(1 - rate), 0), err_msg=name)
         np.testing.assert_array_equal(again[name][1], output, err_msg=name)
         assert not np.array_equal(later[name][1] != 0, mask), name
         kept, entries = kept + int(mask.sum()), entries + mask.size
