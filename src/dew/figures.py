@@ -446,26 +446,26 @@ def heatmap(frames: Sequence[Sequence[Sequence[float]]], *, rows: Sequence[str],
 
 
 def tokens(rows: Sequence[Sequence[str]], *, fills: Sequence[Sequence[Role]], notes: Sequence[str] = (),
-           header: str = "", cell: float = 27, seconds: float = 0.0) -> Figure:
-    """Rows of token boxes, `fills[i][j]` filling token j of row i ("none" leaves it an outline), with
-    `notes[i]` beside row i. With `seconds`, the rows appear one after another."""
-    longest = max(len(row) for row in rows)
-    left, top, gap = 12, 34 if header else 12, 6
-    note_x = left + longest * cell + 16
-    width = note_x + (max(len(note) for note in notes) * 8.6 if notes else 0) + 12
+           cell: float = 27, seconds: float = 0.0) -> Figure:
+    """Rows of token boxes, each as wide as its text and at least `cell`, `fills[i][j]` filling token j
+    of row i ("none" leaves it an outline), with `notes[i]` beside row i. With `seconds`, the rows
+    appear one after another."""
+    # A monospace character is about 0.6 of the font size wide.
+    boxes = [[max(cell, 0.6 * TEXT * len(token) + 14) for token in row] for row in rows]
+    left, top, gap = 12, 12, 6
+    note_x = left + max(sum(row) for row in boxes) + 16
+    width = note_x + (max(len(note) for note in notes) * 0.6 * SMALL if notes else 0) + 12
     height = top + len(rows) * (cell + gap) + 6
     figure = Figure(width, height, seconds=seconds, label="token rows")
-    if header:
-        figure.text(note_x, 20, header, size=SMALL, color="muted", mono=True)
     for i, row in enumerate(rows):
         with figure.group() as group:
-            y = top + i * (cell + gap)
-            for j, token in enumerate(row):
-                fill = fills[i][j]
+            y, x = top + i * (cell + gap), left
+            for token, fill, box in zip(row, fills[i], boxes[i], strict=True):
                 outline: Role = "rule" if fill == "none" else "none"
-                figure.rect(left + j * cell, y, cell - 4, cell, fill=fill, stroke=outline, rx=4)
-                figure.text(left + j * cell + (cell - 4) / 2, y + cell / 2 + 5, token, size=TEXT, mono=True,
+                figure.rect(x, y, box - 4, cell, fill=fill, stroke=outline, rx=4)
+                figure.text(x + (box - 4) / 2, y + cell / 2 + 5, token, size=TEXT, mono=True,
                             anchor="middle", color="muted" if fill == "none" else "text")
+                x += box
             if notes:
                 figure.text(note_x, y + cell / 2 + 5, notes[i], size=SMALL, mono=True)
         if seconds:
