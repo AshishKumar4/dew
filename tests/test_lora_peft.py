@@ -1,13 +1,16 @@
 """LoRA's rsLoRA scaling and its branch dropout in training against PEFT
-0.20.0's own forward and backward (`tools/lora_peft_reference.py`), and a
-target that contracts and produces several axes against a float64 oracle
-of its forward and its factors' gradient."""
+0.20.0's own forward, backward and AdamW steps
+(`tools/lora_peft_reference.py`), and a target that contracts and produces
+several axes against a float64 oracle of its forward and its factors'
+gradient."""
 
+import itertools
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
 from safetensors.numpy import load_file
@@ -17,6 +20,7 @@ from dew.interop.pretrained import Pretrained
 from dew.lora import Adapter, LoRA, Target
 from dew.objectives.base import Step, merge
 from dew.objectives.lm import LMObjective
+from dew.training.optim import OPTIMIZER_MAP
 
 ROOT = Path(__file__).resolve().parents[1]
 LLAMA = ROOT / "tests" / "fixtures" / "hf" / "llama-tiny"
@@ -24,7 +28,8 @@ FIXTURES = ROOT / "tests" / "fixtures" / "lora_peft"
 
 
 STEP = Step(step=jnp.int32(0), key=jax.random.key(1), ema=None)
-"""The training step whose loss the fixtures' gradients are, and whose draw `dew_masks` reads."""
+"""The training step whose loss the fixtures' gradients are, and whose draw `dew_masks` wrote
+masks.npz from."""
 
 
 def adapted(case: str):
@@ -37,8 +42,12 @@ def adapted(case: str):
 
 
 def assert_trains_as_peft(adapter, reference, tmp_path):
-    """One training step's mean next-token cross entropy, and its gradient in all twelve factors
-    exported in PEFT's layout (`Adapter.save`), held to PEFT's float64 run by the float64 rule."""
+    """One training step's mean next-token cross entropy and its gradient in all twelve factors, and
+    what two steps of Dew's AdamW (`OPTIMIZER_MAP`, at PEFT's run's settings `ADAMW`) move each
+    factor by, the factors exported in PEFT's layout (`Adapter.save`): each held to PEFT's float64
+    run by the float64 rule against its float32 one."""
+    from tools.lora_peft_reference import ADAMW
+
     tokens = jnp.asarray(reference["input_ids"])
     objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
     params = objective.init(jax.random.key(0))
@@ -49,15 +58,54 @@ def assert_trains_as_peft(adapter, reference, tmp_path):
 
     value, gradient = jax.value_and_grad(loss)(params["params"])
     assert_as_exact_as_the_reference(np.asarray(value), reference["loss"], reference["loss_f64"], "the loss")
-    adapter.save(merge(adapter.variables, {"params": gradient}), tmp_path)
-    exported = {key.removeprefix(lora.PEFT_PREFIX): value
-                for key, value in load_file(tmp_path / lora.PEFT_WEIGHTS).items()}
     names = sorted(key.removeprefix("grad/") for key in reference
                    if key.startswith("grad/") and not key.endswith("_f64"))
+    exported = peft_factors(adapter, gradient, tmp_path / "gradient")
     assert sorted(exported) == names and len(names) == 12
-    assert_leaves_as_exact({name: np.asarray(exported[name]) for name in names},
-                           {name: reference[f"grad/{name}"] for name in names},
+    assert_leaves_as_exact(exported, {name: reference[f"grad/{name}"] for name in names},
                            {name: reference[f"grad/{name}_f64"] for name in names})
+
+    adamw = OPTIMIZER_MAP["adamw"](ADAMW["lr"], *ADAMW["betas"], ADAMW["eps"],
+                                   weight_decay=ADAMW["weight_decay"])
+    moving, state = params["params"], adamw.init(params["params"])
+    for _ in range(2):
+        updates, state = adamw.update(jax.grad(loss)(moving), state, moving)
+        moving = optax.apply_updates(moving, updates)
+    start = peft_factors(adapter, params["params"], tmp_path / "start")
+    stepped = peft_factors(adapter, moving, tmp_path / "stepped")
+    # Each factor's move, from the float32 factors both runs start at: exact in float64.
+    assert_leaves_as_exact({name: stepped[name] - start[name] for name in names},
+                           {name: reference[f"stepped/{name}"] - start[name] for name in names},
+                           {name: reference[f"stepped/{name}_f64"] - start[name] for name in names})
+
+
+def peft_factors(adapter, factors, directory) -> dict[str, np.ndarray]:
+    """The tree `factors`, shaped as the adapter's own, exported in PEFT's layout (`Adapter.save`)
+    and read back, by PEFT's module path, as float64."""
+    adapter.save(merge(adapter.variables, {"params": factors}), directory)
+    return {key.removeprefix(lora.PEFT_PREFIX): np.asarray(value, np.float64)
+            for key, value in load_file(directory / lora.PEFT_WEIGHTS).items()}
+
+
+def branch_draws(adapter, tokens: np.ndarray, step: Step) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Each target branch's dropout in the LM objective's training loss over `tokens` at `step`,
+    keyed by the target's PEFT module path (`branch_dropout`): its input and its output."""
+    from tools.lora_peft_reference import branch_dropout
+
+    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
+    params = objective.init(jax.random.key(0))
+    drawn = {}
+
+    def capture(next_fun, args, kwargs, context):
+        output = next_fun(*args, **kwargs)
+        owner = branch_dropout(adapter, context)
+        if owner is not None:
+            drawn[owner] = (np.asarray(args[0]), np.asarray(output))
+        return output
+
+    with nn.intercept_methods(capture):
+        objective.loss(params, {"text": jnp.asarray(tokens)}, step)
+    return drawn
 
 
 def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it(tmp_path):
@@ -73,21 +121,56 @@ def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it(tmp_path):
     assert_trains_as_peft(adapter, reference, tmp_path)
 
 
-def test_a_dropout_adapter_trains_as_peft_trains_it_on_the_masks_it_draws(tmp_path):
+def test_a_dropout_adapter_trains_as_peft_trains_it_on_the_masks_peft_ran_on(tmp_path):
     """Dropout at 0.25: a training step drops each target's branch input,
-    `B A dropout(x)`, and not the base path. The masks this step draws are the
-    ones PEFT's run was given (`dew_masks`, masks.npz), so the step's loss and
-    gradients are PEFT's on the same draw (`assert_trains_as_peft`)."""
-    from tools.lora_peft_reference import MASKS, dew_masks
+    `B A dropout(x)`, and not the base path. Each branch's dropout given the
+    mask PEFT's run was given (masks.npz), keeping its input where the mask
+    does at 1 / (1 - p) as torch's dropout keeps it, the steps' loss,
+    gradients and updates are PEFT's (`assert_trains_as_peft`)."""
+    from tools.lora_peft_reference import MASKS, branch_dropout
 
     adapter, reference = adapted("dropout")
     assert (adapter.rslora, adapter.dropout) == (False, 0.25)
-    drawn = dew_masks(adapter, reference["input_ids"])
     with np.load(FIXTURES / "dropout" / MASKS) as given:
-        assert sorted(drawn) == sorted(given.files) and len(drawn) == 6
-        for name, mask in drawn.items():
-            np.testing.assert_array_equal(mask, given[name], err_msg=name)
-    assert_trains_as_peft(adapter, reference, tmp_path)
+        masks = {name: given[name] for name in given.files}
+    dropped = set()
+
+    def given_masks(next_fun, args, kwargs, context):
+        owner = branch_dropout(adapter, context)
+        if owner is None:
+            return next_fun(*args, **kwargs)
+        dropped.add(owner)
+        return jnp.where(masks[owner], args[0] / (1 - adapter.dropout), 0)
+
+    with nn.intercept_methods(given_masks):
+        assert_trains_as_peft(adapter, reference, tmp_path)
+    assert dropped == set(masks) and len(dropped) == 6
+
+
+def test_a_training_step_drops_each_branch_input_at_the_adapters_rate():
+    """A training step draws a dropout of its own on each of the six targets'
+    branch inputs: each entry the input over 1 - p where kept and zero where
+    dropped, the kept count within six standard deviations of (1 - p) n,
+    which a dropout at rate p misses about once in 5e8 draws, each target's
+    mask its own and each step's its own, and the same step the same masks."""
+    adapter, reference = adapted("dropout")
+    tokens, rate = reference["input_ids"], adapter.dropout
+    first, again = branch_draws(adapter, tokens, STEP), branch_draws(adapter, tokens, STEP)
+    later = branch_draws(adapter, tokens, Step(step=jnp.int32(1), key=jax.random.key(2), ema=None))
+    assert len(first) == 6
+    kept, entries = 0, 0
+    for name, (x, output) in first.items():
+        mask = output != 0
+        # A zero input would hide whether the dropout kept it.
+        assert np.all(x != 0), name
+        np.testing.assert_array_equal(output, np.where(mask, x / np.float32(1 - rate), 0), err_msg=name)
+        np.testing.assert_array_equal(again[name][1], output, err_msg=name)
+        assert not np.array_equal(later[name][1] != 0, mask), name
+        kept, entries = kept + int(mask.sum()), entries + mask.size
+    assert abs(kept - (1 - rate) * entries) <= 6 * np.sqrt(rate * (1 - rate) * entries)
+    masks = [output != 0 for _, output in first.values()]
+    for one, other in itertools.combinations(masks, 2):
+        assert one.shape != other.shape or not np.array_equal(one, other)
 
 
 class Host(nn.Module):
