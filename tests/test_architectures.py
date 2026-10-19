@@ -28,6 +28,7 @@ from flax import linen as nn
 from recording import RecordingTracker
 from reference_error import assert_leaves_as_exact, float64_terms
 
+from dew.accuracy import distance
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import ModelConfig, ObjectiveConfig
 from dew.config.data import ImageData
@@ -314,16 +315,17 @@ each gradient's own size, so where a gradient is zero in exact arithmetic
 full step whose sign no order of summation fixes."""
 
 
-def make_trainer(case: Case, tmp_path, fsdp, tracker=None, devices=None, optimizer=LINEAR):
+def make_trainer(case: Case, tmp_path, fsdp, tracker=None, devices=None, optimizer=LINEAR, split=None):
     """The trainer a recipe would build for this case: a registry model, the
     real objective, a real optimizer, no wandb, over `devices` devices (all
-    by default)."""
+    by default), each step's batch read in `split` microbatches (planned
+    where None)."""
     encoder = None if case.is_lm or case.is_jepa else StubText.from_pretrained(
         "stub", tokens=TEXT_TOKENS, features=TEXT_FEATURES, vocab=TEXT_VOCAB)
     model = models.build(case.architecture, **case.config)
     trainer = Trainer(
         make_objective(case, model, encoder), optimizer, key=jax.random.key(0),
-        mesh=MeshSpec(fsdp=fsdp), layout=Layout(min_shard=TINY_SHARD),
+        mesh=MeshSpec(fsdp=fsdp), layout=Layout(min_shard=TINY_SHARD), split=split,
         checkpoints=Checkpoints(str(tmp_path / f"{case.name}-fsdp{fsdp}")), tracker=tracker)
     if devices is not None:
         trainer.device_mesh = trainer.mesh.build(jax.devices()[:devices])
@@ -344,14 +346,16 @@ def fsdp_leaves(tree):
     return [leaf for leaf in jax.tree.leaves(tree) if 'fsdp' in str(leaf.sharding.spec)]
 
 
-def run_case(case: Case, tmp_path, fsdp, devices=None, state=None, steps=2):
+def run_case(case: Case, tmp_path, fsdp, devices=None, state=None, steps=2, split=None):
     """One run of `steps` steps on the mesh over `devices` devices (all by
     default), from `state` (the trainer's own initial state by default),
+    each step's batch read in `split` microbatches (planned where None),
     with everything the assertions read: the trainer, the state and the
     training losses."""
     seen = []
     tracker = RecordingTracker()
-    trainer, encoder = make_trainer(case, tmp_path / f"{devices}-{fsdp}-{steps}", fsdp, tracker, devices)
+    trainer, encoder = make_trainer(case, tmp_path / f"{devices}-{fsdp}-{steps}-{split}", fsdp, tracker,
+                                    devices, split=split)
     artifact, shape = expected_artifact(case)
     source = batches(case, encoder)
 
@@ -570,7 +574,13 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     they read, which their own terms do not see (Gemma 3n's altup output
     scale, a cancelling gradient's smallest element, carries it into a
     per-layer gate's row). Adam's two moments and its count follow the
-    parameters' placement too."""
+    parameters' placement too.
+
+    Each layout's reference is the farther from float64, leaf by leaf, of
+    one device on the whole batch and one device reading it in the
+    layout's per-device rows, so XLA's shape-dependent fp32 dots (an Intel
+    CPU's are nearer float64 at the whole batch's shapes) are no layout
+    effect."""
     initial = make_trainer(case, tmp_path / "initial", 1, devices=1)[0].initial_state()
 
     def copied():
@@ -586,6 +596,9 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     def as_near(steps, rows):
         _, alone, _ = run_case(case, tmp_path, fsdp=1, devices=1, state=copied(), steps=steps)
         layouts = [run_case(case, tmp_path, fsdp=fsdp, state=copied(), steps=steps)[1] for fsdp in (1, 4)]
+        # One device at each layout's per-device rows: the batch over its data axis.
+        split = [run_case(case, tmp_path, fsdp=1, devices=1, state=copied(), steps=steps,
+                          split=jax.device_count() // fsdp)[1] for fsdp in (1, 4)]
         with jax.enable_x64(new_val=True):
             exact = jax.device_get(truth(case, tmp_path, copied(), steps))
             terms = jax.device_get(update_terms(case, tmp_path, copied(), steps))
@@ -599,11 +612,14 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         # A delta net's decay terms stay declared: its float32 rounding runs through the chunked
         # rule's cumulative sums of the decay, which the step's own terms do not see.
         terms = raised(terms, decay_invariants(case, tmp_path, initial, steps))
-        for layout in layouts:
+        for layout, rowwise in zip(layouts, split, strict=True):
             for name in ("variables", "opt_state", "ema"):
-                assert_leaves_as_exact(*jax.device_get((getattr(layout, name), getattr(alone, name))),
-                                       getattr(exact, name), reductions=reductions,
-                                       terms=getattr(terms, name), rows=rows)
+                truth_leaves = getattr(exact, name)
+                reference = jax.tree.map(
+                    lambda whole, split, true: whole if distance(whole, true) >= distance(split, true) else split,
+                    *jax.device_get((getattr(alone, name), getattr(rowwise, name))), truth_leaves)
+                assert_leaves_as_exact(jax.device_get(getattr(layout, name)), reference, truth_leaves,
+                                       reductions=reductions, terms=getattr(terms, name), rows=rows)
         return layouts
 
     as_near(1, rows=True)
