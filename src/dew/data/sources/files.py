@@ -139,6 +139,10 @@ class Files(Dataset):
     CSV is parsed by Python's `csv` module under the process's field size
     limit, 128 KiB a field by default; a source with longer fields reads
     once its caller raises `csv.field_size_limit`.
+
+    `file_info` states the facts of every file the source reads, its offset
+    indexes among them, as their producer published them (a Hub commit's
+    files, a decision export's): an index it does not name is absent.
     """
 
     url: str | tuple[str, ...]
@@ -258,7 +262,8 @@ class Files(Dataset):
         # content, so hosts that mounted one dataset at different paths name it alike.
         root = _mount_root([path for _, fs, path in resolved if local(fs)])
         for url, fs, path in resolved:
-            if url in indexed and url not in self.declared and not fs.exists(path):
+            if url in indexed and url not in self.declared and (self.file_info is not None
+                                                                or not fs.exists(path)):
                 continue
             metadata = self._header(url)
             version = (
@@ -331,6 +336,8 @@ class Files(Dataset):
             return True
         headers = {}
         for url in self._indexes:
+            if self.file_info is not None and url not in self.file_info:
+                return False
             try:
                 headers[url] = self._header(url)
             except FileNotFoundError:
@@ -490,6 +497,11 @@ class Files(Dataset):
         paths = tuple(filesystem.normalize_path(path) for _, path in located)
         return filesystem, paths, {path: name for path, (_, name) in zip(paths, named, strict=True)}
 
+    def _shard_name(self, path: str) -> str:
+        """The name of the file Arrow reads at `path` where the file is,
+        whichever copy Arrow reads it from (`_arrow_files`)."""
+        return self._arrow_files[2][path]
+
     @cached_property
     def arrow(self) -> ds.Dataset:
         filesystem, paths, _ = self._arrow_files
@@ -515,8 +527,7 @@ class Files(Dataset):
         if self.kind in ("parquet", "arrow"):
             for number, fragment in enumerate(self.fragments):
                 rows = None if self.where is not None else _fragment_rows(fragment)
-                # A shard is named where its file is, whichever copy Arrow reads it from.
-                name = self._arrow_files[2][fragment.path]
+                name = self._shard_name(fragment.path)
                 shards.append(Shard(f"{name}:{number}", name, number, number + 1, rows))
         elif self.kind == "array_record":
             shards.extend(Shard(url, url) for url in self.paths)
