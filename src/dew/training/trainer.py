@@ -2003,8 +2003,8 @@ class Trainer(Generic[Loss, Effects]):
         evaluations = []
         for split in chosen:
             suite = plan.suites[split]
-            # The loss is scored where it ranks the run's checkpoints.
-            loss = (self.checkpoints is not None and not plan.best
+            # The loss is scored where it ranks the run's checkpoints, or the state it holds.
+            loss = ((self.checkpoints is not None or plan.held_best) and not plan.best
                     and not any(metric.name == 'loss' for metric in suite.metrics))
             evaluations.append(self._evaluate(state, shardings, suite.data, suite.metrics, plan.preview,
                                               loss=loss, split=split, training=reports))
