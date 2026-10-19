@@ -127,44 +127,48 @@ def leaves(stream, batches):
             for batch in itertools.islice(stream, batches)]
 
 
+@pytest.mark.parametrize("overlap", [0, 1])
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-def test_a_concatenating_pack_that_overlaps_its_cuts_keeps_every_pair_and_resumes(read):
+def test_a_concatenating_pack_keeps_every_pair_where_its_cuts_overlap_and_resumes_anywhere(read, overlap):
     """A concatenating pack whose cuts overlap by a token (`Pack.overlap`) starts each window again
     at the last token a cut through a document left behind, in every field alike: a pass holds
-    every next-token pair of every document once, each field's its own documents'. How full it
-    left its window is saved with its position, so a resumed run reads the windows the
-    uninterrupted one reads."""
+    every next-token pair of every document once, each field's its own documents'. With or without
+    the overlap, a run resumed after any step reads the windows the uninterrupted one reads: how
+    full the overlap left its window is saved with the position, and so is a window that closed
+    where a document ended, whose next document the packer holds whole."""
     lengths = (3, 7, 2, 5, 8, 4, 6, 2, 8, 3, 17)
     documents = [{"text": (np.arange(length) + 100 * index).astype(np.int32),
                   "text_roles": (np.arange(length) + 1000 * index).astype(np.int32)}
                  for index, length in enumerate(lengths)]
-    pipeline = Pipeline(Memory(documents)).pack(8, fields=FIELDS, policy="concat", overlap=1)
-    reader = validation(pipeline, batch=2, read=read, loading=READ)(DataPartition())
-    try:
-        held = list(reader)
-    finally:
-        reader.close()
-    for field in FIELDS:
-        expected = [pair for document in documents for pair in itertools.pairwise(document[field].tolist())]
-        assert sorted(pair for batch in held for pair in pairs(batch, field)) == sorted(expected)
+    pipeline = Pipeline(Memory(documents)).pack(8, fields=FIELDS, policy="concat", overlap=overlap)
+    if overlap:
+        reader = validation(pipeline, batch=2, read=read, loading=READ)(DataPartition())
+        try:
+            held = list(reader)
+        finally:
+            reader.close()
+        for field in FIELDS:
+            drawn = [pair for document in documents for pair in itertools.pairwise(document[field].tolist())]
+            assert sorted(pair for batch in held for pair in pairs(batch, field)) == sorted(drawn)
     data = compile(pipeline.repeat().batch(2), read=read, loading=READ)
     whole = data.train(DataPartition())
     try:
         expected = leaves(whole, 8)
     finally:
         whole.close()
-    stopped = data.train(DataPartition())
-    try:
-        head = leaves(stopped, 3)
-        saved = stopped.get_state()
-    finally:
-        stopped.close()
-    resumed = data.train(DataPartition())
-    try:
-        resumed.set_state(saved)
-        assert head + leaves(resumed, 5) == expected
-    finally:
-        resumed.close()
+    for steps in range(1, 8):
+        stopped = data.train(DataPartition())
+        try:
+            head = leaves(stopped, steps)
+            saved = stopped.get_state()
+        finally:
+            stopped.close()
+        resumed = data.train(DataPartition())
+        try:
+            resumed.set_state(saved)
+            assert head + leaves(resumed, 8 - steps) == expected, steps
+        finally:
+            resumed.close()
 
 
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
