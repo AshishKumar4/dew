@@ -35,7 +35,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers_reference_helpers import perturb, recording, saved_pipeline, tiny_qwen3_encoder
-from diffusers_wan_reference import float64
+from diffusers_wan_reference import float64, float64_scheduler
 from reference_releases import RELEASES
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
@@ -161,6 +161,7 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
     its default scale: the latent it ends on and the image it decodes; in
     float32 and, the saved pipeline loaded widened, in float64 (`fp64.`)."""
     from diffusers import ZImagePipeline
+    from diffusers.pipelines.z_image import pipeline_z_image
 
     pipe = build_pipeline(root)
     generator = torch.Generator().manual_seed(SEED + 9)
@@ -182,7 +183,8 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
         return arrays
 
     narrow = walk(pipe, torch.float32)
-    with float64():
+    # The call keeps its latents in float32, which it names and asserts in its own module.
+    with float64(), float64_scheduler(pipeline_z_image):
         wide_pipe = ZImagePipeline.from_pretrained(root / "pipeline", torch_dtype=torch.float64,
                                                    local_files_only=True)
         wide_pipe.set_progress_bar_config(disable=True)
