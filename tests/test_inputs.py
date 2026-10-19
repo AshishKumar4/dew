@@ -93,11 +93,12 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     assert placed["weight"].sharding == NamedSharding(mesh, P())
 
 
-@pytest.mark.parametrize("parser", ["preference", "prompt", "request", "rollout", "completion"])
+@pytest.mark.parametrize("parser", ["preference", "prompt", "request", "array", "rollout", "completion"])
 def test_every_token_id_parser_reads_ids_by_one_law(parser):
     """A dataset's and a request's token ids are read alike (`token_id`): a Python or NumPy integer
     from 0 through int32's largest passes as an int, and a bool, a negative id or one past int32 is
-    refused, where the parsers once disagreed on all three."""
+    refused, where the parsers once disagreed on all three. A request's rows as a NumPy array are
+    read by the same law as the same rows in a list; a NumPy row holds no bool beside integers."""
     from dew.data.preferences import PreferencePair
     from dew.data.prompts import _prompt_ids
     from dew.data.text import ByteTokenizer
@@ -113,6 +114,8 @@ def test_every_token_id_parser_reads_ids_by_one_law(parser):
             return list(_prompt_ids(ByteTokenizer(), ids, None, "prompt", None))
         if parser == "request":
             return np.asarray(prepared_inputs(None, [ids], images=None).tokens)[0].tolist()
+        if parser == "array":
+            return np.asarray(prepared_inputs(None, np.asarray([ids]), images=None).tokens)[0].tolist()
         if parser == "rollout":
             return list(_prompt(ids))
         rows = _token_rows([ids])
@@ -120,6 +123,74 @@ def test_every_token_id_parser_reads_ids_by_one_law(parser):
         return rows[0]
 
     assert read([np.int64(7), 3]) == [7, 3]
-    for refused in (True, -1, 2**31):
+    for refused in (-1, 2**31) if parser == "array" else (True, -1, 2**31):
         with pytest.raises(ValueError):
             read([5, refused])
+
+
+def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
+    """The same packed, left-padded rows, as `Coordinates` (a data pipeline's
+    packing) or as the validity, segment and position fields (a rollout's), are
+    one request: each validates, and after taking rows, aligning left, slicing
+    and extending into a response the decoder computes the same logits from
+    either form."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.inputs import COORDINATES_FIELD, ModelInputs, coordinates
+
+    model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, num_kv_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32,
+                              attention_impl="reference")
+    tokens = jnp.asarray([[0, 0, 3, 4, 5, 6, 7, 8], [0, 9, 10, 11, 12, 13, 14, 15]], jnp.int32)
+    valid = tokens != 0
+    segments = jnp.asarray([[0, 0, 1, 1, 1, 2, 2, 2], [0, 1, 1, 2, 2, 2, 3, 3]], jnp.int32)
+    positions = jnp.asarray([[0, 0, 0, 1, 2, 0, 1, 2], [0, 0, 1, 0, 1, 2, 0, 1]], jnp.int32)
+    params = model.init(jax.random.key(0), tokens)
+    forms = (ModelInputs(tokens, {"attention_mask": valid, "segment_ids": segments, "positions": positions}),
+             ModelInputs(tokens, {COORDINATES_FIELD: coordinates(segments=segments, valid=valid,
+                                                                   positions=positions)}))
+    steps = (lambda inputs: inputs.take_rows(jnp.asarray([1, 0])),
+             lambda inputs: inputs.align_left(jnp.asarray([2, 1])),
+             lambda inputs: inputs.slice_tokens(0, 6),
+             lambda inputs: inputs.extended(jnp.full((2, 3), 5, jnp.int32)))
+    for step in (lambda inputs: inputs, *steps):
+        fields, laid = (step(ModelInputs.from_value(form)) for form in forms)
+        expected, actual = (model.apply(params, inputs.tokens, **inputs.kwargs())
+                            for inputs in (fields, laid))
+        real = np.asarray(jnp.asarray(fields.token_fields["attention_mask"]))
+        np.testing.assert_array_equal(np.asarray(actual)[real], np.asarray(expected)[real])
+
+
+@pytest.mark.parametrize("placed", [False, True])
+def test_a_request_generates_alike_from_coordinates_and_from_its_fields(placed):
+    """An unpacked, left-padded request with its own positions generates the same
+    tokens whether its validity and positions come as `Coordinates` or as the
+    fields, through `generate`'s request (`Request.prepare`), its prefill and every
+    step; on a mesh its rows are padded to the devices, the repeats marked invalid
+    in the form the request holds (`Request.padded`)."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.inputs import COORDINATES_FIELD, ModelInputs, coordinates
+    from dew.sampling import Sampling, generate
+    from dew.training import MeshSpec
+
+    model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, num_kv_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32,
+                              attention_impl="reference")
+    tokens = jnp.asarray([[0, 0, 3, 4, 5], [6, 7, 8, 9, 10]], jnp.int32)
+    valid = tokens != 0
+    positions = jnp.asarray([[0, 0, 4, 5, 6], [0, 1, 2, 3, 4]], jnp.int32)
+    params = model.init(jax.random.key(0), tokens)
+    if placed:
+        params = jax.device_put(params, NamedSharding(MeshSpec().build(), P()))
+    forms = (ModelInputs(tokens, {"attention_mask": valid, "positions": positions}),
+             ModelInputs(tokens, {COORDINATES_FIELD: coordinates(valid=valid, positions=positions)}))
+    fields, laid = (generate(model, params, form, 4, key=jax.random.key(1), sampling=Sampling(temperature=0))
+                    for form in forms)
+    np.testing.assert_array_equal(np.asarray(laid.tokens), np.asarray(fields.tokens))
+    np.testing.assert_array_equal(np.asarray(laid.lengths), np.asarray(fields.lengths))

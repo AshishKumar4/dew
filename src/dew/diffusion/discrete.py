@@ -298,7 +298,7 @@ def refuse_causal(model: nn.Module) -> None:
 
 def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelInputs,
                       budget: int, steps: int, n: int, eos_ids: tuple[int, ...], pad_id: int) -> None:
-    from dew.sampling.text import Bounded
+    from dew.nn.protocols import Bounded
 
     refuse_causal(model)
     for name, value, minimum in (("max_new_tokens", budget, 0), ("steps", steps, 1), ("n", n, 1)):

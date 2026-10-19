@@ -2323,6 +2323,18 @@ class CausalTransformer(nn.Module):
                 return f"layer {index}: {refusal}"
         return None
 
+    @nn.nowrap
+    def generation_refusal(self) -> str | None:
+        """Why a generation loop cannot continue this decoder's rows, or None
+        (`dew.nn.protocols.Generating`): its sparse layers' mixture, or a mixer it
+        names (`declared_mixers`: a layer kind's, a prediction depth's or the
+        drafter's), that refuses it (`Mixture.generation_refusal`,
+        `MixerBase.generation_refusal`)."""
+        refusal = None if self.mixture is None else self.mixture.generation_refusal()
+        for mixer in self.declared_mixers:
+            refusal = refusal or mixer.generation_refusal()
+        return refusal
+
     @property
     def layer_mixer(self) -> MixerBase:
         """The mixer a layer whose kind names none builds: the model's own, else

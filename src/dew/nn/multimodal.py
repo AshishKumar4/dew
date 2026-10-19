@@ -497,6 +497,10 @@ class MultimodalTransformer(nn.Module):
                                                                            updated=updated)}
 
     @nn.nowrap
+    def generation_refusal(self) -> str | None:
+        return self.language_model.generation_refusal()
+
+    @nn.nowrap
     def with_remat(self, policy: RematPolicy | None) -> Self:
         """Choose the language model's layer policy, leaving the towers as they were."""
         return self.clone(language_model=self.language_model.with_remat(policy))

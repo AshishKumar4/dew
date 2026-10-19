@@ -241,6 +241,35 @@ def test_continuations_run_on_a_routed_expert_decoder(rng):
     assert not np.array_equal(np.asarray(two.tokens)[0, 4:], np.asarray(two.tokens)[1, 4:])
 
 
+@pytest.mark.parametrize("site", ["feedforward", "mixer"])
+def test_generate_refuses_an_exchange_wherever_the_decoder_routes_it(rng, site):
+    """A decoder routes either in its feed-forward slot (its `mixture`) or in a
+    layer kind's mixer slot (Nemotron-H's `MLPMixer` with a mixture of its own);
+    either exchange runs a shard_map that the loop's checks cannot reach
+    (jax-ml/jax#40907), so the decoder reports it (`Generating`) and `generate`
+    refuses it, where the same layers under the global dispatch generate."""
+    from dew.nn.backbones.layer_plan import LayerKind
+    from dew.nn.mixers.mlp import MLPMixer
+
+    def model(dispatch):
+        mixture = Mixture(experts=4, top_k=2, dispatch=dispatch)
+        if site == "feedforward":
+            return tiny(mixture=mixture)
+        return tiny(layer_types=("moe", "full_attention"),
+                    kinds={"moe": LayerKind(mixer=MLPMixer(intermediate_size=16, mixture=mixture))})
+
+    prompt = jax.random.randint(rng, (2, 4), 0, VOCAB)
+    params = model("global").init(rng, prompt)
+    greedy = Sampling(temperature=0)
+    generate(model("global"), params, prompt, 2, key=jax.random.key(1), sampling=greedy)
+    # The refusal itself, not the expert layout an unrefused exchange would fail on downstream.
+    with pytest.raises(ValueError) as refused:
+        generate(model("exchange"), params, prompt, 2, key=jax.random.key(1), sampling=greedy)
+    assert type(refused.value) is ValueError
+    assert model("global").generation_refusal() is None
+    assert model("exchange").generation_refusal() is not None
+
+
 def copy_batch(rng, size):
     """[payload, separator, payload]: the second half is only predictable from
     the first, so a model that scores it learned to look back."""

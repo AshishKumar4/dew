@@ -22,7 +22,7 @@ import math
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Generic, Protocol, runtime_checkable
+from typing import Generic
 
 import jax
 import jax.numpy as jnp
@@ -34,8 +34,6 @@ from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
 from dew.interop.weights import decoding_storage
-from dew.nn.backbones.decoder_block import Mixture
-from dew.nn.dspark import DSpark
 from dew.nn.inputs import (
     ModelInputs,
     PredictionPhase,
@@ -44,11 +42,24 @@ from dew.nn.inputs import (
     mesh_of,
     next_position,
     real_slots,
+    token_positions,
     valid_order,
+    with_validity,
 )
 from dew.nn.kernels.options import compiler_options
-from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned, write_cache
-from dew.nn.protocols import BlockDenoiser, Serving
+from dew.nn.kv_cache import gather_cache_rows, refuse_unassigned, write_cache
+from dew.nn.protocols import (
+    BlockDenoiser,
+    BlockDrafting,
+    Bounded,
+    Decoding,
+    Exposing,
+    Generating,
+    Layered,
+    Predicting,
+    Selective,
+    Serving,
+)
 from dew.objectives.base import Variables
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
@@ -86,73 +97,6 @@ type Identity = str | int | tuple[Identity, ...]
 # class, which is one of these.
 type SelfNaming = type | types.FunctionType | types.MethodType | types.BuiltinFunctionType
 SELF_NAMING = (type, types.FunctionType, types.MethodType, types.BuiltinFunctionType)
-
-
-@runtime_checkable
-class Bounded(Protocol):
-    """A model that declares its vocabulary and cache capacity, which the host
-    checks read to refuse an id outside the vocabulary or a request that would
-    overflow the cache; a model that declares neither is checked for neither."""
-
-    @property
-    def vocab_size(self) -> int: ...
-
-    @property
-    def max_seq_len(self) -> int | None: ...
-
-
-@runtime_checkable
-class Decoding(Protocol):
-    """A decoder that continues its rows token by token: `init_cache` opens the
-    cache its decode calls (`decode=True`) write, a position a call. A caller
-    that appends with those calls itself, past `generate`'s and the server's
-    host checks, reads `dew.nn.kv_cache.overflowed` after them."""
-
-    def init_cache(self, batch_size: int) -> None: ...
-
-
-@runtime_checkable
-class Exposing(Protocol):
-    """A decoder that hands back its hidden states beside its logits, which a
-    drafting strategy seeds from; without them a model decodes but cannot draft."""
-
-    def states_and_logits(self, tokens: jax.Array, **kwargs: jax.Array | bool | None
-                          ) -> tuple[jax.Array, jax.Array]: ...
-
-
-@runtime_checkable
-class Selective(Protocol):
-    """A decoder that scores one position per row instead of them all, so its
-    prefill runs the head only on the slot the first draw reads."""
-
-    def states_and_logits_at(self, tokens: jax.Array, slots: jax.Array, **kwargs: jax.Array | bool | None
-                             ) -> tuple[jax.Array, jax.Array]: ...
-
-
-@runtime_checkable
-class Predicting(Protocol):
-    """A decoder that declares how many multi-token prediction depths it carries."""
-
-    @property
-    def num_nextn_predict_layers(self) -> int: ...
-
-
-@runtime_checkable
-class Routed(Protocol):
-    """A decoder whose sparse layers declare how tokens reach their experts, as `CausalTransformer` does."""
-
-    @property
-    def mixture(self) -> Mixture | None: ...
-
-
-@runtime_checkable
-class BlockDrafting(Protocol):
-    """A decoder that may carry a block drafter: DeepSeek's DSpark (V4.1, V4-Flash-0731),
-    which drafts a whole block per pass from the context its target layers
-    record instead of chaining prediction depths."""
-
-    @property
-    def dspark(self) -> DSpark | None: ...
 
 
 # Transformers' `_get_logits_processor` order, by its own control names: the
@@ -422,7 +366,7 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
         states = _context(model, params, updated)
     drawn = logits if selective else logits[rows, slot]
     rotary = inputs.token_fields.get("rotary_positions")
-    logical = rotary if rotary is not None else inputs.token_fields.get("positions")
+    logical = rotary if rotary is not None else token_positions(inputs.token_fields)
     state = DecoderState(updated["cache"], drawn, next_position(inputs.token_fields, real),
                          None if states is None else states[rows, slot])
     if rebuild_position(model) is not None:
@@ -506,24 +450,11 @@ def rebuild_position(model: nn.Module) -> int | None:
     return model.cache_rebuild_position if isinstance(model, Serving) else None
 
 
-def _refuse_exchange(model: nn.Module) -> None:
-    """Refuse a model whose sparse layers exchange tokens between expert shards.
-
-    The decode loop carries each draw's device checks into the next step's
-    model call, where the exchange runs a `shard_map`, and jax's checkify
-    cannot carry a live check into one (jax-ml/jax#40907). A
-    `dew.inference.serving.Server` step runs the model before it draws, so it
-    serves the exchange; `dispatch='global'` computes the same layer. This
-    refusal goes once a jax release carries the fix.
-    """
-    mixture = model.mixture if isinstance(model, Routed) else None
-    if mixture is not None and mixture.dispatch == "exchange":
-        raise ValueError(
-            "generation cannot run dispatch='exchange' until jax fixes jax-ml/jax#40907: checkify, "
-            "which carries each draw's device checks into the next step's model call, fails on a "
-            "check that reaches a shard_map. Serve the model with dew.inference.serving.Server, or "
-            "generate with model.clone(mixture=dataclasses.replace(model.mixture, dispatch='global')), "
-            "the same layer")
+def _refuse_generation(model: nn.Module) -> None:
+    """Refuse a model that says why a generation loop cannot continue its rows (`Generating`)."""
+    refusal = model.generation_refusal() if isinstance(model, Generating) else None
+    if refusal is not None:
+        raise ValueError(refusal)
 
 
 def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | None) -> DecodeOps:
@@ -747,10 +678,8 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
     """Host checks shared by every caller; returns device inputs whose validity
     field is present only where a prompt is actually padded."""
     valid = check_inputs(model, ids, fields, max_new_tokens, sampling, n)
-    token_fields = {name: jnp.asarray(value) for name, value in fields.items()
-                    if name != "attention_mask"}
-    if not valid.all():
-        token_fields["attention_mask"] = jnp.asarray(valid)
+    token_fields = with_validity({name: jax.tree.map(jnp.asarray, value) for name, value in fields.items()},
+                                 None if valid.all() else jnp.asarray(valid))
     prepared = ModelInputs(jnp.asarray(ids, jnp.int32), token_fields,
                            {name: jnp.asarray(value) for name, value in conditioning.items()})
     prepared.validate()
@@ -874,11 +803,11 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
     would cost it nothing.
     """
     ids = local_rows(inputs.tokens)
-    fields = {name: local_rows(value) for name, value in inputs.token_fields.items()}
+    fields = {name: jax.tree.map(local_rows, value) for name, value in inputs.token_fields.items()}
     conditioning = {name: local_rows(value, host=False) for name, value in inputs.conditioning.items()}
     if "params" not in params:
         raise ValueError("generate takes the full variables dict ({'params': ...})")
-    _refuse_exchange(model)
+    _refuse_generation(model)
     if trips < max_new_tokens:
         raise ValueError(f"trips must cover the budget of {max_new_tokens} tokens, got {trips}")
     prepared = _validated(model, ids, fields, conditioning, trips, sampling, n)
