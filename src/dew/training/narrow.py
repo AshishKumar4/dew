@@ -16,8 +16,9 @@ Which weights: the parameters whose one use in the loss is that cast
 sums its cotangents where it is used; read through a bf16 copy those sums
 would be bf16 where they are fp32 now, so such a weight keeps its fp32
 read. A call the loss passes the weight into unchanged (`pjit`, a
-rematerialized region, a scan over stacked layers) is followed; any other
-use, a custom VJP's included, keeps it.
+rematerialized region, a scan over stacked layers) is followed, and so is
+the stack a scanned run builds of its layers' weights, whose cast is the
+stack of their casts; any other use, a custom VJP's included, keeps it.
 
 A step that pools several microbatches into one update, by accumulation or
 a batch read in parts, reads one set of copies through its window and
@@ -64,8 +65,16 @@ def _inner(eqn, index: int):
     return inner, inner.invars[index]
 
 
+_STACKING = ("reshape", "expand_dims", "squeeze", "broadcast_in_dim", "concatenate")
+"""The ops a stack of layers builds its operand with, each element of the result one of its
+operands': a cast of the result is the stack of its operands' casts, and its cotangent's slices are
+theirs."""
+
+
 def _cast_once(var, jaxpr) -> jnp.dtype | None:
-    """The narrower float dtype `var`'s one use in `jaxpr` casts it to, or None."""
+    """The narrower float dtype `var`'s one use in `jaxpr` casts it to, or None: through a call
+    that passes it on (`_inner`), and through the stack a scanned run builds of its layers'
+    weights (`_STACKING`), whose stacked operand the scan slices and casts."""
     uses = [(eqn, index) for eqn in jaxpr.eqns for index, operand in enumerate(eqn.invars) if operand is var]
     if len(uses) != 1 or var in jaxpr.outvars:
         return None
@@ -74,6 +83,14 @@ def _cast_once(var, jaxpr) -> jnp.dtype | None:
         dtype = jnp.dtype(eqn.params["new_dtype"])
         narrower = jnp.issubdtype(dtype, jnp.floating) and dtype.itemsize < var.aval.dtype.itemsize
         return dtype if narrower else None
+    if eqn.primitive.name in _STACKING and len(eqn.outvars) == 1:
+        stacked = eqn.outvars[0]
+        # A broadcast that repeats elements would read one weight in many places, whose
+        # cotangents it sums in the weight's dtype.
+        operands = [operand for operand in eqn.invars if isinstance(operand, core.Var)]
+        if stacked.aval.size != sum(operand.aval.size for operand in operands):
+            return None
+        return _cast_once(stacked, jaxpr)
     called = _inner(eqn, index)
     return None if called is None else _cast_once(called[1], called[0])
 
