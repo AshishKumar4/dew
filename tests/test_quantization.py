@@ -1108,6 +1108,34 @@ def test_an_int8_training_step_moves_the_weights_by_the_hosts_gradient():
 
 
 def training_flow():
+    assert_step_moves_by_the_hosts_gradient()
+
+
+def test_an_int8_training_step_on_xla_default_options_moves_the_weights_by_the_hosts_gradient():
+    """A run whose recorded plan compiles its step under XLA's default options, the planner's half
+    rung, keeps the options its int8 products need to compute right: one SGD step moves the weights
+    by the host's gradient. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    with_triton_gemms(training_on_xla_default_options_flow)
+
+
+def training_on_xla_default_options_flow():
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as records:
+        os.environ["DEW_RUNG_RECORDS"] = records
+        assert_step_moves_by_the_hosts_gradient()
+        [path] = Path(records).glob("*.json")
+        stored = json.loads(path.read_text())
+        assert not stored["rung"]["xla_defaults"]
+        path.write_text(json.dumps({**stored, "rung": {**stored["rung"], "xla_defaults": True}}))
+        assert_step_moves_by_the_hosts_gradient()
+        assert json.loads(path.read_text())["rung"]["xla_defaults"], "the run planned its own rung"
+
+
+def assert_step_moves_by_the_hosts_gradient():
+    """One SGD step of the trainer over a decoder quantized to int8 moves its weights by the gradient
+    of its loss the host computes."""
     from dew.config.data import RecordsData, loader
     from dew.data import Loading
     from dew.training.trainer import Trainer
