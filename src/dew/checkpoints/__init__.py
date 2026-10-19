@@ -185,6 +185,24 @@ def location(directory: str) -> epath.Path:
     return path if is_uri(directory) else path.resolve()
 
 
+def _attempted(steps: Sequence[tuple[str, Callable[[], object]]], *,
+               primary: BaseException | None = None) -> None:
+    """Run every step, even after one fails. Each failure is noted on `primary`, the error its
+    caller is already raising, which stays the one raised; without one the first failure is raised
+    with the later ones noted on it."""
+    error = primary
+    for label, step in steps:
+        try:
+            step()
+        except BaseException as failure:
+            if error is None:
+                error = failure
+            else:
+                error.add_note(f"{label} failed: {failure!r}")
+    if primary is None and error is not None:
+        raise error
+
+
 def _processes(count: int) -> str:
     return f"{count} process" + ("es" if count != 1 else "")
 
@@ -1817,19 +1835,27 @@ class Checkpoints:
 
     def close(self) -> None:
         """Wait for pending writes, then close the Orbax managers and the threads and metadata stores
-        they hold. A closed `Checkpoints` reopens them on its next use."""
-        self.wait()
-        opened, self._manager, self._local_manager = (self._manager, self._local_manager), None, None
-        for writer in opened:
-            if writer is not None:
-                writer.close()
+        they hold, each even where another, or its own wait, failed: Orbax reports a failed
+        asynchronous write once, from the wait, and its close still releases the manager. The first
+        failure is raised with the rest noted on it. A closed `Checkpoints` reopens its managers on
+        its next use."""
+        _attempted(self._closing())
 
     def __enter__(self) -> Checkpoints:
         return self
 
     def __exit__(self, kind: type[BaseException] | None, raised: BaseException | None,
                  traceback: TracebackType | None) -> None:
-        self.close()
+        """`close`, with a failure noted on the error the body raised, which stays the one raised."""
+        _attempted(self._closing(), primary=raised)
+
+    def _closing(self) -> list[tuple[str, Callable[[], object]]]:
+        """The steps that close the open managers, which this forgets: each one's wait, then each
+        one's close."""
+        opened = [manager for manager in (self._manager, self._local_manager) if manager is not None]
+        self._manager, self._local_manager, self._pending = None, None, None
+        return [*(("Checkpoint wait", manager.wait_until_finished) for manager in opened),
+                *(("Checkpoint close", manager.close) for manager in opened)]
 
     def wait(self) -> None:
         """Block until pending async writes have landed on disk.
@@ -1838,16 +1864,6 @@ class Checkpoints:
         anything that reads a checkpoint back has to call this first.
         """
         with region("checkpoint.wait"):
-            error = None
-            for checkpointer in (self._manager, self._local_manager):
-                if checkpointer is not None:
-                    try:
-                        checkpointer.wait_until_finished()
-                    except BaseException as failure:
-                        if error is None:
-                            error = failure
-                        else:
-                            error.add_note(f"Checkpoint wait also failed: {failure!r}")
-            if error is not None:
-                raise error
+            _attempted([("Checkpoint wait", manager.wait_until_finished)
+                        for manager in (self._manager, self._local_manager) if manager is not None])
             self._pending = None

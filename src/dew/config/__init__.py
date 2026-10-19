@@ -842,12 +842,14 @@ def _local_tracker(directory: str, name: str):
                                      + hashlib.sha256(directory.encode()).hexdigest()[:12]))
 
 
-def _closed(tracker, primary: BaseException | None) -> None:
-    """Close `tracker` on every rank and agree on the outcome.
+def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | None) -> None:
+    """Close `tracker` on every rank and agree on the outcome, then close `checkpoints`, even where
+    the tracker's close failed.
 
     `primary` is the exception the run is already unwinding with, if any. A
     close that fails is noted on it rather than replacing it, since the run's
-    own failure is the one a caller wants.
+    own failure is the one a caller wants; without one, the first failure is
+    raised with the other noted on it.
     """
     error = None
     try:
@@ -855,12 +857,19 @@ def _closed(tracker, primary: BaseException | None) -> None:
             tracker.__exit__(type(primary), primary, None)
     except BaseException as failure:
         error = failure
+    failed = None
     try:
         agree_process_phase(error, phase="tracker close")
     except BaseException as failure:
         if primary is None:
-            raise
-        primary.add_note(f"Tracker close failed: {failure!r}")
+            failed = failure
+        else:
+            primary.add_note(f"Tracker close failed: {failure!r}")
+    raised = primary if primary is not None else failed
+    if checkpoints is not None:
+        checkpoints.__exit__(None if raised is None else type(raised), raised, None)
+    if failed is not None:
+        raise failed
 
 
 def _artifact_name(name: str) -> str:
@@ -1317,9 +1326,7 @@ class RunConfig:
             return state
 
         finally:
-            _closed(tracker, sys.exception())
-            if checkpoints is not None:
-                checkpoints.close()
+            _closed(tracker, checkpoints, sys.exception())
 
     def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
               tracker: Tracker, search: Search = _RANDOM_SEARCH) -> list[TrialFinished]:
