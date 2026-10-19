@@ -216,7 +216,11 @@ class Decide:
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
         variables = objectives[records.text(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        averaged = Checkpoints(directory).stored(step).get("ema") is not None if ema is None else ema
+        if ema is None:
+            with Checkpoints(directory) as checkpoints:
+                averaged = checkpoints.stored(step).get("ema") is not None
+        else:
+            averaged = ema
         task = cls(model, variables, rows, tokenizer_for(settings.tokenizer), settings.specials,
                    name=str(epath.Path(directory).name), weights=Weights(step, averaged),
                    processor=processor)
