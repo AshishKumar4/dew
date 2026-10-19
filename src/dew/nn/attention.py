@@ -842,7 +842,8 @@ def _per_shard(local, query, key, value, **extras):
     """`local(query, key, value, **extras)` on each shard's rows and heads
     (`manual_map`), the key heads repeated until the tensor axes split them as
     they split the query's; whole off a mesh, or inside a map that already
-    holds every axis manual (the sequence exchanges). A Pallas kernel has no
+    holds every axis manual (the sequence exchanges), where the tensor axes
+    split nothing. A Pallas kernel has no
     partitioning rule, and jax's cuDNN attention partitions through
     `custom_partitioning`, whose lowering on several devices names the
     partitioner by a process address (`str(id(...))` in its backend config),
@@ -851,9 +852,6 @@ def _per_shard(local, query, key, value, **extras):
     further argument to its array, or None, and the logical axes it splits on.
     """
     given = {name: pair for name, pair in extras.items() if pair[0] is not None}
-    mesh = jax.sharding.get_abstract_mesh()
-    if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
-        return local(query, key, value, **{name: x for name, (x, _) in given.items()})
     key, value = split_with_queries(key, value, tensor_shards(query))
     queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
     names = tuple(given)
@@ -861,7 +859,9 @@ def _per_shard(local, query, key, value, **extras):
     def shard(query, key, value, *arrays):
         return local(query, key, value, **dict(zip(names, arrays, strict=True)))
 
-    specs = (queries, keys, keys, *(logical_spec(axes, x.shape) for x, axes in given.values()))
+    # An extra may be a tree of arrays (`CrossDocuments`), each leaf split on its axes.
+    specs = (queries, keys, keys, *(jax.tree.map(lambda leaf, axes=axes: logical_spec(axes, leaf.shape), x)
+                                    for x, axes in given.values()))
     return manual_map(shard, specs, queries)(query, key, value, *(x for x, _ in given.values()))
 
 
