@@ -17,9 +17,9 @@ are more than `norm.ppf(sparsity)` standard deviations above the mean.
 import dataclasses
 import functools
 import math
+from collections.abc import Mapping
 from statistics import NormalDist
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
@@ -191,11 +191,16 @@ def clamped_predictions(params, clip: float):
     place before a training forward (modeling_gemma3n.py:1027-1028), so the
     optimizer updates the clamped weight. Any other leaf, and a tree holding
     no AltUp layer, is returned as it is."""
-    def clamped(path, leaf):
-        names = tuple(getattr(key, 'key', None) for key in path[-3:])
-        return jnp.clip(leaf, -clip, clip) if names == ('altup', 'prediction_coefs', 'kernel') else leaf
+    def clamped(tree, name: str | None):
+        if not isinstance(tree, Mapping):
+            return tree
+        coefficients = tree.get('prediction_coefs') if name == 'altup' else None
+        if isinstance(coefficients, Mapping) and 'kernel' in coefficients:
+            return {**tree, 'prediction_coefs': {**coefficients,
+                                                 'kernel': jnp.clip(coefficients['kernel'], -clip, clip)}}
+        return {key: clamped(value, key) for key, value in tree.items()}
 
-    return jax.tree_util.tree_map_with_path(clamped, params)
+    return clamped(params, None)
 
 
 @logical_axes({

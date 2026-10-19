@@ -351,7 +351,8 @@ def part(variables: Variables, name: str) -> Variables:
     return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
 
 
-def projected_parts(params: Variables, owners: Mapping[str, object], *, updated: bool) -> Variables:
+def projected_parts(params: Variables, owners: Mapping[str, ProjectsParameters | nn.Module], *,
+                    updated: bool) -> Variables:
     """`params` with each part `owners` names projected by its owner's constraint
     (`dew.nn.protocols.ProjectsParameters`, which an objective's `projected` also
     answers), where the tree holds that part and the owner declares one; the rest
@@ -365,9 +366,9 @@ def projected_parts(params: Variables, owners: Mapping[str, object], *, updated:
     return projected
 
 
-def projected_draw(owner: object, variables: Variables) -> Variables:
-    """A freshly drawn tree as training stores it: its parameters projected once by
-    `owner`'s constraint (`updated=True`), as is where it declares none."""
+def projected_draw(owner: nn.Module, variables: Variables) -> Variables:
+    """A module's freshly drawn tree as training stores it: its parameters projected
+    once by `owner`'s constraint (`updated=True`), as is where it declares none."""
     if not isinstance(owner, ProjectsParameters) or "params" not in variables:
         return variables
     return {**variables, "params": owner.projected(variables["params"], updated=True)}
@@ -693,7 +694,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         if held is not None and "params" in held:
             tree = held
         elif held is None or self._held_parts:
-            tree = projected_draw(self, self.fresh_variables(key, held))
+            tree = self.fresh_variables(key, held)
+            tree = {**tree, "params": self.projected(tree["params"], updated=True)}
         else:
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
@@ -946,7 +948,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
         A step's forward reads `projected(params, updated=False)`, and its update applies to them,
         which the optimizer sees; the step stores the updated ones `projected(..., updated=True)`.
-        A freshly drawn tree is projected once with `updated=True` (`projected_draw`). The default
+        A freshly drawn tree is projected once with `updated=True`. The default
         projects the `model` this objective trains; an objective that trains several networks
         projects each one's own tree (`projected_parts`)."""
         model = vars(self).get("model")
