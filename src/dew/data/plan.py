@@ -309,16 +309,16 @@ def same_order(saved: str, current: str) -> bool:
     """Whether two orders, as a saved position and a stream state them in JSON, are one order:
     compared without their sources' descriptions, which name where a host mounted them, as a
     pool compares its processes' orders (`Plan.identity`)."""
-    return _unplaced(json.loads(saved)) == _unplaced(json.loads(current))
+    return unplaced(json.loads(saved)) == unplaced(json.loads(current))
 
 
-def _unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
+def unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
     """`order` without its sources' descriptions, which name where a host
     mounted them, its corpora's and phases' included."""
     if isinstance(order, dict):
-        return {name: _unplaced(value) for name, value in order.items() if name != "source"}
+        return {name: unplaced(value) for name, value in order.items() if name != "source"}
     if isinstance(order, list):
-        return [_unplaced(value) for value in order]
+        return [unplaced(value) for value in order]
     return order
 
 
@@ -330,7 +330,12 @@ class Plan:
     makes other rows or draws from the same plan raises it, so a position saved before the change
     is refused. Version 2 keys each random step by its place in what the run wrote
     (`dew.data.lowering._Build.stage_seed`), runs a global order's stages after its batch by index
-    and resumes a count inside a batch past that batch's first rows, in the batches' final order."""
+    and resumes a count inside a batch past that batch's first rows, in the batches' final order.
+    Version 3 keys a mixture member's draws by the name it goes by, or an unnamed one's place among
+    the unnamed, rather than its place among all the members (`dew.data.lowering._member_key`), so
+    a named member joining or leaving leaves the others' draws as they were, and records those
+    names in the order (`dew.data.analysis._members`), so a position is refused where a member was
+    renamed, joined or left."""
 
     lowering: Literal["global", "per-share"]
     manifest: Manifest
@@ -340,7 +345,11 @@ class Plan:
     rejections: Literal["drop", "mask"] = "drop"
     cache: tuple[str, ...] = ()
     volatile: bool = False
-    version: ClassVar[int] = 2
+    members: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    """A mixture's members, each what it reads and runs as one digest under its key, and its own
+    stages under the empty key (`dew.data.analysis._member_manifests`): what a streamed mix's
+    resume reads of a member that joined or left (`check`)."""
+    version: ClassVar[int] = 3
 
     def record(self) -> dict[str, JSON]:
         return {
@@ -354,6 +363,7 @@ class Plan:
             "rejections": self.rejections,
             "cache": list(self.cache),
             "volatile": self.volatile,
+            "members": json_value(self.members, "members"),
             "exact": self.manifest.exact,
         }
 
@@ -364,7 +374,7 @@ class Plan:
         which part differs. The order's sources are named by the manifest's
         content, not by their descriptions: hosts that mount one dataset at
         different paths read the same records."""
-        order = _unplaced(json_value(self.order, "order"))
+        order = unplaced(json_value(self.order, "order"))
         return f"{json.dumps(order, sort_keys=True)} under plan {json.dumps(self.parts(), sort_keys=True)}"
 
     def parts(self) -> dict[str, JSON]:
@@ -400,31 +410,73 @@ class Plan:
             raise ValueError(
                 "data plan contains a step without stable identity; resume='non-exact' is required"
             )
+        edited = self._edited_members(saved)
+        # A mix whose members changed is compared member by member (`_edited_members`): each kept
+        # member's order, sources, steps, facts and caches are its digest's, and the rest is the
+        # mixture's.
+        member_scoped = () if edited is None else ("cache",)
         for name in ("lowering", "rejections", "cache", "volatile"):
-            if current[name] != saved.get(name):
+            if name not in member_scoped and current[name] != saved.get(name):
                 raise ValueError(f"saved data plan {name} changed: {saved.get(name)!r} -> {current[name]!r}")
         # An order is the same wherever its sources are mounted (`same_order`).
-        if _unplaced(json_value(saved.get("order"), "saved order")) != _unplaced(current["order"]):
+        saved_order = unplaced(json_value(saved.get("order"), "saved order"))
+        if edited is None and saved_order != unplaced(current["order"]):
             raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> {current['order']!r}")
         previous = record(saved.get("derived", {}), "saved derived order")
-        for name in sorted(set(previous) | set(self.derived)):
+        for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
             if previous.get(name) != self.derived.get(name):
                 raise ValueError(f"saved data plan derived order {name} changed")
         if self.lowering == "per-share" and current["topology"] != saved.get("topology"):
             raise ValueError("saved per-share data plan topology changed (shares, workers or cycle length)")
         changed = _changed(record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic())
+        if edited is not None:
+            changed = tuple(name for name in changed if name not in ("source", "steps", "tokenizer"))
         if changed:
             raise ValueError(
                 f"saved data plan {', '.join(changed)} changed, so the records the saved position counts "
                 "are not this run's; resume with the sources, steps and tokenizers that wrote it"
             )
-        changes = _changed(
-            record(saved.get("environment"), "saved data environment"), self.manifest.environment()
-        )
+        environment = self.manifest.environment()
+        saved_environment = record(saved.get("environment"), "saved data environment")
+        if edited is not None:
+            environment = {name: value for name, value in environment.items() if name != "modules"}
+            saved_environment = {name: value for name, value in saved_environment.items()
+                                 if name != "modules"}
+        changes = _changed(saved_environment, environment)
         if changes and self.lowering == "per-share":
             raise ValueError(f"saved per-share data environment changed: {', '.join(changes)}")
         if changes:
             _log.warning("data environment changed under an unchanged plan: %s", ", ".join(changes))
         if self.volatile:
             _log.warning("resuming volatile data; fetched outcomes may differ")
-        return changes
+        if edited:
+            _log.warning("resuming a mixture whose members changed: %s", ", ".join(edited))
+        return changes + (edited or ())
+
+    def _edited_members(self, saved: Mapping[str, object]) -> tuple[str, ...] | None:
+        """How a streamed mix's members changed from `saved`'s, which a resume takes: members that
+        joined, which start, members that left, which are dropped, and weights that changed; None
+        where the members and weights are as they were, or the plan keeps no members by key
+        (`dew.data.compile._member_manifests`), whose order is compared whole. Refused where a
+        member kept by both changed what it reads or makes, or where the mixture's own stages, the
+        compile's host steps or the rest of the order changed."""
+        members = record(saved.get("members", {}), "saved members")
+        before = {name: str(value) for name, value in members.items()}
+        order = json_value(saved.get("order"), "saved order")
+        if (self.lowering != "per-share" or not before or not self.members or not isinstance(order, dict)
+                or (before == dict(self.members) and order.get("weights") == self.order.get("weights"))):
+            return None
+        if before.get("") != self.members.get(""):
+            raise ValueError("saved data plan mixture stages changed")
+        kept = (set(before) & set(self.members)) - {""}
+        for key in sorted(kept):
+            if before[key] != self.members[key]:
+                raise ValueError(f"saved data plan member {key} changed what it reads or runs")
+        mixture = ("corpora", "members", "weights")
+        current = {name: json_value(value, name) for name, value in self.order.items() if name not in mixture}
+        before_order = {name: value for name, value in order.items() if name not in mixture}
+        if unplaced(before_order) != unplaced(current):
+            raise ValueError(f"saved data plan order changed: {order!r} -> {self.order!r}")
+        return (*(f"member {key} joined" for key in sorted(set(self.members) - set(before))),
+                *(f"member {key} left" for key in sorted(set(before) - set(self.members))),
+                *(("weights changed",) if order.get("weights") != self.order.get("weights") else ()))
