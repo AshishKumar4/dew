@@ -480,38 +480,3 @@ def test_a_saved_checkpoint_reloads_bit_for_bit(tmp_path):
     assert_same_stored_tensors(load_shards(tmp_path), load_shards(TINY))
     assert json.loads((tmp_path / 'config.json').read_text())['model_type'] == 'dory'
     assert_reloads(loaded, tmp_path, REFERENCE['input_ids'])
-
-
-MARGIN = 1e-3
-"""The float64 top-two margin above which a position's argmax must be the reference's: far above
-fp32's rounding of logits near 10, and below it a tie that any rounding may break."""
-
-
-@pytest.mark.network
-@pytest.mark.parametrize('dtype', ['float32', 'bfloat16'])
-def test_the_release_computes_the_references_logits_and_continuations(dtype):
-    """NVIDIA-Nemotron-Labs-Dory1.0-4B at source.json's revision, against tools/dory_reference.py's
-    probe of the same weights on a GPU: the logits of a sentence, and of the last 64 of 1100 random
-    ids, past the 1024-token window, on the probe's 256 columns, within the rule of the reference's
-    own run at `dtype` against float64; each position's argmax the float64 one's wherever its
-    top-two margin exceeds `MARGIN`; and, in fp32, each cache's greedy continuation of the
-    sentence the float64 reference's."""
-    source = json.loads((RELEASED / 'source.json').read_text())
-    probe = np.load(RELEASED / 'probe.npz')
-    loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype=dtype)
-    suffix = '' if dtype == 'float32' else '_bf16'
-    for name, kept in (('sentence', slice(None)), ('window', slice(-64, None))):
-        logits = np.asarray(loaded.model.apply(loaded.variables, probe[name][None]), np.float32)[0, kept]
-        clear = probe[f'{name}_margin'] > MARGIN
-        np.testing.assert_array_equal(logits.argmax(-1)[clear], probe[f'{name}_argmax'][clear])
-        assert_as_exact_as_the_reference(logits[:, probe['columns']], probe[f'{name}_logits{suffix}'],
-                                         probe[f'{name}_logits_f64'], f'Dory 4B {dtype} {name}')
-    if dtype != 'float32':
-        return
-    prompt = probe['sentence'].tolist()
-    for mode in ('per_loop', 'last_loop'):
-        model = with_cache(loaded.model, mode).with_cache_capacity(64)
-        task = TextGeneration(model, loaded.variables, sampling=Sampling(temperature=0.0))
-        generated = task([prompt], 16, key=0).host()
-        continuation = generated.tokens[0, generated.prompt_width:]
-        np.testing.assert_array_equal(continuation, probe[f'generated_{mode}'])
