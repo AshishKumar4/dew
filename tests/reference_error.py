@@ -779,12 +779,15 @@ def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, round
     entries = np.abs(twin - rows)
     over = ~(entries <= bound * sizes)
     if np.any(over):
-        ratios = np.where(sizes > 0, entries / np.where(sizes > 0, sizes, 1), np.inf)
+        allowed = bound * sizes
+        ratios = np.where(over, np.where(allowed > 0, entries / np.where(allowed > 0, allowed, 1), np.inf), 0.0)
         at = np.unravel_index(int(np.argmax(ratios)), rows.shape)
         raise AssertionError(
             f"{label}: {int(np.count_nonzero(over))} of {rows.size} entries of the reference in float64 are "
             f"past float64 rounding over {roundings} steps; the worst, row {at[0]} entry {at[1]}, is "
-            f"{entries[at]:.3e} from the oracle, of size {sizes[at]:.3e}")
+            f"{entries[at]:.3e} from the oracle {rows[at]:.3e}, of size {sizes[at]:.3e} (its row's rms "
+            f"{float(np.sqrt(np.mean(np.square(rows[at[0]])))):.3e}, the leaf's {scale:.3e}), "
+            f"{ratios[at]:.1f} times the bound")
 
 
 def chain_roundings(closed_jaxpr) -> int:
