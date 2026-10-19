@@ -547,7 +547,9 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
                                                   variables["moe"])}
     assert any(count > 1 for _, count in model.bind(variables).groups)
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
-    on_host = {**variables, "params": jax.device_put(variables["params"], host)}
+    layers = {name: jax.device_put(tree, host) for name, tree in variables["params"].items()
+              if name.startswith("layers_")}
+    on_host = {**variables, "params": {**variables["params"], **layers}}
     opened = ["moe", "router"]
     held = {}
     for name, tree in (("resident", variables), ("host", on_host)):
