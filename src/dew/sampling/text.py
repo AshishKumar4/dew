@@ -44,7 +44,9 @@ from dew.nn.inputs import (
     mesh_of,
     next_position,
     real_slots,
+    token_positions,
     valid_order,
+    with_validity,
 )
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned, write_cache
@@ -422,7 +424,7 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
         states = _context(model, params, updated)
     drawn = logits if selective else logits[rows, slot]
     rotary = inputs.token_fields.get("rotary_positions")
-    logical = rotary if rotary is not None else inputs.token_fields.get("positions")
+    logical = rotary if rotary is not None else token_positions(inputs.token_fields)
     state = DecoderState(updated["cache"], drawn, next_position(inputs.token_fields, real),
                          None if states is None else states[rows, slot])
     if rebuild_position(model) is not None:
@@ -747,10 +749,8 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
     """Host checks shared by every caller; returns device inputs whose validity
     field is present only where a prompt is actually padded."""
     valid = check_inputs(model, ids, fields, max_new_tokens, sampling, n)
-    token_fields = {name: jnp.asarray(value) for name, value in fields.items()
-                    if name != "attention_mask"}
-    if not valid.all():
-        token_fields["attention_mask"] = jnp.asarray(valid)
+    token_fields = with_validity({name: jax.tree.map(jnp.asarray, value) for name, value in fields.items()},
+                                 None if valid.all() else jnp.asarray(valid))
     prepared = ModelInputs(jnp.asarray(ids, jnp.int32), token_fields,
                            {name: jnp.asarray(value) for name, value in conditioning.items()})
     prepared.validate()
@@ -874,7 +874,7 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
     would cost it nothing.
     """
     ids = local_rows(inputs.tokens)
-    fields = {name: local_rows(value) for name, value in inputs.token_fields.items()}
+    fields = {name: jax.tree.map(local_rows, value) for name, value in inputs.token_fields.items()}
     conditioning = {name: local_rows(value, host=False) for name, value in inputs.conditioning.items()}
     if "params" not in params:
         raise ValueError("generate takes the full variables dict ({'params': ...})")
