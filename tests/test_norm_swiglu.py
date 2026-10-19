@@ -612,7 +612,8 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
 
 def fused_function(name, implementation):
     """A fused kernel's public function by `name`, over (x, other, scale) or (gate, up), its operands
-    `fused_operands`: each of the norms, the inverse-rounded one among them, and both SiLU products."""
+    `fused_operands`: each of the norms, the inverse-rounded one and a gated one without a weight
+    ('weightless') among them, and both SiLU products."""
     if name == "swiglu":
         return gated_product("swiglu", implementation=implementation)
     if name == "packed":
@@ -637,13 +638,16 @@ def fused_operands(name, dtype):
     first, second = (jax.random.normal(jax.random.key(index), (4, 96)).astype(dtype) for index in (76, 77))
     if name in ("swiglu", "packed"):
         return first, second
+    if name == "weightless":
+        return first, second, None
     return first, second, (0.7 + 0.2 * jax.random.normal(jax.random.key(79), (96,))).astype(jnp.bfloat16)
 
 
 @pytest.mark.parametrize("composition", ["jvp_grad", "grad_jvp", "jvp_staged", "vmap_grad"])
 @pytest.mark.parametrize("name, dtype", [("swiglu", jnp.bfloat16), ("packed", jnp.float32),
                                          ("rms", jnp.bfloat16), ("stream", jnp.float32),
-                                         ("unweighted", jnp.bfloat16), ("gated", jnp.float32)])
+                                         ("unweighted", jnp.bfloat16), ("gated", jnp.float32),
+                                         ("weightless", jnp.bfloat16)])
 def test_a_fused_kernel_differentiates_at_every_order_through_its_portable_arithmetic(name, dtype,
                                                                                      composition):
     """Each fused norm and SiLU product (interpreted here) differentiated at a second order, forward
