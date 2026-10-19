@@ -19,7 +19,9 @@ from dew.cache import default_compilation_cache_dir, enable_compilation_cache
 # cost; the numbers in docs/performance.md were taken with it set.
 _remote = None
 if os.environ.get("DEW_TEST_NO_CACHE"):
-    # JAX's own switch, which a run's setup reads too (`dew.cache.persist_compilations`).
+    # JAX's own switch, which a run's setup reads too (`dew.cache.persist_compilations`), for this
+    # process and the processes its tests start.
+    os.environ["JAX_ENABLE_COMPILATION_CACHE"] = "false"
     jax.config.update("jax_enable_compilation_cache", val=False)
 else:
     _cache = default_compilation_cache_dir()
