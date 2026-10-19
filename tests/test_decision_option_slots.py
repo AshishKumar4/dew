@@ -174,13 +174,13 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
         truth, truth_gradient = float(truth), jax.tree.map(np.asarray, truth_gradient)
     # The compaction reorders the sums over the grid's option slots.
     slots = options.shape[1] * options.shape[2]
-    assert_leaves_as_exact(fewer, grid, truth)
-    assert_leaves_as_exact(fewer_gradient, grid_gradient, truth_gradient, terms=terms)
+    assert_leaves_as_exact(fewer, grid, truth, reductions=slots)
+    assert_leaves_as_exact(fewer_gradient, grid_gradient, truth_gradient, reductions=slots, terms=terms)
     # A NaN in one gradient leaf fails the same comparison.
     leaves, structure = jax.tree.flatten(fewer_gradient)
     poisoned = jax.tree.unflatten(structure, [np.full_like(leaves[0], np.nan), *leaves[1:]])
     with pytest.raises(AssertionError):
-        assert_leaves_as_exact(poisoned, grid_gradient, truth_gradient, terms=terms)
+        assert_leaves_as_exact(poisoned, grid_gradient, truth_gradient, reductions=slots, terms=terms)
 
     # Whatever the head gives a slot with no real option, the loss and its
     # gradients are the same bits: the model's logits mask those slots.

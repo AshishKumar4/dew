@@ -147,7 +147,8 @@ def test_the_sparse_mlp_trains_on_padded_rows_as_the_reference_does():
     (_, output), (kernels, inputs) = jax.value_and_grad(loss, (0, 1), has_aux=True)(
         params, jnp.asarray(hidden))
     dew = {"output": output, "input": inputs, **{name: kernels[name]["kernel"] for name in names}}
-    assert_leaves_as_exact(jax.tree.map(np.asarray, dew), reference(torch.float32), reference(torch.float64))
+    assert_leaves_as_exact(jax.tree.map(np.asarray, dew), reference(torch.float32), reference(torch.float64),
+                           reductions=hidden.shape[0] * hidden.shape[1])
 
 
 def sparse_mlps(sparsity: float, width: int, rows: int, dtype, hidden: int = HIDDEN):

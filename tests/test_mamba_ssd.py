@@ -121,7 +121,13 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
         truth, terms = jax.tree.map(np.asarray, float64_terms(through(chunk, starts, *cotangents),
                                                               *widened(inputs)))
     reference = {name: fixture[f"mamba.{name}"] for name in ported}
-    assert_leaves_as_exact(ported, reference, truth, terms=terms)
+    # A chunk's entries sum within it; `A` and `D` sum every token's, in another order than mamba_ssm's.
+    batch, length = inputs[0].shape[:2]
+    everywhere = {"A", "D"}
+    for leaves, reductions in ((set(ported) - everywhere, chunk), (everywhere, batch * length)):
+        mine, theirs, true, summed = ({name: tree[name] for name in sorted(leaves)}
+                                      for tree in (ported, reference, truth, terms))
+        assert_leaves_as_exact(mine, theirs, true, reductions=reductions, terms=summed)
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])

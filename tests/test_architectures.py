@@ -14,6 +14,7 @@ afterwards.
 """
 
 import json
+import math
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
@@ -576,6 +577,12 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         # Each fit donates the state it was handed.
         return jax.tree.map(jnp.copy, initial)
 
+    # The most terms a gradient sums: every row's positions, and over every
+    # layer for a weight the layers share (Gemma 3n's per-layer input norm).
+    positions = case.seq_len or math.prod(case.sample_shape[:-1])
+    layers = case.config.get("num_layers", 1)
+    reductions = BATCH * positions * int(np.sum(layers))
+
     def as_near(steps, rows):
         _, alone, _ = run_case(case, tmp_path, fsdp=1, devices=1, state=copied(), steps=steps)
         layouts = [run_case(case, tmp_path, fsdp=fsdp, state=copied(), steps=steps)[1] for fsdp in (1, 4)]
@@ -595,7 +602,8 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         for layout in layouts:
             for name in ("variables", "opt_state", "ema"):
                 assert_leaves_as_exact(*jax.device_get((getattr(layout, name), getattr(alone, name))),
-                                       getattr(exact, name), terms=getattr(terms, name), rows=rows)
+                                       getattr(exact, name), reductions=reductions,
+                                       terms=getattr(terms, name), rows=rows)
         return layouts
 
     as_near(1, rows=True)
