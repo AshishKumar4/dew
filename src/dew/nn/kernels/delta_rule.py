@@ -244,9 +244,10 @@ class FusedStep(tuning.KernelOp):
     config_cls: ClassVar[type[Warps]] = Warps
     ROWS: ClassVar[tuple[str, ...]] = ('active', 'mixed', 'held', 'gate', 'beta', 'z', 'state')
 
-    def _fwd(self, active, mixed, held, taps, gate, beta, log_decay, bias, z, weight, state, *,
-             key_heads: int, epsilon: float, activation: str, dtype: str, interpret: bool, config: Warps,
-             return_residuals: bool = False):
+    def _fwd(self, active: jax.Array, mixed: jax.Array, held: jax.Array, taps: jax.Array, gate: jax.Array,
+             beta: jax.Array, log_decay: jax.Array, bias: jax.Array, z: jax.Array, weight: jax.Array,
+             state: jax.Array, *, key_heads: int, epsilon: float, activation: str, dtype: str, interpret: bool,
+             config: Warps, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         rows, value_heads, key_width, value_width = state.shape
