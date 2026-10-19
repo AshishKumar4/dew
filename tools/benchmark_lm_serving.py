@@ -327,8 +327,23 @@ async def vllm_points(args):
     return {"label": args.hardware}, points
 
 
+def closed_loop(streamed):
+    """A closed-loop request over `streamed(prompt, output)`, the time each of a request's tokens reached
+    the client: the in-process engines' one set of clocks."""
+    async def request(prompt, output, gate, queued):
+        async with gate:
+            sent = time.perf_counter()
+            stamps = await streamed(prompt, output)
+            assert len(stamps) == output, (len(stamps), output)
+            return {"tokens": output, "ttft": stamps[0] - sent,
+                    "itl": (stamps[-1] - stamps[0]) / max(output - 1, 1),
+                    "latency": stamps[-1] - sent, "client_queue": sent - queued}
+    return request
+
+
 async def engine_points(args):
-    """The same scheduler/stream clocks, without HTTP serialization."""
+    """The same scheduler/stream clocks, without HTTP serialization. Output stays token ids, not text, as
+    Dew's and SGLang's do (`detokenize=False`)."""
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.inputs import TokensPrompt
@@ -339,28 +354,10 @@ async def engine_points(args):
         max_num_seqs=max(args.slots), gpu_memory_utilization=0.90,
         generation_config="vllm", enable_prefix_caching=False, disable_log_stats=True))
 
-    async def request(prompt, output, gate, queued):
-        async with gate:
-            sent = time.perf_counter()
-            policy = SamplingParams(temperature=0, top_p=1, top_k=-1, min_p=0,
-                                    repetition_penalty=1, max_tokens=output, ignore_eos=True)
-            stream = engine.generate(TokensPrompt(prompt_token_ids=prompt.tolist()), policy, uuid.uuid4().hex)
-            first = last = None
-            tokens = 0
-            async for result in stream:
-                count = len(result.outputs[0].token_ids)
-                if count > tokens:
-                    last = time.perf_counter()
-                    first = last if first is None else first
-                    tokens = count
-            assert first is not None and last is not None and tokens == output, (tokens, output)
-            return {"tokens": tokens, "ttft": first - sent, "itl": (last - first) / max(tokens - 1, 1),
-                    "latency": last - sent, "client_queue": sent - queued}
-
     async def streamed(prompt, output):
         """The time each of a request's tokens reached the client."""
-        policy = SamplingParams(temperature=0, top_p=1, top_k=-1, min_p=0,
-                                repetition_penalty=1, max_tokens=output, ignore_eos=True)
+        policy = SamplingParams(temperature=0, top_p=1, top_k=-1, min_p=0, repetition_penalty=1,
+                                max_tokens=output, ignore_eos=True, detokenize=False)
         stamps: list[float] = []
         async for result in engine.generate(TokensPrompt(prompt_token_ids=prompt.tolist()), policy,
                                             uuid.uuid4().hex):
@@ -369,14 +366,14 @@ async def engine_points(args):
         return stamps
 
     try:
-        points = await async_sweep(args, request, streamed)
+        points = await async_sweep(args, closed_loop(streamed), streamed)
     finally:
         engine.shutdown()
     return {"label": args.hardware}, points
 
 
 async def sglang_points(args):
-    """SGLang's engine in-process, on the same clocks as vllm-engine."""
+    """SGLang's engine in-process, on the same clocks as vllm-engine, its output token ids."""
     import sglang
 
     engine = sglang.Engine(model_path=args.model, dtype="bfloat16", context_length=args.prompt + args.output,
@@ -385,8 +382,8 @@ async def sglang_points(args):
     policy = {"temperature": 0, "top_p": 1, "top_k": -1, "min_p": 0, "repetition_penalty": 1,
               "ignore_eos": True}
 
-    async def tokens_of(prompt, output):
-        """Each of a request's tokens' arrival time, from SGLang's stream of growing output ids."""
+    async def streamed(prompt, output):
+        """The time each of a request's tokens reached the client, from SGLang's stream of growing output."""
         stamps: list[float] = []
         async for chunk in await engine.async_generate(input_ids=prompt.tolist(), stream=True,
                                                        sampling_params={**policy, "max_new_tokens": output}):
@@ -394,17 +391,8 @@ async def sglang_points(args):
             stamps.extend([time.perf_counter()] * arrived)
         return stamps
 
-    async def request(prompt, output, gate, queued):
-        async with gate:
-            sent = time.perf_counter()
-            stamps = await tokens_of(prompt, output)
-            assert len(stamps) == output, (len(stamps), output)
-            return {"tokens": output, "ttft": stamps[0] - sent,
-                    "itl": (stamps[-1] - stamps[0]) / max(output - 1, 1),
-                    "latency": stamps[-1] - sent, "client_queue": sent - queued}
-
     try:
-        points = await async_sweep(args, request, tokens_of)
+        points = await async_sweep(args, closed_loop(streamed), streamed)
     finally:
         engine.shutdown()
     return {"label": args.hardware}, points

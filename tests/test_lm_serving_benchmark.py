@@ -98,3 +98,52 @@ def test_the_benchmark_serves_through_sglangs_engine_on_its_clocks(tmp_path):
     assert (record["backend"], record["transport"]) == ("sglang-engine", "in-process")
     assert [point["slots"] for point in record["sweep"]] == [2, 4]
     assert all(repeat["output_tokens"] == 6 * 5 for point in record["sweep"] for repeat in point["repeats"])
+
+
+VLLM = {
+    "__init__.py": '''import json, os
+
+class SamplingParams:
+    def __init__(self, **policy):
+        json.dump(policy, open(os.environ["POLICY"], "w"))
+        self.max_tokens = policy["max_tokens"]
+''',
+    "inputs.py": "class TokensPrompt(dict):\n    pass\n",
+    "engine/__init__.py": "",
+    "engine/arg_utils.py": "class AsyncEngineArgs:\n    def __init__(self, **settings):\n        self.settings = settings\n",
+    "v1/__init__.py": "", "v1/engine/__init__.py": "",
+    "v1/engine/async_llm.py": '''import asyncio, types
+
+class AsyncLLM:
+    @classmethod
+    def from_engine_args(cls, args):
+        return cls()
+
+    async def generate(self, prompt, policy, request_id):
+        for count in range(1, policy.max_tokens + 1):
+            await asyncio.sleep(0)
+            yield types.SimpleNamespace(outputs=[types.SimpleNamespace(token_ids=[0] * count)])
+
+    def shutdown(self):
+        pass
+''',
+}
+
+
+def test_vllms_engine_streams_token_ids_as_the_other_engines_do(tmp_path):
+    """vllm-engine asks for token ids, not text (`detokenize=False`), as Dew's and SGLang's engines give,
+    so no engine's clock holds text decoding the others skip; and it times on the same closed loop."""
+    for name, text in VLLM.items():
+        (tmp_path / "engine" / "vllm" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "engine" / "vllm" / name).write_text(text)
+    policy = tmp_path / "policy.json"
+    env = {**os.environ, "PYTHONPATH": str(tmp_path / "engine"), "POLICY": str(policy)}
+    subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_lm_serving.py"),
+                    "--backend", "vllm-engine", "--model", "a/model", "--slots", "2", "--prompt", "8",
+                    "--output", "5", "--vocab-limit", "200", "--repeats", "1", "--requests", "4",
+                    "--out", str(tmp_path / "record.json")], check=True, env=env, cwd=ROOT)
+    assert json.loads(policy.read_text()) == {
+        "temperature": 0, "top_p": 1, "top_k": -1, "min_p": 0, "repetition_penalty": 1, "max_tokens": 5,
+        "ignore_eos": True, "detokenize": False}
+    record = json.loads((tmp_path / "record.json").read_text())
+    assert record["sweep"][0]["repeats"][0]["output_tokens"] == 4 * 5
