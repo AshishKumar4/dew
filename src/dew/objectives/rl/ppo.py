@@ -153,9 +153,6 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         """Tile the actor's head, the vocabulary head this objective trains."""
         return self.actor.tile_head(tile)
 
-    def unfuse_head(self) -> str | None:
-        return self.actor.unfuse_head()
-
     def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
         self.actor.restore_head(tile, fused=fused)
 
