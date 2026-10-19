@@ -277,7 +277,7 @@ def test_a_joint_head_trains_on_the_rows_of_a_head_no_one_matrix_is(head, tmp_pa
     from dew.decision import JointLayout, JointSchemaHead
     from dew.lora import unadapted
     from dew.nn.kernels.generation import device_generation
-    from dew.training.quantization import InputQuantization
+    from dew.quantization import InputQuantization
 
     model = tiny_backbone().clone(head_transform="gelu" if head == "transformed" else None,
                                   tie_embeddings=head == "transformed", max_seq_len=1536)

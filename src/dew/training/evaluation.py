@@ -566,17 +566,26 @@ def _close_source(held) -> None:
 
 class MetricScores[Statistics, Additions](Mapping):
     """A fit's scores keyed by the metric objects, objective scalars and
-    `(split, metric)` pairs that `best=` and `stop=` name."""
+    `(split, metric)` pairs that `best=` and `stop=` name, or by recorded name.
+    Each is resolved against what the fit declares (`declared`, each split's
+    metrics and loss, and the objective's training scalars): a declared score
+    this evaluation did not record, as a split evaluated on a cadence of its
+    own, reads as NaN, which ranks nothing; one the fit does not declare, or a
+    metric `fit` was not given, raises."""
 
     def __init__(
         self,
-        metrics: Sequence[Metric],
+        declared: Mapping[str, Sequence[Metric]],
         scores: Mapping[str, float],
         objective: Objective[Statistics, Additions],
     ):
         self.objective = objective
-        self.metrics = tuple(metrics) + tuple(objective.scalars[name] for name in ('loss', *objective.shown)
-                                              if name == 'loss' or f'train/{name}' in scores)
+        training = ('loss', *objective.shown)
+        every = {id(metric): metric for metrics in declared.values() for metric in metrics}
+        self.metrics = (*every.values(), *(objective.scalars[name] for name in training))
+        self.names = {*scores, *(f"train/{name}" for name in training),
+                      *(f"{split}/{name}" for split, metrics in declared.items()
+                        for name in ('loss', *(metric.name for metric in metrics)))}
         self.scores = scores
 
     def __getitem__(self, metric):
@@ -585,13 +594,17 @@ class MetricScores[Statistics, Additions](Mapping):
             and metric.__name__ == "loss"
             and metric.__self__ is self.objective
         ):
-            return self.scores['train/loss']
-        if isinstance(metric, str):
-            return self.scores[metric]
-        named = metric[1] if isinstance(metric, tuple) and len(metric) == 2 else metric
-        if not isinstance(named, TrainingScalar) and not any(declared is named for declared in self.metrics):
-            raise KeyError("the score refers to a metric not passed to fit")
-        return self.scores[recorded_name(metric, self.scores, self.objective)]
+            name = 'train/loss'
+        elif isinstance(metric, str):
+            name = metric
+        else:
+            named = metric[1] if isinstance(metric, tuple) and len(metric) == 2 else metric
+            if not isinstance(named, TrainingScalar) and not any(known is named for known in self.metrics):
+                raise KeyError("the score refers to a metric not passed to fit")
+            name = recorded_name(metric, self.names, self.objective)
+        if name not in self.names:
+            raise KeyError(f"{name!r} is not a score this fit records")
+        return self.scores.get(name, float("nan"))
 
     def __iter__(self):
         for name in self.scores:

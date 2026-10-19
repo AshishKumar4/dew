@@ -108,7 +108,8 @@ def fla_side(inputs, cuts, dtype) -> list[np.ndarray]:
     its last's: the others start from zero and give theirs no cotangent."""
     python = os.environ.get("DEW_FLA_PYTHON")
     if not python:
-        pytest.skip("DEW_FLA_PYTHON names no interpreter with fla 0.5.2 and torch, the GPU tier's reference")
+        pytest.fail("DEW_FLA_PYTHON names no interpreter with fla 0.5.2 and torch: the GPU tier's reference, "
+                    "which a run selecting fla's gate gives it")
     given = dict(zip(("q", "k", "v", "g", "beta", "h0", "do", "dht"),
                      (np.asarray(x, np.float32) for x in inputs), strict=True))
     if cuts is not None:
