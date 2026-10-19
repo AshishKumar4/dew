@@ -15,7 +15,6 @@ gives its refusal as text alone; any other is undeclared. The markdown lists tho
     python tools/kernel_routes.py trace --families qwen3,llama OUT.json    # named families
     python tools/kernel_routes.py trace --shard 3/16 OUT.json              # every 16th from the 4th
     python tools/kernel_routes.py report OUT.json... docs/reference/kernel-routes.md
-
 """
 
 from __future__ import annotations
