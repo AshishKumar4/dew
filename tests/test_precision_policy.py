@@ -295,22 +295,25 @@ def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
 
 
 def dot_precisions(function, *arguments) -> list:
-    """The precision of every dot_general `function` traces over `arguments`, with the dtype its
+    """The precision of every dot_general `function` traces over `arguments` under JAX's own default
+    precision (the test lane sets 'highest' for every product that states none), with the dtype its
     operands promote to, sub-jaxprs included."""
+    with jax.default_matmul_precision(None):
+        graph = jax.make_jaxpr(function)(*arguments)
     return [(equation.params["precision"],
              jnp.result_type(*(variable.aval.dtype for variable in equation.invars)))
-            for equation in equations(jax.make_jaxpr(function)(*arguments))
-            if equation.primitive.name == "dot_general"]
+            for equation in equations(graph) if equation.primitive.name == "dot_general"]
 
 
 HIGHEST = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
 
 
 def assert_float32_products(precisions) -> None:
-    """Every product of float32 operands at HIGHEST, and no other at it."""
+    """No product of float32 operands at JAX's default precision, which is TF32 on a GPU, and none
+    of narrower ones at HIGHEST. A product stating its own dot algorithm (a bf16 head's) is its own."""
     assert precisions
     off = [(precision, dtype) for precision, dtype in precisions
-           if (precision == HIGHEST) != (dtype == jnp.float32)]
+           if (precision is None and dtype == jnp.float32) or (precision == HIGHEST and dtype != jnp.float32)]
     assert not off, off
 
 
