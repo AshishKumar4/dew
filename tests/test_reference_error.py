@@ -288,5 +288,7 @@ def test_the_oracle_check_finds_a_wrong_small_entry_its_rms_dilutes():
     assert_computes_the_oracle(twin, truth, "a cancelled row", roundings=64)
     wrong = twin.copy()
     wrong[2, 5] = truth[2, 5] + 1e-11
-    with pytest.raises(AssertionError, match="entries"):
+    # The global RMS bound alone passes it.
+    assert distance(wrong, truth) <= FACTOR * 64 * eps * float(np.sqrt(np.mean(np.square(truth))))
+    with pytest.raises(AssertionError):
         assert_computes_the_oracle(wrong, truth, "one entry", roundings=64)
