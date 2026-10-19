@@ -1,86 +1,37 @@
-"""Harbor trials as a session source, each model call recorded by rllm-model-gateway.
+"""Harbor trials as a harness: each sample one `harbor trials start`, its model calls recorded.
 
-`HarborSource` runs one Harbor trial per sample. Harbor starts the task's
-sandbox, installs and runs the harness (mini-swe-agent by default), then
-runs the task's verifier. The harness reaches the model only through a
-recording gateway, `rllm-model-gateway`, at a base URL that names the
-session in its path, `/sessions/{session}/v1`. The gateway forwards each
-call to a vLLM or SGLang replica, asks it for token ids and
-log-probabilities, and records them under that session. The session is
-part of the URL because a CLI harness may drop a header.
+`Harbor` is the `Harness` (`dew.interop.harness`) that runs a sample as one
+Harbor trial. Harbor starts the task's sandbox, installs and runs the agent
+harness (mini-swe-agent by default), then runs the task's verifier. Its
+agent reaches the model through the trial's gateway session
+(`dew.interop.gateway`), given to it as the agent environment's
+`OPENAI_BASE_URL`. Harbor is a separate service in its own environment: Dew
+runs `harbor trials start` as a subprocess and reads the trial's
+`result.json`; it imports nothing of Harbor.
 
-Harbor and the gateway are separate services, each in its own environment.
-Dew runs `harbor trials start` as a subprocess, reads the trial's
-`result.json`, and reads the session's traces over HTTP; it imports
-neither. The gateway must persist traces before it answers
-(`sync_traces: true`), so a session's traces are complete once its harness
-has exited.
-
-`calls` turns gateway traces into `Call` records, in submission order. Each
-holds the engine's prompt ids, sampled ids and behavior log-probabilities
-as recorded, and the version the gateway stamped when the request arrived
-(the publication sets that stamp; see `Publication`). The gateway extracts
-vLLM's ids and SGLang's prompt ids. SGLang's sampled ids
-(`choices[0].response_token_ids`) are read from the raw response the
-gateway keeps.
-
-`outcome` decides how a trial ended from Harbor's result and the calls:
-
-- `COMPLETED` when the harness exited cleanly and the verifier scored the
-  trial.
-- `AGENT_ERROR`, with the verifier's score, when the harness exited nonzero
-  and the verifier still scored the trial.
-- `TRUNCATED` when the agent ran out of time, context or output budget, the
-  harness hit its own step limit, or the last call stopped at its length
-  limit. It has the verifier's reward when the verifier ran, and the
-  scheduler's `truncation` policy decides whether it trains.
-- `INFRA_ERROR` for anything else: a sandbox, gateway, engine or verifier
-  failure, a trace without ids or likelihoods, an aborted call, or a
-  session with no call. The scheduler retries these and never trains on
-  them.
+`outcome` decides how a trial ended from Harbor's result, the harness's own
+exit status and the calls, as `dew.interop.harness` lays out: Harbor's
+exception names say which limit an agent hit, mini-swe-agent's exit status
+says when it stopped at its own limit or its model client failed, and the
+engine's own events come first.
 """
 
 from __future__ import annotations
 
-import atexit
-import contextlib
-import functools
-import itertools
 import json
-import logging
 import os
-import queue
-import re
-import secrets
-import selectors
-import signal
-import subprocess
-import threading
-import time
-import uuid
-from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Future
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-from dew.inference.clients import decode_routed_experts
-from dew.objectives.rl.sessions import Call, Session, Status, Task
+from dew.objectives.rl.sessions import Status, Task
 from dew.records import JSON
 
-if TYPE_CHECKING:
-    from types import TracebackType
-
-    import httpx
-    import jax
-
-_logger = logging.getLogger(__name__)
+from .gateway import Recorded, engine_failure, number, refused_prompt
+from .harness import Judged, Trial
 
 HARBOR_KEY = "harbor"
 """The `Task.data` key that holds the Harbor task directory a trial runs."""
-
-# How often a trial whose output has closed asks whether Harbor has exited, as `Popen.wait` asks.
-_EXIT_POLL_SECONDS = 0.05
 
 # Harbor's exception class names (harbor.trial.errors, harbor.agents.installed.base).
 _TRUNCATIONS = frozenset({"AgentTimeoutError", "ContextWindowExceededError", "OutputTokenExceededError"})
@@ -103,226 +54,6 @@ _CLIENT_FAILURES = frozenset(
         "APITimeoutError",
     }
 )
-_SESSION = re.compile(r"[A-Za-z0-9._:-]+")
-
-
-class Gateway:
-    """Connects a session source to an rllm-model-gateway.
-
-    It builds each session's base URL, waits for the gateway to be ready,
-    stamps the weight version and reads a session's traces. `url` is the
-    gateway's root as Dew reaches it. `sandbox_url` is the address the
-    sandboxes reach it at, and a harness's base URL is built from it.
-
-    rllm-model-gateway (3b40c37) has no authentication. One port serves the
-    model proxy and also `GET /sessions`, every session's traces, `POST
-    /traces/query`, session deletes, `POST /admin/workers` and `POST
-    /admin/weight_version`. A sandbox runs the policy's own commands, so a
-    policy that reaches that port can read its group members' transcripts,
-    reset the version stamp the staleness bound reads, or register a worker
-    that returns fabricated ids and likelihoods. To prevent that:
-
-    - Put `url` on an interface only Dew reaches, by binding the gateway to
-      loopback or a private trainer network.
-    - Make `sandbox_url` a reverse proxy in front of the gateway, on its own
-      address, that forwards only `POST /sessions/<session>/v1/chat/completions`
-      (nginx `location ~ ^/sessions/[^/]+/v1/chat/completions$`) and answers
-      403 to everything else.
-    - Let the task's agent phase reach that address and nothing else, with
-      Harbor's `[agent] network_mode = "allowlist"` and `allowed_hosts`
-      naming the proxy, or with `--allow-agent-host`. This needs a provider
-      that supports allowlists (see Harbor's `tasks/network-policy` page;
-      Docker needs nftables `fib` support). Set
-      `[verifier] network_mode = "no-network"` as well. Harbor's allowlist
-      filters by host and not by path, which is why the proxy is needed.
-
-    `sandbox_url` defaults to `url`. Leave it unset only for trusted
-    harnesses and tests.
-    """
-
-    def __init__(self, url: str, *, sandbox_url: str | None = None, client: httpx.Client | None = None):
-        import httpx
-
-        self.url = url.rstrip("/")
-        self.sandbox_url = (sandbox_url or url).rstrip("/")
-        self._client = client or httpx.Client(timeout=30.0)
-
-    def session(self, session: str) -> str:
-        """Return the OpenAI base URL that makes the gateway record a harness's calls under `session`.
-
-        Raises ValueError unless `session` is URL-path safe: letters, digits
-        and `._:-`.
-        """
-        if not _SESSION.fullmatch(session):
-            raise ValueError(f"session ids are URL-path safe: letters, digits and ._:-; got {session!r}")
-        # The session goes in the path because a CLI harness may drop a header (memo section 5.7).
-        return f"{self.sandbox_url}/sessions/{session}/v1"
-
-    def traces(self, session: str) -> Sequence[object]:
-        response = self._client.get(f"{self.url}/sessions/{session}/traces")
-        response.raise_for_status()
-        traces = response.json()
-        if not isinstance(traces, list):
-            raise ValueError(f"the gateway's traces are a JSON list, got {type(traces).__name__}")
-        return traces
-
-    def ready(self, timeout: float, *, poll: float = 2.0) -> None:
-        """Wait until the gateway routes to a healthy worker that answers, or raise after `timeout` seconds.
-
-        Ready means `/health/workers` counts a healthy worker and `GET /v1/models`, proxied through
-        the gateway to an engine, answers 200. The check runs every `poll` seconds, and the error
-        after `timeout` is a RuntimeError.
-
-        rllm-model-gateway marks a worker dead after three failed health checks, which happens to an
-        engine that is still loading when the gateway starts. Until a later check revives the worker,
-        every proxied call gets a plain-text 500 that leaves no trace. A session submitted in that
-        window would fail because of the gateway, not the policy.
-        """
-        import httpx
-
-        url = f"{self.url}/health/workers"
-        deadline, seen = time.monotonic() + timeout, "no answer"
-        while True:
-            try:
-                response = self._client.get(url)
-                answer = response.json() if response.status_code == 200 else None
-                seen = f"{response.status_code} {response.text[:500]}"
-                healthy = answer.get("healthy") if isinstance(answer, dict) else None
-                if isinstance(healthy, int) and healthy > 0:
-                    # The gateway calls a worker healthy until its first probe fails, so also see the
-                    # engine answer through it; a request without a session leaves no trace.
-                    listing = self._client.get(f"{self.url}/v1/models")
-                    seen = f"GET /v1/models: {listing.status_code} {listing.text[:500]}"
-                    if listing.status_code == 200:
-                        return
-            except (httpx.HTTPError, ValueError) as error:
-                seen = f"{type(error).__name__}: {error}"
-            if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    f"the gateway reported no healthy worker within {timeout:g} s at {url} (last: {seen}); "
-                    "check that the engines are up and registered, or raise ready_timeout")
-            time.sleep(poll)
-
-    def stamp(self, version: int) -> None:
-        """Make the gateway label the calls it records from now on with `version` (a `Publication` stamp)."""
-        response = self._client.post(f"{self.url}/admin/weight_version", json={"weight_version": version})
-        answer = response.json()
-        if (
-            response.status_code != 200
-            or not isinstance(answer, dict)
-            or answer.get("weight_version") != version
-        ):
-            raise RuntimeError(
-                f"the gateway refused version {version}: {response.status_code} {response.text}"
-            )
-
-    def forget(self, session: str) -> None:
-        self._client.delete(f"{self.url}/sessions/{session}").raise_for_status()
-
-
-def _number(name: str, value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} is not a number: {value!r}")
-    return float(value)
-
-
-def _ids(name: str, values: object) -> tuple[int, ...]:
-    if not isinstance(values, list):
-        raise ValueError(f"the trace's {name} are not a list of token ids")
-    ids = tuple(value for value in values if type(value) is int)
-    if len(ids) != len(values):
-        raise ValueError(f"the trace's {name} are not a list of token ids")
-    return ids
-
-
-@dataclass(frozen=True)
-class Recorded:
-    """One session as the gateway recorded it.
-
-    `calls` are its model calls in submission order. `errors` are the
-    messages of the error replies the engine sent instead of a completion.
-    """
-
-    calls: tuple[Call, ...]
-    errors: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class _Trace:
-    """One gateway trace, read: when its request arrived, and either the call or the engine's error."""
-
-    arrival: float
-    call: Call | None
-    error: str
-
-
-def _trace(trace: object, unstamped: int) -> _Trace:
-    """Read one gateway trace, refusing any field that is not the JSON type the gateway writes."""
-    if not isinstance(trace, dict):
-        raise ValueError(f"a gateway trace is a JSON object, got {type(trace).__name__}")
-    raw = trace.get("raw_response") or {}
-    if not isinstance(raw, dict):
-        raise ValueError(f"a trace's raw response is a JSON object, got {type(raw).__name__}")
-    arrival = (
-        _number("timestamp", trace.get("timestamp")) - _number("latency_ms", trace.get("latency_ms")) / 1000
-    )
-    # vLLM answers {"error": {"message": ...}}; SGLang {"object": "error", "message": ...}.
-    error = raw.get("error") or (raw.get("message") if raw.get("object") == "error" else None)
-    if error:
-        return _Trace(arrival, None, str(error.get("message", error) if isinstance(error, dict) else error))
-    sampled = trace.get("completion_token_ids") or []
-    if not sampled:
-        # SGLang lists the sampled ids as choices[0].response_token_ids, which the gateway does not extract.
-        choices = raw.get("choices")
-        choice = choices[0] if isinstance(choices, list) and choices else None
-        sampled = (choice.get("response_token_ids") if isinstance(choice, dict) else None) or []
-    prompt = trace.get("prompt_token_ids") or []
-    if not prompt:
-        raise ValueError(
-            "a trace carries no prompt ids: the engine was not asked for them or cannot list them"
-        )
-    version = trace.get("weight_version")
-    if version is not None and type(version) is not int:
-        raise ValueError(f"a trace's weight version is an integer, got {version!r}")
-    choices = raw.get("choices")
-    choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
-    routed = choice.get("routed_experts")
-    likelihoods = trace.get("logprobs") or []
-    if not isinstance(likelihoods, list):
-        raise ValueError("a trace's log-probabilities are a list")
-    call = Call(_ids("prompt ids", prompt), _ids("sampled ids", sampled),
-                tuple(_number("a log-probability", value) for value in likelihoods),
-                str(trace.get("finish_reason")), unstamped if version is None else version,
-                routed_experts=None if routed is None else decode_routed_experts(routed))
-    return _Trace(arrival, call, "")
-
-
-def calls(traces: Sequence[object], *, unstamped: int) -> Recorded:
-    """The gateway's traces of one session as `Call`s in submission order, and its engine errors.
-
-    A trace records its arrival indirectly: `timestamp` is when the answer
-    was stored and `latency_ms` how long the engine took, so the calls are
-    ordered by their difference. A trace without a version stamp, from a
-    gateway no publication has stamped, takes `unstamped`, the version the
-    session was submitted under: no later push can have served it anything
-    older. The gateway also records an engine's error reply (a prompt past
-    the context length, an engine fault): such a trace carries `error` in its
-    raw response and is an event of the session, returned as its message, not
-    a call. A successful reply without ids, with one likelihood too few or
-    too many, or with a field of the wrong JSON type raises `ValueError`;
-    training on it would mean guessing or re-tokenizing text.
-    """
-    read = sorted((_trace(trace, unstamped) for trace in traces), key=lambda trace: trace.arrival)
-    return Recorded(tuple(trace.call for trace in read if trace.call is not None),
-                    tuple(trace.error for trace in read if trace.call is None))
-
-
-# How vLLM 0.30.0 ("This model's maximum context length is ...") and SGLang 0.5.20 ("The input (N
-# tokens) is longer than the model's context length (M tokens).") word a prompt past the context length;
-# vLLM's input processor, which token-id prompts reach, says
-# "... is longer than the maximum model length of M".
-_OVERFLOW = re.compile(r"maximum context length|longer than the model's context length"
-                       r"|longer than the maximum model length", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -347,59 +78,56 @@ def _judged(trial: object) -> _Judged:
     reported = verdict.get("rewards") or {}
     if not isinstance(reported, dict):
         raise ValueError(f"the verifier's rewards are not an object: {reported!r}")
-    rewards = {str(name): _number(f"reward {name!r}", value) for name, value in reported.items()}
+    rewards = {str(name): number(f"reward {name!r}", value) for name, value in reported.items()}
     if len(rewards) > 1 and "reward" not in rewards:
         raise ValueError(f"the verifier reported {sorted(rewards)} and no 'reward'")
     return _Judged(kind, f"{kind}: {failure.get('exception_message', '')}".strip() if kind else "", rewards)
 
 
-def outcome(trial: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = (),
-            harness_exit: str | None = None) -> tuple[Status, float | None, dict[str, float], str]:
-    """Status, reward, reward components and failure detail of one finished trial.
+def outcome(trial: JSON, recorded: Recorded, *, harness_exit: str | None = None) -> Judged:
+    """How one finished trial ended: its status, reward, reward components and failure detail.
 
-    `trial` is Harbor's `TrialResult` as JSON, `records` the session's calls,
-    `errors` the engine errors the gateway recorded for it, and `harness_exit`
-    the harness's own exit status when it reports one. An engine that refused
-    an overflowing prompt truncated the rollout; any other engine error makes
-    it infra, even when the harness retried and went on, and so does an
-    aborted call or a failed model client, whatever limit the trial also hit.
-    A result whose fields have the wrong JSON types is infra: nothing in it can
-    be trusted to score.
+    `trial` is Harbor's `TrialResult` as JSON, `recorded` the session's calls
+    and engine errors, and `harness_exit` the harness's own exit status when
+    it reports one. An engine that refused an overflowing prompt truncated
+    the rollout; any other engine error makes it infra, even when the harness
+    retried and went on, and so does an aborted call or a failed model
+    client, whatever limit the trial also hit. A result whose fields have the
+    wrong JSON types is infra: nothing in it can be trusted to score.
     """
     try:
         judged = _judged(trial)
     except ValueError as error:
-        return Status.INFRA_ERROR, None, {}, str(error)
+        return Judged(Status.INFRA_ERROR, detail=str(error))
     kind, detail, rewards = judged.kind, judged.detail, judged.rewards
     reward = rewards.get("reward", next(iter(rewards.values()), None))
-    broken = [error for error in errors if not _OVERFLOW.search(error)]
-    if broken:
-        return Status.INFRA_ERROR, reward, rewards, f"the engine answered an error: {broken[0]}"
-    if any(call.finish_reason == "abort" for call in records):
-        return Status.INFRA_ERROR, reward, rewards, "the engine aborted a call"
+    records = recorded.calls
+    failed = engine_failure(recorded)
+    if failed:
+        return Judged(Status.INFRA_ERROR, reward, rewards, failed)
     if harness_exit in _CLIENT_FAILURES:
-        return Status.INFRA_ERROR, reward, rewards, f"the harness's model client failed: {harness_exit}"
-    if errors:
-        return Status.TRUNCATED, reward, rewards, f"the engine refused a prompt: {errors[0]}"
+        return Judged(Status.INFRA_ERROR, reward, rewards,
+                      f"the harness's model client failed: {harness_exit}")
+    refused = refused_prompt(recorded)
+    if refused:
+        return Judged(Status.TRUNCATED, reward, rewards, refused)
     if (kind in _TRUNCATIONS or harness_exit in _HARNESS_LIMITS
             or (records and records[-1].finish_reason == "length")):
-        return (
-            Status.TRUNCATED,
-            reward,
-            rewards,
-            detail or harness_exit or "the last call stopped at its length limit",
-        )
+        return Judged(Status.TRUNCATED, reward, rewards,
+                      detail or harness_exit or "the last call stopped at its length limit")
     if not records:
-        return Status.INFRA_ERROR, reward, rewards, detail or "no model call reached the gateway session"
+        return Judged(Status.INFRA_ERROR, reward, rewards,
+                      detail or "no model call reached the gateway session")
     if reward is not None and kind is None:
-        return Status.COMPLETED, reward, rewards, ""
+        return Judged(Status.COMPLETED, reward, rewards)
     if reward is not None and kind in _AGENT_FAILURES:
-        return Status.AGENT_ERROR, reward, rewards, detail
-    return Status.INFRA_ERROR, reward, rewards, detail or "the verifier reported no reward"
+        return Judged(Status.AGENT_ERROR, reward, rewards, detail)
+    return Judged(Status.INFRA_ERROR, reward, rewards, detail or "the verifier reported no reward")
 
 
-class HarborSource:
-    """Runs each sample as one Harbor trial behind a recording gateway.
+@dataclass(frozen=True)
+class Harbor:
+    """Runs each sample as one Harbor trial (a `Harness` for `HarnessSource`).
 
     - `harbor` is the Harbor executable, installed in its own environment.
     - `agent` and `model` are its `--agent` and `--model`.
@@ -407,391 +135,49 @@ class HarborSource:
     - `environment` is passed to the harness as agent environment (`--ae`),
       beside the per-trial `OPENAI_BASE_URL` that names the session.
     - `arguments` are further `harbor trials start` options, such as the
-      environment provider, timeouts and agent kwargs.
-    - `workers` is how many trials run at once. Harbor's own sandbox limits
-      apply inside each trial.
-    - `trial_timeout`, when set, bounds each trial in seconds from its
-      start. Harbor bounds the environment build, the agent's setup and
-      run, and the verifier itself (`--agent-timeout`, `--verifier-timeout`,
-      `--timeout-multiplier` in `arguments`), but no option of its own
-      bounds the whole trial. A trial past this deadline is interrupted as
-      `cancel` interrupts it, and resolves `INFRA_ERROR`, which the
-      scheduler retries.
+      environment provider, timeouts and agent kwargs. Harbor bounds the
+      environment build, the agent's setup and run, and the verifier itself
+      (`--agent-timeout`, `--verifier-timeout`, `--timeout-multiplier`), but
+      no option of its own bounds the whole trial: `HarnessSource`'s
+      `trial_timeout` does.
 
-    The harness must speak the OpenAI chat API through `OPENAI_BASE_URL`, as
+    A task names its Harbor task directory under `data[HARBOR_KEY]`. The
+    agent must speak the OpenAI chat API through `OPENAI_BASE_URL`, as
     Harbor's mini-swe-agent does.
-
-    Gateway sessions are named `{task}:{group}:{sample}:{token}`. `group` is
-    unique to one `submit` across runs, and `token` is 128 secret bits, so a
-    sandbox can address only the session it was given. As a
-    `SessionSource`, every future it returns resolves to a `Session`. A
-    failure of Harbor, the sandbox, the gateway or the engine gives an
-    `INFRA_ERROR` session, not an exception, and a cancelled trial gives a
-    `CANCELLED` one. Each session's `attempt` is 0, because a retry is a
-    fresh `submit` and the scheduler, which assigns group identity, relabels
-    it.
-
-    The first `submit` waits up to `ready_timeout` seconds for the gateway
-    to report a healthy worker (`Gateway.ready`). So a source started beside
-    engines that are still loading does not launch trials that the gateway
-    would answer with a 500 and no trace.
-
-    Use it as a context manager, or call `close`, to cancel every trial when
-    you are done. A trainer that exits without either, for example on an
-    uncaught KeyboardInterrupt, still stops its trials. Trials run on daemon
-    threads, and an atexit hook cancels the queued trials and interrupts the
-    running ones, then kills their process groups after `grace` seconds.
     """
 
-    def __init__(
-        self,
-        gateway: Gateway,
-        *,
-        harbor: str | os.PathLike[str],
-        model: str,
-        trials: os.PathLike[str],
-        agent: str = "mini-swe-agent",
-        environment: Mapping[str, str] | None = None,
-        arguments: Sequence[str] = (),
-        workers: int = 8,
-        grace: float = 60.0,
-        trial_timeout: float | None = None,
-        ready_timeout: float = 900.0,
-        ready_poll: float = 2.0,
-    ):
-        if type(workers) is not int or workers < 1:
-            raise ValueError("workers must be a positive number of concurrent trials")
-        if not grace > 0 or (trial_timeout is not None and not trial_timeout > 0):
-            raise ValueError("grace and trial_timeout are positive numbers of seconds")
-        self._grace, self._trial_timeout = grace, trial_timeout
-        self._ready_timeout, self._ready_poll = ready_timeout, ready_poll
-        self._ready = False
-        # Serializes the readiness wait apart from `_lock`, so cancel and close never wait on the gateway.
-        self._ready_lock = threading.Lock()
-        self._closed = False
-        self._gateway = gateway
-        self._command = [os.fspath(harbor), "trials", "start", "-a", agent, "-m", model, *arguments]
-        self._environment = dict(environment or {})
-        self._trials = Path(trials)
-        self._run = uuid.uuid4().hex[:8]
-        self._serial = itertools.count()
-        # Daemon workers, not a ThreadPoolExecutor: concurrent.futures joins its pool before atexit
-        # hooks run, which would wait out every running trial and start every queued one on exit.
-        self._queue: queue.SimpleQueue[Callable[[], None] | None] = queue.SimpleQueue()
-        self._workers = [threading.Thread(target=self._work, name=f"dew-harbor-trial-{index}", daemon=True)
-                         for index in range(workers)]
-        for worker in self._workers:
-            worker.start()
-        self._lock = threading.Lock()
-        # One record per submitted, unresolved future, queued or running; a done-callback drops it.
-        self._records: dict[Future[Session], _Trial] = {}
-        # Trials run in their own process groups, so a Ctrl-C of the trainer does not reach them: at
-        # interpreter exit this hook cancels every record and stops every live trial.
-        self._exit_hook = functools.partial(_stop_all, self._records, self._lock, grace)
-        atexit.register(self._exit_hook)
+    harbor: str | os.PathLike[str]
+    model: str
+    trials: os.PathLike[str]
+    agent: str = "mini-swe-agent"
+    environment: Mapping[str, str] = field(default_factory=dict)
+    arguments: Sequence[str] = ()
 
-    def submit(self, task: Task, samples: int, *, version: int, key: jax.Array) -> list[Future[Session]]:
-        del key  # the agent's own requests draw through the gateway, which takes no key
+    def check(self, task: Task) -> None:
         directory = task.data.get(HARBOR_KEY)
         if not isinstance(directory, (str, os.PathLike)) or not Path(directory).is_dir():
             raise ValueError(f"task {task.id!r} names no Harbor task directory under data[{HARBOR_KEY!r}]")
-        if not _SESSION.fullmatch(task.id):
-            raise ValueError(f"a Harbor task id is URL-path safe (letters, digits and ._-); got {task.id!r}")
-        with self._ready_lock:
-            if not self._ready:
-                self._gateway.ready(self._ready_timeout, poll=self._ready_poll)
-                self._ready = True
-        group = f"{self._run}-{next(self._serial)}"
-        futures: list[Future[Session]] = []
-        for sample in range(samples):
-            future: Future[Session] = Future()
-            with self._lock:
-                if self._closed:
-                    raise RuntimeError("the Harbor source is closed")
-                self._records[future] = _Trial()
-                self._queue.put(functools.partial(self._trial, future, task, Path(directory), group, sample,
-                                                  version))
-            future.add_done_callback(self._forget_record)
-            futures.append(future)
-        return futures
 
-    def _forget_record(self, future: Future[Session]) -> None:
-        with self._lock:
-            self._records.pop(future, None)
+    def trial(self, task: Task, url: str, name: str) -> Trial:
+        directory = task.data[HARBOR_KEY]
+        assert isinstance(directory, (str, os.PathLike)), "check refused a task without one"
+        agent = {**self.environment, "OPENAI_BASE_URL": url}
+        return Trial((os.fspath(self.harbor), "trials", "start", "-a", self.agent, "-m", self.model,
+                      *self.arguments, "-p", os.fspath(directory), "--trial-name", name,
+                      "--trials-dir", os.fspath(self.trials),
+                      *(part for key, value in agent.items() for part in ("--ae", f"{key}={value}"))),
+                     Path(self.trials) / name)
 
-    def cancel(self, futures: Sequence[Future[Session]]) -> None:
-        """Interrupt the given trials. Harbor tears down their sandboxes, and each resolves `CANCELLED`.
-
-        A trial whose output is still open `grace` seconds after the
-        interrupt gets SIGTERM, and SIGKILL after another `grace` seconds,
-        each sent to its whole process group. Output still open a `grace`
-        after the SIGKILL is held by a process that left the group, which
-        keeps running; the trial stops reading it and resolves.
-        """
-        with self._lock:
-            for future in futures:
-                record = self._records.get(future)
-                if record is None or record.cancelled:
-                    continue
-                record.cancelled = True
-                self._interrupt(record)
-
-    def _interrupt(self, record: _Trial) -> None:
-        """Send a trial's process group SIGINT, once, and arm its escalation. The caller holds the lock."""
-        process = record.process
-        if record.timer is None and process is not None:
-            _signal(process, signal.SIGINT)
-            record.timer = _timer(self._grace, self._escalate, record, signal.SIGTERM)
-
-    def _escalate(self, record: _Trial, sent: signal.Signals) -> None:
-        """The trial's output stayed open for a whole grace period: signal the group again, SIGTERM then
-        SIGKILL."""
-        with self._lock:
-            process = record.process
-            if process is None:
-                return
-            _logger.warning("Harbor trial %d outlived its grace; sending %s", process.pid, sent.name)
-            _signal(process, sent)
-            record.timer = (_timer(self._grace, self._escalate, record, signal.SIGKILL)
-                            if sent is signal.SIGTERM else _timer(self._grace, self._release, record))
-
-    def _release(self, record: _Trial) -> None:
-        """The output outlived the SIGKILL by a grace: wake the trial's read so it stops."""
-        with self._lock:
-            if record.process is not None:
-                os.write(record.wake, b"\0")
-
-    def close(self) -> None:
-        """Cancel every unresolved trial, queued or running, and wait for the running ones to tear down."""
-        with self._lock:
-            # A submission checks this under the same lock, so none queues a trial behind the stop marks.
-            self._closed = True
-            pending = list(self._records)
-        self.cancel(pending)
-        for _ in self._workers:
-            self._queue.put(None)
-        for worker in self._workers:
-            worker.join()
-        atexit.unregister(self._exit_hook)
-
-    def _work(self) -> None:
-        while (trial := self._queue.get()) is not None:
-            trial()
-
-    def __enter__(self) -> HarborSource:
-        return self
-
-    def __exit__(self, kind: type[BaseException] | None, error: BaseException | None,
-                 trace: TracebackType | None) -> None:
-        self.close()
-
-    def _trial(self, future: Future[Session], task: Task, directory: Path, group: str, sample: int,
-               version: int) -> None:
-        # The token keeps a sandbox from addressing its group siblings' sessions through the gateway.
-        session = f"{task.id}:{group}:{sample}:{secrets.token_hex(16)}"
-        name = f"dew-{group}-{sample}"
-
-        def ended(status: Status, records: tuple[Call, ...] = (), reward: float | None = None,
-                    components: Mapping[str, float] | None = None, detail: str = "") -> Session:
-            return Session(task.id, group, sample, 0, records, status, reward, components or {}, detail)
-
+    def judge(self, task: Task, trial: Trial, log: str, returncode: int, recorded: Recorded) -> Judged:
+        result = trial.artifacts / "result.json"
+        if not result.is_file():
+            return Judged(Status.INFRA_ERROR,
+                          detail=f"harbor exited {returncode} with no result: {log[-2000:]}")
         try:
-            with contextlib.ExitStack() as held:
-                # The read's wake pipe exists before Harbor does, so a cancel never finds a running trial it
-                # cannot wake. Failing to make it settles the future as any other failure does.
-                woken, wake = os.pipe()
-                held.callback(os.close, wake)
-                held.callback(os.close, woken)
-                with self._lock:
-                    record = self._records[future]
-                    record.wake = wake
-                    process = (
-                        None
-                        if record.cancelled
-                        else subprocess.Popen(
-                            [
-                                *self._command,
-                                "-p",
-                                os.fspath(directory),
-                                "--trial-name",
-                                name,
-                                "--trials-dir",
-                                os.fspath(self._trials),
-                                *itertools.chain.from_iterable(
-                                    ("--ae", f"{key}={value}")
-                                    for key, value in {
-                                        **self._environment,
-                                        "OPENAI_BASE_URL": self._gateway.session(session),
-                                    }.items()
-                                ),
-                            ],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            start_new_session=True,
-                        )
-                    )
-                    record.process = process
-                if process is None:
-                    # Resolved outside the lock: the future's done-callback takes it.
-                    future.set_result(ended(Status.CANCELLED))
-                    return
-                try:
-                    log = self._read(process, record, woken)
-                except BaseException:
-                    with self._lock:
-                        # A read that failed takes the trial's group with it, while the group is Harbor's.
-                        if record.process is not None:
-                            _signal(record.process, signal.SIGKILL)
-                    raise
-                finally:
-                    with self._lock:
-                        # Retired before Harbor is reaped: no signal reaches a pid given to another process.
-                        record.process = None
-                        cancelled, expired = record.cancelled, record.expired
-                        if record.timer is not None:
-                            record.timer.cancel()
-                    assert process.stdout is not None
-                    process.stdout.close()
-                    process.wait()
-                    record.closed.set()
-            try:
-                future.set_result(self._verdict(ended, session, self._trials / name, log, process.returncode,
-                                                cancelled, expired, version))
-            finally:
-                # The session's traces leave the gateway on every exit path;
-                # the future already has its verdict.
-                try:
-                    self._gateway.forget(session)
-                except Exception as error:
-                    _logger.warning("could not delete gateway session %s: %s", session, error)
-        except BaseException as error:
-            if not future.done():
-                future.set_exception(error)
-
-    def _read(self, process: subprocess.Popen[bytes], record: _Trial, woken: int) -> str:
-        """Harbor's output, read until it closes and Harbor exits, or the escalation gives up on it.
-
-        Once the output closes, the read asks every `_EXIT_POLL_SECONDS`
-        whether Harbor has exited, under the lock, and retires Harbor in the
-        step that reaps it, so no signal reaches its group's id once another
-        process could hold it. Past `trial_timeout`, whether the output is
-        still open or Harbor alone runs on, the trial is interrupted as
-        `cancel` interrupts it. The escalation of either wakes this read
-        through `woken` a `grace` after its SIGKILL, when the output still
-        open is held outside the group.
-        """
-        assert process.stdout is not None
-        output = bytearray()
-        deadline = None if self._trial_timeout is None else time.monotonic() + self._trial_timeout
-        with selectors.DefaultSelector() as ready:
-            ready.register(process.stdout, selectors.EVENT_READ)
-            ready.register(woken, selectors.EVENT_READ)
-            while True:
-                reading = len(ready.get_map()) > 1
-                if not reading:
-                    with self._lock:
-                        if process.poll() is not None:
-                            record.process = None
-                            break
-                if deadline is not None and time.monotonic() >= deadline:
-                    with self._lock:
-                        record.expired = True
-                        self._interrupt(record)
-                    deadline = None
-                waits = ([] if reading else [_EXIT_POLL_SECONDS]) + (
-                    [] if deadline is None else [deadline - time.monotonic()])
-                events = ready.select(min(waits, default=None))
-                if any(key.fd == woken for key, _ in events):
-                    break
-                for key, _ in events:
-                    if not (chunk := os.read(key.fd, 65536)):
-                        ready.unregister(key.fd)
-                    else:
-                        output.extend(chunk)
-        return output.decode("utf-8", errors="replace")
-
-    def _verdict(self, ended: Callable[..., Session], session: str, trial: Path, log: str, returncode: int,
-                 cancelled: bool, expired: bool, version: int) -> Session:
-        try:
-            recorded = calls(self._gateway.traces(session), unstamped=version)
-        except Exception as error:
-            return ended(Status.CANCELLED if cancelled else Status.INFRA_ERROR,
-                           detail=f"{trial}: unusable gateway traces: {error}")
-        records = recorded.calls
-        if cancelled:
-            return ended(Status.CANCELLED, records, detail=str(trial))
-        if expired:
-            return ended(Status.INFRA_ERROR, records,
-                         detail=f"{trial}: interrupted past trial_timeout={self._trial_timeout:g} s")
-        if not (trial / "result.json").is_file():
-            return ended(
-                Status.INFRA_ERROR,
-                records,
-                detail=f"harbor exited {returncode} with no result: {log[-2000:]}",
-            )
-        try:
-            harness_exit = _harness_exit(trial)
+            harness_exit = _harness_exit(trial.artifacts)
         except ValueError as error:
-            return ended(
-                Status.INFRA_ERROR, records, detail=f"{trial}: unreadable harness trajectory: {error}"
-            )
-        status, reward, components, detail = outcome(
-            json.loads((trial / "result.json").read_text()), records, errors=recorded.errors,
-            harness_exit=harness_exit)
-        return ended(status, records, reward, components, f"{trial}: {detail}".rstrip(": "))
-
-
-@dataclass
-class _Trial:
-    """What `cancel` and the deadline need of one submitted sample: whether it was cancelled or ran
-    past `trial_timeout`, its running Harbor, the timer of its next escalation, and whether its
-    output has closed."""
-
-    cancelled: bool = False
-    expired: bool = False
-    process: subprocess.Popen[bytes] | None = None
-    """The running Harbor, until the trial retires it under the lock: in the step that reaps it once
-    its output has closed, or before reaping it when the escalation gives up on the output. Until
-    then its pid, the group's id, is not given to another process, so a signal sent to the group
-    under the lock while this is set reaches the trial's processes and no others."""
-    timer: threading.Timer | None = None
-    wake: int = -1
-    """The write end of the pipe that stops the trial's read, open while `process` is set."""
-    closed: threading.Event = field(default_factory=threading.Event)
-
-
-def _timer[*Arguments](seconds: float, action: Callable[[*Arguments], None],
-                       *arguments: *Arguments) -> threading.Timer:
-    """A daemon timer: an escalation still pending must not hold the interpreter open at exit."""
-    timer = threading.Timer(seconds, action, arguments)
-    timer.daemon = True
-    timer.start()
-    return timer
-
-
-def _signal(process: subprocess.Popen[bytes], sent: signal.Signals) -> None:
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, sent)
-
-
-def _stop_all(records: dict[Future[Session], _Trial], lock: threading.Lock, grace: float) -> None:
-    """At interpreter exit: cancel every trial, interrupt the live ones, and
-    kill the process group of each whose output is still open `grace`
-    seconds later, so a child Harbor left behind dies too."""
-    with lock:
-        live = []
-        for record in records.values():
-            record.cancelled = True
-            if record.process is not None:
-                _signal(record.process, signal.SIGINT)
-                live.append(record)
-    deadline = time.monotonic() + grace
-    for record in live:
-        # The trial's own thread reads its output, retires and reaps Harbor, then marks it closed.
-        if not record.closed.wait(max(0.0, deadline - time.monotonic())):
-            with lock:
-                if record.process is not None:
-                    _signal(record.process, signal.SIGKILL)
+            return Judged(Status.INFRA_ERROR, detail=f"unreadable harness trajectory: {error}")
+        return outcome(json.loads(result.read_text()), recorded, harness_exit=harness_exit)
 
 
 def _harness_exit(trial: Path) -> str | None:
@@ -808,4 +194,4 @@ def _harness_exit(trial: Path) -> str | None:
     return status
 
 
-__all__ = ["HARBOR_KEY", "Gateway", "HarborSource", "Recorded"]
+__all__ = ["HARBOR_KEY", "Harbor", "outcome"]
