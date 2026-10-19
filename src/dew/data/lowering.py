@@ -260,8 +260,9 @@ def _recounted(output: Record, given: Record) -> Record:
     left every value they were counted from as it was. A step that changes one, as a crop changes
     tokens or a chunk step cuts them, drops the count, and `ValidTargets` measures the row it
     delivers instead of reading a count of the row it was."""
-    if (not isinstance(output, dict) or not isinstance(given, dict) or "_dew_valid_targets" not in given
-            or "_dew_valid_targets" not in output):
+    if any(value is None or isinstance(value, (bytes, Rejected)) for value in (output, given)):
+        return output
+    if "_dew_valid_targets" not in given or "_dew_valid_targets" not in output:
         return output
     if all(output.get(name) is value for name, value in given.items() if not name.startswith("_dew_")):
         return output

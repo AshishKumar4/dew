@@ -589,7 +589,7 @@ def test_a_token_mixture_counts_the_targets_a_corpus_delivers_wherever_its_rows_
 
     long = Pipeline(corpus("long", (20, 20, 20, 20)), name="long")
     long = (long.repeat().random_map(Halved()) if where == "after-repeat"
-            else long.map(CountTargets()).map(Halving()).repeat())
+            else long.filter_map(CountTargets()).map(Halving()).repeat())
     mixed = mix([long, Pipeline(corpus("short", (4, 4)), name="short").repeat()], by="tokens")
     data = compile(mixed.map(Counted()).batch(8), read="memory", loading=READ)
     stream = data.train(DataPartition())
