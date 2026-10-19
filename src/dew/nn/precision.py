@@ -32,11 +32,10 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
 
 
 def biased(product: jax.Array, bias: jax.Array, dtype) -> jax.Array:
-    """`product` plus `bias` broadcast over its leading axes, the sum taken at fp32
-    (`at_least_fp32`) and rounded once to `dtype`, the dtype flax's layer gives its output. A dense
-    layer takes the product at that width (`fp32_result_dot_general`), unrounded, so product and
-    bias round together once, as torch's addmm rounds them: rounding the product first, then the
-    sum, put a Llama 3 query projection's bf16 output 1.42 times as far from float64 as torch's.
+    """`product` plus `bias` broadcast over its leading axes, in `dtype`, as flax's layer adds them.
+    Rounding the product and the bias once together, as torch's addmm does, wrote an fp32 product
+    and a pass of its own on every biased layer (a DiT-B step 17.5% slower on an A100), for a bf16
+    output 1.37 times torch's rounding, which the parity rule holds already.
 
     JAX transposes a broadcast into a sum in the broadcast operand's dtype (jax-ml/jax#30310), so
     a bfloat16 bias added to bfloat16 products sums its gradient over every position in bfloat16,
@@ -44,11 +43,12 @@ def biased(product: jax.Array, bias: jax.Array, dtype) -> jax.Array:
     came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
     at fp32, the gradient sums at fp32 and rounds once into the bias.
     """
-    wide = at_least_fp32(dtype)
+    wide = at_least_fp32(bias.dtype)
     # The bias takes the product's rank before the sum, as flax's layers reshape it, so no rank is
-    # promoted implicitly.
+    # promoted implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds
+    # the round trip, so the product and bias fuse as before) and its gradient sums at fp32.
     bias = jnp.reshape(bias.astype(wide), (1,) * (product.ndim - bias.ndim) + bias.shape)
-    return (product.astype(wide) + bias).astype(dtype)
+    return product.astype(dtype) + jnp.broadcast_to(bias, product.shape).astype(dtype)
 
 
 def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
