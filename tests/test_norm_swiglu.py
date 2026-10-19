@@ -355,10 +355,14 @@ def test_stream_seam_takes_the_add_and_the_stream_cotangent(joined, dtype, shape
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(2, 3, 4, 31), (2, 64, 16, 128)])
-def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, shape):
+@pytest.mark.parametrize("gate_dtype", ["same", jnp.bfloat16])
+def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, shape, gate_dtype):
     """Qwen3-Next's gated norm: the kernel's output and its input, gate and
-    weight gradients each within the gate of XLA's float64 distance."""
+    weight gradients each within the gate of XLA's float64 distance, its
+    gate in the input's dtype or in bf16 beside an fp32 input, as a decode
+    step's recurrence hands it over."""
     x, gate, dy = (jax.random.normal(jax.random.key(index), shape).astype(dtype) for index in (51, 52, 53))
+    gate = gate if gate_dtype == "same" else gate.astype(gate_dtype)
     scale = 0.7 + 0.2 * jax.random.normal(jax.random.key(54), shape[-1:])
     operands = (x, gate, scale)
 
@@ -376,6 +380,19 @@ def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, 
                                                  strict=True):
         assert mine.dtype == theirs.dtype, label
         assert_as_exact_as_the_reference(mine, theirs, want, label, terms=summed)
+
+
+def test_a_decode_steps_gated_norm_takes_the_fused_kernel_where_its_row_names_it():
+    """Traced for an A100, whose row names the fused RMSNorm, the gated norm of a decode step (Qwen3-Next's,
+    Kimi's): an fp32 recurrence output gated by its bf16 projection reports the kernel, not a refusal."""
+    from dew.nn.kernels import generation
+
+    x, gate, scale = jnp.ones((2, 4, 128), jnp.float32), jnp.ones((2, 4, 128), jnp.bfloat16), jnp.ones((128,))
+    with generation.assumed("sm80"), generation.routes() as found:
+        jax.make_jaxpr(lambda x, gate, scale: gated_rms_normalized(
+            x, gate, scale, 1e-6, jnp.bfloat16, "silu"))(x, gate, scale)
+    (route,) = [route for route in found if route.choice == "rms_norm"]
+    assert (route.kernel, route.preferred, route.refusal) == ("pallas", "pallas", None)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
