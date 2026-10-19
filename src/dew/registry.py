@@ -841,9 +841,17 @@ def _owned(member: Callable[..., Configured], *, called: bool) -> bool:
 
 
 def _record_class(member: Callable[..., Configured]) -> type | None:
-    """`member` when it is a dataclass, whose fields a record names; None for
-    a function or a plain class, which declares no fields to narrow."""
-    return member if isinstance(member, type) and dataclasses.is_dataclass(member) else None
+    """`member` when it is a dataclass built from its fields, whose fields a
+    record names; None for a function, a plain class, or a dataclass whose own
+    constructor takes other arguments (a metric over its base's fields), each
+    built from its parameters (`parameters`)."""
+    if not (isinstance(member, type) and dataclasses.is_dataclass(member)):
+        return None
+    # The generated constructor takes the init fields, InitVars among them, in any order
+    # keyword-only ones give it; a constructor of the class's own takes other names.
+    taken = {name for name in inspect.signature(member.__init__).parameters if name != "self"}
+    fields = {f.name for f in dataclasses.fields(member) if f.init}
+    return member if fields <= taken <= set(member.__dataclass_fields__) else None
 
 
 def _construct(member: type, fields: Mapping[str, object], *, dtypes: bool) -> Configured:

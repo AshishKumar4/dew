@@ -259,7 +259,7 @@ class MetricConfig:
     one a record lacks takes the class's default now."""
 
     def __post_init__(self) -> None:
-        member = metrics[self.name]
+        member = _metric_class(self.name)
         object.__setattr__(self, "name", registry.import_path(member))
         object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
         object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
@@ -269,8 +269,17 @@ class MetricConfig:
         where it states none of its own (the field a video run's sample
         is read from, say)."""
         unstated = {name: value for name, value in derived.items() if name not in self.fields}
-        arguments = _arguments(metrics[self.name], self.fields, self.defaults)
+        arguments = _arguments(_metric_class(self.name), self.fields, self.defaults)
         return metrics.build(self.name, arguments, **unstated)
+
+
+def _metric_class(name: str) -> type:
+    """The metric class `name` names, an alias or import path: a run's metric is a class, whose
+    arguments its record holds."""
+    member = metrics[name]
+    if not isinstance(member, type):
+        raise TypeError(f"{name!r} names {member!r}, which is no metric class")
+    return member
 
 
 def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:

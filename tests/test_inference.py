@@ -277,7 +277,7 @@ def validated_run(directory, validates: bool, **fields):
         finally:
             checkpoints.wait()
     with LocalTracker(directory / "tracking") as journal:
-        return journal.scalars(), checkpoints.latest()
+        return journal.scalars(), checkpoints.latest
 
 
 def test_an_image_run_validates_on_clip_by_default_with_the_model_its_metric_names(tmp_path, monkeypatch):
@@ -302,9 +302,9 @@ def test_an_image_run_validates_on_clip_by_default_with_the_model_its_metric_nam
 def test_a_metric_a_run_names_without_a_validation_split_refuses_before_an_update(tmp_path):
     """A run that names a metric asks for it whatever its data holds, so data with no validation
     split refuses the run in `Trainer.fit`, before its first update writes a checkpoint."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="give the dataset a val split"):
         validated_run(tmp_path, False, val_metrics=(MetricConfig("psnr"),))
-    assert Checkpoints(str(tmp_path / "checkpoints"), keep=1).latest() is None
+    assert Checkpoints(str(tmp_path / "checkpoints"), keep=1).latest is None
 
 
 def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
