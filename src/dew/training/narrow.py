@@ -65,7 +65,7 @@ def _inner(eqn, index: int):
     return inner, inner.invars[index]
 
 
-_STACKING = ("reshape", "expand_dims", "squeeze", "broadcast_in_dim", "concatenate")
+_STACKING = ("stack", "reshape", "expand_dims", "squeeze", "broadcast_in_dim", "concatenate")
 """The ops a stack of layers builds its operand with, each element of the result one of its
 operands': a cast of the result is the stack of its operands' casts, and its cotangent's slices are
 theirs."""
@@ -87,8 +87,10 @@ def _cast_once(var, jaxpr) -> jnp.dtype | None:
         stacked = eqn.outvars[0]
         # A broadcast that repeats elements would read one weight in many places, whose
         # cotangents it sums in the weight's dtype.
-        operands = [operand for operand in eqn.invars if isinstance(operand, core.Var)]
-        if stacked.aval.size != sum(operand.aval.size for operand in operands):
+        shapes = [operand.aval for operand in eqn.invars if isinstance(operand, core.Var)]
+        sized = [aval for aval in shapes if isinstance(aval, ShapedArray)]
+        if (not isinstance(stacked.aval, ShapedArray) or len(sized) != len(shapes)
+                or stacked.aval.size != sum(aval.size for aval in sized)):
             return None
         return _cast_once(stacked, jaxpr)
     called = _inner(eqn, index)
