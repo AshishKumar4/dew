@@ -122,7 +122,8 @@ def teacher_weights(variables: Variables | None, run: str | None, *, whole: bool
     if run is not None:
         from dew.checkpoints import Checkpoints
 
-        tree = Checkpoints(run).variables(ema=None, step=None, mesh=None, layout=None, param_dtype=None)
+        with Checkpoints(run) as checkpoints:
+            tree = checkpoints.variables(ema=None, step=None, mesh=None, layout=None, param_dtype=None)
     elif variables is not None and "params" in variables:
         tree = variables
     else:

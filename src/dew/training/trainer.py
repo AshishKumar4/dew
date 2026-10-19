@@ -374,6 +374,9 @@ class _FitRun:
     endless: bool = False
     taken: Taken | None = None
     """The log taken at the latest logging step and not yet read."""
+    stepped: tuple[jax.Array, dict[str, jax.Array], jax.Array] | None = None
+    """The latest step's loss, objective metrics and acceptance, which the log of the interval it
+    ends takes."""
     reads: dict[Signature, tuple[bool, ...]] = dataclasses.field(default_factory=dict)
     """Which leaves of a batch of each signature its compiled step reads
     (`step_reads`), which the prefetcher alone places."""
@@ -1724,12 +1727,9 @@ class Trainer(Generic[Loss, Effects]):
         aux = {name: value for name, value in aux.items()
                if name not in (TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
+        run.stepped = (loss, aux, accepted)
         if current % plan.log_every == 0:
-            run.taken = interval.take(current, loss, aux, accepted,
-                                      held(learning_rate(state.opt_state),
-                                           None if state.scale is None else state.scale.scale),
-                                      {} if self.rollout is None else dict(_rollout_metrics(self.rollout)),
-                                      plan.dataset.statistics())
+            self._take(plan, run, interval, state)
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
             # The clock is read at the log interval, where the step is already
@@ -1763,6 +1763,7 @@ class Trainer(Generic[Loss, Effects]):
             return True
         assert run.notice is not None
         if not ending and run.notice.reached(current):
+            self._take(plan, run, interval, state, unlogged=True)
             if checkpoints is not None and interval.last_saved != current:
                 self._read_taken(run)
                 run.other += self._saved_checkpoint(
@@ -1778,6 +1779,23 @@ class Trainer(Generic[Loss, Effects]):
             return True
         return False
 
+    def _take(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, *,
+              unlogged: bool = False) -> None:
+        """Take the log of the interval ending at the current step (`Interval.take`); with
+        `unlogged`, only where it holds steps no log took, as the step a run ends on between its
+        logging steps does."""
+        if run.stepped is None or (unlogged and not interval.since_log):
+            return
+        if unlogged:
+            # The latest logging step's log, which the loop reads a step late, goes first.
+            self._read_taken(run)
+        loss, aux, accepted = run.stepped
+        run.taken = interval.take(run.current, loss, aux, accepted,
+                                  held(learning_rate(state.opt_state),
+                                       None if state.scale is None else state.scale.scale),
+                                  {} if self.rollout is None else dict(_rollout_metrics(self.rollout)),
+                                  plan.dataset.statistics())
+
     def _saves(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState, position,
                scores: Mapping[str, float], *, evaluation_due: bool, final: bool = False) -> None:
         """Resolve cadence, ranking, stopping and unconditional final saves in one place."""
@@ -1787,6 +1805,7 @@ class Trainer(Generic[Loss, Effects]):
             evaluation_due and checkpoints is not None and (plan.checkpoint_every or plan.best)) else ()
         candidate = bool(winners)
         if scores and self._plateau(plan, run, scores):
+            self._take(plan, run, interval, state, unlogged=True)
             run.stopped = True
             run.stop_control['stop_reason'] = 'validation plateau'
             self._display.note("Stopped: validation plateau")
@@ -1814,6 +1833,7 @@ class Trainer(Generic[Loss, Effects]):
         announced, the trace window stopped, the final validation (skipped on
         a preemption) and the checkpoint of the state the run ends on."""
         profile, checkpoints, current, loss = self.profile, self.checkpoints, run.current, run.loss
+        self._take(plan, run, interval, state, unlogged=True)
         self._read_taken(run)
         if run.notice is not None:
             run.notice.close()

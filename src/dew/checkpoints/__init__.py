@@ -57,6 +57,7 @@ import json
 import math
 import os
 from collections.abc import Callable, Mapping, Sequence
+from types import TracebackType
 from typing import TYPE_CHECKING, Literal, Protocol, overload, runtime_checkable
 
 import jax
@@ -182,6 +183,24 @@ def location(directory: str) -> epath.Path:
     """
     path = epath.Path(directory)
     return path if is_uri(directory) else path.resolve()
+
+
+def _attempted(steps: Sequence[tuple[str, Callable[[], None]]], *,
+               primary: BaseException | None = None) -> None:
+    """Run every step, even after one fails. Each failure is noted on `primary`, the error its
+    caller is already raising, which stays the one raised; without one the first failure is raised
+    with the later ones noted on it."""
+    error = primary
+    for label, step in steps:
+        try:
+            step()
+        except BaseException as failure:
+            if error is None:
+                error = failure
+            else:
+                error.add_note(f"{label} failed: {failure!r}")
+    if primary is None and error is not None:
+        raise error
 
 
 def _processes(count: int) -> str:
@@ -1305,8 +1324,8 @@ class Checkpoints:
             for name, value in values.items():
                 digest = digests[tree][name]
                 if digest not in written and digest not in stored:
-                    with region("checkpoint.frozen"):
-                        ocp.PyTreeCheckpointer().save(root / digest, args=ocp.args.PyTreeSave(value))
+                    with region("checkpoint.frozen"), ocp.PyTreeCheckpointer() as checkpointer:
+                        checkpointer.save(root / digest, args=ocp.args.PyTreeSave(value))
                     written.add(digest)
         kept_tree = dict(state_tree)
         for tree, values in held.items():
@@ -1333,39 +1352,40 @@ class Checkpoints:
         template's placement and dtype or as host arrays, refusing one whose
         content no longer has the digest the step recorded."""
         values = {}
-        for name, digest in digests.items():
-            path = epath.Path(self.directory) / FROZEN_STORE / digest
-            if not path.exists():
-                raise FileNotFoundError(
-                    f"{path} is gone: the step records its {name} collection there, so the run "
-                    f"directory was copied or published without its {FROZEN_STORE}/ directory")
-            checkpointer = ocp.PyTreeCheckpointer()
-            stored = dict(_item_metadata(checkpointer.metadata(path)))
-            template = None if templates is None else templates.get(name)
-            # A template may ask for part of the collection, as a bank reader does
-            # one layer of a frozen base; the part is read through the same partial
-            # restore a step's own leaves take, and only a whole read can check the
-            # content against the digest the step recorded.
-            whole = template is None or (jax.tree.structure(template) == jax.tree.structure(stored))
-            if template is not None and not whole:
-                from dew.inference.banks import narrowed
-                kept = narrowed(template, stored)
-                _refuse_lacking(_paths(template) - _paths(kept), f"{path} ({name})")
-                stored, template = narrowed(stored, template), kept
-            if template is not None:
-                _refuse_reshaped(template, stored, f"{path} ({name})")
-            restore_args = (jax.tree.map(lambda meta: _read(None, meta.dtype), stored) if template is None
-                            else jax.tree.map(lambda meta, want: _read(want, meta.dtype), stored, template))
-            tree = checkpointer.restore(path, args=ocp.args.PyTreeRestore(
-                item=stored, restore_args=restore_args, partial_restore=not whole))
-            if whole:
-                found = _digest(tree)
-                if found != digest:
-                    raise ValueError(f"{path} holds content with digest {found}, not the {digest} the "
-                                     f"step recorded for its {name} collection")
-            if template is not None:
-                tree = _placed(tree, template)
-            values[name] = tree
+        with ocp.PyTreeCheckpointer() as checkpointer:
+            for name, digest in digests.items():
+                path = epath.Path(self.directory) / FROZEN_STORE / digest
+                if not path.exists():
+                    raise FileNotFoundError(
+                        f"{path} is gone: the step records its {name} collection there, so the run "
+                        f"directory was copied or published without its {FROZEN_STORE}/ directory")
+                stored = dict(_item_metadata(checkpointer.metadata(path)))
+                template = None if templates is None else templates.get(name)
+                # A template may ask for part of the collection, as a bank reader does
+                # one layer of a frozen base; the part is read through the same partial
+                # restore a step's own leaves take, and only a whole read can check the
+                # content against the digest the step recorded.
+                whole = template is None or (jax.tree.structure(template) == jax.tree.structure(stored))
+                if template is not None and not whole:
+                    from dew.inference.banks import narrowed
+                    kept = narrowed(template, stored)
+                    _refuse_lacking(_paths(template) - _paths(kept), f"{path} ({name})")
+                    stored, template = narrowed(stored, template), kept
+                if template is not None:
+                    _refuse_reshaped(template, stored, f"{path} ({name})")
+                restore_args = (
+                    jax.tree.map(lambda meta: _read(None, meta.dtype), stored) if template is None
+                    else jax.tree.map(lambda meta, want: _read(want, meta.dtype), stored, template))
+                tree = checkpointer.restore(path, args=ocp.args.PyTreeRestore(
+                    item=stored, restore_args=restore_args, partial_restore=not whole))
+                if whole:
+                    found = _digest(tree)
+                    if found != digest:
+                        raise ValueError(f"{path} holds content with digest {found}, not the {digest} the "
+                                         f"step recorded for its {name} collection")
+                if template is not None:
+                    tree = _placed(tree, template)
+                values[name] = tree
         return values
 
     def profile_steps(self) -> list[int]:
@@ -1608,14 +1628,15 @@ class Checkpoints:
         if deltas:
             stored['ema'] = jax.tree_util.tree_map_with_path(
                 lambda path, leaf: deltas.get(path, leaf), stored['ema'])
-        for tree, names in ((snapshot.custom_metadata or {}).get('frozen') or {}).items():
-            collections = stored.get(tree)
-            if isinstance(collections, Mapping):
-                stored[tree] = {**collections, **{
-                    name: jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), dict(
-                        _item_metadata(ocp.PyTreeCheckpointer().metadata(
-                            epath.Path(self.directory) / FROZEN_STORE / digest))))
-                    for name, digest in names.items()}}
+        frozen = epath.Path(self.directory) / FROZEN_STORE
+        with ocp.PyTreeCheckpointer() as checkpointer:
+            for tree, names in ((snapshot.custom_metadata or {}).get('frozen') or {}).items():
+                collections = stored.get(tree)
+                if isinstance(collections, Mapping):
+                    stored[tree] = {**collections, **{
+                        name: jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), dict(
+                            _item_metadata(checkpointer.metadata(frozen / digest))))
+                        for name, digest in names.items()}}
         return stored
 
     def accumulation_template(self, step: int):
@@ -1812,6 +1833,30 @@ class Checkpoints:
                 f"delete {self.local_directory} to resume from the persistent checkpoint "
                 f"at step {self._open().latest_step()} in {self.directory}.")
 
+    def close(self) -> None:
+        """Wait for pending writes, then close the Orbax managers and the threads and metadata stores
+        they hold, each even where another, or its own wait, failed: Orbax reports a failed
+        asynchronous write once, from the wait, and its close still releases the manager. The first
+        failure is raised with the rest noted on it. A closed `Checkpoints` reopens its managers on
+        its next use."""
+        _attempted(self._closing())
+
+    def __enter__(self) -> Checkpoints:
+        return self
+
+    def __exit__(self, kind: type[BaseException] | None, raised: BaseException | None,
+                 traceback: TracebackType | None) -> None:
+        """`close`, with a failure noted on the error the body raised, which stays the one raised."""
+        _attempted(self._closing(), primary=raised)
+
+    def _closing(self) -> list[tuple[str, Callable[[], None]]]:
+        """The steps that close the open managers, which this forgets: each one's wait, then each
+        one's close."""
+        opened = [writer for writer in (self._manager, self._local_manager) if writer is not None]
+        self._manager, self._local_manager, self._pending = None, None, None
+        return [*(("Checkpoint wait", writer.wait_until_finished) for writer in opened),
+                *(("Checkpoint close", writer.close) for writer in opened)]
+
     def wait(self) -> None:
         """Block until pending async writes have landed on disk.
 
@@ -1819,16 +1864,6 @@ class Checkpoints:
         anything that reads a checkpoint back has to call this first.
         """
         with region("checkpoint.wait"):
-            error = None
-            for checkpointer in (self._manager, self._local_manager):
-                if checkpointer is not None:
-                    try:
-                        checkpointer.wait_until_finished()
-                    except BaseException as failure:
-                        if error is None:
-                            error = failure
-                        else:
-                            error.add_note(f"Checkpoint wait also failed: {failure!r}")
-            if error is not None:
-                raise error
+            _attempted([("Checkpoint wait", writer.wait_until_finished)
+                        for writer in (self._manager, self._local_manager) if writer is not None])
             self._pending = None

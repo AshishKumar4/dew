@@ -731,6 +731,30 @@ def test_a_registry_model_adapts_through_the_names_its_own_kernels_carry(tmp_pat
         unnamed.save(adapted, tmp_path / "unnamed")
 
 
+def test_factors_keep_one_storage_dtype_whether_attached_or_rebuilt_from_the_record():
+    """An adapter's factors are stored in float32 under bfloat16 base weights, as attached and as
+    the model rebuilt from its record initializes them, so a run restoring trained factors onto
+    the rebuilt model's template keeps every bit; the rebuilt model computes what the attached one
+    does over the attached variables."""
+    from dew.config import ModelConfig
+
+    model = nn.Sequential([nn.Dense(8, param_dtype=jnp.bfloat16), nn.Dense(4, param_dtype=jnp.bfloat16)])
+    inputs = jax.random.normal(jax.random.key(1), (2, 6))
+    variables = model.init(jax.random.key(0), inputs)
+    adapter = LoRA(rank=2, modules=("layers_0", "layers_1")).apply(model, variables, key=0)
+    rebuilt = ModelConfig.from_model(adapter.model).build()
+    template = rebuilt.init(jax.random.key(0), inputs)
+
+    def factors(tree):
+        return {name: leaf.dtype for name, leaf in _flat(tree["params"]).items()
+                if name.endswith(lora.FACTORS)}
+
+    attached = factors(adapter.variables)
+    assert factors(template) == attached == dict.fromkeys(attached, jnp.float32)
+    np.testing.assert_array_equal(np.asarray(rebuilt.apply(adapter.variables, inputs)),
+                                  np.asarray(adapter.model.apply(adapter.variables, inputs)))
+
+
 def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
     """A scanned stack runs its like layers as one module, `layers_0_1`; the
     adapter's targets are named per layer, so the branch resolves the run to

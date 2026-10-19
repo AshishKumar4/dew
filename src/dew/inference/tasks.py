@@ -276,9 +276,9 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
     from dew.checkpoints import Checkpoints
     from dew.registry import import_trusted, objectives
     persist_compilations()
-    checkpoints = Checkpoints(directory)
-    step = checkpoints.pinned(step)
-    record = checkpoints.artifact(step)
+    with Checkpoints(directory) as checkpoints:
+        step = checkpoints.pinned(step)
+        record = checkpoints.artifact(step)
     import_trusted(record, trust)
     if record is None:
         raise ValueError("this checkpoint's objective declares no inference record; declare "

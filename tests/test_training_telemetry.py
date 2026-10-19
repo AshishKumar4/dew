@@ -124,6 +124,25 @@ def test_each_checkpoint_follows_the_log_of_its_step(tmp_path):
         step: losses[step] for step in (2, 4, 6, 8)}
 
 
+def test_a_run_ending_between_logs_reports_its_last_interval():
+    """A run whose last step falls between logging steps logs that step as a logging step: three
+    steps at log_every=100 report step 3, and five at log_every=2 report steps 2, 4 and 5, each
+    with the loss, objective metrics and committed gradient norm the run sends at its logs."""
+    values = [1., 3., 2., 6., 1.]
+    every = RecordingTracker()
+    Trainer(Squared(), optax.sgd(.1), key=0, tracker=every).fit(targets(values), steps=5, log_every=1)
+    losses = {step: scalars['train/loss'] for step, scalars in every.scalars if 'train/loss' in scalars}
+    for steps, cadence, logged in ((3, 100, [3]), (5, 2, [2, 4, 5])):
+        sink = RecordingTracker()
+        trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink)
+        trainer.fit(targets(values), steps=steps, log_every=cadence)
+        rows = {step: scalars for step, scalars in sink.scalars if 'train/loss' in scalars}
+        assert sorted(rows) == logged
+        assert {step: row['train/loss'] for step, row in rows.items()} == pytest.approx(
+            {step: losses[step] for step in logged})
+        assert all({'train/probe', 'train/grad_norm'} <= row.keys() for row in rows.values())
+
+
 @pytest.mark.parametrize('cadence,expected', [
     (1, {2: 4., 4: 7.2, 6: 1.76}), (3, {3: 4., 6: 4.48}), (6, {6: 4.32}),
 ])
@@ -145,16 +164,55 @@ def test_rejected_attempts_do_not_contribute_to_grad_norm():
     assert rows == pytest.approx({3: 4.})
 
 
+class Repeated:
+    """One batch over and over, with its position, which a checkpoint saves."""
+
+    def __init__(self, batch):
+        self.batch, self.index = batch, 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.index += 1
+        return self.batch
+
+    def get_state(self):
+        return json.dumps(self.index).encode()
+
+    def set_state(self, state):
+        self.index = json.loads(state)
+
+
 @pytest.mark.parametrize('accumulation', [1, 2])
-def test_complex_gradients_have_a_real_committed_norm(accumulation):
-    batch = {'target': np.broadcast_to(np.array([1 + 2j, 3 + 4j], np.complex64), (8, 2))}
-    data = Loader(lambda partition: iter([batch] * accumulation), None, None, 8)
+def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, accumulation):
+    """A real loss of complex weights descends. JAX's gradient of a real function of a complex
+    weight is the conjugate of its steepest ascent, so the optimizer takes its conjugate: SGD at
+    0.1 on |w - t|^2 moves w by -0.2 (w - t) each update, w_k = t (1 - 0.8^k). The committed norm is
+    the gradient's Euclidean norm, 2|t| at w = 0, and a run resumed from its checkpoint after two
+    updates lands where the whole run does."""
+    from dew.training import Checkpoints
+
+    target = np.array([1 + 2j, 3 + 4j])
+    batch = {'target': np.broadcast_to(target.astype(np.complex64), (8, 2))}
+
+    def fit(steps, directory=None, sink=None):
+        trainer = Trainer(ComplexSquared(), optax.sgd(.1), key=0, tracker=sink, accumulation=accumulation,
+                          checkpoints=None if directory is None else Checkpoints(str(directory)))
+        data = Loader(lambda partition: Repeated(batch), None, None, 8)
+        return trainer.fit(data, steps=steps * accumulation, log_every=accumulation,
+                           checkpoint_every=None if directory is None else accumulation)
+
     sink = RecordingTracker()
-    trainer = Trainer(ComplexSquared(), optax.sgd(.1), key=0, tracker=sink, accumulation=accumulation)
-    trainer.fit(data, steps=accumulation, log_every=1)
-    rows = {step: scalars['train/grad_norm'] for step, scalars in sink.scalars
-            if 'train/grad_norm' in scalars}
-    assert rows == pytest.approx({accumulation: np.sqrt(120.)})
+    weight = np.asarray(fit(4, sink=sink).variables['params']['weight'])
+    # Against float64 truth: four complex64 updates of weights below 5 in magnitude round within
+    # sqrt(4) eps32 |t|_rms = 9.2e-7 each part; the bound is twice that.
+    np.testing.assert_allclose(weight, target * (1 - 0.8 ** 4), rtol=0, atol=1.9e-6)
+    norms = {step: scalars['train/grad_norm'] for step, scalars in sink.scalars
+             if 'train/grad_norm' in scalars}
+    assert norms[accumulation] == pytest.approx(np.sqrt(120.))
+    fit(2, tmp_path)
+    np.testing.assert_array_equal(np.asarray(fit(4, tmp_path).variables['params']['weight']), weight)
 
 
 def test_run_record_names_the_package_checkout_and_hardware(tmp_path, monkeypatch):
