@@ -710,20 +710,56 @@ def test_an_agent_command_runs_in_its_own_directory_against_its_own_session(tmp_
         assert ("DELETE", f"/sessions/{session}") in asked
 
 
-def test_an_agent_command_the_verifier_cannot_score_or_the_engine_failed_is_infra(tmp_path):
-    """A verifier that cannot score leaves the trial unscored, which is infra; so is a session the
-    engine answered with an error, whatever the verifier would say."""
+@pytest.mark.parametrize("extra", [(), (overflow("vllm"),), (trace([1, 2, 10, 4], [5], [-.5], "length"),)],
+                         ids=["ended", "refused", "length"])
+def test_an_agent_command_the_verifier_cannot_score_is_infra_however_the_session_ended(tmp_path, extra):
+    """A verifier that cannot score leaves the trial unscored, which is infra, retried and never
+    trained, also where the engine refused a prompt or the last call ran out of tokens: a
+    truncation would train or mask an invented outcome."""
     source = HarnessSource(agent_command(tmp_path, verify=lambda task, directory, code: None),
-                           fake_gateway()[0])
-    broken = HarnessSource(agent_command(tmp_path), fake_gateway(extra=[refusal("EngineCore died", 500)])[0])
+                           fake_gateway(extra=extra)[0])
     try:
         (unscored,) = source.submit(Task("adds"), 1, version=0, key=KEY)
-        (failed,) = broken.submit(Task("adds"), 1, version=0, key=KEY)
         assert unscored.result(timeout=60).status is Status.INFRA_ERROR
-        assert failed.result(timeout=60).status is Status.INFRA_ERROR
     finally:
         source.close()
-        broken.close()
+
+
+@pytest.mark.parametrize(("extra", "status"), [
+    ((refusal("EngineCore died", 500),), Status.INFRA_ERROR), ((overflow("sglang"),), Status.TRUNCATED),
+    ((trace([1, 2, 10, 4], [5], [-.5], "length"),), Status.TRUNCATED)], ids=["failed", "refused", "length"])
+def test_an_agent_command_is_judged_by_what_the_engine_said_first(tmp_path, extra, status):
+    """An engine failure makes a scored trial infra; a refused prompt or a last call stopped at its
+    length limit truncates it, with its score."""
+    source = HarnessSource(agent_command(tmp_path), fake_gateway(extra=extra)[0])
+    try:
+        (future,) = source.submit(Task("adds"), 1, version=0, key=KEY)
+        rollout = future.result(timeout=60)
+    finally:
+        source.close()
+    assert rollout.status is status and rollout.reward == (None if status is Status.INFRA_ERROR else 1.0)
+
+
+def test_an_agent_command_in_a_relative_workspace_runs_what_it_put_in_its_directory(tmp_path, monkeypatch):
+    """The command factory writes its agent into the trial's directory and runs it from there: the
+    directory it is given resolves inside the trial's own working directory."""
+    monkeypatch.chdir(tmp_path)
+
+    def argv(task, directory):
+        (directory / "agent.py").write_text(AGENT)
+        return [sys.executable, str(directory / "agent.py"), task.id]
+
+    def verify(task, directory, code):
+        return float((directory / "answer.txt").read_text() == "4")
+
+    command = Command(argv, verify, Path("work"))
+    source = HarnessSource(command, fake_gateway()[0])
+    try:
+        (future,) = source.submit(Task("adds"), 1, version=0, key=KEY)
+        rollout = future.result(timeout=60)
+    finally:
+        source.close()
+    assert (rollout.status, rollout.reward) == (Status.COMPLETED, 1.0)
 
 
 def test_a_cancelled_agent_command_is_interrupted_and_resolves_cancelled(tmp_path):
