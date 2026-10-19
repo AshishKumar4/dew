@@ -673,7 +673,7 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
     float64 decoding, entry by entry, within the float64 rounding of the computation. At a few
     positions of every run, vLLM's too, one rounding moves the continuation's log-probabilities by
     whole units, so one run against one decides nothing there: each run is held to vLLM's over the
-    residual orders vLLM ran under (tests/reference_error.py's K-order rule), each row's probe
+    orders vLLM ran under (tests/reference_error.py's K-order rule), each row's probe
     columns overall, row by row and entry by entry, and every entry of every row against vLLM's
     own, each entry's mean error over a batch of orders within FACTOR of vLLM's, an entry flagged
     on one batch measured again on the next (tests/reference_error.py's element rule). On a
@@ -681,6 +681,15 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
     (https://github.com/vllm-project/vllm/pull/60149#issuecomment-6270937659): there the reference
     is that model code at the engine's precision under the same orders, so the engine's departure
     widens no bound.
+
+    The orders are the exact symmetries both engines hold the release under, on the same prompts
+    (tools/dory_vllm_reference.py's `symmetry`): the residual stream's units, each feed-forward's
+    hidden units, each attention's heads and value dimensions. They redraw 90 to 99.5% of the
+    release's summed terms. The rest no order moves on either side, so neither error there is calibrated: the
+    queries' and keys' products over a head's dimensions (RoPE's frequency pairs), the softmax's and
+    the values' sums over the keys (the key order), the queries' and keys' unit norms, and the
+    log-softmax over the vocabulary. A failure that persists there is a finding about those sums, to
+    diagnose, not a draw.
 
     Each arm's precision: the engine computes a bf16 run in bf16 over fp32 accumulation, and an
     fp32 run with its linears at "highest" (VLLM_FLOAT32_MATMUL_PRECISION's default) and its
