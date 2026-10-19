@@ -127,6 +127,51 @@ def test_attention_the_decode_kernel_takes_lowers_for_the_gpu_differentiated_in_
         assert triton_kernels(lowered) == {"decode_attention": 1}
 
 
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_grouped_query_in_its_own_layout_reaches_the_decode_kernel(generation):
+    """A decode step's query of 4 heads over 2 key heads, called in the layer's own `[B, 1, N, D]`
+    layout with key lengths: the core reads each key head's query heads as its query positions
+    (`attention._grouped`), so the decode kernel takes it, lowered for the GPU on this CPU."""
+    from dew.nn.kernels.generation import assumed, gpu_mesh
+    from dew.training._lowering import triton_kernels
+
+    query = jax.ShapeDtypeStruct((2, 1, 4, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, 64, 2, 64), jnp.bfloat16)
+
+    def attend(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation='xla',
+                                            key_value_seq_lengths=jnp.asarray([1, 20], jnp.int32))
+
+    mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(attend).trace(query, key, key).lower(lowering_platforms=("cuda",))
+    assert triton_kernels(lowered) == {"decode_attention": 1}
+
+
+@pytest.mark.parametrize("implementation", ["xla", "reference"])
+def test_a_grouped_query_attends_as_its_heads_do_alone(implementation):
+    """Grouped in the core, a query of 3 positions and 8 heads over 2 key heads with key lengths gives
+    each head's attention over its key head's keys, within tests/reference_error.py's rule of the
+    reference over the key heads repeated, against float64."""
+    from dew.nn.attention import reference_attention, repeat_kv_heads
+
+    rng = np.random.default_rng(3)
+    lengths = jnp.asarray([1, 9, 32], jnp.int32)
+    query, key, value = (jnp.asarray(rng.normal(size=shape), jnp.float32)
+                         for shape in ((3, 3, 8, 32), (3, 32, 2, 32), (3, 32, 2, 32)))
+    found = scaled_dot_product_attention(query, key, value, implementation=implementation,
+                                         key_value_seq_lengths=lengths)
+
+    def alone(query, key, value):
+        mask = (jnp.arange(key.shape[1]) < lengths[:, None])[:, None, None, :]
+        return reference_attention(query, repeat_kv_heads(key, 8), repeat_kv_heads(value, 8), mask=mask)
+
+    with jax.enable_x64(new_val=True):
+        truth = alone(*(jnp.asarray(x, jnp.float64) for x in (query, key, value)))
+    assert_as_exact_as_the_reference(np.asarray(found), np.asarray(alone(query, key, value)),
+                                     np.asarray(truth), f"grouped {implementation}")
+
+
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
 def test_attention_the_decode_kernel_takes_differentiates_as_the_folded_attention():
     """A decode step's attention, its value the kernel's, differentiates as the folded attention it
