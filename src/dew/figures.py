@@ -515,8 +515,11 @@ def points(series: Mapping[str, Sequence[tuple[float, float]]], *, x_label: str,
     def ticks(k: int) -> np.ndarray:
         if not (log_x, log_y)[k]:
             return _ticks(low[k], high[k])
-        decades = 10.0 ** np.arange(np.ceil(low[k]), np.floor(high[k]) + 1)
-        return decades if len(decades) > 1 else 10.0 ** np.array([low[k], high[k]])
+        # Powers of ten, or 1, 2 and 5 times them where the axis spans less than two decades.
+        decades = np.arange(np.floor(low[k]), np.ceil(high[k]) + 1)
+        steps = (1.0,) if high[k] - low[k] >= 2 else (1.0, 2.0, 5.0)
+        marks = np.array([m * 10.0 ** d for d in decades for m in steps])
+        return marks[(np.log10(marks) >= low[k]) & (np.log10(marks) <= high[k])]
 
     for tick in ticks(1):
         _, tick_y = at(every[0, 0], tick)
