@@ -1,7 +1,7 @@
-"""`import dew` stops a process that would run JAX on the CPU beside an
-NVIDIA GPU, with the install that fixes it (`dew.telemetry.devices`). The
-GPU is nvidia-smi's answer, so a stand-in nvidia-smi plays every machine on a
-host without one."""
+"""A run's setup stops a process whose JAX opened on the CPU beside an NVIDIA
+GPU, with the install that fixes it (`dew.telemetry.devices`), and `import dew`
+does not. The GPU is nvidia-smi's answer, so a stand-in nvidia-smi plays every
+machine on a host without one."""
 
 import os
 import subprocess
@@ -30,24 +30,57 @@ def test_nvidia_smi_reads_as_the_driver_and_the_least_sm(tmp_path, monkeypatch, 
     assert nvidia_gpus() == gpus
 
 
+REFUSED = 3
+"""The status the script ends with where the run's setup refuses the machine."""
+
+READIED = f"""
+import logging
+import sys
+
+import dew
+assert not logging.getLogger("dew").handlers, "import dew configured Dew's logger"
+sys.path.insert(0, "tests")
+
+
+def run():
+    if sys.argv[1] == "prepare":
+        from dew.training import prepare_process
+        prepare_process(multi_host=False)
+        return
+    import jax
+    import optax
+    from affine_run import Regression, batches
+    from dew.data.dataset import Loader
+    from dew.training import Trainer
+    Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0)).fit(
+        Loader(lambda partition: batches(), None, None, 8), steps=1, log_every=1)
+
+
+try:
+    run()
+except RuntimeError as refused:
+    print(refused, file=sys.stderr)
+    sys.exit({REFUSED})
+finally:
+    assert logging.getLogger("dew").handlers, "the run left Dew's logger without its handler"
+"""
+
+
 @pytest.mark.parametrize("platforms", [None, "cpu"])
-def test_import_dew_stops_where_the_gpu_would_sit_idle(tmp_path, platforms):
-    """A stand-in nvidia-smi reports driver 580 and two GPUs: `import dew`
-    stops with what `cpu_only_refusal` says of this environment's JAX (the
-    cuda13 install where no CUDA build is present), before any backend opens.
-    JAX_PLATFORMS=cpu imports."""
+@pytest.mark.parametrize("entry", ["prepare", "fit"])
+def test_a_run_stops_where_the_gpu_would_sit_idle_and_import_dew_does_not(tmp_path, platforms, entry):
+    """A stand-in nvidia-smi reports driver 580 and two GPUs beside a JAX that opens on the CPU:
+    `import dew` leaves the process alone, its logger and its hardware, and a run's setup,
+    `prepare_process` or a `Trainer.fit` no `prepare_process` came before, stops with what
+    `cpu_only_refusal` says of this environment's JAX, the plain refusal where it finds an install
+    that should run. Either way the run gives Dew's logger its handler. JAX_PLATFORMS=cpu runs."""
     env = {key: value for key, value in os.environ.items() if key != "JAX_PLATFORMS"}
     env["PATH"] = stand_in(tmp_path, "580.82.07, 8.9\\n580.82.07, 8.6\\n")
     if platforms is not None:
         env["JAX_PLATFORMS"] = platforms
-    done = subprocess.run([sys.executable, "-c", "import dew"], capture_output=True, text=True, env=env,
-                          timeout=120)
-    expected = None if platforms == "cpu" else cpu_only_refusal({}, ("580.82.07", (8, 6)), cuda_builds(),
-                                                                cuda_driver_version())
-    if expected is None:
-        assert done.returncode == 0, done.stderr[-2000:]
-    else:
-        assert done.returncode != 0, done.stderr[-2000:]
+    done = subprocess.run([sys.executable, "-c", READIED, entry], capture_output=True, text=True, env=env,
+                          timeout=300, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    assert done.returncode == (0 if platforms == "cpu" else REFUSED), done.stderr[-2000:]
 
 
 @pytest.mark.parametrize("driver, cuda, newest", [
