@@ -419,9 +419,6 @@ class Mamba2(nn.Module):
         if self.num_heads % self.n_groups:
             raise ValueError(
                 f"num_heads ({self.num_heads}) must be a multiple of n_groups ({self.n_groups})")
-        if self.conv_kernel < 2:
-            raise ValueError(
-                f"the causal conv needs a history, so a kernel of at least 2, got {self.conv_kernel}")
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
         dense = functools.partial(
