@@ -446,6 +446,7 @@ class _NativeTextTask:
     its Hub copy, and the row decoder their generations carry. Each task
     keeps its own controls, loading checks and device call."""
 
+    model: nn.Module
     variables: Variables
     processor: Processor | None
 
