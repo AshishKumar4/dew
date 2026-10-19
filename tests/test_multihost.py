@@ -178,16 +178,37 @@ single.run_pool = gang_pool
 @pytest.mark.distributed
 def test_losing_one_host_ends_the_pool_on_the_others(tmp_path):
     """A host that dies while its pool trains (its process killed outright) ends the pool's process
-    on the other host with an error, rather than leaving it waiting for ever on a peer that is gone."""
+    on the other host with an error, rather than leaving it waiting for ever on a peer that is gone.
+    Every rank swaps what it saw, a failure on rank 0 or 1 included, so a rank that raised is the
+    failure every rank reports, never a wait on an exchange that rank never reached."""
     sequence = next(POOLS)
     together(sequence)
-    if RANK >= 2:
-        exchange(sequence, None)
-        return
+    mine: object = None
+    try:
+        if RANK < 2:
+            mine = lost_host(sequence, tmp_path)
+    except BaseException as failure:
+        mine = {"failed": f"rank {RANK}: {failure!r}"}
+        raise
+    finally:
+        parts = exchange(sequence, mine)
+    failed = [part["failed"] for part in parts if isinstance(part, dict)]
+    if failed:
+        pytest.fail("\n".join(failed))
+    assert [part[0] for part in parts[:2]] == [True, True], "a process ended before rank 1's host died"
+    assert parts[0][1] not in (0, None), (
+        f"rank 0's process kept waiting {parts[0][2]:.0f} s after rank 1's host died")
+
+
+def lost_host(sequence: int, tmp_path: Path) -> list:
+    """Rank 0's or 1's half of the loss: its process of the pool, rank 1's killed `KILL_AFTER` seconds
+    in. Whether it still ran then, how rank 0's ended (None if it outlived ten minutes), and how long
+    rank 0's took to end after the kill."""
     process = spawn("tracked", tmp_path / f"process{RANK}.json", processes=2, process_id=RANK,
                     coordinator=f"rank0:{COORDINATOR + sequence}", fsdp_size=2, steps=1_000_000)
     time.sleep(KILL_AFTER)
     alive = process.poll() is None
+    killed = time.monotonic()
     if RANK == 1:
         terminate(process)
     outcome = None
@@ -197,9 +218,7 @@ def test_losing_one_host_ends_the_pool_on_the_others(tmp_path):
             outcome = process.returncode
         except subprocess.TimeoutExpired:
             terminate(process)
-    parts = exchange(sequence, [alive, outcome])[:2]
-    assert [part[0] for part in parts] == [True, True], "a process ended before rank 1's host died"
-    assert parts[0][1] not in (0, None), "rank 0's process kept waiting ten minutes after rank 1's host died"
+    return [alive, outcome, time.monotonic() - killed]
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

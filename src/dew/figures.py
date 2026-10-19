@@ -354,7 +354,7 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
             mean = np.convolve(ys, np.ones(window) / window, mode="valid")
             lines = [(ys, 1.0), (np.concatenate([np.full(window - 1, np.nan), mean]), 2.5)]
         for drawn, stroke in lines:
-            points = [at(step, y) for step, y in zip(xs, drawn) if np.isfinite(y)]
+            points = [at(step, y) for step, y in zip(xs[:len(drawn)], drawn, strict=True) if np.isfinite(y)]
             line = figure.polyline(points, color=color, width=stroke, dash=dash)
             shade = 0.35 if window > 1 and stroke < 2 else 1
             if dash:
@@ -370,7 +370,8 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
             figure.text(at_x + 24, at_y, f"{name} {last:.2f}", size=TEXT, color=color)
         else:
             at_x, at_y = at(final, last)
-            end = figure.text(at_x - 4, at_y - 10, f"{last:.2f}", size=TEXT, color=color, weight=600, anchor="end")
+            end = figure.text(at_x - 4, at_y - 10, f"{last:.2f}", size=TEXT, color=color, weight=600,
+                              anchor="end")
             figure.appear(end, seconds * 0.55)
     return figure
 
