@@ -12,6 +12,7 @@ tests/test_nvfp4_storage.py.
 
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import NVFP4_QDQ_CASES, assert_same_stored_tensors
@@ -32,8 +33,10 @@ def test_a_quantized_checkpoint_computes_its_reference_and_saves_its_own_bytes(n
     reader decodes exactly (weight-only NVFP4 rounds them to bf16, FP8 to
     its stored scale's dtype), so the format's quantization is common to
     both forwards and the bound measures only their rounding. The checkpoint
-    held in its own storage (`param_dtype='auto'`) saves its own bytes; float32
-    masters would save at their width (test_decoder_export)."""
+    held in its own storage (`param_dtype='auto'`) saves its own bytes; held
+    in float32 masters it saves each dense weight the source stored narrower
+    at the masters' width, the same values, and every other tensor's bytes.
+    Both reload to the same logits."""
     directory = CODECS / name
     with np.load(directory / "reference.npz") as reference:
         ids, expected, truth = reference["ids"].astype(np.int32), reference["logits"], reference["logits_f64"]
@@ -42,7 +45,20 @@ def test_a_quantized_checkpoint_computes_its_reference_and_saves_its_own_bytes(n
     _, terms = float64_forward(loaded.model, loaded.variables, ids)
     assert_as_exact_as_the_reference(actual, expected, truth, f"{name} logits", terms=terms)
     np.testing.assert_array_equal(np.argmax(actual, -1), np.argmax(expected, -1))
-    Pretrained.load(directory, dtype="float32", param_dtype="auto", attention_impl="reference").save(tmp_path)
-    assert_same_stored_tensors(read_weights(tmp_path), read_weights(directory))
-    reloaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
-    np.testing.assert_array_equal(reloaded.model.apply(reloaded.variables, ids), actual)
+    stored = read_weights(directory)
+    own = tmp_path / "own"
+    Pretrained.load(directory, dtype="float32", param_dtype="auto", attention_impl="reference").save(own)
+    assert_same_stored_tensors(read_weights(own), stored)
+    masters = tmp_path / "masters"
+    loaded.save(masters)
+    written = read_weights(masters)
+    assert set(written) == set(stored)
+    for tensor, value in stored.items():
+        if written[tensor].dtype == value.dtype:
+            assert_same_stored_tensors({tensor: written[tensor]}, {tensor: value})
+        else:
+            assert jnp.issubdtype(value.dtype, jnp.floating) and written[tensor].dtype == np.float32, tensor
+            np.testing.assert_array_equal(written[tensor], value.astype(np.float32), err_msg=tensor)
+    for saved in (own, masters):
+        reloaded = Pretrained.load(saved, dtype="float32", attention_impl="reference")
+        np.testing.assert_array_equal(reloaded.model.apply(reloaded.variables, ids), actual)
