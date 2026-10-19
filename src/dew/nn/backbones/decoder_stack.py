@@ -22,6 +22,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.objectives.base import merge
 
+from ..hyper_connections import Carried
 from ..kv_cache import CURSOR
 from ..mla import INDEXER_COLLECTION
 from ..sharding import STAGE_AXIS, microbatched
@@ -353,12 +354,8 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
                          first_slice, store=store, train=train, decode=decode,
                          attention_metadata=attention_metadata)
 
-        def layer(read, state, cache, hidden, per_layer_slice, *, run=run, opened=opened, store=store):
-            variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
-            hidden, changed = run.apply(
-                variables, hidden, mutable=opened, train=train, decode=decode, kv_store=store,
-                per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
-            return hidden, dict(changed)
+        layer = functools.partial(_applied, run, opened, store, train=train, decode=decode,
+                                  attention_metadata=attention_metadata)
 
         if count == 1:
             following = first_of(index + 1, x)
@@ -374,6 +371,17 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
             for name, value in tree.items():
                 run.put_variable(collection, name, value)
     return x
+
+
+def _applied(run: DecoderBlock, opened: list[str], store, read, state, cache, hidden, per_layer_slice, *,
+             train: bool, decode: bool, attention_metadata) -> tuple[jax.Array | Carried, dict]:
+    """One layer of `run` applied in a scope of its own: `read` its read-only variables, `state`
+    the caller's held collections and `cache` its cache slice, writing the `opened` collections."""
+    variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
+    hidden, changed = run.apply(
+        variables, hidden, mutable=opened, train=train, decode=decode, kv_store=store,
+        per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
+    return hidden, dict(changed)
 
 
 def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, list[str]]], read, state,
