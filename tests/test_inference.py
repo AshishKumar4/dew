@@ -254,7 +254,7 @@ def test_build_eval_metrics_follows_the_sample_field(tmp_path):
 TINY_CLIP = str(Path(__file__).parent / "fixtures" / "clip" / "tiny")
 
 
-def validated_run(directory, validates: bool, **fields):
+def validated_run(directory, *, validates: bool, **fields):
     """Two steps of the tiny conditional DiT on a real tiny CLIP's text, `fields` replacing the run's
     own, scored by the metrics the run builds for data that `validates` or does not, and validated at
     its end on one held-out batch where it does: the scalars its tracker logged, and its last
@@ -291,19 +291,23 @@ def test_an_image_run_validates_on_clip_by_default_with_the_model_its_metric_nam
     named = DiffusionRunConfig.cli(["--val-metrics", json.dumps([{"name": "clip",
                                                                   "fields": {"modelname": TINY_CLIP}}])])
     assert named.val_metrics == (MetricConfig("clip", {"modelname": TINY_CLIP}),)
-    scalars, _ = validated_run(tmp_path / "named", True, val_metrics=named.val_metrics)
+    scalars, _ = validated_run(tmp_path / "named", validates=True, val_metrics=named.val_metrics)
     final = {name: value for step, values in scalars if step == 2 for name, value in values.items()}
     assert 0.0 <= final["val/clip_similarity"] <= 2.0
     assert run_config(tmp_path).build_eval_metrics(validates=True)[0].name == "clip_similarity"
-    scalars, latest = validated_run(tmp_path / "unvalidated", False)
+    scalars, latest = validated_run(tmp_path / "unvalidated", validates=False)
     assert latest == 2 and not any(name.startswith("val/") for _, values in scalars for name in values)
 
 
 def test_a_metric_a_run_names_without_a_validation_split_refuses_before_an_update(tmp_path):
     """A run that names a metric asks for it whatever its data holds, so data with no validation
     split refuses the run in `Trainer.fit`, before its first update writes a checkpoint."""
-    with pytest.raises(ValueError, match="give the dataset a val split"):
-        validated_run(tmp_path, False, val_metrics=(MetricConfig("psnr"),))
+    named = (MetricConfig("psnr"),)
+    # The metric builds for data that does not validate; the run is what refuses it.
+    run = dataclasses.replace(run_config(tmp_path), val_metrics=named)
+    assert len(run.build_eval_metrics(validates=False)) == 1
+    with pytest.raises(ValueError):
+        validated_run(tmp_path, validates=False, val_metrics=named)
     assert Checkpoints(str(tmp_path / "checkpoints"), keep=1).latest is None
 
 
