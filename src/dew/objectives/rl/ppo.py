@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn
+from flax import linen as nn, struct
 
 from dew.coordination import agreed, from_every_process
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
@@ -27,7 +27,7 @@ from dew.objectives.base import (
     joined,
     part,
 )
-from dew.rl.advantage import MEAN_EPS, WHITEN_EPS, gae_advantages
+from dew.rl.advantage import gae_advantages, masked_whiten
 from dew.rl.surrogate import clipped_value_loss_terms
 from dew.sampling.text import Generation, Sampling
 from dew.training.distributed import shard_batch
@@ -79,8 +79,16 @@ class _Policy:
         return self.task(inputs, max_new_tokens, key=key, sampling=sampling)
 
 
-class PPOObjective(Objective[Ratio, Variables]):
-    """Trains a policy and a critic together, with both losses over the same token mass.
+@struct.dataclass
+class PPOStatistics:
+    """The actor's loss statistics and the critic's independently normalized value error."""
+
+    actor: Ratio
+    critic: Ratio
+
+
+class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
+    """Trains a policy and a critic together, each over its own loss mass.
 
     The `params` collection holds a `policy` subtree and a `critic` subtree,
     and the ordinary `Trainer` optimizes both. The frozen reference, an EMA
@@ -88,9 +96,9 @@ class PPOObjective(Objective[Ratio, Variables]):
     detached.
 
     The policy is a `GRPOObjective` built from `model`, `seq_len` and the
-    remaining keyword arguments, so `beta` and the clip settings work as they
-    do there. It keeps `"token-mean"` aggregation and takes no sequence
-    masks, because the critic shares the actor's token mass.
+    remaining keyword arguments, so its aggregation, sequence masks, `beta`
+    and clip settings work as they do there. The critic always averages
+    over the response tokens, independently of the actor's weighting.
     `value_coefficient` weights verl's half-squared, clipped value error, and
     `value_clip` is that error's clip range.
 
@@ -113,10 +121,6 @@ class PPOObjective(Objective[Ratio, Variables]):
         for name, value in (("value_coefficient", value_coefficient), ("value_clip", value_clip)):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
-        if (policy_options.get("aggregation", "token-mean") != "token-mean"
-                or any(policy_options.get(name) is not None for name in ("sequence_mask", "geometric_mask"))):
-            raise ValueError("the critic shares the actor's token mass, so PPO keeps token-mean "
-                             "aggregation and no sequence masks")
         self.actor = GRPOObjective(model, seq_len, **policy_options)
         self.critic, self.seq_len = critic, seq_len
         self.value_coefficient, self.value_clip = value_coefficient, value_clip
@@ -196,8 +200,8 @@ class PPOObjective(Objective[Ratio, Variables]):
             raise ValueError("PPO critic must return one scalar value per input position")
         return onto_ids(batch, values.astype(jnp.float32)), qk
 
-    def loss(self, variables: Variables, batch, step: Step) -> tuple[Ratio, Aux[Variables]]:
-        """Return the actor's policy loss plus the weighted, clipped value error, over the same mass.
+    def loss(self, variables: Variables, batch, step: Step) -> tuple[PPOStatistics, Aux[Variables]]:
+        """Return independent statistics for the actor and the clipped value error.
 
         The batch must hold `old_values` and `returns` from the rollout,
         aligned with `response_mask`, or the loss raises `ValueError`.
@@ -211,12 +215,21 @@ class PPOObjective(Objective[Ratio, Variables]):
         values, critic_qk = self._critic_scores(variables, batch, qk_stats=self.actor.qk_stats)
         terms = clipped_value_loss_terms(values, jnp.asarray(batch[RETURNS_KEY]),
                                          jnp.asarray(batch[OLD_VALUES_KEY]), self.value_clip)
-        critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), pg.mass)
+        critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), jnp.sum(mask))
         metrics = {**aux.metrics, "critic/loss": critic.mean()[0]}
         qk = None if aux.qk_stats is None else {"policy": aux.qk_stats}
         if critic_qk is not None:
             qk = {**(qk or {}), "critic": critic_qk}
-        return Ratio(pg.total + self.value_coefficient * critic.total, pg.mass), Aux(metrics, qk_stats=qk)
+        return PPOStatistics(pg, critic), Aux(metrics, qk_stats=qk)
+
+    def reduce_loss(self, stats: PPOStatistics | Ratio) -> tuple[jax.Array, jax.Array]:
+        """Combine the independently normalized actor and weighted critic losses, or the validation NLL."""
+        if isinstance(stats, Ratio):
+            return stats.mean()
+        actor, _ = stats.actor.mean()
+        critic, _ = stats.critic.mean()
+        support = stats.actor.mass + self.value_coefficient * stats.critic.mass
+        return actor + self.value_coefficient * critic, support > 0
 
     def validation_loss(self, variables: Variables, batch, step: Step):
         """Score source prompts under the live actor, without rollout targets or the critic."""
@@ -230,6 +243,12 @@ class PPOObjective(Objective[Ratio, Variables]):
 
     def preview(self, params: Variables, batch, step: Step, *, scored=None):
         return self.actor.preview(part(params, "policy"), batch, replace(step, ema=None), scored=scored)
+
+
+def _over_processes(moments: jax.Array) -> jax.Array:
+    """`moments` summed over every process of the pool (`from_every_process`), in float64."""
+    shared = from_every_process(np.asarray(moments, np.float64).tolist())
+    return jnp.asarray(np.sum(np.asarray(shared, np.float64), axis=0), moments.dtype)
 
 
 @dataclass(frozen=True)
@@ -300,11 +319,7 @@ class PPORollout:
         raw = np.asarray(gae_advantages(jnp.asarray(token_rewards), jnp.asarray(baselines),
                                         jnp.asarray(keep, jnp.float32), self.gamma, self.lam))
         returns = raw + baselines
-        moments = [float(np.sum(keep)), float(np.sum(raw * keep)), float(np.sum(raw * raw * keep))]
-        count, total, squares = np.sum(np.asarray(from_every_process(moments), np.float64), axis=0)
-        mean = total / (count + MEAN_EPS)
-        variance = (squares - 2 * mean * total + mean * mean * count) / (count + MEAN_EPS)
-        advantages = (raw - mean) / np.sqrt(variance * (count / (count - 1)) + WHITEN_EPS)
+        advantages = np.asarray(masked_whiten(jnp.asarray(raw), jnp.asarray(keep), _over_processes))
         shape = values.shape
         placed_advantages = np.zeros(flat.shape, np.float32)
         placed_returns = np.zeros(flat.shape, np.float32)

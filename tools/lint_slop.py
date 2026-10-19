@@ -35,6 +35,9 @@ Scope is per rule, because the rules are not all about the same thing:
   hardware generation) lives in one table, `nn/kernels/generation.py`'s
   `TARGETS`; any other module reads that table's facts, a library's support
   rule the compute capability, and a launch config the autotuner.
+- SLOP018 and SLOP019 are about `src/<package>`, the code a user's process
+  runs: it sleeps, polls and retries only where it deals with what leaves
+  the process, and it detects no feature by the exception its absence raises.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -47,6 +50,13 @@ dynamic dispatch reaches; behaviour across models is the capability matrix's
 proof (tests/test_capability_matrix.py).
 SLOP011 and SLOP012 read each name through the imports of its own lexical
 scope (tools/lint_scopes.py).
+SLOP018 reads one module: a function deals with what leaves the process where
+it names such a module (`EXTERNAL`) or calls a function of the module, or a
+method reached from `self`, that does; work handed to a future is another's.
+It reads a loop over a range whose body reads the number it counts anywhere
+but where a failure is handled as a scan by index, not as attempts, so a retry
+that reads its attempt number outside its handler (returns or logs it) is not
+reported.
 SLOP016 follows the device's generation through the names one file binds, in
 statement order: both arms of a branch in turn and a loop's body once, so a
 name an arm rebinds counts as rebound after it.
@@ -448,9 +458,8 @@ def names(module: Module) -> Iterator[Finding]:
     terms of the equations being implemented: 50 of them, against none that
     meant "the second version of". `_v2` still reports.
     """
-    comprehended = {id(target) for node in ast.walk(module.tree)
-                    if isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp)
-                    for generator in node.generators for target in ast.walk(generator.target)}
+    comprehended = {id(target) for node in ast.walk(module.tree) if isinstance(node, scopes.COMPREHENSIONS)
+                    for target in scopes.targets(node)}
     # An annotated name in a class body is a field: a config key, a CLI flag
     # and a pytree entry a checkpoint is written with. Renaming one is a
     # migration with a converter, which is not something a linter asks for.
@@ -870,14 +879,15 @@ def _held(tree: ast.Module) -> dict[int, frozenset[str]]:
         if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
         # A binding takes effect once its statement's value has been read: at the statement's end.
-        binding = ast.Assign | ast.AnnAssign | ast.AugAssign
-        nodes = [node for node in scopes.own(function) if isinstance(node, binding | ast.Compare | ast.Call)]
-        events = sorted(((node.end_lineno or node.lineno, node.end_col_offset or 0)
-                         if isinstance(node, binding) else (node.lineno, node.col_offset), id(node), node)
-                        for node in nodes)
+        events: list[tuple[int, int, int, ast.AST]] = []
+        for node in scopes.own(function):
+            if isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign):
+                events.append((node.end_lineno or node.lineno, node.end_col_offset or 0, id(node), node))
+            elif isinstance(node, ast.Compare | ast.Call):
+                events.append((node.lineno, node.col_offset, id(node), node))
         names: set[str] = set()
-        for _, _, node in events:
-            if isinstance(node, ast.Compare | ast.Call):
+        for *_, node in sorted(events, key=lambda event: event[:3]):
+            if not isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign):
                 held[id(node)] = frozenset(names)
                 continue
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -906,7 +916,7 @@ def wording(module: Module) -> Iterator[Finding]:
     warning's text matched, a sentence looked for in captured output, or source text read."""
     held = _held(module.tree)
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
-        if _spelled_in_captured(node, held.get(id(node), frozenset())):
+        if isinstance(node, ast.expr) and _spelled_in_captured(node, held.get(id(node), frozenset())):
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                           "looks for a sentence in captured output; assert the state it reports")
         if isinstance(node, ast.Call):
@@ -1168,9 +1178,6 @@ def _spelled_pattern(pattern: ast.pattern) -> bool:
     return isinstance(pattern, ast.MatchValue) and _spelled(pattern.value)
 
 
-COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-
-
 def _eager(node: ast.AST) -> Iterator[ast.AST]:
     """`node` and every node under it that runs where it stands: not a lambda's body."""
     yield node
@@ -1222,11 +1229,10 @@ def _choices(node: ast.AST, hardware: _Hardware, closure: _Hardware,
         if found is not None:
             _scope_choices(node.body, hardware, closure, found)
         return hardware.without([node.name])
-    if isinstance(node, COMPREHENSIONS):
+    if isinstance(node, scopes.COMPREHENSIONS):
         first = node.generators[0]
         hardware = read(first.iter, hardware)
-        names = [name.id for generator in node.generators for name in ast.walk(generator.target)
-                 if isinstance(name, ast.Name)]
+        names = [name.id for name in scopes.targets(node)]
         inner, inherited = hardware.without(names), closure.without(names)
         for generator in node.generators:
             for child in (*([] if generator is first else [generator.iter]), *generator.ifs):
@@ -1278,7 +1284,408 @@ def authorities(module: Module) -> Iterator[Finding]:
                       "a library's rule the compute capability (`capability`), a launch config the autotuner")
 
 
-CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities)
+EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "requests.", "httpx.",
+            "aiohttp.", "grpc.", "huggingface_hub.", "fsspec.", "gcsfs.", "google.", "boto3.", "botocore.",
+            "filelock.", "multiprocessing.", "concurrent.futures.ProcessPoolExecutor.", "os.kill.",
+            "os.killpg.", "os.waitpid.", "os.fork.", "os.posix_spawn.", "jax.distributed.")
+"""What leaves the process: a subprocess, the network, a remote service, another process."""
+
+
+WAITS = {"wait", "wait_for", "join", "get", "put", "acquire"}
+"""The methods that block on in-process synchronization (an event, a condition, a lock, a queue, a
+thread) until a timeout they are given. A future's (`result`, `concurrent.futures.wait`) is not
+among them: its work is handed elsewhere, a thread, a process or a service, whose deadline it is."""
+FUTURE_WAITS = {"concurrent.futures.wait", "asyncio.wait", "asyncio.wait_for"}
+
+
+def _waiting(node: ast.AST, table: Mapping[str, str]) -> str:
+    """What `node` waits on: "a sleep", or "a timed wait", a blocking call (`WAITS`) given a
+    timeout (one of no time asks without waiting); "" else."""
+    if not isinstance(node, ast.Call):
+        return ""
+    called = scopes.resolved(node.func, table)
+    if called in ("time.sleep", "asyncio.sleep"):
+        return "a sleep"
+    method = node.func.attr if isinstance(node.func, ast.Attribute) else ""
+    if method not in WAITS or called in FUTURE_WAITS:
+        return ""
+    # A positional timeout is read where the method is unambiguous (a string's join is not a wait).
+    positional = node.args[:1] if method == "wait" else node.args[1:2] if method == "wait_for" else []
+    timeouts = [*positional, *(keyword.value for keyword in node.keywords if keyword.arg == "timeout")]
+    if any(not (isinstance(value, ast.Constant) and value.value in (None, 0)) for value in timeouts):
+        return "a timed wait"
+    return ""
+
+
+def _evaluated(definition: ast.AST) -> list[ast.AST]:
+    """The parts of a definition evaluated where it is defined: its decorators and defaults, and a
+    class's bases and keywords. An annotation is a type, not an operation (postponed under
+    `from __future__ import annotations`, and lazy since Python 3.14), so it is not among them."""
+    if isinstance(definition, ast.ClassDef):
+        return [*definition.decorator_list, *definition.bases, *definition.keywords]
+    if isinstance(definition, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+        signature = definition.args
+        defaults: list[ast.AST] = [*signature.defaults,
+                                   *(item for item in signature.kw_defaults if item is not None)]
+        return defaults if isinstance(definition, ast.Lambda) else [*definition.decorator_list, *defaults]
+    return []
+
+
+def _comprehended(comprehension: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp
+                  ) -> list[ast.AST]:
+    """What a comprehension evaluates in its own scope: every part but its first iterable."""
+    first, *rest = comprehension.generators
+    elements = [comprehension.key, comprehension.value] if isinstance(comprehension, ast.DictComp) else [
+        comprehension.elt]
+    return [*first.ifs, *(part for generator in rest for part in (generator.iter, *generator.ifs)), *elements]
+
+
+def _executed_in(nodes: Iterable[ast.AST], scope: ast.AST) -> Iterator[tuple[ast.AST, ast.AST]]:
+    """Every node that runs where `nodes` run, in `scope`, with the scope its names resolve in: a nested
+    function's or lambda's evaluated parts (`_evaluated`) but not its body, which runs only where it is
+    called, and a class's body, which runs where the class is defined, in the class's own namespace."""
+    for node in nodes:
+        yield node, scope
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            yield from _executed_in(_evaluated(node), scope)
+        elif isinstance(node, ast.ClassDef):
+            yield from _executed_in(_evaluated(node), scope)
+            yield from _executed_in(node.body, node)
+        elif isinstance(node, ast.For) and isinstance(node.iter, ast.GeneratorExp):
+            # The loop consumes the generator it iterates as it goes round: the generator's body runs here.
+            yield node.iter, scope
+            yield from _executed_in([node.iter.generators[0].iter], scope)
+            yield from _executed_in(_comprehended(node.iter), node.iter)
+            yield from _executed_in([node.target, *node.body, *node.orelse], scope)
+        elif isinstance(node, scopes.COMPREHENSIONS):
+            # Its first iterable is evaluated where it stands; the rest runs in its own scope, where its
+            # targets bind: at once for a list, a set or a dict, and only as it is consumed for a generator.
+            yield from _executed_in([node.generators[0].iter], scope)
+            if not isinstance(node, ast.GeneratorExp):
+                yield from _executed_in(_comprehended(node), node)
+        else:
+            yield from _executed_in(ast.iter_child_nodes(node), scope)
+
+
+def _executed(nodes: Iterable[ast.AST]) -> Iterator[ast.AST]:
+    """Every node that runs where `nodes` run (`_executed_in`)."""
+    for node, _ in _executed_in(nodes, ast.Module(body=[], type_ignores=[])):
+        yield node
+
+
+def _outcomes(statements: Sequence[ast.stmt]) -> frozenset[str]:
+    """How running `statements` can end, by Python's control flow: "next", off their end, or by a
+    "return", a "raise", or a "break" or "continue" of the loop they sit in. A branch, a `with`, a
+    `try` and a `match` end as any of their paths can, a `finally` that completes resumes the exit
+    it interrupted, a nested loop keeps its own `break` and `continue`, and a class's body runs where
+    it is defined; a function's body runs only where it is called. An exception a call raises is
+    not read."""
+    ends = frozenset({"next"})
+    for statement in statements:
+        if "next" not in ends:
+            break
+        ends = ends - {"next"} | _ending(statement)
+    return ends
+
+
+def _then(ends: frozenset[str], statements: Sequence[ast.stmt]) -> frozenset[str]:
+    """`ends` with the path that runs off their end ("next") going on into `statements`."""
+    return ends - {"next"} | (_outcomes(statements) if "next" in ends else frozenset())
+
+
+def _finally(pending: frozenset[str], final: Sequence[ast.stmt]) -> frozenset[str]:
+    """How a `try` ends whose paths end as `pending` before its `final` body runs: a `final` body
+    that completes resumes each of them, and one that leaves replaces them."""
+    ends = _outcomes(final)
+    return ends - {"next"} | (pending if "next" in ends else frozenset())
+
+
+_JUMPS = {ast.Return: "return", ast.Raise: "raise", ast.Break: "break", ast.Continue: "continue"}
+
+
+def _ending(statement: ast.stmt) -> frozenset[str]:
+    """How running one statement can end (`_outcomes`)."""
+    if type(statement) in _JUMPS:
+        return frozenset({_JUMPS[type(statement)]})
+    match statement:
+        case ast.If():
+            return _outcomes(statement.body) | _outcomes(statement.orelse)
+        case ast.With() | ast.AsyncWith() | ast.ClassDef():
+            return _outcomes(statement.body)
+        case ast.Try() | ast.TryStar():
+            pending = _then(_outcomes(statement.body), statement.orelse).union(
+                *(_outcomes(handler.body) for handler in statement.handlers))
+            return _finally(pending, statement.finalbody)
+        case ast.Match():
+            done = frozenset[str]().union(*(_outcomes(case.body) for case in statement.cases))
+            caught = any(case.guard is None and _irrefutable(case.pattern) for case in statement.cases)
+            return done if caught else done | {"next"}
+        case ast.For() | ast.AsyncFor() | ast.While():
+            body = _outcomes(statement.body)
+            forever = (isinstance(statement, ast.While) and isinstance(statement.test, ast.Constant)
+                       and bool(statement.test.value))
+            ran_out = frozenset[str]() if forever else _outcomes(statement.orelse)
+            return body - {"next", "break", "continue"} | ran_out | ({"next"} if "break" in body else set())
+    return frozenset({"next"})
+
+
+def _irrefutable(pattern: ast.pattern) -> bool:
+    """Whether `pattern` matches every subject: a wildcard or a capture, also under `as` or as one
+    alternative of an `|`."""
+    match pattern:
+        case ast.MatchAs(pattern=None):
+            return True
+        case ast.MatchAs(pattern=inner) if inner is not None:
+            return _irrefutable(inner)
+        case ast.MatchOr(patterns=alternatives):
+            return any(map(_irrefutable, alternatives))
+    return False
+
+
+def _attempts(statements: Sequence[ast.stmt], after: Sequence[Sequence[ast.stmt]]
+              ) -> Iterator[tuple[ast.Try | ast.TryStar, list[Sequence[ast.stmt]]]]:
+    """Each `try` that `statements` run at their loop's own level, with the statements that run after
+    it, in turn, on the way to the loop's next round (`after` the ones after `statements`): through
+    a `with`, a branch or a `match` case, not into a nested loop or a definition, whose exits are
+    their own."""
+    for index, statement in enumerate(statements):
+        rest = [statements[index + 1:], *after]
+        if isinstance(statement, ast.Try | ast.TryStar):
+            yield statement, rest
+        elif isinstance(statement, ast.With | ast.AsyncWith):
+            yield from _attempts(statement.body, rest)
+        elif isinstance(statement, ast.If):
+            yield from _attempts(statement.body, rest)
+            yield from _attempts(statement.orelse, rest)
+        elif isinstance(statement, ast.Match):
+            for case in statement.cases:
+                yield from _attempts(case.body, rest)
+
+
+def _retrying(loop: ast.For | ast.While) -> bool:
+    """Whether `loop` retries one piece of work: a `while`, or a `for` over a `range` whose body
+    reads the number it counts only where a failure is handled (attempts, counted to stop; read
+    anywhere else, it can choose the work, a scan by index), with a `try` at its own level
+    (`_attempts`) that leaves the loop on some path where the work succeeds and goes round again on
+    some path where it fails, each path followed through the `try`'s `finally` and every statement
+    after it in the loop's body (`_outcomes`)."""
+    attempts = list(_attempts(loop.body, []))
+    if isinstance(loop, ast.For):
+        counted = {name.id for name in ast.walk(loop.target) if isinstance(name, ast.Name)}
+        handling = {id(node) for attempt, _ in attempts for handler in attempt.handlers
+                    for node in _executed(handler.body)}
+        if not (isinstance(loop.iter, ast.Call) and _named(loop.iter.func) == "range") or any(
+                isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in counted
+                and id(node) not in handling
+                for node in _executed(loop.body)):
+            return False
+    for attempt, rest in attempts:
+        def onward(ends: frozenset[str], attempt: ast.Try | ast.TryStar = attempt,
+                   rest: list[Sequence[ast.stmt]] = rest) -> frozenset[str]:
+            ends = _finally(ends, attempt.finalbody)
+            for statements in rest:
+                ends = _then(ends, statements)
+            return ends
+
+        succeeds = {"break", "return"} & onward(_then(_outcomes(attempt.body), attempt.orelse))
+        again = any({"next", "continue"} & onward(_outcomes(handler.body)) for handler in attempt.handlers)
+        if succeeds and again:
+            return True
+    return False
+
+
+class _Calls:
+    """The module's functions a call reaches, read where it is made, as one module's lexical scopes
+    give them: a bare name through the scopes that enclose the call (a class body's names reach none
+    of its methods) to the definition that binds it there; `self.f` or `cls.f`, the receiver of the
+    method the call is in or closes over, to `f` in the method resolution order of that method's
+    class among the module's classes; and `self.held.f`, through an attribute of another object, to
+    any method `f` of the module's classes. Calls through other modules, callables passed in and
+    attributes set at run time are not followed."""
+
+    def __init__(self, tree: ast.Module):
+        self.enclosing: dict[int, ast.AST | None] = {}
+        self.bindings: dict[int, dict[str, ast.AST | None]] = {}
+        self.named: dict[str, list[ast.AST]] = {}
+        self._index(tree, None)
+
+    def _index(self, scope: ast.AST, enclosing: ast.AST | None) -> None:
+        self.enclosing[id(scope)] = enclosing
+        own = list(scopes.own(scope))
+        parameters = (scopes.arguments(scope)
+                      if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) else [])
+        # A name one definition alone binds is that definition; bound otherwise, or twice, no one's.
+        definitions = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+        self.bindings[id(scope)] = {name: by[0] if len(by) == 1 and isinstance(by[0], definitions) else None
+                                    for name, by in scopes.binders(own, parameters).items()}
+        for node in own:
+            if isinstance(node, scopes.COMPREHENSIONS):
+                self._comprehension(node, scope)
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and isinstance(scope, ast.ClassDef):
+                self.named.setdefault(node.name, []).append(node)
+            if isinstance(node, scopes.SCOPES):
+                self._index(node, scope)
+
+    def _comprehension(self, node: ast.AST, enclosing: ast.AST) -> None:
+        """Index a comprehension, which `_index` meets in the scope that holds it, as a scope of its own: its
+        targets bind there, and a comprehension it holds encloses in it."""
+        if id(node) in self.bindings:
+            return
+        assert isinstance(node, scopes.COMPREHENSIONS)
+        self.enclosing[id(node)] = enclosing
+        self.bindings[id(node)] = {name.id: None for name in scopes.targets(node)}
+        for part in _comprehended(node):
+            for inner in ast.walk(part):
+                if isinstance(inner, scopes.COMPREHENSIONS):
+                    self._comprehension(inner, node)
+
+    def _lookup(self, scope: ast.AST | None, name: str) -> ast.AST | None:
+        """What `name` stands for, read in `scope`: its own binding, else the enclosing scopes'
+        (a class's names reach no scope inside it)."""
+        start = scope
+        while scope is not None:
+            bound = self.bindings.get(id(scope), {})
+            if name in bound and (scope is start or not isinstance(scope, ast.ClassDef)):
+                return bound[name]
+            scope = self.enclosing.get(id(scope))
+        return None
+
+    def _order(self, owner: ast.ClassDef, seen: frozenset[int] = frozenset()) -> list[ast.ClassDef]:
+        """`owner`'s method resolution order among the module's classes (C3, as Python computes it),
+        a base the module does not define ending its line."""
+        if id(owner) in seen:
+            return [owner]
+        bases = [base for base in (self._lookup(self.enclosing.get(id(owner)), node.id)
+                                   for node in owner.bases if isinstance(node, ast.Name))
+                 if isinstance(base, ast.ClassDef)]
+        lines = [self._order(base, seen | {id(owner)}) for base in bases] + [bases]
+        order = [owner]
+        while any(lines):
+            for line in lines:
+                head = line[0] if line else None
+                if head is not None and not any(head in other[1:] for other in lines):
+                    break
+            else:
+                return order  # No consistent order: Python refuses the class; nothing more is read.
+            order.append(head)
+            lines = [line[1:] if line and line[0] is head else line for line in lines]
+        return order
+
+    def _method(self, scope: ast.AST, receiver: str, name: str) -> ast.AST | None:
+        """The method `name` the receiver `receiver`, read in `scope`, reaches: the receiver of the
+        method that scope is in or closes over, to the first class in that method's class's resolution
+        order that binds `name`. A scope on the way that binds the receiver itself (a comprehension's
+        target, a closure's own) makes it another object, whose methods are not followed."""
+        current: ast.AST | None = scope
+        while current is not None:
+            owner = self.enclosing.get(id(current))
+            if isinstance(current, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                parameters = [argument.arg for argument in scopes.arguments(current)]
+                if parameters[:1] == [receiver] and isinstance(owner, ast.ClassDef):
+                    for cls in self._order(owner):
+                        if name in self.bindings[id(cls)]:
+                            return self.bindings[id(cls)][name]
+                    return None
+            if receiver in self.bindings.get(id(current), {}):
+                return None
+            current = owner
+        return None
+
+    def reached(self, scope: ast.AST, call: ast.Call) -> list[ast.AST]:
+        """The definitions `call`, made in `scope`, reaches."""
+        if isinstance(call.func, ast.Name):
+            found = self._lookup(scope, call.func.id)
+            return [found] if isinstance(found, ast.FunctionDef | ast.AsyncFunctionDef) else []
+        if not isinstance(call.func, ast.Attribute):
+            return []
+        through, root = 0, call.func.value
+        while isinstance(root, ast.Attribute):
+            through, root = through + 1, root.value
+        if not isinstance(root, ast.Name) or root.id not in ("self", "cls"):
+            return []
+        if through:
+            return self.named.get(call.func.attr, [])
+        method = self._method(scope, root.id, call.func.attr)
+        return [method] if isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef) else []
+
+
+def _leaves(function: ast.FunctionDef | ast.AsyncFunctionDef, tables: Mapping[int, Mapping[str, str]],
+            calls: _Calls, seen: set[int]) -> bool:
+    """Whether `function` deals with what leaves the process (`EXTERNAL`): what it runs names such
+    a module, or calls a function of the module (`_Calls`) that does."""
+    seen.add(id(function))
+    for node, scope in _executed_in(function.body, function):
+        if isinstance(node, ast.Name | ast.Attribute):
+            path = scopes.resolved(node, tables.get(id(node), {}))
+            if path and f"{path}.".startswith(EXTERNAL):
+                return True
+        if isinstance(node, ast.Call):
+            for helper in calls.reached(scope, node):
+                if (isinstance(helper, ast.FunctionDef | ast.AsyncFunctionDef) and id(helper) not in seen
+                        and _leaves(helper, tables, calls, seen)):
+                    return True
+    return False
+
+
+def waits(module: Module) -> Iterator[Finding]:
+    """SLOP018: a sleep, a poll (a timed wait round a loop) or a retry where nothing leaves the
+    process: one inside a function that deals with no subprocess, network, remote service or other
+    process (`EXTERNAL`), itself or through the module's functions and methods it calls. In-process
+    work is ordered or woken, not waited on; a timed wait made once is a deadline."""
+    calls = _Calls(module.tree)
+    tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
+    for function in ast.walk(module.tree):
+        if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        external = None
+        # What runs again and again: a loop's body, a `while`'s test and a generator a `for` consumes,
+        # and an eager comprehension's body.
+        repeated: list[ast.AST] = []
+        for node in _executed(function.body):
+            if isinstance(node, ast.For | ast.While):
+                repeated += [*node.body, *([node.test] if isinstance(node, ast.While) else []),
+                             *(_comprehended(node.iter) if isinstance(node, ast.For)
+                               and isinstance(node.iter, ast.GeneratorExp) else [])]
+            elif isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp):
+                repeated += _comprehended(node)
+        looped = {id(inner) for inner in _executed(repeated)}
+        for node in _executed(function.body):
+            what = _waiting(node, tables.get(id(node), {}))
+            if what == "a timed wait":
+                # Once, it is a deadline; round a loop, a poll.
+                what = "a poll" if id(node) in looped else ""
+            if not what and isinstance(node, ast.For | ast.While) and _retrying(node):
+                what = "a retry"
+            # A wait is a call and a retry a loop: both have a place in the source.
+            if not what or not isinstance(node, ast.expr | ast.stmt):
+                continue
+            if external is None:
+                external = _leaves(function, tables, calls, set())
+            if not external:
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP018",
+                              f"{what} where nothing leaves the process; order the work or wake the waiter")
+
+
+DETECTED = {"ImportError", "ModuleNotFoundError", "AttributeError"}
+
+
+def detections(module: Module) -> Iterator[Finding]:
+    """SLOP019: a feature detected by the exception its absence raises: a handler of ImportError,
+    ModuleNotFoundError or AttributeError, by any name it is imported as, that carries on along any
+    path instead of raising (`_outcomes`: a raise in a function it only defines does not count)."""
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        if not isinstance(node, ast.ExceptHandler) or node.type is None:
+            continue
+        caught = node.type.elts if isinstance(node.type, ast.Tuple) else [node.type]
+        kinds = [scopes.resolved(kind, table) or _named(kind) for kind in caught]
+        detected = any(kind.removeprefix("builtins.") in DETECTED for kind in kinds)
+        if detected and _outcomes(node.body) != {"raise"}:
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP019",
+                          f"detects a feature by `except {'/'.join(kinds)}`; require it, or ask for it by "
+                          "the version that has it")
+
+
+CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size)
 
 

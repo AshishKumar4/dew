@@ -9,10 +9,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import tokamax
-from fla_gdn_support import CONV_SHAPES, conv_training_cases, kda_training_cases
+from fla_gdn_support import CONV_SHAPES, conv_config_cases, conv_training_cases, kda_training_cases
 from kernel_compile import compile_kernels, failures
 
-from dew.nn.kernels import fla_gdn, fla_kda, generation, tuning
+from dew.nn.kernels import fla_gdn, fla_kda, generation, short_conv, tuning
 
 LAUNCHES = {launch for module in (fla_gdn, fla_kda) for launch in vars(module).values()
             if isinstance(launch, fla_gdn._Launch)}
@@ -139,4 +139,15 @@ def test_the_short_convs_kernels_compile_on_tritons_compiler_within_each_gpus_bl
     pytest.importorskip("triton")
     found = compile_kernels(conv_training_cases(), target)
     assert len(found) == 2 * len(CONV_SHAPES) + 2
+    assert not failures(found), "\n".join(failures(found))
+
+
+@pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
+def test_every_short_conv_config_compiles_on_tritons_compiler_within_each_gpus_block(target):
+    """Each config the tuner may give either launch of the short conv (`short_conv.TILES`,
+    `short_conv.WALKS`), pinned at the 9B's packed delta conv, compiled for each GPU within the compile
+    bound and the block's shared memory."""
+    pytest.importorskip("triton")
+    found = compile_kernels(conv_config_cases(), target)
+    assert len(found) == len(short_conv.TILES) + len(short_conv.WALKS)
     assert not failures(found), "\n".join(failures(found))

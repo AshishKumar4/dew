@@ -25,7 +25,7 @@ import pytest
 from flax.traverse_util import unflatten_dict
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, widened
 
-from dew.data.dataset import Loader, replayed
+from dew.data.dataset import DataPartition, Loader, replayed
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives import DistillationObjective
 from dew.objectives.base import Step
@@ -370,3 +370,29 @@ def test_the_student_tree_is_what_a_plain_student_run_reads():
     loss, _ = objective.student.scalar_loss(own, batch, step_at())
     assert float(loss) == pytest.approx(float(aux.metrics["ce"]), rel=1e-6)
     assert objective.ema is None
+
+
+def test_a_saved_distillation_loads_as_its_student_and_reads_the_students_data(tmp_path):
+    """A distillation reads its batches through the student's data steps, so a token budget the
+    student's loader takes is one it takes too, and a saved run of it loads (`dew.pipeline`) as the
+    student's task, generating what the student's own task over the trained student tree does."""
+    from token_support import write_token_corpus
+
+    import dew
+    from dew.config.data import TextData, loader
+
+    arrays = fixture()
+    objective, _ = fixture_objective(arrays)
+    write_token_corpus(tmp_path / "corpus", np.arange(4 * SEQ * 8, dtype=np.uint16) % 50)
+    loaded = [loader(TextData(source=str(tmp_path / "corpus"), seq_len=SEQ), tokens=2 * SEQ, read="memory",
+                     objective=chosen.data()) for chosen in (objective.student, objective)]
+    batches = [next(data.train(DataPartition())) for data in loaded]
+    np.testing.assert_array_equal(batches[0][TEXT_KEY], batches[1][TEXT_KEY])
+    # The fixture's two rows on every data-parallel device.
+    batch = {TEXT_KEY: jnp.tile(fixture_batch(arrays)[TEXT_KEY], (max(1, jax.device_count() // 2), 1))}
+    state = Trainer(objective, optax.adam(3e-3), key=0, checkpoints=Checkpoints(str(tmp_path / "run"))).fit(
+        fixed(batch), steps=2, log_every=1, checkpoint_every=2)
+    task = dew.pipeline(str(tmp_path / "run"))
+    own = objective.student.build_task(objective.student_variables(state.variables))
+    prompt = np.asarray(batch[TEXT_KEY])[:1, :4]
+    np.testing.assert_array_equal(task(prompt, 3, key=0).tokens, own(prompt, 3, key=0).tokens)

@@ -6,6 +6,7 @@ built around it."""
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
@@ -96,3 +97,31 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     np.testing.assert_array_equal(
         TextToImage.from_run(str(run))(["a red bird"], key=9).host().images, expected
     )
+
+
+@pytest.mark.gpu(reason="a fused attention kernel runs on a cuda device")
+def test_meanflow_trains_through_a_fused_attention_kernel():
+    """cuDNN's attention defines only its reverse-mode derivative, so MeanFlow's target JVP traces
+    for forward mode: a MeanFlow step through it runs, and its loss and gradient agree with the xla
+    kernel's within bf16's rounding of the step's scale."""
+    def run(implementation):
+        model = SimpleDiT(patch_size=2, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=1,
+                          interval=True, attention_impl=implementation, dtype="bfloat16")
+        inputs = InputSpec(Field("image", (16, 16, 3)),
+                           {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
+        task = MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
+        params = task.init(jax.random.PRNGKey(0))
+        pixels = jax.random.randint(jax.random.PRNGKey(1), (8, 16, 16, 3), 0, 256)
+        batch = {"image": np.asarray(pixels, np.uint8), **task.inputs.tokenize(["a", "b", "c", "d"] * 2)}
+        step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
+        def loss_of(tree):
+            return task.scalar_loss({**params, "params": tree}, batch, step)[0]
+
+        loss, grads = jax.jit(jax.value_and_grad(loss_of))(params["params"])
+        return float(loss), jax.tree.leaves(grads)
+
+    (fused, fused_grads), (xla, xla_grads) = run("cudnn"), run("xla")
+    assert fused == pytest.approx(xla, rel=2 ** -7)
+    for left, right in zip(fused_grads, xla_grads, strict=True):
+        scale = float(jnp.max(jnp.abs(right))) + 1e-12
+        assert float(jnp.max(jnp.abs(left - right))) <= 2 * 2 ** -7 * scale

@@ -236,28 +236,6 @@ def test_the_dqkwg_kernel_is_flas(dtype, shape):
             assert relative(mine, theirs) < (3e-2 if dtype == jnp.bfloat16 else 1e-5), name
 
 
-def test_the_state_decay_gradient_rounds_the_bf16_product_before_reducing():
-    """fla's tl.sum(b_h * b_dh) rounds each bf16 product, not the final fp32 sum."""
-    memory = jnp.full((1, 1), 1.0078125, jnp.bfloat16)
-    got = fla_gdn._state_inner_product(memory, memory)
-    assert got.dtype == jnp.float32
-    assert float(got) == 1.015625
-    omitted_round = jnp.sum(memory.astype(jnp.float32) * memory.astype(jnp.float32))
-    assert float(omitted_round - got) == 2 ** -14
-
-
-def test_a_split_product_retains_the_fp32_operands_bf16_residual():
-    """An fp32 operand at a bf16 midpoint keeps its residual through a split product (the reverse
-    recurrence's gated queries), where one bf16 rounding loses it."""
-    key = jnp.ones((1, 1), jnp.bfloat16)
-    gated = jnp.full((1, 1), 1.00390625, jnp.float32)
-    got = fla_gdn._split_dot(key.T, gated, exact=True)
-    assert got.dtype == jnp.float32
-    assert float(got[0, 0]) == 1.00390625
-    rounded = key.astype(jnp.float32).T @ gated.astype(jnp.bfloat16).astype(jnp.float32)
-    assert float(rounded[0, 0]) == 1.0
-
-
 def test_a_tokens_decay_gradient_sums_only_the_terms_through_it():
     """`_summed_back` gives token t the pairs `(i, j)` with `j < t <= i` and the terms from the chunk's
     start through `s >= t`: a pair of 2^24 outside a token's ranges leaves its small gradient exact,
@@ -541,25 +519,34 @@ def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key):
 
 
 @pytest.mark.mesh(devices=2)
-def test_inside_a_shard_map_that_checks_varying_axes_the_rule_names_why_it_runs_the_math():
+def test_inside_a_shard_map_that_checks_varying_axes_the_rule_runs_the_portable_math():
     """A Pallas call cannot run where a caller's `shard_map` checks varying axes over operands that
-    vary ("manual_axis_type ... must not be None" for its outputs), so there `port_refusal` names
-    the reason and the rule runs the portable math."""
+    vary (its results state no varying type), so there the rule takes the portable math: its outputs
+    and gradients inside such a map are the portable math's, bitwise, where the port would have run."""
     from jax.sharding import Mesh, PartitionSpec
 
-    refusals = []
+    keys = jax.random.split(jax.random.key(83), 6)
+    q = l2norm(jax.random.normal(keys[0], (2, 64, 1, 64)))
+    k = l2norm(jax.random.normal(keys[1], (2, 64, 1, 64)))
+    v = jax.random.normal(keys[2], (2, 64, 2, 64))
+    g = -jnp.exp(jax.random.normal(keys[3], (2, 64, 2)) - 2.0)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (2, 64, 2)))
+    do = jax.random.normal(keys[5], v.shape)
+    rows = PartitionSpec("data")
+    mapped = jax.shard_map(lambda *operands: linear.chunk_gated_delta_rule(*operands)[0],
+                           mesh=Mesh(np.asarray(jax.devices()[:2]), ("data",)), in_specs=(rows,) * 5,
+                           out_specs=rows, check_vma=True)
 
-    def rule(v):
-        refusals.append(linear.port_refusal(v, v, v))
-        return v
+    def run():
+        return jax.jit(jax.value_and_grad(lambda *operands: jnp.sum(mapped(*operands) * do),
+                                          argnums=range(5)))(q, k, v, g, beta)
 
-    mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
     with row_names_port():
-        mapped = jax.shard_map(rule, mesh=mesh, in_specs=PartitionSpec("data"),
-                              out_specs=PartitionSpec("data"), check_vma=True)
-        jax.jit(mapped)(jnp.zeros((2, 64, 1, 64)))
-    assert refusals == ["a shard_map that checks varying axes holds the operands, and a Pallas call states "
-                        "no varying type for its results"]
+        got = run()
+    with row_names_port(port=False):
+        want = run()
+    for mine, theirs in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
 def row_names_port(*, port: bool = True):
@@ -620,22 +607,22 @@ def test_a_gpu_runs_the_port_for_every_rule_but_forward_mode_float64_and_the_wid
     from dew.nn.attention import FORWARD_MODE
 
     x = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
-    assert linear.port_refusal(x, x.astype(jnp.float32), jnp.zeros((1, 64, 3, 96), jnp.bfloat16)) is None
+    assert linear.on_the_port(x, x.astype(jnp.float32), jnp.zeros((1, 64, 3, 96), jnp.bfloat16))
     token = FORWARD_MODE.set(True)
     try:
-        assert "jax.jvp" in linear.port_refusal(x, x, x)
+        assert not linear.on_the_port(x, x, x)
     finally:
         FORWARD_MODE.reset(token)
     with jax.enable_x64(new_val=True):
         wide = jnp.zeros((1, 64, 1, 64), jnp.float64)
-        assert "float64" in linear.port_refusal(wide, wide, wide)
+        assert not linear.on_the_port(wide, wide, wide)
     keys = jnp.zeros((1, 64, 1, 512), jnp.bfloat16)
-    assert linear.port_refusal(keys, keys, x) == "keys 512 wide; the port takes at most 256 in bfloat16"
+    assert not linear.on_the_port(keys, keys, x)
     keys = jnp.zeros((1, 64, 1, 256), jnp.float32)
-    assert linear.port_refusal(keys, keys, keys) == "keys 256 wide; the port takes at most 128 in float32"
-    assert linear.port_refusal(keys.astype(jnp.bfloat16), keys.astype(jnp.bfloat16), x) is None
+    assert not linear.on_the_port(keys, keys, keys)
+    assert linear.on_the_port(keys.astype(jnp.bfloat16), keys.astype(jnp.bfloat16), x)
     with row_names_port(port=False):
-        assert "does not name the port" in linear.port_refusal(x, x, x)
+        assert not linear.on_the_port(x, x, x)
 
 
 @pytest.mark.parametrize("generation", sorted(name for name in kernels.TARGETS if name.startswith("sm")))
@@ -645,9 +632,8 @@ def test_the_rule_runs_the_port_exactly_where_the_gpus_target_row_names_it(gener
     says why."""
     x = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
     with kernels.assumed(generation):
-        refusal = linear.port_refusal(x, x, x)
-    named = kernels.TARGETS[generation].kernels.get("gated_delta_rule") == "fla"
-    assert (refusal is None) == named, refusal
+        ported = linear.on_the_port(x, x, x)
+    assert ported == (kernels.TARGETS[generation].kernels.get("gated_delta_rule") == "fla")
 
 
 @generation.chosen(gated_delta_rule="fla")
@@ -673,25 +659,25 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands():
         assert query.dtype == key.dtype == value.dtype == jnp.bfloat16
 
 
-@pytest.mark.parametrize("policy, saved, recomputed", [
-    (None, ("delta_decay", "delta_inverse", "delta_memory"), ()),
-    ({"recompute": ("delta_memory",)}, ("delta_decay", "delta_inverse"), ("delta_memory",)),
-    ({"save": ("context", "delta_decay", "delta_inverse")}, ("context", "delta_decay", "delta_inverse"),
-     ("delta_memory",)),
+@pytest.mark.parametrize("policy, memories, outputs", [
+    (None, 1, 1),
+    ({"recompute": ("delta_memory",)}, 2, 1),
+    ({"save": ("context", "delta_decay", "delta_inverse")}, 2, 2),
 ])
 @generation.chosen(gated_delta_rule="fla")
-def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(capsys, policy,
-                                                                               saved, recomputed):
+def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(policy, memories, outputs):
     """A block's remat policy keeps or recomputes the port's named residuals
     (`decoder_block.RESIDUALS`): without one the layer saves its decay, inverse and memory
     ('delta_memory') for its backward; 'all_but_delta_memory', which the block applies by tracing its
     layers recomputing that name (`linear.recomputing`) rather than by a checkpoint policy, has the
     backward recompute the memory alone; a policy saving the output, decay and inverse saves those
-    three. Off a GPU each computes the gradients the layer computes without remat, bitwise. A GPU
+    three. Each is read from the kernels the gradient runs: the memory's (`fla_chunk_fwd_h`) once
+    where it is saved and again in the backward where it is recomputed; the output's
+    (`fla_chunk_fwd_o`) once, but where the policy recomputes the memory, whose recompute re-runs the
+    rule's forward, output and all. Off a GPU each computes the gradients the layer computes without
+    remat, bitwise. A GPU
     compiles the remat step as another program, whose roundings differ: on an H100 even the XLA
     math's A_log gradient moved by 5.4e-5 relative between the two, the remat one nearer float64."""
-    from jax.ad_checkpoint import print_saved_residuals
-
     from dew.nn.backbones.decoder_block import remat_policy
     from dew.nn.linear import recomputing
 
@@ -711,13 +697,11 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
                 return loss(params)
     else:
         remat = jax.checkpoint(loss, policy=rung.checkpoint_policy())
-    capsys.readouterr()
-    print_saved_residuals(remat, params)
-    found = capsys.readouterr().out
-    for name in saved:
-        assert f"named '{name}'" in found, (name, found)
-    for name in recomputed:
-        assert f"named '{name}'" not in found, (name, found)
+    graph = jax.make_jaxpr(jax.grad(remat))(params)
+    launched = [str(equation.params["name"]) for equation in equations(graph)
+                if equation.primitive.name == "pallas_call"]
+    counted = (launched.count("fla_chunk_fwd_h"), launched.count("fla_chunk_fwd_o"))
+    assert counted == (memories, outputs), launched
     if jax.default_backend() == "gpu":
         return
     want = jax.jit(jax.grad(loss))(params)

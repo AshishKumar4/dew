@@ -141,13 +141,22 @@ def _carry(previous, step):
     return jnp.exp(log_decay)[..., None, None] * previous + writes, previous
 
 
-def xla_chunk_scan(x_c, B_c, C_c, a_c, carried):
+def xla_chunk_scan(x, B, C, a, carried, chunk_size: int):
     """The scan over chunks in plain XLA, the oracle and the fallback for
-    `dew.nn.kernels.ssd`. `x_c` `[NC, B, C, H, P]` already scaled by `dt`,
-    `B_c` and `C_c` `[NC, B, C, H, N]` with the groups expanded, `a_c`
-    `[NC, B, H, C]` the per-step `A dt`, `carried` `[B, H, P, N]` the state
-    entering the sequence; returns the output in `x_c`'s layout and the state
-    leaving it."""
+    `dew.nn.kernels.ssd`, on the operands as `chunk_ssd` hands either: `x`
+    `[B, T, H, P]` already scaled by `dt`, `B` and `C` `[B, T, H, N]` with the
+    groups expanded, `a` `[B, T, H]` the per-step `A dt`, the length whole
+    chunks of `chunk_size`, and `carried` `[B, H, P, N]` the state entering the
+    sequence; returns the output `[B, T, H, P]` and the state leaving it. The
+    chunks lead its own einsums."""
+    batch, total, heads, head_dim = x.shape
+
+    def chunks(t):  # [B, T, ...] -> [NC, B, C, ...]
+        blocked = t.reshape(batch, total // chunk_size, chunk_size, *t.shape[2:])
+        return jnp.moveaxis(blocked, 1, 0)
+
+    x_c, B_c, C_c = chunks(x), chunks(B), chunks(C)         # [NC, B, C, H, ...]
+    a_c = jnp.moveaxis(chunks(a), 3, 2)                     # [NC, B, H, C]
     a_cumsum = jnp.cumsum(a_c, axis=-1)
     # 1. The intra-chunk output: L[i, j] = exp(segsum) masks C_i . B_j.
     L = jnp.exp(segment_sum(a_c))                           # [NC, B, H, C, C]
@@ -161,7 +170,7 @@ def xla_chunk_scan(x_c, B_c, C_c, a_c, carried):
     final, previous = jax.lax.scan(_carry, carried, (states, a_cumsum[..., -1]))
     # 4. The state each chunk reads, decayed to every position of it.
     y_off = jnp.einsum('nbihs,nbhps,nbhi->nbihp', C_c, previous, jnp.exp(a_cumsum))
-    return y_diag + y_off, final
+    return jnp.moveaxis(y_diag + y_off, 0, 1).reshape(batch, total, heads, head_dim), final
 
 
 def _entering_state(decay, write, axis: str):
@@ -222,24 +231,25 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     pad = (chunk_size - length % chunk_size) % chunk_size
     x, B, C = (jnp.pad(t, ((0, 0), (0, pad), (0, 0), (0, 0))) for t in (x, B, C))
     dt = jnp.pad(dt, ((0, 0), (0, pad), (0, 0)))
-    total = length + pad
     skip = D[None, None, :, None] * x                      # the reference's D_residual
     x = x * dt[..., None]                                   # discretised input
     a = A[None, None, :] * dt                               # [B, T, H] log decay per step
     if starts is not None:
         a = jnp.where(jnp.pad(starts, ((0, 0), (0, pad)))[..., None], RESET_DECAY, a)
 
-    def chunks(t):  # [B, T, ...] -> [NC, B, C, ...], chunks leading for the scan
-        blocked = t.reshape(batch, total // chunk_size, chunk_size, *t.shape[2:])
-        return jnp.moveaxis(blocked, 1, 0)
-
-    x_c, B_c, C_c = chunks(x), chunks(B), chunks(C)         # [NC, B, C, H, ...]
-    a_c = jnp.moveaxis(chunks(a), 3, 2)                     # [NC, B, H, C]
     platform = ssd_kernel_platform(chunk_size, head_dim, state_size, dtype=work)
-    scanned, final = (xla_chunk_scan(x_c, B_c, C_c, a_c, carried) if platform is None else
-                      ssd_chunk_scan(x_c, B_c, C_c, a_c, carried, platform))
-    output = jnp.moveaxis(scanned, 0, 1).reshape(batch, total, heads, head_dim) + skip
-    return output[:, :length], final
+    if platform is None:
+        scanned, final = xla_chunk_scan(x, B, C, a, carried, chunk_size)
+    else:
+        def kernel(x, B, C, a, carried):
+            return ssd_chunk_scan(x, B, C, a, carried, chunk_size, platform)
+
+        # The groups are expanded, so any split of the heads divides them.
+        rows, split = grouped_heads(x.shape, heads)
+        four, held = P(rows, None, split, None), P(rows, split, None, None)
+        scanned, final = manual_map(kernel, (four, four, four, P(rows, None, split), held),
+                                    (four, held))(x, B, C, a, carried)
+    return (scanned + skip)[:, :length], final
 
 
 def ssd_port_refusal(x, B, chunk_size: int) -> str | None:
@@ -281,9 +291,6 @@ def _ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
         return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, *(seq or (None,)), chunk_size, interpret)
 
     operands = (x, dt, A, B, C, D, state, *([] if seq is None else [seq]))
-    mesh = jax.sharding.get_abstract_mesh()
-    if mesh.empty or set(mesh.axis_names) <= set(mesh.manual_axes):
-        return scan(*operands)
     rows, heads = grouped_heads(x.shape, B.shape[2])
     four, held = P(rows, None, heads, None), P(rows, heads, None, None)
     specs = (four, P(rows, None, heads), P(heads), four, four, P(heads), held, P(rows, None))
