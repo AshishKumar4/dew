@@ -1,5 +1,5 @@
 """Native edge checks against tools/native_diffusion_edges_reference.py oracles: the source's
-tables and timesteps exactly, and every walk as near float64 as the source's float32
+timesteps exactly, and its noise tables and every walk as near float64 as the source's float32
 (tests/reference_error.py)."""
 import argparse
 import json
@@ -43,7 +43,7 @@ def check(directory, case):
     else:
         ref = np.load(directory / "schedulers.npz")
         policy = SourceSchedule.from_config(json.loads(str(ref[case + ".config"])))
-        np.testing.assert_array_equal(policy.betas, ref[case + ".betas"])
+        assert_as_exact_as_the_reference(policy.betas, ref[case + ".betas"], ref[case + ".betas.fp64"], f"{case} betas")
         process, times = policy.sampling(4)
         model_times = np.asarray(process.sampler_schedule.model_time(times[:-1]))
         expected_times = ref[case + ".times"]
