@@ -872,8 +872,7 @@ def _bind_language_model[C: ConditionEncoder](
         variables, bound, unread = read(tensors, lazy=lazy)
         return (conditioner({"text_encoder": variables}), bound,
                 {f"text_encoder/{name}": tensors[name] for name in unread})
-    held = None if stored is None else stored.specs("text_encoder")
-    if held is None:
+    if stored is None or (held := stored.specs("text_encoder")) is None:
         return conditioner(params), (), {}
     _, bound, unread = read({name: np.broadcast_to(np.zeros((), spec.dtype), spec.shape)
                              for name, (_, spec) in held.items()}, lazy=True)
