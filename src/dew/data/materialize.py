@@ -283,6 +283,21 @@ def _targeted(
     return kept, {"valid_targets": total}
 
 
+def _measured_targets(child: Pipeline, mixture: Mixture) -> Pipeline:
+    """A corpus a mixture weighs by tokens (`Mixture.tokens`), its valid targets measured where the
+    memory read ran steps over its source's rows, whose stated counts then describe other rows
+    (`_Memory.metadata`): the read holds every row the mixture reads, so it counts their targets
+    by the mixture's own rule, and the mixture weighs the corpus by them as by a source's stated
+    counts."""
+    source = child.source
+    if (mixture.tokens is None or not isinstance(source, _Memory) or "valid_targets" in source.metadata()
+            or any(isinstance(value, bytes) for value in source.held)):
+        return child
+    counted = sum(mixture.tokens(record(value, "mixed row")) for value in source.held)
+    return dataclasses.replace(child, source=dataclasses.replace(source, facts={**source.facts,
+                                                                              "valid_targets": counted}))
+
+
 def _memory_mixture(
     pipeline: Pipeline,
     mixture: Mixture,
@@ -290,7 +305,8 @@ def _memory_mixture(
     *,
     training: bool,
 ) -> Pipeline:
-    children = tuple(_materialize(child, counts, training=training) for child in mixture.pipelines)
+    children = tuple(_measured_targets(_materialize(child, counts, training=training), mixture)
+                     for child in mixture.pipelines)
     kept = tuple(
         (child, weight)
         for child, weight in zip(children, mixture.weights, strict=True)
