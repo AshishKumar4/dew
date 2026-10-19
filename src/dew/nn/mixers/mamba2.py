@@ -399,6 +399,11 @@ class Mamba2(nn.Module):
                              self.conv_kernel, groups=self.conv_features)
                 + ssd_flops(lengths, self.num_heads, self.state_size, self.head_dim))
 
+    @nn.nowrap
+    def parameter_flops(self, lengths) -> float:
+        """Frozen learned maps and conv, excluding the scan's state contractions (`ssd_flops`)."""
+        return self.model_flops(lengths) - ssd_flops(lengths, self.num_heads, self.state_size, self.head_dim)
+
     @property
     def conv_features(self) -> int:
         return self.intermediate_size + 2 * self.n_groups * self.state_size

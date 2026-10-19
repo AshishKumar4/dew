@@ -194,13 +194,18 @@ def test_tensors_are_the_ones_transformers_reads(tmp_path, architecture, qtype):
 
 def test_load_pretrained_reads_the_file_and_its_tokenizer(tmp_path):
     """The whole load: logits against transformers over the same GGUF, and the
-    tokenizer the file carries, since the directory ships none."""
+    tokenizer the file carries, since the directory ships none. The directory
+    also ships a diffusion pipeline's index, and the selected file is still
+    what loads; a second payload selector beside it is refused."""
     from transformers import AutoModelForCausalLM
 
     rng = np.random.default_rng(0)
     write_gguf(tmp_path / "model.gguf", "llama", gguf.GGMLQuantizationType.Q8_0,
                hf_tensors("llama", rng), rng)
+    (tmp_path / "model_index.json").write_text('{"_class_name": "FluxPipeline"}')
 
+    with pytest.raises(ValueError):
+        Pretrained.load(tmp_path, gguf_file="model.gguf", single_file="model.safetensors")
     pretrained = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference",
                                  gguf_file="model.gguf")
     reference = AutoModelForCausalLM.from_pretrained(str(tmp_path), gguf_file="model.gguf",
@@ -250,6 +255,42 @@ print(np.asarray(loaded.processor("Hello, GGUF").tokens).tolist()[0])
 
 # Pinned: the bounds below are this commit's files.
 REPO, REVISION = "bartowski/SmolLM2-135M-Instruct-GGUF", "09816acd5d99df7be770d85ea30822623dab342c"
+_SELECTED = """
+import json, sys
+from dew.interop import Pretrained
+from dew.lora import LoRA
+
+loaded = Pretrained.load("dew/tiny-gguf", dtype="float32", attention_impl="reference", gguf_file="model.gguf")
+adapted = loaded.adapt(LoRA(rank=2, modules=("q_proj",)), key=0)
+adapted.adapter.save(adapted.variables, sys.argv[1])
+print(json.dumps([loaded.revision, loaded.origin]))
+"""
+
+
+def test_an_adapter_on_a_gguf_file_chosen_out_of_a_hub_repo_names_no_base(tmp_path):
+    """The load resolves the repo at a commit, but a reader of the repo's id alone,
+    as PEFT reads an adapter's base, loads the repo's own weights, not the file a
+    selector chose, so an adapter bound to the file names no base. The process
+    runs offline over a Hub cache holding the file at one commit."""
+    import json
+    import subprocess
+
+    from interop_support import hub_cache
+
+    rng = np.random.default_rng(0)
+    (tmp_path / "repo").mkdir()
+    write_gguf(tmp_path / "repo" / "model.gguf", "llama", gguf.GGMLQuantizationType.Q8_0,
+               hf_tensors("llama", rng), rng)
+    commit = hub_cache(tmp_path / "hub", "dew/tiny-gguf", tmp_path / "repo")
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu"}
+    run = subprocess.run([sys.executable, "-c", _SELECTED, str(tmp_path / "adapter")], capture_output=True,
+                         text=True, env=env)
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert json.loads(run.stdout.split("\n")[-2]) == [commit, None]
+    written = json.loads((tmp_path / "adapter" / "adapter_config.json").read_text())
+    assert not {"base_model_name_or_path", "revision"} & set(written)
+
+
 PROMPTS = ("The Cascade Range runs from northern California through Oregon and Washington, "
            "and its tallest volcano is",
            "The capital of France is")

@@ -293,7 +293,7 @@ def test_prompts_inside_one_bucket_trace_once_and_draw_what_their_own_width_draw
     """
     exact = {width: generate(roomy.model, roomy.variables, ramp(width), 8, key=0,
                              sampling=roomy.sampling) for width in (100, 120)}
-    compiled = text._compiled(None)
+    compiled = text._compiled(None, ())
     traced = compiled._cache_size()
     for width, reference in exact.items():
         drawn = roomy(ramp(width), 8, key=0)
@@ -335,7 +335,7 @@ def test_a_processor_prompt_is_bucketed_like_bare_ids(roomy):
     # of this test's: the count starts after them.
     references = {width: generate(roomy.model, roomy.variables, ramp(width), 8, key=0,
                                   sampling=roomy.sampling) for width in (100, 120)}
-    compiled = text._compiled(None)
+    compiled = text._compiled(None, ())
     traced = compiled._cache_size()
     for width, reference in references.items():
         drawn = roomy(processor_rows(width), 8, key=0)
@@ -359,7 +359,7 @@ def test_a_budget_inside_a_bucket_returns_the_budget_and_what_the_budget_draws(r
     assert (shaped.tokens.shape[1], trips, capacity) == (64, 128, 256)
     exact = generate(tasks.cache_sized(roomy.model, capacity), roomy.variables, shaped, budget,
                      key=3, sampling=roomy.sampling)
-    compiled = text._compiled(None)
+    compiled = text._compiled(None, ())
     traced = compiled._cache_size()
     drawn = roomy(prompt, budget, key=3)
     assert drawn.tokens.shape == (1, 40 + budget) and drawn.behavior_log_probs.shape == (1, budget)

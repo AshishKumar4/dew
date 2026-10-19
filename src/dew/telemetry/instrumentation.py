@@ -76,6 +76,35 @@ _LABELS = re.compile(r'dim_labels=(\S+?)(?:[,\s]|$)')
 _GROUPS = re.compile(r'feature_group_count=(\d+)')
 # A multiply-add is two FLOPs.
 _MAC = 2
+_ARRAY = re.compile(r'([a-z][a-z0-9]*)\[([\d,]*)\](\{[^}]*\})?')
+_PACKED = re.compile(r'E\((\d+)\)')
+_BITS = re.compile(r'(\d+)')
+COLLECTIVES = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "collective-permute")
+"""The HLO ops that move data between devices. XLA runs some as an async
+pair, `<op>-start` and `<op>-done`, and wraps others in `async-start` over a
+computation that holds the op itself."""
+
+
+def collective(op: str) -> str | None:
+    """The collective (`COLLECTIVES`) HLO op `op` is, or runs half of; None for any other."""
+    kind = op.removesuffix('-start').removesuffix('-done')
+    return kind if kind in COLLECTIVES else None
+
+
+def _buffers(shape: str) -> tuple[int, ...]:
+    """The bytes of each array an instruction's result holds, a tuple's every
+    element, as XLA sizes it (`ShapeUtil::ByteSizeOfElements`): its layout's
+    element size where it packs one (`E(4)`), else its type's width rounded up
+    to whole bytes (`pred` and `s4` one byte each), by its elements, rounded up."""
+    found = []
+    for element, dims, layout in _ARRAY.findall(shape):
+        packed = _PACKED.search(layout)
+        width = 1 if element == 'pred' else int(next(iter(_BITS.findall(element)), 0))
+        bits = int(packed.group(1)) if packed else -(-width // 8) * 8
+        found.append(-(-bits * math.prod(int(d) for d in dims.split(',') if d) // 8))
+    return tuple(found)
+
+
 _CUSTOM_CALLS = (
     ("gemm", re.compile(r'^__cublas')),
     ("convolution", re.compile(r'^__cudnn\$conv')),
@@ -100,6 +129,8 @@ class _Instruction:
     traced: tuple[str, ...] = ()
     """Its metadata's `op_name source_file:line`, interned: a module repeats
     each a great many times."""
+    buffers: tuple[int, ...] = ()
+    """A collective's result, each array's bytes (`_buffers`); empty for any other op."""
 
 
 @dataclass
@@ -185,8 +216,9 @@ def _parse(text: str | Iterable[str]) -> tuple[dict[str, _Computation], str | No
         attributes, metadata = _without_metadata(attributes)
         traced = tuple(sys.intern(f"{op_name} {file}:{line}".strip() if file else op_name)
                        for op_name, file, line in _TRACED.findall(metadata) if op_name)
+        buffers = _buffers(match.group('shape')) if collective(match.group('op')) else ()
         computation.instructions[name] = _Instruction(match.group('op'), dims, operands, attributes,
-                                                      recomputed, traced)
+                                                      recomputed, traced, buffers)
         if stripped.startswith('ROOT'):
             computation.root = name
         literal = _INTEGER.match(match.group('rest'))
@@ -303,31 +335,33 @@ def _reached(queries: int, keys: int, attributes: str) -> int:
 
 def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]], *,
                            query: int, backward: bool) -> float:
-    """A fused-attention call (cuDNN's or dew_flash_attn's), from the query and
-    key it is given, the operands at `query` and the one after it, and the
-    pairs of them its mask computes (`_reached`).
+    """A fused-attention call (cuDNN's or dew_flash_attn's), from the query,
+    key and value it is given, the operands at `query` and the two after it,
+    and the pairs of them its mask computes (`_reached`).
 
     The kernel keeps the scores off memory, so nothing in the module states
     its arithmetic; the operands do. They are `[batch, sequence, heads, width]`
     (checked against the calls XLA emits for `jax.nn.dot_product_attention`,
     including grouped-query and cross attention, where the key carries its own
-    head count and sequence, and against dew_flash_attn's). Both products of
-    the forward pass, `Q K^T` and `P V`, cost one multiply-add per pair, head
-    and width; the backward pass runs four such products, for dV, dP, dQ and
-    dK. A causal mask leaves the kernels about half the square, which is what
-    they compute: on an H100, FlashAttention-3's causal call at 2 x 16 heads
-    x 4096 x 128 counted the whole square, twice its work, before this read
-    the mask.
+    head count and sequence, and against dew_flash_attn's). The forward pass's
+    `Q K^T` costs one multiply-add per pair, head and query width, and its
+    `P V` one per pair, head and value width, which a model may set apart
+    (MiMo's 192 and 128). The backward pass runs each product's two
+    transposes: dP and dV at the value's width, dQ and dK at the query's. A
+    causal mask leaves the kernels about half the square, which is what they
+    compute: on an H100, FlashAttention-3's causal call at 2 x 16 heads x 4096
+    x 128 counted the whole square, twice its work, before this read the mask.
     """
-    if len(instruction.operands) < query + 2:
+    if len(instruction.operands) < query + 3:
         return 0.0
-    queries = shapes.get(instruction.operands[query])
-    key = shapes.get(instruction.operands[query + 1])
-    if queries is None or key is None or len(queries) != 4 or len(key) != 4:
+    queries, key, value = (shapes.get(instruction.operands[query + offset]) for offset in range(3))
+    if any(operand is None or len(operand) != 4 for operand in (queries, key, value)):
         return 0.0
+    assert queries is not None and key is not None and value is not None
     batch, length, heads, width = queries
-    products = 4 if backward else 2
-    return products * _MAC * batch * heads * _reached(length, key[1], instruction.attributes) * width
+    passes = 2 if backward else 1
+    pairs = _reached(length, key[1], instruction.attributes)
+    return passes * _MAC * batch * heads * pairs * (width + value[3])
 
 
 def custom_call_kind(target: str) -> str | None:
@@ -365,6 +399,9 @@ class HloInstruction:
     runs: float
     """Its calls per call of the module, as `hlo_flops` weighs them: a loop
     body's trip count, every branch of a conditional once."""
+    buffers: tuple[int, ...]
+    """A collective's result, each array's bytes: an async pair's `-done` holds
+    what moved, its `-start` what it read as well. Empty for any other op."""
 
 
 def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
@@ -417,7 +454,7 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             flops = _instruction_flops(instruction, computation.shapes) + sum(each for _, _, each in called)
             found[name] = HloInstruction(instruction.op, target.group(1) if target else '',
                                          tuple(instruction.operands), ops, instruction.recomputed, names,
-                                         reads, flops, weights.get(called_as, 0.0))
+                                         reads, flops, weights.get(called_as, 0.0), instruction.buffers)
     computations.clear()
     return found
 
@@ -611,13 +648,35 @@ def _merged_call_counts(computation: _Computation,
 class StepFlops:
     """One step's FLOPs: the `model`'s, the forward a remat recomputes counted
     once, and the `hardware`'s, every matmul the device runs. MFU is read off
-    the first and HFU off the second (PaLM's distinction)."""
+    the first and HFU off the second (PaLM's distinction). `unsized` counts
+    the kernel launches the step runs whose work neither holds: a Pallas
+    kernel lowers to a Triton call its HLO does not size (JAX's Triton
+    lowering drops the kernel's `CostEstimate`), so where any runs both are
+    lower bounds."""
 
     model: float
     hardware: float
+    unsized: float = 0.0
 
     def __add__(self, other: "StepFlops") -> "StepFlops":
-        return StepFlops(self.model + other.model, self.hardware + other.hardware)
+        return StepFlops(self.model + other.model, self.hardware + other.hardware,
+                         self.unsized + other.unsized)
+
+    def __rmul__(self, calls: int) -> "StepFlops":
+        """The FLOPs of `calls` such calls (a step split into microbatches)."""
+        return StepFlops(calls * self.model, calls * self.hardware, calls * self.unsized)
+
+    def utilizations(self, steps: int, step_time: float, peak: float | None = None) -> dict[str, float]:
+        """The interval's HLO utilizations of `steps` steps of `step_time` seconds each, of `peak`
+        (`model_flops_utilization`): train/hfu off `hardware` and train/hlo_flops_util off `model`,
+        both ending `_lower_bound` beside train/unsized_kernels, the launches a step, where any
+        launch's work went uncounted."""
+        bound = "_lower_bound" if self.unsized else ""
+        scalars = {f"train/{name}{bound}": utilization
+                   for name, counted in (("hlo_flops_util", self.model), ("hfu", self.hardware))
+                   if (utilization := model_flops_utilization(counted / steps, step_time, peak))
+                   is not None}
+        return {**scalars, "train/unsized_kernels": self.unsized / steps} if bound else scalars
 
 
 NO_FLOPS = StepFlops(0.0, 0.0)
@@ -637,10 +696,7 @@ def step_flops(compiled: jax.stages.Compiled) -> StepFlops | None:
     gives, since the count would then be the body's, not the run's.
     """
     text = compiled.as_text()
-    if text is None:
-        return None
-    model, hardware = hlo_flops(text, recomputed=False), hlo_flops(text)
-    return None if model is None or hardware is None else StepFlops(model, hardware)
+    return None if text is None else hlo_flops(text)
 
 
 def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
@@ -649,28 +705,44 @@ def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
     return None if flops is None else flops.hardware
 
 
-def hlo_flops(text: str, *, recomputed: bool = True) -> float | None:
-    """Matmul and convolution FLOPs of one call of an optimized HLO module;
-    without the forward a remat recomputes where `recomputed` is False."""
+def hlo_flops(text: str) -> StepFlops | None:
+    """Matmul and convolution FLOPs of one call of an optimized HLO module,
+    parsed and weighted once: the forward a remat recomputes counted once in
+    `model` and each time it runs in `hardware`, beside the Triton launches it
+    runs, which neither counts (`StepFlops.unsized`)."""
     computations, entry = _parse(text)
     if entry is None:
         return None
     weights = _weights(computations, entry)
-    total = 0.0
+    model = hardware = unsized = 0.0
     for name, computation in computations.items():
-        instructions = sum(_instruction_flops(instruction, computation.shapes)
-                           for instruction in computation.instructions.values()
-                           if recomputed or not instruction.recomputed)
-        if not instructions or not weights[name]:
+        if not weights[name]:
             continue
-        total += weights[name] * instructions
-    return total if math.isfinite(total) else None
+        counted = [(_instruction_flops(instruction, computation.shapes), instruction.recomputed)
+                   for instruction in computation.instructions.values()]
+        launches = sum(_unsized(instruction) for instruction in computation.instructions.values())
+        unsized += weights[name] * launches if launches else 0.0
+        ran = sum(flops for flops, _ in counted)
+        if not ran:
+            continue
+        hardware += weights[name] * ran
+        model += weights[name] * sum(flops for flops, recomputed in counted if not recomputed)
+    totals = (model, hardware, unsized)
+    return StepFlops(*totals) if all(math.isfinite(total) for total in totals) else None
+
+
+def _unsized(instruction: _Instruction) -> bool:
+    """Whether `instruction` launches a kernel whose work the HLO does not size: a
+    Triton call, which a Pallas kernel lowers to."""
+    target = _TARGET.search(instruction.attributes) if instruction.op == 'custom-call' else None
+    return target is not None and custom_call_kind(target.group(1)) == 'triton'
 
 
 def model_flops_utilization(
-    flops_per_step: float | None, step_time: float
+    flops_per_step: float | None, step_time: float, peak: float | None = None
 ) -> float | None:
-    """Fraction of one device's dense peak achieved by its executable.
+    """Fraction of one device's dense `peak` achieved by its executable, the
+    bf16 peak of device 0's kind by default.
 
     The optimized module is the program one device runs under SPMD, so its
     shapes are per-device and the denominator is one device's peak rather
@@ -678,7 +750,7 @@ def model_flops_utilization(
     """
     if not flops_per_step or step_time <= 0:
         return None
-    peak = gpu_target(jax.devices()[0].device_kind).bf16_peak
+    peak = gpu_target(jax.devices()[0].device_kind).bf16_peak if peak is None else peak
     if peak is None:
         return None
     return flops_per_step / step_time / peak

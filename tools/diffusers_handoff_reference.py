@@ -28,12 +28,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tools.diffusers_reference_helpers import restore_transformers_names
+from tools.diffusers_wan_reference import float64, float64_scheduler
+
+restore_transformers_names()
+
 ROOT = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(ROOT)]
-
-# Also restores the transformers names Diffusers 0.34.0's pipelines import.
-from tools.diffusers_wan_reference import float64, float64_scheduler  # noqa: E402
-
 FIXTURE = ROOT / "tests" / "fixtures" / "diffusers_handoff.npz"
 STEPS, GUIDANCE, CUTOFF = 4, 3.0, 0.5
 PROMPT, NEGATIVE = "cat", "dog"

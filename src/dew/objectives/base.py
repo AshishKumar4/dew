@@ -17,7 +17,7 @@ import enum
 import functools
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
@@ -40,10 +40,12 @@ from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts, TokenScores
+from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import compensated_sum
 from dew.records import JSON
 
 if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
     from flax import linen as nn
     from jax.sharding import Mesh
     from jax.typing import DTypeLike
@@ -387,6 +389,14 @@ class SavedTask(Protocol):
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self: ...
 
 
+@runtime_checkable
+class ReleasedTask(SavedTask, Protocol):
+    """A saved task that publishes its run as a released checkpoint of its own layout
+    (`Decide.save_pretrained`), which `dew export` writes in place of its model's source layout."""
+
+    def save_pretrained(self, directory: str) -> None: ...
+
+
 class Omitted(enum.Enum):
     """A keyword the caller left out, where None is a value of its own.
 
@@ -462,6 +472,12 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     ema: EMASpec | None = None
     saved_task: ClassVar[type[SavedTask] | None] = None
+    settings: ClassVar[type[DataclassInstance] | None] = None
+    """The dataclass of what a saved run records beside its objective and model
+    (`task_settings`), the one list of those fields: the objective writes an
+    instance, its `saved_task` reads it back, and a record holding any other
+    field is refused (`dew.inference.tasks.run_record`). None records nothing
+    more."""
     """The task class a saved run of this objective loads as, which `dew.pipeline` builds from the run.
 
     A subclass inherits its parent's. None means a saved run of this
@@ -693,15 +709,16 @@ class Objective(ABC, Generic[Loss, Effects]):
             cached = (programs, {})
             self._program_cache = cached
         from dew.nn.sharding import trace_context
-
-        key = (name, trace_context())
+        # The options follow where the program runs (`compiler_options`), so they key it too.
+        options = compiler_options(*(module for module, _ in programs))
+        key = (name, trace_context(), tuple(options.items()))
         if key not in cached[1]:
             # A fresh callable gives JAX a fresh trace even for the same bound method.
             @functools.wraps(function)
             def run(*args, **kwargs):
                 return function(*args, **kwargs)
 
-            cached[1][key] = jax.jit(run, static_argnames=static_argnames)
+            cached[1][key] = jax.jit(run, static_argnames=static_argnames, compiler_options=options)
         return cached[1][key]
 
     @property
@@ -1001,11 +1018,27 @@ class Objective(ABC, Generic[Loss, Effects]):
         variables = Checkpoints(directory).variables(
             step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
             param_dtype=param_dtype, parameter_roots=parameter_roots)
+        return cls._model_tree(variables)
+
+    @classmethod
+    def _model_tree(cls, variables: Variables) -> Variables:
+        """The `_model_part` subtree of `variables`, or the whole tree when the objective names none."""
         return variables if cls._model_part is None else part(variables, cls._model_part)
 
-    def task_record(self) -> Mapping[str, JSON] | None:
-        """Return the task settings a saved step records beside its model, or
-        None when the objective declares no inference contract.
+    def model_variables(self, variables: Variables) -> Variables:
+        """Return the model's own tree out of `variables`, a tree this objective trains.
+
+        That is the tree the model applies with, and another objective over
+        the same model starts from it. It is the whole tree, or the model's
+        part, trained and frozen collections together, of an objective that
+        nests the model beside other networks or frozen ones.
+        """
+        return self._model_tree(variables)
+
+    def task_settings(self) -> DataclassInstance | None:
+        """Return the task settings a saved step records beside its model, an
+        instance of `settings`, or None when the objective declares no
+        inference contract.
 
         They are what the objective's task is built with and a loader cannot
         read off the model: a sampling policy, a token budget, a tokenizer, a
@@ -1013,21 +1046,27 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
+    def recorded_model(self) -> nn.Module:
+        """The model a saved step's record names (`inference_record`): the objective's own."""
+        return self.model
+
     def inference_record(self) -> JSON:
         """Return the model and task settings that let a saved step be rebuilt.
 
-        It records the objective's import path, its `model`'s record, and
-        `task_record`'s settings. An objective that declares no task settings
-        returns None; a custom research method can still restore its raw state.
+        It records the objective's import path, its `recorded_model`'s record,
+        and `task_settings`, field by field. An objective that declares no task
+        settings returns None; a custom research method can still restore its
+        raw state.
         """
         from dew.config import ModelConfig
-        from dew.registry import import_path, to_record
+        from dew.registry import import_path, record_fields, to_record
 
-        settings = self.task_record()
+        settings = self.task_settings()
         if settings is None:
             return None
         return {'objective': import_path(type(self)),
-                'model': to_record(ModelConfig.from_model(self.model), ModelConfig), **settings}
+                'model': to_record(ModelConfig.from_model(self.recorded_model()), ModelConfig),
+                **record_fields(settings, type(settings))}
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> Task | SavedTask:
@@ -1132,6 +1171,28 @@ class Metric(Protocol[S]):
     def finalize(self, accumulated: S, /) -> float:
         """Return the scalar for the completed pass."""
         ...
+
+
+def recorded_name[S, A](key, names: Collection[str], owner: Objective[S, A] | None = None) -> str:
+    """The recorded name a run's score object names, one rule for the scores `best=` and `stop=` read
+    live and the ones a checkpoint keeps: a `TrainingScalar` the training split's (of the objective
+    `owner` where it is given, by identity), a `Metric` the validation split's ('val'), and a
+    `(split, metric)` pair that split's. A metric its split did not record raises with the splits that
+    did."""
+    split = "val"
+    if isinstance(key, tuple) and len(key) == 2:
+        split, key = key
+    if isinstance(key, TrainingScalar):
+        if owner is not None and key.owner is not owner:
+            raise KeyError("training score belongs to another objective")
+        return f"train/{key.name}"
+    if isinstance(key, Metric):
+        if f"{split}/{key.name}" in names:
+            return f"{split}/{key.name}"
+        splits = sorted(name.rpartition("/")[0] for name in names if name.rpartition("/")[2] == key.name)
+        raise KeyError(f"metric {key.name!r} has no {split} score" + (
+            f"; it is recorded under {', '.join(splits)}: ask (split, metric)" if splits else ""))
+    raise KeyError(key)
 
 
 def merge_totals(accumulated: tuple[float, float],

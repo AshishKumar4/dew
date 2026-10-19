@@ -13,8 +13,9 @@ import jax
 import numpy as np
 import optax
 import pytest
+from delta_rule_support import port_formula
 from PIL import Image
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, float64_forward
 from safetensors.numpy import load_file
 
 from dew.checkpoints import Checkpoints
@@ -38,6 +39,8 @@ from dew.decision.calibration import softmax
 from dew.decision.data import Decisions
 from dew.decision.images import Images
 from dew.decision.joint_checkpoint import StoredJointHead
+from dew.nn import linear
+from dew.nn.kernels.generation import measured_kernel
 from dew.training.trainer import Trainer
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -66,6 +69,41 @@ def test_a_transformers_tokenizer_gives_the_special_tokens_its_dew_wrapper_gives
     assert parameter_type(Specials.of, "tokenizer") == Tokenizer | TokenizerSpecials
 
 
+def test_any_tokenizer_holding_the_special_tokens_gives_them(tokenizer):
+    """A tokenizer of no transformers class that holds the ids and token text
+    `TokenizerSpecials` declares gives the same Specials as the transformers
+    tokenizer it copies; one that holds none, a ByteTokenizer, is refused."""
+    from types import SimpleNamespace
+
+    from dew.data.text import ByteTokenizer
+
+    hf = tokenizer.tokenizer
+    names = ("cls_token_id", "sep_token_id", "eos_token_id", "bos_token_id", "mask_token_id", "pad_token_id")
+    own = SimpleNamespace(**{name: getattr(hf, name) for name in names},
+                          convert_ids_to_tokens=hf.convert_ids_to_tokens)
+    assert Specials.of(own) == Specials.of(tokenizer)
+    with pytest.raises(ValueError):
+        Specials.of(ByteTokenizer())
+
+
+@pytest.mark.parametrize("zero", ["[PAD]", "[MASK]"])
+def test_a_special_token_at_id_zero_is_the_tokenizers_own(zero):
+    """A vocabulary may put its padding or mask token at id 0, as BERT's puts
+    [PAD]; Specials.of keeps that id rather than taking 0 for a missing one
+    and laying out the end token in its place."""
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+
+    words = [zero, *(word for word in ("[PAD]", "[MASK]", "[SEP]", "[UNK]") if word != zero)]
+    vocabulary = {word: index for index, word in enumerate(words)}
+    backend = Tokenizer(models.WordLevel(vocabulary, unk_token="[UNK]"))
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, pad_token="[PAD]", mask_token="[MASK]",
+                                        sep_token="[SEP]", unk_token="[UNK]")
+    specials = Specials.of(tokenizer)
+    assert (specials.pad, specials.marker) == (tokenizer.pad_token_id, tokenizer.mask_token_id)
+    assert 0 in (specials.pad, specials.marker)
+
+
 def laid_out(tokenizer: HFTokenizer) -> dict[str, tuple[dict[str, Question], Encoded]]:
     """Each case's questions and its one joint row."""
     rows = {}
@@ -90,29 +128,34 @@ def test_the_joint_layout_lays_out_what_the_release_does(tokenizer):
             assert [questions[laid.name].options[slot] for slot in laid.order] == reference["option_ids"]
 
 
-def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Dew's head, the release's fp32 head, and its float64 head, all on the same
-    fp32 backbone states, over every question of every case."""
+def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, ...]:
+    """Dew's head, the release's fp32 head, its float64 head, and the terms
+    Dew's float64 head sums for each logit (`float64_forward`), all on the
+    same fp32 backbone states, over every question of every case."""
     loaded = StoredJointHead.load(TINY, attention_impl="xla")
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
-    found, reference, truth = [], [], []
+    found, reference, truth, terms = [], [], [], []
     with np.load(TINY / "states.npz") as states, np.load(TINY / "logits.npz") as logits:
         for case, (_, row) in laid_out(tokenizer).items():
             inputs = DecisionInputs.collate([row], 0)
-            scores = loaded.head.apply({"params": loaded.params}, states[case][None], inputs, table)
+            given = ({"params": loaded.params}, states[case][None], inputs, table)
+            scores = loaded.head.apply(*given)
+            _, summed = float64_forward(loaded.head, *given)
             for slot, laid in enumerate(row.questions):
                 key = f"{case}/{laid.name}"
                 found.append(np.asarray(scores)[0, slot, :len(laid.options)])
+                terms.append(np.asarray(summed)[0, slot, :len(laid.options)])
                 reference.append(logits[key])
                 truth.append(logits[f"{key}/head64"])
-    return np.concatenate(found), np.concatenate(reference), np.concatenate(truth)
+    return tuple(map(np.concatenate, (found, reference, truth, terms)))
 
 
 def test_the_stored_joint_head_matches_its_release_under_the_float64_rule(tokenizer):
     """Every question of every case, read off the same fp32 backbone states,
     held to twice the release's own head's fp32 distance from its float64
     run (measured: 1.42 times)."""
-    assert_as_exact_as_the_reference(*head_logits(tokenizer), "stored joint head logits")
+    found, reference, truth, terms = head_logits(tokenizer)
+    assert_as_exact_as_the_reference(found, reference, truth, "stored joint head logits", terms=terms)
 
 
 def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
@@ -142,27 +185,43 @@ def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
     assert np.all(np.isfinite(gradient)) and np.any(gradient)
 
 
-def test_a_joint_release_answers_as_its_own_model(tmp_path):
+def joint_logits(decide) -> np.ndarray:
+    """Dew's logits of every question the cases lay out, in the fixture's order."""
+    found = []
+    for request in CASES.values():
+        questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
+        [row] = decide.layout.rows(decide.tokenizer, decide.specials, request["state"], questions)
+        scores = np.asarray(decide.model.logits(decide.variables, DecisionInputs.collate([row], 0)))
+        found += [scores[0, slot, :len(laid.options)] for slot, laid in enumerate(row.questions)]
+    return np.concatenate(found)
+
+
+def test_a_joint_release_answers_as_its_own_model(tmp_path, monkeypatch):
     """`Decide.from_pretrained` reads a joint-head release, the Qwen 3.5
     backbone with the head beside it. Dew's backbone and head together are
     held to twice the release's own fp32 model's distance from its float64
     run, and `systemone`, with the release's confidence (the top
     probability), gives each option the probability the release's fp32
-    logits give it, within the fourth decimal both round to."""
+    logits give it, within the fourth decimal both round to.
+
+    Where the device's target row names the delta rule's port, Dew's Gated
+    DeltaNet runs the port's formula, one plain fp32 decay prefix per chunk
+    as fla takes it, not the release's: on an A100 the port's logits sat 3.46
+    times the release's distance from float64, the portable math's 1.57. There
+    the reference is Dew's own model with the port's formula in the portable
+    math (`port_formula`), as a packed window's is (test_decision_packing)."""
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (tmp_path / source.name).symlink_to(source.resolve())
     decide = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), confidence=TopProbability())
     layouts = json.loads((TINY / "layouts.json").read_text())
-    found, reference, truth = [], [], []
+    reference, truth = [], []
     with np.load(TINY / "logits.npz") as logits:
         for case, request in CASES.items():
             questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
             [row] = decide.layout.rows(decide.tokenizer, decide.specials, request["state"], questions)
-            scores = np.asarray(decide.model.logits(decide.variables, DecisionInputs.collate([row], 0)))
             answers = decide.systemone(request)["answers"]
-            for slot, (laid, kept) in enumerate(zip(row.questions, layouts[case]["questions"], strict=True)):
+            for laid, kept in zip(row.questions, layouts[case]["questions"], strict=True):
                 key = f"{case}/{laid.name}"
-                found.append(scores[0, slot, :len(laid.options)])
                 reference.append(logits[key])
                 truth.append(logits[f"{key}/f64"])
                 probabilities = softmax(logits[key].astype(np.float64), 1.0)
@@ -173,7 +232,13 @@ def test_a_joint_release_answers_as_its_own_model(tmp_path):
                     assert abs(value - expected[option]) <= 1e-4, (case, laid.name, option)
                 if answer["type"] != "noul":
                     assert answer["confidence"] == max(given.values())
-    assert_as_exact_as_the_reference(np.concatenate(found), np.concatenate(reference), np.concatenate(truth),
+    found, reference = joint_logits(decide), np.concatenate(reference)
+    if measured_kernel("gated_delta_rule", "xla") == "fla":
+        with monkeypatch.context() as patched:
+            patched.setattr(linear, "fla_rule", port_formula)
+            reference = joint_logits(decide)
+        assert not np.array_equal(reference, found), "the formula ran the port itself"
+    assert_as_exact_as_the_reference(found, reference, np.concatenate(truth),
                                      "the joint head over Dew's Qwen 3.5")
 
 

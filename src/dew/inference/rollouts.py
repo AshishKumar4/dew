@@ -22,7 +22,7 @@ import math
 import os
 import shutil
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -39,12 +39,26 @@ from dew.records import JSON
 from dew.sampling.text import Generation, Sampling
 
 from .clients import OpenAICompletion, decode_routed_experts
-from .serving import Server
+from .serving import Server, settled
 
 if TYPE_CHECKING:
     import httpx
 
     from dew.interop.pretrained import Pretrained
+
+
+class InfrastructureError(RuntimeError):
+    """A rollout's infrastructure failed: a connection, an engine, a sandbox, a runtime or a service.
+
+    A session source turns it, like any `OSError`, into an `INFRA_ERROR`
+    session, which the scheduler retries; any other error is broken code or
+    a broken contract and fails the rollout. The remote rollout servers
+    raise it when the engine cannot be reached, times out, or answers 5xx
+    or 429, and Dew's sandbox runners when they cannot run a program. An
+    environment, verifier or reward raises it for a failure of its own
+    external boundary that is not an `OSError`, such as an httpx transport
+    error.
+    """
 
 
 @dataclass(frozen=True)
@@ -151,9 +165,17 @@ class NativeRolloutServer:
     draw keeps both the raw and the behavior likelihoods the server records.
     If the program ends without `close`, an exit hook stops the stepping after
     the step in progress.
+
+    A draw ends on one of the policy's EOS ids or at its budget, which is
+    what `Draw.terminated` tells apart. A server whose task adds stopping
+    criteria of its own (stop strings, `MaxNewTokens`) would end draws a
+    rollout cannot tell from a truncation, so it raises ValueError.
     """
 
     def __init__(self, server: Server, *, version: int = 0):
+        if len(server.stopping) != len(server.sampling.criteria()):
+            raise ValueError("a rollout's draws end on EOS or at their budget; serve a task without stop "
+                             "strings or stopping criteria of its own")
         self._server = server
         self._version = version
         # Reentrant, so a draw's callback may load weights from inside a step.
@@ -167,7 +189,9 @@ class NativeRolloutServer:
         self._thread = threading.Thread(target=self._run, name="dew-rollout-server", daemon=True)
         self._thread.start()
         # A step under way at exit runs to its end inside jaxlib, so the bound is a step's, not a poll's.
-        self._withdraw = stop_at_exit(self._thread, self._stop, timeout=60.0)
+        # The stepping thread stops after the step in progress, which may be a long first compile;
+        # it holds no external call, so exit waits for it rather than finalizing under it.
+        self._withdraw = stop_at_exit(self._thread, self._stop, timeout=None)
 
     @property
     def sampling(self) -> Sampling:
@@ -203,9 +227,14 @@ class NativeRolloutServer:
         def resolve(done: Future[Generation[np.ndarray]]) -> None:
             if not self._claimed(future):  # failed with the stepping thread or by `close`
                 return
-            failure = done.exception()
-            _completed(future, failure if failure is not None else
-                       _native_draw(ids, done.result(), version).check_stops(self.sampling.stops))
+            try:
+                draw = _native_draw(ids, done.result(), version).check_stops(self.sampling.stops)
+            except BaseException as failure:
+                # The generation's own failure, or a draw that fails its checks, such as non-finite
+                # likelihoods: the claimed future takes it, since a done-callback's error reaches no one.
+                settled(future, failure)
+                return
+            settled(future, draw)
 
         ticket.add_done_callback(resolve)
         self._arrived.set()
@@ -249,7 +278,7 @@ class NativeRolloutServer:
                     self._arrived.wait()
         except BaseException as failure:
             for future in self._detached(failure):
-                _completed(future, failure)
+                settled(future, failure)
 
     def _stop(self) -> None:
         with self._futures:
@@ -262,17 +291,7 @@ class NativeRolloutServer:
         self._withdraw()
         cancelled = RuntimeError("the rollout server closed before this draw finished")
         for future in self._detached():
-            _completed(future, cancelled)
-
-
-def _completed(future: Future[Draw], outcome: Draw | BaseException) -> None:
-    """Complete a draw its one owner took, unless its caller cancelled it."""
-    if not future.set_running_or_notify_cancel():
-        return
-    if isinstance(outcome, BaseException):
-        future.set_exception(outcome)
-    else:
-        future.set_result(outcome)
+            settled(future, cancelled)
 
 
 def _served(variables: Variables, dtype: jnp.dtype) -> Variables:
@@ -297,10 +316,13 @@ class SafetensorsReload:
     `{"success": false}`.
 
     For vLLM (`engine="vllm"`, v0.30.0, `VLLM_SERVER_DEV_MODE=1`), the push
-    pauses with `mode=wait`, reloads, resets the prefix cache, sets the
-    weight version and resumes. In-flight draws therefore finish entirely on
-    the old weights, and no cached prefix outlives them. A replica that fails
-    after the pause stays paused until a later push succeeds. For SGLang
+    reloads the directory through `/collective_rpc` inside the publication
+    lifecycle it shares with `NCCLPush`: every replica pauses with
+    `mode=wait`, takes the weights, resets its prefix cache, sets the weight
+    version and resumes, and a phase that fails on any replica stops the
+    push before the next phase, leaving the paused replicas paused until a
+    later push succeeds. In-flight draws therefore finish entirely on
+    the old weights, and no cached prefix outlives them. For SGLang
     (`engine="sglang"`, v0.5.20), the push is one `/update_weights_from_disk`
     call, which waits for in-flight requests, holds new ones and flushes the
     radix cache. A failed SGLang load rolls back by re-reading the same
@@ -348,41 +370,90 @@ class SafetensorsReload:
         agreed("weight publication", lambda: self._publish(version) if jax.process_index() == 0 else None)
 
     def _publish(self, version: int) -> None:
-        with ThreadPoolExecutor(max_workers=len(self.engines), thread_name_prefix="dew-weight-push") as pool:
-            pushes = [(root, pool.submit(self._replica, root, version)) for root in self.engines]
-            failures = [(root, push.exception()) for root, push in pushes if push.exception() is not None]
-        if failures:
-            raise RuntimeError(f"version {version} reached {len(self.engines) - len(failures)} of "
-                               f"{len(self.engines)} replicas: "
-                               + "; ".join(f"{root}: {failure}" for root, failure in failures))
+        def reload(root: str) -> None:
+            _post(root, "/collective_rpc", {"method": "reload_weights"}, self.timeout)
 
-    def _replica(self, root: str, version: int) -> None:
-        root = root.rstrip("/")
-        # (path, JSON body, whether the answer must say {"success": true})
-        calls: tuple[tuple[str, JSON, bool], ...]
+        def load(root: str) -> None:
+            _post(root, "/update_weights_from_disk", {
+                "model_path": str(Path(self.directory).resolve()), "flush_cache": True,
+                "abort_all_requests": False, "weight_version": str(version)}, self.timeout, reports=True)
+
         if self.engine == "vllm":
-            calls = (
-                ("/pause?mode=wait", None, False),
-                ("/collective_rpc", {"method": "reload_weights"}, False),
-                ("/reset_prefix_cache", None, True),
-                ("/update_weight_version", {"new_version": str(version)}, True),
-                ("/resume", None, False),
-            )
+            _vllm_publication(self.engines, version, self.timeout, lambda: _on_every(self.engines, reload))
         else:
-            calls = (("/update_weights_from_disk", {"model_path": str(Path(self.directory).resolve()),
-                                                    "flush_cache": True, "abort_all_requests": False,
-                                                    "weight_version": str(version)}, True),)
-        for path, body, reports in calls:
-            _post(root, path, body, self.timeout, reports=reports)
+            _refused(version, self.engines, _on_every(self.engines, load))
+
+
+def _on_every(engines: Sequence[str], call: Callable[[str], None]) -> dict[str, BaseException]:
+    """Run `call` on every replica root at once, and return each failure by its replica."""
+    failures: dict[str, BaseException] = {}
+    with ThreadPoolExecutor(max_workers=max(1, len(engines)), thread_name_prefix="dew-weight-push") as pool:
+        for root, run in [(root, pool.submit(call, root)) for root in engines]:
+            failure = run.exception()
+            if failure is not None:
+                failures[root] = failure
+    return failures
+
+
+def _refused(version: int, engines: Sequence[str], failures: Mapping[str, BaseException]) -> None:
+    """Raise an error naming every replica in `failures` that did not take `version`, if any."""
+    if failures:
+        raise RuntimeError(f"version {version} did not reach {len(failures)} of {len(engines)} replicas: "
+                           + "; ".join(f"{root}: {failure}" for root, failure in failures.items()))
+
+
+def _vllm_publication(engines: Sequence[str], version: int, timeout: float,
+                      deliver: Callable[[], Mapping[str, BaseException]], *, stamped: bool = False) -> None:
+    """Publish `version` to vLLM replicas (v0.30.0, `VLLM_SERVER_DEV_MODE=1`) around a transport's `deliver`.
+
+    Every replica pauses with `mode=wait`, so its in-flight draws finish on
+    the old weights and no new one starts. `deliver` then loads the weights
+    into every replica and returns the failures by replica. Each replica
+    resets its prefix cache, takes the version through
+    `/update_weight_version` unless the transport `stamped` it while
+    delivering, and resumes. The reset and the stamp must answer
+    `{"success": true}`, which vLLM withholds from one that did not happen.
+
+    A phase that fails on any replica raises before the next phase starts,
+    naming every replica it failed on. So no replica resumes on weights the
+    others may not hold, and a replica the push paused stays paused until a
+    later push succeeds.
+    """
+    def pause(root: str) -> None:
+        _post(root, "/pause?mode=wait", None, timeout)
+
+    def reset(root: str) -> None:
+        _post(root, "/reset_prefix_cache", None, timeout, reports=True)
+
+    def stamp(root: str) -> None:
+        _post(root, "/update_weight_version", {"new_version": str(version)}, timeout, reports=True)
+
+    def resume(root: str) -> None:
+        _post(root, "/resume", None, timeout)
+
+    _refused(version, engines, _on_every(engines, pause))
+    _refused(version, engines, deliver())
+    for step in (reset, resume) if stamped else (reset, stamp, resume):
+        _refused(version, engines, _on_every(engines, step))
 
 
 def _post(root: str, path: str, body: JSON, timeout: float, *, reports: bool = False) -> httpx.Response:
-    """POST `body`, refusing any answer but 200 and, when the call `reports`, a `success` that is not true."""
+    """POST `body`, refusing any answer but 200 and, when the call `reports`, a `success` that is not true.
+
+    An engine that cannot be reached, times out, or answers 5xx or 429 raises
+    `InfrastructureError`; any other refusal raises RuntimeError.
+    """
     import httpx
 
-    response = httpx.post(root + path, json=body, timeout=timeout)
+    route = path.split("?")[0]
+    try:
+        response = httpx.post(root.rstrip("/") + path, json=body, timeout=timeout)
+    except httpx.TransportError as error:
+        raise InfrastructureError(f"{route} failed: {type(error).__name__}: {error}") from error
+    if response.status_code >= 500 or response.status_code == 429:
+        raise InfrastructureError(f"{route} answered {response.status_code}: {response.text}")
     if response.status_code != 200 or (reports and not _succeeded(response)):
-        raise RuntimeError(f"{path.split('?')[0]} answered {response.status_code}: {response.text}")
+        raise RuntimeError(f"{route} answered {response.status_code}: {response.text}")
     return response
 
 
@@ -539,15 +610,20 @@ class OpenAIRolloutServer(_RequestServer):
         self._routing = routing
 
     def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
-        # The pad id shapes Dew's packed rows; it is not a request field.
-        completion = self._completion(
-            [list(prompt)],
-            budget,
-            key=seed,
-            sampling=replace(self._sampling, pad_token_id=0),
-            logprobs=0,
-            extra_body=self._return_ids,
-        )
+        import openai
+
+        try:
+            completion = self._completion(
+                [list(prompt)],
+                budget,
+                key=seed,
+                sampling=self._sampling,
+                logprobs=0,
+                extra_body=self._return_ids,
+            )
+        except (openai.APIConnectionError, openai.InternalServerError, openai.RateLimitError) as error:
+            # Unreachable, timed out, or 5xx or 429 after the client's own retries.
+            raise InfrastructureError(f"the completion failed: {type(error).__name__}: {error}") from error
         tokens, probabilities = completion.tokens[0], completion.log_probs[0]
         if tokens is None or probabilities is None:
             raise ValueError(f"the engine reported no sampled token ids; is it {self._completion.provider}?")

@@ -133,8 +133,7 @@
     "rescale": 0.0
    }
   },
-  "sampling_steps": 20,
-  "condition_precision": null
+  "sampling_steps": 20
  },
  "variables": {
   "autoencoder/decoder/conv_in/bias": [

@@ -14,10 +14,12 @@ import pytest
 from affine_run import Counting, dataset, val_batches
 
 from dew.artifacts import TokenScores
-from dew.checkpoints import Checkpoints, Keep, Ranking
+from dew.checkpoints import Checkpoints, Keep, Metrics, Ranking
+from dew.data.dataset import DataPartition
 from dew.objectives.base import Aux, Objective, Shown
 from dew.telemetry.records import FitEnded
 from dew.training import Trainer
+from dew.training.evaluation import MetricScores
 from dew.training.trainer import Best, Plateau
 
 
@@ -72,6 +74,24 @@ def trainer(path, keep=1):
     )
 
 
+def test_a_score_object_names_one_recorded_score_live_and_in_a_checkpoint():
+    """`best=` and `stop=` read a run's live scores, and a predicate a checkpoint's kept ones, by one
+    rule: a metric is its validation split's, `(split, metric)` that split's and a training scalar
+    the training split's. A metric with no validation score, recorded under another split alone, is
+    refused in both until its split is named, never resolved by guessing which split was meant."""
+    objective = Overfit()
+    metric, other = Value('value', Shown(better='lower')), Value('other', Shown(better='lower'))
+    scores = {'val/value': 1.0, 'test/value': 2.0, 'test/other': 3.0, 'train/loss': 4.0}
+    live, kept = MetricScores([metric, other], scores, objective), Metrics(scores)
+    for read in (live, kept):
+        assert read[metric] == 1.0 and read[('test', metric)] == 2.0 and read[('test', other)] == 3.0
+        assert read[objective.scalars.loss] == 4.0
+        with pytest.raises(KeyError):
+            read[other]
+    with pytest.raises(KeyError):
+        live[Overfit().scalars.loss]
+
+
 def test_default_retains_the_weights_with_lowest_validation_loss(tmp_path):
     run = trainer(tmp_path / 'run')
     result = run.fit(data(), steps=12, log_every=1, eval_every=1, checkpoint_every=6)
@@ -114,6 +134,39 @@ def test_missing_and_undeclared_metrics_are_refused_before_training(tmp_path):
         trainer(tmp_path / 'a').fit(data(), steps=2, best=metric)
     with pytest.raises(ValueError):
         trainer(tmp_path / 'b').fit(data(), steps=2, metrics=[metric], best=metric)
+
+
+@pytest.mark.parametrize('spelling', ['object', 'name', 'recorded'])
+def test_each_suites_best_policy_ranks_that_suites_instance_of_a_metric_two_suites_hold(tmp_path, spelling):
+    """Two suites may each score their own instance of one metric, each declaring its own direction: a
+    policy for each suite, by the instance, by its name and split, or by its recorded name, ranks that
+    suite's scores in that suite's instance's direction, though the other's has the same name and the
+    opposite one. The value rises as training does, so the best of a higher-is-better value is the
+    last step and of a lower-is-better one the first."""
+    from dew.training import EvalSuite
+
+    often, rare = Value('value', Shown(better='higher')), Value('value', Shown(better='lower'))
+    best = {'object': [Best(often, split='often'), Best(rare, split='rare')],
+            'name': [Best('value', split='often'), Best('value', split='rare')],
+            'recorded': ['often/value', 'rare/value']}[spelling]
+    run = trainer(tmp_path / 'run')
+    run.fit(data(), steps=3, log_every=1, eval_every=1, metrics=[often], best=best,
+            validation={'often': data().val, 'rare': EvalSuite(data().val, (rare,), 1)})
+    run.checkpoints.wait()
+    assert run.checkpoints.resolve('best:often/value') == 3
+    assert run.checkpoints.resolve('best:rare/value') == 1
+
+
+def test_restore_best_without_checkpoints_is_refused_before_training():
+    """The best state restore_best returns is a checkpoint, restored: a trainer that writes none is
+    refused before it trains, rather than handing back its final weights as the best. A best policy
+    alone ranks checkpoints, of which there are none to rank, and the run trains as asked."""
+    metric = Value('value', Shown(better='higher'))
+    unsaved = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0))
+    with pytest.raises(ValueError):
+        unsaved.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric], restore_best=True)
+    state = unsaved.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric], best=metric)
+    assert int(state.step) == 2
 
 
 def test_ranked_loss_and_periodic_retention(tmp_path):
@@ -351,11 +404,14 @@ def test_local_resume_keeps_plateau_patience(tmp_path):
     metric = Value('value', Shown(better='lower'))
     plain = trainer(tmp_path / 'plain')
     state = plain.fit(data(), steps=2, log_every=1)
+    plain.checkpoints.wait()
+    # The data position the run saved with its state, which a resume past step 0 needs.
+    _, position = plain.checkpoints.restore(step=2, share=DataPartition())
     path, local = str(tmp_path / 'run'), str(tmp_path / 'local')
     control = {'plateau:val/value': {'best': .2, 'bad': 1, 'step': 2,
                                     'rule': {'mode': 'min', 'evals': 3, 'min_delta': 0.}}}
     checkpoints = Checkpoints(path, local_directory=local, local_every=1)
-    checkpoints.save_local(2, state, None, control=control)
+    checkpoints.save_local(2, state, position, share=DataPartition(), control=control)
     checkpoints.wait()
     resumed = Trainer(Overfit(), optax.sgd(.1), key=jax.random.key(0),
                        checkpoints=Checkpoints(path, local_directory=local, local_every=1))

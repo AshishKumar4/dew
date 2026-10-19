@@ -1,11 +1,9 @@
-"""Every registered objective declares the batch its own data path writes.
-
-`Objective.inputs` names the sample field the loss reads, its per-example
-shape and the condition fields, and the trainer checks the first batch
-against it before compiling. Each case builds one objective the way its
-recipe or example does and draws one batch from the data source that recipe
-trains on, never from the declaration, so a declaration that drifts from its
-data fails here rather than at a user's first step.
+"""Every registered objective as its recipe or example builds it, with the
+first batch the data source that recipe trains on writes (`cases`), never
+one drawn from its declaration (`Objective.inputs`). The trainer checks
+that batch against the declaration before compiling, so a suite that runs
+each case (test_whole_validation) fails on a declaration that drifts from
+its data rather than at a user's first step.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ from dew.config import ModelConfig, ObjectiveConfig
 from dew.config.data import HoldOut, ImageData, PreferenceData, TextData, loader
 from dew.data import TFDS, Loading
 from dew.data.dataset import DataPartition
-from dew.data.steps.image import EncodeCaptions
+from dew.data.images import EncodeCaptions
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
 from dew.decision.data import Decisions

@@ -12,13 +12,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import NAMES, fla_side, recurrence, rule_math, through
-from reference_error import assert_as_exact_as_the_reference, widened
+from delta_rule_support import NAMES, fla_decay_terms, fla_side, recurrence, rule_math, through
+from jax.core import ShapedArray
+from reference_error import assert_as_exact_as_the_reference, equations, float64_terms, widened
 from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
 
 from dew.nn import kernels, linear
-from dew.nn.kernels import fla_gdn, fla_kda, tuning
+from dew.nn.kernels import fla_gdn, fla_kda, generation, tuning
 from dew.nn.linear import GatedDeltaNet, fla_rule, l2norm
 
 pytestmark = pytest.mark.kernel
@@ -432,12 +433,13 @@ def test_a_sequences_first_decay_gradient_is_exactly_zero_from_no_memory(per_key
 @pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
 @pytest.mark.parametrize("per_key", [False, True])
 def test_a_range_late_in_a_long_decayed_chunk_is_as_exact_as_fla(per_key):
-    """A key at token 48 and a query at 63, after a first token that decays by e^-200: `fla_rule`'s
-    output, final memory and gradients, through every kernel and the custom VJP, as near the float64
-    recurrence as fla 0.5.2's own on the same operands. Both take each range as the difference of two
-    fp32 prefixes near -289 in base 2, which round each running sum by up to 1.5e-5. A decay per key
-    dimension (Kimi's delta attention) is the same in each, the pair in one 16-token sub-chunk, its
-    diagonal block."""
+    """A key at token 48 and a query at 63, after a first token that decays by e^-200: `fla_rule`'s output,
+    final memory and gradients, through every kernel and the custom VJP, as near the float64
+    recurrence as fla 0.5.2's own on the same operands, each sized by the portable math's float64
+    terms and Kimi's decay gradient by those of the parts its port sums too. Both take each range as the
+    difference of two fp32 prefixes near -289 in base 2, which round each running sum by up to 1.5e-5.
+    A decay per key dimension (Kimi's delta attention) is the same in each, the pair in one 16-token
+    sub-chunk, its diagonal block."""
     length, width, key_at, query_at = 64, 64, 48, 63
     keys = jax.random.split(jax.random.key(29), 6)
     decay = (-jnp.exp(jax.random.normal(keys[0], (1, length, 1)) - 3.0)).at[:, 0].set(-200.0)
@@ -453,11 +455,19 @@ def test_a_range_late_in_a_long_decayed_chunk_is_as_exact_as_fla(per_key):
     do, dht = jax.random.normal(keys[5], (1, length, 1, width)), jnp.zeros((1, 1, width, width))
     got = [np.asarray(x, np.float64) for x in through(fla_rule, do, dht)(*inputs)]
     theirs = fla_side((*inputs, do, dht), None, jnp.float32)
+
+    def math(q, k, v, g, beta, h0):
+        return linear.chunk_delta_rule(q, k, v, g if per_key else g[..., None], beta, h0)
+
     with jax.enable_x64(new_val=True):
         operands = widened((*inputs, do, dht))
         truth = widened(through(recurrence, *operands[6:])(*operands[:6]))
-    for name, dew, fla, value in zip(NAMES, got, theirs, truth, strict=True):
-        assert_as_exact_as_the_reference(dew, fla, np.asarray(value), name)
+        _, terms = float64_terms(through(math, *operands[6:]), *operands[:6])
+        if per_key:
+            # Kimi's port sums its decay's gradient from parts the math's pairs never add.
+            terms = (*terms[:5], np.maximum(terms[5], fla_decay_terms(*operands)), *terms[6:])
+    for name, dew, fla, value, summed in zip(NAMES, got, theirs, truth, terms, strict=True):
+        assert_as_exact_as_the_reference(dew, fla, np.asarray(value), name, terms=np.asarray(summed))
 
 
 @pytest.mark.parametrize("key_heads, value_heads, width, columns, length", [
@@ -531,13 +541,12 @@ def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key):
 
 
 @pytest.mark.mesh(devices=2)
-def test_inside_a_shard_map_that_checks_varying_axes_the_rule_names_why_it_runs_the_math(monkeypatch):
+def test_inside_a_shard_map_that_checks_varying_axes_the_rule_names_why_it_runs_the_math():
     """A Pallas call cannot run where a caller's `shard_map` checks varying axes over operands that
     vary ("manual_axis_type ... must not be None" for its outputs), so there `port_refusal` names
     the reason and the rule runs the portable math."""
     from jax.sharding import Mesh, PartitionSpec
 
-    row_names_port(monkeypatch)
     refusals = []
 
     def rule(v):
@@ -545,37 +554,33 @@ def test_inside_a_shard_map_that_checks_varying_axes_the_rule_names_why_it_runs_
         return v
 
     mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
-    jax.jit(jax.shard_map(rule, mesh=mesh, in_specs=PartitionSpec("data"), out_specs=PartitionSpec("data"),
-                          check_vma=True))(jnp.zeros((2, 64, 1, 64)))
+    with row_names_port():
+        mapped = jax.shard_map(rule, mesh=mesh, in_specs=PartitionSpec("data"),
+                              out_specs=PartitionSpec("data"), check_vma=True)
+        jax.jit(mapped)(jnp.zeros((2, 64, 1, 64)))
     assert refusals == ["a shard_map that checks varying axes holds the operands, and a Pallas call states "
                         "no varying type for its results"]
 
 
-def row_names_port(monkeypatch, *, port: bool = True):
-    """The device's target row names the port for the rule where `port` (`measured_kernel`), as a
-    GPU's row does; off a GPU the port's kernels then interpret."""
-    monkeypatch.setattr(linear, "measured_kernel",
-                        lambda choice, default: "fla" if port and choice == "gated_delta_rule" else default)
-
-
-def layer_on(monkeypatch, *, port: bool, **fields):
-    """A GatedDeltaNet that runs the port where `port` (as a GPU's target row decides,
-    `row_names_port`) and the portable math where not."""
-    row_names_port(monkeypatch, port=port)
-    return GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64,
-                         **fields)
+def row_names_port(*, port: bool = True):
+    """Choose the port for the rule where `port`, else XLA; off a GPU the port's kernels interpret."""
+    return generation.chosen(gated_delta_rule="fla" if port else "xla")
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])
-def test_a_gated_delta_net_on_fla_matches_it_on_xla(monkeypatch, dtype, bound):
+def test_a_gated_delta_net_on_fla_matches_it_on_xla(dtype, bound):
     """The layer where a GPU runs the port hands it its projections' dtype and its keys on their own
     heads: its output and parameter gradients are the portable rule's, within fp32 rounding in
     float32 and within bf16 storage's rounding in bfloat16, fla's numbers."""
     x = jax.random.normal(jax.random.key(23), (2, 72, 64)).astype(dtype)
-    params = layer_on(monkeypatch, port=False, dtype=dtype).init(jax.random.key(29), x)
+    layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64,
+                          dtype=dtype)
+    with row_names_port(port=False):
+        params = layer.init(jax.random.key(29), x)
 
     def loss(params, *, port):
-        out = layer_on(monkeypatch, port=port, dtype=dtype).apply(params, x)
+        with row_names_port(port=port):
+            out = layer.apply(params, x)
         return jnp.sum(out.astype(jnp.float32) ** 2), out
 
     (_, want), want_grads = jax.value_and_grad(loss, has_aux=True)(params, port=False)
@@ -606,7 +611,8 @@ def test_dews_fla_rule_takes_wide_keys_up_to_fla_s_256_in_bf16(width):
     assert relative(out, want_out) < 2e-2 and relative(final, want_final) < 2e-2
 
 
-def test_a_gpu_runs_the_port_for_every_rule_but_forward_mode_float64_and_the_widest_keys(monkeypatch):
+@generation.chosen(gated_delta_rule="fla")
+def test_a_gpu_runs_the_port_for_every_rule_but_forward_mode_float64_and_the_widest_keys():
     """Every rule a GPU traces runs on the port (`port_refusal`), whatever its chunk size, dtypes,
     heads or mesh, except inside `jax.jvp`'s traces, which its custom VJP gives no tangent, in
     float64, whose rule is the reference math itself, and over keys wider than fla's 256 (128 in
@@ -614,7 +620,6 @@ def test_a_gpu_runs_the_port_for_every_rule_but_forward_mode_float64_and_the_wid
     from dew.nn.attention import FORWARD_MODE
 
     x = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
-    row_names_port(monkeypatch)
     assert linear.port_refusal(x, x.astype(jnp.float32), jnp.zeros((1, 64, 3, 96), jnp.bfloat16)) is None
     token = FORWARD_MODE.set(True)
     try:
@@ -629,8 +634,8 @@ def test_a_gpu_runs_the_port_for_every_rule_but_forward_mode_float64_and_the_wid
     keys = jnp.zeros((1, 64, 1, 256), jnp.float32)
     assert linear.port_refusal(keys, keys, keys) == "keys 256 wide; the port takes at most 128 in float32"
     assert linear.port_refusal(keys.astype(jnp.bfloat16), keys.astype(jnp.bfloat16), x) is None
-    row_names_port(monkeypatch, port=False)
-    assert "does not name the port" in linear.port_refusal(x, x, x)
+    with row_names_port(port=False):
+        assert "does not name the port" in linear.port_refusal(x, x, x)
 
 
 @pytest.mark.parametrize("generation", sorted(name for name in kernels.TARGETS if name.startswith("sm")))
@@ -645,25 +650,27 @@ def test_the_rule_runs_the_port_exactly_where_the_gpus_target_row_names_it(gener
     assert (refusal is None) == named, refusal
 
 
-def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands(monkeypatch):
+@generation.chosen(gated_delta_rule="fla")
+def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands():
     """A bf16 GatedDeltaNet with 256-wide keys asks the port about the bf16 operands it hands it, not
     the fp32 ones its convolution leaves, so the port takes it."""
-    called = []
-
-    def recorded(query, key, value, g, beta, state, *, starts):
-        del starts  # an unpacked layer's
-        called.append(key.dtype)
-        return linear.chunk_delta_rule(jnp.repeat(query, 2, axis=2).astype(jnp.float32),
-                                       jnp.repeat(key, 2, axis=2).astype(jnp.float32),
-                                       value.astype(jnp.float32), g[..., None], beta.astype(jnp.float32))
-
-    row_names_port(monkeypatch)
-    monkeypatch.setattr(linear, "fla_rule", recorded)
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=256, head_v_dim=64,
                           dtype=jnp.bfloat16)
     x = jnp.ones((1, 64, 64), jnp.bfloat16)
-    layer.apply(layer.init(jax.random.key(61), x), x)
-    assert called and set(called) == {jnp.dtype(jnp.bfloat16)}
+    params = layer.init(jax.random.key(61), x)
+    out = jnp.asarray(layer.apply(params, x))
+    assert out.dtype == jnp.bfloat16 and bool(jnp.all(jnp.isfinite(out)))
+    graph = jax.make_jaxpr(layer.apply)(params, x)
+    calls = [equation for equation in equations(graph) if equation.primitive.name == "pallas_call"
+             and str(equation.params["name"]) == "fla_chunk_fwd_o"]
+    assert calls
+    for call in calls:
+        query, key, value = [operand.aval for operand in call.invars[1:4]]
+        assert isinstance(query, ShapedArray)
+        assert isinstance(key, ShapedArray)
+        assert isinstance(value, ShapedArray)
+        assert key.shape[-1] == 256
+        assert query.dtype == key.dtype == value.dtype == jnp.bfloat16
 
 
 @pytest.mark.parametrize("policy, saved, recomputed", [
@@ -672,7 +679,8 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands(monkey
     ({"save": ("context", "delta_decay", "delta_inverse")}, ("context", "delta_decay", "delta_inverse"),
      ("delta_memory",)),
 ])
-def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(monkeypatch, capsys, policy,
+@generation.chosen(gated_delta_rule="fla")
+def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(capsys, policy,
                                                                                saved, recomputed):
     """A block's remat policy keeps or recomputes the port's named residuals
     (`decoder_block.RESIDUALS`): without one the layer saves its decay, inverse and memory
@@ -687,7 +695,7 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     from dew.nn.backbones.decoder_block import remat_policy
     from dew.nn.linear import recomputing
 
-    layer = layer_on(monkeypatch, port=True)
+    layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
     x = jax.random.normal(jax.random.key(71), (1, 64, 64))
     params = layer.init(jax.random.key(73), x)
 
@@ -721,8 +729,8 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
 
 
 @pytest.mark.parametrize("chunk_size", [32, 64])
-def test_the_rule_on_the_port_takes_any_chunk_size_and_mixed_dtypes_in_their_common_dtype(monkeypatch,
-                                                                                        chunk_size):
+@generation.chosen(gated_delta_rule="fla")
+def test_the_rule_on_the_port_takes_any_chunk_size_and_mixed_dtypes_in_their_common_dtype(chunk_size):
     """`chunk_gated_delta_rule` where a GPU runs the port, at any chunk size the caller names, which
     reaches only the portable math (the rule's value does not depend on it), and with float32
     queries over bf16 keys and values, which the port takes in their common dtype: bitwise the port
@@ -733,7 +741,6 @@ def test_the_rule_on_the_port_takes_any_chunk_size_and_mixed_dtypes_in_their_com
     v = jax.random.normal(keys[2], (1, 96, 2, 64)).astype(jnp.bfloat16)
     g = -jnp.exp(jax.random.normal(keys[3], v.shape[:3]) - 3.0)
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], v.shape[:3]))
-    row_names_port(monkeypatch)
     got = linear.chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk_size)
     want = fla_rule(q, k.astype(jnp.float32), v.astype(jnp.float32), g, beta)
     for mine, theirs in zip(got, want, strict=True):

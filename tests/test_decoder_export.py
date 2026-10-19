@@ -97,6 +97,7 @@ from reference_error import (
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
     distance,
+    float64_forward,
     within,
 )
 from residual_orders import orders, permuted, residual_width
@@ -229,7 +230,8 @@ def test_transformers_reads_the_trained_export(trip, tmp_path):
     assert actual == expected
     label = f"{trip.case.name} logits"
     if not trip.case.orders:
-        assert_as_exact_as_the_reference(trip.ours, trip.theirs, trip.truth, label)
+        _, terms = float64_forward(trip.source.model, trip.trained, np.asarray(trip.ids, np.int32))
+        assert_as_exact_as_the_reference(trip.ours, trip.theirs, trip.truth, label, terms=terms)
         return
     forward = jax.jit(trip.source.model.apply)  # one compile for every order
     mine, theirs = [], [distance(trip.theirs, trip.truth)]
@@ -1015,6 +1017,41 @@ def glm5_native_export_case(variant):
             variables["moe"])
     ids = np.load(FIXTURES / "glm5-next-tiny" / "input_ids.npy")
     return model, variables, ids
+
+
+@pytest.mark.parametrize(("fixture", "changed"), [
+    ("gemma4-ple", {"v_norm": False}),
+    ("gemma4-ple", {"qk_norm_scope": "full"}),
+    ("gemma4-ple", {"embedding_scale": False}),
+    ("gemma4-moe-tiny", {"mixture.capacity_factor": 1.25}),
+    ("glm5-next-tiny", {"sandwich_norms": True}),
+    ("glm5-next-tiny", {"mlp": "geglu"}),
+    ("glm5-next-tiny", {"mixture.bias": False}),
+    ("gemma4-ple", {"scale_after_cast": True}),
+    ("glm5-next-tiny", {"layer_scalar": "frozen"}),
+])
+def test_a_model_its_family_config_cannot_carry_is_refused_at_export(fixture, changed):
+    """A computation the family's config does not carry, a norm, an MLP or a router it fixes,
+    reads back as another model, so its export is refused wherever the config is written; so
+    is a way of running it the config does not record and the family fixes."""
+    from dew.interop import PretrainedDecoder
+    from dew.interop.hf_decoders import export_config
+
+    loaded = Pretrained.load(FIXTURES / fixture, dtype="float32", attention_impl="reference")
+    # Gemma 4 exports its layer scalars as frozen or trainable, which a loaded model leaves open.
+    exportable = loaded.model.clone(layer_scalar="frozen") if fixture.startswith("gemma4") else loaded.model
+    model = exportable
+    for name, value in changed.items():
+        if name.startswith("mixture."):
+            routed = dataclasses.replace(model.mixture, **{name.removeprefix("mixture."): value})
+            model = model.clone(mixture=routed)
+        else:
+            model = model.clone(**{name: value})
+    export_config(exportable)
+    with pytest.raises(ValueError):
+        export_config(model)
+    with pytest.raises(ValueError):
+        PretrainedDecoder.from_model(model, loaded.variables)
 
 
 @pytest.mark.parametrize("variant", ["released", "native_geometry", "dense"])

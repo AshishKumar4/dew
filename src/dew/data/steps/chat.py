@@ -1,19 +1,18 @@
-"""Conversation, prompt and preference record encodings."""
+"""Block-diffusion response rows of rendered conversations, and prompt record encodings."""
 
 from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Literal
 
 import grain.python as grain
 import numpy as np
 
-from dew.data.chat import Conversation, render_conversation
+from dew.data.chat import ROLES_KEY, Role
 from dew.data.dataset import Batch
 from dew.data.pipeline import Rejected
-from dew.data.preferences import FIELDS as PREFERENCE_FIELDS, IDS_KEY, MASK_KEY, _ids, _mask
 from dew.data.prompts import (
     FIELDS as PROMPT_FIELDS,
     INFO_KEY,
@@ -31,24 +30,48 @@ from dew.records import integer, record
 
 
 @dataclasses.dataclass(frozen=True)
-class RenderChat(grain.MapTransform):
-    tokenizer: str
-    column: str = "messages"
+class ResponseCanvases:
+    """One block-diffusion row per assistant turn of a rendered conversation.
 
-    @functools.cached_property
-    def vocabulary(self) -> HFTokenizer:
-        """The tokenizer and its template, resolved once as `Tokenize.vocabulary`."""
-        return HFTokenizer(self.tokenizer)
+    The row's `text` is everything before the turn, `pad_id`-padded to
+    `prompt_length`, then the turn's completion over `count` canvases of
+    `canvas_size`: `eos_id` fills the rest of its last canvas, `pad_id` the
+    canvases after it, and `canvas_mask` marks the filled canvases, as the
+    reference's `CanvasChunker` lays a response out (gemma bf0b49901,
+    `diffusion/hackable_diffusion_adapter/data/data.py`). A longer prompt or
+    completion keeps its first ids, as the reference's `Pad(truncate=True)`
+    and `CanvasChunker` cut them (`gm/data/_functional.py:83`). Either cut
+    marks the row truncated.
+    """
 
-    def dependencies(self) -> Mapping[str, object]:
-        return {"tokenizer": self.vocabulary.dependencies()}
+    prompt_length: int
+    canvas_size: int
+    count: int
+    eos_id: int
+    pad_id: int = 0
 
-    def map(self, element: Batch) -> Batch:
-        messages = element.get(self.column, element.get("prompt"))
-        conversation = Conversation.parse(messages, element.get("tools"), self.tokenizer)
-        ids, roles = render_conversation(self.vocabulary.tokenizer, conversation, self.tokenizer)
-        kept = {key: value for key, value in element.items() if key not in (self.column, "prompt", "tools")}
-        return {**kept, "text": ids, "text_roles": roles}
+    def __post_init__(self) -> None:
+        if min(self.prompt_length, self.canvas_size, self.count) < 1:
+            raise ValueError("response canvases need a positive prompt_length, canvas_size and count")
+
+    def flat_map(self, element: Batch) -> Sequence[Batch]:
+        ids = np.asarray(element["text"], np.int32)
+        assistant = (np.asarray(element[ROLES_KEY]) == Role.ASSISTANT).astype(np.int8)
+        edges = np.flatnonzero(np.diff(assistant, prepend=0, append=0))
+        capacity = self.count * self.canvas_size
+        kept = {key: value for key, value in element.items() if key not in ("text", ROLES_KEY)}
+        rows = []
+        for start, end in zip(edges[::2], edges[1::2], strict=True):
+            response = ids[start:min(end, start + capacity)]
+            filled = -(-len(response) // self.canvas_size) * self.canvas_size
+            text = np.full(self.prompt_length + capacity, self.pad_id, np.int32)
+            text[:min(start, self.prompt_length)] = ids[:min(start, self.prompt_length)]
+            text[self.prompt_length:self.prompt_length + filled] = self.eos_id
+            text[self.prompt_length:self.prompt_length + len(response)] = response
+            cut = start > self.prompt_length or end - start > capacity
+            rows.append({**kept, "text": text, "canvas_mask": np.arange(capacity) < filled,
+                         **({"_dew_truncated": True} if cut else {})})
+        return rows
 
 
 @dataclasses.dataclass(frozen=True)
@@ -117,30 +140,3 @@ class ConfigurePrompt:
             self.long,
             self.thinking,
         )
-
-
-@dataclasses.dataclass(frozen=True)
-class PreferencePair(grain.MapTransform):
-    seq_len: int = 256
-    pad_id: int = 0
-
-    def __post_init__(self) -> None:
-        if self.seq_len < 1:
-            raise ValueError("preference seq_len must be positive")
-
-    def map(self, element: Batch) -> Batch:
-        element = record(element, "preference row")
-        if "chosen" not in element or "rejected" not in element:
-            raise ValueError("a preference pair needs both chosen and rejected ids")
-        ids = np.full((2, self.seq_len), self.pad_id, np.int32)
-        mask = np.zeros((2, self.seq_len), np.int32)
-        for row, name in enumerate(("chosen", "rejected")):
-            tokens = _ids(element.get(name), name, "preference")
-            if len(tokens) > self.seq_len:
-                raise ValueError(f"preference {name} has {len(tokens)} tokens for seq_len={self.seq_len}")
-            completion = _mask(
-                element.get(f"{name}_mask", [1] * len(tokens)), f"{name}_mask", len(tokens), "preference"
-            )
-            ids[row, : len(tokens)], mask[row, : len(tokens)] = tokens, completion
-        kept = {key: value for key, value in element.items() if key not in PREFERENCE_FIELDS}
-        return {**kept, IDS_KEY: ids, MASK_KEY: mask}

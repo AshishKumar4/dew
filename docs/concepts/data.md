@@ -50,6 +50,7 @@ The specs in `dew.config.data` provide `.load(batch=..., read=...)`; `loader(spe
 | `RecordsData` / `records` | The source's fields, with numeric values in JAX's configured widths |
 | `TextData` / `text` | `text`, int32 `[B, seq_len + 1]`; packing adds `text_coordinates` |
 | `ChatData` / `chat` | Packed `text`, `text_coordinates` and aligned `text_roles` |
+| `ChatCanvasData` / `chat_canvases` | One row per assistant turn: `text`, int32 `[B, prompt_length + canvases * canvas_size]`, and `canvas_mask` |
 | `PromptData` / `prompts` | Left-padded prompt IDs, prompt lengths and fixed-width reward metadata |
 | `PreferenceData` / `preferences` | `input_ids` and `completion_mask`, `[B, 2, seq_len]` |
 | `ImageData` / `images` | RGB uint8 `image`, `[B, H, W, 3]`, and optional labels |
@@ -66,7 +67,7 @@ All stored locations are URLs. Plain paths and `file://` select local files; sch
 |---|---|---|---|
 | `Memory` records or columns | Materialize records | Direct random access | A physical shard manifest |
 | JSONL or text `Files` | Read the source | Producer offset index, or explicit provisioning | Newline-aligned byte ranges |
-| CSV `Files` | Read the source | Parse-aware offset index | Whole files |
+| CSV `Files` (fields within `csv.field_size_limit`) | Read the source | Parse-aware offset index | Whole files |
 | Parquet or Arrow `Files` | Read the selected records | Footer row groups | Physical row groups |
 | Produced ArrayRecord tokens | Materialize records | Producer length index | Physical shards |
 | `Hub` | Prepared Arrow | Prepared Arrow | Hub Parquet shards |
@@ -80,6 +81,8 @@ All stored locations are URLs. Plain paths and `file://` select local files; sch
 A run that states no read (`--data-read`, `load(read=None)`) lets its sources choose: memory for records held in memory, indexed for a store that reads by index, streamed otherwise, and a mixture the least eager of its corpora's choices.
 
 `dew.data.load` provisions what its read needs, as Hugging Face `datasets` downloads on `load_dataset`: it prepares TFDS, a Hub Arrow cache or an offset index, logging the artifacts it prepares. Preparing can download data and take a long time. `provision=False` (the default of `compile`, spec `.load()` and run configurations) instead raises an error naming the missing artifact.
+
+A `Hub` source keeps, with the Hub offline (`HF_HUB_OFFLINE=1`), what an online read pinned: every answer it takes from the Hub (the commit a revision names, the commit's files, its Parquet conversion, each file's size and content hash) is recorded under Dew's cache (`$XDG_CACHE_HOME/dew/hub`, or `DEW_HUB_ANSWERS`), and offline the source reads those answers. A split prepared as Arrow online then reads offline from the cache `datasets` prepared at that commit, and a streamed split's shards keep the identity a compiled cache is keyed by. Shard bytes are not recorded: a streamed read that compiles no cache still needs the Hub. Offline nothing can be provisioned, and a source never read online raises the Hub's offline error. Streamed Hub shards are identified by their size and content hash, so caches compiled before Dew recorded them compile once more.
 
 For example, a prepared image source is:
 
@@ -129,6 +132,8 @@ For conditional image training, pass `host=(EncodeCaptions(objective.inputs.toke
 
 `Chat` renders conversations with the tokenizer's chat template. Its default long-record policy truncates; `long="chunk"` keeps an over-length conversation as chunks, and `long="drop"` rejects it. The recipe emits role IDs for every token. The objective chooses the loss role, for example `LMObjective(..., loss_role=Role.ASSISTANT)`.
 
+`ChatCanvasData` renders the same way for `BlockDiffusionObjective`, which splits every row at its prompt length, so nothing is packed: each assistant turn is one row, the conversation before it padded to `prompt_length` and the turn on whole canvases, EOS closing the last one. A longer prompt or turn keeps its head, as Google's reference cuts both.
+
 `Prompts` rejects over-length prompts by default. `long="truncate"` keeps their tail when that is the desired RL policy. `Preferences` refuses an over-length completion rather than cutting away its supervision.
 
 To produce token records, export a deterministic prefix. This example downloads nothing:
@@ -140,7 +145,7 @@ from dew.data.pipeline import Pipeline
 from dew.data.dataset import DataPartition
 from dew.data.sinks import export
 import tempfile
-from dew.data.steps.text import Tokenize
+from dew.data.text import Tokenize
 
 tokenizer = ByteTokenizer()
 documents = Memory([{"text": "one document " * 40}, {"text": "another document " * 40}])
@@ -175,7 +180,7 @@ Use a fresh output directory: exports commit immutable shards and a manifest, an
 
 Run configurations select this with --trainer.batch-size None, --trainer.batch-tokens 24576 and --trainer.update-tokens 98304. Both budgets are required, positive, and update_tokens must divide into whole micro-batches. Prepared.run records the derived accumulation (four in this example); an explicitly conflicting accumulation is refused. Row-batch ramps cannot be combined with token budgets.
 
-A first-fit or best-fit `Pipeline.pack(seq_len)` places each document whole and refuses one longer than its window: `flat_map(text.chunk(seq_len))` just before it cuts documents into window-long pieces, which a store's plan of document lengths cuts alike. `Pipeline.pack(seq_len, segments=..., along=...)` packs rows of several axes with Grain's packer: `along` names fields packed on axes of their own, each to its own length, and `segments` bounds the rows a window holds. Its options (`bins`, `segments`, `policy`, `along`) are the ones a memory, indexed and streamed read lay out alike; `shuffle` after `pack` orders the windows. Decision rows pack this way, their questions along a second axis. Packed causal LM geometry keeps its shifted final ID; denoising objectives declare their own sequence geometry.
+A first-fit or best-fit `Pipeline.pack(seq_len)` places each document whole and refuses one longer than its window: `flat_map(text.Chunks(seq_len))` just before it cuts documents into window-long pieces, which a store's plan of document lengths cuts alike. `Pipeline.pack(seq_len, segments=..., along=...)` packs rows of several axes with Grain's packer: `along` names fields packed on axes of their own, each to its own length, and `segments` bounds the rows a window holds. Its options (`bins`, `segments`, `policy`, `along`) are the ones a memory, indexed and streamed read lay out alike; `shuffle` after `pack` orders the windows. Decision rows pack this way, their questions along a second axis. Packed causal LM geometry keeps its shifted final ID; denoising objectives declare their own sequence geometry.
 
 ## Decision layouts and explicit order
 

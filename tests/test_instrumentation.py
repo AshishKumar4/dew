@@ -24,7 +24,7 @@ from dew.cache import enable_compilation_cache
 from dew.data.dataset import Loader
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.telemetry.instrumentation import compiled_flops
+from dew.telemetry.instrumentation import StepFlops, compiled_flops, hlo_flops
 from dew.training import Trainer
 from dew.training.distributed import shard_batch
 
@@ -221,6 +221,55 @@ def test_a_fused_attention_counts_the_pairs_its_mask_computes(window):
     assert both == (2 + 4) * 2 * batch * heads * pairs * width
 
 
+def test_a_fused_attention_counts_its_value_product_at_the_values_width():
+    """`Q K^T` and its two backward products run at the query's width, `P V` and its two at the
+    value's, which a model may set apart (MiMo's 192 and 128): FlashAttention-3's forward and
+    backward calls, as the wheel issues them, count each product at its own width."""
+    batch, length, heads, query_width, value_width = 1, 64, 2, 192, 128
+    module = f"""HloModule step
+
+ENTRY %main (q: bf16[1,64,2,192], k: bf16[1,64,2,192], v: bf16[1,64,2,128], g: bf16[1,64,2,128]) -> f32[] {{
+  %q = bf16[{batch},{length},{heads},{query_width}]{{3,2,1,0}} parameter(0)
+  %k = bf16[{batch},{length},{heads},{query_width}]{{3,2,1,0}} parameter(1)
+  %v = bf16[{batch},{length},{heads},{value_width}]{{3,2,1,0}} parameter(2)
+  %g = bf16[{batch},{length},{heads},{value_width}]{{3,2,1,0}} parameter(3)
+  %fwd = (bf16[{batch},{length},{heads},{value_width}]{{3,2,1,0}}) custom-call(%q, %k, %v), \
+custom_call_target="dew_flash3_mha_fwd", api_version=API_VERSION_TYPED_FFI
+  %bwd = (bf16[{batch},{length},{heads},{query_width}]{{3,2,1,0}}) custom-call(%g, %q, %k, %v), \
+custom_call_target="dew_flash3_mha_bwd", api_version=API_VERSION_TYPED_FFI
+  ROOT %zero = f32[] constant(0)
+}}
+"""
+    counted = hlo_flops(module)
+    assert counted is not None
+    product = 2 * batch * heads * length * length
+    assert counted.hardware == (1 + 2) * product * (query_width + value_width)
+
+
+UNSIZED = """HloModule step
+
+ENTRY %main (p0: f32[8,16], p1: f32[16,4]) -> f32[8,4] {
+  %p0 = f32[8,16]{1,0} parameter(0)
+  %p1 = f32[16,4]{1,0} parameter(1)
+  %pallas_call.1 = (f32[8,16]{1,0}) custom-call(%p0), custom_call_target="__gpu$xla.gpu.triton"
+  %pallas_call.2 = (f32[8,16]{1,0}) custom-call(%p0), custom_call_target="__gpu$xla.gpu.triton"
+  ROOT %dot.1 = f32[8,4]{1,0} dot(%p0, %p1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+"""
+
+
+def test_a_kernel_the_hlo_does_not_size_makes_the_hardware_count_a_named_lower_bound():
+    """A Pallas kernel's Triton call states no work, so the count holds the matmul alone and says
+    how many launches it left out; its utilizations are then reported as lower bounds, never under
+    the names of a complete count."""
+    flops = hlo_flops(UNSIZED)
+    assert (flops.model, flops.hardware, flops.unsized) == (2 * 8 * 16 * 4, 2 * 8 * 16 * 4, 2)
+    assert StepFlops(1.0, 2.0).utilizations(1, 1.0, peak=1.0) == {"train/hlo_flops_util": 1.0,
+                                                                   "train/hfu": 2.0}
+    assert StepFlops(2.0, 4.0, 6.0).utilizations(2, 1.0, peak=1.0) == {
+        "train/hlo_flops_util_lower_bound": 1.0, "train/hfu_lower_bound": 2.0, "train/unsized_kernels": 3.0}
+
+
 def test_compiled_flops_counts_every_iteration_of_a_scanned_body():
     """A scanned stack runs its body once per iteration. The count has to be
     the run's, not the body's: cost analysis reports the body's."""
@@ -314,3 +363,45 @@ def test_the_gpu_autotuners_picks_persist_beside_the_executables_for_this_xla(tm
         assert os.environ["XLA_FLAGS"] == named
     finally:
         jax.config.update("jax_compilation_cache_dir", previous)
+
+
+@pytest.mark.mesh(devices=8)
+def test_the_collectives_of_a_compiled_step_are_counted_with_the_bytes_they_move():
+    """A step over eight devices that gathers an f32 array whole and sums an int32 one across them:
+    the shared parser names both collectives (`collective`) and the bytes each result holds, and
+    the cluster diagnostic counts each once, an async pair by its `-done`, with those bytes."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from tool_support import load
+
+    from dew.telemetry.instrumentation import collective, hlo_instructions
+
+    mesh = Mesh(np.asarray(jax.devices()[:8]), ("data",))
+
+    def step(gathered, summed):
+        whole = jax.lax.all_gather(gathered, "data", tiled=True)
+        return whole, jax.lax.psum(summed, "data")
+
+    # The gathered whole is the same on every device, which shard_map cannot infer of an all_gather.
+    mapped = jax.shard_map(step, mesh=mesh, in_specs=(P("data"), P("data")), out_specs=(P(), P()),
+                           check_vma=False)
+    # f32, as a CPU's collectives move bf16 widened.
+    gathered = jax.device_put(jnp.ones((64, 32), jnp.float32), NamedSharding(mesh, P("data")))
+    summed = jax.device_put(jnp.ones((8, 16), jnp.int32), NamedSharding(mesh, P("data")))
+    text = jax.jit(mapped).lower(gathered, summed).compile().as_text()
+    instructions = hlo_instructions(text).values()
+    found = {collective(instruction.op) for instruction in instructions} - {None}
+    assert found == {"all-gather", "all-reduce"}
+    counted = load("cluster_vs_gpu").collectives(text)
+    assert {kind: (entry["ops"], entry["bytes"]) for kind, entry in counted.items()} == {
+        "all-gather": (1, 64 * 32 * 4), "all-reduce": (1, 16 * 4)}
+
+
+def test_a_collectives_bytes_are_as_xla_sizes_its_sub_byte_and_packed_results():
+    """An XLA dump's all-gather of int4 arrays: one per byte unpacked, a scalar's included, and two per
+    byte where the layout packs them (`E(4)`), each rounded up to a whole byte."""
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    module = """ENTRY %main () -> (s4[3], u4[], s4[3]) {
+  %gathered = (s4[3]{0}, u4[]{}, s4[3]{0:E(4)}, bf16[2,3]{1,0}) all-gather-done(%started)
+}"""
+    assert hlo_instructions(module)["gathered"].buffers == (3, 1, 2, 12)

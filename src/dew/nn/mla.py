@@ -31,11 +31,11 @@ from dew.nn.attention import (
     cache_positions,
     cached_validity,
     causal_attention_mask,
-    document_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
     scaled_dot_product_attention,
 )
+from dew.nn.documents import document_mask
 from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kv_cache import KVCache, write_cache
@@ -239,9 +239,9 @@ class MultiHeadLatentAttention(nn.Module):
     """DeepSeek's multi-head latent attention, dense or sparse.
 
     decode=True runs against the cache like the standard mixer; `positions` and
-    `segment_ids` behave as there. `yarn` replaces the rope base with the YaRN
-    ramp (the mixer's `rope_theta` must equal the record's) and its mscale
-    pre-scales the query. The two latent norms are the model's RMSNorm, as the
+    `segment_ids` behave as there. `yarn`, the layer's YaRN ramp, transforms
+    `rope_theta`, the layer's base, and its mscale pre-scales the query; the
+    mixer resolves both through `MixerContext`. The two latent norms are the model's RMSNorm, as the
     reference builds them from the layer's one norm class.
 
     `index_n_heads` and `index_head_dim` put the indexer beside the attention
@@ -360,12 +360,16 @@ class MultiHeadLatentAttention(nn.Module):
                 raise ValueError(
                     "the indexer reads the query residual, which only exists "
                     "with a q_lora_rank")
-            self.indexer = SparseIndexer(
-                n_heads=self.index_n_heads,
-                head_dim=self.index_head_dim,
-                rope_head_dim=self.qk_rope_head_dim, top_k=self.index_topk,
-                rope_interleave=self.index_rope_interleave,
-                dtype=self.dtype, precision=self.precision, name=INDEXER)
+            self.indexer = self.make_indexer()
+
+    def make_indexer(self) -> nn.Module:
+        """The indexer beside the attention, built in `setup`: V3.2's lightning indexer."""
+        assert self.index_n_heads is not None and self.index_head_dim is not None
+        return SparseIndexer(
+            n_heads=self.index_n_heads, head_dim=self.index_head_dim,
+            rope_head_dim=self.qk_rope_head_dim, top_k=self.index_topk,
+            rope_interleave=self.index_rope_interleave,
+            dtype=self.dtype, precision=self.precision, name=INDEXER)
 
     @property
     def indexed(self) -> bool:
@@ -569,7 +573,7 @@ class MultiHeadLatentAttention(nn.Module):
             # kernel, the way the standard mixer's own masks do. Decoding
             # runs no backward pass, so its cache mask keeps the fused path.
             implementation = kernel_for_materialized_mask(
-                implementation, query, dtype=self.dtype, precision=self.precision)
+                implementation, query, key, dtype=self.dtype, precision=self.precision)
         if objective is not None:
             self._sow_indexer_kl(*objective, query, key)
         # The per-head maxima the QK-Clip reads, with the nope width the
@@ -638,17 +642,19 @@ class MultiHeadLatentAttention(nn.Module):
     def _attends_sparsely(self, selection, total: int) -> bool:
         """Whether a whole-sequence pass runs `sparse_latent_attention`: when the
         selection is narrower than the keys. An open `qk` collection keeps the
-        masked kernel for its dense maxima, and so does a drawn `kv_b_proj` input
-        (`stochastic_input`), since the absorbed path would draw one mask for every
-        token.
+        masked kernel for its dense maxima, and so does a `kv_b_proj` that is not
+        linear in its input (`nonlinear_input`), since the absorbed path applies it
+        to the identity, not to the latents.
         """
         return (selection.shape[-1] < total and not self._qk_open()
-                and not self.stochastic_input("kv_b_proj"))
+                and not self.nonlinear_input("kv_b_proj"))
 
-    def stochastic_input(self, name: str) -> bool:
-        """Whether this call draws randomness on the input of the submodule
-        `name`. The layer draws none; a method interceptor that does, as
-        `dew.lora`'s dropout does on its targets, answers for itself."""
+    def nonlinear_input(self, name: str) -> bool:
+        """Whether this call computes the submodule `name` other than as a
+        linear map of its input. The layer's own Dense is linear; a method
+        interceptor that changes that answers for itself: `dew.lora`'s dropout
+        draws on its targets' inputs, and a checkpoint's input quantization
+        (`dew.training.quantization`) rounds them."""
         del name
         return False
 
@@ -672,10 +678,10 @@ class MultiHeadLatentAttention(nn.Module):
         the heads' context, `[B, S, H, v_head_dim]`.
 
         `kv_b_proj` applied to the identity is its matrix as the layer
-        computes it, dtype policy and any deterministic interceptor's branch
-        (a LoRA adapter without dropout in this call, a quantization rule)
-        included, so the absorbed weights are the ones the expanded path
-        multiplies by. The indexer's objective, when open, still reads the
+        computes it, dtype policy and any interceptor linear in its input
+        (a LoRA adapter without dropout in this call, a rule that quantizes
+        the weights alone) included, so the absorbed weights are the ones the
+        expanded path multiplies by (`_attends_sparsely`). The indexer's objective, when open, still reads the
         expanded keys over the selection mask.
         """
         heads, nope = self.num_heads, self.qk_nope_head_dim
@@ -727,8 +733,8 @@ class MLAMixer(MixerBase):
     """The `mla` kind: DeepSeek's latent attention under the reference's names.
 
     `mixer={"name": "mla", "fields": {...}}` takes a DeepSeek config.json's fields, so
-    translation renames nothing; `yarn` is the rope-scaling record. The rope base
-    is the model's `rope_theta`, transformed by the ramp. The context's GQA
+    translation renames nothing. The rope base and its YaRN ramp are the layer's
+    (`MixerContext.rope_theta` and `yarn`, the model's or its kind's). The context's GQA
     geometry and `qk_norm` are not read (the latent norms are always present).
     A `kv_shared` layer is GLM's IndexShare layer, which shares its provider's
     selection and so needs the kind to select. Dials this cannot honour (a
@@ -743,7 +749,6 @@ class MLAMixer(MixerBase):
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
     rope_interleave: bool = True
-    yarn: YarnScaling | None = None
     index_topk: int | None = None
     index_n_heads: int | None = None
     index_head_dim: int | None = None
@@ -766,11 +771,6 @@ class MLAMixer(MixerBase):
                    "the latent attention scales by its head dims and the yarn mscale, rotates its rope head "
                    "whole, attends the whole sequence with an fp32 softmax and norms its latents, not its "
                    "values")
-        if self.yarn is not None and self.yarn.rope_theta != ctx.rope_theta:
-            raise ValueError(
-                f"the yarn record's rope_theta ({self.yarn.rope_theta}) and "
-                f"the layer's ({ctx.rope_theta}) disagree; the rope base is "
-                "configured once, on the model")
         if ctx.kv_shared and not self.sparse:
             raise ValueError(
                 "a sharing mla layer attends the selection of an earlier "
@@ -789,7 +789,7 @@ class MLAMixer(MixerBase):
             causal=ctx.causal,
             rope_theta=ctx.rope_theta,
             rope_interleave=self.rope_interleave,
-            yarn=self.yarn,
+            yarn=ctx.yarn,
             scale_offset=ctx.scale_offset,
             scale_after_cast=ctx.scale_after_cast,
             attention_bias=ctx.attention_bias,

@@ -13,7 +13,6 @@ import functools
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from functools import partial
 from typing import Generic
 
 import jax
@@ -23,7 +22,17 @@ from flax import linen as nn, struct
 from typing_extensions import TypeVar, get_protocol_members
 
 from dew.interop.weights import decoding_storage
-from dew.nn.inputs import ModelInputs, Request, continuation_keys, local_rows, mesh_of, prompt_major
+from dew.nn.inputs import (
+    ModelInputs,
+    Request,
+    continuation_keys,
+    local_rows,
+    mesh_of,
+    next_position,
+    prompt_major,
+    real_slots,
+)
+from dew.nn.kernels.options import compiler_options
 from dew.nn.protocols import BlockDenoiser
 from dew.objectives.base import Variables
 
@@ -163,10 +172,20 @@ class BlockProcess:
                 mask: jax.typing.ArrayLike) -> jax.Array:
         return jnp.where(mask, accepted, self.noise(key, jnp.shape(accepted)))
 
-    @partial(jax.jit, static_argnames=("self", "model", "batch"))
     def refine(self, model: nn.Module, variables: Variables, cache: Variables,
-               key: jax.Array, batch: int, finished: jax.Array) -> CanvasState:
-        """Refines one canvas without updating its prefix cache."""
+               key: jax.Array, batch: int, finished: jax.Array,
+               positions: jax.Array | None = None) -> CanvasState:
+        """Refines one canvas without updating its prefix cache, compiled with the model's own XLA
+        options (`compiler_options`). `positions` `[B, canvas_length]` are its tokens' logical
+        positions; None places them on from the cache's cursor."""
+        return _refining(tuple(compiler_options(model).items()))(self, model, variables, cache, key, batch,
+                                                                 finished, positions)
+
+    def refined(self, model: nn.Module, variables: Variables, cache: Variables,
+                key: jax.Array, batch: int, finished: jax.Array,
+                positions: jax.Array | None = None) -> CanvasState:
+        """`refine`'s canvas, traced into the program that calls it: JAX takes compiler options on
+        its outermost jit alone, which generation's is."""
         shape = (batch, self.canvas_length)
         initial = CanvasState(
             canvas=self.noise(jax.random.fold_in(key, 0), shape),
@@ -180,7 +199,7 @@ class BlockProcess:
             raw = model.apply(
                 {**variables, "cache": cache}, state.canvas,
                 self_conditioning_logits=state.logits,
-                self_conditioning_mask=jnp.full((batch,), index != 0))
+                self_conditioning_mask=jnp.full((batch,), index != 0), positions=positions)
             if not isinstance(raw, jax.Array):
                 raise TypeError("a canvas forward must return a logits array")
             logits = self.temper(raw, self.max_steps - index)
@@ -215,7 +234,8 @@ class BlockProcess:
         The last canvas is fully refined even when only part is requested,
         and the output is cropped to the token limit. Finished rows are
         padded after their first EOS. No host-side decision depends on a
-        generated token.
+        generated token. Canvases continue the logical positions a prompt
+        gives (`CanvasDecodeState.positions`).
 
         Weights keep their placement. On a mesh, rows split over its batch
         axes and the result keeps that sharding. The canvas sampler draws one
@@ -236,7 +256,7 @@ class BlockProcess:
         plan = request.plan
         # The canvas sampler draws one batch-wide key per refinement, so its
         # repeats stay as they are and its rows take the request's own key.
-        generation = _compiled(plan.sharding)(
+        generation = _compiled(plan.sharding, tuple(compiler_options(model).items()))(
             model, decoding_storage(model, variables), plan.place(plan.pad(request.inputs)), request.key,
             CanvasPlan(self, tuple(eos_token_ids), pad_token_id, max_new_tokens), n)
         return replace(generation, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
@@ -267,12 +287,15 @@ class CanvasDecodeState:
 
     `index` counts refined canvases even after individual rows finish. It is
     the random-key fold and the commit position, independent of the emitted
-    lengths.
+    lengths. `positions` `[B]` is each row's logical position for the next
+    canvas's first token, on from the prompt's own (`next_position`); None
+    where the prompt gives none, and the cache's cursor places each canvas.
     """
 
     cache: Variables
     result: CanvasGeneration
     index: jax.Array
+    positions: jax.Array | None
 
 
 def through_eos(tokens: jax.Array, available: jax.typing.ArrayLike, eos_ids: tuple[int, ...],
@@ -313,7 +336,8 @@ def _validated(model: nn.Module, process: BlockProcess, inputs: ModelInputs, max
 
 def _begin(model: nn.Module, variables: Variables, inputs: ModelInputs,
            plan: CanvasPlan) -> CanvasDecodeState:
-    """The deterministic prefill state: the encoded prompt and an empty result."""
+    """The deterministic prefill state: the encoded prompt, an empty result and
+    where the first canvas continues the prompt's coordinates."""
     batch, prompt_length = inputs.tokens.shape
     output = jnp.full((batch, prompt_length + plan.blocks * plan.process.canvas_length),
                       plan.pad_token_id, jnp.int32)
@@ -328,7 +352,9 @@ def _begin(model: nn.Module, variables: Variables, inputs: ModelInputs,
             {**variables, "cache": cache}, inputs,
             method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
             mutable=["cache"])[1]["cache"]
-    return CanvasDecodeState(cache, generation, jnp.asarray(0, jnp.int32))
+    return CanvasDecodeState(cache, generation, jnp.asarray(0, jnp.int32),
+                             next_position(inputs.token_fields,
+                                           real_slots(inputs.token_fields, (batch, prompt_length))))
 
 
 def _advance(model: nn.Module, variables: Variables, state: CanvasDecodeState,
@@ -339,7 +365,10 @@ def _advance(model: nn.Module, variables: Variables, state: CanvasDecodeState,
     batch, width = generation.tokens.shape
     prompt_length = width - blocks * length
     canvas_key = jax.random.fold_in(key, index)
-    refined = process.refine(model, variables, cache, canvas_key, batch, generation.terminated)
+    # A canvas is refined and committed at the same logical positions, so the
+    # next one reads its keys where the prompt's coordinates put them.
+    positions = None if state.positions is None else state.positions[:, None] + jnp.arange(length)
+    refined = process.refined(model, variables, cache, canvas_key, batch, generation.terminated, positions)
     available = jnp.minimum(length, plan.max_new_tokens - index * length)
     # A row that ended earlier emits nothing more: none of its canvas is available.
     available = jnp.where(generation.terminated, 0, available)
@@ -354,9 +383,10 @@ def _advance(model: nn.Module, variables: Variables, state: CanvasDecodeState,
     cache = jax.lax.cond(
         index + 1 < blocks,
         lambda old: model.apply({**variables, "cache": old}, clean, method=model.encode,
-                                mutable=["cache"])[1]["cache"],
+                                positions=positions, mutable=["cache"])[1]["cache"],
         lambda old: old, cache)
-    return CanvasDecodeState(cache, generation, index + 1)
+    return CanvasDecodeState(cache, generation, index + 1,
+                             None if state.positions is None else state.positions + length)
 
 
 def _materialize(state: CanvasDecodeState, prompt_length: int, max_new_tokens: int) -> CanvasGeneration:
@@ -388,6 +418,15 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs,
 
 
 @functools.cache
-def _compiled(rows: jax.sharding.NamedSharding | None):
+def _refining(options: tuple[tuple[str, bool], ...]):
+    """`BlockProcess.refined` as a program of its own, with the model's XLA `options`."""
+    return jax.jit(BlockProcess.refined, static_argnames=("self", "model", "batch"),
+                   compiler_options=dict(options))
+
+
+@functools.cache
+def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
+    """The generation program over `rows`, compiled with the model's own XLA `options`
+    (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
     return jax.jit(_generate, static_argnames=("model", "plan", "n"),
-                   in_shardings=(None, rows, None), out_shardings=rows)
+                   in_shardings=(None, rows, None), out_shardings=rows, compiler_options=dict(options))

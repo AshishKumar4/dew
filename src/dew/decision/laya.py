@@ -135,6 +135,8 @@ class LayaCheckpoint:
         layout = MarkerLayout(
             max_len=records.integer(config.get("max_len", 512), "max_len"),
             head_max_len=records.integer(config.get("head_max_len", 192), "head_max_len"),
+            option_tokens=records.integer(config.get("option_tokens", MarkerLayout.option_tokens),
+                                          "option_tokens"),
             parallel=config.get("option_layout", "sequential") == "parallel")
         tokenizer = HFTokenizer(str(directory / "tokenizer"), local_files_only=True)
         hf = tokenizer.tokenizer
@@ -158,16 +160,19 @@ class LayaCheckpoint:
         `encoder.` and the head's under Laya's names), `encoder/config.json`, the
         tokenizer under `tokenizer/`, and `rl_agent_config.json` with the head's
         depth, the layout's budgets and the temperatures. The backbone must be a
-        ModernBERT encoder and the head Laya's.
+        ModernBERT encoder and the head Laya's. A backbone under LoRA is written
+        with its factors merged into their kernels (`Pretrained.bound`).
         """
         from dew.interop.pretrained import PretrainedDecoder
 
         head = from_record(DecisionHead, self.model.head)
         backbone = thaw(part(self.variables, "backbone"))
-        if any(isinstance(key, jax.tree_util.DictKey) and key.key in FACTORS
-               for path, _ in jax.tree_util.tree_leaves_with_path(backbone) for key in path):
-            raise ValueError("the backbone carries LoRA factors; merge them into its kernels before saving")
-        bundle = PretrainedDecoder.from_model(self.model.backbone, backbone)
+        encoder = self.model.backbone
+        bundle = PretrainedDecoder.from_model(encoder, backbone).bound(encoder, backbone)
+        if bundle.adapter is None and any(isinstance(key, jax.tree_util.DictKey) and key.key in FACTORS
+                                          for path, _ in jax.tree_util.tree_leaves_with_path(backbone)
+                                          for key in path):
+            raise ValueError("the backbone carries LoRA factors its model binds to no adapter")
         if bundle.config.get("model_type") != "modernbert":
             raise ValueError("Laya's layout holds a ModernBERT encoder, "
                              f"not a {bundle.config.get('model_type')}")
@@ -182,7 +187,7 @@ class LayaCheckpoint:
         self.tokenizer.save_pretrained(root / "tokenizer")
         (root / CONFIG_FILE).write_text(json.dumps({
             "head_layers": head.layers, "max_len": self.layout.max_len,
-            "head_max_len": self.layout.head_max_len,
+            "head_max_len": self.layout.head_max_len, "option_tokens": self.layout.option_tokens,
             "option_layout": "parallel" if self.layout.parallel else "sequential",
             "temperature": list(self.temperatures), "temperature_by_options": self.bucket_temperatures,
         }, indent=2) + "\n")

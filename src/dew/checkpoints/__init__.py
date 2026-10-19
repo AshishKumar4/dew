@@ -233,22 +233,8 @@ class Metrics(Mapping):
         self._values = values
 
     def __getitem__(self, key):
-        from dew.objectives.base import Metric, TrainingScalar
-        if isinstance(key, str):
-            return self._values[key]
-        if isinstance(key, TrainingScalar):
-            return self._values[f'train/{key.name}']
-        if isinstance(key, tuple) and len(key) == 2 and isinstance(key[1], Metric):
-            return self._values[f'{key[0]}/{key[1].name}']
-        if isinstance(key, Metric):
-            names = [name for name in self._values if not name.startswith('checkpoint/')
-                     and (name == key.name or name.endswith('/' + key.name))]
-            if len(names) != 1:
-                raise KeyError(
-                    f"metric {key.name!r} is absent or belongs to several splits; use (split, metric)"
-                )
-            return self._values[names[0]]
-        raise KeyError(key)
+        from dew.objectives.base import recorded_name
+        return self._values[key if isinstance(key, str) else recorded_name(key, self._values)]
 
     def __iter__(self):
         return iter(self._values)
@@ -1435,6 +1421,10 @@ class Checkpoints:
         # A snapshot before the first update holds the initial weights, with no
         # profile to fit.
         held = [(each, updates, stds) for each, updates, stds in held if updates > 0]
+        # A step that made no update (accumulating a window, or rejected by a loss scaler) holds the
+        # averages of the step before it, whose identical rows would leave the solve singular: one
+        # snapshot an update count, the latest.
+        held = list({updates: (each, updates, stds) for each, updates, stds in held}.values())
         if not held or held[-1][0] != step:
             raise ValueError(f"the snapshot at step {step} was taken before the first update")
         weights = iter(coefficients([(updates, deviation) for _, updates, stds in held for deviation in stds],

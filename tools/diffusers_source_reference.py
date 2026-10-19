@@ -30,6 +30,10 @@ and torchsde==0.2.6:
     PYTHONPATH=src python tools/diffusers_source_reference.py
     PYTHONPATH=src python tools/diffusers_source_reference.py rounding \
         tests/fixtures/diffusers/source_rounding.npz 32
+
+`cases NAME...` records those cases alone into the stored record and keeps
+every other array as it is, so a case added later leaves the cases another
+machine's float32 rounding recorded untouched.
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ import json
 import os
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
@@ -49,17 +53,7 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import numpy as np
 import torch
-import transformers.utils as transformers_utils
-
-# Diffusers 0.34.0's pipeline modules import two names Transformers dropped
-# after 4.x. The guidance-rescale helper under test lives beside them, so the
-# names are restored rather than the helper copied.
-for _name, _value in (("FLAX_WEIGHTS_NAME", "flax_model.msgpack"),
-                      ("WEIGHTS_INDEX_NAME", "pytorch_model.bin.index.json")):
-    if not hasattr(transformers_utils, _name):
-        setattr(transformers_utils, _name, _value)
-
-from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import rescale_noise_cfg
+from diffusers_reference_helpers import fed_noise as fed_noise, restore_transformers_names, step_noise as step_noise
 from diffusers.schedulers import (
     scheduling_ddim, scheduling_ddpm, scheduling_deis_multistep,
     scheduling_dpmsolver_multistep, scheduling_dpmsolver_sde,
@@ -69,7 +63,6 @@ from diffusers.schedulers import (
     scheduling_k_dpm_2_discrete, scheduling_lcm, scheduling_lms_discrete, scheduling_pndm,
     scheduling_tcd, scheduling_unipc_multistep,
 )
-from diffusers_reference_helpers import fed_noise as fed_noise, step_noise as step_noise
 from diffusers_wan_reference import float64_scheduler
 
 from dew.diffusion.schedules.common import GeneralizedNoiseScheduler
@@ -191,6 +184,11 @@ def guided_walk(scheduler, module: ModuleType, case: Case, x: torch.Tensor,
     """The same walk under the pipeline's classifier-free guidance: both raw
     predictions, the guided combination, the source's own `rescale_noise_cfg`
     and only then the scheduler's conversion."""
+    # The guidance-rescale helper under test lives among the pipelines, which
+    # import the transformers names `restore_transformers_names` puts back.
+    restore_transformers_names()
+    from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import rescale_noise_cfg
+
     latents, inputs = [], []
     with fed_noise(module, noises):
         for time in scheduler.timesteps:
@@ -244,6 +242,9 @@ CASES: Mapping[str, Case] = {
     "lms.exponential_v": Case("LMSDiscreteScheduler", dict(
         VP, use_exponential_sigmas=True, prediction_type="v_prediction")),
     "euler.default": Case("EulerDiscreteScheduler", VP),
+    # A linspace grid ends at the table's first sigma, which sigma_min appends
+    # again: the last interval has no length.
+    "euler.linspace_min": Case("EulerDiscreteScheduler", dict(VP, final_sigmas_type="sigma_min")),
     "euler.beta_trailing_min": Case("EulerDiscreteScheduler", dict(
         VP, use_beta_sigmas=True, timestep_spacing="trailing", final_sigmas_type="sigma_min")),
     "euler.zero_snr_v": Case("EulerDiscreteScheduler", dict(
@@ -614,19 +615,34 @@ def refused_record() -> dict[str, np.ndarray]:
     return arrays
 
 
-def main() -> None:
+def main(only: Sequence[str] = ()) -> None:
     import diffusers
 
-    if diffusers.__version__ != "0.34.0":
-        raise RuntimeError("Requires diffusers==0.34.0")
+    from reference_releases import require
+
+    require("diffusers")
     torch.set_num_threads(2)
     FIXTURES.mkdir(parents=True, exist_ok=True)
+    unknown = sorted(set(only) - set(CASES))
+    if unknown:
+        raise SystemExit(f"no cases named {unknown}")
     arrays: dict[str, np.ndarray] = {}
+    cases: dict[str, dict[str, object]] = {}
     record: dict[str, object] = {"diffusers": diffusers.__version__, "shape": list(SHAPE),
                                  "guidance_scale": GUIDANCE_SCALE,
-                                 "label": LABEL, "cases": {}}
-    cases: dict[str, dict[str, object]] = record["cases"]  # type: ignore[assignment]
+                                 "label": LABEL, "cases": cases}
+    if only:
+        record = json.loads((FIXTURES / "source_schedulers.json").read_text())
+        if record["diffusers"] != diffusers.__version__:
+            raise SystemExit(f"the stored record is diffusers {record['diffusers']}, "
+                             f"this is {diffusers.__version__}")
+        cases = record["cases"]
+        with np.load(FIXTURES / "source_schedulers.npz") as stored:
+            arrays = {key: stored[key] for key in stored.files
+                      if not any(key.startswith(f"{name}.") for name in only)}
     for name, case in CASES.items():
+        if only and name not in only:
+            continue
         result = run(name, case)
         for key, value in result.items():
             arrays[f"{name}.{key}"] = value
@@ -634,11 +650,12 @@ def main() -> None:
                        "guidance": case.guidance,
                        "latent_scale": float(np.abs(result["latents"]).max())}
         print(f"{name}: {case.steps} intervals, |latent| <= {cases[name]['latent_scale']:.4g}")
-    arrays.update(refused_record())
-    record["refused"] = sorted(REFUSED)
-    for key, value in brownian_record().items():
-        arrays[f"brownian.{key}"] = value
-    print(f"brownian: torchsde tree over {arrays['brownian.bounds']}")
+    if not only:
+        arrays.update(refused_record())
+        record["refused"] = sorted(REFUSED)
+        for key, value in brownian_record().items():
+            arrays[f"brownian.{key}"] = value
+        print(f"brownian: torchsde tree over {arrays['brownian.bounds']}")
     np.savez_compressed(FIXTURES / "source_schedulers.npz", **arrays)
     (FIXTURES / "source_schedulers.json").write_text(json.dumps(record, indent=1) + "\n")
     size = (FIXTURES / "source_schedulers.npz").stat().st_size
@@ -648,5 +665,7 @@ def main() -> None:
 if __name__ == "__main__":
     if sys.argv[1:2] == ["rounding"]:
         rounding(Path(sys.argv[2]), int(sys.argv[3]))
+    elif sys.argv[1:2] == ["cases"]:
+        main(sys.argv[2:])
     else:
         main()

@@ -329,6 +329,39 @@ def test_an_undeclared_generator_trains_and_its_resume_is_refused(tmp_path):
         make_trainer(tmp_path).fit(data, steps=6, log_every=1)
 
 
+def test_a_final_checkpoint_resumes_only_a_stream_that_keeps_or_replays_its_position(tmp_path):
+    """A run that writes only its final checkpoint, as by default, holds no data position for a plain
+    generator: a later run toward more steps, which would read its data again from the start, is
+    refused by name. A generator declared to replay resumes from it onto the uninterrupted run."""
+    plain = stream(lambda partition: drawn())
+    make_trainer(tmp_path / "plain").fit(plain, steps=3, log_every=1)
+    assert Checkpoints(str(tmp_path / "plain" / "run")).latest == 3
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path / "plain").fit(plain, steps=6, log_every=1)
+    declared = stream(replayed(lambda partition: drawn()))
+    make_trainer(tmp_path / "declared").fit(declared, steps=3, log_every=1)
+    resumed = make_trainer(tmp_path / "declared").fit(declared, steps=6, log_every=1)
+    assert int(resumed.step) == 6
+    assert same_variables(resumed, make_trainer().fit(declared, steps=6, log_every=1))
+
+
+def test_a_checkpoint_saved_without_a_position_resumes_no_stream_past_step_zero(tmp_path):
+    """A checkpoint saved by hand without the stream's position (Checkpoints.save's `saved`) past
+    step 0 resumes no stream, not one that keeps positions either: with none to restore it would
+    read its data again from the start, apart from the uninterrupted run, so the run is refused. At
+    step 0 nothing was read, and the run trains on."""
+    trainer = make_trainer(tmp_path)
+    state = trainer.fit(dataset(), steps=3, log_every=1, checkpoint_final=False)
+    trainer.checkpoints.save(3, state)
+    trainer.checkpoints.wait()
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path).fit(dataset(), steps=6, log_every=1)
+    fresh = make_trainer(tmp_path / "fresh")
+    fresh.checkpoints.save(0, fresh.initial_state())
+    fresh.checkpoints.wait()
+    assert int(make_trainer(tmp_path / "fresh").fit(dataset(), steps=2, log_every=1).step) == 2
+
+
 def test_a_declared_stream_whose_batch_at_the_position_differs_is_refused(tmp_path):
     """The replay guard: a stream declared to replay that reads back another
     batch at its position, one over fresh entropy, is refused."""
@@ -1271,6 +1304,53 @@ def test_a_fresh_state_is_built_in_the_buffers_its_held_checkpoint_arrives_in(mo
     assert sharded
     jax.tree.map(np.testing.assert_array_equal, state.variables, weights)
 
+
+
+@pytest.mark.mesh
+def test_only_the_held_arrays_an_output_takes_over_are_donated():
+    """`placed_held` splits a held tree into the copies a state takes over,
+    each placed as its variable, and the rest, replicated: an array beside
+    the variables and one whose shape is not its variable's. `taking_over`
+    donates the first alone, so JAX finds every donation usable and warns of
+    none, the state takes those buffers over, and the rest stay alive until
+    their holder drops them, as donated they were freed only as the call
+    returned."""
+    import warnings
+
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from jax.tree_util import Partial
+
+    from dew.training.distributed import placed_held, taking_over
+
+    mesh = Mesh(np.array(jax.devices()), ("fsdp",))
+    rows = 8 * jax.device_count()
+    sharded, replicated = NamedSharding(mesh, P("fsdp")), NamedSharding(mesh, P())
+
+    def initialize(key, *, variables, table):
+        params = variables["params"]
+        return {"params": {"kernel": params["kernel"] * 2, "bias": jnp.pad(params["bias"], (0, 4))},
+                "count": table.sum()}
+
+    kernel, bias, table = jnp.arange(rows * 4.0).reshape(rows, 4), jnp.ones(4), jnp.arange(5.0)
+    held = Partial(initialize, variables={"params": {"kernel": kernel, "bias": bias}}, table=table)
+    variables = {"params": {"kernel": jax.ShapeDtypeStruct((rows, 4), jnp.float32),
+                            "bias": jax.ShapeDtypeStruct((8,), jnp.float32)}}
+    shardings = {"params": {"kernel": sharded, "bias": replicated}, "count": replicated}
+    taken, kept = placed_held(held, variables, {"params": shardings["params"]}, mesh)
+    copy = taken.keywords["variables"]["params"]["kernel"]
+    assert copy.sharding == sharded
+    assert taken.keywords["variables"]["params"]["bias"] is None and taken.keywords["table"] is None
+    assert kept.keywords["variables"]["params"]["kernel"] is None
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", "Some donated buffers were not usable")
+        state = taking_over(lambda initializer, key: initializer(key), taken, kept, shardings)(
+            jax.random.key(0))
+    assert copy.is_deleted()
+    assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(kept))
+    assert not any(leaf.is_deleted() for leaf in (kernel, bias, table))
+    np.testing.assert_array_equal(state["params"]["kernel"], kernel * 2)
+    np.testing.assert_array_equal(state["params"]["bias"], [1, 1, 1, 1, 0, 0, 0, 0])
+    assert float(state["count"]) == 10.0
 
 def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     """Compiling reads the parameters', optimizer state's and key's shapes

@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import flat_tree
-from reference_error import assert_as_exact_as_the_reference, distance
+from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 from test_hf_decoders import GEMMA4_MOE, fixture_config, fp32_decoder
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -406,6 +406,46 @@ def test_the_glm4_moe_mtp_depth_matches_the_reference_composition():
 GLM_MOE_DSA = FIXTURES / "glm-moe-dsa-tiny"
 
 
+FP8_TENSORS = {'quant_method': 'compressed-tensors', 'format': 'float-quantized', 'ignore': [],
+               'config_groups': {'group_0': {'targets': ['Linear'], 'weights': {
+                   'num_bits': 8, 'type': 'float', 'strategy': 'tensor', 'symmetric': True,
+                   'dynamic': False}}}}
+"""Per-tensor E4M3 weights as compressed-tensors describes them."""
+
+
+@pytest.mark.parametrize(("name", "quantized"),
+                         [("kimi-k25-tiny", ".mlp.experts."), ("gpt-oss-tiny", ".self_attn.")])
+def test_a_family_reads_quantized_weights_through_the_shared_codec(tmp_path, name, quantized):
+    """Kimi K2.5 describes its text weights' storage under text_config, and a GPT OSS source may
+    store its attention in another format than the released MXFP4 experts; the shared codec reads
+    either description, so the source loads as its weights decoded do."""
+    from dew.interop import codecs
+    from dew.interop.safetensors_io import read_weights, save_hf_layout
+
+    stored, dense = {}, {}
+    for key, value in read_weights(FIXTURES / name).items():
+        if quantized in key and key.endswith('.weight') and value.ndim == 2:
+            # One E4M3 scale over the whole tensor, as compressed-tensors calibrates it.
+            scale = np.asarray(np.abs(value).max() / 448, np.float32)
+            codec = codecs.source_quantization({'quantization_config': FP8_TENSORS},
+                                               grid={key.removesuffix('weight') + 'weight_scale': scale})
+            assert codec is not None
+            encoded = dict(codec.encode(key, value))
+            stored.update(encoded)
+            dense[key] = codec.decode(encoded, key)
+        else:
+            stored[key] = dense[key] = value
+    config = fixture_config(name)
+    described = ({**config, 'text_config': {**config['text_config'], 'quantization_config': FP8_TENSORS}}
+                 if 'text_config' in config else {**config, 'quantization_config': FP8_TENSORS})
+    save_hf_layout(stored, described, tmp_path / 'quantized')
+    save_hf_layout(dense, config, tmp_path / 'dense')
+    ids = jnp.asarray(np.load(FIXTURES / name / "input_ids.npy"), jnp.int32)
+    loads = (fp32_decoder(tmp_path / 'quantized'), fp32_decoder(tmp_path / 'dense'))
+    logits = [np.asarray(model.apply(variables, ids)) for model, variables in loads]
+    np.testing.assert_array_equal(*logits)
+
+
 def test_kimi_k25_text_only_placeholders_match_reference():
     import torch
 
@@ -502,6 +542,21 @@ def test_deepseek_v4_logits_match_the_reference_implementation():
     difference = float(np.max(np.abs(logits - reference)))
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
     assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+
+def test_deepseek_v4_a_left_padded_row_pools_its_compressed_windows_over_its_own_tokens():
+    """Uncached, rows padded on the left by three tokens pool the HCA windows and the CSA
+    windows its lightning indexer scores over their real tokens at their ranks, as a cache appends
+    them: the real tokens' logits lie as close to the reference's as the unpadded rows' do, within
+    FACTOR."""
+    model, variables = fp32_decoder(DEEPSEEK_V4)
+    ids = jnp.asarray(np.load(DEEPSEEK_V4 / "input_ids.npy"), jnp.int32)
+    reference = np.load(DEEPSEEK_V4 / "logits.npy")
+    pad = 3
+    valid = jnp.broadcast_to(jnp.arange(ids.shape[1] + pad) >= pad, (ids.shape[0], ids.shape[1] + pad))
+    padded = model.apply(variables, jnp.pad(ids, ((0, 0), (pad, 0))), attention_mask=valid)
+    alone = model.apply(variables, ids)
+    assert distance(padded[:, pad:], reference) <= FACTOR * distance(alone, reference)
 
 
 @pytest.mark.parametrize('saved_spelling', [False, True], ids=['released', 'hf_saved'])

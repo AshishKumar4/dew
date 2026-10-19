@@ -23,17 +23,16 @@ from dew.decision.layout import (
     Bounds,
     DecisionInputs,
     Layout,
-    MarkerLayout,
     QuestionLayout,
     Specials,
-    StateFirstLayout,
     compacted,
+    default_layout,
     question_fields,
 )
 from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Choice, Question, Score
 from dew.decision.scoring import LogLoss, ScoringRule
-from dew.decision.task import Decide, Weights, laid_out
+from dew.decision.task import Decide, DecideSettings, Weights, laid_out
 from dew.inference.pipeline import RunProcessor
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
@@ -58,7 +57,6 @@ from dew.objectives.base import (
     part,
 )
 from dew.records import integer, record
-from dew.registry import import_path
 
 if TYPE_CHECKING:
     from dew.training.state import TrainState
@@ -85,7 +83,8 @@ class Encoding:
     answer. That teaches the model to say
     that no option fits instead of picking the nearest wrong one. Each scored
     slot's target is its gold distribution (`Example.distribution`) in the
-    order the row shows the options.
+    order the row shows the options. A reader passes the state's `tokens` it
+    fitted the example with (`Fit`), which the row lays out again.
     """
 
     layout: Layout
@@ -95,7 +94,8 @@ class Encoding:
     shuffle: bool = True
     none_of_the_above: float = 0.0
 
-    def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None) -> Batch:
+    def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None,
+                 tokens: np.ndarray | None = None) -> Batch:
         labels = example.labels()
         if rng is not None and self.shuffle and self.layout.joint:
             names = [names[int(index)] for index in rng.permutation(len(names))]
@@ -124,7 +124,8 @@ class Encoding:
             if rng is not None and self.shuffle
             else None
         )
-        rows = self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders)
+        rows = self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders,
+                                tokens=None if tokens is None else tokens.tolist())
         if len(rows) != 1:
             raise ValueError(f"an encoding lays out one row, and the layout gave {len(rows)}")
         encoded = rows[0]
@@ -199,6 +200,9 @@ class FittedRow:
     names: tuple[str, ...]
     length: int
     truncated: bool
+    tokens: np.ndarray
+    """The state's tokens, which the encoding lays out again, as int32: a read
+    held in memory keeps them for every example."""
 
 
 @dataclass(frozen=True)
@@ -215,16 +219,19 @@ class Fit(pygrain.MapTransform):
         if not labels:
             return Rejected("unlabelled")
         asked = example.questions if self.layout.joint else {name: example.questions[name] for name in labels}
-        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked)
+        state = self.layout.state(self.tokenizer, self.specials, example.state)
+        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state)
         if not all(map(self.layout.fits, laid)):
             return Rejected("unfit")
         self.head.validate_rows(laid)
+        tokens = np.asarray(state, np.int32)
         fitted = tuple(
             FittedRow(
                 example,
                 tuple(question.name for question in row.questions),
                 len(row.tokens),
                 row.state_kept < row.state_tokens,
+                tokens,
             )
             for row in laid
         )
@@ -275,7 +282,7 @@ class LayoutRows(pygrain.RandomMapTransform):
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         fitted = _fitted(element)
-        return self.encoding(fitted.example, fitted.names, rng)
+        return self.encoding(fitted.example, fitted.names, rng, fitted.tokens)
 
 
 @dataclass(frozen=True)
@@ -284,7 +291,7 @@ class EvaluateRows(pygrain.MapTransform):
 
     def map(self, element: Batch) -> Batch:
         fitted = _fitted(element)
-        return self.encoding(fitted.example, fitted.names, None)
+        return self.encoding(fitted.example, fitted.names, None, fitted.tokens)
 
 
 @dataclass(frozen=True)
@@ -373,10 +380,12 @@ class DecisionObjective(Objective[Ratio]):
     `backbone` is a model built from scratch, a loaded model
     (`Pretrained.load`, adapted with LoRA or partly frozen through `freeze`, as
     `LMObjective` accepts one), or a whole `Decide` task, such as Laya's released
-    checkpoint, which brings its head and layout with it. A bidirectional
-    backbone reads Laya's `MarkerLayout` and a causal one the `StateFirstLayout`,
-    unless `layout` says otherwise. `tokenizer` and `specials` default to the
-    loaded model's.
+    checkpoint, which brings its head and layout with it. Unless `layout` says
+    otherwise, a head that reads several questions a row reads them in one
+    row (`JointLayout`), and one that reads one question a row reads Laya's
+    `MarkerLayout` over a bidirectional backbone and the `StateFirstLayout`
+    over a causal one (`default_layout`). `tokenizer` and `specials` default
+    to the loaded model's.
 
     The loss is `loss`, a proper scoring rule or a sum of them, computed against
     each row's right option, with `label_smoothing` spread evenly over its
@@ -403,6 +412,7 @@ class DecisionObjective(Objective[Ratio]):
     """
 
     saved_task = Decide
+    settings = DecideSettings
     _held_parts = True
 
     counts_tokens = True
@@ -477,7 +487,7 @@ class DecisionObjective(Objective[Ratio]):
                     f"a {type(module).__name__} does not say whether it reads its tokens in "
                     "order; pass layout= (StateFirstLayout if it does, MarkerLayout if not)"
                 )
-            layout = StateFirstLayout() if module.causal else MarkerLayout()
+            layout = default_layout(module.causal, head.one_question)
         self.layout = layout
         self.tokenizer = tokenizer
         self.specials = specials or Specials.of(tokenizer)
@@ -633,30 +643,28 @@ class DecisionObjective(Objective[Ratio]):
             packed=(PackedRows(self.layout.max_len, compact),),
         )
 
-    def inference_record(self):
-        """Return what a saved run rebuilds its task from.
+    def task_settings(self) -> DecideSettings:
+        """What a saved run rebuilds its task from beside the backbone.
 
-        That is the backbone, head, layout, tokenizer, special tokens and the
-        image processor's source, independently of the text tokenizer. Interop
+        That is the head, layout, tokenizer, special tokens and the image
+        processor's source, independently of the text tokenizer. Interop
         reloads that source's processor files and derives its media geometry
         from the source config; the decision record owns neither format.
         """
-        from dew.config import ModelConfig
         from dew.inference.tasks import recorded_tokenizer
         from dew.registry import to_record
 
-        return {
-            "objective": import_path(type(self)),
-            "model": to_record(ModelConfig.from_model(self.model.backbone), ModelConfig),
-            "head": self.model.head.record(),
-            "layout": {
-                "name": type(self.layout).__name__,
-                "fields": to_record(self.layout, type(self.layout)),
-            },
-            "specials": to_record(self.specials, Specials),
-            "tokenizer": recorded_tokenizer(RunProcessor(self.tokenizer)),
-            "processor": None if self.image_processor is None else self.image_processor.source,
-        }
+        return DecideSettings(
+            self.model.head.record(),
+            {"name": type(self.layout).__name__, "fields": to_record(self.layout, type(self.layout))},
+            self.specials, recorded_tokenizer(RunProcessor(self.tokenizer)),
+            # A decision task reads text through its own tokenizer, so only a media processor is kept.
+            None if self.image_processor is None or self.image_processor.directory is None
+            else self.image_processor.source)
+
+    def recorded_model(self) -> nn.Module:
+        """The backbone; the head is a task setting of its own."""
+        return self.model.backbone
 
     def pipeline(
         self,

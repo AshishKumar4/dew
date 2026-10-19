@@ -9,7 +9,7 @@ from jax import lax
 
 from dew.diffusion.schedules import expand
 
-from .common import _push, _sigma_integrator
+from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator
 
 
 def _euler_step(x, denoised, source, target):
@@ -18,11 +18,14 @@ def _euler_step(x, denoised, source, target):
     Returns `(x at the target level, the derivative, the x_0 coefficient,
     the interval)`. A second-order method re-evaluates the derivative at the
     end of this step and needs the coefficient and the interval it was taken
-    over.
+    over. A step between equal levels, which a grid that ends where its
+    final sigma repeats takes (`final_sigmas_type="sigma_min"`), has no
+    length and leaves x as it is, as the source's `x + derivative * dt` does.
     """
     (alpha_t, sigma_t), (alpha_s, sigma_s) = source, target
     dt = sigma_s - sigma_t
-    x_0_coeff = (alpha_t * sigma_s - alpha_s * sigma_t) / dt
+    # Equal levels make the numerator 0 too; any finite coefficient is scaled by the zero interval.
+    x_0_coeff = (alpha_t * sigma_s - alpha_s * sigma_t) / jnp.where(dt == 0, 1, dt)
     derivative = (x - x_0_coeff * denoised) / sigma_t
     # A step to sigma 0 lands on the clean prediction. As x + derivative dt, the sum XLA computes with the
     # reciprocal of sigma_t left x a gradient of an ulp where the prediction is clipped and the source's
@@ -232,6 +235,10 @@ class MultiStepDPM:
     FlaxDiff's `MultiStepDPM`, which despite the name is not DPM-Solver."""
 
     def init(self, x, times, process, *, key):
+        # The order grows by one a step, to three.
+        orders = [min(index, 2) + 1 for index in range(times.shape[0] - 1)]
+        _check_gaps(_grid_levels(process, times)[1], _history_gaps(orders),
+                    reason="its finite differences divide by")
         coefficient = jnp.zeros((x.shape[0],) + (1,) * (x.ndim - 1), jnp.float32)
         return (jnp.zeros_like(x), coefficient, jnp.zeros_like(x), coefficient,
                 jnp.zeros((), jnp.int32))
@@ -293,6 +300,9 @@ class LMS:
             raise ValueError(f"LMS's order is at least 1, not {self.order}")
 
     def init(self, x, times, process, *, key):
+        orders = [min(index, self.order - 1) + 1 for index in range(times.shape[0] - 1)]
+        _check_gaps(_grid_levels(process, times)[1], _history_gaps(orders),
+                    reason="LMS's Lagrange basis divides by")
         sigmas = jnp.ones((self.order, x.shape[0]) + (1,) * (x.ndim - 1), jnp.float32)
         return jnp.zeros((self.order, *x.shape), x.dtype), sigmas, jnp.zeros((), jnp.int32)
 

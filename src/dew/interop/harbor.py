@@ -52,6 +52,7 @@ import os
 import queue
 import re
 import secrets
+import selectors
 import signal
 import subprocess
 import threading
@@ -59,7 +60,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -77,6 +78,9 @@ _logger = logging.getLogger(__name__)
 
 HARBOR_KEY = "harbor"
 """The `Task.data` key that holds the Harbor task directory a trial runs."""
+
+# How often a trial whose output has closed asks whether Harbor has exited, as `Popen.wait` asks.
+_EXIT_POLL_SECONDS = 0.05
 
 # Harbor's exception class names (harbor.trial.errors, harbor.agents.installed.base).
 _TRUNCATIONS = frozenset({"AgentTimeoutError", "ContextWindowExceededError", "OutputTokenExceededError"})
@@ -357,9 +361,10 @@ def outcome(trial: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = (
     `errors` the engine errors the gateway recorded for it, and `harness_exit`
     the harness's own exit status when it reports one. An engine that refused
     an overflowing prompt truncated the rollout; any other engine error makes
-    it infra, even when the harness retried and went on. A result whose
-    fields have the wrong JSON types is infra: nothing in it can be trusted
-    to score.
+    it infra, even when the harness retried and went on, and so does an
+    aborted call or a failed model client, whatever limit the trial also hit.
+    A result whose fields have the wrong JSON types is infra: nothing in it can
+    be trusted to score.
     """
     try:
         judged = _judged(trial)
@@ -367,12 +372,15 @@ def outcome(trial: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = (
         return Status.INFRA_ERROR, None, {}, str(error)
     kind, detail, rewards = judged.kind, judged.detail, judged.rewards
     reward = rewards.get("reward", next(iter(rewards.values()), None))
-    if any(_OVERFLOW.search(error) for error in errors):
-        return Status.TRUNCATED, reward, rewards, f"the engine refused a prompt: {errors[0]}"
-    if errors:
-        return Status.INFRA_ERROR, reward, rewards, f"the engine answered an error: {errors[0]}"
+    broken = [error for error in errors if not _OVERFLOW.search(error)]
+    if broken:
+        return Status.INFRA_ERROR, reward, rewards, f"the engine answered an error: {broken[0]}"
     if any(call.finish_reason == "abort" for call in records):
         return Status.INFRA_ERROR, reward, rewards, "the engine aborted a call"
+    if harness_exit in _CLIENT_FAILURES:
+        return Status.INFRA_ERROR, reward, rewards, f"the harness's model client failed: {harness_exit}"
+    if errors:
+        return Status.TRUNCATED, reward, rewards, f"the engine refused a prompt: {errors[0]}"
     if (kind in _TRUNCATIONS or harness_exit in _HARNESS_LIMITS
             or (records and records[-1].finish_reason == "length")):
         return (
@@ -383,8 +391,6 @@ def outcome(trial: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = (
         )
     if not records:
         return Status.INFRA_ERROR, reward, rewards, detail or "no model call reached the gateway session"
-    if harness_exit in _CLIENT_FAILURES:
-        return Status.INFRA_ERROR, reward, rewards, f"the harness's model client failed: {harness_exit}"
     if reward is not None and kind is None:
         return Status.COMPLETED, reward, rewards, ""
     if reward is not None and kind in _AGENT_FAILURES:
@@ -404,6 +410,13 @@ class HarborSource:
       environment provider, timeouts and agent kwargs.
     - `workers` is how many trials run at once. Harbor's own sandbox limits
       apply inside each trial.
+    - `trial_timeout`, when set, bounds each trial in seconds from its
+      start. Harbor bounds the environment build, the agent's setup and
+      run, and the verifier itself (`--agent-timeout`, `--verifier-timeout`,
+      `--timeout-multiplier` in `arguments`), but no option of its own
+      bounds the whole trial. A trial past this deadline is interrupted as
+      `cancel` interrupts it, and resolves `INFRA_ERROR`, which the
+      scheduler retries.
 
     The harness must speak the OpenAI chat API through `OPENAI_BASE_URL`, as
     Harbor's mini-swe-agent does.
@@ -427,7 +440,7 @@ class HarborSource:
     you are done. A trainer that exits without either, for example on an
     uncaught KeyboardInterrupt, still stops its trials. Trials run on daemon
     threads, and an atexit hook cancels the queued trials and interrupts the
-    running ones, then kills any still running after `grace` seconds.
+    running ones, then kills their process groups after `grace` seconds.
     """
 
     def __init__(
@@ -442,14 +455,15 @@ class HarborSource:
         arguments: Sequence[str] = (),
         workers: int = 8,
         grace: float = 60.0,
+        trial_timeout: float | None = None,
         ready_timeout: float = 900.0,
         ready_poll: float = 2.0,
     ):
         if type(workers) is not int or workers < 1:
             raise ValueError("workers must be a positive number of concurrent trials")
-        if not grace > 0:
-            raise ValueError("grace is a positive number of seconds")
-        self._grace = grace
+        if not grace > 0 or (trial_timeout is not None and not trial_timeout > 0):
+            raise ValueError("grace and trial_timeout are positive numbers of seconds")
+        self._grace, self._trial_timeout = grace, trial_timeout
         self._ready_timeout, self._ready_poll = ready_timeout, ready_poll
         self._ready = False
         # Serializes the readiness wait apart from `_lock`, so cancel and close never wait on the gateway.
@@ -508,8 +522,11 @@ class HarborSource:
     def cancel(self, futures: Sequence[Future[Session]]) -> None:
         """Interrupt the given trials. Harbor tears down their sandboxes, and each resolves `CANCELLED`.
 
-        A trial still running `grace` seconds after the interrupt gets
-        SIGTERM, and SIGKILL after another `grace` seconds.
+        A trial whose output is still open `grace` seconds after the
+        interrupt gets SIGTERM, and SIGKILL after another `grace` seconds,
+        each sent to its whole process group. Output still open a `grace`
+        after the SIGKILL is held by a process that left the group, which
+        keeps running; the trial stops reading it and resolves.
         """
         with self._lock:
             for future in futures:
@@ -517,19 +534,32 @@ class HarborSource:
                 if record is None or record.cancelled:
                     continue
                 record.cancelled = True
-                if record.process is not None and record.process.poll() is None:
-                    _signal(record.process, signal.SIGINT)
-                    record.timer = _timer(self._grace, self._escalate, record, signal.SIGTERM)
+                self._interrupt(record)
+
+    def _interrupt(self, record: _Trial) -> None:
+        """Send a trial's process group SIGINT, once, and arm its escalation. The caller holds the lock."""
+        process = record.process
+        if record.timer is None and process is not None:
+            _signal(process, signal.SIGINT)
+            record.timer = _timer(self._grace, self._escalate, record, signal.SIGTERM)
 
     def _escalate(self, record: _Trial, sent: signal.Signals) -> None:
-        """Harbor ignored the last signal for a whole grace period: send the next, SIGTERM then SIGKILL."""
+        """The trial's output stayed open for a whole grace period: signal the group again, SIGTERM then
+        SIGKILL."""
         with self._lock:
-            if record.process is None or record.process.poll() is not None:
+            process = record.process
+            if process is None:
                 return
-            _logger.warning("Harbor trial %d outlived its grace; sending %s", record.process.pid, sent.name)
-            _signal(record.process, sent)
-            if sent is signal.SIGTERM:
-                record.timer = _timer(self._grace, self._escalate, record, signal.SIGKILL)
+            _logger.warning("Harbor trial %d outlived its grace; sending %s", process.pid, sent.name)
+            _signal(process, sent)
+            record.timer = (_timer(self._grace, self._escalate, record, signal.SIGKILL)
+                            if sent is signal.SIGTERM else _timer(self._grace, self._release, record))
+
+    def _release(self, record: _Trial) -> None:
+        """The output outlived the SIGKILL by a grace: wake the trial's read so it stops."""
+        with self._lock:
+            if record.process is not None:
+                os.write(record.wake, b"\0")
 
     def close(self) -> None:
         """Cancel every unresolved trial, queued or running, and wait for the running ones to tear down."""
@@ -566,48 +596,67 @@ class HarborSource:
             return Session(task.id, group, sample, 0, records, status, reward, components or {}, detail)
 
         try:
-            with self._lock:
-                record = self._records[future]
-                process = (
-                    None
-                    if record.cancelled
-                    else subprocess.Popen(
-                        [
-                            *self._command,
-                            "-p",
-                            os.fspath(directory),
-                            "--trial-name",
-                            name,
-                            "--trials-dir",
-                            os.fspath(self._trials),
-                            *itertools.chain.from_iterable(
-                                ("--ae", f"{key}={value}")
-                                for key, value in {
-                                    **self._environment,
-                                    "OPENAI_BASE_URL": self._gateway.session(session),
-                                }.items()
-                            ),
-                        ],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        start_new_session=True,
+            with contextlib.ExitStack() as held:
+                # The read's wake pipe exists before Harbor does, so a cancel never finds a running trial it
+                # cannot wake. Failing to make it settles the future as any other failure does.
+                woken, wake = os.pipe()
+                held.callback(os.close, wake)
+                held.callback(os.close, woken)
+                with self._lock:
+                    record = self._records[future]
+                    record.wake = wake
+                    process = (
+                        None
+                        if record.cancelled
+                        else subprocess.Popen(
+                            [
+                                *self._command,
+                                "-p",
+                                os.fspath(directory),
+                                "--trial-name",
+                                name,
+                                "--trials-dir",
+                                os.fspath(self._trials),
+                                *itertools.chain.from_iterable(
+                                    ("--ae", f"{key}={value}")
+                                    for key, value in {
+                                        **self._environment,
+                                        "OPENAI_BASE_URL": self._gateway.session(session),
+                                    }.items()
+                                ),
+                            ],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            start_new_session=True,
+                        )
                     )
-                )
-                record.process = process
-            if process is None:
-                # Resolved outside the lock: the future's done-callback takes it.
-                future.set_result(ended(Status.CANCELLED))
-                return
-            log, _ = process.communicate()
-            with self._lock:
-                record.process = None
-                cancelled = record.cancelled
-                if record.timer is not None:
-                    record.timer.cancel()
+                    record.process = process
+                if process is None:
+                    # Resolved outside the lock: the future's done-callback takes it.
+                    future.set_result(ended(Status.CANCELLED))
+                    return
+                try:
+                    log = self._read(process, record, woken)
+                except BaseException:
+                    with self._lock:
+                        # A read that failed takes the trial's group with it, while the group is Harbor's.
+                        if record.process is not None:
+                            _signal(record.process, signal.SIGKILL)
+                    raise
+                finally:
+                    with self._lock:
+                        # Retired before Harbor is reaped: no signal reaches a pid given to another process.
+                        record.process = None
+                        cancelled, expired = record.cancelled, record.expired
+                        if record.timer is not None:
+                            record.timer.cancel()
+                    assert process.stdout is not None
+                    process.stdout.close()
+                    process.wait()
+                    record.closed.set()
             try:
                 future.set_result(self._verdict(ended, session, self._trials / name, log, process.returncode,
-                                                cancelled, version))
+                                                cancelled, expired, version))
             finally:
                 # The session's traces leave the gateway on every exit path;
                 # the future already has its verdict.
@@ -619,8 +668,50 @@ class HarborSource:
             if not future.done():
                 future.set_exception(error)
 
+    def _read(self, process: subprocess.Popen[bytes], record: _Trial, woken: int) -> str:
+        """Harbor's output, read until it closes and Harbor exits, or the escalation gives up on it.
+
+        Once the output closes, the read asks every `_EXIT_POLL_SECONDS`
+        whether Harbor has exited, under the lock, and retires Harbor in the
+        step that reaps it, so no signal reaches its group's id once another
+        process could hold it. Past `trial_timeout`, whether the output is
+        still open or Harbor alone runs on, the trial is interrupted as
+        `cancel` interrupts it. The escalation of either wakes this read
+        through `woken` a `grace` after its SIGKILL, when the output still
+        open is held outside the group.
+        """
+        assert process.stdout is not None
+        output = bytearray()
+        deadline = None if self._trial_timeout is None else time.monotonic() + self._trial_timeout
+        with selectors.DefaultSelector() as ready:
+            ready.register(process.stdout, selectors.EVENT_READ)
+            ready.register(woken, selectors.EVENT_READ)
+            while True:
+                reading = len(ready.get_map()) > 1
+                if not reading:
+                    with self._lock:
+                        if process.poll() is not None:
+                            record.process = None
+                            break
+                if deadline is not None and time.monotonic() >= deadline:
+                    with self._lock:
+                        record.expired = True
+                        self._interrupt(record)
+                    deadline = None
+                waits = ([] if reading else [_EXIT_POLL_SECONDS]) + (
+                    [] if deadline is None else [deadline - time.monotonic()])
+                events = ready.select(min(waits, default=None))
+                if any(key.fd == woken for key, _ in events):
+                    break
+                for key, _ in events:
+                    if not (chunk := os.read(key.fd, 65536)):
+                        ready.unregister(key.fd)
+                    else:
+                        output.extend(chunk)
+        return output.decode("utf-8", errors="replace")
+
     def _verdict(self, ended: Callable[..., Session], session: str, trial: Path, log: str, returncode: int,
-                 cancelled: bool, version: int) -> Session:
+                 cancelled: bool, expired: bool, version: int) -> Session:
         try:
             recorded = calls(self._gateway.traces(session), unstamped=version)
         except Exception as error:
@@ -629,6 +720,9 @@ class HarborSource:
         records = recorded.calls
         if cancelled:
             return ended(Status.CANCELLED, records, detail=str(trial))
+        if expired:
+            return ended(Status.INFRA_ERROR, records,
+                         detail=f"{trial}: interrupted past trial_timeout={self._trial_timeout:g} s")
         if not (trial / "result.json").is_file():
             return ended(
                 Status.INFRA_ERROR,
@@ -649,44 +743,55 @@ class HarborSource:
 
 @dataclass
 class _Trial:
-    """What `cancel` needs of one submitted sample: whether it was cancelled and its running Harbor."""
+    """What `cancel` and the deadline need of one submitted sample: whether it was cancelled or ran
+    past `trial_timeout`, its running Harbor, the timer of its next escalation, and whether its
+    output has closed."""
 
     cancelled: bool = False
-    process: subprocess.Popen[str] | None = None
+    expired: bool = False
+    process: subprocess.Popen[bytes] | None = None
+    """The running Harbor, until the trial retires it under the lock: in the step that reaps it once
+    its output has closed, or before reaping it when the escalation gives up on the output. Until
+    then its pid, the group's id, is not given to another process, so a signal sent to the group
+    under the lock while this is set reaches the trial's processes and no others."""
     timer: threading.Timer | None = None
+    wake: int = -1
+    """The write end of the pipe that stops the trial's read, open while `process` is set."""
+    closed: threading.Event = field(default_factory=threading.Event)
 
 
-def _timer(seconds: float, action: Callable[[_Trial, signal.Signals], None], record: _Trial,
-           sent: signal.Signals) -> threading.Timer:
+def _timer[*Arguments](seconds: float, action: Callable[[*Arguments], None],
+                       *arguments: *Arguments) -> threading.Timer:
     """A daemon timer: an escalation still pending must not hold the interpreter open at exit."""
-    timer = threading.Timer(seconds, action, (record, sent))
+    timer = threading.Timer(seconds, action, arguments)
     timer.daemon = True
     timer.start()
     return timer
 
 
-def _signal(process: subprocess.Popen[str], sent: signal.Signals) -> None:
+def _signal(process: subprocess.Popen[bytes], sent: signal.Signals) -> None:
     with contextlib.suppress(ProcessLookupError):
         os.killpg(process.pid, sent)
 
 
 def _stop_all(records: dict[Future[Session], _Trial], lock: threading.Lock, grace: float) -> None:
-    """At interpreter exit: cancel every trial, interrupt the live ones,
-    and kill any still alive after `grace`."""
+    """At interpreter exit: cancel every trial, interrupt the live ones, and
+    kill the process group of each whose output is still open `grace`
+    seconds later, so a child Harbor left behind dies too."""
     with lock:
         live = []
         for record in records.values():
             record.cancelled = True
-            if record.process is not None and record.process.poll() is None:
-                live.append(record.process)
-    for process in live:
-        _signal(process, signal.SIGINT)
+            if record.process is not None:
+                _signal(record.process, signal.SIGINT)
+                live.append(record)
     deadline = time.monotonic() + grace
-    for process in live:
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(max(0.0, deadline - time.monotonic()))
-        if process.poll() is None:
-            _signal(process, signal.SIGKILL)
+    for record in live:
+        # The trial's own thread reads its output, retires and reaps Harbor, then marks it closed.
+        if not record.closed.wait(max(0.0, deadline - time.monotonic())):
+            with lock:
+                if record.process is not None:
+                    _signal(record.process, signal.SIGKILL)
 
 
 def _harness_exit(trial: Path) -> str | None:

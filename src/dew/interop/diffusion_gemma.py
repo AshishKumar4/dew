@@ -120,10 +120,10 @@ def translate_weights(
     if config.get("vision_config") is not None:
         if not vision or not projection:
             raise ValueError("vision_config requires both vision_tower and embed_vision tensors")
-        tower_variables = vision_variables("gemma4", vision, param_dtype)
+        tower_variables, _ = vision_variables("gemma4", vision, param_dtype)
         params["conditioner"] = {
             "tower": tower_variables["params"],
-            "projector": translate_gemma4_projector_weights(projection, param_dtype=param_dtype)}
+            "projector": translate_gemma4_projector_weights(projection, param_dtype=param_dtype)[0]}
         if "constants" in tower_variables:
             variables.setdefault("constants", {})["conditioner"] = {"tower": tower_variables["constants"]}
     elif vision or projection:
@@ -155,6 +155,28 @@ def generation_process(config: Mapping[str, object], generation: Mapping[str, ob
         entropy_bound=budget,
         stability_threshold=_integer(generation, "stability_threshold", 1),
         confidence_threshold=_number(generation, "confidence_threshold", 0.005))
+
+
+def generation_config_of(process: BlockProcess, *, max_new_tokens: int | None = None,
+                         pad_token_id: int | None = None) -> dict[str, records.JSON]:
+    """The generation_config.json transformers' DiffusionGemmaGenerationConfig
+    reads, and `generation_process` reads back as `process`: its inverse. The
+    canvas and vocabulary are the model's in both, as a block run's process
+    takes them from its model (`BlockDiffusionObjective`)."""
+    # Floats where BlockProcess also takes an int, as transformers' reader
+    # requires (generation_diffusion_gemma.py:181-183, 333).
+    sampler: dict[str, records.JSON] = {"_cls_name": "EntropyBoundSamplerConfig",
+                                        "entropy_bound": float(process.entropy_bound)}
+    values: dict[str, records.JSON] = {
+        "max_denoising_steps": process.max_steps, "t_min": float(process.t_min),
+        "t_max": float(process.t_max), "stability_threshold": process.stability_threshold,
+        "confidence_threshold": float(process.confidence_threshold), "sampler_config": sampler,
+    }
+    if max_new_tokens:
+        values["max_new_tokens"] = max_new_tokens
+    if pad_token_id is not None:
+        values["pad_token_id"] = pad_token_id
+    return values
 
 
 def scalar_placement(text: CausalTransformer, variables: Variables) -> CausalTransformer:

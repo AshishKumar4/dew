@@ -61,6 +61,7 @@ from dew.nn.sharding import (
     ruled_boxes,
 )
 from dew.objectives.base import Batch, Variables
+from dew.records import JSON, number, record
 from dew.telemetry.profile import region
 
 # The role axes no parameter splits over: data holds a batch's replicas,
@@ -274,9 +275,12 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     axis and the devices it spans, and a later pool on them takes it, a
     resume among them: the decisions from it shape the step, and a figure
     measured again moves by noise, across a threshold one time in some."""
-    record = _link_record(mesh, axis)
-    # Every process gathers, or none does: a pool measures unless each of its processes sees the figure.
-    if record is not None and all(from_every_process(record.exists())):
+    topology = link_topology(mesh, axis)
+    record = _link_record(topology)
+    # Every process gathers, or none does: a pool measures unless each of its processes sees the figure,
+    # kept for exactly this placement.
+    if record is not None and all(from_every_process(
+            record.exists() and json.loads(record.read_text()).get("topology") == topology)):
         return min(from_every_process(float(json.loads(record.read_text())["bytes_per_second"])))
     ways = mesh.shape[axis]
     count = size // 4 // ways * ways
@@ -295,20 +299,41 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     received = min(from_every_process((ways - 1) / ways * count * 4 / statistics.median(seconds)))
     if record is not None and jax.process_index() == 0:
         record.parent.mkdir(parents=True, exist_ok=True)
-        write_atomically(record, json.dumps({"bytes_per_second": received}))
+        write_atomically(record, json.dumps({"topology": topology, "bytes_per_second": received}))
     return received
 
 
-def _link_record(mesh: Mesh, axis: str) -> Path | None:
-    """Where `link_bandwidth` keeps `mesh`'s `axis` figure: beside the persistent compilation cache,
-    named by the axis's width, the mesh's shape and its devices' kinds and processes, or nowhere when
-    the process keeps no cache."""
+def link_topology(mesh: Mesh, axis: str) -> str:
+    """What a figure of `mesh`'s `axis` is a figure of: the axis, the mesh's axes and their widths in
+    order, and its devices in the mesh's order, each by id, process, kind and slice. A device's id is
+    its place in its system, so two meshes of one shape over other devices, or over the same devices
+    grouped otherwise along the axis, are other links; one built again over the same placement is the
+    same."""
+    devices = [[device.id, device.process_index, device.device_kind, _slice(device)]
+               for device in mesh.devices.flat]
+    return json.dumps([axis, [[name, width] for name, width in mesh.shape.items()], devices])
+
+
+def link_figures(bandwidths: Mapping[tuple[Mesh, str], float | None]) -> dict[str, JSON]:
+    """The link figures a checkpoint's rung keeps (`Trainer._checkpoint_rung`): each measured figure of
+    `bandwidths`, by mesh and axis, under the placement it was measured on (`link_topology`)."""
+    return {link_topology(mesh, axis): figure for (mesh, axis), figure in bandwidths.items()
+            if figure is not None}
+
+
+def resumed_link_figures(rung: JSON) -> dict[str, float]:
+    """`link_figures` as a checkpoint's rung recorded them; none where it recorded none."""
+    links = record(record(rung, 'rung').get('links', {}), 'rung links')
+    return {topology: number(figure, f'link of {topology}') for topology, figure in links.items()}
+
+
+def _link_record(topology: str) -> Path | None:
+    """Where `link_bandwidth` keeps the figure of `topology` (`link_topology`): beside the persistent
+    compilation cache, or nowhere when the process keeps no cache."""
     cache = jax.config.jax_compilation_cache_dir
     if not cache:
         return None
-    devices = sorted({(device.device_kind, device.process_index) for device in mesh.devices.flat})
-    name = json.dumps([axis, dict(mesh.shape), devices], sort_keys=True)
-    return Path(cache) / "dew-links" / f"{hashlib.sha256(name.encode()).hexdigest()}.json"
+    return Path(cache) / "dew-links" / f"{hashlib.sha256(topology.encode()).hexdigest()}.json"
 
 
 def _slice(device) -> int:
@@ -413,19 +438,25 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, window: int,
     """Refuse a training stream a run cannot resume or cannot shard.
 
     `resumed` is the step a resume restored from a checkpoint without a data
-    position, which a stream that keeps none cannot continue: it would read
-    its data again from the start. A `batch` the mesh cannot divide fails where it is placed or
+    position, which no stream can continue: with no position to restore, one
+    that keeps positions (`Checkpointable`) and one declared to replay alike
+    would read its data again from the start, so past step 0 it is refused.
+    A `batch` the mesh cannot divide fails where it is placed or
     traced (`check_batch`), unless the stream's rows are not the step's
     (`rows`; a rollout's are its own, checked where its step traces), and a
     ramp stage's, for a later stage, an hour in. A ramp reads each stage's
     batch whole, never in a `window` of more than one microbatch.
     """
-    if resumed is not None and not isinstance(source, Checkpointable):
-        raise ValueError(
-            f"step {resumed}'s checkpoint holds no data position, as {stream_identity(source)} keeps "
-            f"none, so resuming would read its data again from the start; give the stream get_state "
-            f"and set_state, read it through dew.data, or declare that it reads the same batches each "
-            f"time it opens (dew.data.dataset.replayed, from_iter(replay=True))")
+    if resumed:
+        kept = isinstance(source, Checkpointable)
+        why = ("it was saved without one (Checkpoints.save's `saved`)" if kept
+               else f"{stream_identity(source)} keeps none")
+        remedy = ("save the stream's position with the state, as Trainer.fit does" if kept else
+                  "give the stream get_state and set_state, read it through dew.data, or declare that "
+                  "it reads the same batches each time it opens (dew.data.dataset.replayed, "
+                  "from_iter(replay=True))")
+        raise ValueError(f"step {resumed}'s checkpoint holds no data position, as {why}, so resuming "
+                         f"would read its data again from the start; {remedy}")
     if not isinstance(source, RampedStream):
         if rows:
             check_batch(batch, mesh, microbatches)
@@ -988,6 +1019,58 @@ def placed_bytes(tree) -> int:
     sharding places it (abstract arrays carry their sharding)."""
     return sum(math.prod(leaf.sharding.shard_shape(np.shape(leaf))) * np.dtype(leaf.dtype).itemsize
                for leaf in jax.tree.leaves(tree))
+
+
+def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Variables],
+                      mesh: Mesh) -> tuple[Held, Held]:
+    """A copy of `held` on `mesh` as two trees, each None where the other holds
+    an array: the arrays a state of `variables` placed by `shardings` takes
+    over, each where the state keeps the variable of its path and shape
+    (`Objective.held_variables`), and the rest, replicated, which no output of
+    the state takes.
+
+    Handed to the state's JIT as they are, the arrays land below the state it
+    builds and leave a hole the checkpoint's size once freed, which splits
+    the free memory a step's temporaries need in one block
+    (`step_headroom`). Placed where the state keeps them and donated
+    (`taking_over`), they become the state's buffers. The copy leaves the
+    objective's own arrays alone."""
+    kept = {path: (sharding, leaf.shape) for (path, leaf), sharding in zip(
+        jax.tree_util.tree_leaves_with_path(variables), jax.tree.leaves(shardings), strict=True)}
+    replicated = NamedSharding(mesh, P())
+
+    def variable(path, leaf) -> NamedSharding | None:
+        # An initializer binds the checkpoint as `variables`
+        # (`Objective.initializer`), so a leaf's path below that keyword
+        # is its variable's.
+        keys = [key.key if isinstance(key, jax.tree_util.DictKey) else None for key in path]
+        sharding, shape = kept.get(path[keys.index('variables') + 1:] if 'variables' in keys else (),
+                                   (None, None))
+        return sharding if shape == np.shape(leaf) else None
+
+    # A copy of an array already on the devices: device_put can reuse a
+    # buffer the target shares with the source, which donation would free.
+    owned = jax.tree.map(lambda leaf: leaf.copy() if isinstance(leaf, jax.Array) else leaf, held)
+    placed = jax.device_put(owned, jax.tree_util.tree_map_with_path(
+        lambda path, leaf: variable(path, leaf) or replicated, held))
+    taken = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: None if variable(path, leaf) is None else leaf, placed)
+    return taken, jax.tree.map(lambda one, leaf: leaf if one is None else None, taken, placed,
+                               is_leaf=lambda leaf: leaf is None)
+
+
+def taking_over[Held, Result](function: Callable[[Held, jax.Array], Result], taken: Held, kept: Held,
+                              shardings: Placement[Result]) -> Callable[[jax.Array], Result]:
+    """`function` jitted onto `shardings` over the held tree `placed_held`
+    splits: `taken` donated, for the outputs to take its buffers over, and
+    `kept` not, as no output takes those and JAX only warns of a donation it
+    cannot use. They are freed as the caller drops them."""
+
+    def joined(taken: Held, kept: Held, key: jax.Array) -> Result:
+        return function(jax.tree.map(lambda one, other: other if one is None else one, taken, kept,
+                                     is_leaf=lambda leaf: leaf is None), key)
+
+    return functools.partial(jax.jit(joined, out_shardings=shardings, donate_argnums=0), taken, kept)
 
 
 def prefetched_bytes(batch: Batch, shardings: Placement[Batch]) -> int:

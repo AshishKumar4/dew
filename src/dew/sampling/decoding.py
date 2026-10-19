@@ -638,9 +638,7 @@ def sequence_bias(entries: Sequence[tuple[Sequence[int], float]]) -> SequenceBia
     pairs = [(tuple(ids), float(value)) for ids, value in entries]
     for ids, _ in pairs:
         _ids("sequence_bias", ids)
-    if not pairs:
-        raise ValueError("sequence_bias needs at least one sequence")
-    width = max(len(ids) for ids, _ in pairs)
+    width = max((len(ids) for ids, _ in pairs), default=1)
     table = np.zeros((len(pairs), width), np.int32)
     for row, (ids, _) in enumerate(pairs):
         table[row, width - len(ids):] = ids
@@ -657,8 +655,6 @@ def bad_words(ids: Sequence[Sequence[int]], eos_token_ids: int | Sequence[int] |
     """
     stops = () if eos_token_ids is None else _ids("eos_token_ids", eos_token_ids)
     kept = [tuple(word) for word in ids if not (len(word) == 1 and word[0] in stops)]
-    if not kept:
-        raise ValueError("bad_words_ids holds no sequence outside the EOS ids")
     return sequence_bias([(word, -math.inf) for word in kept])
 
 
@@ -676,19 +672,24 @@ class SuppressTokens:
 class BeginSuppressTokens(_Numerical):
     """Removes tokens at one generated position, as `SuppressTokensAtBeginLogitsProcessor`.
 
-    The reference suppresses where the sequence still has its prompt width, so
-    `offset` is the generated index the suppression applies at, zero for the
-    first drawn token and one where a forced BOS occupies that slot.
+    The reference suppresses the first drawn token, or the one after it where
+    `forced_bos` (`ForcedBOS`) forces the first: transformers moves the begin
+    index past the forced token only for a one-token prompt
+    (generation/utils.py:1278-1282, 5.16.1), the rows where `ForcedBOS` fires.
+    Each row decides by its own prompt, so rows of mixed prompt lengths
+    suppress each at its own position.
     """
 
     tokens: jax.Array
-    offset: int = struct.field(pytree_node=False, default=0)
+    forced_bos: bool = struct.field(pytree_node=False, default=False)
 
     def numerical(self) -> jax.tree_util.Partial:
-        return jax.tree_util.Partial(BeginSuppressTokens.apply, self.tokens, self.offset)
+        return jax.tree_util.Partial(BeginSuppressTokens.apply, self.tokens, self.forced_bos)
 
     @staticmethod
-    def apply(tokens: jax.Array, offset: int, state: StepState, logits: jax.Array) -> jax.Array:
+    def apply(tokens: jax.Array, forced_bos: bool, state: StepState, logits: jax.Array) -> jax.Array:
+        # A row's prompt is its real tokens less the ones it has drawn.
+        offset = (forced_bos & (state.total() - state.step == 1)).astype(state.step.dtype)
         removed = _membership(tokens, logits.shape[-1])[None, :] & (state.step == offset)[:, None]
         return jnp.where(removed, FILTER, logits)
 

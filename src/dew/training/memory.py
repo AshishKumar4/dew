@@ -18,7 +18,8 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 
 from dew.data.dataset import rows_of
-from dew.nn.kernels.generation import device_generation, gpu_target
+from dew.nn.kernels.generation import backend, device_generation, gpu_target
+from dew.nn.kernels.options import compiler_options
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.nn.sharding import mesh_axes
 from dew.objectives.base import Batch, Objective, Variables
@@ -77,14 +78,15 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
     Only an LM objective gives the tokens per row, its `seq_len`, so any other
     objective's frozen step runs apart. Triton GEMM fusions are turned off where
     `gpu_target().kernels['xla_triton_gemm']` measured a win and no module the step runs
-    keeps them (`TritonGemm`).
+    keeps them (`TritonGemm`), and wherever a module the step runs computes in int8
+    (`compiler_options`).
     """
     generation = device_generation()
     options: dict[str, bool | int] = {}
-    if generation.startswith('sm') and devices > 1:
+    if backend() == 'gpu' and devices > 1:
         options.update({name: value for name, value in COLLECTIVES.items() if xla_flag(name) is None})
     small = tokens <= 128
-    if (generation.startswith('sm') and xla_flag('xla_gpu_dot_merger_threshold_mb') is None
+    if (backend() == 'gpu' and xla_flag('xla_gpu_dot_merger_threshold_mb') is None
             and not (frozen and small)):
         options['xla_gpu_dot_merger_threshold_mb'] = 0
     modules = [entry.module for entry in objective.program_key()]
@@ -93,6 +95,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
             and modules and not any(isinstance(module, TritonGemm) and module.keeps_triton_gemm
                                     for module in modules)):
         options['xla_gpu_enable_triton_gemm'] = False
+    options.update(compiler_options(*modules))
     return options or None
 
 

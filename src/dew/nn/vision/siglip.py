@@ -2,8 +2,11 @@
 (transformers 5.16.1 `models/siglip/modeling_siglip.py`, `models/gemma3/modeling_gemma3.py`).
 """
 
+from __future__ import annotations
+
 import dataclasses
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -15,7 +18,13 @@ from dew import records
 from dew.interop.weights import checkpoint_array
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.conv import Conv
-from dew.nn.text_encoders import _encoder_layer_path, checked_image, clip_layer, tower_activation
+from dew.nn.text_encoders import (
+    TOWER_ACTIVATIONS,
+    _encoder_layer_path,
+    checked_image,
+    clip_layer,
+    tower_activation,
+)
 from dew.objectives.base import Variables
 from dew.registry import Record
 
@@ -24,10 +33,15 @@ from .common import (
     ProjectorBase,
     TowerBase,
     TowerGeometry,
-    _image_size,
+    _side,
     _vision_section,
+    activation_name,
     head_width,
+    trunk_geometry,
 )
+
+if TYPE_CHECKING:
+    from dew.interop.streaming import WeightLayout
 
 
 class SiglipVisionTransformer(nn.Module):
@@ -39,7 +53,7 @@ class SiglipVisionTransformer(nn.Module):
     checkpoints carry is not built; the Gemma path reads the sequence alone.
     """
 
-    config: "SiglipVision"
+    config: SiglipVision
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -182,51 +196,44 @@ def siglip_vision_path(hf_name: str) -> tuple[str, ...] | None:
 
 def translate_gemma_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Variables:
-    """A Gemma projector's two tensors into its parameter tree.
+) -> tuple[Variables, tuple[WeightLayout, ...]]:
+    """A Gemma projector's two tensors into its parameter tree, with the layouts that write them
+    back.
 
     The norm's weight becomes its scale; the projection matrix is a plain
     parameter the reference multiplies as is, so unlike a Linear kernel it
     keeps its layout.
     """
+    from dew.interop.streaming import WeightLayout
+
     known = set(_PROJECTOR_PATHS["gemma"])
     unknown = sorted(set(hf_tensors) - known)
     if unknown:
         raise ValueError(f"unknown tensor names {unknown}")
-    return {module: {leaf: np.ascontiguousarray(checkpoint_array(hf_tensors[name], param_dtype))}
-            for name, (module, leaf) in _PROJECTOR_PATHS["gemma"].items()}
+    paths = _PROJECTOR_PATHS["gemma"]
+    return ({module: {leaf: np.ascontiguousarray(checkpoint_array(hf_tensors[name], param_dtype))}
+             for name, (module, leaf) in paths.items()},
+            tuple(WeightLayout(name, (path,), tuple(np.shape(hf_tensors[name])))
+                  for name, path in paths.items()))
 
 
 def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Record:
     """A SiglipVisionConfig into a SiglipVision value's fields.
 
     Reads the vision_config of a multimodal wrapper or a bare vision config.
-    Only square images map; anything but tanh or exact gelu refuses with its
-    name, and a nonzero dropout refuses as training-only.
+    Only square images map, and an activation the trunk does not compute
+    (`TOWER_ACTIVATIONS`) refuses with its name. Dropout, which the eval trunk
+    never applies, is left unread.
     """
     vision = _vision_section(hf_config)
-    hidden = records.integer(vision["hidden_size"], "hidden_size")
-    patch = vision.get("patch_size", 16)
-    if isinstance(patch, (list, tuple)):
-        patch = patch[0]
-    activation = str(vision.get("hidden_act", vision.get("hidden_activation",
-                                                         "gelu_pytorch_tanh")))
-    if activation not in ("gelu_pytorch_tanh", "gelu"):
-        raise ValueError(
-            f"hidden_act {activation!r} is not expressible: this trunk runs tanh or "
-            "exact gelu")
-    if records.number(vision.get("attention_dropout", 0.0), "attention_dropout"):
-        raise ValueError("attention_dropout is training-time; this trunk runs eval")
     return {
         "class": "siglip", "fields": {
-        "hidden_size": hidden,
-        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
-        "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
-        "num_heads": records.integer(vision["num_attention_heads"], "num_attention_heads"),
-        "image_size": _image_size(vision.get("image_size", 224), "image_size"),
-        "patch_size": records.integer(patch, "patch_size"),
+        **trunk_geometry(vision),
+        "image_size": _side(vision.get("image_size", 224), "image_size"),
+        "patch_size": _side(vision.get("patch_size", 16), "patch_size"),
         "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
-        "hidden_act": activation,
+        "hidden_act": activation_name(vision, TOWER_ACTIVATIONS, "gelu_pytorch_tanh",
+                                      ("hidden_act", "hidden_activation")),
         "layer_norm_eps": records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
     }}
 

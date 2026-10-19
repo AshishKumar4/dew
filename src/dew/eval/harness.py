@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Sequence
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -36,9 +37,10 @@ from lm_eval.api.registry import register_model
 from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, postprocess_generated_text
 
 from dew.inference.tasks import TextGeneration, cache_ceiling
+from dew.interop.generation_config import source_decoding
 from dew.nn.inputs import pad_token_rows
+from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import token_log_probs
-from dew.sampling.text import Sampling
 
 DEFAULT_CONTEXT = 2048
 """The scoring window for a model that declares no `max_seq_len`."""
@@ -50,7 +52,13 @@ TokenRequest = tuple[tuple[str, str] | None, list[int], list[int]]
 """One `_loglikelihood_tokens` request: the strings, context ids, continuation ids."""
 
 
-@functools.partial(jax.jit, static_argnums=(0,))
+@functools.cache
+def _scoring(options: tuple[tuple[str, bool], ...]):
+    """`_scored` compiled with the model's own XLA `options` (`compiler_options`), so a quantized
+    model and another never share it."""
+    return jax.jit(_scored, static_argnums=(0,), compiler_options=dict(options))
+
+
 def _scored(model, variables, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Return the per-target log-probability and whether the target was the argmax.
 
@@ -133,9 +141,11 @@ class DewLM(TemplateLM):
         """
         arguments.update({name: value for name, value in (additional or {}).items()
                           if value is not None})
-        # The harness hands every model a device; a run's weights are placed
-        # on a JAX mesh when the task is built, so it is dropped, not refused.
-        arguments.pop("device", None)
+        device = arguments.pop("device", None)
+        if device is not None:
+            raise ValueError(
+                f"--device {device} names a torch device, and a run's weights are placed on JAX "
+                f"devices when its task is built; leave --device unset")
         run = arguments.pop("run", None)
         if run is None:
             raise ValueError(
@@ -173,15 +183,41 @@ class DewLM(TemplateLM):
         return DEFAULT_CONTEXT if declared is None else declared
 
     def tok_encode(self, string: str, add_special_tokens: bool | None = None,
-                   **kwargs: int | None) -> list[int]:
-        """Encode `string` with the run's own tokenizer into one row of ids.
+                   left_truncate_len: int | None = None, **kwargs: int | None) -> list[int]:
+        """Encode `string` with the run's own tokenizer into one row of ids, as `HFLM.tok_encode` does.
 
-        The run's processor adds special tokens the way it did in training,
-        so `add_special_tokens` and the harness's other integer options
-        (`left_truncate_len`) are accepted but ignored.
+        The run's processor adds the special tokens it added in training.
+        Where it inserts a BOS, the BOS is left off with
+        `add_special_tokens=False`, and with None when the text already
+        starts with a BOS, which the tokenizer reads off the text as a second
+        BOS id, so no such row starts with two. `HFLM` asks instead whether
+        the text starts with the BOS's decoded text. The two agree wherever
+        decoding a BOS gives back its spelling, as in released vocabularies,
+        and this reads only what the processor does: the task's processor
+        names no tokenizer, and a checkpoint's decodes with special tokens
+        skipped. `left_truncate_len` keeps that many of the last ids. Any
+        other option raises TypeError, since `HFLM` reads none.
         """
-        del add_special_tokens, kwargs
+        if kwargs:
+            raise TypeError(f"tok_encode takes no {', '.join(sorted(kwargs))}")
+        ids = self._encoded(string)
+        if self._inserts_bos and (add_special_tokens is False
+                                  or (add_special_tokens is None and ids[1:2] == ids[:1])):
+            ids = ids[1:]
+        return ids[-left_truncate_len:] if left_truncate_len else ids
+
+    def _encoded(self, string: str) -> list[int]:
         return [int(token) for token in np.asarray(self._processor([string]).tokens)[0]]
+
+    @functools.cached_property
+    def _inserts_bos(self) -> bool:
+        """Whether the run's processor starts an encoding with the BOS it declares, as Llama's does.
+
+        GPT-2's declares one and inserts none. The probe is one letter,
+        since a processor refuses an empty row.
+        """
+        bos = self._processor.bos_id
+        return bos is not None and self._encoded("a")[:1] == [bos]
 
     def tok_decode(self, tokens: Sequence[int]) -> str:
         return self._processor.decode(np.asarray([list(tokens)], np.int32))[0]
@@ -198,9 +234,12 @@ class DewLM(TemplateLM):
         a continuation longer than `max_length` is refused, since no row
         could hold it with any of its context, and a continuation with no
         ids of its own is refused: scored, it would be probability 1 and
-        greedy, and win every multiple-choice comparison it is in.
+        greedy, and win every multiple-choice comparison it is in. Any
+        option besides `disable_tqdm` raises TypeError.
         """
-        del disable_tqdm, kwargs
+        del disable_tqdm
+        if kwargs:
+            raise TypeError(f"_loglikelihood_tokens takes no {', '.join(sorted(kwargs))}")
         rows: list[list[int]] = []
         for strings, context, continuation in requests:
             named = repr(strings[1]) if strings is not None else "a continuation"
@@ -216,8 +255,8 @@ class DewLM(TemplateLM):
         answers: list[tuple[float, bool]] = []
         for batch in _batches(len(rows), self.batch_size):
             tokens, _ = pad_token_rows([rows[index] for index in batch], padding_side="right")
-            probabilities, argmax = _scored(self.task.model, self.task.variables,
-                                            jnp.asarray(tokens))
+            scoring = _scoring(tuple(compiler_options(self.task.model).items()))
+            probabilities, argmax = scoring(self.task.model, self.task.variables, jnp.asarray(tokens))
             values, matched = np.asarray(probabilities), np.asarray(argmax)
             for offset, index in enumerate(batch):
                 end = len(rows[index]) - 1
@@ -261,6 +300,21 @@ class DewLM(TemplateLM):
         The stop strings cut the decoded text, so a stop sequence that spans
         two tokens ends the answer where the harness expects. A budget that
         fills the whole window raises ValueError, as it does in `HFLM`.
+
+        A beam search (`num_beams` above 1) raises ValueError. `HFLM` always
+        stops on its EOS's text as well as its stop strings, and its criterion
+        reads the leading candidate alone and ends every beam together, which
+        neither Dew's per-beam search nor a cut of its answer reproduces.
+        A request's `max_length` is the total length `HFLM` hands `generate`,
+        context included, in place of the budget. Its temperature is 0 where
+        it names none, which decodes greedily unless the request asks to
+        sample; sampling at 0 raises ValueError, as `generate` does. The other
+        controls are the ones `HFLM` hands Transformers' `generate`, and they
+        decode as a source's generation config does
+        (`dew.interop.generation_config.source_decoding`), over the task's own
+        EOS and pad ids where the request names none: sampling filters,
+        penalties and logits processors. One Dew has no counterpart for raises
+        ValueError, as `generate` refuses a keyword it does not use.
         """
         del disable_tqdm
         eos = None if self.task.sampling.eos_token_ids in (None, ()) else self.tok_decode([self.eot_token_id])
@@ -268,20 +322,36 @@ class DewLM(TemplateLM):
         for request in requests:
             arguments = list(request.args)
             context, raw = str(arguments[0]), dict(arguments[1])
-            # normalize_gen_kwargs sets the budget and the stop strings; the
-            # type leaves every key optional.
-            controls = normalize_gen_kwargs(raw, DEFAULT_BUDGET)
-            budget = controls.get("max_gen_toks", DEFAULT_BUDGET)
+            # normalize_gen_kwargs sets the budget and the stop strings, and
+            # makes do_sample=False greedy; the type leaves every key optional.
+            controls: dict[str, Any] = dict(normalize_gen_kwargs(raw, DEFAULT_BUDGET))
+            budget = controls.pop("max_gen_toks", DEFAULT_BUDGET)
+            stops = handle_stop_sequences(controls.pop("until", None), eos=eos)
+            if int(controls.get("num_beams") or 1) > 1:
+                raise ValueError(
+                    "a beam search is refused: lm-eval's own model stops on its EOS's text and stop "
+                    "strings by the leading candidate alone and ends every beam together, which "
+                    "Dew's per-beam search would answer differently")
+            seed = int(controls.pop("seed", 0))
+            total = controls.pop("max_length", None)
+            # HFLM._model_generate: no temperature is 0, which is greedy unless sampling is asked for.
+            controls.setdefault("temperature", 0.0)
+            if controls["temperature"] == 0.0 and controls.get("do_sample") is None:
+                controls["do_sample"] = False
+            if controls.get("do_sample") and controls["temperature"] == 0.0:
+                raise ValueError("sampling at temperature 0 is refused, as Transformers' generate refuses it")
+            task_ids = {"eos_token_id": self.task.sampling.eos_token_ids,
+                        "pad_token_id": self.task.sampling.pad_token_id}
+            sampling, chain, strategy = source_decoding(task_ids, controls, self.task.model, 1, None)
             if budget >= self.max_length:
                 raise ValueError(
                     f"a budget of {budget} ids leaves no room for a context in this model's "
                     f"{self.max_length}-id window; lm-eval's HFLM refuses it too")
             ids = self.tok_encode(context)[-(self.max_length - budget):]
-            sampling = Sampling(temperature=float(controls.get("temperature", 0.0)),
-                                eos_token_ids=self.task.sampling.eos_token_ids)
-            drawn = self.task([ids], budget, key=int(raw.get("seed", 0)), sampling=sampling)
-            stops = handle_stop_sequences(controls.get("until"), eos=eos)
-            answers.append(postprocess_generated_text(self.task.decode(drawn)[0], stops, None))
+            drawn_budget = budget if total is None else int(total) - len(ids)
+            text = "" if drawn_budget < 1 else self.task.decode(self.task(
+                [ids], drawn_budget, key=seed, sampling=sampling, logits=chain, strategy=strategy))[0]
+            answers.append(postprocess_generated_text(text, stops, None))
         return answers
 
 

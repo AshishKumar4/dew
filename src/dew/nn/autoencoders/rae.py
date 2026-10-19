@@ -32,7 +32,7 @@ from flax.typing import Dtype
 from dew import records
 from dew.interop.components import bind_component, component_source
 from dew.nn.activations import activation
-from dew.nn.attention import LayerNorm, scaled_dot_product_attention
+from dew.nn.attention import LayerNorm, projected_heads, projected_output, scaled_dot_product_attention
 from dew.nn.backbones.sd3 import sincos_position
 from dew.nn.blocks import torch_bicubic_resize
 from dew.nn.mlp import GatedMLP
@@ -85,12 +85,11 @@ class _Attention(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        batch, length, _ = x.shape
-        split = (batch, length, self.heads, self.width // self.heads)
-        query, key, value = (nn.Dense(self.width, dtype=self.dtype, name=name)(x).reshape(split)
+        query, key, value = (projected_heads(x, name, self.heads, self.width // self.heads, flat=True,
+                                             dtype=self.dtype)
                              for name in ("query", "key", "value"))
         attended = scaled_dot_product_attention(query, key, value, dtype=self.dtype)
-        return nn.Dense(self.width, dtype=self.dtype, name="out")(attended.reshape(batch, length, self.width))
+        return projected_output(attended, "out", self.width, flat=True, dtype=self.dtype)
 
 
 class _Block(nn.Module):
@@ -458,6 +457,7 @@ def load_rae(
     subfolder: str = "",
     param_dtype: str = "float32",
     params: Variables | None = None,
+    lazy: bool = False,
 ) -> tuple[RAEAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published RAE, its parameters and their source layouts from
     `subfolder` of a directory or Hub repo, such as
@@ -465,7 +465,8 @@ def load_rae(
     declares must be published, in the shape it declares.
 
     Supplied `params` are bound unchanged: only the config is read, and no
-    source layouts are returned."""
+    source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
+    placement to read (`dew.interop.weights.record_layouts`)."""
     directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
     if config.get("_class_name") != "AutoencoderRAE":
         raise ValueError(
@@ -478,7 +479,7 @@ def load_rae(
         lambda bound: RAEAutoencoder(model=model, params=bound, latents_mean=config.get("latents_mean"),
                                      latents_std=config.get("latents_std"),
                                      scaling_factor=config.get("scaling_factor", 1.0)),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, inputs=(image,))
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(image,))
 
 
 def load_dinov2(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,

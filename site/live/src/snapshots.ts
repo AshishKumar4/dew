@@ -14,7 +14,8 @@ interface SnapshotEnv {
 	SNAPSHOT_COMMIT: string;
 	// Each queues a preparation, which the preparer's alarms run and report to `prepared`.
 	PREPARER: DurableObjectNamespace<DurableObject & {
-		prepare(commit: string, reply: Reply): Promise<void>;
+		// Asked for an `answer`, false where the preparer holds another job; a preparer of an earlier build throws.
+		prepare(commit: string, reply: Reply, options?: { answer: boolean }): Promise<boolean | void>;
 		trial(commit: string, reply: Reply): Promise<void>;
 	}>;
 	POOL?: DurableObjectNamespace<DurableObject & { configure(generation: SnapshotGeneration): Promise<void> }>;
@@ -63,19 +64,29 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 		};
 	}
 
-	async ensure(commit = this.env.SNAPSHOT_COMMIT): Promise<{
+	/**
+	 * The generation of the registry's pinned commit, or its preparation started: within a second, or once the lease
+	 * a preparation holds ends. The pin is the registry's own deploy's, over `commit`, the caller's (a preview Worker,
+	 * which shares production's registry, or a Worker of the last deploy during the rollout); `commit` where the
+	 * registry has none. Where the pin's last preparation failed, the retry `retry` scheduled keeps its time unless
+	 * `retryNow`, the operator's warm: a visitor's request does not undo the backoff.
+	 */
+	async ensure(commit = this.env.SNAPSHOT_COMMIT, { retryNow = false } = {}): Promise<{
 		generation: SnapshotGeneration | null; rebuilding: boolean;
 	}> {
-		const generation = await this.current(commit);
+		const pinned = this.env.SNAPSHOT_COMMIT || commit;
+		const generation = await this.current(pinned);
 		if (generation) return { generation, rebuilding: false };
-		if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('snapshot generation must be pinned');
+		if (!/^[0-9a-f]{40}$/.test(pinned)) throw new Error('snapshot generation must be pinned');
 		await this.ctx.storage.transaction(async (storage) => {
-			if ((await storage.get<string>('requested')) !== commit) await storage.delete('retries');
-			await storage.put('requested', commit);
+			const requested = await storage.get<string>('requested');
+			if (requested !== pinned) await storage.delete('retries');
+			await storage.put('requested', pinned);
 			const lease = await storage.get<{ until: number }>('rebuild');
 			const next = lease && lease.until > Date.now() ? lease.until + 1000 : Date.now() + 1000;
 			const alarm = await storage.getAlarm();
-			if (alarm === null || alarm > next) await storage.setAlarm(next);
+			const failed = requested === pinned && (await storage.get<{ commit: string }>('failure'))?.commit === pinned;
+			if (alarm === null || (alarm > next && (retryNow || !failed))) await storage.setAlarm(next);
 		});
 		return { generation: null, rebuilding: true };
 	}
@@ -118,7 +129,8 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 			else await this.failed(lease.token, 'the preparation left no outcome within its lease');
 			return;
 		}
-		const commit = await this.ctx.storage.get<string>('requested') || this.env.SNAPSHOT_COMMIT || (await this.previous())?.commit;
+		// The deploy's pinned commit over a request of another (a Worker of the last deploy's, during the rollout).
+		const commit = this.env.SNAPSHOT_COMMIT || await this.ctx.storage.get<string>('requested') || (await this.previous())?.commit;
 		if (commit) await this.refresh(commit);
 		else {
 			console.error('snapshot renewal has no requested generation');
@@ -141,13 +153,49 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 			return true;
 		});
 		if (!acquired) return false;
+		let taken: boolean | void;
+		const asked = Date.now();
 		try {
-			await this.env.PREPARER.get(this.env.PREPARER.idFromName('trusted')).prepare(commit,
-				{ registry: this.ctx.id.toString(), token });
+			taken = await this.env.PREPARER.get(this.env.PREPARER.idFromName('trusted')).prepare(commit,
+				{ registry: this.ctx.id.toString(), token }, { answer: true });
 		} catch (error) {
 			await this.failed(token, String(error));
+			return true;
 		}
+		if (taken === false) await this.waiting(token, asked);
+		else await this.ctx.storage.delete('waiting');
 		return true;
+	}
+
+	/**
+	 * The preparer holds another job, which is no failure of `token`'s commit: the lease ends unfailed, its backoff
+	 * kept as it was, and the preparation waits for the preparer to say it is free (`freed`), or at the latest for as
+	 * long as any job of the preparer's may run.
+	 */
+	private async waiting(token: string, asked: number): Promise<void> {
+		await this.ctx.storage.transaction(async (storage) => {
+			const lease = await storage.get<{ token: string }>('rebuild');
+			if (lease?.token !== token) return;
+			await storage.delete('rebuild');
+			// Freed since it was asked, its word came before this: the preparation runs now.
+			if (((await storage.get<number>('freed')) ?? 0) >= asked) {
+				await storage.setAlarm(Date.now() + 1000);
+				return;
+			}
+			await storage.put('waiting', true);
+			await storage.setAlarm(Date.now() + REBUILD_MS);
+		});
+	}
+
+	/** The trusted preparer is free: a preparation it turned away while it held another job runs now. */
+	async freed(): Promise<void> {
+		await this.ctx.storage.transaction(async (storage) => {
+			await storage.put('freed', Date.now());
+			if (!(await storage.get<boolean>('waiting'))) return;
+			await storage.delete('waiting');
+			const lease = await storage.get<{ until: number }>('rebuild');
+			if (!lease || lease.until <= Date.now()) await storage.setAlarm(Date.now() + 1000);
+		});
 	}
 
 	/** A preparer's report of how a preparation it was handed ended. */
@@ -169,7 +217,7 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 			await storage.delete('failure');
 			await storage.delete('retries');
 			await storage.delete('rebuild');
-			const requested = await storage.get<string>('requested');
+			const requested = this.env.SNAPSHOT_COMMIT || await storage.get<string>('requested');
 			if (requested && requested !== candidate.commit) await storage.setAlarm(Date.now() + 1000);
 			else {
 				await storage.delete('requested');

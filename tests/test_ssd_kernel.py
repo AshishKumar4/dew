@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
+from reference_error import assert_computes_the_oracle, assert_leaves_as_exact, float64_terms
 
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
 from dew.nn.mixers.mamba2 import RESET_DECAY, xla_chunk_scan
@@ -115,7 +115,9 @@ def assert_kernel_parity(operands, *, compiled: bool, roundings: int):
     """The kernel's forward and all five gradients, interpreted or `compiled` for the device this
     process holds, finite and by the float64 rule against the stepwise recurrence in float64 on the
     host, the XLA path's fp32 run the reference; the XLA path's own arithmetic in float64 first held
-    to the recurrence (`assert_computes_the_oracle`, `roundings` the steps and widths it sums)."""
+    to the recurrence (`assert_computes_the_oracle`, `roundings` the steps and widths it sums). An
+    entry sums a chunk's steps of products over the state or the head width, in another order than
+    the XLA path's, so each is held to the rounding of that many reductions."""
     platform = jax.default_backend() if compiled else "tpu"
     if compiled:
         # pallas interprets only for a platform the process holds no device of
@@ -128,10 +130,14 @@ def assert_kernel_parity(operands, *, compiled: bool, roundings: int):
         wide_seeds = tuple(jnp.asarray(np.asarray(t), jnp.float64) for t in seeded)
         truth = jax.jit(stepwise_scan)(*exact)
         truth_gradients = jax.jit(lambda *o: jax.vjp(stepwise_scan, *o)[1](wide_seeds))(*exact)
-        twin = jax.jit(xla_chunk_scan)(*exact)
-        twin_gradients = jax.jit(lambda *o: jax.vjp(xla_chunk_scan, *o)[1](wide_seeds))(*exact)
-        truth, twin = ([np.asarray(t) for t in (*first, *second)]
-                       for first, second in ((truth, truth_gradients), (twin, twin_gradients)))
+        # The XLA path in float64 and each entry's terms, its own sums (`float64_terms`), each entry's
+        # size where its sum cancels.
+        def twin_and_gradients(*o):
+            return (*xla_chunk_scan(*o), *jax.vjp(xla_chunk_scan, *o)[1](wide_seeds))
+
+        twin, terms = float64_terms(twin_and_gradients, *exact)
+        truth = [np.asarray(t) for t in (*truth, *truth_gradients)]
+        twin, terms = ([np.asarray(t) for t in values] for values in (twin, terms))
 
     xla = jax.jit(xla_chunk_scan)(*operands)
     xla_gradients = jax.jit(lambda *o: jax.vjp(xla_chunk_scan, *o)[1](seeded))(*operands)
@@ -139,12 +145,15 @@ def assert_kernel_parity(operands, *, compiled: bool, roundings: int):
     kernel_gradients = jax.jit(lambda *o: jax.vjp(lambda *p: ssd_chunk_scan(*p, platform), *o)[1](
         seeded))(*operands)
 
+    _, _, size, _, width = operands[0].shape
+    reductions = size * max(width, operands[1].shape[-1])
     names = ("output", "final", "x", "B", "C", "A dt", "state")
-    for name, mine, theirs, wide, want in zip(names, (*kernel, *kernel_gradients), (*xla, *xla_gradients),
-                                              twin, truth, strict=True):
+    pairs = zip(names, (*kernel, *kernel_gradients), (*xla, *xla_gradients), twin, truth, terms, strict=True)
+    for name, mine, theirs, wide, want, summed in pairs:
         assert np.all(np.isfinite(np.asarray(mine))), name
         assert_computes_the_oracle(wide, want, name, roundings=roundings)
-        assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), want, name)
+        assert_leaves_as_exact({name: np.asarray(mine)}, {name: np.asarray(theirs)}, {name: want},
+                               reductions=reductions, terms={name: summed})
 
 
 def fixture_case(reference, chunk_size: int, resets: bool):

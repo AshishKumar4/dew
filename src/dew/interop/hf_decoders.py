@@ -44,17 +44,19 @@ from dew.interop.decoder_parts import (
     AudioFields,
     DecoderFamily,
     DecoderFields,
+    Reading,
     WrapperFields,
     _refuse_drafter,
     _unread,
+    held_parts,
     hf_activation,
     record_float,
     record_int,
     refuse,
     translated,
 )
-from dew.interop.streaming import LazyTree, SourceLeaf, materialize
-from dew.interop.weights import checkpoint_dtype, insert
+from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
+from dew.interop.weights import checkpoint_dtype, insert, nested
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -304,7 +306,7 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     ones. A family that reads its media bundle whole keeps the decoder's
     tensors unprefixed.
     """
-    tower_prefix = vision_nn.TOWER_PREFIX[_kind_name(record, "tower")]
+    tower_prefix = vision_nn.TOWERS[_kind_name(record, "tower")].prefix
     projector_prefix = vision_nn.PROJECTOR_PREFIX[_kind_name(record, "projector")]
     audio = record.get("audio") is not None
     bundled = _bundled(record["model_type"])
@@ -473,35 +475,70 @@ def translate_wrapper_weights(
     param_dtype: str = "float32",
     lazy: bool = False,
 ) -> Variables:
-    """Map wrapper weights into language, tower, projector and audio trees.
+    """Map wrapper weights into language, tower, projector and audio trees:
+    `read_wrapper`'s."""
+    return read_wrapper(hf_tensors, record, param_dtype=param_dtype, lazy=lazy)[0]
 
-    Each name routes by prefix (`wrapper_route`). The language half rides
-    the text family's own map, including the top-level tied head copy, and
-    the tower and projector halves ride theirs. `lazy` leaves the language
-    model's leaves unread (`translate_weights`); the towers and projectors
-    are small and read whole.
+
+def read_wrapper(
+    hf_tensors: Mapping[str, np.ndarray],
+    record: WrapperFields,
+    *,
+    param_dtype: str = "float32",
+    lazy: bool = False,
+) -> tuple[Variables, tuple[Reading, ...], tuple[WeightLayout, ...]]:
+    """Map wrapper weights into language, tower, projector and audio trees,
+    and return them with the language model's readings (`read_decoder`),
+    named as the language model reads them (`wrapper_route`'s local names),
+    and the layouts the media readers placed their tensors by, under the
+    source's own names, at their paths in the wrapper's collections. Each
+    name routes by prefix (`wrapper_route`). The language half rides the
+    text family's own map, including the top-level tied head copy, and the
+    tower and projector halves ride theirs. `lazy` leaves the language
+    model's leaves unread; the towers and projectors are small and read
+    whole.
     """
-    sources, _ = _wrapper_sources(hf_tensors, hf_tensors.__getitem__, record)
+    sources, aliases = _wrapper_sources(hf_tensors, hf_tensors.__getitem__, record)
     tables = {group: {local: hf_tensors[name] for local, name in held.items()}
               for group, held in sources.items()}
-    variables = {
-        "language_model": translate_weights(tables["language_model"], record["text"],
-                                            param_dtype=param_dtype, lazy=lazy),
-        "tower": vision_nn.tower_variables(_kind_name(record, "tower"), tables["tower"], param_dtype),
-        "projector": {"params": vision_nn.projector_variables(
-            _kind_name(record, "projector"), tables["projector"], param_dtype)},
-    }
+    language, readings = read_decoder(tables["language_model"], record["text"], param_dtype=param_dtype,
+                                      lazy=lazy)
+    tower, tower_layouts = vision_nn.tower_variables(_kind_name(record, "tower"), tables["tower"],
+                                                     param_dtype)
+    projector, projector_layouts = vision_nn.projector_variables(
+        _kind_name(record, "projector"), tables["projector"], param_dtype)
+    variables = {"language_model": language, "tower": tower, "projector": {"params": projector}}
+    placed = {"tower": tower_layouts, "projector": nested(projector_layouts, 0, "params")}
     audio = record.get("audio")
     if audio is not None:
         encoder = towers.from_record(audio)
         if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
             raise ValueError(f"audio tower {audio['class']!r} has no weight map here")
-        variables["audio_tower"] = audio_nn.audio_weights(
-            tables["audio_tower"], encoder, param_dtype=param_dtype
-        )
-        variables["audio_projector"] = {"params": vision_nn.projector_variables(
-            _kind_name(record, "audio_projector"), tables["audio_projector"], param_dtype)}
-    return variables
+        variables["audio_tower"], placed["audio_tower"] = audio_nn.audio_weights(
+            tables["audio_tower"], encoder, param_dtype=param_dtype)
+        audio_projector, audio_layouts = vision_nn.projector_variables(
+            _kind_name(record, "audio_projector"), tables["audio_projector"], param_dtype)
+        variables["audio_projector"] = {"params": audio_projector}
+        placed["audio_projector"] = nested(audio_layouts, 0, "params")
+    # Each component's collections hold it under its own name in the wrapper's, and every
+    # spelling the source stores of one tensor (`_wrapper_sources` checked them equal) writes
+    # from its one leaf.
+    spellings: dict[str, set[str]] = {}
+    for earlier, later in aliases:
+        spellings.setdefault(later, set()).add(earlier)
+
+    def spelled(name: str) -> list[str]:
+        found, pending = {name}, [name]
+        while pending:
+            fresh = spellings.get(pending.pop(), set()) - found
+            found.update(fresh)
+            pending.extend(fresh)
+        return sorted(found)
+
+    media = tuple(dataclasses.replace(layout, name=name)
+                  for group, layouts in placed.items() for layout in nested(layouts, 1, group)
+                  for name in spelled(sources[group][layout.name]))
+    return variables, readings, media
 
 
 def _stack_experts(params: LazyTree) -> None:
@@ -575,11 +612,26 @@ def translate_weights(
     param_dtype: str = "float32",
     lazy: bool = False,
 ) -> Variables:
-    """Map HF tensors into a CausalTransformer tree, with parameters in FP32 by default.
+    """Map HF tensors into a CausalTransformer tree, with parameters in FP32 by
+    default: `read_decoder`'s tree."""
+    return read_decoder(hf_tensors, config, model_type, param_dtype=param_dtype, lazy=lazy)[0]
 
-    Each tensor goes through its family's `prepare_weights` and `weight_path`. A
-    2-D kernel is transposed from torch's [out, in] to Dense's [in, out], and
-    per-expert tensors are stacked on an expert axis.
+
+def read_decoder(
+    hf_tensors: Mapping[str, np.ndarray],
+    config: DecoderFields,
+    model_type: str | None = None,
+    *,
+    param_dtype: str = "float32",
+    lazy: bool = False,
+) -> tuple[Variables, tuple[Reading, ...]]:
+    """Map HF tensors into a CausalTransformer tree, with parameters in FP32 by
+    default, and return it with the readings it placed (`DecoderFamily.readings`),
+    which the source's bindings are built from.
+
+    Each tensor goes through its family's `prepare` and `packed` split and
+    `weight_path`. A 2-D kernel is transposed from torch's [out, in] to
+    Dense's [in, out], and per-expert tensors are stacked on an expert axis.
 
     A tied checkpoint also stores lm_head.weight as a copy of the embedding
     (Qwen3-0.6B does). The copy is checked and dropped, because the tree has one
@@ -591,8 +643,8 @@ def translate_weights(
     keep their own dtype. Each leaf is converted before its layout copy.
 
     With `lazy`, every leaf is a `SourceLeaf` over the stored tensors that is read
-    only when it is placed (`dew.interop.streaming`); otherwise each leaf is read
-    whole here.
+    and cast only when it is placed (`dew.interop.streaming`); `prepare` and an
+    interleaved split still run here. Otherwise each leaf is read whole here.
 
     `model_type` names the source's own family when the caller read it from a
     config.json. Without it, the family comes from the record, which describes
@@ -608,16 +660,16 @@ def translate_weights(
     # second tensor for a filled leaf is refused where it is placed.
     copies = {copy for copy, _ in _text_aliases(hf_tensors, hf_tensors.__getitem__, config,
                                                  _tied_names(family, config, hf_tensors))}
-
+    readings = family.readings(hf_tensors, config)
     # params is always a collection, mapped tensors or not. A checkpoint
     # whose every tensor maps to nothing is an empty tree.
     params: LazyTree = {}
     variables: LazyTree = {'params': params}
-    for name, tensor in family.prepare_weights(hf_tensors, config).items():
-        path = family.source_path(name, config)
+    for name, part in held_parts(readings).items():
+        path = part.path
         if path is None or name in copies:
             continue
-        stored = np.asarray(tensor)
+        stored = np.asarray(part.tensor)
         dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32", path=path)
         # torch Linear holds [out, in]; a stacked expert kernel arrives
         # [E, in, out], which is the layout dew keeps.
@@ -628,7 +680,7 @@ def translate_weights(
             name,
         )
     _stack_experts(params)
-    return variables if lazy else materialize(variables)
+    return (variables if lazy else materialize(variables)), readings
 
 
 def translate_denoiser_weights(
@@ -744,7 +796,8 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
 
 
 def export_config(model) -> Mapping[str, object]:
-    """Write a CausalTransformer's fields back into HF vocabulary."""
+    """Write a CausalTransformer's fields back into HF vocabulary, refusing a model the config
+    would read back as another computation (`refuse_lossy_export`)."""
     family = _family_for_model(model)
     exported = family.export_fields(model)
     chunked = sorted(name for name, kind in (model.kinds or {}).items() if kind.chunk is not None)
@@ -814,45 +867,37 @@ def export_config(model) -> Mapping[str, object]:
         config['rope_theta'] = model.rope_theta
     if sliding is not None and sliding.window is not None:
         config['sliding_window'] = sliding.window
-    # The ramp writes in the flat spelling every family that reads one
-    # accepts (rope_scaling beside rope_theta, as Llama 3.1 ships it); a
-    # ramp that differs between kinds has that spelling in no reference
-    # this exports, so it is refused naming the kinds.
-    ramps = {kind: model.kind_of(kind).rope_scaling for kind in set(types)}
-    if len(set(ramps.values())) > 1:
-        raise ValueError(
-            f"rope_scaling differs between layer kinds ({sorted(ramps)}), which "
-            "no exported family spells; the model cannot be written back")
-    ramp = model.kind_of(types[0]).rope_scaling
-    if ramp is not None:
-        config['rope_scaling'] = dataclasses.asdict(ramp)
-    # A YaRN table replaces the frequencies rather than riding over them.
-    # One table the whole model shares writes flat beside rope_theta, which
-    # is where the single-table references read it. A table that differs
-    # between the kinds is what Olmo3RotaryEmbedding builds, one per kind
-    # out of nested rope_parameters (modeling_olmo3.py:277-291, the
-    # spelling Olmo3Config.to_dict writes); a reference with one table for
-    # the whole model cannot say it, so that is refused naming the kinds.
-    yarns = {kind: model.kind_of(kind).yarn for kind in sorted(set(types))}
-    ramped = {kind: yarn for kind, yarn in yarns.items() if yarn is not None}
-    per_kind = bool(ramped) and (set(ramped) != set(yarns)
+    # A ramp, Llama 3's over the frequencies or a YaRN table in place of them,
+    # that the whole model shares writes flat beside rope_theta, which is
+    # where the single-table references read it (as Llama 3.1 ships it). A
+    # ramp that differs between the kinds is what Olmo3RotaryEmbedding
+    # builds, each kind's through its own ROPE_INIT_FUNCTIONS entry out of
+    # nested rope_parameters (modeling_olmo3.py:277-291, the spelling
+    # Olmo3Config.to_dict writes); a reference with one table for the whole
+    # model cannot say it, so that is refused naming the kinds.
+    tables = {kind: model.kind_of(kind).yarn or model.kind_of(kind).rope_scaling
+              for kind in sorted(set(types))}
+    ramped = {kind: table for kind, table in tables.items() if table is not None}
+    per_kind = bool(ramped) and (set(ramped) != set(tables)
                                  or len(set(ramped.values())) > 1
                                  or local_theta is not None)
     if per_kind:
         if not sandwich:
             raise ValueError(
-                f"the yarn table differs between the layer kinds {sorted(yarns)}, "
+                f"the rotary ramp differs between the layer kinds {sorted(tables)}, "
                 f"and the {family.export_model_type} reference rotates every layer "
                 "at one table; the model cannot be written back")
         config['rope_parameters'] = {
-            kind: (dataclasses.asdict(yarn) if yarn is not None else
-                   {'rope_type': 'default', 'rope_theta': model.kind_of(kind).rope_theta})
-            for kind, yarn in yarns.items()}
+            kind: {**({'rope_type': 'default'} if table is None else dataclasses.asdict(table)),
+                   'rope_theta': model.kind_of(kind).rope_theta}
+            for kind, table in tables.items()}
         config.pop('rope_local_base_freq', None)
     elif ramped:
         config['rope_scaling'] = dataclasses.asdict(next(iter(ramped.values())))
     config.update(exported)
-    return {key: value for key, value in config.items() if value is not None or key == 'pad_token_id'}
+    written = {key: value for key, value in config.items() if value is not None or key == 'pad_token_id'}
+    refuse_lossy_export(model, written)
+    return written
 
 
 _RUNTIME_FIELDS = frozenset({

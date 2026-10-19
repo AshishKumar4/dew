@@ -5,7 +5,7 @@ import binascii
 import functools
 import io
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
@@ -54,7 +54,8 @@ from dew.decision.questions import (
 from dew.files import write_atomically
 from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop.processors import Processor
-from dew.nn.inputs import RowPlan, mesh_of
+from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
+from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import Metric, Objective, Variables
 from dew.records import JSON, json_value, record
 
@@ -111,6 +112,19 @@ class Usage:
     @property
     def truncated(self) -> bool:
         return self.state_kept < self.state_tokens
+
+
+@dataclass(frozen=True)
+class DecideSettings:
+    """What a decision run records beside its backbone, and its task is built with
+    (`Decide.from_run`): the head's record (`Head.record`), the layout's name and fields, the
+    special tokens, the text tokenizer's name, and an image processor's source, or None."""
+
+    head: JSON
+    layout: JSON
+    specials: Specials
+    tokenizer: str | None
+    processor: str | None
 
 
 @dataclass(frozen=True)
@@ -182,30 +196,28 @@ class Decide:
         the tokenizer that lays out the task's text.
         """
         from dew.data.text import tokenizer_for
-        from dew.inference.tasks import run_record, saved_model
+        from dew.inference.tasks import run_record, saved_model, saved_settings
         from dew.interop.pretrained import load_processor
         from dew.registry import from_record, objectives
 
         record, step = run_record(directory, step)
+        settings = saved_settings(record, DecideSettings)
         backbone = saved_model(record, dtype).build()
         width, head_dtype = DecisionModel.head_size(backbone)
-        model = DecisionModel(backbone, Head.from_record(records.json_value(record["head"], "head"),
-                                                         width, dtype=head_dtype))
-        laid = records.record(record["layout"], "layout")
+        head = Head.from_record(records.json_value(settings.head, "head"), width, dtype=head_dtype)
+        # The head computes in the dtype it recorded, or as a fresh head over
+        # the backbone would where the caller overrides the compute dtype.
+        model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
+        laid = records.record(settings.layout, "layout")
         rows = from_record(_LAYOUTS[records.text(laid["name"], "layout.name")],
                            records.json_value(laid["fields"], "layout.fields"))
-        tokenizer = record.get("tokenizer")
-        if tokenizer is None:
+        if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
-        processor = None
-        saved_processor = record.get("processor")
-        if saved_processor is not None:
-            processor = load_processor(records.text(saved_processor, "processor"), backbone)
+        processor = None if settings.processor is None else load_processor(settings.processor, backbone)
         variables = objectives[records.text(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         averaged = Checkpoints(directory).stored(step).get("ema") is not None if ema is None else ema
-        task = cls(model, variables, rows, tokenizer_for(records.text(tokenizer, "tokenizer")),
-                   from_record(Specials, records.json_value(record["specials"], "specials")),
+        task = cls(model, variables, rows, tokenizer_for(settings.tokenizer), settings.specials,
                    name=str(epath.Path(directory).name), weights=Weights(step, averaged),
                    processor=processor)
         saved = epath.Path(directory) / TASK_FILE
@@ -371,9 +383,20 @@ class Decide:
         plan = RowPlan.over(mesh_of(self.variables), count)
         return plan.host(self._forward(self.variables, plan.place(plan.pad(padded))))[:len(rows)]
 
+    def _forward(self, variables: Variables, inputs: DecisionInputs, *,
+                 media: ModelInputs | None = None) -> jax.Array:
+        """`model.logits`, compiled once for each set of XLA options the model takes where it runs
+        (`compiler_options`)."""
+        model = self.model
+        options = compiler_options(model.backbone, model.head)
+        key = tuple(options.items())
+        if key not in self._forwards:
+            self._forwards[key] = jax.jit(model.logits, compiler_options=options)
+        return self._forwards[key](variables, inputs, media=media)
+
     @functools.cached_property
-    def _forward(self):
-        return jax.jit(self.model.logits)
+    def _forwards(self) -> dict[tuple[tuple[str, bool], ...], Callable[..., jax.Array]]:
+        return {}
 
     def tournament(self, state: JSON, questions: Mapping[str, Question], *,
                    group: int = 16) -> dict[str, Answer]:
@@ -464,8 +487,8 @@ class Decide:
         return DecisionObjective(self, temperatures=self.calibration.temperatures)
 
     def _scored(self, reader: Reader) -> list[Scored]:
-        """Each answered question of `reader`'s rows, with its raw logits in the
-        order the row shows its options and its label."""
+        """Each answered question of `reader`'s rows, with its raw logits and its
+        gold distribution in the order the row shows its options."""
         scored = []
         segments = self.layout.bounds(self.tokenizer, self.specials).segments
         for batch in reader(DataPartition()):
@@ -476,7 +499,7 @@ class Decide:
             for row, slot in zip(*np.nonzero(answered), strict=True):
                 count = int(np.sum(batch["options"][row, slot]))
                 scored.append(Scored(KINDS[int(batch["kinds"][row, slot])].kind, logits[row, slot, :count],
-                                     int(batch["labels"][row, slot])))
+                                     np.asarray(batch["targets"][row, slot, :count], np.float64)))
         return scored
 
     def gated(self, min_confidence: float | Mapping[str, float]) -> Self:

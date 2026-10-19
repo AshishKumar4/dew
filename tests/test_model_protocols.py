@@ -43,7 +43,7 @@ Beside the families: DiffusionGemma's layer-scalar preparation, a LoRA
 adapter on the head, media through the multimodal reads, the JEPA encoders'
 representations (test_architectures.py's cases), and the torchax fallback.
 The last section holds the denoisers and autoencoders to what they declare:
-every registered model built tiny by test_precision_policy.py's `build_model`
+every registered model built tiny by tests/tiny_models.py's `build_model`
 and `tiny_inputs`, which that file's registry-wide parametrization needs.
 """
 
@@ -61,7 +61,7 @@ from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_error import assert_as_exact_as_the_reference, widened
 from test_architectures import CASES as ARCHITECTURES, MASK, TEXT_FEATURES, TEXT_TOKENS, VOCAB
-from test_precision_policy import build_model, tiny_inputs
+from tiny_models import build_model, tiny_inputs
 
 from dew.interop import Pretrained, hf_decoders
 from dew.lora import LoRA
@@ -105,10 +105,12 @@ DECODERS = [name for name in CHECKPOINTS if name not in OWN]
 
 
 def _layers(value, found: set[str], under: bool = False) -> set[str]:
-    """The mixer names a translated record declares, under `mixer` or `kinds`, and its layer types."""
+    """The mixer classes a translated record names, by the `class` of each
+    record under `mixer` or `kinds` (KDA beside MLA is not a delta net beside
+    attention), and its layer types."""
     if isinstance(value, dict):
         for key, item in value.items():
-            if under and key == "name" and isinstance(item, str):
+            if under and key == "class" and isinstance(item, str):
                 found.add(item)
             _layers(item, found, under or key in ("mixer", "kinds"))
             if key == "layer_types" and isinstance(item, (list, tuple)):
@@ -436,7 +438,7 @@ def test_a_torchax_models_reads_are_its_forward(tmp_path):
     config = transformers.GPTNeoXConfig(num_hidden_layers=2, hidden_size=64, num_attention_heads=4,
                                         intermediate_size=256, vocab_size=256, max_position_embeddings=64)
     transformers.GPTNeoXForCausalLM(config).eval().save_pretrained(tmp_path)
-    with pytest.warns(UserWarning, match="tier 3"):
+    with pytest.warns(UserWarning):
         source = Pretrained.load(tmp_path, fallback="torchax", dtype="float32")
     model, variables = source.model, source.variables
     tokens = jnp.asarray(np.random.RandomState(0).randint(0, 256, (ROWS, LENGTH)), jnp.int32)
@@ -704,6 +706,29 @@ def test_a_request_continues_into_its_response_by_each_fields_meaning():
     same(extended.conditioning, request.conditioning)
     extended.validate()
     same(jax.jit(lambda inputs: inputs.extended(response))(request), extended)
+
+
+def test_a_packed_rows_padding_continues_nothing():
+    """Segment 0 pads a packed row as a mask does (`real_slots`), and a
+    caller's mask still narrows a row its segments leave whole: a row padded
+    by segment 0, one padded by its mask, and one whose last document follows
+    another continue their positions and document from their last real
+    token, each as that row's real tokens alone do."""
+    response = jnp.full((3, 2), 3, jnp.int32)
+    packed = ModelInputs(jnp.asarray([[5, 6, 7, 0, 0], [0, 5, 6, 7, 0], [9, 5, 6, 7, 0]], jnp.int32), {
+        "attention_mask": jnp.asarray([[1, 1, 1, 1, 1], [0, 1, 1, 1, 0], [1, 1, 1, 1, 1]], bool),
+        "positions": jnp.asarray([[0, 1, 2, 0, 0], [0, 0, 1, 2, 0], [0, 0, 1, 2, 0]], jnp.int32),
+        "segment_ids": jnp.asarray([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1], [1, 2, 2, 2, 0]], jnp.int32)})
+    alone = ModelInputs(jnp.asarray([[5, 6, 7]] * 3, jnp.int32), {
+        "positions": jnp.asarray([[0, 1, 2]] * 3, jnp.int32),
+        "segment_ids": jnp.asarray([[1, 1, 1], [1, 1, 1], [2, 2, 2]], jnp.int32)})
+    continued, expected = packed.extended(response).token_fields, alone.extended(response).token_fields
+    for name in ("positions", "segment_ids"):
+        same(continued[name][:, 5:], expected[name][:, 3:])
+    # Only the segments mark the padding when the request carries no mask.
+    unmasked = dataclasses.replace(packed, token_fields={
+        name: value for name, value in packed.token_fields.items() if name != "attention_mask"})
+    same(unmasked.extended(response).token_fields["positions"][::2, 5:], expected["positions"][::2, 3:])
 
 
 def test_a_field_with_no_extension_rule_is_refused_and_a_named_rule_extends_it():

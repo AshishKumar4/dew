@@ -18,7 +18,7 @@ import numpy as np
 import optax
 import pytest
 from interop_support import assert_reloads, assert_same_stored_tensors
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, float64_forward
 
 from dew.data.dataset import Loader
 from dew.interop import Pretrained, PretrainedDecoder
@@ -50,6 +50,15 @@ class Export:
     bound: float | None = None
     masked: bool = False
 
+    @property
+    def label(self) -> str:
+        return self.fixture if self.derived or self.fixture not in DERIVED else f'{self.fixture}-saved'
+
+
+# The sources a derived export writes, which their own `save` writes too, as themselves.
+DERIVED = ('gpt-bigcode-tiny', 'gpt-bigcode-mha-tiny', 'starcoder2-tiny', 'falcon-tiny', 'falcon-mha-tiny',
+           'gptj-tiny', 'phi-tiny', 'phi3-tiny', 'mamba-tiny')
+
 
 EXPORTS = (
     Export('gpt-bigcode-tiny', derived=True),
@@ -69,10 +78,11 @@ EXPORTS = (
     Export('mimo-v2-flash-tiny'),
     Export('mamba-tiny', derived=True),
     Export('modernbert-tiny', masked=True),
+    *(Export(name) for name in DERIVED),
 )
 
 
-@pytest.mark.parametrize('case', EXPORTS, ids=lambda case: case.fixture)
+@pytest.mark.parametrize('case', EXPORTS, ids=lambda case: case.label)
 def test_an_untrained_export_reads_in_transformers_and_reloads_bit_for_bit(case, tmp_path):
     """The export names its family and holds the source's tensors byte for
     byte, unless it writes another family's. Transformers reads it on eager
@@ -97,8 +107,9 @@ def test_an_untrained_export_reads_in_transformers_and_reloads_bit_for_bit(case,
                              **({} if case.masked else {'use_cache': False})).logits.numpy()
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
     if case.bound is None:
+        _, terms = float64_forward(loaded.model, loaded.variables, ids)
         assert_as_exact_as_the_reference(actual, expected, np.load(directory / 'logits_f64.npy'),
-                                         f'{case.fixture} export')
+                                         f'{case.fixture} export', terms=terms)
     else:
         np.testing.assert_allclose(actual, expected, atol=case.bound, rtol=0)
         np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))

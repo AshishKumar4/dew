@@ -31,33 +31,36 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
     return jnp.promote_types(jnp.float32 if dtype is None else dtype, jnp.float32)
 
 
-def precision_names(precision: PrecisionLike) -> frozenset[str]:
-    """The canonical names a `PrecisionLike` spells, unordered.
+def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
+    """The canonical names a `jax.lax.PrecisionLike` spells, unordered.
 
-    flax's alias is None, a string, a `jax.lax.Precision`, a dot algorithm, or
-    a pair of precisions. A string is read as JAX reads
+    JAX's alias is None, a string, a `jax.lax.Precision`, a dot algorithm
+    preset or a dot algorithm, or a pair of precisions; flax's is the same
+    without the algorithms. A string is read as JAX reads
     `jax_default_matmul_precision`: a dot algorithm preset's name is that
     preset ('F32_F32_F32'), any other goes through `jax.lax.Precision`, so
-    'tensorfloat32' is 'HIGH' and 'bfloat16' is 'DEFAULT'; a dot algorithm
-    keeps its own name.
+    'tensorfloat32' is 'HIGH' and 'bfloat16' is 'DEFAULT'; a preset keeps its
+    own name, and a dot algorithm, which has none, is named by its fields.
     """
     if precision is None:
         return frozenset()
     written = (precision,) if isinstance(
-        precision, str | jax.lax.Precision | jax.lax.DotAlgorithmPreset) else precision
-    return frozenset(_read(one).name for one in written if one is not None)
+        precision, str | jax.lax.Precision | jax.lax.DotAlgorithmPreset | jax.lax.DotAlgorithm) else precision
+    return frozenset(_name(one) for one in written if one is not None)
 
 
-def _read(precision):
-    """One precision `precision_names` takes, a string read as JAX reads one."""
+def _name(precision: str | jax.lax.Precision | jax.lax.DotAlgorithmPreset | jax.lax.DotAlgorithm) -> str:
+    """The name of one precision `precision_names` takes, a string read as JAX reads one."""
+    if isinstance(precision, jax.lax.DotAlgorithm):
+        return repr(precision)
     if not isinstance(precision, str):
-        return precision
+        return precision.name
     if precision in jax.lax.DotAlgorithmPreset.__members__:
-        return jax.lax.DotAlgorithmPreset[precision]
-    return jax.lax.Precision(precision)
+        return jax.lax.DotAlgorithmPreset[precision].name
+    return jax.lax.Precision(precision).name
 
 
-def asks_default_precision(precision: PrecisionLike, *, configured: bool = False) -> bool:
+def asks_default_precision(precision: jax.lax.PrecisionLike, *, configured: bool = False) -> bool:
     """Whether `precision` asks for no more than the default. With
     `configured`, an unset precision reads `jax_default_matmul_precision`,
     the default a product without one gets."""
@@ -138,6 +141,45 @@ def _two_sum(left, right):
     total = left + right
     part = total - left
     return total, (left - (total - part)) + (right - part)
+
+
+def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
+                rounding: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
+    """Dekker's rounded product and its residual, with a Veltkamp significand split.
+
+    Guidance keeps the multiply split, which also supports float64. `bit_split`
+    truncates fp32 significands instead, avoiding splitter overflow in norm
+    interpretation and quantizer division; near underflow the splits differ.
+    `subtract` keeps division's subtractive residual order and its signed zeros.
+    Norm interpretation passes `optimization_barrier` as `rounding` to keep each
+    product and residual step separate; the other callers allow fusion.
+    With each arithmetic step rounded, the residual is exact where intermediates
+    neither overflow nor underflow.
+    """
+    def rounded(value):
+        return value if rounding is None else rounding(value)
+
+    def split(value):
+        if bit_split:
+            bits = jax.lax.bitcast_convert_type(value, jnp.uint32) & jnp.uint32(0xfffff000)
+            high = jax.lax.bitcast_convert_type(bits, jnp.float32)
+        else:
+            splitter = (1 << 27) + 1 if value.dtype == jnp.float64 else (1 << 12) + 1
+            scaled = value * splitter
+            high = scaled - (scaled - value)
+        return high, rounded(value - high)
+
+    lh, ll = split(left)
+    rh, rl = split(right)
+    product = rounded(left * right)
+    head = rounded(lh * rh)
+    lost = rounded(product - head if subtract else head - product)
+    cross = ((ll, rh), (lh, rl)) if subtract else ((lh, rl), (ll, rh))
+    for first, second in cross:
+        term = rounded(first * second)
+        lost = rounded(lost - term if subtract else lost + term)
+    tail = rounded(ll * rl)
+    return product, rounded(tail - lost if subtract else lost + tail)
 
 
 def compensated_add(left, right):

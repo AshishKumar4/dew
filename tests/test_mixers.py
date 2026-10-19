@@ -19,14 +19,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from delta_rule_support import DECAY_SUMS, port_formula
 from flax import linen as nn
 from model_support import TINY_DECODER
 from reference_error import assert_leaves_as_exact, float64_terms
 
+from dew.nn import linear
+from dew.nn.attention import alibi_bias
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall, coordinates
+from dew.nn.kernels.generation import chosen
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.registry import mixers, models
@@ -101,6 +105,23 @@ def test_a_layer_runs_no_mask_its_mixer_does_not_read():
     params = recurrent.init(jax.random.key(0), ids)
     with pytest.raises(ValueError):
         recurrent.apply(params, ids, attention_pairwise_mask=own.pairwise_mask)
+
+
+def test_alibi_biases_rotated_attention_by_its_keys_places():
+    """ALiBi and rotation are independent: a rotary layer with `alibi` attends
+    as the same rotary layer handed ALiBi's bias at its keys' places as its
+    position bias, bitwise, and not as the rotary layer alone does."""
+    x = jax.random.normal(jax.random.key(1), (2, 6, 32))
+    context = MixerContext(emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=16)
+    with_alibi, rotary = (DecoderBlock(mixer=kind.build(context), feedforward=None, emb_features=32,
+                                       wiring=BlockWiring())
+                          for kind in (AttentionMixer(alibi=True), AttentionMixer()))
+    params = rotary.init(jax.random.key(0), x)
+    bias = AttentionMetadata(position_bias=alibi_bias(jnp.arange(6), 4, dtype=x.dtype))
+    biased = with_alibi.apply(params, x)
+    np.testing.assert_array_equal(np.asarray(biased),
+                                  np.asarray(rotary.apply(params, x, attention_metadata=bias)))
+    assert not np.allclose(biased, rotary.apply(params, x))
 
 
 def hybrid(**overrides):
@@ -252,13 +273,22 @@ def embedded(module, tokens):
     return module.scaled_embeddings(module.token_embeddings(tokens))
 
 
+DELTA_RULES = frozenset({"gated_delta_net", "kimi_delta_attention"})
+"""The registry's kinds on the delta rule, which a GPU runs on its port (`linear.fla_rule`)."""
+
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
-def test_no_token_reaches_another_document(kind):
+def test_no_token_reaches_another_document(kind, monkeypatch):
     """Every mixer in the registry, on every backend: in a packed row (DOCUMENTS' first two, then
     segment-0 padding), changing the first document's tokens and the padding's leaves the second's
     logits, the parameters' gradients of a loss on them alone and its gradient at the second's
     embedded tokens bitwise as they were. The same program on the same shapes, so any difference is
-    information crossing a document boundary.
+    information crossing a document boundary. The delta rule's port runs a row as one sequence, each
+    document's decay prefix shifted by the one before (`linear.FORGET`), so there the second
+    document's values move by that prefix's rounding: they are held to float64 within the distance of
+    the same changed row with the port's formula in the portable math (`port_formula`), whose ranges
+    round as the port's do, and which a token crossing the boundary would miss by orders of magnitude,
+    but the per-head decay parameters (`DECAY_SUMS`). The unchanged row is no reference there: the
+    first document's new decays redraw the second's.
 
     The loss is differentiated at the embedded tokens, not through the lookup: the table's gradient
     adds each position's by a scatter, which a GPU's deterministic XLA (`--xla_gpu_deterministic_ops`)
@@ -280,7 +310,7 @@ def test_no_token_reaches_another_document(kind):
     weight = weight.at[:, :first].set(0).at[:, first + second:].set(0)
     tokens_at = coordinates(segments=segments, positions=positions, max_segments=3)
 
-    def second_document(row):
+    def second_document(row, model=model, variables=variables):
         def loss(variables, inputs):
             logits = model.apply(variables, row, input_embeddings=inputs, coordinates=tokens_at)
             return jnp.sum(logits * weight), logits[:, first:first + second]
@@ -290,7 +320,23 @@ def test_no_token_reaches_another_document(kind):
             variables, inputs)
         return logits, grads, at_inputs[:, first:first + second]
 
-    for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(second_document(changed)),
+    moved = second_document(changed)
+    if kind in DELTA_RULES and linear.measured_kernel("gated_delta_rule", "xla") == "fla":
+        with monkeypatch.context() as patched:
+            patched.setattr(linear, "fla_rule", port_formula)
+            formula = second_document(changed)
+        with jax.enable_x64(new_val=True):
+            widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
+            truth = second_document(tokens, model.clone(dtype=jnp.float64), widened)
+
+        def held(tree):
+            return {name: leaf for name, leaf in ((jax.tree_util.keystr(path), leaf)
+                                                  for path, leaf in jax.tree_util.tree_leaves_with_path(tree))
+                    if not any(decay in name for decay in DECAY_SUMS)}
+
+        assert_leaves_as_exact(held(moved), held(formula), held(truth))
+        return
+    for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(moved),
                                     jax.tree.leaves(second_document(tokens)), strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
                                       err_msg=jax.tree_util.keystr(path))
@@ -350,18 +396,16 @@ def test_a_decoder_climbs_only_the_remat_rungs_its_layers_mark(kind, rungs):
 
 
 @pytest.mark.parametrize("kind", ["kimi_delta_attention", "mamba", "mamba2", "gated_delta_net"])
-def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, monkeypatch, capsys):
+@chosen(gated_delta_rule="fla")
+def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsys):
     """A decoder skips the remat rungs that keep none of its mixers' names (`MixerBase.residuals`), so
     a kind may name only what its layer marks: under `jax.checkpoint` with a policy saving all of them,
     a tiny decoder of that kind saves each one for its backward. A delta rule's decay and inverse are
     its port's (`row_names_port`, interpreted off a GPU)."""
     from jax.ad_checkpoint import print_saved_residuals
 
-    from dew.nn import linear
     from dew.nn.backbones.decoder_block import RematPolicy
 
-    monkeypatch.setattr(linear, "measured_kernel",
-                        lambda choice, default: "fla" if choice == "gated_delta_rule" else default)
     value = mixers.build(kind, **KIND_FIELDS.get(kind, ({}, {}))[0])
     assert value.residuals is not None
     model = tiny(mixer=value, max_seq_len=64, **KIND_FIELDS.get(kind, ({}, {}))[1])

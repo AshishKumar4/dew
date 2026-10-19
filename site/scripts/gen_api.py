@@ -50,8 +50,8 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
               "dew.data.sources.grain", "dew.data.sources.iterator", "dew.data.sources.codec",
               "dew.data.sources.urls", "dew.data.sources.av_utils",
               "dew.data.steps.generic", "dew.data.steps.text", "dew.data.steps.windows", "dew.data.steps.chat",
-              "dew.data.steps.image", "dew.data.steps.video", "dew.data.chat", "dew.data.images", "dew.data.tokens",
-              "dew.data.text", "dew.data.video", "dew.data.preferences", "dew.data.prompts", "dew.data.processors",
+              "dew.data.chat", "dew.data.images", "dew.data.tokens", "dew.data.text", "dew.data.video",
+              "dew.data.audio", "dew.data.preferences", "dew.data.prompts", "dew.data.processors",
               "dew.data.image_codec"]),
     ("Models", ["dew.registry", "dew.nn.backbones", "dew.nn.backbones.causal_transformer",
                 "dew.nn.backbones.decoder_block", "dew.nn.backbones.layer_plan", "dew.nn.kv_cache",
@@ -73,7 +73,8 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                          "dew.decision.layout", "dew.decision.task"]),
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.data", "dew.config.sweep"]),
-    ("Utilities", ["dew.rl", "dew.artifacts", "dew.coordination", "dew.records", "dew.telemetry.profile"]),
+    ("Utilities", ["dew.rl", "dew.artifacts", "dew.coordination", "dew.records", "dew.telemetry.profile",
+                   "dew.figures"]),
 ]
 # Places that show users Dew code; every Dew name they use must resolve to the
 # documented API. A landing snippet file shows only its marked regions.
@@ -127,6 +128,26 @@ P = DEW
 
 class Unresolved(Exception):
     pass
+
+
+def inside(obj: griffe.Object | griffe.Alias) -> griffe.Object | None:
+    """The object `obj` names within the package, one alias at a time; None where an alias leads into
+    another package (flax's Module, a TypedDict), which griffe has not loaded and whose members this
+    does not read. An alias within the package that names nothing, or leads back to itself, raises
+    (`Unresolved`)."""
+    followed = {obj.path}
+    while obj.is_alias:
+        path = obj.target_path
+        if not f"{path}.".startswith(f"{P.package}."):
+            return None
+        if path in followed:
+            raise Unresolved(f"{obj.path} leads back to {path}")
+        followed.add(path)
+        try:
+            obj = module_at(obj.parent.package, path)
+        except KeyError as error:
+            raise Unresolved(f"{obj.path} names {path}, which the package does not hold") from error
+    return obj
 
 
 def resolve(obj: griffe.Object | griffe.Alias) -> griffe.Object:
@@ -271,6 +292,35 @@ def function_signature(function: griffe.Function, name: str | None = None) -> st
     return signature(f"{prefix} {name or function.name}", parameters(function), returns)
 
 
+def declaration(obj: griffe.Object, name: str | None = None, *, value_limit: int | None = None) -> str:
+    if obj.is_class:
+        return class_signature(obj)
+    if obj.is_function:
+        return function_signature(obj, name)
+    if obj.is_attribute:
+        annotation = f": {obj.annotation}" if obj.annotation is not None else ""
+        show_value = obj.value is not None and (value_limit is None or len(str(obj.value)) < value_limit)
+        value = f" = {obj.value}" if show_value else ""
+        return f"{name or obj.name}{annotation}{value}"
+    raise Unresolved(f"{obj.path} has no signature or fields")
+
+
+def render_references(package: griffe.Module, text: str) -> str:
+    """Expand `<!-- api: dotted.name ... -->` with the module pages' source declarations."""
+    def expand(match: re.Match) -> str:
+        declarations = []
+        for path in match[1].split():
+            try:
+                obj = resolve(module_at(package, path))
+            except (KeyError, Unresolved) as error:
+                raise Unresolved(f"{path}: {error}") from error
+            name = f"{obj.parent.name}.{obj.name}" if obj.parent and obj.parent.is_class else obj.name
+            declarations.append(declaration(obj, name))
+        return "```text\n" + "\n\n".join(declarations) + "\n```"
+
+    return re.sub(r"^<!-- api: (.+?) -->$", expand, text, flags=re.M)
+
+
 class Linker:
     """Turns `Name` and `module.Name` code spans in docstrings into links."""
 
@@ -390,14 +440,8 @@ def render_object(entry: Entry, linker: Linker, context: str) -> str:
     if obj.lineno:
         meta += f' <a class="api-source" href="{source_link(obj)}">source</a>'
     lines += [meta + "</p>", ""]
-    if obj.is_class:
-        lines += ["```python", class_signature(obj), "```", ""]
-    elif obj.is_function:
-        lines += ["```python", function_signature(obj, entry.name), "```", ""]
-    elif obj.is_attribute:
-        annotation = f": {obj.annotation}" if obj.annotation is not None else ""
-        value = f" = {obj.value}" if obj.value is not None and len(str(obj.value)) < 200 else ""
-        lines += ["```python", f"{entry.name}{annotation}{value}", "```", ""]
+    if obj.is_class or obj.is_function or obj.is_attribute:
+        lines += ["```python", declaration(obj, entry.name, value_limit=200), "```", ""]
     if obj.docstring:
         lines += [prose(obj.docstring.value, linker, context, own), ""]
     if obj.is_class:
@@ -475,8 +519,9 @@ def usage_code(relative: str, path: Path) -> Iterator[tuple[str, set[int] | None
     if path.suffix == ".ipynb":
         for cell in json.loads(path.read_text())["cells"]:
             if cell["cell_type"] == "code":
-                # IPython's `%` and `!` lines are not Python.
-                yield "".join(re.sub(r"^\s*[%!].*", "", line) for line in cell["source"]), None
+                # IPython's `%` and `!` lines are not Python. A cell's source is one string or a list
+                # of its lines (nbformat's multiline string), which join to the same text.
+                yield re.sub(r"^\s*[%!].*", "", "".join(cell["source"]), flags=re.M), None
     elif path.suffix == ".md":
         for block in re.findall(r"^```(?:python|py)[^\n]*\n(.*?)^```", path.read_text(), re.S | re.M):
             yield block, None
@@ -514,7 +559,8 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
     `name = Class(...)`, which binds an `Instance` whose calls must be methods."""
     try:
         tree = ast.parse(code)
-    except SyntaxError:
+    except SyntaxError as error:
+        yield f"a Python unit does not parse, so none of its names is checked: {error}"
         return
     assigned = {node.id for node in ast.walk(tree)
                 if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
@@ -568,9 +614,12 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
         seen.add(".".join(path))
         start = bound[path[0]]
         held = start if isinstance(start, Instance) else None
-        problem = unresolved_chain(start.cls if held else start, path, home, pages)
-        if problem is None and held is not None and id(node) in called and len(path) == 2:
-            problem = called_attribute(held.cls, path)
+        try:
+            problem = unresolved_chain(start.cls if held else start, path, home, pages)
+            if problem is None and held is not None and id(node) in called and len(path) == 2:
+                problem = called_attribute(held.cls, path)
+        except Unresolved as error:
+            problem = f"`{'.'.join(path)}`: {error}"
         if problem:
             yield problem
 
@@ -607,9 +656,10 @@ def called_attribute(cls: griffe.Object, path: list[str]) -> str | None:
     """Why calling `path`, an instance's member, leaves the documented API:
     the member is a value an instance holds, not a method, which is what a
     method renamed to make room for a field of the same name leaves behind."""
-    try:
-        member = resolve(cls.all_members[path[1]])
-    except (KeyError, Unresolved, griffe.AliasResolutionError, griffe.CyclicAliasError):
+    found = cls.all_members.get(path[1])
+    # A member the class lacks is `unresolved_chain`'s to report; one of another package's, not read.
+    member = None if found is None else inside(found)
+    if member is None:
         return None
     if member.is_attribute and "instance-attribute" in member.labels and "property" not in member.labels:
         return f"`{'.'.join(path)}(...)`: {path[1]} is a value {cls.path} holds, not a method"
@@ -643,28 +693,25 @@ def unresolved_chain(start: griffe.Object, path: list[str], home: dict[str, str]
             member = current.members.get(attribute)
             if member is None or attribute.startswith("_"):
                 return f"`{used}`: {current.path} has no public {attribute}"
-            try:
-                current = resolve(member)
-                # `dew.pipeline` names the function its own module exports.
-                if current.is_module and f"{current.path}.{attribute}" in home:
-                    current = resolve(current.members[attribute])
-            except Unresolved:
+            current = inside(member)
+            # `dew.pipeline` names the function its own module exports.
+            if current is not None and current.is_module and f"{current.path}.{attribute}" in home:
+                current = inside(current.members[attribute])
+            if current is None:
+                # Another package's object, whose members this does not read.
                 return None
             if not current.is_module and current.path not in home:
                 return f"`{used}` ({current.path}) is not documented"
         elif current.is_class:
             if attribute.startswith("_") and not attribute.startswith("__"):
                 return f"`{used}`: {attribute} is private to {current.path}"
-            try:
-                members = current.all_members
-            except (griffe.AliasResolutionError, griffe.CyclicAliasError):
-                return None
+            members = current.all_members
             if attribute not in members:
                 # A base outside Dew (flax, a TypedDict) may define it.
                 return None if outside_bases(current) else f"`{used}`: {current.path} has no {attribute}"
-            try:
-                current = resolve(members[attribute])
-            except Unresolved:
+            current = inside(members[attribute])
+            if current is None:
+                # Another package's object, whose members this does not read.
                 return None
         else:
             return None
@@ -726,11 +773,16 @@ def documented(package: griffe.Module) -> tuple[dict[str, Page], dict[str, str]]
 
 def unresolved_in(file: str, path: Path, package: griffe.Module, pages: dict[str, Page],
                   home: dict[str, str]) -> list[str]:
-    """What `unresolved_uses` reports for each Python unit `path` shows, in
-    order, a unit seeing the names the units before it bound."""
+    """Unresolved code and declaration references, with each Python unit seeing earlier units' bindings."""
     bound: dict[str, griffe.Object | Instance] = {}
-    return [problem for code, shown in usage_code(file, path)
-            for problem in unresolved_uses(package, home, pages, code, shown, bound)]
+    problems = [problem for code, shown in usage_code(file, path)
+                for problem in unresolved_uses(package, home, pages, code, shown, bound)]
+    if path.suffix == ".md":
+        try:
+            render_references(package, path.read_text())
+        except Unresolved as error:
+            problems.append(str(error))
+    return problems
 
 
 def undocumented(package: griffe.Module, pages: dict[str, Page], home: dict[str, str]) -> list[str]:
@@ -863,7 +915,8 @@ def main() -> None:
         index += [f"| [`{module}`](/{page_slug(module)}/) | {escape(first_sentence(pages[module].module))} |"
                   for module in modules]
         index.append("")
-    overview.write_text(overview.read_text().rstrip() + "\n" + "\n".join(index).rstrip() + "\n")
+    overview.write_text(render_references(package, overview.read_text()).rstrip()
+                        + "\n" + "\n".join(index).rstrip() + "\n")
 
     generated.mkdir(parents=True, exist_ok=True)
     sidebar = [{"label": label, "collapsed": True,

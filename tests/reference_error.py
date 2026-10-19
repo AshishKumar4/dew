@@ -60,6 +60,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.accuracy import distance, reduction_bound, within
+
 FACTOR = 2.0
 
 ROW_FACTOR = 4.0
@@ -119,32 +121,14 @@ def equations(graph):
             yield from equations(value)
 
 
-def within(error, bound) -> bool:
-    """Whether every `error` is at most its `bound`, both finite. Written as the
-    passing condition, so a NaN or infinite error never passes, nor does an
-    infinite allowance from a reference that diverged."""
-    error, bound = np.asarray(error, np.float64), np.asarray(bound, np.float64)
-    return bool(np.all(np.isfinite(error) & np.isfinite(bound) & (error <= bound)))
-
-
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
-    """Two fp32 reductions differ by at most 2 gamma_n sum(abs(products)).
-
-    `magnitudes` holds the elementwise sum of absolute products; `terms`
-    counts the products and any bias term in each reduction. gamma_n is
-    n*u/(1-n*u), with fp32 unit roundoff u=2^-24.
-    """
-    roundoffs = terms * np.finfo(np.float32).eps / 2
-    gamma = roundoffs / (1 - roundoffs)
+    """Two fp32 reductions differ by at most 2 gamma_n sum(abs(products))
+    (`dew.accuracy.reduction_bound`): `magnitudes` holds the elementwise sum of
+    absolute products and `terms` counts the products and any bias term in each
+    reduction."""
     error = np.abs(np.asarray(dew, np.float64) - np.asarray(reference, np.float64))
-    bound = 2 * gamma * np.asarray(magnitudes, np.float64)
+    bound = reduction_bound(magnitudes, terms)
     assert within(error, bound), (float(error.max()), float(bound.max()))
-
-
-def distance(value, truth) -> float:
-    """The root-mean-square difference over every entry, in float64."""
-    difference = np.asarray(value, np.float64) - np.asarray(truth, np.float64)
-    return float(np.sqrt(np.mean(np.square(difference))))
 
 
 RESOLUTION = 1024 * float(np.finfo(np.float64).eps)
@@ -265,25 +249,45 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
     assert not over, "\n".join(over)
 
 
-SUMS = frozenset({"dot_general", "reduce_sum", "conv_general_dilated", "cumsum", "scatter-add"})
+SUMS = frozenset({"dot_general", "ragged_dot_general", "reduce_sum", "conv_general_dilated", "cumsum",
+                  "scatter-add"})
 """The operations that sum terms: a leaf's terms are those its own sums add,
-taken at their float64 values (`float64_terms`)."""
+taken at their float64 values (`float64_terms`). A ragged dot, an expert
+layer's grouped matmul, sums as a dot does within each group, and its
+transpose, which the kernel's gradient runs, is one too."""
 
 CARRIES = frozenset({"add", "add_any", "sub", "neg", "convert_element_type", "reshape", "transpose",
                      "broadcast_in_dim", "squeeze", "expand_dims", "copy", "copy_p", "reduce_precision",
-                     "slice", "dynamic_slice", "concatenate", "pad", "select_n", "optimization_barrier"})
+                     "slice", "dynamic_slice", "concatenate", "pad", "select_n", "optimization_barrier",
+                     "name", "psum", "psum_invariant", "reduce_scatter", "all_gather", "all_gather_invariant",
+                     "all_to_all", "ppermute", "pvary"})
 """The operations that carry the terms of sums into a leaf without making
 new ones: sums combined (tied weights, accumulated microbatches, an update
-added to a parameter) and moved. A product or quotient of a sum by a value
-that is none carries them too, scaled element by element (`_applied`), as
-`s_i sum_k x_ik` sums the terms `s_i x_ik`; a product of two sums ends them."""
+added to a parameter, devices' partials) and moved, by a remat name
+(`checkpoint_name`) or a collective too.
+A product or quotient of a sum by a value that is none carries them too,
+scaled element by element (`_applied`), as `s_i sum_k x_ik` sums the terms
+`s_i x_ik`; a product of two sums ends them."""
 
-CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "checkpoint", "custom_jvp_call",
-                   "custom_vjp_call", "custom_vjp_call_jaxpr"})
+CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "remat2", "checkpoint",
+                   "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr"})
 """The calls whose bodies are evaluated op by op, as the computation's own:
-a jit, a remat, a custom rule's primal. A body that runs elsewhere, a
-shard_map's per-device program or a Pallas kernel, is one operation, its
-outputs their own size."""
+a jit, a remat (`jax.checkpoint` binds 'remat2'), a custom rule's primal. A
+shard_map's per-device program is too, on each device's blocks (`_mapped`).
+A body that runs elsewhere, a Pallas kernel, is one operation, its outputs
+their own size."""
+
+
+def float64_forward(module, variables, *args, **kwargs):
+    """`module`'s own forward of `args` in float64, and each output's terms
+    (`float64_terms`): the module computing in float64 over its variables
+    widened, integer inputs as they are, `kwargs` given as they are. A
+    reference's float64 truth written elsewhere (a fixture's) is sized by
+    these terms, what Dew's own float64 sums add."""
+    with jax.enable_x64(new_val=True):
+        wide = module.clone(dtype=jnp.float64)
+        return float64_terms(lambda held, *given: wide.apply(held, *given, **kwargs),
+                             *widened((variables, *args)))
 
 
 def float64_terms(fn, *args):
@@ -366,7 +370,7 @@ def _carried(equation) -> list[int]:
     if not all(_real(var) or not jnp.issubdtype(var.aval.dtype, jnp.inexact) for var in equation.outvars):
         return []
     floats = [index for index, var in enumerate(operands) if _real(var)]
-    if name in CARRIES or _body(equation) is not None or name in ("scan", "while", "cond"):
+    if name in CARRIES or _body(equation) is not None or name in ("scan", "while", "cond", "shard_map"):
         return floats
     if name == "reduce_sum":
         # A sum over unit axes adds nothing: it moves its operand, as a broadcast's transpose does.
@@ -401,6 +405,8 @@ def _applied(equation, inputs, given, wanted: bool):
         return _scanned(params, inputs, given)
     if wanted and name == "while":
         return _looped(params, inputs, given)
+    if wanted and name == "shard_map":
+        return _mapped(params, inputs, given)
     if wanted and name == "cond":
         branch = params["branches"][int(inputs[0])]
         return _evaluated(branch.jaxpr, branch.consts, inputs[1:], given[1:])
@@ -470,6 +476,20 @@ def _looped(params, inputs, given):
         carry, carry_terms = _evaluated(body.jaxpr, body.consts, [*body_consts, *carry],
                                         [*body_terms, *carry_terms])
     return carry, carry_terms
+
+
+def _mapped(params, inputs, given):
+    """A shard_map's outputs and energies (`float64_terms`), its program evaluated
+    op by op on each device's blocks, as the map runs it: an expert layer's
+    dispatch (`dew.nn.moe`), whose grouped matmul and its transpose sum."""
+    body, specs, out_specs = params["jaxpr"], tuple(params["in_specs"]), tuple(params["out_specs"])
+
+    def program(values, energies):
+        return tuple(map(tuple, _evaluated(body.jaxpr, body.consts, values, energies)))
+
+    return jax.shard_map(program, mesh=params["mesh"], in_specs=(specs, specs),
+                         out_specs=(out_specs, out_specs), axis_names=params["newly_manual_axes"],
+                         check_vma=params["check_vma"])(tuple(inputs), tuple(given))
 
 
 def _or_zero(energy, value):

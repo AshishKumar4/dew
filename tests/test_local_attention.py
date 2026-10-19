@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -74,7 +75,8 @@ def test_chunks_match_splash_chunked_causal_mask(implementation, length, chunk):
 def test_packed_documents_restart_their_windows_and_chunks(span):
     """Chunks count from each document's first token, as `chunked_overlay`
     reads packed positions; windows count rows inside the document. Padding
-    keys (segment 0 and invalid) are never read by a real query."""
+    keys (segment 0 and invalid) are never read by a real query, one of a
+    document and valid; a padding query's output is no token's."""
     length = 29
     query, key, value = inputs(length)
     segments, positions = packed(length, (7, 18, 26))
@@ -94,7 +96,7 @@ def test_packed_documents_restart_their_windows_and_chunks(span):
         query, key, value, **span, segment_ids=jnp.broadcast_to(segments, (2, length)),
         positions=None if "window" in span else jnp.asarray(positions), valid=jnp.asarray(valid),
         implementation="xla")
-    real = (segments != 0) & keep.any(-1)
+    real = (segments != 0) & valid & keep.any(-1)
     np.testing.assert_allclose(np.asarray(actual)[real], expected[real], atol=2e-6, rtol=0)
 
 
@@ -141,25 +143,56 @@ def test_memory_grows_with_the_window_not_the_square_of_the_sequence():
     assert banded * 4 < dense
 
 
-def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes():
+@pytest.mark.parametrize("shared", [False, True], ids=["per-row", "shared"])
+@pytest.mark.parametrize("origin", [0, 2], ids=["from-zero", "logical-origin"])
+def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin, shared):
     """The whole-sequence pass runs `local_attention`; the cached decode runs
-    the chunk as a mask over cache slots. Both read the same keys."""
+    the chunk as a mask over cache slots. Both read the same keys: chunks
+    are cut at the tokens' logical places, so a row whose places start at
+    `origin` (a continuation, a canvas) cuts them as its whole pass does,
+    not at its cache slots, whether each row gives its places or the rows
+    share one vector of them."""
     model = CausalTransformer(
         vocab_size=64, num_layers=2, emb_features=32, num_heads=4, num_kv_heads=2,
         max_seq_len=24, layer_types=("chunked_attention", "full_attention"),
         kinds={"chunked_attention": {"chunk": 5}}, attention_impl="xla")
     tokens = jax.random.randint(jax.random.key(1), (2, 13), 0, 64)
+    positions = jnp.arange(13) + origin if shared else jnp.broadcast_to(jnp.arange(13) + origin, tokens.shape)
     variables = model.init(jax.random.key(0), tokens)
-    whole = model.apply(variables, tokens)
+    whole = model.apply(variables, tokens, positions=positions)
     cache = model.apply(variables, 2, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
-    logits, mutated = model.apply({**variables, "cache": cache}, tokens[:, :4],
+    logits, mutated = model.apply({**variables, "cache": cache}, tokens[:, :4], positions=positions[..., :4],
                                   decode=True, mutable=["cache"])
     steps = [logits[:, -1]]
     for index in range(4, 13):
-        logits, mutated = model.apply({**variables, "cache": mutated["cache"]},
-                                      tokens[:, index:index + 1], decode=True, mutable=["cache"])
+        logits, mutated = model.apply({**variables, "cache": mutated["cache"]}, tokens[:, index:index + 1],
+                                      positions=positions[..., index:index + 1], decode=True,
+                                      mutable=["cache"])
         steps.append(logits[:, -1])
     np.testing.assert_allclose(np.stack(steps, 1), whole[:, 3:], atol=1e-5, rtol=0)
+
+
+def test_a_chunked_kind_bands_a_row_with_padding_among_its_tokens_by_its_tokens():
+    """Chunks span tokens, not slots: a row whose four tokens sit at slots 0,
+    3, 6 and 9 among padding, a chunk of 4, attends as the four tokens alone
+    do, as near the float64 truth of the row alone as the row alone's float32
+    run."""
+    model = CausalTransformer(
+        vocab_size=64, num_layers=2, emb_features=32, num_heads=4, num_kv_heads=2,
+        max_seq_len=24, layer_types=("chunked_attention", "full_attention"),
+        kinds={"chunked_attention": {"chunk": 4}}, attention_impl="xla")
+    real = jax.random.randint(jax.random.key(1), (1, 4), 0, 64)
+    slots = jnp.asarray([0, 3, 6, 9])
+    tokens = jnp.zeros((1, 12), jnp.int32).at[:, slots].set(real)
+    valid = jnp.zeros((1, 12), bool).at[:, slots].set(True)
+    variables = model.init(jax.random.key(0), tokens)
+    holey = model.apply(variables, tokens, attention_mask=valid)[:, slots]
+    alone = model.apply(variables, real)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
+        truth = model.clone(dtype=jnp.float64).apply(wide, real)
+    assert_as_exact_as_the_reference(np.asarray(holey), np.asarray(alone), np.asarray(truth, np.float64),
+                                     "holey row")
 
 
 @pytest.mark.gpu(reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")

@@ -7,11 +7,12 @@ import { readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { repository } from '../src/manifest.mjs';
 import { runsLive } from '../src/data/live-notebooks.mjs';
-import { escapeHtml, imageRoot, joined, renderOutputs } from './notebook-outputs.mjs';
+import { escapeHtml, imageRoot, inventory, joined, renderOutputs } from './notebook-outputs.mjs';
 import {
 	blobUrl,
 	checkOnly,
 	describe,
+	generatedRoot,
 	lastUpdated,
 	pageFile,
 	repoRoot,
@@ -46,11 +47,25 @@ function fence(code) {
 
 // `node scripts/render-notebooks.mjs 02 05` renders only the notebooks whose names
 // start with those prefixes, for working on the site while a notebook is re-executed.
+// The site's aggregates still hold every notebook: a partial render replaces the selected ones'
+// images, pages and entries, and keeps the rest from the last render (`inventory`).
 const only = process.argv.slice(2).filter((arg) => arg !== '--check');
-const files = (await readdir(notebooksDir))
-	.filter((name) => name.endsWith('.ipynb') && (only.length === 0 || only.some((prefix) => name.startsWith(prefix))))
-	.sort();
-if (!checkOnly) await rm(imageRoot, { recursive: true, force: true });
+const notebooks = (await readdir(notebooksDir)).filter((name) => name.endsWith('.ipynb')).sort();
+const files = notebooks.filter((name) => only.length === 0 || only.some((prefix) => name.startsWith(prefix)));
+if (!checkOnly) {
+	const stale = only.length === 0 ? [imageRoot] : files.map((file) => path.join(imageRoot, file.replace(/\.ipynb$/, '')));
+	for (const directory of stale) await rm(directory, { recursive: true, force: true });
+}
+
+async function lastRender() {
+	const read = async (name) => JSON.parse(await readFile(path.join(generatedRoot, `${name}.json`), 'utf8'));
+	try {
+		return { listing: await read('tutorial-cards'), outputs: await read('notebook-outputs') };
+	} catch (error) {
+		if (error.code !== 'ENOENT') throw error;
+		throw new Error('render every notebook once (no arguments) before rendering a few');
+	}
+}
 
 const slugOf = (url) => url.replace('https://github.com/', '');
 const listing = [];
@@ -80,8 +95,7 @@ for (const file of files) {
 		}
 		if (cell.cell_type !== 'code' || !text.trim()) continue;
 		// A cell tagged skip-execution is shown without output: its notebook says why. An install
-		// cell may be unexecuted too: tools/run_tutorials.py --full, which makes the committed
-		// outputs, skips it because Dew comes from the checkout.
+		// cell may be unexecuted too, in a run that installed Dew before the notebook started.
 		const skipped = (cell.metadata?.tags ?? []).includes('skip-execution');
 		const install = /^\s*[%!]pip\s/.test(text);
 		if (cell.execution_count == null && !skipped && !install) {
@@ -102,16 +116,6 @@ for (const file of files) {
 		parts.push(block.join('\n'));
 	}
 	if (outputs === 0) throw new Error(`${source}: no recorded outputs; commit the notebook executed`);
-	// Where the outputs come from, as tools/run_tutorials.py --save records it.
-	// tools/check_tutorial_outputs.py reports in CI when the code the notebook imports changes after it.
-	const recorded = notebook.metadata?.dew?.outputs;
-	if (!/^[0-9a-f]{40}$/.test(recorded?.commit ?? '') || !recorded.date || !recorded.device || !recorded.jax) {
-		throw new Error(`${source}: no dew.outputs record (commit, date, device, jax) in its metadata; save it with tools/run_tutorials.py --save`);
-	}
-	const where = recorded.device === 'cpu' ? 'a CPU' : escapeHtml(recorded.device);
-	parts.push(
-		`<p class="nb-provenance">Outputs recorded on ${where}, JAX ${escapeHtml(recorded.jax)}, Dew <a href="${repository.url}/commit/${recorded.commit}"><code>${recorded.commit.slice(0, 7)}</code></a>, ${escapeHtml(recorded.date)}.</p>`,
-	);
 
 	const live = runsLive(accelerator, liveCells.map(({ code }) => code));
 	if (live) {
@@ -137,8 +141,8 @@ for (const file of files) {
 		},
 		parts.join('\n\n'),
 	);
-	// The numbers the Settings cell assigns at the top level (`STEPS = 6000`), before any smoke-test override,
-	// so other pages can quote a notebook's own settings.
+	// The numbers the Settings cell assigns at the top level (`STEPS = 6000`), so other pages can quote a
+	// notebook's own settings.
 	const settingsCell = cells.find((cell) => cell.cell_type === 'code' && /^STEPS = /m.test(joined(cell.source)));
 	const settings = Object.fromEntries(
 		[...(settingsCell ? joined(settingsCell.source) : '').matchAll(/^([A-Z][A-Z0-9_]*) = ([0-9][0-9_.e+-]*)\s*$/gm)].map((match) => [
@@ -150,8 +154,13 @@ for (const file of files) {
 	notebookOutputs[stem] = outputsByCell;
 }
 
+// A check writes nothing, so it needs no earlier render to merge into.
+const previous = only.length === 0 || checkOnly ? { listing: [], outputs: {} } : await lastRender();
+const stems = notebooks.map((file) => file.replace(/\.ipynb$/, ''));
+const tutorials = inventory(previous, { listing, outputs: notebookOutputs }, stems);
+
 // The tutorials overview: sync-docs wrote its prose from docs/tutorials.md; the cards come from the notebooks.
-const cards = listing.map((entry) => {
+const cards = tutorials.listing.map((entry) => {
 	const number = entry.number;
 	const media = entry.thumbnail
 		? `<img src="${entry.thumbnail.src}" width="${entry.thumbnail.width}" height="${entry.thumbnail.height}" alt="" loading="lazy" decoding="async">`
@@ -167,11 +176,14 @@ const cards = listing.map((entry) => {
 	].join('');
 });
 const overview = pageFile('tutorials');
+const grid = '<div class="tutorial-grid not-content">';
 if (!checkOnly) {
-	await writeFile(overview, `${(await readFile(overview, 'utf8')).trimEnd()}\n\n<div class="tutorial-grid not-content">${cards.join('')}</div>\n`);
+	// A render after another, with no sync-docs between, replaces the grid the last one appended.
+	const prose = (await readFile(overview, 'utf8')).split(`\n\n${grid}`)[0].trimEnd();
+	await writeFile(overview, `${prose}\n\n${grid}${cards.join('')}</div>\n`);
 }
 
-await writeGenerated('tutorials', listing.map(({ slug, label }) => ({ slug, label })));
-await writeGenerated('tutorial-cards', listing);
-await writeGenerated('notebook-outputs', notebookOutputs);
-console.log(`render-notebooks: ${listing.length} tutorials`);
+await writeGenerated('tutorials', tutorials.listing.map(({ slug, label }) => ({ slug, label })));
+await writeGenerated('tutorial-cards', tutorials.listing);
+await writeGenerated('notebook-outputs', tutorials.outputs);
+console.log(`render-notebooks: ${files.length} of ${tutorials.listing.length} tutorials rendered`);

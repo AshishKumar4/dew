@@ -44,9 +44,21 @@ class Export:
     """Packages outside Dew whose modules the run's record may import."""
 
     def run_command(self) -> int:
+        from dew.inference.tasks import run_record
         from dew.interop import Pretrained
+        from dew.objectives.base import ReleasedTask
+        from dew.records import text
+        from dew.registry import objectives
 
-        Pretrained.from_run(self.run, ema=self.ema, step=self.step, trust=self.trust).save(self.destination)
+        # A task that publishes its own released layout (a decision run's) writes it; any other
+        # run writes its model in the source layout its family reads.
+        record, _ = run_record(self.run, self.step, self.trust)
+        task = objectives[text(record['objective'], 'objective')].saved_task
+        if task is not None and issubclass(task, ReleasedTask):
+            task.from_run(self.run, ema=self.ema, step=self.step).save_pretrained(self.destination)
+        else:
+            loaded = Pretrained.from_run(self.run, ema=self.ema, step=self.step, trust=self.trust)
+            loaded.save(self.destination)
         emit(f"exported {self.run} to {self.destination}")
         return 0
 
@@ -83,8 +95,7 @@ class DataExport:
             raise ValueError(f"{self.recipe} has no validation source")
         metadata = None
         if self.tokenizer is not None:
-            from dew.data.steps.text import Tokenize
-            from dew.data.text import tokenizer_for
+            from dew.data.text import Tokenize, tokenizer_for
 
             vocabulary = tokenizer_for(self.tokenizer)
             pipeline = pipeline.map(Tokenize(self.tokenizer, eos=self.eos))

@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 
 from dew import records
-from dew.cache import dew_cache_dir
+from dew.cache import hub_answer
 from dew.interop import pickles
 from dew.interop.safetensors_io import read_weights, weight_files
 
@@ -190,17 +190,15 @@ def snapshot(name_or_dir: str, revision: str | None, *,
         selected = list(weight_files(files, "", read, stems=pickles.STEMS, suffix=pickles.SUFFIX))
         if not selected:
             raise FileNotFoundError(missing_weights(f"{name_or_dir} at {directory.name}", files))
-        # The conversion a lookup found is recorded, so the same load offline
-        # reads the conversion it cached rather than pickles it never fetched.
-        record = Path(dew_cache_dir()) / "conversions" / name_or_dir / directory.name
+        # The conversion a lookup found is recorded (`hub_answer`), so the same
+        # load offline reads the conversion it cached rather than pickles it
+        # never fetched; a lookup the Hub refuses, or offline one never made,
+        # finds none.
         try:
-            conversion = _conversion_revision(name_or_dir, directory.name)
+            conversion = hub_answer(("conversion", name_or_dir, directory.name),
+                                    lambda: _conversion_revision(name_or_dir, directory.name)).value
         except (HfHubHTTPError, OfflineModeIsEnabled):
-            conversion = record.read_text() if record.is_file() else None
-        else:
-            if conversion is not None:
-                record.parent.mkdir(parents=True, exist_ok=True)
-                record.write_text(conversion)
+            conversion = None
         if conversion is not None:
             _log.warning("%s at %s ships PyTorch pickles; loading SFconvertbot's safetensors conversion of "
                          "that commit at revision %s", name_or_dir, directory.name, conversion)

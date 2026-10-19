@@ -13,7 +13,7 @@ import dataclasses
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NoReturn, Protocol, TypedDict
+from typing import NamedTuple, NoReturn, Protocol, TypedDict
 
 import jax
 import numpy as np
@@ -149,111 +149,58 @@ SERIALIZED_ENCODER_FIELDS = ('add_cross_attention', 'cross_attention_hidden_size
                               'tie_encoder_decoder', 'pruned_heads')
 
 
-def _any_value(key: str, hf_config: Mapping[str, object]) -> bool:
-    return True
-
-
-def _repeats(name: str, section: str | None = None) -> Callable[[str, Mapping[str, object]], bool]:
-    """A legacy field is inert only when it repeats the reference's field."""
-    def repeats(key: str, hf_config: Mapping[str, object]) -> bool:
-        record = hf_config if section is None else hf_config.get(section)
-        return isinstance(record, Mapping) and record.get(name) == hf_config[key]
-    return repeats
-
-
 # Fields released configs carry that the pinned reference (transformers
 # 5.16.1) neither declares on the family's config class nor reads in its
-# modeling, so the reference computes the same model whatever they hold.
-# Each predicate accepts the values that agree with what the reference
-# computes; any other value describes a different model and is refused by
-# name. The None entry holds the fields no family's reference reads. A field
-# in neither place is still refused as unknown.
-# tests/test_pretrained_sources.py checks every entry against the installed
-# reference config classes.
-_INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, object]], bool]]] = {
+# modeling, so the reference computes the same model whatever they hold, and
+# so does Dew. The None entry holds the fields no family's reference reads. A
+# field in neither place is still refused as unknown.
+_INERT_FIELDS: Mapping[str | None, frozenset[str]] = {
     # Tooling records no reference reads: transformers.js's loading hints
     # (SmolLM2-*-Instruct), Unsloth's patch markers (unsloth/* re-uploads) and
     # the source repo names exporters write.
-    None: {'transformers.js_config': _any_value, 'unsloth_fixed': _any_value, 'unsloth_version': _any_value,
-           'name_or_path': _any_value, 'model_name': _any_value},
+    None: frozenset({'transformers.js_config', 'unsloth_fixed', 'unsloth_version', 'name_or_path',
+                     'model_name'}),
     # nanotron's training flags, which SmolLM2 retains.
-    'llama': {'is_llama_config': _any_value, 'rope_interleaved': _any_value},
-    # Qwen2.5's text configs state the multimodal rotary off; on, it is a
-    # Qwen2-VL rotary the qwen2 reference never applies.
-    'qwen2': {'use_mrope': lambda key, hf_config: hf_config[key] is False},
+    'llama': frozenset({'is_llama_config', 'rope_interleaved'}),
+    # Qwen2.5's text configs state the multimodal rotary, which the qwen2
+    # reference never applies.
+    'qwen2': frozenset({'use_mrope'}),
     # Released Nemotron-H configs retain these older names. The native
-    # reference reads layer_norm_epsilon, has no rotary positions, and
-    # derives dt directly from the Mamba projection.
-    'nemotron_h': {
-        'mamba_num_groups': _repeats('n_groups'),
-        'mamba_state_dim': _repeats('ssm_state_size'),
-        'num_query_groups': _repeats('num_key_value_heads'),
-        'rms_norm_eps': _repeats('layer_norm_epsilon'),
-        'norm_eps': _repeats('layer_norm_epsilon'),
-        **dict.fromkeys(('time_step_rank', 'rope_theta', 'partial_rotary_factor'), _any_value),
-    },
+    # reference reads n_groups, ssm_state_size, num_key_value_heads and
+    # layer_norm_epsilon, has no rotary positions, and derives dt directly
+    # from the Mamba projection.
+    'nemotron_h': frozenset({'mamba_num_groups', 'mamba_state_dim', 'num_query_groups', 'rms_norm_eps',
+                             'norm_eps', 'time_step_rank', 'rope_theta', 'partial_rotary_factor'}),
     # The published HF ports carry mamba_ssm's own fields. The reference
     # normalizes with MambaRMSNormGated alone and gates before it
-    # normalizes (modeling_mamba2.py:417, :477 passes norm_before_gate=False,
-    # mamba_ssm's default; Mamba-Codestral's true is a stale default no
-    # implementation of that checkpoint reads), derives the inner width as
-    # expand * hidden_size (:374), and the time-step init fields only seed
-    # dt_bias at initialization.
-    'mamba2': {
-        'rms_norm': lambda key, hf_config: hf_config[key] is True,
-        'norm_before_gate': _any_value,
-        'intermediate_size': lambda key, hf_config: hf_config[key] == (
-            records.integer(hf_config.get('expand', 2), 'expand')
-            * records.integer(hf_config.get('hidden_size', 4096), 'hidden_size')),
-        'time_step_init_scheme': _any_value,
-        'time_step_scale': _any_value,
-    },
+    # normalizes (modeling_mamba2.py:417, :477 passes norm_before_gate=False),
+    # derives the inner width as expand * hidden_size (:374), and the
+    # time-step init fields only seed dt_bias at initialization.
+    'mamba2': frozenset({'rms_norm', 'norm_before_gate', 'intermediate_size', 'time_step_init_scheme',
+                         'time_step_scale'}),
     # The state-spaces/mamba-*-hf conversions keep mamba_ssm's MambaConfig
-    # beside the reference's: the same width, depth and inner width under
-    # their old names, the RMSNorm MambaBlock always applies, no layer
-    # arguments, a fused kernel's choice, and the multiple vocab_size was
-    # already padded to.
-    'mamba': {
-        'd_model': _repeats('hidden_size'),
-        'n_layer': _repeats('num_hidden_layers'),
-        'd_inner': lambda key, hf_config: hf_config[key] == (
-            records.integer(hf_config.get('expand', 2), 'expand')
-            * records.integer(hf_config.get('hidden_size', 768), 'hidden_size')),
-        'rms_norm': lambda key, hf_config: hf_config[key] is True,
-        'ssm_cfg': lambda key, hf_config: hf_config[key] == {},
-        'fused_add_norm': _any_value,
-        'pad_vocab_size_multiple': _any_value,
-    },
+    # beside the reference's: width, depth and inner width under their old
+    # names, the RMSNorm MambaBlock always applies, layer arguments, a fused
+    # kernel's choice, and the multiple vocab_size was already padded to.
+    'mamba': frozenset({'d_model', 'n_layer', 'd_inner', 'rms_norm', 'ssm_cfg', 'fused_add_norm',
+                        'pad_vocab_size_multiple'}),
     # Ornith's Qwen3.5 wrappers repeat the text width at the top level.
     # Qwen3_5(Moe)Config declares no such field, and the wrapper's model sizes
     # its head from text_config.hidden_size (modeling_qwen3_5.py:1683,
     # modeling_qwen3_5_moe.py:1868).
-    'qwen3_5': {'hidden_size': _repeats('hidden_size', section='text_config')},
-    'qwen3_5_moe': {'hidden_size': _repeats('hidden_size', section='text_config')},
+    'qwen3_5': frozenset({'hidden_size'}),
+    'qwen3_5_moe': frozenset({'hidden_size'}),
 }
 
 
 def _unread(hf_config: Mapping[str, object], used: set[str]) -> set[str]:
-    """The config's fields that neither the translation read nor any rule
-    accepts as describing no computation."""
-    return (set(hf_config) - used - IGNORED_FIELDS - CODEC_FIELDS
-            - _inert(hf_config.get('model_type'), hf_config)
+    """The config's fields that neither the translation read nor the reference
+    leaves inert (`_INERT_FIELDS`)."""
+    model_type = hf_config.get('model_type')
+    inert = _INERT_FIELDS[None] | _INERT_FIELDS.get(model_type if isinstance(model_type, str) else None,
+                                                    frozenset())
+    return (set(hf_config) - used - IGNORED_FIELDS - CODEC_FIELDS - inert
             - {key for key in hf_config if str(key).startswith('_')})
-
-
-def _inert(model_type: object, hf_config: Mapping[str, object]) -> set[str]:
-    """Return the `_INERT_FIELDS` a config carries, refusing a value that is not inert."""
-    rules = {
-        **_INERT_FIELDS[None],
-        **_INERT_FIELDS.get(model_type if isinstance(model_type, str) else None, {}),
-    }
-    present = set(rules) & set(hf_config)
-    for key in sorted(present):
-        if not rules[key](key, hf_config):
-            refuse(f"{key}={hf_config[key]!r}",
-                    f"the {model_type} reference does not read {key} and computes the model "
-                    "another value states")
-    return present
 
 
 def refuse(field: str, detail: str) -> NoReturn:
@@ -309,18 +256,6 @@ def fixed_fields(model: CausalTransformer, fixed: Mapping[str, object], message:
     for name, expected in fixed.items():
         if getattr(model, name) != expected:
             refuse(name, message.format(expected))
-
-
-def fixed_mixture(mixture: Mixture, defaults: Mixture, represented: Collection[str],
-                   detail: str) -> None:
-    """Refuse a mixture field outside `represented` that leaves its family's default.
-
-    `represented` names the fields the export writes back; nothing carries the
-    rest to a file, so they have to hold what `defaults` holds.
-    """
-    for entry in dataclasses.fields(mixture):
-        if entry.name not in represented and getattr(mixture, entry.name) != getattr(defaults, entry.name):
-            refuse(f'mixture.{entry.name}', detail)
 
 
 type Llama3Ramp = NativeFields[RopeScaling]
@@ -436,12 +371,7 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
             ),
         )
     if rope_type == 'yarn' and yarn_max_pos is not None:
-        # The base an entry names, or the shared default until `_at_base`
-        # stamps in the one the entry's layers resolved to: a released
-        # config states it once beside rope_scaling, not inside it.
-        entry_theta = theta if theta is not None else 10000.0
-        return _Rope(theta, yarn_record(dict(entry, rope_theta=entry_theta), field,
-                                         entry_theta, yarn_max_pos))
+        return _Rope(theta, yarn_record(entry, field, yarn_max_pos))
     if rope_type not in ('default', 'none'):
         refuse(f"{field} (rope_type {rope_type!r})",
                 "the backbone applies plain rotary positions at rope_theta, "
@@ -500,19 +430,6 @@ class Ropes:
     full_only: bool = False
 
 
-def _at_base(scaling: Ramp | None, theta: float) -> Ramp | None:
-    """Return a ramp record at the base the layers it rides on rotate at.
-
-    A YaRN record repeats that base (the mixer's `YarnScaling.rope_theta`),
-    and a released config states it once beside `rope_scaling` rather than
-    inside it, so the resolved base is stamped in here. The llama3 ramp
-    names no base and passes through.
-    """
-    if scaling is None or scaling['rope_type'] != 'yarn':
-        return scaling
-    return NativeFields(YarnScaling, {**scaling, 'rope_theta': theta})
-
-
 @dataclass(frozen=True)
 class RopeSpelling:
     """How a family's config class turns the stored rope fields into its
@@ -539,11 +456,12 @@ PLAIN_SPELLING = RopeSpelling()
 """The mixin's own spelling, which most config classes keep: one record, at 10000 when unnamed."""
 
 
-def _rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
+def rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
                   ) -> tuple[tuple[str, dict], tuple[str, dict] | None]:
     """The full layers' and the sliding layers' effective rope records, each
-    with the field it is read under, in the order the class resolves them;
-    None where one record serves every layer."""
+    with the field it is read under and its rope_theta filled in, in the order
+    the class resolves them; None where one record serves every layer. A family
+    that parses a ramp of its own (Phi-3's LongRoPE) reads its record here."""
     scaling, parameters = hf_config.get('rope_scaling'), hf_config.get('rope_parameters')
     base = hf_config.get('rope_theta')
     stated = hf_config.get('layer_types')
@@ -595,18 +513,18 @@ def read_rope(hf_config: Mapping[str, object], used: set, yarn_max_pos: int | No
     used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
     if spelling.local_field is not None:
         used.add(spelling.local_field)
-    (full_field, full_record), sliding = _rope_records(hf_config, spelling)
+    (full_field, full_record), sliding = rope_records(hf_config, spelling)
     if not per_kind and '.' in full_field:
         refuse(full_field, 'this family reads one rotary record for every layer')
     full = _rope_entry(full_record, full_field, yarn_max_pos, ramps=ramps)
     theta = records.number(full_record['rope_theta'], f'{full_field} rope_theta')
-    full_ramp = _at_base(full.scaling, theta)
+    full_ramp = full.scaling
     if sliding is None:
         return Ropes(theta, full_ramp)
     sliding_field, sliding_record = sliding
     local = _rope_entry(sliding_record, sliding_field, yarn_max_pos, ramps=ramps)
     sliding_theta = records.number(sliding_record['rope_theta'], f'{sliding_field} rope_theta')
-    sliding_ramp = _at_base(local.scaling, sliding_theta)
+    sliding_ramp = local.scaling
     return Ropes(theta, full_ramp, None if sliding_theta == theta else sliding_theta,
                   None if sliding_ramp == full_ramp else sliding_ramp,
                   full_only=full.scaling is not None and local.scaling is None)
@@ -652,8 +570,9 @@ def decoder_kinds(layer_types: tuple[str, ...], window: int | None,
     return kinds
 
 
+# A rope entry's rope_theta is the base of the layers the ramp rides on, which they read beside it.
 _YARN_FIELDS = frozenset(field.name for field in dataclasses.fields(YarnScaling)) | {
-    'type', 'partial_rotary_factor'}
+    'type', 'partial_rotary_factor', 'rope_theta'}
 
 
 # vLLM's spelling of a YaRN attention scale, which DeepSeek-R1-0528-Qwen3-8B
@@ -665,8 +584,7 @@ _YARN_FIELDS = frozenset(field.name for field in dataclasses.fields(YarnScaling)
 _YARN_INERT = frozenset({'attn_factor'})
 
 
-def yarn_record(entry: Mapping[str, object], field: str, theta: float,
-                 max_pos: int) -> YarnRamp:
+def yarn_record(entry: Mapping[str, object], field: str, max_pos: int) -> YarnRamp:
     """Read a YaRN rope entry into the mixer's yarn record.
 
     Keeps the reference's names; the mixer's YarnScaling is built from these
@@ -691,7 +609,6 @@ def yarn_record(entry: Mapping[str, object], field: str, theta: float,
         )
     return native_fields(YarnScaling)(
         rope_type="yarn",
-        rope_theta=theta,
         factor=records.number(factor, f"{field} factor"),
         original_max_position_embeddings=records.integer(
             entry["original_max_position_embeddings"], "original_max_position_embeddings"
@@ -1415,7 +1332,7 @@ class Packed:
     concatenated on `axis`, then permuted by `transpose`.
 
     Each name is a suffix after the stem a tensor and its parts share. A load
-    splits the tensor into views of its parts (`DecoderFamily.prepare_weights`)
+    splits the tensor into views of its parts (`DecoderFamily.readings`)
     and an export packs their leaves back (`layout`), so the one entry is
     both directions. With `chunks` the tensor is that many equal runs on
     `axis`, each holding its share of every part in turn, as a checkpoint
@@ -1481,12 +1398,8 @@ class Packed:
 def split_packed(tensors: Mapping[str, np.ndarray], packed: Sequence[Packed],
                  config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
     """`tensors` with each one a `packed` record names split into its parts
-    (`Packed.split`), the rest as they are.
-
-    A fused tensor and a part stored under its own name, such as Qwen's
-    `experts.gate_up_proj` beside `experts.gate_proj`, both hold that part,
-    so the two must be the same tensor, of one dtype and equal values; any
-    other pair is refused, whichever comes first."""
+    (`Packed.split`), the rest as they are, each part held once
+    (`_held_twice`)."""
     split: dict[str, np.ndarray] = {}
     for name, tensor in tensors.items():
         packing = next((packing for packing in packed if name.endswith(packing.name)), None)
@@ -1494,11 +1407,57 @@ def split_packed(tensors: Mapping[str, np.ndarray], packed: Sequence[Packed],
         for part, value in parts.items():
             held = split.setdefault(part, value)
             if held is not value:
-                held, value = np.asarray(held), np.asarray(value)
-                if held.dtype != value.dtype or not np.array_equal(held, value):
-                    raise ValueError(f"{name} holds {part} as {value.dtype}, which another of the "
-                                     f"checkpoint's tensors holds as a different {held.dtype} tensor")
+                _held_twice(name, part, held, value)
     return split
+
+
+def _held_twice(name: str, part: str, held, value) -> None:
+    """Refuse a second tensor for `part`, the stored tensor `name`'s, unless it is the one held.
+
+    A fused tensor and a part stored under its own name, such as Qwen's
+    `experts.gate_up_proj` beside `experts.gate_proj`, both hold that part,
+    and the tree has one leaf for it, so the two must be the same tensor, of
+    one dtype and equal values; any other pair is refused, whichever the
+    checkpoint lists first."""
+    held, value = np.asarray(held), np.asarray(value)
+    if held.dtype != value.dtype or not np.array_equal(held, value):
+        raise ValueError(f"{name} holds {part} as {value.dtype}, which another of the "
+                         f"checkpoint's tensors holds as a different {held.dtype} tensor")
+
+
+class Part(NamedTuple):
+    """One tensor the path map reads: a stored tensor as `prepare` leaves it, or one part of a packed
+    one (`Packed.split`), and the leaf it fills (`DecoderFamily.source_path`), None where the tree
+    has no leaf for it."""
+
+    name: str
+    tensor: np.ndarray
+    path: tuple[str, ...] | None
+
+
+class Reading(NamedTuple):
+    """One tensor as the path map reads it (`DecoderFamily.readings`): its parts, split by its
+    `packing` or, unpacked, the one tensor itself, as `prepare` leaves them; and the tensor as the
+    checkpoint stores it, which a binding rebuilds (None for a name `prepare` made). `prepare`
+    reshapes only unpacked tensors (DeepSeek V4's grouped projection, Kimi's `A_log`), so a packed
+    tensor's parts are its stored tensor's."""
+
+    name: str
+    stored: np.ndarray | None
+    packing: Packed | None
+    parts: tuple[Part, ...]
+
+
+def held_parts(readings: Sequence[Reading]) -> dict[str, Part]:
+    """Each part `readings` hold, once: the tree's one leaf for a part a fused tensor and a tensor
+    of its own both store (`_held_twice`)."""
+    held: dict[str, Part] = {}
+    for reading in readings:
+        for part in reading.parts:
+            kept = held.setdefault(part.name, part)
+            if kept is not part:
+                _held_twice(reading.name, part.name, kept.tensor, part.tensor)
+    return held
 
 
 def joined_packed(tensors: Mapping[str, np.ndarray], packed: Sequence[Packed]) -> dict[str, np.ndarray]:
@@ -1629,20 +1588,28 @@ class DecoderFamily:
     family alike: Gemma's GELU, Gemma 2's caps and query scalar, OLMo 3's
     norm epsilon. Rope bases are the class's `RopeSpelling`."""
 
-    def prepare_weights(self, tensors: Mapping[str, np.ndarray],
-                        config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
-        """The checkpoint's tensors as the path map reads them: `prepare`'s, with
-        every `packed` tensor split into its parts.
-
-        A fused tensor and a part stored under its own name, such as Qwen's
-        `experts.gate_up_proj` beside `experts.gate_proj`, both hold that
-        part, and one leaf reads it, so the two must be the same tensor, of
-        one dtype and equal values; any other pair is refused, whichever the
-        checkpoint lists first. A quantized copy reaches this decoded at the
-        load's storage dtype (`Pretrained.load`), so a dense copy beside it
-        must hold the decoded values in that dtype."""
-        prepared = self.prepare(tensors, config)
-        return split_packed(prepared, self.packed, config) if self.packed else prepared
+    def readings(self, tensors: Mapping[str, np.ndarray],
+                 config: Mapping[str, object]) -> tuple[Reading, ...]:
+        """The checkpoint's tensors as the path map reads them, in its order:
+        `prepare`'s, each `packed` one split into its parts (`Packed.split`:
+        views, or copies where parts interleave in runs), and the leaf each
+        part fills. Loading places them (`hf_decoders.read_decoder`, each part
+        once, `held_parts`), and the bindings that adapters, the export and
+        input quantization resolve source names through
+        (`Pretrained.weight_layouts`) are built from the same readings, so
+        the two directions read one plan. A quantized copy reaches this
+        decoded at the load's storage dtype (`Pretrained.load`), so a dense
+        copy beside it must hold the decoded values in that dtype."""
+        # One read of each tensor: a lazy mapping builds a tensor on every access
+        # (`LazyTensors`), and `prepare` and the stored tensors share these.
+        stored = dict(tensors)
+        readings = []
+        for name, tensor in self.prepare(stored, config).items():
+            packing = self.packing(name)
+            parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
+            readings.append(Reading(name, stored.get(name), packing, tuple(
+                Part(part, value, self.source_path(part, config)) for part, value in parts.items())))
+        return tuple(readings)
 
     def tensor_name(self, name: str, config: Mapping[str, object]) -> str | None:
         """The source name the dew path `name` exports under."""

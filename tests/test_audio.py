@@ -17,9 +17,10 @@ import numpy as np
 import optax
 import pytest
 from interop_support import gemma_features
+from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
-from dew.nn.audio import Gemma3nAudio, audio_config, audio_weight_path, audio_weights
+from dew.nn.audio import AudioLinear, Gemma3nAudio, audio_config, audio_weight_path, audio_weights
 from dew.nn.vision import Gemma3nProjectorModule, Gemma4ProjectorModule
 from dew.nn.vision.gemma3n import translate_gemma3n_projector_weights
 from dew.nn.vision.gemma4 import translate_gemma4_projector_weights
@@ -34,7 +35,7 @@ def _audio(kind):
     path = FIXTURES / kind
     record = json.loads((path / "config.json").read_text())
     config = audio_config(record)
-    variables = audio_weights(load_file(str(path / "encoder.safetensors")), config)
+    variables, _ = audio_weights(load_file(str(path / "encoder.safetensors")), config)
     model = config.build().clone(precision=jax.lax.Precision.HIGHEST)
     tensors = load_file(str(path / "projector.safetensors"))
     if kind == "gemma3n":
@@ -42,12 +43,12 @@ def _audio(kind):
                                            vocab_offset=record["vocab_offset"], norm_eps=config.rms_norm_eps,
                                            precision=jax.lax.Precision.HIGHEST)
         method = projector.soft_embeddings
-        projector_variables = {"params": translate_gemma3n_projector_weights(tensors)}
+        projector_variables = {"params": translate_gemma3n_projector_weights(tensors)[0]}
     else:
         projector = Gemma4ProjectorModule(text_width=32, norm_eps=config.rms_norm_eps,
                                           precision=jax.lax.Precision.HIGHEST)
         method = projector.__call__
-        projector_variables = {"params": translate_gemma4_projector_weights(tensors)}
+        projector_variables = {"params": translate_gemma4_projector_weights(tensors)[0]}
     return path, config, variables, model, projector, method, projector_variables
 
 
@@ -78,6 +79,60 @@ def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
             variables["constants"])
         changed = jax.jit(model.apply)({**variables, "constants": bounds}, **features)
         assert np.max(np.abs(np.asarray(changed.features) - data["encoded"])) > 1e-3
+        # The loaded FP32 bounds clamp in the operand's dtype, as torch.clamp
+        # does, so a bf16 tower stays bf16 through every clipped map, and its
+        # output is as near the float32 tower's as the reference's bf16 tower.
+        lowered, state = jax.jit(lambda variables: model.clone(dtype=jnp.bfloat16).apply(
+            variables, **features, capture_intermediates=lambda module, _: isinstance(module, AudioLinear)))(
+            variables)
+        assert {leaf.dtype for leaf in jax.tree.leaves(state["intermediates"])} == {jnp.dtype(jnp.bfloat16)}
+        real = np.asarray(data["valid"], bool)
+        truth = np.asarray(data["encoded"], np.float64)[real]
+        assert_as_exact_as_the_reference(np.asarray(lowered.features, np.float32)[real],
+                                         data["encoded_bf16"][real], truth, "bf16 encoded")
+
+
+def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_reference_does():
+    """`hidden_act` may name any activation the shared table computes,
+    quick_gelu here, and a tower so configured loads. Its feed-forwards and
+    light convolution, the blocks the activation runs in, each compute the
+    reference's block with the tower's own weights: in fp32, as exact as the
+    reference's fp32 block from its float64 run. The whole reference tower pins
+    its attention to float32, so the blocks run alone."""
+    import functools
+
+    import torch
+    from flax import linen as nn
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel
+
+    from dew.nn.audio import AudioFeedForward, AudioLightConv
+    from tools.audio_reference import audio_config as reference_config, perturb
+
+    config = reference_config("gemma4")
+    config.hidden_act = "quick_gelu"
+    torch.manual_seed(314)
+    reference = Gemma4AudioModel(config).eval()
+    perturb(reference)
+    ours = audio_config(config.to_dict())
+    tensors = {name: tensor.numpy().copy() for name, tensor in reference.state_dict().items()}
+    tree, _ = audio_weights(tensors, ours)
+    linear = functools.partial(AudioLinear, dense=functools.partial(nn.Dense, use_bias=False),
+                               use_clipped_linears=ours.use_clipped_linears)
+    feed_forward = AudioFeedForward(ours.hidden_size, ours.residual_weight, ours.gradient_clipping, linear,
+                                    ours.hidden_act)
+    light_conv = AudioLightConv(ours.hidden_size, ours.conv_kernel_size, ours.rms_norm_eps,
+                                ours.gradient_clipping, linear, ours.hidden_act)
+    x = np.random.default_rng(5).normal(size=(2, 12, ours.hidden_size)).astype(np.float32)
+    layer = reference.layers[0]
+    blocks = {"feed_forward1": feed_forward, "lconv1d": light_conv, "feed_forward2": feed_forward}
+    for name, block in blocks.items():
+        theirs = getattr(layer, name)
+        with torch.no_grad():
+            wide, narrow = (theirs.to(dtype)(torch.from_numpy(x).to(dtype)).numpy()
+                            for dtype in (torch.float64, torch.float32))
+        variables = {collection: held["layers_0"][name] for collection, held in tree.items()
+                     if name in held.get("layers_0", {})}
+        assert_as_exact_as_the_reference(np.asarray(block.apply(variables, x)), narrow, wide, name)
 
 
 @on_gpu

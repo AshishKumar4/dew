@@ -65,7 +65,11 @@ over the training mesh; the compiler's FLOPs remain per-device.
 `train/hfu` is still HLO hardware FLOPs utilization, including rematerialized work.
 The former HLO model count, with a recomputed forward counted once, is now
 `train/hlo_flops_util`; it is not MFU. Both HLO metrics keep their own compiler
-availability checks, independently of the analytical model count.
+availability checks, independently of the analytical model count. A Pallas kernel
+lowers to a Triton call whose work the HLO does not state (JAX's Triton lowering
+drops the kernel's `CostEstimate`), so a step that runs one reports both as
+`train/hfu_lower_bound` and `train/hlo_flops_util_lower_bound`, beside
+`train/unsized_kernels`, the launches a step that neither counts.
 
 MFU previously used the HLO model count. It now uses analytical real-token
 model work: old `train/mfu` and new `train/mfu` values are not directly comparable.
@@ -215,14 +219,16 @@ and the SD VAE's decoder at their released sizes, with random weights;
 Qwen3-0.6B served at 32 and 128 slots; causal attention forward and backward
 (cudnn and xla, 2048 tokens, 128-wide heads); the Oxford Flowers input pipeline;
 and the save and restore of lm-dense's training state. Each row runs in a
-process of its own, with the tree's own copy of the tool where it has one. A row
+process of its own, in the tree's own environment (its `locks/<build>.txt` for
+this machine's CUDA build, built once per lock by `tools/environments.py`),
+with the tree's own copy of the tool where it has one. A row
 regresses when the head's median is worse than the base's by more than either
 tree's spread across rounds (at least 2%), and the two trees' ranges do not
 overlap. With three rounds each, samples separate by chance 1 time in 20 when
 nothing changed, and the band lowers that further. A row's band is also its
 sensitivity: it cannot see a change smaller than its own noise. A row the base
-cannot run in any round (a tree older than its tool) is not compared. A row the
-base runs and the head runs in no round is broken, a row neither runs leaves the
+cannot run in any round (a tree older than its tool, or than the locks) is not
+compared. A row the base runs and the head runs in no round is broken, a row neither runs leaves the
 battery incomplete, and a row either tree measured in only some rounds, or as
 NaN, an infinity or zero, is partial and not judged on the rounds that ran; all
 three fail the gate, as a regression does. `report` writes the table and exits 1
@@ -3398,7 +3404,7 @@ The trainer also plans the batch (`dew.training.planning`). Unless the run fixes
 
 A pool that grows (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) never gives back a region it has grown (openxla/xla#50052). A process that compiles the step autotunes it, and the pool grows for the autotuner's scratch. A process that loads the step from the persistent cache does not. So the same program can fit in the second process and not in the first: the MoE kept its whole logits from a warm cache and tiled its head from a cold one. A check that ignored where the free bytes lie said it fit in the cold process, which then ran out of memory allocating its 8.34 GiB of temporaries.
 
-A checkpoint records the rung its state trained on (head tile, remat and XLA options). A resumed run compiles that rung, climbs from it only if it does not fit, and reports any climb. A fresh run does the same with the rung that an earlier run of the same step chose. That rung is recorded beside the persistent compilation cache (`dew-rungs/`), keyed by the step's program at its starting rung, the devices' kind and allocator limit, and XLA_FLAGS. Identical runs can read different free memory: a process that compiles the step autotunes it, and a growing pool keeps the autotuner's scratch. Without the record, the 99M MoE at 8 x 1024 tiled its head in the run that compiled it (98.2 ms a step) and kept its whole logits in the next one (78.4). With it, both take the first run's rung. If a record's key does not match the run, or the objective cannot take its rung, the run refuses it and names its path. Deleting the record lets the run decide again, for example after a run that shared the device with another process. A resumed run never steps down to a lighter rung: the restoring process may see different free memory than the one that built the state, and a lighter rung would run a different program. The rung a step compiled under is the `remat` of the run's `StepCompiled` record and of `tools/benchmark_step.py`'s rows. The table times forward plus backward plus AdamW in bf16 compute over 10 timed steps, with `tools/benchmark_kernels.py step --remat`:
+A checkpoint records the rung its state trained on (head tile, remat and XLA options). A resumed run compiles that rung, climbs from it only if it does not fit, and reports any climb. A fresh run does the same with the rung that an earlier run of the same step chose. That rung is recorded beside the persistent compilation cache (`dew-rungs/`), or in `DEW_RUNG_RECORDS` when that names a directory, keyed by the step's program at its starting rung, the devices' kind and allocator limit, and XLA_FLAGS. Identical runs can read different free memory: a process that compiles the step autotunes it, and a growing pool keeps the autotuner's scratch. Without the record, the 99M MoE at 8 x 1024 tiled its head in the run that compiled it (98.2 ms a step) and kept its whole logits in the next one (78.4). With it, both take the first run's rung. If a record's key does not match the run, or the objective cannot take its rung, the run refuses it and names its path. Deleting the record lets the run decide again, for example after a run that shared the device with another process. A resumed run never steps down to a lighter rung: the restoring process may see different free memory than the one that built the state, and a lighter rung would run a different program. The rung a step compiled under is the `remat` of the run's `StepCompiled` record and of `tools/benchmark_step.py`'s rows. The table times forward plus backward plus AdamW in bf16 compute over 10 timed steps, with `tools/benchmark_kernels.py step --remat`:
 
 | device | model, batch x tokens | none | minimal / dots | full |
 |---|---|---|---|---|

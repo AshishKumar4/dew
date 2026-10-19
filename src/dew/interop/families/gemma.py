@@ -31,7 +31,6 @@ from dew.interop.decoder_parts import (
     decoder_tensors,
     dew_path,
     fixed_fields,
-    fixed_mixture,
     hf_activation,
     hf_tensor_name,
     kinds_of,
@@ -76,6 +75,18 @@ def _gemma_layer_types(hf_config: Mapping[str, object], used: set[str], *,
         )
     # Gemma4TextConfig rewrites the final layer before building the model.
     return (*types[:-1], 'full_attention') if last_full and types else types
+
+
+GEMMA4_ROPE = {'sliding_attention': {'rope_type': 'default', 'rope_theta': 10000.0},
+               'full_attention': {'rope_type': 'proportional', 'partial_rotary_factor': 0.25,
+                                  'rope_theta': 1000000.0}}
+"""The records Gemma4TextConfig and DiffusionGemmaTextConfig install when
+rope_parameters is absent or null (configuration_gemma4.py:203-208)."""
+
+GEMMA4_DEFAULTS = {'hidden_activation': 'gelu_pytorch_tanh', 'head_dim': 256, 'num_key_value_heads': 4,
+                   'sliding_window': 512}
+"""The class defaults Gemma 4's text configs share where Dew's readers would
+otherwise fall back to another value (configuration_gemma4.py:152-183)."""
 
 
 def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, float | None]:
@@ -335,7 +346,8 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
             full_kv = records.integer(global_kv, 'num_global_key_value_heads')
     # Proportional rope rotates a fraction of the full layers' head dims
     # and passes the rest through; sliding layers rotate all of theirs.
-    entries = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
+    stated = hf_config.get('rope_parameters')
+    entries = GEMMA4_ROPE if stated is None else records.record(stated, 'rope_parameters')
     rope_theta, rope_local_theta, partial = _gemma4_rope(entries)
     used.update(('rope_parameters', 'rope_theta'))
     per_layer = records.integer(
@@ -422,10 +434,9 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
     Every field is read off the model, never copied from the config a source
     shipped, so an exported model and a trained one write the same file.
     """
-    fixed = {'qk_norm': True, 'v_norm': True, 'sandwich_norms': True, 'pre_norms': True,
-             'embedding_scale': True, 'attention_scale': 1.0, 'scale_offset': False,
-             'scale_after_cast': False, 'qk_norm_scope': 'head', 'causal': True}
-    fixed_fields(model, fixed, 'Gemma4 computes {0!r} for this field')
+    # What the config carries is held to the round trip (`refuse_lossy_export`); how the model
+    # runs, which it does not carry, is held here.
+    fixed_fields(model, {'scale_after_cast': False}, 'Gemma4 computes {0!r} for this field')
     for name in ('output_gate', 'attention_sinks', 'attn_logit_softcap', 'altup',
                  'laurel_rank', 'activation_sparsity_pattern', 'num_nextn_predict_layers', 'dropout_rate'):
         if getattr(model, name):
@@ -487,12 +498,6 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
     if mixture is not None:
         if not mixture.parallel or tuple(model.sparse_layers) != tuple(range(model.num_layers)):
             refuse('mixture', 'Gemma4 routes a parallel expert branch on every layer')
-        defaults = Mixture(experts=mixture.experts, top_k=mixture.top_k,
-                           expert_features=mixture.expert_features, parallel=True)
-        represented = {'experts', 'top_k', 'expert_features', 'parallel', 'layers',
-                       'implementation', 'dispatch'}
-        fixed_mixture(mixture, defaults, represented,
-                       'Gemma4 has its fixed parallel router and expert computation')
         fields.update(num_experts=mixture.experts, top_k_experts=mixture.top_k,
                       moe_intermediate_size=mixture.expert_features or model.hidden_features)
     return fields
@@ -605,6 +610,8 @@ GEMMA4_TEXT = DecoderFamily(
     packed=FUSED_EXPERTS,
     export_weights=gemma4_export_weights,
     preserve_source_layout=True,
+    defaults={**GEMMA4_DEFAULTS, 'hidden_size_per_layer_input': 256,
+              'vocab_size_per_layer_input': 262144},
 )
 
 GEMMA3_TEXT = DecoderFamily(

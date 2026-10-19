@@ -13,7 +13,9 @@ captured head input through `chunked_cross_entropy`'s own logsumexp and
 lands one fp32 ulp (4.8e-7) from torch's; `LOSS` is two.
 """
 
+import copy
 import math
+from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +25,7 @@ import pytest
 import torch
 import transformers
 from jax.sharding import PartitionSpec as P
+from reference_error import assert_leaves_as_exact, float64_terms, widened
 
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
@@ -30,6 +33,7 @@ from dew.interop.torchax_fallback import TorchLayout
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
+from tools.diffusers_wan_reference import float64
 
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
@@ -140,6 +144,98 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     assert moved["gpt_neox.embed_in.weight"].sharding.spec == P(("fsdp", "tensor"))
 
 
+GEMMA2 = {**TINY, "intermediate_size": 128, "num_key_value_heads": 2, "head_dim": 16, "sliding_window": 32,
+          "final_logit_softcapping": 2.0, "query_pre_attn_scalar": 16}
+LLAMA = {**TINY, "num_key_value_heads": 2, "tie_word_embeddings": True}
+HEADS = {"zero bias": ("TorchCausalLM", "float32"), "bias": ("TorchCausalLM", "float32"),
+         "softcap": ("TorchCausalLM", "float32"), "tied": ("TorchTableLM", "float32"),
+         "bf16 tied": ("TorchTableLM", "bfloat16")}
+"""Each head below, the module it loads as and the dtype its checkpoint stores.
+Every one computes in float32. Over bf16 compute torchax's XLA ops and torch's
+part by their own bf16 roundings, which a scalar loss over 128 tokens cannot
+average out (measured: logits 8.3e-4 and 8.0e-4 from float64 in RMS, the
+losses 1.5e-4 and 3.0e-5)."""
+
+
+def head_model(head):
+    """A random causal LM: Phi's lm_head with its bias as initialized (zero)
+    or drawn, Gemma 2's softcapped head, or Llama's head tied to its
+    embedding, a plain product, stored in float32 or bf16."""
+    torch.manual_seed(0)
+    if head == "softcap":
+        return transformers.Gemma2ForCausalLM(transformers.Gemma2Config(**GEMMA2)).eval()
+    if head.endswith("tied"):
+        model = transformers.LlamaForCausalLM(transformers.LlamaConfig(**LLAMA)).eval()
+        return model.to(torch.bfloat16) if head.startswith("bf16") else model
+    model = transformers.PhiForCausalLM(transformers.PhiConfig(**TINY)).eval()
+    if head == "bias":
+        with torch.no_grad():
+            model.lm_head.bias.normal_(0, 0.5)
+    return model
+
+
+def torch_step(model, tokens, stored=torch.float32) -> dict[str, np.ndarray]:
+    """transformers' own loss over `tokens` and torch autograd's gradient of
+    every parameter, rounded to the `stored` dtype a parameter is kept in,
+    as float64 arrays."""
+    ids = torch.from_numpy(tokens.astype(np.int64))
+    model.zero_grad()
+    loss = model(ids, labels=ids).loss
+    loss.backward()
+    return {"loss": np.asarray([loss.item()])} | {
+        name: parameter.grad.to(stored).double().numpy() for name, parameter in model.named_parameters()}
+
+
+@pytest.mark.parametrize("head", HEADS)
+def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path):
+    """A head that adds anything to the product, even a bias that is zero
+    now, loads as a model a loss scores whole; a plain head, tied or bf16,
+    as one whose head input and weight it scores. Either way LMObjective's
+    loss and its gradient of every parameter, the head bias included, are
+    as exact as transformers' own over the same stored weights, both measured
+    from transformers in float64 (tests/reference_error.py); a bf16 store's
+    gradients round to bf16 on both sides, as the parameters they update are
+    kept. A leaf whose sum cancels by design (a key bias's gradient, under the
+    softmax's shift invariance) is sized by its float64 terms, which Dew's own
+    forward sums in float64."""
+    module, stored = HEADS[head]
+    model = head_model(head)
+    model.save_pretrained(tmp_path)
+    with pytest.warns(UserWarning):
+        loaded = Pretrained.load(tmp_path, fallback="torchax", dtype="float32", param_dtype=stored)
+    assert type(loaded.model).__name__ == module
+
+    def step(source):
+        objective = LMObjective(source, seq_len=SEQ, ema_decay=None)
+        loss = jax.value_and_grad(lambda params: objective_loss(
+            objective, {**source.variables, "params": params}, tokens, scalar=True))
+        return loss, {name: jnp.asarray(leaf) for name, leaf in source.variables["params"].items()}
+
+    names = [name for name, _ in model.named_parameters()]
+    loss, params = step(loaded)
+    value, grads = loss(params)
+    dew = {"loss": np.asarray([value], np.float64)} | {
+        name: np.asarray(grads[name], np.float64) for name in names}
+    reference = torch_step(copy.deepcopy(model).float(), tokens, getattr(torch, stored))
+    # Truth: the same weights in a model built in float64, its float32 pins
+    # (the loss's logits.float(), an RMS norm's upcast) widened and its
+    # rotary tables rebuilt; Dew's own float64 terms under the same widening.
+    with float64():
+        wide_model = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                                   attn_implementation="eager").eval()
+        wide_model.load_state_dict(model.state_dict())
+        truth = torch_step(wide_model, tokens)
+        with jax.enable_x64(new_val=True):
+            wide = replace(loaded, model=loaded.model.clone(dtype=jnp.float64),
+                           variables=widened(loaded.variables))
+            loss, params = step(wide)
+            _, (loss_terms, grad_terms) = float64_terms(loss, params)
+    terms = {"loss": np.asarray([loss_terms])} | {name: np.asarray(grad_terms[name]) for name in names}
+    assert_leaves_as_exact(dew, reference, truth, reductions=ROWS * SEQ, terms=terms)
+    if head in ("zero bias", "bias"):
+        assert np.abs(dew["lm_head.bias"]).max() > 0
+
+
 def test_save_writes_the_source_names_back(source, loaded, tokens, tmp_path):
     """The saved directory is a transformers checkpoint of the given weights."""
     variables = {**loaded.variables, "params": {name: np.asarray(leaf) * 0.5
@@ -148,3 +244,29 @@ def test_save_writes_the_source_names_back(source, loaded, tokens, tmp_path):
     reloaded = transformers.AutoModelForCausalLM.from_pretrained(tmp_path).eval()
     logits = np.asarray(loaded.model.apply(variables, jnp.asarray(tokens)))
     assert np.abs(logits - torch_logits(reloaded, tokens)).max() <= LOGITS
+
+
+@pytest.mark.parametrize("selector", ["gguf_file", "single_file", "dduf_file"])
+def test_a_payload_selector_is_refused_where_the_fallback_reads_the_repos_own_weights(source, selector):
+    """The fallback builds the transformers model the repo's config.json and
+    weights describe. A GGUF, single-file or DDUF selector names another
+    payload, so it is refused rather than dropped."""
+    with pytest.raises(ValueError):
+        Pretrained.load(source[0], fallback="torchax", dtype="float32", **{selector: "model.bin"})
+
+
+def test_the_output_table_scores_as_the_bf16_forward_whatever_dtype_the_states_arrive_in(source, tokens):
+    """In a bf16 forward the head multiplies bf16 states by the bf16 weight and
+    rounds the logits to bf16. The output table carries that compute dtype,
+    so states handed to it in fp32, as a loss may hold them, score as the
+    forward's own logits do: bf16 values, each within one bf16 step of the
+    forward's, which sums the same products in another order."""
+    loaded = Pretrained.load(source[0], fallback="torchax", dtype="bfloat16")
+    table = loaded.model.apply(loaded.variables, method="output_table")
+    hidden = loaded.model.apply(loaded.variables, jnp.asarray(tokens), method="hidden_states")
+    logits = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(tokens)))
+    scored = np.asarray(table.logits(hidden.astype(jnp.float32)), np.float32)
+    np.testing.assert_array_equal(scored, np.asarray(jnp.asarray(scored, jnp.bfloat16), np.float32))
+    # A bf16 value is an fp32 one's upper 16 bits, so neighbours differ by one there.
+    apart = (scored.view(np.int32) >> 16) - (logits.astype(np.float32).view(np.int32) >> 16)
+    assert np.abs(apart).max() <= 1

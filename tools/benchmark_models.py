@@ -1,7 +1,9 @@
 """Build Dew objectives, trainers and fixed host batches for benchmark cases."""
 
+import contextlib
 import dataclasses
-from collections.abc import Iterator, Mapping, Sequence
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 import jax
@@ -29,6 +31,7 @@ from dew.diffusion.discrete import MDLM
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.encoders import ConditionEncoder
+from dew.nn.attention import AttentionImpl
 from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.backbones.flux2 import Flux2Transformer
 from dew.nn.backbones.qwen_image import QwenImageTransformer
@@ -48,6 +51,8 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
 from dew.registry import models, projectors, resolve_dtype, towers
 from dew.training import Layout, MeshSpec, Trainer
+from dew.training.distributed import DevicePrefetchIterator
+from dew.training.state import TrainState
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
 
@@ -137,6 +142,13 @@ def image_tokens(case: Case) -> int:
     return features.shape[1]
 
 
+def objective_keywords(case: Case) -> dict[str, Any]:
+    """The case's own objective keywords (`Case.objective`), with its head chunking where it names one:
+    what every language-model objective it builds, a decoder's or a canvas's, is given."""
+    chunks: dict[str, Any] = {} if case.head_chunks is None else {"head_chunks": case.head_chunks}
+    return {**chunks, **case.objective}
+
+
 def decoder_objective(
     case: Case, model,
 ) -> LMObjective | DPOObjective | GRPOObjective | MaskedDiffusionObjective:
@@ -144,8 +156,7 @@ def decoder_objective(
     with its own head chunking where it names one and its further objective
     keywords. Masked diffusion corrupts to the vocabulary's last id, which
     `global_batch` never draws."""
-    chunks: dict[str, Any] = {} if case.head_chunks is None else {"head_chunks": case.head_chunks}
-    keywords = {**chunks, **case.objective}
+    keywords = objective_keywords(case)
     match case.decoder_objective:
         case "lm":
             return LMObjective(model, case.seq_len, **keywords)
@@ -160,7 +171,8 @@ def decoder_objective(
             return MaskedDiffusionObjective(model, MDLM(mask_id=vocab - 1)(), case.seq_len, **keywords)
 
 
-def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool = False) -> Objective:
+def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
+                    widened: bool = False) -> Objective:
     """The objective a recipe would train for this case.
 
     The case's dtype, attention kernel and matmul precision go into the
@@ -193,8 +205,11 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         prompt, width, count = canvas_split(case)
         model = DiffusionGemma(text=built("causal_transformer", case.config),
                                canvas_length=width)
+        if case.decoder_objective != "lm":
+            raise ValueError(f"{case.label} trains canvases, which BlockDiffusionObjective scores; "
+                             f"it names decoder_objective={case.decoder_objective!r}")
         objective = BlockDiffusionObjective(
-            model, prompt_length=prompt, canvas_size=width, num_canvases=count)
+            model, prompt_length=prompt, canvas_size=width, num_canvases=count, **objective_keywords(case))
     elif case.media is not None:
         family, tower, projector, token = media_values(case)
         # The decoder carries the attention kernel; the wrapper reads none.
@@ -252,7 +267,7 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
     return objective
 
 
-def build_trainer(case: Case, attention_impl: str = 'auto',
+def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
                   optimizer: optax.GradientTransformation | None = None) -> Trainer:
     """The trainer a recipe would build for this case, minus the tracker and the
     checkpoints, on the case's device order. A case measures its own batch,
@@ -386,3 +401,54 @@ def batches(case: Case, mesh: Mesh) -> Iterator[Batch]:
         yield mine
 
 
+Step = Callable[[TrainState], tuple[TrainState, jax.Array, jax.Array]]
+"""One measured training step: the next state, the loss and whether it was finite."""
+
+
+@dataclasses.dataclass(frozen=True)
+class CompiledStep:
+    """A case's trainer step compiled on its first placed batch.
+
+    `state` is the placed initial state, `step` runs one compiled step, and
+    `compile_seconds` is what compiling it took.
+    """
+
+    state: TrainState
+    step: Step
+    compile_seconds: float
+
+
+@contextlib.contextmanager
+def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) -> Iterator[CompiledStep]:
+    """Place the case's state as a run does (`Trainer.place`), compile its step on the first placed batch,
+    and yield it.
+
+    Each step reads the next placed batch, or with `fixed_batch` the first
+    one again. The batches stay placed until the block ends.
+    """
+    with DevicePrefetchIterator(batches(case, trainer.device_mesh), trainer.device_mesh) as source:
+        state, _, _ = trainer.place()
+        first = next(source)
+        jax.block_until_ready((state, first))
+        start = time.perf_counter()
+        compiled = trainer.compile(state, first)
+        compile_seconds = time.perf_counter() - start
+
+        def step(state: TrainState) -> tuple[TrainState, jax.Array, jax.Array]:
+            state, loss, _, finite, _, _ = compiled(state, first if fixed_batch else next(source))
+            return state, loss, finite
+
+        yield CompiledStep(state, step, compile_seconds)
+
+
+def timed_steps(step: Step, state: TrainState, steps: int
+                ) -> tuple[TrainState, jax.Array, jax.Array, float]:
+    """Run `steps` steps, at least one, dispatched as a run dispatches them, waiting once at the end.
+
+    Returns the last state, loss and finiteness, and the seconds the window took.
+    """
+    start = time.perf_counter()
+    for _ in range(steps):
+        state, loss, finite = step(state)
+    loss.block_until_ready()
+    return state, loss, finite, time.perf_counter() - start

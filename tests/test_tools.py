@@ -15,28 +15,33 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
+from test_t5_encoders import TOLERANCE as T5_TOLERANCE
+from test_text_encoders import TOLERANCE as CLIP_TOLERANCE
+from test_vae_16ch import TOLERANCE as VAE_TOLERANCE
 from tool_support import FIXTURES, REPO_ROOT, load
 
 CLAIMS = json.loads((FIXTURES / "provenance.json").read_text())["references"]
 
-# The existing family parity contracts, not bounds fitted to a CI CPU:
-# test_moe.py (routers and expert sums), test_text_encoders.py (tiny towers),
+# The family parity contracts, read from the tests that hold Dew to these fixtures, not bounds fitted
+# to a CI CPU: test_moe.py (routers and expert sums), test_text_encoders.py (tiny towers),
 # test_t5_encoders.py (tiny hidden states), test_vae_16ch.py (raw encode/decode).
 MOE_OUTPUTS = {
-    "mixtral.npz": {"router_weights": 1e-6, "block_output": 2e-5},
-    "deepseek.npz": {"router_weights": 1e-6, "block_output": 2e-5},
-    "deepseek_v2.npz": {"router_weights": 1e-6},
-    "deepseek_v4.npz": {"router_weights": 1e-6, "experts_output": 2e-5},
+    "mixtral.npz": {"router_weights": ROUTER_TOLERANCE, "block_output": OUTPUT_TOLERANCE},
+    "deepseek.npz": {"router_weights": ROUTER_TOLERANCE, "block_output": OUTPUT_TOLERANCE},
+    "deepseek_v2.npz": {"router_weights": ROUTER_TOLERANCE},
+    "deepseek_v4.npz": {"router_weights": ROUTER_TOLERANCE, "experts_output": OUTPUT_TOLERANCE},
 }
 CLIP_OUTPUTS = dict.fromkeys(
-    ("last_hidden_state", "pooler_output", "text_embeds", "image_embeds"), 1e-4)
-T5_OUTPUTS = {"last_hidden_state": 1e-4}
-VAE_OUTPUTS = {"latent": 1e-5, "decoded": 1e-5}
+    ("last_hidden_state", "pooler_output", "text_embeds", "image_embeds"), CLIP_TOLERANCE)
+T5_OUTPUTS = {"last_hidden_state": T5_TOLERANCE}
+VAE_OUTPUTS = {"latent": VAE_TOLERANCE, "decoded": VAE_TOLERANCE}
 
 
 def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, float]) -> None:
@@ -216,15 +221,19 @@ def test_flaxdiff_fixture_is_what_the_generator_writes(tmp_path, architecture, c
 # tools/optimizer_curve.py
 # ---------------------------------------------------------------------------
 
+LINES = [f"line {i}: the quick brown fox jumps over the lazy dog" for i in range(60)]
+
+
 def token_directory(tmp_path: Path) -> Path:
-    """A byte-tokenized corpus, in the directory the curve reads from."""
-    from token_support import encoded_token_fixture
+    """A byte-tokenized corpus, as the curve's documented producer writes it: `dew data export` over
+    a text file's lines, each a document closed by EOS."""
+    from dew.cli.main import DataExport
 
     corpus = tmp_path / "corpus.txt"
-    corpus.write_text("".join(f"line {i}: the quick brown fox jumps over the lazy dog\n"
-                              for i in range(60)))
+    corpus.write_text("".join(f"{line}\n" for line in LINES))
     out = tmp_path / "tokens"
-    encoded_token_fixture(out, [corpus.read_text()], tokenizer="byte", val_fraction=0.1)
+    assert DataExport("records", str(out), fields=json.dumps({"source": str(corpus)}), tokenizer="byte",
+                      eos=True, read="memory").run_command() == 0
     return out
 
 
@@ -249,8 +258,8 @@ def test_optimizer_curve_arms_share_the_model_and_the_batches(tmp_path):
     assert adamw[0] == muon[0]
     assert adamw[1:] != muon[1:]
     assert curves["adamw"]["tokens"] == 3 * 8 * 8
-    assert curves["adamw"]["corpus_tokens"] == json.loads(
-        (tokens / "meta.json").read_text())["train_tokens"]
+    # Every line's bytes, its newline and its EOS.
+    assert curves["adamw"]["corpus_tokens"] == sum(len(line.encode()) + 2 for line in LINES)
 
 
 # ---------------------------------------------------------------------------
@@ -393,12 +402,9 @@ def parameter_movement(tool, case, steps: int = 2):
                 for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
 
     trainer = tool.build_trainer(case, "reference")
-    source = tool.batches(case, trainer.device_mesh)
-    state = jax.jit(trainer.initial_state)()
-    before = jax.tree.map(np.asarray, named(state.variables))  # the step consumes the state
-    compiled = trainer.compile(state, next(source))
-    for _ in range(steps):
-        state, loss, _, finite, _, _ = compiled(state, next(source))
+    with tool.compiled_step(case, trainer) as compiled:
+        before = jax.tree.map(np.asarray, named(compiled.state.variables))  # the step consumes the state
+        state, loss, finite, _ = tool.timed_steps(compiled.step, compiled.state, steps)
     after = named(state.variables)
     assert bool(finite) and np.isfinite(float(loss))
     moved = {name: float(jnp.max(jnp.abs(value - before[name])))
@@ -466,6 +472,28 @@ def test_step_benchmark_canvas_step_trains_the_self_conditioning_decoder():
     assert two_canvases > one_canvas
 
 
+
+def test_a_canvas_case_trains_with_the_head_chunks_and_objective_keywords_it_names():
+    """A canvas case's head chunking and objective keywords reach the block objective its measured
+    step trains, as a decoder case's reach its objective: with the canvas loss weighed at nothing,
+    the self-conditioning MLP only the canvas pass feeds stays where it was while the trunk the
+    encoder loss trains moves, over the head in the one chunk the case names (chunking changes no
+    number, so that the step trains with it is what is asked). A case that names another decoder
+    objective is refused: the canvas case would benchmark the block objective under its name."""
+    tool = load("benchmark_step")
+    case = dataclasses.replace(
+        composite_case(tool, "diffusion_gemma", canvas={"prompt_length": 12, "canvas_size": 4}),
+        head_chunks=1, objective={"decoder_loss_weight": 0.0})
+
+    moved, _ = parameter_movement(tool, case, steps=1)
+
+    conditioning = [value for name, value in moved.items() if "self_conditioning" in name]
+    assert conditioning and max(conditioning) == 0
+    assert max(value for name, value in moved.items() if "text" in name) > 0
+    with pytest.raises(ValueError):
+        tool.build_objective(dataclasses.replace(case, decoder_objective="dpo"))
+
+
 # ---------------------------------------------------------------------------
 # tools/trace_window.py
 # ---------------------------------------------------------------------------
@@ -488,6 +516,93 @@ def test_a_traced_window_splits_into_compute_exposed_collectives_and_idle():
         "AllGather": 0}
     assert split["window"] == (split["compute"] + split["exposed_communication"]
                                + split["idle_input"] + split["idle_host"])
+
+
+def test_trace_reports_keep_global_busy_time_separate_from_per_device_averages():
+    tool = load("benchmark_step")
+    common = load("reference_runs/common")
+    rows = [
+        (0, "gemm_fusion_dot", 0, 10, None),
+        (0, "ncclDevKernel_SendRecv", 5, 20, "all_to_all.124.1"),
+        (0, "MemcpyH2D", 25, 26, None),
+        (0, "gemm_fusion_dot", 26, 30, None),
+        (0, "ncclDevKernel_SendRecv", 40, 50, "collective-permute.3"),
+        (1, "loop_add_fusion", 100, 110, None),
+        (1, "ncclDevKernel_AllReduce_Sum_bf16_RING_LL", 105, 120, "all-reduce.3"),
+        (1, "loop_add_fusion", 125, 130, None),
+    ]
+    planes = {f"/device:GPU:{device}": [
+        SimpleNamespace(name=name, start_ns=start * 1_000_000, end_ns=end * 1_000_000,
+                        stats=[] if op is None else [("hlo_op", op)])
+        for owner, name, start, end, op in reversed(rows) if owner == device] for device in (0, 1, 2)}
+    kernels = [(name, start * 1_000_000, end * 1_000_000, device)
+               for device, name, start, end, _ in rows]
+
+    timeline = tool.device_timeline("unused", 2, planes=planes)
+    reference = common.kernel_summary(kernels, 2)
+    communication = tool.communication("unused", 2, planes=planes)
+
+    assert timeline["device_busy_ms_per_step"] == pytest.approx(30)
+    assert timeline["device_window_ms_per_step"] == pytest.approx(65)
+    assert timeline["device_busy_percent"] == pytest.approx(100 * 60 / 130)
+    assert timeline["kernels_per_step"] == 4
+    assert timeline["kernel_ms_by_category"] == pytest.approx(
+        {"collective": 20, "elementwise": 7.5, "gemm": 7, "other": 0.5})
+    assert dict(timeline["top_kernels"])["gemm_fusion_dot"] == pytest.approx(7)
+    assert reference["device_busy_ms_per_step"] == pytest.approx(15)
+    assert reference["device_window_ms_per_step"] == pytest.approx(20)
+    assert reference["device_busy_percent"] == pytest.approx(75)
+    assert reference["kernels_per_step"] == 2
+    assert reference["kernel_ms_by_category"] == pytest.approx(
+        {"collective": 10, "elementwise": 3.75, "gemm": 3.5, "other": 0.25})
+    gemm = next(row for row in reference["top_kernels"] if row["name"] == "gemm_fusion_dot")
+    assert (gemm["ms_per_step"], gemm["calls_per_step"]) == pytest.approx((3.5, 0.5))
+    assert communication["traced_devices"] == reference["devices"] == 2
+    assert communication["window_ms_per_step"] == pytest.approx(20)
+    for key, expected in {"compute": 7.5, "communication": 10, "exposed_communication": 7.5,
+                          "idle_input": 1.25, "idle_host": 3.75}.items():
+        assert (communication[f"{key}_ms_per_step"]
+                == reference[f"{key}_ms_per_step"] == pytest.approx(expected))
+    assert communication["all_to_all_ms_per_step"] == pytest.approx(3.75)
+    assert communication["all_to_all_exposed_ms_per_step"] == pytest.approx(2.5)
+    assert communication["collective_permute_ms_per_step"] == pytest.approx(2.5)
+    assert communication["collective_permute_exposed_ms_per_step"] == pytest.approx(2.5)
+    assert communication["all_reduce_exposed_ms_per_step"] == pytest.approx(2.5)
+    assert communication["exposed_communication_percent"] == pytest.approx(37.5)
+
+
+@pytest.mark.parametrize("scale", [1_000, 0.125])
+def test_kernel_sums_preserve_decode_categories_counts_and_overlapping_streams(scale):
+    tool = load("trace_window")
+    rows = [("cudnn_conv", 0, 30), ("flash_gemm", 5, 15), ("cutlass_scatter", 30, 40),
+            ("argmax", 40, 50), ("philox", 60, 70), ("unclassified", 70, 80),
+            ("unclassified", 85, 90), ("ncclDevKernel_SendRecv", 90, 95)]
+    events = [(name, start * scale, end * scale) for name, start, end in reversed(rows)]
+    durations, counts = tool.kernel_totals(events)
+    classes, class_counts = tool.kernel_totals(events, tool.decode_category)
+    training, _ = tool.kernel_totals(events, tool.kernel_category)
+
+    assert {name: duration / scale for name, duration in durations.items()} == pytest.approx({
+        "cudnn_conv": 30, "flash_gemm": 10, "cutlass_scatter": 10, "argmax": 10,
+        "philox": 10, "unclassified": 15, "ncclDevKernel_SendRecv": 5})
+    assert counts == {name: 2 if name == "unclassified" else 1 for name in durations}
+    assert {kind: duration / scale for kind, duration in classes.items()} == pytest.approx(
+        {"attention": 40, "gemm": 10, "reduction": 10, "random": 10, "other": 20})
+    assert class_counts == {"attention": 2, "gemm": 1, "reduction": 1, "random": 1, "other": 3}
+    assert {kind: duration / scale for kind, duration in training.items()} == pytest.approx(
+        {"conv": 30, "attention": 10, "gemm": 10, "other": 35, "collective": 5})
+    split = tool.window_split(events)
+    assert split["busy"] / scale == pytest.approx(80)
+    assert split["window"] / scale == pytest.approx(95)
+    assert sum(durations.values()) == sum(classes.values()) == sum(training.values())
+    assert sum(durations.values()) > split["busy"]
+
+
+def test_a_nested_last_kernel_does_not_shorten_a_traced_window():
+    tool = load("trace_window")
+    split = tool.window_split([("nested", 30.5, 40.25), ("long_kernel", 10.25, 100.75)])
+    assert (split["busy"], split["compute"], split["window"]) == (90.5, 90.5, 90.5)
+    assert split["idle_input"] == split["idle_host"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +666,207 @@ def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
                   for module in modules for finding in lint.check(module))
 
 
+def test_the_gate_reads_the_site_the_docs_generators_and_the_kernel_packages_but_not_installed_npm(tmp_path):
+    """With no roots named, the gate reads the site's scripts, the docs' figure generators and the
+    kernel packages beside the package's source and the scripts, and none of the Python an npm
+    install leaves under the site."""
+    lint = load("lint_slop")
+    roots = lint.default_roots("dew")
+    found = {module.relative for module in lint.collect(roots, REPO_ROOT, "dew")}
+    assert {"site/scripts/gen_api.py", "docs/assets/figures.py",
+            "kernels/flash_attn/dew_flash_attn/__init__.py"} <= found
+    for relative in ("site/scripts/build.py", "site/node_modules/node-gyp/gyp/pylib/gyp/common.py"):
+        (tmp_path / relative).parent.mkdir(parents=True)
+        (tmp_path / relative).write_text("WIDTH = 1  # noqa: E501\n")
+    assert [module.relative for module in lint.collect(roots, tmp_path, "dew")] == ["site/scripts/build.py"]
+
+
+def test_the_gate_skips_the_hero_script_while_its_bytes_are_the_recorded_ones(tmp_path):
+    """The landing hero's script is recorded data: the hero capture pins its bytes (script_sha256),
+    so the gate leaves it alone while they are the recorded ones and reads it once they are not, as
+    an edit the hero is then recorded again for."""
+    lint = load("lint_slop")
+    hero, capture = "site/src/data/hero.py", "site/src/data/capture.json"
+    assert {hero: capture} == lint.RECORDED
+    recorded = (REPO_ROOT / hero).read_bytes()
+    (tmp_path / hero).parent.mkdir(parents=True)
+    (tmp_path / capture).write_bytes((REPO_ROOT / capture).read_bytes())
+    (tmp_path / hero).write_bytes(recorded)
+    assert [module.relative for module in lint.collect(["site"], tmp_path, "dew")] == []
+    (tmp_path / hero).write_bytes(recorded + b"\n")
+    assert [module.relative for module in lint.collect(["site"], tmp_path, "dew")] == [hero]
+
+
+def test_a_suppression_is_reported_in_every_file_and_a_string_or_function_that_spells_one_is_not(tmp_path):
+    """SLOP003 runs in the suite and the tools as in the source: an ignore comment,
+    `typing.cast` however it was imported, and a warning filter whose action is
+    "ignore" are each reported. A string that spells a comment, a function of the
+    file's own named `cast`, a filter that makes warnings errors, and an import kept
+    for the registry entry it makes are not."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": "EDGES = 1\n",
+        "tests/test_graph.py": (
+            "import warnings\n"
+            "from typing import cast as as_type\n"
+            "import pytest\n"
+            "import sparx.plugins  # noqa: F401  (registers the kind)\n"
+            "WIDTH = 1  # noqa: E501\n"
+            "SPELLED = 'x = 1  # noqa: E501'\n"
+            "def cast(value):\n"
+            "    return value\n"
+            "@pytest.mark.filterwarnings('ignore::DeprecationWarning')\n"
+            "def test_quiet():\n"
+            "    warnings.simplefilter('ignore')\n"
+            "    with warnings.catch_warnings(action='ignore'):\n"
+            "        assert as_type(int, cast(1))\n"
+            "@pytest.mark.filterwarnings('error')\n"
+            "def test_loud():\n"
+            "    warnings.filterwarnings(action='error')\n"
+            "@pytest.mark.filterwarnings('error', 'ignore::DeprecationWarning')\n"
+            "def test_quiet_after_all():\n"
+            "    pass\n"),
+        "tools/report.py": ("from typing_extensions import cast\n"
+                            "COUNT: int = '1'  # type: ignore[assignment]\n"
+                            "WIDTH = cast(int, COUNT)\n"),
+    })
+    assert found == [*(("tests/test_graph.py", line, "SLOP003") for line in (5, 9, 11, 12, 13, 17)),
+                     ("tools/report.py", 2, "SLOP003"), ("tools/report.py", 3, "SLOP003")]
+
+
+def test_a_first_party_patch_is_reported_however_its_owner_was_imported_and_a_boundary_is_not(tmp_path):
+    """SLOP008: a first-party module's member or table replaced in a test is reported through an
+    alias, a from-import or a local import, by setattr, delattr, setitem or delitem, and a member
+    named like a seam (`narrowed_paths`) is none. The clock, a Hub snapshot and a subprocess are
+    boundaries a test may replace."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": "EDGES = {}\n",
+        "tests/test_graph.py": (
+            "import time\n"
+            "import sparx.graph as g\n"
+            "from sparx import graph\n"
+            "def test_alias(monkeypatch):\n"
+            "    monkeypatch.setattr(g, 'narrowed_paths', dict)\n"
+            "def test_table(monkeypatch):\n"
+            "    monkeypatch.setitem(graph.EDGES, 'edge', 1)\n"
+            "    monkeypatch.delitem(g.EDGES, 'edge')\n"
+            "def test_local(monkeypatch):\n"
+            "    from sparx.graph import EDGES as edges\n"
+            "    monkeypatch.setitem(edges, 'edge', 1)\n"
+            "    monkeypatch.delattr(graph, 'narrowed_paths')\n"
+            "def test_boundaries(monkeypatch):\n"
+            "    monkeypatch.setattr(time, 'sleep', lambda seconds: None)\n"
+            "    monkeypatch.setattr(graph, 'snapshot', lambda: None)\n"
+            "    monkeypatch.setattr('sparx.graph.subprocess.run', print)\n"),
+    })
+    assert found == [("tests/test_graph.py", line, "SLOP008") for line in (5, 7, 8, 11, 12)]
+
+
+def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
+    """SLOP015: a test that reaches its own package through `pytest.importorskip`,
+    however it imports the skip, turns an import the package breaks into a skip; an
+    optional dependency's skip, or a package that only shares the prefix, is not reported."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": "EDGES = 1\n",
+        "tests/test_graph.py": ("import pytest\n"
+                                "from pytest import importorskip\n"
+                                "graph = pytest.importorskip('sparx.graph')\n"
+                                "sparx = importorskip('sparx')\n"
+                                "torch = pytest.importorskip('torch')\n"
+                                "near = pytest.importorskip('sparxish')\n"
+                                "named = pytest.importorskip(modname='sparx.graph')\n"
+                                "optional = pytest.importorskip(modname='torch')\n"),
+    })
+    assert found == [("tests/test_graph.py", line, "SLOP015") for line in (3, 4, 7)]
+
+
+def test_a_choice_keyed_on_the_device_generation_is_reported_outside_the_target_table(tmp_path):
+    """SLOP016: the device's generation, `device_generation()` or a `gpu_target()`'s `.generation`,
+    however imported, and through a name bound to it in the function, its module or a class body,
+    compared with or prefix-matched against one the source spells, matched against a spelled case,
+    cut up, or used as a table's key or attribute name, is reported outside nn/kernels/generation.py.
+    A value is read before its name takes it, and a comprehension's first iterable before its targets.
+    Comparing it with a recorded generation, reading a fact off the target, passing it to a function
+    (a `getattr` of the caller's among them), a name rebound to something else or shadowed by a
+    parameter or a comprehension (a lambda's in it too), and a class attribute, which no method reads
+    as a name, are not."""
+    found = _linted(tmp_path, {
+        "src/sparx/nn/kernels/generation.py": (
+            "def device_generation():\n"
+            "    return 'sm80'\n"
+            "def gpu_target(name=None):\n"
+            "    return name\n"
+            "def wide():\n"
+            "    return device_generation().startswith('sm')\n"),
+        "src/sparx/tiles.py": (
+            "from sparx.nn.kernels import generation as hardware\n"
+            "from sparx.nn.kernels.generation import device_generation, gpu_target\n"
+            "TILES = {'sm80': 4096}\n"
+            "def tile():\n"
+            "    return TILES.get(device_generation(), 1024)\n"
+            "def held():\n"
+            "    target = hardware.gpu_target()\n"
+            "    return 0 if target.generation == 'sm90' else 1\n"
+            "def narrow():\n"
+            "    named = device_generation()\n"
+            "    return named.startswith('sm8') or int(named[2:]) > 89 or named in ('sm86', 'sm89')\n"
+            "def measured(on):\n"
+            "    named = device_generation()\n"
+            "    return named != on and gpu_target().shared_limit and gpu_target(named) and print(named)\n"
+            "GENERATION = device_generation()\n"
+            "def later():\n"
+            "    return lambda: GENERATION == 'sm90' or getattr(TILES, GENERATION)\n"
+            "class Launch:\n"
+            "    PICK = TILES[device_generation()]\n"
+            "def matched():\n"
+            "    named: str = device_generation()\n"
+            "    match named:\n"
+            "        case 'sm90' | 'sm100':\n"
+            "            return 0\n"
+            "    return 1\n"
+            "def relabeled(record):\n"
+            "    named = device_generation()\n"
+            "    named = record.label\n"
+            "    return named == 'label' or [named == 'sm80' for named in record.names]\n"
+            "def shadowed(GENERATION):\n"
+            "    return GENERATION == 'sm80'\n"
+            "def listed(record):\n"
+            "    named = device_generation()\n"
+            "    return [named == 'sm80' for named in record.names] and named == 'sm90'\n"
+            "def looked_up(TILES):\n"
+            "    named = device_generation()\n"
+            "    named = TILES[named]\n"
+            "    return named\n"
+            "def iterated(TILES):\n"
+            "    named = device_generation()\n"
+            "    return [named for named in TILES[named]]\n"
+            "class Scoped:\n"
+            "    LABEL = device_generation()\n"
+            "    def method(self):\n"
+            "        return LABEL == 'label'\n"
+            "def deferred(records):\n"
+            "    named = device_generation()\n"
+            "    return [lambda: named == 'label' for named in records]\n"
+            "def passed(getattr, TILES):\n"
+            "    return getattr(TILES, device_generation())\n"
+            "def copied(TILES):\n"
+            "    named = device_generation()\n"
+            "    named: str = named\n"
+            "    return TILES[named]\n"
+            "def relabeled_inside():\n"
+            "    named = device_generation()\n"
+            "    [(named := label) for label in ('label',)]\n"
+            "    held = [(found := device_generation()) for _ in ()]\n"
+            "    return named == 'label' or held and found == 'sm80'\n"
+            "def later_or_inner(TILES):\n"
+            "    named = device_generation()\n"
+            "    deferred = ((named := label) for label in ('label',))\n"
+            "    inner = [lambda: (named := 'label') for _ in ('x',)]\n"
+            "    return TILES[named], deferred, inner\n"),
+    })
+    assert found == [("src/sparx/tiles.py", line, "SLOP016")
+                     for line in (5, 8, 11, 11, 11, 17, 17, 19, 22, 34, 37, 41, 54, 59, 64)]
+
+
 def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_checks_behaviour_is_not(tmp_path):
     """SLOP011: `match=` on pytest's raise, a read of a function's source and a
     test that names a source file each prove text, not behaviour, however the
@@ -596,6 +912,45 @@ def test_a_test_that_checks_wording_or_source_text_is_reported_and_one_that_chec
             "    texts = [read(graph) for _ in range(1)]\n"),
     })
     assert found == [("tests/test_graph.py", line, "SLOP011") for line in (7, 9, 12, 12, 14, 22, 26)]
+
+
+def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_report_is_not(tmp_path):
+    """SLOP011: a sentence the test spells, looked for in the output pytest captured, however the test
+    holds it (`capsys.readouterr()`'s `.out`, a name for the capture or its `.out`, the pair unpacked,
+    added to), proves wording. A name bound again to a parse of the output, the same name in a test
+    that captured nothing or only in a function it defines, and a mapping an item of the output is
+    put in, hold data, and are not reported."""
+    found = _linted(tmp_path, {"tests/test_report.py": (
+        "import json\n"
+        "def test_direct(capsys):\n"
+        "    assert 'saved' in capsys.readouterr().out\n"
+        "def test_held(capsys):\n"
+        "    captured = capsys.readouterr()\n"
+        "    assert 'saved' in captured.out\n"
+        "def test_unpacked(capsys):\n"
+        "    out, err = capsys.readouterr()\n"
+        "    assert 'saved' in out\n"
+        "def test_added(capsys):\n"
+        "    text = capsys.readouterr().out\n"
+        "    text += capsys.readouterr().err\n"
+        "    assert text.count('saved')\n"
+        "def test_parsed(capsys):\n"
+        "    report = capsys.readouterr().out\n"
+        "    report = json.loads(report)\n"
+        "    assert 'tokens' in report\n"
+        "def test_unrelated():\n"
+        "    out = {'tokens': 8}\n"
+        "    assert 'tokens' in out\n"
+        "def test_nested(capsys):\n"
+        "    report = {'tokens': 8}\n"
+        "    def later():\n"
+        "        report = capsys.readouterr().out\n"
+        "    assert 'tokens' in report\n"
+        "def test_item(capsys):\n"
+        "    report = {'tokens': 8}\n"
+        "    report['err'] = capsys.readouterr().err\n"
+        "    assert 'tokens' in report\n")})
+    assert found == [("tests/test_report.py", line, "SLOP011") for line in (3, 6, 9, 13)]
 
 
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
@@ -663,75 +1018,3 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
     })
     assert found == [*[("src/sparx/graph.py", line, "SLOP012") for line in (8, 9, 20, 27)],
                      *[("tools/bench.py", line, "SLOP012") for line in (5, 6, 7, 8, 8, 9, 10, 16)]]
-
-
-# ---------------------------------------------------------------------------
-# tools/hf_coverage.py
-# ---------------------------------------------------------------------------
-
-def test_a_tutorials_outputs_are_stale_after_a_dependency_only_commit(tmp_path, monkeypatch):
-    """The outputs come from the library and its pinned dependencies, so a
-    commit that changes only pyproject.toml makes them stale, as one to a
-    module the notebook imported does."""
-    checker = load("check_tutorial_outputs")
-
-    def git(*args):
-        subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True)
-
-    (tmp_path / "src" / "dew").mkdir(parents=True)
-    (tmp_path / "src" / "dew" / "probe.py").write_text("VALUE = 1\n")
-    (tmp_path / "pyproject.toml").write_text('dependencies = ["jax==0.11.2"]\n')
-    git("init", "-q")
-    git("add", "-A")
-    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "outputs")
-    recorded = subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], capture_output=True,
-                              text=True, check=True).stdout.strip()
-    notebook = tmp_path / "probe.ipynb"
-    notebook.write_text(json.dumps({"metadata": {"dew": {"outputs": {"commit": recorded}}}, "cells": []}))
-    monkeypatch.setattr(checker, "ROOT", tmp_path)
-    imports = {"probe.ipynb": ["dew.probe"]}
-    assert checker.verdict(notebook, imports)[0] == "current"
-    (tmp_path / "pyproject.toml").write_text('dependencies = ["jax==0.11.3"]\n')
-    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "dependency")
-    label, lines = checker.verdict(notebook, imports)
-    assert label == "STALE" and "pyproject.toml" in lines[0]
-
-
-@pytest.mark.parametrize("stop", ["CellTimeoutError", "DeadKernelError"])
-def test_a_tutorial_run_records_a_stalled_notebook_and_runs_the_rest(tmp_path, monkeypatch, stop):
-    """A cell that times out or a kernel that dies fails its notebook, and the
-    run goes on to the next one; the kernel spec a reused --workdir holds is
-    written again for this interpreter."""
-    import nbformat
-
-    runner = load("run_tutorials")
-    (tmp_path / "tutorials").mkdir()
-    for name in ("01-stalls.ipynb", "02-runs.ipynb"):
-        nbformat.write(nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("x = 1")]),
-                       tmp_path / "tutorials" / name)
-    workdir = tmp_path / "work"
-    stale = workdir / ".jupyter" / "kernels" / "dew-tutorials"
-    stale.mkdir(parents=True)
-    (stale / "kernel.json").write_text(json.dumps({"argv": ["/gone/python", "-m", "ipykernel_launcher"],
-                                                   "display_name": "old", "language": "python"}))
-    ran = []
-
-    class Client:
-        def __init__(self, notebook, **options):
-            self.notebook = notebook
-
-        def execute(self):
-            ran.append(len(ran))
-            if len(ran) == 1:
-                raise getattr(runner, stop)("stalled")
-            probe = {"modules": ["dew"], "device": "cpu", "jax": "0"}
-            self.notebook.cells[-1].outputs = [nbformat.v4.new_output(
-                "stream", name="stdout", text=runner.PROBE_MARK + json.dumps(probe) + "\n")]
-
-    monkeypatch.setattr(runner, "ROOT", tmp_path)
-    monkeypatch.setattr(runner, "NotebookClient", Client)
-    monkeypatch.setenv("JUPYTER_PATH", "")
-    monkeypatch.setattr(sys, "argv", ["run_tutorials.py", "--workdir", str(workdir)])
-    assert runner.main() == 1
-    assert ran == [0, 1]
-    assert json.loads((stale / "kernel.json").read_text())["argv"][0] == sys.executable

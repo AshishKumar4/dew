@@ -605,6 +605,56 @@ def test_every_process_of_a_pool_takes_the_same_link_bandwidth(tmp_path):
     assert pools[0] == pools[1] and len(list((tmp_path / "cache" / "dew-links").iterdir())) == 1
 
 
+@pytest.mark.mesh(devices=4)
+def test_a_link_figure_is_kept_for_its_placement_and_carried_by_a_checkpoint(tmp_path):
+    """Two tensor meshes of one shape over the same four devices, grouped otherwise along the axis,
+    are other links: the second measures its own figure beside the compilation cache rather than
+    take the first's, and a mesh built again over the first placement takes the first's. A
+    checkpoint's rung carries each figure its trace decided from, by that placement, for a resumed
+    run to decide alike."""
+    import jax
+    import optax
+    from jax.sharding import Mesh
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+    from dew.training.distributed import link_bandwidth, link_topology
+
+    devices = np.asarray(jax.devices()[:4])
+    paired = Mesh(devices.reshape(2, 2), ("data", "tensor"))
+    crossed = Mesh(devices.reshape(2, 2).T, ("data", "tensor"))
+    assert link_topology(paired, "tensor") != link_topology(crossed, "tensor")
+    assert link_topology(paired, "tensor") == link_topology(Mesh(devices.reshape(2, 2), ("data", "tensor")),
+                                                            "tensor")
+    # The figures go beside this test's own compilation cache.
+    kept = jax.config.jax_compilation_cache_dir
+    jax.config.update("jax_compilation_cache_dir", str(tmp_path / "cache"))
+    try:
+        first = link_bandwidth(paired, "tensor", size=1 << 16)
+        link_bandwidth(crossed, "tensor", size=1 << 16)
+        assert len(list((tmp_path / "cache" / "dew-links").iterdir())) == 2
+        again = link_bandwidth(Mesh(devices.reshape(2, 2), ("data", "tensor")), "tensor", size=1 << 16)
+        assert again == first and len(list((tmp_path / "cache" / "dew-links").iterdir())) == 2
+    finally:
+        jax.config.update("jax_compilation_cache_dir", kept)
+
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=8)
+
+    def trainer():
+        return Trainer(LMObjective(model, seq_len=8), optax.sgd(1e-2), key=jax.random.key(0),
+                       mesh=MeshSpec(tensor=2))
+
+    saved = trainer()
+    saved._bandwidths[paired, "tensor"] = first
+    rung = saved._checkpoint_rung()
+    assert rung["links"] == {link_topology(paired, "tensor"): first}
+    resumed = trainer()
+    resumed._resume_rung(rung)
+    assert resumed._resumed_links == {link_topology(paired, "tensor"): first}
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight():
     """Rank 1 has lost one of its shards (deleted, as a failed or donated
@@ -770,6 +820,27 @@ def test_every_process_schedules_its_own_rollouts_and_the_pool_trains_on_all_of_
     for name in ("input_ids", "response_mask", "behavior_log_probs"):
         np.testing.assert_array_equal(together[name], reference[name])
     np.testing.assert_allclose(together["old_log_probs"], reference["old_log_probs"], atol=TOLERANCE)
+    for name, value in single.items():
+        np.testing.assert_allclose(pooled[name], value, atol=TOLERANCE)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_share_whose_calls_recorded_nothing_holds_the_records_its_peer_packed(tmp_path):
+    """fsdp across two processes over a mixture, every call recording its
+    routing and its sampler's support: the second share's tasks all
+    truncate, so its calls train on nothing and pack no record. It holds
+    the records' empty forms, so the pool hands the step one tree, and the
+    pool trains on the rows and moves the parameters one process does."""
+    pool, pooled = scheduled(tmp_path, {"fsdp": 2}, 2, "--records")
+    alone, single = scheduled(tmp_path, {"fsdp": 2}, 1, "--records")
+    assert pool["partition"] == {"count": 2, "readers": 1} and pool["step"] == 1
+    trained = handed(pool, 1)["response_mask"]
+    assert not trained.any(), "the second share was meant to train on nothing"
+    together = {name: np.concatenate(value) for name, value in pool["rows"].items()}
+    reference = {name: np.concatenate(value) for name, value in alone["rows"].items()}
+    order, expected = (np.lexsort(rows["input_ids"].T[::-1]) for rows in (together, reference))
+    for name in ("input_ids", "response_mask", "behavior_log_probs"):
+        np.testing.assert_array_equal(together[name][order], reference[name][expected])
     for name, value in single.items():
         np.testing.assert_allclose(pooled[name], value, atol=TOLERANCE)
 

@@ -5,11 +5,19 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `dew.figures` draws SVG figures for notebooks and docs. Their colors follow
+  the page's light or dark theme (dewml.dev, Colab, JupyterLab, VS Code, and
+  the system setting elsewhere), and their animations are CSS, so they play
+  without script. `curve`, `bars`, `heatmap` and `tokens` draw charts from
+  arrays; the tutorials use them for the figures their runs make.
 - `train/mfu` now measures analytical model FLOPs over real row/segment lengths,
   rather than HLO model FLOPs. Old and new MFU values are not directly comparable;
   the old metric is `train/hlo_flops_util`, and hardware/remat work stays `train/hfu`.
   `train/tokens` counts real tokens per attempted microbatch and `train/tokens_per_s`
   reports their interval rate, independently of gradient accumulation.
+- A `BlockDenoiser`'s call and `encode` take `positions`: block generation
+  refines and commits each canvas at the logical positions that continue its
+  prompt's, as text generation continues them.
 
 ## 0.1.0
 

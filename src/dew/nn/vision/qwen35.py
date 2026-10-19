@@ -12,7 +12,15 @@ from dew._model_types import _QWEN35_VISION_TYPES
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section, block_tensor_path, head_width
+from .common import (
+    ProjectorBase,
+    TowerBase,
+    TowerGeometry,
+    _vision_section,
+    activation_name,
+    block_tensor_path,
+    head_width,
+)
 from .vit import MergeProjector, VisionTransformer, ViTLayout
 
 
@@ -118,16 +126,11 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Record:
         raise ValueError(
             f"num_position_embeddings ({table}) is not a square, this trunk "
             "resamples a square table")
-    activation = str(vision.get("hidden_act", "gelu_pytorch_tanh"))
-    if activation not in ("quick_gelu", "gelu_pytorch_tanh", "gelu"):
-        raise ValueError(
-            f"hidden_act {activation!r} is not expressible: this trunk runs the "
-            "shared MLP's activations")
     return {
         "class": "qwen3_5", "fields": {
         "depth": records.integer(vision["depth"], "depth"),
         "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
-        "hidden_act": activation,
+        "hidden_act": activation_name(vision, TOWER_ACTIVATIONS, "gelu_pytorch_tanh"),
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_heads": records.integer(vision["num_heads"], "num_heads"),
         "in_channels": records.integer(vision.get("in_channels", 3), "in_channels"),

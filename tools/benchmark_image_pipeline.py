@@ -35,7 +35,8 @@ from dew.config.data import Augment, ImageData, loader
 from dew.data import TFDS, Loading
 from dew.data.dataset import DataPartition
 from dew.data.image_augmentation import ImageParameters, apply_device, apply_host
-from dew.data.images import decode_image, resize_image
+from dew.data.image_codec import decode_image
+from dew.data.images import resize_image
 
 
 @dataclass
@@ -196,7 +197,8 @@ def training_timing(config, backend):
 
 def main(config):
     cv2.setNumThreads(1)
-    source = TFDS("oxford_flowers102", path=config.flowers, split="all").records("indexed")
+    source = TFDS("oxford_flowers102", path=config.flowers, split="all",
+                  decoders={"image": tfds.decode.SkipDecoding()}).records("indexed")
     encoded = [source[index]["image"] for index in range(min(config.images, len(source)))]
     if not encoded:
         raise ValueError("the Flowers corpus contains no images")

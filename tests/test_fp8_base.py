@@ -26,12 +26,12 @@ from flax import linen as nn
 from flax.traverse_util import flatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
-from reference_error import assert_leaves_as_exact
+from reference_error import assert_leaves_as_exact, float64_terms
 
 from dew import cache
 from dew.data.dataset import Loader
 from dew.interop.codecs import dequantize_fp8_blocks, quantize_fp8_blocks
-from dew.lora import LoRA
+from dew.lora import LoRA, unadapted
 from dew.nn.kernels.generation import assumed, device_generation, gpu_target
 from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
@@ -50,12 +50,13 @@ from dew.training.quantization import (
 
 VOCAB, SEQ, BATCH = 64, 16, 8
 FEATURES, MLP = 64, 128
-FP8_SITES = ("q_proj", "gate_proj", "up_proj", "down_proj")
+FP8_SITES = ("q_proj", "gate_proj", "up_proj", "down_proj", "lm_head")
+"""The FP8 sites, the untargeted vocabulary head among them."""
 
 
 def decoder(**overrides):
     fields = {**TINY_DECODER, "vocab_size": VOCAB, "emb_features": FEATURES, "mlp_features": MLP,
-              "dtype": "bfloat16"}
+              "dtype": "bfloat16", "tie_embeddings": False}
     return models.build("causal_transformer", **{**fields, **overrides})
 
 
@@ -126,11 +127,14 @@ def assert_products_exact(x, leaves, cotangent, output, gradient):
     forward, forward_scale, dgrad, dgrad_scale = leaves
     rows, packed = operands(x, forward, forward_scale)
     cotangent_rows, packed_dgrad = operands(cotangent, dgrad, dgrad_scale)
-    truth, gradient_truth = rows @ packed.T, cotangent_rows @ packed_dgrad.T
-    assert_leaves_as_exact(np.asarray(output), truth, truth, reductions=x.shape[1])
+    with jax.enable_x64(new_val=True):
+        (truth, gradient_truth), (terms, gradient_terms) = float64_terms(
+            lambda a, b, c, d: (a @ b.T, c @ d.T), rows, packed, cotangent_rows, packed_dgrad)
+    truth, gradient_truth = np.asarray(truth), np.asarray(gradient_truth)
+    assert_leaves_as_exact(np.asarray(output), truth, truth, reductions=x.shape[1], terms=terms)
     rounded = np.asarray(jnp.asarray(gradient_truth, gradient.dtype), np.float64)
     assert_leaves_as_exact(np.asarray(gradient, np.float32), rounded, gradient_truth,
-                           reductions=forward.shape[0])
+                           reductions=forward.shape[0], terms=gradient_terms)
 
 
 def test_the_frozen_product_multiplies_the_cast_rows_exactly_and_trains_no_kernel():
@@ -221,6 +225,22 @@ def test_lora_packs_the_frozen_base_once_in_place_of_its_kernels_and_training_mo
                                           np.asarray(before[path]).view(np.uint8))
 
 
+def test_a_merged_fp8_base_computes_the_kernels_its_training_moved():
+    """A merge decodes each FP8 site's kernel and adds its trained delta, and
+    the codes go with the kernel they stood for: the model without its
+    adapter computes the merged tree as the plain decoder computes its
+    kernels, which the trained deltas moved off the decoded base. The head is
+    tied, so no packed vocabulary head plays a part."""
+    model = decoder(tie_embeddings=True)
+    _, fp8 = adapters(model)
+    state = fit(fp8, 3)
+    merged = fp8.merge(state.variables)
+    expected = np.asarray(model.apply({"params": merged["params"]}, ids()), np.float32)
+    np.testing.assert_array_equal(np.asarray(unadapted(fp8.model).apply(merged, ids()), np.float32), expected)
+    base = fp8.merge(fp8.variables)["params"]
+    assert np.abs(expected - np.asarray(model.apply({"params": base}, ids()), np.float32)).max() > 1e-3
+
+
 def test_a_resumed_fp8_base_run_trains_what_an_uninterrupted_one_does(tmp_path):
     _, fp8 = adapters()
     whole = fit(fp8, 4)
@@ -266,9 +286,11 @@ def test_a_checkpoints_input_quantization_and_an_fp8_base_share_one_wrapper():
 
 
 def test_a_record_runs_on_the_generation_it_was_measured_on_alone():
+    """A record measured on this process's generation runs here, and is refused by name on any
+    other: an A100's record on an H100, anything else's on an A100."""
     _, fp8 = adapters()
     jax.eval_shape(lambda: fp8.model.apply(fp8.variables, ids()))
-    with assumed("sm80"), pytest.raises(ValueError):
+    with assumed("sm90" if device_generation() == "sm80" else "sm80"), pytest.raises(ValueError):
         jax.eval_shape(lambda: fp8.model.apply(fp8.variables, ids()))
 
 

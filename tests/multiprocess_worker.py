@@ -2295,7 +2295,7 @@ def mode_whole_validation(args) -> dict:
     ith, i + nth, ... of them), and in part 0 `Perplexity`'s, on this pool, as
     `tests/test_whole_validation.py` runs them on one process."""
     import jax
-    from test_objective_inputs import corpus_windows
+    from objective_cases import corpus_windows
     from test_whole_validation import EVALUATED, evaluated, perplexity
 
     index, parts = (int(value) for value in args.part.split("/"))
@@ -2305,6 +2305,17 @@ def mode_whole_validation(args) -> dict:
     if index:
         return {"passes": passes}
     return {"passes": passes, "perplexity": perplexity(windows), "one": perplexity(windows, 1)}
+
+
+def mode_host_fields(args) -> dict:
+    """The names a validation pass's metric read on this pool, as `named_records` reads them on one
+    process: each process reads its share of the split, and the names, which no device holds, meet
+    the gathered batch on the host."""
+    from test_whole_validation import named_records
+
+    from dew.training import MeshSpec
+
+    return {"seen": named_records(MeshSpec().build())}
 
 
 MATRIX_RECORDS = 96
@@ -2373,7 +2384,7 @@ def mode_matrix(args) -> dict:
 
 MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
          "host_training": mode_host_training, "step_fits": mode_step_fits,
-         "whole_validation": mode_whole_validation,
+         "whole_validation": mode_whole_validation, "host_fields": mode_host_fields,
          "topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "masked_generation": mode_masked_generation,
          "packed_fit": mode_packed_fit, "reads": mode_reads,

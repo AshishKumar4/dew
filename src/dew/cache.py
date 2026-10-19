@@ -5,9 +5,11 @@ interop, config and inference modules take their cache paths without
 importing the FLOP accounting.
 """
 
+import dataclasses
 import importlib.metadata
 import os
 import sys
+from collections.abc import Callable
 
 import jax
 
@@ -19,6 +21,63 @@ def dew_cache_dir() -> str:
     return os.path.expanduser(
         os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache"), "dew")
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class HubAnswer[Answer]:
+    """An answer of the Hub's (`hub_answer`): `value`, and whether it was `recorded`, read back
+    from an earlier answer with the Hub offline."""
+
+    value: Answer
+    recorded: bool
+
+
+def hub_answer[Answer](question: tuple[str, ...], ask: Callable[[], Answer]) -> HubAnswer[Answer]:
+    """The Hub's answer to `question`: `ask`'s, recorded where answers are kept (DEW_HUB_ANSWERS
+    when set, else `hub/` in Dew's cache), or with the Hub offline, where `ask` raises
+    OfflineModeIsEnabled as every Hub call does under HF_HUB_OFFLINE, the answer last recorded
+    (`recorded_hub_answer`). What an online run pinned (a revision's commit, a commit's files) so
+    resolves the same offline; a question never answered online raises the offline error."""
+    import json
+
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
+    from dew.files import write_atomically
+
+    try:
+        value = ask()
+    except OfflineModeIsEnabled:
+        recorded = recorded_hub_answer(question)
+        if recorded is None:
+            raise
+        return recorded
+    record = _hub_record(question)
+    os.makedirs(os.path.dirname(record), exist_ok=True)
+    write_atomically(record, json.dumps({"question": list(question), "answer": value}))
+    return HubAnswer(value, recorded=False)
+
+
+def recorded_hub_answer(question: tuple[str, ...]) -> HubAnswer | None:
+    """The answer `hub_answer` last recorded to `question`, or None where it recorded none."""
+    import json
+
+    record = _hub_record(question)
+    if not os.path.isfile(record):
+        return None
+    with open(record) as recorded:
+        held = json.load(recorded)
+    return HubAnswer(held["answer"], recorded=True) if held["question"] == list(question) else None
+
+
+def _hub_record(question: tuple[str, ...]) -> str:
+    """Where `question`'s answer is recorded: a file named by the hash of its parts, which no
+    revision's text can steer outside the answers' directory; the record holds the question
+    beside the answer."""
+    import hashlib
+    import json
+
+    answers = os.environ.get("DEW_HUB_ANSWERS") or os.path.join(dew_cache_dir(), "hub")
+    return os.path.join(answers, hashlib.sha256(json.dumps(list(question)).encode()).hexdigest() + ".json")
 
 
 def default_compilation_cache_dir() -> str:
@@ -99,14 +158,25 @@ context only beside no other JAX call."""
 
 KERNEL_LAUNCHES = jax.make_user_context(default_value=False)
 """Whether a traced kernel launch carries tokamax's description of itself
-(`dew.nn.kernels.tuning.launches`), keyed on as `KERNEL_TUNES` is. Only the
-lowering `tune` reads its launches from carries it: jaxlib 0.11.2 writes a
-compiled program holding it to the persistent cache and cannot read it back
-("Invalid metadata payload id")."""
+(`dew.nn.kernels.tuning.launches`), keyed on as `KERNEL_TUNES` is. Only a
+lowering made to read its launches out of carries it, never a step's: jaxlib
+0.11.2 writes a compiled program holding it to the persistent cache and cannot
+read it back ("Invalid metadata payload id")."""
+
+KERNEL_SEEN = jax.make_user_context(default_value=None)
+"""The collection a lowering records its kernel launches into as it traces them
+(`dew.nn.kernels.tuning.seen`): JAX keys its trace caches on its identity, so a
+trace cached before traces, and records, again. The program is the same, and so
+is its key in the persistent cache, which reads no user context."""
 
 KERNEL_PINS = jax.make_user_context(())
 """The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this
 thread, keyed on as `KERNEL_TUNES` is."""
+
+KERNEL_CHOICES = jax.make_user_context(())
+"""The `(choice, kernel)` pairs `dew.nn.kernels.generation.chosen` holds in
+this thread, keyed on as `KERNEL_TUNES` is, so a program traced before a
+choice traces again within it."""
 
 
 def keeps_picks() -> bool:

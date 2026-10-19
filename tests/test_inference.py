@@ -228,12 +228,12 @@ def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
                     key=jax.random.PRNGKey(1)).host().images
 
     first = draw(times=grid)
-    compiled = pipelines._run(None)._cache_size()
+    compiled = pipelines._run(None, ())._cache_size()
     for other in (draw(scale=2.0, times=grid), draw(seed=2, times=grid), draw(times=nudged)):
         assert not np.allclose(other, first)
     assert np.array_equal(draw(times=grid), first)
     assert np.array_equal(draw(), first)
-    assert pipelines._run(None)._cache_size() == compiled
+    assert pipelines._run(None, ())._cache_size() == compiled
 
 
 def test_build_eval_metrics_follows_the_sample_field(tmp_path):
@@ -346,6 +346,61 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
         task("the ", seed=2)
     with pytest.raises(ValueError):
         dataclasses.replace(task, max_new_tokens=None)("the ", key=2)
+
+
+def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path):
+    """A decoder fine-tuned from a checkpoint encodes text with the processor the
+    checkpoint ships; its run records that processor's source, so the reloaded task
+    encodes as the trained one does rather than loading as weights that take ids."""
+    import shutil
+    from pathlib import Path
+
+    from dew.interop import Pretrained
+    from dew.objectives.lm import LMObjective
+
+    fixtures = Path(__file__).parent / "fixtures" / "hf"
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in ("config.json", "model.safetensors"):
+        shutil.copyfile(fixtures / "qwen3-tiny" / name, source / name)
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copyfile(fixtures / "qwen38-dense-tiny" / name, source / name)
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="xla", max_seq_len=32)
+    objective = LMObjective(loaded, 8)
+    batch = {"text": np.random.RandomState(0).randint(1, 100, (8, 9)).astype(np.int32)}
+    run = tmp_path / "run"
+    checkpoints = Checkpoints(str(run), keep=1)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0), checkpoints=checkpoints)
+    trainer.fit(Loader(train=lambda partition: Replaying(lambda position: batch), val=None, records=None,
+                       batch=8), steps=1, log_every=100, checkpoint_every=1)
+    checkpoints.wait()
+
+    task = dew.pipeline(str(run))
+    assert loaded.text_processor is not None and task.processor is not None
+    assert type(task.processor) is type(loaded.text_processor)
+    np.testing.assert_array_equal(np.asarray(task.processor("the cat sat").tokens),
+                                  np.asarray(loaded.text_processor("the cat sat").tokens))
+
+
+def test_a_run_record_holding_a_field_its_objective_does_not_write_is_refused(tmp_path):
+    """An LM run records its decoder's task settings (`TextSettings`) and nothing else beside
+    its objective and model, and they read back as the objective's own; a record holding
+    another field, as a sampling temperature no LM run writes, is refused rather than loaded
+    with the field ignored."""
+    from dew.inference.tasks import TextSettings, saved_settings, settings_fields
+
+    objective, state = make_lm_run(tmp_path)
+    checkpoints = Checkpoints(str(tmp_path), keep=2)
+    record = checkpoints.artifact()
+    assert isinstance(record, dict)
+    assert set(record) == {"objective", "model", *settings_fields(TextSettings)}
+    assert saved_settings(record, TextSettings) == objective.task_settings()
+    dew.pipeline(str(tmp_path))
+    checkpoints.save(int(state.step) + 1, state, artifact={**record, "temperature": 0.5})
+    checkpoints.wait()
+    with pytest.raises(ValueError):
+        dew.pipeline(str(tmp_path))
+
 
 
 def test_pipeline_loads_a_run_published_to_the_hub_at_the_commit_it_resolved(tmp_path, monkeypatch):
@@ -496,14 +551,15 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
                                   live("the ", key=7).host().tokens)
 
 
-def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tokenizer="byte"):
+def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tokenizer="byte",
+                   pad_token_id=0):
     """A block-diffusion run directory: a committed DiffusionGemma fixture's
-    weights under a checkpoint that records the objective and the tokenizer
-    `tokenizer` names, each parameter moved by `moved` times a seeded normal
-    draw (a stand-in for training). The default fixture reads images and is the
-    published layout's own; `diffusion-gemma-sft` is Google's dense
-    text-only model, which transformers' class cannot build, so its export
-    is refused."""
+    weights under a checkpoint that records the objective, its `pad_token_id`
+    and the tokenizer `tokenizer` names, each parameter moved by `moved` times
+    a seeded normal draw (a stand-in for training); returns the objective and
+    the saved state. The default fixture reads images and is the published
+    layout's own; `diffusion-gemma-sft` is Google's dense text-only model,
+    which transformers' class cannot build, so its export is refused."""
     from pathlib import Path
 
     from dew.data.text import tokenizer_for
@@ -513,6 +569,7 @@ def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tok
     fixture = Path(__file__).resolve().parent / "fixtures/hf" / fixture
     bundle = Pretrained.load(str(fixture), dtype="float32", attention_impl="xla", max_seq_len=32)
     objective = BlockDiffusionObjective(bundle.model, prompt_length=3, variables=bundle.variables,
+                                        pad_token_id=pad_token_id,
                                         processor=RunProcessor(tokenizer_for(tokenizer)))
     state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
     if moved:
@@ -524,6 +581,7 @@ def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tok
     checkpoints = Checkpoints(str(directory))
     checkpoints.save(0, state, None, artifact=objective.inference_record())
     checkpoints.wait()
+    return objective, state
 
 
 def make_masked_run(directory):
@@ -566,6 +624,22 @@ def test_every_saved_text_kind_constructs_through_its_own_task_class(
     np.testing.assert_array_equal(drawn.host().tokens, expected.host().tokens)
     assert direct.decode(drawn) == front.decode(expected)
     assert all(isinstance(row, str) for row in direct.decode(drawn))
+
+
+def test_a_saved_block_run_pads_rows_as_its_live_task_does(tmp_path):
+    """The block objective's pad id is a control of its task that a loader
+    cannot read off the model, so the run records it: a restored task pads a
+    row that ended at an EOS with it, as the live task does."""
+    objective, state = make_block_run(tmp_path, pad_token_id=3)
+    live = objective.pipeline(state, ema=False)
+    # The row's first drawn token as the EOS ends it at once, so the rest of
+    # its response is padding.
+    eos = (int(live([[1, 5, 7]], 3, key=5).host().tokens[0, 3]),)
+    expected = dataclasses.replace(live, eos_token_ids=eos)([[1, 5, 7]], 3, key=5).host()
+    restored = dataclasses.replace(dew.pipeline(str(tmp_path), ema=False), eos_token_ids=eos)
+    actual = restored([[1, 5, 7]], 3, key=5).host()
+    np.testing.assert_array_equal(expected.lengths, [1])
+    np.testing.assert_array_equal(actual.tokens, expected.tokens)
 
 
 def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):

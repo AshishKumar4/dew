@@ -6,6 +6,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import jax
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
@@ -36,26 +37,30 @@ def decide() -> Decide:
     return Decide.from_pretrained(TINY, attention_impl="xla")
 
 
+def assert_same_rounded_answers(found: dict, expected: dict, case: str) -> None:
+    """Two `systemone(details=True)` answers to `case` from logits that differ
+    by fp32 rounding: the same choices, and every reported number within one
+    unit of its fourth decimal, the rounding both apply."""
+    assert found["usage"]["input_tokens"] == expected["usage"]["input_tokens"]
+    for name, answer in found["answers"].items():
+        reference = expected["answers"][name]
+        assert answer["type"] == reference["type"]
+        if answer["type"] == "choice":
+            assert answer["choice"] == reference["choice"]
+        for field in ("noul", "score", "confidence"):
+            if field in reference and field in answer:
+                assert abs(answer[field] - reference[field]) <= 1e-4, (case, name, field)
+        for option, value in answer.get("probabilities", {}).items():
+            assert abs(value - reference["probabilities"][option]) <= 1e-4, (case, name, option)
+
+
 def test_systemone_answers_what_layas_agent_answers(decide):
     """Laya's `Agent.system_one` on every case (answers.json), with Laya's
-    entropy confidence selected: the same choice, and every reported number
-    within one unit of its fourth decimal, the rounding both apply to logits
-    that differ by fp32 rounding."""
+    entropy confidence selected (`assert_same_rounded_answers`)."""
     laya = replace(decide, confidence=EntropyConfidence())
     expected = json.loads((TINY / "answers.json").read_text())
     for case, request in CASES.items():
-        found = laya.systemone(request, details=True)
-        assert found["usage"]["input_tokens"] == expected[case]["usage"]["input_tokens"]
-        for name, answer in found["answers"].items():
-            reference = expected[case]["answers"][name]
-            assert answer["type"] == reference["type"]
-            if answer["type"] == "choice":
-                assert answer["choice"] == reference["choice"]
-            for field in ("noul", "score", "confidence"):
-                if field in reference and field in answer:
-                    assert abs(answer[field] - reference[field]) <= 1e-4, (case, name, field)
-            for option, value in answer.get("probabilities", {}).items():
-                assert abs(value - reference["probabilities"][option]) <= 1e-4, (case, name, option)
+        assert_same_rounded_answers(laya.systemone(request, details=True), expected[case], case)
 
 
 @pytest.mark.parametrize("request_body, message", [
@@ -148,7 +153,8 @@ def synthetic(temperature: float, count: int, options: int, seed: int) -> list[S
     scored = []
     for _ in range(count):
         logits = rng.normal(0.0, 3.0, options)
-        scored.append(Scored(question.kind, logits, int(rng.choice(options, p=softmax(logits, temperature)))))
+        label = int(rng.choice(options, p=softmax(logits, temperature)))
+        scored.append(Scored(question.kind, logits, np.eye(options)[label]))
     return scored
 
 
@@ -163,6 +169,44 @@ def test_a_fitted_temperature_is_the_log_loss_minimum():
     fitted = Temperatures.fit(scored, bucket_minimum=100).of("choice", 4)
     assert log_loss(scored, fitted) < log_loss(scored, fitted * 1.01)
     assert log_loss(scored, fitted) < log_loss(scored, fitted / 1.01)
+
+
+def test_calibrating_on_the_distributions_the_model_gives_keeps_its_temperatures(decide):
+    """Held-out answers whose gold is a distribution rather than one option:
+    where every gold is the distribution the uncalibrated model gives, log
+    loss is least at temperature 1, so each question type's fitted
+    temperature is 1. Fitting to each gold's most likely option alone would
+    sharpen it instead."""
+    from dew.decision import Calibration
+
+    raw = replace(decide, calibration=Calibration())
+    held = []
+    for request in CASES.values():
+        example = Example.of({"state": request["state"], "questions": request["questions"],
+                              "answers": dict.fromkeys(request["questions"], 0)})
+        answers = raw(example.state, example.questions)
+        held.append({"state": request["state"], "questions": request["questions"],
+                     "targets": {name: answer.probabilities.tolist() for name, answer in answers.items()}})
+    fitted = raw.calibrated(held, type_minimum=1).calibration.temperatures
+    assert set(fitted.types) == {"choice", "score", "noul"}
+    for temperature in fitted.types.values():
+        assert temperature == pytest.approx(1.0, rel=1e-3)
+
+
+def test_a_temperature_fit_does_not_depend_on_a_common_logit_shift():
+    """Gold distributions packed in float32, as a batch packs them, hold a
+    little less than unit mass; read as they are, the fit's slope would grow
+    with every logit's common offset. Read as distributions, three answers
+    whose gold is their own softmax fit temperature 1 at any offset."""
+    from dew.decision.calibration import _temperature
+
+    logits = np.asarray([[0.0, 1.0, 2.0], [0.5, -1.0, 0.0], [2.0, 2.5, -0.5]])
+    for shift in (0.0, 1e7):
+        for widened in (False, True):
+            golds = [softmax(row, 1.0).astype(np.float32) for row in logits]
+            held = [Scored("choice", row + shift, gold.astype(np.float64) if widened else gold)
+                    for row, gold in zip(logits, golds, strict=True)]
+            assert _temperature(held) == pytest.approx(1.0, rel=1e-6)
 
 
 def test_abstention_keeps_the_accepted_answers_within_the_target_error():
@@ -309,6 +353,15 @@ def test_an_example_refuses_an_answer_its_question_cannot_give():
                     "answers": {"department": "legal"}})
 
 
+def test_an_example_refuses_a_target_for_a_question_it_does_not_ask():
+    """A row's target, like its answer, names a question the row asks; one
+    naming another question is refused rather than dropped, which would
+    train the row as asked and unscored."""
+    with pytest.raises(ValueError):
+        Example.of({"state": "x", "questions": CASES["quickstart"]["questions"],
+                    "targets": {"unasked": [0.5, 0.5]}})
+
+
 def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
     """`save_pretrained` writes what `from_pretrained` reads: Laya's tensors
     under Laya's names (all but the action head and the unused temperature
@@ -340,6 +393,83 @@ def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
     again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=decide.name)
     for request in CASES.values():
         assert again.systemone(request) == decide.systemone(request)
+
+
+def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(decide, tmp_path):
+    """A ModernBERT task whose backbone runs under LoRA, its factors moved off
+    zero, saves in Laya's layout with the factors merged into their kernels
+    (`Pretrained.bound`): the reloaded plain checkpoint answers every case as
+    the adapted task does, the merged sum rounded once into each kernel
+    (`assert_same_rounded_answers`), and differently from the task without the
+    adapter."""
+    from dew.decision.model import DecisionModel
+    from dew.lora import LoRA
+    from dew.objectives.base import joined, part
+
+    backbone = part(decide.variables, "backbone")
+    adapter = LoRA(rank=4, modules=("q_proj", "v_proj")).apply(decide.model.backbone, backbone, key=1)
+    moved = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf + 0.05 if "lora_B" in jax.tree_util.keystr(path) else leaf, adapter.variables)
+    adapted = replace(decide, model=DecisionModel(adapter.model, decide.model.head),
+                      variables=joined({"backbone": moved, "head": part(decide.variables, "head")}))
+
+    adapted.save_pretrained(tmp_path)
+    again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=decide.name)
+    changed = False
+    for case, request in CASES.items():
+        expected = adapted.systemone(request, details=True)
+        assert_same_rounded_answers(again.systemone(request, details=True), expected, case)
+        changed |= decide.systemone(request, details=True)["answers"] != expected["answers"]
+    assert changed
+
+
+def test_dew_export_writes_a_decision_run_in_the_tasks_own_release(decide, tmp_path):
+    """`dew export` writes a decision run through its task's release writer
+    (`Decide.save_pretrained`): the run of a step's training over Laya's tiny
+    checkpoint exports the files that writer writes for it, byte for byte."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.cli.main import Export
+    from dew.config.data import loader
+    from dew.decision import DecisionObjective
+    from dew.decision.data import Decisions as DecisionRecipe
+    from dew.training.trainer import Trainer
+
+    objective = DecisionObjective(decide)
+    data = loader(DecisionRecipe(source=answered() * 2, validation=answered()), batch=8, read="memory",
+                  objective=objective.data())
+    checkpoints = Checkpoints(str(tmp_path / "run"), keep=1)
+    Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+        data, steps=1, log_every=100, checkpoint_every=1, eval_every=100)
+    checkpoints.wait()
+    assert Export(str(tmp_path / "run"), str(tmp_path / "export")).run_command() == 0
+    Decide.from_run(str(tmp_path / "run")).save_pretrained(tmp_path / "release")
+    written = sorted(path.relative_to(tmp_path / "export") for path in (tmp_path / "export").rglob("*")
+                     if path.is_file())
+    assert written == sorted(path.relative_to(tmp_path / "release")
+                             for path in (tmp_path / "release").rglob("*") if path.is_file())
+    for name in written:
+        assert (tmp_path / "export" / name).read_bytes() == (tmp_path / "release" / name).read_bytes(), name
+
+
+def test_a_released_checkpoint_keeps_its_option_budget(decide, tmp_path):
+    """A task whose options keep 4 tokens each, not the layout's 48, saves
+    that budget and reads it back: the reloaded task answers a question of
+    long options as the task does, and the 48-token task answers otherwise."""
+    from dew.decision import Choice
+
+    tight = replace(decide, layout=replace(decide.layout, option_tokens=4))
+    tight.save_pretrained(tmp_path)
+    again = Decide.from_pretrained(tmp_path, attention_impl="xla")
+    assert again.layout.option_tokens == 4
+    question = {"q": Choice("Which team handles it?", {
+        "billing": "invoices, refunds, chargebacks, double charges and any dispute about money taken",
+        "technical": "outages, errors, failed logins, slow pages and anything that does not work"})}
+    state = "I was charged twice and the second charge bounced my rent."
+    expected = tight(state, question)["q"].probabilities
+    np.testing.assert_array_equal(again(state, question)["q"].probabilities, expected)
+    assert not np.array_equal(decide(state, question)["q"].probabilities, expected)
 
 
 def test_a_released_checkpoint_refuses_what_its_layout_cannot_hold(decide, tmp_path):

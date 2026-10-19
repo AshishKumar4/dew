@@ -28,12 +28,14 @@ from dew.data.pipeline import Configured, HostStep, MapBatch, Mixture, Objective
 if TYPE_CHECKING:
     from dew.data.cache import Cache
     from dew.data.generation import Generation
-from dew.data import audio, images, video
+from dew.data import audio, chat, images, video
+from dew.data.chat import RenderChat
+from dew.data.images import ConfigureCaption, EncodeCaptions
+from dew.data.preferences import PreferencePair
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
-from dew.data.steps.chat import ConfigurePrompt, PreferencePair, RenderChat
+from dew.data.steps.chat import ConfigurePrompt, ResponseCanvases
 from dew.data.steps.generic import Formatting
-from dew.data.steps.image import ConfigureCaption, EncodeCaptions
-from dew.data.steps.text import Chunks, LengthPolicy, Tokenize
+from dew.data.text import Chunks, Tokenize
 
 _DEFAULT_LOADING = Loading(workers="auto")
 
@@ -229,11 +231,9 @@ class ChatData(_Loadable):
 
         def policy(pipeline: Pipeline) -> Pipeline:
             if self.long == "chunk":
-                pipeline = pipeline.flat_map(Chunks(self.seq_len + 1, ("text", "text_roles")))
+                pipeline = pipeline.flat_map(Chunks(self.seq_len + 1, fields=("text", "text_roles")))
             else:
-                pipeline = pipeline.filter_map(
-                    LengthPolicy(self.seq_len + 1, long=self.long, aligned=("text_roles",))
-                )
+                pipeline = pipeline.filter_map(chat.fit_length(self.seq_len + 1, long=self.long))
             return pipeline.pack(self.seq_len + 1, fields=("text", "text_roles"), bins=self.packing_bins)
 
         return (
@@ -241,6 +241,36 @@ class ChatData(_Loadable):
             None if held is None else held if isinstance(self.validation, Pipeline) else policy(held),
             (),
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class ChatCanvasData(_Loadable):
+    """Conversations rendered as `ChatData` renders them, each assistant turn
+    then one `BlockDiffusionObjective` row (`ResponseCanvases`), never packed:
+    the objective splits every row at `prompt_length`, so the turn alone
+    fills the canvases it scores."""
+
+    source: Annotated[SourceValue, source_argument(SourceValue)]
+    tokenizer: str
+    prompt_length: int
+    canvas_size: int
+    canvases: int = 1
+    pad_id: int = 0
+    column: str = "messages"
+    validation: Annotated[Validation, source_argument(Validation)] = None
+    split: str = "train"
+
+    def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
+        # The canvases' eos is the rendering's own tokenizer's, one pinned handle for both.
+        renderer = RenderChat(self.tokenizer, self.column)
+        eos = renderer.vocabulary.eos_id
+        if eos is None:
+            raise ValueError(f"tokenizer {self.tokenizer!r} declares no eos token to end a response's canvas")
+        layout = ResponseCanvases(self.prompt_length, self.canvas_size, self.canvases, eos, self.pad_id)
+        rendered = Pipeline(_source(self.source)).map(renderer)
+        prefix = rendered.flat_map(layout).stages
+        train, held = _branches(self.source, self.validation, split=self.split, prefix=prefix)
+        return train, held, ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -343,7 +373,7 @@ class PreferenceData(_Loadable):
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
-        prefix = Pipeline(_source(self.source)).map(PreferencePair(self.seq_len, self.pad_id)).stages
+        prefix = Pipeline(_source(self.source)).map(PreferencePair(self.seq_len, pad_id=self.pad_id)).stages
         train, held = _branches(self.source, self.validation, split=self.split, prefix=prefix)
         return train, held, ()
 
@@ -413,21 +443,21 @@ class ImageData(_Loadable):
         configured = Configured(ConfigureCaption(caption), needs=(), random=bool(self.caption_templates))
 
         def prepared(chain: Pipeline, staging: int) -> Pipeline:
-            return (chain.map(images.decode(self.field, at_least=staging, rejects=False))
-                    .map(images.resize(staging)).map(configured))
+            return (chain.map(images.DecodeImage(self.field, at_least=staging, rejects=False))
+                    .map(images.Resize(staging)).map(configured))
 
         train = prepared(train, size)
         if augment is not None and augment.backend == "host":
             if augment.crop_scale != (1.0, 1.0) or size != self.image_size:
-                train = train.random_map(images.random_crop(self.image_size, scale=augment.crop_scale,
-                                                            flip=augment.flip, jitter=augment.jitter))
+                train = train.random_map(images.RandomCrop(self.image_size, scale=augment.crop_scale,
+                                                           flip=augment.flip, jitter=augment.jitter))
             else:
                 if augment.flip:
-                    train = train.random_map(images.flip())
+                    train = train.random_map(images.Flip())
                 if augment.jitter:
-                    train = train.random_map(images.color_jitter())
+                    train = train.random_map(images.ColorJitter())
         elif augment is not None:
-            train = train.random_map(images.augmentation_key()).then(MapBatch(images.device_augment(
+            train = train.random_map(images.AugmentationKey()).then(MapBatch(images.DeviceAugment(
                 self.image_size, crop_scale=augment.crop_scale, flip=augment.flip, jitter=augment.jitter)))
         held = None if held is None else prepared(held, self.image_size)
         return train, held, (EncodeCaptions(),)
@@ -454,7 +484,9 @@ class VideoData(_Loadable):
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         from pathlib import PurePosixPath
 
-        from dew.data.processors import AutoAudioProcessor
+        from transformers import AutoFeatureExtractor
+
+        from dew.data.processors import sampling_rate
         from dew.data.sources.av_utils import FPS
         from dew.data.sources.files import Files
 
@@ -471,16 +503,15 @@ class VideoData(_Loadable):
         prefix = Pipeline(source).map(_VideoRow(self.caption)).stages
         train, held = _branches(source, self.validation, split=self.split, prefix=prefix)
         # The sound at the rate the audio model reads, `audio_padding` frames either side of the frames.
-        rate = AutoAudioProcessor(tensor_type="np", modelname=self.audio_model).sampling_rate
+        rate = sampling_rate(AutoFeatureExtractor.from_pretrained(self.audio_model))
         padding = self.audio_padding / FPS
 
         def clips(chain: Pipeline) -> Pipeline:
             # A listed clip too short or that does not decode is an error, as it always was here, so the
             # run knows its count.
-            pick = dataclasses.replace(video.pick_clip(self.frames / FPS, margin=padding), rejects=False)
-            frames = dataclasses.replace(video.decode(self.frames, fps=FPS, size=self.frame_size),
-                                         rejects=False)
-            sound = dataclasses.replace(audio.decode(rate, context=padding), rejects=False)
+            pick = video.PickClip(self.frames / FPS, margin=padding, rejects=False)
+            frames = video.DecodeVideo(self.frames, fps=FPS, size=self.frame_size, rejects=False)
+            sound = audio.DecodeAudio(rate, context=padding, rejects=False)
             return chain.random_map(pick).map(frames, sound).remove_columns("mp4", "clip")
 
         return clips(train), None if held is None else clips(held), (EncodeCaptions(),)
