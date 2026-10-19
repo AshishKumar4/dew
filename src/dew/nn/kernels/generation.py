@@ -404,8 +404,9 @@ def linear_tangent(kernel: Callable, portable: Callable) -> Callable:
     tangent is `portable`'s, the same arithmetic in XLA, evaluated as a `linear_call` that transposes
     to `kernel`'s own VJP: forward mode (`jax.jvp`, `jax.linearize`) takes the portable tangent
     however a jit or a scan staged the call first, and reverse mode runs the kernel's backward. It
-    composes with `jax.vmap` of a gradient and with forward over reverse on Dew's jax build, whose
-    `linear_call` batches and carries its residual tangents."""
+    composes with `jax.vmap` of a gradient and with forward over reverse on Dew's jax build
+    (0.11.2.post5 on), whose `linear_call` batches and carries its residual tangents; a stock jax
+    raises its own error for either."""
     import jax
     from jax.custom_derivatives import linear_call
 
