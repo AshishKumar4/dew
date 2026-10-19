@@ -50,7 +50,8 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
     gated = jax.ShapeDtypeStruct((batch, length, value_heads), jnp.float32)
     beta = jax.ShapeDtypeStruct(gated.shape, narrow)
     inverse = jax.ShapeDtypeStruct((batch, length, value_heads, chunk), narrow)
-    entered = jax.ShapeDtypeStruct((max(1, batch * (length // chunk - 1)), value_heads, width, columns), narrow)
+    stored = max(1, batch * (length // chunk - 1))
+    entered = jax.ShapeDtypeStruct((stored, value_heads, width, columns), narrow)
     state = jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32)
     operands = {
         "chunk_local_cumsum": (gated,),
