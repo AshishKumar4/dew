@@ -538,7 +538,7 @@ class _Writer:
             if self.cache.generation(self.key) is None:
                 raise
 
-    def _settled(self, work: Callable[[], object]) -> None:
+    def _settled(self, work: Callable[[], None]) -> None:
         """Run `work` (a seal, or reading its outcome): an upload that fails
         leaves the fill filling, unless the cache blocks on a full spool."""
         try:
