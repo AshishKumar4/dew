@@ -323,7 +323,7 @@ class _RandomSource:
         return grain.MapDataset.source(self._indices(len(rows))).map(_SelectedRow(rows))
 
     def metadata(self) -> Mapping[str, object]:
-        return self.source.metadata()
+        return _uncounted(self.source.metadata())
 
     def lengths(self) -> np.ndarray | None:
         lengths = self.source.lengths()
