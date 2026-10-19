@@ -18,7 +18,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
-from dew.training import MeshSpec, evaluation
+from dew.training import MeshSpec
 
 
 def tiny_decoder(**fields):
@@ -40,43 +40,34 @@ class Recording:
         self.artifacts.append(artifact)
 
 
-def test_a_run_compiles_its_evaluations_before_its_first_step(monkeypatch):
+def test_a_run_compiles_its_evaluations_before_its_first_step():
     """A run that evaluates between steps warms each suite beside its step's compile, before its
-    first step, reporting nothing of it: two batches and the preview. Every program the evaluations
-    it schedules then run to score a batch, pool it and preview, compiled there, and the tracker
-    holds those evaluations alone. Finalizing a pass's scores, which warming does not, is left to
-    the first."""
+    first step, reporting nothing of it: two batches, the loss's reduction and the preview. The
+    evaluations it schedules then compile no program between the log of the steps before them
+    and their own report, and the tracker holds those evaluations alone."""
     model = tiny_decoder()
     objective = LMObjective(model, seq_len=4, samples=Samples([1, 2], 2, sampling=Sampling(temperature=0)))
     batch = {"text": np.tile(np.array([1, 2, 3, 4, 1], np.int32), (8, 1))}
     data = Loader(lambda partition: iter([batch] * 4), lambda partition: iter([batch, batch]), records=8,
                   batch=8)
-    tracker = Recording()
-    compiles, evaluations = [], []
+    compiles: list[str] = []
 
     class Compiles(logging.Handler):
         def emit(self, record):
             if "Finished XLA compilation" in record.getMessage():
                 compiles.append(record.getMessage())
 
-    def counted(function):
-        """`function`, its calls' compiles recorded beside the evaluation they fell in."""
-        def call(*args, **kwargs):
-            before = len(compiles)
-            result = function(*args, **kwargs)
-            evaluations[-1][2].extend(compiles[before:])
-            return result
-        return call
+    class Reports(Recording):
+        """Each report's step, whether it is an evaluation's, and the compiles before it."""
+        def __init__(self):
+            super().__init__()
+            self.reports = []
 
-    run = Evaluation.run
+        def log(self, scalars, step):
+            super().log(scalars, step)
+            self.reports.append((step, any(name.startswith("val/") for name in scalars), len(compiles)))
 
-    def evaluated(*args, **kwargs):
-        evaluations.append((int(kwargs["step"]), kwargs.get("warm", False), []))
-        return run(*args, **kwargs)
-
-    monkeypatch.setattr(Evaluation, "run", evaluated)
-    for name in ("_dispatched", "_merged", "_previewed"):
-        monkeypatch.setattr(evaluation, name, counted(getattr(evaluation, name)))
+    tracker = Reports()
     handler, logger = Compiles(), logging.getLogger("jax")
     logger.addHandler(handler)
     try:
@@ -85,10 +76,11 @@ def test_a_run_compiles_its_evaluations_before_its_first_step(monkeypatch):
                 data, steps=4, eval_every=2, log_every=2, metrics=(Perplexity(),), preview=True)
     finally:
         logger.removeHandler(handler)
-    warm, *scheduled = evaluations
-    assert warm[:2] == (0, True) and warm[2], warm
-    assert [(step, warmed, compiled) for step, warmed, compiled in scheduled] == [
-        (2, False, []), (4, False, [])], scheduled
+    evaluated = [index for index, (_, evaluation, _) in enumerate(tracker.reports) if evaluation]
+    assert [tracker.reports[index][0] for index in evaluated] == [2, 4], tracker.reports
+    for index in evaluated:
+        (_, steps, before), (_, _, after) = tracker.reports[index - 1], tracker.reports[index]
+        assert not steps and compiles[before:after] == [], (tracker.reports, compiles[before:after])
     assert sum(isinstance(artifact, TextSamples) for artifact in tracker.artifacts) == 2
 
 
