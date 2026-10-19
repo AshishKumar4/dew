@@ -529,17 +529,21 @@ def test_packed_documents_on_the_port_are_as_exact_as_flas_own_sequences(dtype):
 @pytest.mark.parametrize("per_key", [False, pytest.param(True, marks=pytest.mark.skipif(
     not INTERPRETED, reason="on a GPU Kimi delta attention's fp32 products are fla's TF32; its packed bar "
                             "is fla's own distance (test_fla_kda's packed case)"))])
-def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key):
+@pytest.mark.parametrize("begun", [False, True])
+def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key, begun):
     """Packed documents (`starts`, each a sequence of its own, fla's varlen), with a
     decay per head or per key dimension (Kimi's delta attention): each document from a zero memory but
     a row's first, from the row's, the row's final memory its last document's; output, final memory
     and gradients within fp32 rounding of the token recurrence run document by document in float64.
-    Documents start on and off the chunk grid, one shorter than a chunk and one longer."""
+    Documents start on and off the chunk grid, one shorter than a chunk and one longer. Where a row's
+    first token is `begun`, marked as a document's start, that row drops its memory, whose gradient
+    is zero."""
     batch, length, key_heads, value_heads, width = 2, 150, 1, 2, 64
     cuts = ((0, 37, 100), (0, 64))
     starts = np.zeros((batch, length), bool)
     for row, begins in enumerate(cuts):
         starts[row, list(begins[1:])] = True
+    starts[1, 0] = begun
     keys = jax.random.split(jax.random.key(19), 8)
     q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width)))
     k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width)))
@@ -554,7 +558,10 @@ def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key):
     port = through(packed, do, dht)(q, k, v, g, beta, h0)
     with jax.enable_x64(new_val=True):
         operands = widened((q, k, v, g, beta, h0, do, dht))
-        documents = functools.partial(recurrence, cuts=cuts)
+        def documents(*operands):
+            memory = jnp.where(jnp.asarray(starts[:, 0])[:, None, None, None], 0.0, operands[-1])
+            return recurrence(*operands[:-1], memory, cuts=cuts)
+
         truth = jax.tree.map(np.asarray, through(documents, *operands[6:])(*operands[:6]))
     names = ("out", "final", "q", "k", "v", "g", "beta", "h0")
     for name, mine, theirs in zip(names, port, truth, strict=True):
