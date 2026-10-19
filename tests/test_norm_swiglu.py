@@ -473,6 +473,19 @@ def test_a_swiglu_takes_the_kernel_its_target_measured_at_its_width(dtype, named
     assert (route.kernel, route.preferred, route.refusal) == (kernel, kernel, None)
 
 
+def test_a_swiglu_of_a_bf16_gate_over_an_fp32_up_is_an_fp32_product_xla_takes():
+    """Gemma-4's per-layer input gates a bf16 projection over its fp32 input: an fp32 product, which
+    XLA fuses (`_measured_width`), so on an A100 it takes XLA as its own preference, reporting no
+    refusal, and computes as XLA's product does."""
+    from dew.nn.kernels import generation
+
+    gate, up = jnp.ones((2, 63, 8), jnp.bfloat16), jnp.ones((2, 63, 8), jnp.float32)
+    with generation.assumed("sm80"), generation.routes() as found:
+        assert norm_swiglu.swiglu_kernel("auto", gate, up) == "xla"
+    (route,) = found
+    assert (route.kernel, route.preferred, route.refusal) == ("xla", "xla", None)
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("implementation", ["auto", "pallas"])
 def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_deterministic_ops, implementation):
