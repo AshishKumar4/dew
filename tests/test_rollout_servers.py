@@ -107,11 +107,28 @@ def vllm_stopping(request):
     return choice("vllm", ids, [-.5] * len(ids), "length")
 
 
+def sglang_stopping(request):
+    """SGLang's answer to `request` over the same draw from the prompt [1], read on from where the
+    request's prompt leaves it: it ends on its model's EOS unless the request ignores every token
+    stop, and on a requested stop id, and reports the id it ended on."""
+    prompt = request["prompt"][0]
+    stops = set(request.get("stop_token_ids") or ()) | (set() if request.get("ignore_eos") else {NATIVE})
+    ids = []
+    for token in [3, NATIVE, 5, EOS, 6, 6, 6, 6][len(prompt) - 1:][:request["max_tokens"]]:
+        ids.append(token)
+        if token in stops:
+            return {**choice("sglang", ids, [-.5] * len(ids), "stop"), "matched_stop": token,
+                    "prompt_token_ids": prompt}
+    return {**choice("sglang", ids, [-.5] * len(ids), "length"), "prompt_token_ids": prompt}
+
+
+@pytest.mark.parametrize("provider", ["vllm", "sglang"])
 @pytest.mark.parametrize("eos", [EOS, None])
-def test_a_vllm_draw_ends_on_the_policys_stops_alone(eos):
-    """A policy's stops are the only ids that end a vLLM draw: its model's own EOS, which the policy
-    does not name, is drawn past, and a policy with no stop runs to its budget."""
-    completion, _ = engine("vllm", vllm_stopping)
+def test_a_draw_ends_on_the_policys_stops_alone(eos, provider):
+    """A policy's stops are the only ids that end a draw: its model's own EOS, which the policy does
+    not name, is drawn past (vLLM told to ignore it, an SGLang draw it ended there going on from
+    the ids it drew), and a policy with no stop runs to its budget."""
+    completion, _ = engine(provider, vllm_stopping if provider == "vllm" else sglang_stopping)
     server = OpenAIRolloutServer(completion, Sampling(eos_token_ids=eos), pushed)
     try:
         draw = server.submit([1], 6, key=0).result(timeout=30)

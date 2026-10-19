@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 import jax
 import numpy as np
 
+from dew.inference.continuation import OwnStops, driven, driven_async, streamed, streamed_async
 from dew.nn.inputs import key_seed, token_id
 from dew.records import JSON
 from dew.sampling.text import Sampling
@@ -369,9 +370,10 @@ def decode_routed_experts(encoded: object) -> np.ndarray:
     return np.load(io.BytesIO(base64.b64decode(encoded)), allow_pickle=False)
 
 
-def _openai_result(raw: JSON, response: object, expected: int) -> Completion:
+def _openai_result(raw: JSON, responses: Sequence[object], expected: int) -> Completion:
+    """The completion `raw` holds, its SDK `responses` kept: the request's and any continuation's."""
     from openai.types import Completion as SDKCompletion
-    if not isinstance(response, SDKCompletion):
+    if not all(isinstance(response, SDKCompletion) for response in responses):
         raise ValueError("a non-streaming completion request returned an incompatible response")
     fields = _object(raw, "completion response")
     choices = fields.get("choices")
@@ -397,7 +399,7 @@ def _openai_result(raw: JSON, response: object, expected: int) -> Completion:
     per_choice = (usage.completion_tokens,) if expected == 1 and usage is not None else (None,) * expected
     choice = [ordered[index] for index in range(expected)]
     return Completion(tuple(entry[0] for entry in choice), tuple(entry[1] for entry in choice),
-                      per_choice, usage, (response,), tuple(entry[2] for entry in choice),
+                      per_choice, usage, tuple(responses), tuple(entry[2] for entry in choice),
                       tuple(entry[3] for entry in choice), tuple(entry[4] for entry in choice))
 
 
@@ -453,12 +455,19 @@ def _engine_stops(sampling: Sampling, provider: Literal["vllm", "sglang"]) -> Ma
     is told to ignore them and given the stops: exact for every policy. SGLang's `ignore_eos`
     turns off every token stop, `stop_token_ids` too, and otherwise it also ends on its model's
     EOS ids (sglang/srt/managers/schedule_batch.py:1707-1729 at v0.5.20): a policy without stops
-    is exact there, and one with stops ends on its model's EOS as well, which a draw that checks
-    its finish refuses where the policy leaves that EOS out."""
+    is exact there, and a draw of one with stops that SGLang ends on an EOS of its own goes on
+    (`dew.inference.continuation`)."""
     stops: list[JSON] = list(sampling.stops)
     if provider == "vllm":
         return {"ignore_eos": True, **({"stop_token_ids": stops} if stops else {})}
     return {"stop_token_ids": stops} if stops else {"ignore_eos": True}
+
+
+def _returning_ids(fields: Mapping[str, object], *flags: str) -> Mapping[str, object]:
+    """`fields` with SGLang's `flags` set in `extra_body`, so its choices report the token ids a
+    continuation reads (`dew.inference.continuation`)."""
+    extra = {} if fields.get("extra_body") is None else _object(fields["extra_body"], "extra_body")
+    return {**fields, "extra_body": {**extra, **dict.fromkeys(flags, True)}}
 
 
 @dataclass(frozen=True)
@@ -546,15 +555,37 @@ class OpenAICompletion:
             raise TypeError("async methods require AsyncOpenAI")
         return self.client
 
+    def _own_stops(self, parameters: Mapping[str, object], budget: int, seed: int | None) -> OwnStops | None:
+        """How this request's policy stops on SGLang (`dew.inference.continuation`), where its stop ids
+        are not all a draw ends on; None on another engine or a policy without stop ids."""
+        sampling = parameters.get("sampling")
+        if self.provider != "sglang" or not isinstance(sampling, Sampling) or not sampling.stops:
+            return None
+        penalized = (sampling.repetition_penalty != 1.0 or sampling.frequency_penalty != 0
+                     or sampling.presence_penalty != 0)
+        return OwnStops(frozenset(sampling.stops), budget, seed, penalized)
+
     def __call__(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *,
                  key: int | jax.Array | None = None, **parameters: RequestField) -> Completion:
         seed = key_seed(key)
         fields, expected = _openai_fields(
             self.model, prompts, max_new_tokens, seed, self._parameters(parameters)
         )
+        own = self._own_stops(parameters, max_new_tokens, seed)
         create: Callable[..., _RawResponse[object]] = self._sync().completions.with_raw_response.create
-        raw = _invoke(create, fields)
-        return _openai_result(raw.http_response.json(), raw.parse(), expected)
+        if own is None:
+            raw = _invoke(create, fields)
+            return _openai_result(raw.http_response.json(), (raw.parse(),), expected)
+        fields = _returning_ids(fields, "return_token_ids")
+        responses: list[object] = []
+
+        def answered(request: Mapping[str, object]) -> JSON:
+            raw = _invoke(create, request)
+            responses.append(raw.parse())
+            return raw.http_response.json()
+
+        payload = driven(own.completed(answered(fields), fields), answered)
+        return _openai_result(payload, responses, expected)
 
     def stream(
         self,
@@ -563,12 +594,17 @@ class OpenAICompletion:
         *,
         key: int | jax.Array | None = None,
         **parameters: RequestField,
-    ) -> Stream[OpenAIResponse]:
+    ) -> Stream[OpenAIResponse] | Iterator[OpenAIResponse]:
         seed = key_seed(key)
         fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed,
                                    self._parameters(parameters), stream=True)
         create: Callable[..., Stream[OpenAIResponse]] = self._sync().completions.create
-        return _invoke(create, fields)
+        own = self._own_stops(parameters, max_new_tokens, seed)
+        if own is None:
+            return _invoke(create, fields)
+        fields = _returning_ids(fields, "return_token_ids")
+        return streamed(_invoke(create, fields), own, fields, "completions",
+                        lambda request: _invoke(create, request))
 
     def _chat_body(self, messages: Sequence[ChatMessage], max_new_tokens: int,
                    seed: int | None, stream: bool,
@@ -598,13 +634,22 @@ class OpenAICompletion:
         key: int | jax.Array | None = None,
         stream: bool = False,
         **parameters: RequestField,
-    ) -> ChatCompletion | Stream[ChatCompletionChunk]:
+    ) -> ChatCompletion | Stream[ChatCompletionChunk] | Iterator[ChatCompletionChunk]:
         seed = key_seed(key)
         fields = self._chat_body(messages, max_new_tokens, seed, stream, parameters)
         create: Callable[..., ChatCompletion | Stream[ChatCompletionChunk]] = (
             self._sync().chat.completions.create
         )
-        return _invoke(create, fields)
+        own = self._own_stops(parameters, max_new_tokens, seed)
+        if own is None:
+            return _invoke(create, fields)
+        fields = _returning_ids(fields, "return_prompt_token_ids", "return_token_ids")
+        completions = self._sync().completions
+        answer = _invoke(create, fields)
+        if stream:
+            return streamed(answer, own, fields, "chat", lambda request: _invoke(completions.create, request))
+        return driven(own.chat_completed(answer, fields), lambda request: _invoke(
+            completions.with_raw_response.create, request).http_response.json())
 
     async def acall(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *,
                     key: int | jax.Array | None = None, **parameters: RequestField) -> Completion:
@@ -612,8 +657,21 @@ class OpenAICompletion:
         fields, expected = _openai_fields(
             self.model, prompts, max_new_tokens, seed, self._parameters(parameters)
         )
-        raw = await _invoke(self._async().completions.with_raw_response.create, fields)
-        return _openai_result(raw.http_response.json(), raw.parse(), expected)
+        own = self._own_stops(parameters, max_new_tokens, seed)
+        create = self._async().completions.with_raw_response.create
+        if own is None:
+            raw = await _invoke(create, fields)
+            return _openai_result(raw.http_response.json(), (raw.parse(),), expected)
+        fields = _returning_ids(fields, "return_token_ids")
+        responses: list[object] = []
+
+        async def answered(request: Mapping[str, object]) -> JSON:
+            raw = await _invoke(create, request)
+            responses.append(raw.parse())
+            return raw.http_response.json()
+
+        payload = await driven_async(own.completed(await answered(fields), fields), answered)
+        return _openai_result(payload, responses, expected)
 
     async def astream(
         self,
@@ -622,11 +680,17 @@ class OpenAICompletion:
         *,
         key: int | jax.Array | None = None,
         **parameters: RequestField,
-    ) -> AsyncStream[OpenAIResponse]:
+    ) -> AsyncStream[OpenAIResponse] | AsyncIterator[OpenAIResponse]:
         seed = key_seed(key)
         fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed,
                                    self._parameters(parameters), stream=True)
-        return await _invoke(self._async().completions.create, fields)
+        create = self._async().completions.create
+        own = self._own_stops(parameters, max_new_tokens, seed)
+        if own is None:
+            return await _invoke(create, fields)
+        fields = _returning_ids(fields, "return_token_ids")
+        return streamed_async(await _invoke(create, fields), own, fields, "completions",
+                              lambda request: _invoke(create, request))
 
     async def achat(
         self,
@@ -636,7 +700,20 @@ class OpenAICompletion:
         key: int | jax.Array | None = None,
         stream: bool = False,
         **parameters: RequestField,
-    ) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
+    ) -> ChatCompletion | AsyncStream[ChatCompletionChunk] | AsyncIterator[ChatCompletionChunk]:
         seed = key_seed(key)
         fields = self._chat_body(messages, max_new_tokens, seed, stream, parameters)
-        return await _invoke(self._async().chat.completions.create, fields)
+        own = self._own_stops(parameters, max_new_tokens, seed)
+        if own is None:
+            return await _invoke(self._async().chat.completions.create, fields)
+        fields = _returning_ids(fields, "return_prompt_token_ids", "return_token_ids")
+        completions = self._async().completions
+        answer = await _invoke(self._async().chat.completions.create, fields)
+        if stream:
+            return streamed_async(answer, own, fields, "chat",
+                                  lambda request: _invoke(completions.create, request))
+
+        async def answered(request: Mapping[str, object]) -> JSON:
+            return (await _invoke(completions.with_raw_response.create, request)).http_response.json()
+
+        return await driven_async(own.chat_completed(answer, fields), answered)
