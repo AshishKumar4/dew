@@ -27,6 +27,7 @@ the committed adapter (`masks`, in Dew's environment); the PEFT run (the
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -128,8 +129,32 @@ def write_masks() -> None:
     print(f"{FIXTURE / 'dropout' / MASKS}: {len(drawn)} masks")
 
 
+@contextlib.contextmanager
+def widened(model):
+    """`model` in float64 with every float32 pin of transformers' Llama (5.16.1) widened, so the
+    float64 run rounds in float64 alone: its RMSNorm's cast (modeling_llama.py:64), its rotary
+    tables' (:108, :115-117), whose inverse frequencies are computed again, and its attention
+    softmax's (:208)."""
+    from torch_precision import dtype_widened, float_as, replaced, widened_to
+
+    with replaced(float_as(torch.float64), (torch.Tensor, "to", widened_to(torch.Tensor.to)),
+                  (torch, "arange", dtype_widened(torch.arange)),
+                  (torch.nn.functional, "softmax", dtype_widened(torch.nn.functional.softmax))):
+        model = model.to(torch.float64)
+        rotary = model.get_base_model().model.rotary_emb
+        rotary.inv_freq = rotary.compute_default_rope_parameters(rotary.config)[0]
+        yield model
+
+
 def run(model, input_ids: torch.Tensor, dtype, drawn: dict[str, np.ndarray] | None, rate: float) -> dict:
-    model = model.to(dtype)
+    if dtype == torch.float64:
+        with widened(model) as wide:
+            return run_at(wide, input_ids, dtype, drawn, rate)
+    return run_at(model.to(dtype), input_ids, dtype, drawn, rate)
+
+
+def run_at(model, input_ids: torch.Tensor, dtype, drawn: dict[str, np.ndarray] | None, rate: float) -> dict:
+    """The adapted logits, the loss and every factor's gradient of `model` as it stands at `dtype`."""
     if drawn is None:
         model.eval()
     else:
