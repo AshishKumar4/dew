@@ -43,7 +43,7 @@ def standing_in(gate, monkeypatch, *, passed: bool) -> list:
     and return the commands run. The reference either passes its claim or
     measures a head at 0.72 of it and exits 1."""
     outputs = {
-        "benchmark_step.py": lambda command: [{"ms_per_step": 5.0}],
+        "benchmark_step.py": lambda command: [{"ms_per_step": 5.0, "compile_seconds": 30.0}],
         "benchmark_forward.py": lambda command: {after(command, "--cases"): 5.0},
         "benchmark_lm_serving.py": lambda command: {"sweep": [
             {"slots": int(slots), "repeats": [{"output_tokens_per_second": rate} for rate in (5.0, 6.0)]}
@@ -226,3 +226,26 @@ def test_a_tree_imports_the_wheels_its_lock_names_and_dew_from_its_own_source(ga
     shared = gate.environment(trees["head"], "cpu", cache)
     assert shared == pythons["main"] and (shared.parent.parent / "complete").stat().st_mtime_ns == finished
     assert imported(trees["head"], shared) == ("1.0", trees["head"] / "src" / "dew" / "__init__.py")
+
+
+def test_a_head_that_grows_its_compile_by_more_than_a_quarter_regresses(gate):
+    """A step's compile row fails a head that grows it by more than the materiality `COMPILE_FLOOR` names:
+    a fifth more over steady rounds is level, a third more regresses, a third less is faster; its step
+    row keeps the 2% floor."""
+    compile_row = next(row for row in gate.BATTERY if row.name == "compile lm-dense 4x1024")
+    step_row = next(row for row in gate.BATTERY if row.name == "step lm-dense 4x1024")
+    base = [60.0, 60.5, 61.0]
+    assert gate.verdict(compile_row, base, [72.0, 72.5, 73.0])[0] == "level"
+    assert gate.verdict(compile_row, base, [80.0, 80.5, 81.0])[0] == "regressed"
+    assert gate.verdict(compile_row, base, [40.0, 40.5, 41.0])[0] == "faster"
+    assert gate.verdict(step_row, [10.0, 10.0, 10.01], [10.5, 10.5, 10.51])[0] == "regressed"
+
+
+def test_every_row_compiles_from_scratch(gate, monkeypatch):
+    """No round reads another's compile from JAX's persistent cache, so a compile row times a compile."""
+    commands = []
+    monkeypatch.setattr(gate.subprocess, "run",
+                        lambda command, **kwargs: commands.append(kwargs["env"]) or
+                        subprocess.CompletedProcess(command, 0, "", ""))
+    gate._run(ROOT, Path(sys.executable), "benchmark_step.py", [], ROOT / "tools", 60)
+    assert commands[0]["JAX_ENABLE_COMPILATION_CACHE"] == "false"
