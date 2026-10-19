@@ -1429,7 +1429,8 @@ class Trainer(Generic[Loss, Effects]):
         suites = _suites(loader, validation, metrics, eval_every)
         selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every, restore_best)
         self._preflight(loader, stop, suites, preview=preview,
-                        loss=(self.checkpoints is not None or restore_best) and not selection)
+                        loss=(self.checkpoints is not None or restore_best) and not selection,
+                        restore_best=restore_best)
         preview = preview and self.tracker is not None
         run = _FitRun(time.perf_counter())
         # A display of this fit's own: one before it may have run other steps.
@@ -2014,7 +2015,7 @@ class Trainer(Generic[Loss, Effects]):
         )
 
     def _preflight(self, dataset: Loader, stop, suites: Mapping[str, EvalSuite], *,
-                   preview: bool, loss: bool) -> None:
+                   preview: bool, loss: bool, restore_best: bool) -> None:
         """The refusals `fit` makes before it places anything: validation
         nothing reads, and a pipeline's batch, whose placement could take
         minutes or run out of memory before the error. Every other mesh's
@@ -2024,19 +2025,22 @@ class Trainer(Generic[Loss, Effects]):
             if loss and not any(metric.name == 'loss' for metric in suite.metrics):
                 self.objective._check_validation_loss()
             if (stop is None or not isinstance(stop.metric, TrainingScalar)) and suite.every:
-                self._check_validation_is_read(name, suite, preview=preview)
+                self._check_validation_is_read(name, suite, preview=preview, restore_best=restore_best)
         if self.device_mesh.shape.get(STAGE_AXIS, 1) > 1 and self.rollout is None:
             check_batch(dataset.batch, self.device_mesh, self.microbatches)
 
-    def _check_validation_is_read(self, name: str, suite: EvalSuite, *, preview: bool) -> None:
+    def _check_validation_is_read(self, name: str, suite: EvalSuite, *, preview: bool,
+                                  restore_best: bool) -> None:
         """Refuse a validation cadence whose batches nothing would read.
 
         A validation pass hands its batches to metrics, to the preview and,
-        under a checkpointer, to the loss that ranks the run's steps. Scheduled
-        with none of them, it would open nothing and report nothing, so the
-        contradiction is refused before the run does any work.
+        under a checkpointer or a `restore_best`, to the loss that ranks the
+        run's steps. Scheduled with none of them, it would open nothing and
+        report nothing, so the contradiction is refused before the run does any
+        work.
         """
-        if not suite.metrics and self.checkpoints is None and not (preview and self.tracker is not None):
+        ranked = self.checkpoints is not None or restore_best
+        if not suite.metrics and not ranked and not (preview and self.tracker is not None):
             raise ValueError(
                 f"{name} is scored every {suite.every} steps and nothing consumes it: "
                 + ("preview=True needs a tracker to receive the samples; "
