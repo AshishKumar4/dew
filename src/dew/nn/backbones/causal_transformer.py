@@ -26,7 +26,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Mapping, Sequence
-from typing import Literal, Self
+from typing import ClassVar, Literal, Self
 
 import flax.core
 import jax
@@ -115,29 +115,10 @@ from .decoder_stack import (
 )
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
-INTERMEDIATES = "intermediates"
+_INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
-
-
-def layer_outputs(module: nn.Module, method: str) -> bool:
-    """The `capture_intermediates` filter that keeps every layer's output.
-
-    It matches the `__call__` of the stack's `layers_N` modules, a scanned
-    run's `layers_3_7` and a pipeline stage's `layers_j` included, and
-    `StackView.unstack` lays what those sow out per layer, as the plain loop
-    does; `layer_output` reads one layer back.
-    """
-    return method == "__call__" and (module.name or "").startswith("layers_")
-
-
-def layer_output(intermediates: Mapping[str, Mapping[str, Sequence[jax.Array]]], index: int) -> jax.Array:
-    """Layer `index`'s output out of the collection `layer_outputs` filled."""
-    kept = intermediates.get(f"layers_{index}")
-    if kept is None:
-        held = sorted(int(name[len("layers_"):]) for name in intermediates
-                      if name.startswith("layers_") and name[len("layers_"):].isdigit())
-        raise ValueError(f"the model kept no layer {index}; it has layers {held}")
-    return kept["__call__"][0]
+_FINAL = "final_residual"
+"""The collection the forward sows its stack's output into (`layer_state`)."""
 
 
 @logical_axes({
@@ -1176,9 +1157,12 @@ class CausalTransformer(nn.Module):
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
         self.specs = specs
+        # What one scanned body shares: the layers' spec and how their variables are stored.
+        structures = StackView.layer_structures(self.variables, self.num_layers)
+        self.scan_keys = tuple(zip(specs, structures, strict=True))
         self.block = block
         self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
-        self.groups = scan_groups(specs, self.bank_layers) if self.scan_layers else tuple(
+        self.groups = scan_groups(self.scan_keys, self.bank_layers) if self.scan_layers else tuple(
             (index, 1) for index in range(self.num_layers))
         self.mtp = self._prediction_depths(types, kinds, mixer_spec, gated_mlp, routed, wiring)
         if self.dspark is not None:
@@ -1704,6 +1688,40 @@ class CausalTransformer(nn.Module):
         """Return the final normalized states, without the vocabulary projection."""
         return self.hidden_and_mtp_inputs(tokens, **kwargs)[0]
 
+    @nn.nowrap
+    def capture_layers(self, module: nn.Module, method: str) -> bool:
+        """The `capture_intermediates` filter that keeps every layer's output (`LayerStates`).
+
+        It matches the `__call__` of the stack's `layers_N` modules, a scanned
+        run's `layers_3_7` and a pipeline stage's `layers_j` included, and
+        `StackView.unstack` lays what those sow out per layer, as the plain loop
+        does; `layer_state` reads one layer back. Neither is a Flax method, so
+        the filter the capture calls on every module runs no module call.
+        """
+        return method == "__call__" and (module.name or "").startswith("layers_")
+
+    layer_collections: ClassVar[tuple[str, ...]] = (_INTERMEDIATES, _FINAL)
+    """The collections a reader of layer states opens (`LayerStates`)."""
+
+    @nn.nowrap
+    def layer_state(self, collections: Mapping[str, Mapping], index: int) -> jax.Array:
+        """Layer `index`'s output out of what the forward kept (`LayerStates`): the last layer's as
+        the stack returns it, and another's as `capture_layers` kept it, the last call's, a looped
+        layer's last pass; a model that carries several residual copies (AltUp's) returns them all
+        at every layer. `index` counts as a Python index does, -1 the last layer."""
+        if not -self.num_layers <= index < self.num_layers:
+            raise ValueError(f"a {self.num_layers}-layer model has no layer {index}")
+        layer = index % self.num_layers
+        final = collections.get(_FINAL, {}).get('states')
+        if layer == self.num_layers - 1 and final is not None:
+            return final
+        kept = collections.get(_INTERMEDIATES, {}).get(f"layers_{layer}")
+        if kept is None:
+            held = sorted(int(name[len("layers_"):]) for name in collections.get(_INTERMEDIATES, {})
+                          if name.startswith("layers_") and name[len("layers_"):].isdigit())
+            raise ValueError(f"the model kept no layer {layer}; it kept layers {held}")
+        return kept["__call__"][-1]
+
     def logits(self, tokens, *, train: bool = False, **fields):
         """Return `__call__`'s fp32 logits over `hidden_states(tokens, **fields)`, which
         write no cache unless `fields` ask to `decode`."""
@@ -1794,6 +1812,11 @@ class CausalTransformer(nn.Module):
             per_layer_input=ple,
             attention_metadata=attention_metadata,
         )
+        if not self.is_initializing() and self.is_mutable_collection(_FINAL):
+            # The last layer's output as the stack returns it whatever runs it (`layer_state`),
+            # before a model that carries several residual copies collapses them; it costs
+            # nothing unless a caller opens the collection.
+            self.sow(_FINAL, 'states', residual, reduce_fn=lambda _, value: value, init_fn=lambda: None)
         streams, x = self._collapse(residual)
         hidden = constrain(x if self.ngpt is not None else self.norm(x), RESIDUAL)
         self._gate_exit(hidden)
@@ -1924,7 +1947,7 @@ class CausalTransformer(nn.Module):
             x = x.astype(at_least_fp32(x.dtype))
         stages = pipeline_stages()
         first, end = (0, self.num_layers) if span is None else span
-        spanned = tuple((first + start, count) for start, count in scan_groups(self.specs[first:end],
+        spanned = tuple((first + start, count) for start, count in scan_groups(self.scan_keys[first:end],
                                                                                self.bank_layers))
         # A seeded initialization (PTQ's abstract annotation pass) reads the
         # supplied layout; the scan's init=True pass would draw over it first.
@@ -1990,7 +2013,7 @@ class CausalTransformer(nn.Module):
                     f"{rows // shards}, or a batch that is a multiple of "
                     f"{count_microbatches * shards} rows")
             view = StackView(
-                scan_groups(self.specs[:count], self.bank_layers) if self.scan_layers
+                scan_groups(self.scan_keys[:count], self.bank_layers) if self.scan_layers
                 else tuple((index, 1) for index in range(count)),
                 stages=stages, microbatches=count_microbatches,
                 # What enters the loop is read on every iteration; what the
@@ -2374,10 +2397,15 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
         """Its layers', depths' and drafter's groups, bound without tracing a
-        forward; an encoder serves no decode step and names none."""
+        forward; an encoder serves no decode step and names none. The groups
+        read which parameters the layers hold, never their values, so the
+        layers are bound over the variables' shapes: flax's bound tree is
+        cyclic, and bound over the weights themselves it would keep them alive
+        after the caller drops them until a full collection."""
         if not self.causal:
             return ()
-        bound = self.bind(variables)
+        bound = self.bind(jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables))
         return declared_groups(*bound.layers, *bound.mtp,
                                *(bound.dspark_stages if self.dspark is not None else ()))
 
