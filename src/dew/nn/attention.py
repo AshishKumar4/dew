@@ -38,7 +38,8 @@ from .attention_kernels import (
     decodes,
     flash_architectures,
     flash_built_for,
-)from .attention_sinks import sink_softmax
+)
+from .attention_sinks import sink_softmax
 from .decode_geometry import folded_attention, folds, grouped_query
 from .documents import (
     CrossDocuments,

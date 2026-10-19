@@ -925,16 +925,17 @@ def eligibility_cases():
     """Calls covering each GPU kernel's requirements pairwise: dtypes, head widths, causality, a window,
     packed documents with and without a bound, a cache call's aligned documents, a softcap and sinks."""
     return [
-        dict(dtype=jnp.bfloat16, head_dim=64, causal=True),
-        dict(dtype=jnp.bfloat16, head_dim=128, causal=False, window=16),
-        dict(dtype=jnp.bfloat16, head_dim=256, causal=True, window=16),
-        dict(dtype=jnp.float16, head_dim=96, causal=True, documents="own", max_segments=2),
-        dict(dtype=jnp.bfloat16, head_dim=64, causal=True, documents="own"),
-        dict(dtype=jnp.bfloat16, head_dim=128, causal=True, documents="cross", max_segments=1, queries=8),
-        dict(dtype=jnp.bfloat16, head_dim=128, causal=True, softcap=30.0),
-        dict(dtype=jnp.bfloat16, head_dim=64, causal=True, sinks=True),
-        dict(dtype=jnp.float32, head_dim=64, causal=True),
-        dict(dtype=jnp.float32, head_dim=72, causal=False),
+        {"dtype": jnp.bfloat16, "head_dim": 64, "causal": True},
+        {"dtype": jnp.bfloat16, "head_dim": 128, "causal": False, "window": 16},
+        {"dtype": jnp.bfloat16, "head_dim": 256, "causal": True, "window": 16},
+        {"dtype": jnp.float16, "head_dim": 96, "causal": True, "documents": "own", "max_segments": 2},
+        {"dtype": jnp.bfloat16, "head_dim": 64, "causal": True, "documents": "own"},
+        {"dtype": jnp.bfloat16, "head_dim": 128, "causal": True, "documents": "cross", "max_segments": 1,
+         "queries": 8},
+        {"dtype": jnp.bfloat16, "head_dim": 128, "causal": True, "softcap": 30.0},
+        {"dtype": jnp.bfloat16, "head_dim": 64, "causal": True, "sinks": True},
+        {"dtype": jnp.float32, "head_dim": 64, "causal": True},
+        {"dtype": jnp.float32, "head_dim": 72, "causal": False},
     ]
 
 
@@ -952,9 +953,9 @@ def eligibility_call(dtype, head_dim, causal, window=None, documents=None, max_s
     elif documents == "cross":
         filled = np.arange(64)[None, :] < np.asarray([[30], [64]])
         segment_ids = CrossDocuments(jnp.ones((2, queries), jnp.int32), jnp.asarray(filled, jnp.int32))
-    return (query, key, value), dict(causal=causal, sliding_window=window, segment_ids=segment_ids,
-                                     max_segments=max_segments, softcap=softcap,
-                                     sinks=jnp.zeros((4,), jnp.float32) if sinks else None)
+    return (query, key, value), {"causal": causal, "sliding_window": window, "segment_ids": segment_ids,
+                                 "max_segments": max_segments, "softcap": softcap,
+                                 "sinks": jnp.zeros((4,), jnp.float32) if sinks else None}
 
 
 @pytest.mark.gpu(reason="each requirement is held to the kernel it declares, on this GPU")
