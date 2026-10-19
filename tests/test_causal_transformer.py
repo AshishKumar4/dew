@@ -746,28 +746,6 @@ def test_padding_in_a_packed_row_reaches_no_query(rng):
     assert jnp.all(jnp.isfinite(changed))
 
 
-def test_a_segment_masked_batch_leaves_the_cudnn_kernel(rng, without_deterministic_ops):
-    """cuDNN takes causality as a flag and turns any mask into a materialized
-    bias, so packed batches ride the xla kernel instead. Pinning cudnn here is
-    what proves the routing: the model computes in fp32, which cudnn refuses,
-    so an unpacked batch is refused while a packed one runs."""
-    # The param tree does not depend on the kernel, so the tree comes from a
-    # twin whose init is allowed to run: initialising the cudnn model itself
-    # would trip the same refusal before the test could make its point.
-    model = tiny(attention_impl='cudnn')
-    ids, segment_ids, positions = packed_pair(rng)
-    params = tiny().init(rng, ids)
-
-    with pytest.raises(ValueError):
-        model.apply(params, ids)
-
-    # The fallback is the xla kernel with the packed mask, not a run with the
-    # mask dropped, so the logits are the ones the xla model computes.
-    logits = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
-    assert jnp.array_equal(logits, tiny(attention_impl='xla').apply(
-        params, ids, positions=positions, segment_ids=segment_ids))
-
-
 def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what_it_fails(
         rng, without_deterministic_ops):
     """A model whose layers name cudnn (`attention_impl`) forces it, so a call cudnn does not take

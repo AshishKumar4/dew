@@ -251,8 +251,6 @@ def test_attention_the_decode_kernel_takes_differentiates_as_the_folded_attentio
     """A decode step's attention, its value the kernel's, differentiates as the folded attention it
     stands in for, in both modes: the value, query, key and value gradients, and the tangent, within
     tests/reference_error.py's rule of the folded attention's against float64 attention."""
-    from dew.nn.kernels import decode_attention
-
     rng = np.random.default_rng(1)
     lengths = jnp.asarray([1, 20, 64], jnp.int32)
     attended, folded = decode_step(lengths)
