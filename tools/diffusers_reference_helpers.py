@@ -1,11 +1,10 @@
-"""Rounded timestep frequencies, replayed draws and tiny text encoders for Diffusers fixtures."""
+"""Replayed draws, saved pipelines and tiny text encoders for Diffusers fixtures."""
 
 from __future__ import annotations
 
 import contextlib
 import json
 import math
-import sys
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
@@ -13,9 +12,6 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from torch_precision import replaced
 
 
 def restore_transformers_names() -> None:
@@ -43,34 +39,6 @@ def torch_exp_disagreements(half: int) -> int:
     rounds differently from the float64 one; the attribution a record carries."""
     exponent = frequency_exponent(half, 0, 10000)
     return int((torch.exp(exponent) != torch.exp(exponent.double()).float()).sum())
-
-
-def rounded_timestep_embedding(timesteps, embedding_dim, flip_sin_to_cos=False,
-                               downscale_freq_shift=1, scale=1, max_period=10000):
-    """The source's `get_timestep_embedding` with its exponential taken in
-    float64 and rounded once to float32.
-
-    Torch's float32 `exp` is off by one unit in the last place at some of the
-    entries, and one ulp of a frequency is one ulp of the 3500-radian angle a
-    distilled guidance embeds; the rounded table is the one Dew builds on the
-    host, so a walk over it holds the rest of the source to the suite's bound
-    with nothing else altered.
-    """
-    half = embedding_dim // 2
-    table = torch.exp(frequency_exponent(half, downscale_freq_shift, max_period).double()).float()
-    angle = scale * (timesteps[:, None].float() * table[None, :])
-    embedded = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1)
-    if flip_sin_to_cos:
-        embedded = torch.cat([embedded[:, half:], embedded[:, :half]], dim=-1)
-    return embedded
-
-
-@contextlib.contextmanager
-def rounded_frequency_table():
-    from diffusers.models import embeddings
-
-    with replaced((embeddings, "get_timestep_embedding", rounded_timestep_embedding)):
-        yield
 
 
 def step_noise(shape: tuple[int, ...], count: int,

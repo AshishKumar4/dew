@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
+import inspect
 import logging
 from collections.abc import Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
@@ -39,9 +40,11 @@ def assumed(generation: str | None) -> Iterator[None]:
 
 
 CHOICES = frozenset({'attention', 'attention_narrow', 'attention_packed', 'attention_sinks',
-                     'attention_window', 'delta_decode', 'delta_gates', 'gate_up', 'gated_delta_rule',
-                     'grouped_matmul', 'narrow_copies', 'rms_norm', 'ssd', 'swiglu'})
-"""The choices `measured_kernel` answers, and so the ones `chosen` may name."""
+                     'attention_window', 'decode', 'delta_decode', 'delta_gates', 'gate_up',
+                     'gated_delta_rule', 'grouped_matmul', 'local_attention', 'mla', 'narrow_copies',
+                     'paged_decode', 'rms_norm', 'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
+"""The choices `measured_kernel` answers, and so the ones `chosen` may name and a dispatch reports
+(`route`). A choice no generation's row names runs its site's own best kernel."""
 
 
 def _named(choices: Iterable[str]) -> None:
@@ -287,26 +290,112 @@ def measured_kernel(choice: str, default: str) -> str:
     return gpu_target(device_generation()).kernels.get(choice, default)
 
 
-# Each (choice, kernel, refusal) `ran_kernel` has logged in this process.
+@dataclasses.dataclass(frozen=True)
+class Refusal:
+    """Why the kernel a target prefers does not take a call, from the call's own facts on that
+    target (its shapes, dtypes, mask): a stable `code`, which a kernel's `SUPPORTS` keys its declared
+    limits on, and the `detail` a log names. What the host cannot run is no refusal (`Route.ran`)."""
+
+    code: str
+    detail: str
+
+    def __str__(self) -> str:
+        return self.detail
+
+
+UNCLASSIFIED = 'unclassified'
+"""The code of a refusal its site gives as text alone, which no kernel's `SUPPORTS` declares."""
+
+
+def refused(*checks: tuple[bool, str, str]) -> Refusal | None:
+    """The `Refusal` of the first of `checks`, each `(holds, code, detail)`, that does not hold, or
+    None where all hold: how a kernel's eligibility says why it turns a call down (`route`)."""
+    return next((Refusal(code, detail) for holds, code, detail in checks if not holds), None)
+
+
+@dataclasses.dataclass(frozen=True)
+class Route:
+    """One dispatch's decision, made from the target's facts (`device_generation`, the call's shapes
+    and dtypes, the binary's architectures), never the host's placement: `kernel` is what the target
+    runs for `choice` at `site` (module:function), `preferred` what it runs where nothing refuses (the
+    generation's row, `chosen`, or the site's own best), `refusal` why `preferred` did not take the
+    call, and `ran` what this host executed, `kernel` but where the host cannot run it (cuDNN within
+    `assumed` on a CPU). A route is generic exactly where `kernel != preferred`."""
+
+    choice: str
+    kernel: str
+    preferred: str
+    refusal: Refusal | None
+    ran: str
+    target: str
+    site: str
+
+
+class _Routes:
+    """The routes a `routes` block collected; hashed by identity, as `dew.cache.KERNEL_ROUTES` keys
+    on it."""
+
+    def __init__(self) -> None:
+        self.found: list[Route] = []
+
+
+@contextlib.contextmanager
+def routes() -> Iterator[list[Route]]:
+    """Collect every `Route` a dispatch reports while code runs or traces in the block, in order: what
+    a step's trace within `assumed(target)` on a CPU shows of that target's kernels. Each block is a
+    fresh collection JAX keys its traces on (`dew.cache.KERNEL_ROUTES`), so a function traced before
+    traces, and reports, again; a block nested in another reports to both."""
+    from dew import cache
+
+    collected = _Routes()
+    with cache.KERNEL_ROUTES((*cache.KERNEL_ROUTES.value, collected)):
+        yield collected.found
+
+
+def _site() -> str:
+    """The module and function of the first caller outside this module."""
+    frame = inspect.currentframe()
+    while frame is not None and frame.f_globals.get('__name__') == __name__:
+        frame = frame.f_back
+    return '?' if frame is None else f"{frame.f_globals.get('__name__')}:{frame.f_code.co_qualname}"
+
+
+# Each (choice, kernel, refusal) `route` has logged in this process.
 _logged: set[tuple[str, str, str]] = set()
+
+
+def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Refusal | str | None = None,
+          ran: str | None = None) -> Route:
+    """Report the dispatch of `choice` to `kernel`, the one call every dispatch site makes once it has
+    decided: `preferred` defaults to the kernel `chosen` or the generation's row names, else `kernel`;
+    a `refusal` given as text alone is `UNCLASSIFIED`; `ran` is what this host executes, `kernel` by
+    default. Every `routes` block open records it. A call off the measured kernel is the dispatch's
+    own choice, logged once a process for each kernel and refusal at INFO, naming both; one that runs
+    the preferred kernel, or a choice no row names, logs nothing."""
+    from dew import cache
+
+    _named((choice,))
+    generation = device_generation()
+    picked = None if preferred else dict(cache.KERNEL_CHOICES.value).get(choice)
+    measured = preferred or picked or gpu_target(generation).kernels.get(choice)
+    if isinstance(refusal, str):
+        refusal = Refusal(UNCLASSIFIED, refusal)
+    found = Route(choice, kernel, measured or kernel, refusal, ran or kernel, generation, _site())
+    for collected in cache.KERNEL_ROUTES.value:
+        collected.found.append(found)
+    detail = '' if refusal is None else refusal.detail
+    if measured not in (None, kernel) and (choice, kernel, detail) not in _logged:
+        _logged.add((choice, kernel, detail))
+        named = "the kernel `chosen` names" if picked else f"the kernel measured fastest on {generation}"
+        _log.info("%s runs %r, not %r, %s: %s", choice, kernel, measured, named, detail)
+    return found
 
 
 def ran_kernel(choice: str, kernel: str, refusal: str, fastest: str | None = None) -> str:
     """Return `kernel`, which a call to `choice` runs because the kernel measured fastest on this
-    generation, `fastest`, `chosen` or else the one `KERNELS` names, turned it down for `refusal`.
-    The first such call in a process for each kernel and refusal is logged at INFO naming both. Calls off
-    the measured kernel show in a run's log as well as its step time; the dispatch owns this choice.
-    A generation without a measurement, or a call that runs the measured kernel, logs nothing."""
-    from dew import cache
-
-    generation = device_generation()
-    picked = None if fastest else dict(cache.KERNEL_CHOICES.value).get(choice)
-    measured = fastest or picked or gpu_target(generation).kernels.get(choice)
-    if measured not in (None, kernel) and (choice, kernel, refusal) not in _logged:
-        _logged.add((choice, kernel, refusal))
-        named = "the kernel `chosen` names" if picked else f"the kernel measured fastest on {generation}"
-        _log.info("%s runs %r, not %r, %s: %s", choice, kernel, measured, named, refusal)
-    return kernel
+    generation, `fastest`, `chosen` or else the one `KERNELS` names, turned it down for `refusal`,
+    reported as `route` reports it."""
+    return route(choice, kernel=kernel, preferred=fastest, refusal=refusal).kernel
 
 
 def first_refusal(*checks: tuple[bool, str]) -> str | None:
