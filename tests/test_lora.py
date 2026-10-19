@@ -731,28 +731,56 @@ def test_a_registry_model_adapts_through_the_names_its_own_kernels_carry(tmp_pat
         unnamed.save(adapted, tmp_path / "unnamed")
 
 
-def test_factors_keep_one_storage_dtype_whether_attached_or_rebuilt_from_the_record():
-    """An adapter's factors are stored in float32 under bfloat16 base weights, as attached and as
-    the model rebuilt from its record initializes them, so a run restoring trained factors onto
-    the rebuilt model's template keeps every bit; the rebuilt model computes what the attached one
-    does over the attached variables."""
+def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_uninterrupted_run(tmp_path):
+    """Factors trained over bfloat16 base weights: a run checkpointed after two steps and resumed on
+    the model rebuilt from its record (`ModelConfig.from_model`) takes its next two steps to every
+    factor, every frozen weight and the outputs an uninterrupted four-step run reaches, bit for bit.
+    A restore that narrowed a trained factor onto its template's dtype would move them all."""
     from dew.config import ModelConfig
+    from dew.inputs import Field, InputSpec
+    from dew.objectives.base import Objective, Ratio
 
     model = nn.Sequential([nn.Dense(8, param_dtype=jnp.bfloat16), nn.Dense(4, param_dtype=jnp.bfloat16)])
-    inputs = jax.random.normal(jax.random.key(1), (2, 6))
-    variables = model.init(jax.random.key(0), inputs)
-    adapter = LoRA(rank=2, modules=("layers_0", "layers_1")).apply(model, variables, key=0)
+    rows = 2 * jax.device_count()
+    inputs = np.asarray(jax.random.normal(jax.random.key(1), (rows, 6)))
+    adapter = LoRA(rank=2, modules=("layers_0", "layers_1")).apply(
+        model, model.init(jax.random.key(0), inputs), key=0)
+
+    class Squared(Objective):
+        """The mean squared output, over whatever tree it is handed."""
+
+        inputs = InputSpec(Field("x", (6,), np.float32))
+
+        def __init__(self, model, variables):
+            self.model, self.variables = model, variables
+
+        def init(self, key, variables=None):
+            return self.variables if variables is None else variables
+
+        def loss(self, variables, batch, step):
+            outputs = self.model.apply(variables, batch["x"])
+            return Ratio(jnp.sum(outputs.astype(jnp.float32) ** 2), jnp.asarray(outputs.size, jnp.float32))
+
+    def data():
+        return Loader(train=lambda partition: iter([{"x": inputs}] * 4), val=None, records=rows, batch=rows)
+
+    def trainer(model, directory):
+        return Trainer(Squared(model, adapter.variables), optax.adam(1e-2), key=jax.random.key(3),
+                       mesh=MeshSpec(), checkpoints=Checkpoints(str(directory)))
+
+    whole = trainer(adapter.model, tmp_path / "whole").fit(data(), steps=4, log_every=4)
+    first = trainer(adapter.model, tmp_path / "split")
+    first.fit(data(), steps=2, log_every=2, checkpoint_every=2)
+    first.checkpoints.wait()
     rebuilt = ModelConfig.from_model(adapter.model).build()
-    template = rebuilt.init(jax.random.key(0), inputs)
-
-    def factors(tree):
-        return {name: leaf.dtype for name, leaf in _flat(tree["params"]).items()
-                if name.endswith(lora.FACTORS)}
-
-    attached = factors(adapter.variables)
-    assert factors(template) == attached == dict.fromkeys(attached, jnp.float32)
-    np.testing.assert_array_equal(np.asarray(rebuilt.apply(adapter.variables, inputs)),
-                                  np.asarray(adapter.model.apply(adapter.variables, inputs)))
+    resumed = trainer(rebuilt, tmp_path / "split").fit(data(), steps=4, log_every=2)
+    assert int(resumed.step) == 4
+    for (path, ours), theirs in zip(jax.tree_util.tree_leaves_with_path(resumed.variables),
+                                    jax.tree.leaves(whole.variables), strict=True):
+        assert ours.dtype == theirs.dtype and np.array_equal(np.asarray(ours), np.asarray(theirs)), \
+            jax.tree_util.keystr(path)
+    np.testing.assert_array_equal(np.asarray(rebuilt.apply(resumed.variables, inputs)),
+                                  np.asarray(adapter.model.apply(whole.variables, inputs)))
 
 
 def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
