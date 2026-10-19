@@ -1,6 +1,6 @@
 # Post-training in Dew: SFT, DPO and online RL on one trainer
 
-Built through wave 6. The current Flow-GRPO usage is in [the post-training guide](../concepts/post_training.md#flow-grpo). The earlier sections record the language post-training implementation as it was when those waves landed.
+This is the binding design for post-training. The current Flow-GRPO usage is in [the post-training guide](../concepts/post_training.md#flow-grpo). The [data design](data.md) supersedes the older data-source sketches below. Implementation and qualification work lives in the [roadmap](../roadmap.md#rl-and-serving).
 
 Correction (2026-09-22): I checked this record against current source. The sketch below still matches the constructors (`src/dew/objectives/lm/objective.py:431-450`, `src/dew/objectives/rl/preference.py:39`, `src/dew/objectives/rl/grpo.py:58`, `src/dew/training/trainer.py:188-203`). Where a section no longer matches, a dated note at the end of that section says what changed.
 
@@ -193,16 +193,11 @@ Correction (2026-09-22): the two totals above are in GB, not GiB. The fixture co
 
 Research scale uses Dew's own `generate` and its samplers. Beyond that, the crossover sits at the capability boundary. A `Rollout` that posts prompts to a vLLM server and returns token ids is one implementation of the protocol in §4, and the weights it serves come from `save_pretrained_decoder`, which writes the HF layout verl and vLLM already consume (`dew/interop/hf_decoders`). Neither reaches the trainer, the objective or the state.
 
-## 11. Waves
+## 11. Qualification contracts
 
-| # | wave | acceptance | status |
-| --- | --- | --- | --- |
-| 1 | chat data path and `loss_role` | mask parity against TRL; a packed SFT batch carries four aligned per-token fields; loss counts assistant targets only | built |
-| 2 | unit-decay reference | a non-finite parameter leaves the reference bit-identical, with and without `dynamic_scale`; a resumed run restores it | built |
-| 3 | the rollout capability | identity default leaves the loop unchanged; one `compile` per run with a rollout; `train/rollout_seconds` in the log tick; a resumed run does not replay | built |
-| 4 | DPO | loss and gradient parity against TRL; the pair layout asserted | built |
-| 5 | GRPO on `dew.rl` | the composition matches verl end to end on one fixed rollout; a mutation of each term fails | built |
-| 6 | trajectory, SDE solver, FlowGRPO | density and gradient parity; Gaussian KL oracle; real DiT update; two-process ownership and one-process parity | built |
+The shared [testing spec](testing.md) applies to every objective. SFT checks the rendered ids and assistant mask against TRL, including their alignment after packing. A unit-decay reference stays bit-identical after a non-finite live update and survives checkpoint and resume. The rollout path keeps compilation shape-stable, logs its host time and continues its recorded random stream on resume.
+
+DPO checks loss and gradients against TRL and catches swapped preference halves. GRPO checks the complete composition against verl and has a failing mutation for every term. Diffusion RL checks trajectory densities and gradients, conditional Gaussian KL, a real DiT update, and ownership and numerical parity across processes. These are behavioral obligations, independent of the order the objectives were implemented.
 
 ## 12. Staged runs
 
@@ -213,3 +208,17 @@ Research scale uses Dew's own `generate` and its samplers. Beyond that, the cros
 Correction (2026-09-22): a `Stage` no longer names its loss. The type of its data decides it: `Chat` trains SFT, `Preferences` DPO and `Prompts` GRPO (`recipes/chain.py:37-68`). The LM recipe's `--objective` accepts `lm`, `masked_diffusion` and `block_diffusion` (`src/dew/objectives/lm/config.py:33-35`, `:77-79`).
 
 Correction (2026-10-16): the chain also trains `TextData` as pretraining and `RecordsData` of `task_id` rows as PPO over a stage's `Episodes`, and a `Teacher` distills a pretraining or SFT stage (`Recipe._build`). A GRPO stage's reward reads text the prompts' tokenizer decodes, and its sampling stops at that tokenizer's EOS. Each stage hands the next the model's part of its final variables (`Objective.model_variables`), so PPO passes on its policy without the critic and distillation its student without the teacher. `Recipe.run` builds every stage's objective and rollout before the first stage trains. The user guide is [Stage chains](../concepts/post_training.md#stage-chains).
+
+## 13. External integrations
+
+External generation engines, agent tools and training frameworks enter through the existing rollout and session interfaces. Each integration uses the maintained system's public API. Dew does not add a second server, sandbox platform or scheduler to duplicate one.
+
+| Boundary | Contract |
+|---|---|
+| Generation and weight publication | `RolloutServer` owns requests and policy versions. Native generation and remote vLLM or SGLang adapters produce the same rollout records. `SafetensorsReload` and `NCCLPush` publish through that interface; the transport does not change the learner's batch contract. |
+| Asynchronous collection | `RolloutScheduler` owns look-ahead, lag, synchronization and admission. Session sources interleave turns through the engine batch. Restoring a learner must account for admitted and in-flight work explicitly. |
+| Agent environments | `Environment` and `EnvironmentFactory` enter through `EpisodeRollout` and `EnvironmentSource`. Harness commands use the gateway's recording interface. Process and sandbox lifecycles stay behind `Runner`; a provider adapter uses the provider's own API. |
+| verl interchange | `to_verl` and `from_verl` map sessions to `AgentLoopOutput`. The adapter owns verl's field names and reward-call signature. Interchange of records does not establish live transport, worker orchestration or learner integration. |
+| Diffusion RL interchange | `FlowGRPOObjective` and `FlowRollout` own the native algorithm. An external adapter first qualifies a shared loss and its gradients on fixed inputs, then maps rollout records through the same session boundary. |
+
+Every engine claim names the engine and the exercised flow. Qualification includes policy-version publication, EOS and truncation semantics, cancellation of a long decode, session restore and a real tool-using rollout. Record conversion, simulated engines and small-model runs establish only the behavior they exercise. The [roadmap](../roadmap.md#rl-and-serving) holds the remaining integration work.

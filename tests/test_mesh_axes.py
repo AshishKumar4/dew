@@ -454,7 +454,7 @@ def dense_layout():
 
 
 TOPOLOGIES = {
-    # plan.md 4.5's four mesh configs, on the eight-device simulated mesh,
+    # Four data/FSDP/tensor mesh configurations on eight simulated devices,
     # plus the sequence axis beside a data axis, where the batch rows split
     # over data and fsdp and the sequence over its own axis, and the stage
     # axis beside them: the two-layer model splits into two stages of one
