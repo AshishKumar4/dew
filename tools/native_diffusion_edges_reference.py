@@ -83,7 +83,7 @@ def generate(root):
         probe = torch.randn((1, 4, 8, width), generator=torch.Generator().manual_seed(9))
 
         def walk(model, dtype, suffix=""):
-            given = value.to(dtype).requires_grad_()
+            given = value.detach().to(dtype).requires_grad_()
             output = model(given, time.to(dtype), encoder_hidden_states=context.to(dtype)).sample
             gradient, = torch.autograd.grad((output * probe.to(dtype)).sum(), given)
             arrays[name + ".output" + suffix] = output.detach().numpy().transpose(0, 2, 3, 1)
