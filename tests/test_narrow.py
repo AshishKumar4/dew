@@ -84,6 +84,29 @@ def test_a_stack_of_weights_one_of_which_is_read_elsewhere_copies_none():
     assert narrowed_paths(loss, params, jnp.ones((2, 4), jnp.bfloat16)) == {}
 
 
+def test_a_stack_inside_a_call_whose_weight_is_read_outside_it_copies_none():
+    """Where a stack sits inside a call and one of its weights is also read outside the call, the
+    weight is read more than once, so no weight of the stack is copied."""
+    joined = jax.jit(lambda a, b: jax.lax.stack([a, b]).astype(jnp.bfloat16))
+
+    def loss(params, x):
+        return jnp.sum(joined(params["a"], params["b"]).astype(jnp.float32)) + jnp.sum(params["b"])
+
+    params = {name: jnp.ones((4, 4), jnp.float32) for name in ("a", "b")}
+    assert narrowed_paths(loss, params, jnp.ones((2, 4), jnp.bfloat16)) == {}
+
+
+def test_a_call_given_a_literal_beside_a_weight_still_copies_the_weight():
+    """A call may take a constant beside a weight; the weight it casts once is copied."""
+    scaled = jax.jit(lambda w, s: jnp.sum(w.astype(jnp.bfloat16)) * s)
+
+    def loss(params, x):
+        return scaled(params["w"], 2.0).astype(jnp.float32)
+
+    params = {"w": jnp.ones((4, 4), jnp.float32)}
+    assert narrowed_paths(loss, params, jnp.ones((2, 4), jnp.bfloat16)) == {("w",): jnp.dtype(jnp.bfloat16)}
+
+
 def _keeping_gradients(optimizer):
     """`optimizer` after a transformation whose state is the last gradient
     the update read, so a run's state holds its gradient as committed."""
