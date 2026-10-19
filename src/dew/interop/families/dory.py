@@ -140,8 +140,9 @@ def _dory_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFiel
         if factor != 1.0 and kind in attention:
             kinds.setdefault(kind, native_fields(LayerKind)())['partial_rotary_factor'] = factor
     if 'mlp' in types:
-        kinds['mlp'] = native_fields(LayerKind)(mixer={'class': 'mlp', 'fields': {
-            'intermediate_size': config['mlp_features'], 'activation': 'swiglu'}})
+        kinds['mlp'] = native_fields(LayerKind)(mixer=None)
+        kinds['mlp']['mixer'] = {'class': 'mlp', 'fields': {'intermediate_size': config['mlp_features'],
+                                                            'activation': 'swiglu'}}
     config.update(
         mlp_features=0, partial_rotary_type='default', narrow_rotary_tables=True,
         qk_norm=False, pre_norms=False, output_gate=True,
@@ -153,12 +154,14 @@ def _dory_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFiel
 
 
 _ATTENTION: dict[str, tuple[str, ...]] = {
-    **{f'mixer.{name}.weight': ('self_attn', name, 'kernel') for name in ('q_proj', 'k_proj', 'v_proj', 'o_proj')},
+    **{f'mixer.{name}.weight': ('self_attn', name, 'kernel')
+       for name in ('q_proj', 'k_proj', 'v_proj', 'o_proj')},
     'mixer.g_proj.weight': ('self_attn', 'gate_proj', 'kernel'),
     'mixer.sqk': ('self_attn', 'sqk'), 'mixer.s_gate': ('self_attn', 's_gate'), 'attn_alpha': ('attn_alpha',)}
 """An attention layer's tensors, by their paths in its block."""
 _MLP: dict[str, tuple[str, ...]] = {
-    **{f'mixer.{name}.weight': ('self_attn', name, 'kernel') for name in ('gate_proj', 'up_proj', 'down_proj')},
+    **{f'mixer.{name}.weight': ('self_attn', name, 'kernel')
+       for name in ('gate_proj', 'up_proj', 'down_proj')},
     'mixer.suv_gate': ('self_attn', 'suv_gate'), 'mixer.suv_up': ('self_attn', 'suv_up'),
     'mlp_alpha': ('attn_alpha',)}
 """An MLP layer's tensors, by their paths in its block: the MLP in the mixer's slot, and its step's
