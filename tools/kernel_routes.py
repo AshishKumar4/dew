@@ -90,11 +90,12 @@ def traced(config: dict, target: str, mode: str) -> list:
     with generation.assumed(target), generation.routes() as found:
         variables = jax.eval_shape(model.init, jax.random.key(0), tokens)
         if mode == "train":
-            def loss(params, ids):
-                logits = model.apply({**variables, "params": params}, ids)
+            def loss(params, rest, ids):
+                logits = model.apply({**rest, "params": params}, ids)
                 return jnp.mean(jnp.asarray(logits, jnp.float32))
 
-            jax.eval_shape(jax.grad(loss), variables["params"], tokens)
+            rest = {name: collection for name, collection in variables.items() if name != "params"}
+            jax.eval_shape(jax.grad(loss), variables["params"], rest, tokens)
         else:
             cache = jax.eval_shape(lambda v: model.apply(v, BATCH, method="init_cache", mutable=["cache"])[1],
                                    variables)["cache"]
