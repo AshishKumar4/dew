@@ -34,8 +34,6 @@ from .attention_kernels import (
     SPLASH_LANES,
     AttentionCase,
     decodes,
-    flash_architectures,
-    flash_built_for,
 )
 from .attention_sinks import sink_softmax
 from .decode_geometry import folded_attention, folds, grouped_query
@@ -1037,18 +1035,8 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
     jax.nn's is aligned to the first, so a causal call is square, or reads
     another sequence's documents, each document's queries aligned to its last
     keys (`CrossDocuments`), which it orders by id. On a mesh it
-    runs per shard (`_per_shard`). It runs where the installed wheel holds
-    code for the device (`flash_built_for`)."""
-    generation = device_generation()
-    architectures = flash_architectures()
-    if architectures is None:
-        raise ValueError("attention 'flash' needs dew_flash_attn (docs/installation.md)")
-    if not flash_built_for(generation, architectures):
-        raise ValueError(f"the installed dew_flash_attn holds code for {', '.join(architectures)} and this "
-                         f"device is {generation}; use attention_impl 'cudnn' or 'xla'")
-    if segment_ids is not None and max_segments is None:
-        raise ValueError("flash attention runs packed rows as varlen sequences, and needs max_segments, "
-                         "the most documents a row holds (Coordinates.max_segments), to bound them")
+    runs per shard (`_per_shard`). What it takes is its requirements'
+    (`attention_kernels.FLASH_SUPPORTS`), which `fused_attention` holds it to."""
     flash = importlib.import_module('dew_flash_attn')
     window = (-1, -1) if sliding_window is None else window_sides(causal, sliding_window)
 
@@ -1343,7 +1331,8 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
         # measured ones aside, for a caller that names it here directly as for the selector.
         case = attention_case(query, key, causal=causal, sliding_window=sliding_window, mask=mask,
                               bias=bias, softcap=softcap, sinks=sinks, segment_ids=segment_ids,
-                              max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths)
+                              max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths,
+                              named=implementation)
         failed = [requirement for requirement in ATTENTION.kernel(implementation).failed(case, forced=True)
                   if requirement.kind != 'handoff']
         if failed:
@@ -1557,8 +1546,9 @@ def _xla_kernel_chains(query, key) -> bool:
 
 def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_softmax=True, softcap=None,
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,
-                   max_segments=None, key_value_seq_lengths=None) -> AttentionCase:
-    """The `AttentionCase` of a call `scaled_dot_product_attention` takes."""
+                   max_segments=None, key_value_seq_lengths=None, named: str = 'auto') -> AttentionCase:
+    """The `AttentionCase` of a call `scaled_dot_product_attention` takes under the `named`
+    `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
     return AttentionCase(
@@ -1573,8 +1563,10 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         narrows=_xla_kernel_narrows(query) or _xla_kernel_chains(query, key),
         folds=folds(query, key, bias, mask, causal, sliding_window),
         # Splash's descriptor reads a concrete mask on the host, so only a call splash could take
-        # builds it: a TPU's, of its dtypes, with no bias or sequence axis, at lengths it tiles.
-        splash=(generation.backend() == 'tpu' and jnp.dtype(query.dtype) in SPLASH_DTYPES
+        # builds it: one that names it or chooses, a TPU's, of its dtypes, with no bias or sequence
+        # axis, at lengths it tiles.
+        splash=(named in ('auto', 'tpu') and generation.backend() == 'tpu'
+                and jnp.dtype(query.dtype) in SPLASH_DTYPES
                 and bias is None and sequence_shards() == 1
                 and q_len % SPLASH_LANES == 0 and kv_len % SPLASH_LANES == 0
                 and min(q_len, kv_len) >= SPLASH_MIN_LENGTH
@@ -1602,7 +1594,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
                           force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
                           causal=causal, sliding_window=sliding_window, mask=mask, bias=bias,
                           segment_ids=segment_ids, max_segments=max_segments,
-                          key_value_seq_lengths=key_value_seq_lengths)
+                          key_value_seq_lengths=key_value_seq_lengths, named=implementation)
     if not (decodes(case) and implementation in ('auto', 'cudnn', 'xla')):
         return select(ATTENTION, case, None if implementation == 'auto' else implementation).ran
     named = {'auto': None, 'cudnn': 'cudnn'}.get(implementation)
@@ -1621,26 +1613,16 @@ def kernel_for_materialized_mask(implementation: str, query, key, *, dtype=None,
     then refuses an odd length while training. The xla kernel masks by
     exclusion with the same fp32 softmax, at 83.6 ms and 5.80 GiB a step against
     cuDNN's fixed window at 75.8 ms and 4.99 GiB
-    (docs/concepts/language_models.md). A call 'auto' or the xla kernel would
-    send to the reference path goes there as `resolve_implementation` sends it
-    (`_takes_reference`), an explicit 'cudnn' among them, which runs here as xla.
+    (docs/concepts/language_models.md). A call the xla kernel hands off goes to
+    the reference path as its requirements say (`attention_kernels.XLA_SUPPORTS`),
+    an explicit 'cudnn' among them, which runs here as xla.
     """
-    masked = 'xla' if implementation == 'cudnn' else implementation
-    if _takes_reference(masked, query, key, dtype, precision, force_fp32_for_softmax):
-        return 'reference'
-    return 'xla' if masked == 'auto' else masked
-
-
-def _takes_reference(implementation: str, query, key, dtype, precision, force_fp32_for_softmax) -> bool:
-    """Whether a call `implementation` names takes the reference path: under
-    'auto' where it asks for arithmetic no fused kernel performs
-    (`reference_only`), and under 'auto' or 'xla' where jax.nn's xla kernel
-    would narrow it (`_xla_kernel_narrows`) or sum it in one chain
-    (`_xla_kernel_chains`). Every route to the xla kernel decides it here."""
-    if implementation not in ('auto', 'xla'):
-        return False
-    return ((implementation == 'auto' and reference_only(query, dtype, precision, force_fp32_for_softmax))
-            or _xla_kernel_narrows(query) or _xla_kernel_chains(query, key))
+    masked = 'xla' if implementation in ('auto', 'cudnn') else implementation
+    if masked != 'xla':
+        return masked
+    case = attention_case(query, key, dtype=dtype, precision=precision,
+                          force_fp32_for_softmax=force_fp32_for_softmax, mask=True, named='xla')
+    return 'reference' if ATTENTION.kernel('xla').failed(case) else 'xla'
 
 
 def cudnn_takes_mask(implementation: str, query, *, softcap=None, sinks: bool = False) -> bool:

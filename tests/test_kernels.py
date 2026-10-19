@@ -142,7 +142,7 @@ def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal, hea
     which is also how far the two kernels sit apart at an even length. A pad
     key left unmasked shifts every output by 1/(kv+1) of the value mass, 12%
     at 7 keys, and a pad query row left in the output changes its shape."""
-    from dew.nn.attention import cudnn_max_head_dim
+    from dew.nn.attention_kernels import cudnn_max_head_dim
     if head_dim > cudnn_max_head_dim():
         pytest.skip(f"cudnn takes heads at most {cudnn_max_head_dim()} wide on {kernels.device_generation()}")
     query, _, _ = qkv((2, q_len, 4, head_dim))
@@ -396,7 +396,7 @@ def test_fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementatio
     """At Qwen3.5's grouped causal heads, 8 queries over 2 keys, FlashAttention's and cuDNN's output
     and three input gradients lie within tests/reference_error.py's rule of the xla kernel's, both
     measured from float64; on Hopper that holds FlashAttention-3 and cuDNN's 256-wide heads to it."""
-    from dew.nn.attention import cudnn_max_head_dim
+    from dew.nn.attention_kernels import cudnn_max_head_dim
     if implementation == 'flash':
         flash_here()
         if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
