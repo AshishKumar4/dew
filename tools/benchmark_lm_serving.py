@@ -16,6 +16,11 @@ per token: each decoding row's time between consecutive tokens.
 Start vLLM in its own environment with bf16, --generation-config vllm and
 --gpu-memory-utilization 0.90. Pass the same snapshot and --vocab-limit to
 all runs. Warmup uses disjoint prompts and the full measured output length.
+
+`--mesh` places Dew's weights on a mesh of those MeshSpec fields before the
+server is built, as `dew.pipeline(mesh=...)` does, to time sharded decode;
+the record names the mesh, the devices the weights span and the mesh axes
+that split them (a weight below the layout's `min_shard` stays whole).
 """
 
 from __future__ import annotations
@@ -186,9 +191,11 @@ def dew_points(args):
     from dew.inference.serving import Server
     from dew.nn.kv_cache import KVCache
     from dew.sampling import Sampling
+    from dew.training import MeshSpec
 
     began = time.perf_counter()
-    task = dew.pipeline(args.model, dtype="bfloat16", param_dtype="bfloat16")
+    mesh = None if args.mesh is None else MeshSpec(**args.mesh)
+    task = dew.pipeline(args.model, mesh=mesh, dtype="bfloat16", param_dtype="bfloat16")
     task = dataclasses.replace(task, sampling=Sampling(temperature=0, eos_token_ids=None),
                                logits=None, stopping=())
     if args.vocab_limit > task.model.vocab_size:
@@ -196,8 +203,14 @@ def dew_points(args):
     capacity = args.prompt + args.output
     load_seconds = time.perf_counter() - began
     print(f"loaded in {load_seconds:.2f}s", flush=True)
+    # Where the weights sit: the devices they span, and the mesh axes that split some weight.
+    shardings = [leaf.sharding for leaf in jax.tree.leaves(task.variables)]
+    split = {axis for sharding in shardings for entry in sharding.spec
+             for axis in (entry if isinstance(entry, tuple) else (entry,)) if axis is not None}
     hardware = {"devices": [device.device_kind for device in jax.devices()], "jax": jax.__version__,
-                "load_seconds": load_seconds}
+                "load_seconds": load_seconds,
+                "weights": {"split_over": sorted(split),
+                            "devices": len({device for sharding in shardings for device in sharding.device_set})}}
     points = []
     for slots in args.slots:
         count = args.requests or max(64, 2 * slots)
@@ -372,6 +385,8 @@ def main():
     parser.add_argument("--admission", type=int, default=0)
     parser.add_argument("--decode-steps", type=int, default=1)
     parser.add_argument("--kv", choices=("dense", "paged"), default="dense")
+    parser.add_argument("--mesh", type=json.loads, default=None,
+                        help='Dew: the weights placed on a mesh of these MeshSpec fields ({"tensor": 2})')
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-steps", type=int, default=20)
     parser.add_argument("--generations", action="store_true")
@@ -382,6 +397,8 @@ def main():
     args.rate = [float(value) for value in args.rate.split(",") if value]
     if args.rate and args.backend == "vllm":
         parser.error("--rate runs Dew and vllm-engine in-process")
+    if args.mesh is not None and args.backend != "dew":
+        parser.error("--mesh places Dew's weights; vLLM takes its own parallelism flags")
     if (min(args.slots) < 1 or min(args.prompt, args.output, args.repeats, args.profile_steps) < 1
             or args.requests < 0 or args.vocab_limit <= 100):
         parser.error("counts must be positive; --requests=0 chooses the default")
@@ -392,7 +409,8 @@ def main():
               "prompt": args.prompt, "output": args.output, "vocab_limit": args.vocab_limit,
               "sampling": {"temperature": 0, "ignore_eos": True}, "warm_output": args.output,
               "transport": "HTTP streaming" if args.backend == "vllm" else "in-process",
-              "decode_steps": args.decode_steps, "kv": args.kv, "host": platform.processor(), "sweep": points}
+              "decode_steps": args.decode_steps, "kv": args.kv, "mesh": args.mesh,
+              "host": platform.processor(), "sweep": points}
     args.out.write_text(json.dumps(record, indent=2) + "\n")
 
 

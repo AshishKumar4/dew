@@ -9,12 +9,12 @@ import ctypes
 import importlib.util
 import logging
 import os
-import re
 import shutil
 import sys
 from collections.abc import Mapping, Sequence
 
 from dew.pool import answered, runs_on_gpu
+from dew.telemetry.builds import CUDA_BUILDS, QUERY, listed_gpus, newest_build, runs_on
 
 _log = logging.getLogger(__name__)
 _late_policy_warned = False
@@ -158,34 +158,12 @@ def cuda_plugin() -> bool:
     return bool(cuda_builds())
 
 
-CUDA_BUILDS = (("cuda13", 580, (7, 5)), ("cuda12", 525, (5, 2)))
-"""JAX's CUDA builds, newest first, each with the least NVIDIA driver major
-and GPU SM it runs on: JAX's installation guide, and NVIDIA's CUDA release
-notes (Table 3, minor-version compatibility). docs/installation.md, "Which
-CUDA build", states the rule; site/scripts/gen_install.py generates the
-standalone install script's minima from this table."""
-
-
-def runs_on(build: str, driver: str, sm: tuple[int, int]) -> bool:
-    """Whether JAX's `build` runs on a driver of version `driver` (`580.82.07`)
-    and GPUs whose least SM is `sm` (`CUDA_BUILDS`)."""
-    least, least_sm = next((major, s) for name, major, s in CUDA_BUILDS if name == build)
-    return int(driver.split(".")[0]) >= least and sm >= least_sm
-
-
 def nvidia_gpus() -> tuple[str, tuple[int, int]] | None:
     """The driver version and the least SM of the GPUs nvidia-smi lists, or
-    None where none answers (`dew.pool.answered`): no nvidia-smi, no GPU, or
-    a driver too old to report an SM, which prints `[N/A]`."""
+    None where none answers (`dew.pool.answered`, `listed_gpus`)."""
     if shutil.which("nvidia-smi") is None:
         return None
-    listed = answered(("nvidia-smi", "--query-gpu=driver_version,compute_cap", "--format=csv,noheader"), 10)
-    lines = (listed or "").splitlines()
-    rows = [[field.strip() for field in line.split(",")] for line in lines if line.strip()]
-    if not rows or not all(len(row) == 2 and re.fullmatch(r"\d+\.\d+", row[1]) for row in rows):
-        return None
-    sms = [(int(major), int(minor)) for major, minor in (row[1].split(".") for row in rows)]
-    return rows[0][0], min(sms)
+    return listed_gpus(answered(QUERY, 10))
 
 
 def cpu_only_refusal(env: Mapping[str, str], gpus: tuple[str, tuple[int, int]] | None,
@@ -202,7 +180,7 @@ def cpu_only_refusal(env: Mapping[str, str], gpus: tuple[str, tuple[int, int]] |
         return None
     found = f"This machine has an NVIDIA GPU (driver {driver}, SM {sm[0]}.{sm[1]}), and JAX would use the CPU"
     on_cpu = "To run on the CPU instead, set JAX_PLATFORMS=cpu."
-    build = next((name for name, _, _ in CUDA_BUILDS if runs_on(name, driver, sm)), None)
+    build = newest_build(gpus)
     if build is None:
         needs = ", ".join(f"{name} needs driver {major}+ and SM {least[0]}.{least[1]}+"
                           for name, major, least in CUDA_BUILDS)
