@@ -240,9 +240,7 @@ class CheckpointBanks(LayerBanks):
                              layers[0], namespace=namespace)
         rows = [one_layer(self._restored(at_layer(_row_placement(placement), index, namespace=namespace)),
                           index, namespace=namespace) for index in layers]
-        stacked = jax.jit(lambda *held: jax.tree.map(lambda *leaves: jnp.stack(leaves), *held),
-                          out_shardings=placement)
-        return stacked(*rows)
+        return jax.jit(_stacked, out_shardings=placement)(*rows)
 
     def _restored(self, placement: Placement) -> Variables:
         """Restore the variables `placement` names onto its shardings."""
@@ -608,10 +606,25 @@ def placed_rows(bank: jax.Array, count: int) -> tuple[jax.Array, ...]:
     sharding places it, in the bank's memory, and the bank deleted after."""
     sharding = bank.sharding
     assert isinstance(sharding, NamedSharding), "a restored bank is placed by a layout's NamedSharding"
-    cut = jax.jit(lambda held: tuple(held[offset] for offset in range(count)),
-                  out_shardings=(row_sharding(sharding),) * count)(bank)
+    cut = jax.jit(_cut, static_argnames="count",
+                  out_shardings=(row_sharding(sharding),) * count)(bank, count=count)
     bank.delete()
     return cut
+
+
+# The programs a load runs are module functions, so `jax.jit` of one with the
+# same shardings again reuses its trace and executable, where a lambda is a
+# new function each call and traces and compiles anew.
+
+
+def _stacked(*rows: Variables) -> Variables:
+    """`rows` stacked on a new leading layer axis, a bank (`LayerBanks.bank`)."""
+    return jax.tree.map(lambda *leaves: jnp.stack(leaves), *rows)
+
+
+def _cut(bank: jax.Array, *, count: int) -> tuple[jax.Array, ...]:
+    """A bank's `count` rows (`placed_rows`)."""
+    return tuple(bank[offset] for offset in range(count))
 
 
 def banked_placement(tree: Mapping, rows: Mapping) -> dict:
