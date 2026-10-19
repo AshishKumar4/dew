@@ -508,7 +508,7 @@ def fp8_format(quantization: Mapping[str, object]) -> tuple[tuple[int, int], boo
 Block = int | tuple[int, int]
 """The rows and columns one FP8 scale covers: DeepSeek's square `block`, or
 `(rows, cols)`, such as `(1, cols)` for one scale a row of a `cols`-wide
-matrix (a frozen FP8 matrix's rows, `dew.training.quantization`)."""
+matrix (a frozen FP8 matrix's rows, `dew.quantization`)."""
 
 
 def _square(block: tuple[int, int], release: str) -> int:
@@ -649,7 +649,7 @@ def quantize_fp8_blocks(weight: ArrayLike, block: Block = BLOCK, *,
 def fp8_block_cast(x: jax.Array, block: Block) -> tuple[jax.Array, jax.Array]:
     """`quantize_fp8_blocks`' cast in a traced program, on a matrix where it
     computes, to the same bytes: a frozen FP8 product's activation rows
-    (`dew.training.quantization`). No value is refused and no scale is
+    (`dew.quantization`). No value is refused and no scale is
     rounded to ue8m0 here."""
     rows, cols = _sides(block)
     # XLA divides through a reciprocal; the cast's two divisions round as IEEE's do.

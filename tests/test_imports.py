@@ -6,6 +6,7 @@ whose diffusion transformers imported `dew.diffusion`, whose masked-token
 process imported `dew.nn.multimodal` again, half initialized. Imports from
 inside the suite never hit it, since `dew` is already loaded.
 """
+import json
 import os
 import subprocess
 import sys
@@ -61,31 +62,57 @@ np.testing.assert_array_equal(result.images, np.zeros((1, 2, 2, 1), np.float32))
 
 def test_importing_the_data_layer_reads_no_configuration_and_its_workers_run(tmp_path):
     """Importing dew.data reads no storage configuration, so a broken one fails the first store
-    that resolves, not the import, and a data pass with worker processes runs in a program that
-    never parsed absl's flags (`import dew` marks them parsed, as absl.app would)."""
+    that resolves, not the import, yet registers Dew's bounded cache, through which fsspec reads a
+    file before any store resolves; and a data pass with worker processes runs in a program that never parsed
+    absl's flags (`import dew` marks them parsed, as absl.app would)."""
     broken = tmp_path / "storage.toml"
     broken.write_text("this is not toml [")
     script = r"""
 import numpy as np
 import dew.data
+import fsspec
+import tempfile
+fsspec.filesystem("memory").pipe("/dewcache-probe/value", b"cached bytes")
+with fsspec.open("dewcache::memory://dewcache-probe/value", "rb",
+                 dewcache={"cache_storage": tempfile.mkdtemp()}) as file:
+    cached = file.read().decode()
 from dew.data.pipeline import Pipeline
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
 from dew.data.sources import Memory
 from dew.data.storage import Store
+import json
 try:
     Store("memory://x").resolve()
 except Exception as error:
-    print("store refused:", type(error).__name__)
+    refused = type(error).__name__
 data = compile(Pipeline(Memory([{"id": np.int32(i)} for i in range(8)])).repeat(1).batch(2),
                read="memory", loading=Loading(workers=2, threads=1, read_buffer=0, worker_buffer=1))
 reader = data.train(DataPartition())
-print("ids:", sorted(int(v) for batch in reader for v in batch["id"]))
+print(json.dumps({"refused": refused, "cached": cached,
+                  "ids": sorted(int(v) for batch in reader for v in batch["id"])}))
 reader.close()
 """
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=600,
                             env={**os.environ, "PYTHONPATH": str(SOURCE), "JAX_PLATFORMS": "cpu",
                                  "DEW_STORAGE_CONFIG": str(broken)})
     assert result.returncode == 0, result.stderr[-2000:]
-    assert "store refused: TOMLDecodeError" in result.stdout
-    assert "ids: [0, 1, 2, 3, 4, 5, 6, 7]" in result.stdout
+    reported = json.loads(result.stdout.splitlines()[-1])
+    assert reported == {"refused": "TOMLDecodeError", "cached": "cached bytes", "ids": list(range(8))}
+
+
+def test_a_models_quantization_imports_no_training():
+    """The model's quantization, which loading, adapters and serving read, imports nothing of
+    training: a checkpoint's input quantizer is the model's, and reading it starts no trainer,
+    runtime or checkpointer."""
+    script = r'''
+import json
+import sys
+from dew.quantization import InputQuantization, Quantization
+training = [name for name in sys.modules if name == "dew.training" or name.startswith("dew.training.")]
+print(json.dumps(sorted(training)))
+'''
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout.splitlines()[-1]) == []

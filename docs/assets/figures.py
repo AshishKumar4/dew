@@ -10,9 +10,9 @@ give on eight simulated CPU devices, and the diffusion figure noises an
 image with the rates of the `Cosine` and `Flow` presets. The data and
 training-step figures draw the order of calls in `Trainer.fit`
 (src/dew/training/trainer.py) and in its compiled step
-(src/dew/training/transaction.py). The RLVR figures score their answers
-with the counting task of tutorials/10-rl-with-verifiable-rewards.ipynb, and
-take their advantages and clipped objective from dew.rl.
+(src/dew/training/transaction.py). The RLVR figures score replies to the
+GSM8K question of tutorials/10-rl-with-verifiable-rewards.ipynb, and take
+their advantages and clipped objective from dew.rl.
 
     XLA_FLAGS=--xla_force_host_platform_device_count=8 JAX_PLATFORMS=cpu \
         python docs/assets/figures.py [NAME_PREFIX ...]
@@ -29,9 +29,9 @@ os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 import jax
 import jax.numpy as jnp
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
-from dew.diffusion.presets import Cosine, Flow
+from dew.diffusion.presets import EDM, Cosine, Flow
 from dew.figures import THEMES, Figure
 from dew.nn.backbones import CausalTransformer, Mixture
 from dew.rl import clipped_surrogate_terms, group_advantage, k3_kl
@@ -325,26 +325,12 @@ def post_training_figure():
         svg.save(HERE / f"post-training-{variant}.svg")
 
 
-# The counting task of tutorials/10: after the prompt's last digit, each written digit should be
-# one more than the digit before it, 9 wrapping to 0.
-PROMPT = "7294"
-ANSWERS = ["567890", "561290", "314159", "567823"]
-
-
-def right_digits(previous: int, digits: str) -> list[bool]:
-    marks = []
-    for digit in map(int, digits):
-        marks.append(digit == (previous + 1) % 10)
-        previous = digit
-    return marks
-
-
-def digit_boxes(svg: Figure, x, y, digits, fills, size=26, step=4):
-    for j, (digit, fill) in enumerate(zip(digits, fills)):
-        svg.rect(x + j * (size + step), y, size, size + 4, fill=fill,
-                 stroke="rule" if fill == "surface" else "none", rx=4)
-        svg.text(x + j * (size + step) + size / 2, y + size / 2 + 7, digit, size=15, mono=True,
-                 anchor="middle")
+# The task of tutorials/10: a GSM8K question (the first of its training split), four of a model's
+# replies, and the answer each puts in \boxed{}, which the checker compares with the reference, 72.
+QUESTION = ("Natalia sold 48", "clips in April and", "half as many in", "May. How many did", "she sell in all?")
+REPLIES = (("48/2 = 24, 48+24 =", "72"), ("48×2 = 96, 48+96 =", "144"), ("April 48, May 24:", "72"),
+           ("half of 48 is", "24"))
+TRUTH = "72"
 
 
 def save_both(svg: Figure, name: str, narrow: bool):
@@ -353,31 +339,44 @@ def save_both(svg: Figure, name: str, narrow: bool):
     svg.save(HERE / f"{name}{'-narrow' if narrow else ''}.svg")
 
 
+def reply_row(svg: Figure, x, y, width, text, answer, fill, size=13):
+    """One reply: its working, then the answer it boxes, in a chip at the row's end."""
+    svg.rect(x, y, width, 30, fill="surface", stroke="rule", rx=6)
+    svg.text(x + 10, y + 20, text, size=size, mono=True, color="muted")
+    chip = 12 + 9 * len(answer)
+    svg.rect(x + width - chip - 4, y + 4, chip, 22, fill=fill, stroke="none" if fill != "surface" else "rule",
+             rx=4)
+    svg.text(x + width - 4 - chip / 2, y + 20, answer, size=size + 1, mono=True, weight=600, anchor="middle")
+
+
 def rlvr_loop_figure():
-    """The loop: the policy writes several answers, the checker scores them, and the update makes the
-    answers that beat their group more likely."""
-    marks = [right_digits(int(PROMPT[-1]), answer) for answer in ANSWERS]
-    rewards = np.array([np.mean(m) for m in marks], np.float32)
-    advantages = np.asarray(group_advantage(jnp.asarray(rewards), len(ANSWERS)))
+    """The loop: the policy writes several replies, the checker scores them, and the update makes the
+    replies that beat their group more likely."""
+    rewards = np.array([float(answer == TRUTH) for _, answer in REPLIES], np.float32)
+    advantages = np.asarray(group_advantage(jnp.asarray(rewards), len(REPLIES)))
     after = np.exp(0.6 * advantages) / np.exp(0.6 * advantages).sum()
-    label = ("The policy writes four answers to a prompt, a checker scores each one, and the update makes "
-             "the answers that scored above the group's mean more likely.")
+    label = ("The policy writes four replies to a maths question, a checker compares each boxed answer with "
+             "the reference, and the update makes the replies that scored above the group's mean more likely.")
     for narrow in (False, True):
         # Where each part sits in the wide (left to right) and narrow (top to bottom) layouts.
-        width, height = (360, 392) if narrow else (720, 316)
-        prompt_x, prompt_y = (16, 44) if narrow else (24, 138)
-        box_x, box_y = (170, 14) if narrow else (154, 86)
-        rows_x, rows_y, row_step = (44, 180, 44) if narrow else (370, 44, 58)
-        checker_x, reward_x = (226, 334) if narrow else (570, 678)
-        size, step = (22, 4) if narrow else (26, 4)
+        width, height = (360, 420) if narrow else (720, 316)
+        card_x, card_y = (12, 30) if narrow else (14, 92)
+        box_x, box_y = (196, 14) if narrow else (172, 86)
+        rows_x, rows_y, row_step, row_w = (30, 196, 44, 198) if narrow else (360, 44, 58, 196)
+        checker_x, checker_w, reward_x = (236, 56, 344) if narrow else (572, 58, 700)
         svg = Figure(width, height, seconds=11, label=label)
         svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
-        svg.text(prompt_x, prompt_y - 10, "prompt", size=13, color="muted")
-        digit_boxes(svg, prompt_x, prompt_y, PROMPT, ["surface"] * 4, size=22)
-        svg.arrow(prompt_x + 104, prompt_y + 17, box_x - 4, prompt_y + 17 if narrow else box_y + 69)
+        svg.text(card_x, card_y - 10, "question", size=13, color="muted")
+        svg.rect(card_x, card_y, 140 if not narrow else 160, 106, fill="raised", stroke="rule", rx=6)
+        for k, line in enumerate(QUESTION):
+            svg.text(card_x + 9, card_y + 21 + 19 * k, line, size=12.5)
+        if narrow:
+            svg.arrow(card_x + 162, card_y + 53, box_x - 4, card_y + 53)
+        else:
+            svg.arrow(card_x + 142, card_y + 53, box_x - 4, card_y + 53)
         svg.rect(box_x, box_y, 124, 140 if not narrow else 124, fill="raised", stroke="accent", rx=8)
         svg.text(box_x + 62, box_y + 24, "policy", size=15, weight=600, anchor="middle")
-        svg.text(box_x + 62, box_y + 44, "P(answer)", size=12, color="muted", anchor="middle")
+        svg.text(box_x + 62, box_y + 44, "P(reply)", size=12, color="muted", anchor="middle")
         bars_y = box_y + (54 if narrow else 60)
         for k, letter in enumerate("abcd"):
             x = box_x + 18 + k * 24
@@ -386,64 +385,63 @@ def rlvr_loop_figure():
             svg.animate(column, {6.4: {"transform": "scaleY(0.25)"},
                                  7.6: {"transform": f"scaleY({after[k]:.3f})"}}, origin="50% 100%")
             svg.text(x + 8, bars_y + 64, letter, size=12, mono=True, color="muted", anchor="middle")
-        svg.text(rows_x, rows_y - 14, "answers", size=13, color="muted")
+        svg.text(rows_x, rows_y - 14, "replies", size=13, color="muted")
         svg.text(reward_x, rows_y - 14, "reward", size=13, color="muted", anchor="end")
-        rows_end = rows_y + 3 * row_step + size + 4
+        rows_end = rows_y + 3 * row_step + 30
         with svg.group() as checker:
-            svg.rect(checker_x, rows_y, 62 if not narrow else 50, rows_end - rows_y, fill="raised",
-                     stroke="text", rx=8)
-            svg.text(checker_x + (31 if not narrow else 25), (rows_y + rows_end) / 2 + 4, "checker", size=12,
+            svg.rect(checker_x, rows_y, checker_w, rows_end - rows_y, fill="raised", stroke="text", rx=8)
+            svg.text(checker_x + checker_w / 2, (rows_y + rows_end) / 2 - 4, "= 72 ?", size=12, mono=True,
+                     anchor="middle")
+            svg.text(checker_x + checker_w / 2, (rows_y + rows_end) / 2 + 14, "checker", size=11, color="muted",
                      anchor="middle")
         svg.appear(checker, 2.9)
         if narrow:
-            # One trunk from the policy down the left edge, a branch to each answer.
-            svg.polyline([(box_x + 62, box_y + 124), (box_x + 62, rows_y - 36), (14, rows_y - 36),
-                          (14, rows_y + 3 * row_step + size / 2)], color="muted", width=1.25)
-        for i, (answer, right) in enumerate(zip(ANSWERS, marks)):
+            # One trunk from the policy down the left edge, a branch to each reply.
+            svg.polyline([(box_x + 62, box_y + 124), (box_x + 62, rows_y - 36), (12, rows_y - 36),
+                          (12, rows_y + 3 * row_step + 15)], color="muted", width=1.25)
+        for i, ((text, answer), reward) in enumerate(zip(REPLIES, rewards)):
             y = rows_y + i * row_step
             with svg.group() as row:
                 if narrow:
-                    svg.arrow(14, y + size / 2 + 2, rows_x - 16, y + size / 2 + 2)
+                    svg.arrow(12, y + 15, rows_x - 4, y + 15)
                 else:
-                    svg.arrow(box_x + 126, box_y + 70, rows_x - 28, y + 15)
-                svg.text(rows_x - 8, y + size / 2 + 7, "abcd"[i], size=13, mono=True, color="muted",
-                         anchor="end")
-                digit_boxes(svg, rows_x, y, answer, ["surface"] * 6, size=size, step=step)
+                    svg.arrow(box_x + 126, box_y + 70, rows_x - 24, y + 15)
+                    svg.text(rows_x - 8, y + 20, "abcd"[i], size=13, mono=True, color="muted", anchor="end")
+                reply_row(svg, rows_x, y, row_w, text, answer, "surface", size=12)
             svg.appear(row, 0.8 + 0.45 * i)
             with svg.group() as scored:
-                digit_boxes(svg, rows_x, y, answer, ["accent_fill" if r else "warm_fill" for r in right],
-                            size=size, step=step)
-                checker_end = checker_x + (62 if not narrow else 50)
-                svg.arrow(checker_end, y + size / 2 + 2, checker_end + 8, y + size / 2 + 2)
-                svg.text(reward_x, y + size / 2 + 8, f"{rewards[i]:.2f}", size=15, mono=True, weight=600,
-                         anchor="end", color="accent" if rewards[i] > rewards.mean() else "warm")
+                reply_row(svg, rows_x, y, row_w, text, answer, "accent_fill" if reward else "warm_fill", size=12)
+                svg.arrow(checker_x + checker_w, y + 15, checker_x + checker_w + 8, y + 15)
+                svg.text(reward_x, y + 21, f"{reward:.0f}", size=15, mono=True, weight=600, anchor="end",
+                         color="accent" if reward > rewards.mean() else "warm")
             svg.appear(scored, 3.4 + 0.35 * i)
         if narrow:
-            back = [(reward_x - 16, rows_end + 6), (reward_x - 16, rows_end + 18), (352, rows_end + 18),
+            back = [(reward_x - 6, rows_end + 6), (reward_x - 6, rows_end + 20), (352, rows_end + 20),
                     (352, box_y + 62), (box_x + 128, box_y + 62)]
             tip_x, tip_y = box_x + 125, box_y + 62
             head = f"M{tip_x},{tip_y} L{tip_x + 7},{tip_y - 3.5} L{tip_x + 7},{tip_y + 3.5} z"
-            note_x, note_y = 180, rows_end + 44
+            note_x, note_y = 180, rows_end + 46
         else:
-            back = [(660, 274), (660, 298), (216, 298), (216, 232)]
-            head = "M216,229 L212.5,236 L219.5,236 z"
-            note_x, note_y = 438, 290
+            back = [(692, 274), (692, 298), (240, 298), (240, 232)]
+            head = "M240,229 L236.5,236 L243.5,236 z"
+            note_x, note_y = 466, 290
         svg.draw(svg.polyline(back, color="accent", width=1.5), 5.2, 6.2)
         svg.appear(svg.add("path", {"d": head}, {"fill": svg.palette["accent"]}), 6.1, 0.2)
-        note = "update: answers that beat the group's mean get more likely"
+        note = "update: replies that beat the group's mean get more likely"
         if narrow:
-            note = "update: answers above the mean get more likely"
+            note = "update: replies above the mean get more likely"
         svg.appear(svg.text(note_x, note_y, note, size=13, color="accent", anchor="middle"), 5.8)
         save_both(svg, "rlvr-loop", narrow)
 
 
 def rlvr_advantage_figure():
-    """GRPO's advantage: each reward against its group's mean, in units of the group's deviation."""
-    rewards = np.array([1.0, 0.67, 0.0, 0.83, 0.17, 0.5, 0.0, 0.33], np.float32)
+    """GRPO's advantage: each reward against its group's mean, in units of the group's deviation. A
+    maths checker's rewards are 0 or 1, so the advantages take two values."""
+    rewards = np.array([1, 0, 0, 1, 1, 0, 0, 0], np.float32)
     advantages = np.asarray(group_advantage(jnp.asarray(rewards), len(rewards)))
     mean, deviation = float(rewards.mean()), float(rewards.std(ddof=1))
-    label = ("Eight rewards, their group mean, and the advantages: each reward minus the mean, divided by "
-             "the group's standard deviation.")
+    label = ("Eight replies to one question scored 1 or 0, their mean, and the advantages: each reward minus "
+             "the mean, divided by the group's standard deviation.")
     for narrow in (False, True):
         width, height = (360, 560) if narrow else (720, 300)
         # Each panel's top-left corner: rewards, then advantages beside them or below.
@@ -452,7 +450,7 @@ def rlvr_advantage_figure():
         svg = Figure(width, height, seconds=11, label=label)
         svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
         floor, tall, slot = ry_ + 236, 150, 38
-        svg.text(rx_ + 8, ry_ + 32, "reward R of 8 answers to one prompt", size=13, color="muted")
+        svg.text(rx_ + 8, ry_ + 32, "reward R of 8 replies to one question", size=13, color="muted")
         svg.line(rx_ + 8, floor, rx_ + 320, floor, color="rule")
         level = floor - tall * mean
         for i, reward in enumerate(rewards):
@@ -467,17 +465,17 @@ def rlvr_advantage_figure():
                                 origin="50% 100%")
                 if at:
                     svg.appear(colored, at)
-            svg.text(x + 13, floor + 18, f"{reward:.2f}", size=12, mono=True, color="muted", anchor="middle")
+            svg.text(x + 13, floor + 18, f"{reward:.0f}", size=12, mono=True, color="muted", anchor="middle")
             gap = svg.line(x + 13, floor - tall * reward, x + 13, level, color="accent" if up else "warm",
                            width=2, dash="2 3")
             svg.appear(gap, 3.6 + 0.1 * i)
         with svg.group() as average:
             svg.line(rx_ + 8, level, rx_ + 324, level, color="text", width=1.5, dash="5 4")
-            svg.text(rx_ + 324, level - 8, f"mean {mean:.2f}", size=13, mono=True, anchor="end")
+            svg.text(rx_ + 324, level - 8, f"mean {mean:.3f}", size=13, mono=True, anchor="end")
         svg.animate(average, {2.4: {"opacity": 0, "transform": "translateX(-24px)"},
                               3.0: {"opacity": 1, "transform": "translateX(0px)"}})
         zero, unit = ay_ + 146, 44
-        svg.text(ax_ + 12, ay_ + 32, f"advantage A = (R − {mean:.2f}) / {deviation:.2f}", size=13,
+        svg.text(ax_ + 12, ay_ + 32, f"advantage A = (R − {mean:.3f}) / {deviation:.2f}", size=13,
                  color="muted")
         svg.line(ax_ + 8, zero, ax_ + 320, zero, color="rule")
         for i, advantage in enumerate(advantages):
@@ -489,9 +487,9 @@ def rlvr_advantage_figure():
                                  5.6 + 0.1 * i: {"transform": "scaleY(1)"}},
                         origin="50% 100%" if up else "50% 0%")
             y = zero - unit * advantage - 8 if up else zero + unit * abs(advantage) + 18
-            svg.appear(svg.text(x + 13, y, f"{advantage:+.1f}", size=12, mono=True, anchor="middle",
+            svg.appear(svg.text(x + 13, y, f"{advantage:+.2f}", size=11, mono=True, anchor="middle",
                                 color="accent" if up else "warm"), 6.2)
-        svg.appear(svg.text(ax_ + 164, ay_ + 280, "above the mean is pushed up, below is pushed down",
+        svg.appear(svg.text(ax_ + 164, ay_ + 280, "right replies are pushed up, wrong ones down",
                             size=13, color="muted", anchor="middle"), 6.6)
         save_both(svg, "rlvr-advantage", narrow)
 
@@ -556,37 +554,39 @@ def rlvr_clip_figure():
 
 
 def rlvr_sequence_figure():
-    """One completion as the loss reads it: its tokens, the mask that keeps the written ones, and the
-    completion's advantage on each written token."""
-    answer = ANSWERS[1]
-    rewards = np.array([np.mean(right_digits(int(PROMPT[-1]), a)) for a in ANSWERS], np.float32)
-    advantage = float(np.asarray(group_advantage(jnp.asarray(rewards), len(ANSWERS)))[1])
-    width, height, left, step = 440, 236, 108, 32
-    svg = Figure(width, height, seconds=9, label=f"The tokens of one completion: the prompt {' '.join(PROMPT)} "
-                 f"with mask 0, and the written digits {' '.join(answer)} with mask 1, each carrying the "
-                 f"completion's advantage {advantage:+.2f}.")
+    """One reply as the loss reads it: its tokens, the mask that keeps the ones the policy wrote, and the
+    reply's advantage on each of them."""
+    prompt, written = ["in", "all", "?"], ["48", "+", "24", "=", "72"]
+    rewards = np.array([float(answer == TRUTH) for _, answer in REPLIES], np.float32)
+    advantage = float(np.asarray(group_advantage(jnp.asarray(rewards), len(REPLIES)))[0])
+    width, height, left, gap = 430, 236, 92, 5
+    svg = Figure(width, height, seconds=9, label=f"The tokens of one reply: the end of the question, "
+                 f"{' '.join(prompt)}, with mask 0, and the tokens the policy wrote, {' '.join(written)}, with "
+                 f"mask 1, each carrying the reply's advantage {advantage:+.2f}.")
     svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
     rows = [("tokens", 30), ("mask m", 82), ("A × m", 134)]
     for name, y in rows:
-        svg.text(left - 14, y + 20, name, size=14, color="muted", anchor="end")
-    for j, token in enumerate(PROMPT + answer):
-        x, y = left + j * step, rows[0][1]
-        written = j >= len(PROMPT)
-        svg.rect(x, y, step - 4, 30, fill="tint1" if written else "surface",
-                 stroke="none" if written else "rule", rx=4)
-        svg.text(x + (step - 4) / 2, y + 21, token, size=15, mono=True, anchor="middle",
-                 color="text" if written else "muted")
-        mask = svg.text(x + (step - 4) / 2, rows[1][1] + 21, "1" if written else "0", size=15, mono=True,
-                        anchor="middle", color="text" if written else "muted")
+        svg.text(left - 12, y + 20, name, size=14, color="muted", anchor="end")
+    x = left
+    for j, token in enumerate(prompt + written):
+        mine = j >= len(prompt)
+        wide = max(38 if mine else 26, 10 + 9 * len(token))
+        svg.rect(x, rows[0][1], wide, 30, fill="tint1" if mine else "surface", stroke="none" if mine else "rule",
+                 rx=4)
+        svg.text(x + wide / 2, rows[0][1] + 20, token, size=14, mono=True, anchor="middle",
+                 color="text" if mine else "muted")
+        mask = svg.text(x + wide / 2, rows[1][1] + 21, "1" if mine else "0", size=15, mono=True,
+                        anchor="middle", color="text" if mine else "muted")
         svg.appear(mask, 1.2 + 0.08 * j)
         with svg.group() as credit:
-            if written:
-                svg.rect(x, rows[2][1], step - 4, 30, fill="accent_fill", stroke="none", rx=4)
-            svg.text(x + (step - 4) / 2, rows[2][1] + 20, f"{advantage:+.1f}" if written else "0", size=12,
-                     mono=True, anchor="middle", color="accent" if written else "muted")
+            if mine:
+                svg.rect(x, rows[2][1], wide, 30, fill="accent_fill", stroke="none", rx=4)
+            svg.text(x + wide / 2, rows[2][1] + 20, f"{advantage:+.2f}" if mine else "0", size=11, mono=True,
+                     anchor="middle", color="accent" if mine else "muted")
         svg.appear(credit, 3.2 + 0.1 * j)
-    svg.appear(svg.text(width / 2, 204, f"reward {rewards[1]:.2f} gives A = {advantage:+.2f} on each written digit, "
-                        "0 on the prompt", size=13, color="muted", anchor="middle"), 4.6)
+        x += wide + gap
+    svg.appear(svg.text(width / 2, 204, f"reward 1 gives A = {advantage:+.2f} on each written token, "
+                        "0 on the question", size=13, color="muted", anchor="middle"), 4.6)
     svg.save(HERE / "rlvr-sequence.svg")
 
 
@@ -627,11 +627,142 @@ def rlvr_kl_figure():
     svg.save(HERE / "rlvr-kl.svg")
 
 
+# The flower of tutorials/02: a 64 x 64 sample from a model Dew trained on Oxford Flowers, in [-1, 1].
+def flower() -> np.ndarray:
+    tile = Image.open(HERE / "gallery/heun.png").convert("RGB").crop((267, 502, 463, 698))
+    return np.asarray(tile.resize((64, 64), Image.BILINEAR), np.float32) / 127.5 - 1
+
+
+def pixels(x: np.ndarray) -> np.ndarray:
+    return np.clip((x + 1) * 127.5, 0, 255).astype(np.uint8)
+
+
+def edm_step_figure():
+    """One training step in two lanes: noise a clean image to a random sigma, then have the model
+    guess the clean image back and score the guess against it."""
+    x0 = flower()
+    sigma = 0.5
+    eps = np.asarray(jax.random.normal(jax.random.key(0), x0.shape))
+    # A model's guess at this noise level is a smoothed version of the image; a blur stands in for it.
+    guess = np.asarray(Image.fromarray(pixels(x0)).filter(ImageFilter.GaussianBlur(2.2)), np.float32) / 127.5 - 1
+    label = ("One training step. A clean flower x0 gets noise at a random level sigma to make x_t; the model "
+             "sees x_t and sigma and guesses x0; the loss is how far the guess is from x0, and the update "
+             "makes the next guess closer.")
+    size = 80
+    for narrow in (False, True):
+        # The wide layout has the loss beside the guess; the narrow one has it under the second lane.
+        width, height = (360, 520) if narrow else (720, 350)
+        x_clean, x_noise, x_noisy = (24, 140, 256) if narrow else (34, 176, 318)
+        lane2 = 300 if narrow else 196
+        x_model, x_guess = (246, 40) if narrow else (308, 460)
+        top1, top2 = 56, lane2 + 22
+        svg = Figure(width, height, seconds=11, label=label)
+        svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+        svg.text(16 if narrow else 20, 34, "1  noise a clean image", size=14, weight=600)
+        svg.text(16 if narrow else 20, lane2, "2  guess it back", size=14, weight=600)
+        with svg.group() as clean:
+            svg.image(x_clean, top1, size, pixels(x0), photo=True)
+            svg.text(x_clean + size / 2, top1 + size + 20, "x₀", size=14, mono=True, anchor="middle")
+        svg.appear(clean, 0.3)
+        with svg.group() as noise:
+            svg.text((x_clean + size + x_noise) / 2, top1 + size / 2 + 6, "+", size=20, anchor="middle")
+            svg.image(x_noise, top1, size, pixels(eps / 3), photo=True)
+            svg.text(x_noise + size / 2, top1 + size + 20, f"σ ε, σ = {sigma:g}", size=13, mono=True,
+                     anchor="middle")
+        svg.appear(noise, 1.1)
+        with svg.group() as noisy:
+            svg.text((x_noise + size + x_noisy) / 2, top1 + size / 2 + 6, "=", size=20, anchor="middle")
+            svg.image(x_noisy, top1, size, pixels(x0 + sigma * eps), photo=True)
+            svg.text(x_noisy + size / 2, top1 + size + 20, "xₜ", size=14, mono=True, anchor="middle")
+        svg.appear(noisy, 1.9)
+        # The noisy image drops into the second lane, to the model straight below it.
+        middle = x_model + 50
+        feed = svg.polyline([(x_noisy + size / 2, top1 + size + 30), (x_noisy + size / 2, lane2 - 24),
+                             (middle, lane2 - 24), (middle, top2 - 4)], color="muted", width=1.25)
+        svg.draw(feed, 2.6, 3.2)
+        with svg.group() as model:
+            svg.rect(x_model, top2, 100, size, fill="raised", stroke="accent", rx=8)
+            svg.text(middle, top2 + 34, "DiT", size=15, weight=600, anchor="middle")
+            svg.text(middle, top2 + 54, "(xₜ, σ)", size=13, mono=True, color="muted", anchor="middle")
+        svg.appear(model, 3.0)
+        with svg.group() as guessed:
+            if narrow:
+                svg.arrow(x_model - 4, top2 + size / 2, x_guess + size + 8, top2 + size / 2)
+            else:
+                svg.arrow(x_model + 104, top2 + size / 2, x_guess - 8, top2 + size / 2)
+            svg.image(x_guess, top2, size, pixels(guess), photo=True)
+            svg.text(x_guess + size / 2, top2 + size + 20, "guess x̂₀", size=14, mono=True, anchor="middle")
+        svg.appear(guessed, 3.8)
+        # The loss compares the guess with x0 from the first lane, and its gradient updates the model.
+        with svg.group() as loss:
+            if narrow:
+                loss_x, loss_bottom = width / 2, top2 + size + 64
+                svg.text(loss_x, loss_bottom - 14, "loss = w(σ) · ‖x̂₀ − x₀‖²", size=14, mono=True,
+                         anchor="middle", color="accent")
+            else:
+                loss_x, loss_bottom = 630, top2 + 66
+                svg.text(566, top2 + 30, "loss =", size=14, mono=True, color="accent")
+                svg.text(566, top2 + 52, "w(σ) · ‖x̂₀ − x₀‖²", size=14, mono=True, color="accent")
+        svg.appear(loss, 4.8)
+        floor = height - 30
+        update = svg.polyline([(loss_x, loss_bottom), (loss_x, floor), (middle, floor), (middle, top2 + size + 4)],
+                              color="accent", width=1.5)
+        svg.draw(update, 5.6, 6.4)
+        svg.appear(svg.text((loss_x + middle) / 2, floor + 18, "update the weights", size=13, color="accent",
+                            anchor="middle"), 6.3)
+        save_both(svg, "edm-step", narrow)
+
+
+def edm_noise_figure():
+    """One flower at eight of EDM's noise levels, from the least noise to the most, at the rates the
+    preset's sampler uses."""
+    x0 = flower()
+    eps = np.asarray(jax.random.normal(jax.random.key(0), x0.shape))
+    process = EDM(regime="pixel")()
+    _, sigmas = (np.asarray(v) for v in process.sampler_schedule.rates(process.times(8)))
+    sigmas = sigmas[::-1]
+    width, height, size = 440, 272, 168
+    svg = Figure(width, height, seconds=10, label="One flower with more and more noise: x_t = x0 + sigma "
+                 "epsilon at eight of EDM's noise levels, from sigma 0.002, where it is clean, to sigma 80, "
+                 "where only noise is left.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    svg.text(24, 34, "xₜ = x₀ + σ ε", size=15, mono=True, weight=600)
+    times = [0.4 + 0.8 * i for i in range(len(sigmas))]
+    frames, captions = [], []
+    for sigma in sigmas:
+        with svg.group() as frame:
+            svg.image(24, 52, size, pixels(x0 + sigma * eps), photo=True)
+        frames.append(frame)
+        captions.append(svg.text(24 + size / 2, 52 + size + 24, f"σ = {sigma:.3g}", size=14, mono=True,
+                                 anchor="middle"))
+    svg.show_in_turn(frames, times)
+    svg.show_in_turn(captions, times)
+    axis_x, axis_w, axis_y = 224, 192, 196
+    svg.image(axis_x, 52, 64, pixels(x0), photo=True)
+    svg.text(axis_x + 76, 90, "x₀, the clean image", size=13, color="muted")
+    # Where each level sits on a log scale, the current one filled.
+    low, high = np.log10(sigmas[0]), np.log10(sigmas[-1])
+
+    def at(sigma: float) -> float:
+        return axis_x + axis_w * (np.log10(sigma) - low) / (high - low)
+
+    svg.line(axis_x, axis_y, axis_x + axis_w, axis_y, color="rule")
+    svg.text(axis_x, axis_y + 26, f"{sigmas[0]:.3g}", size=12, mono=True, color="muted", anchor="middle")
+    svg.text(axis_x + axis_w, axis_y + 26, f"{sigmas[-1]:.3g}", size=12, mono=True, color="muted",
+             anchor="middle")
+    svg.text(axis_x + axis_w / 2, axis_y - 40, "σ, log scale", size=13, color="muted", anchor="middle")
+    for sigma in sigmas:
+        svg.circle(at(sigma), axis_y, 4, fill="tint1")
+    svg.show_in_turn([svg.circle(at(sigma), axis_y, 7, fill="accent") for sigma in sigmas], times)
+    svg.save(HERE / "edm-noise.svg")
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
            "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
-           "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure}
+           "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure, "edm-step": edm_step_figure,
+           "edm-noise": edm_noise_figure}
 
 
 if __name__ == "__main__":
