@@ -311,27 +311,54 @@ def _batch(draw, stage: int, terms, rows: bool) -> tuple[object, dict, list, lis
             leaves, row_distances, sizes)
 
 
-ADMISSION_MARGIN = 0.05
-"""How much less exact than the reference a member may be and still be admitted (`admits`): its mean
-squared distance from float64 over a leaf at most 1.05 times the reference's, 2.5% in RMS. A margin
-of none admits an equally exact member about half the time, by its orders' luck alone. Provisional
-until the owner approves it."""
+ADMISSION_MARGIN = 1.05
+"""How much less exact than the reference, in RMS from float64 over a leaf, a member may be and still be
+admitted (`admitted_members`): 5%, the owner's (bible §7). With no margin an equally exact member is
+admitted about half the time, by its orders' luck alone."""
 
-ADMISSION_LEVEL = 2.326
-"""The one-sided confidence of `admits`' bound, in standard errors: 99%."""
+ADMISSION_CONFIDENCE = 0.99
+"""The simultaneous one-sided confidence of `admitted_members`' bound, over every candidate and leaf."""
+
+def admitted_members(native, candidates) -> dict[str, list[str]]:
+    """The members admitted at each leaf. `native` maps each leaf's path to the reference's mean squared
+    distance from float64 over the leaf at each order of an admission sample (`_admission`), and
+    `candidates` maps each other member to its own so, at the same orders. A candidate is admitted at a
+    leaf where the one-sided ADMISSION_CONFIDENCE upper bound on the mean over the orders of
+    d = its distance - ADMISSION_MARGIN^2 times the reference's is at most zero: a Student t bound on the
+    paired differences, the orders the units, simultaneous over every candidate and leaf (Bonferroni).
+    The orders are shared, so pairing takes out what every member's rounding at an order has in common.
+    The reference is admitted everywhere."""
+    from scipy import stats
+
+    tests = max(1, sum(len(leaves) for leaves in candidates.values()))
+    admitted = {}
+    for leaf, reference in native.items():
+        reference = np.asarray(reference, np.float64)
+        held = [REFERENCE]
+        for member, leaves in candidates.items():
+            difference = np.asarray(leaves[leaf], np.float64) - ADMISSION_MARGIN ** 2 * reference
+            spread = np.std(difference, ddof=1) / np.sqrt(difference.size)
+            quantile = stats.t.ppf(1 - (1 - ADMISSION_CONFIDENCE) / tests, difference.size - 1)
+            if float(np.mean(difference) + quantile * spread) <= 0:
+                held.append(member)
+        admitted[leaf] = held
+    return admitted
 
 
-def admits(member, reference) -> bool:
-    """Whether `member`, its RMS distance from float64 over a leaf at each of the first batch's orders,
-    is no less exact than `reference`, the reference's at the same orders, by ADMISSION_MARGIN: the
-    upper ADMISSION_LEVEL bound on the mean over the orders of their squares' paired difference at
-    most ADMISSION_MARGIN times the reference's mean square. The orders are shared, so their pairing
-    takes out what every member's rounding at an order has in common."""
-    member, reference = (np.square(np.asarray(side, np.float64)) for side in (member, reference))
-    difference = member - reference
-    spread = np.std(difference, ddof=1) / np.sqrt(difference.size)
-    bound = float(np.mean(difference) + ADMISSION_LEVEL * spread)
-    return bound <= ADMISSION_MARGIN * float(np.mean(reference))
+def _admission(draw) -> dict[str, list[str]]:
+    """The members `draw`'s ensemble admits at each leaf (`admitted_members`), over a sample of ORDERS
+    orders of its own past the STAGES batches that hold Dew, taken before them: each member's mean squared
+    distance from float64 over each leaf at each order, Dew's draws unread."""
+    native, candidates = {}, {}
+    for order in range(STAGES * ORDERS, (STAGES + 1) * ORDERS):
+        _, members, truth = draw(order)
+        assert REFERENCE in members, f"the ensemble {sorted(members)} holds no {REFERENCE!r}"
+        paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(truth)]
+        for member, tree in members.items():
+            found = candidates.setdefault(member, {}) if member != REFERENCE else native
+            for name, leaf, true in zip(paths, jax.tree.leaves(tree), jax.tree.leaves(truth), strict=True):
+                found.setdefault(name, []).append(distance(leaf, true) ** 2)
+    return admitted_members(native, candidates)
 
 
 def assert_leaves_as_exact_over_orders(draw, label: str, *, terms=None, rows: bool = True) -> dict:
@@ -360,19 +387,19 @@ def assert_leaves_as_exact_over_orders(draw, label: str, *, terms=None, rows: bo
     comparison passes `rows=False` and its first step holds the rows.
 
     A member other than the reference (`REFERENCE`) is admitted at a leaf where it is no less exact than
-    the reference there over the first batch (`admits`), and the element rule holds Dew to the worst
-    admitted member; the leaf and row rules hold it to the reference alone. Returns
+    the reference there by ADMISSION_MARGIN, judged over a sample of orders of its own before any batch
+    that holds Dew (`_admission`); the element rule holds Dew to the worst admitted member, the leaf and row
+    rules to the reference alone. Returns
     `assert_elements_as_exact`'s report: by leaf, the members admitted and the bar's inflation over
     the reference alone."""
+    # Eligibility is frozen on the reference's ensemble alone before any batch holds Dew.
+    admitted = _admission(draw)
     batches = {0: _batch(draw, 0, terms, rows)}
     _, _, leaves, row_distances, sizes = batches[0]
-    admitted = {}
     for name in leaves[0]:
         mine = np.asarray([order[name][0] for order in leaves])
         theirs = {member: np.asarray([order[name][1][member] for order in leaves])
                   for member in leaves[0][name][1]}
-        assert REFERENCE in theirs, f"{label} {name}: the ensemble {sorted(theirs)} holds no {REFERENCE!r}"
-        admitted[name] = [member for member in theirs if admits(theirs[member], theirs[REFERENCE])]
         # The leaf and row supplements hold Dew to the reference alone, so admission moves accuracy
         # between elements without loosening the leaf's.
         assert_as_exact_over_orders(mine, theirs[REFERENCE], f"{label} {name}")

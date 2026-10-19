@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
-from reference_error import REFERENCE, assert_leaves_as_exact_over_orders, widened
+from reference_error import ORDERS, REFERENCE, assert_leaves_as_exact_over_orders, widened
 from reference_trees import assignments, tree_contract, tree_sum
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -121,6 +121,30 @@ def test_a_hundredfold_error_on_a_thousandth_of_a_row_fails():
 
     with pytest.raises(AssertionError):
         assert_leaves_as_exact_over_orders(draw, "one element", rows=False)
+
+
+def test_a_hundredfold_error_where_the_ensemble_raises_the_bar_most_fails():
+    """The same fault at the element whose bar the members raise most over the reference's own, measured
+    over the first batch before Dew is injected: the ensemble's widest allowance still fails it."""
+    shape = (8, 1024)
+    base = norm_draw(xla_sum, shape)
+    sums = {}
+    for order in range(ORDERS):
+        _, members, truth = base(order)
+        for name, found in members.items():
+            sums[name] = sums.get(name, 0) + np.abs(found["output"] - truth["output"])
+    native, widest = sums[REFERENCE], np.max(np.stack(list(sums.values())), axis=0)
+    raised = np.where(native > 0, widest / np.where(native > 0, native, 1), 0)
+    at = np.unravel_index(int(np.argmax(raised)), shape)
+
+    def draw(order):
+        dew, members, truth = base(order)
+        output = dew["output"].copy()
+        output[at] = truth["output"][at] + 100 * (output[at] - truth["output"][at])
+        return {"output": output}, members, truth
+
+    with pytest.raises(AssertionError):
+        assert_leaves_as_exact_over_orders(draw, "the widest element", rows=False)
 
 
 def test_an_ulp_off_where_every_member_is_exact_fails():
