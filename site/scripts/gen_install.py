@@ -42,10 +42,11 @@ def main() -> None:
     args = parser.parse_args()
     builds, python = facts()
     shell = [f"python_min={python}"]
-    table = ["| Build | NVIDIA driver | GPU (SM) |", "|---|---|---|"]
-    for build, driver, (major, minor) in builds:
+    table = ["| Build | CUDA | NVIDIA driver | GPU (SM) |", "|---|---|---|---|"]
+    for build, driver, (major, minor), cuda in builds:
         shell.extend((f"{build}_driver={driver}", f"{build}_sm={major}.{minor}"))
-        table.append(f"| `{build}` | {driver} or later | {major}.{minor} or later |")
+        table.append(f"| `{build}` | {cuda // 1000}.{cuda % 1000 // 10} or later | {driver} or later, or an older "
+                     f"one under NVIDIA's cuda-compat | {major}.{minor} or later |")
     least = [f"Dew needs Python {python} or newer."]
     stale = []
     for path, blocks in ((REPO / "site/public/install.sh", ((SHELL, shell),)),
