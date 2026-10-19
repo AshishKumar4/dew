@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import functools
 import hashlib
 import io
 import json
@@ -377,6 +378,7 @@ class Store:
     retention: LocalRetention | None = field(default=None, repr=False)
 
     def resolve(self) -> tuple[AbstractFileSystem, str]:
+        _registered()
         options = dict(self.storage_options or {})
         layers = self.url.split("::")
         for cache in ("dewcache", "filecache", "simplecache", "blockcache"):
@@ -462,14 +464,26 @@ class Store:
         retry is worth making; this host's disk and memory fail for reasons a retry keeps."""
         return self._backend()[2] not in ("file", "memory")
 
-    def put_immutable(self, payload: bytes) -> str:
+    def put_immutable(self, payload: bytes, retries: int = 0) -> str:
         """Create this object from `payload`, or accept the byte-identical
         object an earlier attempt created, and return the stored version.
 
-        Other bytes already at the URL are refused with a ValueError. An
-        object this call created that reads back otherwise is an OSError, so
-        a caller that retries uploads tries it again.
+        Other bytes already at the URL are refused with a ValueError. A failed
+        transfer, or an object this call created that reads back otherwise, is
+        an OSError, tried again up to `retries` times, a longer wait before
+        each, before it is raised.
         """
+        for attempt in range(retries + 1):
+            try:
+                return self._put_immutable(payload)
+            except OSError:
+                if attempt == retries:
+                    raise
+                time.sleep(min(0.25 * 2**attempt, 10))
+        raise AssertionError("the last attempt returns or raises")
+
+    def _put_immutable(self, payload: bytes) -> str:
+        """One attempt of `put_immutable`."""
         try:
             self.put_if_absent(payload)
         except PreconditionFailed:
@@ -661,7 +675,11 @@ class Store:
         return outcome.oid
 
 
-def _register() -> None:
+@functools.cache
+def _registered() -> None:
+    """Register Dew's filesystems with fsspec, once, as the first store resolves: the bounded cache
+    (`dewcache`) and the profiles the storage config names (DEW_STORAGE_CONFIG, else
+    ~/.config/dew/storage.toml)."""
     fsspec.register_implementation("dewcache", BoundedFileCache, clobber=True)
     config = Path(os.environ.get("DEW_STORAGE_CONFIG", "~/.config/dew/storage.toml")).expanduser()
     if config.is_file():
@@ -669,6 +687,3 @@ def _register() -> None:
             options = dict(values)
             base = options.pop("base")
             _profile(name, base, options)
-
-
-_register()

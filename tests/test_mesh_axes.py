@@ -15,6 +15,7 @@ import numpy as np
 import optax
 import pytest
 import sharded
+from flax import linen as nn
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 from model_support import TINY_DECODER
 from recording import RecordingTracker
@@ -325,6 +326,109 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
     else:
         assert split_flops == kept_flops
         assert split_bytes == kept_bytes
+
+
+@pytest.mark.parametrize(("mesh", "devices"), [
+    pytest.param(MeshSpec(fsdp=2), 2, marks=pytest.mark.mesh(devices=2), id="fsdp2"),
+    pytest.param(MeshSpec(fsdp=2, tensor=2), 4, marks=pytest.mark.mesh(devices=4), id="fsdp2_tensor2"),
+])
+def test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp(mesh, devices):
+    """`Layout.frozen_whole` holds a LoRA base whole over fsdp and split as
+    the rules split it over the rest (tensor): the step gathers none of what
+    fsdp split, the optimizer state and the trained parameters lie as the
+    split layout lays them, and one step trains what it trains."""
+    from dew.lora import LoRA
+    from dew.nn.sharding import mesh_axes
+    from dew.objectives.base import FROZEN
+    from dew.training.distributed import placed_bytes
+
+    model = tiny()
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj", "gate_proj", "down_proj")).apply(
+        model, model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)), key=1)
+    batch = next(token_batches())
+
+    def stepped(frozen_whole: bool):
+        objective = LMObjective(adapter.model, SEQ_LEN, variables=jax.tree.map(np.asarray, adapter.variables))
+        trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=mesh, checkpoints=None,
+                          tracker=None, layout=Layout(min_shard=TINY_SHARD, frozen_whole=frozen_whole))
+        trainer.device_mesh = mesh.build(jax.devices()[:devices])
+        state, shardings, _ = trainer.place()
+        placed = shard_batch(trainer.device_mesh, batch)
+        run = trainer.compile(state, placed)
+        gathered = sharded.collective_bytes(trainer.executable.as_text(), ("all-gather",))
+        trained, *_ = run(state, placed)
+        return state, shardings, gathered, jax.device_get(trained.variables["params"])
+
+    split_state, split, split_gathered, split_trained = stepped(frozen_whole=False)
+    whole_state, whole, whole_gathered, whole_trained = stepped(frozen_whole=True)
+    split_specs = [sharding.spec for sharding in jax.tree.leaves(split.variables[FROZEN])]
+    whole_specs = [sharding.spec for sharding in jax.tree.leaves(whole.variables[FROZEN])]
+    assert any("fsdp" in mesh_axes(entry) for spec in split_specs for entry in spec)
+    def unsplit(entry):
+        kept = [axis for axis in mesh_axes(entry) if axis != "fsdp"]
+        return tuple(kept) if kept else None
+
+    assert whole_specs == [P(*map(unsplit, spec)) for spec in split_specs]
+    assert mesh.tensor == 1 or any("tensor" in mesh_axes(entry) for spec in whole_specs for entry in spec)
+    assert jax.tree.leaves(whole.variables["params"]) == jax.tree.leaves(split.variables["params"])
+    assert placed_bytes(whole_state.opt_state) == placed_bytes(split_state.opt_state)
+    kept = placed_bytes(whole_state.variables[FROZEN]) - placed_bytes(split_state.variables[FROZEN])
+    assert kept > 0 and split_gathered - whole_gathered >= kept
+    for got, want in zip(jax.tree.leaves(whole_trained), jax.tree.leaves(split_trained), strict=True):
+        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
+
+
+class Named(nn.Module):
+    """A two-layer map whose trainable second layer is named as the frozen collection is."""
+
+    @nn.compact
+    def __call__(self, x):
+        from dew.objectives.base import FROZEN
+
+        return nn.Dense(16, name=FROZEN)(jax.nn.relu(nn.Dense(64, name="hidden")(x)))
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("grouped", [False, True], ids=["adam", "optax-groups"])
+def test_a_module_or_optimizer_group_named_frozen_keeps_its_split_under_frozen_whole(grouped):
+    """`Layout.frozen_whole` reads a leaf's collection where the variables are, so a trainable
+    module or an optimizer group that is only named `frozen` keeps its fsdp split, in its
+    parameters and its Adam moments: with no frozen collection the layout places every train-state
+    leaf and trains one step exactly as the split layout does."""
+    from dew.inputs import Field, InputSpec
+    from dew.objectives.base import FROZEN
+    from dew.objectives.supervised import Supervised
+
+    rng = np.random.default_rng(0)
+    batch = {"x": rng.normal(size=(8, 32)).astype(np.float32),
+             "y": rng.normal(size=(8, 16)).astype(np.float32)}
+    mesh = MeshSpec(fsdp=2)
+
+    def stepped(frozen_whole: bool):
+        optimizer = optax.adam(1e-2)
+        if grouped:
+            optimizer = optax.multi_transform({FROZEN: optax.adam(1e-2), "hidden": optax.adam(1e-3)},
+                                              lambda params: {name: name for name in params})
+        objective = Supervised(Named(), lambda outputs, rows: (outputs - rows["y"]) ** 2,
+                               inputs=InputSpec(Field("x", (32,))))
+        trainer = Trainer(objective, optimizer, key=jax.random.key(0), mesh=mesh, checkpoints=None,
+                          tracker=None, layout=Layout(min_shard=TINY_SHARD, frozen_whole=frozen_whole))
+        trainer.device_mesh = mesh.build(jax.devices()[:2])
+        state, shardings, _ = trainer.place()
+        placed = shard_batch(trainer.device_mesh, batch)
+        trained, *_ = trainer.compile(state, placed)(state, placed)
+        return shardings, jax.device_get(trained.variables["params"])
+
+    split, split_trained = stepped(frozen_whole=False)
+    whole, whole_trained = stepped(frozen_whole=True)
+    from dew.nn.sharding import mesh_axes
+
+    split_specs = [sharding.spec for sharding in jax.tree.leaves(split)]
+    assert any("fsdp" in mesh_axes(entry) for sharding in jax.tree.leaves(split.opt_state)
+               for entry in sharding.spec)
+    assert [sharding.spec for sharding in jax.tree.leaves(whole)] == split_specs
+    for got, want in zip(jax.tree.leaves(whole_trained), jax.tree.leaves(split_trained), strict=True):
+        np.testing.assert_array_equal(got, want)
 
 
 def token_batches():

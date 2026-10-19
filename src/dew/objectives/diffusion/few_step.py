@@ -30,6 +30,7 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
+from dew.nn.attention import forward_mode_attention
 from dew.nn.protocols import IntervalModel
 from dew.objectives.base import Aux, Step, model_rngs
 from dew.sampling.solvers import Euler, Solver
@@ -65,12 +66,16 @@ def guided_velocity(v, unconditional, conditional, omega, kappa):
 def mean_flow_target(velocity: Velocity, z, t, r, v) -> tuple[jax.Array, jax.Array]:
     """Return the model's average velocity at (z, t, r) and its regression target v - (t - r) du/dt.
 
-    One JVP takes the derivative along (dz/dt, dt/dt, dr/dt) = (v, 1, 0). No
-    gradient flows through the target.
+    One JVP, traced for forward mode (`forward_mode_attention`), takes the
+    derivative along (dz/dt, dt/dt, dr/dt) = (v, 1, 0); the velocity the loss
+    trains comes from the ordinary forward, which a fused attention kernel
+    differentiates in reverse, as sCM's student does. No gradient flows
+    through the target.
     """
-    u, derivative = jax.jvp(velocity, (z, t, r), (v, jnp.ones_like(t), jnp.zeros_like(r)))
+    with forward_mode_attention():
+        _, derivative = jax.jvp(velocity, (z, t, r), (v, jnp.ones_like(t), jnp.zeros_like(r)))
     target = v - expand(jnp.clip(t - r, 0.0, 1.0), derivative) * derivative
-    return u, jax.lax.stop_gradient(target)
+    return velocity(z, t, r), jax.lax.stop_gradient(target)
 
 
 def adaptive_loss(u, target, power: float, epsilon: float) -> jax.Array:
@@ -115,9 +120,9 @@ def shortcut_target(velocity: Velocity, x, sigma, step) -> jax.Array:
 _EULER = Euler()
 
 SMOOTH_TIME_SCALE = 0.002
-"""The Fourier time scale a model trained through a derivative in time takes
-when its config names none, and the fastest an sCM teacher's may turn. On a
-2-D two-class toy (RTX 4080), one-step class accuracy at simple_dit's
+"""The recommended Fourier time scale for losses with time derivatives,
+used when a run config names none. On a 2-D two-class toy (RTX 4080),
+one-step class accuracy at simple_dit's
 default 16 against 0.002 was MeanFlow 23% against 99%, an sCM student 11%
 against 98.6%."""
 

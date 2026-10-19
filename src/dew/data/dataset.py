@@ -33,8 +33,6 @@ import grain.python as pygrain
 import jax
 import numpy as np
 import tyro
-from absl import flags
-from grain._src.python.dataset.transformations.batch import make_batch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
@@ -45,11 +43,6 @@ from dew.nn.sharding import LayoutRefused, batch_axes
 from dew.objectives.base import VALID_ROWS, Batch
 
 _log = logging.getLogger(__name__)
-
-# Grain's worker processes read absl flags, which a script without absl.app never
-# parsed; importing Dew's data layer marks them parsed, as `absl.app` would.
-if not flags.FLAGS.is_parsed():
-    flags.FLAGS.mark_as_parsed()
 
 if TYPE_CHECKING:
     from dew.data.mixing import CorpusCounts
@@ -309,14 +302,9 @@ _QUIET_STOP_SECONDS = 5.0
 (`Loading.announced_stop`)."""
 
 
-def _grain_kill_seconds() -> int:
-    """How long grain waits for a stopped worker process to exit before it
-    kills it: its own `_PROCESS_KILL_TIMEOUT_S`. The name is private, so it is
-    read where a grain-backed stream needs it, and a grain release that moves
-    it breaks only grain-backed loading."""
-    from grain._src.python.dataset.transformations import process_prefetch
-
-    return process_prefetch._PROCESS_KILL_TIMEOUT_S
+GRAIN_KILL_SECONDS = 25
+"""How long Grain waits for a stopped worker process to exit before it kills it, which it publishes
+no setting or reading of: 25 s in grain 0.2.18 (process_prefetch.py), the release tested."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -411,11 +399,9 @@ class Loading:
         exited within Grain's kill timeout; the read gets the same time. Slow
         stops are normal: four workers took 5.1 to 7.4 s to stop on 12 vCPUs.
         """
-        # Grain's kill timeout is read from Grain (`_grain_kill_seconds`), so an
-        # upgrade that changes it moves this budget too. The 5.1 to 7.4 s stop
-        # was examples/sft_gemma4.py's four workers.
+        # The 5.1 to 7.4 s stop was examples/sft_gemma4.py's four workers.
         return float(
-            _grain_kill_seconds()
+            GRAIN_KILL_SECONDS
             * (1 + (self.max_workers or os.cpu_count() or 1) if self.workers == "auto" else 1 + self.workers)
         )
 
@@ -443,7 +429,7 @@ class Loading:
             return None
         line = (
             f"waiting for {self.workers} grain workers to stop, "
-            f"up to {self.workers * _grain_kill_seconds()} s"
+            f"up to {self.workers * GRAIN_KILL_SECONDS} s"
         )
         timer = threading.Timer(_QUIET_STOP_SECONDS, _log.warning, (line,))
         timer.daemon = True
@@ -963,9 +949,9 @@ def take_batch(batch: Batch, indices: int | slice | np.ndarray) -> Batch:
     )
 
 
-_UNSTACKED = "Expected all input elements to have the same structure"
-"""How grain's batching starts the error it raises when records' fields do
-not stack. A grain that words it otherwise raises its own error unchanged."""
+class Unstacked(ValueError):
+    """The records of one batch hold a field in different shapes or structures, which no array
+    stacks (`record_batch`)."""
 
 
 def _stacked(value) -> bool:
@@ -1004,31 +990,51 @@ def record_batch(rows: Sequence[Batch], *, shared: bool = False) -> Batch:
     batched: Batch = {}
     for name in rows[0]:
         values = [row[name] for row in rows]
-        batched[name] = (make_batch(values, output_to_shared_memory=shared and _shareable(values))
+        batched[name] = (_column(values, shared=shared and _shareable(values))
                          if all(_stacked(value) for value in values) else values)
     return batched
 
 
+def _column(values: Sequence[object], *, shared: bool):
+    """`values`, one field's across a batch's records, stacked along a new leading axis, a mapping
+    of them field by field, as Grain batches them: into Grain's shared memory with `shared`, which
+    `_shareable` gives only a numeric column."""
+    if len(values) == 1:
+        return jax.tree.map(lambda leaf: np.expand_dims(leaf, 0), values[0])
+
+    from grain.multiprocessing import SharedMemoryArray
+
+    def stack(*leaves):
+        if not shared:
+            return np.stack(leaves)
+        first = np.asanyarray(leaves[0])
+        return np.stack(leaves, out=SharedMemoryArray((len(leaves), *first.shape), dtype=first.dtype))
+
+    try:
+        return jax.tree.map(stack, *values)
+    except ValueError as error:
+        shapes = sorted({str(jax.tree.map(np.shape, value)) for value in values})
+        raise Unstacked(f"the field's records do not stack: {'; '.join(shapes[:6])}") from error
+
+
 def stacked(rows: Sequence[Batch], stack: Callable[[Sequence[Batch]], Batch]) -> Batch:
-    """`rows` stacked into one batch by `stack`, with grain's failure to
+    """`rows` stacked into one batch by `stack`, with its failure to
     stack them said in terms of what to change. Every batch Dew makes of
     rows is stacked here, so a reader and the loading tuner that samples it
     refuse alike.
 
     The usual cause is a field of varying length, as token ids are before
-    anything cuts or packs them, and grain's message names the batch's
-    structure rather than the field or the remedy.
+    anything cuts or packs them. A batch function of the caller's own raises
+    its own errors unchanged.
     """
     try:
         return stack(rows)
-    except ValueError as failed:
-        if not str(failed).startswith(_UNSTACKED):
-            raise
+    except Unstacked as failed:
         raise ValueError(
             "the records of one batch hold a field in different shapes, and a batch "
             "stacks each field into one array: cut or pad a variable-length field, such "
             "as token ids, to one length, or pack documents into fixed windows (Training "
-            "data, Packing). Grain's report of the shapes is the cause below"
+            "data, Packing). The shapes are in the cause below"
         ) from failed
 
 

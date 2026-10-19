@@ -75,7 +75,7 @@ Trained 300 steps in 0:00:14: first step after 2.76 s, then 30.0 step/s
 One day, Lily saw a big dog in the park. The dog want
 ```
 
-`Text(seq_len=64)` yields rows of 65 IDs under the key `text`. `LMObjective(model, seq_len=64)` feeds the first 64 to the model and scores the predictions against the next 64. Token IDs must be integers inside the model's vocabulary. `temperature=0.0` picks the most likely token at every step, and the returned row holds the prompt followed by the continuation.
+`TextData(seq_len=64)` yields rows of 65 IDs under the key `text`. `LMObjective(model, seq_len=64)` feeds the first 64 to the model and scores the predictions against the next 64. Token IDs must be integers inside the model's vocabulary. `temperature=0.0` picks the most likely token at every step, and the returned row holds the prompt followed by the continuation.
 
 The training loss is near zero because the same four sentences repeat, and validation on the held-out start of the stream scores just as low. Validation and the generation above both use the trained `lm_state.variables`, since the objective keeps no moving average unless `ema_decay` is set.
 
@@ -109,7 +109,7 @@ The measured run changes these settings from the example:
 | Setting | Value |
 |---|---|
 | Tokenizer | `HFTokenizer("gpt2")` |
-| Data | `load(Text(source="data/tinystories/train", validation="data/tinystories/val", seq_len=256), batch=32, read="memory")` |
+| Data | `loader(TextData(source="data/tinystories/train", validation="data/tinystories/val", seq_len=256), batch=32, read="memory")` |
 | Model | `emb_features=256, num_layers=4, num_heads=4, max_seq_len=256, dtype=jnp.bfloat16` |
 | Optimizer | `OptimConfig(learning_rate=1e-3)` |
 | Objective | `LMObjective(model, seq_len=256, ema_decay=0.999)` |
@@ -138,7 +138,7 @@ dew data export records data/corpus-byte \
     --format array_record --tokenizer byte --eos --read memory
 ```
 
-That command publishes the complete input. Prepare held-out records separately and pass their URL as `Text(validation=...)`. To preserve a token-axis head split, encode the stream once and export two slices:
+That command publishes the complete input. Prepare held-out records separately and pass their URL as `TextData(validation=...)`. To preserve a token-axis head split, encode the stream once and export two slices:
 
 ```python
 from pathlib import Path
@@ -157,7 +157,7 @@ export([{"text": ids[:held]}], "data/corpus-byte/val", format="array_record",
        metadata=metadata, length_field="text")
 ```
 
-`load(Text(source="data/corpus-byte/train", validation="data/corpus-byte/val", seq_len=64), batch=8, read="memory")` reads those stores. Indexed mode reads producer lengths without scanning token payloads. Binary token stores remain native inputs through TokenFiles; new producers use committed shards.
+`loader(TextData(source="data/corpus-byte/train", validation="data/corpus-byte/val", seq_len=64), batch=8, read="memory")` reads those stores. Indexed mode reads producer lengths without scanning token payloads. Binary token stores remain native inputs through TokenFiles; new producers use committed shards.
 
 - Fixed windows contain `seq_len + 1` IDs, `{"text": int32 [B, seq_len + 1]}`. Each starts `seq_len` IDs after the last.
 - `pack="first-fit"` keeps documents in padded windows and adds aligned segment IDs and positions. `pack="concat"` concatenates and splits aligned fields.
@@ -393,7 +393,7 @@ An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_featur
 
 ## Masked diffusion language models
 
-`MaskedDiffusionObjective` trains a bidirectional decoder to recover masked tokens under MDLM's negative ELBO. As in MDLM's SUBS parameterization, the mask token gets no probability mass, so its column is left out of the cross entropy's partition. LLaDA's published training script takes the cross entropy over the whole vocabulary, so its loss values differ from Dew's by that term. Each row holds exactly `seq_len` tokens, because there is no next-token shift; `Text(seq_len=63)`, whose rows hold 64 IDs, feeds a 64-token objective. The mask token needs an ID of its own, here the one after the last byte:
+`MaskedDiffusionObjective` trains a bidirectional decoder to recover masked tokens under MDLM's negative ELBO. As in MDLM's SUBS parameterization, the mask token gets no probability mass, so its column is left out of the cross entropy's partition. LLaDA's published training script takes the cross entropy over the whole vocabulary, so its loss values differ from Dew's by that term. Each row holds exactly `seq_len` tokens, because there is no next-token shift; `TextData(seq_len=63)`, whose rows hold 64 IDs, feeds a 64-token objective. The mask token needs an ID of its own, here the one after the last byte:
 
 ```python
 from dew.data import Loading

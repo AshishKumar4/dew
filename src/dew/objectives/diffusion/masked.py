@@ -242,7 +242,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         """
         def generate(prepared):
             weights, count = prepared
-            return self._sample(weights, step.key, count=count), None
+            return self._sample(weights, step.key, count=count), None, None
 
         return text_preview("masked diffusion preview",
                              lambda: (self.evaluation_variables(params, step), self.samples), generate,

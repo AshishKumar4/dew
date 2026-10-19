@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from functools import wraps
 
 import jax
 import jax.numpy as jnp
@@ -42,6 +43,37 @@ def test_a_plain_flax_model_trains_on_a_loss_function():
     before, _ = objective.scalar_loss(start.variables, batch(), STEP)
     after, _ = objective.scalar_loss(state.variables, batch(), STEP)
     assert after < before / 4
+
+
+def finite_inputs(call):
+    """Supply the wrapped model's finite-input mask from its sample."""
+    @wraps(call)
+    def apply(self, x):
+        return call(self, x, jnp.isfinite(x))
+    return apply
+
+
+class MaskedAffine(nn.Module):
+    """An affine map whose call decorator supplies its mask."""
+
+    @nn.compact
+    @finite_inputs
+    def __call__(self, x, mask):
+        return nn.Dense(2)(jnp.where(mask, x, 0).astype(jnp.float32))
+
+
+def test_a_decorated_flax_call_trains_through_its_actual_calling_convention():
+    model = MaskedAffine()
+    sample = batch()
+    variables = model.init(jax.random.key(0), sample["x"])
+    assert model.apply(variables, sample["x"]).shape == sample["y"].shape
+    objective = Supervised(model, squared, inputs=INPUTS)
+    trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(0))
+    initial = trainer.initial_state()
+    before = float(objective.scalar_loss(initial.variables, sample, STEP)[0])
+    trained, _, _, _, accepted, _ = trainer.compile(initial, sample)(initial, sample)
+    assert bool(accepted) and int(trained.updates) == 1
+    assert float(objective.scalar_loss(trained.variables, sample, STEP)[0]) < before
 
 
 def test_the_loss_is_the_mean_over_the_real_rows_and_metrics_report_by_name():

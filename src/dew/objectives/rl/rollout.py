@@ -16,7 +16,7 @@ from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.objectives.base import Shown
 from dew.sampling.text import Sampling
 
-from ..lm import LMObjective
+from ..lm import TokenScorer
 from .sessions import (
     OLD_LOG_PROBS_KEY,
     Call,
@@ -55,8 +55,8 @@ class SampledRollout:
 
     EOS counts as an action in the response mask, but the text passed to
     `reward` leaves it out. The batch has `pack`'s layout, `prompts * groups`
-    rows of the prompt width plus `max_new_tokens`, so size the objective's
-    `seq_len` one below that width; any other size raises ValueError. Every
+    rows of the objective's `seq_len + 1`; a draw longer than a row, its
+    prompt and completion together, raises ValueError there. Every
     completion is scored. One that ran out of `max_new_tokens` is TRUNCATED,
     and `truncation` decides whether it trains; the default, `score`, trains
     it on its reward. `old_log_probs` holds the raw likelihoods the cached
@@ -66,7 +66,7 @@ class SampledRollout:
     `rollout/<name>`.
     """
 
-    objective: LMObjective
+    objective: TokenScorer
     reward: Reward
     decode: Callable[[Sequence[int]], str] = lambda ids: " ".join(str(token) for token in ids)
     groups: int = 4
@@ -97,8 +97,6 @@ class SampledRollout:
             raise ValueError("key must be a single JAX PRNG key")
         prompts, prompt_lengths, sources, truths, infos = prompt_rows(batch)
         width = prompts.shape[1]
-        if width + self.max_new_tokens != self.objective.seq_len + 1:
-            raise ValueError("size the objective one below the prompt width plus max_new_tokens")
         # The lengths are already here on the host, so a batch of whole
         # prompts states its validity by carrying none.
         padded = bool(np.any(prompt_lengths < width))
@@ -147,7 +145,8 @@ class SampledRollout:
                                         Status.COMPLETED if stopped else Status.TRUNCATED,
                                         float(rewards[row, group])))
         # Session `row * groups + group` is that draw, which is what `sampled_values` hands its callback.
-        packed = pack(sessions, width + sampled.shape[2], rows=rows * self.groups,
+        # The rows are the objective's, which `pack` refuses a draw too long for.
+        packed = pack(sessions, self.objective.seq_len + 1, rows=rows * self.groups,
                       estimator=self.estimator, truncation=self.truncation)
         packed[OLD_LOG_PROBS_KEY] = sampled_values(
             packed, lambda index, _: raw[index // self.groups, index % self.groups,
