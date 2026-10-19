@@ -7,7 +7,7 @@ import itertools
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import jax
 import jax.numpy as jnp
@@ -40,7 +40,7 @@ type ModelKwarg = jax.Array | Mapping[str, jax.Array] | bool | None
 
 # A token field's `[B, W, ...]` response values from its `[B, S, ...]` prompt
 # values, the prompt's `[B, S]` real slots and the width (`ModelInputs.extended`).
-type FieldExtension = Callable[[jax.Array, jax.Array, int], jax.Array]
+type FieldExtension = Callable[[Any, jax.Array, int], Any]
 
 PredictionPhase = Literal["ordinary", "extend", "draft"]
 
@@ -265,8 +265,7 @@ class ModelInputs:
         width = tokens.shape[1]
         return replace(
             self, tokens=jnp.concatenate([self.tokens, tokens.astype(self.tokens.dtype)], axis=1),
-            token_fields={name: jnp.concatenate([value, known[name](value, valid, width).astype(value.dtype)],
-                                                axis=1)
+            token_fields={name: _joined(value, known[name](value, valid, width))
                           for name, value in self.token_fields.items()})
 
 
@@ -631,6 +630,27 @@ def _response_text(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
     return jnp.full((value.shape[0], width, *value.shape[2:]), -1, value.dtype)
 
 
+def _response_layout(value: Coordinates, valid: jax.Array, width: int) -> Coordinates:
+    """A request's `Coordinates` over its response's slots: each field by its own field's rule, and
+    no document starting in the response."""
+    def continued(field, rule):
+        return None if field is None else rule(field, valid, width)
+
+    return value.replace(
+        valid=continued(value.valid, _response_validity),
+        positions=continued(value.positions, _response_positions),
+        segments=continued(value.segments, _response_document),
+        starts=None if value.starts is None else jnp.zeros((len(value.starts), width), value.starts.dtype))
+
+
+def _joined(prompt, response):
+    """A token field's prompt slots, then its response's, leaf by leaf. A response follows the
+    prompt's padding, so a `Coordinates`' real tokens no longer all come first."""
+    joined = jax.tree.map(lambda first, then: jnp.concatenate([first, then.astype(first.dtype)], axis=1),
+                          prompt, response)
+    return joined.replace(right_padded=False) if isinstance(joined, Coordinates) else joined
+
+
 RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
     VALIDITY_FIELD: _response_validity,
     "positions": _response_positions,
@@ -639,6 +659,7 @@ RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
     "image_indices": _response_text,
     "audio_indices": _response_text,
     "image_groups": _response_text,
+    COORDINATES_FIELD: _response_layout,
 }
 """How each token field Dew's processors write continues into a response."""
 

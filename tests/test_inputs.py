@@ -131,8 +131,9 @@ def test_every_token_id_parser_reads_ids_by_one_law(parser):
 def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
     """The same packed, left-padded rows, as `Coordinates` (a data pipeline's
     packing) or as the validity, segment and position fields (a rollout's), are
-    one request: each validates, and after taking rows, aligning left and
-    slicing the decoder computes the same logits from either form."""
+    one request: each validates, and after taking rows, aligning left, slicing
+    and extending into a response the decoder computes the same logits from
+    either form."""
     import jax
     import jax.numpy as jnp
 
@@ -152,7 +153,8 @@ def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
                                                                    positions=positions)}))
     steps = (lambda inputs: inputs.take_rows(jnp.asarray([1, 0])),
              lambda inputs: inputs.align_left(jnp.asarray([2, 1])),
-             lambda inputs: inputs.slice_tokens(0, 6))
+             lambda inputs: inputs.slice_tokens(0, 6),
+             lambda inputs: inputs.extended(jnp.full((2, 3), 5, jnp.int32)))
     for step in (lambda inputs: inputs, *steps):
         fields, laid = (step(ModelInputs.from_value(form)) for form in forms)
         expected, actual = (model.apply(params, inputs.tokens, **inputs.kwargs())
