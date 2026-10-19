@@ -14,6 +14,7 @@ the same arrays step after step.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable
 from typing import Generic, overload
 
@@ -24,7 +25,7 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
-from dew.objectives.base import FROZEN, Aux, Batch, Ratio, Step, Variables, merge
+from dew.objectives.base import FROZEN, Aux, Batch, Ratio, Step, Variables, merge, with_projected
 from dew.training.model_flops import step_counts
 from dew.training.narrow import forward_variables, narrowed
 from dew.training.state import Accumulation, TrainState
@@ -359,8 +360,8 @@ class Transaction:
         reads them (`Objective.projected`), whether or not the objective's
         forward trains the model, so the loss and its gradient are taken where
         the update applies. The projection is not differentiated."""
-        read = forward_variables(variables, compute)
-        return {**read, "params": self.objective.projected(read["params"], updated=False)}
+        return with_projected(forward_variables(variables, compute),
+                              functools.partial(self.objective.projected, updated=False))
 
     @staticmethod
     def unscaled(gradient, factor):
