@@ -35,7 +35,7 @@ from .attention import RMSNorm
 from .deepseek_v4 import DRAFT_CONTEXT, DRAFT_VALID
 from .hyper_connections import Carried, HyperConnections, HyperHead, collapse_by, expand_streams, first_stream
 from .inputs import MixerCall
-from .precision import at_least_fp32
+from .precision import Float32Products, at_least_fp32
 from .protocols import ProjectionGroup
 from .sharding import logical_axes
 
@@ -79,7 +79,7 @@ class DSpark:
     ("main_proj",): (None, "embed"),
     ("confidence",): (None, None),
 })
-class DSparkStage(nn.Module):
+class DSparkStage(Float32Products, nn.Module):
     """One drafter stage: its decoder block, the context projection on the
     first, and the norm, Markov head and confidence head on the last.
     `weighted_head` is the trunk's streams when the last stage collapses
@@ -101,7 +101,7 @@ class DSparkStage(nn.Module):
         self.layer = self.block(name='block')
         if self.first:
             self.main_proj = nn.Dense(self.emb_features, use_bias=False, dtype=self.dtype,
-                                      precision=self.precision, name='main_proj')
+                                      precision=self.products, name='main_proj')
             self.main_norm = RMSNorm(epsilon=self.norm_eps, scale_after_cast=True,
                                      dtype=self.dtype, name='main_norm')
         if self.last:
@@ -112,7 +112,7 @@ class DSparkStage(nn.Module):
             self.markov_head = self.param('markov_head', nn.initializers.normal(self.markov_rank ** -0.5),
                                           (self.vocab_size, self.markov_rank), jnp.float32)
             self.confidence = nn.Dense(1, use_bias=False, dtype=at_least_fp32(self.dtype),
-                                       precision=self.precision, name='confidence')
+                                       precision=self.products, name='confidence')
             if self.weighted_head is not None:
                 self.hc_head = HyperHead(spec=self.weighted_head, emb_features=self.emb_features,
                                          norm_eps=self.norm_eps, name='hc_head')
@@ -145,7 +145,7 @@ class DSparkStage(nn.Module):
         """The bigram bias `[B, vocab]` a drafted token adds to the next
         position, and the token's embedding (v41:1077-1086)."""
         embedded = jnp.take(self.markov_embed, tokens, axis=0)
-        return jnp.einsum('br,vr->bv', embedded, self.markov_head, precision=self.precision), embedded
+        return jnp.einsum('br,vr->bv', embedded, self.markov_head, precision=self.products), embedded
 
     def confident(self, hidden, embedded):
         """Each position's acceptance score (v41:1089-1097)."""

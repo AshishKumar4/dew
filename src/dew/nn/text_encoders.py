@@ -51,6 +51,7 @@ from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
+from dew.nn.precision import Float32Products
 from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
 
@@ -136,7 +137,7 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
 
 
 @logical_axes({("token_embedding",): ("vocab", "embed"), ("position_embedding",): (None, "embed")})
-class CLIPTextTransformer(nn.Module):
+class CLIPTextTransformer(Float32Products, nn.Module):
     """The text tower of CLIP, param layout and defaults of `CLIPTextConfig`.
 
     `attention_mask` is the tokenizer's, ones on the real tokens and zeros on
@@ -166,7 +167,7 @@ class CLIPTextTransformer(nn.Module):
         return clip_layer(self.hidden_size, self.num_heads, self.intermediate_size,
                           self.max_position_embeddings, causal=True,
                           activation=tower_activation(self.activation),
-                          eps=self.layer_norm_eps, dtype=self.dtype, precision=self.precision, name=name)
+                          eps=self.layer_norm_eps, dtype=self.dtype, precision=self.products, name=name)
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -215,7 +216,7 @@ class CLIPTextTransformer(nn.Module):
 
 
 @logical_axes({("patch_embedding",): (None, None, None, "embed"), ("position_embedding",): (None, "embed")})
-class CLIPVisionTransformer(nn.Module):
+class CLIPVisionTransformer(Float32Products, nn.Module):
     """The vision tower of CLIP, param layout and defaults of `CLIPVisionConfig`.
 
     `pixel_values` are what the checkpoint's image processor emits and what
@@ -239,13 +240,13 @@ class CLIPVisionTransformer(nn.Module):
     def _layer(self, name=None):
         patches = (self.image_size // self.patch_size) ** 2
         return clip_layer(self.hidden_size, self.num_heads, self.intermediate_size, patches + 1,
-                          eps=self.layer_norm_eps, dtype=self.dtype, precision=self.precision, name=name)
+                          eps=self.layer_norm_eps, dtype=self.dtype, precision=self.products, name=name)
 
     @nn.nowrap
     def _patch_embedding(self, **scope):
         return Conv(self.hidden_size, (self.patch_size, self.patch_size),
                     strides=(self.patch_size, self.patch_size), padding="VALID", use_bias=False,
-                    dtype=self.dtype, precision=self.precision, **scope)
+                    dtype=self.dtype, precision=self.products, **scope)
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -292,7 +293,7 @@ class CLIPVisionTransformer(nn.Module):
 
 
 @logical_axes({("text_projection",): ("embed", "output"), ("visual_projection",): ("embed", "output")})
-class CLIP(nn.Module):
+class CLIP(Float32Products, nn.Module):
     """Both towers and their projection heads, `CLIPModel` in the reference.
 
     `get_text_features` and `get_image_features` are the pooled rows through
@@ -307,7 +308,7 @@ class CLIP(nn.Module):
 
     def setup(self):
         dense = functools.partial(nn.Dense, self.projection_dim, use_bias=False,
-                                  dtype=self.dtype, precision=self.precision)
+                                  dtype=self.dtype, precision=self.products)
         self.text_projection = dense(name="text_projection")
         self.visual_projection = dense(name="visual_projection")
 
@@ -651,7 +652,7 @@ feed-forward SD3.5 and Flux run."""
 
 
 @logical_axes({("embed_tokens",): ("vocab", "embed")})
-class T5EncoderTransformer(nn.Module):
+class T5EncoderTransformer(Float32Products, nn.Module):
     """The T5 encoder stack: token embedding, pre-norm blocks of
     bidirectional relative-bias attention and feed-forward, a final RMS norm,
     modeling_t5.py `T5Stack` as `T5EncoderModel` runs it, or modeling_umt5.py
@@ -702,14 +703,14 @@ class T5EncoderTransformer(nn.Module):
             CausalSelfAttention, ctx=MixerContext(
                 emb_features=self.d_model, num_heads=self.num_heads, num_kv_heads=self.num_heads,
                 head_dim=self.head_dim, max_seq_len=0, causal=False, qk_norm=False, attention_scale=1.0,
-                attention_dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision),
+                attention_dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.products),
             nope=True)
         mlp = functools.partial(GatedMLP, hidden_features=self.d_ff, out_features=self.d_model,
                                 activation=_T5_FEED_FORWARDS[self.feed_forward_proj],
-                                dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision)
+                                dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.products)
         return DecoderBlock(attention, mlp, self.d_model, BlockWiring(), norm_eps=self.layer_norm_epsilon,
                             dropout_rate=self.dropout_rate, dtype=self.dtype,
-                            precision=self.precision, **scope)
+                            precision=self.products, **scope)
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:

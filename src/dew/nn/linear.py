@@ -49,7 +49,14 @@ from .inputs import PLAIN_CALL, Coordinates, MixerCall, coordinates_of, valid_or
 from .joined import joined_dense, joins
 from .kernels import generation
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
-from .precision import asks_default_precision, at_least_fp32, compensated_add, compensated_difference
+from .precision import (
+    Float32Products,
+    asks_default_precision,
+    at_least_fp32,
+    compensated_add,
+    compensated_difference,
+    float32_products,
+)
 from .sharding import (
     HEADS,
     MLP_HIDDEN,
@@ -611,9 +618,10 @@ def _paired(left, right, decay):
     """`sum_d left[s, d] right[t, d] decay[s, t, d]` within each chunk,
     `[..., C, C]`: one decay channel scales the product after it, one per key
     dimension weighs each term of it."""
+    products = float32_products(left.dtype)
     if decay.shape[-1] == 1:
-        return (left @ jnp.swapaxes(right, -1, -2)) * decay[..., 0]
-    return jnp.einsum('...sd,...td,...std->...st', left, right, decay)
+        return jnp.matmul(left, jnp.swapaxes(right, -1, -2), precision=products) * decay[..., 0]
+    return jnp.einsum('...sd,...td,...std->...st', left, right, decay, precision=products)
 
 
 def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *, starts=None):
@@ -963,7 +971,7 @@ def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
     ("in_proj_a",): ("embed", "kv"),
     ("out_proj",): ("attention", "embed"),
 })
-class GatedDeltaNet(nn.Module):
+class GatedDeltaNet(Float32Products, nn.Module):
     """The token mixer of a linear_attention layer.
 
     Projects into q, k, v, z, b and a, runs the causal conv over qkv, applies
@@ -1061,7 +1069,7 @@ class GatedDeltaNet(nn.Module):
                 "gate_activation must be 'silu' or 'sigmoid' (the reference's "
                 f"output_gate_type), got {self.gate_activation!r}")
         dense = functools.partial(
-            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.products)
         for name, (_, outputs) in self.projections().items():
             setattr(self, name, dense(outputs, name=name))
         self.conv1d = DepthwiseConv1d(features=self.conv_features,
@@ -1170,7 +1178,7 @@ class GatedDeltaNet(nn.Module):
         # position or leave state behind. The conv normalises the queries
         # and keys (`l2norm`).
         stored = (jnp.promote_types(self.dtype, jnp.bfloat16)
-                  if self.dtype is not None and asks_default_precision(self.precision, configured=True)
+                  if self.dtype is not None and asks_default_precision(self.products, configured=True)
                   else wide)
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
         out = held_scan(self, mixed, self.conv1d()[0], None, scan,

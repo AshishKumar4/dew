@@ -32,7 +32,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.flops import attention_flops, matching_lengths, patch_lengths, projection_flops
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import Float32Products, at_least_fp32
 from dew.nn.rope import axis_tables, rotate
 from dew.nn.sharding import logical_axes
 
@@ -65,7 +65,7 @@ def flux2_positions(rows: int, columns: int, text: int) -> np.ndarray:
 
 
 @logical_axes({("to_qkv_mlp_proj",): ("embed", None), ("proj_fused",): (None, "embed")})
-class Flux2SingleBlock(nn.Module):
+class Flux2SingleBlock(Float32Products, nn.Module):
     """Runs one `Flux2SingleTransformerBlock` over the joined sequence.
 
     One map gives the queries, keys, values and SwiGLU input. Per-head RMS
@@ -101,7 +101,7 @@ class Flux2SingleBlock(nn.Module):
         normalized = modulate(layer_norm(self.dtype, self.epsilon)(x), shift, scale)
         maps = self.projections()
         projected = nn.Dense(maps['to_qkv_mlp_proj'][1], use_bias=False, dtype=self.dtype,
-                             precision=self.precision, name="to_qkv_mlp_proj")(normalized)
+                             precision=self.products, name="to_qkv_mlp_proj")(normalized)
         heads = (x.shape[0], x.shape[1], self.heads, self.head_dim)
         query, key, value = (
             part.reshape(heads) for part in jnp.split(projected[..., : 3 * inner], 3, axis=-1)
@@ -110,7 +110,7 @@ class Flux2SingleBlock(nn.Module):
         key = RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm_k")(key)
         attended = scaled_dot_product_attention(
             rotate(query, *rotation, pairs="adjacent"), rotate(key, *rotation, pairs="adjacent"), value,
-            implementation=self.attention_impl, precision=self.precision)
+            implementation=self.attention_impl, precision=self.products)
         gated, value_half = jnp.split(projected[..., 3 * inner:], 2, axis=-1)
         joined = jnp.concatenate(
             [attended.reshape(x.shape[0], x.shape[1], inner), nn.silu(gated) * value_half], axis=-1
@@ -118,12 +118,12 @@ class Flux2SingleBlock(nn.Module):
         # The source's `attn.to_out`, named as Flux's single block names its
         # fused output map.
         return x + gate[:, None] * nn.Dense(maps['proj_fused'][1], use_bias=False, dtype=self.dtype,
-                                            precision=self.precision, name="proj_fused")(joined)
+                                            precision=self.products, name="proj_fused")(joined)
 
 
 @logical_axes({("context_embedder",): (None, "embed"), ("x_embedder",): (None, "embed"),
                ("proj_out",): ("embed", None), **embedding_axes("timestep_embedder", "guidance_embedder")})
-class Flux2Transformer(TextStream, nn.Module):
+class Flux2Transformer(TextStream, Float32Products, nn.Module):
     """Runs Diffusers 0.40.0's `Flux2Transformer2DModel` behind Dew's model interface.
 
     `__call__` takes the pipeline's NHWC latent (the VAE's channels folded
@@ -192,7 +192,7 @@ class Flux2Transformer(TextStream, nn.Module):
         if x.ndim != 4:
             raise ValueError(f"FLUX.2 takes NHWC latents, got shape {x.shape}")
         batch, rows, columns, _ = x.shape
-        dense = {"use_bias": False, "dtype": self.dtype, "precision": self.precision}
+        dense = {"use_bias": False, "dtype": self.dtype, "precision": self.products}
         image = nn.Dense(self.features, name="x_embedder", **dense)(x.reshape(batch, rows * columns, -1))
         context = nn.Dense(self.features, name="context_embedder", **dense)(conditioning.context)
 
@@ -202,13 +202,13 @@ class Flux2Transformer(TextStream, nn.Module):
             features = sinusoidal_time(values, self.timestep_guidance_channels,
                                        dtype=at_least_fp32(self.dtype)).astype(image.dtype)
             return embedding(features, self.features, name, bias=False, dtype=self.dtype,
-                             precision=self.precision)
+                             precision=self.products)
 
         embedded = guided_time(embed, time, conditioning.guidance, guidance_embeds=self.guidance_embeds)
 
         def modulation(name: str):
             return Modulation(self.features, self.modulation_pieces[name], bias=False,
-                              dtype=self.dtype, precision=self.precision,
+                              dtype=self.dtype, precision=self.products,
                               name=name)(embedded)
 
         mods = (modulation("double_stream_modulation_img"), modulation("double_stream_modulation_txt"))
@@ -217,7 +217,7 @@ class Flux2Transformer(TextStream, nn.Module):
                              self.rope_theta, dtype=np.float64)
         rotation = tuple(jnp.asarray(table[None], at_least_fp32(image.dtype)) for table in tables)
         hidden = int(self.features * self.mlp_ratio)
-        block = {"epsilon": self.eps, "dtype": self.dtype, "precision": self.precision,
+        block = {"epsilon": self.eps, "dtype": self.dtype, "precision": self.products,
                  "attention_impl": self.attention_impl}
         for index in range(self.num_layers):
             image, context = DoubleStreamBlock(

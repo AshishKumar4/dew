@@ -23,6 +23,7 @@ from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
+from dew.nn.precision import Float32Products
 from dew.objectives.base import Variables
 from dew.registry import Record
 
@@ -75,7 +76,7 @@ class Gemma4ClippableLinear(nn.Dense):
         return clipped_linear(self, super().__call__, inputs, self.use_clipped_linears)
 
 
-class Gemma4VisionTransformer(nn.Module):
+class Gemma4VisionTransformer(Float32Products, nn.Module):
     """The Gemma 4 vision trunk, param layout of `Gemma4VisionConfig`.
 
     The processor supplies [B, patches, patch_pixels] and (x, y) position IDs
@@ -110,7 +111,7 @@ class Gemma4VisionTransformer(nn.Module):
                 f"({cfg.num_key_value_heads})")
         self.patch_embed = nn.Dense(
             cfg.hidden_size, use_bias=False, dtype=self.dtype,
-            precision=self.precision, name="patch_embed")
+            precision=self.products, name="patch_embed")
         self.position_table = self.param(
             "position_table", nn.initializers.normal(0.02),
             (2, cfg.position_embedding_size, cfg.hidden_size))
@@ -120,15 +121,15 @@ class Gemma4VisionTransformer(nn.Module):
                 emb_features=cfg.hidden_size, num_heads=cfg.num_heads, num_kv_heads=cfg.num_key_value_heads,
                 head_dim=head_dim, max_seq_len=cfg.position_embedding_size, causal=False, v_norm=True,
                 norm_eps=cfg.rms_norm_eps, attention_scale=1.0, rope_theta=cfg.rope_theta, dtype=self.dtype,
-                precision=self.precision),
+                precision=self.products),
             rotary_axes=(head_dim // 2, head_dim // 2), rotary_per_axis=True, linear=linear)
         mlp = functools.partial(
             GatedMLP, hidden_features=cfg.intermediate_size, out_features=cfg.hidden_size,
             activation="geglu" if cfg.hidden_act == "gelu_pytorch_tanh" else "geglu_exact", linear=linear,
-            dtype=self.dtype, precision=self.precision)
+            dtype=self.dtype, precision=self.products)
         self.layers = [
             DecoderBlock(attention, mlp, cfg.hidden_size, BlockWiring(output_norms=True),
-                         norm_eps=cfg.rms_norm_eps, dtype=self.dtype, precision=self.precision,
+                         norm_eps=cfg.rms_norm_eps, dtype=self.dtype, precision=self.products,
                          name=f"layers_{index}")
             for index in range(cfg.num_layers)]
         if cfg.standardize:
@@ -216,7 +217,7 @@ class Gemma4Vision(TowerBase):
         return TowerGeometry(patch_size=self.patch_size, block_size=self.pooling_kernel_size)
 
 
-class Gemma4ProjectorModule(nn.Module):
+class Gemma4ProjectorModule(Float32Products, nn.Module):
     """Soft tokens to text width: a scale-free RMS norm, then the map.
 
     The reference keeps this beside the tower (modeling_gemma4.py,
@@ -234,7 +235,7 @@ class Gemma4ProjectorModule(nn.Module):
                                 dtype=self.dtype, name="pre_norm")
         self.projection = nn.Dense(
             self.text_width, use_bias=False, dtype=self.dtype,
-            precision=self.precision, name="projection")
+            precision=self.products, name="projection")
 
     def __call__(self, image_features) -> jax.Array:
         return self.projection(self.pre_norm(image_features))

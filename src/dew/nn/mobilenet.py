@@ -19,6 +19,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.precision import Float32Products
+
 from .activations import gelu_tanh
 from .attention import RMSNorm, scaled_dot_product_attention
 from .blocks import torch_nearest_resize
@@ -72,7 +74,7 @@ def _timm_rms_norm(dtype: Dtype | None, name: str) -> RMSNorm:
     return RMSNorm(epsilon=1e-6, fp32_statistics=False, scale_after_cast=True, dtype=dtype, name=name)
 
 
-class MobileConvNormAct(nn.Module):
+class MobileConvNormAct(Float32Products, nn.Module):
     features: int
     kernel: int = 1
     stride: int = 1
@@ -87,7 +89,7 @@ class MobileConvNormAct(nn.Module):
     def __call__(self, x):
         x = _conv(self.features, self.kernel, stride=self.stride, groups=self.groups,
                   padding=self.padding, bias=self.bias, dtype=self.dtype,
-                  precision=self.precision, name="conv")(x)
+                  precision=self.products, name="conv")(x)
         x = _timm_rms_norm(self.dtype, "bn")(x)
         return gelu_tanh(x) if self.activate else x
 
@@ -153,7 +155,7 @@ _ARCHITECTURE = (
     ("pw_proj", "bn"): ("embed",),
     ("layer_scale",): ("embed",),
 })
-class MobileResidual(nn.Module):
+class MobileResidual(Float32Products, nn.Module):
     spec: _Block
     features: int
     padding: str = "same"
@@ -182,16 +184,16 @@ class MobileResidual(nn.Module):
             return MobileConvNormAct(
                 features, kernel, stride=stride, groups=groups(features) if grouped else 1,
                 padding=self.padding, activate=activate, dtype=self.dtype,
-                precision=self.precision, name=name)(value)
+                precision=self.products, name=name)(value)
 
         if spec.kind == "edge":
             x = _conv(middle, spec.middle_kernel, stride=spec.stride,
                       groups=groups(middle), padding=self.padding, dtype=self.dtype,
-                      precision=self.precision, name="conv_exp")(x)
+                      precision=self.products, name="conv_exp")(x)
             x = _timm_rms_norm(self.dtype, "bn1")(x)
             x = gelu_tanh(x)
             x = _conv(self.features, 1, padding=self.padding, dtype=self.dtype,
-                      precision=self.precision, name="conv_pwl")(x)
+                      precision=self.products, name="conv_pwl")(x)
             x = _timm_rms_norm(self.dtype, "bn2")(x)
         else:
             if spec.start_kernel:
@@ -213,7 +215,7 @@ class MobileResidual(nn.Module):
         return x
 
 
-class MobileKVProjection(nn.Module):
+class MobileKVProjection(Float32Products, nn.Module):
     features: int
     stride: int = 1
     padding: str = "same"
@@ -225,10 +227,10 @@ class MobileKVProjection(nn.Module):
         if self.stride > 1:
             x = _conv(x.shape[-1], 3, stride=self.stride, groups=x.shape[-1],
                       padding=self.padding, dtype=self.dtype,
-                      precision=self.precision, name="down_conv")(x)
+                      precision=self.products, name="down_conv")(x)
             x = _timm_rms_norm(self.dtype, "norm")(x)
         return _conv(self.features, 1, padding=self.padding, dtype=self.dtype,
-                     precision=self.precision, name="proj")(x)
+                     precision=self.products, name="proj")(x)
 
 
 # `MobileKVProjection` names its convolutions `proj`, which a router already
@@ -245,7 +247,7 @@ class MobileKVProjection(nn.Module):
     ("value", "proj"): (None, None, None, "kv"),
     ("output", "proj"): (None, None, None, "embed"),
 })
-class MobileMultiQueryAttention(nn.Module):
+class MobileMultiQueryAttention(Float32Products, nn.Module):
     spec: _Block
     features: int
     padding: str = "same"
@@ -258,24 +260,24 @@ class MobileMultiQueryAttention(nn.Module):
         batch, height, width, _ = x.shape
         spec = self.spec
         query = MobileKVProjection(spec.heads * spec.head_dim, dtype=self.dtype,
-                                    precision=self.precision, name="query")(x)
+                                    precision=self.products, name="query")(x)
         key = MobileKVProjection(spec.head_dim, stride=spec.kv_stride,
                                   padding=self.padding, dtype=self.dtype,
-                                  precision=self.precision, name="key")(x)
+                                  precision=self.products, name="key")(x)
         value = MobileKVProjection(spec.head_dim, stride=spec.kv_stride,
                                     padding=self.padding, dtype=self.dtype,
-                                    precision=self.precision, name="value")(x)
+                                    precision=self.products, name="value")(x)
         query = query.reshape(batch, height * width, spec.heads, spec.head_dim)
         key, value = (a.reshape(batch, -1, 1, spec.head_dim) for a in (key, value))
         out = scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.precision,
+            query, key, value, dtype=self.dtype, precision=self.products,
             implementation=self.attention_impl)
         out = out.reshape(batch, height, width, spec.heads * spec.head_dim)
         return MobileKVProjection(self.features, dtype=self.dtype,
-                                   precision=self.precision, name="output")(out)
+                                   precision=self.products, name="output")(out)
 
 
-class MobileAttention(nn.Module):
+class MobileAttention(Float32Products, nn.Module):
     spec: _Block
     features: int
     padding: str = "same"
@@ -291,7 +293,7 @@ class MobileAttention(nn.Module):
         x = _timm_rms_norm(self.dtype, "norm")(x)
         x = MobileMultiQueryAttention(
             self.spec, self.features, padding=self.padding, dtype=self.dtype,
-            precision=self.precision, attention_impl=self.attention_impl,
+            precision=self.products, attention_impl=self.attention_impl,
             name="attn")(x)
         if self.layer_scale is not None:
             x = MobileLayerScale(self.layer_scale, name="layer_scale")(x)
@@ -301,7 +303,7 @@ class MobileAttention(nn.Module):
         return x + shortcut
 
 
-class MobileStage(nn.Module):
+class MobileStage(Float32Products, nn.Module):
     index: int
     multiplier: float
     padding: str
@@ -322,18 +324,18 @@ class MobileStage(nn.Module):
             if spec.kind == "attention":
                 block = MobileAttention(
                     spec, features, padding=self.padding, layer_scale=self.layer_scale,
-                    drop_path=drop_path, dtype=self.dtype, precision=self.precision,
+                    drop_path=drop_path, dtype=self.dtype, precision=self.products,
                     attention_impl=self.attention_impl, name=f"blocks_{i}")
             else:
                 block = MobileResidual(
                     spec, features, group_size=self.group_size, padding=self.padding,
                     layer_scale=self.layer_scale, drop_path=drop_path, dtype=self.dtype,
-                    precision=self.precision, name=f"blocks_{i}")
+                    precision=self.products, name=f"blocks_{i}")
             x = block(x, train=train)
         return x
 
 
-class MobileMultiScaleFusion(nn.Module):
+class MobileMultiScaleFusion(Float32Products, nn.Module):
     resolution: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -346,7 +348,7 @@ class MobileMultiScaleFusion(nn.Module):
         x = jnp.concatenate(resized, axis=-1)
         x = MobileResidual(_Block("inverted", 2048, expansion=2), 2048,
                            layer_scale=None, noskip=True, dtype=self.dtype,
-                           precision=self.precision, name="ffn")(x)
+                           precision=self.products, name="ffn")(x)
         size = self.resolution
         if (height, width) != (size, size):
             if height % size or width % size:
@@ -387,7 +389,7 @@ class MobileNetV5:
     ("conv_stem", "bn"): ("embed",),
     ("msfa", "norm"): ("embed",),
 })
-class MobileNetV5Encoder(nn.Module):
+class MobileNetV5Encoder(Float32Products, nn.Module):
     """The mobilenetv5_300m_enc graph, built as its `construction` says.
 
     Strict GPU fp32 reference comparisons use precision=HIGHEST. The bf16
@@ -430,15 +432,15 @@ class MobileNetV5Encoder(nn.Module):
         stem = args.stem_size if fixed else _divisible(args.stem_size * args.channel_multiplier)
         x = MobileConvNormAct(stem, 3, stride=2, padding=args.pad_type,
                               bias=args.stem_bias, dtype=self.dtype,
-                              precision=self.precision, name="conv_stem")(x)
+                              precision=self.products, name="conv_stem")(x)
         features = [x] if 0 in self.selected else []
         for stage in range(4):
             x = MobileStage(stage, args.channel_multiplier, args.pad_type,
                             args.group_size, args.layer_scale_init_value,
-                            args.drop_path_rate, self.dtype, self.precision,
+                            args.drop_path_rate, self.dtype, self.products,
                             self.attention_impl, name=f"stages_{stage}")(x, train=train)
             if stage + 1 in self.selected:
                 features.append(x)
         x = MobileMultiScaleFusion(args.msfa_output_resolution, dtype=self.dtype,
-                                   precision=self.precision, name="msfa")(tuple(features))
+                                   precision=self.products, name="msfa")(tuple(features))
         return x.reshape(x.shape[0], -1, x.shape[-1])

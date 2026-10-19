@@ -14,7 +14,7 @@ from jax.typing import DTypeLike
 from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
-from .precision import at_least_fp32
+from .precision import Float32Products, at_least_fp32
 from .sharding import constrain, explicit_spec, whole_spec
 
 
@@ -94,7 +94,7 @@ def modulation(conditioning, features: int, pieces: int, *, name: str, silu: boo
         nn.silu(conditioning) if silu else conditioning)
 
 
-class Modulation(nn.Module):
+class Modulation(Float32Products, nn.Module):
     """Projects the conditioning as the source's `AdaLayerNormZero` family does: SiLU, then one linear
     layer (`modulation`, named `linear`).
 
@@ -122,7 +122,7 @@ class Modulation(nn.Module):
     @nn.compact
     def __call__(self, conditioning):
         projected = modulation(conditioning, self.features, self.pieces, name="linear", bias=self.bias,
-                               zero_init=self.zero_init, dtype=self.dtype, precision=self.precision)
+                               zero_init=self.zero_init, dtype=self.dtype, precision=self.products)
         return jnp.split(projected, self.pieces, axis=-1)
 
 
@@ -199,7 +199,7 @@ def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, 
     return jnp.concatenate([first, second], axis=-1)
 
 
-class TimeProjection(nn.Module):
+class TimeProjection(Float32Products, nn.Module):
     """Two dense layers with the activation after each."""
     features: int
     activation: Callable = jax.nn.gelu
@@ -213,7 +213,7 @@ class TimeProjection(nn.Module):
     @nn.compact
     def __call__(self, x):
         dense = partial(nn.DenseGeneral, self.features,
-                        dtype=self.dtype, precision=self.precision)
+                        dtype=self.dtype, precision=self.products)
         x = self.activation(dense()(x))
         return self.activation(dense()(x))
 
@@ -284,7 +284,7 @@ def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False)
     return jnp.einsum("oh,bhwc,pw->bopc", rows, x, columns, precision=jax.lax.Precision.HIGHEST)
 
 
-class Upsample(nn.Module):
+class Upsample(Float32Products, nn.Module):
     """Nearest-neighbour upsampling by `scale`, then a 3x3 convolution to `features`."""
     features: int
     scale: int
@@ -293,7 +293,7 @@ class Upsample(nn.Module):
 
     @nn.nowrap
     def _convolution(self, **scope):
-        return Conv(self.features, (3, 3), dtype=self.dtype, precision=self.precision, **scope)
+        return Conv(self.features, (3, 3), dtype=self.dtype, precision=self.products, **scope)
 
     @nn.nowrap
     def model_flops(self, lengths, input_features: int) -> float:
@@ -311,7 +311,7 @@ class Upsample(nn.Module):
         return self._convolution()(out)
 
 
-class Downsample(nn.Module):
+class Downsample(Float32Products, nn.Module):
     """A stride-2 3x3 convolution to `features`."""
     features: int
     dtype: Dtype | None = None
@@ -320,7 +320,7 @@ class Downsample(nn.Module):
     @nn.nowrap
     def _convolution(self, **scope):
         return Conv(self.features, (3, 3), strides=(2, 2), dtype=self.dtype,
-                    precision=self.precision, **scope)
+                    precision=self.products, **scope)
 
     @nn.nowrap
     def model_flops(self, lengths, input_features: int) -> float:
@@ -335,7 +335,7 @@ class Downsample(nn.Module):
         return self._convolution()(x)
 
 
-class ResidualBlock(nn.Module):
+class ResidualBlock(Float32Products, nn.Module):
     """Norm, activation, convolution, the projected time embedding added,
     norm, activation, convolution, plus the input (through a 1x1 convolution
     when the width changes). `norm_groups` of 0 swaps the group norms for
@@ -375,11 +375,11 @@ class ResidualBlock(nn.Module):
     @nn.compact
     def __call__(self, x: jax.Array, temb: jax.Array, *, train: bool = False):
         conv = partial(Conv, features=self.features, kernel_size=self.kernel_size,
-                       strides=(1, 1), dtype=self.dtype, precision=self.precision)
+                       strides=(1, 1), dtype=self.dtype, precision=self.products)
         out = conv(name="conv1")(self.norm1(x))
 
         temb = nn.DenseGeneral(features=self.features, name="temb_projection",
-                               dtype=self.dtype, precision=self.precision)(temb)
+                               dtype=self.dtype, precision=self.products)(temb)
         out = out + temb[:, None, None, :]
 
         out = self.norm2(out)

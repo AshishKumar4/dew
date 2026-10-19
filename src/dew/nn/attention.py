@@ -44,10 +44,12 @@ from .kernels.generation import (
 )
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
+    Float32Products,
     asks_default_precision,
     at_default_precision,
     at_least_fp32,
-    bf16_operand_precision,
+    float32_products,
+    operand_precision,
     rounded_to,
 )
 from .rope import rotate
@@ -284,7 +286,7 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
     scale = 1.0 / math.sqrt(query.shape[-1])
     logits = jnp.einsum('...qhd,...khd->...hqk',
                         query.astype(jnp.float32) * jnp.asarray(scale, jnp.float32),
-                        key.astype(jnp.float32))
+                        key.astype(jnp.float32), precision=operand_precision(jnp.float32))
     if bias is not None:
         logits = logits + bias.astype(jnp.float32)
     combined = combined_attention_mask(
@@ -1470,7 +1472,7 @@ def folded_attention(query, key, value, mask=None):
     batch, positions, heads, width = query.shape
     keys = key.shape[-3]
     wide = jnp.promote_types(query.dtype, jnp.float32)
-    precision = bf16_operand_precision(query.dtype)
+    precision = operand_precision(query.dtype)
     logits = jnp.einsum('bxd,byd->bxy', query.reshape(batch, positions * heads, width),
                         key.reshape(batch, keys * heads, width), precision=precision,
                         preferred_element_type=wide)
@@ -1483,7 +1485,8 @@ def folded_attention(query, key, value, mask=None):
     # Each query head's probabilities over its own head's keys, zeros elsewhere.
     spread = jnp.moveaxis(probs, 3, 2)[..., None] * jnp.eye(heads, dtype=probs.dtype)[:, None, :]
     out = jnp.einsum('bxy,byd->bxd', spread.reshape(batch, positions * heads, keys * heads),
-                     value.reshape(batch, keys * heads, value.shape[-1]))
+                     value.reshape(batch, keys * heads, value.shape[-1]),
+                     precision=float32_products(value.dtype))
     return out.reshape(batch, positions, heads, value.shape[-1])
 
 
@@ -2153,7 +2156,7 @@ def projected_output(attended, name: str, features: int, *, flat: bool, bias: bo
     ("to_v",): ("embed", "heads", "head_dim"),
     ("to_out_0",): ("heads", "head_dim", "embed"),
 })
-class NormalAttention(nn.Module):
+class NormalAttention(Float32Products, nn.Module):
     """Attend over a `[B, S, C]` or `[B, H, W, C]` input with multiple heads.
 
     `freqs_cis` rotates the queries and keys of a self-attention call;
@@ -2205,7 +2208,7 @@ class NormalAttention(nn.Module):
         projected = projected_heads(
             x, name, self.heads, self.dim_head, flat=False,
             bias=self.use_bias if self.qkv_bias is None else self.qkv_bias, dtype=self.dtype,
-            precision=self.precision,
+            precision=self.products,
             norm=RMSNorm(epsilon=1e-6, dtype=self.dtype, name=norm) if norm and self.qk_norm else None)
         return constrain(projected, HEADS)
 
@@ -2232,17 +2235,17 @@ class NormalAttention(nn.Module):
             key = rotate(key, freqs_cos, freqs_sin)
 
         hidden_states = scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.precision,
+            query, key, value, dtype=self.dtype, precision=self.products,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=self.attention_impl, mask=mask, key_value_seq_lengths=key_value_seq_lengths,
             segment_ids=segment_ids, key_segment_ids=key_segment_ids, max_segments=max_segments,
         )
         proj = projected_output(constrain(hidden_states, HEADS), "to_out_0", self.query_dim, flat=False,
-                                bias=self.use_bias, dtype=self.dtype, precision=self.precision)
+                                bias=self.use_bias, dtype=self.dtype, precision=self.products)
         return proj.reshape(orig_x_shape)
 
 
-class FlaxGEGLU(nn.Module):
+class FlaxGEGLU(Float32Products, nn.Module):
     """Project to twice the hidden width, then gate one half by the other.
 
     The gate is GELU, the gated linear unit of Shazeer 2020
@@ -2265,7 +2268,7 @@ class FlaxGEGLU(nn.Module):
         return projection_flops(lengths, *self.projections()["proj"])
 
     def setup(self):
-        self.proj = nn.Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision)
+        self.proj = nn.Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.products)
 
     def __call__(self, hidden_states):
         hidden_states = self.proj(hidden_states)
@@ -2274,7 +2277,7 @@ class FlaxGEGLU(nn.Module):
 
 
 @logical_axes({("net_0", "proj"): ("embed", "mlp"), ("net_2",): ("mlp", "embed")})
-class FlaxFeedForward(nn.Module):
+class FlaxFeedForward(Float32Products, nn.Module):
     """Run GEGLU then a linear layer back to `dim`, as diffusers does.
 
     The checkpoint keys `net_0` and `net_2` are the indices the reference's
@@ -2300,9 +2303,9 @@ class FlaxFeedForward(nn.Module):
 
     def setup(self):
         self.net_0 = FlaxGEGLU(
-            self.dim, dtype=self.dtype, precision=self.precision, approximate=self.approximate_gelu
+            self.dim, dtype=self.dtype, precision=self.products, approximate=self.approximate_gelu
         )
-        self.net_2 = nn.Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.precision)
+        self.net_2 = nn.Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.products)
         self.dropout_layer = nn.Dropout(self.dropout)
 
     def __call__(self, hidden_states, *, train: bool = False):
@@ -2312,7 +2315,7 @@ class FlaxFeedForward(nn.Module):
         return self.net_2(hidden_states)
 
 
-class BasicTransformerBlock(nn.Module):
+class BasicTransformerBlock(Float32Products, nn.Module):
     """Run self-attention, cross-attention over `context`, then feed-forward.
 
     Each is pre-normed with a residual. `use_cross_only` drops the
@@ -2348,7 +2351,7 @@ class BasicTransformerBlock(nn.Module):
             query_dim=self.query_dim,
             heads=self.heads,
             dim_head=self.dim_head,
-            precision=self.precision,
+            precision=self.products,
             use_bias=self.use_bias,
             dtype=self.dtype,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
@@ -2357,7 +2360,7 @@ class BasicTransformerBlock(nn.Module):
         self.attention1 = attention(name='Attention1')
         self.attention2 = attention(name='Attention2')
 
-        self.ff = FlaxFeedForward(dim=self.query_dim, dtype=self.dtype, precision=self.precision)
+        self.ff = FlaxFeedForward(dim=self.query_dim, dtype=self.dtype, precision=self.products)
         self.norm1 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
         self.norm2 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
         self.norm3 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
@@ -2416,7 +2419,7 @@ def stage_attention(stage: Stage, channels: int, attention_impl: str, dtype: Dty
         name=name)
 
 
-class TransformerBlock(nn.Module):
+class TransformerBlock(Float32Products, nn.Module):
     """Run a `BasicTransformerBlock`, optionally at its own head width.
 
     `use_projection` puts a dense projection into and out of
@@ -2456,7 +2459,7 @@ class TransformerBlock(nn.Module):
             x = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(x)
 
         def project(features: int, name: str):
-            return nn.Dense(features=features, use_bias=False, precision=self.precision,
+            return nn.Dense(features=features, use_bias=False, precision=self.products,
                             dtype=self.dtype, name=name)
 
         if self.use_projection:
@@ -2469,7 +2472,7 @@ class TransformerBlock(nn.Module):
             heads=self.heads,
             dim_head=self.dim_head,
             name='Attention',
-            precision=self.precision,
+            precision=self.products,
             use_bias=False,
             dtype=self.dtype,
             use_cross_only=(not self.use_self_and_cross),

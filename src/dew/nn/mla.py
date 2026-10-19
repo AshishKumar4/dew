@@ -44,7 +44,7 @@ from dew.nn.kv_cache import KVCache, write_cache
 # contracts from base avoids importing the kind hub back during this module's
 # initialization, so either kind can be the first imported.
 from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import Float32Products, at_least_fp32, float32_products
 from dew.nn.rope import YarnScaling, deinterleaved, rotate, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
@@ -122,7 +122,8 @@ def indexer_kl(scores, query, key, keep, scale: float):
 
     def head(summed, projections):
         q, k = projections
-        logits = jnp.where(keep, jnp.einsum('bsd,btd->bst', q, k), masked)
+        product = jnp.einsum('bsd,btd->bst', q, k, precision=float32_products(q.dtype))
+        logits = jnp.where(keep, product, masked)
         return summed + jax.nn.softmax(logits, axis=-1), None
 
     summed, _ = jax.lax.scan(
@@ -148,7 +149,7 @@ def _rotate(interleave: bool, part, freqs_cos, freqs_sin):
     # Maps the hidden states onto one weight per indexer head.
     ("weights_proj",): ("embed", "index"),
 })
-class SparseIndexer(nn.Module):
+class SparseIndexer(Float32Products, nn.Module):
     """DeepSeek sparse attention's lightning indexer: a score per query and key.
 
     `modeling_deepseek_v32.DeepseekV32Indexer`: `wq_b` reads the query residual,
@@ -175,7 +176,7 @@ class SparseIndexer(nn.Module):
                 f"out of heads of width {self.head_dim}, so the heads have "
                 "to be wider")
         dense = functools.partial(
-            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.products)
         self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
         self.wk = dense(self.head_dim, name='wk')
         # A LayerNorm with weight and bias at a hardcoded 1e-6: the reference
@@ -214,7 +215,7 @@ class SparseIndexer(nn.Module):
         q_rot, q_pass = jnp.split(query, [self.rope_head_dim], axis=-1)
         query = jnp.concatenate(
             [_rotate(self.rope_interleave, q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
-        return index_scores(query, keys, self.weights_proj(hidden), self.precision)
+        return index_scores(query, keys, self.weights_proj(hidden), self.products)
 
     def select(self, scores, keep):
         """The top-k keys of each query among those `keep` allows, as
@@ -235,7 +236,7 @@ class SparseIndexer(nn.Module):
     ("q_a_layernorm",): ("qlora",),
     ("kv_a_layernorm",): ("kvlora",),
 })
-class MultiHeadLatentAttention(nn.Module):
+class MultiHeadLatentAttention(Float32Products, nn.Module):
     """DeepSeek's multi-head latent attention, dense or sparse.
 
     decode=True runs against the cache like the standard mixer; `positions` and
@@ -327,7 +328,7 @@ class MultiHeadLatentAttention(nn.Module):
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         dense = functools.partial(
             nn.Dense, use_bias=self.attention_bias, dtype=self.dtype,
-            precision=self.precision)
+            precision=self.products)
         norm = functools.partial(
             RMSNorm, epsilon=self.norm_eps,
             scale_offset=self.scale_offset,
@@ -337,24 +338,24 @@ class MultiHeadLatentAttention(nn.Module):
             # attention_bias says; only the low-rank projections do.
             self.q_proj = nn.Dense(
                 self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
-                precision=self.precision, name='q_proj')
+                precision=self.products, name='q_proj')
         else:
             self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
             self.q_a_layernorm = norm(name='q_a_layernorm')
             self.q_b_proj = nn.Dense(
                 self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
-                precision=self.precision, name='q_b_proj')
+                precision=self.products, name='q_b_proj')
         self.kv_a_proj_with_mqa = dense(
             self.kv_lora_rank + self.qk_rope_head_dim, name='kv_a_proj_with_mqa')
         self.kv_a_layernorm = norm(name='kv_a_layernorm')
         self.kv_b_proj = nn.Dense(
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            use_bias=False, dtype=self.dtype, precision=self.precision,
+            use_bias=False, dtype=self.dtype, precision=self.products,
             name='kv_b_proj')
         self.o_proj = dense(self.emb_features, name='o_proj')
         if self.output_gate:
             self.g_proj = nn.Dense(self.num_heads * self.v_head_dim, use_bias=False,
-                                   dtype=self.dtype, precision=self.precision, name='g_proj')
+                                   dtype=self.dtype, precision=self.products, name='g_proj')
         if self.index_n_heads is not None and self.index_head_dim is not None:
             if self.q_lora_rank is None:
                 raise ValueError(
@@ -369,7 +370,7 @@ class MultiHeadLatentAttention(nn.Module):
             n_heads=self.index_n_heads, head_dim=self.index_head_dim,
             rope_head_dim=self.qk_rope_head_dim, top_k=self.index_topk,
             rope_interleave=self.index_rope_interleave,
-            dtype=self.dtype, precision=self.precision, name=INDEXER)
+            dtype=self.dtype, precision=self.products, name=INDEXER)
 
     @property
     def indexed(self) -> bool:
@@ -573,7 +574,7 @@ class MultiHeadLatentAttention(nn.Module):
             # kernel, the way the standard mixer's own masks do. Decoding
             # runs no backward pass, so its cache mask keeps the fused path.
             implementation = kernel_for_materialized_mask(
-                implementation, query, key, dtype=self.dtype, precision=self.precision)
+                implementation, query, key, dtype=self.dtype, precision=self.products)
         if objective is not None:
             self._sow_indexer_kl(*objective, query, key)
         # The per-head maxima the QK-Clip reads, with the nope width the
@@ -585,7 +586,7 @@ class MultiHeadLatentAttention(nn.Module):
                 query, key, causal=causal, mask=mask))
             self.sow("qk", "qk_nope", jnp.asarray(self.qk_nope_head_dim))
         attention = scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.precision,
+            query, key, value, dtype=self.dtype, precision=self.products,
             implementation=implementation, causal=causal, mask=mask)
         return self._output(attention, x)
 
@@ -698,7 +699,7 @@ class MultiHeadLatentAttention(nn.Module):
             q_pass * scale if scale != 1.0 else q_pass,
             q_rot * scale if scale != 1.0 else q_rot,
             latent, rot, key_weight, value_weight, selection,
-            scale=1.0 / math.sqrt(nope + self.qk_rope_head_dim), precision=self.precision)
+            scale=1.0 / math.sqrt(nope + self.qk_rope_head_dim), precision=self.products)
 
     def _output(self, attention, x):
         """o_proj over the heads' context, gated by `x` under `output_gate`."""

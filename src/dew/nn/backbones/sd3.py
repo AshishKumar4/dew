@@ -26,7 +26,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import Float32Products, at_least_fp32
 from dew.nn.scan_orders import unpatchify
 from dew.nn.sharding import logical_axes
 
@@ -67,7 +67,7 @@ def sincos_position(channels: int, grid: int, *, base_size: int):
 
 @logical_axes({("context_embedder",): (None, "embed"), ("proj_out",): ("embed", None),
                **embedding_axes("timestep_embedder", "text_embedder")})
-class SD3Transformer(TextStream, nn.Module):
+class SD3Transformer(TextStream, Float32Products, nn.Module):
     """Runs Diffusers 0.34.0's `SD3Transformer2DModel` behind Dew's model interface.
 
     `__call__` takes NHWC latents, the model time and a `DenoisingCondition`,
@@ -139,7 +139,7 @@ class SD3Transformer(TextStream, nn.Module):
 
     @nn.nowrap
     def _output_modulation(self):
-        return Modulation(self.features, 2, dtype=self.dtype, precision=self.precision, name="norm_out")
+        return Modulation(self.features, 2, dtype=self.dtype, precision=self.products, name="norm_out")
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
@@ -162,7 +162,7 @@ class SD3Transformer(TextStream, nn.Module):
             raise ValueError("SD3 conditioning needs the pooled text vector")
         if self.qk_norm not in (None, "rms_norm"):
             raise ValueError(f"Native SD3 implements qk_norm 'rms_norm', not {self.qk_norm!r}")
-        dense = {"dtype": self.dtype, "precision": self.precision}
+        dense = {"dtype": self.dtype, "precision": self.products}
         image = Conv(self.features, (patch, patch), strides=(patch, patch), padding="VALID",
                      name="pos_embed_proj", **dense)(x)
         image = image.reshape(image.shape[0], rows * columns, self.features)

@@ -40,7 +40,7 @@ from dew.nn.attention import (
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import Float32Products, at_least_fp32
 from dew.nn.rope import axis_tables, rotate
 from dew.nn.sharding import logical_axes
 
@@ -67,7 +67,7 @@ def wan_rotation(frames: int, rows: int, columns: int, head_dim: int, *,
 @logical_axes({(module, name): axes for module in ("attn1", "attn2")
                for name, axes in (*(((name), ("embed", None)) for name in ("to_q", "to_k", "to_v")),
                                   ("to_out_0", (None, "embed")))})
-class WanAttention(nn.Module):
+class WanAttention(Float32Products, nn.Module):
     """Runs the source's `Attention` under `WanAttnProcessor2_0`, for text-to-video.
 
     Queries come from the video tokens. Keys and values come from `context`
@@ -103,7 +103,7 @@ class WanAttention(nn.Module):
         # Diffusers' `RMSNorm` rounds the normalized row to the weight's
         # dtype before it scales.
         return projected_heads(x, name, self.heads, self.head_dim, flat=True, dtype=self.dtype,
-                               precision=self.precision, across_heads=True,
+                               precision=self.products, across_heads=True,
                                norm=RMSNorm(epsilon=self.epsilon, scale_after_cast=True, dtype=self.dtype,
                                             name=norm) if norm and self.qk_norm else None)
 
@@ -117,12 +117,12 @@ class WanAttention(nn.Module):
             # The source rotates in float64 and rounds once to its dtype.
             query, key = (rotate(part, *rotation, pairs="adjacent") for part in (query, key))
         attended = scaled_dot_product_attention(query, key, value, implementation=self.attention_impl,
-                                                precision=self.precision)
+                                                precision=self.products)
         return projected_output(attended, "to_out_0", self.heads * self.head_dim, flat=True, dtype=self.dtype,
-                                precision=self.precision)
+                                precision=self.products)
 
 
-class WanBlock(nn.Module):
+class WanBlock(Float32Products, nn.Module):
     """Runs `WanTransformerBlock`: modulated self-attention, cross-attention to the text, and a feed-forward.
 
     The cross-attention reads the text through its own affine norm
@@ -145,13 +145,13 @@ class WanBlock(nn.Module):
     @nn.nowrap
     def _attention(self, name=None):
         return WanAttention(self.heads, self.features // self.heads, qk_norm=self.qk_norm,
-                            epsilon=self.epsilon, dtype=self.dtype, precision=self.precision,
+                            epsilon=self.epsilon, dtype=self.dtype, precision=self.products,
                             attention_impl=self.attention_impl, name=name)
 
     @nn.nowrap
     def _feed_forward(self, name=None):
         return GatedMLP(self.ffn_dim, self.features, activation="gelu", use_bias=True, dtype=self.dtype,
-                        precision=self.precision, name=name)
+                        precision=self.products, name=name)
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -188,7 +188,7 @@ class WanBlock(nn.Module):
 @logical_axes({("text_embedder_linear_1",): (None, "embed"), ("text_embedder_linear_2",): (None, "embed"),
                ("time_embedder_linear_1",): (None, "embed"), ("time_embedder_linear_2",): (None, "embed"),
                ("patch_embedding_3d",): (None, None, None, None, "embed"), ("proj_out",): ("embed", None)})
-class WanTransformer(nn.Module):
+class WanTransformer(Float32Products, nn.Module):
     """Runs Diffusers 0.34.0's `WanTransformer3DModel` for text-to-video, behind Dew's model interface.
 
     `__call__` takes a clip's latent `[B, F, H, W, C]`, the model time the
@@ -233,7 +233,7 @@ class WanTransformer(nn.Module):
 
     @nn.nowrap
     def _modulation(self):
-        return Modulation(self.features, 6, dtype=self.dtype, precision=self.precision, name="time_proj")
+        return Modulation(self.features, 6, dtype=self.dtype, precision=self.products, name="time_proj")
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -280,7 +280,7 @@ class WanTransformer(nn.Module):
         if max(grid) > self.rope_max_seq_len:
             raise ValueError(f"A {grid} patch grid runs past the rotary table's "
                              f"{self.rope_max_seq_len} positions")
-        dense = {"dtype": self.dtype, "precision": self.precision}
+        dense = {"dtype": self.dtype, "precision": self.products}
         wide = at_least_fp32(self.dtype)
 
         # The source's `patch_embedding`; CLIP's vision tower holds a 2-D
@@ -292,7 +292,7 @@ class WanTransformer(nn.Module):
         # in the model's dtype, and one projection of it into six pieces.
         sinusoids = sinusoidal_time(time, self.freq_dim, dtype=wide)
         embedded = embedding(sinusoids, self.features, "time_embedder", dtype=wide,
-                             precision=self.precision).astype(tokens.dtype)
+                             precision=self.products).astype(tokens.dtype)
         modulation = jnp.stack(self._modulation()(embedded), axis=1)
         context = embedding(conditioning.context, self.features, "text_embedder",
                             activation=lambda hidden: nn.gelu(hidden, approximate=True), **dense)

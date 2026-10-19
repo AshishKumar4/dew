@@ -136,12 +136,12 @@ class UViT(_TransformerOptions):
         maps = self.projections()
         def dense(name, **options):
             key = 'skip_linear' if name.startswith('skip_linear_') else name
-            return nn.Dense(maps[key][1], dtype=self.dtype, precision=self.precision, name=name, **options)
+            return nn.Dense(maps[key][1], dtype=self.dtype, precision=self.products, name=name, **options)
         if self.scan_order == "hilbert":
             self.hilbert_proj = dense("hilbert_projection")
         else:
             self.patch_embed = PatchEmbedding(patch_size=self.patch_size, embedding_dim=self.emb_features,
-                                              dtype=self.dtype, precision=self.precision, name="patch_embed")
+                                              dtype=self.dtype, precision=self.products, name="patch_embed")
         patches = (self.image_size // self.patch_size) ** 2
         self.pos_embed = self.param("pos_embed", nn.initializers.truncated_normal(0.02),
                                     (1, 1 + self.text_tokens + patches, self.emb_features))
@@ -162,7 +162,7 @@ class UViT(_TransformerOptions):
 
     def _final_layer(self, **scope):
         return Conv(self.output_channels, (3, 3), padding="SAME", dtype=self.dtype,
-                    precision=self.precision, **scope)
+                    precision=self.products, **scope)
 
     def __call__(self, x, temb, textcontext=None, train: bool = False):
         _, H, W, _ = x.shape
@@ -266,14 +266,14 @@ class SimpleUDiT(RematLadder, _TransformerOptions):
             patch_size=self.patch_size,
             embedding_dim=self.emb_features,
             dtype=self.dtype,
-            precision=self.precision,
+            precision=self.products,
             name="patch_embed"
         )
         if self.scan_order == "hilbert":
             self.hilbert_proj = nn.Dense(
                 features=self.projections()['hilbert_projection'][1],
                 dtype=self.dtype,
-                precision=self.precision,
+                precision=self.products,
                 name="hilbert_projection"
             )
         self.conditioning = self._conditioning(self.emb_features, text_pooling=self.text_pooling)
@@ -285,7 +285,7 @@ class SimpleUDiT(RematLadder, _TransformerOptions):
             nn.DenseGeneral(
                 features=self.projections()['up_dense'][1],
                 dtype=self.dtype,
-                precision=self.precision,
+                precision=self.products,
                 name=f"up_dense_{i}"
             ) for i in range(half_layers)
         ]
