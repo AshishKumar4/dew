@@ -74,6 +74,41 @@ def test_an_eager_translation_swaps_kernels_in_tiles_as_the_strided_copy_does(dt
         assert leaf.shape == expected.shape and leaf.tobytes() == expected.tobytes(), name
 
 
+@pytest.mark.parametrize("copy", ["equal", "rounds alike", "differs"])
+def test_an_eager_and_a_streamed_binding_bind_aliases_alike(copy):
+    """Two source names that fill one leaf (a tied embedding stored twice) bind alike eagerly
+    (`translate_parameters`) and through the streamed binding (`record_layouts`): equal copies
+    bind once, each name keeping its layout, and copies that differ are refused before the
+    storage cast, even where they round to the same bf16."""
+    import ml_dtypes
+
+    from dew.interop.weights import placed, record_layouts
+
+    rng = np.random.default_rng(3)
+    # bf16 values, which a relative change of 2^-12, under half their spacing, leaves where they are.
+    first = rng.standard_normal((16, 8)).astype(ml_dtypes.bfloat16).astype(np.float32)
+    second = {"equal": first, "rounds alike": first * np.float32(1 + 2 ** -12), "differs": first + 1}[copy]
+    assert copy != "rounds alike" or np.array_equal(first.astype(ml_dtypes.bfloat16),
+                                                    second.astype(ml_dtypes.bfloat16))
+    tensors = {"embed": first, "lm_head": second, "norm": rng.standard_normal(8).astype(np.float32)}
+
+    def path_of(name):
+        return ("params", "norm", "scale") if name == "norm" else ("params", "embed", "embedding")
+
+    bindings = (lambda: placed(tensors, path_of, "bfloat16"),
+                lambda: record_layouts("", tensors, path_of, (), param_dtype="bfloat16"))
+    if copy != "equal":
+        for bind in bindings:
+            with pytest.raises(ValueError):
+                bind()
+        return
+    (eager, eager_layouts), (streamed, streamed_layouts) = (bind() for bind in bindings)
+    assert eager_layouts == streamed_layouts
+    assert sorted(layout.name for layout in eager_layouts) == ["embed", "lm_head", "norm"]
+    for ours, theirs in zip(jax.tree.leaves(eager), jax.tree.leaves(streamed), strict=True):
+        assert ours.dtype == theirs.dtype and ours.tobytes() == theirs.tobytes()
+
+
 @pytest.mark.parametrize("transposed", [True, False])
 def test_concatenated_projections_read_only_the_requested_columns_in_storage_precision(transposed):
     """A shard can start inside Q and cross K/V, with no concatenated host model."""
