@@ -269,10 +269,10 @@ def assert_leaves_as_exact(dew, reference, truth, *, terms=None, rows: bool = Tr
     assert not over, "\n".join(over)
 
 
-def _batch(draw, stage: int, terms, rows: bool) -> tuple[dict, dict, list, list, dict]:
+def _batch(draw, stage: int, terms, rows: bool) -> tuple[object, dict, list, list, dict]:
     """Batch `stage` of ORDERS draws (`assert_leaves_as_exact_over_orders`), orders `stage` ORDERS on:
-    each leaf's absolute distance from float64 at every element summed over them, Dew's by the leaf's
-    path and each reference member's by member and path; each order's RMS distance of each leaf, and,
+    each leaf's absolute distance from float64 at every element summed over them, Dew's in Dew's tree
+    and each reference member's so, by member; each order's RMS distance of each leaf, and,
     where `rows`, of each row (`row_errors`), Dew's and each member's; and each leaf's row sizes, from
     the batch's first truth and `terms`."""
     dew_sums, member_sums, leaves, row_distances, sizes = {}, {}, [], [], {}
@@ -303,7 +303,12 @@ def _batch(draw, stage: int, terms, rows: bool) -> tuple[dict, dict, list, list,
                                               for member, leaf in theirs.items()})
         leaves.append(at_order)
         row_distances.append(rows_at_order)
-    return dew_sums, member_sums, leaves, row_distances, sizes
+    # The sums in Dew's own tree, so the element rule names each leaf by its path.
+    structure, names = jax.tree.structure(dew), list(dew_sums)
+    return (jax.tree.unflatten(structure, [dew_sums[name] for name in names]),
+            {member: jax.tree.unflatten(structure, [sums[name] for name in names])
+             for member, sums in member_sums.items()},
+            leaves, row_distances, sizes)
 
 
 def assert_leaves_as_exact_over_orders(draw, label: str, *, terms=None, rows: bool = True) -> dict:

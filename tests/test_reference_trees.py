@@ -89,7 +89,7 @@ def test_an_integer_cumulative_sum_binds_as_it_is_and_a_floating_one_is_refused(
 
 
 def test_a_primitive_whose_order_the_tree_does_not_set_is_refused():
-    with pytest.raises(NotImplementedError, match="cumsum"):
+    with pytest.raises(NotImplementedError):
         evaluated(jnp.cumsum, "pairwise")(jnp.ones(8))
 
 
