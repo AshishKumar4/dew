@@ -406,11 +406,43 @@ def test_a_streamed_mix_refuses_a_kept_nested_member_whose_order_changed():
     """A member that is itself a mix keeps its order whole: one whose limit moved from an inner
     member to the inner mix, reading the same sources through the same steps, is refused when the
     outer weights change too, as its saved position counts other rows."""
-    limited_inside = mix([corpus("a", 0).take(5), corpus("b", 1)]).named("inner")
-    limited_outside = mix([corpus("a", 0), corpus("b", 1)]).take(5).named("inner")
+    def leaf(name, source):
+        return Pipeline(roled(source, 6, 2, count=8), name=name)
+
+    # The same steps either way, a limit of five; only where it sits differs.
+    limited_inside = mix([leaf("a", 0).take(5), leaf("b", 1)]).named("inner")
+    limited_outside = mix([leaf("a", 0), leaf("b", 1)]).take(5).named("inner")
     _, saved = member_rows([limited_inside, corpus("c", 2)])
     with pytest.raises(ValueError):
         member_rows([limited_outside, corpus("c", 2)], weights=[1, 2], saved=saved)
+
+
+@pytest.mark.parametrize("read", ["streamed", "memory"])
+def test_two_members_of_one_source_keep_their_own_caches_when_one_leaves(read):
+    """Two members may read one source, one of them through a cache: each member's digest holds its
+    own caches, so the one that stays resumes when the other leaves."""
+    shared = roled(0, 6, 2, count=8)
+    cached = Pipeline(shared, name="cached").cache(Cache(f"memory://{uuid4().hex}")).repeat()
+    plain = Pipeline(shared, name="plain").repeat()
+
+    def rows(members, saved=None):
+        data = compile(mix(members).batch(2), read=read, loading=READ, seed=5)
+        stream = data.train(DataPartition())
+        try:
+            if saved is not None:
+                stream.set_state(saved)
+            next(stream)
+            return stream.get_state()
+        finally:
+            stream.close()
+
+    saved = rows([cached, plain])
+    if read == "memory":
+        # A memory read is a global order, which keeps no member by key: the edit is refused.
+        with pytest.raises(ValueError):
+            rows([cached], saved)
+    else:
+        rows([cached], saved)
 
 
 def test_a_memory_mix_with_a_member_that_accepts_no_row_compiles_and_reads_the_others():
