@@ -372,15 +372,9 @@ class Adapter:
             _insert(merged, ("params", *site, "kernel"), _base_kernel(variables, ("params", *site)))
         for path, target in self.targets.items():
             node = _node(variables, path)
-            kernel, a, b = _base_kernel(variables, path), node["lora_A"], node["lora_B"]
-            dtype = jnp.promote_types(kernel.dtype, jnp.float32)
-            delta = jnp.tensordot(a.astype(dtype), b.astype(dtype), axes=1,
-                                  precision=jax.lax.Precision.HIGHEST)
-            _insert(
-                merged,
-                (*path, "kernel"),
-                (kernel.astype(dtype) + self.scale(target) * delta).astype(kernel.dtype),
-            )
+            kernel = _updated(_base_kernel(variables, path), node["lora_A"], node["lora_B"],
+                              self.scale(target))
+            _insert(merged, (*path, "kernel"), kernel)
         dropped = ({(*path, factor) for path in self.targets for factor in FACTORS}
                    | {(QUANTIZATION, *site, leaf) for site in coded for leaf in FROZEN_FP8})
         return select(overlay(variables, merged), lambda path: path not in dropped)
@@ -441,6 +435,14 @@ def _scale(target: Target, rslora: bool) -> float:
     return target.alpha / (math.sqrt(target.rank) if rslora else target.rank)
 
 
+def _updated(kernel: jax.Array, a: jax.Array, b: jax.Array, scale: float) -> jax.Array:
+    """`kernel` plus `scale` times the factors' product, summed in at least fp32 at full precision
+    and stored in the kernel's dtype, as PEFT's `merge_and_unload` does."""
+    dtype = jnp.promote_types(kernel.dtype, jnp.float32)
+    delta = jnp.tensordot(a.astype(dtype), b.astype(dtype), axes=1, precision=jax.lax.Precision.HIGHEST)
+    return (kernel.astype(dtype) + scale * delta).astype(kernel.dtype)
+
+
 def _target_at(targets: Mapping[Path, Target], path: Path) -> Target | None:
     """Return the target a module path names, seen through the stack that runs
     it: a scanned run's module `layers_3_7` stands for layers 3 through 7,
@@ -483,6 +485,18 @@ class _Branch:
             return next_fun(*args, **kwargs) or bool(
                 self.dropout and module.has_rng("dropout")
                 and _target_at(self.targets, root + module.path + (name,)) is not None)
+        if context.method_name == "applied_kernel":
+            # A model asks for the kernel its submodule multiplies by
+            # (`CausalTransformer.applied_kernel`): a target's carries the
+            # branch's update, as `LoRA.merge` sums it.
+            name = args[0] if args else kwargs["name"]
+            kernel = next_fun(*args, **kwargs)
+            target = _target_at(self.targets, root + module.path + (name,))
+            if target is None:
+                return kernel
+            child = getattr(module, name)
+            a, b = child.get_variable("params", "lora_A"), child.get_variable("params", "lora_B")
+            return _updated(kernel, a, b, _scale(target, self.rslora))
         target = _target_at(self.targets, root + module.path) if context.method_name == "__call__" else None
         if target is None:
             return next_fun(*args, **kwargs)

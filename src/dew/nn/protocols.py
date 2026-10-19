@@ -383,6 +383,17 @@ class AffineHead(Protocol):
 
 
 @runtime_checkable
+class VocabularyRows(Protocol):
+    """A model whose head scores its final states against one row per vocabulary token: each
+    token's `[vocab, features]` row as `OutputTable.rows` gives it, read from the bound variables,
+    where no matrix alone is the head too (an `AffineHead` returning None): past a nonlinear head
+    transform the matrix's rows, with an adapter on the head its rows as the adapter updates them.
+    A reader of tokens' vectors, a decision head's lexical prior, takes these."""
+
+    def vocabulary_rows(self) -> jax.Array: ...
+
+
+@runtime_checkable
 class QuantizesInputs(Protocol):
     """A model computing under a checkpoint's input quantization
     (`dew.training.quantization.InputQuantization`): the quantizer a bound

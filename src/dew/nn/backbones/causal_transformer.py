@@ -2217,12 +2217,29 @@ class CausalTransformer(nn.Module):
         head = None if self.tie_embeddings else self.lm_head.variables.get("params", {})
         if self.head_transform is not None or (head is not None and set(head) != {"kernel"}):
             return None
-        matrix = self.embed_tokens.embedding if head is None else head["kernel"]
+        return self._head_table()
+
+    def vocabulary_rows(self) -> jax.Array:
+        """Each vocabulary token's `[features]` row of the head (`OutputTable.rows`) where no exact
+        table is: past a `head_transform` the matrix's, which the transformed states meet, and with
+        an adapter on the head its rows as the adapter updates them (`applied_kernel`)."""
+        return self._head_table().rows()
+
+    def _head_table(self) -> OutputTable:
+        """The head's matrix, as `lm_head`'s call multiplies by it (`applied_kernel`) or the tied
+        embeddings, with `_logits`'s scale, bias, softcap and precision, the compute dtype its
+        product follows and a checkpoint's quantizer of its input."""
+        matrix = self.embed_tokens.embedding if self.tie_embeddings else self.applied_kernel("lm_head")
         quantizer = (self.input_quantizer(self.lm_head)
                      if isinstance(self, QuantizesInputs) and not self.tie_embeddings else None)
         return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
                            self.final_logit_softcap, self.precision, compute=self.dtype,
                            input_quantizer=quantizer, scale=self._token_gains())
+
+    def applied_kernel(self, name: str) -> jax.Array:
+        """The kernel the submodule `name` multiplies its input by on this call: its own. A method
+        interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update."""
+        return getattr(self, name).get_variable("params", "kernel")
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.
