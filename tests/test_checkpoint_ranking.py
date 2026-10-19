@@ -198,8 +198,7 @@ def test_restore_best_without_checkpoints_ranks_by_the_training_loss_without_val
 def test_a_held_best_no_evaluation_ranks_ends_the_run_failed():
     """Without checkpoints, a restore_best whose every evaluation its threshold leaves unranked has
     no state to return: the trackers hear a failed run, as a checkpointed one's do, not the final
-    state handed back as the best. A validation cadence a training-scalar best reads nothing of is
-    refused, as without restore_best."""
+    state handed back as the best."""
     metric = Value('value', Shown(better='lower'))
     tracker = Outcomes()
     run = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker)
@@ -207,9 +206,17 @@ def test_a_held_best_no_evaluation_ranks_ends_the_run_failed():
         run.fit(data(), steps=2, log_every=1, eval_every=1, metrics=[metric],
                 best=Best(metric, threshold=-1.0), restore_best=True)
     assert tracker.ended == ['failed']
-    unread = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0))
-    with pytest.raises(ValueError):
-        unread.fit(data(), steps=2, log_every=1, eval_every=1, best=unread.objective.loss, restore_best=True)
+
+
+def test_a_scheduled_validation_records_its_loss_whatever_the_best_ranks_by():
+    """A validation scheduled with no metric and a best that ranks by the training loss still
+    reads its batches: it records the objective's validation loss, and restore_best returns the
+    state the training loss ranked best, as a checkpointed run's best does."""
+    tracker = Outcomes()
+    run = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker)
+    run.fit(data(), steps=4, log_every=1, eval_every=1, best=run.objective.loss, restore_best=True)
+    assert tracker.ended == ['completed']
+    assert any('val/loss' in scalars for scalars in tracker.logged)
 
 def test_ranked_loss_and_periodic_retention(tmp_path):
     run = trainer(tmp_path / 'run', keep=Keep(latest=1, every=2))
@@ -305,13 +312,13 @@ def test_a_finished_run_fit_again_returns_its_best_state(tmp_path):
 
 
 class Outcomes:
-    """A tracker that keeps the run's reported end."""
+    """A tracker that keeps the run's reported end and the scalars it logged."""
 
     def __init__(self):
-        self.ended = []
+        self.ended, self.logged = [], []
 
     def log(self, scalars, step):
-        pass
+        self.logged.append(dict(scalars))
 
     def artifact(self, value, step):
         if isinstance(value, FitEnded):
