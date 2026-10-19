@@ -311,8 +311,11 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
     return dot_general
 
 
-def biased_logits(logits: jax.Array, bias: jax.Array | None) -> jax.Array:
-    """The vocabulary bias after the product's rounding, in fp32 or wider."""
+def scaled_logits(logits: jax.Array, scale: jax.Array | None, bias: jax.Array | None) -> jax.Array:
+    """A vocabulary head's per-column terms after its product's rounding, in fp32 or wider: each
+    column times its `scale` (nGPT's per-token logit gain), then plus its `bias`."""
+    if scale is not None:
+        logits = logits * jnp.asarray(scale, logits.dtype)
     return logits if bias is None else logits + jnp.asarray(bias, logits.dtype)
 
 

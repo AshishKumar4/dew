@@ -41,7 +41,8 @@ from dew.nn.kernels.generation import backend
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.precision import at_least_fp32, scaled
+from dew.nn.ngpt import NGPT, gain, unit
+from dew.nn.precision import at_least_fp32, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import axis_halves, axis_tables, mrope_tables, rotary_freqs, rotate, yarn_rope_freqs
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
@@ -254,6 +255,8 @@ class CausalSelfAttention(nn.Module):
             self.q_norm = norm(name='q_norm')
             if not self.ctx.kv_shared:
                 self.k_norm = norm(name='k_norm')
+        if self.ctx.ngpt is not None:
+            self._ngpt_gains(self.ctx.ngpt)
         if self.ctx.v_norm and not self.ctx.kv_shared:
             # Gemma 4 norms the values with a scale-free RMSNorm before they
             # are cached or shared (modeling_gemma4.py, Gemma4TextAttention).
@@ -261,6 +264,28 @@ class CausalSelfAttention(nn.Module):
             # parameters either way.
             self.values_norm = RMSNorm(epsilon=self.ctx.norm_eps, with_scale=False,
                                        dtype=self.ctx.dtype, name='v_norm')
+
+    def _ngpt_gains(self, ngpt: NGPT):
+        """nGPT's query gain and, under an output gate, the gate's logit gain, one a feature of the
+        heads, each stored from its initializer's scale (`NGPT.start`)."""
+        if self.ctx.qk_norm or self.ctx.kv_shared or self.ctx.k_eq_v or self.nope:
+            raise ValueError("an nGPT attention unit-norms its own rotated queries and keys: it takes no "
+                             "q/k norm, shared or value keys, or unrotated heads")
+        width = self.ctx.num_heads * self.ctx.head_dim
+        self.sqk = self.param('sqk', nn.initializers.constant(ngpt.start), (width,), jnp.float32)
+        if self.ctx.output_gate:
+            if self.gate_projection != 'own':
+                raise ValueError("an nGPT attention gates its output by a projection of its own "
+                                 "(gate_projection='own')")
+            self.s_gate = self.param('s_gate', nn.initializers.constant(ngpt.start), (width,), jnp.float32)
+
+    def _ngpt_rotated(self, ngpt: NGPT, query, key):
+        """The rotated query and key heads on the unit sphere, the query times the square of its
+        learned gain, in fp32 and back to its dtype (dory.py:139-149)."""
+        heads = gain(self.sqk, ngpt.query(self.ctx.head_dim))
+        heads = heads.reshape(self.ctx.num_heads, self.ctx.head_dim)
+        query = (jnp.square(heads) * unit(query).astype(jnp.float32)).astype(query.dtype)
+        return query, unit(key)
 
     @property
     def reads_train(self) -> bool:
@@ -393,13 +418,19 @@ class CausalSelfAttention(nn.Module):
 
     def _rotary_angles(self, rotary_positions, heads: jax.Array):
         """Build the rotary cos and sin this layer rotates its heads by, in
-        the arithmetic `rotate` rotates `heads` in.
+        the arithmetic `rotate` rotates `heads` in, rounded to `heads`'
+        dtype under `MixerContext.narrow_rotary_tables` (`rounded_to`, which
+        compilation keeps)."""
+        tables = self._rotary_tables(rotary_positions, at_least_fp32(heads.dtype))
+        if not self.ctx.narrow_rotary_tables:
+            return tables
+        return rounded_to(tables[0], heads.dtype), rounded_to(tables[1], heads.dtype)
 
-        Interleaved mRoPE, YaRN and the plain rope each build their own
-        angles; YaRN rotates whole heads at its own frequencies, so it
-        takes neither a partial rotary nor a Llama 3.1 ramp.
-        """
-        dtype = at_least_fp32(heads.dtype)
+    def _rotary_tables(self, rotary_positions, dtype):
+        """The rotary cos and sin at `dtype`. Interleaved mRoPE, YaRN and the
+        plain rope each build their own angles; YaRN rotates whole heads at
+        its own frequencies, so it takes neither a partial rotary nor a
+        Llama 3.1 ramp."""
         if self.rotary_axes is not None:
             if rotary_positions is None or rotary_positions.ndim != 3:
                 raise ValueError(f"a rotary over {len(self.rotary_axes)} axes reads their ids "
@@ -570,6 +601,8 @@ class CausalSelfAttention(nn.Module):
         if not self.ctx.kv_shared:
             if freqs_cos is not None and freqs_sin is not None:
                 key = rotate(self._turned(key), freqs_cos, freqs_sin, pairs=self.rotary_pairs)
+            if self.ctx.ngpt is not None:
+                query, key = self._ngpt_rotated(self.ctx.ngpt, query, key)
             if kv_store is not None and self.ctx.kv_store_key is not None:
                 # Post-norm, post-rope, the same tensors the reference hands
                 # its sharing layers (modeling_gemma4.py, Gemma4TextAttention).
@@ -1030,13 +1063,22 @@ class CausalSelfAttention(nn.Module):
         where it gates, then project them."""
         if self.exclusive_self_attention:
             attention = exclusive_self_attention(attention, own_value)
-        if gate is not None:
+        if gate is not None and self.ctx.ngpt is not None:
+            # nGPT scales the gate's logits by the square of their learned gain, gates in fp32 and
+            # unit-norms the gated heads together (dory.py:154-157).
+            scale = gain(self.s_gate, self.ctx.ngpt.gate(self.ctx.emb_features))
+            logits = gate.astype(jnp.float32) * jnp.square(scale).reshape(self.ctx.num_heads,
+                                                                           self.ctx.head_dim)
+            attention = (attention.astype(jnp.float32) * jax.nn.sigmoid(logits)).astype(attention.dtype)
+        elif gate is not None:
             # The branch multiplies by the sigmoid of its gate, then projects
             # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
             attention = attention * jax.nn.sigmoid(gate).astype(attention.dtype)
         attention = constrain(attention, HEADS)
-        return checkpoint_name(
-            self.o_proj(attention.reshape(batch, length, self.ctx.num_heads * self.value_dim)), 'o_proj')
+        joined = attention.reshape(batch, length, self.ctx.num_heads * self.value_dim)
+        if self.ctx.ngpt is not None:
+            joined = unit(joined)
+        return checkpoint_name(self.o_proj(joined), 'o_proj')
 
 
 @dataclasses.dataclass(frozen=True)

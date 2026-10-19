@@ -36,7 +36,7 @@ from dew.decision import (
 from dew.decision.data import Decisions as DecisionRecipe
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import FROZEN, VALID_ROWS
+from dew.objectives.base import FROZEN, VALID_ROWS, joined
 from dew.training.trainer import Trainer
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
@@ -264,6 +264,58 @@ def test_lora_trains_its_factors_and_the_head_over_a_fixed_base_and_reloads_from
     first, second = live("charged twice!", asked), reloaded("charged twice!", asked)
     for answer, again in zip(first.values(), second.values(), strict=True):
         np.testing.assert_array_equal(answer.probabilities, again.probabilities)
+
+
+@pytest.mark.parametrize("head", ["transformed", "adapted", "fp8", "fp8-adapted"])
+def test_a_joint_head_trains_on_the_rows_of_a_head_no_one_matrix_is(head, tmp_path):
+    """A joint head's lexical prior gathers its backbone's vocabulary rows where no one matrix gives
+    the logits, so no output table exists: past a nonlinear prediction head (dense, GELU and norm
+    before the tied matrix) the embedding's rows; with an adapter on the head the rows of the head
+    its factors update; and with the head's kernel frozen in FP8 under an adapter, its codes
+    decoded, updated where the adapter targets it: each as `merge` folds them into one matrix. A
+    step through the head moves the head and the backbone's part the rows come from."""
+    from dew.decision import JointLayout, JointSchemaHead
+    from dew.lora import unadapted
+    from dew.nn.kernels.generation import device_generation
+    from dew.training.quantization import InputQuantization
+
+    model = tiny_backbone().clone(head_transform="gelu" if head == "transformed" else None,
+                                  tie_embeddings=head == "transformed", max_seq_len=1536)
+    variables = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
+    if head == "transformed":
+        given, backbone, held = model, model, variables
+        expected = variables["params"]["embed_tokens"]["embedding"]
+        moving = ("params", "backbone", "embed_tokens")
+    else:
+        modules = ("q_proj",) if head == "fp8" else ("lm_head", "q_proj")
+        fp8 = (InputQuantization(frozen_fp8=("lm_head",), measured_on=device_generation())
+               if head.startswith("fp8") else None)
+        adapter = LoRA(rank=4, modules=modules).apply(model, variables, key=1, fp8_base=fp8)
+        # B starts at zero; drawn, the rows show its update.
+        held = jax.tree_util.tree_map_with_path(
+            lambda path, leaf: jax.random.normal(jax.random.key(3), leaf.shape, leaf.dtype) / 8
+            if "lora_B" in jax.tree_util.keystr(path) else leaf, adapter.variables)
+        given, backbone = replace(adapter, variables=held), adapter.model
+        expected = unadapted(backbone).apply(given.merge(held), method="output_table").rows()
+        moving = ("params", "backbone")
+    assert backbone.apply(held, method="output_table") is None
+    np.testing.assert_array_equal(backbone.apply(held, method="vocabulary_rows"), expected)
+
+    objective = DecisionObjective(given, variables=joined({"backbone": held}), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=JointLayout(max_len=1536),
+                                  head=JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2,
+                                                       feedforward=32))
+    data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
+                  objective=objective.data())
+    trainer = Trainer(objective, optax.adam(1e-2), key=0, checkpoints=Checkpoints(str(tmp_path)))
+    initial = trainer.initial_state()
+    # The step donates the state it is handed; the host keeps what it started from.
+    started = jax.device_get(initial.variables)
+    state = trainer.fit(data, steps=1, log_every=100, state=initial)
+    for path in (("params", "head"), moving):
+        moved = [not np.array_equal(np.asarray(before), np.asarray(after)) for before, after in
+                 zip(leaves(started, *path), leaves(state.variables, *path), strict=True)]
+        assert any(moved), path
 
 
 def test_a_held_out_row_fewer_than_a_batch_counts_once_in_the_loss_and_the_metrics():
