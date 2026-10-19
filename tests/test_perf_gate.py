@@ -103,3 +103,55 @@ def test_a_head_reads_every_row_of_the_battery_from_the_tool_it_names(gate, tmp_
     for row in gate.BATTERY:
         value = sample[row.name]
         assert value["exit_code"] == 0 if row.head_only else gate.measured(value), (row.name, value)
+
+
+def test_each_tree_runs_in_the_environment_its_own_lock_installs(gate, tmp_path, monkeypatch):
+    """A head that changes a locked wheel (a kernel's new version) is measured with it: each tree's
+    rows run in the Python of the environment its own lock installs, by its own installer, and two
+    trees whose locks agree share one environment, built once."""
+    from types import SimpleNamespace
+
+    standing_in(gate, monkeypatch, passed=True)
+    measured_row = gate.subprocess.run
+    built, rows = [], []
+
+    def child(command, **kwargs):
+        if command[0] == "uv":
+            (Path(command[-1]) / "bin").mkdir(parents=True)
+        elif command[0] == "sh":
+            built.append((Path(kwargs["cwd"]), Path(kwargs["env"]["VIRTUAL_ENV"])))
+        else:
+            rows.append((Path(kwargs["cwd"]), Path(command[0])))
+            return measured_row(command, **kwargs)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(gate.subprocess, "run", child)
+    lock = gate.build()
+    trees = {name: tmp_path / name for name in ("main", "head")}
+    for tree, wheel in zip(trees.values(), ("0.3.3", "0.3.4"), strict=True):
+        (tree / "locks").mkdir(parents=True)
+        (tree / "locks" / f"{lock}.txt").write_text(f"dew-flash-attn-cu13=={wheel}\n")
+        (tree / "tools").mkdir()
+        installer = (ROOT / "tools" / "install_environment.sh").read_bytes()
+        (tree / "tools" / "install_environment.sh").write_bytes(installer)
+        (tree / ".python-version").write_text("3.12\n")
+
+    def gated(environments):
+        built.clear()
+        rows.clear()
+        args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=2,
+                               only=["step lm-dense"], claim=False, model="unused", flowers="unused",
+                               torch_python="", out=str(tmp_path / "gate.json"),
+                               environments=str(environments))
+        assert gate.run(args) == 0
+        return dict(built)
+
+    environments = gated(tmp_path / "apart")
+    assert environments.keys() == set(trees.values()) and len(set(environments.values())) == 2
+    assert {tree for tree, _ in rows} == set(trees.values())
+    assert all(python == environments[tree] / "bin" / "python" for tree, python in rows)
+
+    same = (trees["main"] / "locks" / f"{lock}.txt").read_bytes()
+    (trees["head"] / "locks" / f"{lock}.txt").write_bytes(same)
+    (shared,) = gated(tmp_path / "shared").values()
+    assert len(built) == 1 and {python for _, python in rows} == {shared / "bin" / "python"}
