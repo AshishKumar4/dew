@@ -3,9 +3,10 @@
 
     python tools/smoke_wheel.py dist/dewml-*.whl
 
-The wheel is installed from PyPI's index alone, so a requirement the index
-cannot serve fails here. Then, from outside the checkout so nothing of it
-is importable:
+The wheel is installed from PyPI's index and Dew's package index, which
+serves Dew's JAX build alone (`INDEX`), as a user installs it, so a
+requirement neither can serve fails here. Then, from outside the checkout so
+nothing of it is importable:
 
 - every module the wheel installed compiles (`compileall`), so a syntax
   error anywhere in the package fails, imported or not;
@@ -25,6 +26,9 @@ import sys
 import tempfile
 import venv
 from pathlib import Path
+
+INDEX = "https://pypi.dewml.dev/simple"
+"""Dew's package index, the one place Dew's JAX build is served (pyproject.toml, docs/installation.md)."""
 
 TRAIN = """
 import json, sys
@@ -72,8 +76,8 @@ def main() -> None:
         root = Path(scratch)
         venv.create(root / "env", with_pip=True)
         python = root / "env" / "bin" / "python"
-        run(python, "-m", "pip", "install", "--quiet", "--index-url", "https://pypi.org/simple", wheel,
-            cwd=root)
+        run(python, "-m", "pip", "install", "--quiet", "--index-url", "https://pypi.org/simple",
+            "--extra-index-url", INDEX, wheel, cwd=root)
         # find_spec locates the package without importing it, so a module
         # that does not compile fails at compileall, named.
         locate = ("import importlib.util, pathlib; "
