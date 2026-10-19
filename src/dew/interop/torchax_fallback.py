@@ -224,12 +224,19 @@ def _accumulating(closed: ClosedJaxpr, *arguments: jax.Array) -> list[jax.Array]
 
     def evaluate(jaxpr, consts, values):
         held = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, values, strict=True))
+        # Each value is dropped after the last equation that reads it, as XLA would free it.
+        last = {var: index for index, equation in enumerate(jaxpr.eqns)
+                for var in equation.invars if not isinstance(var, Literal)}
+        kept = {var for var in jaxpr.outvars if not isinstance(var, Literal)}
 
         def read(var):
             return var.val if isinstance(var, Literal) else held[var]
 
-        for equation in jaxpr.eqns:
+        for index, equation in enumerate(jaxpr.eqns):
             inputs = [read(var) for var in equation.invars]
+            for var in equation.invars:
+                if not isinstance(var, Literal) and last[var] == index and var not in kept:
+                    held.pop(var, None)
             if equation.primitive is jit_p:
                 inner = equation.params["jaxpr"]
                 outputs = evaluate(inner.jaxpr, inner.consts, inputs)
