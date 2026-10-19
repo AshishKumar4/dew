@@ -18,7 +18,7 @@ import pytest
 
 from dew import position
 from dew.data.cache import Cache
-from dew.data.compile import compile, iterate, publish, validation
+from dew.data.compile import compile, iterate, validation
 from dew.data.dataset import DataPartition, Loading
 from dew.data.mixing import SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import Configured, Pipeline, Rejected, mix
@@ -243,6 +243,289 @@ def test_a_random_step_draws_alike_in_every_read_of_one_order():
     assert [draw for _, draw in again] != [draw for _, draw in draws(alone, "indexed")]
 
 
+@dataclasses.dataclass(frozen=True)
+class Member:
+    """A record marked with the mixture member it came from."""
+
+    index: int
+
+    def __call__(self, element):
+        return {**element, "member": np.int32(self.index)}
+
+
+def test_a_mixture_members_draws_stay_as_they_were_when_another_member_joins():
+    """A random step in a mixture member draws by the name the member goes by, not by its place among
+    the members: a member joining before it leaves its draws as they were, and two members of one
+    name draw apart."""
+    def member(name, index):
+        return Pipeline(source(8), name=name).map(Member(index)).random_map(Draw()).repeat(1)
+
+    def draws(members):
+        data = compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
+        stream = data.train(DataPartition())
+        try:
+            return {(int(index), int(of)): int(draw) for batch in stream
+                    for index, of, draw in zip(batch["id"], batch["member"], batch["draw"], strict=True)}
+        finally:
+            stream.close()
+
+    alone = draws([member("kept", 1)])
+    joined = draws([member("joining", 0), member("kept", 1)])
+    assert {key: draw for key, draw in joined.items() if key[1] == 1} == alone
+    twins = draws([member("twin", 0), member("twin", 1)])
+    assert [twins[index, 0] for index in range(8)] != [twins[index, 1] for index in range(8)]
+
+
+def test_an_unnamed_member_draws_alike_wherever_a_host_mounts_it_and_when_a_named_one_joins(tmp_path):
+    """A member given no name goes by its place among the members given none, never by where its
+    source sits: one dataset mounted at two paths draws alike in a mixture, whose plans agree, and a
+    named member joining the mixture leaves its draws as they were."""
+    def mounted(directory, joining=False):
+        directory.mkdir(exist_ok=True)
+        (directory / "rows.jsonl").write_text("".join(json.dumps({"id": i}) + "\n" for i in range(8)))
+        chain = Pipeline(Files(str(directory / "rows.jsonl"))).map(Member(0)).random_map(Draw())
+        named = Pipeline(source(8), name="joining").map(Member(1)).random_map(Draw()).repeat(1)
+        joined = [named] if joining else []
+        return compile(mix([*joined, chain.repeat(1)]).batch(4), read="memory", loading=READ, seed=5)
+
+    here, there = mounted(tmp_path / "here"), mounted(tmp_path / "there")
+    assert here.plan.identity() == there.plan.identity()
+    draws = []
+    for data in (here, there, mounted(tmp_path / "here", joining=True)):
+        stream = data.train(DataPartition())
+        try:
+            draws.append({int(index): int(draw) for batch in stream
+                          for index, of, draw in zip(batch["id"], batch["member"], batch["draw"], strict=True)
+                          if of == 0})
+        finally:
+            stream.close()
+    assert draws[0] == draws[1]
+    # The mixture may end once a member runs out; every row it read draws as it did alone.
+    assert draws[2] and all(draws[0][index] == draw for index, draw in draws[2].items())
+
+
+def test_a_member_named_as_a_place_keeps_its_draws_when_an_unnamed_one_joins():
+    """A member's name and an unnamed member's place are kept apart, whatever the name spells: a
+    member named like a place keeps its draws when an unnamed member joins ahead of it, and an
+    unnamed member keeps its own when that named member joins ahead of it."""
+    def member(name, index):
+        return Pipeline(source(8), name=name).map(Member(index)).random_map(Draw()).repeat(1)
+
+    def draws(members, of):
+        data = compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
+        stream = data.train(DataPartition())
+        try:
+            return {int(index): int(draw) for batch in stream
+                    for index, at, draw in zip(batch["id"], batch["member"], batch["draw"], strict=True)
+                    if at == of}
+        finally:
+            stream.close()
+
+    for name in ("place:0", "#0", "0"):
+        alone = draws([member(name, 1)], 1)
+        joined = draws([member(None, 0), member(name, 1)], 1)
+        assert joined and all(alone[index] == draw for index, draw in joined.items())
+        unnamed = draws([member(None, 0)], 0)
+        ahead = draws([member(name, 1), member(None, 0)], 0)
+        assert ahead and all(unnamed[index] == draw for index, draw in ahead.items())
+
+
+def member_rows(members, by="records", saved=None, batches=6, above=lambda chain: chain, host=(),
+                weights=None):
+    """The (member, id) rows a streamed mix of `members` delivers over `batches` batches, and its
+    position after the first two, resumed from `saved` when given."""
+    chain = above(mix(members, weights, by=by)).batch(2)
+    data = compile(chain, read="streamed", loading=READ, seed=5, host=host)
+    stream = data.train(DataPartition())
+    try:
+        if saved is not None:
+            stream.set_state(saved)
+        rows, position = [], None
+        for step in range(batches):
+            if step == 2 and saved is None:
+                position = stream.get_state()
+            batch = next(stream)
+            rows += [(int(of), int(index)) for of, index in zip(batch["source"], batch["id"], strict=True)]
+        return rows, position
+    finally:
+        stream.close()
+
+
+def corpus(name, source, **options):
+    return Pipeline(roled(source, 6, 2, count=8), name=name, **options).repeat()
+
+
+@pytest.mark.parametrize("by", ["records", "tokens"])
+@pytest.mark.parametrize("edit", ["joined-last", "joined-first", "left-last", "left-first"])
+def test_a_streamed_mix_resumes_its_members_where_they_were_when_one_joins_or_leaves(by, edit):
+    """A streamed mix keeps each member's position under its key, wherever the member sits among
+    the others: resumed with a member joined, ahead of the others or after them, the members it had
+    read on from where they were and the new one from its first row; resumed with a member gone,
+    ahead of the others or after them, the others read on from where they were."""
+    kept = [corpus("a", 0), corpus("b", 1)]
+    other = [corpus("c", 2)]
+    place = (lambda members: other + members) if edit.endswith("first") else (lambda members: members + other)
+    before, after = (kept, place(kept)) if edit.startswith("joined") else (place(kept), kept)
+    whole, saved = member_rows(before, by)
+    resumed, _ = member_rows(after, by, saved=saved)
+
+    def rows_of(rows, source):
+        return [index for of, index in rows if of == source]
+
+    read = 2 * 2  # the rows of the two batches read before the position was saved
+    for source in (0, 1):
+        ahead = rows_of(whole[read:], source)
+        again = rows_of(resumed, source)
+        # Each kept member reads on as it read uninterrupted, as far as both read.
+        assert again and again[:len(ahead)] == ahead[:len(again)]
+    if edit.startswith("joined"):
+        assert rows_of(resumed, 2)[:1] == [0]
+
+
+@pytest.mark.parametrize("edit", ["member-steps", "mixture-limit", "host-steps", "mixture-stages"])
+def test_a_streamed_mix_refuses_a_resume_whose_kept_rows_changed(edit):
+    """A resume takes members joining, leaving or reweighted, and refuses one where what a kept
+    member reads or makes changed: its own steps, a limit over the whole mix, the compile's host
+    steps, or the mixture's own stages."""
+    members = [corpus("a", 0), corpus("b", 1)]
+    _, saved = member_rows(members, host=(Shift(1),))
+    relabelled = Pipeline(roled(0, 6, 2, count=8), name="a").map(Relabelled()).repeat()
+    changed = {
+        "member-steps": {"members": [relabelled, corpus("b", 1)], "host": (Shift(1),)},
+        "mixture-limit": {"members": members, "weights": [1, 2], "host": (Shift(1),),
+                          "above": lambda chain: chain.take(10_000)},
+        "host-steps": {"members": members, "weights": [1, 2], "host": (Shift(2),)},
+        "mixture-stages": {"members": members, "weights": [1, 2], "host": (Shift(1),),
+                           "above": lambda chain: chain.map(Relabelled())},
+    }[edit]
+    with pytest.raises(ValueError):
+        member_rows(saved=saved, **changed)
+
+
+def test_a_streamed_mix_refuses_a_kept_nested_member_whose_order_changed():
+    """A member that is itself a mix keeps its order whole: one whose limit moved from an inner
+    member to the inner mix, reading the same sources through the same steps, is refused when the
+    outer weights change too, as its saved position counts other rows."""
+    def leaf(name, source):
+        return Pipeline(roled(source, 6, 2, count=8), name=name)
+
+    # The same steps either way, a limit of five; only where it sits differs.
+    limited_inside = mix([leaf("a", 0).take(5), leaf("b", 1)]).named("inner")
+    limited_outside = mix([leaf("a", 0), leaf("b", 1)]).take(5).named("inner")
+    _, saved = member_rows([limited_inside, corpus("c", 2)])
+    with pytest.raises(ValueError):
+        member_rows([limited_outside, corpus("c", 2)], weights=[1, 2], saved=saved)
+
+
+@pytest.mark.parametrize("read", ["streamed", "memory"])
+def test_two_members_of_one_source_keep_their_own_caches_when_one_leaves(read):
+    """Two members may read one source, one of them through a cache: each member's digest holds its
+    own caches, so the one that stays resumes when the other leaves."""
+    shared = roled(0, 6, 2, count=8)
+    cached = Pipeline(shared, name="cached").cache(Cache(f"memory://{uuid4().hex}")).repeat()
+    plain = Pipeline(shared, name="plain").repeat()
+
+    def rows(members, saved=None):
+        data = compile(mix(members).batch(2), read=read, loading=READ, seed=5)
+        stream = data.train(DataPartition())
+        try:
+            if saved is not None:
+                stream.set_state(saved)
+            next(stream)
+            return stream.get_state()
+        finally:
+            stream.close()
+
+    saved = rows([cached, plain])
+    if read == "memory":
+        # A memory read is a global order, which keeps no member by key: the edit is refused.
+        with pytest.raises(ValueError):
+            rows([cached], saved)
+    else:
+        rows([cached], saved)
+
+
+def test_a_memory_mix_with_a_member_that_accepts_no_row_compiles_and_reads_the_others():
+    """A memory read drops a member every row of which its steps reject: the mix compiles and reads
+    the other member's rows."""
+    empty = Pipeline(roled(0, 6, 2), name="empty").filter(lambda row: False, identity="none@1").repeat()
+    full = corpus("full", 1)
+    data = compile(mix([empty, full]).workers(1).batch(1), read="memory", loading=READ, seed=5)
+    stream = data.train(DataPartition())
+    try:
+        assert int(next(stream)["source"][0]) == 1
+    finally:
+        stream.close()
+
+
+def test_a_streamed_mix_beneath_a_shuffle_refuses_a_member_joining():
+    """A shuffle above a mix holds the mix's rows in its window across a saved position, which a
+    member joining would change beneath it: that resume is refused rather than replaying rows."""
+    def shuffled(chain):
+        return chain.shuffle(42, window=10)
+
+    _, saved = member_rows([corpus("a", 0)], above=shuffled)
+    with pytest.raises(ValueError):
+        member_rows([corpus("a", 0), corpus("b", 1)], above=shuffled, saved=saved)
+
+
+def test_a_member_joining_a_resumed_mix_is_read_ahead_before_the_mix_gives_a_row():
+    """A member that joins a resumed mix has its first row read ahead before the mix gives one, as
+    every member has at the start, so a member whose every row is rejected exhausts its budget at
+    once rather than after the others have run on."""
+    _, saved = member_rows([corpus("a", 0)])
+    # A member that joins and can give rows resumes beside the other.
+    rows, _ = member_rows([corpus("a", 0), corpus("b", 1)], saved=saved, weights=[1, 1e-9], batches=1)
+    assert rows
+    hopeless = (Pipeline(roled(1, 6, 2, count=8), name="b")
+                .filter(lambda row: False, identity="none@1").repeat())
+    with pytest.raises(ValueError):
+        member_rows([corpus("a", 0), hopeless], saved=saved, weights=[1, 1e-9], batches=1)
+
+
+def test_an_indexed_mix_still_refuses_a_member_joining():
+    """An indexed mix reads by one global index over all its members, which a member joining moves:
+    its resume refuses the edit."""
+    def mixed(members):
+        return compile(mix(members).batch(2), read="indexed", loading=READ, seed=5)
+
+    members = [Pipeline(roled(0, 6, 2), name="a").repeat(), Pipeline(roled(1, 6, 2), name="b").repeat()]
+    stream = mixed(members).train(DataPartition())
+    try:
+        next(stream)
+        saved = stream.get_state()
+    finally:
+        stream.close()
+    resumed = mixed([*members, Pipeline(roled(2, 6, 2), name="c").repeat()]).train(DataPartition())
+    try:
+        with pytest.raises(ValueError):
+            resumed.set_state(saved)
+    finally:
+        resumed.close()
+
+
+def test_a_position_is_refused_where_a_mixture_member_was_renamed():
+    """A mixture's plan names its members, whose draws their names key: a position saved under one
+    name is refused by the mixture that renamed it, which would draw other rows."""
+    def mixed(name):
+        members = [Pipeline(source(8), name=name).random_map(Draw()).repeat(),
+                   Pipeline(source(4)).random_map(Draw()).repeat()]
+        return compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
+
+    stream = mixed("first").train(DataPartition())
+    try:
+        next(stream)
+        saved = stream.get_state()
+    finally:
+        stream.close()
+    resumed = mixed("second").train(DataPartition())
+    try:
+        with pytest.raises(ValueError):
+            resumed.set_state(saved)
+    finally:
+        resumed.close()
+
+
 def drawn_natively(rows):
     """A Grain step Dew does not name, whose random step draws by the default seed of the rows it
     is handed."""
@@ -449,7 +732,7 @@ def test_a_validation_pass_starts_at_most_one_worker_per_batch(monkeypatch):
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
     corpora = [grain.MapDataset.source([{"id": tag, "targets": targets}]).repeat().to_iter_dataset()
                for tag, targets in [(0, 2), (1, 7)]]
-    mix = TokenDeficit(corpora, [1, 3], tokens=Targets(), names=["short", "long"])
+    mix = TokenDeficit(corpora, [1, 3], tokens=Targets(), names=["short", "long"], keys=["short", "long"])
     reader = iter(mix)
     delivered = [0, 0]
     for row in itertools.islice(reader, 100):
@@ -535,6 +818,273 @@ def test_a_memory_read_weighs_a_token_mixture_by_the_targets_of_the_rows_it_hold
     assert abs(targets[0] - targets[1]) <= 19
 
 
+@dataclasses.dataclass(frozen=True)
+class Halved:
+    """A random step that keeps the first half of a token row, as a random crop keeps a part, so the
+    rows a corpus delivers hold fewer targets than the rows its read holds."""
+
+    def __call__(self, row, rng):
+        return {**row, "text": row["text"][: len(row["text"]) // 2]}
+
+
+def test_a_token_mixture_weighs_a_corpus_by_the_targets_its_rows_deliver():
+    """A corpus whose rows a step still to run changes, here a random crop to half, delivers other
+    targets than the rows its read holds and its store states: the mixture by tokens counts them as
+    they arrive, so both corpora deliver equal targets, to within one row's."""
+    def corpus(name, lengths):
+        return Stated([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
+                       for size in lengths])
+
+    parts = [Pipeline(corpus("long", (20, 20, 20, 20)), name="long").random_map(Halved()),
+             Pipeline(corpus("short", (4, 4)), name="short")]
+    mixed = mix([part.repeat() for part in parts], by="tokens")
+    data = compile(mixed.map(Counted()).batch(8), read="memory", loading=READ)
+    stream = data.train(DataPartition())
+    targets = [0, 0]
+    try:
+        for batch in itertools.islice(stream, 16):
+            for source, count in zip(batch["source"], batch["targets"], strict=True):
+                targets[int(source)] += int(count)
+    finally:
+        stream.close()
+    assert abs(targets[0] - targets[1]) <= 9
+
+
+def test_a_token_mixture_counts_the_targets_a_corpus_delivers_after_its_repeat_changes_them():
+    """A corpus whose rows a random crop changes after its repeat delivers other targets than its
+    store states: the mixture by tokens weighs it by the targets its rows deliver, so both corpora
+    deliver equal targets, to within one row's."""
+    def corpus(name, lengths):
+        return Stated([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
+                       for size in lengths])
+
+    long = Pipeline(corpus("long", (20, 20, 20, 20)), name="long").repeat().random_map(Halved())
+    mixed = mix([long, Pipeline(corpus("short", (4, 4)), name="short").repeat()], by="tokens")
+    data = compile(mixed.map(Counted()).batch(8), read="memory", loading=READ)
+    stream = data.train(DataPartition())
+    targets = [0, 0]
+    try:
+        for batch in itertools.islice(stream, 16):
+            for source, count in zip(batch["source"], batch["targets"], strict=True):
+                targets[int(source)] += int(count)
+    finally:
+        stream.close()
+    assert abs(targets[0] - targets[1]) <= 9
+
+
+@dataclasses.dataclass(frozen=True)
+class Cropped:
+    """A step that keeps the first half of a token row and its roles, as a crop keeps a part."""
+
+    def __call__(self, row):
+        half = len(row["text"]) // 2
+        return {**row, "text": row["text"][:half], "text_roles": row["text_roles"][:half]}
+
+
+@dataclasses.dataclass(frozen=True)
+class CroppedTokens:
+    """`Cropped` over a row whose tokens a projection named `tokens`."""
+
+    def __call__(self, row):
+        half = len(row["tokens"]) // 2
+        return {**row, "tokens": row["tokens"][:half], "text_roles": row["text_roles"][:half]}
+
+
+@dataclasses.dataclass(frozen=True)
+class Relabelled:
+    """A step that changes only a token row's id, leaving its tokens and roles as they were."""
+
+    def __call__(self, row):
+        return {**row, "id": row["id"] + 100}
+
+
+@dataclasses.dataclass(frozen=True)
+class Scored:
+    """A delivered row as its corpus and the targets the loss scores of it, by `role`'s rule."""
+
+    role: int | None
+
+    def __call__(self, row):
+        from dew.data.steps.text import ValidTargets
+
+        # A row whose roles a projection renamed reads them under their new name.
+        scored = {"text": row["text"], "text_roles": row.get("text_roles", row.get("roles"))}
+        return {"source": row["source"],
+                "targets": np.int32(ValidTargets(role=self.role, measured=False)(scored))}
+
+
+@dataclasses.dataclass(frozen=True)
+class Copied:
+    """A step that copies a token row's arrays, values unchanged, as a format conversion does."""
+
+    def __call__(self, row):
+        return {name: np.array(value) for name, value in row.items()}
+
+
+@dataclasses.dataclass(frozen=True)
+class Encoded(grain.MapTransform):
+    """A step that stores a record as the artifact codec's bytes, which `Restored` reads back."""
+
+    def map(self, element):
+        from dew.data.sources.codec import encode
+
+        return encode(element)
+
+
+@dataclasses.dataclass(frozen=True)
+class Restored(grain.MapTransform):
+    """A step that reads back the record `Encoded` stored."""
+
+    def map(self, element):
+        from dew.data.sources.codec import decode
+
+        return decode(element)
+
+
+def roled(source, length, scored, count=4):
+    """`count` token rows of `length`, the first `scored` of each row's targets in role 1."""
+    roles = np.asarray([1] * (scored + 1) + [0] * (length - scored - 1), np.int32)
+    return Memory(tuple({"text": np.arange(length, dtype=np.int32), "text_roles": roles,
+                         "id": np.int32(index), "source": np.int32(source)} for index in range(count)))
+
+
+def delivered(corpora, role, read, batches=24):
+    """The targets each of two corpora mixed by tokens delivers, as the loss scores them by `role`.
+    A mix by tokens keeps each corpus within one of its own rows of its share, so the two differ by
+    at most one row of each."""
+    mixed = mix([corpus.repeat() for corpus in corpora], by="tokens")
+    data = compile(mixed.map(Scored(role)).batch(8), read=read, loading=READ)
+    stream = data.train(DataPartition())
+    targets = [0, 0]
+    try:
+        for batch in itertools.islice(stream, batches):
+            for source, count in zip(batch["source"], batch["targets"], strict=True):
+                targets[int(source)] += int(count)
+    finally:
+        stream.close()
+    return targets
+
+
+@pytest.mark.parametrize("role", [None, 1])
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_token_mixture_weighs_a_cropped_corpus_by_the_targets_left_after_the_crop(read, role):
+    """Targets counted on a row (`CountTargets`) a crop then halves are counted again by the rule
+    that counted them, its role included: the mixture weighs the cropped corpus by what its rows
+    deliver, so both corpora deliver equal targets, to within one row of each (`delivered`)."""
+    from dew.data.steps.text import CountTargets
+
+    long = Pipeline(roled(0, 24, 22), name="long").filter_map(CountTargets(role=role)).map(Cropped())
+    short = Pipeline(roled(1, 6, 4), name="short").filter_map(CountTargets(role=role))
+    left, right = delivered([long, short], role, read)
+    rows = (Cropped()(roled(0, 24, 22).records("memory")[0]), roled(1, 6, 4).records("memory")[0])
+    assert abs(left - right) <= sum(int(Scored(role)(row)["targets"]) for row in rows)
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_token_mixture_keeps_a_rows_count_through_a_step_over_its_other_fields(read):
+    """A step that changes only a row's other fields keeps the targets its count's own rule counted,
+    a role's here, which no other rule gives: two corpora whose rows score one and three role-1
+    targets deliver equal scored targets, to within one row of each (`delivered`)."""
+    from dew.data.steps.text import CountTargets
+
+    one = Pipeline(roled(0, 8, 1), name="one").filter_map(CountTargets(role=1)).map(Relabelled())
+    three = Pipeline(roled(1, 8, 3), name="three").filter_map(CountTargets(role=1))
+    left, right = delivered([one, three], 1, read)
+    assert abs(left - right) <= 1 + 3
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+@pytest.mark.parametrize("after", ["renamed-roles", "renamed-roles-then-copied",
+                                   "renamed-text-then-cropped", "selected-then-copied",
+                                   "counted-again-then-copied", "encoded-and-decoded"])
+def test_a_rows_count_and_its_rule_ride_through_the_steps_that_leave_its_targets(read, after):
+    """A row's count, by its role's rule, holds through steps that change no target: its roles
+    renamed, and copied after, its fields narrowed and then copied, the bytes of an encoding and
+    back; a crop of tokens a projection renamed counts them again under their new name; and a
+    second count, by the plain rule, replaces the first one's rule with its own, which a later copy
+    keeps.
+    Two corpora whose rows score one and three role-1 targets, or seven plain ones each, deliver
+    equal targets by the rule last counted, to within one row of each (`delivered`)."""
+    from dew.data.steps.text import CountTargets
+
+    def corpus(source, scored):
+        chain = Pipeline(roled(source, 8, scored), name=str(source)).filter_map(CountTargets(role=1))
+        if after == "renamed-roles":
+            return chain.rename_columns({"text_roles": "roles"})
+        if after == "renamed-roles-then-copied":
+            return chain.rename_columns({"text_roles": "roles"}).map(Copied())
+        if after == "renamed-text-then-cropped":
+            return (chain.rename_columns({"text": "tokens"}).map(CroppedTokens())
+                    .rename_columns({"tokens": "text"}))
+        if after == "selected-then-copied":
+            return chain.select_columns("text", "text_roles", "source").map(Copied())
+        if after == "counted-again-then-copied":
+            return chain.filter_map(CountTargets()).map(Copied())
+        return chain.map(Encoded()).map(Restored())
+
+    role = None if after == "counted-again-then-copied" else 1
+    # A crop halves a row's six role-1 targets to three and leaves the other's two as they were.
+    scored = (6, 2) if after == "renamed-text-then-cropped" else (1, 3)
+    left, right = delivered([corpus(0, scored[0]), corpus(1, scored[1])], role, read)
+    bound = {None: 7 + 7, 1: 3 + 2 if after == "renamed-text-then-cropped" else 1 + 3}[role]
+    assert abs(left - right) <= bound
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_count_follows_its_tokens_through_a_rename_that_reuses_their_name(read):
+    """A rename that moves the counted tokens away and names another field as they were, and then
+    back again, leaves the count on the tokens: the padding the other field holds is no target."""
+    from dew.data.steps.text import CountTargets
+
+    def corpus(source):
+        rows = Memory(tuple({"text": np.asarray([1, 2, 3, 4], np.int32), "backup": np.zeros(4, np.int32),
+                             "source": np.int32(source)} for _ in range(4)))
+        return (Pipeline(rows, name=str(source)).filter_map(CountTargets(pad_id=0))
+                .rename_columns({"text": "tokens", "backup": "text"})
+                .rename_columns({"text": "backup", "tokens": "text"}))
+
+    mixed = mix([corpus(0).repeat(), corpus(1).repeat()], by="tokens")
+    stream = compile(mixed.batch(4), read=read, loading=READ).train(DataPartition())
+    try:
+        assert np.asarray(next(stream)["text"]).tolist()[0] == [1, 2, 3, 4]
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_tokenized_rows_pack_by_concatenation(read):
+    """Rows a tokenizer made, which carry Dew's own record of their lengths, pack by concatenation
+    into windows of the packed field alone."""
+    from dew.data.text import Tokenize
+
+    rows = Memory(tuple({"text": "abcdefgh"[: 3 + index % 5]} for index in range(12)))
+    chain = Pipeline(rows).map(Tokenize()).pack(4, policy="concat").batch(2)
+    stream = compile(chain, read=read, loading=READ).train(DataPartition())
+    try:
+        batch = next(stream)
+    finally:
+        stream.close()
+    assert np.asarray(batch["text"]).shape == (2, 4)
+
+
+def test_a_counted_corpus_projected_after_its_count_keeps_it_in_memory():
+    """A corpus counted and then renamed or narrowed to other fields keeps its rows' counts, which
+    no field it still holds could give again."""
+    from dew.data.steps.text import CountTargets
+
+    for projected in (lambda chain: chain.rename_columns({"text": "tokens"}),
+                      lambda chain: chain.select_columns("id", "source")):
+        chains = [projected(Pipeline(roled(source, 8, 3), name=str(source)).filter_map(CountTargets(role=1)))
+                  for source in (0, 1)]
+        data = compile(mix([chain.repeat() for chain in chains], by="tokens").batch(4), read="memory",
+                       loading=READ)
+        stream = data.train(DataPartition())
+        try:
+            assert len(next(stream)["id"]) == 4
+        finally:
+            stream.close()
+
+
 @pytest.mark.parametrize("held", [False, True])
 def test_a_token_mixture_weighs_a_random_holdout_by_the_rows_it_keeps(held):
     """Mixed by tokens, two corpora whose stores state their counts deliver equal valid targets,
@@ -570,10 +1120,11 @@ def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation()
     parents = [grain.MapDataset.source([{"targets": count}]).repeat().to_iter_dataset()
                for count in (0, 4)]
     reader = iter(TokenDeficit(parents, [1, 1], tokens=Targets(), names=["all-zero", "useful"],
+                              keys=["all-zero", "useful"],
                               budget=SearchBudget(consecutive=5)))
     with pytest.raises(ValueError):
         next(reader)
-    counts = reader.get_state()["parents"][0]["counts"]
+    counts = reader.get_state()["parents"]["all-zero"]["counts"]
     assert counts["attempted"] == 5
     assert counts["rejected"] == {"zero_targets": 5}
     reader.close()
@@ -966,6 +1517,7 @@ def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row(tiny_
     parents = [grain.MapDataset.source([{"targets": 3}]).repeat().to_iter_dataset(),
                grain.MapDataset.source([{"targets": tiny_targets}]).repeat().to_iter_dataset()]
     reader = iter(TokenDeficit(parents, [1, 1e-9], tokens=Targets(), names=["normal", "tiny"],
+                              keys=["normal", "tiny"],
                               budget=SearchBudget(consecutive=3)))
     try:
         if tiny_targets:
@@ -1308,23 +1860,6 @@ def test_a_token_split_on_a_mixture_within_a_mixture_records_its_spans():
         return compile(mixed.batch(1), read="indexed", loading=READ).plan.derived["token_spans"]
 
     assert spans(4) != spans(8)
-
-
-def test_a_recipe_reads_a_published_packing_before_its_default_order(tmp_path):
-    """A typed recipe given a generation with a published packing plan reads
-    that plan, and shuffles its windows, instead of packing again online."""
-    from dew.config.data import TextData, loader
-    from dew.data.text import Chunks, Tokenize
-
-    stored = Memory(tuple({"text": "x" * size} for size in (3, 7, 18, 2, 4, 12, 8, 1, 15, 6)))
-    published = publish(Pipeline(stored).map(Tokenize()).flat_map(Chunks(9)).pack(9, bins=3),
-                        Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
-    data = loader(TextData(source=stored, seq_len=8, pack="first-fit", packing_bins=3,
-                           eos=False, token_holdout=None), batch=2,
-                  cache=published,
-                read="indexed", loading=READ)
-    assert data.plan is not None
-    assert "packing" in data.plan.manifest.source["sources"][0]
 
 
 @dataclasses.dataclass(frozen=True)

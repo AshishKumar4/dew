@@ -93,6 +93,36 @@ def reference(tmp_path_factory) -> dict:
     return train(tmp_path_factory.mktemp("reference"), {"fsdp": 8}, processes=1)
 
 
+@pytest.mark.parametrize("shared", [True, False], ids=["shared", "apart"])
+def test_a_pool_caches_by_default_only_where_its_processes_share_the_directory(tmp_path, monkeypatch, shared):
+    """A pool of two processes caches its compilations under the user's cache directory where both
+    read it as one, and leaves the cache off where each has its own: JAX writes entries from process
+    0 alone, so caches apart would find a step on one process and compile it on the other."""
+    program = (
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "base = Path(sys.argv[1])\n"
+        "own = base / os.environ['DEW_PROCESS_ID']\n"
+        "os.environ['XDG_CACHE_HOME'] = str(base if sys.argv[3] == 'shared' else own)\n"
+        "from dew.training.runtime import prepare_process\n"
+        "prepare_process()\n"
+        "import jax\n"
+        "held = jax.config.jax_compilation_cache_dir\n"
+        "Path(sys.argv[2], f'{jax.process_index()}.json').write_text(json.dumps(held))\n"
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    for name in ("JAX_COMPILATION_CACHE_DIR", "JAX_ENABLE_COMPILATION_CACHE"):
+        monkeypatch.delenv(name, raising=False)
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program,
+                  str(tmp_path / "home"), str(out), "shared" if shared else "apart", devices=1, timeout=150)
+    assert done.returncode == 0, done.stdout + done.stderr
+    directories = [json.loads(path.read_text()) for path in sorted(out.iterdir())]
+    minor = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    expected = str(tmp_path / "home" / "dew" / "xla" / minor) if shared else None
+    assert directories == [expected] * 2
+
+
 def test_hybrid_sharding_groups_hosts_into_replicas_and_trains_like_fsdp(tmp_path, reference):
     """Four processes of two devices, fsdp=2 over replicas=2: each replica is
     two processes and fsdp crosses the pair, where `jax.make_mesh` would put

@@ -93,8 +93,6 @@ class SampledRollout:
         and info strings the reward is called with, and the `ModelInputs`
         the policy is given.
         """
-        if key.shape != ():
-            raise ValueError("key must be a single JAX PRNG key")
         prompts, prompt_lengths, sources, truths, infos = prompt_rows(batch)
         width = prompts.shape[1]
         # The lengths are already here on the host, so a batch of whole
