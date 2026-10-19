@@ -562,8 +562,14 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
     columns overall, row by row and entry by entry, and every entry of every row against vLLM's
     own. On a last-loop run's rows past the window, vLLM's engine parts from its own model code
     (https://github.com/vllm-project/vllm/pull/60149#issuecomment-6270937659): there the reference
-    is that model code at the run's precision under the same orders, so the engine's departure
-    widens no bound."""
+    is that model code at the engine's precision under the same orders, so the engine's departure
+    widens no bound.
+
+    Each arm's precision: the engine computes a bf16 run in bf16 over fp32 accumulation, and an
+    fp32 run with its linears at "highest" (VLLM_FLOAT32_MATMUL_PRECISION's default) and its
+    Triton attention's products in TF32; the model-code arm takes the same, bf16 throughout or
+    fp32 with TF32 attention products. Dew leaves each product to JAX's default, which on this GPU
+    multiplies a float32 run's linears and attention alike in TF32."""
     from residual_orders import permuted
 
     source = json.loads((RELEASED / 'source.json').read_text())
