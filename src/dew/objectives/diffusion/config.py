@@ -12,12 +12,13 @@ from __future__ import annotations
 import dataclasses
 import os
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Annotated, ClassVar
 
 import jax
 
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, Prepared, RunConfig
 from dew.config.data import Augment, HoldOut, ImageData, VideoData
+from dew.data.dataset import record_argument
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
@@ -216,11 +217,14 @@ class DiffusionRunConfig(RunConfig):
     """
     pretrained_param_dtype: DtypeName = "float32"
     """The dtype `pretrained`'s parameters are stored and trained in."""
-    val_metrics: tuple[MetricConfig, ...] | None = None
+    val_metrics: (Annotated[tuple[MetricConfig, ...], record_argument(tuple[MetricConfig, ...])]
+                  | None) = None
     """The metrics scored on every validation pass, each with the arguments the run gives it (a
-    CLIP metric's model, an FID's weights). None is the run's default: CLIP where an image run's
-    data holds a validation split, and nothing otherwise. A metric given is asked for whatever the
-    data holds, so data with no validation split refuses it.
+    CLIP metric's model, an FID's weights), one JSON list on the command line:
+    `--val-metrics '[{"name": "clip", "fields": {"modelname": "openai/clip-vit-base-patch32"}}]'`.
+    None is the run's default: CLIP where an image run's data holds a validation split, and
+    nothing otherwise. A metric given is asked for whatever the data holds, so data with no
+    validation split refuses it.
     """
 
     def __post_init__(self) -> None:
