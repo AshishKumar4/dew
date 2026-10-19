@@ -219,14 +219,16 @@ and the SD VAE's decoder at their released sizes, with random weights;
 Qwen3-0.6B served at 32 and 128 slots; causal attention forward and backward
 (cudnn and xla, 2048 tokens, 128-wide heads); the Oxford Flowers input pipeline;
 and the save and restore of lm-dense's training state. Each row runs in a
-process of its own, with the tree's own copy of the tool where it has one. A row
+process of its own, in the tree's own environment (its `locks/<build>.txt` for
+this machine's CUDA build, built once per lock by `tools/environments.py`),
+with the tree's own copy of the tool where it has one. A row
 regresses when the head's median is worse than the base's by more than either
 tree's spread across rounds (at least 2%), and the two trees' ranges do not
 overlap. With three rounds each, samples separate by chance 1 time in 20 when
 nothing changed, and the band lowers that further. A row's band is also its
 sensitivity: it cannot see a change smaller than its own noise. A row the base
-cannot run in any round (a tree older than its tool) is not compared. A row the
-base runs and the head runs in no round is broken, a row neither runs leaves the
+cannot run in any round (a tree older than its tool, or than the locks) is not
+compared. A row the base runs and the head runs in no round is broken, a row neither runs leaves the
 battery incomplete, and a row either tree measured in only some rounds, or as
 NaN, an infinity or zero, is partial and not judged on the rounds that ran; all
 three fail the gate, as a regression does. `report` writes the table and exits 1
