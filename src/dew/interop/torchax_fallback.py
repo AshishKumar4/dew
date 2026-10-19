@@ -247,7 +247,9 @@ def _accumulating(closed: ClosedJaxpr, *arguments: jax.Array) -> list[jax.Array]
             else:
                 if equation.primitive in _BROADCASTING:
                     shape = equation.outvars[0].aval.shape
-                    inputs = [_accumulated(value, shape, tuple(range(len(shape))))
+                    rank = len(shape)
+                    # An operand broadcasts on its trailing dimensions: a scalar on none.
+                    inputs = [_accumulated(value, shape, tuple(range(rank - jnp.ndim(value), rank)))
                               if _narrow_float(value) and jnp.shape(value) != shape else value
                               for value in inputs]
                 # As `jax.core.eval_jaxpr` binds an equation.
