@@ -129,8 +129,10 @@ class SampledRollout:
         lengths, terminated = grouped(generated.lengths), grouped(generated.terminated)
         raw, behavior = grouped(generated.raw_log_probs), grouped(generated.behavior_log_probs)
         def completion(row: int, group: int) -> str:
-            end = int(lengths[row, group]) - int(terminated[row, group])
-            return self.decode(sampled[row, group, :end].tolist())
+            # Without the EOS id a draw ended on, with a stop string it ended on (`Draw.response`).
+            count = int(lengths[row, group])
+            ended = count > 0 and int(sampled[row, group, count - 1]) in self.sampling.stops
+            return self.decode(sampled[row, group, :count - int(ended)].tolist())
 
         rewards = np.asarray([[self.reward(completion(row, group), records[row])
                                for group in range(self.groups)] for row in range(rows)], np.float32)
