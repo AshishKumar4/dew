@@ -25,7 +25,10 @@ def loss(x, branch, scale, gate, up):
     stream, normed = stream_rms_normalized(x, branch, scale, 1e-6, x.dtype, scale_offset=True,
                                            scale_after_cast=False, fp32_statistics=True,
                                            implementation="pallas")
-    return jnp.sum(stream * normed) + jnp.sum(gated_product("swiglu", implementation="pallas")(gate, up))
+    # The product feeds the rest of the step, as a down projection reads it: a step whose gradient
+    # never reads a fused kernel's output drops its forward launch (`generation.linear_tangent`).
+    product = gated_product("swiglu", implementation="pallas")(gate, up)
+    return jnp.sum(stream * normed) + jnp.sum(product * product)
 
 
 def plain(x, scale):
@@ -415,3 +418,17 @@ def test_a_checkout_whose_kernel_drops_an_operand_keeps_the_others_picks_of_it(t
     _, theirs, foreign = fresh(STORES, "[4, 2]", cache_dir=cache_dir, flags=flags, source=other)
     [(names, pick)] = theirs.items()
     assert "shift" in json.loads(names) and pick == [4, 2] and foreign == 1
+
+
+def test_a_launch_is_chosen_for_the_gpu_its_operands_or_its_mesh_name():
+    """`tuning._kind`, read through public jax as tokamax reads a launch's GPU for its cache: a traced
+    launch under a mesh of abstract A100s (`generation.gpu_mesh`, `Trainer.lower_for`) is the A100's,
+    whatever this host is; a concrete one is its operands' device's; neither, the default device's."""
+    mesh = jax.make_mesh((1,), ("data",), axis_types=(jax.sharding.AxisType.Explicit,))
+    shape = jax.ShapeDtypeStruct((8, 64), jnp.bfloat16)
+    keyed = tokamax.BoundArguments(norm_swiglu.RmsForward(), {"x": shape})
+    with jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm80")):
+        assert tuning._kind(keyed) == generation.gpu_target("sm80").device_kind
+    assert tuning._kind(keyed) == jax.devices()[0].device_kind
+    concrete = tokamax.BoundArguments(norm_swiglu.RmsForward(), {"x": jnp.ones((8, 64), jnp.bfloat16)})
+    assert tuning._kind(concrete) == jax.devices()[0].device_kind

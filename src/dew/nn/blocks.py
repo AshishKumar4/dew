@@ -11,6 +11,8 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
+from dew.nn.dense import Dense, DenseGeneral
+
 from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
@@ -89,8 +91,8 @@ def modulation(conditioning, features: int, pieces: int, *, name: str, silu: boo
     named `name` in the calling module so each family keeps its checkpoint's path. `silu` False
     projects the conditioning as it is (FlaxDiff 0.2's DiT); `zero_init` starts it at zero,
     adaLN-Zero's identity block at the start of training."""
-    return nn.Dense(pieces * features, use_bias=bias, dtype=dtype, precision=precision, name=name,
-                    kernel_init=nn.initializers.zeros if zero_init else nn.initializers.lecun_normal())(
+    return Dense(pieces * features, use_bias=bias, dtype=dtype, precision=precision, name=name,
+                 kernel_init=nn.initializers.zeros if zero_init else nn.initializers.lecun_normal())(
         nn.silu(conditioning) if silu else conditioning)
 
 
@@ -212,7 +214,7 @@ class TimeProjection(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        dense = partial(nn.DenseGeneral, self.features,
+        dense = partial(DenseGeneral, self.features,
                         dtype=self.dtype, precision=self.precision)
         x = self.activation(dense()(x))
         return self.activation(dense()(x))
@@ -378,8 +380,8 @@ class ResidualBlock(nn.Module):
                        strides=(1, 1), dtype=self.dtype, precision=self.precision)
         out = conv(name="conv1")(self.norm1(x))
 
-        temb = nn.DenseGeneral(features=self.features, name="temb_projection",
-                               dtype=self.dtype, precision=self.precision)(temb)
+        temb = DenseGeneral(features=self.features, name="temb_projection",
+                            dtype=self.dtype, precision=self.precision)(temb)
         out = out + temb[:, None, None, :]
 
         out = self.norm2(out)

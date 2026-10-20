@@ -692,22 +692,24 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
 
 
+@pytest.mark.parametrize("prefix_cache", [False, True], ids=["unshared", "prefix"])
 @pytest.mark.parametrize("fields", [{"position_embedding": "alibi"},
                                     {"layer_types": ("chunked_attention",),
                                      "kinds": {"chunked_attention": {"chunk": 4}}}], ids=["alibi", "chunked"])
-def test_a_paged_server_serves_layers_that_read_their_keys_places(fields):
-    """ALiBi and a chunk read their keys' places, which a dense cache keeps
-    beside its keys; a paged server seats its rows at canonical positions,
-    where a key's slot is its place, so its pool keeps none. Over a pool of
-    pages every row is the lone task call's."""
+def test_a_paged_server_serves_layers_that_read_their_keys_places(fields, prefix_cache):
+    """ALiBi and a chunk read their keys' places, which the cache keeps
+    beside its keys, in a paged pool's pages too, so a shared prefix's pages
+    carry theirs. Over a pool of pages every row is the lone task call's."""
     model = decoder().clone(max_seq_len=128, **fields)
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    _, tickets = served_alongside(bound, kv_cache=KVCache(page_size=16, pages=12))
+    server, tickets = served_alongside(bound, kv_cache=KVCache(page_size=4, pages=40),
+                                       prefix_cache=prefix_cache)
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), lone)
+    assert server.prefix_hits == (4 if prefix_cache else 0)
 
 
 @pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],

@@ -15,6 +15,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.dense import Dense
 from dew.records import JSON
 
 from ..activations import GatedActivation, gated_product
@@ -669,7 +670,7 @@ class DecoderBlock(nn.Module):
             self.output_scalar = self.param("layer_scalar", nn.initializers.ones, (1,), jnp.float32)
         if self.per_layer_input_dim:
             dense = functools.partial(
-                nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+                Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
             self.per_layer_input_gate = dense(projections['per_layer_input_gate'][1],
                                               name='per_layer_input_gate')
             self.per_layer_projection = dense(projections['per_layer_projection'][1],
@@ -1139,8 +1140,8 @@ class MTPBlock(nn.Module):
         self.hnorm = norm(name='hnorm')
         maps = self.projections()
         def dense(name):
-            return nn.Dense(maps[name][1], use_bias=False, dtype=self.dtype,
-                            precision=self.precision, name=name)
+            return Dense(maps[name][1], use_bias=False, dtype=self.dtype,
+                         precision=self.precision, name=name)
         if self.hyper_connections is None:
             self.eh_proj = dense('eh_proj')
         else:
