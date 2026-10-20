@@ -1162,9 +1162,12 @@ class GatedDeltaNet(nn.Module):
             state = None if held is None else held.astype(wide)
             if S > 1:
                 # fla's layer hands its rule the projections' dtype, the
-                # queries and keys on their own heads and beta beside them.
+                # queries and keys on their own heads and beta beside them. A
+                # held history can make the convolved operands vary where the
+                # projections did not, so the route is asked again of them.
                 return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size,
-                                              ported=ported, starts=starts, max_segments=tokens.max_segments)
+                                              ported=ported and on_the_port(query, key, value),
+                                              starts=starts, max_segments=tokens.max_segments)
             # One key head serves `per_v` value heads, the reference's `repeat_interleave`.
             query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
             if S == 1 and held is not None and delta_rule.fits(held):
