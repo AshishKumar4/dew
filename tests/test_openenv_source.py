@@ -3,9 +3,9 @@
 The environment is a guessing game (`openenv_support`) served by `openenv`'s
 `create_fastapi_app` over uvicorn, in-process or as a server process the test
 kills, and each episode opens its own session through `GenericEnvClient`, as
-a trainer reaching a remote environment does. The policy is a bigram model on Dew's own server
-whose draws are its argmax: it guesses 3 after the prompt and 7 after the
-environment's hint.
+a trainer reaching a remote environment does. The policy is a bigram model on
+Dew's own server whose draws are its argmax: it guesses 3 after the prompt and
+7 after the environment's hint.
 """
 
 import socket
