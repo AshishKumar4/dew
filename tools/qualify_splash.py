@@ -57,7 +57,7 @@ import numpy as np
 import tyro
 
 from dew.nn.attention import pallas_flash_attention, scaled_dot_product_attention
-from dew.nn.kernels.tuning import samples
+from dew.telemetry.benchmark import samples
 
 KERNELS = ('splash', 'flash', 'xla')
 SHAPES = ('causal', 'softcap', 'sinks', 'packed', 'packed_window')

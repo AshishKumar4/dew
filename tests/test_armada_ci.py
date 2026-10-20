@@ -468,6 +468,34 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     assert Path(least[0].removeprefix("| ")).name == "unused.py" and least[-1] == "0.0% |"
 
 
+def test_a_split_file_pays_its_setup_once_a_group_and_is_not_cut_finer_for_it(ci):
+    """Twenty recorded tests of 10 s that armada measured whole at 400 s paid 200 s besides their
+    tests, which every group pays again: at a 150 s target that leaves a group half the target of
+    tests, so 3 groups of 270, 270 and 260 s, not slivers each paying it. Measured at 2 groups,
+    300 s, each paid 50 s: its setup is not counted again for the groups it ran as, and it is
+    measured by its rows at that cut, not by a median that remembers other cuts."""
+    tests = [10.0] * 20
+    assert ci.split(tests, 400.0, 150.0, cut=1) == [270.0, 270.0, 260.0]
+    assert ci.split(tests, 200.0 + 2 * 50.0, 150.0, cut=2) == [150.0, 150.0]
+    # A cut whose heaviest group, setup included, holds within half again the target is kept, so
+    # its cached programs are: 4 groups of 100 s, and 20 groups of 50 s (an over-cut paying 40 s
+    # each), stay as they ran; 2 groups at 130 s of setup each (230 s, past 225) are cut again.
+    assert ci.split(tests, 400.0, 150.0, cut=4) == [100.0] * 4
+    assert ci.split(tests, 200.0 + 20 * 40.0, 150.0, cut=20) == [50.0] * 20
+    assert ci.split(tests, 200.0 + 2 * 130.0, 150.0, cut=2) == [200.0, 200.0, 190.0]
+    # The file's median remembers runs at other cuts; its rows are timed at the cut they name. Here
+    # four runs at 4 groups (400 s) and the last at 2 (300 s, its rows): measured at 2, it stays at 2.
+    rows = {"3.12:tests/test_split.py#1/2": 150.0, "3.12:tests/test_split.py#2/2": 150.0,
+            "3.12:tests/test_split.py#3/4": 100.0, "3.14:tests/test_split.py#1/4": 10.0,
+            "3.12:tests/test_split.py#collect": 1.0, "3.12:tests/test_whole.py": 30.0}
+    timings = {"rows": rows, "files": {"3.12:tests/test_split.py": 400.0}}
+    assert ci.measured_cut(timings, "3.12", "tests/test_split.py") == (300.0, 2)
+    seconds, count = ci.measured_cut(timings, "3.12", "tests/test_split.py")
+    assert ci.split(tests, seconds, 150.0, cut=count) == [150.0, 150.0]
+    assert ci.measured_cut(timings, "3.12", "tests/test_whole.py") == (30.0, 1)
+    assert ci.measured_cut(timings, "3.12", "tests/test_unseen.py") is None
+
+
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
     """Each task of a split file runs its own group (split.py) of the same
     cut, so the groups together run every test, none twice, a test the
@@ -543,7 +571,8 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     assert long / short == pytest.approx(3.0, rel=0.25)
 
 
-def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch):
+def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch,
+                                                                                  cache_worker):
     """A file that ran green is reused by a later task on the same CPU class while its inputs are
     unchanged; a task on another class, after its inputs change, or planned with DEW_TEST_CACHE=off
     (the daily full run) runs it again, and once it has run red on those inputs, so does every task
@@ -561,16 +590,8 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
-    worker: dict[str, bytes] = {}
-
-    def cache_request(url, token, data=None):
-        if data is not None:
-            worker[url] = data
-            return b""
-        return worker.get(url)
-
-    monkeypatch.setattr(ci, "cache_request", cache_request)
-    monkeypatch.setenv("DEW_XLA_CACHE_URL", "https://cache.invalid")
+    url, _, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
     out = tmp_path / "verdict.json"
     command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
@@ -627,7 +648,7 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
 
 
 def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_list_changes(
-        ci, tmp_path, monkeypatch):
+        ci, tmp_path, monkeypatch, cache_worker):
     """A test's inputs outside tests/ and src/ are its file's inputs too (executed.py): a documentation
     page its test reads, and the pages of a directory it lists, so a green row is reused while they
     stay, and its file runs again once the page it trains from changes or a page is added. So are a
@@ -656,17 +677,9 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
-    worker: dict[str, bytes] = {}
-
-    def cache_request(url, token, data=None):
-        if data is not None:
-            worker[url] = data
-            return b""
-        return worker.get(url)
-
-    monkeypatch.setattr(ci, "cache_request", cache_request)
+    url, _, _ = cache_worker
     monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
-    monkeypatch.setenv("DEW_XLA_CACHE_URL", "https://cache.invalid")
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
     # Beside the checkout's entries, not among them: the checkout's own directory is an input.
     (tmp_path / ".verdict").mkdir()

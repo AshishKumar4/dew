@@ -408,7 +408,7 @@ def test_a_source_exports_the_records_its_pipeline_exports():
         return [np.asarray(row["id"]).tolist() for shard in files.manifest().shards
                 for row in files.manifest().reader(shard)]
 
-    assert exported(stored) == exported(stored.chain()) == [[2 * index, 2 * index + 1] for index in range(5)]
+    assert exported(stored) == exported(stored._chain()) == [[2 * index, 2 * index + 1] for index in range(5)]
 
 
 def test_spark_directory_requires_success_marker(tmp_path):
@@ -1570,31 +1570,26 @@ def test_content_fingerprint_preserves_array_identity_and_sequence_order():
     assert content_fingerprint(np.int16(4)) != content_fingerprint(np.int32(4))
 
 
-@pytest.mark.parametrize("content", [b" \n\n", b'{"id": 1}\n'], ids=["empty", "one row"])
-def test_empty_shard_cycles_exhaust_their_search_budget(content):
-    """A shard that yields no row exhausts the budget the read searches with;
-    the same read of a shard with a row yields it."""
-    root = Store(f"memory://empty-shards-{uuid4().hex}/empty.jsonl")
-    root.write(content)
-    files = Files(root.url)
-    dataset = streamed(
-        files.manifest(),
-        partition=DataPartition(),
-        epochs=None,
-        empty_shard_budget=3,
-        name="empty-corpus",
-        cycle_length=1,
-        loading=Loading(workers=0, threads=1, read_buffer=1),
-    )
-    reader = iter(dataset)
-    try:
-        if content.strip():
-            assert next(reader) == {"id": 1}
-            return
-        with pytest.raises(ValueError):
-            next(reader)
-    finally:
-        reader.close()
+def test_a_pass_reads_its_rows_after_any_run_of_empty_shards():
+    """A pass over a stream reads the rows of its last shard however many empty shards come before
+    it: four thousand and more in a row are no proof the stream holds none."""
+    root = Store(f"memory://empty-run-{uuid4().hex}")
+    for number in range(4097):
+        # A blank line is a shard that holds no row.
+        root.child(f"{number:05d}.jsonl").write(b'{"id": 7}\n' if number == 4096 else b"\n")
+    dataset = streamed(Files(root.url, format="jsonl").manifest(), partition=DataPartition(), epochs=1,
+                       cycle_length=1, loading=Loading(workers=0, threads=1, read_buffer=1))
+    assert list(dataset) == [{"id": 7}]
+
+
+def test_an_endless_read_of_a_store_that_states_it_holds_no_row_is_refused():
+    """A store whose every shard states it holds no row would read nothing forever endlessly, which
+    is refused; read once, it is a pass that yields nothing."""
+    manifest = Memory([], shard_rows=4).manifest()
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    assert list(streamed(manifest, partition=DataPartition(), epochs=1, loading=loading)) == []
+    with pytest.raises(ValueError):
+        streamed(manifest, partition=DataPartition(), epochs=None, loading=loading)
 
 
 @pytest.mark.parametrize("field", [None, "ids"])
@@ -1647,6 +1642,9 @@ class _StreamOnly:
 
     def describe(self):
         return f"stream-only {self.memory.describe()}"
+
+    def label(self):
+        return self.memory.label()
 
     def fingerprint(self):
         return self.memory.fingerprint()
@@ -1759,7 +1757,7 @@ def test_a_default_read_is_judged_on_the_order_the_recipe_adds_at_that_read(tmp_
 
     class Split:
         def pipelines(self):
-            return Pipeline(Files(str(tmp_path / "rows.parquet"))).token_split(0.5, held=False), None, ()
+            return Pipeline(Files(str(tmp_path / "rows.parquet"))).holdout(tokens=0.5)[0]._chain(), None, ()
 
     rows = [{"text": [index] * 4} for index in range(8)]
     pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
@@ -1799,7 +1797,7 @@ def test_a_local_store_whose_producer_declared_other_bytes_is_refused(tmp_path):
     path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(8)))
     url = str(path)
     held = {"bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-    assert [row["id"] for row in Files(url, file_info={url: held}).iterate()] == list(range(8))
+    assert [row["id"] for row in Files(url, file_info={url: held})] == list(range(8))
     for stale in ({**held, "bytes": 2 * held["bytes"]}, {**held, "sha256": "0" * 64}):
         with pytest.raises(ValueError):
             Files(url, file_info={url: stale}).fingerprint()
@@ -1943,6 +1941,35 @@ def test_native_map_datasets_read_as_streams_and_mix_with_a_stream_only_member()
             resumed.close()
 
 
+@dataclasses.dataclass(frozen=True)
+class Stated(Memory):
+    """Records with the facts their store states, as a producer's metadata states them."""
+
+    facts: tuple[tuple[str, object], ...] = ()
+
+    def metadata(self):
+        return {**super().metadata(), **dict(self.facts)}
+
+
+def test_a_concatenation_states_what_its_stores_state_of_their_records():
+    """Two splits of one token store joined (`dew.data.Concatenate`) state its tokenizer contract and
+    class names, the targets of both and the rows of both, so a token mixture weighs the joined
+    store and a run checks its contract as of either split; a fact one split alone states or the
+    two state apart is none of the join's, and two contracts make no one store."""
+    from dew.data import Concatenate
+
+    contract = (("tokenizer", "gpt2"), ("vocab_size", 50257), ("class_names", {"label": ("a", "b")}))
+    first = Stated([{"id": np.int32(index)} for index in range(3)],
+                   facts=(*contract, ("valid_targets", 30), ("split", "train")))
+    second = Stated([{"id": np.int32(index)} for index in range(2)],
+                    facts=(*contract, ("valid_targets", 20), ("split", "validation"), ("shuffled", True)))
+    assert Concatenate((first, second)).metadata() == {
+        **dict(contract), "rows": 5, "valid_targets": 50}
+    other = Stated([{"id": np.int32(0)}], facts=(("tokenizer", "llama"),))
+    with pytest.raises(ValueError):
+        Concatenate((first, other)).metadata()
+
+
 @pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
 def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(read):
     """Two stores read in turn (`dew.data.Concatenate`) are one store to a recipe and to the verbs:
@@ -1957,7 +1984,7 @@ def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(re
     train = Memory([{"id": np.int32(index)} for index in range(6)])
     held = Memory([{"id": np.int32(index)} for index in range(100, 104)])
     joined = Concatenate((train, held))
-    assert joined.map(lambda record: {"id": record["id"] + 1}).chain().source is joined
+    assert joined.map(lambda record: {"id": record["id"] + 1})._chain().source is joined
     loading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
     passed = validation(Pipeline(joined).batch(2), batch=2, read=read, loading=loading)(DataPartition())
     try:

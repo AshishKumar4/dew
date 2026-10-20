@@ -34,7 +34,7 @@ Three types, six function shapes.
 
 | Type | What it is |
 |---|---|
-| `Record` | One example: a nested pytree of `np.ndarray`, `str`, `bytes`, numbers, `dict` and `list` (chat messages, tool calls, image payloads, decision objects). |
+| `Record` | One example: a nested pytree of `np.ndarray`, `str`, `bytes`, numbers, `dict` and `list` (chat messages, tool calls, image payloads, decision objects). At `batch`, numeric and string fields stack as arrays; opaque object fields stay lists. |
 | `Rejected(reason)` | What a `filter_map` stage returns to drop a record. Counted by reason. |
 | `Dataset` | The one chain type. Immutable and lazy. Every verb returns a `Dataset`; every source is one. |
 
@@ -42,7 +42,8 @@ Three types, six function shapes.
 |---|---|---|---|
 | `RecordFn` | `(r) -> r` or a `grain.MapTransform` | `map` | exactly 1 |
 | `RandomFn` | `(r, rng) -> r` or a `grain.RandomMapTransform` | `random_map` | exactly 1 |
-| `Predicate` | `(r) -> bool` | `filter` | 0 or 1 |
+| `IndexedFn` | `(index, r) -> r`, `index` the record's position in its source; `-> r \| Rejected` where it declares `rejects = True` | `map_with_index` | exactly 1; 0 or 1 where it declares `rejects` |
+| `Predicate` | `(r) -> bool` | `filter` (a rejected record counts under the predicate's `reason`) | 0 or 1 |
 | `TryFn` | `(r) -> r \| Rejected` | `filter_map` | 0 or 1, with a reason |
 | `RandomTryFn` | `(r, rng) -> r \| Rejected` or a `grain.RandomMapTransform` | `random_filter_map` | 0 or 1, with a reason |
 | `ExpandFn` | `(r) -> Iterable[r]` (finite) | `flat_map` | any |
@@ -65,13 +66,13 @@ flowchart TD
   D -- "it makes several" --> FLM["flat_map"]
 ```
 
-Library stages are values of these shapes. `images.Resize(256)` is a `RecordFn`, `images.Flip(p=0.5)` a `RandomFn`, `images.MinSide(256)` a `Predicate`, `images.fetch()` a `TryFn`. Each is a small frozen value with `__call__`: picklable for worker processes, printable in `show()`, and identified for caching by its configuration and the versions it depends on. Your own function works the same way. A `map` stage that returns `Rejected` raises, naming the stage.
+Library stages are values of these shapes. `images.Resize(256)` is a `RecordFn`, `images.Flip(p=0.5)` a `RandomFn`, `images.MinSide(256)` a `Predicate`, `images.fetch()` a `TryFn`. Each is a small frozen value with `__call__`: picklable for worker processes, printable in `show()`, and identified for caching by its configuration and the versions it depends on. Your own function works the same way. A `map` stage that returns `Rejected` raises, naming the stage. Every library step passes through the fields it does not read (`text.tokenize` included); `pack` keeps only the fields it packs, as its `fields=` says. A step reads its field by the record's convention (`jpg`/`png`/`image`, `txt`/`text`/`caption`, `url`, `mp4`) and names it where the convention does not fit: `images.DecodeImage(field="jpg", to="image")`, `images.Resize(field=)`, `images.Processor(field=, to=)`, `images.fetch(url=, to=)`. `text.Normalized(form=, field=)` puts text in one Unicode normal form before it tokenizes. Errors that name the failing stage, field and fix are not built yet for every step.
 
 ## 2. Sources
 
 | Source | Reads | Built on |
 |---|---|---|
-| `Files(url, format=None, where=, columns=)` | Local, `gs://`, `s3://`, `hf://`, http. Parquet, ArrayRecord, JSONL, CSV, Arrow, WebDataset tar. `where=` prunes Parquet row groups before decode. | fsspec, pyarrow, Grain's ArrayRecord and Parquet readers |
+| `Files(url, format=None, where=, columns=)` | Local, `gs://`, `s3://`, `hf://`, R2 (an S3-compatible storage profile), http. Parquet, ArrayRecord, JSONL (`.jsonl.gz`, `.jsonl.zst` too), CSV, Arrow, WebDataset tar. `where=` prunes Parquet row groups before decode. | fsspec, pyarrow, Grain's ArrayRecord and Parquet readers |
 | `Hub(repo, name=, split=, columns=, revision=)` | Hugging Face Hub datasets, streamed or prepared. `split=` is HF's own named split. | HF datasets, Hub Parquet shards |
 | `TFDS(name, split=)` | TensorFlow Datasets | TFDS ArrayRecord |
 | `Memory(records or columns)` | Arrays, lists of dicts, DataFrames | numpy, pyarrow |
@@ -87,18 +88,20 @@ Preparing a Hub dataset happens on first use, with one log line naming what is p
 
 | Group | Verbs |
 |---|---|
-| Per record | `map`, `random_map`, `filter`, `filter_map`, `random_filter_map`, `flat_map`; `map` and `flat_map` also take `batched=True, batch_size=k` |
+| Per record | `map`, `random_map`, `map_with_index`, `filter`, `filter_map`, `random_filter_map`, `flat_map`; `map` and `flat_map` also take `batched=True, batch_size=k` |
 | Reuse | `pipe(fn, *args, **kwargs)` for [presets](#5-presets) and your own `Dataset -> Dataset` functions; `grain(fn)` for any Grain operation Dew doesn't name; the plan can't see inside `fn`, so the chain after it reads per share and resumes through Grain's own state |
 | Columns | `rename_columns({"old": "new"})`, `select_columns(*names)`, `remove_columns(*names)` (Hugging Face's names) |
 | Other | `take(n)`, `named(name)` |
-| Sequence | `pack(seq_len, fields=, bins=, segments=, policy=, along=)`, the options every read lays out alike; `text.Chunks(length, overlap=)` cuts long documents first; `shuffle` after `pack` orders the windows |
+| Sequence | `pack(seq_len, fields=, bins=, segments=, policy=, along=)`, the options every read lays out alike; `text.Chunks(length, overlap=)` cuts long documents first; `windows(seq_len, stride=)` cuts one stream of tokens across documents at a stride, for perplexity over overlapping windows; `shuffle` after `pack` orders the windows |
 | Order | `shuffle(seed=, window=)`, `repeat(epochs=)` |
 | Combine | `mix(datasets, weights=, by="records" \| "tokens")`, which ends at its first exhausted member, as Grain's does (repeat a member to read on); `concat(datasets)`; `interleave(cycle_length=)` over a store's shards; `schedule([(dataset, tokens), ...])` |
-| Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split="validation" | ("validation", "test"))`, each with `key=` |
+| Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split="validation" | ("validation", "test"))`, each with `key=`; `holdout(tokens=0.01, fields=("text",))`, the first hundredth of a finite order's tokens, its per-token fields cut together |
 | Batch | `batch(n)`, the global training batch; a `map` after it receives the whole batch |
 | Persist | `cache(url)` (write-through accelerator), `snapshot(url)` (a terminal job that seals an immutable generation, read back with `Files(url)`) |
-| Execution | `workers(n)`, `threads(n)`, `prefetch(n)`, `read(mode)` |
-| Look | `take(n).show()`, `stats(records=n)` |
+| Execution | `workers(n)`, `threads(n)`, `prefetch(n)`, `read(mode)`, `loading(Loading(...))` for every read setting at once |
+| Look | `take(n).show()`, `stats(records=n)`, `for record in ds` (one pass, with training's draws) |
+
+Both diagnostics open a fresh reader, never the training stream. `stats` returns counters from at most `n` accepted records and runs before `batch`; `show` also takes batches. Both handle random and repeated chains. Training logs its own live counters, wait time and throughput.
 
 Batched preprocessing uses Hugging Face's form: `map(fn, batched=True, batch_size=k)` hands `fn` a dict of columns (`{"text": [...k strings]}`). One difference from Hugging Face: there, a batched `map` may return any number of rows; in Dew it must return the same number, and `flat_map(fn, batched=True)` is the one that may change it. The verb keeps saying how many records come out, which is what lets Dew keep exact global resume. A Hugging Face function that changes the row count goes through `flat_map(..., batched=True)` unchanged. The chain stays a stream of records, so `pack`, `mix` and `batch` still follow. After `batch(n)`, a `map` receives the training batch, as in Grain and tf.data.
 
@@ -293,7 +296,7 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 
 | Preset | Reads per record | Writes per batch |
 |---|---|---|
-| `images(ds, size, *, batch, augment=False, crop_scale=(1, 1), cache=None)` | `image`: encoded bytes or uint8 `[H, W, 3]` | `image` uint8 `[B, size, size, 3]` |
+| `images(ds, size, *, batch, augment=False, crop_scale=(1, 1), field="image", staging_size=None, draft=False, rejects=True, caption=None, cache=None, records=None, host=())` | `field`: encoded bytes or uint8 `[H, W, 3]` | `image` uint8 `[B, size, size, 3]`; with `caption`, `caption` |
 | `lm(ds, tokenizer, *, seq_len, batch, field="text", cache=None)` | `text`: a string | `text` int32 `[B, seq_len + 1]`; `text_coordinates`, the windows' documents (`dew.nn.inputs.Coordinates`) |
 | `sft(ds, tokenizer, *, seq_len, batch, cache=None)` | `messages`: chat turns | the `lm` fields and `text_roles` int32 `[B, seq_len + 1]` |
 | `clips(ds, seconds, *, frames, fps, size, batch, sample_rate=None)` | `mp4`: bytes | `video` uint8 `[B, frames, size, size, 3]`; with `sample_rate`, `audio` float32 `[B, samples]` and `audio_valid` bool `[B, samples]` |
@@ -301,7 +304,10 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 - A `lm` or `sft` row holds `seq_len` inputs and their next-token targets.
 - `images` and `clips` pass every other field through, stacked per batch: `label` becomes `[B]`, `caption` a list of `B` strings.
 - `lm` and `sft` pack several documents into one row, so a per-document field has no row to land in. They keep only the fields they write. To pack a per-token field of your own along, write the chain with `pack(fields=)`.
-- `augment=True` crops to `crop_scale` of the area, flips and colour-jitters on the accelerator, as in [Augmenting on the GPU](#augmenting-on-the-gpu). `augment=` also takes your own random step, such as `images.Albumentations(aug)`, which runs on the host right after the resize.
+- `augment=True` crops to `crop_scale` of the area, flips and colour-jitters on the accelerator, as in [Augmenting on the GPU](#augmenting-on-the-gpu); an `images.DeviceAugment(size, crop_scale=, flip=, jitter=)` value sets those itself. `augment=` also takes your own random step or a tuple of them, such as `images.Albumentations(aug)` or `images.RandomCrop(size, scale=)`, which run on the host right after the resize.
+- `staging_size=` resizes to a larger square first, for an augmentation that crops to `size`; `draft=True` decodes a JPEG at a reduced scale no smaller than it. `rejects=False` stops the run on an image that does not decode instead of counting and dropping it.
+- `caption=images.caption(...)` writes each record's caption after the resize, with the source's class names (`class_names.label` in its metadata) where it names none; with `templates=` it draws one per record.
+- `records=n` keeps `n` prepared records before the batch, as a validation split's `take(n)`; `host=` steps read each batch on the host, before any step on the accelerator. Every preset takes both.
 - `cache=url` caches the preset's fixed steps (decode and resize, or tokenize). Augmentation, packing and batching run after the cache.
 
 ### Where the rest of the chain goes
@@ -410,11 +416,11 @@ The chain lowers one stage per Grain operator. Dew passes `where=` predicates to
 
 ## 10. Execution and storage contracts
 
-These contracts govern the executor behind the `Dataset` surface. They replace the old `load` and recipe-class sketches; those sketches do not define a second public API.
+These contracts govern the executor behind the `Dataset` surface. The chain is the one data API. The run-layer recipes, `spec.load` and the public `loader` are to be removed, and run.json is to record the chain; neither is built yet.
 
 ### Lowering and positions
 
-The chain is analyzed once before readers open. Its plan chooses the lowering and records the facts that determine record order.
+The chain is analyzed once before readers open. Its plan chooses the lowering and records the facts that determine record order. The compiler resolves each configured factory once, refusing a missing key by name; the resolved step and the values it read enter the saved plan and cache key. `random=True` declares a random factory before it is resolved, so ordering and cache checks do not depend on opening data. Run-scoped metadata merges slot maxima across the training and validation branches compiled together; the validation chains `fit` compiles apart do not share them yet.
 
 | Lowering | Order and saved position | Resume |
 |---|---|---|
@@ -424,7 +430,7 @@ The chain is analyzed once before readers open. Its plan chooses the lowering an
 
 A streamed file source exposes physical shards with immutable identities. The manifest is the sliceable root; readers and Grain workers take disjoint slices and interleave their shard readers. JSONL ranges start at line boundaries. CSV shards are whole files because a quoted field may contain a newline; indexed CSV uses a parser-built index. Parquet uses footer and row-group metadata. A pinned Hub revision names the bytes actually read; resolving a converted branch records that branch's revision.
 
-Indexes, accepted counts, lengths and packing plans come from producer metadata or an explicit preparation job. Memory mode may compute them from its resident records. Training startup does not scan an entire remote corpus to discover them. Length grouping reads lightweight length metadata; global packing at scale reads a published sharded plan. Heavy transforms run once per consumed record.
+Indexes, accepted counts, lengths and packing plans come from producer metadata or an explicit preparation job. Memory mode may compute them from its resident records. Training startup may scan a source when `fit` provisions its missing index, which it does where the source can build one, and otherwise reports the read mode it cannot have; a compile with provisioning off suggests `dew data provision` or `provision=True`. Refusing a missing artifact before any read, with its name, its size where the store states it and the command to provision it, is not built yet. Length grouping reads lightweight length metadata; global packing at scale reads a published sharded plan. Heavy transforms run once per consumed record.
 
 The saved plan includes its format version, lowering, source snapshots, stage identities, order, mixture weights and accounting rule, packing policy, derived-order fingerprints, cache generations, volatility and relevant topology. Changing an algorithm that produces different rows or random draws changes the plan version. Resume checks the plan before opening readers. A global record count can survive an environment change only if its semantic plan and derived order are unchanged; the change is recorded. Per-share replay also needs the same environment.
 
@@ -432,33 +438,33 @@ A callable without a stable identity makes exact replay unavailable. A declared 
 
 ### Rejection and accounting
 
-Rejecting stages drop records before mixing and count them by source and reason. Mixture shares count accepted records or committed valid target tokens, as requested. Packing happens per source before token-weighted mixing. With authoritative valid-target counts, the plan pins those counts; without them, a checkpointed deficit scheduler selects the source furthest below its requested share. Zero-target windows are rejected before the mix so they cannot stall that scheduler.
+Rejecting stages drop records before mixing and count them by source and reason. Mixture shares count accepted records or committed valid target tokens, as requested. Packing happens per source before token-weighted mixing. With an authoritative per-source valid-token count (a cache generation's index, or a producer's), the lowering weights each source's windows by `weight / mean valid targets a window` from those counts, and pins the counts in the plan. Without one, a checkpointed deficit scheduler selects the source furthest below its requested share; ties go to the lower source index. The deficit rule needs no estimate and no warm-up: the shares hold exactly at every window boundary, to within one window's tokens. It is deterministic, since the counts come from the data, and its state is the per-source delivered counts, saved in the iterator's state beside the sources'. Zero-target windows are rejected before the mix so they cannot stall that scheduler. Each member draws its randomness under its `named()` key; an unnamed member goes by its place among the unnamed members, and two members of one name by their order. A per-share mixture whose later stages keep each member's state (no shuffle window or packer above the mix) resumes across an edit of its member list, each named member at its own position; a global order, or a chain that buffers mixed records, resumes only an unchanged list. Per-member attempted, accepted and rejected-by-reason counts log under that name; per-member committed tokens do not yet.
 
-An epoch budget needs an authoritative accepted count. A finite exhausted source proves emptiness; a diagnostic sample estimates rejection rates only. A rejection limit, where one is part of an external read policy, reports exhausted work rather than claiming the corpus is empty. Padding or masking a rejected record requires an objective whose loss, gradients, metrics, mutable collections and effects all honor validity, including an all-masked batch.
+An epoch budget needs an authoritative accepted count. A finite exhausted source proves emptiness; a diagnostic sample estimates rejection rates only. No count of rejections or of empty shards refuses a read: an endless read reads on through any run of them, logging the corpus, its run and its most frequent reasons at each doubling, and its data metrics show the rows it delivered. An endless read is refused only where it is certain to read nothing forever: a share that holds no rows, a store whose shards state they hold none, or a repeated stream whose pass yields nothing with no step before the repeat that drops a row. Padding or masking a rejected record requires an objective whose loss, gradients, metrics, mutable collections and effects all honor validity, including an all-masked batch.
 
-Long text is chunked before packing. Chat truncation and filtering are explicit preparation choices, and every per-position field is cut with the ids it describes. An over-length RL prompt is filtered by default; truncating it is an explicit change to the task. Truncation, rejection and expansion counts are reported per source.
+Long text is chunked before packing. A long conversation is chunked by default, every turn kept; truncating or filtering it is an explicit preparation choice, and every per-position field is cut with the ids it describes. An over-length RL prompt keeps its tail by default; filtering it is an explicit choice, counted as a rejection under its reason. `JointLayout` cuts a decision row's state to `max_state_tokens`, when set, and to the room the framing, media and schema leave; it keeps the schema whole and drops a row that still passes `max_len`. `MarkerLayout` and `StateFirstLayout` also cut question instructions and option text. Each source reports `data/truncated/<source>`, the share of records a preparation stage marked cut (an RL prompt's tail cut is not marked yet); `data/rejected/<source>/<reason>`; and `data/chunks_per_record/<source>` for chunked text. A read warns when a source's rejected share passes `warn_over=` (1% by default).
 
 Validation reads a finite canonical order through the same executor. `take(n)` counts accepted rows before a topology-dependent share cut, so changing the reader count does not change the held-out set. Training-only augmentation and host steps stay on the training chain. Shared steps are written once before the split.
 
 ### Cache identity and publication
 
-The artifact key is a canonical dependency manifest: resolved source snapshots and immutable file versions, stages in order, the Dew revision and lock, Python and platform, external stage identities, processor and template revisions, and codec/schema version. A diagnostic recomputation is not proof that a cache is current.
+The artifact key is a canonical dependency manifest: resolved source snapshots and immutable file versions, stages in order, the Dew revision and lock, Python and platform, external stage identities, processor and template revisions, and codec/schema version. A step whose module is not in Dew contributes its qualified name, the sha256 of its module's source file, and a declared `identity="name@version"`; without one the cache refuses it, since the Dew revision does not cover that code. A memory source contributes the sha256 of its records serialized in order. A torch dataset's content cannot be hashed without reading it, so caching one needs `identity=`. A tokenizer and template contribute the resolved repo revision and the sha256 of every file read. A diagnostic recomputation is not proof that a cache is current.
 
 Indexed rows are identified by source index; streamed rows by physical shard and row; expansion outputs by input identity and output number. These identities do not depend on worker ownership or shuffle. A source without immutable identities keeps fills separate by execution plan.
 
 Writers publish immutable shards and segments. Each input has a completion record with its fan-out and output digest, including rejected or empty outputs. A sealed writer certifies its segment sequence. A generation is published only after coverage of every source input, its outputs and referenced shard checksums has been established. The immutable index and packing plan are written first; one conditional manifest update commits them. Readers follow that manifest to a single generation. Missing or corrupt committed objects fail at the read boundary.
 
-An accepted-index manifest certifies only the stages in its prefix. A later rejecting or expanding stage still needs its own lowering. Network fetches remain volatile during training; a cache never freezes a failed fetch. A sealed snapshot records the outcomes and bytes needed for exact replay.
+An accepted-index manifest certifies only the stages in its prefix. A later rejecting or expanding stage still needs its own lowering. Volatility is declared (`volatile=True`), never inferred from what a step does. The saved plan reads the declaration on map stages; other stage kinds' declarations do not reach it yet. Network fetches remain volatile during training; a cache never freezes a failed fetch. A sealed snapshot records the outcomes and bytes needed for exact replay.
 
-The spool, downloaded-file mirror and retained local generations have separate byte budgets. Active readers pin the files they use. A full spool stops admitting cache writes by default and training continues; blocking is an explicit choice. Upload work belongs to the reader's resource lifecycle and closes with it.
+The spool, downloaded-file mirror and retained local generations have separate byte budgets. Active readers pin the files they use. The spool holds transformed shards not yet uploaded, pinned until verified. The mirror holds disposable downloaded shards: least recently used first, with pins for the shards an active reader holds, single-flight downloads and bounded look-ahead. Retained local generations are evicted least recently used among those no running process has open; remote generations are untouched. While a full spool stops admission, the artifact stays filling; some of the paths that stop it log a warning. Uploads retry with backoff through `Store.put_immutable`; `close` cancels queued uploads and abandons unfinished ones, and an upload already in flight may finish after it. The trainer reports data wait (`train/data_wait_ms`). The cache keeps admission, spool, upload and mirror counters. The planned reader report gives `data/cache/admitting`, spool and backlog bytes, upload rate, mirror hit rate and downloaded bytes; it is not built yet. A full spool stops admitting cache writes by default and training continues; blocking is an explicit choice. Upload work belongs to the reader's resource lifecycle and closes with it.
 
 ### Storage and native integrations
 
-Sources, cache roots, manifests and sinks take fsspec URLs. Native ArrayRecord and Arrow readers are used where they support the scheme; other schemes use fsspec. Connection setup is resolved at first use, outside run records. Importing a module does not read storage configuration.
+Sources, cache roots, manifests and sinks take fsspec URLs. Native ArrayRecord and Arrow readers are used where they support the scheme; other schemes use fsspec. Connection setup is resolved at first use. Dew reads storage profiles from `~/.config/dew/storage.toml` (or `$DEW_STORAGE_CONFIG`) on the first `Store.resolve` and registers each named protocol once; a malformed file fails that resolution. Profile URLs work with native fsspec after that. A profile whose environment variable is unset is refused when a URL first uses it, naming the variable. Records also hold the non-secret options (endpoint, region) and never the key. Importing a module does not read storage configuration.
 
 Transport caches use fsspec URL chaining, such as `filecache::s3://example/data/` or `blockcache::hf://datasets/example/data/`. Dew's `dewcache::` adds byte-bounded eviction, reader pins and single-flight downloads. This disposable file cache is separate from transformed artifacts and their dependency manifests.
 
-One writer publishes cache shards and exported datasets. ArrayRecord closes a local shard before uploading it; Parquet uses `pyarrow.dataset.write_dataset`; Hub writes use a commit with a parent revision. Each sink publishes its manifest after the immutable shards. Spark and Ray exchange large datasets through Parquet. Delta uses its table log and records the table version; WebDataset reads tar members grouped by key. Resumable library iterators use `from_iter` and the library's own state.
+One writer interface publishes cache shards and exported datasets. ArrayRecord closes a local shard before uploading it; Parquet uses `pyarrow.dataset.write_dataset`; Hub writes use a commit with a parent revision. Each sink publishes its manifest after the immutable shards. Spark and Ray exchange large datasets through Parquet. A `_SUCCESS` marker is written too, so Spark and Hadoop readers see a committed directory. Spark's normal output is a Parquet directory with `_SUCCESS` and `key=value/` partitions; `Files(..., spark=True)` reads it as a `pyarrow.dataset` source with `partitioning="hive"` and refuses a directory without `_SUCCESS` as uncommitted. Delta uses its table log and records the table version; WebDataset reads tar members grouped by key. Resumable library iterators use `from_iter` and the library's own state.
 
 Publication is qualified across interrupted shards, segments and manifest updates, concurrent finalizers, conflicting duplicates, full spools and external upload failures. [Testing](testing.md) owns the shared behavioral requirements. Performance comparisons use the same workload against plain Grain and report accepted throughput, first-batch latency, host memory, transform calls, remote read amplification and device-timeline idle time. Warm-up, compilation and replay are reported separately from steady execution.
 

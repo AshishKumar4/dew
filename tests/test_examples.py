@@ -302,7 +302,7 @@ def test_sft_diffusion_gemma_puts_each_assistant_turn_alone_on_the_canvases(tmp_
     config = example.smoke_config(example.Config(smoke=True, out=tmp_path))
     _, objective = example.adapted_objective(config)
     train, _, _ = example.chat_rows(config, objective).pipelines()
-    rows = list(train.iterate())
+    rows = list(train)
     template = AutoTokenizer.from_pretrained(config.model)
     expected = []
     for turns in example.CONVERSATIONS:

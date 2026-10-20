@@ -75,7 +75,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.data", "dew.config.sweep"]),
     ("Utilities", ["dew.rl", "dew.artifacts", "dew.coordination", "dew.records", "dew.telemetry.profile",
-                   "dew.figures"]),
+                   "dew.telemetry.benchmark", "dew.figures"]),
 ]
 # Places that show users Dew code; every Dew name they use must resolve to the
 # documented API. A landing snippet file shows only its marked regions.

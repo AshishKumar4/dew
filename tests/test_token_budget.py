@@ -48,14 +48,11 @@ def test_a_token_budget_reads_its_rows_on_every_share_as_one_global_batch():
         resumed.close()
 
 
-@pytest.mark.parametrize("refused", ["part rows", "rebatched rows"])
-def test_a_token_budget_of_part_rows_or_rebatched_rows_is_refused(refused):
-    """A budget of whole 8-token rows compiles; one of 36 tokens, or the whole
-    rows rebatched, is refused."""
+def test_a_token_budget_of_part_rows_is_refused():
+    """A budget of whole 8-token rows compiles; one of 36 tokens is refused."""
     compile(windows(32), read="memory", loading=READ)
     with pytest.raises(ValueError):
-        compile(windows(36) if refused == "part rows" else windows(32).rebatch(8), read="memory",
-                loading=READ)
+        compile(windows(36), read="memory", loading=READ)
 
 
 def _batched(records: Pipeline, by: str, drop_remainder: bool) -> Pipeline:
