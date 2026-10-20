@@ -540,7 +540,7 @@ def assert_as_exact_over_orders(dew, reference, label: str) -> None:
     mine, theirs = float(np.sqrt(np.mean(dew ** 2))), float(np.sqrt(np.mean(reference ** 2)))
     assert within(mine, FACTOR * theirs), (
         f"{label}: dew is {mine:.3e} from float64 (rms over {ORDERS} orders), the reference "
-        f"{theirs:.3e} (ratio {mine / theirs:.2f}, allowed {FACTOR})")
+        f"{theirs:.3e} (allowed {FACTOR} times it)")
 
 
 def assert_rows_as_exact_over_orders(dew, reference, label: str, sizes=None) -> None:
