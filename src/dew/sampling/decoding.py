@@ -1018,25 +1018,39 @@ class Finish(NamedTuple):
     ended: jax.Array
 
 
-def finish(stopping: Sequence[Stopping]) -> Callable[[StepState, jax.Array], Finish]:
-    """The criteria as one callable: which rows any of them finished, and which a criterion that
-    does not truncate finished, each combined with OR."""
+class Finishing(NamedTuple):
+    """A request's criteria as pytrees (`components`), those that end a row apart from those that
+    cut it short at a length, which is told from each criterion as given (`Stopping`'s `truncates`)
+    before it is one: a built-in's numbers ride as data (`as_pytree`)."""
+
+    ending: tuple[Stopping, ...]
+    truncating: tuple[Stopping, ...]
+
+    @classmethod
+    def of(cls, criteria: Sequence[Stopping]) -> Finishing:
+        cut = [bool(getattr(type(stop), "truncates", False)) for stop in criteria]
+        return cls(tuple(as_pytree(stop) for stop, short in zip(criteria, cut, strict=True) if not short),
+                   tuple(as_pytree(stop) for stop, short in zip(criteria, cut, strict=True) if short))
+
+
+def finish(stopping: Finishing) -> Callable[[StepState, jax.Array], Finish]:
+    """The criteria as one callable: which rows any of them finished, and which one that ends a row
+    finished, each combined with OR."""
 
     def finished(state: StepState, tokens: jax.Array) -> Finish:
-        done = ended = jnp.zeros(tokens.shape, bool)
-        for stop in stopping:
-            fired = stop(state, tokens)
-            done = done | fired
-            if not getattr(type(stop), "truncates", False):
-                ended = ended | fired
-        return Finish(done, ended)
+        ended = cut = jnp.zeros(tokens.shape, bool)
+        for stop in stopping.ending:
+            ended = ended | stop(state, tokens)
+        for stop in stopping.truncating:
+            cut = cut | stop(state, tokens)
+        return Finish(ended | cut, ended)
 
     return finished
 
 
-def criterion(stopping: Sequence[Stopping]) -> Callable[[StepState, jax.Array], jax.Array]:
+def criterion(stopping: Finishing | Sequence[Stopping]) -> Callable[[StepState, jax.Array], jax.Array]:
     """The criteria as one callable, combined with OR: which rows any of them finished (`finish`)."""
-    finished = finish(stopping)
+    finished = finish(stopping if isinstance(stopping, Finishing) else Finishing(tuple(stopping), ()))
     return lambda state, tokens: finished(state, tokens).done
 
 
@@ -1047,6 +1061,7 @@ __all__ = [
     "EtaCutoff",
     "ExponentialDecayLengthPenalty",
     "Finish",
+    "Finishing",
     "ForcedBOS",
     "ForcedEOS",
     "FrequencyPenalty",

@@ -85,7 +85,7 @@ ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, cova
 
 Transforms = LogitsTransform | Sequence[LogitsTransform]
 Criteria = Stopping | Sequence[Stopping]
-Components = tuple[tuple[LogitsTransform, ...], tuple[Stopping, ...], Strategy]
+Components = tuple[tuple[LogitsTransform, ...], decoding.Finishing, Strategy]
 
 # A resolved component's configuration as every process can spell it: a repr,
 # a number (an array's shape is a tuple of them), or a tuple of either nested
@@ -700,9 +700,8 @@ def resolve(sampling: Sampling, logits: Transforms | None, stopping: Criteria | 
     termination by accident. No strategy means `Sample`.
     """
     transforms = sampling.transforms() if logits is None else logits
-    return (decoding.components(transforms),
-            (() if stopping is None else decoding.components(stopping))
-            + sampling.criteria(),
+    given = () if stopping is None else (stopping,) if callable(stopping) else tuple(stopping)
+    return (decoding.components(transforms), decoding.Finishing.of((*given, *sampling.criteria())),
             Sample() if strategy is None else strategies.as_pytree(strategy))
 
 
