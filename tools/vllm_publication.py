@@ -76,16 +76,20 @@ def engines(python: str, base: Path, policy: Path, gpu: int, out: Path) -> Itera
 
 
 def healthy(root: str, process: subprocess.Popen[bytes], name: str) -> None:
+    """Wait until the engine at `root` answers its health check, the readiness its server reports;
+    an engine still loading refuses the connection."""
     deadline = time.monotonic() + 900
-    while True:
-        try:
-            if httpx.get(f"{root}/health", timeout=2).status_code == 200:
-                return
-        except httpx.HTTPError:
-            pass
+    while not _answers(f"{root}/health"):
         if process.poll() is not None or time.monotonic() > deadline:
             raise RuntimeError(f"the {name} engine did not start; see its log")
         time.sleep(3)
+
+
+def _answers(url: str) -> bool:
+    try:
+        return httpx.get(url, timeout=2).status_code == 200
+    except httpx.HTTPError:
+        return False
 
 
 def main() -> None:
