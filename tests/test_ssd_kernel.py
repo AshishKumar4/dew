@@ -184,6 +184,7 @@ SEEDS = {
     ("shape", ((2, 193, 4, 16, 8, 2), 64)): 32,
     ("shape", ((2, 257, 2, 64, 128, 1), 256)): 128,
     ("shape", ((1, 1024, 4, 64, 64, 1), 128)): 64,
+    ("shape", ((1, 4096, 4, 64, 64, 1), 128)): 256,
 }
 """Sized by seeds_for on XLA's output, final state and all five gradients (2026-10-20, armada)."""
 
