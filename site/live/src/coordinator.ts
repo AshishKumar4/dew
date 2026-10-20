@@ -48,8 +48,8 @@ export class Coordinator extends DurableObject<Env> {
 	}
 
 	/**
-	 * End the started sessions the model pool no longer holds. The pool is shared by the
-	 * production and preview Workers, so each Coordinator asks it rather than being told.
+	 * End the started sessions the model pool no longer holds, which the Coordinator asks the pool
+	 * rather than being told.
 	 */
 	private async reconcile(now: number): Promise<void> {
 		const sql = this.ctx.storage.sql;
