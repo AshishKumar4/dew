@@ -106,8 +106,13 @@ def jpegs(count: int) -> list[dict]:
     for index in range(count):
         picture = io.BytesIO()
         Image.fromarray(rng.integers(0, 256, (40, 48, 3), np.uint8)).save(picture, format="JPEG")
-        encoded.append({"image": picture.getvalue(), "label": index % 3})
+        encoded.append({"image": picture.getvalue(), "label": index % 3, "description": f"picture {index}"})
     return encoded
+
+
+def kept_captions(captions):
+    """The captions a batch holds, kept as an array to compare."""
+    return {"caption": np.asarray(captions)}
 
 
 IMAGE_RECIPES = {
@@ -122,6 +127,9 @@ IMAGE_RECIPES = {
     "drawn caption templates, no augmentation": (
         {"caption_templates": ("a {label}", "a photo of {}"), "augment": None},
         {"caption": images.caption(templates=("a {label}", "a photo of {}"), classes=("cat", "dog", "owl"))}),
+    "a caption column": (
+        {"caption_columns": ("description",), "augment": None},
+        {"caption": images.caption(columns=("description",), classes=("cat", "dog", "owl"))}),
 }
 
 
@@ -132,7 +140,7 @@ def test_the_images_preset_prepares_what_the_image_recipe_does(read, case):
     own settings: the same training batches and validation batches, and where the chain orders its
     records where the recipe does, the same plan. A memory read orders the recipe's records after
     its fixed steps and the chain's where they are written, before the preset: the same rows, in
-    a plan that records the order's place."""
+    a plan that records the order's place. The captions each writes are kept and compared."""
     from dew.config.data import Augment, ImageData, loader
     from dew.data.holdout import HoldOut
 
@@ -147,7 +155,8 @@ def test_the_images_preset_prepares_what_the_image_recipe_does(read, case):
     recipe = ImageData(source, image_size=16, augment=augment, classes=("cat", "dog", "owl"),
                        validation=holdout, **recipe_settings)
     recipe_settings["augment"] = backend
-    expected = loader(recipe, batch=4, read=read, loading=loading, validation_records=3)
+    host = (images.EncodeCaptions(kept_captions),)
+    expected = loader(recipe, batch=4, read=read, loading=loading, validation_records=3, host=host)
 
     order = {"memory": None, "indexed": None, "streamed": 64}[read]
     caption = preset_settings.pop("caption", images.caption(classes=("cat", "dog", "owl")))
@@ -157,7 +166,7 @@ def test_the_images_preset_prepares_what_the_image_recipe_does(read, case):
                                                          **preset_settings)
     validation = held.pipe(presets.images, 16, batch=4, records=3, **common)
     preset_settings["caption"] = caption
-    built = compile(chain, validation=validation, read=read, loading=loading, host=(images.EncodeCaptions(),))
+    built = compile(chain, validation=validation, read=read, loading=loading, host=host)
 
     if read != "memory":
         assert built.plan.identity() == expected.plan.identity()
@@ -175,6 +184,19 @@ def test_the_images_preset_prepares_what_the_image_recipe_does(read, case):
     assert len(scored[0]) == len(scored[1]) == 1
     for name in scored[0][0]:
         np.testing.assert_array_equal(scored[1][0][name], scored[0][0][name])
+
+
+@pytest.mark.parametrize("crop", ["random resized crop", "own crop"])
+def test_images_staged_larger_are_cropped_to_size_by_a_host_step(crop):
+    """Images staged at 24 pixels reach a host crop that returns 16-pixel squares, whichever step
+    it is: the preset's batches hold what the crop made."""
+
+    def corner(record, rng):
+        return {**record, "image": record["image"][:16, :16]}
+
+    step = images.RandomResizedCrop(16) if crop == "random resized crop" else corner
+    batch = first_batch(Memory(jpegs(8)).pipe(presets.images, 16, batch=4, staging_size=24, augment=step))
+    assert batch["image"].shape == (4, 16, 16, 3)
 
 
 def test_lm_packs_documents_into_rows_that_keep_every_target():
