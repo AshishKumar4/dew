@@ -230,38 +230,28 @@ def token_weights(
 
 
 class _DeficitIterator(pygrain.DatasetIterator[Batch]):
+    """Each row from the corpus furthest below its share of the targets delivered, each corpus
+    read through its first row ahead (`_PrimeReads`)."""
+
     def __init__(
         self,
-        parents: Sequence[pygrain.DatasetIterator[Batch]],
+        reads: Sequence[_PrimedRead],
         weights: tuple[int, ...],
         tokens: Callable[[Batch], int],
         keys: tuple[str, ...],
     ):
-        super().__init__(parents)
-        self._reads, self._weights, self._tokens, self._keys = tuple(parents), weights, tokens, keys
-        self._delivered = [0] * len(parents)
-        self._pending: list[Batch | None] = [None] * len(parents)
-        self._pending_states: list[Mapping[str, object] | None] = [None] * len(parents)
-        # The corpora whose first row was read ahead, so a rejection budget a corpus exhausts is
-        # met before any row: every corpus at the start, and one that joins a resumed mix.
-        self._primed = [False] * len(parents)
+        super().__init__(reads)
+        self._reads, self._weights, self._tokens, self._keys = tuple(reads), weights, tokens, keys
+        self._delivered = [0] * len(reads)
 
     def __next__(self) -> Batch:
-        for index, parent in enumerate(self._reads):
-            if not self._primed[index]:
-                self._pending_states[index] = parent.get_state()
-                self._pending[index] = next(parent)
-                self._primed[index] = True
         total = sum(self._delivered)
         scale = sum(self._weights)
         chosen = max(
             range(len(self._reads)),
             key=lambda index: self._weights[index] * total - self._delivered[index] * scale,
         )
-        value = self._pending[chosen]
-        if value is None:
-            value = next(self._reads[chosen])
-        self._pending[chosen], self._pending_states[chosen] = None, None
+        value = next(self._reads[chosen])
         tokens = self._tokens(value)
         if tokens <= 0:
             raise RuntimeError(
@@ -272,14 +262,8 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
 
     def get_state(self) -> Mapping[str, object]:
         return {
-            "parents": {
-                key: pending if value is not None and pending is not None else parent.get_state()
-                for key, parent, value, pending in zip(
-                    self._keys, self._reads, self._pending, self._pending_states, strict=True
-                )
-            },
+            "parents": {key: read.get_state() for key, read in zip(self._keys, self._reads, strict=True)},
             "delivered": dict(zip(self._keys, self._delivered, strict=True)),
-            "primed": dict(zip(self._keys, self._primed, strict=True)),
         }
 
     def set_state(self, state: Mapping[str, object]) -> None:
@@ -295,23 +279,17 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         if any(count < 0 for count in delivered.values()):
             raise ValueError("token deficit state has negative delivered targets")
         kept = [key in parents for key in self._keys]
-        for key, parent in zip(self._keys, self._reads, strict=True):
+        for key, read in zip(self._keys, self._reads, strict=True):
             if key in parents:
-                parent.set_state(record(parents[key], "corpus iterator"))
+                read.set_state(record(parents[key], "corpus iterator"))
         restored = [delivered[key] for key in self._keys if key in parents]
         total, weight = sum(restored), sum(w for w, held in zip(self._weights, kept, strict=True) if held)
         self._delivered = [delivered[key] if held else (w * total // weight if weight else 0)
                            for key, w, held in zip(self._keys, self._weights, kept, strict=True)]
-        self._pending = [None for _ in self._reads]
-        self._pending_states = [None for _ in self._reads]
-        # A corpus whose first row was read ahead is restored to before it, and reads it when chosen;
-        # one that joined is read ahead as the mix reads on.
-        primed = record(state["primed"], "primed corpora")
-        self._primed = [key in primed and boolean(primed[key], "primed") for key in self._keys]
 
     def close(self) -> None:
-        for parent in self._reads:
-            parent.close()
+        for read in self._reads:
+            read.close()
 
 
 class TokenDeficit(pygrain.IterDataset[Batch]):
@@ -349,8 +327,9 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
         )
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        return _DeficitIterator([iter(parent) for parent in self._corpora], self._weights, self._tokens,
-                                self._keys)
+        group = _PrimeReads([iter(parent) for parent in self._corpora])
+        reads = [_PrimedRead(group, index) for index in range(len(self._corpora))]
+        return _DeficitIterator(reads, self._weights, self._tokens, self._keys)
 
 
 class _PrimeMap:
