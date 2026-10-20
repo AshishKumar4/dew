@@ -222,6 +222,9 @@ an assertion decides alike on every run."""
 CONFIDENCE = 0.999
 """The bootstrap interval check 1 reads: a site whose pooled ratio's 99.9% interval is wider than
 PARITY cannot tell an equally exact computation from one PARITY off, and is inconclusive."""
+FEWEST_SEEDS = 8
+"""The fewest seeds check 1 judges by: a bootstrap over fewer has too few distinct resamples for its
+interval to mean anything, so fewer is Inconclusive whatever their ratio reads (`seeds_for` starts here)."""
 REDRAW = 4
 """A failing site's pooled ratio is drawn again over REDRAW times its seeds before it fails."""
 
@@ -352,6 +355,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/op_certificates.py)."""
+    if seeds < FEWEST_SEEDS:
+        raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
+                           f"(`seeds_for`)")
     draws = _drawn(dew_fn, reference_fn, draw, range(seeds), truth_fn)
     over_first = [index for index in range(len(draws.names))
                   if np.sum(draws.theirs[:, index]) > 0 and _judged(draws, index)[0] > PARITY]

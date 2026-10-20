@@ -121,13 +121,27 @@ def test_check_one_fails_a_sum_that_differs_rather_than_rounds(wrong):
 
 
 def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
-    """One element over two seeds: its pooled ratio's interval is wider than PARITY, so the site is
-    inconclusive, never passed, however its draws fell."""
-    def total(fn):
-        return jax.jit(lambda x, w: {"sum": jnp.sum(fn(x, w)["y"])})
+    """Errors set seed by seed, alike on every host: Dew's squared error is 4 on even seeds and 0.01 on
+    odd ones, the reference's 1 on each, so the pooled ratio (1.42) is under PARITY but its interval
+    over 8 seeds straddles it and is wider than it: inconclusive, never a pass. Fewer seeds than
+    FEWEST_SEEDS are inconclusive whatever they read."""
+    def errors(seed):
+        return (np.zeros(64, np.float32), np.full(64, 2.0 if seed % 2 == 0 else 0.1, np.float32),
+                np.ones(64, np.float32))
+
+    def dew(x, mine, theirs):
+        return {"y": x + mine}
+
+    def reference(x, mine, theirs):
+        return {"y": x + theirs}
+
+    def truth(x, mine, theirs):
+        return {"y": x}
 
     with pytest.raises(Inconclusive):
-        assert_as_exact(total(_reordered), total(_product), _draw, "one element", seeds=2)
+        assert_as_exact(dew, reference, errors, "straddling", seeds=8, truth_fn=truth)
+    with pytest.raises(Inconclusive):
+        assert_as_exact(_reordered, _product, _draw, "two seeds", seeds=2)
 
 
 def test_check_one_holds_dew_exact_where_the_reference_is_exact_on_every_seed():
