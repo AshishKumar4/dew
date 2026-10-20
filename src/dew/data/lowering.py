@@ -814,7 +814,8 @@ class _Build:
             rows = self.stage(rows, stage, pipeline, partition, index)
             if index == last:
                 rows = rows.map(_unplaced)
-        if not self.global_order:
+        if not self.global_order and not isinstance(pipeline.source, (Mixture, Phases)):
+            # A corpus counts the rows it delivers; a mixture's are its corpora's, each counted.
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
         return rows
 
