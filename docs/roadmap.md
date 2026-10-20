@@ -63,6 +63,7 @@ The kernel direction was approved on 2026-10-19:
 - Prefer XLA for fp32 SwiGLU where its fusion wins. Fuse transaction admission and narrowing into the update pass where measured. [646, 648]
 - Compile evaluation and generation before their measured interval. Profile first compilation separately through lowering and XLA passes. [627, 629]
 - Keep document resets out of recurrence decay prefixes, move decode regrouping into the kernel boundary and finish shared tuner/template coverage. [NNK-4, NNK-8, 597]
+- Take paged attention through the typed kernel selector, so its eligibility is each kernel's own as every other operation's is. [742]
 - Give the chunked gated delta rule one dtype contract on every route. With mixed operands the port returns their common dtype, while the portable math returns the query's and casts its cotangent to it, so output dtype and gradient precision depend on the GPU row. [730]
 
 ## Data
@@ -103,6 +104,7 @@ The kernel direction was approved on 2026-10-19:
 - Add explicit continue/restart control beside automatic latest-checkpoint restore. In-memory state continuation was rejected. [208]
 - Match PNDM's multistep grouping and startup steps against Diffusers before remeasuring its parity margin. [647]
 - Find the tiled chunked head's residual: at token tile 2, about 40 of 8192 head-gradient elements sit more than twice as far from float64 as the whole-logits reference; at tile 20 there are none. [737]
+- Let `generate` run without a key where its sampling needs none, or require one; its None default is refused today. [745]
 - Keep quantized and plain traces apart. Qwix patches `dot_general` only while a wrapped call traces, so `jnp.matmul`'s jit cache can hold a quantized trace that a later plain call at the same shapes reuses, and the reverse. [736]
 - Bring the vocabulary-split head to the whole head's accuracy. Over exact-symmetry orders it sits 2.3–3.0× the whole head's distance from float64; combining the shards' partial log-sum-exps is the suspected cause. [734]
 - Compile a step lowered by `Trainer(lower_for=)` before allocating training time, carry its executable and tuning picks to the run, and measure the saved startup time. Lowering alone already works. [720]
@@ -165,4 +167,5 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
   - Recurrences and looped models: [659, 660, 661, 662, 664, 665, 678, 706, 711].
   - Data and packing: [683, 684, 685, 694].
 - Fix the training qualification's setup, which reads an empty marker file in the full suite. [735]
-- Dew requires its own JAX build, installed from pypi.dewml.dev, with no stock-JAX routes or version gates. The fork AshishKumar4/jax follows upstream releases by CI and carries a patch stack, each patch sent upstream and dropped at the fork's first rebase onto a release that contains it: the compilation cache-key fixes for jax-ml/jax#40940 and #41502 (jax-ml/jax#41776, #41777), and `linear_call`'s batching and forward-mode rules (jax-ml/jax#41782, #41780). [713, 714, 731, 732]
+- Make float32 numpy references independent of the worker's OpenBLAS kernels, which round differently on x86-64-v3 and v4, without pinning the weaker one. [744]
+- Dew requires its own JAX build, installed from pypi.dewml.dev, with no stock-JAX routes or version gates. The fork AshishKumar4/jax follows upstream releases by CI and carries a patch stack, each patch sent upstream and dropped at the fork's first rebase onto a release that contains it: the compilation cache-key fixes for jax-ml/jax#40940 and #41502 (jax-ml/jax#41776, #41777), and `linear_call`'s batching and forward-mode rules (jax-ml/jax#41782, #41780). Before Dew moves to JAX 0.12, its XLA:CPU narrow float32 dots, which sum K in one sequential chain about twice as far from float64 as 0.11.2's partial sums, need a fix or an upstream report. [713, 714, 731, 732, 743]
