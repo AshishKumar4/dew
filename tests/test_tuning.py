@@ -4,6 +4,8 @@ heuristic, stored and read back in a fresh process, and measured once on a
 GPU that a process has to itself (dew.nn.kernels.tuning)."""
 
 import ast
+import dataclasses
+import functools
 import json
 import os
 import shutil
@@ -359,6 +361,54 @@ def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_
     assert fresh(MEASURED, "2048", cache_dir=tmp_path / "cache", flags=inherited) == [path, measured, True, 1]
     assert fresh(MEASURED, "1024", cache_dir=tmp_path / "cache",
                  flags=f"{inherited} {READ_ONLY}".strip()) == [path, measured, False, 1]
+
+
+class KernelBug(Exception):
+    """A kernel's own failure, which no GPU limit explains."""
+
+
+@pytest.mark.gpu(reason="the tuner measures on CUDA")
+def test_a_config_failing_for_more_than_its_shared_memory_stops_the_measurement():
+    """A launch one of whose configs raises as it lowers, a kernel's bug and not its GPU's shared
+    memory: measuring the launch propagates the error, where the tuner had counted it one more
+    failed config and kept the others' fastest."""
+    with tuning.launches():
+        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+    [norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
+    broken_config = sorted(norm.autotuning_configs, key=repr)[0]
+
+    class Broken(norm_swiglu.RmsForward):
+        """The norm's forward, raising for one config of its space. Its signature is the norm's, which
+        tokamax reads to bind the launch's operands."""
+
+        @functools.wraps(norm_swiglu.RmsForward._fwd)
+        def _fwd(self, *args, config, **kwargs):
+            if config == broken_config:
+                raise KernelBug
+            return super()._fwd(*args, config=config, **kwargs)
+
+    fields = {field.name: getattr(norm.op, field.name) for field in dataclasses.fields(norm.op) if field.init}
+    broken = tokamax.BoundArguments(Broken(**fields), norm.arguments)
+    with pytest.raises(KernelBug):
+        tuning._measured(broken.op, broken)
+
+
+@pytest.mark.gpu(reason="the tuner measures on CUDA")
+def test_a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path):
+    """A profile capture holds CUPTI, which takes one subscriber: measuring a launch beside it times
+    no config, returns each as failed, so the launch keeps its heuristic, and leaves CUPTI to the
+    capture without raising; once the capture ends, the same launch measures every config."""
+    with tuning.launches():
+        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+    [norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
+    jax.profiler.start_trace(str(tmp_path / "trace"))
+    try:
+        beside = tuning._measured(norm.op, norm)
+    finally:
+        jax.profiler.stop_trace()
+    assert set(beside) == set(norm.autotuning_configs) and not beside.prune_errors()
+    alone = tuning._measured(norm.op, norm)
+    assert set(alone.prune_errors()) == set(norm.autotuning_configs)
 
 
 STORES = """

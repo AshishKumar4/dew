@@ -277,6 +277,36 @@ def _kernel_times(cupti, executable, *args) -> list[tuple[str, float]]:
     return kernels if isinstance(kernels, list) else []
 
 
+def _another_subscriber(error: RuntimeError) -> bool:
+    """Whether CUPTI refused the tuner's subscription for another subscriber's, a profile capture or
+    Nsight's: the launch keeps its heuristic until a later compile. Mosaic's profiler raises it as a
+    RuntimeError naming the other subscriber; every other failure is the tuner's to report."""
+    return "another subscriber" in str(error)
+
+
+def _detach(profiler, evicting: jax.stages.Compiled, flush: jax.Array) -> None:
+    """Detach CUPTI from the process with a finalizing read of `evicting`, so a profiler can subscribe
+    after; where one already holds it (`_another_subscriber`), there is nothing of the tuner's to
+    detach."""
+    try:
+        _kernel_times(profiler.Cupti(), evicting, flush)
+    except RuntimeError as error:
+        if not _another_subscriber(error):
+            raise
+
+
+def _resource_exhausted(error: Exception) -> bool:
+    """Whether a config failed for a block past the GPU's own resources, the failures a config of a
+    launch's space may meet on a GPU it was not declared for: its shared memory as XLA's compile
+    reports it ("RESOURCE_EXHAUSTED: Shared memory size limit exceeded"), or its registers or threads as
+    the driver refuses the launch (CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES, which XLA passes on as an
+    INTERNAL error naming it). Any other failure, device memory's included, is the kernel's or the
+    tuner's, and propagates."""
+    message = str(error)
+    return (message.startswith("RESOURCE_EXHAUSTED: Shared memory size limit exceeded")
+            or "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES" in message)
+
+
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
@@ -313,26 +343,29 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
     read = {}
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
         futures = {config: pool.submit(compiled, config) for config in ba.autotuning_configs}
-    # One CUPTI subscription reads every run, the flush's own first. CUPTI
-    # takes one subscriber, so beside an open profile capture none is
-    # measured and the launch keeps its heuristic until a later compile.
+    # CUPTI reads every run, the flush's own first, subscribing for each and
+    # unsubscribing after. It takes one subscriber, so where a profile capture
+    # holds it, from the first run or any later one, the launch keeps its
+    # heuristic until a later compile.
     cupti = profiler.Cupti(finalize=False)
     try:
         flushes = {name for name, _ in _kernel_times(cupti, evicting, flush)}
-    except RuntimeError as error:
-        return AutotuningData(dict.fromkeys(ba.autotuning_configs, error))
-    try:
         for config, future in futures.items():
             try:
                 executable, lowering, compiling = future.result()
                 runs = [_kernel_times(cupti, executable, flush, arrays) for _ in range(REPEATS)]
-            except Exception as error:  # a config past the GPU's shared memory or registers
+            except jax.errors.JaxRuntimeError as error:
+                if not _resource_exhausted(error):
+                    raise
                 timings[config] = error
                 continue
             read[config] = runs, lowering, compiling
+    except RuntimeError as error:
+        if not _another_subscriber(error):
+            raise
+        return AutotuningData(dict.fromkeys(ba.autotuning_configs, error))
     finally:
-        # A finalizing read detaches the subscription, so a profiler can subscribe after.
-        _kernel_times(profiler.Cupti(), evicting, flush)
+        _detach(profiler, evicting, flush)
     for config, (runs, lowering, compiling) in read.items():
         times = tuple(sum(milliseconds for name, milliseconds in run if name not in flushes) for run in runs)
         timings[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
