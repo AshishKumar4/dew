@@ -483,7 +483,10 @@ def test_muon_steps_an_adapted_head_whose_factors_it_splits_between_its_optimize
     off both factors, so the masked tree raised on Muon's first update."""
     adapter = LoRA(rank=2, modules=("q_proj", "lm_head")).apply(
         decoder.model, decoder.variables, key=0, layouts=decoder.layouts)
-    factors = adapter.variables["params"]
+    # A fresh adapter's B is zero, which leaves A's gradient zero; a drawn B moves both.
+    factors = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jax.random.normal(jax.random.key(7), leaf.shape, leaf.dtype)
+        if path[-1].key == "lora_B" else leaf, adapter.variables["params"])
     numbers = muon_weight_dimension_numbers(factors)
     assert numbers["lm_head"]["lora_A"] is not None and numbers["lm_head"]["lora_B"] is None
     optimizer = OPTIMIZER_MAP["muon"](1e-3)
