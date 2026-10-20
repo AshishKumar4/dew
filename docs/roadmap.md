@@ -26,6 +26,7 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Let an FP8 frozen base differentiate in forward mode through the shared tangent boundary, keeping its reverse kernel, and test MeanFlow over it. [782]
 - Take the grouped convolution's backward off Qwix's private modules: its public provider API, or an upstream Qwix fix carried meanwhile. [783]
 - Let Llama 4's mixer take any KV cache, its context derived from the caller's, not rebuilt. [784]
+- Let latent attention (MLA and its sparse pooling) and DeepSeek V4's compressed cache take paged and quantized KV cache layouts. [830, 831]
 - Route MPConv through Conv's shared operand path after its normalization. [785]
 - One patch projection for every scan order in DiT, UViT and SimpleUDiT, the tokens permuted after it. [787]
 - Build Llama 4's vision adapter from MergeProjector. [788]
