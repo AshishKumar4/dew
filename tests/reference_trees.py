@@ -8,9 +8,7 @@ each summing the same terms in float32 with an error bound of the reference's ow
 
 - "pairwise": adjacent terms added, then their sums, recursively, as a tree reduction does;
 - "blocked-<b>": each block of b consecutive terms summed pairwise, then the blocks' sums left to
-  right, as a tiled kernel accumulates its tiles;
-- "strided-<w>": w lanes, each summing in turn the terms whose index is its own modulo w, then the
-  lanes pairwise, as a vectorized loop's accumulators do.
+  right, as a tiled kernel accumulates its tiles.
 
 A sequential sum is no member: its error grows with the term count (one large term and 127 ones,
 uniformly placed, part from float64 by 63 on average against pairwise's 1), so it would raise the
@@ -51,32 +49,18 @@ def _sequential(x):
 
 
 def tree_sum(x, axis: int, tree: str):
-    """`x` summed over `axis` in its own dtype under `tree`: "pairwise"; "blocked-<b>", each block
-    of b terms pairwise and the blocks' sums in turn; or "strided-<w>", w lanes each summing the
-    terms whose index is its own modulo w in turn, then the lanes pairwise (`sum_family`)."""
+    """`x` summed over `axis` in its own dtype under `tree`: "pairwise", or "blocked-<b>", each block
+    of b terms pairwise and the blocks' sums in turn."""
     x = jnp.moveaxis(x, axis, -1)
     if tree == "pairwise":
         return _pairwise(x)
     kind, _, size = tree.partition("-")
-    if kind not in ("blocked", "strided") or not size.isdigit():
-        raise ValueError(f"no summation tree {tree!r}: a tree is 'pairwise', 'blocked-<b>' or 'strided-<w>'")
-    width = int(size)
-    count = -(-x.shape[-1] // width)
-    padded = jnp.concatenate([x, jnp.zeros((*x.shape[:-1], count * width - x.shape[-1]), x.dtype)], axis=-1)
-    grouped = padded.reshape(*x.shape[:-1], count, width)
-    if kind == "blocked":
-        return _sequential(_pairwise(grouped))
-    return _pairwise(_sequential(jnp.swapaxes(grouped, -1, -2)))
-
-
-def sum_family(block: int) -> tuple[str, ...]:
-    """The canonical trees every Sum class declares its members from, the same for every class and
-    chosen before any run: pairwise; blocks of the class's kernel tile `block`; and strided trees of
-    8 and 16 lanes, a vectorized loop's accumulators over AVX2's and AVX-512's float32 lanes. A
-    strided tree approximates a vectorizing compiler's schedule, not the schedule itself (XLA:CPU's
-    row sum over 48 terms on an AVX-512 worker is "strided-16" bit for bit, and over longer rows is
-    not), so it is a strided-tree member, named for its arithmetic, never for an ISA."""
-    return ("pairwise", f"blocked-{block}", "strided-8", "strided-16")
+    if kind != "blocked" or not size.isdigit():
+        raise ValueError(f"no summation tree {tree!r}: a tree is 'pairwise' or 'blocked-<b>'")
+    block = int(size)
+    count = -(-x.shape[-1] // block)
+    padded = jnp.concatenate([x, jnp.zeros((*x.shape[:-1], count * block - x.shape[-1]), x.dtype)], axis=-1)
+    return _sequential(_pairwise(padded.reshape(*x.shape[:-1], count, block)))
 
 
 def tree_contract(a, b, axis: int, tree: str):
