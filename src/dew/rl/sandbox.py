@@ -31,8 +31,8 @@ stalls removing one. A session source retries either as an infrastructure
 failure.
 
 `MathReward` is a verifiable reward that runs no program. It reads the
-completion's final answer and compares it with the reference as an exact
-rational number.
+completion's final answer and compares it with the record's reference as an
+exact rational number.
 """
 
 from __future__ import annotations
@@ -60,6 +60,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
 
+from dew.data.prompts import PromptRecord
 from dew.inference.rollouts import InfrastructureError
 from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
 from dew.records import JSON
@@ -655,22 +656,23 @@ class MathReward:
     The answer is the last `\\boxed{}` in the completion. With
     `require_boxed=False`, a completion without one uses its last number
     instead. Integers, decimals, `a/b` and `\\frac{a}{b}` compare exactly, so
-    `0.5`, `1/2` and `\\frac{1}{2}` agree. A reference that is not a number
-    is compared as trimmed text.
+    `0.5`, `1/2` and `\\frac{1}{2}` agree. The reference is the record's
+    `ground_truth`; one that is not a number is compared as trimmed text.
     """
 
     require_boxed: bool = True
 
-    def __call__(self, data_source: str, completion: str, ground_truth: str, extra_info: str) -> float:
+    def __call__(self, completion: str, record: PromptRecord) -> float:
         answer = _boxed(completion)
         if answer is None and not self.require_boxed:
             numbers = _NUMBER.findall(completion)
             answer = numbers[-1] if numbers else None
         if answer is None:
             return 0.0
-        expected = _rational(ground_truth)
+        reference = record.ground_truth
+        expected = _rational(reference)
         if expected is None:
-            return float(answer.strip() == ground_truth.strip())
+            return float(answer.strip() == reference.strip())
         return float(_rational(answer) == expected)
 
 
