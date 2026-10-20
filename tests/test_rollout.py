@@ -252,6 +252,32 @@ def test_the_reward_sees_each_rows_own_context():
     assert [record.ground_truth for _, record in reward.seen] == ["1", "1", "2", "2"]
 
 
+def test_each_data_source_reports_its_own_rewards_and_statuses():
+    """Rows from two data sources: each source's reward mean is its own rows' scores, its status
+    shares its own draws', beside the batch's; a later batch from one source alone reports no
+    source, and the earlier batch's keys are gone."""
+    objective = tiny_objective()
+    params = objective.init(jax.random.key(0))
+    reward = Calls()
+    rollout = SampledRollout(objective, reward, groups=GROUPS, max_new_tokens=NEW_TOKENS,
+                             sampling=Sampling(temperature=1.0), truncation="score")
+    rollout(FakeState(params), prompt_batch(), jax.random.key(1))
+    scores = {}
+    for completion, record in reward.seen:
+        score = float(completion.split().count(record.ground_truth))
+        scores.setdefault(record.data_source, []).append(score)
+    for source in ("rule", "other"):
+        assert rollout.metrics[f"source/{source}/reward/mean"] == float(np.mean(scores[source]))
+        shares = [rollout.metrics[f"source/{source}/status/{status}"]
+                  for status in ("completed", "truncated")]
+        assert sum(shares) == 1.0
+    assert rollout.metrics["reward/mean"] == pytest.approx(np.mean([*scores["rule"], *scores["other"]]),
+                                                           rel=1e-6)
+    single = {key: value[:1] for key, value in prompt_batch().items()}
+    rollout(FakeState(params), single, jax.random.key(2))
+    assert not any(key.startswith("source/") for key in rollout.metrics)
+
+
 @pytest.mark.parametrize("estimator", ["group", "mean", "rloo"])
 def test_each_estimator_turns_the_calls_rewards_into_the_packed_advantages(estimator):
     """Four completions a prompt under a sampling policy, scored by how many

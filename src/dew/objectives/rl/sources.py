@@ -339,10 +339,10 @@ class PromptSource:
             score = self.reward(text, prompt.record)
         except _INFRASTRUCTURE as error:
             # The reward's boundary failed, a sandbox or a service: infrastructure, retried.
-            return Session(
-                task.id, "", 0, 0, (call,), Status.INFRA_ERROR, None, {}, f"reward: {_failure(error)}"
-            )
-        return Session(task.id, "", 0, 0, (call,), status, finite_reward(score))
+            return Session(task.id, "", 0, 0, (call,), Status.INFRA_ERROR, None, {},
+                           f"reward: {_failure(error)}", prompt.record.data_source)
+        return Session(task.id, "", 0, 0, (call,), status, finite_reward(score),
+                       source=prompt.record.data_source)
 
     def _scored(self, task: Task, prompt: _Prompt, version: int, drawn: Future[Draw]) -> Future[Session]:
         """The draw's future, chained into its reward on a scorer thread."""

@@ -26,6 +26,7 @@ from .sessions import (
     check_truncation,
     pack,
     sampled_values,
+    source_metrics,
 )
 
 type Reward = Callable[[str, PromptRecord], float]
@@ -144,7 +145,7 @@ class SampledRollout:
                             "stop" if stopped else "length", version)
                 sessions.append(Session(str(row), "", group, 0, (call,),
                                         Status.COMPLETED if stopped else Status.TRUNCATED,
-                                        float(rewards[row, group])))
+                                        float(rewards[row, group]), source=records[row].data_source))
         # Session `row * groups + group` is that draw, which is what `sampled_values` hands its callback.
         # The rows are the objective's, which `pack` refuses a draw too long for.
         packed = pack(sessions, self.objective.seq_len + 1, rows=rows * self.groups,
@@ -152,6 +153,9 @@ class SampledRollout:
         packed[OLD_LOG_PROBS_KEY] = sampled_values(
             packed, lambda index, _: raw[index // self.groups, index % self.groups,
                                          :int(lengths[index // self.groups, index % self.groups])].tolist())
+        # The call's metrics replace the last call's whole: a source this batch lacks reports nothing.
+        self.metrics.clear()
         self.metrics.update({"reward/mean": float(rewards.mean()), "length/mean": float(lengths.mean()),
-                             "status/truncated": float(1 - terminated.mean())})
+                             "status/truncated": float(1 - terminated.mean()),
+                             **source_metrics(sessions, self.truncation)})
         return packed
