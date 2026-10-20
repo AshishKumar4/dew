@@ -6,10 +6,13 @@ run ends with the panel's last frame and the summary as static outputs. A notebo
 per logging interval.
 """
 
+import os
 from pathlib import Path
 
 import nbformat
 from nbclient import NotebookClient
+
+import dew
 
 TESTS = Path(__file__).resolve().parent
 
@@ -34,7 +37,10 @@ def text(output) -> str:
 
 def test_a_notebook_redraws_the_panel_in_one_widget_and_keeps_its_last_frame_and_the_summary(tmp_path):
     notebook = nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell(FIT)])
-    NotebookClient(notebook, kernel_name="python3", resources={"metadata": {"path": str(TESTS)}}).execute()
+    # The kernel imports the Dew under test, wherever this process found it.
+    path = os.pathsep.join(filter(None, [str(Path(dew.__file__).parents[1]), os.environ.get("PYTHONPATH")]))
+    NotebookClient(notebook, kernel_name="python3", resources={"metadata": {"path": str(TESTS)}}).execute(
+        env={**os.environ, "PYTHONPATH": path})
     nbformat.write(notebook, tmp_path / "fit.ipynb")
     notebook = nbformat.read(tmp_path / "fit.ipynb", as_version=4)
     outputs = notebook.cells[0].outputs
