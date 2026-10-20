@@ -306,7 +306,7 @@ def test_an_accumulated_distillation_alternates_its_networks_update_by_update(tm
         "tangent_warmup": 1, "student_update_freq": 2, "max_simulation_steps": 2})).build()
 
     trainer = Trainer(task, optax.sgd(1e-2), key=jax.random.PRNGKey(5), accumulation=2)
-    distilled = trainer.initial_state()
+    distilled, _, _ = trainer.place()
     step = trainer.compile(distilled, batch)
     moved = []
     for _ in range(4):
