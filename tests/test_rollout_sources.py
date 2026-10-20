@@ -16,6 +16,7 @@ that reports no raw likelihood records none, and its sessions still train;
 and the prompt source scores decoded text and components per draw.
 """
 
+import dataclasses
 import json
 import socket
 import threading
@@ -33,7 +34,7 @@ from dew.data.prompts import PromptRecord
 from dew.inference import Draw, VLLMGenerateServer
 from dew.objectives.rl.episodes import EpisodeStatus, Observation
 from dew.objectives.rl.records import episode_from_record
-from dew.objectives.rl.sessions import Status, Task, pack
+from dew.objectives.rl.sessions import Status, Task, Transcript, pack
 from dew.objectives.rl.sources import EnvironmentSource, PromptSource, prompt_tasks
 from dew.rl.sandbox import ContainerRunner, SandboxFleet
 from dew.sampling import Sampling
@@ -193,6 +194,41 @@ def test_a_session_ended_at_reset_takes_no_turn_in_the_turn_credit():
     for credit, expected in (("turn", 0.0), ("session", -0.5)):
         batch = pack([ended, called], 16, rows=1, estimator="mean", credit=credit)
         assert (batch["advantages"][batch["session_index"] == 1] == np.float32(expected)).all()
+
+
+def test_each_call_lists_the_messages_the_observations_before_it_carried():
+    """An environment whose reset and steps say, beside the ids, the chat messages their context
+    added: each call's transcript lists the messages before it, the episode's journal record keeps
+    them, and the ids the model read are the training record."""
+    class Talking(Counter):
+        def reset(self):
+            return dataclasses.replace(super().reset(), messages=({"role": "user", "content": "count"},))
+
+        def step(self, action):
+            seen = super().step(action)
+            return dataclasses.replace(seen, messages=({"role": "tool", "content": f"step {self.steps}"},))
+
+    @contextmanager
+    def environment(task, identity):
+        yield Talking()
+
+    recorded = []
+
+    def scored(task, episode):
+        recorded.append(episode)
+        return verifier(task, episode)
+
+    episodes = source(Server(), environment, verifier=scored)
+    (rollout,) = [future.result() for future in episodes.submit(Task("3"), 1, version=0, key=KEY)]
+    episodes.close()
+    user, *tools = [{"role": "user", "content": "count"}, *({"role": "tool", "content": f"step {step}"}
+                                                            for step in (1, 2))]
+    assert [call.transcript for call in rollout.calls] == [
+        Transcript((user,)), Transcript((user, tools[0])), Transcript((user, *tools))]
+    assert [call.prompt_ids for call in rollout.calls] == [
+        (1, 2), (1, 2, 5, EOS, 4), (1, 2, 5, EOS, 4, 5, EOS, 4)]
+    (episode,) = recorded
+    assert episode_from_record(json.loads(json.dumps(asdict(episode)))) == episode
 
 
 def test_every_call_of_a_multi_turn_session_carries_its_draws_engine_records():

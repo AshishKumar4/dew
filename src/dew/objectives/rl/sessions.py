@@ -51,6 +51,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.data.tokens import first_fit
+from dew.records import json_value, record as section
 from dew.rl import group_advantage, rloo_advantage
 
 IDS_KEY = "input_ids"
@@ -148,6 +149,36 @@ def _token_ids(name: str, ids: object) -> None:
 
 
 @dataclass(frozen=True)
+class Transcript:
+    """One call's conversation in the structure the harness spoke it, as JSON.
+
+    `messages` are the chat messages the call was asked with, those the
+    harness sent or those the environment's observations carried so far, and
+    `response` is the message the engine answered with, tool calls included,
+    or None where the source holds no structured answer (its sampled ids
+    are the answer). The call's ids stay its training record: nothing is
+    tokenized from a transcript, and it is kept for reading a session, not
+    for scoring it.
+    """
+
+    messages: tuple[Mapping[str, object], ...]
+    response: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "messages", json_objects(self.messages, "a transcript's messages"))
+        if self.response is not None:
+            object.__setattr__(self, "response", json_objects((self.response,), "a transcript's response")[0])
+
+
+def json_objects(values: object, name: str) -> tuple[Mapping[str, object], ...]:
+    """`values`, a tuple of JSON objects in any `Mapping`, as plain JSON trees (`json_value`), which
+    journals copy and write as they are; ValueError for anything else."""
+    if not isinstance(values, tuple) or not all(isinstance(value, Mapping) for value in values):
+        raise ValueError(f"{name} are a tuple of JSON objects")
+    return tuple(section(json_value(value, name), name) for value in values)
+
+
+@dataclass(frozen=True)
 class Call:
     """One model call as the engine served it.
 
@@ -169,6 +200,10 @@ class Call:
     ids the sampler's top-k/top-p filters kept (vLLM's `sampling_mask`).
     With a support, the behavior log-probability is the filtered one, and
     the trainer renormalizes over the same support. None means no filter.
+
+    `reward` is what the environment paid for this call, a step reward, or
+    None. `transcript` is the call's conversation in the structure the
+    harness spoke it (`Transcript`), where the source has one.
     """
 
     prompt_ids: tuple[int, ...]
@@ -179,6 +214,7 @@ class Call:
     routed_experts: np.ndarray | None = field(default=None, compare=False)
     support: tuple[tuple[int, ...], ...] | None = None
     reward: float | None = None
+    transcript: Transcript | None = None
 
     def __post_init__(self) -> None:
         _token_ids("prompt_ids", self.prompt_ids)

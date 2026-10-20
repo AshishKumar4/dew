@@ -35,7 +35,13 @@ def observation_record(value: Mapping[str, object]) -> Observation:
     reward = record["reward"]
     return Observation(integers(record["context"], "context"),
                        EpisodeStatus(integer(record["status"], "status")), text(record["detail"], "detail"),
-                       None if reward is None else real(reward, "reward"))
+                       None if reward is None else real(reward, "reward"),
+                       messages(record["messages"], "messages"))
+
+
+def messages(value: object, key: str) -> tuple[Mapping[str, object], ...]:
+    """A list of chat messages, each a JSON object, kept as written."""
+    return sequence(value, lambda message: section(message, key), key)
 
 
 def action_record(value: Mapping[str, object]) -> Action:

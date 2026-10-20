@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import math
 from asyncio import CancelledError as AsyncCancelledError
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import CancelledError
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass, field
@@ -30,7 +30,17 @@ from dew.objectives.base import Batch, Variables
 from dew.sampling.text import Generation, Sampling
 from dew.training.state import TrainState
 
-from .sessions import OLD_LOG_PROBS_KEY, Call, Session, Status, check_credit, pack, sampled_values
+from .sessions import (
+    OLD_LOG_PROBS_KEY,
+    Call,
+    Session,
+    Status,
+    Transcript,
+    check_credit,
+    json_objects,
+    pack,
+    sampled_values,
+)
 
 if TYPE_CHECKING:
     from .journal import EpisodeJournal, JournalRun
@@ -68,19 +78,24 @@ class Observation:
     one needs a context. `detail` can hold a verifier result or an artifact
     reference without encoding it into device arrays. `reward` is what the
     environment paid for the action that led here, a step reward, or None
-    where it pays only through the verifier at the end.
+    where it pays only through the verifier at the end. `messages` are the
+    chat messages, as JSON, the environment's context holds that it added
+    here (a tool's result, a user's turn), which each later call's
+    `Transcript` lists; the context's ids stay what the model reads.
     """
 
     context: tuple[int, ...]
     status: EpisodeStatus = EpisodeStatus.RUNNING
     detail: str = ""
     reward: float | None = None
+    messages: tuple[Mapping[str, object], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, EpisodeStatus):
             raise TypeError("observation status must be an EpisodeStatus")
         if self.reward is not None:
             object.__setattr__(self, "reward", finite_reward(self.reward))
+        object.__setattr__(self, "messages", json_objects(self.messages, "an observation's messages"))
         if any(type(token) is not int or token < 0 for token in self.context):
             raise ValueError("observation context must contain nonnegative token ids")
         if self.status == EpisodeStatus.RUNNING and not self.context:
@@ -768,8 +783,10 @@ def session_of(episode: Episode, *, group: str) -> Session:
     Each transition's action becomes one call. The call's prompt is the
     action's context, its sampled ids are the action's tokens with their
     behavior likelihoods, its reward is the step reward the observation after
-    it carries, and its finish reason is `stop` when the action ended on EOS
-    and `length` otherwise. An error the environment reports
+    it carries, its transcript lists the messages the observations before it
+    carried (none where they carried none), and its finish reason is `stop`
+    when the action ended on EOS and `length` otherwise. An error the
+    environment reports
     becomes `INFRA_ERROR`, because the verifier's reward, not the status,
     says how well the agent did.
     """
@@ -779,10 +796,14 @@ def session_of(episode: Episode, *, group: str) -> Session:
         EpisodeStatus.ERROR: Status.INFRA_ERROR,
         EpisodeStatus.CANCELLED: Status.CANCELLED,
     }[episode.status]
-    calls = tuple(Call(turn.action.context, turn.action.tokens, turn.action.behavior_log_probs,
-                       "stop" if turn.action.terminated else "length", turn.action.policy_step,
-                       reward=turn.observation.reward)
-                  for turn in episode.transitions)
+    said = list(() if episode.initial is None else episode.initial.messages)
+    calls = []
+    for turn in episode.transitions:
+        calls.append(Call(turn.action.context, turn.action.tokens, turn.action.behavior_log_probs,
+                          "stop" if turn.action.terminated else "length", turn.action.policy_step,
+                          reward=turn.observation.reward,
+                          transcript=Transcript(tuple(said)) if said else None))
+        said.extend(turn.observation.messages)
     identity = episode.identity
-    return Session(str(identity.task), group, identity.sample, identity.attempt, calls, status,
+    return Session(str(identity.task), group, identity.sample, identity.attempt, tuple(calls), status,
                    episode.reward, detail=episode.detail)

@@ -34,7 +34,7 @@ TOOLS = [{"type": "function", "function": {
     "name": "bash", "description": "Run a bash command.",
     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}]
 KEPT = ("prompt_token_ids", "completion_token_ids", "logprobs", "finish_reason", "weight_version", "timestamp",
-        "latency_ms")
+        "latency_ms", "messages", "response_message")
 
 
 def venv(root: Path, name: str) -> Path:
