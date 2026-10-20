@@ -51,14 +51,26 @@ def test_a_timing_mapping_takes_its_fastest_run_and_drops_its_failures():
 
 
 def test_a_launch_of_numpy_descriptors_keys_and_round_trips_as_jaxs():
-    """The gated delta rule unpacked passes its chunk and span descriptors as NumPy arrays; each launch
-    keys them as shapes and dtypes (`KernelOp.keyed`), as it does JAX's arrays, so its launches
-    round-trip through Dew's JSON as every other's."""
-    from test_kernel_configs import rule_launches
+    """The gated delta rule unpacked passes its chunk and span descriptors as NumPy arrays; each launch,
+    recorded as the tuner records it while the rule traces (`tuning.seen`), keys them as shapes and
+    dtypes (`KernelOp.keyed`), as it does JAX's arrays, so its launches round-trip through Dew's JSON
+    as every other's."""
+    import jax.numpy as jnp
 
     from dew.nn.kernels import fla_gdn
 
-    keyed = [ba.op.keyed(ba) for ba in rule_launches(fla_gdn)]
+    q = jax.ShapeDtypeStruct((1, 64, 1, 64), jnp.bfloat16)
+    v = jax.ShapeDtypeStruct((1, 64, 2, 64), jnp.bfloat16)
+    g = jax.ShapeDtypeStruct((1, 64, 2), jnp.float32)
+    beta = jax.ShapeDtypeStruct((1, 64, 2), jnp.bfloat16)
+    h0 = jax.ShapeDtypeStruct((1, 2, 64, 64), jnp.float32)
+    with tuning.seen() as found:
+        jax.make_jaxpr(lambda *args: fla_gdn.chunk_gated_delta_rule(*args, None, 0.125, 64,
+                                                                    interpret=True))(q, q, v, g, beta, h0)
+    # The rule's launches as `KernelOp.keyed` gives them from the NumPy descriptors (`fla_gdn.sequences`),
+    # which JSON has no form for unless they key as shapes.
+    keyed = [ba for _, ba in found]
+    assert keyed
     again = tuning.loads_launches(tuning.dumps_launches(keyed))
     assert [(ba.op, ba.autotuning_cache_key) for ba in again] == [
         (tuning._identity(ba.op), ba.autotuning_cache_key) for ba in keyed]
