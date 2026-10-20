@@ -648,10 +648,14 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
                                 objective=ObjectiveConfig("flow_grpo", settings), rollout=rollout)
     saved = config.build()
     initial = started(saved)
-    # The run's step-0 state is the pipeline's own weights.
-    for got, want in zip(jax.tree.leaves(saved.model_variables(initial.variables)),
-                         jax.tree.leaves(source.variables), strict=True):
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    # The run's step-0 state holds every weight of the pipeline's, where the pipeline holds it.
+    held = dict(jax.tree_util.tree_leaves_with_path(initial.variables))
+    pipeline_weights = dict(jax.tree_util.tree_leaves_with_path(source.variables))
+    missing = pipeline_weights.keys() - held.keys()
+    assert not missing, sorted(map(jax.tree_util.keystr, missing))[:5]
+    for path, weight in pipeline_weights.items():
+        np.testing.assert_array_equal(np.asarray(held[path]), np.asarray(weight),
+                                      err_msg=jax.tree_util.keystr(path))
     checkpoints = Checkpoints(str(tmp_path / "run"))
     checkpoints.save(0, initial, None, {}, artifact=saved.inference_record())
     checkpoints.wait()
