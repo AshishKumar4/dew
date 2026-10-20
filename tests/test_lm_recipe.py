@@ -250,6 +250,40 @@ def test_a_pretrained_runs_record_trains_again(tmp_path, lora):
                                          jax.tree.leaves(after), strict=True))
 
 
+def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
+    """`dew train run.json` and `dew export` each run in a process of their own, which imports what
+    the record names and nothing a test happened to import before: the recorded run trains on to
+    two steps, and the export reads back as that step's weights, leaf for leaf."""
+    import subprocess
+    import sys
+
+    from dew.checkpoints import Checkpoints
+    from dew.interop import Pretrained
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
+    pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
+                      "--trainer.name", "fresh").run()
+    run, exported = tmp_path / "runs" / "fresh", tmp_path / "exported"
+
+    def dew(*arguments: str) -> None:
+        done = subprocess.run([sys.executable, "-m", "dew.cli.main", *arguments], capture_output=True,
+                              text=True, check=False)
+        assert done.returncode == 0, done.stdout + done.stderr
+
+    dew("train", str(run / "run.json"), "--set", "trainer.steps=2")
+    dew("export", str(run), str(exported))
+
+    assert Checkpoints(str(run)).latest == 2
+    trained = Checkpoints(str(run)).variables(step=2)["params"]
+    loaded = Pretrained.load(str(exported), dtype="float32", attention_impl="reference").variables["params"]
+    for path, leaf in jax.tree_util.tree_flatten_with_path(loaded)[0]:
+        held = trained
+        for entry in path:
+            held = held[entry.key]
+        np.testing.assert_array_equal(np.asarray(held), np.asarray(leaf), err_msg=jax.tree_util.keystr(path))
+
+
 def test_a_pretrained_run_stores_its_parameters_in_the_dtype_it_names(tmp_path):
     """`--pretrained-param-dtype bfloat16` loads the checkpoint's parameters
     as bf16 and trains them so, and the run records it; with no
