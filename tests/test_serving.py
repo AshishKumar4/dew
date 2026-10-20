@@ -538,6 +538,33 @@ def test_a_prompt_past_the_bucket_under_the_capacity_is_served_as_the_task_serve
     assert_same_generation(ticket.result(), bound(prompt, 50, key=0))
 
 
+@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
+                         ids=["dense", "paged"])
+def test_a_multimodal_model_serves_over_its_language_models_cache(options):
+    """A wrapper that conditions its language model on images, as Qwen3.5 and Gemma 3 load,
+    holds its cache in that language model, whose layout a server replaces through the wrapper
+    (`Layered.with_kv_cache`), dense or paged: every served row of a text prompt is the greedy
+    continuation a fresh full forward gives at each token, and the lone task call's."""
+    from model_support import greedy_walk
+    from tiny_models import build_model, tiny_inputs
+
+    model = build_model("multimodal_transformer", dtype="float32").with_cache_capacity(128)
+    args, fields = tiny_inputs("multimodal_transformer", jax.random.key(0))
+    params = model.init(jax.random.key(1), *args, **fields)
+    bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    _, tickets = served_alongside(bound, **options)
+    for ticket, lone, prompt, budget in zip(tickets, [*alone, alone[2]], [*PROMPTS, PROMPTS[2]],
+                                            [*BUDGETS, BUDGETS[2]], strict=True):
+        served = ticket.result()
+        assert_same_generation(served, lone)
+        ids = np.asarray([Digits().encode(prompt)], np.int32)
+        # A generation's tokens are the prompt and its continuation.
+        walked = greedy_walk(model, params, ids, budget)
+        np.testing.assert_array_equal(served.host().tokens[:, :walked.shape[1]], walked)
+
+
 def served_alongside(bound, slots=4, admission=2, **options):
     """Every prompt submitted at once, plus the longest again once it is done,
     through a server with `options`; returns the server and the tickets."""
