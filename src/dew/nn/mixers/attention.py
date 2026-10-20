@@ -25,7 +25,6 @@ from dew.nn.attention import (
     causal_attention_mask,
     chunk_mask,
     combined_attention_mask,
-    cudnn_runs,
     cudnn_takes_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
@@ -47,8 +46,8 @@ from dew.nn.inputs import (
     counted_places,
     document_reach,
 )
-from dew.nn.kernels.generation import backend
-from dew.nn.kv_cache import PLACES, TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
+from dew.nn.kernels.selection import select
+from dew.nn.kv_cache import PAGED, PLACES, TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain, unit
@@ -146,6 +145,11 @@ class _Masking(NamedTuple):
     """The most documents a row of `documents` holds (`Coordinates.max_segments`)."""
     implementation: str
     cursor: jax.Array | None
+    """The decode mask over the cache's filled slots a decode step's kernels stand in for, where this
+    call builds it."""
+    starts: jax.Array | None
+    """Each row's first key under the layer's window, `[rows]`, which the decode kernels read beside
+    the rows' key counts in place of the window's mask."""
     key_places: jax.Array
     """Each key's place counted over its document's tokens (`counted_places`), which a chunk and ALiBi
     read: a cached key's where its cache keeps them (`dew.nn.kv_cache.Append.places`), else
@@ -689,9 +693,8 @@ class CausalSelfAttention(nn.Module):
                         valid=None if attention_metadata is None else attention_metadata.valid,
                         layout=self.ctx.kv_cache, places=self._reads_places)
             elif self.ctx.kv_cache != KVCache():
-                raise ValueError(
-                    "a bidirectional canvas reads its encoder prefix as dense, full-precision "
-                    "keys; it takes the default kv_cache layout")
+                self.ctx.refuse("attention", {"kv_cache": True}, "a bidirectional canvas reads its "
+                                "encoder prefix as dense, full-precision keys")
             elif self.ctx.kv_shared:
                 raise ValueError(
                     "a bidirectional canvas over a cache shares no keys across "
@@ -757,8 +760,7 @@ class CausalSelfAttention(nn.Module):
         queries' places counted over their documents' tokens (`counted_places`),
         and `held_places` a sharing layer's keys'."""
         B, S = query.shape[:2]
-        causal, mask, documents = self.ctx.causal, None, None
-        implementation = self.ctx.attention_impl
+        causal, mask, documents, implementation = self.ctx.causal, None, None, self.ctx.attention_impl
         # An uncached call's keys are its own tokens; a cached call's keys are
         # at the places their cache keeps beside them where the layer reads
         # them (`Append.places`), else at their slots, which nothing reads.
@@ -769,7 +771,7 @@ class CausalSelfAttention(nn.Module):
         # bounds the cached keys itself.
         window = (None if decode or not (causal or self.ctx.bidirectional_window)
                   else self.ctx.sliding_window)
-        cursor = None  # the decode mask the paged kernel stands in for, when this call builds it
+        cursor = starts = None  # the decode mask the kernels stand in for, when this call builds it
         if prefix is not None:
             # Every canvas query reads the same retained encoder keys and all
             # canvas keys (modeling_diffusion_gemma.py:1399-1401). A local
@@ -808,7 +810,8 @@ class CausalSelfAttention(nn.Module):
             key, value = append(key, value)
             query = append.query(query)
             if S == 1:
-                (cursor, mask), causal = self._decode_masks(positions, key.shape[-3]), False
+                (mask, starts), causal = self._decode_masks(positions, key.shape[0], key.shape[-3]), False
+                cursor = mask
             else:  # several tokens appended after the keys their rows held
                 documents, causal, window = self._cached_call(positions, cached_validity(self, key.shape[-3]))
             key_places = append.places(places) if self._reads_places else jnp.arange(key.shape[-3])
@@ -849,7 +852,7 @@ class CausalSelfAttention(nn.Module):
         max_segments = (None if documents is None else 1 if isinstance(documents, CrossDocuments)
                         else coordinates_of(attention_metadata, B, S).max_segments)
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
-                        cursor, key_places)
+                        cursor, starts, key_places)
 
     @staticmethod
     def _chunked(mask, documents, causal: bool, window: int | None, places, key_places, length: int,
@@ -895,7 +898,8 @@ class CausalSelfAttention(nn.Module):
         paged kernel or a per-row key count for a plain decode step, the
         general kernel otherwise, with the per-head logit maxima sown for
         QK-Clip when a caller opened that collection."""
-        query, key, value, causal, window, mask, documents, max_segments, implementation, cursor, _ = masking
+        (query, key, value, causal, window, mask, documents, max_segments, implementation, cursor, starts,
+         _) = masking
         B, S = query.shape[:2]
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
@@ -919,14 +923,15 @@ class CausalSelfAttention(nn.Module):
                 mask=mask, bias=bias, sinks=sinks, softcap=self.ctx.attn_logit_softcap, segment_ids=documents,
                 dropout_rate=self.ctx.attention_dropout_rate, dropout_rng=self.make_rng("dropout"),
                 deterministic=False), 'context')
-        # A chunk, window or metadata mask replaces `cursor` and keeps the gather.
+        # A chunk or metadata mask replaces `cursor` and keeps the gather; a window the kernels read
+        # as each row's first key (`starts`).
         plain_step = (append is not None and mask is cursor and S == 1 and sinks is None
                       and bias is None and not sowing)
-        if (append is not None and plain_step and self._page_kernel_runs(query)
-                and append.store.kernel(query[:, 0])):
-            attention = self._paged(append, query, jnp.asarray(positions).reshape(B, S)[:, 0])
+        if append is not None and plain_step and self._pages(append.store, query[:, 0], starts is not None):
+            attention = self._paged(append, query, jnp.asarray(positions).reshape(B, S)[:, 0], starts)
         elif plain_step:
-            attention = self._decode_attention(query, key, value, jnp.asarray(positions).reshape(B, S)[:, 0])
+            attention = self._decode_attention(query, key, value, jnp.asarray(positions).reshape(B, S)[:, 0],
+                                               starts)
         else:
             attention = checkpoint_name(scaled_dot_product_attention(
                 query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
@@ -983,7 +988,7 @@ class CausalSelfAttention(nn.Module):
         prompt = positions[rows:].reshape(pieces, width)
         index.value = (index.value + (positions[:rows] >= 0)).at[admitted.slots].set(
             admitted.cursors + jnp.sum(prompt >= 0, axis=1, dtype=jnp.int32), mode="drop")
-        if self._page_kernel_runs(query) and store.kernel(query[0, :rows]):
+        if self._pages(store, query[0, :rows], windowed=False):
             decoded = store.decode(query[0, :rows], held_reads(index.value, positions[:rows]),
                                    self.ctx.attn_logit_softcap)
             decoded = checkpoint_name(decoded[:, None], 'context')
@@ -1010,9 +1015,11 @@ class CausalSelfAttention(nn.Module):
         return jnp.concatenate([decoded.reshape(1, rows, *decoded.shape[2:]),
                                 prefilled.reshape(1, -1, *prefilled.shape[2:])], axis=1)
 
-    def _decode_attention(self, query, key, value, positions):
+    def _decode_attention(self, query, key, value, positions, starts=None):
         """One query a row `[rows, 1, heads, head_dim]` over its row of the
-        cache, whose token sits at `positions` `[rows]` (-1 for padding).
+        cache, whose token sits at `positions` `[rows]` (-1 for padding), from
+        each row's first key under the layer's window, `starts` `[rows]`
+        where it has one.
 
         The cache is compact, so a decode query reads the filled slots
         before its own: a key count per row, which cuDNN takes as its
@@ -1031,36 +1038,37 @@ class CausalSelfAttention(nn.Module):
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
             implementation=self.ctx.attention_impl, causal=False,
             softcap=self.ctx.attn_logit_softcap,
-            key_value_seq_lengths=reads.astype(jnp.int32))
+            key_value_seq_lengths=reads.astype(jnp.int32), key_value_seq_starts=starts)
         return checkpoint_name(attention, 'context')
 
-    def _page_kernel_runs(self, query) -> bool:
-        """Whether a decode step may read a paged pool through its device's
-        paged kernel (`KVStore.decode`) rather than the gathered rows. The
-        paged kernels read keys and values of one width, so narrower values
-        take the gathered rows, which the attention core widens. Neither
-        device's paged kernel performs what only the reference path does
-        (`reference_only`), so such a step takes the gathered rows, where an
-        explicit kernel refuses it by name."""
-        if self.value_dim != self.ctx.head_dim or reference_only(
-                query, self.ctx.dtype, self.ctx.precision, self.ctx.force_fp32_for_softmax):
+    def _pages(self, store, query, windowed: bool) -> bool:
+        """Whether a decode step's query `[rows, heads, head_dim]` reads the paged pool `store` through
+        its device's paged kernel (`KVStore.decode`), as the paged selector chooses it (`PAGED`), rather
+        than the gathered rows through the layer's attention; a compact cache keeps no pages. A
+        `windowed` step reads each row from its window's first key."""
+        if store.layout.page_size is None:
             return False
-        if backend() != 'gpu':
-            return self.ctx.attention_impl in ('auto', 'tpu')
-        return self.ctx.attention_impl in ('auto', 'cudnn') and cudnn_runs(query, self.ctx.attn_logit_softcap)
+        case = store.case(query, value_dim=self.value_dim, softcap=self.ctx.attn_logit_softcap,
+                          arithmetic=reference_only(query, self.ctx.dtype, self.ctx.precision,
+                                                    self.ctx.force_fp32_for_softmax),
+                          named=self.ctx.attention_impl, windowed=windowed)
+        return select(PAGED, case).kernel != 'gathered'
 
-    def _decode_masks(self, positions, key_length: int) -> tuple[jax.Array, jax.Array]:
-        """The cursor mask over the cache's filled slots, and the layer's decode mask.
-
-        They are the same array exactly when the layer narrows nothing, which
-        is when the paged kernel, attending every filled slot, may stand in
-        for the mask; a window builds a mask of its own.
+    def _decode_masks(self, positions, rows: int, key_length: int) -> tuple[jax.Array, jax.Array | None]:
+        """The layer's decode mask over the cache's filled slots, and each
+        row's first key under its window `[rows]`, None where the layer
+        narrows nothing: the kernels stand in for the mask with each row's key
+        count and that start (`_decode_attention`). A window at least the
+        cache's capacity narrows nothing.
         """
         valid = cached_validity(self, key_length)
-        cursor = causal_attention_mask(positions, key_length, key_valid=valid)
-        if self.ctx.sliding_window is None:
-            return cursor, cursor
-        return cursor, causal_attention_mask(positions, key_length, self.ctx.sliding_window, key_valid=valid)
+        window = self.ctx.sliding_window
+        if window is None or window >= key_length:
+            return causal_attention_mask(positions, key_length, key_valid=valid), None
+        # A decode token's first key under the window.
+        first = jnp.broadcast_to(jnp.atleast_2d(jnp.asarray(positions))[:, 0], (rows,)) + 1 - window
+        return (causal_attention_mask(positions, key_length, window, key_valid=valid),
+                jnp.maximum(first, 0).astype(jnp.int32))
 
     def _cached_call(self, positions, held) -> tuple[CrossDocuments, bool, int | None]:
         """A cache call of several tokens at `positions` `[B, S]` (-1 for padding) over the keys
@@ -1074,13 +1082,14 @@ class CausalSelfAttention(nn.Module):
                                    jnp.asarray(held, jnp.int32))
         return documents, True, None if window is None or window >= held.shape[-1] else window
 
-    def _paged(self, append: Append, query: jax.Array, positions: jax.Array) -> jax.Array:
-        """One decode step through the Pallas paged kernel, which reads the pool
-        through the page table; the gathered keys go unread and XLA drops the gather.
-        A row whose query is padding (`positions` -1) reads one key (`held_reads`)."""
+    def _paged(self, append: Append, query: jax.Array, positions: jax.Array, starts=None) -> jax.Array:
+        """One decode step through the device's paged kernel, which reads the pool
+        through the page table from each row's `starts` under a window; the
+        gathered keys go unread and XLA drops the gather. A row whose query is
+        padding (`positions` -1) reads one key (`held_reads`)."""
         reads = held_reads(self.get_variable("cache", "cache_index"), positions)
-        return checkpoint_name(append.store.decode(query[:, 0], reads, self.ctx.attn_logit_softcap)[:, None],
-                               'context')
+        out = append.store.decode(query[:, 0], reads, self.ctx.attn_logit_softcap, starts)
+        return checkpoint_name(out[:, None], 'context')
 
     def _runs_local(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
         """Whether this call runs `local_attention`, which never builds the
