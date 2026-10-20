@@ -9,6 +9,7 @@ byte, and the refusals for rows without a prompt, unknown fields and empty
 files.
 """
 
+import dataclasses
 import json
 
 import numpy as np
@@ -40,6 +41,30 @@ def prompt_rows(rows, tokenizer, width, pad_id, thinking=None):
                      max_prompt_len=width, pad_id=pad_id, thinking=thinking, long="truncate")
     pipeline, _, _ = recipe.pipelines()
     return list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
+
+
+def test_an_overlong_prompt_keeps_its_tail_by_default_and_drop_counts_it_rejected():
+    """A prompt longer than the window keeps its last `max_prompt_len` ids (P62), not dropped; asked
+    to drop it (`long="drop"`), the read leaves it out and counts it rejected as over length."""
+    from dew.data.compile import compile
+
+    recipe = PromptData(source=({"prompt": LONG}, {"prompt": IDS}), tokenizer=TOKENIZER,
+                        max_prompt_len=WINDOW)
+    pipeline, _, _ = recipe.pipelines()
+    kept, short = list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
+    assert int(kept[LENGTH_KEY]) == WINDOW
+    np.testing.assert_array_equal(kept[PROMPT_KEY], LONG[-WINDOW:])
+    assert int(short[LENGTH_KEY]) == len(IDS)
+    from dew.data import Memory, prompts
+
+    # The chain's own prompt step keeps the tail as the recipe does.
+    step = prompts.encode(TOKENIZER, max_prompt_len=WINDOW)
+    (chained,) = list(Memory([{"prompt": LONG}]).filter_map(step).iterate())
+    np.testing.assert_array_equal(chained[PROMPT_KEY], LONG[-WINDOW:])
+    dropping, _, _ = dataclasses.replace(recipe, long="drop").pipelines()
+    data = compile(dropping.batch(1), read="memory", loading=Loading(workers=0))
+    assert data.records == 1
+    assert [count.rejected["over_length"] for count in data.counts.values()] == [1]
 
 
 def test_a_string_prompt_encodes_on_its_own():
