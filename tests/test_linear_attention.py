@@ -248,6 +248,52 @@ def test_the_port_takes_each_packed_tokens_gradients_as_its_document_alone_does(
     assert_leaves_as_exact(got, reference, want, reductions=CHUNKED, terms=terms)
 
 
+@pytest.mark.parametrize("per_key", [False, True], ids=["gated delta net", "Kimi delta attention"])
+def test_the_port_carries_nothing_across_a_document_start(per_key):
+    """A packed row on the port (`linear.fla_rule`), documents starting mid-chunk and two apart in one:
+    each document's output and the gradients of a loss on it alone at its own tokens bitwise the same
+    whatever the other documents' queries, keys, values and betas, and every gradient at the other
+    documents' tokens exactly zero, on every backend. The decays stay: each document's first token
+    forgets the memory before it (`linear.FORGET`) by shifting its chunk's cumulated decays, which
+    rounds the documents after it alike in both rows. A memory that crossed would move them by its
+    whole size; the share of a later document in an earlier one's decay gradient cancels exactly but
+    for its rounding, which the port's reverse sum over the chunk would carry back
+    (`linear._forgotten`)."""
+    length, heads, width = 128, 2, 16
+    begins = (0, 5, 40, 42, 90)
+    starts = np.isin(np.arange(length), begins[1:])[None]
+    document = np.searchsorted(begins, np.arange(length), side="right") - 1
+    keys = jax.random.split(jax.random.key(31), 7)
+    q = 0.3 * jax.random.normal(keys[0], (1, length, heads, width))
+    k = l2norm(jax.random.normal(keys[1], (1, length, heads, width)))
+    v = jax.random.normal(keys[2], (1, length, heads, width))
+    g = -0.1 * jax.nn.softplus(jax.random.normal(keys[3], (1, length, heads, *(width,) * per_key)))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, length, heads)))
+    do = jax.random.normal(keys[5], v.shape)
+    others = jax.tree.map(lambda x, key: jax.random.permutation(key, x, axis=1), (q, k, v, beta),
+                          tuple(jax.random.split(keys[6], 4)))
+
+    @jax.jit
+    def taken(mine, q, k, v, beta):
+        def loss(q, k, v, g, beta):
+            out = linear.fla_rule(q, k, v, g, beta, starts=jnp.asarray(starts))[0]
+            return jnp.sum(out * jnp.where(mine[None, :, None, None], do, 0)), out
+        (_, out), grads = jax.value_and_grad(loss, argnums=range(5), has_aux=True)(q, k, v, g, beta)
+        return (out, *grads)
+
+    for each in range(len(begins)):
+        mine = document == each
+        moved = [jnp.where(mine.reshape(1, -1, *(1,) * (x.ndim - 2)), x, other)
+                 for x, other in zip((q, k, v, beta), others, strict=True)]
+        kept, changed = taken(mine, q, k, v, beta), taken(mine, *moved)
+        for name, held, found in zip(("out", "q", "k", "v", "g", "beta"), kept, changed, strict=True):
+            held, found = np.asarray(held), np.asarray(found)
+            np.testing.assert_array_equal(found[:, mine], held[:, mine], err_msg=f"document {each} {name}")
+            if name != "out":
+                for value in (held, found):
+                    np.testing.assert_array_equal(value[:, ~mine], 0.0, err_msg=f"document {each} {name}")
+
+
 def test_strong_decay_has_the_same_finite_gradient_in_both_forms():
     """Masked positive log differences must never reach exp in the chunk rule.
 
