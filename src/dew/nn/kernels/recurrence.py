@@ -530,21 +530,23 @@ def fits(hooks: Hooks, state) -> bool:
             and all(width > 0 and width & (width - 1) == 0 for width in (dk, dv)))
 
 
-def _one_tap(hooks: Hooks, operands: Step, given: dict, dtype):
-    """`step` of a one-tap conv: its token scaled by the taps and activated in at least fp32, as the
-    launch's prologue sums one term, rounded to the token's dtype, then the launch without a conv, the
-    empty history returned as it came."""
+def _one_tap(hooks: Hooks, conv: Conv, operands: Step, given: dict, dtype):
+    """`step` of a one-tap `conv`: its token scaled by the taps and activated in at least fp32, as the
+    launch's prologue sums one term, kept in that precision as the prologue keeps it, then the launch
+    without a conv, the output in the token's dtype unless `dtype` names another, the empty history
+    returned as it came."""
     token = given['token']
     rows, (value_heads, key_width, value_width) = token.shape[0], given['state'].shape[1:]
     key_heads = _pieces(hooks, value_heads, key_width, value_width, token.shape[-1])
     work = jnp.promote_types(token.dtype, jnp.float32)
     pre = token.astype(work) * given['taps'][:, 0].astype(work)
-    convolved = (pre if hooks.conv.activation is None else pre * jax.nn.sigmoid(pre)).astype(token.dtype)
+    convolved = pre if conv.activation is None else pre * jax.nn.sigmoid(pre)
     query, key, value = jnp.split(convolved, [key_heads * key_width, 2 * key_heads * key_width], axis=-1)
     unconvolved = dataclasses.replace(
         operands, token=None, held=None, taps=None, query=query.reshape(rows, key_heads, key_width),
         key=key.reshape(rows, key_heads, key_width), value=value.reshape(rows, value_heads, value_width))
-    out, _, state = step(dataclasses.replace(hooks, conv=None), unconvolved, dtype=dtype)
+    out, _, state = step(dataclasses.replace(hooks, conv=None), unconvolved,
+                         dtype=token.dtype if dtype is None else dtype)
     return out, given['held'], state
 
 
@@ -557,7 +559,7 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     and the launch steps the queries, keys and values it makes."""
     given = _read(hooks, operands)
     if hooks.conv is not None and given['held'].shape[1] == 0:
-        return _one_tap(hooks, operands, given, dtype)
+        return _one_tap(hooks, hooks.conv, operands, given, dtype)
     rows = given['state'].shape[0]
     flags = (jnp.ones(rows, jnp.int32) if operands.active is None
              else jnp.asarray(operands.active).astype(jnp.int32))[:, None]

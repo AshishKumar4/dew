@@ -120,16 +120,19 @@ def test_a_write_gate_without_the_delta_rule_scales_what_the_token_writes():
     one_tap = recurrence.Hooks(conv=recurrence.Conv(None), decay='none', delta=False)
     channels = 2 * 16 + 16
     rng = np.random.default_rng(3)
-    given = recurrence.Step(jnp.asarray(rng.standard_normal((ROWS, 1, 16, 16)) * 0.3, jnp.float32),
-                            token=jnp.asarray(rng.standard_normal((ROWS, channels)), jnp.float32),
-                            held=jnp.zeros((ROWS, 0, channels)),
-                            taps=jnp.asarray(rng.standard_normal((channels, 1)), jnp.float32))
-    for step in (recurrence.step, recurrence.step_reference):
-        assert step(one_tap, given)[1].shape == (ROWS, 0, channels)
-    with jax.enable_x64(new_val=True):
-        wide = recurrence.Step(**{name: None if value is None else widened(value)
-                                  for name, value in vars(given).items()})
-        exact = np.asarray(recurrence.step_reference(one_tap, wide)[0])
-    assert_as_exact_as_the_reference(np.asarray(recurrence.step(one_tap, given)[0]),
-                                     np.asarray(recurrence.step_reference(one_tap, given)[0]), exact,
-                                     'the one-tap output')
+    for dtype in (jnp.float32, jnp.bfloat16):
+        given = recurrence.Step(jnp.asarray(rng.standard_normal((ROWS, 1, 16, 16)) * 0.3, jnp.float32),
+                                token=jnp.asarray(rng.standard_normal((ROWS, channels)), dtype),
+                                held=jnp.zeros((ROWS, 0, channels), dtype),
+                                taps=jnp.asarray(rng.standard_normal((channels, 1)), dtype))
+        for step in (recurrence.step, recurrence.step_reference):
+            assert step(one_tap, given)[1].shape == (ROWS, 0, channels)
+        with jax.enable_x64(new_val=True):
+            wide = recurrence.Step(**{name: None if value is None else widened(value)
+                                      for name, value in vars(given).items()})
+            exact = recurrence.step_reference(one_tap, wide)
+        found, reference = recurrence.step(one_tap, given), recurrence.step_reference(one_tap, given)
+        for index, name in ((0, 'output'), (2, 'state')):
+            mine, theirs = (np.asarray(x[index], np.float32) for x in (found, reference))
+            assert_as_exact_as_the_reference(mine, theirs, np.asarray(exact[index]),
+                                             f'the one-tap {jnp.dtype(dtype).name} {name}')
