@@ -761,10 +761,11 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     and files start heaviest first while what they hold with their children (`gpu_needs`) fits
     the share this process was given (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at
     most `processes` at once. A file that runs out of a measured share is red: it took more than
-    its last run, whose peak its next run is given. A file given the whole share, alone for want of
-    a measurement of it or of a child it did not follow (another environment's Python, as the fla
-    reference's), grows its pool as it uses it rather than taking the share at its first GPU op
-    (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a child has what the file leaves of the share."""
+    its last run, whose peak its next run is given. A file given the lane's whole share (unmeasured,
+    measured that large, or with a child the lane did not follow, as the fla reference's in another
+    environment's Python) grows its pool as it uses it rather than taking the share at its first GPU
+    op (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a child has what the file has not yet taken; a file
+    that grows to the whole share still leaves its child none."""
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
