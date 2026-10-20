@@ -40,6 +40,7 @@ from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.inputs import ModelInputs
+from dew.nn.kernels import generation
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mlp import MLPMixer
@@ -720,8 +721,11 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
                                       prompt_rows=part == 'sentence') for part in ('sentence', 'window')])
 
     loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype='float32')
-    with jax.enable_x64(new_val=True):
-        variables = jax.device_put(widened(loaded.variables))
+    # The float64 arm on the host, its kernels chosen as a CPU's: the 4B in float64 outgrows a 40 GB GPU,
+    # and float64 is float64 on either.
+    host = jax.devices('cpu')[0]
+    with jax.enable_x64(new_val=True), jax.default_device(host), generation.assumed('cpu'):
+        variables = jax.device_put(widened(loaded.variables), host)
         for loops, mode, run in recorder.RUNS:
             key = recorder.name(loops, mode, run)
             wide = with_cache(loaded.model.with_passes(loops), mode).clone(dtype=jnp.float64)
