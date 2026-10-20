@@ -26,7 +26,7 @@ from dew.data.prompts import (
     _utf8,
 )
 from dew.data.text import ByteTokenizer, HFTokenizer, tokenizer_for
-from dew.records import integer, json_value, record
+from dew.records import JSON, integer, json_value, record
 
 
 @dataclasses.dataclass(frozen=True)
@@ -74,13 +74,32 @@ class ResponseCanvases:
         return rows
 
 
+
+def _extra_info(element: Mapping[str, object]) -> JSON:
+    """A prompt row's `extra_info`, its `ability` (a verl row's task family) folded in as a field of
+    it, as the reward reads it. A row whose `extra_info` is no mapping has no field to carry it in,
+    and one whose `extra_info` names another ability contradicts itself: both are refused."""
+    info = json_value(element.get("extra_info"), "prompt extra_info")
+    if "ability" not in element:
+        return info
+    ability = json_value(element["ability"], "prompt ability")
+    match info:
+        case None:
+            return {"ability": ability}
+        case {"ability": held} if held != ability:
+            raise ValueError(f"a prompt row's ability {ability!r} differs from its extra_info's {held!r}")
+        case dict():
+            return {**info, "ability": ability}
+        case _:
+            raise ValueError(f"a prompt row's extra_info {info!r} is no mapping its ability can join")
+
 @dataclasses.dataclass(frozen=True)
 class RenderPrompt(grain.MapTransform):
     tokenizer: str
     max_prompt_len: int = 256
     pad_id: int = 0
     reward_bytes: int = 1024
-    long: Literal["drop", "truncate"] = "drop"
+    long: Literal["drop", "truncate"] = "truncate"
     thinking: bool | None = None
     rejects = True
 
@@ -108,8 +127,7 @@ class RenderPrompt(grain.MapTransform):
         prompt = np.full(self.max_prompt_len, self.pad_id, np.int32)
         prompt[-len(ids) :] = ids
         row = PromptRecord.of(json_value(element.get("data_source"), "prompt data_source"),
-                              _ground_truth(element, "prompt"),
-                              json_value(element.get("extra_info"), "prompt extra_info"))
+                              _ground_truth(element, "prompt"), _extra_info(element))
         context = {SOURCE_KEY: row.data_source, TRUTH_KEY: row.ground_truth, INFO_KEY: row.extra_info}
         for name, value in context.items():
             if len(value.encode("utf-8")) > self.reward_bytes:

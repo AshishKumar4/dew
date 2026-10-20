@@ -42,6 +42,15 @@ def prompt_rows(rows, tokenizer, width, pad_id, thinking=None):
     return list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
 
 
+def test_an_overlong_prompt_keeps_its_tail_by_default():
+    """A prompt longer than the window keeps its last `max_prompt_len` ids (P62), not dropped."""
+    recipe = PromptData(source=({"prompt": LONG},), tokenizer=TOKENIZER, max_prompt_len=WINDOW)
+    pipeline, _, _ = recipe.pipelines()
+    (row,) = list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
+    assert int(row[LENGTH_KEY]) == WINDOW
+    np.testing.assert_array_equal(row[PROMPT_KEY], LONG[-WINDOW:])
+
+
 def test_a_string_prompt_encodes_on_its_own():
     """Plain text is tokenized as it is: no chat template, no special tokens."""
     from dew.data.text import load_tokenizer
