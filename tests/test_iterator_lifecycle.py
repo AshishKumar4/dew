@@ -766,6 +766,29 @@ def _running(pid: int) -> bool:
     return status.rsplit(")", 1)[1].split()[0] != "Z"
 
 
+def test_a_process_that_ends_as_its_state_is_read_is_not_running(monkeypatch):
+    """A loading worker that ends after its state file opens and before it is read: the kernel fails
+    the read with ESRCH, which says the process has ended, as a missing file does."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    state = Path(f"/proc/{child.pid}/stat")
+    read = Path.read_text
+
+    def ended_while_read(path, *args, **kwargs):
+        if path != state:
+            return read(path, *args, **kwargs)
+        with path.open() as opened:
+            child.kill()
+            child.wait()
+            return opened.read()
+
+    monkeypatch.setattr(Path, "read_text", ended_while_read)
+    try:
+        assert not _running(child.pid)
+    finally:
+        child.kill()
+        child.wait()
+
+
 def _segments_marked(mark: bytes) -> set[str]:
     """The shared memory segments on this host that begin with `mark`: those a run whose every
     batch begins with it handed its batches over in, whatever else shares the host. Python names a
