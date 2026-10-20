@@ -219,7 +219,7 @@ def _ladder(value, rows, out, slots, epi_m: int, epi_n: int) -> None:
                                 epi_column * epi_n:(epi_column + 1) * epi_n]
             plgpu.commit_smem()
             stored = jnp.clip(rows - epi_row * epi_m, 0, epi_m)
-            offset = jnp.int32(0)
+            offset = 0
             size = epi_m
             while size:
                 _store_rows(slots.at[slot], out, epi_row * epi_m, epi_column * epi_n, offset, size,
