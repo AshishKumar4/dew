@@ -26,7 +26,7 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Let an FP8 frozen base differentiate in forward mode through the shared tangent boundary, keeping its reverse kernel, and test MeanFlow over it. [782]
 - Take the grouped convolution's backward off Qwix's private modules: its public provider API, or an upstream Qwix fix carried meanwhile. [783]
 - Let Llama 4's mixer take any KV cache, its context derived from the caller's, not rebuilt. [784]
-- Let latent attention (MLA and its sparse pooling) and DeepSeek V4's compressed cache take paged and quantized KV cache layouts. [830, 831]
+- Let latent attention (MLA and its sparse pooling), DeepSeek V4's compressed cache and a bidirectional canvas's encoder prefix take paged and quantized KV cache layouts. [830, 831, 838]
 - Place a loaded pretrained model's variables on JAX's default device, as jnp arrays are; keeping them on the host is an explicit request. [832]
 - Route MPConv through Conv's shared operand path after its normalization. [785]
 - One patch projection for every scan order in DiT, UViT and SimpleUDiT, the tokens permuted after it. [787]
@@ -191,6 +191,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Reconcile requested capabilities with implementation and qualification evidence, and audit upstream reproductions and fixes. [224, 306]
 - The float64 gate is the owner's (2026-10-20): each leaf's RMS error within 1.5× the reference's and its worst row within ROW_FACTOR of the reference's, on the same inputs, with no floor; every element within a certified roundoff bound for its own operation on common native inputs (faithful rounding for pointwise steps, a bound for each sum, native probes at opaque kernels), behind one assertion, `assert_as_exact`. [560, 649, 719, 793, 827]
 - Every accuracy comparison in the tests and tools goes through that assertion; the files that still compare within a tolerance are an inventory that only shrinks, empty by 2026-11-27. [650, 668, 669, 670, 676, 682, 705, 712]
+- Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients, a packed row's state gradient, ragged decision options, distillation's cosine and L2 losses, and Z-Image's padded flow. [833, 834, 835, 836, 837]
 - Replace test-policy violations with observable lifecycle and reference behavior:
 
   - Training, sampling and objectives: [651, 652, 653, 654, 657, 658, 663, 667, 679, 680, 686, 687, 688, 692, 695, 698, 701, 702, 707, 708].
