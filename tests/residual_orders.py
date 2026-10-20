@@ -36,8 +36,9 @@ RESIDUAL_NORMS = frozenset({
     "post_per_layer_input_norm", "embedding_layernorm", "head_norm", "enorm", "hnorm",
     "final_norm"})
 """The norms over the residual stream a Dew decoder names (backbones/decoder_block.py,
-causal_transformer.py; an MTP head's `final_norm`), beside the final `norm` outside every layer; a mixer's own `norm`
-(Mamba-2's, a gated delta rule's) and the query and key norms are over other widths."""
+causal_transformer.py; an MTP head's `final_norm`), beside the final `norm` outside every layer;
+a mixer's own `norm` (Mamba-2's, a gated delta rule's) and the query and key norms are over
+other widths."""
 
 LAYER = re.compile(r"layers(_\d+)?")
 """A decoder layer's module, under which a `norm` is a mixer's own, not the final norm."""
