@@ -143,6 +143,18 @@ class GpuTarget:
 # https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
 # https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html
 # https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html
+# Attention and grouped products against tokamax 0.0.15's kernels, bf16, causal 2x4096, 16 query over
+# 8 key heads, fwd/step ms (bench_tokamax.py; float64-gated, every arm within it). A100: width 128,
+# the FA wheel 0.96/4.15, tokamax Triton 1.44/6.73, cuDNN 1.36/5.57; width 64, 0.80/2.44, 0.93/3.55,
+# 0.84/3.44; 8 packed documents, the FA wheel's varlen 0.50/1.44 against tokamax Triton's key ranges
+# 0.52/7.00. H100: width 128, the FA wheel (FA3) 0.30/1.03, tokamax Mosaic 0.37/1.28, Triton
+# 0.55/2.00, cuDNN 0.37/1.28; width 64, 0.25/0.68, 0.30/0.93, 0.40/1.30, 0.30/0.91; packed,
+# 0.17/0.60 against Triton's 0.22/1.88. A10 (sm86), causal 2x2048: width 64, the FA wheel
+# 0.46/1.32, Triton 0.51/1.51, cuDNN 0.58/1.97; width 32, 0.23/0.82, 0.28/0.99, 0.47/1.67. Grouped
+# products, 8192 tokens x 2048 -> 768 over 64 experts: Dew's Pallas grouped matmul 0.60/2.41 on an
+# A100 and 0.27/0.86 on an H100, XLA's ragged dot 7.54/33.99 and 2.62/14.51; tokamax's ragged_dot
+# has no Triton kernel in 0.0.15 and its Mosaic one's backward takes no mixed dtypes. No tokamax
+# implementation is a row's kernel; Dew calls its own through tokamax's Op and tuning.
 TARGETS = {target.generation: target for target in (
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
               aliases=('gpu:t4', 't4')),
@@ -153,7 +165,7 @@ TARGETS = {target.generation: target for target in (
                'rms_norm': 'pallas', 'swiglu': 'pallas', 'gate_up': 'joined', 'delta_gates': 'joined',
                'gated_delta_rule': 'fla', 'ssd': 'pallas'},
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), head_tile=(4096, 8192)),
-    GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'grouped_matmul': 'pallas'},
+    GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'attention_narrow': 'flash', 'grouped_matmul': 'pallas'},
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'attention': 'flash', 'attention_window': 'flash', 'attention_sinks': 'flash',
