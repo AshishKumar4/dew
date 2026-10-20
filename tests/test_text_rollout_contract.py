@@ -10,6 +10,7 @@ import optax
 import pytest
 from model_support import decoder
 from rl_support import clipped_surrogate
+from test_mixers import KIND_FIELDS, tiny
 
 from dew.data.dataset import Loader
 from dew.inference import TextGeneration
@@ -17,6 +18,7 @@ from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective, SampledRollout
 from dew.objectives.rl.episodes import EpisodeRollout, EpisodeStatus, Observation
+from dew.registry import mixers
 from dew.sampling import Sampling, generate
 from dew.training import Trainer
 
@@ -62,6 +64,31 @@ def test_padding_and_cached_likelihoods_match_unpadded_full_forwards(kind):
                                               left_padding=jnp.array([2, 0]))[:, 3:]
     np.testing.assert_allclose(rescored, result.raw_log_probs, atol=2e-6, rtol=2e-6)
     assert np.max(np.abs(np.asarray(result.raw_log_probs - result.behavior_log_probs))) > 0.1
+
+
+@pytest.mark.parametrize("kind", sorted(mixers.paths))
+def test_every_registered_mixer_draws_padded_rows_as_their_unpadded_full_forwards_score(kind):
+    """Every mixer in the registry, in a decoder of its own: a left-padded batch drawn through the
+    cache scores each drawn token, under the raw model and under the top-k policy that drew it, as a
+    fresh full forward over that row's unpadded tokens scores it, within the toy decoders' bound."""
+    fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
+    model = tiny(mixer=mixers.build(kind, **fields), dtype="float32", **overrides)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    batch = prompts()
+    sampling = Sampling(temperature=0.7, top_k=5)
+    result = generate(model, params, model_inputs(batch), 3, key=jax.random.key(1), sampling=sampling)
+    for row, length in enumerate(batch["prompt_length"]):
+        context = jnp.asarray(batch["prompt"][row:row + 1, 4 - length:])
+        for index, action in enumerate(np.asarray(result.tokens)[row, 4:4 + int(result.lengths[row])]):
+            logits = model.apply(params, context)[0, -1].astype(jnp.float32)
+            scores = logits / sampling.temperature
+            cutoff = jax.lax.top_k(scores, 5)[0][-1]
+            behavior = jax.nn.log_softmax(jnp.where(scores >= cutoff, scores, -jnp.inf))[action]
+            np.testing.assert_allclose(result.raw_log_probs[row, index], jax.nn.log_softmax(logits)[action],
+                                       atol=2e-6, rtol=2e-6, err_msg=f"{kind} row {row} token {index}")
+            np.testing.assert_allclose(result.behavior_log_probs[row, index], behavior, atol=2e-6, rtol=2e-6,
+                                       err_msg=f"{kind} row {row} token {index}")
+            context = jnp.concatenate([context, jnp.array([[action]], jnp.int32)], axis=1)
 
 
 @pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])

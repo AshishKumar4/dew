@@ -134,8 +134,8 @@ Every run logs canonical MFU (analytic model FLOPs on real tokens over wall time
 
 ```python
 pipe = dew.pipeline("runs/lm-1b")                 # the trained model with its processor
-pipe("The capital of France is", max_new_tokens=32)
-pipe([{"role": "user", "content": "Hi"}])        # chat, no PyTorch needed
+pipe("The capital of France is", max_new_tokens=32, key=0)
+pipe([{"role": "user", "content": "Hi"}], key=1)  # chat, no PyTorch needed
 
 Pretrained.from_run("runs/lm-1b").save("out/")     # loads in transformers and vLLM
 adapter.save("out/lora")                          # a complete PEFT adapter
@@ -175,7 +175,7 @@ model = DiT.preset("dit-b/2")
 data = Files("gs://data/laion/*.array_record").filter_map(images.DecodeImage()).map(images.Resize(256)).batch(256)
 trainer = Trainer(DiffusionObjective(model, process=FlowMatching(), vae="stabilityai/sd-vae-ft-ema"), optax.adamw(1e-4), key=0)
 state = trainer.fit(data, steps=400_000)
-images = dew.pipeline(trainer)("a red fox in snow", steps=50, guidance=4.0)
+images = dew.pipeline(trainer)("a red fox in snow", steps=50, guidance=4.0, key=0)
 ```
 
 ### The same LM script on 64 GPUs
