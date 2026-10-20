@@ -30,12 +30,15 @@ from dew.data import (
     text as text_steps,
     video as video_steps,
 )
-from dew.data.pipeline import Configured, DeviceStep, Pack, Pipeline
+from dew.data.pipeline import Configured, DeviceStep, Pack
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from transformers import PreTrainedTokenizerBase
 
-    from dew.data.pipeline import Dataset, HostStep, RandomStep
+    from dew.data.pipeline import Dataset, HostStep, Mixture, Phases, Pipeline, RandomStep
+    from dew.data.sources.base import Source
 
 
 def images(dataset: Dataset, size: int, *, batch: int,
@@ -111,43 +114,22 @@ def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase | None, *, seq
     always, `False` never), cut into pieces that keep every next-token target, and packed into
     rows of `seq_len + 1` tokens (the last a target) by `pack`, first-fit with `bins` open rows,
     best-fit, or concatenated, in batches of `batch` rows (`records` and `host` as `images` takes
-    them). `pack=None` cuts one stream of each document's tokens into windows `stride` apart
-    instead (`windows`). With `tokenizer=None` the documents are token ids already, under "text",
-    such as a token store's, which must state where its documents end."""
+    them). `pack=None` joins the documents into one stream of tokens instead and cuts it into
+    windows `stride` apart (`windows`), which carry no document coordinates. With
+    `tokenizer=None` the documents are token ids already, under "text", such as a token store's,
+    whose windows a store reads by index (`TokenFiles(url).pipe(presets.lm, None, seq_len=512,
+    batch=8, pack=None)`); a store packed must state where its documents end."""
 
     if pack is not None and stride is not None:
         raise ValueError("stride places fixed windows, pack=None; a pack lays documents out whole")
-    if tokenizer is None:
-        _documented(dataset)
-        documents = dataset
-    else:
-        documents = dataset.map(text_steps.tokenize(tokenizer, field=field, eos=eos))
+    documents = dataset if tokenizer is None else dataset.map(
+        text_steps.tokenize(tokenizer, field=field, eos=eos))
     if pack is None:
         windows = documents.windows(seq_len, stride=stride)
     else:
+        if tokenizer is None:
+            _documented(dataset)
         windows = _next_token_windows(documents, Pack(seq_len + 1, bins=bins, policy=pack))
-    return _finished(windows, batch=batch, records=records, host=host)
-
-
-def token_windows(dataset: Dataset, seq_len: int, *, batch: int, stride: int | None = None,
-                  records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
-    """A token store's tokens as one stream, cut into contiguous windows of `seq_len + 1` tokens
-    `stride` apart (`seq_len` by default), read by index, in batches of `batch` rows; no
-    tokenizer, and none of the store's documents' ends. It reads the store's tokens itself, so a
-    `shuffle` or `repeat` written before it orders and repeats its windows:
-    `TokenFiles(url).shuffle(0).repeat().pipe(presets.token_windows, 512, batch=8)`."""
-    from dew.data.pipeline import Repeat, Shuffle
-    from dew.data.sources.tokens import TokenFiles
-    from dew.data.steps.windows import WindowSource
-
-    chain = dataset._chain()
-    store = chain.source
-    ordering = all(isinstance(stage, (Shuffle, Repeat)) for stage in chain.stages)
-    if not isinstance(store, TokenFiles) or not ordering:
-        raise ValueError("token_windows reads a token store's tokens directly: give it TokenFiles(...), "
-                         "ordered and repeated as it should read its windows, with other steps after it")
-    windows = Pipeline(WindowSource(store, store.tokens, seq_len, seq_len if stride is None else stride),
-                       chain.stages)
     return _finished(windows, batch=batch, records=records, host=host)
 
 
@@ -170,14 +152,33 @@ def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: 
 
 
 def _documented(dataset: Dataset) -> None:
-    """Refuse token documents from a store that states no document ends (neither an index of them
-    nor an EOS token): its tokens would read as one document, whose pieces no producer made."""
-    from dew.data.holdout import selecting
+    """Refuse to pack token documents from a store that states no document ends (neither an index
+    of them nor an EOS token), wherever it sits in the chain's sources: its tokens would read as
+    one document, whose pieces no producer made."""
     from dew.data.sources.tokens import TokenFiles
 
-    for source in selecting(dataset._chain().source):
+    for source in _stores(dataset._chain().source):
         if isinstance(source, TokenFiles) and not source.documented:
             raise ValueError(f"packed text needs producer document boundaries or EOS: {source.describe()}")
+
+
+def _stores(source: Source | Mixture | Phases) -> Iterator[Source]:
+    """Every store under `source`: a mixture's or phases' corpora's, a concatenation's parts, and
+    the store each holdout selection selects from."""
+    from dew.data.holdout import selecting
+    from dew.data.pipeline import Mixture, Phases
+    from dew.data.sources.concatenate import Concatenate
+
+    if isinstance(source, (Mixture, Phases)):
+        for child in source.pipelines:
+            yield from _stores(child.source)
+        return
+    for selected in selecting(source):
+        if isinstance(selected, Concatenate):
+            for part in selected.sources:
+                yield from _stores(part)
+        elif not isinstance(selected, (Mixture, Phases)):
+            yield selected
 
 
 _CHAT_FIELDS = ("text", chat.ROLES_KEY)
