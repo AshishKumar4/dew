@@ -22,6 +22,7 @@ set -eu
 
 # BEGIN install facts (site/scripts/gen_install.py)
 python_min=3.12
+package_index=https://pypi.dewml.dev/simple
 cuda13_driver=580
 cuda13_sm=7.5
 cuda12_driver=525
@@ -189,9 +190,8 @@ extra=''
 [ "$build" = cpu ] || extra="[$build]"
 package="dewml$extra${version:+==$version}"
 # Dew runs on its own JAX build, which only Dew's package index serves (docs/installation.md).
-index=https://pypi.dewml.dev/simple
-if [ -n "$use_pip" ]; then set -- "$python" -m pip install --extra-index-url "$index" "$package"
-else set -- uv pip install --python "$python" --extra-index-url "$index" "$package"
+if [ -n "$use_pip" ]; then set -- "$python" -m pip install --extra-index-url "$package_index" "$package"
+else set -- uv pip install --python "$python" --extra-index-url "$package_index" "$package"
 fi
 shown=''
 for word in "$@"; do shown="$shown${shown:+ }$(quote "$word")"; done
