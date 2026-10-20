@@ -887,3 +887,20 @@ def test_an_fp32_port_dot_names_its_products_whatever_the_global_precision():
         return jnp.dot(a, b, preferred_element_type=jnp.float32)
 
     assert _lowered_dot(unnamed, "default") != _lowered_dot(unnamed, "highest")
+
+
+@pytest.mark.parametrize("read", ["chunks", "spans", "both"])
+def test_a_timed_launch_draws_the_descriptors_it_reads(read):
+    """The tuner times a launch on operands it draws (`_Launch.operands`): a packed launch that reads
+    only chunk descriptors, only sequence ones, or both gets descriptors of its own shapes, as a
+    step's measurement (`tuning.tune(measure=True)`, tools/kernel_picks.py) hands it some of them."""
+    batch, length, documents = 2, 150, 5
+    packed = fla_gdn.sequences(batch, length, jnp.asarray(np.linspace(0, batch * length, documents + 1),
+                                                          jnp.int32))
+    query = jax.ShapeDtypeStruct((batch, length, 2, 64), jnp.bfloat16)
+    descriptors = {"chunks": [packed.chunks], "spans": [packed.spans],
+                   "both": [packed.chunks, packed.spans]}[read]
+    specs = [query, *(jax.ShapeDtypeStruct(array.shape, array.dtype) for array in descriptors)]
+    drawn = fla_gdn.ChunkFwdH().operands(specs, 0)
+    assert [array.shape for array in drawn] == [spec.shape for spec in specs]
+    assert all(array.dtype == spec.dtype for array, spec in zip(drawn, specs, strict=True))
