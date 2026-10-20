@@ -55,7 +55,7 @@ The objective reads the pair index explicitly and shifts the completion mask wit
 
 ### 1.3 Prompts and packed rollouts
 
-`RenderPrompt` accepts a message conversation, string or id sequence. Each row encodes to a left-padded `prompt` of `max_prompt_len` ids plus `prompt_length`. The reward columns become fixed-width UTF-8 byte arrays so every leaf survives the device transfer. Missing reward fields become empty strings. Over-length prompts are dropped by default; `long="truncate"` explicitly keeps the tail. Blank prompts fail. The source makes no masks, because the rollout produces them.
+`RenderPrompt` accepts a message conversation, string or id sequence. Each row encodes to a left-padded `prompt` of `max_prompt_len` ids plus `prompt_length`. The reward columns become fixed-width UTF-8 byte arrays so every leaf survives the device transfer. Missing reward fields become empty strings. Prompts longer than the window keep their tail; `long="drop"` drops them instead, each dropped prompt counted as a rejection. Blank prompts fail. The source makes no masks, because the rollout produces them.
 
 `SampledRollout` generates a group of completions per prompt, scores each completion and builds one-call sessions through `sessions.pack`. The learner reads fixed-width packed chains; a prompt and completion must fit the objective's `seq_len+1`. The primary aligned columns are:
 
