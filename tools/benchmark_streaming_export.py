@@ -5,9 +5,11 @@
 Loads `repo` in bfloat16 onto the default device (the mesh load streams, so
 the host holds no model afterwards), then saves it with `max_shard_size`.
 Prints one JSON line: RSS before the save, the highest RSS a 2 ms sampler
-saw during it, the export's weight bytes and the shard count. A save that
-gathers the model to the host first rises one model above the baseline; a
-streamed one, one shard. `main` as the shard size calls `save` without one,
+saw during it, the most memory the save itself held at once (`traced_peak_gb`,
+the allocations `tracemalloc` traces, numpy's arrays among them, which no other
+process or earlier allocation moves), the export's weight bytes and the shard
+count. A save that gathers the model to the host first rises one model above
+the baseline; a streamed one, one shard. `main` as the shard size calls `save` without one,
 for the writer before sharding.
 """
 
@@ -15,6 +17,7 @@ import json
 import sys
 import threading
 import time
+import tracemalloc
 from pathlib import Path
 
 from dew.interop import Pretrained
@@ -42,18 +45,22 @@ def main() -> None:
 
     sampler = threading.Thread(target=sample)
     sampler.start()
+    tracemalloc.start()
     start = time.perf_counter()
     if shard_size == "main":
         loaded.save(out)
     else:
         loaded.save(out, max_shard_size=int(shard_size) if shard_size.isdigit() else shard_size)
     seconds = time.perf_counter() - start
+    _, traced = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
     done.set()
     sampler.join()
     files = sorted(out.rglob("*.safetensors"))
     print(json.dumps({"repo": repo, "max_shard_size": shard_size, "rss_before_gb": round(before, 2),
                       "rss_peak_during_save_gb": round(highest[0], 2),
-                      "rise_gb": round(highest[0] - before, 2), "seconds": round(seconds, 1),
+                      "rise_gb": round(highest[0] - before, 2), "traced_peak_gb": round(traced / 2**30, 3),
+                      "seconds": round(seconds, 1),
                       "shards": len(files), "weights_gb": round(sum(f.stat().st_size for f in files) / 2**30, 2)}))
 
 
