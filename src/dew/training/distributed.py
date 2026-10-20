@@ -79,8 +79,9 @@ rules place on fsdp, `Layout` splits over both where together they divide it
 (`state_spec`): a sequence-parallel run then holds its parameters, optimizer
 moments, EMA and gradients in shares rather than whole on every device of a
 sequence, which torchtitan's FSDP mesh does over dp_shard and cp alike
-(`resolve_fsdp_mesh`). A step gathers each weight over both as it reads it
-and reduces its gradient to the share each device holds."""
+(`resolve_fsdp_mesh`). Leaves below `Layout.min_shard`, or that the pair
+cannot divide, keep their own placement. A step reads a weight split so as
+it reads an fsdp split."""
 
 
 def parameter_axes(names) -> tuple[str, ...]:
@@ -96,9 +97,11 @@ def state_spec(spec_on: Callable[[Mesh | AbstractMesh], P], mesh: Mesh | Abstrac
     (`STATE_AXES`): the spec is read on `mesh` with the two as one fsdp axis
     of both sizes, so the rules' divisibility and fallbacks judge the
     group, and each fsdp entry then names both. Where the group divides no
-    dimension fsdp would take, the rules place the leaf on sequence already
-    or sequence is Explicit, whose placement the program's types carry and
-    the partitioner does not choose, the spec is `spec_on`'s on `mesh`."""
+    dimension fsdp would take, the group's spec moves a split of another axis
+    (a vocabulary the group times tensor cannot divide), the rules place the
+    leaf on sequence already or sequence is Explicit, whose placement the
+    program's types carry and the partitioner does not choose, the spec is
+    `spec_on`'s on `mesh`."""
     plain = spec_on(mesh)
     sequence = mesh.shape.get(SEQUENCE_AXIS, 1)
     if (sequence == 1 or SEQUENCE_AXIS in _spec_axes(plain)
@@ -111,7 +114,11 @@ def state_spec(spec_on: Callable[[Mesh | AbstractMesh], P], mesh: Mesh | Abstrac
     abstract = mesh.abstract_mesh if isinstance(mesh, Mesh) else mesh
     grouped = spec_on(abstract.update(axis_sizes=tuple(sizes[name] for name in names), axis_names=names,
                                       axis_types=(*mesh.axis_types, *(AxisType.Auto for _ in added))))
-    if FSDP_AXIS not in _spec_axes(grouped):
+    def others(spec: P) -> list[MeshAxes]:
+        entries = [_without_state_axes(entry) for entry in spec]
+        return entries + [None] * (len(grouped) + len(plain) - len(entries))
+
+    if FSDP_AXIS not in _spec_axes(grouped) or others(grouped) != others(plain):
         return plain
     group = (FSDP_AXIS,) * (fsdp > 1) + (SEQUENCE_AXIS,)
 
