@@ -19,13 +19,11 @@ import pytest
 from affine_run import Replaying
 from diffusion_stubs import STUB_TEXT
 from reference_error import (
-    ORDERS,
     REFERENCE,
     assert_as_exact_as_the_reference,
     assert_leaves_as_exact_over_orders,
     widened,
 )
-from residual_orders import orders as residual_orders
 from steady_state import steady_state
 
 import dew
@@ -438,10 +436,11 @@ def test_a_packed_projection_is_as_exact_as_its_members_element_by_element(tmp_p
     product = jax.jit(jnp.dot)
     with jax.enable_x64(new_val=True):
         truth = {"output": np.asarray(product(*widened((x, kernel))))}
-    contraction = residual_orders(kernel.shape[0], ORDERS, 7)
-
     def draw(order):
-        units = contraction[order]
+        # Order 0 is the case's own; every other a permutation of the contraction, drawn from its index,
+        # since the gate asks for orders past its first batch while an element stays flagged.
+        units = (np.arange(kernel.shape[0]) if order == 0
+                 else np.random.default_rng(order).permutation(kernel.shape[0]))
         moved = jnp.asarray(x[:, units])
         dew_output = np.asarray(product(moved, jnp.asarray(kernel[units])), np.float64)
         separate = np.concatenate([np.asarray(product(moved, jnp.asarray(member[units])), np.float64)
