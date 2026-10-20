@@ -274,8 +274,9 @@ def test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device(tm
     `data_axes` split the rows over all three: fit splits the parameters
     over both fsdp levels and the rows over all three axes, and two steps,
     a checkpoint and a resumed third step train what one device trains in
-    three, as a `MeshSpec` mesh does. A rule naming an axis the mesh lacks
-    is refused before anything is placed."""
+    three, as a `MeshSpec` mesh does. A rule naming an axis the mesh lacks,
+    one of Dew's role axes among them, is refused before anything is placed;
+    Dew's own rules, which name every role axis, place on whatever the mesh has."""
     layers = delta_layers(fused=False) if hybrid else {}
     native = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 2, 2), ("replica", "zero", "zero2"))
     layout = Layout(rules=NATIVE_RULES, data_axes=("replica", "zero", "zero2"), min_shard=TINY_SHARD)
@@ -299,6 +300,11 @@ def test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device(tm
     misspelt = Layout(rules={**NATIVE_RULES, "embed": "zer0"}, data_axes=layout.data_axes)
     with pytest.raises(ValueError):
         native_trainer(native, misspelt, None, **layers).fit(data, steps=1)
+    # A rule of one's own (none of Dew's: those put the width on fsdp) that names Dew's tensor axis,
+    # which this mesh lacks, would split nothing.
+    absent = Layout(rules={**NATIVE_RULES, "embed": "tensor"}, data_axes=layout.data_axes)
+    with pytest.raises(ValueError):
+        native_trainer(native, absent, None, **layers).fit(data, steps=1)
 
 
 @pytest.mark.mesh(devices=8)
