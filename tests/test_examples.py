@@ -275,9 +275,17 @@ def test_sft_diffusion_gemma_images_smoke_trains_on_two_splits_and_captions_the_
 
     report = json.loads((tmp_path / "result.json").read_text())
     assert (report["train_images"], report["test_images"], report["classes"]) == (16, 8, 2)
-    # The test split shares no image with the two that train.
+    # The run trains on the train and validation files and captions the test file, which shares no
+    # image with them: the example's own data spec, read as its run reads it.
+    example = load("sft_diffusion_gemma_images", "examples")
+    config = example.Config(smoke=True, out=tmp_path)
+    spec = example.data_spec(config, {split: example.Files(str(tmp_path / "data" / f"{split}.parquet"),
+                                                           format="parquet") for split in example.SPLITS})
+    assert [source.url for source in spec.source.sources] == [
+        str(tmp_path / "data" / f"{split}.parquet") for split in ("train", "validation")]
+    assert spec.validation.url == str(tmp_path / "data" / "test.parquet")
     images = {split: {row["bytes"] for row in parquet.read_table(tmp_path / "data" / f"{split}.parquet")
-                      .column("image").to_pylist()} for split in ("train", "validation", "test")}
+                      .column("image").to_pylist()} for split in example.SPLITS}
     assert len(images["test"]) == 8 and not images["test"] & (images["train"] | images["validation"])
     run = tmp_path / "checkpoints" / "flowers-caption"
     journal = [json.loads(row) for row in (run / "tracking" / "scalars.jsonl").read_text().splitlines()]
@@ -322,7 +330,7 @@ def test_sft_diffusion_gemma_puts_each_assistant_turn_alone_on_the_canvases(tmp_
     config = example.smoke_config(example.Config(smoke=True, out=tmp_path))
     _, objective = example.adapted_objective(config)
     train, _, _ = example.chat_rows(config, objective).pipelines()
-    rows = list(train.iterate())
+    rows = list(train)
     template = AutoTokenizer.from_pretrained(config.model)
     expected = []
     for turns in example.CONVERSATIONS:
