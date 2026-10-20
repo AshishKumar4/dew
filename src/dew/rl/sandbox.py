@@ -63,7 +63,7 @@ from typing import Protocol
 from dew.data.prompts import PromptRecord
 from dew.inference.rollouts import InfrastructureError
 from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
-from dew.objectives.rl.records import real
+from dew.objectives.rl.records import messages, real
 from dew.records import JSON
 
 
@@ -106,7 +106,8 @@ def _observation(value: object) -> Observation:
         state = EpisodeStatus[status.upper()]
     except KeyError:
         raise ValueError(f"unknown sandbox observation status {status!r}") from None
-    return Observation(tuple(context), state, detail, None if reward is None else real(reward, "reward"))
+    return Observation(tuple(context), state, detail, None if reward is None else real(reward, "reward"),
+                       messages(value.get("messages", []), "messages"))
 
 
 def launch(command: tuple[str, ...], limits: SandboxLimits, directory: str) -> subprocess.Popen[bytes]:
@@ -250,9 +251,10 @@ class SubprocessEnvironment:
     without a shell in a temporary working directory. Each request has an
     operation and either an episode identity or an action record. Each
     reply holds `context` (integer ids), `status` (running, completed,
-    truncated, cancelled or error), an optional string `detail` and an
-    optional number `reward`, the step's reward (`Observation.reward`). It
-    runs on Linux only.
+    truncated, cancelled or error), an optional string `detail`, an
+    optional number `reward`, the step's reward (`Observation.reward`), and
+    an optional list `messages` of the chat messages it added
+    (`Observation.messages`). It runs on Linux only.
 
     Leaving the session kills the process group, whether the episode
     succeeded, failed or was cancelled. The worker itself also gets SIGKILL

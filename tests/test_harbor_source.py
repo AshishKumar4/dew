@@ -32,7 +32,7 @@ import pytest
 from dew.interop.gateway import Gateway, calls
 from dew.interop.harbor import HARBOR_KEY, Harbor, outcome
 from dew.interop.harness import Command, HarnessSource
-from dew.objectives.rl.sessions import Call, Status, Task
+from dew.objectives.rl.sessions import Call, Status, Task, Transcript
 
 KEY = jax.random.key(0)
 
@@ -775,3 +775,24 @@ def test_a_cancelled_agent_command_is_interrupted_and_resolves_cancelled(tmp_pat
     finally:
         source.close()
     assert rollout.status is Status.CANCELLED and time.monotonic() - began < 30
+
+
+def test_an_agent_commands_calls_keep_the_conversation_the_gateway_recorded(tmp_path):
+    """The gateway records each call's chat messages and the message the engine answered, tool calls
+    included, beside its ids: the call carries them as its transcript, its ids as recorded."""
+    asked = [{"role": "system", "content": "Use the bash tool."}, {"role": "user", "content": "Add 2 and 2."}]
+    command = {"name": "bash", "arguments": '{"command": "echo 4"}'}
+    call = {"id": "call-0", "type": "function", "function": command}
+    answered = {"role": "assistant", "content": None, "tool_calls": [call]}
+    conversation = trace([1, 2, 10], [5, 6], [-.5, -.25], "tool_calls", messages=asked,
+                         response_message=answered)
+    source = HarnessSource(agent_command(tmp_path), fake_gateway(extra=[conversation])[0])
+    try:
+        (future,) = source.submit(Task("adds"), 1, version=0, key=KEY)
+        rollout = future.result()
+    finally:
+        source.close()
+    plain, spoken = rollout.calls
+    assert plain.transcript is None
+    assert spoken == Call((1, 2, 10), (5, 6), (-.5, -.25), "tool_calls", 0,
+                          transcript=Transcript(tuple(asked), answered))
