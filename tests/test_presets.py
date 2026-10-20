@@ -197,7 +197,7 @@ def test_sft_token_mixture_weighs_final_assistant_targets_and_resumes(weights, e
         reader.close()
     assert [delivered[marker] / sum(delivered.values()) for marker in (1, 2)] == pytest.approx(weights,
                                                                                           abs=0.01)
-    assert data.counts["sft-1"].accepted == 64 - empty_rows
+    assert data.counts["sft-1"].rows == 64 - empty_rows
     assert data.counts["sft-1"].rejected["zero_targets"] == empty_rows
     resumed = compile(train.batch(8), objective=policy, read="memory",
                       loading=Loading(workers=0)).train(DataPartition())
