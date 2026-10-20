@@ -86,15 +86,15 @@ class Timings(dict):
     @property
     def fastest_config(self) -> Hashable:
         """The config of least median time; a mapping with none that ran raises naming its failures."""
-        ran = [(config, data) for config, data in self.items() if isinstance(data, tokamax.BenchmarkData)]
+        ran = [(config, timing) for config, timing in self.items() if isinstance(timing, tokamax.BenchmarkData)]
         if not ran:
             raise ValueError(f"no config ran: {list(self.values())}")
-        return min(ran, key=lambda item: item[1].median_evaluation_time_ms)[0]
+        return min(ran, key=lambda pair: pair[1].median_evaluation_time_ms)[0]
 
     def prune_errors(self) -> Timings:
         """The configs that ran."""
-        return Timings({config: data for config, data in self.items()
-                        if isinstance(data, tokamax.BenchmarkData)})
+        return Timings({config: timing for config, timing in self.items()
+                        if isinstance(timing, tokamax.BenchmarkData)})
 
     def prune(self) -> Timings:
         """The fastest config alone."""
@@ -163,8 +163,8 @@ def decoded(value: Json) -> Rebuilt:
 
 
 def _key(value: Rebuilt) -> Hashable:
-    """`value` as a mapping's key or a config, which hash."""
-    if not isinstance(value, Hashable):
+    """`value` as a mapping's key or a config, which hash: a list or a mapping does not."""
+    if isinstance(value, (list, dict)):
         raise ValueError(f"expected a hashable value in a kernel's picks: {value!r}")
     return value
 
