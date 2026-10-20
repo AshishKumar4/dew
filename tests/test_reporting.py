@@ -234,7 +234,8 @@ def test_mlflow_takes_a_metric_named_in_free_text_under_a_name_it_accepts(tmp_pa
     from dew.training import MLflowTracker
 
     names = ("rollout/source/openai/gsm8k/reward/mean", "rollout/source/math[hard]/reward/mean",
-             "rollout/source/math(hard)/reward/mean", "rollout/source/a/../b/reward/mean", "..loss", ".../loss")
+             "rollout/source/math(hard)/reward/mean", "rollout/source/a/../b/reward/mean", "..loss",
+             ".../loss")
     with MLflowTracker('dew-reporting', 'free-text', uri=store) as tracker:
         tracker.log({name: float(index) for index, name in enumerate(names)}, 1)
         client, run = tracker.run
