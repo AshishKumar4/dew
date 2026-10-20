@@ -172,6 +172,28 @@ def test_a_fetch_goes_through_the_proxy_its_environment_names_by_its_authority(m
     assert proxied == ["http://catalog.invalid/object"]
 
 
+def test_a_file_that_keeps_arriving_past_the_timeout_is_dropped(tmp_path):
+    """A file read by urllib whose bytes keep arriving, each well inside its timeout, until after
+    it has passed (a pipe its writer trickles into) is dropped as transient, as a slow server is."""
+    import os
+
+    pipe = tmp_path / "pipe"
+    os.mkfifo(pipe)
+
+    def trickle():
+        with open(pipe, "wb") as writer:
+            for _ in range(15):
+                writer.write(b"x")
+                writer.flush()
+                time.sleep(0.1)
+
+    writer = threading.Thread(target=trickle, daemon=True)
+    writer.start()
+    fetched = Fetch(timeout=1.0)({"url": pipe.as_uri()})
+    writer.join()
+    assert isinstance(fetched, Rejected) and not fetched.permanent
+
+
 def test_a_fetch_ends_at_its_timeout_however_long():
     """A fetch's timeout ends it when it passes, at five seconds and over as below: a body that
     would finish half a second later is dropped as transient by then."""

@@ -130,5 +130,10 @@ class Fetch:
         left = deadline - time.monotonic()
         if left <= 0:
             raise TimeoutError(f"no time left to read {url}")
+        # urllib's timeout bounds each wait, not a body that keeps arriving, so the attempt's deadline
+        # judges the read once it ends.
         with urllib.request.urlopen(url, timeout=left) as response:
-            return 200, response.read(limit)
+            payload = response.read(limit)
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"{url} outlasted its {self.timeout:.1f} s")
+        return 200, payload
