@@ -405,9 +405,11 @@ class TrainingDisplay:
             if self.live is not None:
                 self.ended = True
                 self.live.stop()
-                if self.live.ipy_widget is not None:
-                    # A saved notebook and the site keep no widget's state.
-                    self.live.ipy_widget.close()
+                if (widget := self.live.ipy_widget) is not None:
+                    # The site keeps no widget, and a notebook that saves the widget's state would
+                    # draw the frame twice: the widget empties and the frame stays as an output.
+                    widget.clear_output()
+                    widget.close()
                     self.live.console.print(self)
         finally:
             self.live = None

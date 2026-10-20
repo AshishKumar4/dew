@@ -36,12 +36,17 @@ def test_a_notebook_redraws_the_panel_in_one_widget_and_keeps_its_last_frame_and
     notebook = nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell(FIT)])
     NotebookClient(notebook, kernel_name="python3", resources={"metadata": {"path": str(TESTS)}}).execute()
     nbformat.write(notebook, tmp_path / "fit.ipynb")
-    outputs = nbformat.read(tmp_path / "fit.ipynb", as_version=4).cells[0].outputs
+    notebook = nbformat.read(tmp_path / "fit.ipynb", as_version=4)
+    outputs = notebook.cells[0].outputs
 
     assert not [output for output in outputs if output.output_type == "error"], outputs
     widgets = [output for output in outputs
                if "application/vnd.jupyter.widget-view+json" in output.get("data", {})]
     assert len(widgets) == 1, outputs
+    # The widget's saved state holds no frame of its own beside the static one.
+    (model,) = [state for state in notebook.metadata.widgets["application/vnd.jupyter.widget-state+json"]
+                ["state"].values() if state["model_name"] == "OutputModel"]
+    assert model["state"]["outputs"] == []
     assert not [output for output in outputs if "step 1/4" in text(output)], "a line per logging interval"
     frame, summary = [output for output in outputs if output.get("data", {}).get("text/html")][-2:]
     assert "dew" in text(frame) and "Affine" in text(frame) and "finished" in text(frame)
