@@ -84,7 +84,8 @@ def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, a
     state = trainer.fit(dataset(), tokens=30, log_every=log_every)
     assert int(state.step) == steps
     if log_every == 1:
-        assert [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars] == logged
+        assert [scalars["train/tokens"] for _, scalars in tracker.scalars
+                if "train/tokens" in scalars] == logged
 
 
 def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
