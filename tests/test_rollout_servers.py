@@ -41,13 +41,26 @@ EOS = 7
 
 
 def engine(provider, answer):
-    """An OpenAI client for `provider` whose transport answers each completion with `answer(request)`."""
+    """An OpenAI client for `provider` whose transport answers each completion with `answer(request)`,
+    a request that streams as SGLang streams it: an event a sampled id, the last with the choice's
+    finish reason."""
     calls = []
 
     def network(request):
         calls.append(json.loads(request.content))
-        return httpx2.Response(200, json={"id": "fixture", "model": "tiny", "created": 1,
-                                          "object": "text_completion", "choices": [answer(calls[-1])]})
+        whole = answer(calls[-1])
+        if not calls[-1].get("stream"):
+            return httpx2.Response(200, json={"id": "fixture", "model": "tiny", "created": 1,
+                                              "object": "text_completion", "choices": [whole]})
+        logprobs, last = whole["logprobs"], len(whole["token_ids"]) - 1
+        events = [{"id": "fixture", "model": "tiny", "created": 1, "object": "text_completion", "choices": [{
+            "index": 0, "text": "", "token_ids": [token],
+            "finish_reason": whole["finish_reason"] if index == last else None,
+            "logprobs": {"tokens": [logprobs["tokens"][index]], "top_logprobs": [], "text_offset": [-1],
+                         "token_logprobs": [logprobs["token_logprobs"][index]]}}]}
+            for index, token in enumerate(whole["token_ids"])]
+        return httpx2.Response(200, text="".join(f"data: {json.dumps(event)}\n\n" for event in events)
+                               + "data: [DONE]\n\n", headers={"Content-Type": "text/event-stream"})
 
     client = openai.OpenAI(base_url="http://fixture/v1", api_key="fixture", max_retries=0,
                            http_client=httpx2.Client(transport=httpx2.MockTransport(network)))
@@ -82,7 +95,11 @@ def test_a_draw_is_the_reported_ids_and_behavior_likelihoods(provider):
     assert draw.raw_log_probs is None and draw.version == 4
     sent = calls[0]
     assert sent["prompt"] == [[1, 2, 9]] and sent["seed"] == 11 and sent["max_tokens"] == 8
-    assert sent["stop_token_ids"] == [EOS]
+    if provider == "vllm":
+        assert sent["stop_token_ids"] == [EOS] and "stream" not in sent
+    else:
+        # SGLang draws as the policy without its stops, streamed, and Dew cuts it at the first.
+        assert "stop_token_ids" not in sent and sent["ignore_eos"] is True and sent["stream"] is True
     assert sent["logprobs"] == 0 and sent["temperature"] == 1.0 and sent["top_k"] == -1
     returned = {"vllm": "return_tokens_as_token_ids", "sglang": "return_token_ids"}
     assert (
