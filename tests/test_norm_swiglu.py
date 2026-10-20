@@ -534,9 +534,31 @@ def test_a_swiglu_takes_the_kernel_its_target_measured_at_its_width(dtype, named
     assert (route.kernel, route.preferred, route.refusal) == (kernel, kernel, None)
 
 
+@pytest.mark.parametrize("width, dtype, code, row", [
+    (9000, jnp.bfloat16, "width", "roadmap: norm kernel widths"), (64, jnp.float16, "dtype", "inherent")])
+def test_a_norm_the_kernel_refuses_reports_the_requirement_and_its_row(width, dtype, code, row):
+    """On an A100, a norm the fused kernel does not take runs XLA's arithmetic and reports the
+    requirement it fails (`norm_swiglu.NORM_SUPPORTS`) with the roadmap row that tracks lifting it, or
+    'inherent' where no implementation of the kernel would (`tools/kernel_routes.verdict`); a kernel
+    forced by `chosen` raises naming it, as every selector's forced kernel does."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import KernelRefused
+
+    x = jnp.ones((4, width), dtype)
+    with generation.assumed("sm80"), generation.routes() as found:
+        assert norm_swiglu.rms_kernel("auto", x, None, dtype, fp32_statistics=True) == "xla"
+    (route,) = found
+    assert (route.kernel, route.preferred) == ("xla", "pallas")
+    assert (route.refusal.code, route.refusal.row) == (code, row)
+    with generation.assumed("sm80"), generation.chosen(rms_norm="pallas"):
+        with pytest.raises(KernelRefused) as refused:
+            norm_swiglu.rms_kernel("auto", x, None, dtype, fp32_statistics=True)
+    assert code in {refusal.code for refusal in refused.value.refusals}
+
+
 def test_a_swiglu_of_a_bf16_gate_over_an_fp32_up_is_an_fp32_product_xla_takes():
     """Gemma-4's per-layer input gates a bf16 projection over its fp32 input: an fp32 product, which
-    XLA fuses (`_measured_width`), so on an A100 it takes XLA as its own preference, reporting no
+    XLA fuses (`_swiglu_preferred`), so on an A100 it takes XLA as its own preference, reporting no
     refusal, and computes as XLA's product does."""
     from dew.nn.kernels import generation
 
