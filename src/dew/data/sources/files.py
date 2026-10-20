@@ -649,7 +649,8 @@ class Files(Dataset):
             metadata = self.committed.get("metadata", {})
             if not isinstance(metadata, Mapping):
                 raise ValueError("export metadata must be a mapping")
-            return {**metadata, "rows": self.committed["rows"], "format": self.committed["format"]}
+            rules = {"count_rules": self.committed["count_rules"]} if "count_rules" in self.committed else {}
+            return {**metadata, **rules, "rows": self.committed["rows"], "format": self.committed["format"]}
         if self.kind in ("parquet", "arrow"):
             schema = self.arrow.schema.metadata or {}
             details = json.loads(schema[b"huggingface"]) if b"huggingface" in schema else {}

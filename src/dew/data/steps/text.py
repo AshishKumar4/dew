@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Literal
 
 import grain.python as grain
@@ -167,6 +167,28 @@ class CountRule:
                 if value is not None}
         held = {**window, **rule, _BOUND: (field, f"{field}_segment_ids", self.roles or f"{field}_roles")}
         return {**held, "_dew_valid_targets": _scored(held)}
+
+
+def count_rules(rows: Iterable[Batch | bytes | None]) -> list[list[int | None]]:
+    """The rules other than every target's that `rows`' targets were counted by (`CountRule`), as
+    a store states them (`count_rules`): each a role and a pad id."""
+    rules = {(rule.role, rule.pad_id) for row in rows if isinstance(row, Mapping)
+             for rule in (CountRule.of(row),) if rule is not None}
+    return [list(rule) for rule in sorted(rules, key=repr)]
+
+
+def stated_rules(value: object) -> set[tuple[int | None, int | None]]:
+    """The rules a store's `count_rules` states, each a role and a pad id (`CountRule`), either
+    None, as a generation writes them."""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"count_rules is a list of [role, pad_id] pairs, not {value!r}")
+    rules: set[tuple[int | None, int | None]] = set()
+    for rule in value:
+        if not (isinstance(rule, (list, tuple)) and len(rule) == 2
+                and all(part is None or isinstance(part, int) for part in rule)):
+            raise ValueError(f"a count rule is a [role, pad_id] pair of integers or None, not {rule!r}")
+        rules.add((rule[0], rule[1]))
+    return rules
 
 
 class LayoutRule:
