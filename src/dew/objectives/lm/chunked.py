@@ -490,17 +490,21 @@ def _softmax_cotangent(logits, first, excluded, peaks, masses, labels, d_first, 
     output is the target's logit, the share times the partition's alone, plus
     that output's at the target. The share is taken against the whole row's
     maximum and sum of exponentials scaled to it, so a tile needs no
-    renormalisation and every share rounds once, where dividing by an
-    exponentiated log Z would carry log Z's rounding into every share. A
-    target outside the tile one-hots to zero rather than to a wrapped
-    column."""
-    probabilities = jnp.exp(_without(logits, first, excluded) - (peaks + jnp.log(masses))[:, None])
+    renormalisation, where dividing by an exponentiated log Z would carry log
+    Z's rounding into every share. The cotangent over the sum is one number a
+    row, so each column's exponential rounds once more, in its product with
+    it, as autodiff of `jax.nn.logsumexp` takes it: a share divided out and
+    then scaled rounds twice, which put some of a head's gradient twice as
+    far from float64 as that reference's (tests/test_chunked_cross_entropy.py's
+    vocabulary-split head). A target outside the tile one-hots to zero rather
+    than to a wrapped column."""
+    exponentials = jnp.exp(_without(logits, first, excluded) - peaks[:, None])
     # A target at the excluded column scores a constant +inf, which no logit moves.
     selected = _without(jax.nn.one_hot(labels - first, logits.shape[-1], dtype=logits.dtype), first,
                         excluded, value=0)
     if picked:
-        return d_partition[:, None] * probabilities + d_first[:, None] * selected
-    return (d_first + d_partition)[:, None] * probabilities - d_first[:, None] * selected
+        return exponentials * (d_partition / masses)[:, None] + d_first[:, None] * selected
+    return exponentials * ((d_first + d_partition) / masses)[:, None] - d_first[:, None] * selected
 
 
 def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, predict, temperature,
