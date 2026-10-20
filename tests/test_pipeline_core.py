@@ -925,8 +925,10 @@ class Scored:
     def __call__(self, row):
         from dew.data.steps.text import ValidTargets
 
-        # A row whose roles a projection renamed reads them under their new name.
-        scored = {"text": row["text"], "text_roles": row.get("text_roles", row.get("roles"))}
+        # A row whose roles a projection renamed reads them under their new name; a packed row's
+        # segments end its documents' targets at their boundaries.
+        scored = {"text": row["text"], "text_roles": row.get("text_roles", row.get("roles")),
+                  **{name: row[name] for name in ("text_segment_ids",) if name in row}}
         return {"source": row["source"],
                 "targets": np.int32(ValidTargets(role=self.role, measured=False)(scored))}
 
@@ -996,6 +998,102 @@ def test_a_token_mixture_weighs_a_cropped_corpus_by_the_targets_left_after_the_c
     left, right = delivered([long, short], role, read)
     rows = (Cropped()(roled(0, 24, 22).records("memory")[0]), roled(1, 6, 4).records("memory")[0])
     assert abs(left - right) <= sum(int(Scored(role)(row)["targets"]) for row in rows)
+
+
+@dataclasses.dataclass(frozen=True)
+class Sourced:
+    """Labels a window with its corpus, which a windows or pack stage leaves out of its windows."""
+
+    source: int
+
+    def __call__(self, row):
+        return {**row, "source": np.int32(self.source)}
+
+
+ROLED = ("text", "text_roles")
+LAYOUTS = {
+    # Each layout's documents of seven tokens, and the most targets one of its windows holds.
+    "windows": (lambda counted: counted.windows(8, fields=ROLED), 8),
+    "first-fit": (lambda counted: counted.pack(16, fields=ROLED), 12),
+    "concat": (lambda counted: counted.pack(8, fields=ROLED, policy="concat"), 7),
+    "windows-then-pack": (lambda counted: counted.windows(4, fields=ROLED).pack(10, fields=ROLED), 8),
+}
+
+
+@pytest.mark.parametrize("role", [None, 1])
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_token_mixture_weighs_laid_out_windows_by_the_rule_their_documents_were_counted_by(
+        read, layout, role):
+    """Targets counted on documents by a rule (`CountTargets(role=)`) describe none of the windows a
+    windows or pack stage makes of them: each window is counted again by that rule, in every read,
+    and a second layout counts its own windows by it too. Two corpora whose documents score one
+    and five role-1 targets deliver equal targets by the rule, to within one window of each."""
+    from dew.data.steps.text import CountTargets
+
+    laid_out, most = LAYOUTS[layout]
+
+    def corpus(source, scored):
+        counted = Pipeline(roled(source, 7, scored), name=str(source)).filter_map(CountTargets(role=role))
+        return laid_out(counted).map(Sourced(source))
+
+    left, right = delivered([corpus(0, 1), corpus(1, 5)], role, read)
+    assert abs(left - right) <= most + most
+
+
+@pytest.mark.parametrize("layout", ["windows", "first-fit"])
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_windows_that_drop_the_roles_their_documents_were_counted_in_are_refused(read, layout):
+    """A layout that leaves out the roles a count was taken in (`CountTargets(role=1)`) makes
+    windows no rule can count again, which a token mixture would weigh by another rule."""
+    from dew.data.steps.text import CountTargets
+
+    counted = Pipeline(roled(0, 7, 3), name="dropped").filter_map(CountTargets(role=1))
+    laid_out = counted.windows(8) if layout == "windows" else counted.pack(16)
+    data = mix([laid_out.map(Sourced(0)).repeat()], by="tokens").batch(2)
+    with pytest.raises(ValueError):
+        stream = compile(data, read=read, loading=READ).train(DataPartition())
+        try:
+            next(stream)
+        finally:
+            stream.close()
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupted_read(read):
+    """A read of windows counted by their documents' rule saves the rule with its position, so a
+    resume whose next windows come from documents already read counts them by it too."""
+    from dew.data.steps.text import CountTargets
+
+    def corpus(source, scored):
+        counted = Pipeline(roled(source, 7, scored), name=str(source)).filter_map(CountTargets(role=1))
+        return counted.windows(8, fields=ROLED).map(Sourced(source)).repeat()
+
+    def stream():
+        mixed = mix([corpus(0, 1), corpus(1, 5)], by="tokens")
+        return compile(mixed.map(Scored(1)).batch(2), read=read, loading=READ).train(DataPartition())
+
+    uninterrupted = stream()
+    try:
+        expected = [{name: np.asarray(value).tolist() for name, value in next(uninterrupted).items()}
+                    for _ in range(6)]
+    finally:
+        uninterrupted.close()
+    stopped = stream()
+    try:
+        for _ in range(3):
+            next(stopped)
+        saved = stopped.get_state()
+    finally:
+        stopped.close()
+    resumed = stream()
+    try:
+        resumed.set_state(saved)
+        rest = [{name: np.asarray(value).tolist() for name, value in next(resumed).items()}
+                for _ in range(3)]
+    finally:
+        resumed.close()
+    assert rest == expected[3:]
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
