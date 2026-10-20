@@ -74,10 +74,11 @@ class Server:
 
 
 class Counter:
-    """Appends each action and one tool id to the context; completes after `turns` steps."""
+    """Appends each action and one tool id to the context; completes after `turns` steps, paying
+    `paid[step]` for each step where given."""
 
-    def __init__(self, turns=3, fail=None, on_step=None):
-        self.turns, self.fail, self.on_step = turns, fail, on_step
+    def __init__(self, turns=3, fail=None, on_step=None, paid=None):
+        self.turns, self.fail, self.on_step, self.paid = turns, fail, on_step, paid
         self.context, self.steps = (1, 2), 0
 
     def reset(self):
@@ -94,9 +95,10 @@ class Counter:
         if self.fail == "malformed":
             return {"context": [1, 2]}
         self.context = action.context + action.tokens + (4,)
+        reward = None if self.paid is None else self.paid[self.steps - 1]
         if self.steps == self.turns:
-            return Observation((), EpisodeStatus.COMPLETED, "tests passed")
-        return Observation(self.context)
+            return Observation((), EpisodeStatus.COMPLETED, "tests passed", reward)
+        return Observation(self.context, reward=reward)
 
 
 def factory(entered, exited, **options):
@@ -142,6 +144,55 @@ def test_a_multi_turn_session_keeps_each_calls_version_and_packs_into_one_chain(
     batch = pack([rollout], 16)
     assert batch["input_ids"].shape == (1, 16) and set(batch["text_segment_ids"][0].tolist()) == {0, 1}
     np.testing.assert_array_equal(batch["versions"][0][batch["response_mask"][0] > 0], [0, 0, 1, 1, 2, 2])
+
+
+@pytest.mark.parametrize("credit", ["session", "turn"])
+def test_step_rewards_credit_each_call_with_the_return_ahead_of_it(credit):
+    """An environment that pays each sample its own reward at each of three steps: every call
+    records the reward its step paid, and a session's return is the verifier's reward plus every
+    step's. With `credit="turn"` each call's advantage is the session's return from that call on,
+    centred on the group's members' at the same turn (`estimator="mean"`); with
+    `credit="session"` every call takes its session's, the whole return centred."""
+    paid = {0: (0.5, 0.0, 0.25), 1: (0.0, 0.25, 0.25), 2: (1.0, 0.0, 0.0), 3: (0.25, 0.25, 0.5)}
+
+    @contextmanager
+    def environment(task, identity):
+        yield Counter(paid=paid[identity.sample])
+
+    episodes = source(Server(), environment)
+    rollouts = [future.result() for future in episodes.submit(Task("3"), 4, version=0, key=KEY)]
+    episodes.close()
+    assert [[call.reward for call in rollout.calls] for rollout in rollouts] == [
+        list(paid[rollout.sample]) for rollout in rollouts]
+    batch = pack(rollouts, 16, rows=4, estimator="mean", credit=credit)
+    ahead = [[rollout.reward + sum(paid[rollout.sample][turn:]) for turn in range(3)] for rollout in rollouts]
+    for index in range(len(rollouts)):
+        for turn in range(3):
+            at = turn if credit == "turn" else 0
+            expected = ahead[index][at] - np.mean([returns[at] for returns in ahead])
+            mine = (batch["session_index"] == index) & (batch["call_index"] == turn)
+            assert mine.any() and (batch["advantages"][mine] == np.float32(expected)).all()
+
+
+def test_a_session_ended_at_reset_takes_no_turn_in_the_turn_credit():
+    """An environment whose sample 0 ends at its reset, scored 1 with no call, beside one that
+    takes one call and scores 0: the call has no other call at its turn to compare with, so its
+    turn advantage is zero, while session credit compares the two whole returns."""
+    class Ended:
+        def reset(self):
+            return Observation((), EpisodeStatus.COMPLETED, "solved at reset")
+
+    @contextmanager
+    def environment(task, identity):
+        yield Ended() if identity.sample == 0 else Counter(turns=1)
+
+    episodes = source(Server(), environment, verifier=lambda task, episode: 1.0 - len(episode.transitions))
+    ended, called = [future.result() for future in episodes.submit(Task("3"), 2, version=0, key=KEY)]
+    episodes.close()
+    assert (ended.calls, ended.reward, len(called.calls), called.reward) == ((), 1.0, 1, 0.0)
+    for credit, expected in (("turn", 0.0), ("session", -0.5)):
+        batch = pack([ended, called], 16, rows=1, estimator="mean", credit=credit)
+        assert (batch["advantages"][batch["session_index"] == 1] == np.float32(expected)).all()
 
 
 def test_every_call_of_a_multi_turn_session_carries_its_draws_engine_records():

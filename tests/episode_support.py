@@ -104,6 +104,7 @@ class SquareSession:
     def step(self, action):
         assert action.tokens[-1] == EOS
         command = action.tokens[:-1]
+        paid = self.harness.paid
         if self.harness.failure == "tool":
             raise OSError("tool transport failed")
         if self.harness.failure == "cancel":
@@ -117,16 +118,20 @@ class SquareSession:
             self.harness.calls.append((self.identity, value, self.answer))
             observation = {9: NINE, 16: SIXTEEN}[self.answer]
             return Observation((*action.context, *action.tokens, observation),
-                               detail=f"square({value}) = {self.answer}")
+                               detail=f"square({value}) = {self.answer}",
+                               reward=None if paid is None else paid[0])
         answer = {ANSWER_NINE: 9, ANSWER_SIXTEEN: 16, WRONG: 8}[command[0]]
         return Observation(
-            (), EpisodeStatus.COMPLETED, json.dumps({"answer": answer, "expected": self.answer})
+            (), EpisodeStatus.COMPLETED, json.dumps({"answer": answer, "expected": self.answer}),
+            reward=None if paid is None else paid[1],
         )
 
 
 class Harness:
-    def __init__(self, failure=None):
-        self.failure = failure
+    """Square tool sessions; `paid`, where given, is the reward the tool step and the answer step pay."""
+
+    def __init__(self, failure=None, paid=None):
+        self.failure, self.paid = failure, paid
         self.opened, self.closed, self.calls = [], [], []
 
     @contextmanager
