@@ -223,8 +223,10 @@ CONFIDENCE = 0.999
 """The bootstrap interval check 1 reads: a site whose pooled ratio's 99.9% interval is wider than
 PARITY cannot tell an equally exact computation from one PARITY off, and is inconclusive."""
 FEWEST_SEEDS = 8
-"""The fewest seeds check 1 judges by: a bootstrap over fewer has too few distinct resamples for its
-interval to mean anything, so fewer is Inconclusive whatever their ratio reads (`seeds_for` starts here)."""
+"""The fewest seeds check 1 judges by, an engineering minimum and no statistical threshold: over very few
+seeds a bootstrap has so few distinct resamples that its interval can sit wholly to one side of PARITY by
+the draws' luck, so fewer is Inconclusive whatever their ratio reads; above it the measured interval
+decides. `seeds_for` never declares fewer."""
 REDRAW = 4
 """A failing site's pooled ratio is drawn again over REDRAW times its seeds before it fails."""
 
@@ -399,12 +401,13 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive("\n".join(unresolved))
 
 
-def seeds_for(reference_fn, draw, label: str, *, start: int = 8, most: int = 512, truth_fn=None) -> int:
+def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = 512,
+              truth_fn=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the reference compared
     with itself (its errors on two disjoint seed sets, `_interval`'s control) resolves PARITY in every
     leaf: the pooled ratio's CONFIDENCE interval no wider than PARITY. Fails past `most`, where the
     site needs larger inputs or fewer shared factors, not more seeds."""
-    count = start
+    count = max(start, FEWEST_SEEDS)
     while count <= most:
         first = _drawn(reference_fn, reference_fn, draw, range(count), truth_fn)
         second = _drawn(reference_fn, reference_fn, draw, range(count, 2 * count), truth_fn)
