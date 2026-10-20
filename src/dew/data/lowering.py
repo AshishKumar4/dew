@@ -36,6 +36,7 @@ from dew.data.analysis import (
     _identity,
     _in_memory,
     _Lowering,
+    _member_keys,
     _name,
     _until,
 )
@@ -615,12 +616,9 @@ batches, so a resume cuts the batches before them (`_Build.batched`)."""
 
 
 def _member_key(members: Sequence[str], index: int) -> int:
-    """A mixture member's key for its random draws: the name it goes by (`_members`), as the plan's
-    order records it for every read alike, so adding or removing another member leaves its draws as
-    they were, and among members of one name its place among them, so two such members draw apart."""
-    name = members[index]
-    alike = sum(member == name for member in members[:index])
-    return int.from_bytes(hashlib.blake2b(f"{alike}:{name}".encode(), digest_size=8).digest(), "big")
+    """A mixture member's key for its random draws (`_member_keys`), as a seed."""
+    key = _member_keys(members)[index]
+    return int.from_bytes(hashlib.blake2b(key.encode(), digest_size=8).digest(), "big")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -646,16 +644,22 @@ class _Build:
         return dataclasses.replace(self, lowering=self.lowering.children[index],
                                    corpus=(*self.corpus, _member_key(members, index)))
 
-    def stage_seed(self, pipeline: Pipeline, at: int) -> int:
+    def stage_seed(self, pipeline: Pipeline, at: int, partition: DataPartition) -> int:
         """The seed of the random stage written at `at` in `pipeline`: the run's seed, the corpus's
         key in each of its mixtures and how many random stages its corpus wrote before this one. No stage
         a read leaves out or runs ahead draws (a cache's prefix, a published generation's steps,
         the steps a memory read runs over the whole source), so this count is the same in every
         read. Grain's default seed counts the datasets between a step and the nearest seeded one
         instead, which those reads and the wrappers a read adds change. A native step is a random
-        stage too: the dataset it is handed seeds the random steps it adds by that default."""
+        stage too: the dataset it is handed seeds the random steps it adds by that default.
+
+        A stage after the batch draws for this share's part of each batch, which other shares'
+        parts must not repeat, so its seed adds the share where there is more than one."""
         drawn = sum(isinstance(stage, (RandomMap, Native)) for stage in pipeline.stages[:at])
-        return int(np.random.SeedSequence((self.seed, *self.corpus, drawn)).generate_state(1, np.uint32)[0])
+        batched = any(isinstance(stage, BatchStage) for stage in pipeline.stages[:at])
+        share = (partition.index, partition.count) if batched and partition.count > 1 else ()
+        key = (self.seed, *self.corpus, drawn, *share)
+        return int(np.random.SeedSequence(key).generate_state(1, np.uint32)[0])
 
     def mixed(self, pipeline: Pipeline, partition: DataPartition) -> Rows:
         source = pipeline.source
@@ -671,15 +675,19 @@ class _Build:
             Accepted(_as_iter(parent, self.loading), _name(child), budget=self.budget)
             for parent, child in zip(parents, source.pipelines, strict=True)
         ]
+        # A streamed mix saves each member's position under its key, so a member that joins starts
+        # and one that left is dropped while the others resume (`Plan.check`).
+        keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
         if source.tokens is not None:
             return TokenDeficit(
                 streams,
                 source.weights,
                 tokens=source.tokens,
                 names=[_name(child) for child in source.pipelines],
+                keys=keys,
                 budget=self.budget,
             )
-        return PrimedMix(streams, source.weights)
+        return PrimedMix(streams, source.weights, keys)
 
     def indexed(
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int
@@ -705,7 +713,7 @@ class _Build:
             rows = stored.map_with_index(placed) if last >= 0 else stored
             return self.shared(rows, pipeline, partition), 0
         filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
-        cached = filled.mapped(stored, manifest, transform=prefix)
+        cached = filled.mapped(stored, manifest, transform=prefix, source=source)
         placed = cached.map_with_index(_Placed(rows=len(cached))) if last > cache else cached
         view = self.shared(placed, pipeline, partition)
         rows = cached.iterated(view, pygrain.ReadOptions(self.loading.threads, self.loading.read_buffer))
@@ -797,7 +805,7 @@ class _Build:
     def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition, at: int) -> Rows:
         """`rows` through `stage`, written at `at` in `pipeline`."""
         if isinstance(stage, (Map, RandomMap, MapWithIndex, Filter, FlatMap)):
-            return self.record_stage(rows, stage, pipeline, at)
+            return self.record_stage(rows, stage, pipeline, partition, at)
         if isinstance(stage, Shuffle) and stage.block_shards is not None:
             return self.block_shuffle(rows, stage, pipeline, partition)
         if isinstance(stage, Repeat):
@@ -831,7 +839,7 @@ class _Build:
                 _as_iter(rows, self.loading), partition.rows(stage.size), drop_remainder=self.training
             )
         elif isinstance(stage, Native):
-            rows = stage.function(rows.seed(self.stage_seed(pipeline, at)))
+            rows = stage.function(rows.seed(self.stage_seed(pipeline, at, partition)))
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
             rows = gx.FlatMapIterDataset(groups, _Groups(stage))
@@ -892,13 +900,13 @@ class _Build:
 
     def record_stage(
         self, rows: Rows, stage: Map | RandomMap | MapWithIndex | Filter | FlatMap, pipeline: Pipeline,
-        at: int,
+        partition: DataPartition, at: int,
     ) -> Rows:
         lowered = _Rows(stage)
         if isinstance(stage, FlatMap):
             rows = _expanded(_as_iter(rows, self.loading), stage, _name(pipeline))
         elif isinstance(stage, RandomMap):
-            rows = rows.random_map(lowered, seed=self.stage_seed(pipeline, at))
+            rows = rows.random_map(lowered, seed=self.stage_seed(pipeline, at, partition))
         else:
             rows = rows.map(lowered)
         if isinstance(stage, (Filter, FlatMap)) or stage.rejects:

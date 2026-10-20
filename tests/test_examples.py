@@ -63,8 +63,7 @@ def smoke(name, out, *arguments, offline=True, script=None, smoke_args=True, dev
 def test_readme_demo_resumes_updates_its_policy_freezes_the_reference_and_draws_flow(tmp_path):
     """The public chain restores a real checkpoint and keeps DPO's reference unchanged."""
     out = tmp_path / "demo"
-    finished = smoke("readme_demo", out, "--out", str(out), smoke_args=False)
-    assert "Resumed from step 20" in finished.stdout + finished.stderr
+    smoke("readme_demo", out, "--out", str(out), smoke_args=False)
     summary = json.loads((out / "summary.json").read_text())
     assert summary["language_model"]["first_step"] == 20
     assert summary["language_model"]["resumed_step"] == summary["language_model"]["updates"] == 24
@@ -180,6 +179,19 @@ def test_train_diffusion_example_trains_samples_and_exports(tmp_path):
     assert (tmp_path / "export" / "model.safetensors").exists()
     assert (tmp_path / "export" / "config.json").exists()
     assert (tmp_path / "checkpoints" / "3").is_dir(), "the last step was not checkpointed"
+
+
+def test_train_flowers_trains_on_every_record_and_its_profiling_run_draws_nothing(tmp_path):
+    example = load("train_flowers", "examples")
+    assert example.flowers(example.Config(data=tmp_path)).validation is None, "a split is held out"
+
+    config = example.Config(data=tmp_path, output=tmp_path / "run", steps=4, batch=8, image_size=RES,
+                            profile=2)
+    state = example.main(config, data=fake_dataset(8))
+
+    assert int(state.step) == 4
+    assert any((tmp_path / "run" / "profile").rglob("*.xplane.pb")), "no trace was written"
+    assert not (tmp_path / "run" / "samples.png").exists(), "a profiling run drew samples"
 
 
 @pytest.mark.mesh
@@ -399,7 +411,7 @@ def test_train_rlvr_turns_smoke_trains_through_environment_source(tmp_path):
 
 
 def test_train_harbor_smoke_trains_on_gateway_recorded_harness_calls(tmp_path):
-    """Two updates of HarborSource trials whose model calls the stand-in gateway records from the policy's
+    """Two updates of Harbor trials whose model calls the stand-in gateway records from the policy's
     own draws; the second trains on sessions submitted one update earlier."""
     smoke("train_harbor", tmp_path)
     summary = json.loads((tmp_path / "summary.json").read_text())

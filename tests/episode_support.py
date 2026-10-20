@@ -32,9 +32,9 @@ SAMPLING = Sampling(temperature=.7, top_k=2, eos_token_ids=EOS, pad_token_id=PAD
 IDENTITY = EpisodeId(task=3, attempt=0, sample=0, seed=(1, 2))
 
 
-def environment(mode: str = "ok", **limits) -> SubprocessEnvironment:
+def environment(mode: str = "ok", *arguments: str, **limits) -> SubprocessEnvironment:
     worker = Path(__file__).with_name("sandbox_square_worker.py")
-    return SubprocessEnvironment((sys.executable, str(worker), mode), SandboxLimits(**limits))
+    return SubprocessEnvironment((sys.executable, str(worker), mode, *arguments), SandboxLimits(**limits))
 
 
 def action(context, *tokens: int) -> Action:
@@ -104,6 +104,7 @@ class SquareSession:
     def step(self, action):
         assert action.tokens[-1] == EOS
         command = action.tokens[:-1]
+        paid = self.harness.paid
         if self.harness.failure == "tool":
             raise OSError("tool transport failed")
         if self.harness.failure == "cancel":
@@ -117,16 +118,20 @@ class SquareSession:
             self.harness.calls.append((self.identity, value, self.answer))
             observation = {9: NINE, 16: SIXTEEN}[self.answer]
             return Observation((*action.context, *action.tokens, observation),
-                               detail=f"square({value}) = {self.answer}")
+                               detail=f"square({value}) = {self.answer}",
+                               reward=None if paid is None else paid[0])
         answer = {ANSWER_NINE: 9, ANSWER_SIXTEEN: 16, WRONG: 8}[command[0]]
         return Observation(
-            (), EpisodeStatus.COMPLETED, json.dumps({"answer": answer, "expected": self.answer})
+            (), EpisodeStatus.COMPLETED, json.dumps({"answer": answer, "expected": self.answer}),
+            reward=None if paid is None else paid[1],
         )
 
 
 class Harness:
-    def __init__(self, failure=None):
-        self.failure = failure
+    """Square tool sessions; `paid`, where given, is the reward the tool step and the answer step pay."""
+
+    def __init__(self, failure=None, paid=None):
+        self.failure, self.paid = failure, paid
         self.opened, self.closed, self.calls = [], [], []
 
     @contextmanager

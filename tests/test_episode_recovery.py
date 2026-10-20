@@ -5,15 +5,29 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 
 import jax
 import numpy as np
 import pytest
-from episode_support import CALL_THREE, EOS, IDENTITY, NINE, START, action, build, collect, environment
+from episode_support import (
+    CALL_THREE,
+    EOS,
+    IDENTITY,
+    NINE,
+    START,
+    Harness,
+    SquareSession,
+    action,
+    build,
+    collect,
+    environment,
+)
 
-from dew.objectives.rl import EpisodeJournal, RecoverableEnvironment
+from dew.objectives.rl import EpisodeJournal, RecoverableEnvironment, Transcript, session_of
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("episode_recovery_worker.py")
@@ -27,6 +41,44 @@ def test_journal_refuses_a_different_policy_at_identical_clocks(tmp_path):
     changed = replace(state, variables=jax.tree.map(lambda value: value + .001, state.variables))
     with pytest.raises(ValueError):
         collect(rollout, changed)
+
+
+class Saying(SquareSession):
+    """The square tool, whose observations also say the chat messages they added, as read-only mappings."""
+
+    def reset(self):
+        return replace(super().reset(), messages=(MappingProxyType({"role": "user", "content": "square"}),))
+
+    def step(self, action):
+        seen = super().step(action)
+        return replace(seen, messages=(MappingProxyType({"role": "tool", "content": seen.detail}),))
+
+    def get_state(self):
+        return json.dumps({"answer": self.answer}).encode()
+
+    def set_state(self, state):
+        self.answer = json.loads(state)["answer"]
+
+
+class Sayings(Harness):
+    @contextmanager
+    def __call__(self, identity):
+        yield Saying(identity, self)
+
+
+def test_a_journaled_episode_keeps_the_messages_its_environment_said(tmp_path):
+    """Messages an environment gives in any mapping are kept as JSON: a journaled collection writes
+    them and reads the same episodes back, and each call's transcript lists those before it."""
+    trainer, rollout = build(Sayings(), journal=EpisodeJournal(str(tmp_path)))
+    state = trainer.initial_state()
+    episodes = collect(rollout, state)
+    assert collect(rollout, state) == episodes
+    for episode in episodes:
+        said = [{"role": "user", "content": "square"},
+                *({"role": "tool", "content": turn.observation.detail} for turn in episode.transitions)]
+        calls = session_of(episode, group="0").calls
+        assert [call.transcript for call in calls] == [Transcript(tuple(said[:turn + 1]))
+                                                       for turn in range(len(calls))]
 
 
 def launch(directory, mode):

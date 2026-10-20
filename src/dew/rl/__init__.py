@@ -7,8 +7,7 @@ the package can be tested on fixed tensors.
 
 Imports go one way. `dew.rl` may import from `dew`, but nothing in `dew`
 outside `dew.rl` and `dew.objectives.rl` may import `dew.rl`. That way,
-splitting it into a separate distribution only means moving a directory
-(`docs/design/plan.md`, section 5.1).
+splitting it into a separate distribution only means moving a directory.
 
 `sandbox` runs untrusted programs and tool sessions in bounded subprocesses
 or containers, and a verifiable reward uses it to score completions. It

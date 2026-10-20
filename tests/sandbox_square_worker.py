@@ -1,7 +1,8 @@
 """A JSON-lines square tool worker for SubprocessEnvironment tests.
 
 Argument one selects a failure mode: ok, hang, allocate, garbage, crash or
-fork. The square tool vocabulary matches tests/test_tool_episodes.py.
+fork; or wait, whose reset waits until the pipe named by argument three
+carries a byte. The square tool vocabulary matches tests/test_tool_episodes.py.
 """
 
 import base64
@@ -38,6 +39,9 @@ def main():
             identity = request["episode"]
             if mode == "hang":
                 time.sleep(3600)
+            if mode == "wait":
+                with open(sys.argv[3], "rb") as gate:
+                    gate.read(1)
             if mode == "cpu":
                 while True:
                     pass

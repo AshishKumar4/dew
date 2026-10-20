@@ -6,10 +6,10 @@ Needs one GPU and `uv`. Installs SGLang 0.5.20 (with ninja), vLLM 0.30.0 and rll
 3b40c37 in their own venvs under --venvs. For each engine, on 127.0.0.1: start the engine on
 Qwen/Qwen2.5-0.5B-Instruct and wait for /health; warm it with one chat request (SGLang compiles for
 minutes on its first one, stalling /health past the gateway's 5 s probe); start the gateway
-(sync_traces, health_check_interval 60) and wait until `dew.interop.harbor.Gateway.ready`
+(sync_traces, health_check_interval 60) and wait until `dew.interop.gateway.Gateway.ready`
 passes; run one three-turn tool-calling session and one prompt past the context length through
 /sessions/{sid}/v1; write the session's traces as `{engine}_session_traces.json` and the overflow's
-as `{engine}_overflow_trace.json`, keeping only the fields `dew.interop.harbor.calls` reads.
+as `{engine}_overflow_trace.json`, keeping only the fields `dew.interop.gateway.calls` reads.
 The fixtures committed were captured on a Colab L4 on 2026-09-23.
 """
 
@@ -23,7 +23,7 @@ from pathlib import Path
 
 import httpx
 
-from dew.interop.harbor import Gateway
+from dew.interop.gateway import Gateway
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 ENGINE, GATEWAY = "http://127.0.0.1:8011", "http://127.0.0.1:9090"
@@ -34,7 +34,7 @@ TOOLS = [{"type": "function", "function": {
     "name": "bash", "description": "Run a bash command.",
     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}]
 KEPT = ("prompt_token_ids", "completion_token_ids", "logprobs", "finish_reason", "weight_version", "timestamp",
-        "latency_ms")
+        "latency_ms", "messages", "response_message")
 
 
 def venv(root: Path, name: str) -> Path:

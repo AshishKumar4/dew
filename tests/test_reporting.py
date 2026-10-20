@@ -137,7 +137,8 @@ def test_local_scalar_sink_does_not_enable_preview_computation(tmp_path, preview
         trainer = Trainer(Display(), optax.sgd(.01), key=jax.random.key(0), tracker=sink)
         data = Loader(lambda partition: batches(), lambda partition: iter([next(batches())]), None, 8)
         trainer.fit(data, steps=2, eval_every=1, preview=preview)
-    assert generated == [1, 2]
+    # The pass that warms the evaluations before the first step previews too, and logs nothing.
+    assert generated == [0, 1, 2]
     assert len(list(tmp_path.glob('*.png'))) == 2
 
 
