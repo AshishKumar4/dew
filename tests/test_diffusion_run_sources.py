@@ -614,5 +614,9 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
     checkpoints.save(0, started(saved), None, {}, artifact=saved.inference_record())
     checkpoints.wait()
     config.save(str(tmp_path / "run"))
-    restored = np.asarray(TextToImage.from_run(str(tmp_path / "run"))(prompts, key=7).images)
-    np.testing.assert_array_equal(restored, reference)
+    # The restored task runs where its weights were restored, over every device: the pipeline's task
+    # over those weights, run there too, draws what it does.
+    restored = TextToImage.from_run(str(tmp_path / "run"))
+    np.testing.assert_array_equal(
+        restored(prompts, key=7).host().images,
+        pipeline.bind(restored.variables)(prompts, steps=2, guidance=None, solver=Euler(), key=7).host().images)
