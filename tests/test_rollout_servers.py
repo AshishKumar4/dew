@@ -348,14 +348,16 @@ def test_a_draw_a_stop_string_ends_is_cut_at_the_id_completing_it(provider):
 def test_a_stop_strings_id_is_found_where_a_longer_prefix_does_not_extend_a_shorter_ones_text():
     """A tokenizer's text for a longer prefix need not extend a shorter one's: Transformers' cleanup
     writes "a" "." as "a." where "a" " " alone is "a ". A stop string the second id completes ends the
-    draw there, though the whole draw's text no longer holds it; ids no prefix decodes to the string
-    the engine named are refused."""
-    pieces = {3: "a", 4: " ", 5: "."}
+    draw there, though the whole draw's text no longer holds it, and ids that decode to nothing may sit
+    inside a string; ids that don't decode to the string the engine named are refused."""
+    pieces = {3: "a", 4: " ", 5: ".", 6: "", 7: "b"}
 
     def decode(ids):
         return "".join(pieces[token] for token in ids).replace(" .", ".")
 
-    for drawn, stop, kept in (([3, 4, 5], "a ", (3, 4)), ([3, 5, 5], "a ", None)):
+    # Ids that decode to nothing (a special token, skipped) may sit inside the string they complete.
+    for drawn, stop, kept in (([3, 4, 5], "a ", (3, 4)), ([3, *[6] * 20, 7, 5], "ab", (3, *[6] * 20, 7)),
+                              ([3, 5, 5], "a ", None)):
         completion, _ = engine("vllm", lambda _, drawn=drawn, stop=stop: {
             **choice("vllm", drawn, [-.5] * len(drawn), "stop"), "stop_reason": stop})
         server = OpenAIRolloutServer(completion, Sampling(temperature=1.0, eos_token_ids=EOS, stop=(stop,)),
