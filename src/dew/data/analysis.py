@@ -390,18 +390,6 @@ def _label(pipeline: Pipeline) -> str:
     return "mixture" if isinstance(pipeline.source, (Mixture, Phases)) else pipeline.source.label()
 
 
-def _reshapes(stage: Stage) -> bool:
-    """Whether `stage` makes rows other than its records: an expansion, a layout or a Grain step."""
-    return (isinstance(stage, (FlatMap, Pack, Windows, TokenSplit, Native))
-            or (isinstance(stage, Batched) and not stage.same_rows))
-
-
-def _reads_records(stages: Sequence[Stage]) -> bool:
-    """Whether what `stages` make is still the corpus's records, which its counts count
-    (`CorpusCounts.records`): none of them reshapes them."""
-    return not any(_reshapes(stage) for stage in stages)
-
-
 def _members(pipelines: Sequence[Pipeline]) -> list[str]:
     """The names a mixture's members go by, for their draws and in its plan: the one each was given
     (`Pipeline.named`, as `name:<name>`), else its place among the members given none (`place:0`,
