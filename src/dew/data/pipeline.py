@@ -686,8 +686,8 @@ class Dataset:
 
     def stats(self, records: int = 1000) -> dict[str, float]:
         """The counts a run logs from a fresh, lazy pass over at most
-        `records` accepted records: records attempted and accepted, rows
-        delivered and drops by reason (`dew.data.mixing.CorpusCounts`)."""
+        `records` accepted records: the rows delivered and the drops by
+        reason (`dew.data.mixing.CorpusCounts`)."""
         from dew.data.compile import _diagnostic
         from dew.data.mixing import data_metrics, state_counts
         from dew.records import record
