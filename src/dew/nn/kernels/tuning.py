@@ -30,7 +30,8 @@ without a pick compiles on a thread pool and runs alone, its kernel's device
 time read by CUPTI after `FLUSH_BYTES` are read, and the fastest is kept.
 Any other compile measures nothing and says once how many launches lack a
 measurement. Picks persist per GPU model and jaxlib beside XLA's own
-(`dew.cache.kernel_picks_path`). Wall-clock timing is
+(`dew.cache.kernel_picks_path`), in Dew's own JSON (`encoded`, `decoded`), which tokamax's public API
+leaves to its callers. Wall-clock timing is
 `dew.telemetry.benchmark.samples`, which every benchmark tool in Dew measures with.
 
 Tile choice changes a kernel's reduction order, and its error is not
@@ -45,6 +46,8 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import dataclasses
+import enum
+import importlib
 import json
 import logging
 import os
@@ -56,16 +59,9 @@ from typing import ClassVar
 import filelock
 import jax
 import jax.numpy as jnp
+import numpy as np
 import tokamax
 from jax.extend.backend import get_default_device
-
-# tokamax's writer of launches as JSON, public only as a file writer (`bound_args_to_json`); goes to
-# `tokamax.autotuning.dump_bound_args_to_json` once a tokamax release carries openxla/tokamax#1676.
-from tokamax._src.autotuning.api import dump_bound_args_to_json
-
-# tokamax names the type of one launch's timings by config nowhere public; its picks are read as this type.
-# Goes to `tokamax.autotuning.AutotuningData` once a tokamax release carries openxla/tokamax#1676.
-from tokamax._src.autotuning.autotuner import AutotuningData
 
 from dew import cache, coordination
 from dew.files import write_atomically
@@ -83,6 +79,142 @@ REPEATS = 5
 """The timed launches of each config."""
 
 
+class Timings(dict):
+    """One launch's timings by config: `tokamax.BenchmarkData` where a config ran, the exception where
+    it did not; tokamax's cache lookup returns it as a launch's pick (`KernelOp.get_autotuning_cache`)."""
+
+    @property
+    def fastest_config(self) -> Hashable:
+        """The config of least median time; a mapping with none that ran raises naming its failures."""
+        ran = [(config, data) for config, data in self.items() if isinstance(data, tokamax.BenchmarkData)]
+        if not ran:
+            raise ValueError(f"no config ran: {list(self.values())}")
+        return min(ran, key=lambda item: item[1].median_evaluation_time_ms)[0]
+
+    def prune_errors(self) -> Timings:
+        """The configs that ran."""
+        return Timings({config: data for config, data in self.items()
+                        if isinstance(data, tokamax.BenchmarkData)})
+
+    def prune(self) -> Timings:
+        """The fastest config alone."""
+        config = self.fastest_config
+        return Timings({config: self[config]})
+
+
+def encoded(value: object) -> object:
+    """`value`, an op's field, a launch's argument or a config, as JSON `decoded` rebuilds equal: a
+    scalar, None or string as itself; a shape and dtype, a dtype, a tuple, a list, a mapping, an enum
+    member and a dataclass by their parts, a class by its module and name. Anything else, a callable
+    among them, has no JSON form here, and raises."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, jax.ShapeDtypeStruct):
+        return {"shape": list(value.shape), "dtype": str(value.dtype)}
+    if isinstance(value, np.dtype):
+        return {"dtype": str(value)}
+    if isinstance(value, enum.Enum):
+        return {"enum": _named(type(value)), "name": value.name}
+    if isinstance(value, type):
+        return {"class": _named(value)}
+    if dataclasses.is_dataclass(value):
+        return {"dataclass": _named(type(value)),
+                "fields": {field.name: encoded(getattr(value, field.name))
+                           for field in dataclasses.fields(value) if field.init}}
+    if isinstance(value, tuple):
+        return {"tuple": [encoded(item) for item in value]}
+    if isinstance(value, list):
+        return [encoded(item) for item in value]
+    if isinstance(value, Mapping):
+        return {"mapping": [[encoded(key), encoded(item)] for key, item in value.items()]}
+    raise TypeError(f"{type(value).__name__} has no JSON form in a kernel's picks: {value!r}")
+
+
+def decoded(value: object) -> object:
+    """What `encoded` wrote, rebuilt: a class it names that this checkout lacks raises ValueError."""
+    if isinstance(value, list):
+        return [decoded(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if "shape" in value:
+        return jax.ShapeDtypeStruct(tuple(value["shape"]), jnp.dtype(value["dtype"]))
+    if "dtype" in value:
+        return jnp.dtype(value["dtype"])
+    if "enum" in value:
+        return getattr(_located(value["enum"]), value["name"])
+    if "class" in value:
+        return _located(value["class"])
+    if "dataclass" in value:
+        return _located(value["dataclass"])(**{name: decoded(item) for name, item in value["fields"].items()})
+    if "tuple" in value:
+        return tuple(decoded(item) for item in value["tuple"])
+    return {decoded(key): decoded(item) for key, item in value["mapping"]}
+
+
+def _named(cls: type) -> str:
+    return f"{cls.__module__}:{cls.__qualname__}"
+
+
+def _located(name: str):
+    """The class `_named` names; ValueError where this checkout has no such class."""
+    module, _, qualified = name.partition(":")
+    try:
+        found = importlib.import_module(module)
+        for part in qualified.split("."):
+            found = getattr(found, part)
+    except (ImportError, AttributeError) as error:
+        raise ValueError(f"this checkout has no {name}") from error
+    return found
+
+
+def _launch_json(ba: tokamax.BoundArguments) -> dict:
+    """A launch as JSON: its op as its picks name it (`_identity`) and its arguments."""
+    return {"op": encoded(_identity(ba.op)), "arguments": {name: encoded(value)
+                                                           for name, value in ba.arguments.items()}}
+
+
+def _launch(entry: dict) -> tokamax.BoundArguments:
+    """The launch `_launch_json` wrote; ValueError where this checkout cannot rebuild it."""
+    try:
+        op = decoded(entry["op"])
+        arguments = {name: decoded(value) for name, value in entry["arguments"].items()}
+        return tokamax.BoundArguments(op, arguments)
+    except (TypeError, KeyError) as error:
+        raise ValueError(f"a launch this checkout cannot rebuild: {error}") from error
+
+
+def _timings_json(timings: Timings) -> list:
+    """The configs that ran and their times, as JSON (`_timings`)."""
+    return [[encoded(config), {"compile_time_ms": data.compile_time_ms, "lower_time_ms": data.lower_time_ms,
+                               "evaluation_times_ms": list(data.evaluation_times_ms),
+                               "metadata": encoded(dict(data.metadata))}]
+            for config, data in timings.prune_errors().items()]
+
+
+def _timings(entries: list) -> Timings:
+    return Timings({decoded(config): tokamax.BenchmarkData(
+        compile_time_ms=data["compile_time_ms"], lower_time_ms=data["lower_time_ms"],
+        evaluation_times_ms=tuple(data["evaluation_times_ms"]), metadata=decoded(data["metadata"]))
+        for config, data in entries})
+
+
+def dumps_launches(launches: list[tokamax.BoundArguments]) -> str:
+    """`launches` as JSON, which `loads_launches` reads back."""
+    return json.dumps([_launch_json(ba) for ba in launches])
+
+
+def loads_launches(text: str) -> list[tokamax.BoundArguments]:
+    """The launches `dumps_launches` wrote."""
+    return [_launch(entry) for entry in json.loads(text)]
+
+
+def dumps_picks(device_kind: str, picks) -> str:
+    """`picks`, `(launch, Timings)` pairs measured on GPUs of `device_kind`, as the JSON Dew stores
+    them (`_read`): each launch with the configs that ran."""
+    return json.dumps({"device_kind": device_kind, "data": [
+        {**_launch_json(ba), "timings": _timings_json(timings)} for ba, timings in picks]})
+
+
 class _Picks(dict):
     """One op's picks on one GPU model, by key; a key without one reads None,
     tokamax's miss."""
@@ -97,7 +229,7 @@ _bound_args: Callable[[jax.stages.Lowered], tuple[tokamax.BoundArguments, ...]] 
     tokamax.autotuning.get_bound_args)
 
 _PICKS: dict[tuple[tokamax.Op, str], _Picks] = {}
-_NEAREST: dict[tuple[tokamax.Op, str], dict[Hashable, AutotuningData | None]] = {}
+_NEAREST: dict[tuple[tokamax.Op, str], dict[Hashable, Timings | None]] = {}
 """Per op and GPU model, the nearest pick process 0 resolved for each key without a pick of its own,
 None for its heuristic (`_settle`): what every process launches there, whatever other picks it holds."""
 _LOADED: set[str] = set()
@@ -166,14 +298,14 @@ class KernelOp(tokamax.Op):
         return tokamax.BoundArguments(_identity(self), {name: shaped(name, value)
                                                         for name, value in ba.arguments.items()})
 
-    def _nearest(self, ba: tokamax.BoundArguments) -> AutotuningData | None:
+    def _nearest(self, ba: tokamax.BoundArguments) -> Timings | None:
         """The pick a launch without its own takes: the one process 0 settled for `ba`'s key
         (`_settle`), else the nearest this process stores (`_stored_nearest`)."""
         settled = _NEAREST.get((_identity(self), _kind(ba)), {})
         key = ba.autotuning_cache_key
         return settled[key] if key in settled else self._stored_nearest(ba)
 
-    def _stored_nearest(self, ba: tokamax.BoundArguments) -> AutotuningData | None:
+    def _stored_nearest(self, ba: tokamax.BoundArguments) -> Timings | None:
         """The pick measured for the stored key nearest `ba`'s: every argument
         the same but the token counts (`ROWS`), the fewest powers of two away,
         the smaller on a tie, where `ba`'s space holds its config."""
@@ -244,7 +376,7 @@ def _kind(ba: tokamax.BoundArguments) -> str:
     return (device or get_default_device()).device_kind
 
 
-def _pick(ba: tokamax.BoundArguments) -> AutotuningData | None:
+def _pick(ba: tokamax.BoundArguments) -> Timings | None:
     """The pick tokamax's cache holds for `ba` (its key's shapes), where
     `ba`'s space holds its fastest config; any other is no pick."""
     stored = ba.cached_autotuning_data
@@ -294,7 +426,7 @@ def _resource_exhausted(error: Exception) -> bool:
             or "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES" in message)
 
 
-def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
+def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
     kernels, each run after `FLUSH_BYTES` are read, so every config starts
@@ -350,21 +482,21 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
     except RuntimeError as error:
         if not _another_subscriber(error):
             raise
-        return AutotuningData(dict.fromkeys(ba.autotuning_configs, error))
+        return Timings(dict.fromkeys(ba.autotuning_configs, error))
     finally:
         _detach(profiler, evicting, flush)
     for config, (runs, lowering, compiling) in read.items():
         times = tuple(sum(milliseconds for name, milliseconds in run if name not in flushes) for run in runs)
         timings[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
                                                 metadata={}, evaluation_times_ms=times)
-    return AutotuningData(timings)
+    return Timings(timings)
 
 
-def _config(fastest: AutotuningData | None) -> Hashable:
+def _config(fastest: Timings | None) -> Hashable:
     return None if fastest is None else fastest.fastest_config
 
 
-Keyed = dict[tuple[tokamax.Op, Hashable], tuple[tokamax.BoundArguments, AutotuningData]]
+Keyed = dict[tuple[tokamax.Op, Hashable], tuple[tokamax.BoundArguments, Timings]]
 """Launches by their op and cache key, each with its timings (`_keyed`)."""
 
 Launch = tuple[KernelOp, tokamax.BoundArguments]
@@ -407,8 +539,8 @@ def _read(path: str) -> tuple[Keyed, list]:
     foreign = []
     for entry in entries:
         try:
-            launches = _keyed(tokamax.AutotuningResult.loads(json.dumps({**stored, "data": [entry]})).data)
-        except ValueError:
+            launches = _keyed([(_launch(entry), _timings(entry["timings"]))])
+        except (ValueError, KeyError, TypeError):
             foreign.append(entry)
             continue
         if any(set(entry[0]["arguments"]) != set(ba.signature.parameters) - {"config"}
@@ -431,19 +563,17 @@ def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:
     return picks
 
 
-def _store(picks: tokamax.AutotuningResult) -> None:
-    """Merge `picks` into the stored picks for their GPU model, one writer at a
-    time, a launch's newer timings replacing its older, the entries this
-    checkout does not read kept as they are (`_read`). The file is replaced
-    whole (`write_atomically`), so no reader on the shared filesystem sees a
-    part of it."""
-    path = cache.kernel_picks_path(picks.device_kind)
+def _store(device_kind: str, picks) -> None:
+    """Merge `picks`, `(launch, Timings)` pairs measured on GPUs of `device_kind`, into the stored
+    picks for that model, one writer at a time, a launch's newer timings replacing its older, the
+    entries this checkout does not read kept as they are (`_read`). The file is replaced whole
+    (`write_atomically`), so no reader on the shared filesystem sees a part of it."""
+    path = cache.kernel_picks_path(device_kind)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with filelock.FileLock(path + '.lock'):
         stored, foreign = _read(path)
-        merged = {**stored, **_keyed(picks.data)}
-        written = json.loads(tokamax.AutotuningResult(picks.device_kind, tuple(merged.values()))
-                             .dumps(prune_errors=True))
+        merged = {**stored, **_keyed(picks)}
+        written = json.loads(dumps_picks(device_kind, merged.values()))
         write_atomically(path, json.dumps({**written, "data": [*written["data"], *foreign]}))
 
 
@@ -499,7 +629,7 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     _settle(distinct, measure=measure)
     if cache.KERNEL_TUNES.get_global() != tuned:
         lowered = lower()
-    return lowered, dump_bound_args_to_json([ba for _, ba in distinct])
+    return lowered, dumps_launches([ba for _, ba in distinct])
 
 
 def _distinct(found: list[Launch]) -> list[Launch]:
@@ -517,7 +647,7 @@ def settled(launches: str) -> bool:
     recorded settles instead of lowering for `tune`."""
     if not generation.triton_runs():
         return True
-    found = [(op, ba) for ba in tokamax.autotuning.bound_args_from_json(launches)
+    found = [(op, ba) for ba in loads_launches(launches)
              if isinstance(op := ba.op, KernelOp)]
     return _settle(found, measure=False) == 0
 
@@ -562,14 +692,13 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
             if (near := op._stored_nearest(ba)) is not None:
                 nearest.append((ba, near))
         if measured:
-            _store(tokamax.AutotuningResult(kind, tuple(measured)))
-        return json.dumps([json.loads(tokamax.AutotuningResult(kind, tuple(chosen)).dumps())
-                           for chosen in (decisions, nearest)])
+            _store(kind, measured)
+        return json.dumps([json.loads(dumps_picks(kind, chosen)) for chosen in (decisions, nearest)])
 
     text = coordination.broadcast_from_process_zero(coordination.agreed("settling kernel configs", decided))
-    picked, near = (_keyed(tokamax.AutotuningResult.loads(json.dumps(chosen)).data)
+    picked, near = (_keyed([(_launch(entry), _timings(entry["timings"])) for entry in chosen["data"]])
                     for chosen in json.loads(text))
-    settled: dict[tuple[tokamax.Op, Hashable], AutotuningData] = {
+    settled: dict[tuple[tokamax.Op, Hashable], Timings] = {
         (op, key): fastest for op, key, fastest in _kernel_launches(picked)}
     def launched() -> list[Hashable]:
         # The configs the launches take, as the trace read them; tokamax's ignore-cache setting keeps

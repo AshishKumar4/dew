@@ -77,7 +77,7 @@ def main() -> None:
     path = Path(cache.kernel_picks_path(jax.devices()[0].device_kind))
     # A store exists once a launch has been measured on this GPU model: a step with no Pallas launch
     # there (the dense 1.1B on an RTX PRO 6000 Blackwell) leaves none.
-    stored = () if not path.is_file() else tokamax.AutotuningResult.load(path.open()).data
+    stored = [] if not path.is_file() else list(tuning._read(str(path))[0].values())
     for ba, timings in stored:
         fastest = timings.prune()
         print(json.dumps({"kernel": type(ba.op).__name__, "key": str(dict(ba.autotuning_cache_key)),
