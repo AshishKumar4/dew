@@ -112,7 +112,7 @@ def test_a_pipelines_conditioner_records_the_tokenizer_files_it_reads(tmp_path, 
 
     def recorded():
         source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
-        return source.inputs.conditions["conditioning"].dependencies()
+        return source.inputs.conditions["conditioning"].encoder.dependencies()
 
     published = recorded()
     config = directory / tokenizer / "tokenizer_config.json"
