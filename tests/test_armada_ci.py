@@ -469,17 +469,20 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
 
 
 def test_a_split_file_pays_its_setup_once_a_group_and_is_not_cut_finer_for_it(ci):
-    """Twenty recorded tests of 10 s that armada measured at 400 s over the 4 groups they last ran
-    as paid 50 s a group besides their tests. At a 150 s target a group holds 100 s of tests and its
-    setup, so the file runs as 2 groups of 150 s, where scaling every test by the file's total would
-    cut it in 3 and each would pay the setup again. Measured at that cut, 300 s over 2 groups, the
-    file is cut the same way: its setup is not counted again for the groups it ran as, and it is
-    measured by its rows at that cut, not by a median that remembers other cuts. A setup past half
-    the target leaves each group half the target of tests, not a sliver."""
+    """Twenty recorded tests of 10 s that armada measured whole at 400 s paid 200 s besides their
+    tests, which every group pays again: at a 150 s target that leaves a group half the target of
+    tests, so 3 groups of 270, 270 and 260 s, not slivers each paying it. Measured at 2 groups,
+    300 s, each paid 50 s: its setup is not counted again for the groups it ran as, and it is
+    measured by its rows at that cut, not by a median that remembers other cuts."""
     tests = [10.0] * 20
-    assert ci.split(tests, 400.0, 150.0, cut=4) == [150.0, 150.0]
-    assert ci.split(tests, 300.0, 150.0, cut=2) == [150.0, 150.0]
-    assert ci.split(tests, 800.0, 150.0, cut=5) == [190.0, 190.0, 180.0]
+    assert ci.split(tests, 400.0, 150.0, cut=1) == [270.0, 270.0, 260.0]
+    assert ci.split(tests, 200.0 + 2 * 50.0, 150.0, cut=2) == [150.0, 150.0]
+    # A cut whose heaviest group, setup included, holds within half again the target is kept, so
+    # its cached programs are: 4 groups of 100 s, and 20 groups of 50 s (an over-cut paying 40 s
+    # each), stay as they ran; 2 groups at 130 s of setup each (230 s, past 225) are cut again.
+    assert ci.split(tests, 400.0, 150.0, cut=4) == [100.0] * 4
+    assert ci.split(tests, 200.0 + 20 * 40.0, 150.0, cut=20) == [50.0] * 20
+    assert ci.split(tests, 200.0 + 2 * 130.0, 150.0, cut=2) == [200.0, 200.0, 190.0]
     # The file's median remembers runs at other cuts; its rows are timed at the cut they name. Here
     # four runs at 4 groups (400 s) and the last at 2 (300 s, its rows): measured at 2, it stays at 2.
     rows = {"3.12:tests/test_split.py#1/2": 150.0, "3.12:tests/test_split.py#2/2": 150.0,

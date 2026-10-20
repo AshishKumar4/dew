@@ -362,15 +362,27 @@ def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> li
     whose tests fit what the setup leaves of `target`, at least half of it, so a file whose setup
     is most of a group is not cut into slivers that each pay it again; a heavier test runs alone.
     Counting the setup once a group, rather than scaling every test by the file's total, keeps a
-    file from being cut finer each run for the setup its last cut added. A file with no recorded
-    time runs as equal counts of its tests."""
+    file from being cut finer each run for the setup its last cut added. A file keeps the cut it
+    ran as while that cut's heaviest group, setup included, stays within `KEPT` of `target`:
+    a group's compiled programs are cached under its cut (tests/remote_cache.py), so a new cut
+    compiles every group from nothing, and the setup that measures moves the next cut again
+    (armada dew-20261020144644-dceff433: a new cut fetched no programs, and 14 of its 20 split
+    files would have been cut again). A file with no recorded time runs as equal counts of its
+    tests."""
     if sum(tests) <= 0:
         count = math.ceil(seconds / target)
         return [seconds / count] * count
     setup = max(seconds - sum(tests), 0.0) / cut
-    room = max(target - setup, target / 2)
-    count = len(starts(milliseconds(tests), round(room * 1000)))
+    if cut > 1 and max(sum(tests[run.start:run.stop]) for run in groups(tests, cut)) + setup <= KEPT * target:
+        count = cut
+    else:
+        room = max(target - setup, target / 2)
+        count = len(starts(milliseconds(tests), round(room * 1000)))
     return [sum(tests[run.start:run.stop]) + setup for run in groups(tests, count) if run]
+
+
+KEPT = 1.5
+"""How far past the target a split file's heaviest group may run before the file is cut again."""
 
 
 def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | None:
