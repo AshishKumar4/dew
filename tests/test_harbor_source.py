@@ -1,8 +1,11 @@
-"""Harbor trials behind a recording gateway, as a rollout source.
+"""Agent harnesses behind a recording gateway, as a rollout source: Harbor trials, and any agent
+command under `Command`.
 
 The gateway's traces are the JSON rllm-model-gateway serves for a vLLM or
 SGLang worker; Harbor is a stand-in executable that takes the same `trials
-start` arguments and writes a `TrialResult`-shaped `result.json`. A trial
+start` arguments and writes a `TrialResult`-shaped `result.json`, and an
+agent command is a stand-in CLI that records what it was given and leaves an
+answer for its verifier. A trial
 that hangs past `trial_timeout` is interrupted and retried by a real
 `RolloutScheduler` under a `Trainer`, and a child Harbor leaves in its
 process group, which ignores SIGINT and SIGTERM and holds its output open,
@@ -26,7 +29,9 @@ import jax
 import numpy as np
 import pytest
 
-from dew.interop.harbor import HARBOR_KEY, Gateway, HarborSource, calls, outcome
+from dew.interop.gateway import Gateway, calls
+from dew.interop.harbor import HARBOR_KEY, Harbor, outcome
+from dew.interop.harness import Command, HarnessSource
 from dew.objectives.rl.sessions import Call, Status, Task
 
 KEY = jax.random.key(0)
@@ -131,7 +136,7 @@ def test_an_engine_error_is_an_event_that_decides_the_session(refused, status):
         [trace([1, 2], [3], [-0.5]), {**refused, "timestamp": 9.0, "latency_ms": 10.0}], unstamped=0
     )
     assert recorded.calls == (Call((1, 2), (3,), (-.5,), "stop", 0),) and len(recorded.errors) == 1
-    assert outcome(result(rewards={"reward": 0}), recorded.calls, errors=recorded.errors)[0] is status
+    assert outcome(result(rewards={"reward": 0}), recorded).status is status
 
 
 @pytest.mark.parametrize(
@@ -151,9 +156,8 @@ def test_an_infrastructure_failure_outranks_a_limit_the_trial_also_hit(traces, e
     a trial the infrastructure broke is infra even where it also overflowed or
     ran out of time."""
     recorded = calls([{**entry, "timestamp": 1.0 + index} for index, entry in enumerate(traces)], unstamped=0)
-    status, *_ = outcome(result(exception, rewards={"reward": 0}), recorded.calls, errors=recorded.errors,
-                         harness_exit=harness_exit)
-    assert status is Status.INFRA_ERROR
+    judged = outcome(result(exception, rewards={"reward": 0}), recorded, harness_exit=harness_exit)
+    assert judged.status is Status.INFRA_ERROR
 
 
 def result(exception=None, rewards=None):
@@ -213,6 +217,11 @@ with open(os.path.join(trial, "result.json"), "w") as out:
 '''
 
 
+def harbor_trials(harbor, trials, *, model="hosted_vllm/policy", **options):
+    """The stand-in Harbor as a harness, writing its trials under `trials`."""
+    return Harbor(harbor=harbor, model=model, trials=trials, **options)
+
+
 @pytest.fixture
 def harbor(tmp_path):
     executable = tmp_path / "harbor"
@@ -221,8 +230,9 @@ def harbor(tmp_path):
     return executable
 
 
-def fake_gateway(unhealthy_checks=0, unreachable_models=0, version=7):
-    """A gateway whose every session recorded one call sampling [10 + sample], stamped `version`.
+def fake_gateway(unhealthy_checks=0, unreachable_models=0, version=7, extra=()):
+    """A gateway whose every session recorded one call sampling [10 + sample], stamped `version`,
+    and the traces `extra` after it.
 
     Its one worker is dead for the first `unhealthy_checks` health reads, like rllm-model-gateway
     started beside an engine still loading: its health loop marks the worker dead, and until the
@@ -250,7 +260,8 @@ def fake_gateway(unhealthy_checks=0, unreachable_models=0, version=7):
             return httpx.Response(200, json={"deleted": 1})
         session = request.url.path.removeprefix("/sessions/").removesuffix("/traces")
         sample = int(session.split(":")[2])
-        return httpx.Response(200, json=[trace([1, 2], [10 + sample], [-.5], version=version)])
+        later = ({**entry, "timestamp": 2.0 + index} for index, entry in enumerate(extra))
+        return httpx.Response(200, json=[trace([1, 2], [10 + sample], [-.5], version=version), *later])
 
     return Gateway("http://gateway", sandbox_url="http://172.17.0.1:9090",
                    client=httpx.Client(transport=httpx.MockTransport(network))), asked
@@ -273,8 +284,8 @@ def test_the_gateway_stamp_is_checked():
 def test_each_sample_is_its_own_trial_and_gateway_session(tmp_path, harbor):
     (tmp_path / "task").mkdir()
     gateway, asked = fake_gateway()
-    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
-                          environment={"MSWEA_API_KEY": "none"}, arguments=("-e", "docker"))
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials", environment={"MSWEA_API_KEY": "none"},
+                                         arguments=("-e", "docker")), gateway)
     try:
         futures = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 2, version=5, key=KEY)
         rollouts = [future.result(timeout=60) for future in futures]
@@ -308,7 +319,7 @@ def test_each_sample_is_its_own_trial_and_gateway_session(tmp_path, harbor):
 def test_a_cancelled_trial_is_interrupted_and_resolves_cancelled(tmp_path, harbor):
     (tmp_path / "slow").mkdir()
     gateway, asked = fake_gateway()
-    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials")
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials"), gateway)
     try:
         (future,) = source.submit(Task("slow", {HARBOR_KEY: str(tmp_path / "slow")}), 1, version=0, key=KEY)
         deadline = time.monotonic() + 30
@@ -328,9 +339,7 @@ def test_a_cancelled_trial_is_interrupted_and_resolves_cancelled(tmp_path, harbo
 def test_a_harbor_that_ignores_the_interrupt_is_terminated_after_the_grace(tmp_path, harbor):
     (tmp_path / "stubborn").mkdir()
     gateway, _ = fake_gateway()
-    source = HarborSource(
-        gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials", grace=1.0
-    )
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials"), gateway, grace=1.0)
     try:
         (future,) = source.submit(Task("stubborn", {HARBOR_KEY: str(tmp_path / "stubborn")}), 1,
                                   version=0, key=KEY)
@@ -366,8 +375,7 @@ def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tm
     hanging = tmp_path / "once"
     hanging.mkdir()
     gateway, _ = fake_gateway(version=None)
-    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
-                          grace=1.0, trial_timeout=10.0)
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials"), gateway, grace=1.0, trial_timeout=10.0)
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
                               mlp_features=32, max_seq_len=16, dtype="float32")
     objective = GRPOObjective(model, seq_len=7)
@@ -414,8 +422,7 @@ def test_a_trial_past_its_timeout_resolves_whatever_holds_its_output(tmp_path, h
     the child's minute-long sleep ends."""
     (tmp_path / task).mkdir()
     gateway, _ = fake_gateway()
-    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
-                          grace=1.0, trial_timeout=2.0)
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials"), gateway, grace=1.0, trial_timeout=2.0)
     began = time.monotonic()
     try:
         (future,) = source.submit(Task(task, {HARBOR_KEY: str(tmp_path / task)}), 1, version=0, key=KEY)
@@ -439,8 +446,7 @@ def test_a_trial_that_closes_its_output_and_runs_on_is_bounded_by_its_deadline(t
     task = "quiet"
     (tmp_path / task).mkdir()
     gateway, _ = fake_gateway()
-    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
-                          grace=1.0, trial_timeout=2.0)
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials"), gateway, grace=1.0, trial_timeout=2.0)
     began = time.monotonic()
     try:
         (future,) = source.submit(Task(task, {HARBOR_KEY: str(tmp_path / task)}), 1, version=0, key=KEY)
@@ -473,8 +479,7 @@ def descriptorless_flow(harbor: str, root: str) -> None:
     import resource
 
     task = Task("hello", {HARBOR_KEY: str(Path(root) / "task")})
-    source = HarborSource(fake_gateway()[0], harbor=harbor, model="hosted_vllm/policy",
-                          trials=Path(root) / "trials", workers=1)
+    source = HarnessSource(harbor_trials(harbor, Path(root) / "trials"), fake_gateway()[0], workers=1)
     try:
         (first,) = source.submit(task, 1, version=0, key=KEY)
         before = first.result(timeout=120)
@@ -501,8 +506,7 @@ def test_a_cancel_alone_resolves_a_trial_whose_output_a_detached_child_holds(tmp
     task = "lingering-detached-waits"
     (tmp_path / task).mkdir()
     gateway, _ = fake_gateway()
-    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials",
-                          grace=1.0)
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials"), gateway, grace=1.0)
     try:
         (future,) = source.submit(Task(task, {HARBOR_KEY: str(tmp_path / task)}), 1, version=0, key=KEY)
         deadline = time.monotonic() + 30
@@ -524,9 +528,7 @@ def test_a_cancel_alone_resolves_a_trial_whose_output_a_detached_child_holds(tmp
 def test_close_resolves_queued_trials_without_launching_them(tmp_path, harbor):
     (tmp_path / "slow").mkdir()
     gateway, _ = fake_gateway()
-    source = HarborSource(
-        gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials", workers=1
-    )
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials"), gateway, workers=1)
     futures = source.submit(Task("slow", {HARBOR_KEY: str(tmp_path / "slow")}), 2, version=0, key=KEY)
     deadline = time.monotonic() + 30
     while not list((tmp_path / "trials").glob("*/seen.json")) and time.monotonic() < deadline:
@@ -544,7 +546,7 @@ def test_close_resolves_queued_trials_without_launching_them(tmp_path, harbor):
 def test_the_first_submission_waits_for_a_healthy_gateway_worker(tmp_path, harbor):
     (tmp_path / "task").mkdir()
     gateway, asked = fake_gateway(unhealthy_checks=3)
-    source = HarborSource(gateway, harbor=harbor, model="m/p", trials=tmp_path / "trials", ready_poll=0.01)
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials", model="m/p"), gateway, ready_poll=0.01)
     try:
         (future,) = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0, key=KEY)
         assert future.result(timeout=60).status is Status.COMPLETED
@@ -558,7 +560,7 @@ def test_the_first_submission_waits_for_a_healthy_gateway_worker(tmp_path, harbo
 def test_a_gateway_that_reports_healthy_before_its_engine_listens_is_waited_for(tmp_path, harbor):
     (tmp_path / "task").mkdir()
     gateway, _ = fake_gateway(unreachable_models=3)
-    source = HarborSource(gateway, harbor=harbor, model="m/p", trials=tmp_path / "trials", ready_poll=0.01)
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials", model="m/p"), gateway, ready_poll=0.01)
     try:
         (future,) = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0, key=KEY)
         assert future.result(timeout=60).status is Status.COMPLETED
@@ -570,8 +572,8 @@ def test_a_gateway_that_reports_healthy_before_its_engine_listens_is_waited_for(
 def test_waiting_for_the_gateway_does_not_block_close_or_cancel(tmp_path, harbor):
     (tmp_path / "task").mkdir()
     gateway, _ = fake_gateway(unhealthy_checks=10 ** 9)
-    source = HarborSource(gateway, harbor=harbor, model="m/p", trials=tmp_path / "trials",
-                          ready_timeout=3.0, ready_poll=0.01)
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials", model="m/p"), gateway,
+                           ready_timeout=3.0, ready_poll=0.01)
     waiting = threading.Thread(
         target=lambda: pytest.raises(
             RuntimeError, source.submit, Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0,
@@ -590,8 +592,8 @@ def test_waiting_for_the_gateway_does_not_block_close_or_cancel(tmp_path, harbor
 def test_a_gateway_with_no_healthy_worker_refuses_the_submission(tmp_path, harbor):
     (tmp_path / "task").mkdir()
     gateway, _ = fake_gateway(unhealthy_checks=10 ** 9)
-    source = HarborSource(gateway, harbor=harbor, model="m/p", trials=tmp_path / "trials",
-                          ready_timeout=0.2, ready_poll=0.01)
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials", model="m/p"), gateway,
+                           ready_timeout=0.2, ready_poll=0.01)
     try:
         with pytest.raises(RuntimeError):
             source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0, key=KEY)
@@ -605,12 +607,12 @@ import sys, time
 from pathlib import Path
 sys.path.insert(0, {src!r}); sys.path.insert(0, {tests!r})
 from test_harbor_source import KEY, fake_gateway
-from dew.interop.harbor import HARBOR_KEY, HarborSource
+from dew.interop.harbor import HARBOR_KEY, Harbor
+from dew.interop.harness import HarnessSource
 from dew.objectives.rl.sessions import Task
 root = Path({root!r})
-source = HarborSource(fake_gateway()[0], harbor=root / "harbor", model="m/p",
-                      trials=root / "trials", workers=1,
-                      grace=2.0)
+source = HarnessSource(Harbor(harbor=root / "harbor", model="m/p", trials=root / "trials"), fake_gateway()[0],
+                       workers=1, grace=2.0)
 source.submit(Task({task!r}, {{HARBOR_KEY: str(root / {task!r})}}), 2, version=0, key=KEY)
 while not list((root / "trials").glob({ready!r})):
     time.sleep(0.05)
@@ -655,3 +657,121 @@ def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_pa
         if lingering:
             os.kill(pid, 9)
         assert not lingering, "a child of the interrupted trainer's trial outlived it"
+
+
+AGENT = """\
+import json, os, sys, time
+task, directory = sys.argv[1], os.getcwd()
+with open("seen.json", "w") as seen:
+    json.dump({"task": task, "cwd": directory, "url": os.environ["OPENAI_BASE_URL"],
+               "key": os.environ.get("OPENAI_API_KEY")}, seen)
+if task == "slow":
+    time.sleep(60)
+with open("answer.txt", "w") as answer:
+    answer.write("4" if task != "wrong" else "5")
+sys.exit(3 if task == "failing" else 0)
+"""
+
+
+def agent_command(tmp_path, verify=None):
+    """`Command` over the stand-in agent CLI; the verifier scores 1 for a directory whose answer is 4,
+    0 for any other, and nothing where the agent left none."""
+    script = tmp_path / "agent.py"
+    script.write_text(AGENT)
+
+    def scored(task, directory, returncode):
+        answer = directory / "answer.txt"
+        return (answer.read_text() == "4") * 1.0 if answer.is_file() else None
+
+    return Command(lambda task, directory: [sys.executable, str(script), task.id], verify or scored,
+                   tmp_path / "work", environment={"OPENAI_API_KEY": "none"})
+
+
+@pytest.mark.parametrize(("task", "status", "reward"), [
+    ("adds", Status.COMPLETED, 1.0), ("wrong", Status.COMPLETED, 0.0), ("failing", Status.AGENT_ERROR, 1.0)])
+def test_an_agent_command_runs_in_its_own_directory_against_its_own_session(tmp_path, task, status, reward):
+    """Each sample runs the command once in a fresh directory, its model at its own gateway session
+    and the environment it was given; the verifier scores what it left, and a command that exits
+    nonzero is the agent's error, scored all the same."""
+    gateway, asked = fake_gateway()
+    source = HarnessSource(agent_command(tmp_path), gateway)
+    try:
+        rollouts = [future.result(timeout=60) for future in source.submit(Task(task), 2, version=3, key=KEY)]
+    finally:
+        source.close()
+    for rollout in rollouts:
+        assert (rollout.status, rollout.reward) == (status, reward)
+        assert rollout.calls == (Call((1, 2), (10 + rollout.sample,), (-.5,), "stop", 7),)
+        directory = tmp_path / "work" / f"dew-{rollout.group}-{rollout.sample}"
+        seen = json.loads((directory / "seen.json").read_text())
+        session = seen["url"].removeprefix("http://172.17.0.1:9090/sessions/").removesuffix("/v1")
+        assert re.fullmatch(rf"{task}:{rollout.group}:{rollout.sample}:[0-9a-f]{{32}}", session)
+        assert seen == {"task": task, "cwd": str(directory), "url": seen["url"], "key": "none"}
+        assert ("DELETE", f"/sessions/{session}") in asked
+
+
+@pytest.mark.parametrize("extra", [(), (overflow("vllm"),), (trace([1, 2, 10, 4], [5], [-.5], "length"),)],
+                         ids=["ended", "refused", "length"])
+def test_an_agent_command_the_verifier_cannot_score_is_infra_however_the_session_ended(tmp_path, extra):
+    """A verifier that cannot score leaves the trial unscored, which is infra, retried and never
+    trained, also where the engine refused a prompt or the last call ran out of tokens: a
+    truncation would train or mask an invented outcome."""
+    source = HarnessSource(agent_command(tmp_path, verify=lambda task, directory, code: None),
+                           fake_gateway(extra=extra)[0])
+    try:
+        (unscored,) = source.submit(Task("adds"), 1, version=0, key=KEY)
+        assert unscored.result(timeout=60).status is Status.INFRA_ERROR
+    finally:
+        source.close()
+
+
+@pytest.mark.parametrize(("extra", "status"), [
+    ((refusal("EngineCore died", 500),), Status.INFRA_ERROR), ((overflow("sglang"),), Status.TRUNCATED),
+    ((trace([1, 2, 10, 4], [5], [-.5], "length"),), Status.TRUNCATED)], ids=["failed", "refused", "length"])
+def test_an_agent_command_is_judged_by_what_the_engine_said_first(tmp_path, extra, status):
+    """An engine failure makes a scored trial infra; a refused prompt or a last call stopped at its
+    length limit truncates it, with its score."""
+    source = HarnessSource(agent_command(tmp_path), fake_gateway(extra=extra)[0])
+    try:
+        (future,) = source.submit(Task("adds"), 1, version=0, key=KEY)
+        rollout = future.result(timeout=60)
+    finally:
+        source.close()
+    assert rollout.status is status and rollout.reward == (None if status is Status.INFRA_ERROR else 1.0)
+
+
+def test_an_agent_command_in_a_relative_workspace_runs_what_it_put_in_its_directory(tmp_path, monkeypatch):
+    """The command factory writes its agent into the trial's directory and runs it from there: the
+    directory it is given resolves inside the trial's own working directory."""
+    monkeypatch.chdir(tmp_path)
+
+    def argv(task, directory):
+        (directory / "agent.py").write_text(AGENT)
+        return [sys.executable, str(directory / "agent.py"), task.id]
+
+    def verify(task, directory, code):
+        return float((directory / "answer.txt").read_text() == "4")
+
+    command = Command(argv, verify, Path("work"))
+    source = HarnessSource(command, fake_gateway()[0])
+    try:
+        (future,) = source.submit(Task("adds"), 1, version=0, key=KEY)
+        rollout = future.result(timeout=60)
+    finally:
+        source.close()
+    assert (rollout.status, rollout.reward) == (Status.COMPLETED, 1.0)
+
+
+def test_a_cancelled_agent_command_is_interrupted_and_resolves_cancelled(tmp_path):
+    source = HarnessSource(agent_command(tmp_path), fake_gateway()[0])
+    try:
+        (future,) = source.submit(Task("slow"), 1, version=0, key=KEY)
+        deadline = time.monotonic() + 30
+        while not list((tmp_path / "work").glob("*/seen.json")) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        began = time.monotonic()
+        source.cancel([future])
+        rollout = future.result(timeout=30)
+    finally:
+        source.close()
+    assert rollout.status is Status.CANCELLED and time.monotonic() - began < 30

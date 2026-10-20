@@ -39,7 +39,7 @@ replaced according to its status:
 The scheduler keeps no clock of its own: a deadline belongs to the
 operation that can stop when it passes. The remote rollout servers bound
 each request, a sandboxed environment (`SubprocessEnvironment`) its
-`wall_seconds`, and `HarborSource` each trial (`trial_timeout`). A rollout
+`wall_seconds`, and `HarnessSource` each trial (`trial_timeout`). A rollout
 that runs out of time there comes back as an INFRA_ERROR, which the
 scheduler retries. A reward's program past its sandbox's wall clock is a
 TIMEOUT verdict that the reward scores, not a failure.
