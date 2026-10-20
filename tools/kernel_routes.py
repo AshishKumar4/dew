@@ -102,6 +102,17 @@ def published(config: dict) -> tuple[dict, bool]:
     # its heads' (`expand` hidden widths, Mamba 2's `validate_architecture`).
     if "expand" in fixture and fixture.get("num_heads") and fixture.get("head_dim"):
         fixture[hidden_key] = fixture["num_heads"] * fixture["head_dim"] // fixture["expand"]
+    # LongRoPE states a factor a rotated pair of a head; the widened head's pairs take the fixture's
+    # factors in turn, as a trace reads only how many there are.
+    width = fixture.get("head_dim") or (fixture[hidden_key] // fixture[heads_key] if fixture.get(heads_key)
+                                         else None)
+    for rope in (fixture.get("rope_scaling"), fixture.get("rope_parameters")):
+        if isinstance(rope, dict) and width:
+            pairs = int(width * (rope.get("partial_rotary_factor") or fixture.get("partial_rotary_factor")
+                                 or 1.0)) // 2
+            for name in ("short_factor", "long_factor"):
+                if isinstance(rope.get(name), list) and rope[name]:
+                    rope[name] = [rope[name][index % len(rope[name])] for index in range(pairs)]
     if "rotary_dim" in fixture and fixture.get("partial_rotary_factor") and fixture.get("head_dim"):
         fixture["rotary_dim"] = int(fixture["head_dim"] * fixture["partial_rotary_factor"])
     if "qk_head_dim" in fixture:
