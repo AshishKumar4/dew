@@ -20,6 +20,7 @@ import time
 import pytest
 from tool_support import load
 
+from dew.data.prompts import PromptRecord
 from dew.inference import InfrastructureError
 from dew.rl.sandbox import (
     ContainerRunner,
@@ -137,24 +138,24 @@ def test_code_reward_scores_the_fraction_of_passing_cases(fleet):
     right = "Here:\n```python\na, b = map(int, input().split())\nprint(a + b)\n```"
     half = "```python\na, b = map(int, input().split())\nprint(5)\n```"
     looping = "```python\nwhile True:\n    pass\n```"
-    assert reward("code", right, CASES, "") == 1.0
-    assert reward("code", half, CASES, "") == 0.5
-    assert reward("code", "the answer is 5", CASES, "") == 0.0
-    assert CodeReward(fleet, all_or_nothing=True)("code", half, CASES, "") == 0.0
+    assert reward(right, PromptRecord("code", CASES)) == 1.0
+    assert reward(half, PromptRecord("code", CASES)) == 0.5
+    assert reward("the answer is 5", PromptRecord("code", CASES)) == 0.0
+    assert CodeReward(fleet, all_or_nothing=True)(half, PromptRecord("code", CASES)) == 0.0
     with SandboxFleet(limits=SandboxLimits(wall_seconds=1, cpu_seconds=1), workers=2) as tight:
-        assert CodeReward(tight)("code", looping, CASES, "") == 0.0
+        assert CodeReward(tight)(looping, PromptRecord("code", CASES)) == 0.0
 
 
 def test_math_reward_compares_rational_answers():
     reward = MathReward()
-    assert reward("math", r"so \boxed{\frac{1}{2}}", "0.5", "") == 1.0
-    assert reward("math", r"\boxed{1,024}", "1024", "") == 1.0
-    assert reward("math", r"\boxed{-3/4}", "-0.75", "") == 1.0
-    assert reward("math", r"\boxed{7}", "8", "") == 0.0
-    assert reward("math", "the answer is 8", "8", "") == 0.0
-    assert MathReward(require_boxed=False)("math", "the answer is 8.", "8", "") == 1.0
-    assert reward("math", r"\boxed{x+1}", "x+1", "") == 1.0
-    assert reward("math", r"\boxed{12,345.5}", "12345.5", "") == 1.0
+    assert reward(r"so \boxed{\frac{1}{2}}", PromptRecord("math", "0.5")) == 1.0
+    assert reward(r"\boxed{1,024}", PromptRecord("math", "1024")) == 1.0
+    assert reward(r"\boxed{-3/4}", PromptRecord("math", "-0.75")) == 1.0
+    assert reward(r"\boxed{7}", PromptRecord("math", "8")) == 0.0
+    assert reward("the answer is 8", PromptRecord("math", "8")) == 0.0
+    assert MathReward(require_boxed=False)("the answer is 8.", PromptRecord("math", "8")) == 1.0
+    assert reward(r"\boxed{x+1}", PromptRecord("math", "x+1")) == 1.0
+    assert reward(r"\boxed{12,345.5}", PromptRecord("math", "12345.5")) == 1.0
 
 
 IMAGE = "python:3.12-slim"
@@ -218,7 +219,7 @@ def test_a_runtime_that_stalls_removing_the_container_is_an_infrastructure_failu
 def test_code_reward_runs_the_containers_own_interpreter():
     with SandboxFleet(ContainerRunner(IMAGE), limits=SandboxLimits(wall_seconds=30), workers=2) as fleet:
         right = "```python\na, b = map(int, input().split())\nprint(a + b)\n```"
-        assert CodeReward(fleet)("code", right, CASES, "") == 1.0
+        assert CodeReward(fleet)(right, PromptRecord("code", CASES)) == 1.0
 
 
 @pytest.mark.skipif(not _image_present(), reason=f"needs a Docker daemon with {IMAGE} pulled")
