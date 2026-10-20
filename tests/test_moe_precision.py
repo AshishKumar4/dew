@@ -14,7 +14,7 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact
 from scipy.special import erfc
 from tuned import each_config
 
@@ -199,42 +199,46 @@ def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width,
     """Each tile the tuner may pick for a launch, of the implementation the
     launch is forced to, over groups ragged against every tile size, one
     empty and one of a single row: the output and both gradients of a bf16
-    projection lie within tests/reference_error.py's rule of XLA's ragged
-    dot, both measured from float64 sums of the same bf16 operands. The
-    space declares only tiles proven here. Triton's widths are ragged against
-    its tiles, which mask them; Mosaic's divide its tiles, which it needs."""
-    rng = np.random.default_rng(91)
+    projection over an fp32 master hold check 1 against XLA's ragged dot,
+    from float64 sums of the same bf16 operands, over the site's draws. The
+    space declares only tiles proven here. Triton's widths are ragged
+    against its tiles, which mask them; Mosaic's divide its tiles, which it
+    needs."""
     sizes = np.array([0, 70, 1, 129, 100, 0], np.int32)
-    rows = int(sizes.sum())
-    x = rounded(rng.normal(size=(rows, width)))
-    kernel_matrix = rounded(rng.normal(size=(len(sizes), width, features)) / np.sqrt(width))
-    dy = rounded(rng.normal(size=(rows, features)))
-    group = np.repeat(np.arange(len(sizes)), sizes)
-    truth = (np.einsum('ri,rio->ro', x, kernel_matrix[group]),
-             np.einsum('ro,rio->ri', dy, kernel_matrix[group]),
-             np.stack([x[group == expert].T @ dy[group == expert] for expert in range(len(sizes))]))
+    rows, group = int(sizes.sum()), np.repeat(np.arange(len(sizes)), sizes)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(len(sizes), width, features)) / np.sqrt(width), jnp.float32),
+                jnp.asarray(rng.normal(size=(rows, features)), jnp.bfloat16))
 
     def projected(implementation):
-        def run(x, kernel_matrix):
+        def run(x, kernel_matrix, dy):
             y, pull = jax.vjp(lambda x, k: expert_projection(x, k, jnp.asarray(sizes), jnp.bfloat16,
                                                              implementation, None), x, kernel_matrix)
-            return (y, *pull(jnp.asarray(dy, jnp.bfloat16)))
+            return (y, *pull(dy))
         return run
 
-    operands = (jnp.asarray(x, jnp.bfloat16), jnp.asarray(kernel_matrix, jnp.bfloat16))
-    reference = [np.asarray(value, np.float64) for value in jax.jit(projected('xla'))(*operands)]
+    def truth(x, kernel_matrix, dy):
+        # The products of the operands as the projection rounds them, in float64.
+        x, kernel_matrix, dy = (np.asarray(value, np.float64) for value in (x, rounded(kernel_matrix), dy))
+        return (np.einsum('ri,rio->ro', x, kernel_matrix[group]),
+                np.einsum('ro,rio->ri', dy, kernel_matrix[group]),
+                np.stack([x[group == expert].T @ dy[group == expert] for expert in range(len(sizes))]))
+
+    reference = jax.jit(projected('xla'))
     with kernel_choices(grouped_matmul=kernel.name):
-        configs = each_config(kernel, projected('pallas'), *operands)
+        configs = each_config(kernel, projected('pallas'), *draw(0))
         assert len(configs) > 1
         for config in configs:
             with tuning.pinned({kernel: config}):
-                actual = [np.asarray(value, np.float64) for value in jax.jit(projected('pallas'))(*operands)]
-            for name, got, theirs, exact in zip(("y", "dx", "dk"), actual, reference, truth, strict=True):
-                try:
-                    assert_as_exact_as_the_reference(got, theirs, exact, name)
-                except AssertionError as error:
-                    error.add_note(f"{kernel.__name__} at {config}")
-                    raise
+                assert_as_exact(jax.jit(projected('pallas')), reference, draw,
+                                f"{kernel.__name__} at {config}", seeds=TILE_SEEDS, truth_fn=truth)
+
+
+TILE_SEEDS = 8
+"""The tile gate's declared draws (`reference_error.seeds_for` of XLA's ragged dot on them)."""
 
 
 @pytest.mark.gpu(reason="needs a GPU the Pallas kernels compile for")
