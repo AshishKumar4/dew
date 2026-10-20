@@ -21,6 +21,7 @@ from dew.data.prompts import (
     SOURCE_KEY,
     TRUTH_KEY,
     PromptRecord,
+    _extra_info,
     _ground_truth,
     _prompt_ids,
     _utf8,
@@ -74,13 +75,14 @@ class ResponseCanvases:
         return rows
 
 
+
 @dataclasses.dataclass(frozen=True)
 class RenderPrompt(grain.MapTransform):
     tokenizer: str
     max_prompt_len: int = 256
     pad_id: int = 0
     reward_bytes: int = 1024
-    long: Literal["drop", "truncate"] = "drop"
+    long: Literal["drop", "truncate"] = "truncate"
     thinking: bool | None = None
     rejects = True
 
@@ -108,8 +110,7 @@ class RenderPrompt(grain.MapTransform):
         prompt = np.full(self.max_prompt_len, self.pad_id, np.int32)
         prompt[-len(ids) :] = ids
         row = PromptRecord.of(json_value(element.get("data_source"), "prompt data_source"),
-                              _ground_truth(element, "prompt"),
-                              json_value(element.get("extra_info"), "prompt extra_info"))
+                              _ground_truth(element, "prompt"), _extra_info(element))
         context = {SOURCE_KEY: row.data_source, TRUTH_KEY: row.ground_truth, INFO_KEY: row.extra_info}
         for name, value in context.items():
             if len(value.encode("utf-8")) > self.reward_bytes:

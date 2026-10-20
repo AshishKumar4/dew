@@ -97,7 +97,7 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import Plan, StepIdentity, fingerprint, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
-from dew.data.sources.base import Read, ShardManifest, Source, _consumed
+from dew.data.sources.base import Read, ShardManifest, Source, _consumed, tokenizer_contract
 from dew.data.steps.generic import Coordinated
 from dew.records import JSON, integer, json_value, record
 
@@ -225,20 +225,8 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
 
 
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
-    declared: dict[str, JSON] = {}
-    for pipeline in pipelines:
-        for leaf, source in _leaves(pipeline):
-            metadata = source.metadata()
-            for key in ("tokenizer", "vocab_size", "eos_id", "tokenizer_revision"):
-                if key not in metadata:
-                    continue
-                value = json_value(metadata[key], key)
-                if key in declared and value != declared[key]:
-                    raise ValueError(
-                        f"corpus {_name(leaf)} has {key}={value!r}, expected {declared[key]!r}; "
-                        "mixed corpora must share the tokenizer contract"
-                    )
-                declared[key] = value
+    tokenizer_contract((f"corpus {_name(leaf)}", source.metadata())
+                       for pipeline in pipelines for leaf, source in _leaves(pipeline))
 
 
 def _row_tokens(pipeline: Pipeline) -> int | None:

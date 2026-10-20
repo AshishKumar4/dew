@@ -223,7 +223,7 @@ class ChatData(_Loadable):
     tokenizer: str
     seq_len: int = 256
     column: str = "messages"
-    long: Literal["truncate", "drop", "chunk"] = "truncate"
+    long: Literal["truncate", "drop", "chunk"] = "chunk"
     packing_bins: int = 8
     validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
@@ -280,7 +280,7 @@ class PromptData(_Loadable):
     max_prompt_len: int = 256
     pad_id: int = 0
     reward_bytes: int | None = None
-    long: Literal["drop", "truncate"] = "drop"
+    long: Literal["drop", "truncate"] = "truncate"
     thinking: bool | None = None
     validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
@@ -330,7 +330,7 @@ class _PromptFacts:
         return self.source.supports(read)
 
     def records(self, read: Read):
-        from dew.data.prompts import _ground_truth, _text
+        from dew.data.prompts import _extra_info, _ground_truth, _text
 
         rows = self.source.records(read)
         if read == "memory" and self.width is None and "reward_bytes" not in self._measured:
@@ -345,7 +345,7 @@ class _PromptFacts:
                         for text in (
                             _text(row.get("data_source")),
                             _ground_truth(row, "prompt"),
-                            _text(row.get("extra_info")),
+                            _text(_extra_info(row)),
                         )
                     ),
                     default=1,

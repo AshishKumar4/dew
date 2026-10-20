@@ -130,11 +130,11 @@ For conditional image training, pass `host=(EncodeCaptions(objective.inputs.toke
 
 `TextData` tokenizes raw text or opens a produced token store. Fixed windows contain `seq_len + 1` IDs with one overlap token. `pack="first-fit"` places documents in padded windows, a document longer than a window cut into window-long pieces first; `"concat"` concatenates and splits them. A packed batch carries `text_coordinates`, a `dew.nn.inputs.Coordinates` pytree built on the host. Its `.segments` array stops attention and target scoring at document boundaries, and its `.positions` array restarts within each document. Its static `.max_segments` is the most documents a window of the run holds: as many as the packing plan or the memory read placed in one, or a streamed pack's `segments`, or else its window length; a flash kernel's work follows it (performance.md). Record-level transforms before batching still read `text_segment_ids` and `text_positions`.
 
-`Chat` renders conversations with the tokenizer's chat template. Its default long-record policy truncates; `long="chunk"` keeps an over-length conversation as chunks, and `long="drop"` rejects it. The recipe emits role IDs for every token. The objective chooses the loss role, for example `LMObjective(..., loss_role=Role.ASSISTANT)`.
+`Chat` renders conversations with the tokenizer's chat template. By default it keeps an over-length conversation as chunks, every turn kept; `long="truncate"` keeps its first window, and `long="drop"` rejects it, counted under its reason. The recipe emits role IDs for every token. The objective chooses the loss role, for example `LMObjective(..., loss_role=Role.ASSISTANT)`.
 
 `ChatCanvasData` renders the same way for `BlockDiffusionObjective`, which splits every row at its prompt length, so nothing is packed: each assistant turn is one row, the conversation before it padded to `prompt_length` and the turn on whole canvases, EOS closing the last one. A longer prompt or turn keeps its head, as Google's reference cuts both.
 
-`Prompts` rejects over-length prompts by default. `long="truncate"` keeps their tail when that is the desired RL policy. `Preferences` refuses an over-length completion rather than cutting away its supervision.
+`Prompts` keeps an over-length prompt's tail by default, its last `max_prompt_len` ids. `long="drop"` rejects it instead, counted as a rejection under its reason (`over_length`). `Preferences` refuses an over-length completion rather than cutting away its supervision.
 
 To produce token records, export a deterministic prefix. This example downloads nothing:
 

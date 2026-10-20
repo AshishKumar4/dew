@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+
+from dew.records import JSON, json_value
 
 if TYPE_CHECKING:
     import grain.python as pygrain
@@ -36,6 +38,27 @@ records by index through an index the store holds, `streamed` reads shards in
 order with no index."""
 
 READS: tuple[Read, ...] = ("memory", "indexed", "streamed")
+
+TOKENIZER_CONTRACT = ("tokenizer", "vocab_size", "eos_id", "tokenizer_revision")
+"""The facts of a store of token ids that say what its ids mean, which every corpus a run reads
+together, and every store a concatenation joins, must state alike where they state them."""
+
+
+def tokenizer_contract(stated: Iterable[tuple[str, Mapping[str, object]]]) -> dict[str, JSON]:
+    """The tokenizer contract (`TOKENIZER_CONTRACT`) of stores read together, each `(name,
+    metadata)`: every fact any of them states, which every other that states it states alike.
+    Raises ValueError naming the store whose fact differs from the first's."""
+    declared: dict[str, JSON] = {}
+    for name, metadata in stated:
+        for key in TOKENIZER_CONTRACT:
+            if key not in metadata:
+                continue
+            value = json_value(metadata[key], key)
+            if key in declared and value != declared[key]:
+                raise ValueError(f"{name} has {key}={value!r}, expected {declared[key]!r}; stores read "
+                                 "together must share the tokenizer contract, whose ids they hold")
+            declared[key] = value
+    return declared
 
 
 @dataclasses.dataclass(frozen=True)
