@@ -882,6 +882,50 @@ def _boxed_record(boxed: Mapping[tuple[str, ...], LogicalAxes] | None) -> list[d
     return [{"path": list(path), "names": list(names)} for path, names in (boxed or {}).items()]
 
 
+def inference_artifact(objective: InferenceRecorded) -> JSON:
+    """`objective`'s inference record, which a checkpoint carries for loaders, or, where no record
+    can describe its model or a component (one defined in `__main__`, a function), a record of why:
+    such a run still checkpoints, and a loader raises the reason."""
+    try:
+        return objective.inference_record()
+    except (KeyError, TypeError, ValueError) as error:
+        return {"unrecorded": f"{type(objective).__name__}: {error}"}
+
+
+@runtime_checkable
+class InferenceRecorded(Protocol):
+    def inference_record(self) -> JSON: ...
+
+
+EXECUTION = ("dtype", "param_dtype", "precision", "attention_impl", "remat")
+"""The model fields that choose how a model computes, not what it is, which a run may change
+between one launch and its resume (a kernel for another GPU, a dtype, a remat policy)."""
+
+
+def run_identity(artifact: JSON) -> JSON:
+    """What a checkpoint's inference record says its run is: the objective and the model, without
+    the fields that choose how the model computes (`EXECUTION`); None where the record describes
+    no model (an objective that declares none, or one a record cannot describe)."""
+    if not isinstance(artifact, Mapping) or "model" not in artifact:
+        return None
+
+    def kept(value: JSON) -> JSON:
+        if isinstance(value, Mapping):
+            return {key: kept(entry) for key, entry in value.items() if key not in EXECUTION}
+        if isinstance(value, list):
+            return [kept(entry) for entry in value]
+        return value
+
+    return {"objective": artifact.get("objective"), "model": kept(json_value(artifact["model"], "model"))}
+
+
+def _differences(here: JSON, there: JSON, path: str = "") -> list[str]:
+    """The paths at which two records differ, each with both values."""
+    if isinstance(here, Mapping) and isinstance(there, Mapping):
+        return [found for key in sorted(set(here) | set(there), key=str)
+                for found in _differences(here.get(key), there.get(key), f"{path}.{key}".lstrip("."))]
+    return [] if here == there else [f"{path}: {there!r} in the directory, {here!r} in this run"]
+
 class Checkpoints:
     """Manages the checkpoints of one run in one directory.
 
@@ -999,6 +1043,21 @@ class Checkpoints:
         local = step == self._local_latest()
         custom = self._step_metadata(step, local=local).custom_metadata or {}
         return json_value(custom.get('artifact'), 'artifact')
+
+    def refuse_another_run(self, artifact: JSON, step: int | str | None = None) -> None:
+        """Refuse to resume the step at `step` (the latest) as the run `artifact` records, its
+        inference record, where the directory holds another run's: one whose objective or model
+        differs by more than how the model computes (`run_identity`). A directory belongs to one
+        run, and a fresh run takes a new one. A record that describes no model on either side has
+        nothing to compare, and the shapes the restore reads are the check."""
+        here, there = run_identity(artifact), run_identity(self.artifact(step))
+        if here is None or there is None or here == there:
+            return
+        differences = _differences(here, there)
+        raise ValueError(f"{self.directory} holds another run's checkpoints, which this run would "
+                         f"resume: {'; '.join(differences[:5])}"
+                         f"{f' and {len(differences) - 5} more' if len(differences) > 5 else ''}. "
+                         "A fresh run takes a directory of its own")
 
     def control(self, step: int) -> dict:
         if step == self._local_latest():

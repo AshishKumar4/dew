@@ -35,7 +35,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
-from dew.checkpoints import Checkpoints, Ranking
+from dew.checkpoints import Checkpoints, Ranking, inference_artifact
 from dew.coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew.data.compile import fitted
 from dew.data.dataset import (
@@ -716,6 +716,7 @@ class Trainer(Generic[Loss, Effects]):
                 return self._placed_host(initializer, key, shardings), shardings, None
             held = placed_held(initializer, abstract.variables, shardings.variables, self.device_mesh)
             return taking_over(self.initial_state, *held, shardings)(key), shardings, None
+        checkpoints.refuse_another_run(self._artifact(), resume)
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
         shardings = self.shardings(abstract)
         if self.host_master and FROZEN in abstract.variables:
@@ -742,17 +743,12 @@ class Trainer(Generic[Loss, Effects]):
 
     def _artifact(self) -> JSON:
         """The objective's inference record, which a checkpoint carries for
-        loaders. Training and resuming never read it, so a model or component
-        no record can describe still checkpoints: the record says why, a
+        loaders and a resume compares its run with (`Checkpoints.refuse_another_run`). A model
+        or component no record can describe still checkpoints: the record says why, a
         loader raises that, and the first checkpoint warns it, as it does a
         model defined where no import path reaches it (`__main__`, a function)."""
-        artifact: JSON
-        reason = None
-        try:
-            artifact = self.objective.inference_record()
-        except (KeyError, TypeError, ValueError) as error:
-            reason = f"{type(self.objective).__name__}: {error}"
-            artifact = {'unrecorded': reason}
+        artifact = inference_artifact(self.objective)
+        reason = artifact.get('unrecorded') if isinstance(artifact, Mapping) else None
         if reason is not None and reason != self._unrecorded:
             self._unrecorded = reason
             _log.warning("this run's checkpoints resume, but no loader can rebuild their model "

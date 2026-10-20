@@ -98,6 +98,28 @@ def test_a_token_only_run_uses_the_schedules_own_horizon(schedule):
     assert int(state.step) == 3
 
 
+def test_a_directory_refuses_another_runs_resume_and_resumes_its_own_on_another_kernel(tmp_path):
+    """A checkpoint directory belongs to one run: a decoder of the same shapes and another rotary
+    base is another run, whose resume is refused before its first step; the same decoder computing
+    through another attention kernel is the same run, and resumes."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    def run(steps, **fields):
+        model = CausalTransformer(**{"vocab_size": 16, "emb_features": 16, "num_layers": 1, "num_heads": 2,
+                                     "mlp_features": 32, "max_seq_len": 8, "attention_impl": "xla", **fields})
+        batch = {"text": np.tile(np.arange(9, dtype=np.int32) % 16, (jax.device_count(), 1))}
+        return Trainer(LMObjective(model, 8), optax.sgd(0.1), key=0,
+                       checkpoints=Checkpoints(str(tmp_path / "run"))).fit(
+            Loader(lambda partition: itertools.repeat(batch), None, None, len(batch["text"])),
+            steps=steps, log_every=100, checkpoint_every=1)
+
+    run(1)
+    with pytest.raises(ValueError):
+        run(2, rope_theta=500.0)
+    assert int(run(2, attention_impl="reference").step) == 2
+
+
 def test_a_token_budget_resumes_its_count_from_the_checkpoint(tmp_path):
     first = make_trainer(tmp_path, objective=TokenRegression())
     assert int(first.fit(dataset(), steps=2, tokens=30, log_every=1).step) == 2

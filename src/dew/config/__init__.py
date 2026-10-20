@@ -45,10 +45,10 @@ from etils import epath
 import dew.io
 from dew import registry
 from dew.cache import dew_cache_dir
-from dew.checkpoints import RUN_FILE, Checkpoints, Keep
+from dew.checkpoints import RUN_FILE, Checkpoints, Keep, inference_artifact
 from dew.config.data import Augment, HoldOut, ImageData, RunData, loader
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
-from dew.coordination import agree_process_phase, agreed
+from dew.coordination import agree_process_phase, agreed, agreed_same
 from dew.data import Loading
 from dew.data.dataset import Loader, Ramp, Reader, ramped, record_argument
 from dew.data.pipeline import ObjectiveData
@@ -1328,6 +1328,10 @@ class RunConfig:
             checkpoints = Checkpoints(os.path.join(trainer.checkpoint_dir, name), keep=trainer.keep)
             local = _local_tracker(checkpoints.directory, name)
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
+            if agreed_same("newest checkpoint", lambda: checkpoints.latest) is not None:
+                # Before this run's record replaces the one it would resume.
+                checkpoints.refuse_another_run(inference_artifact(objective))
+
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
                 if jax.process_index() == 0:
