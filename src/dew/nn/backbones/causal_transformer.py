@@ -194,6 +194,10 @@ class CausalTransformer(nn.Module):
     None for `max_seq_len`. The model computes nothing from it: `max_seq_len` is its decode cache's
     capacity, which a loader caps below a long context (`decoder_parts.DEFAULT_MAX_SEQ_LEN`)."""
     position_embedding: Literal['rotary', 'learned', 'alibi'] = 'rotary'
+    """How a layer whose kind names no mixer places its tokens (`layer_mixer`): rotary attention,
+    or unrotated attention after a learned table the embedding adds ('learned') or with ALiBi's
+    biases ('alibi'). A mixer a model or a kind names places its own tokens; the learned table is
+    added whatever the mixers."""
     position_embedding_size: int | None = None
     """The number of rows in the learned position table; None means `max_seq_len`.
     It does not depend on the decode cache's capacity."""
@@ -687,10 +691,6 @@ class CausalTransformer(nn.Module):
             raise ValueError('scale_offset describes RMSNorm weights')
         if self.position_embedding not in ('rotary', 'learned', 'alibi'):
             raise ValueError('position_embedding must be rotary, learned or alibi')
-        if self.position_embedding != "rotary" and (
-            self.mixer is not None or any(kind.mixer is not None for kind in (self.kinds or {}).values())
-        ):
-            raise ValueError('learned positions and ALiBi require the default unrotated attention mixer')
         if self.position_embedding_size is not None and (
                 self.position_embedding != 'learned' or self.position_embedding_size < self.max_seq_len):
             raise ValueError('position_embedding_size requires learned positions and covers max_seq_len')
