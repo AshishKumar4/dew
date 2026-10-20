@@ -214,9 +214,9 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
     The loss is the mean over rows, while rCM's trainer backpropagates their
     sum. Under Adam the two take the same steps when the epsilon is rCM's
     divided by the batch size. The phases alternate from one update to the
-    next, so a trainer that accumulates more than one microbatch per update
-    is refused. Sampling runs the student's multistep consistency solver,
-    `Consistency`.
+    next, each read off the committed updates (`Step.updates`), so every
+    microbatch an update accumulates is of its phase. Sampling runs the
+    student's multistep consistency solver, `Consistency`.
 
     sCM's loss differentiates the student with respect to time. The
     recommended training default is `simple_dit(time_scale=0.002)`; other
@@ -265,8 +265,7 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         return jnp.where(iteration < self.tangent_warmup, iteration, self.tangent_warmup
                          + (iteration - self.tangent_warmup) // self.student_update_freq)
 
-    def optimizer(self, tx: optax.GradientTransformation, *,
-                  accumulation: int) -> optax.GradientTransformation:
+    def optimizer(self, tx: optax.GradientTransformation) -> optax.GradientTransformation:
         """Return an optimizer that gives the student and the fake score each their own copy of `tx`.
 
         Each copy steps only on its own network's updates, as rCM's two
@@ -275,7 +274,6 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         reads the committed updates (`Step.updates`), the clock these masks
         count, however many microbatches an update takes.
         """
-        del accumulation
 
         def network(params):
             return {name: FAKE_SCORE if name == FAKE_SCORE else "student" for name in params}

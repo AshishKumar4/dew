@@ -253,6 +253,28 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
 
+def test_every_microbatch_of_an_accumulated_update_reads_the_updates_committed_before_it():
+    """An update of two microbatches (`accumulation=2`) hands each of them the updates the run
+    committed before its own (`Step.updates`), the clock an alternating objective reads its phase
+    from, beside the accepted microbatches its schedules read (`Step.step`)."""
+    from affine_run import Regression, batches
+
+    from dew.data.dataset import Loader
+
+    seen = []
+
+    class Clocked(Regression):
+        def loss(self, variables, batch, step):
+            jax.debug.callback(lambda updates, microbatch: seen.append((int(updates), int(microbatch))),
+                               step.updates, step.step, ordered=True)
+            return super().loss(variables, batch, step)
+
+    state = Trainer(Clocked(), optax.sgd(0.1), key=jax.random.PRNGKey(0), accumulation=2).fit(
+        Loader(lambda partition: batches(), None, None, 8), steps=6, log_every=100)
+    assert int(state.updates) == 3
+    assert seen == [(0, 0), (0, 1), (1, 2), (1, 3), (2, 4), (2, 5)]
+
+
 @pytest.mark.gpu("XLA:GPU's simplifier speculates the branch; XLA:CPU's pipeline kept it a branch")
 def test_an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
     """A window's microbatches before its last only accumulate: nothing in the
