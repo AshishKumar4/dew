@@ -378,7 +378,7 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
     promotes the states to at least fp32. Under bf16 compute at the default
     precision both operands multiply as bf16 and the logits are bf16 values
     (`head_product`); otherwise the product is the layer's own, in the
-    operands' dtype.
+    operands' dtype, at the precision that dtype takes (`float32_products`).
     """
     resolved = operand_precision(dtype, precision)
     rounds = rounds_to_bf16(dtype, precision)
@@ -388,7 +388,8 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
         del precision, preferred_element_type  # this head's policy, not the layer's
         if rounds:
             rhs = _algorithm_operand(rhs)
-        logits = jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=resolved,
+        logits = jax.lax.dot_general(lhs, rhs, dimension_numbers,
+                                     precision=float32_products(products_dtype(lhs, rhs), resolved),
                                      preferred_element_type=at_least_fp32(lhs.dtype))
         return bf16_logits(logits) if rounds else logits
 

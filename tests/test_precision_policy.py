@@ -1,15 +1,18 @@
 """Models' own dtype and attention fields, and the arithmetic their kernels honor."""
 
+import functools
 from fractions import Fraction
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from reference_error import assert_fp32_reduction_bound, equations
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.diffusion_gemma import soft_embeddings
 from dew.nn.dsa_kpool import KPoolSparseAttention
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
 from dew.nn.llama4 import Llama4Mixer
@@ -17,6 +20,7 @@ from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.mlp import GatedMLP
+from dew.nn.precision import fp32_result_dot_general
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
 
@@ -317,14 +321,16 @@ def assert_float32_products(precisions) -> None:
     assert not off, off
 
 
+@pytest.mark.parametrize("tied", [True, False])
 @pytest.mark.parametrize("stored", ["float32", "bfloat16", "bfloat16 kernels"])
-def test_a_model_with_no_dtype_multiplies_each_product_as_its_operands_compute(stored):
+def test_a_model_with_no_dtype_multiplies_each_product_as_its_operands_compute(stored, tied):
     """A model with no dtype computes each product in the dtype its operands promote to, as flax's
     layers do, so float32 products multiply at HIGHEST and bf16 ones at their own precision, product
-    by product: over float32 parameters, bf16 ones, and bf16 kernels beside float32 norm scales.
-    Initializing it multiplies as applying it does. A precision resolved once for the whole model
-    from its parameters pinned HIGHEST on bf16 products and missed float32 ones."""
-    model = LAYERS["packed"]()
+    by product: over float32 parameters, bf16 ones, and bf16 kernels beside float32 norm scales,
+    its vocabulary head tied to its embedding or its own. Initializing it multiplies as applying it
+    does. A precision resolved once for the whole model from its parameters pinned HIGHEST on bf16
+    products and missed float32 ones."""
+    model = LAYERS["packed"](tie_embeddings=tied)
     tokens = jnp.arange(16, dtype=jnp.int32).reshape(1, 16) % 64
     variables = model.init(jax.random.key(0), tokens)
     if stored != "float32":
@@ -345,6 +351,25 @@ def test_a_layer_over_bf16_parameters_fed_float32_multiplies_float32_products():
     precisions = dot_precisions(layer.apply, variables, x)
     assert precisions and all(dtype == jnp.float32 for _, dtype in precisions)
     assert_float32_products(precisions)
+
+
+def test_soft_embeddings_over_a_bf16_table_multiply_float32_products():
+    """Soft embeddings mix a bf16-stored table by float32 probabilities, a product jax computes in
+    float32, so it multiplies at HIGHEST as a float32-stored table's does."""
+    logits = jax.random.normal(jax.random.key(0), (2, 3, 32), jnp.float32)
+    for stored in (jnp.float32, jnp.bfloat16):
+        table = jax.random.normal(jax.random.key(1), (32, 16), jnp.float32).astype(stored)
+        precisions = dot_precisions(lambda logits, table: soft_embeddings(logits, table, 1.0), logits, table)
+        assert [precision for precision, _ in precisions] == [HIGHEST]
+
+
+def test_a_projection_factory_keeps_the_contraction_its_caller_gives():
+    """A layer built from a caller's projection factory multiplies as that factory says: a bf16 MLP
+    whose projections return float32 results (`fp32_result_dot_general`) returns float32."""
+    x = jax.random.normal(jax.random.key(0), (2, 16), jnp.bfloat16)
+    layer = GatedMLP(hidden_features=24, out_features=16, dtype=jnp.bfloat16,
+                     linear=functools.partial(nn.Dense, dot_general=fp32_result_dot_general()))
+    assert layer.apply(layer.init(jax.random.key(1), x), x).dtype == jnp.float32
 
 
 def test_xla_attention_honours_a_precision_only_where_jax_nn_multiplies_at_it():

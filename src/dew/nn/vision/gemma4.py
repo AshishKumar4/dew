@@ -115,7 +115,8 @@ class Gemma4VisionTransformer(nn.Module):
         self.position_table = self.param(
             "position_table", nn.initializers.normal(0.02),
             (2, cfg.position_embedding_size, cfg.hidden_size))
-        linear = functools.partial(Gemma4ClippableLinear, use_clipped_linears=cfg.use_clipped_linears)
+        linear = functools.partial(Gemma4ClippableLinear, use_clipped_linears=cfg.use_clipped_linears,
+                                   dot_general=float32_dot_general)
         attention = functools.partial(
             CausalSelfAttention, ctx=MixerContext(
                 emb_features=cfg.hidden_size, num_heads=cfg.num_heads, num_kv_heads=cfg.num_key_value_heads,
