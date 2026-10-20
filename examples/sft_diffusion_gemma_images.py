@@ -180,6 +180,27 @@ def smoke_splits(config: Config) -> dict[str, str]:
     return files
 
 
+def captioned(task, data, config: Config, labels) -> list[dict[str, str]]:
+    """Each real test image's label and the caption `task` writes for it, the prompt's tokens its
+    image and the canvas its caption, drawn under one key."""
+    tokenizer = ByteTokenizer()
+    captions = []
+    stream = data.val(DataPartition())
+    try:
+        for batch in stream:
+            generated = task(batch["text"].slice_tokens(stop=config.prompt_tokens), config.canvas_length,
+                             key=3).host()
+            for row, length, label, real in zip(
+                    np.asarray(generated.tokens), np.asarray(generated.lengths), batch["label"],
+                    batch.get(VALID_ROWS, np.ones(len(batch["label"]), bool)), strict=True):
+                if real:
+                    captions.append({"label": labels[int(label)], "caption": tokenizer.decode(
+                        [int(token) for token in row[config.prompt_tokens:][:length] if token < 256])})
+    finally:
+        stream.close()
+    return captions
+
+
 def main(config: Config) -> Path:
     if config.smoke:
         config = replace(config, image_size=16, staging_size=20, prompt_tokens=24, canvas_length=32,
@@ -205,7 +226,8 @@ def main(config: Config) -> Path:
                                                       "pad_token_id": PAD}),
         optim=OptimConfig(weight_decay=0.05, clip_grads=1.0, schedule=Cosine(
             peak=config.learning_rate, warmup_steps=config.warmup_steps, end=config.learning_rate / 20)),
-        trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"), keep=1,
+        # A smoke run keeps both of its checkpoints, so what training moved between them can be read.
+        trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"), keep=2 if config.smoke else 1,
                               batch_size=config.batch_size, steps=config.steps,
                               log_every=1 if config.smoke else 100, eval_every=config.eval_every,
                               checkpoint_every=config.eval_every, mesh=MeshSpec(fsdp=1),
@@ -217,36 +239,26 @@ def main(config: Config) -> Path:
                   host=(CaptionLayout(config, labels),))
     started = time.perf_counter()
     name = "flowers-caption"
-    run.train(objective, data, name=name, metrics=(Perplexity(),),
-              summary={"dataset": config.dataset, "classes": len(labels)})
+    state = run.train(objective, data, name=name, metrics=(Perplexity(),),
+                      summary={"dataset": config.dataset, "classes": len(labels)})
     trained = time.perf_counter()
 
     # The other half, from the files alone: the run directory loads as the
-    # canvas task its objective saved, and it captions every test image.
+    # canvas task its objective saved, and it captions every test image, as
+    # the trained model in this process does.
     run_dir = Path(run.trainer.checkpoint_dir) / name
-    task = replace(dew.pipeline(str(run_dir)), eos_token_ids=(EOS,), pad_token_id=PAD)
-    tokenizer = ByteTokenizer()
-    captions, correct = [], 0
-    stream = data.val(DataPartition())
-    try:
-        for batch in stream:
-            generated = task(batch["text"].slice_tokens(stop=config.prompt_tokens), config.canvas_length,
-                             key=3).host()
-            for row, length, label, real in zip(
-                    np.asarray(generated.tokens), np.asarray(generated.lengths), batch["label"],
-                    batch.get(VALID_ROWS, np.ones(len(batch["label"]), bool)), strict=True):
-                if not real:
-                    continue
-                text = tokenizer.decode([int(token) for token in row[config.prompt_tokens:][:length]
-                                         if token < 256])
-                captions.append({"label": labels[int(label)], "caption": text})
-                correct += text == caption(labels[int(label)])
-    finally:
-        stream.close()
+    restored = replace(dew.pipeline(str(run_dir)), eos_token_ids=(EOS,), pad_token_id=PAD)
+    # The weights the run directory serves: the averaged ones where the run kept them.
+    served = state.variables if state.ema is None else state.averaged
+    live = replace(objective.build_task(served), eos_token_ids=(EOS,), pad_token_id=PAD)
+    captions = captioned(restored, data, config, labels)
     report = {"dataset": config.dataset, "train_images": data.records, "test_images": len(captions),
               "classes": len(labels), "device": jax.devices()[0].device_kind, "steps": config.steps,
               "batch_size": config.batch_size, "train_seconds": round(trained - started, 1),
-              "caption_accuracy": correct / len(captions), "captions": captions[:32]}
+              "caption_accuracy": sum(row["caption"] == caption(row["label"]) for row in captions)
+              / len(captions),
+              "captions": captions[:32],
+              "restored_matches_live": captions == captioned(live, data, config, labels)}
     (config.out / "result.json").write_text(json.dumps(report, indent=2) + "\n")
     (config.out / "model-config.json").write_text(json.dumps(record, indent=2) + "\n")
     (config.out / "captions.jsonl").write_text("".join(json.dumps(row) + "\n" for row in captions))
