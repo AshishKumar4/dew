@@ -13,7 +13,8 @@ activations and a gated RMS norm of the output are its prologue and epilogue.
 This module holds the decode token, the chunk of one (`step`): one program a row and value head
 reads the state once and writes it once, with its hooks inlined, which is the decode step and the
 fused decode step it replaces. Its arithmetic is the XLA reference's (`step_reference`), which is
-also its CPU path and, on float64 operands, the float64 truth.
+also its CPU path and, on float64 operands, the float64 truth. Of the chunked form it holds the first
+stage every row of it shares, the decay's prefix within each chunk (`cumulated`).
 """
 
 import dataclasses
@@ -24,7 +25,9 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from . import norm_swiglu, short_conv, tuning
+from dew.nn.precision import compensated_add
+
+from . import chunked_launch, norm_swiglu, short_conv, tuning
 from .generation import triton_runs
 
 L2NORM_EPS = 1e-6
@@ -573,3 +576,83 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     state, *history, out = StepLaunch()(flags, *(given.get(name) for name in OPERANDS), hooks=hooks,
                                         dtype=named, interpret=not triton_runs())
     return out, history[0] if history else None, state
+
+
+def _cumsum_kernel(chunk_ref, s_ref, o_ref, *, chunk: int, aligned: bool, scale: float | None, reverse: bool):
+    """fla's `chunk_local_cumsum_scalar_kernel` (fla/ops/utils/cumsum.py:33-73) for one chunk of one
+    head, of each column of a gate per key dimension (fla's vector kernel, :90-133) too: forward, fla's
+    inclusive cumulative sum over its tokens in fp32, then `scale`. `reverse`, the decay's gradient,
+    sums from the end compensated, each running sum a `(hi, lo)` pair (`compensated_add`) taken token
+    by token and stored rounded once."""
+    start, count = chunked_launch._chunk_of(chunk_ref, chunk, aligned)
+    if not reverse:
+        @pl.when(count > 0)
+        def _():
+            tokens = chunked_launch._read(chunked_launch._rows(s_ref, start, chunk), count)
+            total = jnp.cumsum(tokens.astype(jnp.float32), axis=0)
+            chunked_launch._write(chunked_launch._rows(o_ref, start, chunk), count,
+                                  total if scale is None else total * scale)
+        return
+
+    def step(i, total):
+        row = start + count - 1 - i
+        token = chunked_launch._rows(s_ref, row, 1)[...].astype(jnp.float32)
+        if scale is not None:
+            token = token * scale
+        total = compensated_add(total, (token, jnp.zeros_like(token)))
+        chunked_launch._rows(o_ref, row, 1)[...] = total[0] + total[1]
+        return total
+
+    zero = jnp.zeros((1, *s_ref.shape[1:]), jnp.float32)
+    jax.lax.fori_loop(0, count, step, (zero, zero))
+
+
+@dataclasses.dataclass(frozen=True)
+class ChunkLocalCumsum(chunked_launch._Launch):
+    """`cumulated`'s launch (tuning.KernelOp), fla's `chunk_local_cumsum`."""
+
+    NAME = "cumulated"
+    KEYS, VALUES = None, None
+    revision: int = 2
+    SPACES = chunked_launch._spaces(chunked_launch._tiles([(0, 0)], (1, 2, 4, 8), (1,)))
+    PICKS = chunked_launch._picks(chunked_launch.Tiles(0, 0, 2, 1))
+
+    def _fwd(self, g: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int,
+             scale: float | None, reverse: bool, interpret: bool, config: chunked_launch.Tiles,
+             return_residuals: bool = False):
+        from jax.experimental.pallas import triton as plgpu
+
+        spans = chunked_launch.Sequences(chunk_spans, sequence_spans)
+        warps, stages = config.warps, config.stages
+        batch, length, heads, *columns = (int(size) for size in g.shape)
+        aligned = chunked_launch._aligned(spans, batch, length, chunk)
+        # A decay per key dimension in 64-column blocks, fla's vector kernel's BS.
+        blocks = [min(64, width) for width in columns]
+        tiles = [width // block for width, block in zip(columns, blocks, strict=True)]
+        spec = pl.BlockSpec((batch * length, None, *blocks), lambda i_t, h, *i_k: (0, h, *i_k))
+        out = pl.pallas_call(
+            functools.partial(_cumsum_kernel, chunk=chunk, aligned=aligned, scale=scale, reverse=reverse),
+            grid=(spans.chunks.shape[0], heads, *tiles),
+            in_specs=[chunked_launch._CHUNK, spec], out_specs=spec,
+            out_shape=jax.ShapeDtypeStruct((batch * length, heads, *columns), jnp.float32),
+            compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
+            interpret=interpret, name="recurrence_cumulated",
+        )(spans.chunks, *chunked_launch._flat(g))
+        return out.reshape(g.shape), None
+
+
+_CHUNK_LOCAL_CUMSUM = ChunkLocalCumsum()
+
+
+def cumulated(g, *, chunk: int = 64, scale: float | None = None, reverse: bool = False,
+              spans: chunked_launch.Sequences | None = None, interpret: bool = False):
+    """The chunked recurrences' first stage, their decay's prefix: `g` `[B, T, H]`, or `[B, T, H, K]`
+    per key dimension, cumulated within each chunk of `chunk` tokens of each sequence (`spans`, the
+    rows where None), fp32: fla's `chunk_local_cumsum`
+    (cumsum.py:262-341), `scale` RCP_LN2 for the forward's base-2 decay, `reverse` for its gradient.
+    Forward is fla's plain prefix, whose difference between two positions every kernel takes as a
+    range's exponent; `reverse` the sums from the end, each rounded once. fla autotunes only
+    `num_warps` over 1, 2, 4 and 8 here."""
+    batch, length = g.shape[:2]
+    spans = chunked_launch.sequences(batch, length, chunk=chunk) if spans is None else spans
+    return _CHUNK_LOCAL_CUMSUM(g, *spans, chunk=chunk, scale=scale, reverse=reverse, interpret=interpret)

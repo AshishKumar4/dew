@@ -9,10 +9,11 @@ The port follows fla-org/flash-linear-attention v0.5.2 (fla/ops/kda/chunk.py) on
 takes: the queries and keys normalised before the rule, the log decay per key dimension computed
 before it, beta given, fla's varlen sequences, 64-token chunks and fla's default `safe_gate=False`. It
 is fla's gated delta rule (`fla_gdn`) with a decay per key dimension, and shares that port's memory
-kernels, whose USE_GK branch it takes (`fla_gdn.chunk_fwd_h`, `fla_gdn.chunk_bwd_dhu`), its chunk-local
-cumsum, its forward substitution, its dot helpers, its token spans (`fla_gdn.Sequences`) and its
-launches' base (`fla_gdn._Launch`, a tuner KernelOp); the kernels here are KDA's own. Each names its fla
-origin. `linear.chunk_gated_delta_rule` runs it for a decay per key dimension.
+kernels, whose USE_GK branch it takes (`fla_gdn.chunk_fwd_h`, `fla_gdn.chunk_bwd_dhu`), its forward
+substitution and its dot helpers, the recurrence template's decay prefix (`recurrence.cumulated`),
+and the chunked launches' token spans (`Sequences`) and base (`chunked_launch._Launch`, a tuner
+KernelOp); the kernels here are KDA's own. Each names its fla origin. `linear.chunk_gated_delta_rule`
+runs it for a decay per key dimension.
 
 fla's grids are kept: a program per place of each chunk for the intra-chunk diagonal blocks (fla's
 per token, which searches the token's sequence), per chunk for the solve, per key block and
@@ -20,7 +21,7 @@ sub-chunk for the backward intra-chunk gradients.
 
 Operands keep their dtypes as fla's do: bf16 queries, keys and values store `A`, `w`, `u`, the
 gated keys and the memory each chunk enters in bf16 with fp32 accumulation; the decay is fp32 and
-cumulated in base 2 (`fla_gdn.chunk_local_cumsum`); gradients of q, k, the decay and beta accumulate
+cumulated in base 2 (`recurrence.cumulated`); gradients of q, k, the decay and beta accumulate
 in fp32.
 """
 
@@ -33,15 +34,13 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import fla_gdn
-from dew.nn.kernels.fla_gdn import (
+from dew.nn.kernels import fla_gdn, recurrence
+from dew.nn.kernels.chunked_launch import (
     _CHUNK,
-    RCP_LN2,
     Sequences,
     Tiles,
     _aligned,
     _chunk_of,
-    _dot,
     _flat,
     _gates,
     _headed,
@@ -52,11 +51,10 @@ from dew.nn.kernels.fla_gdn import (
     _rows,
     _spaces,
     _tiles,
-    _tril_inverse,
-    _weighted_values,
     _write,
     sequences,
 )
+from dew.nn.kernels.fla_gdn import RCP_LN2, _dot, _tril_inverse, _weighted_values
 
 SUB = 16
 """fla's BC: the sub-chunk the intra-chunk kernels build their 16 x 16 blocks over."""
@@ -240,7 +238,7 @@ def intra_solve(q, k, g, beta, *, scale: float, chunk: int = 64, spans: Sequence
     causal, and the inverse `(I + tril(beta (k exp2(g)) (k exp2(-g))^T, -1))^-1`: fla's
     `chunk_kda_fwd_intra` before its `recompute_w_u_fwd` (chunk_intra.py:794-894), each pair's decay
     its own (`intra_rows`), then the solve chunk by chunk (`spans`, the rows' own where None). `q`, `k`
-    `[B, T, H, K]`, `g` the base-2 cumulated decay (`fla_gdn.chunk_local_cumsum`) `[B, T, HV, K]` fp32,
+    `[B, T, H, K]`, `g` the base-2 cumulated decay (`recurrence.cumulated`) `[B, T, HV, K]` fp32,
     `beta` `[B, T, HV]`."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
     aqk, akk = intra_rows(q, k, g, beta, scale=scale, chunk=chunk, spans=spans, interpret=interpret)
@@ -343,7 +341,7 @@ def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, o_ref, *, chunk: int
     """fla's `chunk_gla_fwd_kernel_o` (fla/ops/gla/chunk.py:345-432) for one chunk of one head and `BV`
     value columns: `scale (q exp2(g))_narrow h + tril(Aqk) v`, the gated queries rounded to their
     dtype and `Aqk` to the values', fp32 products IEEE as the gated delta rule's output kernel takes
-    them (`fla_gdn._o_kernel`), the memory the chunk enters read at its slot (`fla_gdn.Sequences`)."""
+    them (`fla_gdn._o_kernel`), the memory the chunk enters read at its slot (`Sequences`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
     entered = chunk_ref[2]
 
@@ -494,7 +492,7 @@ def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, beta_ref, a_r
     the WY representation, the values' through `A`, and the gradient of `Akk`, with fla's casts and
     sums in its order. `A` is read transposed, as fla loads it; fla's first key block's value terms
     run first, on their own loop. The memory the chunk enters and its gradient where it leaves are
-    read at their slots (`fla_gdn.Sequences`)."""
+    read at their slots (`Sequences`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
     entered, left = chunk_ref[2], chunk_ref[3]
 
@@ -806,14 +804,14 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     values, which fla recomputes in its backward ('delta_memory', as `fla_gdn._rule_fwd` keeps it)."""
     spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
     # Named as the gated delta rule's port names them (`fla_gdn._rule_fwd`) for a remat policy.
-    g = checkpoint_name(fla_gdn.chunk_local_cumsum(g, scale=RCP_LN2, chunk=chunk, spans=spans,
-                                                   interpret=interpret), 'delta_decay')
+    g = checkpoint_name(recurrence.cumulated(g, scale=RCP_LN2, chunk=chunk, spans=spans, interpret=interpret),
+                        'delta_decay')
     return cumulated_fwd(q, k, v, g, beta, h0, spans, scale, chunk, interpret, keep)
 
 
 def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: int, interpret: bool,
                   keep: bool = True):
-    """`_rule_fwd` from the decay cumulated in base 2 within each chunk (`fla_gdn.chunk_local_cumsum`),
+    """`_rule_fwd` from the decay cumulated in base 2 within each chunk (`recurrence.cumulated`),
     which is all the rest of the rule reads of it, as `fla_gdn.cumulated_fwd`: a node of the port's
     graph and the port's arithmetic on it."""
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
@@ -867,7 +865,7 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, residual, c
     group = v.shape[2] // k.shape[2]
     if group > 1:
         dq, dk = (x.reshape(*x.shape[:2], k.shape[2], group, x.shape[-1]).sum(axis=3) for x in (dq, dk))
-    dg = first_decay_grad(fla_gdn.chunk_local_cumsum(dg, reverse=True, **kernels), h0, dh0, spans)
+    dg = first_decay_grad(recurrence.cumulated(dg, reverse=True, **kernels), h0, dh0, spans)
     return (dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype), dg, db.astype(beta.dtype), dh0, None)
 
 

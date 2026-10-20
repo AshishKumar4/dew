@@ -329,7 +329,7 @@ def _per_document(block, cuts) -> list[np.ndarray]:
 
 
 def plain_prefix(g, chunk: int = CHUNKED):
-    """`g` re-cut from the port's plain fp32 prefix (`fla_gdn.chunk_local_cumsum`, fla's): each chunk
+    """`g` re-cut from the port's plain fp32 prefix (`recurrence.cumulated`, fla's): each chunk
     of `chunk` tokens from the row's start summed, then scaled to base 2 (`fla_gdn.RCP_LN2`), each
     token's decay the difference of its prefix and the one before carried back to natural log. The
     portable rule, rebuilding the prefixes, then takes every range as the port does, the difference
