@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound
+from test_attention_splash import attention_terms
 
 from dew.nn.attention import scaled_dot_product_attention, with_key_lengths
 from dew.nn.decode_geometry import folded_attention
@@ -406,3 +407,110 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
     assert not failures(found), "\n".join(failures(found))
     # Each case lowered to a kernel Triton compiled, which takes shared memory.
     assert all(record["shared"] > 0 for record in found), found
+
+
+def cache_call(window=None):
+    """A cache call of 6 tokens over 16 slots: row 0 left-padded by 2 after an empty cache, row 1
+    right-padded by 1 after 3 held tokens, row 2 with a hole after 7, and row 3 all padding; the
+    tokens' slots (`open_kv_cache`'s positions, -1 for padding), the slots filled after the call, and
+    the cache's mask over them (`causal_attention_mask`), a window's where given."""
+    from dew.nn.attention import causal_attention_mask
+
+    held = np.array([0, 3, 7, 5])
+    valid = np.array([[0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 0], [1, 1, 0, 1, 1, 1], [0, 0, 0, 0, 0, 0]], bool)
+    positions = np.where(valid, held[:, None] + np.cumsum(valid, axis=1) - 1, -1)
+    filled = np.arange(16)[None, :] < (held + valid.sum(axis=1))[:, None]
+    return (jnp.asarray(positions, jnp.int32), jnp.asarray(filled),
+            causal_attention_mask(positions, 16, window, key_valid=filled))
+
+
+def cache_documents(positions, filled):
+    """A cache call's tokens as one document a row whose last keys they are (`CrossDocuments`)."""
+    from dew.nn.documents import CrossDocuments
+
+    return CrossDocuments(jnp.asarray(positions >= 0, jnp.int32), jnp.asarray(filled, jnp.int32))
+
+
+@pytest.mark.parametrize("window", [None, 4])
+def test_a_cache_calls_documents_aligned_to_their_last_keys_are_its_mask(window):
+    """A cache call's tokens, as one document a row whose last keys they are (`CrossDocuments`
+    under causality and a window, `cross_document_mask`), see the keys the cache's own mask over its
+    slots gives them, row by row, left, right and inner padding alike."""
+    from dew.nn.documents import cross_document_mask
+
+    positions, filled, mask = cache_call(window)
+    aligned = cross_document_mask(cache_documents(positions, filled), causal=True, sliding_window=window)
+    np.testing.assert_array_equal(np.asarray(aligned), np.asarray(mask))
+
+
+@pytest.mark.parametrize("implementation", ["xla", "reference"])
+@pytest.mark.parametrize("window", [None, 4])
+def test_a_cache_call_read_as_documents_attends_as_its_mask(implementation, window):
+    """Attention of a cache call over its documents (causal, windowed, `CrossDocuments`) is bitwise
+    the attention over the cache's mask on the kernels that build it, a padding row's output zero."""
+    positions, filled, mask = cache_call(window)
+    rng = np.random.default_rng(7)
+    query = jnp.asarray(rng.normal(size=(4, 6, 2, 32)), jnp.float32)
+    key, value = (jnp.asarray(rng.normal(size=(4, 16, 2, 32)), jnp.float32) for _ in range(2))
+    read = scaled_dot_product_attention(query, key, value, implementation=implementation, causal=True,
+                                        sliding_window=window, segment_ids=cache_documents(positions, filled),
+                                        max_segments=1)
+    masked = scaled_dot_product_attention(query, key, value, implementation=implementation, mask=mask)
+    np.testing.assert_array_equal(np.asarray(read), np.asarray(masked))
+    np.testing.assert_array_equal(np.asarray(read[3]), 0)
+
+
+@pytest.mark.gpu(reason="FlashAttention runs on CUDA")
+@pytest.mark.parametrize("window", [None, 4])
+def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask(without_deterministic_ops,
+                                                                                 window):
+    """FlashAttention chosen for a cache call (`generation.chosen`) reads its documents as its packed
+    sequences, the queries put in id order and back: its output and its query, key and value
+    gradients are within tests/reference_error.py's rule of jax.nn's xla attention over the cache's
+    mask, against float64, padding rows zero."""
+    from dew.nn.attention import flash_refusal
+    from dew.nn.kernels.generation import chosen
+
+    positions, filled, mask = cache_call(window)
+    rng = np.random.default_rng(8)
+    query = jnp.asarray(rng.normal(size=(4, 6, 2, 64)), jnp.bfloat16)
+    key, value = (jnp.asarray(rng.normal(size=(4, 16, 2, 64)), jnp.bfloat16) for _ in range(2))
+    cotangent = jnp.asarray(rng.normal(size=(4, 6, 2, 64)) * np.asarray(positions >= 0)[:, :, None, None],
+                            jnp.float32)
+    documents = cache_documents(positions, filled)
+
+    def pulled(attend, *operands):
+        wide = jnp.promote_types(operands[0].dtype, jnp.float32)
+        out, pull = jax.vjp(lambda *operands: attend(*operands).astype(wide), *operands)
+        return out, *pull(cotangent.astype(out.dtype))
+
+    def flash(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation="flash", causal=True,
+                                            sliding_window=window, segment_ids=documents, max_segments=1)
+
+    def plain(query, key, value):
+        out = jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")
+        return out * jnp.asarray(positions >= 0, out.dtype)[:, :, None, None]
+
+    def truth(query, key, value):
+        logits = jnp.where(mask, jnp.einsum("btnd,bsnd->bnts", query, key) / 8.0, -jnp.inf)
+        seen = jnp.isfinite(logits).any(-1, keepdims=True)
+        probs = jnp.where(seen, jax.nn.softmax(jnp.where(seen, logits, 0.0), axis=-1), 0.0)
+        return jnp.einsum("bnts,bsnd->btnd", probs, value)
+
+    with chosen(attention="flash", attention_packed="flash", attention_window="flash"):
+        assert flash_refusal(query, key, causal=True, sliding_window=window, segment_ids=documents,
+                             max_segments=1) is None
+        found = pulled(flash, query, key, value)
+    reference = pulled(plain, query, key, value)
+    with jax.enable_x64(new_val=True):
+        exact = pulled(truth, *(jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value)))
+    # Each row sized by the float64 terms of its sums as the suite's flash gradients are
+    # (`attention_terms`): a query that keeps one key has a gradient that cancels to zero, which a
+    # flash kernel forms from its rounded output.
+    terms = attention_terms(query, key, value, cotangent, mask)
+    for name, mine, theirs, true, summed in zip(("out", "query", "key", "value"), found, reference, exact,
+                                                terms, strict=True):
+        assert_as_exact_as_the_reference(np.asarray(mine, np.float64), np.asarray(theirs, np.float64),
+                                         np.asarray(true), f"window {window} {name}",
+                                         terms=np.asarray(summed))
