@@ -18,20 +18,28 @@ it are read as verl wrote them. verl fields Dew keeps no record of
 (multimodal data and processor payloads, metrics, verl's own extra fields)
 travel beside the session in `VerlTrajectory.extras` and are written back as
 they came. No torch or verl import happens in Dew.
+
+Rewards cross here too. verl scores a reply with `compute_score(data_source,
+solution_str, ground_truth, extra_info)` (`verl/utils/reward_score/__init__.py`
+`default_compute_score`); Dew's `Reward` is `(completion, PromptRecord)`.
+`verl_reward` brings a verl function in and `compute_score` hands a Dew reward
+to verl, each passing the record's three fields as verl names them.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TypedDict
 
 import numpy as np
 
-from dew.records import integer, integers, record as section, text
+from dew.data.prompts import PromptRecord
+from dew.records import JSON, integer, integers, record as section, text
 
 from .records import real, reals, sequence
+from .rollout import Reward
 from .sessions import Call, Session, Status, chains
 
 MEDIA = ("multi_modal_data", "mm_processor_kwargs", "mm_processor_output")
@@ -315,3 +323,27 @@ def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
         trajectories.append(VerlTrajectory(session, MappingProxyType(extras)))
         cursor += used
     return tuple(trajectories)
+
+
+type ComputeScore = Callable[[str, str, JSON, JSON], float]
+"""verl's reward function: `(data_source, solution_str, ground_truth, extra_info) -> score`, where
+verl may pass a ground truth or extra info that is not a string."""
+
+
+def verl_reward(score: ComputeScore) -> Reward:
+    """The Dew `Reward` that scores with verl's `compute_score` function `score`."""
+
+    def reward(completion: str, record: PromptRecord) -> float:
+        return score(record.data_source, completion, record.ground_truth, record.extra_info)
+
+    return reward
+
+
+def compute_score(reward: Reward) -> ComputeScore:
+    """verl's `compute_score` for the Dew `reward`: verl's arguments, read back as the record a
+    prompt batch would hold (`PromptRecord.of`)."""
+
+    def score(data_source: str, solution_str: str, ground_truth: JSON, extra_info: JSON) -> float:
+        return reward(solution_str, PromptRecord.of(data_source, ground_truth, extra_info))
+
+    return score
