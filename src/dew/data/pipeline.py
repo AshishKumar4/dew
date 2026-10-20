@@ -340,6 +340,22 @@ type Stage = (
     | Batched
 )
 
+type Step = (
+    RecordStep
+    | RandomStep
+    | ExpandStep
+    | HostStep
+    | DeviceStep
+    | ColumnStep
+    | Callable[[int, Batch], Batch | Rejected]
+    | Callable[[Batch], bool]
+    | Callable[[pygrain.MapDataset | pygrain.IterDataset], pygrain.MapDataset | pygrain.IterDataset]
+    | Callable[[Mapping[str, object]], RecordStep | pygrain.RandomMapTransform | Expansion]
+)
+"""What a stage runs and its identity names (`dew.data.plan.StepIdentity`): a record, random,
+indexed, expanding, batch or column step, a predicate, a Grain function or a configured step's
+factory."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Mixture:
@@ -643,19 +659,20 @@ class Dataset:
         from dew.data.steps.generic import Fields
 
         moves = tuple(names.items())
-        return self.map(Fields(rename=moves), identity=f"dew.rename_columns:{sorted(moves)}")
+        return self.map(Fields(rename=moves, bookkeeping=True),
+                        identity=f"dew.rename_columns:{sorted(moves)}")
 
     def select_columns(self, *names: str) -> Pipeline:
         """Each record with the fields `names` alone."""
         from dew.data.steps.generic import Fields
 
-        return self.map(Fields(names), identity=f"dew.select_columns:{list(names)}")
+        return self.map(Fields(names, bookkeeping=True), identity=f"dew.select_columns:{list(names)}")
 
     def remove_columns(self, *names: str) -> Pipeline:
         """Each record without the fields `names`."""
         from dew.data.steps.generic import Fields
 
-        return self.map(Fields(remove=names), identity=f"dew.remove_columns:{list(names)}")
+        return self.map(Fields(remove=names, bookkeeping=True), identity=f"dew.remove_columns:{list(names)}")
 
     def grain(self, function: Callable[[pygrain.MapDataset | pygrain.IterDataset],
                                             pygrain.MapDataset | pygrain.IterDataset],

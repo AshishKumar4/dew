@@ -37,6 +37,41 @@ def store(request, tmp_path):
     return Store(f"s3://{bucket}/value", options)
 
 
+def test_a_versioned_s3_read_is_the_filesystems_own_request():
+    """An S3 store's versioned read sends what its filesystem's options add to every request: an
+    object written under a customer-provided key (SSE-C) is read with that key, and an object that
+    is absent raises FileNotFoundError."""
+    import base64
+    import hashlib
+    import os
+
+    from moto.server import ThreadedMotoServer
+
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    try:
+        _, port = server.get_host_and_port()
+        secret = os.urandom(32)
+        sealed = {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": base64.b64encode(secret).decode(),
+                  "SSECustomerKeyMD5": base64.b64encode(hashlib.md5(secret).digest()).decode()}
+        options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}",
+                   "s3_additional_kwargs": sealed}
+        bucket = "sealed-" + uuid4().hex
+        fs = fsspec.filesystem("s3", **options)
+        fs.mkdir(bucket)
+        fs.pipe(f"{bucket}/value", b"payload")
+        # The read's own parameters, as botocore builds the request from them.
+        sent = []
+        fs.s3.meta.events.register("before-parameter-build.s3.GetObject",
+                                   lambda params, **kwargs: sent.append(dict(params)))
+        assert Store(f"s3://{bucket}/value", options).get_versioned().data == b"payload"
+        assert sent and all(sent[-1].get(name) == value for name, value in sealed.items())
+        with pytest.raises(FileNotFoundError):
+            Store(f"s3://{bucket}/absent", options).get_versioned()
+    finally:
+        server.stop()
+
+
 def test_compare_and_swap_rejects_stale_and_duplicate_publication(store):
     first = store.put_if_absent(b"first")
     assert store.get_versioned().data == b"first"
@@ -354,9 +389,7 @@ def test_gcs_generation_preconditions_are_sent_to_the_json_api():
 
 @pytest.mark.network
 def test_real_r2_conditional_publication_and_bounded_read(tmp_path):
-    root = os.environ.get("DEW_DATA_TEST_URL")
-    if not root:
-        pytest.skip("DEW_DATA_TEST_URL names a writable remote smoke prefix")
+    root = os.environ["DEW_DATA_TEST_URL"]  # a writable remote smoke prefix
     store = Store(root.rstrip("/") + "/CURRENT")
     first = ('{"generation":"' + uuid4().hex + '"}').encode()
     try:

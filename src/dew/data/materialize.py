@@ -42,7 +42,7 @@ from dew.data.pipeline import (
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, ShardManifest, Source, _uncounted
 from dew.data.steps.generic import Fields
-from dew.data.steps.text import CountTargets, ValidTargets
+from dew.data.steps.text import CountTargets, ValidTargets, targets_changed
 from dew.records import JSON, integer, json_value, record
 
 _log = logging.getLogger(__name__)
@@ -140,7 +140,7 @@ def _memory_inputs(
     consumed = 0
     if artifact_at is not None:
         filled, manifest, prefix = _fill(pipeline, source, artifact_at, "memory")
-        cached = filled.mapped(pygrain.MapDataset.source(stored), manifest, transform=prefix)
+        cached = filled.mapped(pygrain.MapDataset.source(stored), manifest, transform=prefix, source=source)
         try:
             for index in range(len(cached)):
                 outputs = cached[index]
@@ -251,7 +251,13 @@ def _memory_stages(
                         if counts_targets:
                             expanded_counts[output_id] = ValidTargets()(record(output, "counted row"))
                         elif counted is not None:
-                            expanded_counts[output_id] = counted[identifier]
+                            # A row's count holds while the step left the fields it was counted from;
+                            # where it changed one, the row's own targets, as `recounted` carries them.
+                            if (isinstance(value, Mapping) and isinstance(output, Mapping)
+                                    and targets_changed(value, output)):
+                                expanded_counts[output_id] = ValidTargets()(output)
+                            else:
+                                expanded_counts[output_id] = counted[identifier]
             rows = expanded
             if counts_targets or counted is not None:
                 counted = expanded_counts

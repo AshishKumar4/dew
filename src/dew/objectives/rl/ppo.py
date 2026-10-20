@@ -26,6 +26,8 @@ from dew.objectives.base import (
     Variables,
     joined,
     part,
+    projected_draw,
+    projected_parts,
 )
 from dew.rl.advantage import gae_advantages, masked_whiten
 from dew.rl.surrogate import clipped_value_loss_terms
@@ -57,6 +59,12 @@ class ValueHead(nn.Module):
     """
 
     backbone: HiddenStates
+
+    @nn.nowrap
+    def projected(self, params: Variables, *, updated: bool) -> Variables:
+        """The backbone's projection of its own parameters (`ProjectsParameters`); the value map's
+        as they are."""
+        return projected_parts(params, {"backbone": self.backbone}, updated=updated)
 
     @nn.compact
     def __call__(self, tokens: jax.Array, *, segment_ids: jax.Array | None = None,
@@ -137,12 +145,16 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         *actor, self.critic = modules
         self.actor.substitute(actor)
 
+    def projected(self, params: Variables, *, updated: bool) -> Variables:
+        """The actor's projection of the policy's tree, and the critic's of its own."""
+        return projected_parts(params, {"policy": self.actor, "critic": self.critic}, updated=updated)
+
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Tile the actor's head, the vocabulary head this objective trains."""
         return self.actor.tile_head(tile)
 
-    def restore_head_tile(self, tile: tuple[int, int] | None) -> None:
-        self.actor.restore_head_tile(tile)
+    def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
+        self.actor.restore_head(tile, fused=fused)
 
     def held_variables(self) -> Variables | None:
         """Return the actor's held variables, such as a loaded policy checkpoint, or None.
@@ -154,8 +166,8 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         return self.actor.held_variables()
 
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
-        critic = self.critic.init(jax.random.fold_in(key, 1),
-                                  jnp.zeros((1, self.seq_len), jnp.int32))
+        critic = projected_draw(self.critic, self.critic.init(jax.random.fold_in(key, 1),
+                                                              jnp.zeros((1, self.seq_len), jnp.int32)))
         return joined({"policy": self.actor.init(key, variables), "critic": critic})
 
     def policy(self, variables: Variables) -> EpisodeInference:
@@ -257,10 +269,12 @@ class PPORollout:
 
     GAE runs across the action tokens of all turns in one episode, wherever
     the packer placed them. Tool observations and padding are outside the
-    mask, so they get no targets. The verifier's terminal reward goes on the
-    last action, with no bootstrap value after it, which matches the input
-    convention of the pinned verl GAE. The packer masks truncated episodes,
-    so they take no targets either.
+    mask, so they get no targets. Each step reward the environment paid
+    (`Observation.reward`) goes on the last action id of the call it paid
+    for, and the verifier's terminal reward on the episode's last action,
+    with no bootstrap value after it, which matches the input convention of
+    the pinned verl GAE. The packer masks truncated episodes, so they take
+    no targets either.
 
     A cohort with no trainable token at all returns zero targets and zero
     mass. A cohort with a single trainable token raises `ValueError`,
@@ -300,13 +314,15 @@ class PPORollout:
             order[episode, :mine.size] = mine
         return order
 
-    def _targets(self, values: np.ndarray, batch: Mapping[str, np.ndarray],
-                 rewards: np.ndarray) -> dict[str, np.ndarray]:
+    def _targets(self, values: np.ndarray, batch: Mapping[str, np.ndarray], rewards: np.ndarray,
+                 steps: Sequence[Sequence[float | None]]) -> dict[str, np.ndarray]:
         """Run verl's masked GAE over each episode's actions, then whiten over every process.
 
-        The reward of an episode lands on its last action id, and GAE runs
-        across the actions of all its turns at once. Whitening reads the
-        global action count and moments, as it did over one device batch.
+        Each episode's call `c` with a step reward `steps[episode][c]` has it on
+        its last action id, and the episode's reward lands on its last action
+        id; GAE runs across the actions of all its turns at once. Whitening
+        reads the global action count and moments, as it did over one device
+        batch.
         """
         order = self._order(batch, rewards.shape[0])
         keep = order >= 0
@@ -314,8 +330,14 @@ class PPORollout:
         baselines = np.where(keep, flat[np.maximum(order, 0)], 0).astype(np.float32)
         last = np.where(keep.any(axis=1), keep.shape[1] - 1 - np.argmax(keep[:, ::-1], axis=1), -1)
         token_rewards = np.zeros_like(baselines)
+        calls = np.where(keep, np.asarray(batch[CALL_INDEX_KEY]).reshape(-1)[np.maximum(order, 0)], -1)
+        for episode, paid in enumerate(steps):
+            for call, reward in enumerate(paid):
+                ids = np.flatnonzero(calls[episode] == call)
+                if reward is not None and ids.size:
+                    token_rewards[episode, ids[-1]] += reward
         scored = last >= 0
-        token_rewards[scored, last[scored]] = rewards[scored]
+        token_rewards[scored, last[scored]] += rewards[scored]
         raw = np.asarray(gae_advantages(jnp.asarray(token_rewards), jnp.asarray(baselines),
                                         jnp.asarray(keep, jnp.float32), self.gamma, self.lam))
         returns = raw + baselines
@@ -350,4 +372,5 @@ class PPORollout:
         rewards = np.asarray(
             [0.0 if episode.reward is None else episode.reward for episode in episodes], np.float32
         )
-        return {**projected, **self._targets(np.asarray(values), projected, rewards)}
+        steps = [[turn.observation.reward for turn in episode.transitions] for episode in episodes]
+        return {**projected, **self._targets(np.asarray(values), projected, rewards, steps)}

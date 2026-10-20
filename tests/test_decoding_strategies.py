@@ -213,6 +213,21 @@ def test_an_explicit_chain_runs_in_the_order_it_is_written(model):
     assert int(np.asarray(second.tokens)[0, -1]) == after
 
 
+def test_any_sequence_of_components_decodes_as_its_tuple_does(model):
+    """Components are a callable or any sequence of them: a `UserList` of transforms and criteria
+    decodes the walk their tuple does, where every container but a tuple or a list was refused."""
+    from collections import UserList
+
+    module, params = model
+    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
+    transforms, criteria = (decoding.Temperature(0.5), decoding.TopK(2)), (decoding.MaxNewTokens(3),)
+    given = generate(module, params, prompt, 4, key=jax.random.key(0), logits=UserList(transforms),
+                     stopping=UserList(criteria))
+    written = generate(module, params, prompt, 4, key=jax.random.key(0), logits=transforms, stopping=criteria)
+    np.testing.assert_array_equal(np.asarray(given.tokens), np.asarray(written.tokens))
+    np.testing.assert_array_equal(np.asarray(given.lengths), np.asarray(written.lengths))
+
+
 def test_a_callers_criterion_ends_the_row_it_names(model):
     """A stopping callable runs after every committed token, and the row that
     matched keeps the token that ended it."""

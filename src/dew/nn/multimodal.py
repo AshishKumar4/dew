@@ -16,6 +16,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import Coordinates, coordinates as build_coordinates, next_position
+from dew.nn.kv_cache import POSITION
 from dew.nn.protocols import OutputTable, ProjectionGroup
 from dew.nn.sharding import explicit_spec
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
@@ -23,6 +24,7 @@ from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
 if TYPE_CHECKING:
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.hyper_connections import HyperConnections
+    from dew.nn.kv_cache import KVCache
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
 
@@ -397,8 +399,8 @@ class MultimodalTransformer(nn.Module):
             coordinates = build_coordinates(tokens.shape, segments=segment_ids, valid=attention_mask,
                                             positions=positions, right_padded=right_padded)
         if decode:
-            allocated = self.has_variable("cache", "next_position")
-            cursor = self.variable("cache", "next_position", jnp.zeros, (tokens.shape[0],), jnp.int32)
+            allocated = self.has_variable("cache", POSITION)
+            cursor = self.variable("cache", POSITION, jnp.zeros, (tokens.shape[0],), jnp.int32)
             valid = (jnp.ones(tokens.shape, bool) if coordinates is None or coordinates.valid is None
                      else coordinates.valid)
             positions = None if coordinates is None else coordinates.positions
@@ -481,7 +483,7 @@ class MultimodalTransformer(nn.Module):
     @nn.compact
     def init_cache(self, batch_size: int):
         """Allocate the language model's cache and the next-position counter, without running the towers."""
-        self.variable("cache", "next_position", jnp.zeros, (batch_size,), jnp.int32)
+        self.variable("cache", POSITION, jnp.zeros, (batch_size,), jnp.int32)
         self.language_model.init_cache(batch_size)
 
     # The serving and training hooks (`dew.nn.protocols`), its language
@@ -490,6 +492,27 @@ class MultimodalTransformer(nn.Module):
     @nn.nowrap
     def with_cache_capacity(self, capacity: int) -> Self:
         return self.clone(language_model=self.language_model.with_cache_capacity(capacity))
+
+    @property
+    def kv_cache(self) -> KVCache:
+        return self.language_model.kv_cache
+
+    @nn.nowrap
+    def with_kv_cache(self, layout: KVCache) -> Self:
+        return self.clone(language_model=self.language_model.with_kv_cache(layout))
+
+    @nn.nowrap
+    def projected(self, params, *, updated: bool):
+        """The language model's projection of its own parameters (`ProjectsParameters`); the
+        towers' as they are."""
+        if 'language_model' not in params:
+            return params
+        return {**params, 'language_model': self.language_model.projected(params['language_model'],
+                                                                           updated=updated)}
+
+    @nn.nowrap
+    def generation_refusal(self) -> str | None:
+        return self.language_model.generation_refusal()
 
     @nn.nowrap
     def with_remat(self, policy: RematPolicy | None) -> Self:

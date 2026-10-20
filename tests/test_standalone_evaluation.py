@@ -1,5 +1,6 @@
 """Standalone evaluation uses the same variables, RNG and metrics as fit."""
 
+import logging
 import pickle
 
 import jax
@@ -39,6 +40,64 @@ class Recording:
         self.artifacts.append(artifact)
 
 
+def test_a_run_compiles_its_evaluations_before_its_first_step():
+    """A run that evaluates between steps warms each suite beside its step's compile, before its
+    first step, reporting nothing of it: two batches, the loss's reduction and the preview. The
+    evaluations it schedules then compile no program between the log of the steps before them
+    and their own report, and the tracker holds those evaluations alone."""
+    model = tiny_decoder()
+    objective = LMObjective(model, seq_len=4, samples=Samples([1, 2], 2, sampling=Sampling(temperature=0)))
+    batch = {"text": np.tile(np.array([1, 2, 3, 4, 1], np.int32), (8, 1))}
+    data = Loader(lambda partition: iter([batch] * 4), lambda partition: iter([batch, batch]), records=8,
+                  batch=8)
+    compiles: list[str] = []
+
+    class Compiles(logging.Handler):
+        def emit(self, record):
+            if "Finished XLA compilation" in record.getMessage():
+                compiles.append(record.getMessage())
+
+    class Reports(Recording):
+        """Each report's step, whether it is an evaluation's, and the compiles before it."""
+        def __init__(self):
+            super().__init__()
+            self.reports = []
+
+        def log(self, scalars, step):
+            super().log(scalars, step)
+            self.reports.append((step, any(name.startswith("val/") for name in scalars), len(compiles)))
+
+    tracker = Reports()
+    handler, logger = Compiles(), logging.getLogger("jax")
+    logger.addHandler(handler)
+    try:
+        with jax.log_compiles():
+            Trainer(objective, optax.adam(.01), key=jax.random.key(1), tracker=tracker).fit(
+                data, steps=4, eval_every=2, log_every=2, metrics=(Perplexity(),), preview=True)
+    finally:
+        logger.removeHandler(handler)
+    evaluated = [index for index, (_, evaluation, _) in enumerate(tracker.reports) if evaluation]
+    assert [tracker.reports[index][0] for index in evaluated] == [2, 4], tracker.reports
+    for index in evaluated:
+        (_, steps, before), (_, _, after) = tracker.reports[index - 1], tracker.reports[index]
+        assert not steps and compiles[before:after] == [], (tracker.reports, compiles[before:after])
+    assert sum(isinstance(artifact, TextSamples) for artifact in tracker.artifacts) == 2
+
+
+def test_a_run_warms_a_validation_whose_first_batch_counts_no_target():
+    """Warming a split scores no part of it, so a validation whose first batch is all padding,
+    its targets counted by a later batch, trains and evaluates."""
+    objective = LMObjective(tiny_decoder(), seq_len=4, pad_id=0)
+    batch = {"text": np.tile(np.array([1, 2, 3, 4, 1], np.int32), (8, 1))}
+    padding = {"text": np.zeros((8, 5), np.int32)}
+    data = Loader(lambda partition: iter([batch] * 2), lambda partition: iter([padding, padding, batch]),
+                  records=8, batch=8)
+    tracker = Recording()
+    Trainer(objective, optax.adam(.01), key=jax.random.key(1), tracker=tracker).fit(
+        data, steps=2, eval_every=1, log_every=1, metrics=(Perplexity(),))
+    assert sum("val/perplexity" in scalars for scalars in tracker.scalars) == 2
+
+
 def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
     model = tiny_decoder()
     objective = LMObjective(model, seq_len=4, samples=Samples([1, 2], 2, sampling=Sampling(temperature=0)),
@@ -48,9 +107,10 @@ def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
     tracker = Recording()
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(1), tracker=tracker)
     state = trainer.fit(data, steps=2, eval_every=2, log_every=2, metrics=(Perplexity(),), preview=True)
+    # A fit's validation records the objective's loss beside its metrics, as this pass asks.
     result = Evaluation.run(objective, state.variables, data.val, key=state.key, step=state.step,
                       schedule_step=state.microstep, averaged=state.averaged,
-                      metrics=(Perplexity(),), preview=True, mesh=trainer.device_mesh)
+                      metrics=(Perplexity(),), preview=True, mesh=trainer.device_mesh, loss=True)
     logged = next(item for item in tracker.scalars if "val/perplexity" in item)
     assert result.scalars == logged
     previews = [artifact for artifact in tracker.artifacts if isinstance(artifact, TextSamples)]

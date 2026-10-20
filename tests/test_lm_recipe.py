@@ -250,6 +250,43 @@ def test_a_pretrained_runs_record_trains_again(tmp_path, lora):
                                          jax.tree.leaves(after), strict=True))
 
 
+def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
+    """`dew train run.json` and `dew export` each run in a process of their own, which imports what
+    the record names and nothing a test happened to import before: the recorded run trains on to
+    two steps, and the export reads back as that step's weights, leaf for leaf."""
+    import os
+    import subprocess
+    import sys
+
+    from dew.checkpoints import Checkpoints
+    from dew.interop import Pretrained
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
+    pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
+                      "--trainer.name", "fresh").run()
+    run, exported = tmp_path / "runs" / "fresh", tmp_path / "exported"
+
+    def dew(*arguments: str) -> None:
+        """The command line on this checkout's source, as a fresh interpreter imports it."""
+        environment = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")}
+        done = subprocess.run([sys.executable, "-m", "dew.cli.main", *arguments], capture_output=True,
+                              text=True, check=False, env=environment)
+        assert done.returncode == 0, done.stdout + done.stderr
+
+    dew("train", str(run / "run.json"), "--set", "trainer.steps=2")
+    dew("export", str(run), str(exported))
+
+    assert Checkpoints(str(run)).latest == 2
+    trained = Checkpoints(str(run)).variables(step=2)["params"]
+    loaded = Pretrained.load(str(exported), dtype="float32", attention_impl="reference").variables["params"]
+    for path, leaf in jax.tree_util.tree_flatten_with_path(loaded)[0]:
+        held = trained
+        for entry in path:
+            held = held[entry.key]
+        np.testing.assert_array_equal(np.asarray(held), np.asarray(leaf), err_msg=jax.tree_util.keystr(path))
+
+
 def test_a_pretrained_run_stores_its_parameters_in_the_dtype_it_names(tmp_path):
     """`--pretrained-param-dtype bfloat16` loads the checkpoint's parameters
     as bf16 and trains them so, and the run records it; with no
@@ -516,6 +553,41 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
     prompt = [[4, 5, 6, 7]]
     np.testing.assert_array_equal(task(prompt, 4, key=9).host().tokens,
                                   trained(prompt, 4, key=9).host().tokens)
+
+
+def test_block_diffusion_trains_quantized_as_any_lm_recipe_does(tmp_path):
+    """`--trainer.quantization` wraps the module block-diffusion SFT trains, as it does any
+    objective's (`quantize_trunk`): the recipe takes it, its step runs on the quantized forward,
+    and it moves the checkpoint other than the same step without it does."""
+    from dew.quantization import Quantization
+
+    checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-sft"
+    directory = tmp_path / "tokens"
+    directory.mkdir()
+    for split, count in (("train", 160), ("val", 32)):
+        ids = np.random.RandomState(count).randint(4, 32, count).astype(np.uint8)
+        (directory / f"{split}.bin").write_bytes(ids.tobytes())
+    (directory / "meta.json").write_text(json.dumps(
+        {"tokenizer": str(checkpoint), "vocab_size": 32, "dtype": "uint8", "eos_id": 1}))
+
+    def run(name, *quantized):
+        return LMRunConfig.cli([
+            "--pretrained", str(checkpoint), "--objective", "block_diffusion",
+            "--tokenizer", str(checkpoint), "--data.source", str(directory), "--data.seq-len", "11",
+            "--objective.prompt-length", "4", "--loading.workers", "0",
+            "--model.dtype", "float32", "--model.attention-impl", "xla",
+            "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
+            "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", name,
+            "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
+            "--max-new-tokens", "0", "--optim.learning-rate", "0.001", *quantized])
+
+    quantized = run("quantized")
+    quantized = dataclasses.replace(quantized, trainer=dataclasses.replace(
+        quantized.trainer, quantization=Quantization()))
+    state, plain = quantized.run(), run("plain").run()
+    assert int(state.updates) == int(plain.updates) == 1
+    assert any(not np.array_equal(a, b) for a, b in zip(jax.tree.leaves(state.variables),
+                                                      jax.tree.leaves(plain.variables), strict=True))
 
 
 def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):

@@ -14,7 +14,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from episode_support import ToolPolicy
 from flax import linen as nn
+from jax.experimental import checkify
 from model_support import Digits, decoder, serving_task as task
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
@@ -111,6 +113,91 @@ def test_a_server_holds_its_weights_at_decoding_storage_and_reloads_into_it():
     same(wide.variables, narrow.variables)
     for actual, expected in zip(wide([[3, 4, 5]], 5, key=3), narrow([[3, 4, 5]], 5, key=3), strict=True):
         assert_same_generation(actual, expected)
+
+
+def test_a_dropped_server_frees_its_weights_without_a_collection():
+    """A server and its task, once their last references go, free their weights, the packed copy
+    the server serves included, with the cyclic collector off: reading which projections the
+    model packs binds it over the weights' shapes, since flax's bound tree is cyclic and, bound
+    over the weights themselves, would keep them alive until a full collection."""
+    import gc
+    from collections import Counter
+
+    def live() -> Counter:
+        return Counter(tuple(array.shape) for array in jax.live_arrays())
+
+    def serve() -> Counter:
+        # Drawn under jit, as a run draws them: an eager `init` leaves its own cyclic scope
+        # holding what it drew, which is flax's to drop, not the server's.
+        model = decoder().clone(max_seq_len=128)
+        params = jax.jit(model.init)(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+        bound = TextGeneration(model, params, RunProcessor(Digits()),
+                               sampling=Sampling(temperature=0, eos_token_ids=None))
+        server = Server.from_task(bound, slots=2, capacity=128)
+        server(["12", "34"], 3, key=0)
+        return Counter(tuple(leaf.shape) for leaf in jax.tree.leaves(bound.variables))
+
+    gc.collect()
+    gc.disable()
+    try:
+        before = live()
+        weights = serve()
+        after = live()
+    finally:
+        gc.enable()
+    kept = {shape: after[shape] - before[shape] for shape in weights if after[shape] > before[shape]}
+    assert not kept, kept
+
+
+def _host_loaded(dtype="float32"):
+    from pathlib import Path
+
+    from dew.interop import Pretrained
+
+    loaded = Pretrained.load(Path(__file__).parent / "fixtures/hf/phi-tiny", dtype=dtype,
+                             attention_impl="xla", max_seq_len=64)
+    assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(loaded.variables["params"]))
+    return loaded.text_generation(sampling=Sampling(temperature=0, eos_token_ids=None))
+
+
+def test_a_server_over_loaded_weights_places_them_once():
+    """`Pretrained.load` returns its weights in host memory, which a task keeps as given and places
+    on the device once, at its first generation, as decoding reads them (`resident`); a server over
+    the task serves that same device copy. Decode steps after a request's admission move nothing
+    from the host, and the server draws the task's tokens."""
+    bound = _host_loaded()
+    server = Server.from_task(bound, slots=2, capacity=32)
+    assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(bound.variables["params"]))
+    for placed, served in zip(jax.tree.leaves(bound.placed), jax.tree.leaves(server.variables), strict=True):
+        assert isinstance(placed, jax.Array) and placed is served
+    prompt = np.asarray([1, 2, 3], np.int32)
+    ticket = server.submit(prompt, 8, key=0)
+    server.step()  # admits the request, whose rows move to the device
+    with guarded():
+        server.step()
+        server.step()
+    server.run()
+    assert_same_generation(ticket.result(), bound(prompt[None], 8, key=0))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_task_places_loaded_weights_on_the_default_device_as_its_compute_reads_them():
+    """A task over host weights places them where JAX's default device is, committed there, and
+    in the storage decoding reads (`decoding_storage`), cast on the host: a bfloat16 load's float32
+    masters reach the device as the host's own bfloat16 rounding of them, no float32 copy."""
+    from dew.interop.weights import decoding_storage
+
+    with jax.default_device(jax.devices()[1]):
+        bound = _host_loaded("bfloat16")
+        placed = bound.placed
+    assert {leaf.devices().pop() for leaf in jax.tree.leaves(placed)} == {jax.devices()[1]}
+    # Committed there, so a call made outside the context runs on them rather than moving them.
+    assert all(leaf.committed for leaf in jax.tree.leaves(placed))
+    cast = decoding_storage(bound.model, bound.variables)
+    for leaf, host in zip(jax.tree.leaves(placed), jax.tree.leaves(cast), strict=True):
+        assert leaf.dtype == host.dtype
+        np.testing.assert_array_equal(np.asarray(leaf), host)
+    assert jnp.dtype(jnp.bfloat16) in {leaf.dtype for leaf in jax.tree.leaves(placed)}
 
 
 def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
@@ -235,7 +322,7 @@ def test_reload_normalizes_source_precision_before_concatenating_projections():
 
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
 def test_quantized_weights_serve_the_same_greedy_text_as_the_task(dtype):
-    from dew.training.quantization import Quantization
+    from dew.quantization import Quantization
 
     pytest.importorskip("qwix")
     bound = task().quantized(Quantization(dtype=dtype, weight_only=True))
@@ -338,6 +425,32 @@ def test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_ste
         second = served(rounds[1])
     for mine, theirs in zip(second, first, strict=True):
         np.testing.assert_array_equal(mine.host().tokens, theirs.host().tokens)
+
+
+@pytest.mark.parametrize("decode_steps", [1, 4])
+def test_a_step_whose_draw_has_no_distribution_stops_the_server(decode_steps):
+    """A bigram policy that draws 5 after every id but 5, after which every score is 3e38, which
+    a temperature of 0.5 doubles past float32's range: the step after the first draw has no
+    distribution to draw from, which the device checks. The server raises that check and stops,
+    whether the failing step is a call of its own or a later step of the call that admitted the
+    row."""
+    vocab = 16
+
+    def logits():
+        table = np.full((vocab, vocab), -3e38, np.float32)
+        table[:, 5] = 0.0
+        table[5] = 3e38
+        return table
+
+    model = ToolPolicy(vocab_size=vocab, max_seq_len=64, logits=logits)
+    params = model.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32))
+    bound = TextGeneration(model, params, None, sampling=Sampling(temperature=0.5, eos_token_ids=None))
+    server = Server.from_task(bound, slots=2, capacity=64, decode_steps=decode_steps)
+    server.submit(np.asarray([1, 2, 3], np.int32), 4, key=0)
+    with pytest.raises(checkify.JaxRuntimeError):
+        server.run()
+    with pytest.raises(RuntimeError):
+        server.step()
 
 
 def test_a_request_admitted_mid_flight_draws_what_it_draws_alone():
@@ -453,6 +566,74 @@ def test_a_prompt_past_the_bucket_under_the_capacity_is_served_as_the_task_serve
     assert_same_generation(ticket.result(), bound(prompt, 50, key=0))
 
 
+@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
+                         ids=["dense", "paged"])
+def test_a_multimodal_model_serves_over_its_language_models_cache(options):
+    """A wrapper that conditions its language model on images, as Qwen3.5 and Gemma 3 load,
+    holds its cache in that language model, whose layout a server replaces through the wrapper
+    (`Layered.with_kv_cache`), dense or paged: every served row of a text prompt is the greedy
+    continuation a fresh full forward gives at each token, and the lone task call's."""
+    from model_support import greedy_walk
+    from tiny_models import build_model, tiny_inputs
+
+    model = build_model("multimodal_transformer", dtype="float32").with_cache_capacity(128)
+    args, fields = tiny_inputs("multimodal_transformer", jax.random.key(0))
+    params = model.init(jax.random.key(1), *args, **fields)
+    bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    _, tickets = served_alongside(bound, **options)
+    for ticket, lone, prompt, budget in zip(tickets, [*alone, alone[2]], [*PROMPTS, PROMPTS[2]],
+                                            [*BUDGETS, BUDGETS[2]], strict=True):
+        served = ticket.result()
+        assert_same_generation(served, lone)
+        ids = np.asarray([Digits().encode(prompt)], np.int32)
+        # A generation's tokens are the prompt and its continuation.
+        walked = greedy_walk(model, params, ids, budget)
+        np.testing.assert_array_equal(served.host().tokens[:, :walked.shape[1]], walked)
+
+
+def hybrid_task():
+    """Qwen3.5's stack at toy size: two gated-delta-net layers, whose recurrent memory and conv
+    tail are each row's own state, and one full-attention layer, whose keys a paged server pages."""
+    model = CausalTransformer(
+        vocab_size=VOCAB, emb_features=16, num_layers=3, num_heads=2, num_kv_heads=2, head_dim=8,
+        mlp_features=32, max_seq_len=128, dtype="float32",
+        layer_types=("linear_attention",) * 2 + ("full_attention",),
+        kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
+            "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
+            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}})
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    return TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=EOS))
+
+
+@pytest.mark.parametrize("options", [
+    {}, {"kv_cache": KVCache(page_size=4, pages=64)},
+    {"kv_cache": KVCache(page_size=4, pages=64), "chunk": 3},
+], ids=["dense", "paged", "paged-chunked"])
+def test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages(options):
+    """A paged server keeps the attention layer's keys in its pool and each row's recurrent state
+    in the row's slot: a row starts from a fresh state, wherever a former occupant left its own,
+    and a prompt prefilled three tokens a step continues the state its earlier pieces left. Every
+    row is the lone task call's."""
+    bound = hybrid_task()
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    _, tickets = served_alongside(bound, **options)
+    for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), lone)
+
+
+def test_a_shared_prefix_is_refused_where_rows_hold_state_beside_their_pages():
+    """A shared prefix's pages hold its keys and nothing of the recurrent state its prompt left,
+    so a row reusing them would start that state from nothing: the server refuses the prefix
+    cache for such a stack rather than serve it."""
+    with pytest.raises(ValueError):
+        Server.from_task(hybrid_task(), slots=4, capacity=128, kv_cache=KVCache(page_size=4, pages=64),
+                         prefix_cache=True)
+
+
 def served_alongside(bound, slots=4, admission=2, **options):
     """Every prompt submitted at once, plus the longest again once it is done,
     through a server with `options`; returns the server and the tickets."""
@@ -558,13 +739,15 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
 
 
 @pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("decode_steps", [1, 4])
 @pytest.mark.parametrize("dispatch", ["global"])
-def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
+def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode_steps):
     """A mixture layer on an expert mesh can run its dispatch in a shard_map,
     and jax's checkify cannot carry a device check into one (jax-ml/jax#40907).
-    The server's step runs the model before its draws check anything, and a
-    pool smaller than every row's capacity checks nothing on the device, so
-    either dispatch serves what the global one draws alone on one device.
+    The server's step runs the model before its draws check anything, each of
+    a call's steps checks its own draws, and a pool smaller than every row's
+    capacity checks nothing on the device, so either dispatch serves what the
+    global one draws alone on one device, one step a call or several.
     TextGeneration, whose loop carries each draw's checks into the next
     step's model call, refuses the exchange."""
     def generation(dispatch, params):
@@ -582,7 +765,8 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
     served = generation(
         dispatch, place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0))
     )
-    server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32))
+    server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32),
+                                       decode_steps=decode_steps)
     assert_sharded(served.variables["params"], server.mesh)
     assert server.groups == jax.device_count()
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):

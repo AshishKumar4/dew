@@ -30,7 +30,7 @@ which is where XLA's [B, H, S, S] logits live. A kernel that refuses a shape,
 or runs out of memory, is a row with served=False and the reason, which is
 part of the answer rather than an error. `--xla-only-where-faster` is not a
 flag here: which kernel `auto` picks is read off these rows by hand and
-written, with the numbers, at `tpu_runs`.
+written, with the numbers, at `attention_kernels.TPU_SUPPORTS`.
 
 Usage:
     JAX_PLATFORMS=tpu PYTHONPATH=src python tools/qualify_splash.py

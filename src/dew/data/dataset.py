@@ -17,7 +17,6 @@ import bisect
 import contextlib
 import dataclasses
 import functools
-import hashlib
 import itertools
 import json
 import logging
@@ -664,46 +663,14 @@ class Identified(Protocol):
     def identity(self) -> str: ...
 
 
-type _Held = Mapping[str, _Held] | Sequence[_Held] | str | bytes | np.ndarray | np.generic | float | None
-"""What a batch's fields hold, as `batch_digest` reads them."""
-
-
 def batch_digest(batch: Batch) -> str:
-    """A digest of what `batch` holds: its fields by name, their values'
-    dtypes, shapes and every element, its strings, bytes and scalars, and
-    the type of any other object."""
-    digest = hashlib.blake2b(digest_size=16)
+    """A digest of what `batch` holds, as the codec reads content (`content_fingerprint`): its fields
+    by name, their values' dtypes, shapes and every element, a Dew dataclass's fields, its strings,
+    bytes and scalars, and the type of any object the codec has no schema for."""
+    # The sources read this module's batches, so their package imports it first.
+    from dew.data.sources.codec import content_fingerprint
 
-    def visit(value: _Held) -> None:
-        if isinstance(value, Mapping):
-            digest.update(b"{%d" % len(value))
-            for key in sorted(value, key=repr):
-                digest.update(repr(key).encode())
-                visit(value[key])
-        elif isinstance(value, (list, tuple)):
-            digest.update(b"[%d" % len(value))
-            for element in value:
-                visit(element)
-        elif isinstance(value, str):
-            digest.update(b"s" + value.encode())
-        elif isinstance(value, bytes):
-            digest.update(b"b" + value)
-        elif value is None or isinstance(value, (bool, int, float, complex)):
-            digest.update(b"v" + repr(value).encode())
-        else:
-            array = np.asarray(value)
-            digest.update(f"{array.dtype}{array.shape}".encode())
-            if array.dtype != object:
-                digest.update(np.ascontiguousarray(array).data)
-            elif array.ndim:
-                for element in array.flat:
-                    visit(element)
-            else:
-                # An object NumPy holds whole, whose text may name its address: its type alone.
-                digest.update(type(value).__qualname__.encode())
-
-    visit(batch)
-    return digest.hexdigest()
+    return content_fingerprint(batch, opaque=True).hex()
 
 
 class Replayed(Forwarding):

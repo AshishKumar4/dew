@@ -37,6 +37,7 @@ from dew.config.data import loader
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.objectives.base import Aux, EMASpec, Objective, merge, under
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
+from dew.training.evaluation import WARM_BATCHES
 from dew.training.optim import Cosine, Power
 from dew.training.runtime import Preempted
 from dew.training.state import CHECKPOINTED
@@ -1092,8 +1093,9 @@ def test_eval_every_scores_the_validation_split_and_logs_the_artifacts():
     state = trainer.fit(dataset(val=val_batches(3)), steps=4, log_every=2, eval_every=2,
                         metrics=(Spread(seen),), preview=True)
 
-    # Two passes: at step 2, and at the end of the run.
-    assert seen == [((BATCH, 2), (BATCH, FEATURES))] * 6
+    # The pass that warms the evaluations before the first step scores its first batches, and two
+    # passes the whole split: at step 2, and at the end of the run.
+    assert seen == [((BATCH, 2), (BATCH, FEATURES))] * (WARM_BATCHES + 6)
     scored = [(step, s) for step, s in tracker.scalars if "val/spread" in s]
     assert [step for step, _ in scored] == [2, 4]
     # The pass at the end scores the averaged weights over the whole split, so
@@ -1543,3 +1545,15 @@ def test_a_failing_metric_fails_the_validation_pass():
     with pytest.raises(ZeroDivisionError):
         make_trainer(objective=Features()).fit(dataset(val=val_batches(1)), steps=1,
                                                log_every=1, eval_every=1, metrics=(Broken(),))
+
+
+def test_a_mesh_without_stages_takes_its_one_microbatch_asked_for():
+    """A mesh with no stage axis feeds one microbatch a step through it, which a run may ask for by
+    name: it trains as the run that leaves it unset does, where asking once refused the run."""
+    def fit(**asked):
+        trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0), **asked)
+        return trainer.fit(dataset(), steps=2, log_every=1)
+
+    named, planned = fit(microbatches=1), fit()
+    for left, right in zip(jax.tree.leaves(named.variables), jax.tree.leaves(planned.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
