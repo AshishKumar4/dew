@@ -14,7 +14,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from pathlib import PurePosixPath
-from typing import BinaryIO, Literal
+from typing import BinaryIO, Literal, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 import grain.python as grain
@@ -74,7 +74,7 @@ def _arrow_filesystem(fs: AbstractFileSystem) -> pafs.FileSystem:
     if "file" in protocols:
         return pafs.LocalFileSystem()
     if isinstance(fs, S3FileSystem) and _native_s3(fs):
-        endpoint = urlsplit(fs.client_kwargs.get("endpoint_url") or fs.endpoint_url or "")
+        endpoint = urlsplit(fs.endpoint_url or fs.client_kwargs.get("endpoint_url") or "")
         return pafs.S3FileSystem(
             access_key=fs.key,
             secret_key=fs.secret,
@@ -96,13 +96,22 @@ def _arrow_filesystem(fs: AbstractFileSystem) -> pafs.FileSystem:
     return pafs.PyFileSystem(pafs.FSSpecHandler(fs))
 
 
+@runtime_checkable
+class _Constructed(Protocol):
+    """An fsspec filesystem as fsspec's constructor records it: the keyword
+    arguments it was given, where an injected botocore session shows, which
+    s3fs's own `session` does not tell from the one it makes."""
+
+    storage_options: Mapping[str, object]
+
+
 def _native_s3(fs: S3FileSystem) -> bool:
     """Whether Arrow's S3 client carries every setting `fs` reads with: keys,
     anonymity, region, endpoint and TLS, and nothing it cannot express, such
     as a profile, a session, botocore configuration, requester pays, extra
     request arguments or object versions."""
     return (not (fs.kwargs or fs.config_kwargs or fs.req_kw or fs.s3_additional_kwargs or fs.version_aware)
-            and "session" not in fs.storage_options
+            and not (isinstance(fs, _Constructed) and "session" in fs.storage_options)
             and set(fs.client_kwargs) <= {"region_name", "endpoint_url"})
 
 
