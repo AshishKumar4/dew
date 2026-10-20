@@ -1461,9 +1461,7 @@ threadpoolctl==3.7.0
 tinycss2==1.5.1
     # via bleach
 tokamax==0.0.15
-    # via
-    #   -c constraints.txt
-    #   dewml (pyproject.toml)
+    # via dewml (pyproject.toml)
 tokenizers==0.23.3
     # via transformers
 toml==0.10.2

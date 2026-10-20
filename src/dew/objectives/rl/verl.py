@@ -195,6 +195,8 @@ def _runs(mask: Sequence[int], offset: int) -> list[tuple[int, int]]:
 
 def _transcript(value: object) -> Transcript:
     """A call's transcript as `to_verl` wrote it into `extra_fields.dew.calls`."""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"transcript={value!r}: a call's transcript records its messages and response")
     written = section(value, "transcript")
     response = written["response"]
     return Transcript(messages(written["messages"], "messages"),
