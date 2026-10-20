@@ -45,6 +45,9 @@ def standing_in(gate, monkeypatch, *, passed: bool) -> list:
     outputs = {
         "benchmark_step.py": lambda command: [{"ms_per_step": 5.0, "compile_seconds": 30.0}],
         "benchmark_forward.py": lambda command: {after(command, "--cases"): 5.0},
+        "benchmark_serving_compile.py": lambda command: {
+            "construction_seconds": 8.0, "warm_seconds": 40.0,
+            "by_admission_width": {f"admission {rows}": 8.0 for rows in (1, 2, 4, 8)}},
         "benchmark_lm_serving.py": lambda command: {"sweep": [
             {"slots": int(slots), "repeats": [{"output_tokens_per_second": rate} for rate in (5.0, 6.0)]}
             for slots in after(command, "--slots").split(",")]},
@@ -302,14 +305,7 @@ def test_a_gate_keeps_each_trees_compiles_apart_and_judges_compile_rows_on_the_f
         return measured_row(command, **kwargs)
 
     monkeypatch.setattr(gate.subprocess, "run", child)
-    trees = {name: tmp_path / name for name in ("main", "head")}
-    for tree in trees.values():
-        (tree / "locks").mkdir(parents=True)
-        for lock in (ROOT / "locks").glob("*.txt"):
-            (tree / "locks" / lock.name).write_text("numpy\n")
-        (tree / "tools").mkdir()
-        shutil.copy(ROOT / "tools" / "install_environment.sh", tree / "tools")
-        (tree / ".python-version").write_text("3.12\n")
+    trees = gate_trees(tmp_path)
     out = tmp_path / "not" / "yet" / "gate.json"
     args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=3,
                            only=["lm-dense 4x1024"], claim=False, model="unused", flowers="unused",
@@ -325,3 +321,50 @@ def test_a_gate_keeps_each_trees_compiles_apart_and_judges_compile_rows_on_the_f
         assert compiles == [True, False, False], (tree, compiles)
     assert set(results["seconds"]) == {"first round", "later rounds"}
     assert gate.report(SimpleNamespace(results=out, table=None, claim=False)) == 0
+
+
+def gate_trees(tmp_path: Path) -> dict[str, Path]:
+    """A base and a head tree, each with the locks, installer and Python version a gate run reads."""
+    trees = {name: tmp_path / name for name in ("main", "head")}
+    for tree in trees.values():
+        (tree / "locks").mkdir(parents=True)
+        for lock in (ROOT / "locks").glob("*.txt"):
+            (tree / "locks" / lock.name).write_text("numpy\n")
+        (tree / "tools").mkdir()
+        shutil.copy(ROOT / "tools" / "install_environment.sh", tree / "tools")
+        (tree / ".python-version").write_text("3.12\n")
+    return trees
+
+
+def test_a_probe_measuring_compiles_alone_runs_in_the_first_round_alone(gate, tmp_path, monkeypatch):
+    """A probe whose every row is a first round's compile, the Server's program by program, runs once
+    per tree: a later round would recompile it uncached and read nothing. Each of its programs is a
+    row of its own, and the whole warm is shown beside them, ungated."""
+    from types import SimpleNamespace
+
+    commands = standing_in(gate, monkeypatch, passed=True)
+    measured_row = gate.subprocess.run
+
+    def child(command, **kwargs):
+        if command[0] == "nvidia-smi":
+            return subprocess.CompletedProcess(command, 0, "580.82.07, 9.0\n", "")
+        if command[0] == "uv":
+            (Path(command[-1]) / "bin").mkdir(parents=True)
+        if command[0] in ("uv", "sh"):
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return measured_row(command, **kwargs)
+
+    monkeypatch.setattr(gate.subprocess, "run", child)
+    trees = gate_trees(tmp_path)
+    out = tmp_path / "gate.json"
+    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=3,
+                           only=["compile serve"], claim=False, model="unused", flowers="unused",
+                           torch_python="", out=str(out), environments=str(tmp_path / "environments"))
+    assert gate.run(args) == 0
+    served = [command for command in commands if Path(command[1]).name == "benchmark_serving_compile.py"]
+    assert len(served) == len(trees)
+    rows = {row.name: row for probe in gate.PROBES for row in probe.rows if "compile serve" in row.name}
+    assert sorted(name for name, row in rows.items() if row.gated) == sorted(
+        f"compile serve dory-1.0-4b {program}"
+        for program in ("construction", "admission 1", "admission 2", "admission 4", "admission 8"))
+    assert not rows["compile serve dory-1.0-4b warm 16 slots"].gated
