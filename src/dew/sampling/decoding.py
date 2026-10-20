@@ -27,7 +27,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable, Sequence
-from typing import NamedTuple, Protocol, overload, runtime_checkable
+from typing import NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -960,15 +960,7 @@ def _stop_string_tables(pieces: Sequence[str | bytes], ids: Sequence[int],
                        positions, ends, max(len(value) for value in strings))
 
 
-@overload
-def as_pytree(value: LogitsTransform) -> LogitsTransform: ...
-
-
-@overload
-def as_pytree(value: Stopping) -> Stopping: ...
-
-
-def as_pytree(value: LogitsTransform | Stopping) -> LogitsTransform | Stopping:
+def as_pytree(value: LogitsTransform) -> LogitsTransform:
     """`value` in a form `jax.jit` accepts as data.
 
     A built-in whose numbers fix no shape lowers to its `apply` with them
