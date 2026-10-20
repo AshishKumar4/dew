@@ -468,6 +468,23 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     assert Path(least[0].removeprefix("| ")).name == "unused.py" and least[-1] == "0.0% |"
 
 
+def test_a_split_file_pays_its_setup_once_a_group_and_is_not_cut_finer_for_it(ci):
+    """Twenty recorded tests of 10 s that armada measured at 400 s over the 4 groups they last ran
+    as paid 50 s a group besides their tests. At a 150 s target a group holds 100 s of tests and its
+    setup, so the file runs as 2 groups of 150 s, where scaling every test by the file's total would
+    cut it in 3 and each would pay the setup again. Measured at that cut, 300 s over 2 groups, the
+    file is cut the same way: its setup is not counted again for the groups it ran as. A setup past
+    half the target leaves each group half the target of tests, not a sliver."""
+    tests = [10.0] * 20
+    assert ci.split(tests, 400.0, 150.0, cut=4) == [150.0, 150.0]
+    assert ci.split(tests, 300.0, 150.0, cut=2) == [150.0, 150.0]
+    assert ci.split(tests, 800.0, 150.0, cut=5) == [190.0, 190.0, 180.0]
+    rows = {"3.12:tests/test_split.py#1/4": 100.0, "3.12:tests/test_split.py#4/4": 100.0,
+            "3.14:tests/test_split.py#1/2": 10.0, "3.12:tests/test_other.py": 5.0}
+    assert ci.last_cut({"rows": rows}, "3.12", "tests/test_split.py") == 4
+    assert ci.last_cut({"rows": rows}, "3.12", "tests/test_other.py") == 1
+
+
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
     """Each task of a split file runs its own group (split.py) of the same
     cut, so the groups together run every test, none twice, a test the
