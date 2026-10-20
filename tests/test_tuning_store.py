@@ -84,10 +84,11 @@ def test_a_launch_of_numpy_descriptors_keys_and_round_trips_as_jaxs():
         (tuning._identity(ba.op), ba.autotuning_cache_key) for ba in keyed]
 
 
-def test_a_stored_class_this_checkout_lacks_is_unreadable_and_an_imports_own_failure_propagates():
+def test_a_stored_class_this_checkout_lacks_is_unreadable_and_an_imports_own_failure_propagates(
+        tmp_path, monkeypatch):
     """A class name whose module, outer class or class this checkout lacks is `Unreadable`, which the
-    store keeps aside as another checkout's entry; a module that fails as it imports is this
-    checkout's error, and propagates."""
+    store keeps aside as another checkout's entry; a module that fails as it imports, here on a
+    dependency it lacks, is this checkout's error, and propagates."""
     import pytest
 
     for name in ("dew.nn.kernels.removed_module:Kernel", "dew.nn.kernels.tuning:Removed",
@@ -95,3 +96,8 @@ def test_a_stored_class_this_checkout_lacks_is_unreadable_and_an_imports_own_fai
         with pytest.raises(tuning.Unreadable):
             tuning._located(name)
     assert tuning._located("dew.nn.kernels.tuning:Timings") is tuning.Timings
+    (tmp_path / "kernel_needing_a_dependency.py").write_text("import a_dependency_nobody_installed\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(ModuleNotFoundError) as failed:
+        tuning._located("kernel_needing_a_dependency:Kernel")
+    assert not isinstance(failed.value, tuning.Unreadable)
