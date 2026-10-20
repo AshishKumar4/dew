@@ -21,7 +21,7 @@ from tuned import each_config
 from dew.nn.activations import exact_gelu
 from dew.nn.gpt_oss import GptOssExperts
 from dew.nn.kernels import grouped_matmul, tuning
-from dew.nn.kernels.generation import triton_runs
+from dew.nn.kernels.generation import chosen as kernel_choices, gpu_target, triton_runs
 from dew.nn.moe import ExpertMLP, expert_dispatch, expert_projection
 from dew.training import MeshSpec
 
@@ -184,18 +184,28 @@ def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
                                rtol=TOLERANCE)
 
 
+HOPPER = pytest.mark.skipif(not (triton_runs() and gpu_target().wgmma),
+                            reason="Mosaic GPU's grouped launches need Hopper's warpgroup MMA")
+
+
 @pytest.mark.gpu(reason="the tuner's space is a GPU's")
 @pytest.mark.skipif(not triton_runs(), reason="needs a GPU the Pallas kernels compile for")
-@pytest.mark.parametrize("kernel", [grouped_matmul.Gmm, grouped_matmul.GmmTransposed, grouped_matmul.Tgmm])
-def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel):
-    """Each tile the tuner may pick for a launch, over groups ragged against
-    every tile size, one empty and one of a single row: the output and both
-    gradients of a bf16 projection lie within tests/reference_error.py's rule
-    of XLA's ragged dot, both measured from float64 sums of the same bf16
-    operands. The space declares only tiles proven here."""
+@pytest.mark.parametrize("kernel,width,features", [
+    (grouped_matmul.Gmm, 192, 320), (grouped_matmul.GmmTransposed, 192, 320), (grouped_matmul.Tgmm, 192, 320),
+    pytest.param(grouped_matmul.MosaicGmm, 256, 512, marks=HOPPER),
+    pytest.param(grouped_matmul.MosaicGmmTransposed, 256, 512, marks=HOPPER),
+    pytest.param(grouped_matmul.MosaicTgmm, 256, 512, marks=HOPPER)])
+def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width, features):
+    """Each tile the tuner may pick for a launch, of the implementation the
+    launch is forced to, over groups ragged against every tile size, one
+    empty and one of a single row: the output and both gradients of a bf16
+    projection lie within tests/reference_error.py's rule of XLA's ragged
+    dot, both measured from float64 sums of the same bf16 operands. The
+    space declares only tiles proven here. Triton's widths are ragged against
+    its tiles, which mask them; Mosaic's divide its tiles, which it needs."""
     rng = np.random.default_rng(91)
     sizes = np.array([0, 70, 1, 129, 100, 0], np.int32)
-    rows, width, features = int(sizes.sum()), 192, 320
+    rows = int(sizes.sum())
     x = rounded(rng.normal(size=(rows, width)))
     kernel_matrix = rounded(rng.normal(size=(len(sizes), width, features)) / np.sqrt(width))
     dy = rounded(rng.normal(size=(rows, features)))
@@ -213,17 +223,18 @@ def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel):
 
     operands = (jnp.asarray(x, jnp.bfloat16), jnp.asarray(kernel_matrix, jnp.bfloat16))
     reference = [np.asarray(value, np.float64) for value in jax.jit(projected('xla'))(*operands)]
-    configs = each_config(kernel, projected('pallas'), *operands)
-    assert len(configs) > 1
-    for config in configs:
-        with tuning.pinned({kernel: config}):
-            actual = [np.asarray(value, np.float64) for value in jax.jit(projected('pallas'))(*operands)]
-        for name, got, theirs, exact in zip(("y", "dx", "dk"), actual, reference, truth, strict=True):
-            try:
-                assert_as_exact_as_the_reference(got, theirs, exact, name)
-            except AssertionError as error:
-                error.add_note(f"{kernel.__name__} at {config}")
-                raise
+    with kernel_choices(grouped_matmul=kernel.name):
+        configs = each_config(kernel, projected('pallas'), *operands)
+        assert len(configs) > 1
+        for config in configs:
+            with tuning.pinned({kernel: config}):
+                actual = [np.asarray(value, np.float64) for value in jax.jit(projected('pallas'))(*operands)]
+            for name, got, theirs, exact in zip(("y", "dx", "dk"), actual, reference, truth, strict=True):
+                try:
+                    assert_as_exact_as_the_reference(got, theirs, exact, name)
+                except AssertionError as error:
+                    error.add_note(f"{kernel.__name__} at {config}")
+                    raise
 
 
 @pytest.mark.gpu(reason="needs a GPU the Pallas kernels compile for")

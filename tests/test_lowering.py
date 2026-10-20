@@ -210,14 +210,23 @@ def _experts_lowered(generation: str, implementation: str):
 
 @pytest.mark.parametrize("generation", GPUS)
 def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generation_chooses(generation):
-    """'auto' takes the generation's grouped matmul: its forward and both backward products lower to
-    the Pallas kernels where the row names them, and to none where it does not. The experts' SiLU
-    product takes the fused SwiGLU where the row names it, forward and backward, as every fused kernel
-    is differentiated through its portable arithmetic (`generation.linear_tangent`)."""
-    expected = set().union(*(FAMILIES[key][1] for key in chosen(generation, "experts")
-                             if key[0] == 'grouped_matmul'))
+    """'auto' runs the grouped matmul's kernels on every GPU generation, each of its forward and both
+    backward launches the implementation its cost model picks there (the route says which), and the
+    Triton kernels that lower are those of the launches that run Triton; Hopper's Mosaic GPU kernels
+    lower as Mosaic calls, no Triton kernel. The experts' SiLU product takes the fused SwiGLU where the
+    row names it, forward and backward, as every fused kernel is differentiated through its portable
+    arithmetic (`generation.linear_tangent`)."""
+    with routes() as taken:
+        lowered = _experts_lowered(generation, 'auto')
+    forward, input_gradient, kernel_gradient = (route.kernel for route in taken
+                                                if route.choice == 'grouped_matmul')
+    assert {forward, input_gradient, kernel_gradient} <= {'triton', 'mosaic_gpu'}
+    expected = {name for name, implementation in (("pallas_triton_ragged_dot", forward),
+                                                  ("pallas_triton_ragged_dot", input_gradient),
+                                                  ("tgmm_ragged_dot", kernel_gradient))
+                if implementation == 'triton'}
     expected |= set().union(*(FAMILIES[key][1] for key in chosen(generation, "step") if key[0] == 'swiglu'))
-    assert set(triton_kernels(_experts_lowered(generation, 'auto'))) == expected
+    assert set(triton_kernels(lowered)) == expected
 
 
 def _mamba2_lowered(generation: str):
