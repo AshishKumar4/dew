@@ -6,6 +6,8 @@ this package may import `dew.rl`.
 """
 
 # tests/test_rl_imports.py enforces the one-way import rule above.
+from dew.data.prompts import PromptRecord
+
 from .episodes import (
                        Action,
                        Environment,
@@ -73,6 +75,7 @@ __all__ = [
                        "Observation",
                        "PPOObjective",
                        "PPORollout",
+                       "PromptRecord",
                        "PromptSource",
                        "Publisher",
                        "RecoverableEnvironment",

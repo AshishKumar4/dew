@@ -182,6 +182,19 @@ def test_train_diffusion_example_trains_samples_and_exports(tmp_path):
     assert (tmp_path / "checkpoints" / "3").is_dir(), "the last step was not checkpointed"
 
 
+def test_train_flowers_trains_on_every_record_and_its_profiling_run_draws_nothing(tmp_path):
+    example = load("train_flowers", "examples")
+    assert example.flowers(example.Config(data=tmp_path)).validation is None, "a split is held out"
+
+    config = example.Config(data=tmp_path, output=tmp_path / "run", steps=4, batch=8, image_size=RES,
+                            profile=2)
+    state = example.main(config, data=fake_dataset(8))
+
+    assert int(state.step) == 4
+    assert any((tmp_path / "run" / "profile").rglob("*.xplane.pb")), "no trace was written"
+    assert not (tmp_path / "run" / "samples.png").exists(), "a profiling run drew samples"
+
+
 @pytest.mark.mesh
 def test_train_jepa_example_trains_probes_and_saves_the_encoder(tmp_path):
     example = load("train_jepa", "examples")
