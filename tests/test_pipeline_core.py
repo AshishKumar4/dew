@@ -501,6 +501,21 @@ def test_a_member_joining_a_resumed_mix_is_read_ahead_before_the_mix_gives_a_row
         member_rows([corpus("a", 0), hopeless], saved=saved, weights=[1, 1e-9], batches=1)
 
 
+@pytest.mark.parametrize("by", ["records", "tokens"])
+@pytest.mark.parametrize("weights", [None, [1, 1e-9]], ids=["even", "one-rarely-chosen"])
+def test_a_streamed_mix_resumed_where_a_member_holds_a_row_read_ahead_reads_what_the_uninterrupted_one_reads(
+        by, weights):
+    """A streamed mix reads every member's first row ahead before it gives a row, so a position it
+    saves may fall while a member holds a row it has not given: one it gives next, or one a member
+    weighted too small to be chosen holds throughout. Resumed there, by records or by tokens, the
+    mix reads on record for record as the uninterrupted one does."""
+    members = [corpus("a", 0), corpus("b", 1)]
+    whole, saved = member_rows(members, by, weights=weights)
+    resumed, _ = member_rows(members, by, saved=saved, weights=weights, batches=4)
+    read = 2 * 2  # the rows of the two batches read before the position was saved
+    assert resumed == whole[read:]
+
+
 def test_an_indexed_mix_still_refuses_a_member_joining():
     """An indexed mix reads by one global index over all its members, which a member joining moves:
     its resume refuses the edit."""
