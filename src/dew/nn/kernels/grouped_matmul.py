@@ -77,11 +77,11 @@ Where the cost model ties, the first wins: the deeper step, which synchronizes i
 a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78, GMM-h100-2), and the
 more warps."""
 
-MOSAIC_TILES = tuple(mosaic_gpu.Tiles(tile_m, tile_n, 64, stages, split, width)
-                     for tile_m, tile_n, stages, split, width in itertools.product(
-                         (128, 64), (128, 64), (4, 3, 5), ('n', 'm'), (8, 4)))
-"""Every tile the Mosaic GPU launches may take, a contraction step of 64 (`mosaic_gpu.Tiles`); where the
-cost model ties, the first wins, the larger tile."""
+MOSAIC_TILES = tuple(mosaic_gpu.Tiles(*shape) for shape in itertools.product(
+    (128, 192, 64), (128, 192, 64), (64,), (4, 5, 2), (8, 4, 2, 1)))
+"""Every tile the Mosaic GPU launches may take: the sweep JAX ships with the kernels
+(`ragged_dot_mgpu.main`), where an H100's fastest lie (GMM-h100-3). Where the cost model ties, the first
+wins."""
 
 INTERPRETED = plgpu.InterpretGPUParams(out_of_bounds_reads="uninitialized", uninitialized_memory="zero")
 """How a CPU interprets the Mosaic GPU launches: a read past an operand's rows gives zeros, as the TMA
@@ -305,8 +305,10 @@ class Tgmm(_Triton):
 
 
 class _Mosaic(_GroupedLaunch):
-    """The Pallas Mosaic GPU kernels (`templates.gemm.mosaic_gpu`): Hopper's warpgroup MMA, one 16-bit
-    dtype, and widths the space's tiles divide."""
+    """JAX's Pallas Mosaic GPU kernels (`templates.gemm.mosaic_gpu`): Hopper's warpgroup MMA, one 16-bit
+    dtype, and widths the space's tiles divide. Each runs one warpgroup a multiprocessor, persistent over
+    the output tiles in a planar snake, so the rows a band of `grid_block_n` column tiles shares and the
+    matrix block the row tiles in flight share come from the L2."""
     name: ClassVar[str] = 'mosaic_gpu'
     config_cls: ClassVar[type[mosaic_gpu.Tiles]] = mosaic_gpu.Tiles
 
@@ -317,19 +319,23 @@ class _Mosaic(_GroupedLaunch):
                 and _rated(target, first) and bool(self.space(ba)))
 
     def staged_bytes(self, ba, config: mosaic_gpu.Tiles) -> int:
+        # The pipeline's stages of both operand blocks, and the output block the epilogue stores from.
         size = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
-        return config.stages * self.loaded(config) * size + self.epilogue(config) * jnp.dtype(
-            ba.arguments['out_dtype']).itemsize
+        out = jnp.dtype(ba.arguments['out_dtype']).itemsize
+        return (config.stages * (config.block_m + config.block_n) * config.block_k * size
+                + config.block_m * config.block_n * out)
 
-    @staticmethod
-    @abc.abstractmethod
-    def loaded(tile: mosaic_gpu.Tiles) -> int:
-        """The elements of both operand tiles one contraction step loads."""
-
-    @staticmethod
-    @abc.abstractmethod
-    def epilogue(tile: mosaic_gpu.Tiles) -> int:
-        """The elements of the epilogue's shared-memory slots."""
+    def _cost(self, ba, config: mosaic_gpu.Tiles, target, items: float, steps: float, moved: float) -> float:
+        """`items` output tiles of `steps` contraction steps each, `moved` device bytes."""
+        size = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
+        out = jnp.dtype(ba.arguments['out_dtype']).itemsize
+        # Each step's blocks are written by TMA and read once by the warpgroup's MMA.
+        staged = steps * 2 * (config.block_m + config.block_n) * config.block_k * size
+        return cost.seconds(cost.Cost(
+            programs=items, device_bytes=moved,
+            program_flops=2 * steps * config.block_m * config.block_n * config.block_k,
+            program_staged=staged + config.block_m * config.block_n * out,
+            mode=_mode(ba.arguments['tokens'].dtype)), target)
 
     def _multiprocessors(self, interpret: bool) -> int:
         # The interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret).
@@ -345,33 +351,21 @@ class MosaicGmm(_Mosaic):
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         kernel = ba.arguments['kernel']
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
-        return tuple(tile for tile in MOSAIC_TILES if depth % tile.tile_k == 0 and width % tile.cta_n == 0)
-
-    @staticmethod
-    def loaded(tile: mosaic_gpu.Tiles) -> int:
-        return (tile.cta_m + tile.cta_n) * tile.tile_k
-
-    @staticmethod
-    def epilogue(tile: mosaic_gpu.Tiles) -> int:
-        return 2 * 2 * min(mosaic_gpu.EPILOGUE, tile.tile_m) * min(mosaic_gpu.EPILOGUE, tile.tile_n)
+        return tuple(tile for tile in MOSAIC_TILES if depth % tile.block_k == 0 and width % tile.block_n == 0)
 
     def cost(self, ba, config: mosaic_gpu.Tiles, target) -> float:
-        # Persistent: each multiprocessor takes output tiles in turn.
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
         (rows, depth), groups = tokens.shape, kernel.shape[0]
         width = kernel.shape[1] if ba.arguments['trans_rhs'] else kernel.shape[2]
         size, out = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(ba.arguments['out_dtype']).itemsize
-        tiles, columns = _row_tiles(rows, groups, config.cta_m), width // config.cta_n
-        steps = depth // config.tile_k
-        # Each step's tiles are written by TMA and read by both warpgroups' wgmma, each its own rows of
-        # the left operand (or all of them) and its own columns of the right (or all of them).
-        read = 2 * (config.tile_m + config.tile_n) * config.tile_k
-        staged = steps * (self.loaded(config) + read) * size + 2 * config.cta_m * config.cta_n * out
-        return cost.seconds(cost.Cost(
-            programs=tiles * columns,
-            device_bytes=(rows * depth + _routed(rows, groups) * kernel.size) * size + rows * width * out,
-            program_flops=2 * config.cta_m * config.cta_n * depth, program_staged=staged,
-            mode=_mode(tokens.dtype)), target)
+        tiles, columns = _row_tiles(rows, groups, config.block_m), width // config.block_n
+        # The rows are read once a band; a group's matrix once for the row tiles of it in flight.
+        bands = math.ceil(columns / config.grid_block_n)
+        in_flight = max(1.0, _facts(target).multiprocessors / config.grid_block_n)
+        per_group = tiles / max(min(groups, rows), 1)
+        matrices = _routed(rows, groups) * kernel.size * size * math.ceil(per_group / in_flight)
+        moved = bands * rows * depth * size + matrices + rows * width * out
+        return self._cost(ba, config, target, tiles * columns, depth / config.block_k, moved)
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array, *, out_dtype: str,
              trans_rhs: bool, interpret: bool, config: mosaic_gpu.Tiles, return_residuals: bool = False):
@@ -387,37 +381,28 @@ class MosaicGmmTransposed(MosaicGmm):
 
 @dataclasses.dataclass(frozen=True)
 class MosaicTgmm(_Mosaic):
-    """`Tgmm` on Hopper (`mosaic_gpu.tgmm`): its warpgroups split the output's columns."""
+    """`Tgmm` on Hopper (`mosaic_gpu.tgmm`): `block_m` x `block_n` tiles of each group's gradient, its rows
+    `block_k` at a time."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
-        return tuple(tile for tile in MOSAIC_TILES
-                     if tile.split == 'n' and depth % tile.tile_m == 0 and width % tile.cta_n == 0)
-
-    @staticmethod
-    def loaded(tile: mosaic_gpu.Tiles) -> int:
-        return tile.tile_k * (tile.tile_m + tile.cta_n)
-
-    @staticmethod
-    def epilogue(tile: mosaic_gpu.Tiles) -> int:
-        return 2 * tile.tile_m * tile.tile_n
+        return tuple(tile for tile in MOSAIC_TILES if depth % tile.block_m == 0 and width % tile.block_n == 0)
 
     def cost(self, ba, config: mosaic_gpu.Tiles, target) -> float:
-        # Persistent over each group's output tiles.
         tokens, cotangent, sizes = ba.arguments['tokens'], ba.arguments['cotangent'], ba.arguments['sizes']
         (rows, depth), width, groups = tokens.shape, cotangent.shape[1], sizes.shape[0]
         size, out = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(ba.arguments['out_dtype']).itemsize
-        tiles = groups * (depth // config.tile_m) * (width // config.cta_n)
-        steps = _row_tiles(rows, groups, config.tile_k) / groups
-        read = 2 * (config.tile_m + config.tile_n) * config.tile_k
-        staged = steps * (self.loaded(config) + read) * size + config.tile_m * config.cta_n * out
-        moved = rows * (depth + width) * size + groups * depth * width * out
-        return cost.seconds(cost.Cost(
-            programs=tiles, device_bytes=moved,
-            program_flops=2 * steps * config.tile_k * config.tile_m * config.cta_n, program_staged=staged,
-            mode=_mode(tokens.dtype)), target)
+        blocks = depth // config.block_m, width // config.block_n
+        # A group's rows are read once a band of column tiles, its cotangent once for the row tiles in
+        # flight.
+        bands = math.ceil(blocks[1] / config.grid_block_n)
+        in_flight = max(1.0, _facts(target).multiprocessors / config.grid_block_n)
+        moved = ((bands * rows * depth + math.ceil(blocks[0] / in_flight) * rows * width) * size
+                 + groups * depth * width * out)
+        steps = _row_tiles(rows, groups, config.block_k) / groups
+        return self._cost(ba, config, target, groups * blocks[0] * blocks[1], steps, moved)
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array, *, out_dtype: str,
              interpret: bool, config: mosaic_gpu.Tiles, return_residuals: bool = False):

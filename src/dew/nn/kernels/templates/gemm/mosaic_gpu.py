@@ -12,29 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Grouped matmuls for Hopper in Pallas Mosaic GPU: `gmm`, `[rows, depth] x [groups, depth, width]` over
-rows sorted by group (with `transpose_rhs`, `[groups, width, depth]`), and `tgmm`, each group's rows
-transposed times their cotangent rows, `[groups, depth, width]`.
+"""JAX's Pallas Mosaic GPU grouped matmuls for Hopper, vendored: `gmm`, `[rows, depth] x [groups, depth,
+width]` over rows sorted by group (with `transpose_rhs`, `[groups, width, depth]`), and `tgmm`, each
+group's rows transposed times their cotangent rows, `[groups, depth, width]`.
 
-Derived from the jax-v0.11.2 source tree (tag jax-v0.11.2, 32544801; license header above), which ships
-these as examples: `pallas/ops/gpu/hopper_matmul_mgpu.py`'s kernel (one memory warpgroup feeding two
-compute warpgroups through `emit_pipeline_warp_specialized`, persistent over the multiprocessors, a
-planar snake over the output tiles) with the grouping of `ragged_dot_mgpu.py` and
-`transposed_ragged_dot_mgpu.py`. Changed for Dew:
+They are `ragged_dot` of `pallas/ops/gpu/ragged_dot_mgpu.py` and `transposed_ragged_dot` of
+`pallas/ops/gpu/transposed_ragged_dot_mgpu.py` in the jax-v0.11.2 source tree (tag jax-v0.11.2,
+32544801; license header above), which ship as examples: wgmma over pipelined TMA loads, persistent
+over the multiprocessors, a planar snake over the output tiles. A tile is a block-aligned row block of
+one group, a block two groups share running once for each, and a tile stores only its group's rows, in
+a power-of-two ladder of TMA stores. Changed for Dew, each marked `# Dew:`:
 
-- A group's tiles start at its first row, so only its last tile (or contraction step) is partial and
-  its valid rows are a prefix. Which group and rows each tile holds is computed in XLA before the
-  launch (`tile_map`, as MaxText's megablox computes its group metadata), where upstream searched
-  every group from each tile.
-- Rows past the routed ones form one more group, whose tiles store zeros, so the output's unrouted
-  rows are zero.
-- `gmm` stores a partial tile's valid rows in a power-of-two ladder of TMA stores through untiled
-  64 x 64 epilogue slots.
-- `tgmm` zeroes the rows past its group in both operands (a select, so a non-finite neighbour stays
-  out): each compute warpgroup in its own half of the cotangent tile, and warpgroup 0 in the shared
-  row tile, which warpgroup 1 waits for on a barrier. It writes any output dtype, an fp32 gradient
-  above all.
-- The program count is the device's multiprocessors, where upstream fixed an H100 SXM's 132.
+- the rows past the routed ones are one more group, whose tiles store zeros, so they come back zero;
+- each writes the output dtype it is asked for (fp32 for a kernel gradient), not the operands';
+- `tgmm` zeroes the neighbouring groups' rows of both operands by selection, where upstream
+  multiplied one operand by a mask, which kept a neighbour's NaN or infinity (NaN * 0);
+- the program count is the device's multiprocessors, where `ragged_dot` fixed an H100 SXM's 132.
 
 Each sums exact products of its 16-bit operands in fp32 (wgmma's accumulator) and rounds once to the
 output dtype.
@@ -42,323 +35,277 @@ output dtype.
 
 import dataclasses
 import functools
+import math
 
 import jax
-import jax.numpy as jnp
-from jax import lax
+from jax import lax, numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
-
-EPILOGUE = 64
-"""The rows and columns of an epilogue slot: a tile's accumulator is stored 64 x 64 at a time."""
 
 
 @dataclasses.dataclass(frozen=True)
 class Tiles:
-    """One launch's tiles: each compute warpgroup's accumulator (`tile_m` x `tile_n`), the contraction
-    step (`tile_k`), the steps in flight (`stages`), the output dimension the two compute warpgroups
-    split (`split`, 'm' or 'n'), and the output tiles in each band of the planar snake (`width`)."""
-    tile_m: int
-    tile_n: int
-    tile_k: int
+    """One launch's output tile (`block_m` x `block_n`), contraction step (`block_k`), the steps in flight
+    (`stages`, upstream's `max_concurrent_steps`) and the column tiles in each band of the planar snake
+    (`grid_block_n`)."""
+    block_m: int
+    block_n: int
+    block_k: int
     stages: int
-    split: str
-    width: int
-
-    @property
-    def cta_m(self) -> int:
-        """The rows of one program's output tile."""
-        return self.tile_m * (2 if self.split == 'm' else 1)
-
-    @property
-    def cta_n(self) -> int:
-        """The columns of one program's output tile."""
-        return self.tile_n * (2 if self.split == 'n' else 1)
+    grid_block_n: int
 
 
-def capacity(rows: int, groups: int, cta_m: int) -> int:
-    """The most tiles `tile_map` lays over `rows` rows in `groups` groups and the unrouted rest: each
-    of the `groups + 1` parts adds at most one partial tile to `ceil(rows / cta_m)`."""
-    return pl.cdiv(rows, cta_m) + groups
+@dataclasses.dataclass(frozen=True)
+class GroupInfo:
+    """Information regarding the group being processed in a block."""
 
+    group_id: jax.Array
+    block: jax.Array
+    block_start: jax.Array
+    actual_start: jax.Array
+    actual_end: jax.Array
+    start_within_block: jax.Array
+    actual_size: jax.Array
 
-def tile_map(group_sizes: jax.Array, rows: int, cta_m: int):
-    """Each of `capacity` tiles' group, first row and valid rows, and how many tiles are live.
+    @classmethod
+    def create(cls, group_lengths, tile, tid):
+        """Get the group info for the current block."""
 
-    A group's tiles cover its rows from its first, `cta_m` at a time; the rows past the routed ones
-    are group `groups`, whose tiles store zeros. Slots past the live tiles name group `groups` and
-    no rows."""
-    groups = group_sizes.shape[0]
-    sizes = group_sizes.astype(jnp.int32)
-    routed = jnp.sum(sizes)
-    parts = jnp.concatenate([sizes, jnp.maximum(rows - routed, 0)[None]])
-    starts = jnp.cumsum(parts) - parts
-    counts = (parts + cta_m - 1) // cta_m
-    ends = jnp.cumsum(counts)
-    slots = jnp.arange(capacity(rows, groups, cta_m), dtype=jnp.int32)
-    part = jnp.minimum(jnp.searchsorted(ends, slots, side='right'), groups).astype(jnp.int32)
-    index = slots - (ends[part] - counts[part])
-    first = starts[part] + index * cta_m
-    valid = jnp.clip(parts[part] - index * cta_m, 0, cta_m)
-    return part, first, valid, ends[-1:]
+        tile = jnp.int32(tile)
+        group_boundaries = [group_lengths[i] for i in range(len(group_lengths))]
 
+        # We usually only have very few groups, so we unroll the loop processing
+        # them. Normally we'd break out of the loop early, once we'd have found our
+        # boundary, but we can't do that when unrolling, so we rely on many selects
+        # to mask out the epilogue of the loop.
+        group_end = group_start = block = group = end = jnp.array(0, dtype=jnp.int32)
 
-def _transforms(dtype, columns: int):
-    """hopper_matmul_mgpu's tiling and swizzle for a block `columns` wide."""
-    swizzle = plgpu.find_swizzle(columns * jnp.dtype(dtype).itemsize * 8)
-    return (plgpu.TilingTransform((8, swizzle // jnp.dtype(dtype).itemsize)), plgpu.SwizzleTransform(swizzle))
+        for i, b in enumerate(group_boundaries):
+            # Start/end are inclusive
+            start = end
+            end = start + b
+            final = end - 1
+            start_block = lax.div(start, tile)
+            final_block = lax.div(final, tile)
+            block_end = final_block + 1
+            tid_begin = start_block + i
+            tid_end = block_end + i
+            # How many blocks after is our block?
+            this_is_group = (tid_begin <= tid) & (tid < tid_end)
+            block = lax.select(this_is_group, tid - tid_begin + start_block, block)
+            group = lax.select(this_is_group, jnp.int32(i), group)
+            group_start = lax.select(this_is_group, start, group_start)
+            group_end = lax.select(this_is_group, end, group_end)
 
-
-def _ignore(*_, **__) -> None:
-    """A pipeline body or compute context that does nothing: the allocations a pipeline takes do not
-    depend on them (hopper_matmul_mgpu's `ignore`)."""
+        block_start = block * tile
+        actual_start = jnp.maximum(group_start, block_start)
+        actual_end = jnp.minimum(group_end, block_start + tile)
+        start_within_block = actual_start - block_start
+        actual_size = actual_end - actual_start
+        return cls(group_id=group, block=block, block_start=block_start, actual_start=actual_start,
+                   actual_end=actual_end, start_within_block=start_within_block, actual_size=actual_size)
 
 
 def _compiler_params():
     return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup)
 
 
-def gmm(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, transpose_rhs: bool,
-        out_dtype, multiprocessors: int, interpret: bool = False) -> jax.Array:
-    """Each group's rows of `tokens` times its matrix of `kernel`, or of its transpose with
-    `transpose_rhs`, `[rows, width]` in `out_dtype`; unrouted rows are zero. The depth must divide by
-    `tiles.tile_k` and the width by `tiles.cta_n`."""
-    rows, depth = tokens.shape
-    groups = kernel.shape[0]
-    width = kernel.shape[1] if transpose_rhs else kernel.shape[2]
-    out_dtype = jnp.dtype(out_dtype)
-    t = tiles
-    k_steps, n_tiles = depth // t.tile_k, width // t.cta_n
-    transforms = _transforms(tokens.dtype, t.tile_k)
-    part, first, valid, live = tile_map(group_sizes, rows, t.cta_m)
-    epi_m, epi_n = min(EPILOGUE, t.tile_m), min(EPILOGUE, t.tile_n)
+def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, transpose_rhs: bool,
+        out_dtype, multiprocessors: int, interpret=False) -> jax.Array:
+    """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or
+    with `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, the rows past the
+    routed ones zero. The depth must divide by `tiles.block_k` and the width by `tiles.block_n`."""
+    block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
+    m, k = lhs.shape
+    g, k2, n = rhs.shape
+    if transpose_rhs:
+        k2, n = n, k2
+    if k != k2 or k % block_k or n % block_n:
+        raise ValueError(f"a [{m}, {k}] x [{g}, {k2}, {n}] product does not take {tiles}")
+    # Dew: the rows past the routed ones are a last group, whose tiles store zeros.
+    lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
+                               jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
 
-    def pipeline(step, compute_context):
-        rhs = (plgpu.BlockSpec((t.cta_n, t.tile_k), lambda k: (0, k), transforms=transforms)
-               if transpose_rhs else
-               plgpu.BlockSpec((t.tile_k, t.cta_n), lambda k: (k, 0), transforms=transforms))
-        return plgpu.emit_pipeline_warp_specialized(
-            step, grid=(k_steps,), memory_registers=40,
-            in_specs=[plgpu.BlockSpec((t.cta_m, t.tile_k), lambda k: (0, k), transforms=transforms), rhs],
-            wg_axis="wg", num_compute_wgs=2, max_concurrent_steps=t.stages,
-            compute_context=compute_context)
+    def body(rows_per_expert_gmem, lhs_gmem, rhs_gmem, o_gmem):
+        grid_m = pl.cdiv(m, block_m) + g  # Dew: g groups and the unrouted rows
+        grid_n = pl.cdiv(n, block_n)
 
-    def body(part_ref, first_ref, valid_ref, live_ref, x_ref, w_ref, out_ref):
-        @functools.partial(pl.run_scoped,
-                           allocations=pipeline(_ignore, _ignore).get_allocations(x_ref, w_ref.at[0]),
-                           slots=plgpu.SMEM((2, 2, epi_m, epi_n), out_dtype),
-                           collective_axes="wg")
-        def scope(allocations, slots):
-            wg = lax.axis_index("wg")
-            wg_rows = wg * t.tile_m if t.split == 'm' else 0
-            wg_columns = wg * t.tile_n if t.split == 'n' else 0
+        @plgpu.nd_loop((grid_m * grid_n,), collective_axes="sm")
+        def mn_loop(loop_info: plgpu.NDLoopInfo):
+            mi, ni = plgpu.planar_snake(loop_info.index[0], (grid_m, grid_n), 1, tiles.grid_block_n)
+            group_info = GroupInfo.create(rows_per_expert_gmem, block_m, mi)
 
-            @plgpu.nd_loop((live_ref[0] * n_tiles,), collective_axes="sm")
-            def _(info):
-                (index,) = info.index
-                tile, column = plgpu.planar_snake(index, (live_ref[0], n_tiles), 1, t.width)
-                group, start, count = part_ref[tile], first_ref[tile], valid_ref[tile]
-                # This warpgroup's rows of the tile that are the group's: a prefix of its own.
-                own = jnp.clip(count - wg_rows, 0, t.tile_m)
-                out = out_ref.at[pl.ds(start + wg_rows, t.tile_m),
-                                 pl.ds(column * t.cta_n + wg_columns, t.tile_n)]
-
-                def store(value):
-                    _ladder(value, own, out, slots.at[wg], epi_m, epi_n)
-
-                def compute_context(run):
-                    @functools.partial(pl.run_scoped, acc=plgpu.ACC((t.tile_m, t.tile_n), jnp.float32))
-                    def _(acc):
-                        run(acc)
-                        store(acc[...].astype(out_dtype))
-
-                def step(_, x_smem, w_smem, acc):
-                    lhs = x_smem.at[pl.ds(wg_rows, t.tile_m)] if t.split == 'm' else x_smem
-                    if transpose_rhs:
-                        rhs = (w_smem.at[pl.ds(wg_columns, t.tile_n)] if t.split == 'n' else w_smem).T
-                    else:
-                        rhs = w_smem.at[:, pl.ds(wg_columns, t.tile_n)] if t.split == 'n' else w_smem
-                    plgpu.wgmma(acc, lhs, rhs)
-                    plgpu.wgmma_wait(0)
-                    return acc
-
-                @pl.when(group < groups)
+            def acc_scope(acc_ref):
+                # Dew: the unrouted rows' tiles multiply nothing, their accumulator stays zero.
+                @pl.when(group_info.group_id < g)
                 def _():
-                    columns = pl.ds(column * t.cta_n, t.cta_n)
-                    pipeline(step, compute_context)(
-                        x_ref.at[pl.ds(start, t.cta_m)],
-                        w_ref.at[group].at[columns] if transpose_rhs else w_ref.at[group].at[:, columns],
-                        allocations=allocations)
+                    plgpu.emit_pipeline(
+                        lambda _, lhs_smem, rhs_smem: plgpu.wgmma(
+                            acc_ref, lhs_smem, rhs_smem.transpose((1, 0)) if transpose_rhs else rhs_smem),
+                        grid=(k // block_k,),
+                        in_specs=[
+                            plgpu.BlockSpec((block_m, block_k), lambda k: (group_info.block, k),
+                                            delay_release=1),
+                            plgpu.BlockSpec((block_n, block_k) if transpose_rhs else (block_k, block_n),
+                                            lambda k: (ni, k) if transpose_rhs else (k, ni), delay_release=1),
+                        ],
+                        max_concurrent_steps=tiles.stages,
+                    )(lhs_gmem, rhs_gmem.at[jnp.minimum(group_info.group_id, g - 1)])
+                return acc_ref[...]
 
-                # The unrouted rows: the compute warpgroups store zeros, the memory warpgroup idles.
-                @pl.when((group == groups) & (wg < 2))
-                def _():
-                    store(_zeros((t.tile_m, t.tile_n), out_dtype))
+            acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
 
-        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+            @functools.partial(pl.run_scoped, o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype))
+            def store_scope(o_smem):
+                o_smem[...] = acc.astype(o_smem.dtype)
+                plgpu.commit_smem()
 
-    launch = plgpu.kernel(
-        body, out_type=jax.ShapeDtypeStruct((rows, width), out_dtype), grid=(multiprocessors,),
-        grid_names=("sm",), num_threads=3, thread_name="wg", compiler_params=_compiler_params(),
-        interpret=interpret)
-    return launch(part, first, valid, live, tokens, kernel)
+                smem_start = group_info.start_within_block
+                remaining_rows = min(block_m, m)
+                # TMA descriptors need to be generated with static tile sizes along each axis, but we
+                # do not know at compile time how many rows we will need to store, only that it is at
+                # most min(block_m, m): a logarithmic ladder of descriptors, each storing 2**i rows,
+                # stores any count between 1 and min(block_m, m).
+                while remaining_rows > 0:
+                    const_rows_len = 1 << int(math.log2(remaining_rows))
+                    remaining_rows //= 2
+                    _store_rows(o_smem, o_gmem, group_info, smem_start, const_rows_len, ni * block_n)
+                    smem_start += group_info.actual_size & const_rows_len
+                plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
-
-def _ladder(value, rows, out, slots, epi_m: int, epi_n: int) -> None:
-    """Store the first `rows` rows of `value`, one warpgroup's tile, to `out` at its own place: 64 x 64
-    at a time through `slots` (two, double-buffered), each slot's valid rows in TMA stores of 64, 32, ...,
-    1 rows, which every count below 128 sums to. A slot is written again only once its last store has
-    read it."""
-    tile_m, tile_n = value.shape
-    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-    for epi_row in range(tile_m // epi_m):
-        for epi_column in range(tile_n // epi_n):
-            slot = (epi_row * (tile_n // epi_n) + epi_column) % 2
-            plgpu.wait_smem_to_gmem(1, wait_read_only=True)
-            slots[slot] = value[epi_row * epi_m:(epi_row + 1) * epi_m,
-                                epi_column * epi_n:(epi_column + 1) * epi_n]
-            plgpu.commit_smem()
-            stored = jnp.clip(rows - epi_row * epi_m, 0, epi_m)
-            offset = 0
-            size = epi_m
-            while size:
-                _store_rows(slots.at[slot], out, epi_row * epi_m, epi_column * epi_n, offset, size,
-                            (stored & size) != 0)
-                offset = offset + (stored & size)
-                size //= 2
-            plgpu.commit_smem_to_gmem_group()
+    kernel = plgpu.kernel(
+        body,
+        # Dew: the output dtype asked for, and the device's multiprocessors.
+        out_type=jax.ShapeDtypeStruct((m, n), jnp.dtype(out_dtype)),
+        grid=(multiprocessors,),
+        grid_names=("sm",),
+        compiler_params=_compiler_params(),
+        interpret=interpret,
+    )
+    return kernel(lengths, lhs, rhs)
 
 
-def _store_rows(slot, out, row, column, offset, size: int, stored) -> None:
-    """Where `stored`, copy `size` rows of `slot` from `offset` to `out` at (`row` + `offset`, `column`),
-    uncommitted."""
-    @pl.when(stored)
+def _store_rows(o_smem, o_gmem, group_info: GroupInfo, smem_start, rows: int, column) -> None:
+    """One rung of the ladder: where the tile's group has `rows` rows left, store them from `smem_start`."""
+    @pl.when(group_info.actual_size & rows != 0)
     def _():
-        plgpu.copy_smem_to_gmem(slot.at[pl.ds(offset, size)],
-                                out.at[pl.ds(row + offset, size), pl.ds(column, slot.shape[1])],
-                                commit_group=False)
+        o_smem_slice = o_smem.at[pl.ds(smem_start, rows)]
+        o_gref_slice = o_gmem.at[pl.ds(group_info.block_start + smem_start, rows),
+                                 pl.ds(column, o_smem.shape[1])]
+        plgpu.copy_smem_to_gmem(o_smem_slice, o_gref_slice)
 
 
-def tgmm(tokens: jax.Array, cotangent: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, out_dtype,
-         multiprocessors: int, interpret: bool = False) -> jax.Array:
-    """Each group's rows of `tokens` `[rows, depth]` transposed times its rows of `cotangent`
-    `[rows, width]`, `[groups, depth, width]` in `out_dtype`; an empty group's is zero. The two compute
-    warpgroups split the width (`tiles.split` is 'n'); `tiles.tile_m` is the depth of an output tile
-    and `tiles.tile_k` the rows a contraction step takes. The depth must divide by `tiles.tile_m` and the
-    width by `tiles.cta_n`."""
-    rows, depth = tokens.shape
-    width = cotangent.shape[1]
-    groups = group_sizes.shape[0]
+def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, out_dtype,
+         multiprocessors: int, interpret=False) -> jax.Array:
+    """Each group's rows of `lhs` `[rows, depth]` transposed times its rows of `rhs` `[rows, width]`:
+    `[groups, depth, width]` in `out_dtype`, an empty group's zero. The depth must divide by
+    `tiles.block_m` and the width by `tiles.block_n`; `tiles.block_k` is the rows a step takes."""
+    block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
+    k, m = lhs.shape
+    k2, n = rhs.shape
+    g = group_sizes.shape[0]
+    if k != k2 or m % block_m or n % block_n:
+        raise ValueError(f"a [{k}, {m}] by [{k2}, {n}] kernel gradient does not take {tiles}")
+
+    group_sizes = group_sizes.astype(jnp.int32)
+    group_starts = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(group_sizes)[:-1]]).astype(jnp.int32)
+    group_ends = jnp.cumsum(group_sizes).astype(jnp.int32)
+    group_block_starts = group_starts // block_k * block_k
+    group_block_ends = -(group_ends // -block_k) * block_k
+    group_num_blocks = (group_block_ends - group_block_starts) // block_k
+
+    swizzle = plgpu.find_swizzle(block_k * jnp.dtype(lhs.dtype).itemsize * 8)
+    swizzle_elems = swizzle // jnp.dtype(lhs.dtype).itemsize
+    transforms = (plgpu.TilingTransform((8, swizzle_elems)), plgpu.SwizzleTransform(swizzle))
     out_dtype = jnp.dtype(out_dtype)
-    t = tiles
-    if t.split != 'n':
-        raise ValueError(f"tgmm's warpgroups split the width, not {t.split!r}")
-    m_tiles, n_tiles = depth // t.tile_m, width // t.cta_n
-    sizes = group_sizes.astype(jnp.int32)
-    starts = jnp.cumsum(sizes) - sizes
-    x_transforms = _transforms(tokens.dtype, t.tile_m)
-    dy_transforms = _transforms(cotangent.dtype, t.tile_n)
-    out_transforms = _transforms(out_dtype, t.tile_n)
+    out_swizzle = plgpu.find_swizzle(block_n * out_dtype.itemsize * 8)
+    out_transforms = (plgpu.TilingTransform((8, out_swizzle // out_dtype.itemsize)),
+                      plgpu.SwizzleTransform(out_swizzle))
 
-    def pipeline(step, compute_context, steps):
-        return plgpu.emit_pipeline_warp_specialized(
-            step, grid=(steps,), memory_registers=40,
-            in_specs=[plgpu.BlockSpec((t.tile_k, t.tile_m), lambda r: (r, 0), transforms=x_transforms),
-                      plgpu.BlockSpec((t.tile_k, t.cta_n), lambda r: (r, 0), transforms=dy_transforms)],
-            wg_axis="wg", num_compute_wgs=2, max_concurrent_steps=t.stages,
-            compute_context=compute_context)
+    def body(group_sizes_gmem, group_starts_gmem, group_ends_gmem, group_num_blocks_gmem,
+             group_block_starts_gmem, lhs_gmem, rhs_gmem, o_gmem):
+        grid_m = pl.cdiv(m, block_m)
+        grid_n = pl.cdiv(n, block_n)
 
-    def body(sizes_ref, starts_ref, x_ref, dy_ref, out_ref):
-        @functools.partial(pl.run_scoped,
-                           # A static grid of fewer steps than stages would shrink the buffers.
-                           allocations=pipeline(_ignore, _ignore, t.stages).get_allocations(x_ref, dy_ref),
-                           slots=plgpu.SMEM((2, t.tile_m, t.tile_n), out_dtype, transforms=out_transforms),
-                           masked=plgpu.Barrier(num_arrivals=1), seen=plgpu.Barrier(num_arrivals=1),
-                           collective_axes="wg")
-        def scope(allocations, slots, masked, seen):
-            wg = lax.axis_index("wg")
-            columns = wg * t.tile_n
+        @plgpu.nd_loop((g, grid_m * grid_n), collective_axes="sm")
+        def mn_loop(loop_info: plgpu.NDLoopInfo):
+            g_i = loop_info.index[0]
+            m_i, n_i = plgpu.planar_snake(loop_info.index[1], (grid_m, grid_n), 1, tiles.grid_block_n)
 
-            @plgpu.nd_loop((groups, m_tiles * n_tiles), collective_axes="sm")
-            def _(info):
-                group, flat = info.index
-                m_tile, n_tile = plgpu.planar_snake(flat, (m_tiles, n_tiles), 1, t.width)
-                size, start = sizes_ref[group], starts_ref[group]
-                steps = pl.cdiv(size, t.tile_k)
-                out = out_ref.at[group, pl.ds(m_tile * t.tile_m, t.tile_m),
-                                 pl.ds(n_tile * t.cta_n + columns, t.tile_n)]
+            # This slice is potentially out of bounds, but we never access the out of bound part in
+            # emit_pipeline.
+            group_block_start = pl.multiple_of(group_block_starts_gmem[g_i], block_k)
+            gmem_slice = pl.ds(group_block_start, k)
 
-                def store(value):
-                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-                    slots[wg] = value
-                    plgpu.commit_smem()
-                    plgpu.copy_smem_to_gmem(slots.at[wg], out)
+            def acc_scope(acc_ref):
+                def block_matmul(block_idx, lhs_smem, rhs_smem):
+                    block_idx = block_idx[0]
 
-                def compute_context(run):
-                    @functools.partial(pl.run_scoped, acc=plgpu.ACC((t.tile_m, t.tile_n), jnp.float32))
-                    def _(acc):
-                        run(acc)
-                        store(acc[...].astype(out_dtype))
-
-                def step(indices, x_smem, dy_smem, acc):
-                    (r,) = indices
-                    kept = size - r * t.tile_k
-                    own = dy_smem.at[:, pl.ds(columns, t.tile_n)]
-
-                    # The group's last step may hold the next group's rows: zero them in both
-                    # operands, each warpgroup its own cotangent columns, warpgroup 0 the shared rows,
-                    # which warpgroup 1 reads once `masked` says so. Warpgroup 0 waits for `seen` in
-                    # turn, so it never arrives on `masked` twice before warpgroup 1 waits once (a
-                    # barrier's waits tell phases apart only by their parity).
-                    @pl.when(kept < t.tile_k)
+                    # Dew: the first and last blocks of the group may hold a neighbour's rows, which
+                    # both operands zero by selection, so a neighbour's NaN or infinity stays out.
+                    @pl.when(block_idx == 0)
                     def _():
-                        _zero_rows(own, kept)
+                        start_index = lax.rem(group_starts_gmem[g_i], block_k)
+                        _zero_rows(lhs_smem, rhs_smem, lambda rows: rows >= start_index, block_k, block_m,
+                                   block_n)
 
-                        @pl.when(wg == 0)
-                        def _():
-                            _zero_rows(x_smem, kept)
-                            plgpu.commit_smem()
-                            plgpu.barrier_arrive(masked)
-                            plgpu.barrier_wait(seen)
+                    @pl.when(block_idx == group_num_blocks_gmem[g_i] - 1)
+                    def _():
+                        last_index = lax.rem(group_ends_gmem[g_i] - 1, block_k)
+                        _zero_rows(lhs_smem, rhs_smem, lambda rows: rows <= last_index, block_k, block_m,
+                                   block_n)
 
-                        @pl.when(wg == 1)
-                        def _():
-                            plgpu.commit_smem()
-                            plgpu.barrier_wait(masked)
-                            plgpu.barrier_arrive(seen)
+                    plgpu.wgmma(acc_ref, lhs_smem.transpose((1, 0)), rhs_smem)
+                    if tiles.stages == 1:
+                        # Without delayed release, we won't have at least two separate smem blocks in
+                        # flight, so we cannot rely on the implicit wait of wgmma to guarantee that the
+                        # data in smem is ready to be overwritten by the next pipeline iteration.
+                        plgpu.wgmma_wait(0)
 
-                    plgpu.wgmma(acc, x_smem.T, own)
-                    plgpu.wgmma_wait(0)
-                    return acc
-
-                @pl.when(size > 0)
+                @pl.when(group_sizes_gmem[g_i] > 0)  # Skip the group if it is empty.
                 def _():
-                    pipeline(step, compute_context, steps)(
-                        x_ref.at[pl.ds(start, rows), pl.ds(m_tile * t.tile_m, t.tile_m)],
-                        dy_ref.at[pl.ds(start, rows), pl.ds(n_tile * t.cta_n, t.cta_n)],
-                        allocations=allocations)
+                    plgpu.emit_pipeline(
+                        block_matmul,
+                        grid=(group_num_blocks_gmem[g_i],),
+                        in_specs=[
+                            plgpu.BlockSpec((block_k, block_m), lambda k_i: (k_i, m_i),
+                                            delay_release=int(tiles.stages > 1), transforms=transforms),
+                            plgpu.BlockSpec((block_k, block_n), lambda k_i: (k_i, n_i),
+                                            delay_release=int(tiles.stages > 1), transforms=transforms),
+                        ],
+                        max_concurrent_steps=tiles.stages,
+                    )(lhs_gmem.at[gmem_slice, :], rhs_gmem.at[gmem_slice, :])
 
-                @pl.when((size == 0) & (wg < 2))
-                def _():
-                    store(_zeros((t.tile_m, t.tile_n), out_dtype))
+                return acc_ref[...]
 
-        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+            acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
 
-    launch = plgpu.kernel(
-        body, out_type=jax.ShapeDtypeStruct((groups, depth, width), out_dtype), grid=(multiprocessors,),
-        grid_names=("sm",), num_threads=3, thread_name="wg", compiler_params=_compiler_params(),
-        interpret=interpret)
-    return launch(sizes, starts, tokens, cotangent)
+            # Dew: the output in its own dtype and swizzle, an fp32 gradient above all.
+            @functools.partial(pl.run_scoped, o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype,
+                                                                transforms=out_transforms))
+            def store_scope(o_smem):
+                o_smem[...] = acc.astype(o_smem.dtype)
+                plgpu.commit_smem()
+                plgpu.copy_smem_to_gmem(
+                    o_smem, o_gmem.at[g_i, pl.ds(m_i * block_m, block_m), pl.ds(n_i * block_n, block_n)])
+                plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+
+    kernel = plgpu.kernel(
+        body,
+        out_type=jax.ShapeDtypeStruct((g, m, n), out_dtype),
+        grid=(multiprocessors,),
+        grid_names=("sm",),
+        compiler_params=_compiler_params(),
+        interpret=interpret,
+    )
+    return kernel(group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts, lhs, rhs)
 
 
-def _zeros(shape, dtype) -> jax.Array:
-    """Zeros in the layout of a warpgroup's accumulator, which the stores take."""
-    return plgpu.layout_cast(jnp.zeros(shape, dtype), plgpu.Layout.WGMMA)
-
-
-def _zero_rows(block, kept) -> None:
-    """Zero the rows of the SMEM `block` from `kept` on, by selection, as transposed_ragged_dot_mgpu
-    masks its first and last blocks."""
-    values = block[...]
-    rows = plgpu.layout_cast(lax.broadcasted_iota(jnp.int32, values.shape, 0), plgpu.Layout.WGMMA)
-    block[...] = jnp.where(rows < kept, values, jnp.zeros_like(values))
+def _zero_rows(lhs_smem, rhs_smem, kept, block_k: int, block_m: int, block_n: int) -> None:
+    """Zero the rows of both staged blocks, `[block_k, block_m]` and `[block_k, block_n]`, that `kept`
+    (of each row's index) turns down, by selection."""
+    for ref, columns in ((lhs_smem, block_m), (rhs_smem, block_n)):
+        values = ref[...]
+        rows = plgpu.layout_cast(lax.broadcasted_iota(jnp.int32, (block_k, columns), 0), plgpu.Layout.WGMMA)
+        ref[...] = jnp.where(kept(rows), values, jnp.zeros_like(values))
+    plgpu.commit_smem()
