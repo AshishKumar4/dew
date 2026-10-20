@@ -1,17 +1,32 @@
-"""tools/kernel_routes.py: a family's CPU trace within a GPU target reports the route each choice takes
-there."""
+"""tools/kernel_routes.py: every registered decoder family's CPU trace within each row of TARGETS that
+names a kernel reports the route each choice takes there, and each route is the target's kernel or a
+refusal a row or an inherent limit explains."""
 
 import json
 
-from dew.nn.kernels.generation import TARGETS
+import pytest
+
 from tools import kernel_routes
 
 
+@pytest.mark.parametrize("target", kernel_routes.audited())
+@pytest.mark.parametrize("family", kernel_routes.families())
+def test_every_route_of_a_family_is_its_targets_kernel_or_explained(family, target):
+    """The family's committed fixture, traced for each audited target and every mode (`kernel_routes.cells`):
+    each choice takes the target's preferred kernel, or leaves it by a refusal its kernel declares, a
+    gap with its row or inherent; a mixer refusing the mode's cache layout names its ledger row
+    (`LAYOUT_GAPS`). A bidirectional family prefills through its causal view and decodes a canvas over
+    that prefix. Any other route, refusal or a family with no fixture fails, each named."""
+    cells = list(kernel_routes.cells([family], [target]))
+    assert all(cell["fixture"] is not None for cell in cells), cells[0].get("error")
+    assert [cell["mode"] for cell in cells] == list(kernel_routes.MODES)
+    unexplained = [f"{cell['mode']}: {why}" for cell in cells for why in kernel_routes.unexplained(cell)]
+    assert not unexplained, "\n".join(unexplained)
+
+
 def test_a_family_traced_for_a_gpu_target_reports_each_choice_as_that_target_routes_it():
-    """Every audited row is a GPU target of the table, and llama's training step traced for sm80 reports
-    its attention as sm80 routes it: on the target's preferred kernel, or off it with the refusal's code
-    judged."""
-    assert set(kernel_routes.AUDITED) <= set(TARGETS)
+    """llama's training step traced for sm80 reports its attention as sm80 routes it: on the target's
+    preferred kernel, or off it with the refusal's code judged."""
     config = json.loads((kernel_routes.fixtures()["llama"] / "config.json").read_text())
     traced = kernel_routes.traced(config, "sm80", "train")
     attention = [route for route in traced if route.choice == "attention"]
