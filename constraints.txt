@@ -12,8 +12,8 @@
 # share one compiled kernel; and linear_call's batching rule, an all-unmapped
 # call left unmapped, and the JVP of its residuals and constants, which the
 # experts' fused SwiGLU route needs, with the values its transpose closes over
-# passed to the call as residuals (post9). Every CI and development install takes
-# this one build. Return to a release once one ships the fixes.
+# passed to the call as residuals (post9). Every CI and development install
+# takes this one build. Return to a release once one ships the fixes.
 # BEGIN package index (site/scripts/gen_install.py)
 --extra-index-url https://pypi.dewml.dev/simple
 # END package index
