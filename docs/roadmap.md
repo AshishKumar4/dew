@@ -48,7 +48,6 @@ The kernel direction was approved on 2026-10-19:
 - Tune fp32 paths and the ported fla kernels, retaining fusions only where measured. [276]
 - Improve one-row decode: M=1 products, repeated output-weight layout conversion and launch overhead. [483]
 - Fuse decode short convolution and its weight cast into one shared GDN, KDA and Mamba kernel. [485]
-- Let a one-chunk fused-head plan choose the untiled head when it improves memory or time. [542]
 - Measure pairwise KDA decay gradients under the same accuracy and performance gates before changing their reduction. [551]
 - Revisit host dispatch and command-buffer address updates when device time approaches the currently hidden host cost. [569]
 - Fold shared-mean gradient accumulation into weight-gradient work where it pays. [563]
@@ -60,8 +59,8 @@ The kernel direction was approved on 2026-10-19:
 - Separate normalization and shared attention policy from `attention.py`. [NNK-11]
 - Measure joined QKV in the same A100 session before adopting it. For unbounded packing, evaluate a recurrence implementation that stores continuation state without one full chunk state per position.
 - Accumulate low-precision bias gradients in fp32, keep cancelling key-bias gradients visible and use a single-rounding bias epilogue without a step-time regression. [620, 621, 634]
-- Prefer XLA for fp32 SwiGLU where its fusion wins. Fuse transaction admission and narrowing into the update pass where measured. [646, 648]
-- Compile evaluation and generation before their measured interval. Profile first compilation separately through lowering and XLA passes. [627, 629]
+- Prefer XLA for fp32 SwiGLU where its fusion wins. [646]
+- Profile first compilation separately through lowering and XLA passes. [629]
 - Keep document resets out of recurrence decay prefixes, move decode regrouping into the kernel boundary and finish shared tuner/template coverage. [NNK-4, NNK-8, 597]
 - Take paged attention through the typed kernel selector, so its eligibility is each kernel's own as every other operation's is. [742]
 - Close the route audit's gaps: rms_norm's inverse rounding and its decode operands, swiglu's dtype and its forward mode, each routed to the kernel its row names. [759]
@@ -98,7 +97,6 @@ The kernel direction was approved on 2026-10-19:
 - Infer ordinary input geometry once while retaining explicit `InputSpec` overrides. [207]
 - Record MFU runs through the configured tracker outside steady-step timing. [285]
 - Find manually quantized towers through a shared module inventory so compilation receives the required options. [594]
-- Reallocate composite-loss replay state at batch-ramp boundaries. [616]
 - Replace private distributed-client and cluster-detection access once jax-ml/jax#41735 provides the public seam. [617]
 - Keep model quantization below the training layer in `dew.quantization`; complete the remaining caller move. [TRN-7]
 - Measure the sharded optimizer frontier on two GPUs before adoption. Restore a distilled run's student without reading unused teacher weights. [OBJ-9]
@@ -106,8 +104,6 @@ The kernel direction was approved on 2026-10-19:
 - Match PNDM's multistep grouping and startup steps against Diffusers before remeasuring its parity margin. [647]
 - Find the tiled chunked head's residual: at token tile 2, about 40 of 8192 head-gradient elements sit more than twice as far from float64 as the whole-logits reference; at tile 20 there are none. [737]
 - Let `generate` run without a key where its sampling needs none, or require one; its None default is refused today. [745]
-- Keep quantized and plain traces apart. Qwix patches `dot_general` only while a wrapped call traces, so `jnp.matmul`'s jit cache can hold a quantized trace that a later plain call at the same shapes reuses, and the reverse. [736]
-- Bring the vocabulary-split head to the whole head's accuracy. Over exact-symmetry orders it sits 2.3–3.0× the whole head's distance from float64; combining the shards' partial log-sum-exps is the suspected cause. [734]
 - Compile a step lowered by `Trainer(lower_for=)` before allocating training time, carry its executable and tuning picks to the run, and measure the saved startup time. Lowering alone already works. [720]
 
 ## RL and serving
@@ -152,7 +148,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Build registry-backed uninterrupted/resumed flows and extend them to compiled-program reuse. [182, 183]
 - Inventory every kernel's float64 gate and derive GPU obligations from `TARGETS`. Runtime qualification remains open until the named device runs it. [184, 185]
 - Replace implementation pins with compile, fit and numerical behavior. Restore DeepSeek lifecycle gates against an independent, unmodified oracle. [192, 354]
-- Run one bounded image lifecycle qualification at a meaningful resolution and fresh-process CLI train/export flows. [295, 347]
+- Run one bounded image lifecycle qualification at a meaningful resolution. [295]
 - Extend low-coverage sampling, source and publication modules through scenario settings; run device-only code under device coverage. [580]
 - Keep numerical results keyed by CPU model and qualify CPU-dependent rounding against the reference on that same class. [478]
 - Reuse test results at executed-function and fixture-dependency granularity. [515]
@@ -163,11 +159,11 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Convert the suite's one-draw float64 comparisons, about 860, to that gate in waves by file group. Each wave is owned by the lane that owns its files, starts with a measured CI cost, and regenerates fixtures at K orders on the VM. Kernels expose their graphs as they move to templates; the black-box flash wheel and cuDNN stay end to end until the attention template replaces them. Move the remaining numerical consumers without filtering outputs or gradients. 294 call sites on main 411fc5964 in twelve file groups; a group draws one compiled program a comparison (orders do not batch under vmap, which changes XLA's arithmetic), and the estimate is about half again the suite's task time, not 52 times. [650, 668, 669, 670, 676, 682, 705, 712, 746, 747, 748, 749, 750, 751, 752, 753, 754, 755, 756, 757]
 - Replace test-policy violations with observable lifecycle and reference behavior:
 
-  - Training, sampling and objectives: [651, 652, 653, 654, 657, 658, 663, 667, 679, 680, 686, 687, 688, 692, 693, 695, 698, 701, 702, 707, 708, 709, 710].
+  - Training, sampling and objectives: [651, 652, 653, 654, 657, 658, 663, 667, 679, 680, 686, 687, 688, 692, 695, 698, 701, 702, 707, 708].
   - Model loading, adapters and exports: [675, 677, 681, 691, 699, 700, 703, 704].
   - Attention, convolution and tuning: [655, 656, 674, 689, 690, 696].
   - Recurrences and looped models: [659, 660, 661, 662, 664, 665, 678, 706, 711].
   - Data and packing: [683, 684, 685, 694].
-- Fix the training qualification's setup, which reads an empty marker file in the full suite. [735]
+  - Printed programs and assertion-only pins in the remaining lanes' files, Training's done: [709, 710].
 - Make float32 numpy references independent of the worker's OpenBLAS kernels, which round differently on x86-64-v3 and v4, without pinning the weaker one. [744]
 - Dew requires its own JAX build, installed from pypi.dewml.dev, with no stock-JAX routes or version gates. The fork AshishKumar4/jax follows upstream releases by CI and carries a patch stack, each patch sent upstream and dropped at the fork's first rebase onto a release that contains it: the compilation cache-key fixes for jax-ml/jax#40940 and #41502 (jax-ml/jax#41776, #41777), and `linear_call`'s batching and forward-mode rules (jax-ml/jax#41782, #41780). Before Dew moves to JAX 0.12, its XLA:CPU narrow float32 dots, which sum K in one sequential chain about twice as far from float64 as 0.11.2's partial sums, need a fix or an upstream report. [713, 714, 731, 732, 743]
