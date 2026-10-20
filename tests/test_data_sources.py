@@ -984,10 +984,12 @@ def test_a_parquet_store_reads_with_the_credentials_its_profile_names(tmp_path, 
     try:
         iam = boto3.client("iam", endpoint_url=endpoint, region_name="us-east-1",
                            aws_access_key_id="setup", aws_secret_access_key="setup")
-        iam.create_user(UserName="reader")
-        iam.put_user_policy(UserName="reader", PolicyName="s3", PolicyDocument=json.dumps({
+        # The endpoint's users outlive it in this process, so each test names its own.
+        user = "reader-" + uuid4().hex
+        iam.create_user(UserName=user)
+        iam.put_user_policy(UserName=user, PolicyName="s3", PolicyDocument=json.dumps({
             "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}))
-        key = iam.create_access_key(UserName="reader")["AccessKey"]
+        key = iam.create_access_key(UserName=user)["AccessKey"]
         (tmp_path / "credentials").write_text(
             f"[reader]\naws_access_key_id = {key['AccessKeyId']}\n"
             f"aws_secret_access_key = {key['SecretAccessKey']}\n")
