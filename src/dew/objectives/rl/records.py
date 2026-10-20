@@ -32,8 +32,18 @@ def reals(value: object, key: str) -> tuple[float, ...]:
 
 def observation_record(value: Mapping[str, object]) -> Observation:
     record = section(value, "observation")
+    reward = record["reward"]
     return Observation(integers(record["context"], "context"),
-                       EpisodeStatus(integer(record["status"], "status")), text(record["detail"], "detail"))
+                       EpisodeStatus(integer(record["status"], "status")), text(record["detail"], "detail"),
+                       None if reward is None else real(reward, "reward"),
+                       messages(record["messages"], "messages"))
+
+
+def messages(value: object, key: str) -> tuple[Mapping[str, object], ...]:
+    """A list of chat messages, each a JSON object, kept as written."""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{key}={value!r}: this field is a list of chat messages")
+    return tuple(section(message, key) for message in value)
 
 
 def action_record(value: Mapping[str, object]) -> Action:

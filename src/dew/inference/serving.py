@@ -332,16 +332,19 @@ class PagedRows:
         """How many reloads the rows have seen; a row seated before the last one keeps older keys."""
 
     def check(self, cache: Variables) -> None:
-        """Every cached leaf has to be one of paged attention's: a paged server
-        moves rows by page table and cursor alone, and a layer with other
-        per-row state (a recurrent mixer, latent attention) takes the dense one."""
-        leaves = jax.tree_util.tree_leaves_with_path(cache)
+        """The pool holds paged attention's keys and values, and every other
+        cached leaf is a row's own state (a recurrent mixer's memory, latent
+        attention's cache, image groups), kept in the row's slot. A shared
+        prefix's pages hold its keys alone, not the state its prompt left, so
+        a cache with such state is refused a prefix cache."""
         if not is_paged(cache):
             raise ValueError("the model did not take the paged layout: none of its layers keeps a page table")
-        for path, _ in leaves:
-            if leaf_name(path) not in POOLED | {TABLE} | ROW_CURSORS:
-                raise ValueError(f"a paged server needs every cached layer to be paged attention; "
-                                 f"{jax.tree_util.keystr(path)} is not")
+        if any(part.prefix_cache for part in self.pages):
+            for path, _ in jax.tree_util.tree_leaves_with_path(cache):
+                if leaf_name(path) not in POOLED | {TABLE} | ROW_CURSORS:
+                    raise ValueError(f"a shared prefix's pages hold its keys, not "
+                                     f"{jax.tree_util.keystr(path)}, a row's own state its prompt left; "
+                                     "serve this model without prefix_cache")
 
     def refuse(self, length: int, budget: int) -> None:
         part = self.pages[0]

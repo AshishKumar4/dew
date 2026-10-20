@@ -21,14 +21,16 @@ artifact it then uploads; CI's package job runs it on every push.
 from __future__ import annotations
 
 import argparse
+import runpy
 import subprocess
 import sys
 import tempfile
 import venv
 from pathlib import Path
 
-INDEX = "https://pypi.dewml.dev/simple"
-"""Dew's package index, the one place Dew's JAX build is served (pyproject.toml, docs/installation.md)."""
+INDEX = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src/dew/telemetry/builds.py"))[
+    "PACKAGE_INDEX"]
+"""Dew's package index, the one place Dew's JAX build is served (dew.telemetry.builds.PACKAGE_INDEX)."""
 
 TRAIN = """
 import json, sys
