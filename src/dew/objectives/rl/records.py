@@ -41,7 +41,9 @@ def observation_record(value: Mapping[str, object]) -> Observation:
 
 def messages(value: object, key: str) -> tuple[Mapping[str, object], ...]:
     """A list of chat messages, each a JSON object, kept as written."""
-    return sequence(value, lambda message: section(message, key), key)
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{key}={value!r}: this field is a list of chat messages")
+    return tuple(section(message, key) for message in value)
 
 
 def action_record(value: Mapping[str, object]) -> Action:
