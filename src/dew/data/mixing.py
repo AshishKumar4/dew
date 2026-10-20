@@ -215,9 +215,13 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         }
 
     def set_state(self, state: Mapping[str, object]) -> None:
+        """Restore the position and counts. A repeat above rewinds this iterator to its first state
+        after each pass, which leaves the run of rejections going on and a warning given, so they
+        are kept where this iterator holds more."""
         super().set_state(state)
-        self._predicate.consecutive = integer(state["consecutive"], "consecutive")
-        self._predicate.warned = bool(state["warned"])
+        self._predicate.consecutive = max(self._predicate.consecutive,
+                                          integer(state["consecutive"], "consecutive"))
+        self._predicate.warned = self._predicate.warned or boolean(state["warned"], "warned")
 
 
 class Accepted(pygrain.IterDataset[Batch]):
