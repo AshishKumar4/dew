@@ -209,6 +209,166 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
 
 
 
+PARITY = 1.5
+"""The owner's factor (bible §7, 2026-10-20): each leaf's RMS error from float64 within 1.5 times the
+reference's, on the same inputs, with no floor of any kind. Check 1 (`assert_as_exact`) holds it now;
+the one-draw rule's FACTOR joins it once every site that rule would then fail has moved to check 1."""
+
+BOOTSTRAP = 2000
+"""Resamples of a site's seeds for the pooled ratio's interval (`_interval`), drawn by one fixed key so
+an assertion decides alike on every run."""
+CONFIDENCE = 0.999
+"""The bootstrap interval check 1 reads: a site whose pooled ratio's 99.9% interval is wider than
+PARITY cannot tell an equally exact computation from one PARITY off, and is inconclusive."""
+REDRAW = 4
+"""A failing site's pooled ratio is drawn again over REDRAW times its seeds before it fails."""
+
+
+class Inconclusive(AssertionError):
+    """Check 1 could not decide a leaf: its seeds do not resolve PARITY. Never a pass; the site takes
+    larger inputs or more seeds (`seeds_for`)."""
+
+
+def _pooled(mine: np.ndarray, theirs: np.ndarray) -> float:
+    """sqrt(sum a / sum b): the RMS ratio over every draw and element, each draw's mean squared error
+    weighed alike, as the owner's estimand reads it."""
+    return float(np.sqrt(np.sum(mine) / np.sum(theirs))) if np.sum(theirs) > 0 else (
+        0.0 if np.sum(mine) == 0 else float("inf"))
+
+
+def _interval(mine: np.ndarray, theirs: np.ndarray | None = None, control: np.ndarray | None = None
+              ) -> tuple[float, float]:
+    """The pooled ratio's CONFIDENCE bootstrap interval over seeds: Dew's and the reference's errors
+    resampled by the same seeds, or, for `control`, the reference's errors on two disjoint seed sets
+    resampled apart (the reference compared with itself, an equally exact pair)."""
+    rng = np.random.default_rng(0)
+    count = len(mine)
+    picks = rng.integers(0, count, (BOOTSTRAP, count))
+    if control is None:
+        ratios = np.sqrt(mine[picks].sum(axis=1) / np.maximum(theirs[picks].sum(axis=1), 1e-300))
+    else:
+        other = rng.integers(0, len(control), (BOOTSTRAP, len(control)))
+        ratios = np.sqrt(mine[picks].sum(axis=1) / np.maximum(control[other].sum(axis=1), 1e-300))
+    tail = (1 - CONFIDENCE) / 2
+    return float(np.quantile(ratios, tail)), float(np.quantile(ratios, 1 - tail))
+
+
+def _resolves(low: float, high: float) -> bool:
+    """Whether a pooled ratio's interval is no wider than PARITY, so it tells an equally exact
+    computation from one PARITY off."""
+    return high <= PARITY * max(low, 1e-300)
+
+
+def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None):
+    """Each leaf's per-seed mean squared errors from float64, Dew's and the reference's, and each
+    seed's (Dew's, the reference's) worst row over its size, with the leaves' names: every function
+    run on `draw(seed)`'s inputs, truth `truth_fn` on them (by default `reference_fn` on them widened
+    to float64)."""
+    mine, theirs, rows, names = [], [], [], None
+    for seed in seeds:
+        inputs = draw(seed)
+        dew, reference = dew_fn(*inputs), reference_fn(*inputs)
+        with jax.enable_x64(new_val=True):
+            truth = (truth_fn or reference_fn)(*widened(inputs))
+        paths = jax.tree_util.tree_leaves_with_path(dew)
+        names = names or [jax.tree_util.keystr(path) for path, _ in paths]
+        leaves = zip([leaf for _, leaf in paths], jax.tree.leaves(reference), jax.tree.leaves(truth),
+                     strict=True)
+        errors, worst = [], []
+        for leaf, their_leaf, true in leaves:
+            true = np.asarray(true, np.float64)
+            errors.append((float(np.mean(np.square(np.asarray(leaf, np.float64) - true))),
+                           float(np.mean(np.square(np.asarray(their_leaf, np.float64) - true)))))
+            sizes, my_rows = row_errors(leaf, true)
+            _, their_rows = row_errors(their_leaf, true)
+            sized = sizes > 0
+            worst.append((float(np.max(my_rows[sized] / sizes[sized])) if sized.any() else 0.0,
+                          float(np.max(their_rows[sized] / sizes[sized])) if sized.any() else 0.0))
+        mine.append([error[0] for error in errors])
+        theirs.append([error[1] for error in errors])
+        rows.append(worst)
+    return np.asarray(mine), np.asarray(theirs), np.asarray(rows), names
+
+
+def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
+    """Check 1 of the owner's gate (bible §7, 2026-10-20): on par. Each leaf's RMS error from float64,
+    pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
+    those seeds within ROW_FACTOR times the reference's worst.
+
+    `draw(seed)` returns the inputs of one draw, the same for a seed on every run; `dew_fn(*inputs)`
+    and `reference_fn(*inputs)` return the same tree, and truth is `reference_fn` on the inputs
+    widened to float64, or `truth_fn` on them where the reference fixes a precision of its own (an
+    output dtype it closes over). A draw may be an orbit's: the same values under an exact symmetry the seed
+    picks. `seeds` is the site's declared count, sized by `seeds_for` so the reference compared with
+    itself resolves PARITY; jit the two functions so every seed reuses one compiled program.
+
+    A leaf passes when its pooled ratio (`_pooled`) is at most PARITY and its seeds resolve it: the
+    ratio's CONFIDENCE bootstrap interval over them no wider than PARITY, or lying wholly at or under
+    it. An interval that straddles PARITY and is wider than it is inconclusive, never a pass: its site
+    takes larger inputs or more seeds; one lying wholly over PARITY is over it, however wide. A leaf
+    over PARITY is drawn again over REDRAW times as many further declared seeds, and fails if it is
+    still over: a finding in the code or the reference arm. A leaf the reference holds exactly on
+    every seed, Dew must too.
+
+    This is an engineering gate, deterministic and reproducible, not a guarantee against every error
+    law: "never wrong" is check 2's, each element within its operation's certified bound
+    (tests/op_certificates.py)."""
+    mine, theirs, rows, names = _drawn(dew_fn, reference_fn, draw, range(seeds), truth_fn)
+    over, unresolved = [], []
+    for index, name in enumerate(names):
+        leaf = label + name
+        a, b = mine[:, index], theirs[:, index]
+        ratio = _pooled(a, b)
+        if np.sum(b) == 0:
+            if np.sum(a) > 0:
+                over.append(f"{leaf}: the reference equals float64 on every seed and dew does not")
+            continue
+        low, high = _interval(a, b)
+        # Decided where the whole interval lies on one side of PARITY, however wide; straddling it, an
+        # interval wider than PARITY cannot tell an equally exact computation from one PARITY off.
+        if low <= PARITY < high and not _resolves(low, high):
+            unresolved.append(f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s {CONFIDENCE:.1%} "
+                              f"interval over {seeds} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}; "
+                              f"give the site larger inputs or more seeds (`seeds_for`)")
+            continue
+        if ratio > PARITY:
+            further = range(seeds, (1 + REDRAW) * seeds)
+            more_mine, more_theirs, _, _ = _drawn(dew_fn, reference_fn, draw, further, truth_fn)
+            again = _pooled(np.concatenate([a, more_mine[:, index]]),
+                            np.concatenate([b, more_theirs[:, index]]))
+            if again > PARITY:
+                total = (1 + REDRAW) * seeds
+                over.append(f"{leaf}: dew's RMS error from float64 is {again:.3f} times the reference's "
+                            f"over {total} seeds (allowed {PARITY}; {ratio:.3f} over the first {seeds})")
+        my_row, their_row = float(np.max(rows[:, index, 0])), float(np.max(rows[:, index, 1]))
+        if not within(my_row, ROW_FACTOR * their_row):
+            over.append(f"{leaf}: the worst row over {seeds} seeds is {my_row:.3e} from float64 over its "
+                        f"size, the reference's {their_row:.3e}, allowed {ROW_FACTOR * their_row:.3e}")
+    if over:
+        raise AssertionError("\n".join(over + unresolved))
+    if unresolved:
+        raise Inconclusive("\n".join(unresolved))
+
+
+def seeds_for(reference_fn, draw, label: str, *, start: int = 8, most: int = 512, truth_fn=None) -> int:
+    """The seeds a site declares: the fewest, doubling from `start`, for which the reference compared
+    with itself (its errors on two disjoint seed sets, `_interval`'s control) resolves PARITY in every
+    leaf: the pooled ratio's CONFIDENCE interval no wider than PARITY. Fails past `most`, where the
+    site needs larger inputs or fewer shared factors, not more seeds."""
+    count = start
+    while count <= most:
+        _, first, _, names = _drawn(reference_fn, reference_fn, draw, range(count), truth_fn)
+        _, second, _, _ = _drawn(reference_fn, reference_fn, draw, range(count, 2 * count), truth_fn)
+        wide = [name for index, name in enumerate(names)
+                if np.sum(first[:, index]) > 0 and np.sum(second[:, index]) > 0
+                and not _resolves(*_interval(first[:, index], control=second[:, index]))]
+        if not wide:
+            return count
+        count *= 2
+    raise AssertionError(f"{label}: the reference compared with itself does not resolve {PARITY} within "
+                         f"{most} seeds at {wide[:4]}; give the site larger inputs or fewer shared factors")
+
+
 def assert_no_less_exact(dew, reference, truth, label: str) -> None:
     """An unchanged computation has no larger float64 distance than its source."""
     mine, theirs = distance(dew, truth), distance(reference, truth)
