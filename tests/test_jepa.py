@@ -321,7 +321,7 @@ def health_in(z, dtype):
     return np.asarray([z.std(axis=0).mean(), np.sqrt(np.mean(off ** 2))])
 
 
-HEALTH_SEEDS = 32
+HEALTH_SEEDS = 256
 """Check 1's declared seeds for the health statistics, sized by `seeds_for` (2026-10-21, on armada)."""
 
 
