@@ -1436,8 +1436,18 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     recomputing 'delta_memory', `dew.nn.backbones.decoder_block.RematPolicy.recompute`). Each is
     named for a block's remat policy, which keeps or recomputes it."""
     spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
+    g = checkpoint_name(chunk_local_cumsum(g, scale=RCP_LN2, chunk=chunk, spans=spans, interpret=interpret),
+                        'delta_decay')
+    return cumulated_fwd(q, k, v, g, beta, h0, spans, scale, chunk, interpret, keep)
+
+
+def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: int, interpret: bool,
+                  keep: bool = True):
+    """`_rule_fwd` from the decay cumulated in base 2 within each chunk (`chunk_local_cumsum`), which is
+    all the rest of the rule reads of it: the inverse, `w` and `u`, the memory across chunks, then the
+    output, and what the backward saves. The prefix is a value the port rounds and holds, a node of
+    its graph (bible §7's source-aware gate), and this the port's arithmetic on it."""
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
-    g = checkpoint_name(chunk_local_cumsum(g, scale=RCP_LN2, **kernels), 'delta_decay')
     a = checkpoint_name(kkt_solve(k, g, beta, **kernels), 'delta_inverse')
     w, u = recompute_w_u(k, v, beta, a, g, **kernels)
     h, corrected, final = chunk_fwd_h(k, w, u, g, h0, **kernels)
