@@ -17,6 +17,7 @@ from reference_error import assert_as_exact_as_the_reference
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import counted_places
+from dew.nn.kv_cache import KVCache
 from dew.nn.kernels import bf16_dot_runs
 from dew.nn.local_attention import local_attention
 
@@ -229,19 +230,21 @@ def test_a_row_with_padding_among_its_tokens_bands_its_window_over_a_sequence_ax
     assert banded * 4 < dense
 
 
+@pytest.mark.parametrize("layout", [KVCache(), KVCache(page_size=4)], ids=["dense", "paged"])
 @pytest.mark.parametrize("shared", [False, True], ids=["per-row", "shared"])
 @pytest.mark.parametrize("origin", [0, 2], ids=["from-zero", "logical-origin"])
-def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin, shared):
+def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin, shared, layout):
     """The whole-sequence pass runs `local_attention`; the cached decode runs
     the chunk as a mask over cache slots. Both read the same keys: chunks
     are cut at the tokens' logical places, so a row whose places start at
     `origin` (a continuation, a canvas) cuts them as its whole pass does,
     not at its cache slots, whether each row gives its places or the rows
-    share one vector of them."""
+    share one vector of them, and whether the cache keeps its keys in rows
+    or in a pool of pages."""
     model = CausalTransformer(
         vocab_size=64, num_layers=2, emb_features=32, num_heads=4, num_kv_heads=2,
         max_seq_len=24, layer_types=("chunked_attention", "full_attention"),
-        kinds={"chunked_attention": {"chunk": 5}}, attention_impl="xla")
+        kinds={"chunked_attention": {"chunk": 5}}, attention_impl="xla").with_kv_cache(layout)
     tokens = jax.random.randint(jax.random.key(1), (2, 13), 0, 64)
     positions = jnp.arange(13) + origin if shared else jnp.broadcast_to(jnp.arange(13) + origin, tokens.shape)
     variables = model.init(jax.random.key(0), tokens)
