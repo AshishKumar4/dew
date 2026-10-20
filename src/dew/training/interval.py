@@ -52,11 +52,6 @@ def committed_tokens(control: dict, budget: int | None) -> int | None:
     return None
 
 
-def known_tokens(count: int | None) -> dict[str, int | bool]:
-    """An interval's starting token clock from a checkpoint's count (`committed_tokens`): the count,
-    or 0 and unknown where the checkpoint could not say."""
-    return {"tokens_before_log": count or 0, "tokens_known": count is not None}
-
 class Book(NamedTuple):
     """The loop's device-side counters.
 
@@ -180,6 +175,14 @@ class Interval:
         streak = self.streak()
         if streak is not None:
             checked_streak(int(on_host(streak, step)), step, display)
+
+    @classmethod
+    def resumed(cls, control: dict, budget: int | None, *, last_saved: int | None) -> Interval:
+        """An interval from now on, its token clock read off a checkpoint's `control`
+        (`committed_tokens`), which it takes the clock's fields out of."""
+        counted = committed_tokens(control, budget)
+        return cls(time.time(), last_saved=last_saved, tokens_before_log=counted or 0,
+                   tokens_known=counted is not None)
 
     @property
     def token_control(self) -> dict[str, int]:

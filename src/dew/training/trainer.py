@@ -132,7 +132,7 @@ from dew.training.distributed import (
     taking_over,
 )
 from dew.training.evaluation import EvalSuite, Evaluation
-from dew.training.interval import Interval, Taken, committed_tokens, held, known_tokens
+from dew.training.interval import Interval, Taken, held
 from dew.training.memory import (
     climb_to,
     device_tokens,
@@ -1488,9 +1488,8 @@ class Trainer(Generic[Loss, Effects]):
             state = jax.device_put(initial, shardings)
             position = None
         run.last_checkpoint = time.perf_counter()
-        interval = Interval(time.time(), last_saved=(
-            int(state.step) if checkpoints is not None and checkpoints.latest is not None else None),
-            **known_tokens(committed_tokens(run.stop_control, plan.tokens)))
+        interval = Interval.resumed(run.stop_control, plan.tokens, last_saved=(
+            int(state.step) if checkpoints is not None and checkpoints.latest is not None else None))
         if self._opened(plan, run, interval, state, position,
                         resumed=initial is None and interval.last_saved is not None):
             return state
