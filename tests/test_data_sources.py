@@ -1570,31 +1570,26 @@ def test_content_fingerprint_preserves_array_identity_and_sequence_order():
     assert content_fingerprint(np.int16(4)) != content_fingerprint(np.int32(4))
 
 
-@pytest.mark.parametrize("content", [b" \n\n", b'{"id": 1}\n'], ids=["empty", "one row"])
-def test_empty_shard_cycles_exhaust_their_search_budget(content):
-    """A shard that yields no row exhausts the budget the read searches with;
-    the same read of a shard with a row yields it."""
-    root = Store(f"memory://empty-shards-{uuid4().hex}/empty.jsonl")
-    root.write(content)
-    files = Files(root.url)
-    dataset = streamed(
-        files.manifest(),
-        partition=DataPartition(),
-        epochs=None,
-        empty_shard_budget=3,
-        name="empty-corpus",
-        cycle_length=1,
-        loading=Loading(workers=0, threads=1, read_buffer=1),
-    )
-    reader = iter(dataset)
-    try:
-        if content.strip():
-            assert next(reader) == {"id": 1}
-            return
-        with pytest.raises(ValueError):
-            next(reader)
-    finally:
-        reader.close()
+def test_a_pass_reads_its_rows_after_any_run_of_empty_shards():
+    """A pass over a stream reads the rows of its last shard however many empty shards come before
+    it: four thousand and more in a row are no proof the stream holds none."""
+    root = Store(f"memory://empty-run-{uuid4().hex}")
+    for number in range(4097):
+        # A blank line is a shard that holds no row.
+        root.child(f"{number:05d}.jsonl").write(b'{"id": 7}\n' if number == 4096 else b"\n")
+    dataset = streamed(Files(root.url, format="jsonl").manifest(), partition=DataPartition(), epochs=1,
+                       cycle_length=1, loading=Loading(workers=0, threads=1, read_buffer=1))
+    assert list(dataset) == [{"id": 7}]
+
+
+def test_an_endless_read_of_a_store_that_states_it_holds_no_row_is_refused():
+    """A store whose every shard states it holds no row would read nothing forever endlessly, which
+    is refused; read once, it is a pass that yields nothing."""
+    manifest = Memory([], shard_rows=4).manifest()
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    assert list(streamed(manifest, partition=DataPartition(), epochs=1, loading=loading)) == []
+    with pytest.raises(ValueError):
+        streamed(manifest, partition=DataPartition(), epochs=None, loading=loading)
 
 
 @pytest.mark.parametrize("field", [None, "ids"])

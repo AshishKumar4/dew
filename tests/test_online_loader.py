@@ -17,7 +17,6 @@ from dew.data import Files, Loading, Memory, Rejected, images, video
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
 from dew.data.images import DecodeImage, Resize
-from dew.data.mixing import SearchBudget
 from dew.data.pipeline import Pipeline
 from dew.data.sources.urls import Fetch
 from dew.objectives.base import VALID_ROWS
@@ -241,19 +240,6 @@ def test_an_oversized_object_is_rejected_before_decode(tmp_path):
     path.write_bytes(b"x" * 17)
     result = Fetch(max_bytes=16)({"url": path.as_uri()})
     assert isinstance(result, Rejected) and result.reason == "too_large"
-
-
-def test_an_all_rejected_catalog_exhausts_its_search_budget(tmp_path):
-    pipeline = Pipeline(Memory([{"url": (tmp_path / "missing").as_uri()}])).repeat().filter_map(
-        Fetch(output="image"), DecodeImage("image")).batch(4)
-    data = compile(pipeline, read="indexed", loading=READ,
-                   budget=SearchBudget(consecutive=8))
-    stream = data.train(DataPartition())
-    try:
-        with pytest.raises(ValueError):
-            next(stream)
-    finally:
-        stream.close()
 
 
 @pytest.mark.parametrize("workers", [0, 2])
