@@ -18,8 +18,11 @@ before a GPU session; its numbers are the CPU's, not the kernel's.
 """
 
 import argparse
+import concurrent.futures
 import functools
 import json
+import multiprocessing
+import os
 import sys
 import time
 from pathlib import Path
@@ -210,35 +213,54 @@ def bitwise(left, right) -> int:
     return int((left.view(bits) != right.view(bits)).sum())
 
 
-def sweep(name: str, fn, kind: str, config, chunk: int = 1 << 26, limit: int = 1 << 32) -> dict:
+def _patterns(start: int, count: int) -> np.ndarray:
+    """The fp32 values of the bit patterns [start, start + count)."""
+    return np.arange(start, start + count, dtype=np.uint64).astype(np.uint32).view(np.float32)
+
+
+def _swept_oracle(kind: str, start: int, count: int) -> np.ndarray:
+    """A worker's share of a sweep: the correctly rounded value at each pattern, as fp32 (it is one)."""
+    return np.asarray(oracle(kind, [_patterns(start, count)]), np.float32)
+
+
+def sweep(name: str, fn, kind: str, config, chunk: int = 1 << 24, limit: int = 1 << 32) -> dict:
     """`fn` over every fp32 bit pattern (the first `limit`), each against its correctly rounded
     value: the node's largest distance in ulps on this GPU and where it sits, over the elements
-    whose argument and result are normal, and apart, how many subnormal ones it flushed or missed."""
+    whose argument and result are normal, and apart, how many subnormal ones it flushed or missed and
+    the worst of them in steps of the least subnormal. The oracle runs on the host's cores alongside
+    the GPU (each worker spawned, so none inherits the GPU's state), chunk by chunk in order."""
     worst, where, nonfinite, flushed, subnormal_wrong, started = 0, None, 0, 0, 0, time.time()
     subnormal_worst, subnormal_at = 0.0, None
     chunk = min(chunk, limit)
-    for start in range(0, limit, chunk):
-        bits = np.arange(start, start + chunk, dtype=np.uint64).astype(np.uint32)
-        x = bits.view(np.float32)
-        native = np.asarray(probe(fn, [jnp.asarray(x)], config), np.float32)
-        want = oracle(kind, [x])
-        tiny = _subnormal(x) | _subnormal(want)
-        finite = np.isfinite(want) & np.isfinite(x) & ~tiny
-        distance = np.where(finite, ulps(native, want), 0)
-        if distance.max() > worst:
-            worst, where = int(distance.max()), float(x[int(distance.argmax())])
-        edge = ~np.isfinite(want) & ~np.isnan(x)
-        nonfinite += int(oc.mismatches(native[edge], want[edge], oc.FLOAT32).sum())
-        flushed += int((tiny & (native == 0) & (want != 0)).sum())
-        subnormal_wrong += int((tiny & oc.mismatches(native, want, oc.FLOAT32)).sum())
-        # Subnormal results in units of fp32's least subnormal, 2^-149: their contract is absolute.
-        steps = np.where(tiny & np.isfinite(want), np.abs(native.astype(np.float64) - want) / 2.0 ** -149, 0)
-        if steps.max() > subnormal_worst:
-            subnormal_worst, subnormal_at = float(steps.max()), float(x[int(steps.argmax())])
+    starts = range(0, limit, chunk)
+    workers = max(1, min(32, (os.cpu_count() or 2) - 2))
+    spawned = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(workers, mp_context=spawned) as pool:
+        wanted = pool.map(_swept_oracle, [kind] * len(starts), starts, [chunk] * len(starts))
+        for start, want in zip(starts, wanted, strict=True):
+            x = _patterns(start, chunk)
+            native = np.asarray(probe(fn, [jnp.asarray(x)], config), np.float32)
+            want = want.astype(np.float64)
+            tiny = _subnormal(x) | _subnormal(want)
+            finite = np.isfinite(want) & np.isfinite(x) & ~tiny
+            distance = np.where(finite, ulps(native, want), 0)
+            if distance.max() > worst:
+                worst, where = int(distance.max()), float(x[int(distance.argmax())])
+            edge = ~np.isfinite(want) & ~np.isnan(x)
+            nonfinite += int(oc.mismatches(native[edge], want[edge], oc.FLOAT32).sum())
+            flushed += int((tiny & (native == 0) & (want != 0)).sum())
+            subnormal_wrong += int((tiny & oc.mismatches(native, want, oc.FLOAT32)).sum())
+            # Subnormal results in units of fp32's least subnormal, 2^-149: their contract is absolute.
+            counted = tiny & np.isfinite(want) & np.isfinite(native)
+            steps = np.zeros(chunk)
+            np.subtract(native, want, out=steps, where=counted)
+            steps = np.abs(steps) / 2.0 ** -149
+            if steps.max() > subnormal_worst:
+                subnormal_worst, subnormal_at = float(steps.max()), float(x[int(steps.argmax())])
     return {"node": name, "max_ulps": worst, "at": where, "nonfinite_mismatch": nonfinite,
             "subnormal_flushed": flushed, "subnormal_mismatch": subnormal_wrong,
             "subnormal_worst_steps": subnormal_worst, "subnormal_worst_at": subnormal_at,
-            "patterns": limit, "seconds": round(time.time() - started, 1)}
+            "patterns": limit, "workers": workers, "seconds": round(time.time() - started, 1)}
 
 
 def main() -> int:
