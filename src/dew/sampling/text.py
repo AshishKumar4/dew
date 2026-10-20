@@ -395,7 +395,8 @@ def _empty_cache(model: nn.Module, params: Variables, batch: int, ops: DecodeOps
     """A zeroed decode cache for `batch` rows, with the drafter's own beside it. A decoder whose every
     mixer is tokenwise (`MLPMixer`) keeps no cache, and its collection is empty."""
     def initialized(method: str) -> dict:
-        return flatten_dict(dict(model.apply(params, batch, method=method, mutable=["cache"])[1].get("cache", {})))
+        _, mutated = model.apply(params, batch, method=method, mutable=["cache"])
+        return flatten_dict(dict(mutated.get("cache", {})))
 
     cache = initialized("init_cache")
     for method in ("init_mtp_cache",) * bool(ops.depths) + ("init_draft_cache",) * (ops.record is not None):
