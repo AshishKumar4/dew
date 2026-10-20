@@ -761,8 +761,7 @@ class CausalSelfAttention(nn.Module):
         queries' places counted over their documents' tokens (`counted_places`),
         and `held_places` a sharing layer's keys'."""
         B, S = query.shape[:2]
-        causal, mask, documents = self.ctx.causal, None, None
-        implementation = self.ctx.attention_impl
+        causal, mask, documents, implementation = self.ctx.causal, None, None, self.ctx.attention_impl
         # An uncached call's keys are its own tokens; a cached call's keys are
         # placed by `_cached_places` where the layer reads their places. A
         # paged cache holds rows a server seats at canonical positions, where
@@ -814,8 +813,8 @@ class CausalSelfAttention(nn.Module):
             key, value = append(key, value)
             query = append.query(query)
             if S == 1:
-                mask, starts = self._decode_masks(positions, key.shape[0], key.shape[-3])
-                cursor, causal = mask, False
+                (mask, starts), causal = self._decode_masks(positions, key.shape[0], key.shape[-3]), False
+                cursor = mask
             else:  # several tokens appended after the keys their rows held
                 documents, causal, window = self._cached_call(positions, cached_validity(self, key.shape[-3]))
             key_places = self._cached_places(places, positions) if keeps_places else jnp.arange(key.shape[-3])
@@ -939,11 +938,11 @@ class CausalSelfAttention(nn.Module):
         # as each row's first key (`starts`).
         plain_step = (append is not None and mask is cursor and S == 1 and sinks is None
                       and bias is None and not sowing)
-        tokens = jnp.asarray(positions).reshape(B, S)[:, 0]
         if append is not None and plain_step and self._pages(append.store, query[:, 0], starts is not None):
-            attention = self._paged(append, query, tokens, starts)
+            attention = self._paged(append, query, jnp.asarray(positions).reshape(B, S)[:, 0], starts)
         elif plain_step:
-            attention = self._decode_attention(query, key, value, tokens, starts)
+            attention = self._decode_attention(query, key, value, jnp.asarray(positions).reshape(B, S)[:, 0],
+                                               starts)
         else:
             attention = checkpoint_name(scaled_dot_product_attention(
                 query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
@@ -1000,7 +999,7 @@ class CausalSelfAttention(nn.Module):
         prompt = positions[rows:].reshape(pieces, width)
         index.value = (index.value + (positions[:rows] >= 0)).at[admitted.slots].set(
             admitted.cursors + jnp.sum(prompt >= 0, axis=1, dtype=jnp.int32), mode="drop")
-        if self._pages(store, query[0, :rows]):
+        if self._pages(store, query[0, :rows], windowed=False):
             decoded = store.decode(query[0, :rows], held_reads(index.value, positions[:rows]),
                                    self.ctx.attn_logit_softcap)
             decoded = checkpoint_name(decoded[:, None], 'context')
