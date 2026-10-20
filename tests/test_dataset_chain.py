@@ -739,6 +739,26 @@ def test_a_mix_counts_each_corpus_under_a_name_of_its_own(tmp_path):
     assert sum(counts[f"data/rows/train-{place}"] for place in (1, 2, 3)) == 6
 
 
+def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
+    """A memory read runs a corpus's steps before its repeat and reads the rest as it goes: every
+    row it delivers was cut short after the repeat, so its truncated share is one, whatever the
+    rows the memory read held before."""
+    from dew.data.steps.text import LengthPolicy
+
+    rows = Memory([{"text": np.arange(5, dtype=np.int32)} for _ in range(4)])
+    chain = (rows.repeat(1).map(LengthPolicy(2)).filter(lambda row: True, identity="all@1")
+             .take(1).batch(1))
+    data = compile(chain, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1))
+    stream = data.train(DataPartition())
+    try:
+        assert np.asarray(next(stream)["text"]).tolist() == [[0, 1]]
+    finally:
+        stream.close()
+    counts = data.statistics()
+    assert counts["data/rows/memory"] == 1
+    assert counts["data/truncated/memory"] == 1.0
+
+
 def test_a_character_filter_and_caption_dropout_keep_and_empty_their_records():
     """text.MinChars keeps the texts of at least its count of characters, and text.Dropped empties
     a kept record's caption by the record's own draw: none at p=0, every one at p=1, and at any p
