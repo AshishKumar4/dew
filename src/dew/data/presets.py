@@ -209,20 +209,53 @@ def _conversation_windows(rendered: Dataset, pack: Pack, *,
     return (rendered.filter_map(fitted) if long == "drop" else rendered.map(fitted))._then(pack)
 
 
+def preferences(dataset: Dataset, *, seq_len: int, batch: int, pad_id: int = 0, records: int | None = None,
+                host: tuple[HostStep, ...] = ()) -> Pipeline:
+    """Preference pairs of token ids, chosen and rejected, each laid out in `seq_len` tokens with
+    its completion's mask, padded with `pad_id` (`preferences.PreferencePair`), in batches of
+    `batch` (`records` and `host` as `images` takes them). No tokenizer: a pair of raw text is
+    tokenized by a step before it."""
+    from dew.data.preferences import PreferencePair
+
+    return _finished(dataset.map(PreferencePair(seq_len, pad_id=pad_id)), batch=batch, records=records,
+                     host=host)
+
+
+def canvas(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, prompt_length: int,
+           canvas_size: int, batch: int, canvases: int = 1, pad_id: int = 0, messages: str = "messages",
+           records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
+    """Conversations in `messages` rendered through the tokenizer's chat template, then each
+    assistant turn one row of a block-diffusion objective: its prompt in `prompt_length` tokens and
+    its response in `canvases` canvases of `canvas_size`, ended by the tokenizer's EOS and padded
+    with `pad_id` (`ResponseCanvases`), never packed, in batches of `batch` (`records` and `host`
+    as `images` takes them). A tokenizer with no EOS cannot end a response, and is refused."""
+    from dew.data.steps.chat import ResponseCanvases
+
+    renderer = chat.template(tokenizer, messages=messages)
+    eos = renderer.vocabulary.eos_id
+    if eos is None:
+        raise ValueError(f"tokenizer {renderer.tokenizer!r} declares no eos token to end a response's canvas")
+    layout = ResponseCanvases(prompt_length, canvas_size, canvases, eos, pad_id)
+    return _finished(dataset.map(renderer).flat_map(layout), batch=batch, records=records, host=host)
+
+
 def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: int, batch: int,
-          sample_rate: int | None = None, records: int | None = None,
+          sample_rate: int | None = None, margin: float = 0.0, context: float = 0.0,
+          missing: Literal["silence", "reject"] = "silence", rejects: bool = True, records: int | None = None,
           host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Windows of `seconds` drawn from the media in `mp4`, each record's own
     on every read and resume (`video.PickClip`), as `frames` frames at `fps`
     fitted into `size` squares, in batches of `batch`. With `sample_rate`,
     the window's sound beside them, mono at that rate, filled with silence
-    marked invalid where the media has none (`audio.DecodeAudio`). Media shorter
-    than the window, or that does not decode, is counted and dropped; the
+    marked invalid where the media has none (`audio.DecodeAudio`), or with
+    `missing="reject"` dropped. Media shorter than the window, or that does not decode, is
+    counted and dropped, or with `rejects=False` stops the run. A window is drawn `margin`
+    seconds clear of the media's ends, and its sound is `context` seconds wider on each side. The
     media and its window are read here and leave the record. `records` and `host` as `images`
     takes them."""
 
-    windows = _clips(dataset, seconds, frames=frames, fps=fps, size=size, sample_rate=sample_rate,
-                     missing="silence")
+    windows = _clips(dataset, seconds, frames=frames, fps=fps, size=size, margin=margin,
+                     sample_rate=sample_rate, context=context, missing=missing, rejects=rejects)
     return _finished(windows, batch=batch, records=records, host=host)
 
 
