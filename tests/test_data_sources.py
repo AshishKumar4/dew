@@ -1030,10 +1030,10 @@ def test_an_anonymous_storage_profile_reads_parquet_though_it_names_keys():
         endpoint = f"http://127.0.0.1:{port}"
         bucket = "public-" + uuid4().hex
         remote = fsspec.filesystem("s3", key="testing", secret="testing", endpoint_url=endpoint)
-        remote.mkdir(bucket)
+        remote.mkdir(bucket, acl="public-read")
         written = io.BytesIO()
         pq.write_table(pa.Table.from_pylist([{"id": index} for index in range(5)]), written)
-        remote.pipe(f"{bucket}/rows.parquet", written.getvalue())
+        remote.pipe(f"{bucket}/rows.parquet", written.getvalue(), ACL="public-read")
         _profile("publics3", "s3a", {"key": "unused", "secret": "unused", "anon": True,
                                      "endpoint_url": endpoint})
         source = Files(f"publics3://{bucket}/rows.parquet")
