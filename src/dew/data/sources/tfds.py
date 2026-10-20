@@ -115,6 +115,14 @@ def prepared(name: str, *, config: str | None = None, version: str | None = None
     return True
 
 
+def _selected(builder, split: str) -> tuple[str, ...]:
+    """The shard files a split expression reads, each once, as TFDS resolves the expression (a
+    split, a slice, a sum of them or `all`), which raises ValueError for a split the dataset has
+    not."""
+    instructions = builder.info.splits[split].file_instructions
+    return tuple(dict.fromkeys(instruction.filename for instruction in instructions))
+
+
 def read_only_builder(path: str, *, name: str | None, config: str | None, version: str | None):
     """The read-only builder over the prepared data at `path`, checked against
     what was asked for.
@@ -254,30 +262,21 @@ class TFDS(Dataset):
         for path in fs.find(prefix):
             if path.endswith((".json", ".labels.txt")):
                 definitions[path[len(prefix) :].lstrip("/")] = hashlib.sha256(fs.cat_file(path)).hexdigest()
-        splits = self.builder.info.splits
-        names = (
-            tuple(splits)
-            if self.split == "all"
-            else tuple(part.split("[", 1)[0] for part in self.split.split("+"))
-        )
         files = []
-        for name in names:
-            if name not in splits:
-                raise ValueError(f"TFDS {self.name!r} has no split {name!r}")
-            for instruction in splits[name].file_instructions:
-                store = Store(instruction.filename)
-                fs, path = store.resolve()
-                try:
-                    header = fs.info(path)
-                except FileNotFoundError as error:
-                    raise FileNotFoundError(
-                        f"Missing prepared ArrayRecord shard {instruction.filename!r}; "
-                        "copy the complete split or provision it again"
-                    ) from error
-                files.append(
-                    {"uri": posixpath.relpath(path, prefix), "bytes": header["size"],
-                     "version": content_version(fs, path, header["size"])}
-                    if mounted else {"uri": store.url, "bytes": header["size"], "version": fs.ukey(path)})
+        for filename in _selected(self.builder, self.split):
+            store = Store(filename)
+            fs, path = store.resolve()
+            try:
+                header = fs.info(path)
+            except FileNotFoundError as error:
+                raise FileNotFoundError(
+                    f"Missing prepared ArrayRecord shard {filename!r}; "
+                    "copy the complete split or provision it again"
+                ) from error
+            files.append(
+                {"uri": posixpath.relpath(path, prefix), "bytes": header["size"],
+                 "version": content_version(fs, path, header["size"])}
+                if mounted else {"uri": store.url, "bytes": header["size"], "version": fs.ukey(path)})
         if self.remote:
             mirrored = json.loads(Path(self.directory, "READY").read_text())
             files = mirrored["files"]
@@ -363,17 +362,9 @@ class TFDS(Dataset):
                 builder = read_only_builder(
                     str(staged), name=self.name, config=self.config, version=self.version
                 )
-                selected = (
-                    tuple(builder.info.splits)
-                    if self.split == "all"
-                    else tuple(part.split("[", 1)[0] for part in self.split.split("+"))
-                )
-                for name in selected:
-                    if name not in builder.info.splits:
-                        raise ValueError(f"TFDS {self.name!r} has no split {name!r}")
-                    for instruction in builder.info.splits[name].file_instructions:
-                        filename = Path(instruction.filename).name
-                        download(path.rstrip("/") + "/" + filename, staged / filename)
+                for filename in _selected(builder, self.split):
+                    name = Path(filename).name
+                    download(path.rstrip("/") + "/" + name, staged / name)
                 (staged / "READY").write_text(
                     json.dumps({"source": self.path, "split": self.split, "files": copied})
                 )
