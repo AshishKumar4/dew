@@ -317,6 +317,24 @@ NORM: Op[NormCase] = Op('rms_norm', (Kernel('pallas', NORM_SUPPORTS), Kernel('xl
 else XLA's arithmetic."""
 
 
+def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
+               branch=None, axes=None, activated: bool = False) -> str:
+    """Resolve RMSNorm without changing its arithmetic or collecting a split
+    feature axis. Float64 and input-dtype statistics belong to XLA, and so
+    do a residual `branch` the stream's own add would broadcast or cast and
+    an activation after the norm. `axes`, `x`'s logical axes, places the
+    kernel on a mesh (`_placed`)."""
+    return _selected(NORM, norm_case(implementation, x, scale, dtype, axes, branch=branch, activated=activated,
+                                     fp32_statistics=fp32_statistics), implementation)
+
+
+def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str, *, axes=None) -> str:
+    """Resolve the gated RMSNorm (`gated_rms_norm`), the one kernel family
+    `KERNELS` names 'rms_norm'; other gates keep their XLA arithmetic."""
+    return _selected(NORM, norm_case(implementation, x, scale, dtype, axes, gate=gate, activation=activation),
+                     implementation)
+
+
 @dataclasses.dataclass(frozen=True)
 class SwigluCase:
     """A SiLU product as the SwiGLU selector reads it (`SWIGLU`): its operands' common `dtype`, whether
