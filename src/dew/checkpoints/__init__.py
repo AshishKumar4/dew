@@ -1045,7 +1045,10 @@ class Checkpoints:
         take one, stops them all. A run or step with no identity (one a record cannot describe, a
         step saved before steps recorded one) has nothing to compare, and the restore's shapes are
         the check."""
-        here, there = agreed_same("run identity", lambda: [identity(), self.identity(step)])
+        # This run's identity first, agreed apart: the step's lookup below runs collectives of its own,
+        # which a rank that failed to build an identity would not join.
+        here = agreed_same("run identity", identity)
+        there = agreed_same("stored run identity", lambda: self.identity(step))
         if here is None or there is None or here == there:
             return
         differences = _differences(here, there)

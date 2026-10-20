@@ -43,7 +43,7 @@ from typing_extensions import TypeIs, TypeVar
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import compensated_sum
-from dew.nn.protocols import HiddenStates, ProjectsParameters
+from dew.nn.protocols import CacheCapacity, HiddenStates, ProjectsParameters
 from dew.records import JSON
 
 if TYPE_CHECKING:
@@ -475,12 +475,13 @@ def _ruled_jvp(primals, tangents):
 
 
 EXECUTION_FIELDS = frozenset({"dtype", "param_dtype", "precision", "attention_impl", "kv_cache", "remat",
-                              "scan_layers", "bank_layers", "max_seq_len", "context_length"})
+                              "scan_layers", "bank_layers", "context_length"})
 """The fields of a network that choose how it computes or what it holds for decoding, not what it
 computes over its parameters: a run changes them between a launch and its resume (a kernel for
-another GPU, a dtype, a remat policy, a scan, a decode cache's capacity), in any module that has
-them. A field whose change also changes the parameters (a learned position table's length) the
-restore's shapes refuse."""
+another GPU, a dtype, a remat policy, a scan, an exported context length), in any module that has
+them. A decoder's cache capacity is set apart through its own `with_cache_capacity`
+(`CacheCapacity`), which keeps a learned position table's rows. A field whose change also changes
+the parameters the restore's shapes refuse."""
 
 
 def module_identity(module: nn.Module) -> JSON:
@@ -504,6 +505,9 @@ def _as_computed[Value](value: Value) -> Value:
     sequence entries among them."""
     from flax import linen as nn
 
+    if isinstance(value, CacheCapacity) and isinstance(value, nn.Module):
+        # Any one capacity: a decode cache's size chooses no computation of training's.
+        value = value.with_cache_capacity(1)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         updates = {}
         for field in dataclasses.fields(value):
