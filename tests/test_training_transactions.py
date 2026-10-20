@@ -84,6 +84,25 @@ def trainer(composite=False, k=2, checkpoints=None):
                    accumulation=k, dynamic_scale=True, checkpoints=checkpoints)
 
 
+def test_a_commit_counts_the_tokens_of_its_windows_accepted_microbatches_alone():
+    """A window of two whose second microbatch is rejected (a non-finite loss) commits with its third:
+    its update trained on the first and third microbatches' tokens, which its commit reports
+    (`Committed.tokens`), the rejected one's never, and nothing before the commit."""
+    from dew.training.model_flops import TOKENS, _TokenCount
+
+    train = trainer()
+    rows = 2 * jax.device_count()
+    data = [{**batch, TOKENS: _TokenCount.words(np.full(rows, tokens))}
+            for batch, tokens in zip(batches(), (3, 5, 7, 11), strict=True)]
+    state = train.initial_state()
+    run = train.compile(state, data[0])
+    reported = []
+    for batch in data[:3]:
+        state, _, _, _, accepted, committed = run(state, batch)
+        reported.append((bool(accepted), _TokenCount.host(jax.device_get(committed.tokens))))
+    assert reported == [(True, 0), (False, 0), (True, (3 + 7) * rows)]
+
+
 @pytest.mark.parametrize("composite", [False, True])
 def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composite):
     train = trainer(composite)
