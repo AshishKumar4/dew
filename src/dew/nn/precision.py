@@ -17,6 +17,7 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 from flax.typing import Dtype, PrecisionLike
+from jax.custom_derivatives import linear_call
 from jax.typing import DTypeLike
 
 
@@ -43,13 +44,32 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     where torch's addmm sums its in float32: Qwen 2's projection biases, summed over 8192 tokens,
     came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
     at fp32, the gradient sums at fp32 and rounds once into the bias.
+
+    That sum is the double-float reduction `compensated_sum` (through `_spread`), not whichever
+    reduction XLA picks for the cotangent's shape: on the CPU a plain one split over eight devices
+    summed each shard as one sequential chain, where one device's went to YNNPACK (ledger 833).
     """
     dtype, wide = jnp.result_type(product, bias), at_least_fp32(bias.dtype)
     # The bias takes the product's rank before the sum, as flax's layers reshape it, so no rank is
     # promoted implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds
     # the round trip, so the product and bias fuse as before) and its gradient sums at fp32.
     bias = jnp.reshape(bias.astype(wide), (1,) * (product.ndim - bias.ndim) + bias.shape)
-    return product.astype(dtype) + jnp.broadcast_to(bias, product.shape).astype(dtype)
+    return product.astype(dtype) + jnp.asarray(_spread(bias, product.shape)).astype(dtype)
+
+
+def _spread(bias: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+    """`bias` broadcast to `shape`, a linear call whose transpose, a bias's gradient (`biased`), sums
+    every position the bias spread over with `compensated_sum`."""
+    spread = tuple(axis for axis, (size, total) in enumerate(zip(bias.shape, shape, strict=True))
+                   if size == 1 and total != 1)
+
+    def broadcast(_, value):
+        return jnp.broadcast_to(value, shape)
+
+    def summed(_, cotangent):
+        return jnp.reshape(compensated_sum(cotangent, spread), bias.shape)
+
+    return linear_call(broadcast, summed, (), bias)
 
 
 def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
