@@ -234,7 +234,8 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     step that cuts documents as the plan does (`chunks_for`) may come between,
     and the plan then cuts them, which it otherwise refuses. A source read
     only as a stream, such as one filtered by a predicate, is packed as its
-    rows arrive."""
+    rows arrive, and so are documents a generation counted by a role or a pad
+    id (`_ruled`), whose windows a plan of their lengths does not count."""
     from dew.data.generation import Generation, _GenerationSource
     from dew.data.packing import PackedSource, chunks_for, plan_name
 
@@ -248,15 +249,17 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     source, stages = pipeline.source, pipeline.stages
     if isinstance(source, (Mixture, Phases)):
         source = dataclasses.replace(source, pipelines=tuple(_promoted(child) for child in source.pipelines))
+    ruled = False
     for index, stage in enumerate(stages):
         if isinstance(stage, Artifact) and isinstance(stage.cache, Generation):
+            ruled = _ruled(stages[:index])
             source, stages = _standing_in(stage.cache, pipeline, source, stages[:index]), stages[index + 1 :]
             plans = record(stage.cache.manifest.get("plan", {}), "published plans")
             overlap = cutting(stages)
             at = int(overlap is not None)
             packing = stages[at] if len(stages) > at else None
             # A published plan cuts a document as a window-long chunk step without overlap does.
-            if (isinstance(source, _GenerationSource) and isinstance(packing, Pack)
+            if (isinstance(source, _GenerationSource) and isinstance(packing, Pack) and not ruled
                     and plan_name(packing, "accepted") in plans and overlap in (None, 0)):
                 source = PackedSource.published(source, stage.cache, packing, chunked=overlap is not None)
                 stages = stages[at + 1 :]
@@ -268,12 +271,24 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         isinstance(pack, Pack)
         and pack.policy == "first-fit"
         and not pack.along
+        and not ruled
         and not isinstance(source, (Mixture, Phases))
         and source.supports("indexed")
         and source.lengths() is not None
     ):
         source, stages = PackedSource.planned(source, pack, overlap=overlap), stages[at + 1 :]
     return dataclasses.replace(pipeline, source=source, stages=stages)
+
+
+def _ruled(stages: Sequence[Stage]) -> bool:
+    """Whether the last count `stages` take (`CountTargets`) is by a role or a pad id: their
+    documents' windows are then counted by that rule (`dew.data.steps.text.CountRule`), which a plan
+    of document lengths, counting every target, does not."""
+    from dew.data.steps.text import CountTargets
+
+    counts = [stage.step for stage in stages
+              if isinstance(stage, Map) and isinstance(stage.step, CountTargets)]
+    return bool(counts) and (counts[-1].role is not None or counts[-1].pad_id is not None)
 
 
 def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision: bool) -> Read:
