@@ -65,9 +65,12 @@ def test_a_templates_heuristic_is_its_fastest_fitting_config_the_first_of_equals
 
 
 def test_a_target_that_reports_no_block_takes_the_least_any_gpu_holds():
-    """A generation the table holds no facts for, and that is not this device, budgets 99 KiB."""
+    """A GPU generation the table holds no facts for, and that is not this device, budgets 99 KiB; a
+    CPU interprets the kernels as an A100, so budgets an A100's block."""
     assert generation.shared_budget(generation.GpuTarget("sm100", "NVIDIA B200")) == generation.SHARED_BUDGET
     assert generation.shared_budget(generation.TARGETS["sm90"]) == generation.TARGETS["sm90"].shared_limit
+    sm80 = generation.TARGETS["sm80"].shared_limit
+    assert generation.shared_budget(generation.GpuTarget("cpu", "cpu")) == sm80
 
 
 def test_a_call_no_config_holds_is_refused_naming_its_bytes_and_the_budget():
@@ -89,17 +92,17 @@ class Slow(Doubling):
 class Hopper(Doubling):
     name: ClassVar[str] = "hopper"
 
-    def eligible(self, target):
-        return target.wgmma
+    def eligible(self, ba, target):
+        return target.wgmma and ba.arguments["x"].dtype == jnp.bfloat16
 
     def cost(self, ba, config, target):
         return 0.1
 
 
 def test_a_call_runs_the_implementation_estimated_fastest_on_the_device_or_the_one_chosen():
-    """Among the implementations that run on the device, the one whose fastest fitting config is
-    estimated fewest seconds, reported as the call's route; `generation.chosen` names another, and
-    one that does not run on the device is refused."""
+    """Among the implementations that run the call on the device, the one whose fastest fitting
+    config is estimated fewest seconds, reported as the call's route; `generation.chosen` names
+    another, and one that does not run the call there is refused. Hopper's runs bf16 on sm90 alone."""
     x = jax.ShapeDtypeStruct((4096, 512), jnp.float32)
     implementations = [Slow(), Doubling(), Hopper()]
     with generation.assumed("sm80"), generation.routes() as found:
@@ -111,4 +114,5 @@ def test_a_call_runs_the_implementation_estimated_fastest_on_the_device_or_the_o
     assert [(route.kernel, route.preferred) for route in found] == [
         ("doubling", "doubling"), ("slow", "doubling")]
     with generation.assumed("sm90"):
-        assert type(choose("decode", implementations, x)) is Hopper
+        assert type(choose("decode", implementations, x)) is Doubling
+        assert type(choose("decode", implementations, x.update(dtype=jnp.bfloat16))) is Hopper

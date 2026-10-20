@@ -19,10 +19,11 @@ from dew.nn.kernels import generation, selection, tuning
 class Template(tuning.KernelOp):
     """A template's launch: `space`, `staged_bytes` and `cost` give its configs, the ones that fit a
     block of the device (`fitting`), and its heuristic, the fitting config `cost` estimates fastest,
-    ties going to the first in `space`'s order. An implementation that does not run on a target says
-    so in `eligible`; its operands' token counts are `ROWS`, as for any `KernelOp`, and every other
-    argument is keyed as it is. A hook is a plain JAX callable the kernel's body traces, and the ops
-    beside the launch fuse into it through `jax.experimental.pallas.fuser`: neither is the base's."""
+    ties going to the first in `space`'s order. An implementation that does not run a call on a
+    target says so in `eligible`; its operands' token counts are `ROWS`, as for any `KernelOp`, and
+    every other argument is keyed as it is. A hook is a plain JAX callable the kernel's body traces,
+    and the ops beside the launch fuse into it through `jax.experimental.pallas.fuser`: neither is
+    the base's."""
 
     name: ClassVar[str] = "template"
     """The implementation's name, as a route reports it and `generation.chosen` may name it."""
@@ -39,8 +40,9 @@ class Template(tuning.KernelOp):
         """The seconds the launch of `ba` is estimated to take at `config` on `target`."""
         raise NotImplementedError(f"{type(self).__name__} declares no cost")
 
-    def eligible(self, target: generation.GpuTarget) -> bool:
-        """Whether the implementation runs on `target`: every one does unless it says otherwise."""
+    def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
+        """Whether the implementation runs the call `ba` on `target` (its dtypes, its widths, the
+        target's facts): every one does unless it says otherwise."""
         return True
 
     def fitting(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Hashable, ...]:
@@ -74,28 +76,30 @@ class Template(tuning.KernelOp):
 
 def choose(choice: str, implementations: Sequence[Template], *args, **kwargs) -> Template:
     """The implementation of `implementations` one call of `choice` runs, reported as its route: the
-    one `generation.chosen` names, else the eligible one whose fastest fitting config `estimate`s
-    fewest seconds on this device, the first of the order given where several tie. Every one shares
-    the template's signature, so each binds the call's own arguments. A named implementation that
-    does not run here or holds no config for the call raises."""
+    one `generation.chosen` names, else the one whose fastest fitting config `estimate`s fewest
+    seconds among those `eligible` for the call on this device, the first of the order given where
+    several tie. The choice is the cost model's: a measured pick chooses a launch's config, never its
+    implementation. Every implementation shares the template's signature, so each binds the call's
+    own arguments. A named implementation that does not run the call here raises."""
     target = generation.gpu_target()
-    by_name = {implementation.name: implementation for implementation in implementations}
-    eligible = [implementation for implementation in implementations if implementation.eligible(target)]
+    bound = {implementation.name: (implementation, implementation.bind(*args, **kwargs))
+             for implementation in implementations}
+    eligible = [(implementation, ba) for implementation, ba in bound.values()
+                if implementation.eligible(ba, target)]
     if not eligible:
-        raise ValueError(f"no implementation of {choice} runs on {target.generation}: "
-                         f"{', '.join(by_name)}")
-    estimated = min(eligible, key=lambda implementation: (
-        implementation.estimate(implementation.bind(*args, **kwargs), target)[0],
-        eligible.index(implementation)))
+        raise ValueError(f"no implementation of {choice} runs this call on {target.generation}: "
+                         f"{', '.join(bound)}")
+    costs = [implementation.estimate(ba, target)[0] for implementation, ba in eligible]
+    estimated = eligible[min(range(len(eligible)), key=lambda index: (costs[index], index))][0]
     named = selection.forced(choice)
     if named is None:
         picked = estimated
-    elif named not in by_name or not by_name[named].eligible(target):
-        raise ValueError(f"{choice}'s implementation {named!r} is chosen and does not run on "
+    elif named not in bound or not bound[named][0].eligible(bound[named][1], target):
+        raise ValueError(f"{choice}'s implementation {named!r} is chosen and does not run this call on "
                          f"{target.generation}; the ones that do are "
-                         f"{', '.join(implementation.name for implementation in eligible)}")
+                         f"{', '.join(implementation.name for implementation, _ in eligible)}")
     else:
-        picked = by_name[named]
-        picked.fitting(picked.bind(*args, **kwargs), target)
+        picked, ba = bound[named]
+        picked.fitting(ba, target)
     generation.route(choice, kernel=picked.name, preferred=estimated.name)
     return picked
