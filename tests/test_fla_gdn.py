@@ -599,6 +599,7 @@ def test_inside_a_shard_map_that_checks_varying_axes_the_rule_runs_the_portable_
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
+@pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("kind", ["gated delta net", "Kimi delta attention"])
 def test_a_cached_continuation_whose_history_varies_in_a_checked_map_runs_the_portable_math(kind):
     """A layer's cached continuation of more than one token inside a `shard_map` that checks varying
