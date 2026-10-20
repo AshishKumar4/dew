@@ -30,7 +30,7 @@ from dew.nn.scatter import DROPPED
 from dew.nn.sharding import logical_spec
 from dew.objectives.base import Variables
 from dew.sampling import decoding
-from dew.sampling.decoding import LogitsTransform, StepState, Stopping
+from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import DecoderState, draw
 from dew.sampling.text import decode_ops, prefill_state
@@ -236,7 +236,7 @@ Placement = Dense | Paged
 
 def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Placement, state: Slots,
               admission: Admission | None, transforms: tuple[LogitsTransform, ...],
-              stopping: tuple[Stopping, ...], grammar: Grammar | None) -> tuple[Slots, Draws]:
+              stopping: decoding.Finishing, grammar: Grammar | None) -> tuple[Slots, Draws]:
     """One iteration: admit, feed every drawing row its last draw, then every active row draws.
 
     This is `strategies._sample_rows`'s step over rows that carry their own
@@ -357,7 +357,7 @@ def joined(resident: Slots, carried: Slots) -> Slots:
 def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
              resident: Slots, carried: Slots,
              admission: Admission | None, transforms: tuple[LogitsTransform, ...],
-             stopping: tuple[Stopping, ...], grammar: Grammar | None
+             stopping: decoding.Finishing, grammar: Grammar | None
              ) -> tuple[checkify.Error, tuple[Slots, Slots, Draws]]:
     """Run `steps` iterations of `_advanced` over a split state, carrying their device checks as a value.
 
@@ -441,7 +441,7 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
 
 def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
                       state: Slots, shardings: Slots, rows: NamedSharding | None,
-                      transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
+                      transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
                       grammar: Grammar | None) -> Formats:
     """Choose the memory layout the resident state keeps, by asking XLA for it.
 

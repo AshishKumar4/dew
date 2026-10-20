@@ -27,7 +27,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable, Sequence
-from typing import ClassVar, NamedTuple, Protocol, runtime_checkable
+from typing import NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -207,8 +207,12 @@ class Stopping(Protocol):
     """A pure per-row finish test over the tokens a step just drew.
 
     A criterion that cuts a row short at a length rather than ending it, as
-    `MaxNewTokens` and `MaxLength` do, says so with a class attribute
-    `truncates = True`: a row it finishes is not terminated (`Finish`)."""
+    `MaxNewTokens` and `MaxLength` do, is a `Truncates`: a row it finishes
+    is not terminated (`Finish`)."""
+
+
+class Truncates:
+    """Marks a stopping criterion that cuts a row short at a length rather than ending it."""
 
     def __call__(self, state: StepState, tokens: jax.Array, /) -> jax.Array: ...
 
@@ -820,10 +824,9 @@ class EndOfSequence:
 
 
 @struct.dataclass
-class MaxNewTokens(_Numerical):
+class MaxNewTokens(_Numerical, Truncates):
     """Finishes a row once it has drawn `count` tokens, which truncates it."""
 
-    truncates: ClassVar[bool] = True
     count: int = struct.field(pytree_node=False, default=0)
 
     def __post_init__(self) -> None:
@@ -839,11 +842,10 @@ class MaxNewTokens(_Numerical):
 
 
 @struct.dataclass
-class MaxLength(_Numerical):
+class MaxLength(_Numerical, Truncates):
     """Finishes a row once prompt and generated tokens reach `length`, as `MaxLengthCriteria`, which
     truncates it."""
 
-    truncates: ClassVar[bool] = True
     length: int = struct.field(pytree_node=False, default=0)
 
     def __post_init__(self) -> None:
@@ -1020,15 +1022,15 @@ class Finish(NamedTuple):
 
 class Finishing(NamedTuple):
     """A request's criteria as pytrees (`components`), those that end a row apart from those that
-    cut it short at a length, which is told from each criterion as given (`Stopping`'s `truncates`)
-    before it is one: a built-in's numbers ride as data (`as_pytree`)."""
+    cut it short at a length, which is told from each criterion as given (`Truncates`) before it is
+    one: a built-in's numbers ride as data (`as_pytree`)."""
 
     ending: tuple[Stopping, ...]
     truncating: tuple[Stopping, ...]
 
     @classmethod
     def of(cls, criteria: Sequence[Stopping]) -> Finishing:
-        cut = [bool(getattr(type(stop), "truncates", False)) for stop in criteria]
+        cut = [isinstance(stop, Truncates) for stop in criteria]
         return cls(tuple(as_pytree(stop) for stop, short in zip(criteria, cut, strict=True) if not short),
                    tuple(as_pytree(stop) for stop, short in zip(criteria, cut, strict=True) if short))
 
@@ -1089,5 +1091,6 @@ __all__ = [
     "TopH",
     "TopK",
     "TopP",
+    "Truncates",
     "Typical",
 ]

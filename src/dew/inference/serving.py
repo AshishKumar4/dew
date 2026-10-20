@@ -114,7 +114,7 @@ from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, KVCache, is_paged, leaf_
 from dew.nn.protocols import Layered, ProjectionGroup, Serving
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
 from dew.objectives.base import Variables
-from dew.sampling.decoding import LogitsTransform, Stopping
+from dew.sampling.decoding import Finishing, LogitsTransform
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import Sample
 from dew.sampling.text import Generation, Sampling, check_inputs, rebuild_position, resolve
@@ -432,7 +432,7 @@ class Server:
     """
 
     def __init__(self, model: nn.Module, variables: Variables, processor: Processor | None, *,
-                 sampling: Sampling, transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
+                 sampling: Sampling, transforms: tuple[LogitsTransform, ...], stopping: Finishing,
                  grammar: Grammar | None, rows: Rows, slots: int, capacity: int, admission: int,
                  default_budget: int | None, max_length: int | None, decode_steps: int) -> None:
         if type(slots) is not int or slots < 1:
