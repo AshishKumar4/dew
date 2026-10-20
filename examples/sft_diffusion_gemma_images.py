@@ -180,6 +180,15 @@ def smoke_splits(config: Config) -> dict[str, str]:
     return files
 
 
+def data_spec(config: Config, parts: dict[str, Source]) -> ImageData:
+    """Train on train + validation, score on test, which the run never reads. The crops and flips
+    run on the host, before the caption layout reads their pixels into the model's inputs; a device
+    augment would run after it, on the batch the layout already made."""
+    return ImageData(source=Concatenate((parts["train"], parts["validation"])), validation=parts["test"],
+                     caption_columns=(), image_size=config.image_size, staging_size=config.staging_size,
+                     augment=Augment(flip=True, crop_scale=(0.6, 1.0), backend="host"))
+
+
 def captioned(task, data, config: Config, labels) -> list[dict[str, str]]:
     """Each real test image's label and the caption `task` writes for it, the prompt's tokens its
     image and the canvas its caption, drawn under one key."""
@@ -208,12 +217,7 @@ def main(config: Config) -> Path:
                          vision_features=16, vision_layers=1, eval_every=2)
     (config.out / "data").mkdir(parents=True, exist_ok=True)
     parts = splits(config)
-    # Train on train + validation, score on test, which the run never reads.
-    # The crops and flips run on the host, before the caption layout reads their pixels into the
-    # model's inputs; a device augment would run after it, on the batch the layout already made.
-    spec = ImageData(source=Concatenate((parts["train"], parts["validation"])), validation=parts["test"],
-                     caption_columns=(), image_size=config.image_size, staging_size=config.staging_size,
-                     augment=Augment(flip=True, crop_scale=(0.6, 1.0), backend="host"))
+    spec = data_spec(config, parts)
     # The label names the dataset's Hugging Face schema records, as its source reads them.
     names = read_record(parts["train"].metadata().get("class_names", {}), "class names").get("label")
     labels = tuple(name.strip() for name in strings(names, "class_names.label"))
@@ -248,9 +252,7 @@ def main(config: Config) -> Path:
     # the trained model in this process does.
     run_dir = Path(run.trainer.checkpoint_dir) / name
     restored = replace(dew.pipeline(str(run_dir)), eos_token_ids=(EOS,), pad_token_id=PAD)
-    # The weights the run directory serves: the averaged ones where the run kept them.
-    served = state.variables if state.ema is None else state.averaged
-    live = replace(objective.build_task(served), eos_token_ids=(EOS,), pad_token_id=PAD)
+    live = replace(objective.pipeline(state), eos_token_ids=(EOS,), pad_token_id=PAD)
     captions = captioned(restored, data, config, labels)
     report = {"dataset": config.dataset, "train_images": data.records, "test_images": len(captions),
               "classes": len(labels), "device": jax.devices()[0].device_kind, "steps": config.steps,
