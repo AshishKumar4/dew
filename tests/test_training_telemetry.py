@@ -32,10 +32,13 @@ class Squared(Objective):
 
 
 class ComplexSquared(Objective):
-    """A real loss whose optimizer input has complex coordinates, as an SSM's can."""
+    """A real loss whose optimizer input has `width` complex coordinates, as an SSM's can."""
+
+    def __init__(self, width=2):
+        self.width = width
 
     def fresh_variables(self, key, held):
-        return {'params': {'weight': jnp.zeros(2, jnp.complex64)}}
+        return {'params': {'weight': jnp.zeros(self.width, jnp.complex64)}}
 
     def loss(self, variables, batch, step):
         error = variables['params']['weight'] - batch['target']
@@ -189,9 +192,13 @@ COMPLEX_SEEDS = 32
 """Check 1's declared seeds for the complex descent, sized by `seeds_for` (2026-10-21, on armada)."""
 
 
+COMPLEX_WIDTH = 64
+"""The drawn targets' complex coordinates: enough for a few seeds to resolve the factor."""
+
+
 def complex_target(seed: int) -> tuple[np.ndarray]:
-    """A target of two complex coordinates, each part drawn from a unit normal."""
-    parts = np.random.default_rng(seed).normal(size=(2, 2))
+    """A target of COMPLEX_WIDTH complex coordinates, each part drawn from a unit normal."""
+    parts = np.random.default_rng(seed).normal(size=(2, COMPLEX_WIDTH))
     return ((parts[0] + 1j * parts[1]).astype(np.complex64),)
 
 
@@ -211,13 +218,13 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
     from dew.training import Checkpoints
 
     target = np.array([1 + 2j, 3 + 4j], np.complex64)
-    untracked = Trainer(ComplexSquared(), optax.sgd(.1), key=0, accumulation=accumulation)
+    untracked = Trainer(ComplexSquared(COMPLEX_WIDTH), optax.sgd(.1), key=0, accumulation=accumulation)
 
     def fit(steps, target=target, directory=None, sink=None):
         trainer = untracked if directory is None and sink is None else Trainer(
             ComplexSquared(), optax.sgd(.1), key=0, tracker=sink, accumulation=accumulation,
             checkpoints=None if directory is None else Checkpoints(str(directory)))
-        batch = {'target': np.broadcast_to(target, (8, 2))}
+        batch = {'target': np.broadcast_to(target, (8, len(target)))}
         data = Loader(lambda partition: Repeated(batch), None, None, 8)
         return trainer.fit(data, steps=steps * accumulation, log_every=accumulation,
                            checkpoint_every=None if directory is None else accumulation)
@@ -230,7 +237,7 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
     # imaginary parts alike.
     @jax.jit
     def optax_descent(target):
-        batch = {'target': jnp.broadcast_to(target, (8, 2))}
+        batch = {'target': jnp.broadcast_to(target, (8, COMPLEX_WIDTH))}
 
         def update(carry, _):
             weight, state = carry
@@ -239,7 +246,7 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
             updates, state = optax.sgd(.1).update(grads, state, weight)
             return (optax.apply_updates(weight, updates), state), None
 
-        start = jnp.zeros(2, jnp.complex64)
+        start = jnp.zeros(COMPLEX_WIDTH, jnp.complex64)
         (weight, _), _ = jax.lax.scan(update, (start, optax.sgd(.1).init(start)), None, length=4)
         return weight
 
@@ -250,8 +257,9 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
     norms = {step: scalars['train/grad_norm'] for step, scalars in sink.scalars
              if 'train/grad_norm' in scalars}
     assert norms[accumulation] == pytest.approx(np.sqrt(120.))
-    fit(2, tmp_path)
-    np.testing.assert_array_equal(np.asarray(fit(4, tmp_path).variables['params']['weight']), weight)
+    fit(2, directory=tmp_path)
+    resumed = fit(4, directory=tmp_path).variables['params']['weight']
+    np.testing.assert_array_equal(np.asarray(resumed), weight)
 
 
 def test_run_record_names_the_package_checkout_and_hardware(tmp_path, monkeypatch):
