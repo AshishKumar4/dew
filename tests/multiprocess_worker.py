@@ -658,14 +658,21 @@ def mode_fit(args) -> dict:
         val = data.val
         assert val is not None
         available = sum(1 for _ in val(DataPartition.of(trainer.device_mesh)))
-    from dew.training import Best
+    from dew.training import Best, Observe
     counter = Batches()
+    # The variables, split over the processes by fsdp, which an observation gathers whole on each.
+    observe = None if args.observe_every is None else Observe(args.observe_every,
+                                                              lambda state: state.variables)
     state = trainer.fit(Loader(open_train, val=val, batch=BATCH, records=args.records),
                         steps=args.steps, log_every=1,
                         eval_every=args.steps if args.tokens else None,
                         checkpoint_every=args.save_every, metrics=(counter,) if args.tokens else (),
-                        best=Best(counter, mode='max') if args.tokens else None)
+                        best=Best(counter, mode='max') if args.tokens else None, observe=observe)
     dump_params(args.out.with_suffix(".npz"), state.variables)
+    if observe is not None:
+        np.savez(args.out.with_suffix(".observed.npz"), **{
+            f"{step}{name}": leaf for step, variables in observe.values
+            for name, leaf in params_dict(variables).items()})
     _, final_position = restored_state(trainer)
     return {
         "step": int(as_numpy(state.step)),
@@ -2415,6 +2422,7 @@ def parse_args(argv=None):
     parser.add_argument("--explicit", action="store_true",
                         help="spell validity out on every row instead of omitting it")
     parser.add_argument("--save-every", type=int)
+    parser.add_argument("--observe-every", type=int, help="fit observes its parameters every so many steps")
     parser.add_argument("--local-dir", help="every process's local checkpoint directory")
     parser.add_argument("--local-every", type=int)
     parser.add_argument("--records", type=int, default=BATCH * 16)
