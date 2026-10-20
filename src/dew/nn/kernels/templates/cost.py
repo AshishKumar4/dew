@@ -4,11 +4,10 @@ geometry: the cost every template's `cost` returns (`dew.nn.kernels.templates.ba
 A launch runs `programs` programs. Each does `program_flops` tensor-core FLOPs, moves `program_staged`
 bytes through shared memory (its operand tiles written there and read back by its matrix
 instructions) and evaluates `program_exponentials` exponentials; the launch as a whole reads and writes
-`device_bytes` of device memory, each byte once: the programs' reads of one tile again are served by
-the L2 cache, whose bandwidth no device or datasheet states, and an H100's grouped launches ranked so
-(GMM-h100-3, where counting every reread from device memory tied every tile at the memory bound). A
-multiprocessor holds `resident` programs at once, which share its tensor cores, shared memory and
-special-function units. So, per multiprocessor,
+`device_bytes` of device memory, rereads counted where the launch's order evicts them from the L2
+before they come again (each template's `cost` says which). A multiprocessor holds `resident`
+programs at once, which share its tensor cores, shared memory and special-function units. So, per
+multiprocessor,
 
     program  = max(program_flops / tensor rate, program_staged / shared-memory rate,
                    program_exponentials / special-function rate)

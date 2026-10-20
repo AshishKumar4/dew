@@ -210,23 +210,23 @@ def _experts_lowered(generation: str, implementation: str):
 
 @pytest.mark.parametrize("generation", GPUS)
 def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generation_chooses(generation):
-    """'auto' runs the grouped matmul's kernels on every GPU generation, each of its forward and both
-    backward launches the implementation its cost model picks there (the route says which), and the
-    Triton kernels that lower are those of the launches that run Triton; Hopper's Mosaic GPU kernels
-    lower as Mosaic calls, no Triton kernel. The experts' SiLU product takes the fused SwiGLU where the
-    row names it, forward and backward, as every fused kernel is differentiated through its portable
-    arithmetic (`generation.linear_tangent`)."""
+    """'auto' runs the grouped matmul's kernels on every GPU generation, each forward and backward
+    launch of each projection the implementation its cost model picks there (its route says which):
+    Triton's on a GPU without warpgroup MMA, whose two kernels lower, and on Hopper Triton's only where
+    a launch runs it, Mosaic GPU's lowering as no Triton kernel. The experts' SiLU product takes the
+    fused SwiGLU where the row names it, forward and backward, as every fused kernel is differentiated
+    through its portable arithmetic (`generation.linear_tangent`)."""
     with routes() as taken:
         lowered = _experts_lowered(generation, 'auto')
-    forward, input_gradient, kernel_gradient = (route.kernel for route in taken
-                                                if route.choice == 'grouped_matmul')
-    assert {forward, input_gradient, kernel_gradient} <= {'triton', 'mosaic_gpu'}
-    expected = {name for name, implementation in (("pallas_triton_ragged_dot", forward),
-                                                  ("pallas_triton_ragged_dot", input_gradient),
-                                                  ("tgmm_ragged_dot", kernel_gradient))
-                if implementation == 'triton'}
-    expected |= set().union(*(FAMILIES[key][1] for key in chosen(generation, "step") if key[0] == 'swiglu'))
-    assert set(triton_kernels(lowered)) == expected
+    kernels = {route.kernel for route in taken if route.choice == 'grouped_matmul'}
+    grouped = {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}
+    assert kernels and kernels <= {'triton', 'mosaic_gpu'}
+    lowered_grouped = set(triton_kernels(lowered)) & grouped
+    if not gpu_target(generation).wgmma:
+        assert kernels == {'triton'} and lowered_grouped == grouped
+    assert bool(lowered_grouped) == ('triton' in kernels)
+    swiglu = set().union(*(FAMILIES[key][1] for key in chosen(generation, "step") if key[0] == 'swiglu'))
+    assert set(triton_kernels(lowered)) - grouped == swiglu
 
 
 def _mamba2_lowered(generation: str):
@@ -302,9 +302,9 @@ def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():
     block's shared memory from the device, and Hopper's warpgroup MMA from its capability, 9.0 alone,
     so a launch sized by them sizes itself rather than taking a default for want of a row."""
     blackwell = runtime_facts(GpuTarget("sm100", "NVIDIA B200"), SimpleNamespace(
-        compute_capability="10.0", core_count=148, shared_memory_per_block_optin=232448))
+        compute_capability="10.0", core_count=148, shared_memory_per_block_optin=232448, local_hardware_id=0))
     hopper = runtime_facts(GpuTarget("sm90", "NVIDIA H100 80GB HBM3"), SimpleNamespace(
-        compute_capability="9.0", core_count=132, shared_memory_per_block_optin=232448))
+        compute_capability="9.0", core_count=132, shared_memory_per_block_optin=232448, local_hardware_id=0))
     assert (blackwell.multiprocessors, blackwell.shared_limit, blackwell.wgmma) == (148, 232448, False)
     assert (hopper.multiprocessors, hopper.shared_limit, hopper.wgmma) == (132, 232448, True)
 
@@ -323,6 +323,18 @@ def test_a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_
     row = TARGETS.get(device_generation())
     if row is not None and row.shared_limit is not None:
         assert named.shared_limit == row.shared_limit
+
+
+@pytest.mark.gpu(reason="reads a CUDA device's clocks from its driver")
+def test_a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver():
+    """The default device's multiprocessor clock and memory bandwidth, which JAX's device does not
+    carry, come from the CUDA driver at the device's own ordinal (`local_hardware_id`, which a process
+    seeing a subset of the GPUs numbers from zero): positive, and a GPU's bandwidth between that of the
+    slowest and the fastest memory Dew's targets name."""
+    target = gpu_target()
+    assert target.clock_hz > 1e8
+    rows = [row.memory_bandwidth for row in TARGETS.values() if row.memory_bandwidth]
+    assert min(rows) / 2 < target.memory_bandwidth < 2 * max(rows)
 
 
 def test_chosen_kernels_keep_other_choices_and_restore_the_row_after_an_exception():
