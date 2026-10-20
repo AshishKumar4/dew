@@ -27,7 +27,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable, Sequence
-from typing import NamedTuple, Protocol, runtime_checkable
+from typing import NamedTuple, Protocol, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -960,7 +960,15 @@ def _stop_string_tables(pieces: Sequence[str | bytes], ids: Sequence[int],
                        positions, ends, max(len(value) for value in strings))
 
 
-def as_pytree[Component: (LogitsTransform, Stopping)](value: Component) -> Component:
+@overload
+def as_pytree(value: LogitsTransform) -> LogitsTransform: ...
+
+
+@overload
+def as_pytree(value: Stopping) -> Stopping: ...
+
+
+def as_pytree(value: LogitsTransform | Stopping) -> LogitsTransform | Stopping:
     """`value` in a form `jax.jit` accepts as data.
 
     A built-in whose numbers fix no shape lowers to its `apply` with them
@@ -1030,9 +1038,8 @@ class Finishing(NamedTuple):
 
     @classmethod
     def of(cls, criteria: Sequence[Stopping]) -> Finishing:
-        cut = [isinstance(stop, Truncates) for stop in criteria]
-        return cls(tuple(as_pytree(stop) for stop, short in zip(criteria, cut, strict=True) if not short),
-                   tuple(as_pytree(stop) for stop, short in zip(criteria, cut, strict=True) if short))
+        ending = tuple(as_pytree(stop) for stop in criteria if not isinstance(stop, Truncates))
+        return cls(ending, tuple(as_pytree(stop) for stop in criteria if isinstance(stop, Truncates)))
 
 
 def finish(stopping: Finishing) -> Callable[[StepState, jax.Array], Finish]:
