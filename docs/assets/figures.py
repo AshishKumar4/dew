@@ -938,7 +938,9 @@ def fsdp_step_figure():
                 if j != d:
                     svg.rect(x + 4, top + 4 + j * (tall - 8) / devices, 52, (tall - 8) / devices - 2,
                              fill=tints[j], stroke="none", rx=3)
-        svg.appear(full, times[1], 0.4)
+        # The gathered quarters are dropped again once the backward pass is done.
+        svg.animate(full, {times[1]: {"opacity": 0}, times[1] + 0.4: {"opacity": 1},
+                           times[3]: {"opacity": 1}, times[3] + 0.4: {"opacity": 0.15}})
     svg.appear(svg.text(26, top + tall / 2 + 5, "W", size=16, weight=600, mono=True), times[0])
     # 3. compute on each device's slice of the batch
     for d in range(devices):
