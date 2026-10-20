@@ -6,9 +6,13 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+// Dew's package index, the one place Dew's JAX build is served (dew.telemetry.builds.PACKAGE_INDEX).
+// BEGIN package index (site/scripts/gen_install.py)
+const PACKAGE_INDEX = 'https://pypi.dewml.dev/simple';
+// END package index
 // Colab's Python has no virtual environment, so uv installs into it with --system. streaming
 // for the Hugging Face datasets the cells read, quantization for Qwix.
-export const INSTALL = '!uv pip install --system -q "dewml[cuda12,streaming,quantization]" --extra-index-url https://pypi.dewml.dev/simple';
+export const INSTALL = `!uv pip install --system -q "dewml[cuda12,streaming,quantization]" --extra-index-url ${PACKAGE_INDEX}`;
 const site = fileURLToPath(new URL('..', import.meta.url));
 
 export const colabUrl = (name) =>

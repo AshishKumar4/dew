@@ -143,14 +143,14 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `ci` | The test suite's whole environment: `test` and every extra a test file imports |
 
 ```bash
-uv pip install 'dewml[interop,streaming] @ git+https://github.com/AshishKumar4/dew'
+uv pip install 'dewml[interop,streaming] @ git+https://github.com/AshishKumar4/dew' --extra-index-url https://pypi.dewml.dev/simple
 ```
 
 The `vision` extra expects CPU builds of PyTorch and torchvision, installed first, so that no CUDA PyTorch sits beside JAX's accelerator runtime. Without it the native multimodal checkpoints still load, but their processors raise an error when given images.
 
 ```bash
 uv pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cpu
-uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
+uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew' --extra-index-url https://pypi.dewml.dev/simple
 ```
 
 Run the first command even if CPU torch is already installed. Installing `vision`

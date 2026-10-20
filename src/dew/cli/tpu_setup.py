@@ -2,7 +2,8 @@
 
 The setup script is rendered from the Python version, the extras and the
 source mode. Every step is guarded, so a second run re-creates nothing, but
-the `uv pip install` lines resolve against PyPI each time. A checkout is
+the `uv pip install` lines resolve against PyPI and Dew's package index, which
+serves Dew's JAX build, each time. A checkout is
 installed alone with its `tpu` extra, the libtpu for the jax the checkout
 requires. A release installs after jax[tpu], so a jax[tpu] or dewml release
 since the last run is installed; `setup --version` pins the dewml side.
@@ -11,6 +12,8 @@ since the last run is installed; `setup --version` pins the dewml side.
 from __future__ import annotations
 
 import shlex
+
+from dew.telemetry.builds import PACKAGE_INDEX
 
 #: Paths the remote side owns, and the only thing the commands agree on.
 VENV = "$HOME/dew-venv"
@@ -89,9 +92,9 @@ PY="$VENV/bin/python"
 
 step "$PACKAGE_SPEC"
 if [ "$EDITABLE" = 1 ]; then
-  uv pip install --quiet --python "$PY" -e "$HOME/$PACKAGE_SPEC"
+  uv pip install --quiet --python "$PY" --extra-index-url "$PACKAGE_INDEX" -e "$HOME/$PACKAGE_SPEC"
 else
-  uv pip install --quiet --python "$PY" "$PACKAGE_SPEC"
+  uv pip install --quiet --python "$PY" --extra-index-url "$PACKAGE_INDEX" "$PACKAGE_SPEC"
 fi
 
 step "environment"
@@ -161,6 +164,7 @@ def render(
         "set -euo pipefail",
         f"PYTHON_VERSION={shlex.quote(python_version)}",
         f"PACKAGE_SPEC={shlex.quote(package_spec)}",
+        f"PACKAGE_INDEX={shlex.quote(PACKAGE_INDEX)}",
         f"EDITABLE={int(editable)}",
         f"GCS_BUCKET={shlex.quote(gcs_bucket)}",
         f"GIT_KEY={int(git_key)}",
