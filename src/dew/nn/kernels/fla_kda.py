@@ -67,13 +67,15 @@ def _intra_rows_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, aqk_ref, akk_re
     """One token's row of its chunk's scores and keys' products for `BH` value heads, every pair's
     decay its own: `Aqk_ij = scale sum_k q_ik k_jk exp2(g_ik - g_jk)` for `j <= i` and `Akk_ij = sum_k
     beta_i k_ik k_jk exp2(g_ik - g_jk)` for `j < i`, in fp32, `Aqk` stored in its dtype and `Akk` fp32.
-    fla's `chunk_kda_fwd_kernel_intra_token_parallel` (chunk_intra_token_parallel.py:33-118) takes the
-    diagonal 16-token blocks so, and factors every block below them through its sub-chunk's first row
-    (`(q exp2(g_i - g_n)) (k exp2(g_n - g_j))`, chunk_intra.py:43-391): two exponentials rounded and one
-    more product a term, against one exponential here (Dew's portable math's, `linear.chunk_decay`'s),
-    which put 0.9% of a packed row's scores and inverse past twice its distance from float64. A program
-    per place of a chunk, where fla's searches the token's sequence; a place past the chunk's end does
-    nothing."""
+    fla's `chunk_kda_fwd_kernel_intra_token_parallel` (chunk_intra_token_parallel.py:33-118, its
+    `safe_gate=False` path) takes the diagonal 16-token blocks so, and factors every block below them
+    through its sub-chunk's first row (`(q exp2(g_i - g_n)) (k exp2(g_n - g_j))`, chunk_intra.py:43-391):
+    two exponentials rounded and one more product a term, against one exponential here (Dew's portable
+    math's, `linear.chunk_decay`'s). This port's earlier factored blocks, which moved decayed keys from
+    sub-chunk to sub-chunk where fla recomputes each factor, put 11 of a packed row's 16384 scores and 5
+    of its inverse's past twice the pairwise form's distance from float64; fla's own factored form was
+    not measured. A program per place of a chunk, where fla's searches the token's sequence; a place
+    past the chunk's end does nothing."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
     place = pl.program_id(0) % chunk
 
