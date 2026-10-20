@@ -2,14 +2,13 @@
 
     python tools/benchmark_serving_compile.py --family dory-1.0-4b --slots 16 --json-out compile.json
 
-Builds the family's committed config (tests/fixtures/hf/<family>/config.json) at every layer it has
-but a narrow width (`--hidden`), since a program's compile scales with its layers and not its width,
-over random weights, and times the Server's warm (first) compile of every step program a run of
-`--slots` slots compiles: its construction's decode step (`Server.__init__` compiles it to choose
+Builds the family's committed config (tests/fixtures/hf/<family>/config.json), every layer at its
+released width, over random weights, and times the Server's warm (first) compile of every step
+program a run of `--slots` slots compiles: its construction's decode step (`Server.__init__` compiles it to choose
 the resident layouts), then each power-of-two admission width's prefill (`Server.admission`). The
 record holds the wall seconds of construction (`construction_seconds`), of each admission width's
 first round (`by_admission_width`) and of the whole warm (`warm_seconds`), which compiles fill (the
-narrow model runs each step in milliseconds), and the device they compiled for. Nothing is read
+steps themselves run in a fraction of a second), and the device they compiled for. Nothing is read
 from or written to a compilation cache.
 """
 
@@ -34,7 +33,9 @@ def narrow(config: dict, hidden: int) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", default="dory-1.0-4b")
-    parser.add_argument("--hidden", type=int, default=256)
+    parser.add_argument("--hidden", type=int, default=None,
+                        help="a width other than the released one, in four heads; a narrow width hides "
+                             "fusion pathologies the released one shows (ledger 635)")
     parser.add_argument("--slots", type=int, default=16)
     parser.add_argument("--prompt", type=int, default=512)
     parser.add_argument("--output", type=int, default=16)
@@ -53,7 +54,8 @@ def main() -> None:
     from dew.sampling import Sampling
 
     source = ROOT / "tests/fixtures/hf" / args.family / "config.json"
-    config = narrow(json.loads(source.read_text()), args.hidden)
+    released = json.loads(source.read_text())
+    config = released if args.hidden is None else narrow(released, args.hidden)
     # The model's length leaves room for the Server's rounding of its capacity to its cache's pages.
     model = models.build("causal_transformer", hf_decoders.translate_config(config)).clone(
         dtype=jnp.bfloat16, max_seq_len=2 * (args.prompt + args.output))
@@ -76,8 +78,8 @@ def main() -> None:
         for ticket in tickets:
             ticket.result()
         timed[f"admission {rows}"] = time.perf_counter() - start
-    record = {"family": args.family, "hidden": args.hidden, "layers": config.get("num_hidden_layers"),
-              "slots": args.slots, "admission": server.admission, "device": jax.devices()[0].device_kind,
+    record = {"family": args.family, "hidden": config["hidden_size"],
+              "layers": config.get("num_hidden_layers"), "slots": args.slots, "admission": server.admission, "device": jax.devices()[0].device_kind,
               "construction_seconds": constructed, "by_admission_width": timed,
               "warm_seconds": time.perf_counter() - began}
     args.json_out.write_text(json.dumps(record, indent=2))

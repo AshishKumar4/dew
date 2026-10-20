@@ -203,10 +203,11 @@ PROBES = [
           lambda args, out: ["--backend", "dew", "--model", args.model, "--slots", ",".join(map(str, SLOTS)),
                              "--repeats", "5", "--out", str(out)],
           lambda _, out: _served(out)),
-    # The Server's warm compiles over a full-depth Dory 1.0 at a narrow width, program by program: its
-    # construction's decode step, then each admission width's prefill. A program's compile grows with
-    # its layers, and XLA's fusion of nGPT's per-layer normalization grew the prefill's quadratically
-    # with them (ledger 635); the whole warm is shown beside them.
+    # The Server's warm compiles over Dory 1.0 4B as released (random weights), program by program: its
+    # construction's decode step, then each admission width's prefill. XLA's fusion of nGPT's per-layer
+    # normalization grew the prefill's compile quadratically with depth at the released width, a warm of
+    # 3012 s on an A100, where a narrow width showed none of it (ledger 635); the whole warm is shown
+    # beside them.
     Probe((*(Row(f"compile serve dory-1.0-4b {program}", "s", "benchmark_serving_compile.py",
                  floor=COMPILE_FLOOR, first_round=True)
              for program in ("construction", *(f"admission {rows}" for rows in (1, 2, 4, 8)))),
