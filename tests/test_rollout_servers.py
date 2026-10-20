@@ -356,8 +356,8 @@ def test_a_stop_strings_id_is_found_where_a_longer_prefix_does_not_extend_a_shor
         return "".join(pieces[token] for token in ids).replace(" .", ".")
 
     # Ids that decode to nothing (a special token, skipped) may sit inside the string they complete.
-    for drawn, stop, kept in (([3, 4, 5], "a ", (3, 4)), ([3, *[6] * 20, 7, 5], "ab", (3, *[6] * 20, 7)),
-                              ([3, 5, 5], "a ", None)):
+    for drawn, stop, kept in (([3, 4, 5], "a ", (3, 4)), ([3, 4, 5, 3, 4], "a ", (3, 4)),
+                              ([3, *[6] * 20, 7, 5], "ab", (3, *[6] * 20, 7)), ([3, 5, 5], "a ", None)):
         completion, _ = engine("vllm", lambda _, drawn=drawn, stop=stop: {
             **choice("vllm", drawn, [-.5] * len(drawn), "stop"), "stop_reason": stop})
         server = OpenAIRolloutServer(completion, Sampling(temperature=1.0, eos_token_ids=EOS, stop=(stop,)),
