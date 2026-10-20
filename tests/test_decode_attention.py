@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound
 
-from dew.nn.attention import folded_attention, scaled_dot_product_attention, with_key_lengths
+from dew.nn.attention import scaled_dot_product_attention, with_key_lengths
+from dew.nn.decode_geometry import folded_attention
 
 pytestmark = pytest.mark.kernel
 
@@ -92,9 +93,9 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
 
 
 def decode_step(lengths):
-    """fp32 attention of a decode step's grouped query (`CausalSelfAttention._decode_attention`) over
-    key lengths on 'xla', which the decode kernel takes on a GPU (`decode_attention.fits`), and the
-    folded attention it stands in for over the prefix those lengths mean."""
+    """fp32 attention of a decode step's grouped query (`decode_geometry.grouped_query`) over key
+    lengths on 'xla', which the decode kernel takes on a GPU (`decode_attention.fits`), and the folded
+    attention it stands in for over the prefix those lengths mean."""
     def attended(query, key, value):
         return scaled_dot_product_attention(query, key, value, implementation='xla',
                                             key_value_seq_lengths=lengths)
@@ -125,6 +126,119 @@ def test_attention_the_decode_kernel_takes_lowers_for_the_gpu_differentiated_in_
         with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
             lowered = jax.jit(differentiated).trace(query, key, key).lower(lowering_platforms=("cuda",))
         assert triton_kernels(lowered) == {"decode_attention": 1}
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_grouped_query_in_its_own_layout_reaches_the_decode_kernel(generation):
+    """A decode step's query of 4 heads over 2 key heads, called in the layer's own `[B, 1, N, D]`
+    layout with key lengths: the core reads each key head's query heads as its query positions
+    (`decode_geometry.grouped_query`), so the decode kernel takes it, lowered for the GPU on this CPU."""
+    from dew.nn.kernels.generation import assumed, gpu_mesh
+    from dew.training._lowering import triton_kernels
+
+    query = jax.ShapeDtypeStruct((2, 1, 4, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, 64, 2, 64), jnp.bfloat16)
+
+    def attend(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation='xla',
+                                            key_value_seq_lengths=jnp.asarray([1, 20], jnp.int32))
+
+    mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(attend).trace(query, key, key).lower(lowering_platforms=("cuda",))
+    assert triton_kernels(lowered) == {"decode_attention": 1}
+
+
+@pytest.mark.parametrize("implementation", ["xla", "reference"])
+def test_a_grouped_query_attends_as_its_heads_do_alone(implementation):
+    """Grouped in the core, a lone query of 8 heads over 2 key heads with key lengths gives each head's
+    attention over its key head's keys, within tests/reference_error.py's rule of the reference over
+    the key heads repeated, against float64."""
+    from dew.nn.attention import reference_attention, repeat_kv_heads
+
+    rng = np.random.default_rng(3)
+    lengths = jnp.asarray([1, 9, 32], jnp.int32)
+    query, key, value = (jnp.asarray(rng.normal(size=shape), jnp.float32)
+                         for shape in ((3, 1, 8, 32), (3, 32, 2, 32), (3, 32, 2, 32)))
+    found = scaled_dot_product_attention(query, key, value, implementation=implementation,
+                                         key_value_seq_lengths=lengths)
+
+    def alone(query, key, value):
+        mask = (jnp.arange(key.shape[1]) < lengths[:, None])[:, None, None, :]
+        return reference_attention(query, repeat_kv_heads(key, 8), repeat_kv_heads(value, 8), mask=mask)
+
+    with jax.enable_x64(new_val=True):
+        truth = alone(*(jnp.asarray(x, jnp.float64) for x in (query, key, value)))
+    assert_as_exact_as_the_reference(np.asarray(found), np.asarray(alone(query, key, value)),
+                                     np.asarray(truth), f"grouped {implementation}")
+
+
+def test_a_lone_query_whose_heads_do_not_group_is_refused_by_name():
+    """A lone query of 5 heads over 3 key heads is no grouped query: the core leaves it as it is, and
+    the kernel refuses its head counts, as it refuses them in any call."""
+    query = jnp.zeros((1, 1, 5, 16), jnp.float32)
+    key = jnp.zeros((1, 8, 3, 16), jnp.float32)
+    with pytest.raises(ValueError):
+        scaled_dot_product_attention(query, key, key, implementation="reference",
+                                     key_value_seq_lengths=jnp.asarray([4], jnp.int32))
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("kv_heads", [2, 1])
+def test_a_grouped_query_keeps_the_tensor_axis_split(kv_heads):
+    """Over a tensor axis of two, a lone query of 8 heads over 2 key heads, or over 1 that the core
+    repeats to the axis's 2 as each shard would hold it, is grouped per shard: each device's program
+    does half the work of the call off the mesh, by XLA's own count on the reference path (no Pallas
+    call, whose work XLA does not count), and attends as that call does."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training import MeshSpec
+
+    rng = np.random.default_rng(4)
+    lengths = jnp.asarray([5, 32], jnp.int32)
+    query, key, value = (jnp.asarray(rng.normal(size=shape), jnp.float32)
+                         for shape in ((2, 1, 8, 32), (2, 32, kv_heads, 32), (2, 32, kv_heads, 32)))
+
+    def attend(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation="reference",
+                                            key_value_seq_lengths=lengths)
+
+    def flops(compiled):
+        analysis = compiled.cost_analysis()
+        return (analysis[0] if isinstance(analysis, list) else analysis)["flops"]
+
+    whole = jax.jit(attend).lower(query, key, value).compile()
+    mesh = MeshSpec(tensor=2).build(jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        heads = NamedSharding(mesh, PartitionSpec(None, None, "tensor"))
+        placed = [jax.device_put(x, heads if x.shape[2] % 2 == 0 else NamedSharding(mesh, PartitionSpec()))
+                  for x in (query, key, value)]
+        compiled = jax.jit(attend).lower(*placed).compile()
+        split = compiled(*placed)
+    np.testing.assert_allclose(np.asarray(split), np.asarray(whole(query, key, value)), atol=1e-6, rtol=1e-6)
+    assert flops(compiled) <= 0.6 * flops(whole), (flops(compiled), flops(whole))
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_grouped_query_over_one_key_head_reaches_the_decode_kernel_on_each_tensor_shard(generation):
+    """Lowered for the GPU over a tensor axis of two, a lone query of 8 heads over a single key head,
+    which the core repeats to the axis's two, reaches the decode kernel, which reads each row's keys
+    to its length alone, on each shard's group."""
+    from dew.nn.kernels.generation import assumed, gpu_mesh
+    from dew.training._lowering import triton_kernels
+
+    query = jax.ShapeDtypeStruct((2, 1, 8, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, 256, 1, 64), jnp.bfloat16)
+
+    def attend(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation='xla',
+                                            key_value_seq_lengths=jnp.asarray([1, 20], jnp.int32))
+
+    mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:2]), ("tensor",)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(attend).trace(query, key, key).lower(lowering_platforms=("cuda",))
+    assert triton_kernels(lowered) == {"decode_attention": 1}
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")

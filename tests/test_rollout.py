@@ -123,9 +123,9 @@ class Calls:
     def __init__(self):
         self.seen = []
 
-    def __call__(self, data_source, completion, ground_truth, extra_info):
-        self.seen.append((data_source, completion, ground_truth, extra_info))
-        return float(completion.split().count(ground_truth))
+    def __call__(self, completion, record):
+        self.seen.append((completion, record))
+        return float(completion.split().count(record.ground_truth))
 
 
 def tiny_objective(seq=PROMPT_WIDTH + NEW_TOKENS - 1):
@@ -248,8 +248,8 @@ def test_the_reward_sees_each_rows_own_context():
 
     rollout(FakeState(params), prompt_batch(), jax.random.key(1))
 
-    assert [seen[0] for seen in reward.seen] == ["rule", "rule", "other", "other"]
-    assert [seen[2] for seen in reward.seen] == ["1", "1", "2", "2"]
+    assert [record.data_source for _, record in reward.seen] == ["rule", "rule", "other", "other"]
+    assert [record.ground_truth for _, record in reward.seen] == ["1", "1", "2", "2"]
 
 
 @pytest.mark.parametrize("estimator", ["group", "mean", "rloo"])
