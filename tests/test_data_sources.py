@@ -611,6 +611,91 @@ def test_cli_token_exports_are_readable_by_the_dispatched_token_source(tmp_path,
     assert actual.tolist() == expected.tolist()
 
 
+@pytest.mark.parametrize("read", ["streamed", "indexed"])
+def test_a_parquet_store_reads_with_the_credentials_its_profile_names(tmp_path, monkeypatch, read):
+    """An S3 Parquet store whose storage options name an AWS profile reads its rows with that
+    profile's credentials, on an endpoint that refuses every other request: every setting the
+    store was given reaches the reads, not only those Arrow's own S3 client can take."""
+    import boto3
+    import fsspec
+    import pyarrow.parquet as pq
+    from moto.core import set_initial_no_auth_action_count
+    from moto.server import ThreadedMotoServer
+
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+
+    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE",
+                 "AWS_DEFAULT_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "config"))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "credentials"))
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    _, port = server.get_host_and_port()
+    endpoint = f"http://127.0.0.1:{port}"
+
+    # The endpoint authenticates every request after the three that make the profile's user.
+    @set_initial_no_auth_action_count(3)
+    def read_through_the_profile():
+        iam = boto3.Session().client("iam", endpoint_url=endpoint, region_name="us-east-1",
+                                     aws_access_key_id="setup", aws_secret_access_key="setup")
+        # The endpoint's users outlive it in this process, so each test names its own.
+        user = "reader-" + uuid4().hex
+        iam.create_user(UserName=user)
+        iam.put_user_policy(UserName=user, PolicyName="s3", PolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}))
+        key = iam.create_access_key(UserName=user)["AccessKey"]
+        (tmp_path / "credentials").write_text(
+            f"[reader]\naws_access_key_id = {key['AccessKeyId']}\n"
+            f"aws_secret_access_key = {key['SecretAccessKey']}\n")
+        options = {"profile": "reader", "endpoint_url": endpoint}
+        bucket = "profiles-" + uuid4().hex
+        remote = fsspec.filesystem("s3", **options)
+        remote.mkdir(bucket)
+        written = io.BytesIO()
+        pq.write_table(pa.Table.from_pylist([{"id": index} for index in range(5)]), written)
+        remote.pipe(f"{bucket}/rows.parquet", written.getvalue())
+        source = Files(f"s3://{bucket}/rows.parquet", storage_options=options)
+        return sorted(int(row["id"]) for row in iterate(Pipeline(source), read=read))
+
+    try:
+        assert read_through_the_profile() == list(range(5))
+    finally:
+        server.stop()
+
+
+def test_an_anonymous_storage_profile_reads_parquet_though_it_names_keys():
+    """A storage profile over S3 that reads anonymously reads a Parquet store's rows, though it
+    names keys too, which an anonymous client does not sign with."""
+    import fsspec
+    import pyarrow.parquet as pq
+    from moto.server import ThreadedMotoServer
+
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+    from dew.data.storage import _profile
+
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    try:
+        _, port = server.get_host_and_port()
+        endpoint = f"http://127.0.0.1:{port}"
+        bucket = "public-" + uuid4().hex
+        remote = fsspec.filesystem("s3", key="testing", secret="testing", endpoint_url=endpoint)
+        remote.mkdir(bucket, acl="public-read")
+        written = io.BytesIO()
+        pq.write_table(pa.Table.from_pylist([{"id": index} for index in range(5)]), written)
+        remote.pipe(f"{bucket}/rows.parquet", written.getvalue(), ACL="public-read")
+        _profile("publics3", "s3a", {"key": "unused", "secret": "unused", "anon": True,
+                                     "endpoint_url": endpoint})
+        source = Files(f"publics3://{bucket}/rows.parquet")
+        assert sorted(int(row["id"]) for row in iterate(Pipeline(source), read="streamed")) == list(range(5))
+    finally:
+        server.stop()
+
+
 def test_a_token_export_reads_through_the_storage_options_it_is_given(tmp_path):
     """A committed token export that only its storage options reach, an S3 endpoint of its own,
     reads its manifest, metadata and tokens through them, as its shards and index do."""
