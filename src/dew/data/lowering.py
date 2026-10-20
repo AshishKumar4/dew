@@ -60,6 +60,7 @@ from dew.data.mixing import (
     PrimedMix,
     TokenDeficit,
     primed_maps,
+    rewound,
     token_weights,
 )
 from dew.data.pipeline import (
@@ -608,7 +609,9 @@ class _PassesIterator(pygrain.DatasetIterator):
         return self._rows.get_state()
 
     def set_state(self, state) -> None:
-        self._rows.set_state(state)
+        # Right after a pass ends, this is the repeat rewinding it, which keeps the corpus's counts.
+        self._rows.set_state(record(rewound(state, self._rows.get_state()), "rewound pass") if self._ended
+                             else state)
         self._yielded, self._ended = not self._ended, False
 
 

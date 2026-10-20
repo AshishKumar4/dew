@@ -179,13 +179,9 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         }
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        """Restore the position and counts. A repeat above rewinds this iterator to its first state
-        after each pass, which leaves the run of rejections going on and a warning given, so they
-        are kept where this iterator holds more."""
         super().set_state(state)
-        self._predicate.consecutive = max(self._predicate.consecutive,
-                                          integer(state["consecutive"], "consecutive"))
-        self._predicate.warned = self._predicate.warned or boolean(state["warned"], "warned")
+        self._predicate.consecutive = integer(state["consecutive"], "consecutive")
+        self._predicate.warned = boolean(state["warned"], "warned")
 
 
 class Accepted(pygrain.IterDataset[Batch]):
@@ -487,6 +483,21 @@ class PrimedMix(pygrain.IterDataset[Batch]):
                    for index, (key, parent) in enumerate(zip(self._keys, self._corpora, strict=True))}
         weights = dict(zip(self._keys, self._weights, strict=True))
         return iter(pygrain.IterDataset.mix(parents, weights))
+
+
+def rewound(start: object, current: object) -> object:
+    """`start`, the position a repeat rewinds its pass to, with the counts `current` holds at each
+    counter's place (its count, run of rejections and warning): a pass read again goes on counting
+    the corpus, where a restored position replaces its counts."""
+    if isinstance(start, Mapping) and isinstance(current, Mapping):
+        kept = {key: rewound(value, current[key]) if key in current else value
+                for key, value in start.items()}
+        if "corpus" in start and "counts" in current:
+            kept.update({key: current[key] for key in ("counts", "consecutive", "warned") if key in current})
+        return kept
+    if isinstance(start, list) and isinstance(current, list) and len(start) == len(current):
+        return [rewound(value, now) for value, now in zip(start, current, strict=True)]
+    return start
 
 
 def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
