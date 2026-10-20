@@ -11,6 +11,7 @@ import numpy as np
 
 from dew.data.dataset import Batch
 from dew.data.pipeline import Rejected
+from dew.records import boolean, integer, record, text
 
 
 @dataclasses.dataclass(frozen=True)
@@ -124,11 +125,78 @@ def recounted(given: Batch, output: Batch) -> Batch:
     does, from the fields as they are named now."""
     if "_dew_valid_targets" not in output or not targets_changed(given, output):
         return output
-    view = {counted: output[name] for counted, name in zip(_COUNTED, _bound(output), strict=True)
-            if name in output}
-    rule = ValidTargets(role=output.get("_dew_target_role"), pad_id=output.get("_dew_target_pad"),
-                        measured=False)
-    return {**output, "_dew_valid_targets": rule(view)}
+    return {**output, "_dew_valid_targets": _scored(output)}
+
+
+def _scored(row: Batch) -> int:
+    """The targets of a counted `row` by the rule it carries, from the fields as they are named now."""
+    view = {counted: row[name] for counted, name in zip(_COUNTED, _bound(row), strict=True) if name in row}
+    rule = ValidTargets(role=row.get("_dew_target_role"), pad_id=row.get("_dew_target_pad"), measured=False)
+    return rule(view)
+
+
+@dataclasses.dataclass(frozen=True)
+class CountRule:
+    """The rule a record's targets were counted by (`CountTargets`) and the name its roles go by
+    (`rebound`): a windows or pack stage counts the windows it makes of such records by it, as the
+    loss scores them, since their documents' counts describe none of them."""
+
+    role: int | None
+    pad_id: int | None
+    roles: str
+
+    @classmethod
+    def of(cls, element: Batch) -> CountRule | None:
+        """The rule `element`'s targets were counted by, or None where none were."""
+        if "_dew_valid_targets" not in element:
+            return None
+        role, pad_id = (element.get(name) for name in _RULE)
+        return cls(None if role is None else int(role), None if pad_id is None else int(pad_id),
+                   _bound(element)[2])
+
+    def counted(self, window: Batch, field: str) -> Batch:
+        """`window`, made of records counted by this rule from its token `field`, its own targets
+        counted by the rule and carrying it, so a later step or layout counts them by it again."""
+        if self.role is not None and self.roles not in window:
+            raise ValueError(
+                f"the documents' targets were counted in role {self.role}, and the windows made of them "
+                f"drop the roles {self.roles!r}; keep them among the stage's fields")
+        rule = {name: value for name, value in zip(_RULE, (self.role, self.pad_id), strict=True)
+                if value is not None}
+        held = {**window, **rule, _BOUND: (field, f"{field}_segment_ids", self.roles)}
+        return {**held, "_dew_valid_targets": _scored(held)}
+
+
+class LayoutRule:
+    """The one rule the documents a pack or windows stage lays out were counted by (`CountRule`),
+    or None where nothing counted them, as each document passes. Documents counted by two rules,
+    or some by none, make windows no one rule counts, and are refused."""
+
+    def __init__(self) -> None:
+        self.seen = False
+        self.rule: CountRule | None = None
+
+    def __call__(self, document: Batch) -> Batch:
+        rule = CountRule.of(document)
+        if not self.seen:
+            self.seen, self.rule = True, rule
+        elif rule != self.rule:
+            raise ValueError(f"the documents of one layout were counted by two rules, {self.rule!r} and "
+                             f"{rule!r}, and the windows made of them hold one")
+        return document
+
+    def state(self) -> Mapping[str, object]:
+        return {"seen": self.seen, "rule": None if self.rule is None else dataclasses.asdict(self.rule)}
+
+    def restore(self, state: Mapping[str, object]) -> None:
+        self.seen = boolean(state["seen"], "seen count rule")
+        if state["rule"] is None:
+            self.rule = None
+            return
+        rule = record(state["rule"], "count rule")
+        role, pad_id = (None if rule[name] is None else integer(rule[name], name)
+                        for name in ("role", "pad_id"))
+        self.rule = CountRule(role, pad_id, text(rule["roles"], "roles"))
 
 
 @dataclasses.dataclass(frozen=True)
