@@ -11,7 +11,7 @@ torch share one venv:
     uv pip install --python /tmp/hfref/bin/python torch torchvision \
         --index-url https://download.pytorch.org/whl/cpu
     uv pip install --python /tmp/hfref/bin/python -e '.[torch]' safetensors \
-        sentencepiece
+        sentencepiece --extra-index-url https://pypi.dewml.dev/simple
     /tmp/hfref/bin/python tools/hf_reference.py
 
 What lands in tests/fixtures/hf:

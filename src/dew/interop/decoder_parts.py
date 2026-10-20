@@ -1111,7 +1111,7 @@ def _layer_param_path(parts: list[str], config: Mapping[str, object]) -> tuple[s
     if module in _PROJECTIONS and len(parts) == 6:
         sublayer = parts[4]
         if sublayer in _PROJECTIONS[module] and leaf in ('weight', 'bias'):
-            # torch Linear holds [out, in]; nn.Dense keeps [in, out]
+            # torch Linear holds [out, in]; Dense keeps [in, out]
             return (module, sublayer, 'kernel' if leaf == 'weight' else 'bias')
         if module == 'self_attn' and sublayer in _HEAD_NORMS and leaf == 'weight':
             return (module, sublayer, 'scale')
