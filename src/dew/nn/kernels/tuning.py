@@ -184,7 +184,7 @@ def decoded(value: JSON) -> Rebuilt:
     return rebuilt
 
 
-def _field[T](reader: Callable[[object, str], T], value: JSON, key: str) -> T:
+def _field[T](reader: Callable[[object, str], T], value: object, key: str) -> T:
     """`value` read by `dew.records`' `reader`; `Unreadable` where it refuses it."""
     try:
         return reader(value, key)
@@ -235,40 +235,58 @@ def _launch_json(ba: tokamax.BoundArguments) -> dict[str, JSON]:
                                                            for name, value in ba.arguments.items()}}
 
 
-def _launch(entry: JSON) -> tokamax.BoundArguments:
+def _launch(entry: object) -> tokamax.BoundArguments:
     """The launch `_launch_json` wrote; `Unreadable` where this checkout cannot rebuild it: its op's
     class or fields, or arguments that are not exactly its kernel's parameters (another checkout's
     signature of it)."""
-    if not isinstance(entry, dict) or not isinstance(entry.get("arguments"), dict):
-        raise Unreadable(f"a stored launch is no mapping of an op and its arguments: {entry!r}")
-    op, stored = decoded(entry.get("op")), entry["arguments"]
-    if not isinstance(op, tokamax.Op) or not isinstance(stored, dict):
+    stored = _field(records.record, entry, "launch")
+    arguments = _field(records.record, stored.get("arguments"), "arguments")
+    op = decoded(_field(records.json_value, stored.get("op"), "op"))
+    if not isinstance(op, tokamax.Op):
         raise Unreadable(f"a stored launch's op is no tokamax Op: {op!r}")
-    ba = tokamax.BoundArguments(op, {name: decoded(value) for name, value in stored.items()})
-    if set(stored) != set(ba.signature.parameters) - {"config"}:
-        raise Unreadable(f"{type(op).__name__}'s stored arguments are not this checkout's: {sorted(stored)}")
+    ba = tokamax.BoundArguments(op, {name: decoded(_field(records.json_value, value, name))
+                                     for name, value in arguments.items()})
+    if set(arguments) != set(ba.signature.parameters) - {"config"}:
+        raise Unreadable(f"{type(op).__name__}'s stored arguments are not this checkout's: "
+                         f"{sorted(arguments)}")
     return ba
 
 
+TIMING_FIELDS = ("compile_time_ms", "lower_time_ms", "evaluation_times_ms", "metadata", "peak_memory_mb")
+"""Every field of `tokamax.BenchmarkData`, which a launch's stored timings keep."""
+
+
 def _timings_json(timings: Timings) -> list[JSON]:
-    """The configs that ran and every field of their times, as JSON (`_timings`)."""
-    return [[encoded(config), {field.name: encoded(getattr(timing, field.name))
-                               for field in dataclasses.fields(tokamax.BenchmarkData)}]
+    """The configs that ran and every field of their times (`TIMING_FIELDS`), as JSON (`_timings`)."""
+    return [[encoded(config), {"compile_time_ms": timing.compile_time_ms,
+                               "lower_time_ms": timing.lower_time_ms,
+                               "evaluation_times_ms": list(timing.evaluation_times_ms),
+                               "metadata": encoded(dict(timing.metadata)),
+                               "peak_memory_mb": timing.peak_memory_mb}]
             for config, timing in timings.prune_errors().items()]
 
 
-def _timings(entries: JSON) -> Timings:
+def _timings(entries: object) -> Timings:
     """The timings `_timings_json` wrote; `Unreadable` where they are not."""
     if not isinstance(entries, list):
         raise Unreadable(f"stored timings are no list: {entries!r}")
-    names = {field.name for field in dataclasses.fields(tokamax.BenchmarkData)}
     measured: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     for pair in entries:
-        if not (isinstance(pair, list) and len(pair) == 2 and isinstance(pair[1], dict)
-                and set(pair[1]) == names):
-            raise Unreadable(f"a stored timing is not this checkout's: {pair!r}")
-        fields = {name: decoded(value) for name, value in pair[1].items()}
-        measured[_key(decoded(pair[0]))] = tokamax.BenchmarkData(**fields)
+        if not (isinstance(pair, list) and len(pair) == 2):
+            raise Unreadable(f"a stored timing is no pair of a config and its times: {pair!r}")
+        fields = _field(records.record, pair[1], "timing")
+        if set(fields) != set(TIMING_FIELDS):
+            raise Unreadable(f"a stored timing's fields are not this checkout's: {sorted(fields)}")
+        metadata = decoded(_field(records.json_value, fields["metadata"], "metadata"))
+        if not isinstance(metadata, dict):
+            raise Unreadable(f"a stored timing's metadata is no mapping: {metadata!r}")
+        peak = fields["peak_memory_mb"]
+        measured[_key(decoded(_field(records.json_value, pair[0], "config")))] = tokamax.BenchmarkData(
+            compile_time_ms=_field(records.number, fields["compile_time_ms"], "compile_time_ms"),
+            lower_time_ms=_field(records.number, fields["lower_time_ms"], "lower_time_ms"),
+            evaluation_times_ms=_field(records.numbers, fields["evaluation_times_ms"], "evaluation_times_ms"),
+            metadata=metadata,
+            peak_memory_mb=None if peak is None else _field(records.number, peak, "peak_memory_mb"))
     return Timings(measured)
 
 
