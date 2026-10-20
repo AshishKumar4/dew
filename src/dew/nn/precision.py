@@ -34,6 +34,27 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
     return jnp.promote_types(jnp.float32 if dtype is None else dtype, jnp.float32)
 
 
+def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
+    """`product` plus `bias` broadcast over its leading axes, in the dtype their addition promotes
+    to, as flax's layer adds them.
+    Rounding the product and the bias once together, as torch's addmm does, wrote an fp32 product
+    and a pass of its own on every biased layer (a DiT-B step 17.5% slower on an A100), for a bf16
+    output 1.37 times torch's rounding, which the parity rule holds already.
+
+    JAX transposes a broadcast into a sum in the broadcast operand's dtype (jax-ml/jax#30310), so
+    a bfloat16 bias added to bfloat16 products sums its gradient over every position in bfloat16,
+    where torch's addmm sums its in float32: Qwen 2's projection biases, summed over 8192 tokens,
+    came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
+    at fp32, the gradient sums at fp32 and rounds once into the bias.
+    """
+    dtype, wide = jnp.result_type(product, bias), at_least_fp32(bias.dtype)
+    # The bias takes the product's rank before the sum, as flax's layers reshape it, so no rank is
+    # promoted implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds
+    # the round trip, so the product and bias fuse as before) and its gradient sums at fp32.
+    bias = jnp.reshape(bias.astype(wide), (1,) * (product.ndim - bias.ndim) + bias.shape)
+    return product.astype(dtype) + jnp.broadcast_to(bias, product.shape).astype(dtype)
+
+
 def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
     """The canonical names a `jax.lax.PrecisionLike` spells, unordered.
 
@@ -115,15 +136,6 @@ def float32_einsum(subscripts: str, *operands, precision: jax.lax.PrecisionLike 
 def float32_matmul(lhs, rhs) -> jax.Array:
     """`lhs @ rhs` at the precision its operands' own dtype takes (`float32_products`)."""
     return jnp.matmul(lhs, rhs, precision=float32_products(products_dtype(lhs, rhs)))
-
-
-def float32_conv_general_dilated(lhs, rhs, *args, precision: jax.lax.PrecisionLike = None,
-                                 **kwargs) -> jax.Array:
-    """`jax.lax.conv_general_dilated` at the precision its operands' own dtype takes, as
-    `float32_dot_general` is a product's: a flax convolution's
-    (`nn.Conv(conv_general_dilated=...)`)."""
-    return jax.lax.conv_general_dilated(
-        lhs, rhs, *args, precision=float32_products(products_dtype(lhs, rhs), precision), **kwargs)
 
 
 def configurable_precision(precision: jax.lax.PrecisionLike) -> bool:

@@ -35,6 +35,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.dense import Dense
 from dew.objectives.base import merge
 from dew.records import JSON
 from dew.registry import from_record, read_arguments
@@ -1102,7 +1103,7 @@ class CausalTransformer(nn.Module):
             self.embed_tokens_per_layer = TokenEmbedding(
                 num_embeddings=self.per_layer_vocab, features=self.num_layers * ple,
                 dtype=self.dtype, name='embed_tokens_per_layer')
-            self.per_layer_model_projection = nn.Dense(
+            self.per_layer_model_projection = Dense(
                 projections['per_layer_model_projection'][1], use_bias=False,
                 dtype=self.dtype, precision=self.precision,
                 name='per_layer_model_projection', dot_general=float32_dot_general)
@@ -1139,7 +1140,7 @@ class CausalTransformer(nn.Module):
             # and leave through their own (modeling_gemma3n.py,
             # Gemma3nTextModel.altup_projections and altup_unembed_projections).
             projection = functools.partial(
-                nn.Dense, use_bias=False, dtype=self.dtype,
+                Dense, use_bias=False, dtype=self.dtype,
                 precision=self.precision, dot_general=float32_dot_general)
             self.altup_projections = [
                 projection(projections[f'altup_projections_{index}'][1], name=f'altup_projections_{index}')
@@ -1159,18 +1160,18 @@ class CausalTransformer(nn.Module):
                                               name='engram_hashes')
         self._final_norm()
         if self.loop is not None and self.loop.exit_gate:
-            self.early_exit_gate = nn.Dense(
+            self.early_exit_gate = Dense(
                 projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
                 name='early_exit_gate', **normal_kernel(self.initializer_range),
                 dot_general=float32_dot_general)
         if not self.tie_embeddings:
-            self.lm_head = nn.Dense(
+            self.lm_head = Dense(
                 features=projections['lm_head'][1], use_bias=False, dtype=at_least_fp32(self.dtype),
                 precision=self.precision,
                 dot_general=head_dot_general(self.dtype, self.precision),
                 name='lm_head', **normal_kernel(self.initializer_range))
         if self.head_transform is not None:
-            self.head_dense = nn.Dense(
+            self.head_dense = Dense(
                 projections['head_dense'][1], use_bias=False, dtype=self.dtype, precision=self.precision,
                 name='head_dense', **normal_kernel(self.initializer_range), dot_general=float32_dot_general)
             self.head_norm = decoder_norm(

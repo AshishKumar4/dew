@@ -15,7 +15,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.core import meta
 
-from dew.nn.precision import float32_dot_general
+from dew.nn.dense import Dense
+from dew.nn.precision import biased, float32_dot_general
 
 from ..registry import wrapper_layers
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel
@@ -37,8 +38,8 @@ def _intercepted() -> bool:
 def join_refusal(projections: Sequence[nn.Module]) -> str | None:
     """Why one GEMM cannot stand in for `projections`' own calls, or None."""
     return first_refusal(
-        (all(type(projection) is nn.Dense for projection in projections),
-         "a projection is not a plain nn.Dense, whose call the join reproduces"),
+        (all(type(projection) is Dense for projection in projections),
+         "a projection is not a plain Dense, whose call the join reproduces"),
         (all(projection.dot_general in (None, float32_dot_general) and projection.dot_general_cls is None
              for projection in projections),
          "a projection takes a dot_general other than the join's (`float32_dot_general`)"),
@@ -79,8 +80,11 @@ def joined_dense(x: jax.Array, projections: Sequence[nn.Module], *, axis: int) -
     inputs = promoted[0][0]
     # A kernel is [inputs, features]; the stacked axis sits beside its features as it will in the output.
     kernel = jnp.stack([kernel for _, kernel, _ in promoted], axis=axis + 3)
-    y = float32_dot_general(inputs, kernel, (((inputs.ndim - 1,), (0,)), ((), ())),
-                            precision=projections[0].precision)
-    if not projections[0].use_bias:
+    biases = (jnp.stack([bias for _, _, bias in promoted], axis=axis + 2) if projections[0].use_bias
+              else None)
+    dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
+    y = float32_dot_general(inputs, kernel, dimensions, precision=projections[0].precision)
+    if biases is None:
         return y
-    return y + jnp.stack([bias for _, _, bias in promoted], axis=axis + 2)
+    # Taken and biased as each Dense takes and biases its own (`dew.nn.dense`).
+    return biased(y, biases)

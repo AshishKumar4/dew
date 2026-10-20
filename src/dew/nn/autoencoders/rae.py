@@ -35,6 +35,7 @@ from dew.nn.activations import activation
 from dew.nn.attention import LayerNorm, projected_heads, projected_output, scaled_dot_product_attention
 from dew.nn.backbones.sd3 import sincos_position
 from dew.nn.blocks import torch_bicubic_resize
+from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import float32_dot_general
 from dew.objectives.base import Variables
@@ -188,8 +189,8 @@ class _Decoder(nn.Module):
         if latents.shape[1:3] != (self.grid, self.grid):
             raise ValueError(f"an RAE decodes a {self.grid}x{self.grid} latent, not "
                              f"{latents.shape[1]}x{latents.shape[2]}")
-        tokens = nn.Dense(self.width, dtype=self.dtype, name="embed",
-                          dot_general=float32_dot_general)(
+        tokens = Dense(self.width, dtype=self.dtype, name="embed",
+                       dot_general=float32_dot_general)(
             latents.reshape(batch, -1, latents.shape[-1])
         )
         cls_token = self.param("cls_token", nn.initializers.zeros, (1, 1, self.width))
@@ -202,8 +203,8 @@ class _Decoder(nn.Module):
             tokens = _Block(self.width, self.heads, self.intermediate, 1e-12, "gelu", dtype=self.dtype,
                             name=f"layers_{index}")(tokens)
         tokens = LayerNorm(epsilon=1e-12, dtype=self.dtype, name="norm")(tokens)
-        patches = nn.Dense(self.patch * self.patch * self.channels, dtype=self.dtype, name="pred",
-                           dot_general=float32_dot_general)(
+        patches = Dense(self.patch * self.patch * self.channels, dtype=self.dtype, name="pred",
+                        dot_general=float32_dot_general)(
             tokens[:, 1:]
         )
         patches = patches.reshape(batch, self.grid, self.grid, self.patch, self.patch, self.channels)

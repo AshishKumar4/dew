@@ -35,6 +35,7 @@ from dew.nn.attention import (
     max_attention_logits,
     scaled_dot_product_attention,
 )
+from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
 from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
@@ -176,7 +177,7 @@ class SparseIndexer(nn.Module):
                 f"out of heads of width {self.head_dim}, so the heads have "
                 "to be wider")
         dense = functools.partial(
-            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+            Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
             dot_general=float32_dot_general)
         self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
         self.wk = dense(self.head_dim, name='wk')
@@ -328,7 +329,7 @@ class MultiHeadLatentAttention(nn.Module):
                 "names the layer type that stashes it")
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         dense = functools.partial(
-            nn.Dense, use_bias=self.attention_bias, dtype=self.dtype,
+            Dense, use_bias=self.attention_bias, dtype=self.dtype,
             precision=self.precision, dot_general=float32_dot_general)
         norm = functools.partial(
             RMSNorm, epsilon=self.norm_eps,
@@ -337,27 +338,27 @@ class MultiHeadLatentAttention(nn.Module):
         if self.q_lora_rank is None:
             # The reference's plain q_proj takes no bias, whatever
             # attention_bias says; only the low-rank projections do.
-            self.q_proj = nn.Dense(
+            self.q_proj = Dense(
                 self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
                 precision=self.precision, name='q_proj', dot_general=float32_dot_general)
         else:
             self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
             self.q_a_layernorm = norm(name='q_a_layernorm')
-            self.q_b_proj = nn.Dense(
+            self.q_b_proj = Dense(
                 self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
                 precision=self.precision, name='q_b_proj', dot_general=float32_dot_general)
         self.kv_a_proj_with_mqa = dense(
             self.kv_lora_rank + self.qk_rope_head_dim, name='kv_a_proj_with_mqa')
         self.kv_a_layernorm = norm(name='kv_a_layernorm')
-        self.kv_b_proj = nn.Dense(
+        self.kv_b_proj = Dense(
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             use_bias=False, dtype=self.dtype, precision=self.precision,
             name='kv_b_proj', dot_general=float32_dot_general)
         self.o_proj = dense(self.emb_features, name='o_proj')
         if self.output_gate:
-            self.g_proj = nn.Dense(self.num_heads * self.v_head_dim, use_bias=False,
-                                   dtype=self.dtype, precision=self.precision, name='g_proj',
-                                   dot_general=float32_dot_general)
+            self.g_proj = Dense(self.num_heads * self.v_head_dim, use_bias=False,
+                                dtype=self.dtype, precision=self.precision, name='g_proj',
+                                dot_general=float32_dot_general)
         if self.index_n_heads is not None and self.index_head_dim is not None:
             if self.q_lora_rank is None:
                 raise ValueError(
