@@ -484,7 +484,7 @@ def test_a_pools_observer_holds_every_processs_parameters_whole_at_each_observed
     observed = [dict(np.load(tmp_path / "out" / f"process{index}.observed.npz")) for index in range(2)]
     assert sorted({name.partition("[")[0] for name in observed[0]}) == ["2", "4"]
     assert_identical_parameters(*observed)
-    final = dumped_params(tmp_path / "out" / "process0.json")
+    final = dict(np.load(tmp_path / "out" / "process0.whole.npz"))
     assert_identical_parameters({name.removeprefix("4"): leaf for name, leaf in observed[0].items()
                                  if name.startswith("4")}, final)
     assert any(not np.array_equal(observed[0][f"2{name}"], leaf) for name, leaf in final.items())
