@@ -147,14 +147,6 @@ def configured_precision(precision: jax.lax.PrecisionLike):
     return jax.default_matmul_precision(name if preset else name.lower())
 
 
-def jax_attention_honors(dtype: DTypeLike, precision: jax.lax.PrecisionLike) -> bool:
-    """Whether jax.nn's xla attention over `dtype` queries multiplies at `precision`, under its
-    `configured_precision`: float32 queries at any a config can name; a 16-bit query's logits take
-    jax.nn's own dot algorithm for its dtype whatever the config says, so the default alone."""
-    wide = jnp.dtype(dtype).itemsize >= 4
-    return (configurable_precision if wide else asks_default_precision)(precision)
-
-
 def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = None) -> jax.lax.PrecisionLike:
     """The precision a product of `dtype` operands takes: float32 products for float32 operands
     where none is stated (`float32_products`), and for bf16 operands at the default precision the
