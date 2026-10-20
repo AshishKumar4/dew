@@ -10,9 +10,11 @@ are its fixture's but for its head widths, which are the reference's: transforme
 the model_type (its flagship sizes), the fixture's hidden width rescaled where the family derives its head
 width from it. A family transformers has no config for keeps its fixture's widths, and its cells say so.
 
-A route is generic where `kernel != preferred`. One whose refusal code its kernel's `SUPPORTS` declares is
-a tracked gap, named by its roadmap or ledger row; one whose code is `UNCLASSIFIED` comes from a site that
-gives its refusal as text alone; any other is undeclared. The markdown lists those three first.
+A route is generic where `kernel != preferred`. One whose refusal carries a row (a selector requirement's,
+`Refusal.row`) or whose code its kernel's `SUPPORTS` declares is a tracked gap, named by its roadmap or
+ledger row, or inherent where no implementation of the kernel lifts it; one whose code is `UNCLASSIFIED`
+comes from a site that gives its refusal as text alone; any other is undeclared. The markdown lists the
+gaps, the unclassified and the undeclared first.
 
     python tools/kernel_routes.py trace --families qwen3,llama OUT.json    # named families
     python tools/kernel_routes.py trace --shard 3/16 OUT.json              # every 16th from the 4th
@@ -93,13 +95,19 @@ def families() -> list[str]:
 
 
 def _supports(route) -> str | None:
-    """The roadmap or ledger row the refusing kernel's `SUPPORTS` names for the route's code, or None."""
+    """The row the route's refusal carries (`Refusal.row`, a selector requirement's), else the one the
+    refusing kernel's `SUPPORTS` names for its code, or None."""
+    if route.refusal is None:
+        return None
+    if route.refusal.row is not None:
+        return route.refusal.row
     module = importlib.import_module(route.site.split(":")[0])
-    return getattr(module, "SUPPORTS", {}).get(route.refusal.code) if route.refusal else None
+    supports = getattr(module, "SUPPORTS", {})
+    return supports.get(route.refusal.code) if isinstance(supports, dict) else None
 
 
 def verdict(route) -> str:
-    """'kernel', 'gap: <row>', 'unclassified' or 'undeclared' (see the module docstring)."""
+    """'kernel', 'gap: <row>', 'inherent', 'unclassified' or 'undeclared' (see the module docstring)."""
     from dew.nn.kernels.generation import UNCLASSIFIED
 
     if route.kernel == route.preferred:
@@ -107,6 +115,8 @@ def verdict(route) -> str:
     if route.refusal is not None and route.refusal.code == UNCLASSIFIED:
         return "unclassified"
     row = _supports(route)
+    if row == "inherent":
+        return "inherent"
     return f"gap: {row}" if row else "undeclared"
 
 
