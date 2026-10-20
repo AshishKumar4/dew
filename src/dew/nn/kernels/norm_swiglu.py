@@ -212,6 +212,23 @@ def _within_fp32(dtype) -> bool:
     return not jnp.issubdtype(dtype, jnp.floating) or jnp.finfo(dtype).bits <= 32
 
 
+def _dtype_requirements(name: str) -> tuple[Requirement, ...]:
+    """What the norm and SwiGLU kernels need of every dtype a call reads and writes (the case's
+    `dtypes`): none wider than fp32, whose accuracy the kernels compute at; none fp16, which they are
+    not yet qualified on (ledger 823); and none but fp32, bf16 and fp16, the floats they compute."""
+    return (
+        Requirement('precision', lambda case: all(_within_fp32(dtype) for dtype in case.dtypes),
+                    lambda case: f"{name} reads or writes {', '.join(map(str, case.dtypes))}; the kernel "
+                                 "computes in fp32, which a wider dtype's accuracy needs more than",
+                    inherent=True),
+        Requirement('fp16', lambda case: jnp.float16 not in case.dtypes,
+                    f"{name}'s kernel is not yet qualified on float16 operands", row=QUALIFY_FP16),
+        Requirement('dtype', lambda case: all(dtype in (*DTYPES, jnp.float16) for dtype in case.dtypes),
+                    lambda case: f"{name} reads or writes {', '.join(map(str, case.dtypes))}; the kernel "
+                                 "computes float32, bfloat16 and float16 alone", inherent=True),
+    )
+
+
 def _runs(case) -> bool:
     """Whether the Pallas kernels run for `case` here: a GPU Dew's Triton kernels run on, or on a CPU
     interpreted where the call names them (`case.named`)."""
@@ -252,14 +269,14 @@ def _per_shard(local, axes, operands, replicated):
 
 @dataclasses.dataclass(frozen=True)
 class NormCase:
-    """A norm call as the norm selector reads it (`NORM`): its input `dtype` and `output` dtype, its
-    `width` (0 without a feature axis) and whether it is `empty`; whether its weight, a residual
-    branch and a gate fit the kernel (`scale_fits`, `branch_fits`, `gate_fits`) and its operands' mesh
-    placement does (`placed`); whether an activation follows it (`activated`), its statistics are
-    fp32's, and a gated norm's `activation` (None for a plain one); and the implementation the call
-    `named`, None for 'auto'."""
-    dtype: np.dtype
-    output: np.dtype
+    """A norm call as the norm selector reads it (`NORM`): the `dtypes` it reads and writes (its input,
+    its output, its weight's and its gate's where it has them), its `width` (0 without a feature axis)
+    and whether it is `empty`; whether its weight is a vector over the features (`scale_fits`), a
+    residual branch is the input's shape and dtype (`branch_fits`) and a gate its shape
+    (`gate_fits`), and its operands' mesh placement fits (`placed`); whether an activation follows it
+    (`activated`), its statistics are fp32's, and a gated norm's `activation` (None for a plain one);
+    and the implementation the call `named`, None for 'auto'."""
+    dtypes: tuple[np.dtype, ...]
     width: int
     empty: bool
     scale_fits: bool
@@ -278,11 +295,12 @@ def norm_case(implementation: str, x, scale, dtype, axes, *, branch=None, gate=N
     branch adds in `x`'s dtype, as the stream's own add does; a gate is read in fp32 whatever its float
     dtype, as the XLA arithmetic widens it."""
     return NormCase(
-        dtype=jnp.dtype(x.dtype), output=jnp.dtype(dtype), width=x.shape[-1] if x.shape else 0,
-        empty=not x.shape or x.size == 0,
-        scale_fits=scale is None or (scale.shape == x.shape[-1:] and scale.dtype in DTYPES),
+        dtypes=tuple(jnp.dtype(dtype_of) for dtype_of in (x.dtype, dtype, *(
+            operand.dtype for operand in (scale, gate) if operand is not None))),
+        width=x.shape[-1] if x.shape else 0, empty=not x.shape or x.size == 0,
+        scale_fits=scale is None or scale.shape == x.shape[-1:],
         branch_fits=branch is None or (branch.shape == x.shape and branch.dtype == x.dtype),
-        gate_fits=gate is None or (gate.shape == x.shape and gate.dtype in DTYPES),
+        gate_fits=gate is None or gate.shape == x.shape,
         placed=_placed(axes, (x, scale, branch, gate), whole_last=True), activated=activated,
         fp32_statistics=fp32_statistics, activation=activation,
         named=None if implementation == 'auto' else implementation)
@@ -299,23 +317,18 @@ NORM_SUPPORTS: tuple[Requirement[NormCase], ...] = (
     Requirement('gate_activation', lambda case: case.activation in (None, 'silu', 'sigmoid'),
                 lambda case: f"the gated kernel gates by silu or sigmoid, not {case.activation!r}",
                 inherent=True),
-    Requirement('precision', lambda case: _within_fp32(case.dtype) and _within_fp32(case.output),
-                lambda case: f"RMSNorm input {case.dtype} and output {case.output}; the kernel computes in "
-                             "fp32, which a wider dtype's accuracy needs more than", inherent=True),
-    Requirement('dtype', lambda case: case.dtype in DTYPES and case.output in DTYPES,
-                lambda case: f"RMSNorm input {case.dtype} and output {case.output}; the kernel is qualified "
-                             "on float32 and bfloat16", row=QUALIFY_FP16),
+    *_dtype_requirements('RMSNorm'),
     Requirement('empty', lambda case: not case.empty, "RMSNorm needs nonempty rows with a feature axis",
                 inherent=True),
     Requirement('width', lambda case: 0 < case.width <= 8192,
                 "RMSNorm's register tile holds at most 8192 features", row='ledger 820'),
     Requirement('scale', lambda case: case.scale_fits,
-                "the kernel takes a float32 or bfloat16 vector scale, not a broadcast affine tensor",
+                "the kernel takes a vector scale over the features, not a broadcast affine tensor",
                 inherent=True),
     Requirement('branch', lambda case: case.branch_fits,
                 "a residual branch must match the normalized input's shape and dtype", inherent=True),
-    Requirement('gate', lambda case: case.gate_fits,
-                "a gate must match the normalized input's shape, in float32 or bfloat16", inherent=True),
+    Requirement('gate', lambda case: case.gate_fits, "a gate must match the normalized input's shape",
+                inherent=True),
     Requirement('placement', lambda case: case.placed,
                 "a mesh splits RMSNorm's operands by axes the caller does not name or across its features, "
                 "or a shard_map that checks varying axes holds them, and a Pallas call states no varying "
@@ -351,11 +364,10 @@ def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str
 
 @dataclasses.dataclass(frozen=True)
 class SwigluCase:
-    """A SiLU product as the SwiGLU selector reads it (`SWIGLU`): its operands' common `dtype`, whether
-    they share one the kernel takes (`dtype_fits`) and a shape it reads (`shape_fits`), whether their
-    mesh placement fits (`placed`), and the implementation the call `named`, None for 'auto'."""
-    dtype: np.dtype
-    dtype_fits: bool
+    """A SiLU product as the SwiGLU selector reads it (`SWIGLU`): its operands' `dtypes`, whether they
+    share a shape the kernel reads (`shape_fits`), whether their mesh placement fits (`placed`), and the
+    implementation the call `named`, None for 'auto'."""
+    dtypes: tuple[np.dtype, ...]
     shape_fits: bool
     placed: bool
     named: str | None
@@ -363,12 +375,10 @@ class SwigluCase:
 
 SWIGLU_SUPPORTS: tuple[Requirement[SwigluCase], ...] = (
     Requirement('capability', _runs, "the Pallas kernels need a GPU of sm80 or later", inherent=True),
-    Requirement('precision', lambda case: _within_fp32(case.dtype),
-                lambda case: f"SwiGLU of {case.dtype} operands; the kernel computes in fp32, which a wider "
-                             "dtype's accuracy needs more than", inherent=True),
-    Requirement('dtype', lambda case: case.dtype_fits,
-                "SwiGLU needs matching operands, float32 or bfloat16, the dtypes the kernel is qualified on",
-                row=QUALIFY_FP16),
+    *_dtype_requirements('SwiGLU'),
+    Requirement('matching', lambda case: len(set(case.dtypes)) == 1,
+                lambda case: f"SwiGLU of {' and '.join(map(str, case.dtypes))} operands; the kernel reads "
+                             "one dtype, and XLA's product promotes mixed ones", inherent=True),
     Requirement('shape', lambda case: case.shape_fits,
                 "SwiGLU needs nonempty equal shapes, not broadcasting, or a packed [..., 2, H] gate and up",
                 inherent=True),
@@ -388,7 +398,7 @@ def _swiglu_preferred(case: SwigluCase) -> str:
     converts and neighbours into one pass the kernel's launch splits (8 layers of Dory's 1 x 2048 nGPT
     block on an A100: 5.4 ms a step through the kernel, 2.6 through XLA). A kernel named per call or
     by `chosen` runs as named."""
-    return 'xla' if case.dtype == jnp.float32 else measured_kernel('swiglu', 'xla')
+    return 'xla' if jnp.result_type(*case.dtypes) == jnp.float32 else measured_kernel('swiglu', 'xla')
 
 
 SWIGLU: Op[SwigluCase] = Op('swiglu', (Kernel('pallas', SWIGLU_SUPPORTS), Kernel('xla', (), generic=True)),
@@ -401,8 +411,7 @@ def swiglu_kernel(implementation: str, gate, up, *, axes=None) -> str:
     """Resolve the SiLU product only. GeGLU and SiTU keep their own XLA
     arithmetic; broadcasting or mixed operand dtypes also stay there.
     `axes`, the operands' logical axes, places the kernel on a mesh (`_placed`)."""
-    case = SwigluCase(dtype=jnp.dtype(jnp.result_type(gate, up)),
-                      dtype_fits=gate.dtype in DTYPES and gate.dtype == up.dtype,
+    case = SwigluCase(dtypes=(jnp.dtype(gate.dtype), jnp.dtype(up.dtype)),
                       shape_fits=gate.shape == up.shape and bool(gate.shape) and gate.size > 0,
                       placed=_placed(axes, (gate, up), whole_last=False),
                       named=None if implementation == 'auto' else implementation)
@@ -413,7 +422,7 @@ def packed_swiglu_kernel(implementation: str, gate_up, *, axes=None) -> str:
     """Resolve the SiLU product of one packed projection's `[..., 2, H]` output (`packed_swiglu`),
     the kernel `KERNELS` names 'swiglu', which reads the halves where the projection wrote them.
     `axes` are the product's logical axes, `[..., H]`'s."""
-    case = SwigluCase(dtype=jnp.dtype(gate_up.dtype), dtype_fits=gate_up.dtype in DTYPES,
+    case = SwigluCase(dtypes=(jnp.dtype(gate_up.dtype),),
                       shape_fits=gate_up.ndim >= 2 and gate_up.shape[-2] == 2 and gate_up.size > 0,
                       placed=_placed(None if axes is None else (*axes[:-1], None, axes[-1]), (gate_up,),
                                      whole_last=False),
