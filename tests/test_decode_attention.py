@@ -602,13 +602,13 @@ def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes
         lowered = jax.jit(step).trace(placed(params), placed(cache), placed(tokens, "data" if "data" in axes
                                                                             else None))
         text = lowered.lower(lowering_platforms=("cuda",)).as_text(debug_info=False)
-    # Each launch's operand types: the row lengths, the padded queries, the cache's keys and values.
+    # Each launch's operand types: the rows' key spans, the padded queries, the cache's keys and values.
     called = r'custom_call @__gpu\$xla\.gpu\.triton\(.*?name = "decode_attention".*?: \((.*?)\) ->'
     launches = re.findall(called, text)
     assert launches
     for types in launches:
-        lengths, query = types.split(", ")[:2]
-        assert lengths == f"tensor<{rows}x1xi32>" and query.startswith(f"tensor<{rows}x16x{heads}x"), types
+        spans, query = types.split(", ")[:2]
+        assert spans == f"tensor<{rows}x2xi32>" and query.startswith(f"tensor<{rows}x16x{heads}x"), types
 
 
 def paged_case(page_size, windowed=False):
