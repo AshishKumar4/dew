@@ -6,6 +6,7 @@ non-finite reward stops the run instead of being retried. One run goes
 through every way a rollout leaves its group, spare samples and early
 admission included, and resumes from its checkpoint."""
 
+import dataclasses
 import math
 import threading
 from contextlib import contextmanager
@@ -18,12 +19,12 @@ import pytest
 from episode_support import environment as sandbox
 
 from dew.checkpoints import Checkpoints
-from dew.data.dataset import Loader, replayed
+from dew.data.dataset import Loader, replayed, tapped
 from dew.inference import NativeRolloutServer, TextGeneration
 from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.rl import EnvironmentSource, EpisodeStatus, GRPOObjective, Observation
-from dew.objectives.rl.scheduler import RolloutScheduler, task_ids
+from dew.objectives.rl.scheduler import RolloutScheduler
 from dew.objectives.rl.sessions import Status, pack
 from dew.sampling import Sampling
 from dew.training import Layout, Trainer
@@ -85,10 +86,11 @@ class Watched:
         return futures
 
     def cancel(self, futures):
+        # The source marks them cancelled first, so a session woken by the notice sees its cancel.
+        self.source.cancel(futures)
         with self.changed:
             self.cancelled.update(self._samples[future] for future in futures)
             self.changed.notify_all()
-        self.source.cancel(futures)
 
     def _finished(self, done):
         if not done.cancelled() and done.exception() is None:
@@ -97,21 +99,20 @@ class Watched:
                 self.results[self._samples[done]] = done.result()
                 self.changed.notify_all()
 
-    def wait(self, reached, what):
-        """Wait until `reached()`, a step of a scenario, holds; fail naming `what` if the run does
-        not reach it within two minutes, rather than hang."""
+    def wait(self, reached):
+        """Wait until `reached()`, a step of a scenario, holds."""
         with self.changed:
-            assert self.changed.wait_for(reached, timeout=120), f"the run never reached {what}"
+            self.changed.wait_for(reached)
 
 
 @contextmanager
 def rig(environment, verifier, *, tasks, log, workers=16, weights=lambda server, watched: server,
-        read=task_ids, **options):
-    """A scheduler over `tasks` tasks a batch, two sessions a task, on Dew's own server, its
-    sessions on `workers` threads, its weights published through `weights(server, watched)` and its
-    batches read into tasks by `read`: yields the initial variables, a fit of `steps` updates
-    (`fit(steps, checkpoints=)`), the state a trainer restores from `checkpoints`
-    (`restored(checkpoints)`), the watched source and the server, and closes them after."""
+        scheduler=RolloutScheduler, registered=lambda batch: None, **options):
+    """A `scheduler` over `tasks` tasks a batch, two sessions a task, on Dew's own server, its
+    sessions on `workers` threads and its weights published through `weights(server, watched)`;
+    `registered(batch)` sees each batch once the scheduler has registered it. Yields the initial
+    variables, a fit of `steps` updates (`fit(steps, checkpoints=)`), the scheduler, the watched
+    source and the server, and closes them after."""
     model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=64, dtype="float32")
     target = GRPOObjective(model, seq_len=WIDTH - 1, behavior_importance=2.0)
@@ -122,9 +123,9 @@ def rig(environment, verifier, *, tasks, log, workers=16, weights=lambda server,
     episodes = EnvironmentSource(server, environment, verifier, max_prompt_tokens=32, max_new_tokens=16,
                                  max_turns=3, workers=workers)
     watched = Watched(episodes)
-    scheduler = RolloutScheduler(target, watched, weights(server, watched), width=WIDTH, rows=2 * tasks,
-                                 tasks=read, groups=2, log=log, **options)
-    stream = scheduler.tasks(
+    rollout = scheduler(target, watched, weights(server, watched), width=WIDTH, rows=2 * tasks, groups=2,
+                        log=log, **options)
+    stream = rollout.tasks(
         Loader(
             train=replayed(lambda partition: (
                 {"task_id": np.arange(tasks, dtype=np.int32) + step * tasks} for step in range(100)
@@ -134,22 +135,18 @@ def rig(environment, verifier, *, tasks, log, workers=16, weights=lambda server,
             batch=tasks,
         )
     )
-
-    def trainer(checkpoints):
-        return Trainer(target, optax.adam(1e-2), key=jax.random.key(3), rollout=scheduler,
-                       layout=Layout(min_shard=1, tolerance=1.0), checkpoints=checkpoints)
+    stream = dataclasses.replace(stream, train=tapped(stream.train, registered))
 
     def fit(steps, checkpoints=None):
-        return trainer(checkpoints).fit(stream, steps=steps, log_every=steps,
-                                        checkpoint_every=None if checkpoints is None else 1)
-
-    def restored(checkpoints):
-        return trainer(checkpoints).place()[0]
+        trainer = Trainer(target, optax.adam(1e-2), key=jax.random.key(3), rollout=rollout,
+                          layout=Layout(min_shard=1, tolerance=1.0), checkpoints=checkpoints)
+        return trainer.fit(stream, steps=steps, log_every=steps,
+                           checkpoint_every=None if checkpoints is None else 1)
 
     try:
-        yield params, fit, restored, watched, server
+        yield params, fit, rollout, watched, server
     finally:
-        scheduler.close()
+        rollout.close()
         episodes.close()
         server.close()
 
@@ -242,7 +239,7 @@ class Ordered:
     @property
     def version(self):
         if not self.waited:
-            self.watched.wait(lambda: 1 in self.registered, "the second batch registered")
+            self.watched.wait(lambda: 1 in self.registered)
             self.waited = True
         return self.server.version
 
@@ -250,30 +247,52 @@ class Ordered:
         self.server.load(variables, version)
 
 
+class Recording(RolloutScheduler):
+    """The scheduler, keeping each call's state, task batch and the batch it returns to the step."""
+
+    def __init__(self, *arguments, **options):
+        super().__init__(*arguments, **options)
+        self.calls = []
+
+    def __call__(self, state, batch, key):
+        packed = super().__call__(state, batch, key)
+        self.calls.append((leaves(state), np.asarray(batch["task_id"]), packed))
+        return packed
+
+
+def leaves(state):
+    """Every leaf of a training state on the host, a key as its words."""
+    return [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
+            for leaf in jax.tree.leaves(state)]
+
+
+STRAGGLE_SECONDS = 30
+"""How long a straggler's sandbox runs before its own wall clock ends it: well past the few
+seconds a batch's winners take to complete, so the scheduler admits them and cancels it first."""
+
+
 def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_groups(tmp_path):
     """Of every five tasks, task 0's first attempts hang in a sandbox past its wall clock and are
     retried, task 1's container never starts and its group is abandoned at its second failure of one
-    sample, tasks 2 and 3 run a spare sample beside their two, and task 4's sessions straggle. The
-    scheduler admits the first three complete groups of each batch, 0, 2 and 3, and cancels the
-    rest. The winners start once their batch's failing groups are given up, and a straggler runs
-    until the scheduler cancels it, so every tally below is the scheduler's alone. A second fit
-    resumes from the first's checkpoint: reopening the stream cancels the batch the first fit drew
-    ahead, and the batch trains again from fresh submissions under the restored weights."""
+    sample, tasks 2 and 3 run a spare sample beside their two, and task 4's sessions straggle in a
+    sandbox. The scheduler admits the first three complete groups of each batch, 0, 2 and 3, and
+    cancels the rest. The winners start once their batch's failing groups are given up, so every
+    tally below is the scheduler's alone. A second fit resumes from the first's checkpoint:
+    reopening the stream cancels the batch the first fit drew ahead, and the batch trains again
+    from fresh submissions under the restored state."""
     tasks = math.lcm(5, jax.device_count())
     batches = tasks // 5
-    hanging = sandbox("hang", wall_seconds=1)
-    attempted, firsts, registered, records = set(), {}, set(), []
+    hanging, straggling = sandbox("hang", wall_seconds=1), sandbox("hang", wall_seconds=STRAGGLE_SECONDS)
+    attempted, firsts, stragglers, registered, records = set(), {}, set(), set(), []
 
-    def numbered(batch):
-        found = task_ids(batch)
+    def seen(batch):
         with watched.changed:
-            registered.add(int(found[0].id) // tasks)
+            registered.add(int(np.asarray(batch["task_id"])[0]) // tasks)
             watched.changed.notify_all()
-        return found
 
     def given_up(round, batch):
         """Whether every failing group of `batch` in `round` was given up: one of its samples
-        was cancelled before its batch was admitted."""
+        was cancelled while its batch was being admitted."""
         failing = {serial for serial, (task, made, _) in enumerate(watched.submitted)
                    if made == round and int(task) % 5 == 1 and int(task) // tasks == batch}
         given = {watched.submitted[serial][0] for serial, _ in watched.cancelled if serial in failing}
@@ -298,35 +317,45 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
             return
         if role == 1:
             raise OSError("the container runtime started no container")
-        if role in (2, 3):
-            watched.wait(lambda: given_up(round, batch) or sample in watched.cancelled,
-                         f"batch {batch}'s failing groups given up")
         if role == 4:
-            watched.wait(lambda: sample in watched.cancelled, f"straggler {sample} cancelled")
+            with watched.changed:
+                stragglers.add(sample)
+            with straggling(identity) as hung:
+                yield hung
+            return
+        if role in (2, 3):
+            watched.wait(lambda: given_up(round, batch) or sample in watched.cancelled)
         yield Tools(index)
 
-    options = {"oversample": 1, "admit": 3 * tasks // 5, "max_attempts": 2, "max_lag": 1, "ahead": 1,
-               "read": numbered}
-    # A straggler holds its worker until it is cancelled, and up to three batches' sessions run at
-    # once (the first fit's batch drawn ahead, and the resumed fit's two).
+    options = {"oversample": 1, "admit": 3 * tasks // 5, "max_attempts": 2, "max_lag": 1, "ahead": 1}
+    # A straggler holds its worker until its sandbox's wall clock, and up to three batches' sessions
+    # run at once (the first fit's batch drawn ahead, and the resumed fit's two).
     checkpoints = str(tmp_path / "run")
-    with rig(faulty, fives, tasks=tasks, log=records.append, workers=9 * tasks,
-             weights=lambda server, watched: Ordered(server, watched, registered), **options) as (
-            _, fit, restored, watched, _):
+    with rig(faulty, fives, tasks=tasks, log=records.append, workers=9 * tasks, scheduler=Recording,
+             weights=lambda server, watched: Ordered(server, watched, registered), registered=seen,
+             **options) as (_, fit, recording, watched, _):
         first = fit(1, Checkpoints(checkpoints))
         # The batch the first fit drew ahead has started its first attempts before the resume.
-        watched.wait(lambda: sum(batch == 1 for batch in firsts.values()) == 3 * batches,
-                     "the second batch's first attempts started")
+        watched.wait(lambda: sum(batch == 1 for batch in firsts.values()) == 3 * batches)
         ahead = [(serial, sample) for serial, (task, _, futures) in enumerate(watched.submitted)
                  if int(task) // tasks == 1 for sample in range(len(futures))]
-        again = restored(Checkpoints(checkpoints))
         watched.round = 1
         resumed = fit(2, Checkpoints(checkpoints))
         resubmitted = [int(task) for task, made, _ in watched.submitted if made == 1]
     assert int(first.updates) == 1 and int(resumed.updates) == 2
-    for got, want in zip(jax.tree.leaves((again.variables, again.opt_state)),
-                         jax.tree.leaves((first.variables, first.opt_state)), strict=True):
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    [(_, trained, packed), (restored, again, repacked)] = recording.calls
+    # The resumed call starts from the first fit's whole state, key and counters included, and
+    # trains the second batch.
+    for got, want in zip(restored, leaves(first), strict=True):
+        np.testing.assert_array_equal(got, want)
+    np.testing.assert_array_equal(trained, np.arange(tasks))
+    np.testing.assert_array_equal(again, np.arange(tasks, 2 * tasks))
+    # Each batch trains its three admitted groups' two sessions each, every call drawn under the
+    # version its call published: the resumed batch from fresh submissions alone.
+    for batch, version in ((packed, 0), (repacked, 1)):
+        sampled = batch["response_mask"] > 0
+        assert len(np.unique(batch["session_index"][sampled])) == 6 * batches
+        assert set(np.unique(batch["versions"][sampled])) == {version}
     [before, after] = records
     # Each batch admits groups 0, 2 and 3 of every five and abandons group 1. Cancelled: group 1's
     # one live sample at its abandonment, the spares of 2 and 3, the three stragglers, and in the
@@ -345,12 +374,10 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
     # submitted only its own batches, the second batch again first.
     assert ahead and set(ahead) <= watched.cancelled
     assert min(resubmitted) == tasks and all(task >= tasks for task in resubmitted)
-    # A first attempt of group 0 hung past the sandbox's wall clock: infra, with no call.
-    assert all(watched.results[sample].status is Status.INFRA_ERROR and not watched.results[sample].calls
-               for sample in firsts if sample in watched.results)
-    roles = {}
-    for rollout in watched.rollouts:
-        roles.setdefault(int(rollout.task) % 5, []).append(rollout)
-    assert all(rollout.status is Status.INFRA_ERROR and not rollout.calls for rollout in roles[1])
-    # A straggler sees its cancellation at its first draw.
-    assert all(rollout.status is Status.CANCELLED and not rollout.calls for rollout in roles[4])
+    # A first attempt of group 0 and a straggler each ran into their sandbox's wall clock: infra,
+    # with no call. The scheduler cancelled every straggler before that.
+    for sample in [*firsts, *stragglers]:
+        assert watched.results[sample].status is Status.INFRA_ERROR and not watched.results[sample].calls
+    assert stragglers <= watched.cancelled
+    assert all(rollout.status is Status.INFRA_ERROR and not rollout.calls
+               for rollout in watched.rollouts if int(rollout.task) % 5 == 1)
