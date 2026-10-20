@@ -19,7 +19,6 @@ from reference_error import (
     assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
-    assert_leaves_as_exact_over_orders,
     assert_rounds_where_the_reference_does,
     assert_rows_as_exact_over_orders,
     chain_roundings,
@@ -397,11 +396,17 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     (`g_proj`) apart from the feed-forward's `gate_proj`: one step moves every B factor, so the
     loss reaches each projection; a run resumed after its first step ends where two uninterrupted
     steps end; the saved factors load back to the same logits; PEFT, the saved adapter's consumer,
-    merges it into the checkpoint's projections by their names, and the transcription over that
-    merge computes the adapted model's logits within the rule of its own run against float64; and
-    the merged checkpoint reloads to the adapted model's logits within the same rule."""
+    merges it into every projection the checkpoint holds by its name there, and the transcription
+    over that merge computes the adapted model's logits within the rule of its own run against
+    float64; and the merged checkpoint reloads to the adapted model's logits within the same rule."""
+    from safetensors.numpy import load_file
+
     loaded = load()
     adapted = loaded.adapt(LoRA(rank=2, modules=PROJECTIONS), key=0)
+    original = load_file(str(TINY / 'model.safetensors'))
+    # Every projection the checkpoint holds, by its name there, is one PEFT's merge moves.
+    projections = {name for name in original
+                   if name.removesuffix('.weight').rsplit('.', 1)[-1] in PROJECTIONS}
 
     def objective():
         return LMObjective(adapted.model, 8, variables=adapted.variables)
@@ -426,6 +431,7 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     import torch
 
     config, peft = json.loads((TINY / 'config.json').read_text()), peft_merged(TINY, tmp_path / 'adapter')
+    assert {name for name in peft if not np.array_equal(peft[name], original[name])} == projections
     assert_as_exact_as_the_reference(logits, TOOL.DoryReference(config, peft, torch.float32).forward(ids),
                                      TOOL.DoryReference(config, peft, torch.float64).forward(ids),
                                      'the adapter as PEFT merges it')
@@ -670,17 +676,19 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
     1024-token window, every entry of every row.
 
     The float64 truth is vLLM's own model code run in float64 on the same tokens, which the
-    transcription tools/dory_reference.py (the CPU tests' reference) is held to, and Dew's own
-    float64 decoding, entry by entry, within the float64 rounding of the computation. At a few
-    positions of every run, vLLM's too, one rounding moves the continuation's log-probabilities by
-    whole units, so one run against one decides nothing there: each run is held to vLLM's over the
-    orders vLLM ran under (tests/reference_error.py's over-orders rules), every row over the whole
-    vocabulary overall (`assert_as_exact_over_orders`) and row by row (`assert_rows_as_exact_over_orders`,
-    each row sized by the truth row's own RMS), and each row's probe columns overall, row by row and
-    entry by entry. vLLM is an opaque reference no surrogate can witness, so its leaf and row RMS are
-    the end-to-end bar; every element is held through Dory's own graph against Dew's fp32 XLA
-    reference of the same math. On a last-loop run's rows past the window, vLLM's engine parts from
-    its own model code
+    transcription tools/dory_reference.py (the CPU tests' reference) and Dew's own float64 decoding
+    are held to within the float64 rounding of the computation, in RMS. At a few positions of every
+    run, vLLM's too, one rounding moves the continuation's log-probabilities by whole units, so one
+    run against one decides nothing there: each run is held to vLLM's over the first batch of orders
+    vLLM ran under (tests/reference_error.py's over-orders rules), its rows over the whole vocabulary
+    overall (`assert_as_exact_over_orders`, within FACTOR) and row by row
+    (`assert_rows_as_exact_over_orders`, each row sized by the truth row's own RMS, the worst within
+    the gate's ROW_FACTOR: an extreme value of many rows, which equally exact code put at up to 2.42
+    times the reference's), and the same on each row's probe columns. vLLM is an opaque reference no
+    surrogate can witness, so its leaf and row RMS are the end-to-end bar, parity carried at FACTOR
+    by the leaf; this test holds no element alone, which Dory's per-element graph checks do, and the
+    recording's further batches and entry sums are calibration data. On a last-loop run's rows past
+    the window, vLLM's engine parts from its own model code
     (https://github.com/vllm-project/vllm/pull/60149#issuecomment-6270937659): there the reference
     is that model code at the engine's precision under the same orders, so the engine's departure
     widens no bound.
@@ -734,18 +742,27 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
             key = recorder.name(loops, mode, run)
             model = with_cache(loaded.model.with_passes(loops), mode).with_cache_capacity(recorder.CONTEXT)
             programs, columns, truth = decoding(model), recorder.columns_of(probe, key), truths[key]
-            placed, draws, distances = jax.device_put(loaded.variables), [], np.zeros((ORDERS, len(truth)))
+            placed = jax.device_put(loaded.variables)
             theirs = np.load(recorder.fetched(f'columns-{recorder.tag(key)}-0.npy'))
-            for order, reference in enumerate(theirs):
+            sampled = np.take_along_axis(truth, columns, axis=1)
+            # Each order's distance of each row from float64: over the whole vocabulary, then on the
+            # probe's columns, Dew's and vLLM's.
+            distances = {'whole': np.zeros((ORDERS, len(truth))), 'columns': np.zeros((ORDERS, len(truth))),
+                         'theirs': np.sqrt(np.mean(np.square(theirs - sampled), axis=2))}
+            for order in range(ORDERS):
                 # Each order's weights are reordered where they sit, on the device.
                 found = rows(programs, symmetric(placed, config, recorder.symmetry(config, 0, order)), key)
-                distances[order] = np.sqrt(np.mean(np.square(found - truth), axis=1))
-                draws.append((np.take_along_axis(found, columns, axis=1), reference,
-                              np.take_along_axis(truth, columns, axis=1)))
-            spread = np.load(recorder.fetched(f'rms-{recorder.tag(key)}-vllm.npy'))[0]
-            assert_as_exact_over_orders(np.sqrt(np.mean(np.square(distances), axis=1)), spread,
-                                        f'Dory 4B {key}, every entry')
-            assert_rows_as_exact_over_orders(distances, np.load(recorder.fetched(
-                f'rows-{recorder.tag(key)}-vllm.npy'))[0], f'Dory 4B {key}, row by row',
-                sizes=np.load(recorder.fetched(f'sizes-{recorder.tag(key)}.npy')))
-            assert_leaves_as_exact_over_orders(draws, f'Dory 4B {key}, its columns')
+                distances['whole'][order] = np.sqrt(np.mean(np.square(found - truth), axis=1))
+                distances['columns'][order] = np.sqrt(np.mean(np.square(
+                    np.take_along_axis(found, columns, axis=1) - sampled), axis=1))
+            for part, mine, reference, sizes in (
+                    ('every entry', distances['whole'], np.load(recorder.fetched(
+                        f'rows-{recorder.tag(key)}-vllm.npy'))[0],
+                     np.load(recorder.fetched(f'sizes-{recorder.tag(key)}.npy'))),
+                    ('its columns', distances['columns'], distances['theirs'],
+                     np.sqrt(np.mean(np.square(sampled), axis=1)))):
+                assert_as_exact_over_orders(np.sqrt(np.mean(np.square(mine), axis=1)),
+                                            np.sqrt(np.mean(np.square(reference), axis=1)),
+                                            f'Dory 4B {key}, {part}')
+                assert_rows_as_exact_over_orders(mine, reference, f'Dory 4B {key}, {part} row by row',
+                                                 sizes=sizes)
