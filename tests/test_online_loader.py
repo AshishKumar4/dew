@@ -85,6 +85,33 @@ def serving(handle):
         server.server_close()
 
 
+def test_an_endless_read_reads_on_through_passes_whose_fetches_failed_until_one_returns():
+    """A catalog's one url fails for its first three fetches, so each of those passes yields
+    nothing; a failed fetch may succeed next time, so the endless read reads on and gives the
+    record once the server returns it, where the first empty pass was once refused."""
+    served = []
+
+    def handle(request):
+        served.append(request.path)
+        if len(served) <= 3:
+            request.send_response(503)
+            request.end_headers()
+            return
+        request.send_response(200)
+        request.send_header("Content-Length", "7")
+        request.end_headers()
+        request.wfile.write(b"payload")
+
+    with serving(handle) as address:
+        chain = Pipeline(Memory([{"url": f"http://{address}/object"}])).filter_map(Fetch()).repeat().batch(1)
+        stream = compile(chain, read="indexed", loading=READ).train(DataPartition())
+        try:
+            assert np.asarray(next(stream)["bytes"]).tolist() == [b"payload"]
+        finally:
+            stream.close()
+    assert len(served) == 4
+
+
 @pytest.mark.parametrize("header", ["Location", "URI"])
 def test_a_fetch_follows_a_redirect_and_keeps_the_bytes_the_server_sent(header):
     """A fetch follows its server's redirect, named by `Location` or by `URI`, and keeps the body
