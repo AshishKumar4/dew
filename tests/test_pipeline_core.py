@@ -1792,6 +1792,26 @@ def test_a_limit_counts_the_whole_order_and_a_prefetch_never_moves_the_share_cut
     assert read(1) == read(2) and len(read(1)) == 12
 
 
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_token_holdout_cuts_the_per_token_fields_it_names_together(read):
+    """A token holdout over a field of another name and its roles keeps the first 3/8 of the tokens
+    for the held part and the rest for training, cutting the one document it splits in both fields
+    alike: the parts together are the corpus, each role beside its token."""
+    documents = [{"ids": np.arange(6 * index, 6 * index + 6, dtype=np.int32),
+                  "ids_roles": np.arange(6 * index, 6 * index + 6, dtype=np.int32) % 2} for index in range(4)]
+    train, held = Memory(documents).holdout(tokens=0.375, fields=("ids", "ids_roles"))
+
+    def rows(part):
+        return [{name: np.asarray(row[name]).tolist() for name in ("ids", "ids_roles")}
+                for row in part.read(read).loading(READ)]
+
+    trained, kept = rows(train), rows(held)
+    tokens = [token for part in (kept, trained) for row in part for token in row["ids"]]
+    assert tokens == list(range(24))
+    assert [len(row["ids"]) for row in kept] == [6, 3]
+    assert all(row["ids_roles"] == [token % 2 for token in row["ids"]] for row in (*kept, *trained))
+
+
 def test_a_token_split_is_part_of_the_order_a_resume_checks():
     """Four 4-token documents split at a quarter train on documents 1-3 and
     at a half on 2-3, so a position saved under one split is refused under
