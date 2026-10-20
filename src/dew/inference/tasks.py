@@ -152,7 +152,7 @@ def prepared_inputs(processor: Processor | None, request: Request, *, images: Me
 
 def _task_inputs(processor: Processor | None, request: Request, *, images: Media | None,
                  collective: bool, max_new_tokens: int | None, default_tokens: int | None,
-                 max_length: int | None, key: int | jax.Array | None) -> tuple[ModelInputs, int, jax.Array]:
+                 max_length: int | None, key: int | jax.Array) -> tuple[ModelInputs, int, jax.Array]:
     def prepared() -> tuple[ModelInputs, int, jax.Array]:
         """Tokenize the request, size its budget and draw its key."""
         random_key = request_key(key)
@@ -797,7 +797,7 @@ class TextGeneration(_NativeTextTask):
                    max_new_tokens=settings.max_new_tokens or None, prefix=settings.prefix)
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: int | jax.Array | None = None, n: int | None = None,
+                 key: int | jax.Array, n: int | None = None,
                  sampling: Sampling | None = None, images: Media | None = None,
                  logits: Transforms | None = None, stopping: Criteria | None = None,
                  strategy: Strategy | None = None) -> Generation:
@@ -881,7 +881,7 @@ class BlockGeneration(_NativeTextTask):
 
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: int | jax.Array | None = None, n: int | None = None,
+                 key: int | jax.Array, n: int | None = None,
                  process: BlockProcess | None = None, images: Media | None = None) -> CanvasGeneration:
         with region("inference.block"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
@@ -969,7 +969,7 @@ class MaskedGeneration(_NativeTextTask):
 
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: int | jax.Array | None = None, n: int | None = None,
+                 key: int | jax.Array, n: int | None = None,
                  steps: int | None = None, images: Media | None = None) -> CanvasGeneration:
         with region("inference.masked"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
