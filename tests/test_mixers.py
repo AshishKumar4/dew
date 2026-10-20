@@ -30,8 +30,8 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall, coordinates
-from dew.nn.mixer_base import MixerRefused
 from dew.nn.kernels.generation import chosen
+from dew.nn.mixer_base import MixerRefused
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.registry import mixers, models
