@@ -883,6 +883,25 @@ def test_a_user_decoder_module_is_packed_where_it_names_its_groups():
         assert_same_generation(actual, retrained(prompt, 5, key=3))
 
 
+def test_a_projection_quantized_apart_from_its_group_is_served_unpacked():
+    """A model quantized by its modules' paths (`Quantization.patterns`) selecting its query
+    projection alone keeps its query, key and value apart, each quantized as the pattern selects it,
+    and packs its gate and up projections, which no pattern selects: a server draws what the task
+    draws on its own. Packed, the query was served as `qkv_proj`, which the pattern does not
+    select, so unquantized."""
+    from dew.inference.projections import projection_groups
+    from dew.quantization import Quantization
+
+    bound = task(Sampling(temperature=0, eos_token_ids=None))
+    quantized = Quantization(patterns=(".*/q_proj",)).apply(bound.model)
+    groups = {group.packed for group in projection_groups(quantized, bound.variables)}
+    assert "qkv_proj" not in groups and "gate_up_proj" in groups
+    alone = TextGeneration(quantized, bound.variables, bound.processor, sampling=bound.sampling)
+    server = Server.from_task(alone, slots=2, capacity=128)
+    for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
+        assert_same_generation(actual, alone(prompt, 5, key=3))
+
+
 @pytest.mark.parametrize("finished", [True, False], ids=["prefilled", "prefilling"])
 def test_reloaded_weights_share_no_prefix_page_the_old_weights_wrote(finished):
     """A cached prompt page holds keys the old weights computed; after a

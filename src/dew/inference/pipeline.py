@@ -116,39 +116,29 @@ NATIVE_TASKS = (TextGeneration, BlockGeneration, MaskedGeneration, TextToImage)
 
 def _prepared(task: Task, layout: Layout | None) -> Task:
     """`task` as every task `pipeline` returns is prepared, however it was read: the projection
-    groups its model reads packed are packed (`inference_projections`, which leaves a packed group
-    as it is), whether its weights sit on the host or on a mesh. A packed weight on a mesh is placed
-    as `layout` places it (the trainer's default when None), and every other weight keeps its
-    placement; weights on the host stay there, for the task to place at its first call
+    groups its model reads packed are packed (`inference_projections`), whether its weights sit on
+    the host or on a mesh. A packed weight on a mesh is placed as `layout` places it (the trainer's
+    default when None), and every weight packing left alone keeps its array and its placement;
+    weights on the host stay there, for the task to place at its first call
     (`dew.inference.tasks.resident`), so they can still be quantized on the host. A source's loader
     packs before it places (`Pretrained._load`), so its task is already prepared; a run's reader
-    does not."""
-    from dew.inference.projections import pack_projections, projection_groups
+    does not. A plugin's saved task prepares itself."""
+    from dew.inference.projections import inference_projections
     from dew.nn.inputs import mesh_of
     from dew.training.distributed import Layout as DefaultLayout
 
     if not isinstance(task, NATIVE_TASKS):
         return task
-    groups = tuple(group for group in projection_groups(task.model, task.variables)
-                   if group.packed not in _params_node(task.variables, group.path))
-    if not groups:
+    packed = inference_projections(task.model, task.variables)
+    if packed is task.variables:
         return task
-    packed = pack_projections(task.variables, groups)
     mesh = mesh_of(packed)
     if mesh is not None:
+        kept = {id(leaf) for leaf in jax.tree.leaves(task.variables)}
         shardings = (DefaultLayout() if layout is None else layout).shardings(mesh, packed)
-        packed = jax.tree.map(
-            lambda leaf, sharding: jax.device_put(leaf, sharding) if isinstance(leaf, jax.Array)
-            and not leaf.sharding.is_equivalent_to(sharding, leaf.ndim) else leaf, packed, shardings)
+        packed = jax.tree.map(lambda leaf, sharding: leaf if id(leaf) in kept
+                              else jax.device_put(leaf, sharding), packed, shardings)
     return task.bind(packed)
-
-
-def _params_node(variables: Variables, path: Sequence[str]) -> Mapping:
-    """The parameter node at `path` of `variables`."""
-    node = variables["params"]
-    for part in path:
-        node = node[part]
-    return node
 
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
