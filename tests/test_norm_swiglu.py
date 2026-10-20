@@ -113,14 +113,42 @@ def kernels(fn, *args) -> set[str]:
             if equation.primitive.name == "pallas_call"}
 
 
-def compare(functions, operands, seed, labels, *, coefficient=None):
+SEEDS = {(2, 3, 31): 32, (3, 257, 17): 32, (5, 1000): 32, (2, 3, 4, 31): 64, (2, 64, 16, 128): 8,
+         (2, 1, 16, 128): 32, (7, 1000): 32, (3, 4096): 32, (5, 37): 32, (24576, 1000): 8, (2, 31): 32,
+         "composed": 32}
+"""Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
+XLA compared with itself resolves the factor in every output and gradient (2026-10-20, on armada)."""
+
+
+def assert_drawn_as_exact(fused, xla, exact, draw, leaves, label, seeds):
+    """Check 1 over `draw`'s seeds: the kernel's outputs and gradients (`leaves` of `evaluated`) on par with
+    XLA's, truth XLA's float64 run on the CPU."""
+    def truth(operands, seed):
+        with jax.default_device(jax.devices("cpu")[0]):
+            return leaves(evaluated(exact, operands, seed))
+
+    assert_as_exact(jax.jit(lambda operands, seed: leaves(evaluated(fused, operands, seed))),
+                    jax.jit(lambda operands, seed: leaves(evaluated(xla, operands, seed))),
+                    draw, label, seeds=seeds, truth_fn=truth)
+
+
+def compare(functions, operands, seed, labels, *, coefficient=None, draw=None, seeds=None):
+    """The kernels launched and every output's dtype and accumulation on `operands`; their accuracy
+    held by check 1 over `draw`'s `seeds` (`assert_drawn_as_exact`), or, for operands no draw
+    redraws (a row of one value, a cotangent at a format's edge), by the one-draw rule on them."""
     pallas = functions[1]
     assert kernels(pallas, *operands) & {"rms_norm_forward", "swiglu_forward"}
     differentiated = kernels(functools.partial(evaluated, pallas), operands, seed)
     assert differentiated & {"rms_norm_backward", "swiglu_backward"}
     reference, (truth, terms) = oracles(functions, operands, seed)
     actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
-    gated(labels, actual, reference, truth, terms, seed, coefficient)
+    gated(labels, actual, reference, truth, terms, seed, coefficient, parity=draw is None)
+    if draw is not None:
+        def leaves(result):
+            return {label: value for label, value in zip(labels, result, strict=True) if value is not None}
+
+        xla, _, exact = functions
+        assert_drawn_as_exact(pallas, xla, exact, draw, leaves, " ".join(labels), seeds)
 
 
 def oracles(functions, operands, seed):
@@ -137,8 +165,9 @@ def float64(function, operands, seed):
         return float64_terms(functools.partial(evaluated, function), *widened((operands, seed)))
 
 
-def gated(labels, actual, reference, truth, terms, seed, coefficient):
-    """Every output and gradient within the float64 gate."""
+def gated(labels, actual, reference, truth, terms, seed, coefficient, parity=True):
+    """Every output and gradient's dtype and the weight gradient's accumulation, and, where `parity`,
+    each within the one-draw rule."""
     try:
         for label, mine, theirs, want, summed in zip(labels, actual, reference, truth, terms, strict=True):
             if mine is None:
@@ -150,7 +179,8 @@ def gated(labels, actual, reference, truth, terms, seed, coefficient):
                 assert_scale_accumulation(mine, theirs, coefficient, seed)
             elif mine.dtype == jnp.float32 and reference[0].dtype == jnp.float32:
                 assert relative(mine, theirs) < 1e-5, label
-            assert_as_exact_as_the_reference(mine, theirs, want, label, terms=summed)
+            if parity:
+                assert_as_exact_as_the_reference(mine, theirs, want, label, terms=summed)
     except AssertionError as error:
         report = rounding_report(labels, actual, reference, truth)
         print(report, flush=True)
@@ -167,11 +197,16 @@ def norm_functions(dtype, offset, after_cast):
             functools.partial(norm, "xla", jnp.float64))
 
 
-def norm_operands(shape, dtype, scale_dtype):
-    x = jax.random.normal(jax.random.key(23), shape).astype(dtype)
+def drawn_key(index: int, draw: int):
+    """The key of an operand's `index` in draw `draw` of a check-1 comparison, draw 0 the key itself."""
+    return jax.random.key(index) if draw == 0 else jax.random.fold_in(jax.random.key(index), draw)
+
+
+def norm_operands(shape, dtype, scale_dtype, draw: int = 0):
+    x = jax.random.normal(drawn_key(23, draw), shape).astype(dtype)
     scale = None if scale_dtype is None else (
-        0.7 + 0.2 * jax.random.normal(jax.random.key(24), (shape[-1],))).astype(scale_dtype)
-    seed = jax.random.normal(jax.random.key(25), shape).astype(dtype)
+        0.7 + 0.2 * jax.random.normal(drawn_key(24, draw), (shape[-1],))).astype(scale_dtype)
+    seed = jax.random.normal(drawn_key(25, draw), shape).astype(dtype)
     return (x, scale), seed
 
 
@@ -182,7 +217,8 @@ def norm_operands(shape, dtype, scale_dtype):
 def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast):
     operands, seed = norm_operands((2, 3, 31), dtype, scale_dtype)
     compare(norm_functions(dtype, offset, after_cast), operands, seed, ("y", "x", "scale"),
-            coefficient=scale_coefficient(operands[0], dtype, after_cast))
+            coefficient=scale_coefficient(operands[0], dtype, after_cast),
+            draw=lambda draw: norm_operands((2, 3, 31), dtype, scale_dtype, draw), seeds=SEEDS[(2, 3, 31)])
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -248,7 +284,8 @@ def test_an_unweighted_norm_takes_the_fused_kernel_and_keeps_a_staged_jvp():
 def test_rms_ragged_widths_and_many_rows(dtype, shape):
     operands, seed = norm_operands(shape, dtype, jnp.float32)
     compare(norm_functions(dtype, offset=True, after_cast=True), operands, seed, ("y", "x", "scale"),
-            coefficient=scale_coefficient(operands[0], dtype, after_cast=True))
+            coefficient=scale_coefficient(operands[0], dtype, after_cast=True),
+            draw=lambda draw: norm_operands(shape, dtype, jnp.float32, draw), seeds=SEEDS[shape])
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -257,13 +294,14 @@ def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
     # grows to Qwen3.5-0.8B's size, isolating partial-sum error from bf16 midpoint flips.
     (x, scale), seed = full_step(dtype)
     compare(norm_functions(dtype, offset=True, after_cast=True), (x, scale), seed, ("y", "x", "scale"),
-            coefficient=scale_coefficient(x, dtype, after_cast=True))
+            coefficient=scale_coefficient(x, dtype, after_cast=True),
+            draw=lambda draw: full_step(dtype, draw), seeds=SEEDS[(24576, 1000)])
 
 
-def full_step(dtype):
-    """E1's 24,576 rows of one repeated 1000-wide token, so the weight
-    gradient's sums reach a step's length (`test_rms_weight_gradient...`)."""
-    (row, scale), seed = norm_operands((1, 1000), dtype, jnp.float32)
+def full_step(dtype, draw: int = 0):
+    """24,576 rows of one repeated 1000-wide token, so the weight gradient's sums reach a step's
+    length (`test_rms_weight_gradient...`)."""
+    (row, scale), seed = norm_operands((1, 1000), dtype, jnp.float32, draw)
     x = jnp.broadcast_to(row, (24576, 1000))
     return (x, scale), jnp.broadcast_to(seed, x.shape)
 
@@ -344,10 +382,14 @@ def test_random_bf16_gradients_keep_fp32_intermediates_near_float64():
                                                        (jnp.float32, jnp.bfloat16)])
 @pytest.mark.parametrize("after_cast", [False, True])
 def test_rms_output_dtype_is_independent_of_input(input_dtype, output_dtype, after_cast):
-    operands, seed = norm_operands((5, 37), input_dtype, jnp.float32)
-    compare(norm_functions(output_dtype, offset=False, after_cast=after_cast), operands,
-            seed.astype(output_dtype), ("y", "x", "scale"),
-            coefficient=scale_coefficient(operands[0], output_dtype, after_cast))
+    def draw(draw):
+        operands, seed = norm_operands((5, 37), input_dtype, jnp.float32, draw)
+        return operands, seed.astype(output_dtype)
+
+    operands, seed = draw(0)
+    compare(norm_functions(output_dtype, offset=False, after_cast=after_cast), operands, seed,
+            ("y", "x", "scale"), coefficient=scale_coefficient(operands[0], output_dtype, after_cast),
+            draw=draw, seeds=SEEDS[(5, 37)])
 
 
 def stream_seam(implementation: str, dtype, joined: bool, offset: bool = True, after_cast: bool = True):
@@ -356,24 +398,6 @@ def stream_seam(implementation: str, dtype, joined: bool, offset: bool = True, a
         return stream_rms_normalized(x, branch if joined else None, scale, 1e-5, dtype, offset, after_cast,
                                      fp32_statistics=True, implementation=implementation)
     return seam
-
-
-SEEDS = {(2, 3, 31): 32, (3, 257, 17): 32, (5, 1000): 32, (2, 3, 4, 31): 64, (2, 64, 16, 128): 8,
-         (2, 1, 16, 128): 32}
-"""Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
-XLA compared with itself resolves the factor in every output and gradient (2026-10-20, on armada)."""
-
-
-def assert_drawn_as_exact(fused, xla, exact, draw, leaves, label, seeds):
-    """Check 1 over `draw`'s seeds: the kernel's outputs and gradients (`leaves` of `evaluated`) on par with
-    XLA's, truth XLA's float64 run on the CPU."""
-    def truth(operands, seed):
-        with jax.default_device(jax.devices("cpu")[0]):
-            return leaves(evaluated(exact, operands, seed))
-
-    assert_as_exact(jax.jit(lambda operands, seed: leaves(evaluated(fused, operands, seed))),
-                    jax.jit(lambda operands, seed: leaves(evaluated(xla, operands, seed))),
-                    draw, label, seeds=seeds, truth_fn=truth)
 
 
 @pytest.mark.parametrize("joined", [False, True])
@@ -732,14 +756,14 @@ def fused_function(name, implementation):
                                                         implementation=implementation)
 
 
-def fused_operands(name, dtype):
+def fused_operands(name, dtype, draw: int = 0):
     """`fused_function(name)`'s operands at `dtype`, a bf16 weight where the norm takes one."""
-    first, second = (jax.random.normal(jax.random.key(index), (4, 96)).astype(dtype) for index in (76, 77))
+    first, second = (jax.random.normal(drawn_key(index, draw), (4, 96)).astype(dtype) for index in (76, 77))
     if name in ("swiglu", "packed"):
         return first, second
     if name == "weightless":
         return first, second, None
-    return first, second, (0.7 + 0.2 * jax.random.normal(jax.random.key(79), (96,))).astype(jnp.bfloat16)
+    return first, second, (0.7 + 0.2 * jax.random.normal(drawn_key(79, draw), (96,))).astype(jnp.bfloat16)
 
 
 @pytest.mark.parametrize("composition", ["jvp_grad", "grad_jvp", "jvp_staged", "vmap_grad"])
@@ -754,8 +778,13 @@ def test_a_fused_kernel_differentiates_at_every_order_through_its_portable_arith
     first operand alone and under a score that squares the output, so the cotangent varies: each is the
     portable arithmetic's own composition, within the float64 gate of it, while the first level's value
     and, where the composition takes a gradient of the call, its backward run the kernels."""
-    operands = fused_operands(name, dtype)
-    tangent = jax.random.normal(jax.random.key(78), operands[0].shape).astype(dtype)
+    def draw(draw):
+        operands = fused_operands(name, dtype, draw)
+        return (operands[0], jax.random.normal(drawn_key(78, draw), operands[0].shape).astype(dtype),
+                *operands[1:])
+
+    first, tangent, *rest = draw(0)
+    operands = (first, *rest)
 
     def composed(implementation):
         fused = fused_function(name, implementation)
@@ -784,39 +813,31 @@ def test_a_fused_kernel_differentiates_at_every_order_through_its_portable_arith
     assert forward in launched
     if composition in ("jvp_grad", "vmap_grad"):
         assert forward.replace("forward", "backward") in launched
-    found = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
-                         jax.jit(composed("pallas"))(operands[0], tangent, *operands[1:]))
-    reference = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
-                             jax.jit(composed("xla"))(operands[0], tangent, *operands[1:]))
-    with jax.enable_x64(new_val=True):
-        wide = [None if leaf is None else jnp.asarray(np.asarray(leaf, np.float64))
-                for leaf in (operands[0], tangent, *operands[1:])]
-        truth = jax.tree.map(np.asarray, composed("xla")(*wide))
-    for mine, theirs, want in zip(jax.tree.leaves(found), jax.tree.leaves(reference), jax.tree.leaves(truth),
-                                  strict=True):
-        if np.array_equal(theirs, want):
-            # Exact by construction (a stream's tangent is its addends'): Dew must be exact too.
-            np.testing.assert_array_equal(mine, want)
-        else:
-            assert_as_exact_as_the_reference(mine, theirs, want, f"{name} {composition}")
+    # Exact by construction (a stream's tangent is its addends'), or on par over the draws: check 1,
+    # which holds Dew exact where the reference is on every draw.
+    assert_as_exact(jax.jit(composed("pallas")), jax.jit(composed("xla")), draw, f"{name} {composition}",
+                    seeds=SEEDS["composed"], truth_fn=composed("xla"))
 
 
 def test_a_fused_norms_jvp_is_its_kernels_value_and_the_portable_tangent():
     """`jax.jvp` through the fused norm, with no forward-mode context, staged by a jit or not: its
     value is the kernel's own output, and its tangent within the float64 gate of the XLA norm's
     (`generation.linear_tangent`)."""
-    x = jax.random.normal(jax.random.key(75), (2, 31))
-    direction = jax.random.normal(jax.random.key(74), (2, 31))
+    def draw(draw):
+        return tuple(jax.random.normal(drawn_key(index, draw), (2, 31)) for index in (75, 74))
+
+    def tangent_of(norm):
+        return lambda x, direction: jax.jvp(lambda x: norm(x, None), (x,), (direction,))[1]
+
+    x, direction = draw(0)
     xla, pallas, exact = norm_functions(jnp.float32, offset=True, after_cast=True)
     fused = jax.jit(lambda x: pallas(x, None))
-    want = jax.jit(lambda x: jax.jvp(lambda x: xla(x, None), (x,), (direction,))[1])(x)
-    with jax.enable_x64(new_val=True):
-        truth = np.asarray(jax.jvp(lambda x: exact(x, None), (jnp.asarray(np.asarray(x, np.float64)),),
-                                   (jnp.asarray(np.asarray(direction, np.float64)),))[1])
     for norm in (lambda x: pallas(x, None), fused):
-        value, tangent = jax.jvp(norm, (x,), (direction,))
+        value, _ = jax.jvp(norm, (x,), (direction,))
         np.testing.assert_array_equal(value, fused(x))
-        assert_as_exact_as_the_reference(np.asarray(tangent), np.asarray(want), truth, "jvp")
+        assert_as_exact(jax.jit(lambda x, direction, norm=norm: jax.jvp(norm, (x,), (direction,))[1]),
+                        jax.jit(tangent_of(xla)),
+                        draw, "jvp", seeds=SEEDS[(2, 31)], truth_fn=tangent_of(exact))
 
 
 # Same-session c53, A100-SXM4-40GB, Liger 0.8.4 / torch 2.11.0+cu130:
