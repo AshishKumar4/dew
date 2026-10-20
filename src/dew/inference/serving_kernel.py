@@ -24,7 +24,7 @@ from dew.inference.tasks import cache_sized
 from dew.nn.inputs import Admitted, ModelInputs
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kernels.tuning import tune
-from dew.nn.kv_cache import CURSOR, POOLED, TABLE, as_words, from_words, grouped, is_paged, leaf_name
+from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, as_words, from_words, grouped, is_paged, leaf_name
 from dew.nn.protocols import Serving
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import logical_spec
@@ -213,7 +213,8 @@ class Paged:
             name = leaf_name(path)
             if name == TABLE:
                 return admission.tables
-            if name == CURSOR:
+            if name in ROW_CURSORS:
+                # A text row's next position is its count of tokens (`dew.nn.kv_cache.POSITION`).
                 return admission.cursors
             return leaf
 

@@ -614,10 +614,14 @@ class Decoding(Protocol):
 
 @runtime_checkable
 class Layered(Protocol):
-    """A decoder that declares its decode cache's layout, as `CausalTransformer` does."""
+    """A decoder that declares its decode cache's layout, as `CausalTransformer` does, and gives
+    the same model over another (`with_kv_cache`): a wrapper answers for the decoder that holds
+    the cache."""
 
     @property
     def kv_cache(self) -> KVCache: ...
+
+    def with_kv_cache(self, layout: KVCache) -> Self: ...
 
 
 @runtime_checkable
