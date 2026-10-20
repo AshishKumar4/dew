@@ -625,7 +625,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         step=jnp.zeros(batch, jnp.int32), active=real, keys=keys, prompt_width=width,
         budget=jnp.full(batch, budget, jnp.int32))
     drawn: Draws = strategy(state, start, ops, decoding.chain(transforms),
-                            decoding.criterion(stopping), trips, n)
+                            decoding.finish(stopping), trips, n)
     return Generation(
         jnp.concatenate([prompt, jnp.where(drawn.valid, drawn.tokens, pad_id)], axis=1),
         jnp.sum(drawn.valid, axis=1, dtype=jnp.int32), drawn.terminated,

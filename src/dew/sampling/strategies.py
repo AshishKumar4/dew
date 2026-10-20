@@ -26,7 +26,7 @@ from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
 from dew.nn.scatter import DROPPED
 from dew.objectives.base import Variables, token_log_probs
 from dew.sampling import decoding
-from dew.sampling.decoding import StepState
+from dew.sampling.decoding import Finish, StepState
 from dew.sampling.guided import Grammar
 
 
@@ -63,7 +63,7 @@ class Draws:
     `valid` marks the slots a row actually emitted, so its length is that
     row's count and the slots above it carry no likelihood. `terminated`
     marks a row a stopping criterion ended, as opposed to one that ran out
-    of budget.
+    of budget or that a length limit cut short (`decoding.Finish`).
     """
 
     tokens: jax.Array
@@ -125,7 +125,7 @@ class Strategy(Protocol):
 
     def __call__(self, state: DecoderState, start: StepState, ops: DecodeOps,
                  transform: Callable[[StepState, jax.Array], jax.Array],
-                 stopping: Callable[[StepState, jax.Array], jax.Array],
+                 stopping: Callable[[StepState, jax.Array], Finish],
                  budget: int, n: int, /) -> Draws: ...
 
 
@@ -255,7 +255,7 @@ class Sample:
 
     def __call__(self, state: DecoderState, start: StepState, ops: DecodeOps,
                  transform: Callable[[StepState, jax.Array], jax.Array],
-                 stopping: Callable[[StepState, jax.Array], jax.Array],
+                 stopping: Callable[[StepState, jax.Array], Finish],
                  budget: int, n: int) -> Draws:
         return continuations(start, n, lambda drawn: _sample_rows(
             state, drawn, ops, transform, stopping, budget, self.grammar))
@@ -263,7 +263,7 @@ class Sample:
 
 def _sample_rows(state: DecoderState, start: StepState, ops: DecodeOps,
                  transform: Callable[[StepState, jax.Array], jax.Array],
-                 stopping: Callable[[StepState, jax.Array], jax.Array],
+                 stopping: Callable[[StepState, jax.Array], Finish],
                  budget: int, grammar: Grammar | None = None) -> Draws:
     """The fixed-trip decode scan from one prefilled state, guided when a grammar is given."""
 
@@ -273,10 +273,11 @@ def _sample_rows(state: DecoderState, start: StepState, ops: DecodeOps,
         chain = transform if grammar is None else grammar.guiding(transform, automaton)
         token, behavior, raw = draw(step_state, state.logits, chain)
         committed = step_state.commit(token, active)
-        stopped = active & stopping(committed, token)
+        finished = stopping(committed, token)
+        stopped = active & finished.done
         following = ops.advance(state, token, active)
         carry = (following, dataclasses.replace(committed, active=active & ~stopped),
-                 terminated | stopped,
+                 terminated | (active & finished.ended),
                  None if grammar is None else grammar.advanced(automaton, token, active))
         return carry, (token, active, jnp.where(active, behavior, 0.0), jnp.where(active, raw, 0.0))
 
@@ -354,7 +355,7 @@ class Beam:
 
     def __call__(self, state: DecoderState, start: StepState, ops: DecodeOps,
                  transform: Callable[[StepState, jax.Array], jax.Array],
-                 stopping: Callable[[StepState, jax.Array], jax.Array],
+                 stopping: Callable[[StepState, jax.Array], Finish],
                  budget: int, n: int) -> Draws:
         if n > self.width:
             raise ValueError(f"beam search returns at most its width; asked for {n} of {self.width}")
@@ -427,7 +428,7 @@ class _BeamCarry(NamedTuple):
 
 def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
                  transform: Callable[[StepState, jax.Array], jax.Array],
-                 stopping: Callable[[StepState, jax.Array], jax.Array],
+                 stopping: Callable[[StepState, jax.Array], Finish],
                  budget: int, n: int, search: Beam) -> Draws:
     """`Beam`'s scan: one step per position, keeping `width` live beams.
 
@@ -451,9 +452,10 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         branch = _beam_rows(parent, prompts, width)
         candidates = jax.tree.map(lambda leaf: jnp.take(leaf, branch, axis=0), carry.beams)
         flat = token.reshape(-1)
-        ended = stopping(candidates.commit(flat, jnp.repeat(start.active, keep)), flat)
-        ended = ended.reshape(prompts, keep) & jnp.repeat(start.active, keep).reshape(prompts, keep)
-        hit = ended | (position + 1 >= limit)
+        finished = stopping(candidates.commit(flat, jnp.repeat(start.active, keep)), flat)
+        asked = jnp.repeat(start.active, keep).reshape(prompts, keep)
+        ended = finished.ended.reshape(prompts, keep) & asked
+        hit = (finished.done.reshape(prompts, keep) & asked) | (position + 1 >= limit)
 
         grown = jnp.take(carry.drawn, branch, axis=0).reshape(prompts, keep, budget)
         grown = grown.at[:, :, position].set(token)
@@ -597,7 +599,7 @@ class Speculative:
 
     def __call__(self, state: DecoderState, start: StepState, ops: DecodeOps,
                  transform: Callable[[StepState, jax.Array], jax.Array],
-                 stopping: Callable[[StepState, jax.Array], jax.Array],
+                 stopping: Callable[[StepState, jax.Array], Finish],
                  budget: int, n: int) -> Draws:
         depths = ops.propose is not None and ops.embed is not None and ops.depths
         if ops.verify is None or not (depths or ops.draft is not None):
@@ -656,7 +658,7 @@ def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepS
 
     def reached(depth: int) -> jax.Array:
         """The rows still drafting at `depth`, once the criteria saw the candidate before it."""
-        ending.append(stopping(states[depth], candidates[depth - 1]))
+        ending.append(stopping(states[depth], candidates[depth - 1]).done)
         live.append(live[-1] & ~ending[depth - 1] & asked(depth))
         states[depth] = dataclasses.replace(states[depth], active=live[-1])
         return live[-1]
@@ -698,7 +700,7 @@ def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepS
             drawn_at(depth, logits[:, 0])
     # Every candidate gets the real criterion, the last one included: a
     # block accepted whole must not draw its bonus behind a stop.
-    ending.append(stopping(states[block_size], candidates[block_size - 1]))
+    ending.append(stopping(states[block_size], candidates[block_size - 1]).done)
     return _Drafted(drafting, candidates, scores, states, offered, ending)
 
 
@@ -762,13 +764,14 @@ def _committed(block_size: int, step: StepState, emitted: jax.Array, terminated:
     """
     active = step.active
     limit = jnp.where(active, jnp.minimum(matched + 1, budget - step.step), 0)
-    walked, live, ended = step, active, terminated
+    walked, live, ended, stopped = step, active, terminated, jnp.zeros_like(active)
     for at in range(block_size + 1):
         kept = live & (at < limit)
         walked = walked.commit(emitted[:, at], kept)
-        fired = stopping(walked, emitted[:, at]) & kept
-        ended, live = ended | fired, live & ~fired
-    walked = dataclasses.replace(walked, active=active & ~ended & (walked.step < budget))
+        fired = stopping(walked, emitted[:, at])
+        done = fired.done & kept
+        ended, stopped, live = ended | (fired.ended & kept), stopped | done, live & ~done
+    walked = dataclasses.replace(walked, active=active & ~stopped & ~ended & (walked.step < budget))
     return walked, walked.step - step.step, ended
 
 
@@ -852,7 +855,7 @@ def _block(carry: _SpeculativeCarry, plan: Speculative, ops: DecodeOps, transfor
 
 def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
                transform: Callable[[StepState, jax.Array], jax.Array],
-               stopping: Callable[[StepState, jax.Array], jax.Array],
+               stopping: Callable[[StepState, jax.Array], Finish],
                budget: int, plan: Speculative) -> Draws:
     """`Speculative`'s loop of `_block`s. The carry is the model state, the
     `StepState` the accepted tokens leave behind, and the rows emitted so
