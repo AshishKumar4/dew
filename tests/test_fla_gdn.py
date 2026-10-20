@@ -713,15 +713,17 @@ def test_the_rule_computes_the_route_its_geometry_selects(label):
 
 @pytest.mark.parametrize("label", sorted(ROUTES))
 def test_both_routes_return_the_operands_common_dtype(label):
-    """One contract whichever route a GPU's row picks: the port (`fla_rule`) and the portable math
-    (`chunk_delta_rule`) return the output in the queries', keys' and values' common dtype, the final
-    memory in at least fp32, and each operand's gradient in its own, at every geometry."""
+    """One contract whichever route a GPU's row picks: the port (`fla_rule`), at every geometry it takes
+    (`linear.port_refusal`'s widths), and the portable math (`chunk_delta_rule`), at every geometry,
+    return the output in the queries', keys' and values' common dtype, the final memory in at least
+    fp32, and each operand's gradient in its own."""
     dtypes, width, heads, _, _, _ = ROUTES[label]
     operands = routed_operands(dtypes, width, heads)
     cotangents = route_cotangents("reverse", operands)
     common = jnp.result_type(*dtypes)
     want = [common, jnp.promote_types(common, jnp.float32), *(jnp.dtype(x.dtype) for x in operands)]
-    for rule in (fla_rule, portable):
+    widest = fla_gdn.WIDEST_KEYS if common.itemsize == 2 else fla_gdn.WIDEST
+    for rule in (fla_rule, portable) if width <= widest else (portable,):
         found = [jnp.dtype(x.dtype) for x in through(rule, *cotangents)(*operands)]
         assert found == want, (rule.__name__, found, want)
 
