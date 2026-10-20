@@ -500,6 +500,8 @@ class DiffusionObjective(Objective[Ratio]):
     @property
     def _sample(self):
         return self.program('sample', self._sample_impl, static_argnames=("count",),
+                            holds=tuple(held for held in (self.guidance, self.autoencoder)
+                                        if held is not None),
                             modules=sampling_modules(self.model, self.guidance, self.autoencoder))
 
     def task_settings(self) -> ImageSettings:

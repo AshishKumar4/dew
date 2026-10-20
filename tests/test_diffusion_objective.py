@@ -19,7 +19,6 @@ from flax import linen as nn
 from dew.data.dataset import Loader
 from dew.diffusion import broadcast_rates, expand, presets
 from dew.inputs import CharTable, Condition, Field, InputSpec, unit_range
-from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones import SimpleDiT, SimpleMMDiT
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
@@ -93,45 +92,30 @@ def test_compiled_samples_follow_the_substituted_denoiser():
     np.testing.assert_array_equal(after, expected)
 
 
-class Repeated(AutoEncoder):
-    """Latents of the 2x2 means of the pixels' first channel, decoded by repeating them `gain` times
-    over; its network holds no weight."""
-
-    def __init__(self, gain: float = 1.0):
-        self.params, self.gain, self.model = {}, gain, nn.Dense(1)
-
-    def encode_batch(self, params, x, key=None):
-        rows, height, width, _ = x.shape
-        return x[..., :1].reshape(rows, height // 2, 2, width // 2, 2, 1).mean(axis=(2, 4))
-
-    def decode_batch(self, params, z):
-        return self.gain * jnp.repeat(jnp.repeat(jnp.repeat(z, 2, axis=1), 2, axis=2), 3, axis=-1)
-
-    @property
-    def downscale_factor(self):
-        return 2
-
-    @property
-    def latent_channels(self):
-        return 1
-
-
 def test_compiled_samples_follow_the_autoencoder_they_decode_with():
-    """The sample program runs the autoencoder beside the denoiser, so it keys on it as on the
-    denoiser (`sampling_modules`): an objective given another autoencoder decodes its samples with
-    that one, as an objective built over it does."""
-    inputs = InputSpec(Field("image", (4, 4, 3)))
-    objective = DiffusionObjective(Zero(), presets.Flow(), inputs, autoencoder=Repeated(), guidance=None,
-                                   steps=2)
+    """The sample program runs the autoencoder beside the denoiser, whose scale it bakes in, so it
+    keys on the autoencoder as on the denoiser (`sampling_modules`): an objective given another
+    autoencoder over the same network, scaled apart, decodes its samples with that one, as an
+    objective built over it does."""
+    from test_autoencoder import IMAGE_SIZE, tiny_vae
+
+    first = tiny_vae()
+    scaled = tiny_vae(latent_scale=2.0, params=first.params)
+    assert scaled.model == first.model
+    inputs = InputSpec(Field("image", (IMAGE_SIZE, IMAGE_SIZE, 3)))
+
+    def built(autoencoder):
+        return DiffusionObjective(Zero(), presets.Flow(), inputs, autoencoder=autoencoder, guidance=None,
+                                  steps=2)
+
+    objective = built(first)
     variables = objective.init(jax.random.key(0))
-    batch = {"image": jnp.zeros((2, 4, 4, 3))}
+    batch = {"image": jnp.zeros((2, IMAGE_SIZE, IMAGE_SIZE, 3))}
     step = Step(jnp.array(0), jax.random.key(1), None)
     before = objective.evaluate(variables, batch, step).images
-    objective.autoencoder = Repeated(0.5)
+    objective.autoencoder = scaled
     after = objective.evaluate(variables, batch, step).images
-    fresh = DiffusionObjective(Zero(), presets.Flow(), inputs, autoencoder=Repeated(0.5), guidance=None,
-                               steps=2)
-    expected = fresh.evaluate(variables, batch, step).images
+    expected = built(scaled).evaluate(variables, batch, step).images
     assert not np.allclose(before, expected)
     np.testing.assert_array_equal(after, expected)
 

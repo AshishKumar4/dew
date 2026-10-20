@@ -55,7 +55,9 @@ if TYPE_CHECKING:
     from dew.data.text import Tokenizer
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
     from dew.inputs import InputSpec
+    from dew.nn.autoencoders import AutoEncoder
     from dew.nn.backbones.decoder_stack import DecoderBank
+    from dew.sampling.guidance import Guidance
     from dew.sampling.pipelines import TextToImage
     from dew.training.distributed import Layout, MeshSpec
     from dew.training.state import TrainState
@@ -730,7 +732,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         return tree
 
     def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
-                holds: tuple[DeviceStep, ...] = (), modules: tuple[nn.Module, ...] = ()):
+                holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (),
+                modules: tuple[nn.Module, ...] = ()):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
 
@@ -740,10 +743,11 @@ class Objective(ABC, Generic[Loss, Effects]):
         alone cannot identify those programs, nor can they the pipeline's microbatch count, the
         layout's rules or the links a model decides from. `name` names everything else the program
         fixes. `holds` are the objects `function` runs beyond the modules, as the device steps a host
-        step runs: the program is reused only while they are the same objects, and one over others
-        replaces it. `modules` are the networks it runs beside the objective's own, an autoguide's
-        or an autoencoder's: they key it as `holds` do, and its options cover them. Keep only the
-        current specialization, not a history of old models or steps.
+        step runs or a sample's guidance and autoencoder, whose numbers it bakes in: the program is
+        reused only while they are the same objects, and one over others replaces it. `modules` are
+        the networks it runs beside the objective's own, an autoguide's or an autoencoder's: they key
+        it as `holds` do, and its options cover them. Keep only the current specialization, not a
+        history of old models or steps.
         """
         programs = tuple((program.module, (program.head_tile, program.head_fused))
                          for program in self.program_key())
