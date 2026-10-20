@@ -1020,10 +1020,12 @@ def cells(supported: bool) -> list:
 
 @pytest.fixture(autouse=True)
 def release_compilations():
-    """conftest's release after every test here rather than at the file's
-    end. This file alone compiles some 200 cells' executables, whose code
-    reached 62,146 of the 65,530 memory mappings armada's containers allow
-    (vm.max_map_count) before the next compile aborted."""
+    """conftest's release after every test here rather than past its budget
+    of mappings (`released_past_budget`): this file's 167 cells each compile
+    their own executables, which no later cell reuses, and in one process the
+    file took 2,457 s releasing after each against 3,101 s holding them to
+    the budget (33,491 mappings, 4.6 against 2.9 GB resident), on an armada
+    container."""
     yield
     jax.clear_caches()
     gc.collect()

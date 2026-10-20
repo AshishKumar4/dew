@@ -35,7 +35,10 @@ gate install-script "$python" site/scripts/gen_install.py --check
 gate pythons "$python" tools/armada/ci.py pythons --check
 gate api-tests uv run --no-project --with-requirements site/scripts/requirements.txt --with pytest \
   python -m pytest -q --noconftest tests/test_gen_api.py
-gate pyright uvx pyright@1.1.406 --pythonpath "$(command -v "$python")" src/dew
+# pyright runs on Node, whose default heap limit follows the machine's memory: 2,240 MiB on an armada
+# medium container (12 GiB), where checking src/dew ran out of heap. With 8 GiB it passed, the task
+# peaking at 4.3 GiB (2026-10-20); 8 GiB also fits GitHub's runner (16 GiB), so both check alike.
+gate pyright env NODE_OPTIONS=--max-old-space-size=8192 uvx pyright@1.1.406 --pythonpath "$(command -v "$python")" src/dew
 wait "$scan"
 gate duplicates sh -c 'cat "$1"; rm -f "$1"; exit "$2"' _ "$duplicates" "$?"
 if [ -z "$failed" ]; then echo "check: all gates green"; else echo "check: FAILED$failed"; exit 1; fi
