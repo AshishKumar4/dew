@@ -14,7 +14,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from episode_support import ToolPolicy
 from flax import linen as nn
+from jax.experimental import checkify
 from model_support import Digits, decoder, serving_task as task
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
@@ -423,6 +425,30 @@ def test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_ste
         second = served(rounds[1])
     for mine, theirs in zip(second, first, strict=True):
         np.testing.assert_array_equal(mine.host().tokens, theirs.host().tokens)
+
+
+@pytest.mark.parametrize("decode_steps", [1, 4])
+def test_a_step_whose_model_has_no_distribution_stops_the_server(decode_steps):
+    """A bigram policy whose prompt's last id leads to a uniform row and every other id to a row
+    of NaNs, so the step after the first draw has no distribution to score, which the device
+    checks. The server raises that check and stops, whether the failing step is a call of its
+    own or a later step of the call that admitted the row."""
+    vocab = 16
+
+    def logits():
+        table = np.full((vocab, vocab), np.nan, np.float32)
+        table[3] = 0.0
+        return table
+
+    model = ToolPolicy(vocab_size=vocab, max_seq_len=64, logits=logits)
+    params = model.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32))
+    bound = TextGeneration(model, params, None, sampling=Sampling(temperature=1.0, eos_token_ids=None))
+    server = Server.from_task(bound, slots=2, capacity=64, decode_steps=decode_steps)
+    server.submit(np.asarray([1, 2, 3], np.int32), 4, key=0)
+    with pytest.raises(checkify.JaxRuntimeError):
+        server.run()
+    with pytest.raises(RuntimeError):
+        server.step()
 
 
 def test_a_request_admitted_mid_flight_draws_what_it_draws_alone():
