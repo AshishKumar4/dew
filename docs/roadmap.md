@@ -128,7 +128,6 @@ The kernel direction was approved on 2026-10-19:
 - Add explicit continue/restart control beside automatic latest-checkpoint restore. In-memory state continuation was rejected. [208]
 - Match PNDM's multistep grouping and startup steps against Diffusers before remeasuring its parity margin. [647]
 - Find the tiled chunked head's residual: at token tile 2, about 40 of 8192 head-gradient elements sit more than twice as far from float64 as the whole-logits reference; at tile 20 there are none. [737]
-- Let `generate` run without a key where its sampling needs none, or require one; its None default is refused today. [745]
 - Compile a step lowered by `Trainer(lower_for=)` before allocating training time, carry its executable and tuning picks to the run, and measure the saved startup time. Lowering alone already works. [720]
 - One sampling-module inventory for objective evaluation and TextToImage, so quantized guidance and autoencoders get their compiler options. [774]
 - Restore a distilled student without its teacher, and count its tokens as the student's. [775, 776]
@@ -175,7 +174,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 ## CI and tooling
 
 - Derive executable training and generation qualification from the registries. Cover codec combinations with fusion, scan and pipeline stages. [176, 178]
-- Compare cached and full forwards on logits and likelihoods; cover padded versus unpadded behavior for every mixer. [179, 180]
+- Compare cached and full forwards on logits and likelihoods. [179]
 - Build registry-backed uninterrupted/resumed flows and extend them to compiled-program reuse. [182, 183]
 - Inventory every kernel's float64 gate and derive GPU obligations from `TARGETS`. Runtime qualification remains open until the named device runs it. [184, 185]
 - Replace implementation pins with compile, fit and numerical behavior. Restore DeepSeek lifecycle gates against an independent, unmodified oracle. [192, 354]
