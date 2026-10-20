@@ -421,6 +421,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable) ->
     error for either."""
     import jax
     import jax.numpy as jnp
+    import numpy as np
     from jax.custom_derivatives import SymbolicZero, linear_call
 
     @jax.custom_jvp
@@ -462,7 +463,10 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable) ->
 
         def tangent(residuals, moving):
             operands, _ = residuals
-            whole = [jnp.zeros_like(operand) for operand in jax.tree.leaves(operands)]
+            # An operand with no tangent space (an index, a length) takes float0's zero.
+            whole = [jnp.zeros_like(operand) if jnp.issubdtype(operand.dtype, jnp.inexact)
+                     else np.zeros(operand.shape, jax.dtypes.float0)
+                     for operand in jax.tree.leaves(operands)]
             for index, value in zip(live, moving, strict=True):
                 whole[index] = value
             return jax.jvp(portable, operands, jax.tree.unflatten(tree, whole))[1]

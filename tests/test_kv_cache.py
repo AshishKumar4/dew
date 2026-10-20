@@ -17,13 +17,14 @@ from flax import linen as nn
 from model_support import TINY_DECODER
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.nn.attention import cudnn_attention, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import bf16_dot_runs
 from dew.nn.kv_cache import (
     KVCache,
     KVStore,
     _gather_pages,
+    _gathered_attention,
     _gpu_paged,
     hadamard,
     overflowed,
@@ -155,20 +156,22 @@ def test_a_quantized_read_is_the_rotated_write_within_the_formats_rounding(quant
 
 @pytest.mark.gpu(reason="the paged BF16 decode kernel needs CUDA sm80+")
 @pytest.mark.skipif(not bf16_dot_runs(), reason="the paged BF16 decode kernel needs CUDA sm80+")
-def test_native_gpu_paged_value_and_vjp_keep_the_gathered_attention(without_deterministic_ops):
+@pytest.mark.parametrize("width", [64, 256])
+def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(without_deterministic_ops, width):
     """Over reordered and shared pages and distinct key counts, the Pallas
-    kernel's value is as exact as the gathered cuDNN attention's, measured
-    from float64, and its gradients are that attention's."""
-    q = jax.random.normal(jax.random.key(3), (2, 4, 64), jnp.bfloat16)
-    k = jax.random.normal(jax.random.key(4), (2, 4, 16, 64), jnp.bfloat16)
+    kernel's value is as exact as the gathered attention's through the
+    dispatch, measured from float64, and its gradients and its jvp are that
+    attention's (`_gathered_attention`): at 256-wide heads too, which cuDNN's
+    backward does not take before Hopper, as the derivative's own kernel
+    needs nothing of cuDNN."""
+    q = jax.random.normal(jax.random.key(3), (2, 4, width), jnp.bfloat16)
+    k = jax.random.normal(jax.random.key(4), (2, 4, 16, width), jnp.bfloat16)
     v = jax.random.normal(jax.random.key(5), k.shape, jnp.bfloat16)
     table = jnp.asarray([[2, 0], [0, 3]], jnp.int32)
     lengths = jnp.asarray([21, 32], jnp.int32)
 
     def old(q, k, v):
-        return cudnn_attention(q[:, None], _gather_pages(k, table, 1), _gather_pages(v, table, 1),
-                                bias=None, mask=None, causal=False, sliding_window=None,
-                                key_value_seq_lengths=lengths)[:, 0]
+        return _gathered_attention(q, k, v, table, lengths)
 
     def loss(function, q, k, v):
         out = function(q, k, v)
@@ -182,6 +185,10 @@ def test_native_gpu_paged_value_and_vjp_keep_the_gathered_attention(without_dete
                                                      argnums=(0, 1, 2), has_aux=True))(q, k, v)
     for actual, expected in zip(gradients, previous, strict=True):
         np.testing.assert_array_equal(actual, expected)
+    direction = jax.random.normal(jax.random.key(6), q.shape, jnp.bfloat16)
+    np.testing.assert_array_equal(
+        jax.jit(lambda q: jax.jvp(lambda q: native(q, k, v), (q,), (direction,))[1])(q),
+        jax.jit(lambda q: jax.jvp(lambda q: old(q, k, v), (q,), (direction,))[1])(q))
 
     with jax.enable_x64():
         def reference(q, k, v):
@@ -301,3 +308,86 @@ def test_a_paged_decode_step_lowers_for_a_tpu_on_a_mesh_that_splits_rows_or_head
     rows = "data" if "data" in axes else None
     lowered = tpu_lowering(step, (placed(params), placed(cache), placed(tokens, rows)), mesh)
     assert ("tpu_custom_call" in lowered) is native
+
+
+def paged_case(**changed):
+    """A bf16 decode step's `PagedCase` over a 16-slot paged pool, as an A100's step sees it, with
+    `changed` fields."""
+    from dew.nn.kv_cache import PagedCase
+
+    fields = {"heads": 8, "kv_heads": 2, "head_dim": 128, "value_dim": 128, "dtype": jnp.dtype(jnp.bfloat16),
+              "pool": jnp.dtype(jnp.bfloat16), "page_size": 16, "quantized": False, "groups": 1,
+              "head_shards": 1, "softcap": None, "arithmetic": False, "named": "auto"}
+    return PagedCase(**{**fields, **changed})
+
+
+@pytest.mark.parametrize("changed, kernel, code", [
+    ({}, "triton", None),
+    ({"softcap": 30.0}, "gathered", "softcap"),
+    ({"quantized": True}, "gathered", "quantized"),
+    ({"groups": 2}, "gathered", "groups"),
+    ({"pool": jnp.dtype(jnp.float32), "dtype": jnp.dtype(jnp.float32)}, "gathered", "dtype"),
+    ({"value_dim": 64}, "gathered", "widths"),
+    ({"head_dim": 512}, "gathered", "geometry"),
+    ({"page_size": 64}, "gathered", "geometry"),
+    ({"kv_heads": 2, "head_shards": 4}, "gathered", "head_shards"),
+    ({"arithmetic": True}, "gathered", "arithmetic"),
+    ({"named": "xla"}, "gathered", None),
+    ({"named": "cudnn"}, "triton", None),
+], ids=["fits", "softcap", "quantized", "grouped", "fp32", "narrow-values", "wide-heads", "large-pages",
+        "heads-past-the-pool", "reference-arithmetic", "named-xla", "named-cudnn"])
+def test_the_paged_selector_reads_a_gpu_steps_pool_through_its_kernel_where_its_requirements_hold(
+        changed, kernel, code):
+    """On an A100 (`generation.assumed`), a decode step over a paged pool takes Dew's paged kernel where
+    every requirement holds (`kv_cache.PAGED`), else the gathered rows through the layer's attention,
+    reporting the requirement that turned it down; a softcap the GPU kernel does not apply is one, where
+    the step used to reach the kernel and raise. A layer naming xla takes the gathered rows by its
+    choice, no refusal."""
+    from dew.nn.kernels.generation import assumed, routes
+    from dew.nn.kernels.selection import select
+    from dew.nn.kv_cache import PAGED
+
+    with assumed("sm80"), routes() as found:
+        assert select(PAGED, paged_case(**changed)).kernel == kernel
+    (route,) = found
+    assert (route.refusal.code if route.refusal else None) == code
+
+
+def test_a_tpu_steps_paged_pool_takes_its_kernel_with_a_softcap_the_gpus_turns_down():
+    """On a TPU (`generation.assumed('v6e')`) the paged attention kernel applies the softcap itself, so a
+    softcapped step reads its pool there; the GPU's selection of the same step takes the gathered rows."""
+    from dew.nn.kernels.generation import assumed
+    from dew.nn.kernels.selection import select
+    from dew.nn.kv_cache import PAGED
+
+    with assumed("v6e"):
+        assert select(PAGED, paged_case(softcap=30.0)).kernel == "tpu"
+    with assumed("sm80"):
+        assert select(PAGED, paged_case(softcap=30.0)).kernel == "gathered"
+
+
+@pytest.mark.gpu(reason="the paged BF16 decode kernel needs CUDA sm80+")
+@pytest.mark.skipif(not bf16_dot_runs(), reason="the paged BF16 decode kernel needs CUDA sm80+")
+def test_a_softcapped_model_decodes_a_paged_cache_as_its_compact_cache_decodes(without_deterministic_ops):
+    """A bf16 decoder with a logit softcap over a paged cache decodes through the gathered rows, as the
+    paged selector chooses for a GPU, where the step used to reach the paged kernel and raise; its
+    logits are the compact cache's, step by step."""
+    def model(layout):
+        # Heads 16 wide, which the paged kernel's geometry takes.
+        return CausalTransformer(**{**TINY_DECODER, "vocab_size": 64, "head_dim": 16, "dtype": "bfloat16",
+                                    "attn_logit_softcap": 20.0, "kv_cache": layout})
+
+    tokens = jax.random.randint(jax.random.key(7), (2, 8), 0, 64)
+    params = model(KVCache()).init(jax.random.key(8), tokens)
+
+    def decoded(layout):
+        found, cache = [], model(layout).apply(params, 2, method=CausalTransformer.init_cache,
+                                               mutable=["cache"])[1]["cache"]
+        for step in range(tokens.shape[1]):
+            logits, updated = model(layout).apply({**params, "cache": cache}, tokens[:, step:step + 1],
+                                                  decode=True, mutable=["cache"])
+            cache = updated["cache"]
+            found.append(np.asarray(logits, np.float32))
+        return np.stack(found)
+
+    np.testing.assert_array_equal(decoded(KVCache(page_size=16)), decoded(KVCache()))
