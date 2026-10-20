@@ -173,7 +173,7 @@ class NativeRolloutServer:
     """
 
     def __init__(self, server: Server, *, version: int = 0):
-        if len(server.stopping) != len(server.sampling.criteria()):
+        if len(server.stopping.ending) + len(server.stopping.truncating) != len(server.sampling.criteria()):
             raise ValueError("a rollout's draws end on EOS or at their budget; serve a task without stop "
                              "strings or stopping criteria of its own")
         self._server = server
