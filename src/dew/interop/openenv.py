@@ -29,11 +29,10 @@ messages each observation holds become the episode's transcript
 
 Dew imports nothing of OpenEnv. `session(task, identity)` opens the caller's
 client, a context manager whose exit closes the session, and the protocols
-below are what Dew reads of it. A failure of the session's transport is an
-infrastructure failure, which the source retries; the session's context
-manager says which: with `GenericEnvClient`, it re-raises the
-`websockets.exceptions.ConnectionClosed` a dropped connection raises as an
-`dew.inference.InfrastructureError`.
+below are what Dew reads of it. OpenEnv's client speaks to its server over a
+WebSocket, and a connection that drops while a reset or a step waits raises
+`websockets.exceptions.ConnectionClosed`: that call raises it as an
+`InfrastructureError`, an infrastructure failure the source retries.
 """
 
 from __future__ import annotations
@@ -43,8 +42,12 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from websockets.exceptions import ConnectionClosed
+
+from dew.inference.rollouts import InfrastructureError
 from dew.objectives.rl.episodes import Action, EpisodeId, EpisodeStatus, Observation
 from dew.objectives.rl.sessions import Task
+from dew.records import JSON
 
 
 class StepResult[ObservationT](Protocol):
@@ -63,7 +66,7 @@ class StepResult[ObservationT](Protocol):
 class Session[ObservationT, ActionT](Protocol):
     """One open OpenEnv session, as `EnvClient.sync()` serves it."""
 
-    def reset(self, **options: object) -> StepResult[ObservationT]: ...
+    def reset(self, **options: JSON) -> StepResult[ObservationT]: ...
 
     def step(self, action: ActionT) -> StepResult[ObservationT]: ...
 
@@ -89,7 +92,7 @@ class OpenEnv[ObservationT, ActionT]:
     prompt: Callable[[ObservationT], Said]
     reply: Callable[[ObservationT], Said]
     action: Callable[[tuple[int, ...]], ActionT]
-    options: Callable[[Task, EpisodeId], Mapping[str, object]] = field(default=lambda task, identity: {})
+    options: Callable[[Task, EpisodeId], Mapping[str, JSON]] = field(default=lambda task, identity: {})
 
     @contextlib.contextmanager
     def __call__(self, task: Task, identity: EpisodeId) -> Iterator[_Episode[ObservationT, ActionT]]:
@@ -103,22 +106,34 @@ class _Episode[ObservationT, ActionT]:
 
     adapters: OpenEnv[ObservationT, ActionT]
     session: Session[ObservationT, ActionT]
-    options: Mapping[str, object]
+    options: Mapping[str, JSON]
 
     def reset(self) -> Observation:
-        result = self.session.reset(**self.options)
-        said = self.adapters.prompt(result.observation)
-        if result.done:
-            return Observation((), EpisodeStatus.COMPLETED, reward=result.reward, messages=said.messages)
-        return Observation(said.ids, reward=result.reward, messages=said.messages)
+        with _dropped():
+            answered = self.session.reset(**self.options)
+        said = self.adapters.prompt(answered.observation)
+        if answered.done:
+            return Observation((), EpisodeStatus.COMPLETED, reward=answered.reward, messages=said.messages)
+        return Observation(said.ids, reward=answered.reward, messages=said.messages)
 
     def step(self, action: Action) -> Observation:
-        result = self.session.step(self.adapters.action(action.tokens))
-        said = self.adapters.reply(result.observation)
-        if result.done:
-            return Observation((), EpisodeStatus.COMPLETED, reward=result.reward, messages=said.messages)
-        return Observation(action.context + action.tokens + said.ids, reward=result.reward,
+        sent = self.adapters.action(action.tokens)
+        with _dropped():
+            answered = self.session.step(sent)
+        said = self.adapters.reply(answered.observation)
+        if answered.done:
+            return Observation((), EpisodeStatus.COMPLETED, reward=answered.reward, messages=said.messages)
+        return Observation(action.context + action.tokens + said.ids, reward=answered.reward,
                            messages=said.messages)
+
+
+@contextlib.contextmanager
+def _dropped() -> Iterator[None]:
+    """A session call whose connection drops raises an infrastructure failure."""
+    try:
+        yield
+    except ConnectionClosed as error:
+        raise InfrastructureError(f"the OpenEnv session's connection dropped: {error}") from error
 
 
 __all__ = ["OpenEnv", "Said", "Session", "StepResult"]
