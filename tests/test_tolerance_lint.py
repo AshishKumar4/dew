@@ -56,6 +56,10 @@ COMPARISONS = {
     "a fractional range": ("import numpy as np\nactual = np.arange(0, 1, 0.1, dtype=np.float32)\n"
                            "expected = np.arange(0, 1, 0.1)\n"
                            "assert np.max(np.abs(actual - expected)) < 1e-6", 1),
+    "a range of a keyword step, a named step, a negative power": (
+        "import numpy as np, jax.numpy as jnp\nstep = 0.1\n"
+        "a, b = jnp.arange(start=0, stop=1, step=0.1), jnp.arange(0, 1, step)\nc = np.arange(0, 1, 2 ** -4)\n"
+        "assert np.max(np.abs(a - b)) < 1e-6\nassert np.max(np.abs(c - b)) < 1e-6", 2),
     "a whole number divided in place": ("residual = 1\nresidual /= 2\nassert abs(residual) < 0.6", 1),
     "a whole number to a negative power": ("step = 2 ** -20\nassert abs(step) < 1e-5", 1),
     "a profiler's milliseconds": ("import pytest\n"

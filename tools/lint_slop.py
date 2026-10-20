@@ -1804,16 +1804,28 @@ RANGES = frozenset({"numpy.arange", "jax.numpy.arange", "torch.arange"})
 float dtype is asked: a range of a length is a range of positions."""
 
 
-def _fractional(value: ast.AST) -> bool:
-    """Whether `value` is evidently no whole number: a float literal, a quotient, a float() call, or
-    arithmetic of one."""
+def _fractional(value: ast.AST, scope, seen: frozenset = frozenset()) -> bool:
+    """Whether `value` is evidently no whole number: a float literal, a quotient, a negative or
+    fractional power, a float() call, arithmetic of one, or a name the scope binds to one."""
     if isinstance(value, ast.Constant):
         return type(value.value) is float
     if isinstance(value, ast.UnaryOp):
-        return _fractional(value.operand)
+        return _fractional(value.operand, scope, seen)
     if isinstance(value, ast.BinOp):
-        return isinstance(value.op, ast.Div) or _fractional(value.left) or _fractional(value.right)
+        power = value.right
+        negative = isinstance(value.op, ast.Pow) and (
+            (isinstance(power, ast.UnaryOp) and isinstance(power.op, ast.USub))
+            or (isinstance(power, ast.Constant) and isinstance(power.value, int | float) and power.value < 0))
+        return isinstance(value.op, ast.Div) or negative or any(
+            _fractional(side, scope, seen) for side in (value.left, value.right))
+    if isinstance(value, ast.Name) and value.id not in seen:
+        return any(_fractional(node.value, scope, seen | {value.id}) for node in scope.nodes
+                   if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None
+                   and value.id in [name for target in (node.targets if isinstance(node, ast.Assign)
+                                                        else [node.target]) for name in _bound_names(target)])
     return isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "float"
+
+
 CARRIED = frozenset({"sum", "max", "min", "abs", "tuple", "list", "sorted", "round"})
 """Built-ins whose value is whole, or a time, when what they are given is."""
 CLOCKS = frozenset({"time.perf_counter", "time.monotonic", "time.time", "time.process_time",
@@ -1884,7 +1896,8 @@ def _integral_value(value: ast.AST, integral: Set[str], scope: _Scope, reading: 
         counted = isinstance(value.func, ast.Attribute) and value.func.attr == "integers"
         carried = called in CARRIED and bool(value.args) and all(
             _integral_value(argument, integral, scope, reading) for argument in value.args)
-        ranged = called in RANGES and not any(_fractional(argument) for argument in value.args) and not any(
+        bounds = [*value.args, *(keyword.value for keyword in value.keywords if keyword.arg != "dtype")]
+        ranged = called in RANGES and not any(_fractional(bound, scope) for bound in bounds) and not any(
             keyword.arg == "dtype" and "int" not in ast.unparse(keyword.value) for keyword in value.keywords)
         return called in INTEGRAL_CALLS or counted or carried or ranged or _defined(value, scope, reading,
                                                                                     reading.counting)
