@@ -179,3 +179,71 @@ def mismatches(native, oracle, fmt: Format) -> np.ndarray:
     bits = np.uint32 if fmt.name == "float32" else np.uint16
     return (native.view(bits) != oracle.view(bits)) | np.isnan(native.astype(np.float64)) | np.isnan(
         oracle.astype(np.float64))
+
+
+TRANSCENDENTAL_MARGIN = 2.0 ** -40
+"""The relative distance from float64's `exp` within which the exact value is taken to lie before
+interval arithmetic decides: 2^13 times glibc's documented bound (0.511 float64 ulps), so the only
+assumption is that numpy's float64 exp is not wrong past its 13th bit from the last."""
+
+
+def _decided(low: np.ndarray, high: np.ndarray, fmt: Format) -> tuple[np.ndarray, np.ndarray]:
+    """RN in `fmt` of each end of an enclosure of the exact value, and where the ends agree, so the
+    rounding of every value between them is that one (round to nearest is monotone)."""
+    lower, upper = exact_cast(low, fmt), exact_cast(high, fmt)
+    return lower, (lower == upper) | (np.isnan(lower) & np.isnan(upper))
+
+
+def _fraction(raw) -> fractions.Fraction:
+    """An mpmath raw mpf (sign, mantissa, exponent, bits) as an exact rational."""
+    sign, mantissa, exponent, _ = raw
+    value = fractions.Fraction(mantissa) * fractions.Fraction(2) ** exponent
+    return -value if sign else value
+
+
+def exp_rounded(x, fmt: Format) -> np.ndarray:
+    """RN(exp(x)) in `fmt` for values of a format no wider than fp32, validated: float64's exp
+    widened by `TRANSCENDENTAL_MARGIN` decides every element whose enclosure rounds one way, and
+    mpmath's interval exp at rising precision decides the rest (exp of a nonzero rational is never
+    a midpoint, so the precision needed is finite)."""
+    import mpmath
+
+    x = np.asarray(x, np.float64)
+    estimate = np.exp(x)
+    low, high = estimate * (1 - TRANSCENDENTAL_MARGIN), estimate * (1 + TRANSCENDENTAL_MARGIN)
+    result, decided = _decided(low, np.where(np.isinf(estimate), estimate, high), fmt)
+    for index in np.flatnonzero(~decided):
+        for precision in (96, 192, 384, 768):
+            with mpmath.iv.workprec(precision):
+                lower, upper = mpmath.iv.exp(mpmath.iv.mpf(float(x.flat[index])))._mpi_
+            lower, upper = (fraction_rounded(_fraction(end), fmt) for end in (lower, upper))
+            if lower == upper:
+                result.flat[index] = lower
+                break
+        else:
+            raise ArithmeticError(f"exp({x.flat[index]!r}) undecided at 768 bits")
+    return result
+
+
+def rsqrt_rounded(x, fmt: Format) -> np.ndarray:
+    """RN(1/sqrt(x)) in `fmt` for positive values of a format no wider than fp32, exactly: float64's
+    1/sqrt rounds twice, so it is within 2^-51 of the exact value relative to it, and an element whose
+    enclosure straddles a midpoint m of `fmt` is decided by the sign of m²·x - 1 in exact rationals."""
+    x = np.asarray(x, np.float64)
+    estimate = 1 / np.sqrt(x)
+    margin = 2.0 ** -51
+    result, decided = _decided(estimate * (1 - margin), estimate * (1 + margin), fmt)
+    for index in np.flatnonzero(~decided & np.isfinite(estimate) & (x > 0)):
+        value = float(x.flat[index])
+        below = float(exact_cast(estimate.flat[index] * (1 - margin), fmt))
+        above = below + float(_quantum(np.asarray(below), fmt))
+        midpoint = (fractions.Fraction(below) + fractions.Fraction(above)) / 2
+        side = midpoint * midpoint * fractions.Fraction(value) - 1
+        # 1/sqrt(x) > m exactly when m²·x < 1; a tie (m²·x = 1) goes to the even neighbour.
+        if side < 0:
+            result.flat[index] = above
+        elif side > 0:
+            result.flat[index] = below
+        else:
+            result.flat[index] = float(fraction_rounded(midpoint, fmt))
+    return result
