@@ -10,7 +10,7 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from fractions import Fraction
-from typing import TypeGuard, overload
+from typing import Protocol, TypeGuard, overload, runtime_checkable
 
 import grain.experimental as gx
 import grain.python as pygrain
@@ -492,6 +492,15 @@ class PrimedMix(pygrain.IterDataset[Batch]):
         return iter(pygrain.IterDataset.mix(parents, weights))
 
 
+@runtime_checkable
+class _NamedTuple(Protocol):
+    """A named tuple, which its documented `_make` rebuilds from its fields' values."""
+
+    _fields: tuple[str, ...]
+
+    def _make(self, iterable: Iterable[object]) -> tuple[object, ...]: ...
+
+
 def rewound(start: object, current: object) -> object:
     """`start`, the position a repeat rewinds its pass to, with each counter's counts as `current`
     holds them (`_COUNTER`: its counts, run of rejections and warning): a pass read again goes on
@@ -504,7 +513,10 @@ def rewound(start: object, current: object) -> object:
             kept[_COUNTER] = current[_COUNTER]
         return kept
     if isinstance(start, (list, tuple)) and isinstance(current, (list, tuple)) and len(start) == len(current):
-        return type(start)(rewound(value, now) for value, now in zip(start, current, strict=True))
+        items = [rewound(value, now) for value, now in zip(start, current, strict=True)]
+        if isinstance(start, list):
+            return items
+        return start._make(items) if isinstance(start, _NamedTuple) else tuple(items)
     return start
 
 
