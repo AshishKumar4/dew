@@ -599,8 +599,9 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
     np.testing.assert_array_equal(rolled(inherited), rolled(unset))
 
     prompts = list(PROMPTS[:2])
-    reference = np.asarray(source.text_to_image()(prompts, steps=2, guidance=None, solver=Euler(), key=7))
-    published = np.asarray(inherited.build_task(started(inherited).variables)(prompts, key=7))
+    pipeline = source.text_to_image()
+    reference = np.asarray(pipeline(prompts, steps=2, guidance=None, solver=Euler(), key=7).images)
+    published = np.asarray(inherited.build_task(started(inherited).variables)(prompts, key=7).images)
     np.testing.assert_array_equal(published, reference)
 
     config = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
@@ -613,5 +614,5 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
     checkpoints.save(0, started(saved), None, {}, artifact=saved.inference_record())
     checkpoints.wait()
     config.save(str(tmp_path / "run"))
-    restored = np.asarray(TextToImage.from_run(str(tmp_path / "run"))(prompts, key=7))
+    restored = np.asarray(TextToImage.from_run(str(tmp_path / "run"))(prompts, key=7).images)
     np.testing.assert_array_equal(restored, reference)
