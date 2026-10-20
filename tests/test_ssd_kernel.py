@@ -53,15 +53,6 @@ def blocks(x, dt, A, B, C, state, chunk_size: int, dtype=jnp.float32):
     return tuple(jnp.asarray(t, dtype) for t in (x * dt[..., None], B, C, A[None, None, :] * dt, state))
 
 
-def scan_operands(reference, chunk_size: int, dtype=jnp.float32):
-    """The reference fixture's own scan, at 2 sequences of 70 steps, 4 heads of
-    6 channels, 2 groups and a state of 5."""
-    step = jax.nn.softplus(jnp.asarray(reference["scan.dt"]) + jnp.asarray(reference["scan.dt_bias"]))
-    return blocks(jnp.asarray(reference["scan.x"]), step, jnp.asarray(reference["scan.A"]),
-                  jnp.asarray(reference["scan.B"]), jnp.asarray(reference["scan.C"]),
-                  jnp.asarray(reference["scan.initial"]), chunk_size, dtype)
-
-
 def cotangents(y, final, seed: int = 0):
     """A loss that reads every output, so no term of the scan drops out of the
     gradients under test."""
@@ -137,17 +128,6 @@ def assert_kernel_parity(draw, chunk_size: int, *, compiled: bool, roundings: in
     assert_as_exact(mine, xla, draw, label, seeds=seeds, truth_fn=truth)
 
 
-def fixture_case(reference, chunk_size: int, resets: bool):
-    """The reference fixture's scan, at 2 sequences of 70 steps, 4 heads of 6 channels, 2 groups and
-    a state of 5; with `resets`, documents starting at a chunk's first step and inside one."""
-    x, b, c, a, state = scan_operands(reference, chunk_size)
-    if resets:
-        a = a.at[0, 7].set(RESET_DECAY).at[1, 20].set(RESET_DECAY)
-        if a.shape[1] > chunk_size:
-            a = a.at[0, chunk_size].set(RESET_DECAY)
-    return (x, b, c, a, state), chunk_size, 70 + 6 + 5
-
-
 def shape_case(shape, chunk_size: int, seed: int = 0):
     """`mixer_operands` at `shape`: a nonzero entering state, steps that decay a chunk's state by
     about e (Mamba-2's small steps; at `mixer_operands`' own a chunk's carry vanishes and its gradient
@@ -193,7 +173,19 @@ def case_draw(reference, kind, case):
     return draw
 
 
-SEEDS = {}
+SEEDS = {
+    ("fixture", (32, False)): 256,
+    ("fixture", (32, True)): 256,
+    ("fixture", (128, False)): 256,
+    ("fixture", (128, True)): 256,
+    ("shape", ((2, 63, 4, 8, 8, 2), 64)): 128,
+    ("shape", ((2, 64, 4, 8, 8, 2), 64)): 64,
+    ("shape", ((2, 65, 4, 16, 8, 2), 64)): 32,
+    ("shape", ((2, 193, 4, 16, 8, 2), 64)): 32,
+    ("shape", ((2, 257, 2, 64, 128, 1), 256)): 128,
+    ("shape", ((1, 1024, 4, 64, 64, 1), 128)): 64,
+}
+"""Sized by seeds_for on XLA's output, final state and all five gradients (2026-10-20, armada)."""
 
 
 on_device = pytest.mark.skipif(jax.default_backend() != "tpu",
@@ -223,7 +215,12 @@ def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled)
     if compiled:
         shape, chunk_size = case
         assert ssd_kernel_runs(chunk_size, shape[3], shape[4], jax.default_backend(), dtype=jnp.float32)
-    built = fixture_case(reference, *case) if kind == "fixture" else shape_case(*case)
-    _, chunk_size, roundings = built
+    if kind == "fixture":
+        chunk_size = case[0]
+        _, length, _, width = reference["scan.x"].shape
+        roundings = length + width + reference["scan.B"].shape[-1]
+    else:
+        shape, chunk_size = case
+        roundings = shape[1] + shape[3] + shape[4]
     assert_kernel_parity(case_draw(reference, kind, case), chunk_size, compiled=compiled,
                          roundings=roundings, seeds=SEEDS[kind, case], label=f"{kind} {case}")
