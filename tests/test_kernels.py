@@ -994,14 +994,21 @@ def test_a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu(kernel, ca
 @pytest.mark.parametrize("generation_name, narrow", [("sm80", "flash"), ("sm86", "flash"),
                                                      ("sm90", "flash"), ("sm89", "triton")])
 def test_narrow_heads_take_the_kernel_their_target_measured_fastest(generation_name, narrow):
-    """A causal bf16 call of 64-wide heads takes its GPU row's narrow-heads kernel ('attention_narrow'):
-    the FA wheel where it was measured fastest, an A10, an A100 and an H100 (`generation.TARGETS`),
-    tokamax's Triton kernel where the row names none."""
+    """A causal bf16 call of 64-wide heads prefers its GPU row's narrow-heads kernel
+    ('attention_narrow'): the FA wheel where it was measured fastest, an A10, an A100 and an H100
+    (`generation.TARGETS`), tokamax's Triton kernel where the row names none. FlashAttention's own row
+    requirement reads the same row, so where the wheel holds code for the GPU the preference is the
+    route, an A10's narrow heads included where its attention row names none."""
     from dew.nn.attention import resolve_implementation
+    from dew.nn.attention_kernels import ATTENTION, kernel_refusals
     from dew.nn.kernels import generation
 
     query = jnp.zeros((2, 128, 4, 64), jnp.bfloat16)
     with generation.assumed(generation_name), generation.routes() as found:
         resolve_implementation("auto", query, query, causal=True)
+        refused = {refusal.code for refusal in kernel_refusals(
+            ATTENTION, narrow, attention_case(query, query, causal=True))}
     (route,) = [route for route in found if route.choice == "attention"]
     assert route.preferred == narrow
+    # The row qualifies the preferred kernel: only host facts (backend, wheel) may turn it down here.
+    assert "row" not in refused
