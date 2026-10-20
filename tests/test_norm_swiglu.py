@@ -837,11 +837,12 @@ def test_a_fused_norms_jvp_is_its_kernels_value_and_the_portable_tangent():
     x, direction = draw(0)
     xla, pallas, exact = norm_functions(jnp.float32, offset=True, after_cast=True)
     fused = jax.jit(lambda x: pallas(x, None))
-    for norm in (lambda x: pallas(x, None), fused):
+    # The eager JVP, traced op by op, and the staged one, each as it is called.
+    for norm, staged in ((lambda x: pallas(x, None), False), (fused, True)):
         value, _ = jax.jvp(norm, (x,), (direction,))
         np.testing.assert_array_equal(value, fused(x))
-        assert_as_exact(jax.jit(lambda x, direction, norm=norm: jax.jvp(norm, (x,), (direction,))[1]),
-                        jax.jit(tangent_of(xla)),
+        tangent = tangent_of(lambda x, _, norm=norm: norm(x))
+        assert_as_exact(jax.jit(tangent) if staged else tangent, jax.jit(tangent_of(xla)),
                         draw, "jvp", seeds=SEEDS[(2, 31)], truth_fn=tangent_of(exact))
 
 
