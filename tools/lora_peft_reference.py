@@ -167,13 +167,16 @@ def write_orders(out: Path) -> None:
     for case in CASES:
         adapter = LoRA.load(decoder.model, decoder.variables, FIXTURE / case / "adapter",
                             layouts=decoder.layouts)
-        drawn = orders(residual_width(adapter.variables), ORDERS, ORDER_SEED)
+        # The adapter holds its factors as its parameters and the base as frozen; an order
+        # moves both, so they are permuted as one tree.
+        whole = {"params": _joined(adapter.variables["frozen"], adapter.variables["params"])}
+        drawn = orders(residual_width(whole), ORDERS, ORDER_SEED)
         (out / case).mkdir(parents=True, exist_ok=True)
         np.save(out / case / "orders.npy", drawn)
-        declared = declarations(adapter.variables["params"])
+        declared = declarations(whole["params"])
         residual_inputs = {
             "model." + ".".join(parameter_path(path)[:-1]).replace("layers_", "layers.")
-            for path, leaf in jax.tree_util.tree_leaves_with_path(adapter.variables["params"])
+            for path, leaf in jax.tree_util.tree_leaves_with_path(whole["params"])
             if parameter_path(path)[-1] == "lora_A"
             and declared_axes(path, leaf.ndim, declared)[0] == "embed"}
         masks = None
@@ -181,10 +184,11 @@ def write_orders(out: Path) -> None:
             with np.load(FIXTURE / case / MASKS) as saved:
                 masks = {key: saved[key] for key in saved}
         for k, order in enumerate(drawn):
-            variables = permuted(adapter.variables, order)
-            base = {**variables, "params": _without(variables["params"], FACTORS)}
-            decoder.save(out / case / str(k) / "base", variables=base)
-            adapter.save(variables, out / case / str(k) / "adapter")
+            moved = permuted(whole, order)["params"]
+            base = _without(moved, FACTORS)
+            decoder.save(out / case / str(k) / "base", variables={**decoder.variables, "params": base})
+            adapter.save({**adapter.variables, "params": _only(moved, FACTORS), "frozen": base},
+                         out / case / str(k) / "adapter")
             if masks is not None:
                 np.savez(out / case / str(k) / MASKS, **{
                     key: mask[..., order] if key in residual_inputs else mask for key, mask in masks.items()})
@@ -195,6 +199,21 @@ def _without(tree: dict, names) -> dict:
     """`tree` without the leaves `names` holds at any depth."""
     return {key: _without(value, names) if isinstance(value, dict) else value
             for key, value in tree.items() if key not in names}
+
+
+def _only(tree: dict, names) -> dict:
+    """`tree`'s leaves named one of `names`, at any depth, and the dicts that hold them."""
+    kept = {key: value if key in names else _only(value, names)
+            for key, value in tree.items() if key in names or isinstance(value, dict)}
+    return {key: value for key, value in kept.items() if not isinstance(value, dict) or value}
+
+
+def _joined(one: dict, other: dict) -> dict:
+    """Two trees with disjoint leaves joined into one."""
+    joined = dict(one)
+    for key, value in other.items():
+        joined[key] = _joined(joined[key], value) if isinstance(value, dict) and key in joined else value
+    return joined
 
 
 def record_orders(drawn: Path) -> None:
