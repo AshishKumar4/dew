@@ -494,7 +494,7 @@ def _softmax_cotangent(logits, first, excluded, peaks, masses, labels, d_first, 
     exponentiated log Z would carry log Z's rounding into every share. A
     target outside the tile one-hots to zero rather than to a wrapped
     column."""
-    probabilities = jnp.exp(_without(logits, first, excluded) - peaks[:, None]) / masses[:, None]
+    probabilities = jnp.exp(_without(logits, first, excluded) - peaks[:, None] - jnp.log(masses)[:, None])
     # A target at the excluded column scores a constant +inf, which no logit moves.
     selected = _without(jax.nn.one_hot(labels - first, logits.shape[-1], dtype=logits.dtype), first,
                         excluded, value=0)
