@@ -142,3 +142,24 @@ def test_check_one_holds_dew_exact_where_the_reference_is_exact_on_every_seed():
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(shifted, exact, integral, "shifted", seeds=8)
     assert raised.type is AssertionError
+
+
+def test_check_one_fails_a_value_that_is_not_finite():
+    """A NaN in Dew's leaf fails, whatever the pooled errors would read."""
+    poisoned = jax.jit(lambda x, w: {"y": jnp.dot(x, w, precision="highest").at[0, 0].set(jnp.nan)})
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(poisoned, _product, _draw, "poisoned", seeds=8)
+    assert raised.type is AssertionError
+
+
+def test_check_one_holds_a_row_of_float64_zero_to_the_references_own():
+    """A row the float64 truth holds at exactly zero, the reference too, is no further from zero in Dew
+    than ROW_FACTOR times the reference on that row: a corruption too small to move the pooled error
+    still fails there."""
+    def zero_row(offset):
+        return jax.jit(lambda x, w: {"y": jnp.concatenate(
+            [jnp.dot(x, w, precision="highest"), jnp.full((1, w.shape[1]), offset, jnp.float32)])})
+
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(zero_row(1e-12), zero_row(0.0), _draw, "zero row", seeds=8)
+    assert raised.type is AssertionError
