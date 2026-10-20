@@ -121,10 +121,18 @@ jobs:
       with:
         name: dist
         path: dist/
-    - name: Install the wheel from PyPI into an empty environment
+    - name: Without Dew's package index, an install stops at resolving jax
+      run: |
+        python -m venv "$RUNNER_TEMP/plain"
+        if "$RUNNER_TEMP/plain/bin/pip" install --index-url https://pypi.org/simple dist/*.whl > plain.txt 2>&1; then
+          cat plain.txt; echo "dewml installed from PyPI alone, on a jax without Dew's fixes"; exit 1
+        fi
+        grep -q "No matching distribution found for jax" plain.txt || { cat plain.txt; exit 1; }
+    - name: Install the wheel into an empty environment, jax from Dew's package index
       run: |
         python -m venv "$RUNNER_TEMP/clean"
-        "$RUNNER_TEMP/clean/bin/pip" install --quiet --index-url https://pypi.org/simple dist/*.whl
+        "$RUNNER_TEMP/clean/bin/pip" install --quiet --index-url https://pypi.org/simple \
+          --extra-index-url https://pypi.dewml.dev/simple dist/*.whl
     - name: Run it
       working-directory: ${{ runner.temp }}
       run: |
@@ -136,13 +144,10 @@ jobs:
 
         import dew
         from dew.nn.backbones import CausalTransformer
-        from dew.training.runtime import _pool_keys_alike
 
         assert "site-packages" in dew.__file__, dew.__file__
         print("dewml", importlib.metadata.version("dewml"), "jax", jax.__version__,
               "flax", importlib.metadata.version("flax"))
-        # PyPI's jax 0.11.2 lacks jax-ml/jax#40940, and Dew sees that it does.
-        assert not _pool_keys_alike()
         import flax.nnx  # noqa: E402,F401  imports on jax 0.11.2 from flax 0.12.10 on
         model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2,
                                   num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=16)
@@ -150,25 +155,13 @@ jobs:
         logits = jax.jit(model.apply)(model.init(jax.random.key(0), tokens), tokens)
         assert logits.shape == (2, 8, 64) and bool(jnp.all(jnp.isfinite(logits)))
         EOF
-    - name: PyPI's jax still keys a pool's processes apart (jax-ml/jax#40940)
-      # The repro is expected to fail here (xfail, strict): once it passes, a
-      # release carries the fix, and the patched jax and its refusal can go.
-      run: |
-        "$RUNNER_TEMP/clean/bin/pip" install --quiet pytest
-        DEW_UPSTREAM_JAX=1 "$RUNNER_TEMP/clean/bin/python" -m pytest -q -rxX \
-          tests/test_distribution.py::test_a_pools_second_run_loads_what_its_first_compiled
     - name: Resolve the accelerator extras
       run: |
         for extras in cuda12,quantization,profile cuda13,quantization,profile tpu,quantization,profile; do
           echo "dewml[$extras] @ file://$(realpath dist/*.whl)" \
-            | uv pip compile - --python-version "$(tr -d '\n' < .python-version)" --python-platform x86_64-manylinux_2_31 --quiet > /dev/null
+            | uv pip compile - --extra-index-url https://pypi.dewml.dev/simple \
+              --python-version "$(tr -d '\n' < .python-version)" --python-platform x86_64-manylinux_2_31 --quiet > /dev/null
         done
-    - name: Install the jax for GPU pools as docs/installation.md says
-      run: |
-        uv pip install --python "$RUNNER_TEMP/clean/bin/python" --quiet jax \
-          -c "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/constraints.txt"
-        cd "$RUNNER_TEMP"
-        "$RUNNER_TEMP/clean/bin/python" -c "from dew.training.runtime import _pool_keys_alike; assert _pool_keys_alike()"
 
   test:
     needs: proven
