@@ -59,7 +59,7 @@ from dew.data.dataset import (
 )
 from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _split_spans, _weights, _workers
 from dew.data.materialize import _materialize, _Memory
-from dew.data.mixing import CorpusCounts, SearchBudget
+from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
     Artifact,
     Batched,
@@ -102,7 +102,6 @@ from dew.data.steps.generic import Coordinated
 from dew.records import JSON, integer, json_value, record
 
 _DEFAULT_LOADING = Loading()
-_DEFAULT_BUDGET = SearchBudget()
 
 
 @runtime_checkable
@@ -446,7 +445,6 @@ def compile(
     loading: Loading | None = None,
     seed: int = 0,
     rejections: Literal["drop", "mask"] = "drop",
-    budget: SearchBudget = _DEFAULT_BUDGET,
     resume: Literal["exact", "non-exact"] = "exact",
 ) -> Loader:
     """Check every leaf before opening readers, then build both branches.
@@ -465,11 +463,10 @@ def compile(
             loading=loading,
             seed=seed,
             rejections=rejections,
-            budget=budget,
             resume=resume,
         )
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
-                     seed=seed, rejections=rejections, budget=budget)
+                     seed=seed, rejections=rejections)
     return _compiled(staged, _coordinated(staged.train), host=host, resume=resume)
 
 
@@ -498,7 +495,6 @@ def _staged(
     loading: Loading,
     seed: int,
     rejections: Literal["drop", "mask"],
-    budget: SearchBudget,
 ) -> _Staged:
     if rejections == "mask":
         raise ValueError(
@@ -529,7 +525,7 @@ def _staged(
         if validation_counts and not any(count.accepted for count in validation_counts.values()):
             validation = None
         _released(branches)
-    build = _Build(read, loading, seed, batch, budget, _analyzed(train, read), training=True)
+    build = _Build(read, loading, seed, batch, _analyzed(train, read), training=True)
     return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens)
 
 
@@ -717,7 +713,6 @@ def _compile_phases(
     loading: Loading,
     seed: int,
     rejections: Literal["drop", "mask"],
-    budget: SearchBudget,
     resume: Literal["exact", "non-exact"],
 ) -> Loader:
     source = train.source
@@ -730,7 +725,7 @@ def _compile_phases(
     for index, (pipeline, until) in enumerate(zip(source.pipelines, source.until_steps, strict=True)):
         phase = _staged(_continued(pipeline, consumed)._then(*train.stages),
                         validation if index == 0 else None, objective=objective, read=read,
-                        provision=provision, loading=loading, seed=seed, rejections=rejections, budget=budget)
+                        provision=provision, loading=loading, seed=seed, rejections=rejections)
         end = None if until is None else until * phase.build.batch
         staged.append((phase, end))
         if end is not None:
@@ -998,7 +993,7 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
         lowering = _finite(lowering)
     # A token budget is fixed-length rows by now (`_budgeted`).
     batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
-    build = _Build(read, loading, 0, batch, _DEFAULT_BUDGET, lowering, training=True)
+    build = _Build(read, loading, 0, batch, lowering, training=True)
     return _Host(build.tuned(pipeline).batches(pipeline, DataPartition()), packed + _batch_steps(pipeline)[0])
 
 
@@ -1014,7 +1009,6 @@ def iterate(
     read: Read = "streamed",
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
-    budget: SearchBudget = _DEFAULT_BUDGET,
 ) -> pygrain.IterDataset:
     """A finite record pass through the same lowering, for publication and export."""
     if any(
@@ -1027,7 +1021,7 @@ def iterate(
         pipeline = _materialize(pinned, {}, training=False)
         _released((pinned,))
     lowering = _analyzed(pipeline, read, validation=True)
-    build = _Build(read, loading, 0, 1, budget, lowering, training=False)
+    build = _Build(read, loading, 0, 1, lowering, training=False)
     rows = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
 
@@ -1084,7 +1078,6 @@ def validation(
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
     seed: int = 0,
-    budget: SearchBudget = _DEFAULT_BUDGET,
 ) -> Reader:
     """Compile one finite evaluation branch without constructing a training
     stream. With no `read`, the sources choose it (`_preferred_read`)."""
@@ -1100,7 +1093,7 @@ def validation(
         _released((pinned,))
     packed = _coordinated(pipeline)
     lowering = _analyzed(pipeline, read, validation=True)
-    build = _Build(read, loading, seed, batch, budget, lowering, training=False)
+    build = _Build(read, loading, seed, batch, lowering, training=False)
     return functools.partial(_validation_reader, pipeline=pipeline, build=build.tuned(pipeline),
                              host=packed + _held_steps(pipeline) + host)
 
