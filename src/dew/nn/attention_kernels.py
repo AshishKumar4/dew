@@ -158,6 +158,21 @@ def _qualified(code: str, has: Callable[[AttentionCase], bool], choice: str, def
                        row='roadmap: qualify flash attention', kind='measured')
 
 
+def _narrow(case: AttentionCase) -> bool:
+    """Whether the target's narrow heads' row ('attention_narrow') speaks for `case`: heads at most 64
+    wide with no window, mask, bias, documents or key lengths."""
+    return (case.head_dim <= 64 and case.window is None and not (case.mask or case.bias or case.lengths)
+            and case.documents is None)
+
+
+def _row_names_flash(case: AttentionCase) -> bool:
+    """Whether the target's row names FlashAttention for `case`: its narrow heads' row where that
+    speaks for the call (`_narrow`), else its attention row."""
+    if _narrow(case) and measured_kernel('attention_narrow', 'triton') == 'flash':
+        return True
+    return measured_kernel('attention', 'cudnn') == 'flash'
+
+
 _ARITHMETIC = _Need('arithmetic', lambda case: not case.arithmetic,
                           "the call asks for arithmetic only the reference path computes "
                           "(`reference_only`)", inherent=True)
@@ -165,7 +180,7 @@ _ON_GPU = _Need('backend', _on_gpu, "it runs on a GPU", inherent=True)
 
 FLASH_SUPPORTS = (
     _ON_GPU,
-    _Need('row', lambda case: measured_kernel('attention', 'cudnn') == 'flash',
+    _Need('row', _row_names_flash,
                 lambda case: f"its target row names it on no {device_generation()}",
                 row='roadmap: qualify flash attention', kind='measured'),
     _qualified('window', lambda case: case.window is not None, 'attention_window', 'cudnn',
@@ -319,18 +334,17 @@ def _attention_preferred(case: AttentionCase) -> str:
     xla for a query no fused kernel takes the dtype of, else its row's ('attention', cuDNN by
     default), and the narrow heads' row's ('attention_narrow') for heads at most 64 wide with no
     window, mask, bias, documents or key lengths: by default tokamax's Triton kernel, measured faster
-    than cuDNN there on an L4 and an RTX 4080; the A100's and H100's rows name flash."""
+    than cuDNN there on an L4 and an RTX 4080; the A10's, A100's and H100's rows name flash, measured
+    faster than both (`generation.TARGETS`)."""
     backend = generation.backend()
     if backend != 'gpu':
         return 'tpu' if backend == 'tpu' else 'xla'
     if case.dtype not in CUDNN_DTYPES:
         # No fused GPU kernel takes another dtype, so no measurement prefers one.
         return 'xla'
-    row = measured_kernel('attention', 'cudnn')
-    if (case.head_dim <= 64 and case.window is None and not (case.mask or case.bias or case.lengths)
-            and case.documents is None):
+    if _narrow(case):
         return measured_kernel('attention_narrow', 'triton')
-    return row
+    return measured_kernel('attention', 'cudnn')
 
 
 def _hosted(kernel: str) -> str:

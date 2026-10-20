@@ -11,7 +11,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from delta_rule_support import DECAY_SUMS, port_formula
 from recording import RecordingTracker
 from reference_error import assert_as_exact_as_the_reference, float64_terms
 
@@ -36,7 +35,6 @@ from dew.decision.layout import OPTION_TILE, DecisionInputs, compacted
 from dew.decision.objective import _ALONG_THE_QUESTIONS
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
-from dew.nn import linear
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import VALID_ROWS, Step
 from dew.training.trainer import Trainer
@@ -199,56 +197,21 @@ def decided(objective, variables, batch, segments: int):
     return objective.model.logits(variables, laid_out(batch, segments)), gradient(objective, variables, batch)
 
 
-ON_THE_PORT = pytest.mark.skipif(jax.default_backend() != "cpu", reason=(
-    "Qwen3.5's delta rule runs on the port on a GPU, where "
-    "test_the_port_runs_a_packed_window_by_its_own_formula holds a packed window"))
-"""The arms over Qwen3.5, whose packing contract runs on the host: packing is the same plumbing on
-every device, and the delta rule's port runs a window as one sequence, its rows' decay prefixes
-shifted by those before them (`linear.FORGET`)."""
-
-
-@pytest.mark.parametrize("arm", [pytest.param("joint", marks=ON_THE_PORT),
-                                 pytest.param("marker", marks=ON_THE_PORT), "parallel"])
+@pytest.mark.parametrize("arm", ["joint", "marker", "parallel"])
 def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     """Rows packed into windows (segments, positions restarting per row, spans moved) give each
-    question's logits and the parameters' gradients each row gives in a window of its own, through
-    Qwen3.5's Gated DeltaNet conv and state and its attention, and through the head, within the
-    float64 gate: no state, attention, pooled span or last-token feature crosses a row. The float64
-    truth is the rows in windows of their own in float64."""
+    question's logits and the parameters' gradients each row gives alone where its window packed it,
+    through Qwen3.5's Gated DeltaNet conv and state and its attention, and through the head, within
+    the float64 gate: no state, attention, pooled span or last-token feature crosses a row. The float64
+    truth is the rows in windows of their own in float64.
+
+    The reference runs the same kernels at the same shapes as the window (`rows_alone`), so this
+    holds what packing does; on a GPU the delta rule runs on its port in both, and its algorithm's
+    parity with fla is held at the layer, against fla's own packed sequences (test_fla_gdn,
+    test_fla_kda)."""
     objective = objective_for(arm)
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
                                           objective.model.head.clone(dtype=jnp.float64)))
-
-
-@pytest.mark.gpu(reason="the delta rule's port runs where a GPU's target row names it")
-@pytest.mark.parametrize("arm", ["joint", "marker"])
-def test_the_port_runs_a_packed_window_by_its_own_formula(arm, monkeypatch):
-    """A packed window's logits and gradients on the GPU, Qwen3.5's Gated DeltaNet on the port, as
-    near the float64 rows in windows of their own as the same window with the port's formula in the
-    portable math (`port_formula`: each row's decay prefix shifted by the rows before it in its
-    chunk, `linear.FORGET`, every range two plain fp32 base-2 prefixes apart), within the float64
-    gate. fla's own packed path rounds in TF32 (~1e-3 in fp32), so this bar sits well inside fla
-    parity.
-
-    But the decay parameters (`DECAY_SUMS`), whose tokens the per-token port test holds, and the
-    scorer's norm scale, which sums every option's normalised feature times its logit's cotangent,
-    a draw of every token's rounding on the rule: on an A100 [marker]'s sat 2.2e-6 from float64 on the
-    port, 8.1e-7 by the formula and 2.8e-7 with the rule in float64. Each token's rule output is held
-    by the same per-token test."""
-    objective = objective_for(arm)
-
-    def held(path: str) -> bool:
-        return not any(decay in path for decay in (*DECAY_SUMS, "['scorer_norm']['scale']"))
-
-    def by_the_formula(objective, variables, batch):
-        with monkeypatch.context() as patched:
-            patched.setattr(linear, "fla_rule", port_formula)
-            logits, grads = decided(objective, variables, batch, objective.bounds.segments)
-        return asked(batch, logits), grads
-
-    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
-                                          objective.model.head.clone(dtype=jnp.float64)),
-                              held=held, reference=by_the_formula)
 
 
 @pytest.mark.gpu(reason="FlashAttention's packed sequences run on CUDA")
@@ -298,12 +261,11 @@ def rows_alone(objective, variables, batch):
     return np.concatenate(logits), grads
 
 
-def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True, reference=rows_alone) -> None:
-    """Two packed windows of the examples decide each row's questions as the row does in a window
-    of its own, logits and the gradients of the leaves `held` names (by `jax.tree_util.keystr`)
-    within the float64 gate, the truth `wide_modules`, the backbone and head in float64, over the
-    rows alone. `reference(objective, variables, batch)` is the run the gate measures against, its
-    logits in `asked`'s order: the rows alone, or the window by another formula."""
+def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True) -> None:
+    """Two packed windows of the examples decide each row's questions as the row does alone where its
+    window packed it (`rows_alone`), logits and the gradients of the leaves `held` names (by
+    `jax.tree_util.keystr`) within the float64 gate, the truth `wide_modules`, the backbone and head
+    in float64, over the rows in windows of their own."""
     batch = windows(objective, 2)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
@@ -314,7 +276,7 @@ def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True, r
     variables = objective.init(jax.random.key(0))
     packed_logits, packed_grads = decided(objective, variables, batch, segments)
     packed = asked(batch, packed_logits)
-    logits, grads = reference(objective, variables, batch)
+    logits, grads = rows_alone(objective, variables, batch)
     rows = apart(batch)
     with jax.enable_x64(new_val=True):
         wide = copy.copy(objective)
