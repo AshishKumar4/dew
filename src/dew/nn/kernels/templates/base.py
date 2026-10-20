@@ -101,7 +101,10 @@ def choose(choice: str, implementations: Sequence[Template], *args, **kwargs) ->
     if not eligible:
         raise ValueError(f"no implementation of {choice} runs this call on {target.generation}: "
                          f"{', '.join(bound)}")
-    costs = [implementation.estimate(ba, target)[0] for implementation, ba in eligible]
+    # One eligible implementation is the call's without an estimate, so a target with no cost facts
+    # (a TPU, where XLA's alone runs) needs none.
+    costs = [0.0] if len(eligible) == 1 else [implementation.estimate(ba, target)[0]
+                                              for implementation, ba in eligible]
     estimated = eligible[min(range(len(eligible)), key=lambda index: (costs[index], index))][0]
     named = selection.forced(choice)
     if named is None:

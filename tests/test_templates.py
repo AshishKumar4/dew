@@ -100,6 +100,16 @@ class Hopper(Doubling):
         return 0.1
 
 
+@dataclasses.dataclass(frozen=True)
+class Unpriced(Doubling):
+    """An implementation with no cost facts on its target, as XLA on a TPU."""
+
+    name: ClassVar[str] = "unpriced"
+
+    def cost(self, ba, config, target):
+        raise ValueError("no cost facts")
+
+
 def test_a_call_runs_the_implementation_estimated_fastest_on_the_device_or_the_one_chosen():
     """Among the implementations that run the call on the device, the one whose fastest fitting
     config is estimated fewest seconds, reported as the call's route; `generation.chosen` names
@@ -116,4 +126,5 @@ def test_a_call_runs_the_implementation_estimated_fastest_on_the_device_or_the_o
         ("doubling", "doubling"), ("slow", "doubling")]
     with generation.assumed("sm90"):
         assert type(choose("decode", implementations, x)) is Doubling
+        assert type(choose("decode", [Unpriced()], x)) is Unpriced
         assert type(choose("decode", implementations, x.update(dtype=jnp.bfloat16))) is Hopper
