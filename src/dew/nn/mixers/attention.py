@@ -47,7 +47,7 @@ from dew.nn.inputs import (
     document_reach,
 )
 from dew.nn.kernels.generation import backend
-from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
+from dew.nn.kv_cache import PLACES, TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain, unit
@@ -147,7 +147,7 @@ class _Masking(NamedTuple):
     cursor: jax.Array | None
     key_places: jax.Array
     """Each key's place counted over its document's tokens (`counted_places`), which a chunk and ALiBi
-    read: a cached key's where the layer keeps them (`CausalSelfAttention._cached_places`), else
+    read: a cached key's where its cache keeps them (`dew.nn.kv_cache.Append.places`), else
     its slot."""
 
 
@@ -686,7 +686,7 @@ class CausalSelfAttention(nn.Module):
                     positions, append = open_kv_cache(
                         self, key, self.ctx.max_seq_len, value_dim=self.value_dim,
                         valid=None if attention_metadata is None else attention_metadata.valid,
-                        layout=self.ctx.kv_cache)
+                        layout=self.ctx.kv_cache, places=self._reads_places)
             elif self.ctx.kv_cache != KVCache():
                 raise ValueError(
                     "a bidirectional canvas reads its encoder prefix as dense, full-precision "
@@ -759,12 +759,9 @@ class CausalSelfAttention(nn.Module):
         causal, mask, documents = self.ctx.causal, None, None
         implementation = self.ctx.attention_impl
         # An uncached call's keys are its own tokens; a cached call's keys are
-        # placed by `_cached_places` where the layer reads their places. A
-        # paged cache holds rows a server seats at canonical positions, where
-        # a key's slot is its place, so it keeps none.
+        # at the places their cache keeps beside them where the layer reads
+        # them (`Append.places`), else at their slots, which nothing reads.
         key_places = places
-        keeps_places = ((self.ctx.attention_chunk is not None or self.alibi)
-                        and self.ctx.kv_cache.page_size is None)
         # A bidirectional layer windows only where its kind keeps the window on
         # both sides; DiffusionGemma's decoder reads its whole canvas
         # (modeling_diffusion_gemma.py:1399-1401), and its prefix branch below
@@ -790,9 +787,10 @@ class CausalSelfAttention(nn.Module):
             key = jnp.concatenate([cached_key, key], axis=-3)
             value = jnp.concatenate([cached_value, value], axis=-3)
             causal, window = False, None
-            key_places = (jnp.concatenate([self.get_variable("cache", "cached_places"),
+            # The encoder's dense cache keeps a place a slot, `[rows, alloc, 1]`.
+            key_places = (jnp.concatenate([self.get_variable("cache", PLACES)[..., 0],
                                            jnp.broadcast_to(places, (B, S))], axis=-1)
-                          if keeps_places else jnp.arange(alloc + S))
+                          if self._reads_places else jnp.arange(alloc + S))
         elif self.ctx.kv_shared and decode:
             # The provider's stashed keys carry the full history, read as its own cache is.
             if S == 1:
@@ -812,7 +810,7 @@ class CausalSelfAttention(nn.Module):
                 (cursor, mask), causal = self._decode_masks(positions, key.shape[-3]), False
             else:  # several tokens appended after the keys their rows held
                 documents, causal, window = self._cached_call(positions, cached_validity(self, key.shape[-3]))
-            key_places = self._cached_places(places, positions) if keeps_places else jnp.arange(key.shape[-3])
+            key_places = append.places(places) if self._reads_places else jnp.arange(key.shape[-3])
             if kv_store is not None and self.ctx.kv_store_key is not None:
                 kv_store[self.ctx.kv_store_key] = (key, value, positions, key_places)
         elif segment_ids is not None:
@@ -886,18 +884,10 @@ class CausalSelfAttention(nn.Module):
                 mask = mask & (jnp.abs(distance) < self.ctx.sliding_window)[:, None]
         return mask, key_positions
 
-    def _cached_places(self, places, slots) -> jax.Array:
-        """Each cache slot's place `[rows, capacity]`, where a chunk and ALiBi
-        read its key: the place the call that wrote the slot counted its token
-        at (`counted_places`). A slot is that place only by default, so the
-        cache keeps it beside the key, and this call's `places` go in at their
-        `slots` as its keys do."""
-        allocated = self.has_variable("cache", "cached_places")
-        held = self.variable("cache", "cached_places", jnp.zeros, (slots.shape[0], self.ctx.max_seq_len),
-                             jnp.int32)
-        if allocated:
-            held.value = write_cache(held.value, jnp.broadcast_to(places, slots.shape), slots)
-        return held.value
+    @property
+    def _reads_places(self) -> bool:
+        """Whether the layer reads its keys' places, a chunk or ALiBi, so its cache keeps them."""
+        return self.ctx.attention_chunk is not None or self.alibi
 
     def _attended(self, masking: _Masking, positions, append, sinks, train: bool, *, bias=None):
         """The attention output through the kernel the masking chose: the
