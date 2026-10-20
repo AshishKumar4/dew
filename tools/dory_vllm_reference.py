@@ -576,8 +576,8 @@ def dew_traces(directory: Path) -> None:
 
 def permute(model, config: dict, drawn: dict[str, np.ndarray]) -> np.ndarray:
     """vLLM's `model` under the symmetries `drawn` (`symmetry`), each parameter set in place from the
-    model's own weights as it loaded them, which the first call keeps beside them on their device
-    (`MEMORY` leaves the engine room for them): each attention's
+    model's own weights as it loaded them, which the first call keeps in host memory, so a float64
+    model and its copy need not share a 40 GB GPU: each attention's
     fused query, key and value rows, output gate rows and gains, output columns; each feed-forward's
     fused gate and up rows, gains and down columns (`maps`); then every parameter's one axis of the
     residual width, as tests/residual_orders.py reorders Dew's. Returns the embeddings' first row, by
@@ -587,7 +587,8 @@ def permute(model, config: dict, drawn: dict[str, np.ndarray]) -> np.ndarray:
     import torch
 
     if not hasattr(model, 'dory_loaded'):
-        model.dory_loaded = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+        model.dory_loaded = {name: parameter.detach().to('cpu', copy=True)
+                             for name, parameter in model.named_parameters()}
     loaded, found = model.dory_loaded, maps(config, drawn)
     hidden, residual = config['hidden_size'], torch.as_tensor(drawn['residual'])
     heads, kv, width = config['num_attention_heads'], config['num_key_value_heads'], config['head_dim']
