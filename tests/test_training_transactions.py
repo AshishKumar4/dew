@@ -265,14 +265,16 @@ def test_every_microbatch_of_an_accumulated_update_reads_the_updates_committed_b
 
     class Clocked(Regression):
         def loss(self, variables, batch, step):
+            # Unordered, as a sharded program's callback is, and once a device: the set says each.
             jax.debug.callback(lambda updates, microbatch: seen.append((int(updates), int(microbatch))),
-                               step.updates, step.step, ordered=True)
+                               step.updates, step.step)
             return super().loss(variables, batch, step)
 
     state = Trainer(Clocked(), optax.sgd(0.1), key=jax.random.PRNGKey(0), accumulation=2).fit(
         Loader(lambda partition: batches(), None, None, 8), steps=6, log_every=100)
     assert int(state.updates) == 3
-    assert seen == [(0, 0), (0, 1), (1, 2), (1, 3), (2, 4), (2, 5)]
+    assert sorted(set(seen), key=lambda clocks: clocks[1]) == [(0, 0), (0, 1), (1, 2), (1, 3), (2, 4),
+                                                                (2, 5)]
 
 
 @pytest.mark.gpu("XLA:GPU's simplifier speculates the branch; XLA:CPU's pipeline kept it a branch")
