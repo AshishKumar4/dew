@@ -81,7 +81,7 @@ CASES = [
 def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
     """Every output and gradient on par with recorded mamba_ssm on fresh input and exact orbit draws.
 
-    The truth remains the XLA scan in float64. With `heads`, the kernels that sum a group's heads
+    The truth is mamba_ssm's minimal torch reference in float64. With `heads`, kernels summing a group's heads
     take that many a program; both configured forms see the same declared draws and every leaf.
     """
     stored = ieee_fixture(FIXTURES / "ssd_mamba_ssm_seeded.npz")
