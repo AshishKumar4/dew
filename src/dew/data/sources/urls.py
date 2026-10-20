@@ -10,9 +10,10 @@ from typing import ClassVar
 from urllib.parse import urlsplit
 
 import aiohttp
-import fsspec
-from fsspec.asyn import sync
+from fsspec.asyn import get_loop, sync
 from fsspec.implementations.http import HTTPFileSystem
+
+from dew.data.storage import Store
 
 _log = logging.getLogger(__name__)
 
@@ -38,7 +39,8 @@ class Fetch:
     the proxies its environment names and the redirects its server gives
     included, so a reader waits at most `timeout` on it from connecting to its
     last byte, however slowly a server sends (aiohttp's total deadline); any
-    other url, through the store fsspec reads it from. Resolving a host is the
+    other url, through the store it names (`dew.data.storage.Store`, a
+    storage profile's included). Resolving a host is the
     system resolver's, which takes no timeout. A cache never freezes a fetch's
     outcome; only `snapshot(url)` seals outcomes."""
 
@@ -82,8 +84,11 @@ class Fetch:
         other than HTTP(S) has no status but 200."""
         limit = self.max_bytes + 1
         if urlsplit(url).scheme in ("http", "https"):
-            http = HTTPFileSystem(client_kwargs={"trust_env": True,
-                                                 "timeout": aiohttp.ClientTimeout(total=self.timeout)})
-            return sync(http.loop, _get, sync(http.loop, http.set_session), url, limit)
-        with fsspec.open(url, "rb") as file:
+            # fsspec's own IO loop, where the filesystem keeps its session for every fetch in this process.
+            loop = get_loop()
+            http = HTTPFileSystem(loop=loop, client_kwargs={
+                "trust_env": True, "timeout": aiohttp.ClientTimeout(total=self.timeout)})
+            return sync(loop, _get, sync(loop, http.set_session), url, limit)
+        fs, path = Store(url).resolve()
+        with fs.open(path, "rb") as file:
             return 200, file.read(limit)
