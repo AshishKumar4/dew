@@ -4,6 +4,8 @@ heuristic, stored and read back in a fresh process, and measured once on a
 GPU that a process has to itself (dew.nn.kernels.tuning)."""
 
 import ast
+import dataclasses
+import functools
 import json
 import os
 import shutil
@@ -206,7 +208,7 @@ def test_a_launch_is_resolved_and_described_without_asking_a_traced_array_for_it
 
 
 DISTINCT = """
-import json
+import json, logging
 import jax, tokamax
 from test_tuning import loss, operands, step
 from dew.nn.kernels import generation, tuning
@@ -221,10 +223,22 @@ def described(launches):
                   for ba in tokamax.autotuning.bound_args_from_json(launches))
 
 
+class Told(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append([record.levelname, record.getMessage()])
+
+
+told = Told()
+logging.getLogger(tuning.__name__).addHandler(told)
+logging.getLogger(tuning.__name__).setLevel(logging.DEBUG)
 with generation.assumed("sm80"):
     _, two = tuning.tune(lambda: jax.make_jaxpr(jax.grad(layers, argnums=(0, 1, 2, 3, 4)))(*operands(15)))
     _, one = tuning.tune(lambda: jax.make_jaxpr(step())(*operands(15)))
-print(json.dumps([described(two), described(one)]))
+print(json.dumps([described(two), described(one), told.records]))
 """
 
 
@@ -232,9 +246,12 @@ def test_a_step_settles_each_distinct_launch_once(tmp_path):
     """Two layers of one shape launch the same four kernels at the same keys.
     Tuned as on a GPU, the two-layer step's launches are the one layer's,
     each once: the pool decides each distinct launch once, and a measuring
-    pass measures it once, not once a layer."""
-    two, one = fresh(DISTINCT, cache_dir=tmp_path / "cache", flags=keeping_picks())
+    pass measures it once, not once a layer. With no picks stored, the process
+    says so once, as information: a heuristic config is a working default,
+    which a notebook's output should not flag as a fault."""
+    two, one, told = fresh(DISTINCT, cache_dir=tmp_path / "cache", flags=keeping_picks())
     assert len(one) == 4 and two == one
+    assert [level for level, message in told if "have no config measured" in message] == ["INFO"]
 
 
 @pytest.mark.parametrize("stores, rows, norms", [
@@ -359,6 +376,54 @@ def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_
     assert fresh(MEASURED, "2048", cache_dir=tmp_path / "cache", flags=inherited) == [path, measured, True, 1]
     assert fresh(MEASURED, "1024", cache_dir=tmp_path / "cache",
                  flags=f"{inherited} {READ_ONLY}".strip()) == [path, measured, False, 1]
+
+
+class KernelBug(Exception):
+    """A kernel's own failure, which no GPU limit explains."""
+
+
+@pytest.mark.gpu(reason="the tuner measures on CUDA")
+def test_a_config_failing_for_more_than_its_shared_memory_stops_the_measurement():
+    """A launch one of whose configs raises as it lowers, a kernel's bug and not its GPU's shared
+    memory: measuring the launch propagates the error, where the tuner had counted it one more
+    failed config and kept the others' fastest."""
+    with tuning.launches():
+        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+    [norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
+    broken_config = sorted(norm.autotuning_configs, key=repr)[0]
+
+    class Broken(norm_swiglu.RmsForward):
+        """The norm's forward, raising for one config of its space. Its signature is the norm's, which
+        tokamax reads to bind the launch's operands."""
+
+        @functools.wraps(norm_swiglu.RmsForward._fwd)
+        def _fwd(self, *args, config, **kwargs):
+            if config == broken_config:
+                raise KernelBug
+            return super()._fwd(*args, config=config, **kwargs)
+
+    fields = {field.name: getattr(norm.op, field.name) for field in dataclasses.fields(norm.op) if field.init}
+    broken = tokamax.BoundArguments(Broken(**fields), norm.arguments)
+    with pytest.raises(KernelBug):
+        tuning._measured(broken.op, broken)
+
+
+@pytest.mark.gpu(reason="the tuner measures on CUDA")
+def test_a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path):
+    """A profile capture holds CUPTI, which takes one subscriber: measuring a launch beside it times
+    no config, returns each as failed, so the launch keeps its heuristic, and leaves CUPTI to the
+    capture without raising; once the capture ends, the same launch measures every config."""
+    with tuning.launches():
+        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+    [norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
+    jax.profiler.start_trace(str(tmp_path / "trace"))
+    try:
+        beside = tuning._measured(norm.op, norm)
+    finally:
+        jax.profiler.stop_trace()
+    assert set(beside) == set(norm.autotuning_configs) and not beside.prune_errors()
+    alone = tuning._measured(norm.op, norm)
+    assert set(alone.prune_errors()) == set(norm.autotuning_configs)
 
 
 STORES = """
