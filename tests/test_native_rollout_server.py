@@ -111,7 +111,14 @@ def test_a_draw_a_criterion_cuts_short_is_truncated_and_one_the_task_alone_ends_
         return tokens == 3
 
     task = TextGeneration(target.model, params, None, sampling=unstopped, stopping=(three,))
-    with pytest.raises(ValueError, match="no policy names"):
+    with pytest.raises(ValueError, match="no draw's policy names"):
+        NativeRolloutServer(Server.from_task(task, slots=2, capacity=64))
+    # An EOS criterion beside the policy's own ends draws on an id the policy does not name.
+    from dew.sampling.decoding import EndOfSequence
+
+    task = TextGeneration(target.model, params, None, sampling=SAMPLING,
+                          stopping=(EndOfSequence(jnp.asarray([3], jnp.int32)),))
+    with pytest.raises(ValueError, match="no draw's policy names"):
         NativeRolloutServer(Server.from_task(task, slots=2, capacity=64))
 
 
@@ -188,6 +195,68 @@ def test_a_native_draw_ends_on_the_stop_string_it_completes(pieces):
         source.close()
         server.close()
     assert seen == ["stop"] and session.calls[0].finish_reason == "stop"
+
+    # A tool episode under a policy with a stop string and no EOS id: each turn ends on the string,
+    # the environment steps on it, and the turns chain into one packed row of trained actions.
+    from contextlib import contextmanager
+
+    from dew.objectives.rl import EnvironmentSource
+    from dew.objectives.rl.episodes import EpisodeStatus, Observation
+    from dew.objectives.rl.sessions import Status, Task, pack
+
+    class Turns:
+        def __init__(self):
+            self.context, self.steps = (ids["a"],), 0
+
+        def reset(self):
+            return Observation(self.context)
+
+        def step(self, action):
+            self.steps += 1
+            self.context = (*action.context, *action.tokens, ids["a"])
+            if self.steps == 2:
+                return Observation((), EpisodeStatus.COMPLETED, "two turns")
+            return Observation(self.context)
+
+    @contextmanager
+    def environment(task, identity):
+        yield Turns()
+
+    task = TextGeneration(model, params, RunProcessor(pieces),
+                          sampling=Sampling(temperature=1.0, stop=("stop",)))
+    server = NativeRolloutServer(Server.from_task(task, slots=2, capacity=64))
+    episodes = EnvironmentSource(server, environment, lambda task, episode: 1.0, max_prompt_tokens=16,
+                                 max_new_tokens=6, max_turns=4)
+    try:
+        [session] = [future.result(timeout=120)
+                     for future in episodes.submit(Task("0"), 1, version=0, key=KEY)]
+    finally:
+        episodes.close()
+        server.close()
+    assert session.status == Status.COMPLETED
+    assert [(call.sampled_ids, call.finish_reason) for call in session.calls] == [
+        ((ids["st"], ids["op"]), "stop")] * 2
+    packed = pack([session], 16)
+    np.testing.assert_array_equal(packed["input_ids"][0][packed["response_mask"][0] > 0],
+                                  [ids["st"], ids["op"]] * 2)
+
+
+def test_a_draw_that_terminated_ends_as_its_policy_ends_one():
+    """A terminated draw ends on an EOS id of its policy or on the id completing one of its stop
+    strings, which any id may be; one that ended on neither, or ran past an EOS id, breaks its
+    contract."""
+    from dew.inference import Draw
+
+    def draw(tokens, terminated):
+        return Draw((1,), tokens, (-0.5,) * len(tokens), None, terminated, 0)
+
+    stopping, plain = Sampling(eos_token_ids=EOS, stop=("x",)), Sampling(eos_token_ids=EOS)
+    for tokens, terminated in (((4, EOS), True), ((4, 5), True), ((4, 5), False)):
+        assert draw(tokens, terminated).checked(stopping).tokens == tokens
+    for tokens, terminated, policy in (((4, 5), True, plain), ((4, EOS), False, stopping),
+                                       ((EOS, 4), True, stopping)):
+        with pytest.raises(ValueError):
+            draw(tokens, terminated).checked(policy)
 
 
 def test_a_refused_request_raises_at_submit_and_the_native_server_keeps_serving(native_server):

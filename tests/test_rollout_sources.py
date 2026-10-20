@@ -51,12 +51,10 @@ def words(key):
 
 
 class Server:
-    """Draws `(5, EOS)`, or `tokens`, at the version served on submission, terminated where it ends on
-    EOS or as `terminated` says; `hold` keeps draws pending."""
+    """Draws `(5, EOS)`, or `tokens`, at the version served on submission; `hold` keeps draws pending."""
 
-    def __init__(self, tokens=(5, EOS), raw=True, sampling=SAMPLING, hold=False, terminated=None):
+    def __init__(self, tokens=(5, EOS), raw=True, sampling=SAMPLING, hold=False):
         self.version, self.tokens, self.raw, self._sampling, self.hold = 0, tokens, raw, sampling, hold
-        self.terminated = tokens[-1] == EOS if terminated is None else terminated
         self.held, self.prompts, self.keys = [], [], []
 
     @property
@@ -68,7 +66,7 @@ class Server:
         self.keys.append(words(key))
         future = Future()
         draw = Draw(tuple(prompt), self.tokens, (-.5,) * len(self.tokens),
-                    (-.4,) * len(self.tokens) if self.raw else None, self.terminated, self.version)
+                    (-.4,) * len(self.tokens) if self.raw else None, self.tokens[-1] == EOS, self.version)
         if self.hold:
             self.held.append((future, draw))
         else:
@@ -500,41 +498,6 @@ def test_the_prompt_source_scores_decoded_text_without_eos_and_masks_the_budget_
     assert long.submit(task, 1, version=0, key=KEY)[0].result(timeout=10).status == Status.TRUNCATED
     prompts.close()
     long.close()
-
-
-def test_a_draw_that_ends_on_a_stop_string_is_scored_with_it_and_its_turn_steps_the_environment():
-    """A policy's stop string ends a draw on the id that completes it, as vLLM, SGLang and Dew's own
-    server end one: the prompt source scores the text with the string in it, where it drops an EOS
-    id, and a tool episode takes the turn as ended and steps its environment."""
-    stopping = Sampling(temperature=1.0, eos_token_ids=EOS, stop=("6",))
-    seen = []
-
-    def reward(completion, record):
-        seen.append(completion)
-        return 1.0
-
-    [task] = prompt_tasks(prompt_batch())
-    prompts = PromptSource(Server(tokens=(5, 6), sampling=stopping, terminated=True), reward,
-                           decode=lambda ids: " ".join(map(str, ids)), max_new_tokens=4)
-    [rollout] = [future.result(timeout=10) for future in prompts.submit(task, 1, version=0, key=KEY)]
-    prompts.close()
-    assert seen == ["5 6"] and rollout.status == Status.COMPLETED
-    assert [(call.sampled_ids, call.finish_reason) for call in rollout.calls] == [((5, 6), "stop")]
-
-    entered, exited = [], []
-    episodes = source(Server(tokens=(5, 6), sampling=stopping, terminated=True), factory(entered, exited))
-    rollout = episodes.submit(Task("3"), 1, version=0, key=KEY)[0].result(timeout=10)
-    episodes.close()
-    assert rollout.status == Status.COMPLETED and rollout.reward == 3.0
-    assert [call.prompt_ids for call in rollout.calls] == [(1, 2), (1, 2, 5, 6, 4), (1, 2, 5, 6, 4, 5, 6, 4)]
-    assert all(call.finish_reason == "stop" for call in rollout.calls)
-
-    # Without the string in its policy, a draw that ends on no EOS id and says it terminated breaks
-    # its contract, and the episode's future fails with it.
-    broken = source(Server(tokens=(5, 6), terminated=True), factory([], []))
-    with pytest.raises(ValueError, match="stop strings"):
-        broken.submit(Task("3"), 1, version=0, key=KEY)[0].result(timeout=10)
-    broken.close()
 
 
 def test_the_prompt_sources_calls_carry_the_draws_routing_into_the_packed_batch():

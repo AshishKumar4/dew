@@ -218,7 +218,7 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
     def draw(eos: int | None, seed: int, stop: str | None = None) -> dict:
         proxy.exchanges.clear()
         sampling = Sampling(temperature=1.0, eos_token_ids=eos, stop=() if stop is None else (stop,))
-        server = OpenAIRolloutServer(completion, sampling, published)
+        server = OpenAIRolloutServer(completion, sampling, published, decode=tokenizer.decode)
         try:
             drawn = server.submit(prompt, STOPS_BUDGET, key=seed).result()
             outcome = {"tokens": list(drawn.tokens), "terminated": drawn.terminated}
