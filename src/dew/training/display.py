@@ -9,8 +9,11 @@ evaluation of each split with its history; and, in the bottom border, the
 phase the run is in. Notes print above the panel. The run ends with a
 summary panel that keeps the final evaluations and their histories.
 
-Anywhere else (a pipe, a log file, CI, a notebook) the same numbers are
-printed as one line per logging interval. Only process zero shows anything.
+In a notebook the same panel is one output that IPython's display handle
+updates in place (`NotebookPanel`), so the saved notebook and the site keep
+its last frame, and the summary follows it. Anywhere else (a pipe, a log
+file, CI) the same numbers are printed as one line per logging interval. Only
+process zero shows anything.
 
 Nothing here knows a workload. The rows are whatever scalars are logged,
 grouped by the prefix of their names (`train`, `rollout`, ...), and how one
@@ -22,8 +25,10 @@ from __future__ import annotations
 import collections
 import dataclasses
 import datetime
+import io
 import math
 import sys
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager
@@ -32,6 +37,7 @@ import jax
 from rich import box
 from rich.color import Color, blend_rgb
 from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
+from rich.jupyter import JUPYTER_HTML_FORMAT
 from rich.live import Live
 from rich.panel import Panel
 from rich.spinner import Spinner
@@ -64,11 +70,67 @@ PLAIN = Shown()
 WIDEST = 120
 
 
-def terminal(console: Console) -> bool:
-    """Whether `console` is a terminal the panel can redraw. rich takes
-    FORCE_COLOR, which a CI job may set, for a terminal; that asks for
-    colour, not for redraws in a log, so stdout must be a TTY as well."""
+def redraws(console: Console) -> bool:
+    """Whether the panel can redraw on `console`: a terminal or a notebook. rich
+    takes FORCE_COLOR, which a CI job may set, for a terminal; that asks for
+    colour, not for redraws in a log, so a terminal's stdout must be a TTY."""
+    if console.is_jupyter:
+        return True
     return sys.stdout.isatty() and console.is_terminal and not console.is_dumb_terminal
+
+
+class NotebookPanel:
+    """A renderable as one notebook output, redrawn eight times a second by
+    updating it through IPython's display handle, and left as its last frame.
+
+    Not rich's `Live`, whose notebook path redraws an output widget: while it
+    holds the widget, whatever else the cell prints, from any thread, lands in
+    it and is cleared with the next frame, and a saved notebook keeps no
+    widget. An update replaces one output's data and captures nothing."""
+
+    def __init__(self, renderable: RenderableType, console: Console):
+        from IPython.display import DisplayHandle
+
+        self.renderable = renderable
+        self.console = console
+        # Each frame is rendered here and exported as the HTML and text rich prints in a notebook;
+        # the console's own output is emptied after each, which the export does not read.
+        self._sink = io.StringIO()
+        self._frames = Console(record=True, file=self._sink, width=console.width, height=console.height,
+                               color_system="truecolor", force_terminal=True, force_jupyter=False)
+        self._shown = self._frame()
+        self._handle = DisplayHandle()
+        self._handle.display(self._shown, raw=True)
+        self._stopped = threading.Event()
+        self._ticker = threading.Thread(target=self._tick, name="dew-notebook-panel", daemon=True)
+
+    def _frame(self) -> dict[str, str]:
+        self._frames.print(self.renderable)
+        self._sink.seek(0)
+        self._sink.truncate()
+        text = self._frames.export_text(clear=False)
+        return {"text/html": self._frames.export_html(code_format=JUPYTER_HTML_FORMAT, inline_styles=True),
+                "text/plain": text}
+
+    def _update(self) -> None:
+        from IPython.display import update_display
+
+        if (frame := self._frame()) != self._shown:
+            self._shown = frame
+            update_display(frame, display_id=self._handle.display_id, raw=True)
+
+    def _tick(self) -> None:
+        while not self._stopped.wait(1 / 8):
+            self._update()
+
+    def start(self) -> None:
+        self._ticker.start()
+
+    def stop(self) -> None:
+        """Draw the last frame once the redraws have stopped."""
+        self._stopped.set()
+        self._ticker.join()
+        self._update()
 
 
 def mesh_text(mesh: Mapping[str, int]) -> str:
@@ -216,32 +278,33 @@ def goodput(wall: float, first_step: float | None, other: float) -> dict[str, fl
 
 
 def data_line(counters: Mapping[str, float]) -> Text | None:
-    """A run's data counters (`data/...`) as one line: the rows its readers delivered and the records
-    they rejected, summed over the corpora, with each corpus's rows where a mixture reads more than
-    one (`data/rows/<corpus>`), each reason only where something was rejected for it
-    (`data/rejected/<corpus>/<reason>`), and the share of the rows truncated where any was
-    (`data/truncated/<corpus>`, each corpus's share of its own rows). None where the run reports
-    no rows."""
+    """A run's data counters (`data/...`) as one line: the rows each label's reader delivered
+    (`data/rows/<label>`), as they are, since a chain's labels count different stages (a mixture's
+    corpora the rows they fed it, the mixture those a later step kept) and no sum of them is the
+    run's; the records rejected, summed over the labels, with each reason only where something was
+    rejected for it (`data/rejected/<label>/<reason>`); and the share of the rows truncated where
+    any was (`data/truncated/<label>`, each label's share of its own rows). None where the run
+    reports no rows."""
     rows = {name.removeprefix("data/rows/"): value for name, value in counters.items()
             if name.startswith("data/rows/")}
     if not rows:
         return None
+    line = Text("data ", LABEL)
+    for index, (label, count) in enumerate(rows.items()):
+        line.append("  " if index else "").append("" if len(rows) == 1 else f"{label} ", LABEL)
+        line.append(f"{int(count):,}", "bold")
     reasons: collections.Counter[str] = collections.Counter()
     for name, value in counters.items():
         if name.startswith("data/rejected/"):
             reasons[name.rpartition("/")[2]] += int(value)
-    delivered = sum(rows.values())
-    line = Text.assemble(("data ", LABEL), (f"{int(delivered):,}", "bold"), (" rows", LABEL),
-                         ("  ·  ", LABEL), (f"{sum(reasons.values()):,}", "bold"), (" rejected", LABEL))
+    line.append(" rows", LABEL).append("  ·  ", LABEL).append(f"{sum(reasons.values()):,}", "bold")
+    line.append(" rejected", LABEL)
     if counted := {reason: count for reason, count in reasons.items() if count}:
         line.append(" (" + ", ".join(f"{reason} {count:,}" for reason, count in counted.items()) + ")", LABEL)
-    truncated = sum(counters.get(f"data/truncated/{corpus}", 0.0) * count for corpus, count in rows.items())
-    if truncated and delivered:
-        line.append("  ·  ", LABEL).append(f"{truncated / delivered:.1%}", "bold").append(" truncated", LABEL)
-    if len(rows) > 1:
-        line.append("  ·  ", LABEL)
-        for index, (corpus, count) in enumerate(rows.items()):
-            line.append("  " if index else "").append(f"{corpus} ", LABEL).append(f"{int(count):,}")
+    shares = {label: counters[name] for label in rows if (name := f"data/truncated/{label}") in counters}
+    weight = sum(rows[label] for label in shares)
+    if weight and (truncated := sum(share * rows[label] for label, share in shares.items())):
+        line.append("  ·  ", LABEL).append(f"{truncated / weight:.1%}", "bold").append(" truncated", LABEL)
     return line
 
 
@@ -283,7 +346,7 @@ class TrainingDisplay:
     ended: bool = False
     # How the phase is drawn, not what the display holds: left out of equality.
     spinner: Spinner = dataclasses.field(default_factory=lambda: Spinner("dots", style=ACCENT), compare=False)
-    live: Live | None = None
+    live: Live | NotebookPanel | None = None
     _logs: AbstractContextManager[None] | None = dataclasses.field(default=None, compare=False)
 
     @property
@@ -317,13 +380,18 @@ class TrainingDisplay:
             self.header.append(("mesh", mesh))
         self.header += [("batch", str(batch)), ("", precision)]
         console = Console()
-        if not terminal(console):
+        if not redraws(console):
             target = (f"to {started.target_steps}" if started.target_steps is not None
                       else f"for {started.tokens} real tokens")
             self.note(f"Training {model} from step {started.start_step} {target}: "
                       + ", ".join(f"{label} {value}".strip() for label, value in self.header))
             return
         self.phase = "compiling"
+        if console.is_jupyter:
+            # Dew's diagnostics print beside the panel as any output does.
+            self.live = NotebookPanel(self, console)
+            self.live.start()
+            return
         self.live = Live(self, console=console, refresh_per_second=8, vertical_overflow="visible")
         self.live.start()
         self._logs = display_console(console)
@@ -419,7 +487,7 @@ class TrainingDisplay:
         rate = (steps - 1) / stepping if steps > 1 and stepping > 0 else None
         fraction = f"{goodput['goodput/step_fraction']:.1%} of the wall time in steps"
         console = Console()
-        if not terminal(console):
+        if not redraws(console):
             timing = f"Trained {steps} steps in {duration(seconds)}"
             if first is not None:
                 timing += f": first step after {first:.2f} s"

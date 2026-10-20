@@ -46,6 +46,8 @@ if TYPE_CHECKING:
     from tensorboard.compat.proto.summary_pb2 import Summary
     from tensorboard.summary.writer.event_file_writer import EventFileWriter
 
+    from dew.figures import Figure
+
 
 type Reported = Record | Artifact
 """What a tracker is handed: one of the run's own records, or an artifact an
@@ -287,8 +289,8 @@ class LocalTracker(_OwnedTracker):
     The reports are JSONL journals (`scalars.jsonl` and `records.jsonl`),
     preview files and, with `plots`, plots. Nonfinite metrics are written to
     the journal as the strings NaN, +Inf and -Inf. Plots are drawn only by
-    `plot()`, or by `close` when `plots` is set, and they read the journal,
-    so the tracker keeps no history in memory.
+    `plot()`, or by `close` when `plots` is set, as `dew.figures` curves, and
+    they read the journal, so the tracker keeps no history in memory.
     """
 
     def __init__(self, directory: str | Path, *, plots: bool = False):
@@ -297,10 +299,6 @@ class LocalTracker(_OwnedTracker):
         self._files: dict[str, TextIO] = {}
         self._closed = False
         self._sequence = 0
-        if plots:
-            import importlib.util
-            if importlib.util.find_spec('matplotlib') is None:
-                raise ImportError('LocalTracker plots need dewml[plots]')
 
     def _check(self) -> None:
         if self._closed:
@@ -349,33 +347,38 @@ class LocalTracker(_OwnedTracker):
                                 {name: reported_number(value, name) for name, value in values.items()}))
         return reports
 
-    def plot(self) -> list[Path]:
-        """Plot each metric in the journal to `metric-<index>.png` with matplotlib's Agg backend, and
-        return the paths. The journal is not changed."""
+    def plot(self, *metrics: str, smooth: int = 1, y_label: str | None = None,
+             y_range: tuple[float, float] | None = None) -> Figure:
+        """The journal's `metrics` as one figure (`dew.figures.curve`), each line at the steps its
+        metric was logged: by default the training loss beside every split's validation loss (each
+        `<prefix>/loss` the journal holds). `smooth` draws each line's running mean over that many
+        points over it, and `y_label` names the axis, by default the metrics' common last part
+        (`loss`). A nonfinite value is left out of its line and counted on the figure; the journal
+        keeps it. Raises `KeyError` for a metric the journal never logged, naming those it holds."""
         self._check()
-        from matplotlib.backends.backend_agg import FigureCanvasAgg
-        from matplotlib.figure import Figure
-        history: dict[str, list[tuple[int, float]]] = {}
-        for step, values in self.scalars():
-            for key, value in values.items():
-                history.setdefault(key, []).append((step, value))
+        return _curves(self._history(), metrics, smooth=smooth, y_label=y_label, y_range=y_range)
+
+    def plot_files(self) -> list[Path]:
+        """Draw each metric in the journal to its own SVG file and return the paths. A file is named
+        for its metric, each character outside `[A-Za-z0-9_.-]` written `-`, with a digest of the
+        whole name, so two names never share a file. The journal is not changed."""
+        self._check()
+        history = self._history()
         paths = []
-        for index, (key, points) in enumerate(history.items()):
-            figure = Figure(figsize=(7, 4))
-            FigureCanvasAgg(figure)
-            axes = figure.subplots()
-            x, y = zip(*points, strict=True)
-            values = np.asarray(y)
-            axes.plot(x, np.where(np.isfinite(values), values, np.nan), marker=".")
-            axes.set(title=key, xlabel='step')
-            nonfinite = sum(not np.isfinite(value) for value in y)
-            if nonfinite:
-                axes.text(0.02, 0.98, f'{nonfinite} nonfinite values (see journal)',
-                          transform=axes.transAxes, va='top')
-            path = self.directory / f'metric-{index}.png'
-            figure.savefig(path)
+        for name in history:
+            readable = re.sub(r'[^A-Za-z0-9_.-]', '-', name)[:64]
+            path = self.directory / f'{readable}-{hashlib.sha256(name.encode()).hexdigest()[:8]}.svg'
+            _curves(history, (name,)).save(path)
             paths.append(path)
         return paths
+
+    def _history(self) -> dict[str, list[tuple[int, float]]]:
+        """Each metric the journal holds, its steps and values in the order logged."""
+        history: dict[str, list[tuple[int, float]]] = {}
+        for step, values in self.scalars():
+            for name, value in values.items():
+                history.setdefault(name, []).append((step, value))
+        return history
 
     def close(self) -> None:
         if self._closed:
@@ -383,7 +386,7 @@ class LocalTracker(_OwnedTracker):
         error = None
         try:
             if self.plots:
-                self.plot()
+                self.plot_files()
         except BaseException as failure:
             error = failure
         self._closed = True
@@ -398,6 +401,21 @@ class LocalTracker(_OwnedTracker):
         self._files.clear()
         if error is not None:
             raise error
+
+
+def _curves(history: Mapping[str, list[tuple[int, float]]], metrics: tuple[str, ...], *, smooth: int = 1,
+            y_label: str | None = None, y_range: tuple[float, float] | None = None) -> Figure:
+    """`metrics` of a journal's `history` as one curve (`LocalTracker.plot`)."""
+    from dew.figures import curve
+    names = metrics or tuple(name for name in history if name.count('/') == 1 and name.endswith('/loss'))
+    if missing := [name for name in names if name not in history] or ([] if names else ['train/loss']):
+        raise KeyError(f'the journal logged no {", ".join(missing)}; it holds {sorted(history)}')
+    if y_label is None:
+        lasts = {name.rpartition('/')[2] for name in names}
+        y_label = lasts.pop() if len(lasts) == 1 else 'value'
+    return curve({name: [value for _, value in history[name]] for name in names},
+                 x={name: [step for step, _ in history[name]] for name in names},
+                 x_label='step', y_label=y_label, y_range=y_range, smooth=smooth)
 
 
 @functools.singledispatch

@@ -609,7 +609,7 @@ def test_a_video_recipe_reads_frames_and_the_sound_around_them_at_its_audio_mode
                  audio_padding=1)
 
     train, _, _ = spec.pipelines()
-    records = list(train.repeat(1).iterate())
+    records = list(train.repeat(1))
 
     assert len(records) == len(clips)
     for record in records:
@@ -923,7 +923,7 @@ def test_a_prepared_set_is_the_deterministic_half_of_the_transform(tmp_path):
     spec = Augmenting(length=16, image_size=8, augment=None, val_batches=None, **WORKERS)
     live = _Images(16)
     rows = [{name: column[index] for name, column in batch.items()}
-            for batch in spec.prepared(live, training=False).batch(4).iterate()
+            for batch in spec.prepared(live, training=False).batch(4)
             for index in range(4)]
     manifest = export(rows, str(tmp_path), format="array_record", rows_per_shard=8,
                       metadata={"image_size": 8})
@@ -979,6 +979,9 @@ class _Lazy:
 
     def describe(self):
         return describe(self.values)
+
+    def label(self):
+        return "lazy"
 
     def fingerprint(self):
         return {"source": describe(self.values), "records": len(self.values)}
@@ -1096,7 +1099,7 @@ def test_the_image_transform_resizes_augments_and_captions_one_record():
     spec = Augmenting(image_size=8, augment=None)
     element = _Images(16)[5]
 
-    out = next(spec.prepared([element]).batch(1).iterate())
+    out = next(iter(spec.prepared([element]).batch(1)))
 
     np.testing.assert_array_equal(
         out["image"][0], cv2.resize(element["image"], (8, 8), interpolation=cv2.INTER_AREA))
