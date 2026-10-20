@@ -1,26 +1,15 @@
-"""Mamba-2 against the transformers 5.16.1 reference, at fp32.
+"""Mamba-2 against the transformers 5.16.1 reference.
 
 tools/mamba2_reference.py runs `mamba2_chunk_scan`,
 `mamba2_selective_state_update` and one `Mamba2Mixer` layer
-(modeling_mamba2.py) on fixed-seed operands and writes what they produced;
-the tests here run dew's forms on the same operands and the same weights
-and hold them to the reference. Nothing here imports torch.
-
-Tolerances and the differences actually observed, fp32 on CPU:
-
-- chunked scan, zero state     : output 5.5e-06 on outputs of magnitude up
-  to 30, state 7.2e-07, tolerance 1e-5
-- chunked scan, carried state  : the same numbers, tolerance 1e-5
-- one recurrent step           : output 9.5e-07, state 9.5e-07, tolerance 1e-5
-- chunked vs recurrent         : output 3.8e-06, state 1.4e-06, tolerance 1e-5
-- the whole layer              : 1.6e-06 on outputs of magnitude up to 3.0
-  over 70 tokens (4 heads of 6, 2 groups, state 5), tolerance 1e-5; in
-  bfloat16 against the reference's own bfloat16 forward 3.1e-02 (one bf16
-  ulp at that magnitude; the reference's bfloat16 sits 8.2e-02 from its
-  own fp32, dew's 5.1e-02), tolerance 1e-1
-- its decode path              : 8.3e-07 against its parallel forward
-- the two-layer model          : 4.8e-07 between a prefill plus single-token
-  steps and the parallel logits, of magnitude 3.1
+(modeling_mamba2.py) on fixed-seed operands and writes what they produced,
+in fp32 (bf16 for the layer too) and again in float64; the tests here run
+dew's forms on the same operands and the same weights and hold each within
+tests/reference_error.py's rule of the reference's own distance from the
+float64 run. Where dew's forms are held to each other (chunked against
+recurrent, a cut sequence, chunk sizes, decoding, padding, packing), the
+one under test is held to the other's distance from dew's own float64 run
+of it. Nothing here imports torch.
 """
 
 import itertools
@@ -32,14 +21,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import decode_through
+from reference_error import FACTOR, assert_as_exact_as_the_reference, widened
 
+from dew.accuracy import distance
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import AttentionMetadata, MixerCall, ModelInputs, coordinates
 from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd, recurrent_ssd
 from dew.objectives.lm import LMObjective
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
-BOUND = 1e-5
 
 
 @pytest.fixture(scope="module")
@@ -52,8 +42,30 @@ def geometry():
     return json.loads((FIXTURES / "config.json").read_text())
 
 
-def largest(left, right) -> float:
-    return float(np.max(np.abs(np.asarray(left, np.float32) - np.asarray(right, np.float32))))
+def outside(wrong, reference, truth, label: str):
+    """`wrong` far outside the rule a test holds: more than FACTOR times `reference`'s RMS distance from
+    `truth`, so the test tells the computation it checks from the one that leaves its operands out."""
+    mine = distance(np.asarray(wrong), np.asarray(truth))
+    theirs = distance(np.asarray(reference), np.asarray(truth))
+    assert mine > FACTOR * theirs, f"{label}: {mine:.3e} from float64, the rule's {FACTOR} x {theirs:.3e}"
+
+
+def in_float64(function, *args, **kwargs):
+    """`function` run in float64 on its array arguments widened (integers kept), as host arrays."""
+    def wide(value):
+        return widened(value) if hasattr(value, "dtype") else value
+
+    with jax.enable_x64(new_val=True):
+        return jax.tree.map(np.asarray, function(*map(wide, args), **{name: wide(value)
+                                                                     for name, value in kwargs.items()}))
+
+
+def as_exact(dew, reference, truth, label: str):
+    """Each leaf of `dew` within the rule of `reference`'s distance from `truth`."""
+    for index, (mine, theirs, exact) in enumerate(zip(jax.tree.leaves(dew), jax.tree.leaves(reference),
+                                                      jax.tree.leaves(truth), strict=True)):
+        assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), np.asarray(exact),
+                                         f"{label} {index}")
 
 
 def operands(reference):
@@ -72,50 +84,48 @@ def operands(reference):
 
 def test_the_chunked_scan_matches_the_reference(reference):
     out, final = chunk_ssd(*operands(reference), None, 32)
-    assert largest(out, reference["scan.output"]) < BOUND
-    assert largest(final, reference["scan.final"]) < BOUND
+    as_exact((out, final), (reference["scan.output"], reference["scan.final"]),
+             (reference["scan.output_f64"], reference["scan.final_f64"]), "the scan")
 
 
 def test_a_carried_state_matches_the_reference(reference):
     out, final = chunk_ssd(*operands(reference), jnp.asarray(reference["scan.initial"]), 32)
-    assert largest(out, reference["scan.output_carried"]) < BOUND
-    assert largest(final, reference["scan.final_carried"]) < BOUND
+    as_exact((out, final), (reference["scan.output_carried"], reference["scan.final_carried"]),
+             (reference["scan.output_carried_f64"], reference["scan.final_carried_f64"]), "the carried scan")
 
 
 def test_one_recurrent_step_matches_selective_state_update(reference):
     x, step, A, B, C, D = operands(reference)
     out, final = recurrent_ssd(x[:, :1], step[:, :1], A, B[:, :1], C[:, :1], D,
                                jnp.asarray(reference["scan.initial"]))
-    assert largest(out[:, 0], reference["step.output"]) < BOUND
-    assert largest(final, reference["step.state"]) < BOUND
+    as_exact((out[:, 0], final), (reference["step.output"], reference["step.state"]),
+             (reference["step.output_f64"], reference["step.state_f64"]), "the step")
 
 
 def test_the_chunked_and_recurrent_forms_agree(reference):
     initial = jnp.asarray(reference["scan.initial"])
-    chunked, chunked_final = chunk_ssd(*operands(reference), initial, 32)
-    recurrent, recurrent_final = recurrent_ssd(*operands(reference), initial)
-    assert largest(chunked, recurrent) < BOUND
-    assert largest(chunked_final, recurrent_final) < BOUND
+    chunked = chunk_ssd(*operands(reference), initial, 32)
+    recurrent = recurrent_ssd(*operands(reference), initial)
+    as_exact(recurrent, chunked, in_float64(chunk_ssd, *operands(reference), initial, 32), "recurrent")
 
 
 def test_a_sequence_split_in_two_carries_its_state_across_the_cut(reference):
     """Chunk boundaries that do not line up with the cut: 70 tokens as 30
     then 40 at a chunk of 32, the second half from the first's final state."""
     x, step, A, B, C, D = operands(reference)
-    whole, final = chunk_ssd(x, step, A, B, C, D, None, 32)
+    whole = chunk_ssd(x, step, A, B, C, D, None, 32)
     head, carried = chunk_ssd(x[:, :30], step[:, :30], A, B[:, :30], C[:, :30], D, None, 32)
     tail, tail_final = chunk_ssd(x[:, 30:], step[:, 30:], A, B[:, 30:], C[:, 30:], D, carried, 32)
-    assert largest(jnp.concatenate([head, tail], axis=1), whole) < BOUND
-    assert largest(tail_final, final) < BOUND
+    as_exact((jnp.concatenate([head, tail], axis=1), tail_final), whole,
+             in_float64(chunk_ssd, x, step, A, B, C, D, None, 32), "the cut sequence")
 
 
 def test_the_chunk_size_does_not_change_the_scan(reference):
     x, step, A, B, C, D = operands(reference)
-    at_32, final_32 = chunk_ssd(x, step, A, B, C, D, None, 32)
-    at_7, final_7 = chunk_ssd(x, step, A, B, C, D, None, 7)
-    at_256, final_256 = chunk_ssd(x, step, A, B, C, D, None, 256)
-    assert largest(at_7, at_32) < BOUND and largest(final_7, final_32) < BOUND
-    assert largest(at_256, at_32) < BOUND and largest(final_256, final_32) < BOUND
+    at_32 = chunk_ssd(x, step, A, B, C, D, None, 32)
+    truth = in_float64(chunk_ssd, x, step, A, B, C, D, None, 32)
+    for size in (7, 256):
+        as_exact(chunk_ssd(x, step, A, B, C, D, None, size), at_32, truth, f"a chunk of {size}")
 
 
 def layer(geometry, **overrides) -> Mamba2:
@@ -125,13 +135,21 @@ def layer(geometry, **overrides) -> Mamba2:
                   chunk_size=geometry["chunk_size"], norm_eps=geometry["layer_norm_epsilon"], **overrides)
 
 
+def wide_apply(module, variables, *args, **kwargs):
+    """`module` applied in float64 on `variables` and `args` widened, as host arrays."""
+    with jax.enable_x64(new_val=True):
+        wide = module.clone(dtype=jnp.float64)
+        return np.asarray(wide.apply(widened(variables), *widened(args), **kwargs))
+
+
 def layer_params(reference):
     """The reference layer's state dict under the module's names: kernels
     transposed from torch's [out, in], everything else as stored."""
     weights = {
         name[len("layer.") :]: value
         for name, value in reference.items()
-        if name.startswith("layer.") and name not in ("layer.hidden", "layer.output", "layer.output_bf16")
+        if name.startswith("layer.")
+        and name not in ("layer.hidden", "layer.output", "layer.output_bf16", "layer.output_f64")
     }
     return {
         "params": {
@@ -152,8 +170,7 @@ def layer_params(reference):
 def test_the_layer_matches_mamba2_mixer(reference, geometry):
     """The whole mixer on the reference's own weights: the projection, the
     conv with its bias, the step, the scan with two heads per group, the
-    D skip, the gated norm and the output projection. Largest observed
-    difference 1.6e-06 over 70 tokens on outputs of magnitude up to 3.0."""
+    D skip, the gated norm and the output projection."""
     module = layer(geometry)
     variables = layer_params(reference)
     template = jax.eval_shape(module.init, jax.random.key(0), jnp.zeros((1, 4, geometry["hidden_size"])))
@@ -161,29 +178,25 @@ def test_the_layer_matches_mamba2_mixer(reference, geometry):
 
     out = module.apply(variables, jnp.asarray(reference["layer.hidden"]))
 
-    assert largest(out, reference["layer.output"]) < BOUND
+    as_exact(out, reference["layer.output"], reference["layer.output_f64"], "the layer")
 
 
 def test_the_layer_in_bfloat16_matches_the_reference_in_bfloat16(reference, geometry):
     """Compute in bfloat16 with fp32 parameters, against the reference run
-    in bfloat16 end to end; the scan itself is fp32 in both. Largest
-    observed difference 3.1e-02 on outputs of magnitude up to 3.0, one
-    bf16 ulp at that magnitude; the two round at different points, and
-    each sits further from the fp32 output than they do from each other
-    (8.2e-02 for the reference, 5.1e-02 for dew)."""
+    in bfloat16 end to end; the scan itself is fp32 in both."""
     module = layer(geometry, dtype=jnp.bfloat16)
     out = jnp.asarray(
         module.apply(layer_params(reference), jnp.asarray(reference["layer.hidden"], jnp.bfloat16))
     )
     assert out.dtype == jnp.bfloat16
-    assert largest(out, reference["layer.output_bf16"]) < 1e-1
+    as_exact(np.asarray(out, np.float32), reference["layer.output_bf16"], reference["layer.output_f64"],
+             "the layer in bfloat16")
 
 
 def test_the_layer_decodes_as_it_prefills(reference, geometry):
     """A prefill against the cache and single-token steps after it reproduce
     the parallel forward: the conv tail and the SSM state both cross the
-    step boundary. Largest observed difference 8.3e-07 against the parallel
-    forward on the same 70 tokens."""
+    step boundary."""
     module = layer(geometry)
     variables = layer_params(reference)
     hidden = jnp.asarray(reference["layer.hidden"])
@@ -191,7 +204,7 @@ def test_the_layer_decodes_as_it_prefills(reference, geometry):
 
     decoded, cache, _ = decode_through(module, variables, hidden, prefill=5)
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))
-    assert largest(decoded, parallel) < BOUND
+    as_exact(decoded, parallel, wide_apply(module, variables, hidden), "decoded")
 
 
 def test_padded_rows_preserve_the_state_and_the_history(reference, geometry):
@@ -209,8 +222,8 @@ def test_padded_rows_preserve_the_state_and_the_history(reference, geometry):
     plain = jnp.asarray(module.apply(variables, hidden[:1]))
     closed = jnp.asarray(module.apply(variables, compact))
 
-    assert largest(padded[0], plain[0]) < BOUND
-    assert largest(padded[1][valid[1]], closed[0]) < BOUND
+    as_exact(padded[0], plain[0], wide_apply(module, variables, hidden[:1])[0], "the full row")
+    as_exact(padded[1][valid[1]], closed[0], wide_apply(module, variables, compact)[0], "the padded row")
     assert not jnp.any(padded[1][~valid[1]])
 
 
@@ -218,10 +231,9 @@ def test_packed_documents_run_as_if_each_ran_alone(reference, geometry):
     """A row of packed documents computes, for each document, what that
     document computes alone: neither the SSM state nor the conv's taps
     cross a segment change. Documents of 20, 2 (shorter than the conv's
-    three-token history) and 48 tokens, the cuts off the chunk grid.
-    Largest observed difference 8.3e-07 on outputs of magnitude up to 2.9;
-    the same row without segment ids, which carries the state and the conv
-    across the cuts, is 2.9 away."""
+    three-token history) and 48 tokens, the cuts off the chunk grid. The
+    same row without segment ids carries the state and the conv across the
+    cuts, far outside the rule."""
     module = layer(geometry)
     variables = layer_params(reference)
     hidden = jnp.asarray(reference["layer.hidden"])[:1]
@@ -233,23 +245,24 @@ def test_packed_documents_run_as_if_each_ran_alone(reference, geometry):
     alone = jnp.concatenate([module.apply(variables, hidden[:, start:end])
                              for start, end in itertools.pairwise(cuts)], axis=1)
 
-    assert largest(packed, alone) < BOUND
-    assert largest(module.apply(variables, hidden), alone) > 1e-1
+    truth = np.concatenate([wide_apply(module, variables, hidden[:, start:end])
+                            for start, end in itertools.pairwise(cuts)], axis=1)
+    as_exact(packed, alone, truth, "the packed row")
+    outside(module.apply(variables, hidden), alone, truth, "the row without segment ids")
 
 
 def test_the_chunked_and_recurrent_forms_reset_alike(reference):
     """Document starts drop the state in both forms, including a start on
-    the first token of a chunk and one inside it. Largest observed
-    difference 1.9e-06 on outputs up to 30 and 2.4e-07 on the state; the
-    scan without the starts is 3.4 away."""
+    the first token of a chunk and one inside it; the scan without the
+    starts far outside the rule."""
     x, step, A, B, C, D = operands(reference)
     starts = jnp.zeros(step.shape[:2], bool).at[0, 32].set(True).at[1, 7].set(True).at[1, 45].set(True)
     initial = jnp.asarray(reference["scan.initial"])
-    chunked, chunked_final = chunk_ssd(x, step, A, B, C, D, initial, 32, starts=starts)
-    recurrent, recurrent_final = recurrent_ssd(x, step, A, B, C, D, initial, starts=starts)
-    assert largest(chunked, recurrent) < BOUND
-    assert largest(chunked_final, recurrent_final) < BOUND
-    assert largest(chunked, chunk_ssd(x, step, A, B, C, D, initial, 32)[0]) > 1e-1
+    chunked = chunk_ssd(x, step, A, B, C, D, initial, 32, starts=starts)
+    recurrent = recurrent_ssd(x, step, A, B, C, D, initial, starts=starts)
+    truth = in_float64(chunk_ssd, x, step, A, B, C, D, initial, 32, starts=starts)
+    as_exact(recurrent, chunked, truth, "recurrent with starts")
+    outside(chunk_ssd(x, step, A, B, C, D, initial, 32)[0], chunked[0], truth[0], "the scan without starts")
 
 
 def padded_packed_row(length: int):
@@ -274,21 +287,23 @@ def test_padded_packed_rows_reset_at_each_document():
     padded row computes what it computes with the holes closed, the second
     document starting fresh after the gap, through the model's
     `hidden_and_mtp_inputs` and through `LMObjective.token_scores` with both
-    token fields. Observed 0.0 apart in fp32. The padded row without its
-    segment ids, and the layer before it passed segments to its stateful
-    path, sit 2.7 away on states of magnitude 2.7."""
+    token fields. The padded row without its segment ids, as the layer
+    computed before it passed segments to its stateful path, sits far
+    outside the rule."""
     model = tiny_lm()
     (ids, valid, segments), (closed_ids, closed_segments) = padded_packed_row(16)
     params = model.init(jax.random.key(0), ids)
 
-    def hidden(tokens, **fields):
+    def hidden(tokens, model=model, params=params, **fields):
         return model.apply(params, tokens, method=CausalTransformer.hidden_and_mtp_inputs, **fields)[0]
 
     closed = hidden(closed_ids, segment_ids=closed_segments)[0]
     padded = hidden(ids, attention_mask=valid, segment_ids=segments)[0]
-    assert largest(padded[valid[0]], closed) < BOUND
-    carried = hidden(ids, attention_mask=valid)[0]
-    assert largest(carried[valid[0]], closed) > 1e-1
+    with jax.enable_x64(new_val=True):
+        truth = np.asarray(hidden(closed_ids, model.clone(dtype=jnp.float64), widened(params),
+                                  segment_ids=closed_segments)[0])
+    as_exact(padded[valid[0]], closed, truth, "the padded packed row")
+    outside(hidden(ids, attention_mask=valid)[0][valid[0]], closed, truth, "the row without segment ids")
 
     (ids, valid, segments), (closed_ids, closed_segments) = padded_packed_row(17)
     scored = LMObjective(model, 16).token_scores(
@@ -296,7 +311,12 @@ def test_padded_packed_rows_reset_at_each_document():
     alone = LMObjective(model, 12).token_scores(
         params, ModelInputs(closed_ids, {"segment_ids": closed_segments}))
     kept = valid[0, :-1]
-    assert largest(scored.hidden[0][kept], alone.hidden[0][:int(kept.sum())]) < BOUND
+    with jax.enable_x64(new_val=True):
+        wide = LMObjective(model.clone(dtype=jnp.float64), 12).token_scores(
+            widened(params), ModelInputs(closed_ids, {"segment_ids": closed_segments}))
+    count = int(kept.sum())
+    as_exact(scored.hidden[0][kept], alone.hidden[0][:count], np.asarray(wide.hidden[0][:count]),
+             "the scored padded row")
 
 
 def tiny_lm(**overrides) -> CausalTransformer:
@@ -311,8 +331,7 @@ def tiny_lm(**overrides) -> CausalTransformer:
 def test_the_model_decodes_as_it_scores_in_parallel():
     """A prefill of four tokens and eight single-token steps, every layer's
     state riding the flax cache collection, against the same twelve tokens
-    scored at once. Largest observed logit difference 4.8e-07 on logits of
-    magnitude 3.1."""
+    scored at once."""
     model = tiny_lm()
     rng = jax.random.key(0)
     ids = jax.random.randint(rng, (2, 12), 0, 32)
@@ -328,4 +347,6 @@ def test_the_model_decodes_as_it_scores_in_parallel():
                                       decode=True, mutable=["cache"])
         steps.append(logits[:, -1])
 
-    assert largest(jnp.stack(steps, axis=1), full[:, 3:]) < BOUND
+    with jax.enable_x64(new_val=True):
+        truth = np.asarray(model.clone(dtype=jnp.float64).apply(widened(params), ids))
+    as_exact(jnp.stack(steps, axis=1), full[:, 3:], truth[:, 3:], "the decoded logits")
