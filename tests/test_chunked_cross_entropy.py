@@ -179,7 +179,7 @@ def columns(vocab: int, seed: int = 0):
             jax.random.normal(bias, (vocab,), jnp.float32) / 17)
 
 
-COLUMN_SEEDS = {"scale and bias": 32, "vocabulary split": 16}
+COLUMN_SEEDS = {"scale and bias": 64, "vocabulary split": 256}
 FUSED_SEEDS = 16
 """Check 1's declared seeds for the fused head, sized by `seeds_for` (2026-10-21, on armada)."""
 """Check 1's declared seeds for the head's gradient sites, sized by `seeds_for` (2026-10-21, on armada)."""

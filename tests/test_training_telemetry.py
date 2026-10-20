@@ -188,7 +188,7 @@ class Repeated:
         self.index = json.loads(state)
 
 
-COMPLEX_SEEDS = 32
+COMPLEX_SEEDS = 8
 """Check 1's declared seeds for the complex descent, sized by `seeds_for` (2026-10-21, on armada)."""
 
 
