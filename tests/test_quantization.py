@@ -1011,10 +1011,9 @@ def test_a_function_the_model_keeps_in_float_runs_unquantized(name, dtype):
 
     def ran(function, quantize: bool) -> np.ndarray:
         model = Calls(functools.partial(function, **keywords))
-        if quantize:
-            # Qwix quantizes a product as it is traced, and jnp.matmul is jitted: a quantized run
-            # that reused the plain runs' cached trace would quantize nothing.
-            jax.clear_caches()
+        # Qwix quantizes a product as it is traced, and jnp.matmul is jitted, so each run traces
+        # afresh: one that reused another's cached trace would take its products, quantized or not.
+        jax.clear_caches()
         return np.asarray((Quantization().apply(model) if quantize else model).apply({}, *operands))
 
     plain = ran(function, quantize=False)
