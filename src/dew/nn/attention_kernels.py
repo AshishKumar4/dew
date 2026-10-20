@@ -90,7 +90,8 @@ class AttentionCase:
     """What attention's selector reads of a call (`select_attention`): its shapes `[B, T, N, D]`
     over `[B, S, K, D]` keys, dtypes and validity, which comes as coordinates, never a mask a cache
     built: causality and a window, packed documents (a call's own or another sequence's, `aligned`
-    to their last keys under causality or a window, `CrossDocuments`) and key lengths; `mask`
+    to their last keys under causality or a window, `CrossDocuments`), key lengths and key starts
+    (a windowed decode step's first key, `key_value_seq_starts`); `mask`
     is an arbitrary mask only the generic path takes. `arithmetic` is a call asking what only the
     reference path computes (`reference_only`), `narrows` one jax.nn's xla kernel would compute
     below its precision (`_xla_kernel_narrows`, `_xla_kernel_chains`), `folds` one of few query
@@ -110,6 +111,7 @@ class AttentionCase:
     aligned: bool
     max_segments: int | None
     lengths: bool
+    starts: bool
     mask: bool
     bias: bool
     sinks: bool
@@ -160,9 +162,9 @@ def _qualified(code: str, has: Callable[[AttentionCase], bool], choice: str, def
 
 def _narrow(case: AttentionCase) -> bool:
     """Whether the target's narrow heads' row ('attention_narrow') speaks for `case`: heads at most 64
-    wide with no window, mask, bias, documents or key lengths."""
-    return (case.head_dim <= 64 and case.window is None and not (case.mask or case.bias or case.lengths)
-            and case.documents is None)
+    wide with no window, mask, bias, documents, key lengths or key starts."""
+    return (case.head_dim <= 64 and case.window is None
+            and not (case.mask or case.bias or case.lengths or case.starts) and case.documents is None)
 
 
 def _row_names_flash(case: AttentionCase) -> bool:
@@ -208,6 +210,8 @@ FLASH_SUPPORTS = (
     _Need('mask', lambda case: not case.mask, "the call has an arbitrary mask", inherent=True),
     _Need('key_lengths', lambda case: not case.lengths, "the call ends its rows' keys by lengths",
                 row='roadmap: flash attention over key lengths'),
+    _Need('key_starts', lambda case: not case.starts, "the call starts its rows' keys by starts",
+                row='roadmap: flash attention over key lengths'),
     _Need('bias', lambda case: not case.bias, "the call has a bias (ALiBi's slopes among them)",
                 row='roadmap: flash attention ALiBi'),
     _Need('softcap', lambda case: case.softcap is None, "the call has a logit softcap",
@@ -249,6 +253,10 @@ CUDNN_SUPPORTS = (
                 "cuDNN takes an arbitrary mask as a dense bias, which costs more than the xla kernel's "
                 "mask but in a forward-only cache call (`kernel_for_materialized_mask`)",
                 row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
+    _Need('key_starts', lambda case: not case.starts,
+                "cuDNN takes key starts only as their mask, a dense bias, where the decode kernel reads "
+                "each row's span of the cache alone (`decode_attention.attend`)",
+                row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
     _Need('deterministic', lambda case: not deterministic_ops_requested(),
                 "--xla_gpu_deterministic_ops is set, under which XLA's cuDNN attention backward crashes "
                 "(openxla/xla#46500)", inherent=True),
@@ -279,21 +287,23 @@ TRITON_SUPPORTS = (
         ('softcap', lambda case: case.softcap is None, "the call has a logit softcap"),
         ('documents', lambda case: case.documents is None, "the call packs documents"),
         ('key_lengths', lambda case: not case.lengths, "the call ends its keys by lengths"),
+        ('key_starts', lambda case: not case.starts, "the call starts its keys by starts"),
     )),
     _ARITHMETIC,
 )
 """tokamax's Triton flash kernel's requirements (`triton_attention`): a GPU of sm80 or later, heads at
 most 64 wide where it was measured faster (an RTX 4080's SimpleDiT-B attention 5.62 to 4.33 ms, its
 causal 3-layer decoder's 1.82 to 1.24; Qwen3-0.6B's 128-wide 9.13 to 9.24), and no window, mask, bias,
-sinks, softcap, documents or key lengths."""
+sinks, softcap, documents or key lengths or starts."""
 
 TPU_SUPPORTS = (
     # Elsewhere it runs interpreted, where 'tpu' is named.
     _Need('backend', lambda case: generation.backend() == 'tpu', "it runs on a TPU", inherent=True,
                 kind='measured'),
     _Need('bias', lambda case: not case.bias, "splash takes no bias", inherent=True, kind='measured'),
-    _Need('key_lengths', lambda case: not case.lengths,
-                "splash takes key lengths only as a mask it cannot describe", inherent=True, kind='measured'),
+    _Need('key_lengths', lambda case: not (case.lengths or case.starts),
+                "splash takes key lengths and starts only as a mask it cannot describe", inherent=True,
+                kind='measured'),
     # Named, the tpu path takes the documents' mask on its pallas flash kernel (`_attention_kernel`).
     _Need('aligned', lambda case: not case.aligned,
                 "splash aligns causality to the first key, not a cache call's last",
@@ -333,7 +343,7 @@ def _attention_preferred(case: AttentionCase) -> str:
     """The kernel the target measured fastest for `case`: splash on a TPU and xla on a CPU; on a GPU
     xla for a query no fused kernel takes the dtype of, else its row's ('attention', cuDNN by
     default), and the narrow heads' row's ('attention_narrow') for heads at most 64 wide with no
-    window, mask, bias, documents or key lengths: by default tokamax's Triton kernel, measured faster
+    window, mask, bias, documents, key lengths or key starts (`_narrow`): by default tokamax's Triton kernel, measured faster
     than cuDNN there on an L4 and an RTX 4080; the A10's, A100's and H100's rows name flash, measured
     faster than both (`generation.TARGETS`)."""
     backend = generation.backend()
