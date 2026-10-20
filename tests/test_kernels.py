@@ -94,8 +94,10 @@ def test_flash_through_dews_attention_refuses_rows_it_would_misread(without_dete
         for k, v in malformed:
             with pytest.raises(ValueError):
                 jax.eval_shape(attend('flash', **packed), query, k, v)
+    # Not causal: a causal call over its own documents is square, which the selector holds it to first.
     with pytest.raises(ValueError, match="document's id"):
-        jax.eval_shape(attend('flash', **own), query, normal(1, 64, 2, 64), normal(1, 64, 2, 64))
+        jax.eval_shape(attend('flash', causal=False, **own), query, normal(1, 64, 2, 64),
+                       normal(1, 64, 2, 64))
     with pytest.raises(ValueError, match="document's id"):
         jax.eval_shape(attend('flash', causal=False, **cross), query, normal(1, 32, 2, 64),
                        normal(1, 32, 2, 64))
