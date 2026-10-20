@@ -107,10 +107,11 @@ from .decoder_stack import (
     PassView,
     SharedPassView,
     StackView,
+    on_host,
     run_pipeline,
     run_stack,
 )
-from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
+from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, run_period, scan_groups
 
 _INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
@@ -366,6 +367,13 @@ class CausalTransformer(nn.Module):
     """The vocabulary id that a masked-diffusion objective corrupts tokens to.
     None means plain training."""
     scan_layers: bool = False                 # runs of like layers under flax's scan
+    scan_decode: bool = True
+    """Whether a decode step scans the stack whatever `scan_layers` says. A scan over weights
+    resident on the device runs each run of layers that repeat one period of specs as one body
+    (`scan_groups(periodic=True)` over `scan_keys`, so a period repeats its layers' specs and
+    variable structures): Qwen3.5's `[linear, linear, linear, full]` x 6 is one body of four
+    layers, so a step's program grows with the period, not the depth. Training scans only
+    under `scan_layers`."""
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is also how many layers its
     parameter bank stacks. A longer run of like layers is split into
@@ -1916,18 +1924,29 @@ class CausalTransformer(nn.Module):
                 run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,
                                        trans_out_fn=view.unstack, init=True, mutable=True)
                 return run(self, view, x, train, decode, per_layer_input, attention_metadata)
-        if self.is_initializing() or (stages == 1 and not self.scan_layers):
+        banked = () if self.is_initializing() else self.banked_collections()
+        # Weights a step reads a layer at a time (banked, streamed from disk or held in host memory)
+        # keep the runs their banks hold; a decode step over resident ones scans by period.
+        periodic = decode and stages == 1 and not (
+            banked or 'streaming' in self.variables or on_host(self.variables.get('params', {})))
+        scanned = self.scan_layers or (periodic and self.scan_decode)
+        if self.is_initializing() or (stages == 1 and not scanned):
             return run_stack(
                 self.layers, self.block, self.specs,
                 tuple((index, 1) for index in range(first, end)), x,
                 train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
-        banked = self.banked_collections()
         if stages == 1:
             if span is not None and banked:
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                     f"by run holds whole runs; {list(banked)} arrived banked")
-            view = StackView(self.groups if span is None else spanned, banked=banked)
+            if periodic and self.scan_decode:
+                groups = tuple((first + start, count) for start, count in scan_groups(
+                    self.scan_keys[first:end], self.bank_layers, periodic=True))
+            else:
+                groups = self.groups if span is None else spanned
+            periods = tuple(run_period(self.scan_keys, start, count) for start, count in groups)
+            view = StackView(groups, banked=banked, periods=periods)
         else:
             if span is not None:
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, which a pipeline "
@@ -2129,7 +2148,7 @@ class CausalTransformer(nn.Module):
                 self.layers, self.block, self.specs, view.groups, x,
                 train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
-                banked='params' in view.banked)
+                banked='params' in view.banked, periods=view.periods)
         return run_pipeline(
             self,
             view,
