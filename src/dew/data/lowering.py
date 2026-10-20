@@ -195,6 +195,15 @@ def _position(value: Record) -> int | None:
     return int(value[_POSITION])
 
 
+def _counts_own_rows(pipeline: Pipeline) -> bool:
+    """Whether a per-share read counts `pipeline`'s rows as they leave it: a corpus does, and a
+    mixture does only where a Grain step of its own may drop rows, which no count of its own
+    follows; else its rows are its corpora's, each counted."""
+    if not isinstance(pipeline.source, (Mixture, Phases)):
+        return True
+    return any(isinstance(stage, Native) for stage in pipeline.stages)
+
+
 def _unplaced(value: Record) -> Record:
     if value is None or isinstance(value, (bytes, Rejected)) or _POSITION not in value:
         return value
@@ -853,8 +862,7 @@ class _Build:
             rows = self.stage(rows, stage, pipeline, partition, index)
             if index == last:
                 rows = rows.map(_unplaced)
-        if not self.global_order and not isinstance(pipeline.source, (Mixture, Phases)):
-            # A corpus counts the rows it delivers; a mixture's are its corpora's, each counted.
+        if not self.global_order and _counts_own_rows(pipeline):
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
         return rows
 

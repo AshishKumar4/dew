@@ -739,6 +739,27 @@ def test_a_mix_counts_each_corpus_under_a_name_of_its_own(tmp_path):
     assert sum(counts[f"data/rows/train-{place}"] for place in (1, 2, 3)) == 6
 
 
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_mixtures_grain_step_drops_rows_it_rejects_and_counts_them(read):
+    """A Grain step after a mix that rejects rows (`Rejected`) has them dropped before the batch
+    and counted under the mixture, beside its corpora's own counts."""
+    from dew.data.pipeline import Rejected
+
+    def odd_rejected(rows):
+        return rows.map(lambda row: Rejected("odd") if int(row["i"]) % 2 else row)
+
+    mixed = mix([Memory(rows("a", 8)).named("a"), Memory(rows("b", 8)).named("b")])
+    chain = mixed.grain(odd_rejected, identity="odd-rejected@1").batch(2)
+    data = compile(chain, read=read, loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        batches = [next(stream) for _ in range(3)]
+    finally:
+        stream.close()
+    assert all(int(value) % 2 == 0 for batch in batches for value in batch["i"])
+    assert data.statistics()["data/rejected/mixture/odd"] > 0
+
+
 def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
     """A memory read runs a corpus's steps before its repeat and reads the rest as it goes: every
     row it delivers was cut short after the repeat, so its truncated share is one, whatever the
