@@ -281,6 +281,55 @@ def test_the_gateway_stamp_is_checked():
     assert asked == [{"weight_version": 7}, {"weight_version": 8}]
 
 
+def test_constructing_a_harness_source_or_a_publication_opens_nothing(tmp_path, harbor):
+    """Constructing a source starts no trial worker and asks the gateway nothing, and constructing a
+    publication stamps nothing (api spec A15): a source starts its workers at its first `submit`, and
+    a publication stamps its launch version when the version is first read, before any draw is
+    submitted under it, so a gateway an earlier run left ahead still cannot mislabel the first
+    calls."""
+    from dew.inference import Publication
+
+    before = {thread.name for thread in threading.enumerate()}
+    gateway, asked = fake_gateway()
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials"), gateway)
+    assert not any(thread.name.startswith("dew-harness-trial") for thread in threading.enumerate()
+                   if thread.name not in before)
+    assert asked == []
+    source.close()
+
+    stamped = []
+    publication = Publication(lambda variables, version: None, version=3, stamp=stamped.append)
+    assert stamped == []
+    assert publication.version == 3 and stamped == [3]
+    assert publication.version == 3 and stamped == [3]
+    publication.load({}, 4)
+    assert publication.version == 4 and stamped == [3, 4]
+
+    # A load before the version is first read leaves the launch stamp unsent.
+    loaded = []
+    early = Publication(lambda variables, version: None, version=3, stamp=loaded.append)
+    early.load({}, 5)
+    assert early.version == 5 and loaded == [5]
+
+    # A first read while a load is publishing waits for it, so its stamp cannot land on the load's.
+    pushing, release, raced = threading.Event(), threading.Event(), []
+
+    def push(variables, version):
+        pushing.set()
+        release.wait()
+
+    racing = Publication(push, version=0, stamp=raced.append)
+    loader = threading.Thread(target=racing.load, args=({}, 1))
+    loader.start()
+    pushing.wait()
+    reader = threading.Thread(target=lambda: raced.append(("read", racing.version)))
+    reader.start()
+    release.set()
+    loader.join()
+    reader.join()
+    assert raced == [1, ("read", 1)]
+
+
 def test_each_sample_is_its_own_trial_and_gateway_session(tmp_path, harbor):
     (tmp_path / "task").mkdir()
     gateway, asked = fake_gateway()

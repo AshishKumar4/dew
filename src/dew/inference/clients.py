@@ -329,33 +329,50 @@ def _choice_tokens(entry: Mapping[str, object]) -> tuple[tuple[int, ...] | None,
     of the logprob tokens; text tokens are not reverse-mapped through a
     vocabulary.
     """
+    ids = listed_ids(entry)
+    reported = reported_log_probs(entry)
+    if reported is None:
+        return ids, None
+    rendered, probabilities = reported
+    if ids is not None:
+        if len(ids) != len(probabilities):
+            raise ValueError("choice token_ids must be aligned with its token_logprobs")
+        return ids, probabilities
+    rendered_ids: list[int] = []
+    for token in rendered:
+        if not token.startswith("token_id:"):
+            return None, probabilities
+        rendered_ids.append(int(token.removeprefix("token_id:")))
+    return tuple(rendered_ids), probabilities
+
+
+def listed_ids(entry: Mapping[str, object]) -> tuple[int, ...] | None:
+    """A choice's `token_ids` list (SGLang's `return_token_ids`), or None where it has none."""
     listed = entry.get("token_ids")
     if listed is not None and (not isinstance(listed, list) or any(
             type(token) is not int or token < 0 for token in listed)):
         raise ValueError("choice token_ids must be a list of nonnegative ids")
-    ids = None if listed is None else tuple(listed)
+    return None if listed is None else tuple(listed)
+
+
+def reported_log_probs(entry: Mapping[str, object]) -> tuple[tuple[str, ...], tuple[float, ...]] | None:
+    """A choice's logprob tokens as rendered and their log-probabilities, or None where it reports
+    none."""
     logprobs = entry.get("logprobs")
     if logprobs is None:
-        return ids, None
+        return None
     record = _object(logprobs, "choice logprobs")
     rendered, values = record.get("tokens"), record.get("token_logprobs")
     if not isinstance(rendered, list) or not isinstance(values, list) or len(rendered) != len(values):
         raise ValueError("choice logprobs need aligned tokens and token_logprobs lists")
+    if not all(isinstance(token, str) for token in rendered):
+        raise ValueError("choice logprobs tokens must be the rendered tokens' text")
     probabilities: list[float] = []
     for value in values:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("each reported token log-probability must be a number")
         probabilities.append(float(value))
-    if ids is not None:
-        if len(ids) != len(probabilities):
-            raise ValueError("choice token_ids must be aligned with its token_logprobs")
-        return ids, tuple(probabilities)
-    rendered_ids: list[int] = []
-    for token in rendered:
-        if not isinstance(token, str) or not token.startswith("token_id:"):
-            return None, tuple(probabilities)
-        rendered_ids.append(int(token.removeprefix("token_id:")))
-    return tuple(rendered_ids), tuple(probabilities)
+    return tuple(rendered), tuple(probabilities)
 
 
 def decode_routed_experts(encoded: object) -> np.ndarray:
@@ -445,6 +462,22 @@ def _openai_fields(model: str, prompts: str | Sequence[str] | TokenRows, budget:
     return _bound(parameters, fixed), count * n
 
 
+def _engine_stops(sampling: Sampling, provider: Literal["vllm", "sglang"]) -> Mapping[str, JSON]:
+    """The request fields that end an engine's draw on `sampling.stops`.
+
+    vLLM ends a draw on its model's EOS and its generation config's EOS ids unless told to ignore
+    them, and on `stop_token_ids` either way (vllm/sampling_params.py:690-718 at v0.30.0), so it
+    is told to ignore them and given the stops: exact for every policy. SGLang's `ignore_eos`
+    turns off every token stop, `stop_token_ids` too, and otherwise it also ends on its model's
+    EOS ids (sglang/srt/managers/schedule_batch.py:1707-1729 at v0.5.20): a policy without stops
+    is exact there, and one with stops ends on its model's EOS as well, which a draw that checks
+    its finish refuses where the policy leaves that EOS out."""
+    stops: list[JSON] = list(sampling.stops)
+    if provider == "vllm":
+        return {"ignore_eos": True, **({"stop_token_ids": stops} if stops else {})}
+    return {"stop_token_ids": stops} if stops else {"ignore_eos": True}
+
+
 @dataclass(frozen=True)
 class OpenAICompletion:
     """Calls one model through an OpenAI client, including one pointed at a vLLM or SGLang `base_url`.
@@ -497,8 +530,8 @@ class OpenAICompletion:
         controls: dict[str, object] = {"top_k": -1 if sampling.top_k is None else sampling.top_k,
                                       "min_p": sampling.min_p,
                                       "repetition_penalty": sampling.repetition_penalty}
-        if sampling.eos_token_ids is not None:
-            controls["stop_token_ids"] = list(sampling.stops)
+        if self.provider != "openai":
+            controls.update(_engine_stops(sampling, self.provider))
         extra = {} if fields.get("extra_body") is None else _object(fields["extra_body"], "extra_body")
         if self.provider == "openai" and controls.keys() & extra.keys():
             raise ValueError(
