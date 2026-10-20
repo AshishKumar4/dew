@@ -25,7 +25,8 @@ distance from its float64 one over the K-order rule's residual orders
 in each order (`write_orders`, tests/residual_orders.py, the factors' residual
 sides read off their declared axes), with the dropout case's masks moved with
 the branch inputs that carry the residual, and PEFT's run reads them back
-(`record_orders`).
+(`record_orders`), on an AVX-512 (x86-64-v4) CPU, the CI runners' ISA: torch's
+float32 products sum in other orders on an AVX2 one.
 The dropout case reads its masks, one per target keyed by the target's
 PEFT module path, from `masks.npz` beside it, which Dew writes first over
 the committed adapter (`masks`, in Dew's environment); the PEFT run (the
