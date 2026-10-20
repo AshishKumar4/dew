@@ -34,10 +34,6 @@ def drawn(spread: float, rounding: float = 1.0, *, unstable: bool = False):
     return draw
 
 
-ADMISSION = range(STAGES * ORDERS, (STAGES + 1) * ORDERS)
-"""The orders the ensemble is admitted over before any batch holds Dew."""
-
-
 def counted(draw, calls: list):
     """`draw`, each order it is asked for appended to `calls`."""
     def run(order):
@@ -47,13 +43,14 @@ def counted(draw, calls: list):
 
 
 def test_a_comparison_is_held_over_a_whole_batch_of_orders_and_one_rounding_more_fails():
-    """The K-order gate (`assert_leaves_as_exact_over_orders`) admits its ensemble over orders of its
-    own, then takes ORDERS orders before it passes anything, as one draw within its factors is no
-    evidence that every element is: an equally exact port passes on them, as does one whose order 0
-    meets a reference rounding by luck a tenth as far; one rounding three times as far fails."""
+    """The K-order gate (`assert_leaves_as_exact_over_orders`) takes ORDERS orders before it passes
+    anything, as one draw within its factors is no evidence that every element is, and an ensemble of
+    the reference alone draws no admission sample: an equally exact port passes on them, as does one
+    whose order 0 meets a reference rounding by luck a tenth as far; one rounding three times as far
+    fails."""
     calls = []
     assert_leaves_as_exact_over_orders(counted(drawn(1.0), calls), "equal", rows=False)
-    assert calls == [*ADMISSION, *range(ORDERS)]
+    assert calls == list(range(ORDERS))
     assert_leaves_as_exact_over_orders(drawn(1.0, unstable=True), "lucky", rows=False)
     with pytest.raises(AssertionError):
         assert_leaves_as_exact_over_orders(drawn(3.0), "rounds more", rows=False)
@@ -78,7 +75,7 @@ def test_a_localized_defect_that_the_leaf_and_row_rules_pass_fails_element_by_el
     calls = []
     with pytest.raises(AssertionError):
         assert_leaves_as_exact_over_orders(counted(draw, calls), "localized")
-    assert calls == [*ADMISSION, *range(STAGES * ORDERS)]
+    assert calls == list(range(STAGES * ORDERS))
 
 
 def test_a_row_rounding_more_fails_over_orders_where_the_global_rms_passes():
