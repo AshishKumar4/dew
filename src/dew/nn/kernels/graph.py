@@ -14,8 +14,8 @@ A node's kind says how its own rounding is redrawn:
   symmetry of the node, and the node's orbit;
 - `Online(axes)`: an online reduction that rescales its accumulator (flash attention's running max and
   sum over key tiles), whose keys, permuted with their mask, are an exact symmetry of its math;
-- `Ordered()`: a recurrence whose terms do not commute; no orbit of its own, its spread is the
-  reference ensemble's;
+- `Ordered(axes, follows)`: a recurrence whose terms do not commute; its spread is the reference
+  ensemble's, over an orbit of the axes that are an exact symmetry of it where it has one, else once;
 - `Pointwise()`: no sum; checked once, element by element.
 
 A node's `sentinel` is the one non-finite value its math defines (attention's empty row holds a max of
@@ -29,19 +29,29 @@ from collections.abc import Callable, Mapping
 
 @dataclasses.dataclass(frozen=True)
 class Sum:
-    """A sum over one axis of some parents, given as a parent's name to its summed axis."""
+    """A sum over one axis of some parents, given as a parent's name to its summed axis. `follows`
+    names the output axes the permutation carries, each output axis to the parent whose permuted
+    axis it is (a dot's output over a width it does not sum, a state [K, V] over the permuted K):
+    the gate maps those back before it compares an element across orders."""
     axes: Mapping[str, int]
+    follows: Mapping[int, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
 class Online:
-    """An online reduction over one axis of some parents (keys, their values and their mask)."""
+    """An online reduction over one axis of some parents (keys, their values and their mask), and
+    the output axes the permutation carries (`Sum.follows`)."""
     axes: Mapping[str, int]
+    follows: Mapping[int, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
 class Ordered:
-    """A reduction whose terms do not commute."""
+    """A reduction whose terms do not commute. Where an axis of its parents can be permuted as an
+    exact symmetry of the whole node (a recurrence's key width), `axes` and `follows` give that orbit
+    as `Sum`'s do; the sums it does not reorder keep one order."""
+    axes: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    follows: Mapping[int, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
