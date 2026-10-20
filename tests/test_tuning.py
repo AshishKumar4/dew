@@ -390,6 +390,24 @@ def test_a_config_failing_for_more_than_its_shared_memory_stops_the_measurement(
         tuning._measured(broken.op, broken)
 
 
+@pytest.mark.gpu(reason="the tuner measures on CUDA")
+def test_a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path):
+    """A profile capture holds CUPTI, which takes one subscriber: measuring a launch beside it times
+    no config, returns each as failed, so the launch keeps its heuristic, and leaves CUPTI to the
+    capture without raising; once the capture ends, the same launch measures every config."""
+    with tuning.launches():
+        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+    [norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
+    jax.profiler.start_trace(str(tmp_path / "trace"))
+    try:
+        beside = tuning._measured(norm.op, norm)
+    finally:
+        jax.profiler.stop_trace()
+    assert set(beside) == set(norm.autotuning_configs) and not beside.prune_errors()
+    alone = tuning._measured(norm.op, norm)
+    assert set(alone.prune_errors()) == set(norm.autotuning_configs)
+
+
 STORES = """
 import json, sys
 import jax
