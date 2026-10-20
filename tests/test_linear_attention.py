@@ -44,6 +44,7 @@ from reference_error import (
     float64_terms,
     widened,
 )
+from reference_trees import sum_family, tree_sum
 from tuned import each_config, launches, timed
 
 from dew.nn import linear
@@ -411,17 +412,27 @@ def port_graph(per_key: bool, shape: tuple[int, ...], scale: float) -> Graph:
 
 def reference_graph(dew: Graph, per_key: bool, scale: float) -> Graph:
     """`dew`'s graph with each node the XLA reference's arithmetic (`port_reference`) on the same
-    parents, the prefix's members its scan, and the witness the nodes composed."""
+    parents, the prefix's members each of its elements, a sum of its chunk's earlier terms, under the
+    canonical Sum family over a chunk's positions (`reference_trees.sum_family`), and the witness the
+    nodes composed."""
     arithmetic = port_reference(per_key, scale)
-    scanned = functools.partial(jax.lax.associative_scan, jnp.add)
 
-    def scan_prefix(g):
-        (g,) = (jnp.asarray(g).astype(jnp.promote_types(jnp.asarray(g).dtype, jnp.float32)),)
-        return scanned(g, axis=2) * fla_gdn.RCP_LN2
+    def summed(tree):
+        """The prefix with each element its own sum of its chunk's terms up to it under `tree`, the
+        later terms masked to zero in place."""
+        def prefix(g):
+            g = jnp.asarray(g)
+            g = g.astype(jnp.promote_types(g.dtype, jnp.float32))
+            chunk = g.shape[2]
+            earlier = jnp.arange(chunk)[:, None] >= jnp.arange(chunk)[None, :]
+            terms = jnp.where(earlier.reshape(1, 1, chunk, chunk, *(1,) * (g.ndim - 3)), g[:, :, None], 0.0)
+            return tree_sum(terms, 3, tree) * fla_gdn.RCP_LN2
+        return prefix
 
     nodes = tuple(Node(node.name, node.parents, node.kind,
                        lambda fn=arithmetic[node.name], **given: fn(**given),
-                       members={"scan": scan_prefix} if node.name == "prefix" else {})
+                       members={tree: summed(tree) for tree in sum_family(linear.CHUNK_SIZE)}
+                       if node.name == "prefix" else {})
                   for node in dew.nodes)
 
     def fused(**given):
@@ -433,6 +444,7 @@ def reference_graph(dew: Graph, per_key: bool, scale: float) -> Graph:
     return Graph(dew.inputs, nodes, dew.outputs, fused)
 
 
+@pytest.mark.gpu(reason="a kernel's graph is held where it runs, its witness the compiled kernel")
 @pytest.mark.parametrize("per_key", [False, True], ids=["gated delta net", "Kimi delta attention"])
 def test_the_port_rounds_packed_documents_where_its_reference_does(per_key):
     """A packed row on the port held where it rounds (bible §7's source-aware gate,
