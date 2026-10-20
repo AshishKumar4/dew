@@ -68,8 +68,8 @@ class UViT(_TransformerOptions):
     go up; each up block first projects [x, skip] back to the width. A final
     LN and dense layer read the patches, which are unpatchified and, with
     `conv`, refined by a 3x3 convolution. The text attends unmasked, padding
-    included, as U-ViT's CLIP states do. A Hilbert `scan_order` orders the
-    patches along the curve, each projected by a dense layer, and the
+    included, as U-ViT's CLIP states do. A Hilbert `scan_order` gathers the
+    embedded patches along the curve (`dew.nn.dit.scan_ordered`), and the
     position rows follow that order.
     """
     output_channels: int = 3
