@@ -1,8 +1,8 @@
-"""The kernel every op of every registered decoder family runs on each GPU target, from a CPU trace.
+"""The kernel every op of every registered decoder family runs on each device, from a CPU trace.
 
-Each family's committed tiny config (tests/fixtures/hf/<name>/config.json, the first fixture whose
-model_type is one of the family's) is built in bf16 without weights and traced on a CPU within
-`generation.assumed(target)` for each row of `TARGETS` that names a kernel: a training step's gradient, a
+Each family's committed tiny config (tests/fixtures/hf/<name>/config.json, the fixture of fewest layers
+whose model_type is one of the family's, `fixtures`) is built in bf16 without weights and traced on a CPU
+within `generation.assumed(device)` for each of `DEVICES`: a training step's gradient, a
 64-token prefill, and one decode step on the dense cache and on a paged one. A bidirectional family
 (`causal` False) prefills through its causal view, as DiffusionGemma's encoder does, and decodes a canvas
 over that frozen prefix (`CausalSelfAttention._step_positions`); one whose layers keep a window on both
@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import importlib
 import json
 import os
@@ -47,14 +48,25 @@ PROMPT, BATCH = 64, 2
 """The prompt and batch each mode traces; a fixture whose positions are fewer takes all but its last."""
 
 
+def _layers(config: dict) -> int:
+    """The decoder layers a committed config states, its text model's where it nests one."""
+    text = config.get("text_config") or config
+    return text.get("num_hidden_layers") or text.get("num_layers") or 0
+
+
+@functools.cache
 def fixtures() -> dict[str, Path]:
-    """Each model_type's first committed fixture directory, by name."""
-    found: dict[str, Path] = {}
+    """Each model_type's tiniest committed fixture directory: the fewest decoder layers, then the first
+    by name. A released model's config committed beside its tiny twin (Llama 3.1 8B's 32 layers beside
+    llama-tiny's 2) traces each layer, so the tiny one stands for the family."""
+    found: dict[str, tuple[int, str, Path]] = {}
     for directory in sorted(FIXTURES.iterdir()):
         config = directory / "config.json"
         if config.is_file():
-            found.setdefault(json.loads(config.read_text()).get("model_type"), directory)
-    return found
+            read = json.loads(config.read_text())
+            entry = (_layers(read), directory.name, directory)
+            found[read.get("model_type")] = min(found.get(read.get("model_type"), entry), entry)
+    return {kind: directory for kind, (_, _, directory) in found.items()}
 
 
 WIDTHS = ("head_dim", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim", "kv_lora_rank",
@@ -92,11 +104,14 @@ def published(config: dict) -> tuple[dict, bool]:
     return ({**config, "text_config": fixture} if nested else fixture), True
 
 
-def audited() -> tuple[str, ...]:
-    """The rows of `generation.TARGETS` the report audits: every one that names a kernel."""
-    from dew.nn.kernels.generation import TARGETS
+DEVICES = ("sm80", "sm86", "sm89", "sm90", "sm100", "sm120", "v6e")
+"""The devices the report traces each family on (`generation.assumed`): every CUDA generation Dew's
+kernels take, Blackwell's datacenter part among them, and a TPU."""
 
-    return tuple(row for row, target in TARGETS.items() if target.kernels)
+
+def audited() -> tuple[str, ...]:
+    """The devices the report audits (`DEVICES`)."""
+    return DEVICES
 
 
 LAYOUT_GAPS = {"mla": "ledger 830", "kpool_sparse_attention": "ledger 830",
@@ -209,8 +224,16 @@ def traced(config: dict, target: str, mode: str, held: dict | None = None) -> li
     return found
 
 
-def cells(names: Iterable[str], targets: Iterable[str] | None = None) -> Iterator[dict]:
-    """One record per family, target (every audited one where None) and mode: its routes,
+@functools.cache
+def _held(name: str) -> dict:
+    """The parameter and cache shapes a family's traces share across its cells within a process
+    (`traced`'s `held`), so a mode traced alone reuses its device's."""
+    return {}
+
+
+def cells(names: Iterable[str], targets: Iterable[str] | None = None,
+          modes: Iterable[str] = MODES) -> Iterator[dict]:
+    """One record per family, device (every audited one where None) and mode: its routes,
     deduplicated; the mixer's refusal of the mode's cache layout, with its row; or why none was
     traced."""
     from dew.nn.mixer_base import MixerRefused
@@ -222,13 +245,13 @@ def cells(names: Iterable[str], targets: Iterable[str] | None = None) -> Iterato
             yield {"family": name, "fixture": None, "error": "no committed tiny fixture"}
             continue
         config, widened = published(json.loads((found / "config.json").read_text()))
-        held: dict = {}
+        held = _held(name)
         model = model_of(config)
         # A layer keeping a window on both sides takes no causal view (`CausalTransformer`'s kinds).
         prefixless = not model.causal and any(model.kind_of(kind).bidirectional_window
                                               for kind in model.per_layer_types)
         for target in audited() if targets is None else targets:
-            for mode in MODES:
+            for mode in modes:
                 cell = {"family": name, "fixture": found.name, "target": target, "mode": mode,
                         "widths": "reference" if widened else "fixture"}
                 if prefixless and mode != "train":
