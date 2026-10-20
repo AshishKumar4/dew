@@ -1459,6 +1459,8 @@ I recommend 3.14, and CI tests both. To install it yourself, choose the extra fo
 | NVIDIA GPU, driver 525+ | `uv pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` |
 | Google TPU VM | `uv pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` |
 
+Use pip 26.2.2 or newer and uv 0.13.4 or newer: older ones trust the roots of eMudhra's compromised certificate authorities (October 2026). `python -m pip install --upgrade pip` and `uv self update` update them.
+
 Dew runs on its own build of JAX 0.11.2, which only its package index serves; without `--extra-index-url https://pypi.dewml.dev/simple` the install stops at resolving jax ([installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#dews-jax-build)).
 
 CUDA 13 also needs a GPU of compute capability 7.5 or later ([which CUDA build](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#which-cuda-build)).

@@ -121,16 +121,18 @@ jobs:
       with:
         name: dist
         path: dist/
+    # --upgrade-deps: each environment's pip comes from PyPI, at 26.2.2 or newer, whose own bundled
+    # roots leave out those of eMudhra's compromised CAs (2026-10-20).
     - name: Without Dew's package index, an install stops at resolving jax
       run: |
-        python -m venv "$RUNNER_TEMP/plain"
+        python -m venv --upgrade-deps "$RUNNER_TEMP/plain"
         if "$RUNNER_TEMP/plain/bin/pip" install --index-url https://pypi.org/simple dist/*.whl > plain.txt 2>&1; then
           cat plain.txt; echo "dewml installed from PyPI alone, on a jax without Dew's fixes"; exit 1
         fi
         grep -q "No matching distribution found for jax" plain.txt || { cat plain.txt; exit 1; }
     - name: Install the wheel into an empty environment, jax from Dew's package index
       run: |
-        python -m venv "$RUNNER_TEMP/clean"
+        python -m venv --upgrade-deps "$RUNNER_TEMP/clean"
         index=$(python -c "import runpy; print(runpy.run_path('src/dew/telemetry/builds.py')['PACKAGE_INDEX'])")
         "$RUNNER_TEMP/clean/bin/pip" install --quiet --index-url https://pypi.org/simple \
           --extra-index-url "$index" dist/*.whl
