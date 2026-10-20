@@ -417,7 +417,7 @@ def update_terms(case: Case, tmp_path, initial, steps=2):
 
         def stepped(state):
             for batch in rows:
-                advanced, *_ = body(state, batch, 0)
+                advanced, *_ = body(state, batch, 0, jnp.zeros((2,), jnp.uint32))
                 state = replace(advanced, step=state.step + 1)
             return state
 

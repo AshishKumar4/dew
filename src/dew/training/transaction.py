@@ -26,7 +26,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
 from dew.objectives.base import FROZEN, Aux, Batch, Ratio, Step, Variables, merge, with_projected
-from dew.training.model_flops import TOKENS, _TokenCount, step_counts
+from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
 from dew.training.state import Accumulation, TrainState
 
@@ -419,7 +419,7 @@ class Transaction:
             return _chosen(native_finite, apply(current), current), native_finite, norm
         return _only_when(native_finite, apply, lambda x: x, current), native_finite, norm
 
-    def finish_attempt(self, state, batch, aux, pending, gradient, attempt):
+    def finish_attempt(self, state, batch, aux, pending, gradient, attempt, tokens):
         """Commit the window when it is due, then advance the state's clocks.
 
         A rejected attempt costs the same trace as an accepted one. With a
@@ -461,8 +461,9 @@ class Transaction:
             return committed, native_finite, norm
 
         due = pending.due & pending.active & accepted
-        # The microbatch's real tokens, which its window's commit trains on, the window's before it too.
-        read = _TokenCount.sum(batch[TOKENS]) if TOKENS in batch else jnp.zeros((2,), jnp.uint32)
+        # The microbatch's real tokens (`tokens`, two uint32 words), which its window's commit trains on,
+        # the window's accepted ones before it too.
+        read = tokens
         held = read if previous is None or previous.tokens is None else _TokenCount.add(previous.tokens, read)
         if self.size == 1:
             committed, native_finite, norm = commit(numerical)
@@ -543,10 +544,12 @@ class Transaction:
         unscale = compile_phase(self.unscaled)
         add = compile_phase(self.add_contribution)
 
-        def run(state, batch, part):
+        def run(state, batch, part, tokens):
             # The `part`th microbatch of the step's batch is attempt step *
             # split + part, with a draw of its own; the objective's schedules
-            # count steps, however many microbatches each is read in.
+            # count steps, however many microbatches each is read in. `tokens`
+            # is its real tokens, which the trainer reads off the accounting
+            # columns the objective's batch no longer holds (`model_batch`).
             attempt = state.step * self.split + part
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
                              with_ema(state.variables, state.ema))
@@ -591,13 +594,13 @@ class Transaction:
                 # its own gradient is ready.
                 aux, pending, gradient = jax.tree.map(
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
-                return finish(state, batch, aux, pending, gradient, attempt)
+                return finish(state, batch, aux, pending, gradient, attempt, tokens)
             if FROZEN not in state.variables:
-                return finish(state, batch, realized.aux, pending, gradient, attempt)
+                return finish(state, batch, realized.aux, pending, gradient, attempt, tokens)
             held = state.variables[FROZEN]
             moving = {name: tree for name, tree in state.variables.items() if name != FROZEN}
             advanced, loss, aux, committed = finish(dataclasses.replace(state, variables=moving), batch,
-                                                    realized.aux, pending, gradient, attempt)
+                                                    realized.aux, pending, gradient, attempt, tokens)
             return (dataclasses.replace(advanced, variables={**advanced.variables, FROZEN: held}),
                     loss, aux, committed)
         return run
