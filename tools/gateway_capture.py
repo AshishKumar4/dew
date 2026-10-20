@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import subprocess
 import threading
 import time
@@ -79,7 +80,9 @@ def served(name: str, bin: Path, out: Path) -> Iterator[None]:
     """The engine `name` started from `bin`, healthy and warm, stopped after; its output goes to
     `{name}_engine.log` in `out`."""
     log = (out / f"{name}_engine.log").open("w")
-    server = subprocess.Popen(engine(name, bin), stdout=log, stderr=subprocess.STDOUT)
+    # The engine's own environment first on PATH: it runs build tools (SGLang's ninja) from there.
+    server = subprocess.Popen(engine(name, bin), stdout=log, stderr=subprocess.STDOUT,
+                              env={**os.environ, "PATH": os.pathsep.join((str(bin), os.environ["PATH"]))})
     try:
         deadline = time.monotonic() + 1200
         while not _answers(f"{ENGINE}/health"):
