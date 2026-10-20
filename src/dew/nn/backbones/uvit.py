@@ -23,11 +23,12 @@ from ..dit import (
     RematLadder,
     _TransformerOptions,
     remat_block,
+    scan_ordered,
 )
 from ..flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from ..precision import at_least_fp32, float32_dot_general
 from ..rope import rotary_freqs
-from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
+from ..scan_orders import hilbert_unpatchify, unpatchify
 
 
 def u_walk(x, down, middle, merges, up, run):
@@ -86,7 +87,7 @@ class UViT(_TransformerOptions):
     @nn.nowrap
     def projections(self, input_channels: int = 0, text_features: int = 0) -> dict[str, tuple[int, int]]:
         width = self.emb_features
-        maps = {'hilbert_projection': (self.patch_size**2 * input_channels, width),
+        maps = {'patch_embed': (self.patch_size**2 * input_channels, width),
                 'context_embed': (text_features, width), 'skip_linear': (2 * width, width),
                 'decoder_pred': (width, self.patch_size**2 * self.output_channels)}
         if self.mlp_time_embed:
@@ -109,7 +110,7 @@ class UViT(_TransformerOptions):
         joined, rows = (image + text + 1).astype(np.int64), np.ones(image.shape, np.int64)
         width, patch = self.emb_features, self.patch_size**2
         maps = self.projections(input_channels, text_features)
-        count = (projection_flops(lengths, *maps['hilbert_projection'])
+        count = (projection_flops(lengths, *maps['patch_embed'])
                  + projection_flops(context_lengths, *maps['context_embed']))
         block = ModulatedBlock(width, self.num_heads, modulated=False, **self._block_options(), parent=None)
         count += (self.num_layers + 1) * block.model_flops(joined)
@@ -138,11 +139,8 @@ class UViT(_TransformerOptions):
             key = 'skip_linear' if name.startswith('skip_linear_') else name
             return nn.Dense(maps[key][1], dtype=self.dtype, precision=self.precision, name=name, **options,
                             dot_general=float32_dot_general)
-        if self.scan_order == "hilbert":
-            self.hilbert_proj = dense("hilbert_projection")
-        else:
-            self.patch_embed = PatchEmbedding(patch_size=self.patch_size, embedding_dim=self.emb_features,
-                                              dtype=self.dtype, precision=self.precision, name="patch_embed")
+        self.patch_embed = PatchEmbedding(patch_size=self.patch_size, embedding_dim=self.emb_features,
+                                          dtype=self.dtype, precision=self.precision, name="patch_embed")
         patches = (self.image_size // self.patch_size) ** 2
         self.pos_embed = self.param("pos_embed", nn.initializers.truncated_normal(0.02),
                                     (1, 1 + self.text_tokens + patches, self.emb_features))
@@ -172,12 +170,8 @@ class UViT(_TransformerOptions):
         if num_patches > rows:
             raise ValueError(f"{num_patches} patches exceed the position table's {rows} "
                              f"(image_size {self.image_size})")
-        inverse = None
-        if self.scan_order == "hilbert":
-            patches, inverse = hilbert_patchify(x, self.patch_size)
-            patches = self.hilbert_proj(patches)
-        else:
-            patches = self.patch_embed(x)
+        patches, inverse = scan_ordered(self.patch_embed(x), self.scan_order, H // self.patch_size,
+                                        W // self.patch_size)
 
         wide = at_least_fp32(self.dtype)
         time = sinusoidal_time(jnp.asarray(temb, wide) * self.time_scale, self.emb_features, dtype=wide)
@@ -232,8 +226,7 @@ class SimpleUDiT(RematLadder, _TransformerOptions):
 
     @nn.nowrap
     def projections(self, input_channels: int = 0) -> dict[str, tuple[int, int]]:
-        return {'hilbert_projection': (self.patch_size**2 * input_channels, self.emb_features),
-                'up_dense': (2 * self.emb_features, self.emb_features)}
+        return {'up_dense': (2 * self.emb_features, self.emb_features)}
 
     def _block(self, remat: RematChoice = False, **scope) -> ModulatedBlock:
         return remat_block(ModulatedBlock, remat)(features=self.emb_features, num_heads=self.num_heads,
@@ -270,13 +263,6 @@ class SimpleUDiT(RematLadder, _TransformerOptions):
             precision=self.precision,
             name="patch_embed"
         )
-        if self.scan_order == "hilbert":
-            self.hilbert_proj = nn.Dense(
-                features=self.projections()['hilbert_projection'][1],
-                dtype=self.dtype,
-                precision=self.precision,
-                name="hilbert_projection", dot_general=float32_dot_general
-            )
         self.conditioning = self._conditioning(self.emb_features, text_pooling=self.text_pooling)
 
         block = partial(self._block, self.remat)
@@ -300,12 +286,8 @@ class SimpleUDiT(RematLadder, _TransformerOptions):
             "Image dimensions must be divisible by patch size"
         )
 
-        hilbert_inv_idx = None
-        if self.scan_order == "hilbert":
-            patches_raw, hilbert_inv_idx = hilbert_patchify(x, self.patch_size)
-            x_seq = self.hilbert_proj(patches_raw)
-        else:
-            x_seq = self.patch_embed(x)
+        x_seq, hilbert_inv_idx = scan_ordered(self.patch_embed(x), self.scan_order, H // self.patch_size,
+                                              W // self.patch_size)
 
         cond_emb = self.conditioning(temb, textcontext)
         freqs_cis = rotary_freqs(jnp.arange(x_seq.shape[1]), self.emb_features // self.num_heads,
