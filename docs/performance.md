@@ -216,7 +216,8 @@ decoder and a 321.8M MoE decoder at 4 x 1024 tokens, SimpleDiT-B and an MM-DiT
 of its size at batch 32, and FLUX.2 and Wan 2.1 at their head width over a few
 blocks; the forward pass of the SigLIP-400M, Qwen3.5 and Gemma 4 vision towers
 and the SD VAE's decoder at their released sizes, with random weights;
-Qwen3-0.6B served at 32 and 128 slots; causal attention forward and backward
+Qwen3-0.6B served at 32 and 128 slots; the warm compiles of a 16-slot server over Dory 1.0 4B as released,
+its construction's decode step and each admission width's prefill (each gated as a compile); causal attention forward and backward
 (cudnn and xla, 2048 tokens, 128-wide heads); the Oxford Flowers input pipeline;
 and the save and restore of lm-dense's training state, and each step's compile time (gated at a
 25% change: compile time is performance). Each tree keeps its programs in a compile cache of its own
