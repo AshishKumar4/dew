@@ -299,7 +299,9 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 | `images(ds, size, *, batch, augment=False, crop_scale=(1, 1), field="image", staging_size=None, draft=False, rejects=True, caption=None, cache=None, records=None, host=())` | `field`: encoded bytes or uint8 `[H, W, 3]` | `image` uint8 `[B, size, size, 3]`; with `caption`, `caption` |
 | `lm(ds, tokenizer, *, seq_len, batch, field="text", eos=None, pack="first-fit", bins=32, stride=None, cache=None, records=None, host=())` | `field`: a string; with `tokenizer=None`, token ids under `text`, such as a token store's documents | `text` int32 `[B, seq_len + 1]`; packed, `text_coordinates`, the windows' documents (`dew.nn.inputs.Coordinates`) |
 | `sft(ds, tokenizer, *, seq_len, batch, messages="messages", long="chunk", pack="first-fit", bins=32, cache=None, records=None, host=())` | `messages`: chat turns | the `lm` fields and `text_roles` int32 `[B, seq_len + 1]` |
-| `clips(ds, seconds, *, frames, fps, size, batch, sample_rate=None)` | `mp4`: bytes | `video` uint8 `[B, frames, size, size, 3]`; with `sample_rate`, `audio` float32 `[B, samples]` and `audio_valid` bool `[B, samples]` |
+| `clips(ds, seconds, *, frames, fps, size, batch, sample_rate=None, margin=0, context=0, missing="silence", rejects=True, records=None, host=())` | `mp4`: bytes | `video` uint8 `[B, frames, size, size, 3]`; with `sample_rate`, `audio` float32 `[B, samples]` and `audio_valid` bool `[B, samples]` |
+| `preferences(ds, *, seq_len, batch, pad_id=0, records=None, host=())` | `chosen`, `rejected`: token ids, with `chosen_mask`, `rejected_mask` | each laid out in `seq_len` tokens with its mask (`preferences.PreferencePair`) |
+| `canvas(ds, tokenizer, *, prompt_length, canvas_size, batch, canvases=1, pad_id=0, messages="messages", records=None, host=())` | `messages`: chat turns | each assistant turn one block-diffusion row: its prompt in `prompt_length` tokens, its response in `canvases` canvases of `canvas_size`, ended by EOS |
 
 - A `lm` or `sft` row holds `seq_len` inputs and their next-token targets.
 - `images` and `clips` pass every other field through, stacked per batch: `label` becomes `[B]`, `caption` a list of `B` strings.
@@ -310,6 +312,8 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 - `staging_size=` resizes to a larger square first, for an augmentation that crops to `size`; `draft=True` decodes a JPEG at a reduced scale no smaller than it. `rejects=False` stops the run on an image that does not decode instead of counting and dropping it.
 - `caption=images.caption(...)` writes each record's caption after the resize, with the source's class names (`class_names.label` in its metadata) where it names none; with `templates=` it draws one per record.
 - `records=n` keeps `n` prepared records before the batch, as a validation split's `take(n)`; `host=` steps read each batch on the host, before any step on the accelerator. Every preset takes both.
+- `clips` draws a window `margin` seconds clear of the media's ends and its sound `context` seconds wider on each side; `missing="reject"` drops media without sound instead of filling silence, and `rejects=False` stops the run on media that is too short or does not decode.
+- `canvas` never packs: the objective splits each row at `prompt_length`. A tokenizer with no EOS cannot end a response, and is refused.
 - `cache=url` caches the preset's fixed steps (decode and resize, or tokenize). Augmentation, packing and batching run after the cache.
 
 ### Where the rest of the chain goes
