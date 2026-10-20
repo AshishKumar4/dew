@@ -145,25 +145,28 @@ def decoded(value: object) -> object:
     if "class" in value:
         return _located(value["class"])
     if "dataclass" in value:
-        return _located(value["dataclass"])(**{name: decoded(item) for name, item in value["fields"].items()})
+        fields = {name: decoded(field) for name, field in value["fields"].items()}
+        return _located(value["dataclass"])(**fields)
     if "tuple" in value:
-        return tuple(decoded(item) for item in value["tuple"])
-    return {decoded(key): decoded(item) for key, item in value["mapping"]}
+        return tuple(decoded(element) for element in value["tuple"])
+    return {decoded(key): decoded(entry) for key, entry in value["mapping"]}
 
 
 def _named(cls: type) -> str:
     return f"{cls.__module__}:{cls.__qualname__}"
 
 
-def _located(name: str):
+def _located(name: str) -> type:
     """The class `_named` names; ValueError where this checkout has no such class."""
     module, _, qualified = name.partition(":")
     try:
-        found = importlib.import_module(module)
+        found: object = importlib.import_module(module)
         for part in qualified.split("."):
             found = getattr(found, part)
     except (ImportError, AttributeError) as error:
         raise ValueError(f"this checkout has no {name}") from error
+    if not isinstance(found, type):
+        raise ValueError(f"{name} names no class")
     return found
 
 
@@ -178,24 +181,33 @@ def _launch(entry: dict) -> tokamax.BoundArguments:
     try:
         op = decoded(entry["op"])
         arguments = {name: decoded(value) for name, value in entry["arguments"].items()}
-        return tokamax.BoundArguments(op, arguments)
     except (TypeError, KeyError) as error:
         raise ValueError(f"a launch this checkout cannot rebuild: {error}") from error
+    if not isinstance(op, tokamax.Op):
+        raise ValueError(f"a launch's op is no tokamax Op: {op!r}")
+    return tokamax.BoundArguments(op, arguments)
 
 
 def _timings_json(timings: Timings) -> list:
     """The configs that ran and their times, as JSON (`_timings`)."""
-    return [[encoded(config), {"compile_time_ms": data.compile_time_ms, "lower_time_ms": data.lower_time_ms,
-                               "evaluation_times_ms": list(data.evaluation_times_ms),
-                               "metadata": encoded(dict(data.metadata))}]
-            for config, data in timings.prune_errors().items()]
+    return [[encoded(config), {"compile_time_ms": timing.compile_time_ms,
+                               "lower_time_ms": timing.lower_time_ms,
+                               "evaluation_times_ms": list(timing.evaluation_times_ms),
+                               "metadata": encoded(dict(timing.metadata))}]
+            for config, timing in timings.prune_errors().items()]
 
 
 def _timings(entries: list) -> Timings:
-    return Timings({decoded(config): tokamax.BenchmarkData(
-        compile_time_ms=data["compile_time_ms"], lower_time_ms=data["lower_time_ms"],
-        evaluation_times_ms=tuple(data["evaluation_times_ms"]), metadata=decoded(data["metadata"]))
-        for config, data in entries})
+    """The timings `_timings_json` wrote."""
+    measured = {}
+    for config, timing in entries:
+        metadata = decoded(timing["metadata"])
+        if not isinstance(metadata, dict):
+            raise ValueError(f"a timing's metadata is no mapping: {metadata!r}")
+        measured[decoded(config)] = tokamax.BenchmarkData(
+            compile_time_ms=timing["compile_time_ms"], lower_time_ms=timing["lower_time_ms"],
+            evaluation_times_ms=tuple(timing["evaluation_times_ms"]), metadata=metadata)
+    return Timings(measured)
 
 
 def dumps_launches(launches: list[tokamax.BoundArguments]) -> str:
@@ -380,7 +392,8 @@ def _pick(ba: tokamax.BoundArguments) -> Timings | None:
     """The pick tokamax's cache holds for `ba` (its key's shapes), where
     `ba`'s space holds its fastest config; any other is no pick."""
     stored = ba.cached_autotuning_data
-    return stored if stored is not None and stored.fastest_config in ba.autotuning_configs else None
+    # Dew's own picks alone (`get_autotuning_cache`); tokamax's overlays hold none of Dew's launches.
+    return stored if isinstance(stored, Timings) and stored.fastest_config in ba.autotuning_configs else None
 
 
 def _bucketed(spec: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
@@ -543,7 +556,7 @@ def _read(path: str) -> tuple[Keyed, list]:
         except (ValueError, KeyError, TypeError):
             foreign.append(entry)
             continue
-        if any(set(entry[0]["arguments"]) != set(ba.signature.parameters) - {"config"}
+        if any(set(entry["arguments"]) != set(ba.signature.parameters) - {"config"}
                for ba, _ in launches.values()):
             foreign.append(entry)
             continue
