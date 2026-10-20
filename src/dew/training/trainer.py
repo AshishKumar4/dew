@@ -44,6 +44,7 @@ from dew.data.dataset import (
     Loader,
     RampedStream,
     Reader,
+    Stage,
     stream_endless,
     stream_identity,
 )
@@ -110,6 +111,7 @@ from dew.training.distributed import (
     batch_shardings,
     batch_signature,
     check_batch,
+    check_ramp_window,
     check_stream,
     device_mesh,
     explicit_axes,
@@ -157,7 +159,7 @@ from dew.training.planning import Candidate, Planned, Timer, plan_step, settled,
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, HeldBest, rankings
-from dew.training.state import MODEL_STATE, Accumulation, TrainState
+from dew.training.state import MODEL_STATE, Accumulation, TrainState, kept_window
 from dew.training.tracker import Tracker
 from dew.training.transaction import Committed, Transaction, compact_qk, outcome, with_ema
 
@@ -519,8 +521,8 @@ class Trainer(Generic[Loss, Effects]):
         # cut every batch the run reads (`_rows`, read off `fit`'s data).
         self._split: int | None = 1 if whole is not None else split
         self._rows: tuple[int, ...] | None = None
-        # Whether `fit` reads a batch ramp, whose stages change the batch's shape.
-        self._ramped = False
+        # The stages of the batch ramp `fit` reads, which change the batch's shape; none without one.
+        self._ramp: tuple[Stage, ...] = ()
         # The training batch's device steps, which the compiled step runs (`Loader.device`).
         self._device: tuple[DeviceStep, ...] = ()
 
@@ -954,19 +956,15 @@ class Trainer(Generic[Loss, Effects]):
 
     def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, window: int,
                                  shape_only=False):
-        """The state with the accumulation a `window` of microbatches of
-        `batch`'s shapes pools in, empty; unchanged under a window of one, a
-        custom step or an accumulation already held."""
+        """The state with the accumulation a `window` of microbatches of `batch`'s shapes pools in,
+        empty; unchanged under a window of one, a custom step or a held one that replays such batches
+        (`Accumulation.replays`): a ramp's stage begins with a window (`check_ramp_window`)."""
         if window == 1 or self.step is not None:
             return state
         stats, aux = shapes
         shared = isinstance(stats, (Ratio, jax.ShapeDtypeStruct))
-        if self._ramped and not shared:
-            # A restored accumulation too: its replay slots hold the batches of the run that saved it.
-            raise ValueError("a loss of composite statistics replays its accumulation window's batches, "
-                             "whose shape a batch ramp changes at each stage; ramp the batch or accumulate")
-        if state.accumulation is not None:
-            return state
+        if self._ramp and not shared:
+            check_ramp_window(self._ramp, window)
         mean_dtype = jnp.result_type(jnp.float32, *(x.dtype for x in jax.tree.leaves(stats)))
         slots = window - 1
         def shape(leaf: jax.Array) -> jax.ShapeDtypeStruct:
@@ -978,12 +976,8 @@ class Trainer(Generic[Loss, Effects]):
                    jax.tree.map(shape, {name: state.variables[name] for name in aux.variables}))
 
         def zeros(leaf):
-            dtype = (
-                jnp.promote_types(leaf.dtype, jnp.float32)
-                if jnp.issubdtype(leaf.dtype, jnp.inexact)
-                else leaf.dtype
-            )
-            return jnp.zeros(leaf.shape, dtype)
+            wide = jnp.promote_types(leaf.dtype, jnp.float32)
+            return jnp.zeros(leaf.shape, wide if jnp.issubdtype(leaf.dtype, jnp.inexact) else leaf.dtype)
 
         def buffer(tree):
             return jax.tree.map(lambda x: jnp.zeros((slots, *x.shape), x.dtype), tree)
@@ -1004,6 +998,8 @@ class Trainer(Generic[Loss, Effects]):
                 attempts=None if shared else jnp.zeros((slots,), jnp.int32))
 
         pending = jax.eval_shape(allocate)
+        if kept_window(state.accumulation, pending, None if shape_only else int(state.microstep) % window):
+            return state
         if not shape_only:
             placement = self.shardings(dataclasses.replace(state, accumulation=pending)).accumulation
             # Allocate on the final shards, without a replicated window-sized temporary.
@@ -1125,7 +1121,8 @@ class Trainer(Generic[Loss, Effects]):
                     current = dataclasses.replace(current, compute=jax.jit(
                         lambda variables: narrowed(variables, candidate.copies),
                         out_shardings=candidate.shardings.compute)(current.variables))
-                if current.accumulation is None and split * self.accumulation > 1 and self.step is None:
+                if (split * self.accumulation > 1 and self.step is None and (current.accumulation is None or (
+                        self._ramp and not current.accumulation.replays(candidate.prepared.accumulation)))):
                     # The window, and with it the split, is the state's from here on.
                     current = dataclasses.replace(self._initialize_accumulation(
                         current, candidate.micro, candidate.shapes, window=split * self.accumulation),
@@ -1198,13 +1195,14 @@ class Trainer(Generic[Loss, Effects]):
         shardings = self.shardings(prepared)
         prepared = jax.tree.map(
             lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
-        # The check reads the state's arguments as already on the devices.
-        # The copies and accumulators `run` builds on the first call are not
-        # yet, so they count with the prefetched batches beside the step.
+        # The check reads the state's arguments as already on the devices. The copies and accumulators
+        # `run` builds on the first call are not yet, so they count with the prefetched batches beside
+        # the step, a ramp stage's window too, which `run` builds beside the last, already resident.
+        last = state.accumulation
+        rebuilt = last is not None and not last.replays(prepared.accumulation)
+        built = [(prepared.compute, state.compute), (prepared.accumulation, None if rebuilt else last)]
         held = prefetched_bytes(batch, placement) + placed_bytes(
-            [field for field, built in ((prepared.compute, state.compute),
-                                        (prepared.accumulation, state.accumulation))
-             if built is None and field is not None])
+            [field for field, kept in built if kept is None and field is not None])
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
         lower = functools.partial(jitted.lower, prepared, batch, part)
@@ -1326,7 +1324,8 @@ class Trainer(Generic[Loss, Effects]):
         def run(current, batch):
             with self._traced_on(cpu):
                 batch = transfer(batch, batch_shardings(cpu, batch))
-                if current.accumulation is None and self.accumulation > 1:
+                if self.accumulation > 1 and (current.accumulation is None or (
+                        self._ramp and not current.accumulation.replays(prepared.accumulation))):
                     current = self._initialize_accumulation(current, batch, shapes, window=self.accumulation)
                 # The device steps run in the accelerator's forward (`HostExecution`).
                 advanced, loss, aux, committed = body(current, model_batch(batch), 0)
@@ -1666,8 +1665,8 @@ class Trainer(Generic[Loss, Effects]):
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
-            self._ramped = isinstance(run.source, RampedStream)
-            if self._ramped:
+            self._ramp = run.source.stages if isinstance(run.source, RampedStream) else ()
+            if self._ramp:
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
             self._rows = (plan.dataset.batch,)
