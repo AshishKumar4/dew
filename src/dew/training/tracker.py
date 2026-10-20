@@ -14,8 +14,11 @@ backend is imported when the first value is logged into it.
 from __future__ import annotations
 
 import functools
+import hashlib
 import io
 import json
+import posixpath
+import re
 import tempfile
 import time
 from collections.abc import Mapping
@@ -455,6 +458,29 @@ def _(value: Decisions, prefix: Path) -> list[Path]:
     return [path]
 
 
+MLFLOW_NAME = re.compile(r"[/\w.\- ]{0,250}")
+"""The metric names MLflow takes on every platform: alphanumerics, underscores, periods, dashes,
+spaces and slashes, at most 250 of them (mlflow/utils/validation.py, `validate_param_and_metric_name`
+and `MAX_ENTITY_KEY_LENGTH`; a colon only off Windows)."""
+
+
+def mlflow_name(name: str) -> str:
+    """`name` as an MLflow metric's: as it is where MLflow takes it, else with each character MLflow
+    refuses and each empty, `.` or `..` path segment as `_`, cut to fit, and the first 8 hex digits
+    of `name`'s SHA-256 after a period. A metric's name can carry free text (a rollout's data
+    source, `math[hard]`), which MLflow would refuse at the first log; the digest keeps two names
+    that read alike apart."""
+    taken = MLFLOW_NAME.fullmatch(name) and posixpath.normpath(name) == name
+    if taken and not name.startswith(("/", "..")) and name not in ("", "."):
+        return name
+    digest = hashlib.sha256(name.encode()).hexdigest()[:8]
+    segments = [segment if segment not in ("", ".", "..") else "_"
+                for segment in re.sub(r"[^/\w.\- ]", "_", name).split("/")]
+    path = "/".join(segments)
+    # MLflow refuses a name whose normal form starts with `..` (`path_not_unique`), `..loss` too.
+    return f"{'_' * path.startswith('..')}{path}"[:250 - len(digest) - 1] + f".{digest}"
+
+
 class MLflowTracker(_OwnedTracker):
     """An MLflow run in `experiment`, opened on the first value logged into it.
 
@@ -471,6 +497,8 @@ class MLflowTracker(_OwnedTracker):
         self._run = None
         self._closed = False
         self._status = 'FINISHED'
+        # Each name MLflow holds, by the name logged under it (`mlflow_name`).
+        self._names: dict[str, str] = {}
 
     @property
     def run(self) -> tuple[MlflowClient, str]:
@@ -493,8 +521,18 @@ class MLflowTracker(_OwnedTracker):
 
         client, run = self.run
         moment = int(time.time() * 1000)
-        client.log_batch(run, metrics=[Metric(name, float(value), moment, step)
+        client.log_batch(run, metrics=[Metric(self._held(name), float(value), moment, step)
                                        for name, value in scalars.items()])
+
+    def _held(self, name: str) -> str:
+        """The name MLflow holds `name`'s metric under, refused where another of the run's names took
+        it, as a name already of MLflow's form and another's repair (`mlflow_name`) can, whose two
+        series MLflow would merge into one."""
+        held = mlflow_name(name)
+        owner = self._names.setdefault(held, name)
+        if owner != name:
+            raise ValueError(f"metrics {owner!r} and {name!r} both reach MLflow as {held!r}; rename one")
+        return held
 
     def artifact(self, value: Reported, step: int) -> None:
         client, run = self.run

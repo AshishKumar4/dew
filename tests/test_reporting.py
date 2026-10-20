@@ -228,6 +228,71 @@ def test_mlflow_run_holds_the_fit_read_back_with_mlflows_client(tmp_path, monkey
     assert Image.open(drawn).size == (8, 8)
 
 
+def test_mlflow_takes_a_metric_named_in_free_text_under_a_name_it_accepts(tmp_path, monkeypatch):
+    """A rollout source's free-text name in a metric's (`math[hard]`, `a/../b`) reaches MLflow as a
+    name it accepts, two such names apart; a name MLflow accepts arrives as it is."""
+    store = mlflow_store(tmp_path, monkeypatch)
+    from dew.training import MLflowTracker
+
+    names = ("rollout/source/openai/gsm8k/reward/mean", "rollout/source/math[hard]/reward/mean",
+             "rollout/source/math(hard)/reward/mean", "rollout/source/a/../b/reward/mean", "..loss",
+             ".../loss")
+    with MLflowTracker('dew-reporting', 'free-text', uri=store) as tracker:
+        tracker.log({name: float(index) for index, name in enumerate(names)}, 1)
+        client, run = tracker.run
+    logged = client.get_run(run).data.metrics
+    from dew.training.tracker import mlflow_name
+
+    assert len({mlflow_name(name) for name in names}) == len(names)
+    assert {mlflow_name(name): index for index, name in enumerate(names)} == logged
+    assert mlflow_name(names[0]) == names[0]
+    # A name already of MLflow's form that another's repair reaches is refused, not merged with it.
+    with MLflowTracker('dew-reporting', 'taken', uri=store) as tracker:
+        tracker.log({"": 1.0}, 1)
+        with pytest.raises(ValueError):
+            tracker.log({mlflow_name(""): 2.0}, 2)
+
+
+def test_the_panel_shows_the_metrics_its_last_interval_reported():
+    """A metric an interval no longer reports, a rollout source absent from its batch, leaves the
+    panel rather than keep showing its last value, and shows its trend again when it returns."""
+    from dew.training.display import TrainingDisplay
+
+    display = TrainingDisplay(total=10)
+    display.interval(1, {"train/loss": 2.0, "rollout/source/a/reward": 1.0})
+    display.interval(2, {"train/loss": 1.5})
+    assert [row.name for _, row in display.rows()] == ["loss"]
+    display.interval(3, {"train/loss": 1.0, "rollout/source/a/reward": 0.5})
+    assert [(row.name, list(row.values)) for _, row in display.rows()] == [
+        ("loss", [2.0, 1.5, 1.0]), ("source/a/reward", [1.0, 0.5])]
+
+
+def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counters():
+    """A run's data counters (`data/...`) reach the panel as one line, the rows delivered and the
+    records rejected over every corpus, not as a row each: a corpus is named only where a mixture
+    reads more than one, a reason only where something was rejected for it, and the share of the
+    rows truncated, over every corpus's rows, only where any was."""
+    from dew.training import display as shown
+    from dew.training.display import TrainingDisplay
+
+    display = TrainingDisplay(total=10)
+    display.interval(1, {"train/loss": 2.0, "data/rows/tiny-shakespeare": 4824.0,
+                         "data/rejected/tiny-shakespeare/empty": 0.0, "data/truncated/tiny-shakespeare": 0.0,
+                         "data/chunks_per_record/tiny-shakespeare": 1.0})
+    assert [row.name for _, row in display.rows()] == ["loss"]
+    data_line = shown.data_line
+    line = data_line(display.corpus_counts)
+    assert line is not None and line.plain == "data 4,824 rows  ·  0 rejected"
+    mixture = data_line({"data/rows/web": 3000.0, "data/rows/code": 1824.0,
+                         "data/rejected/web/too_long": 2.0, "data/rejected/code/too_long": 1.0,
+                         "data/rejected/code/empty": 0.0, "data/truncated/web": 0.25,
+                         "data/truncated/code": 0.0})
+    assert mixture is not None
+    assert mixture.plain == ("data 4,824 rows  ·  3 rejected (too_long 3)  ·  15.5% truncated  ·  "
+                             "web 3,000  code 1,824")
+    assert data_line({"train/loss": 1.0}) is None
+
+
 def test_tensorboard_events_hold_the_fit_read_back_with_the_accumulator(tmp_path):
     pytest.importorskip('tensorboard')
     from tensorboard.backend.event_processing.event_accumulator import (

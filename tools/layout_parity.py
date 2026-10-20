@@ -360,14 +360,20 @@ def _drawn(params, key):
     first step's gradient reaches those layers alone: 2 of the zoo DiT's 70
     leaves, and a layout that split anything above them wrongly would pass.
     Every state of a comparison, the reference's, a layout's, a floor's and
-    the fp64 anchor's, comes through here from one key, so they start alike."""
+    the fp64 anchor's, comes through here from one key, so they start alike.
+
+    `key` is concrete, and each draw runs eagerly even inside a trace
+    (`jax.ensure_compile_time_eval`), so an initializer holds the draws as
+    constants: staged, a normal for every leaf made the initializer's compile
+    most of a cell's time (the UNet's 286 leaves, 187 s of its 302)."""
     import jax
     import jax.numpy as jnp
 
     def draw(index, leaf):
         if not jnp.issubdtype(leaf.dtype, jnp.floating):
             return leaf
-        drawn = (0.02 * jax.random.normal(jax.random.fold_in(key, index), leaf.shape)).astype(leaf.dtype)
+        with jax.ensure_compile_time_eval():
+            drawn = (0.02 * jax.random.normal(jax.random.fold_in(key, index), leaf.shape)).astype(leaf.dtype)
         return jnp.where(jnp.any(leaf != 0), leaf, drawn)
 
     leaves, tree = jax.tree.flatten(params)
@@ -396,7 +402,9 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     class Drawn(Trainer):
         def initial_state(self, initializer=None, key=None):
             state = super().initial_state(initializer, key)
-            params = {**state.variables, "params": _drawn(state.variables["params"], jax.random.key(7))}
+            with jax.ensure_compile_time_eval():
+                drawing = jax.random.key(7)
+            params = {**state.variables, "params": _drawn(state.variables["params"], drawing)}
             return dataclasses.replace(state, variables=params, opt_state=self.optimizer.init(params["params"]))
 
         def place(self):

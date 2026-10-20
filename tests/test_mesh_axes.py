@@ -31,6 +31,7 @@ from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
+from dew.telemetry.instrumentation import COLLECTIVES
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import shard_batch
 
@@ -176,6 +177,10 @@ def test_an_fsdp_step_splits_leading_dimensions_and_moves_no_activation(fused):
              if sharding.spec and "kernel" in jax.tree_util.keystr(path) and declared_axes(path, 2, declared)}
     assert specs.pop("['lm_head']['kernel']") == P(None, "fsdp")
     assert set(specs.values()) == {P("fsdp")}, specs
+    if fused:
+        # Qwen3-Next's fused projections declare the residual axis their unfused ones do.
+        assert all(any(f"['{name}']" in path for path in specs) for name in ("in_proj_qkvz", "in_proj_ba")), (
+            sorted(specs))
     assert moved(text) == moved(stepped(MeshSpec(fsdp=2), 2)[1])
     assert_trains_alike(trained, stepped(MeshSpec(), 1, **delta_layers(fused=fused))[2])
 
@@ -270,8 +275,9 @@ def test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device(tm
     `data_axes` split the rows over all three: fit splits the parameters
     over both fsdp levels and the rows over all three axes, and two steps,
     a checkpoint and a resumed third step train what one device trains in
-    three, as a `MeshSpec` mesh does. A rule naming an axis the mesh lacks
-    is refused before anything is placed."""
+    three, as a `MeshSpec` mesh does. A rule naming an axis the mesh lacks,
+    one of Dew's role axes among them, is refused before anything is placed;
+    Dew's own rules, which name every role axis, place on whatever the mesh has."""
     layers = delta_layers(fused=False) if hybrid else {}
     native = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 2, 2), ("replica", "zero", "zero2"))
     layout = Layout(rules=NATIVE_RULES, data_axes=("replica", "zero", "zero2"), min_shard=TINY_SHARD)
@@ -295,6 +301,11 @@ def test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device(tm
     misspelt = Layout(rules={**NATIVE_RULES, "embed": "zer0"}, data_axes=layout.data_axes)
     with pytest.raises(ValueError):
         native_trainer(native, misspelt, None, **layers).fit(data, steps=1)
+    # A rule of one's own (none of Dew's: those put the width on fsdp) that names Dew's tensor axis,
+    # which this mesh lacks, would split nothing.
+    absent = Layout(rules={**NATIVE_RULES, "embed": "tensor"}, data_axes=layout.data_axes)
+    with pytest.raises(ValueError):
+        native_trainer(native, absent, None, **layers).fit(data, steps=1)
 
 
 @pytest.mark.mesh(devices=8)
@@ -357,7 +368,7 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
         result = jax.device_get(executable(*inputs))
         flops = compiled_flops(executable)
         assert flops is not None
-        moved = sharded.collective_bytes(executable.as_text(), sharded.COLLECTIVE_OPS)
+        moved = sharded.collective_bytes(executable.as_text(), COLLECTIVES)
         return result, flops * sequence * tensor, moved
 
     expected, _, _ = compiled(1, 1, Link(None, None, "cpu"))
@@ -432,9 +443,10 @@ class Named(nn.Module):
 
     @nn.compact
     def __call__(self, x):
+        from dew.nn.dense import Dense
         from dew.objectives.base import FROZEN
 
-        return nn.Dense(16, name=FROZEN)(jax.nn.relu(nn.Dense(64, name="hidden")(x)))
+        return Dense(16, name=FROZEN)(jax.nn.relu(Dense(64, name="hidden")(x)))
 
 
 @pytest.mark.mesh(devices=2)
@@ -502,7 +514,7 @@ def dense_layout():
 
 
 TOPOLOGIES = {
-    # plan.md 4.5's four mesh configs, on the eight-device simulated mesh,
+    # Four data/FSDP/tensor mesh configurations on eight simulated devices,
     # plus the sequence axis beside a data axis, where the batch rows split
     # over data and fsdp and the sequence over its own axis, and the stage
     # axis beside them: the two-layer model splits into two stages of one
@@ -797,10 +809,16 @@ custom_call_target="__gpu$xla.gpu.triton"
 
 
 def test_an_async_collective_counts_its_results_not_its_operands():
-    """An async `-start` names `(operands, results)`; only the results are the collective's bytes."""
-    text = """  %ag = ((bf16[4,8]{1,0}), bf16[8,8]{1,0}) all-gather-start(bf16[4,8]{1,0} %x), dimensions={0}
+    """An async pair counts once, by its `-done`, which holds what moved: its `-start` names
+    `(operands, results)`. Each result's bytes are as XLA sizes them, an fp8 element's one byte."""
+    text = """ENTRY %main (x: bf16[4,8], y: f32[16], z: f32[8], w: f8e4m3fn[2,8]) -> f32[8] {
+  %ag = ((bf16[4,8]{1,0}), bf16[8,8]{1,0}) all-gather-start(bf16[4,8]{1,0} %x), dimensions={0}
+  %agd = bf16[8,8]{1,0} all-gather-done(((bf16[4,8]{1,0}), bf16[8,8]{1,0}) %ag)
   %rs = (f32[16]{0}, f32[8]{0}) reduce-scatter-start(f32[16]{0} %y), dimensions={0}
-  %ar = f32[8]{0} all-reduce(f32[8]{0} %z), to_apply=%add"""
+  %rsd = f32[8]{0} reduce-scatter-done((f32[16]{0}, f32[8]{0}) %rs)
+  %ar = f32[8]{0} all-reduce(f32[8]{0} %z), to_apply=%add
+  ROOT %wg = f8e4m3fn[8,8]{1,0} all-gather(f8e4m3fn[2,8]{1,0} %w), dimensions={0}
+}"""
     assert sharded.collectives(text) == [("all-gather", [(8, 8)]), ("reduce-scatter", [(8,)]),
-                                         ("all-reduce", [(8,)])]
-    assert sharded.collective_bytes(text, sharded.COLLECTIVE_OPS) == 128 + 32 + 32
+                                         ("all-reduce", [(8,)]), ("all-gather", [(8, 8)])]
+    assert sharded.collective_bytes(text, COLLECTIVES) == 128 + 32 + 32 + 64
