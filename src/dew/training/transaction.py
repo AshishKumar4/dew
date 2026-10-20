@@ -351,7 +351,7 @@ class Transaction:
             **state.variables, **jax.tree.map(lambda x: x[index], previous.variables)}
         step_info = Step((state.microstep - fill + index) // self.split,
                     jax.random.fold_in(state.key, previous.attempts[index]),
-                    with_ema(variables, state.ema))
+                    with_ema(variables, state.ema), committed=state.updates)
         return self.read(variables, state.compute), batch, step_info
 
     def read(self, variables, compute):
@@ -540,7 +540,7 @@ class Transaction:
             # count steps, however many microbatches each is read in.
             attempt = state.step * self.split + part
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
-                             with_ema(state.variables, state.ema))
+                             with_ema(state.variables, state.ema), committed=state.updates)
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             realized = realize(self.read(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
