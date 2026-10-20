@@ -3,8 +3,12 @@
 `dew.nn.kernels.ssd` computes what `dew.nn.mixers.mamba2.xla_chunk_scan`
 computes. The kernel is written for TPU (a GPU runs mamba_ssm's own kernels,
 `dew.nn.kernels.mamba_ssd`); a host without one runs it through
-`pallas_call(interpret=True)`, which tests the formulation, the block specs,
-the chunk recurrence and the hand-written backward pass, and a TPU compiles it.
+`pallas_call(interpret=True)`, which checks shapes, dtypes, resets and state gradients. The compiled
+TPU kernel is the venue for numerical parity at every geometry.
+
+CPU interpretation's dots follow the host ISA. The one-short state-gradient RMS ratio was 1.598
+(99.9% interval [1.581, 1.617], 640 seeds) on AMD x86-64-v4, versus 0.77 on v3; one-over's final-state
+ratio was 1.508 ([1.475, 1.543], 160 seeds) on v4. These measure CPU lowering, not TPU arithmetic.
 
 One driver (`assert_kernel_parity`) holds every case to the same rule: the
 kernel's forward, final state and all five gradients finite and, by
@@ -88,13 +92,15 @@ def stepwise_scan(x, b, c, a, state):
     return jnp.moveaxis(ys, 0, 1), final
 
 
+def evaluated(scan, operands, seeded):
+    """A scan's output, final state and every operand gradient under both cotangents."""
+    output, backward = jax.vjp(scan, *operands)
+    return dict(zip(("output", "final", "x", "B", "C", "A dt", "state"),
+                    (*output, *backward(seeded)), strict=True))
+
+
 def parity_functions(chunk_size: int, roundings: int):
     """XLA's output, final state and all five gradients, and its independently checked float64 truth."""
-    def evaluated(scan, operands, seeded):
-        output, backward = jax.vjp(scan, *operands)
-        return dict(zip(("output", "final", "x", "B", "C", "A dt", "state"),
-                        (*output, *backward(seeded)), strict=True))
-
     xla = jax.jit(lambda operands, seeded: evaluated(
         lambda *o: xla_chunk_scan(*o, chunk_size), operands, seeded))
     recurrence = jax.jit(lambda operands, seeded: evaluated(stepwise_scan, operands, seeded))
@@ -107,7 +113,7 @@ def parity_functions(chunk_size: int, roundings: int):
                                       roundings=roundings)
         return exact
 
-    return xla, truth, evaluated
+    return xla, truth
 
 
 def assert_kernel_parity(draw, chunk_size: int, *, compiled: bool, roundings: int, seeds: int, label: str):
@@ -123,7 +129,7 @@ def assert_kernel_parity(draw, chunk_size: int, *, compiled: bool, roundings: in
     def kernel(*operands):
         return ssd_chunk_scan(*operands, chunk_size, platform)
 
-    xla, truth, evaluated = parity_functions(chunk_size, roundings)
+    xla, truth = parity_functions(chunk_size, roundings)
     mine = jax.jit(lambda operands, seeded: evaluated(kernel, operands, seeded))
     assert_as_exact(mine, xla, draw, label, seeds=seeds, truth_fn=truth)
 
@@ -209,10 +215,10 @@ CASES = [
 ]
 
 
+@on_device
 @pytest.mark.parametrize(("kind", "case", "compiled"), CASES)
 def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled):
-    """The kernel against the stepwise recurrence in float64, forward and all five gradients
-    (`assert_kernel_parity`), interpreted on the host or compiled on a TPU."""
+    """The compiled TPU kernel against float64, every forward and gradient leaf over declared draws."""
     if compiled:
         shape, chunk_size = case
         assert ssd_kernel_runs(chunk_size, shape[3], shape[4], jax.default_backend(), dtype=jnp.float32)
@@ -225,3 +231,41 @@ def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled)
         roundings = shape[1] + shape[3] + shape[4]
     assert_kernel_parity(case_draw(reference, kind, case), chunk_size, compiled=compiled,
                          roundings=roundings, seeds=SEEDS[kind, case], label=f"{kind} {case}")
+
+
+@pytest.mark.parametrize(("kind", "case"), [pytest.param(*param.values[:2], id=param.id)
+                                          for param in CASES if not param.values[2]])
+def test_the_scan_preserves_resets_and_initial_state_gradients(reference, kind, case):
+    """The original host geometries run with every output/gradient shape and dtype intact.
+
+    Resets remove entering-state influence exactly, including its final-only cotangent gradient;
+    before a reset a nonzero state still influences the outputs. CPU interpretation checks these
+    exact contracts, while check 1 measures the compiled TPU arithmetic.
+    """
+    operands, seeded = case_draw(reference, kind, case)(0)
+    chunk_size = case[0] if kind == "fixture" else case[1]
+    run = jax.jit(lambda inputs, cotangents: evaluated(
+        lambda *args: ssd_chunk_scan(*args, chunk_size, "tpu"), inputs, cotangents))
+    actual = jax.tree.map(np.asarray, run(operands, seeded))
+    expected = {"output": operands[0], "final": operands[-1],
+                **dict(zip(("x", "B", "C", "A dt", "state"), operands, strict=True))}
+    for name, value in actual.items():
+        assert value.shape == expected[name].shape, name
+        assert value.dtype == expected[name].dtype, name
+        assert np.isfinite(value).all(), name
+
+    zero_state = (*operands[:-1], np.zeros_like(operands[-1]))
+    without_state = jax.tree.map(np.asarray, run(zero_state, seeded))
+    final_only = jax.tree.map(np.asarray, run(operands, (np.zeros_like(seeded[0]), seeded[1])))
+    resets = np.all(operands[3] == RESET_DECAY, axis=-1)
+    for row in range(resets.shape[0]):
+        starts = np.flatnonzero(resets[row])
+        prefix = int(starts[0]) if starts.size else resets.shape[1]
+        if prefix:
+            assert not np.array_equal(actual["output"][row, :prefix],
+                                      without_state["output"][row, :prefix])
+        if starts.size:
+            np.testing.assert_array_equal(actual["output"][row, prefix:],
+                                          without_state["output"][row, prefix:])
+            np.testing.assert_array_equal(actual["final"][row], without_state["final"][row])
+            np.testing.assert_array_equal(final_only["state"][row], np.zeros_like(final_only["state"][row]))
