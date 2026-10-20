@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
     from transformers import CLIPTokenizer, PreTrainedTokenizerBase
 
+    from dew.data.text import PinnedTokenizer
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.training.distributed import Layout, MeshSpec
 
@@ -106,6 +107,8 @@ class T5Segment:
     tokenizer: PreTrainedTokenizerBase
     name: str
     tokens: int
+    files: PinnedTokenizer | None = None
+    """The tokenizer's files, pinned as they were loaded (`dew.data.text.pin_tokenizer`)."""
 
 
 @dataclass(eq=False)
@@ -139,7 +142,17 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     t5: T5Segment | None = None
     guidance: float | None = None
     param_dtype: str = "float32"
+    tokenizer_files: tuple[PinnedTokenizer, ...] = field(default=(), kw_only=True)
+    """The files of the CLIP tokenizers, each pinned as it was loaded (`dew.data.text.pin_tokenizer`),
+    which `dependencies` records with the T5 segment's: the ids a caption tokenizes to are theirs."""
     keyword: ClassVar[str] = "conditioning"
+
+    def dependencies(self) -> Mapping[str, object]:
+        """The encoder's fields and the hashes of the tokenizer files it reads, so an exact resume
+        refuses a caption's ids from other files."""
+        t5 = () if self.t5 is None or self.t5.files is None else (self.t5.files,)
+        pins = (*self.tokenizer_files, *t5)
+        return {**super().dependencies(), "tokenizers": [pinned.snapshot for pinned in pins]}
 
     def conditioning_flops(self, tokens) -> ConditionWork:
         """Count each native tower and pooled projection using the pipeline's masks.
@@ -376,8 +389,17 @@ class _LanguageText(ConditionEncoder[str | Mapping[str, object]]):
     checkpoint: str
     tokens: int = field(default=512, kw_only=True)
     param_dtype: str = field(default="float32", kw_only=True)
+    tokenizer_files: PinnedTokenizer | None = field(default=None, kw_only=True)
+    """The tokenizer's files, pinned as they were loaded (`dew.data.text.pin_tokenizer`), which
+    `dependencies` records."""
     keyword: ClassVar[str] = "conditioning"
     assets: ClassVar[str] = "tokenizer"
+
+    def dependencies(self) -> Mapping[str, object]:
+        """The encoder's fields and the hashes of the tokenizer files it reads, so an exact resume
+        refuses a prompt's ids from other files."""
+        files = None if self.tokenizer_files is None else self.tokenizer_files.snapshot
+        return {**super().dependencies(), "tokenizer": files}
 
     @classmethod
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
