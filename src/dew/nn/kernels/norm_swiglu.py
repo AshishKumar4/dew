@@ -494,17 +494,27 @@ def _rounded_inverse(inverse, rounded: bool, dtype, interpret: bool):
     return _round(inverse, dtype, interpret) if rounded else inverse
 
 
-def _rounded_inverse_cotangent(m, x, inverse, multiplier, narrow, width: int, interpret: bool):
+def _rsqrt_slope(x, inverse, epsilon: float, width: int):
+    """The derivative of each row's inverse RMS by its mean square, as XLA's rsqrt transposes it:
+    `-0.5 * (inverse / (mean(x * x) + epsilon))`, the mean square recomputed as the forward formed it.
+    Where the direct and reduced cotangents cancel, this keeps the inverse's one rounding in both;
+    the cube of the inverse took it three times (a row of 0.5 under cotangents of 1.5 * 2**119 came
+    out 4 times XLA's distance from float64, TIER13 on an A100 and an H100). `width` is the row's own,
+    not its padded block's."""
+    return -0.5 * (inverse / (jnp.sum(x * x, axis=1) * (1.0 / width) + epsilon))
+
+
+def _rounded_inverse_cotangent(m, x, multiplier, slope, narrow, width: int, interpret: bool):
     """The input's cotangent, `[rows, width]` in fp32, of `x * inverse.astype(narrow)` for the
     cotangent `m`, where XLA and torch round it: the direct product and the inverse's cotangent, its
     products summed, each round to `narrow`, and the reduction's contribution rounds apart before the
     two join (the store rounds the join). A rounding the inverse took then recurs in both, so where
-    they cancel, it cancels too. `width` is the row's own, not its padded block's."""
+    they cancel, it cancels too. `slope` is `_rsqrt_slope`'s; `width` is the row's own."""
     direct = _round(m * multiplier[:, None], narrow, interpret)
     sensed = _round(jnp.sum(_round(m * x, narrow, interpret), axis=1), narrow, interpret)
     # rsqrt's half in its coefficient and the square's two apart, as XLA's transposes keep them, so no
     # product overflows, nor a small cotangent's halving rounds, where XLA's does not.
-    correction = sensed * (-0.5 * (inverse * inverse * inverse)) * (1.0 / width)
+    correction = sensed * slope * (1.0 / width)
     reduced = _round((2.0 * x) * correction[:, None], narrow, interpret)
     return direct + reduced
 
@@ -521,7 +531,7 @@ def _pairwise(values, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
 
 
 def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, dx_ref, dgate_ref, partial_ref,
-                  correction_ref, *, row_block: int, offset: bool, stored, after_cast: bool,
+                  correction_ref, *, row_block: int, epsilon: float, offset: bool, stored, after_cast: bool,
                   inverse_rounded: bool, activation: str, interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
@@ -557,11 +567,12 @@ def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, d
                         eviction_policy="evict_first")
             dy = dy * activated
         m = dy * weight
+        slope = _rsqrt_slope(x, inverse, epsilon, width)
         if inverse_rounded:
-            dx = _rounded_inverse_cotangent(m, x, inverse, multiplier, dy_ref.dtype, width, interpret)
+            dx = _rounded_inverse_cotangent(m, x, multiplier, slope, dy_ref.dtype, width, interpret)
         else:
             # The two x contributions are kept separate, as XLA's square VJP is.
-            correction = (-0.5 * jnp.sum(m * x, axis=1)) * (inverse * inverse * inverse) * (1.0 / width)
+            correction = jnp.sum(m * x, axis=1) * slope * (1.0 / width)
             dx = m * multiplier[:, None] + (2.0 * x) * correction[:, None]
         if ds is not None:
             # The stream's own cotangent joins in fp32, one rounding for the sum.
@@ -652,16 +663,16 @@ class RmsBackward(tuning.KernelOp):
     ROWS: ClassVar[tuple[str, ...]] = ('x', 'gate', 'inverse', 'dy', 'ds')
 
     def _fwd(self, x: jax.Array, scale: jax.Array | None, gate: jax.Array | None, inverse: jax.Array,
-             dy: jax.Array, ds: jax.Array | None, *, offset: bool, stored: str, after_cast: bool,
-             inverse_rounded: bool, activation: str, interpret: bool, config: ReverseConfig,
+             dy: jax.Array, ds: jax.Array | None, *, epsilon: float, offset: bool, stored: str,
+             after_cast: bool, inverse_rounded: bool, activation: str, interpret: bool, config: ReverseConfig,
              return_residuals: bool = False):
         rows, width = x.shape
         groups = max(1, min(config.programs, pl.cdiv(rows, config.rows)))
         partial = None if scale is None else jax.ShapeDtypeStruct((groups, width), jnp.float32)
         return pl.pallas_call(
-            functools.partial(_rms_backward, row_block=config.rows, offset=offset, stored=jnp.dtype(stored),
-                              after_cast=after_cast, inverse_rounded=inverse_rounded, activation=activation,
-                              interpret=interpret),
+            functools.partial(_rms_backward, row_block=config.rows, epsilon=epsilon, offset=offset,
+                              stored=jnp.dtype(stored), after_cast=after_cast,
+                              inverse_rounded=inverse_rounded, activation=activation, interpret=interpret),
             grid=(groups,),
             out_shape=(jax.ShapeDtypeStruct((rows, width), x.dtype),
                        None if gate is None else jax.ShapeDtypeStruct((rows, width), gate.dtype),
@@ -703,9 +714,9 @@ def _rms_backward_call(stream, scale, gate, inverse, dy, ds, norm: _Norm):
         zeros = [None if value is None else jnp.zeros_like(value) for value in (stream, gate, scale)]
         return (zeros[0] if ds is None else ds), zeros[1], zeros[2]
     dx, dgate, partial, correction = _RMS_BACKWARD(
-        _flat(stream), scale, _flat(gate), inverse, _flat(dy), _flat(ds), offset=norm.offset,
-        stored=norm.stored, after_cast=norm.after_cast, inverse_rounded=norm.inverse_rounded,
-        activation=norm.activation, interpret=norm.interpret)
+        _flat(stream), scale, _flat(gate), inverse, _flat(dy), _flat(ds), epsilon=norm.epsilon,
+        offset=norm.offset, stored=norm.stored, after_cast=norm.after_cast,
+        inverse_rounded=norm.inverse_rounded, activation=norm.activation, interpret=norm.interpret)
     dscale = None if scale is None else _scale_sum(partial, correction)
     return dx.reshape(stream.shape), None if gate is None else dgate.reshape(gate.shape), dscale
 
