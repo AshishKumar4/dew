@@ -153,7 +153,9 @@ def test_a_store_of_role_counted_documents_states_its_rule_so_its_pack_counts_by
                             shard_bytes=256 * 1024) for part in range(2)]
             return Concatenate(tuple(publish(documents(source, scored), cache, read="indexed", loading=READ)
                                      .source() for cache in caches))
-        rows = list(documents(source, scored))
+        # Rows a chain delivers carry no count of Dew's; these are the step's own outputs, called
+        # on each record, which do.
+        rows = [CountTargets(role=1).map(row) for row in roled(source, 7, scored).records("memory")]
         if store == "memory":
             # Columns with each document's length, which a store in memory states.
             return Memory({**{name: [row[name] for row in rows] for name in rows[0]},
