@@ -209,8 +209,9 @@ def _row_terms(logits, predict: bool) -> tuple[
     and then the blocks' terms (`_row_blocks`): XLA's CPU compiler runs a
     reduction with a combine of its own as one loop over the row, and over
     512 columns that loop's sum of exponentials held a whole head's state
-    gradient 4.2 times as far from float64 as `jax.nn.logsumexp`'s, where
-    the two levels' loops, each a block long, hold it 1.15 times as far."""
+    gradient 3.9 times as far from float64 as `jax.nn.logsumexp`'s over 52
+    orders of its columns (tests/test_chunked_cross_entropy.py), where the
+    two levels' loops are each a block long."""
     def combine(first, second):
         larger = jnp.maximum(first[0], second[0])
         total = _rescaled(first[0], first[1], larger) + _rescaled(second[0], second[1], larger)
