@@ -161,9 +161,9 @@ def test_sft_keeps_every_turn_of_a_conversation_longer_than_its_rows():
 
     turns = [{"role": role, "content": f"turn {index} of a long talk"}
              for index in range(12) for role in ("user", "assistant")]
-    whole = next(Memory([{"messages": turns}]).map(template(str(CHAT))).iterate())["text"]
+    whole = next(iter(Memory([{"messages": turns}]).map(template(str(CHAT)))))["text"]
     assert len(whole) > 49
-    pieces = list(Memory([{"messages": turns}]).pipe(presets.sft, str(CHAT), seq_len=48, batch=1).iterate())
+    pieces = list(Memory([{"messages": turns}]).pipe(presets.sft, str(CHAT), seq_len=48, batch=1))
     kept = [row[row_segments > 0] for batch in pieces
             for row, row_segments in zip(batch["text"], batch["text_coordinates"].segments, strict=True)]
     rebuilt = np.concatenate([kept[0], *(piece[1:] for piece in kept[1:])])

@@ -1,5 +1,6 @@
 """URL fetches use the ordinary pipeline worker and rejection paths."""
 
+import collections
 import contextlib
 import gzip
 import hashlib
@@ -9,6 +10,7 @@ import threading
 import time
 from pathlib import Path
 
+import grain.python as grain
 import numpy as np
 import pytest
 from PIL import Image
@@ -17,7 +19,6 @@ from dew.data import Files, Loading, Memory, Rejected, images, video
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
 from dew.data.images import DecodeImage, Resize
-from dew.data.mixing import SearchBudget
 from dew.data.pipeline import Pipeline
 from dew.data.sources.urls import Fetch
 from dew.objectives.base import VALID_ROWS
@@ -84,6 +85,77 @@ def serving(handle):
     finally:
         server.shutdown()
         server.server_close()
+
+
+Parents = collections.namedtuple("Parents", ["first", "second"])
+
+
+class TupleWrapped(grain.IterDataset):
+    """A Grain step of the caller's, whose position keeps its parent's in a tuple, or in a named
+    tuple (`named`)."""
+
+    named = False
+
+    def __iter__(self):
+        return TupleWrappedRead(self._parent.__iter__(), self.named)
+
+
+class NamedTupleWrapped(TupleWrapped):
+    named = True
+
+
+class TupleWrappedRead(grain.DatasetIterator):
+    def __init__(self, parent, named):
+        super().__init__(parent)
+        self.named = named
+
+    def __next__(self):
+        return next(self._parent)
+
+    def get_state(self):
+        state = self._parent.get_state()
+        return {"parents": Parents(state, None) if self.named else (state,)}
+
+    def set_state(self, state):
+        self._parent.set_state(state["parents"][0])
+
+
+@pytest.mark.parametrize("repeats", ["endless", "two passes, endlessly", "behind a Grain step",
+                                     "behind a Grain step's named tuple"])
+def test_an_endless_read_reads_on_through_passes_whose_fetches_failed_until_one_returns(repeats):
+    """A catalog's one url fails for its first three fetches, so each of those passes yields
+    nothing; a failed fetch may succeed next time, so the endless read reads on, counting each
+    failure through every pass, a finite repeat's within an endless one's too, and gives the record
+    once the server returns it, where the first empty pass was once refused."""
+    served = []
+
+    def handle(request):
+        served.append(request.path)
+        if len(served) <= 3:
+            request.send_response(503)
+            request.end_headers()
+            return
+        request.send_response(200)
+        request.send_header("Content-Length", "7")
+        request.end_headers()
+        request.wfile.write(b"payload")
+
+    with serving(handle) as address:
+        fetched = Pipeline(Memory([{"url": f"http://{address}/object"}])).filter_map(Fetch())
+        if repeats.startswith("behind"):
+            wrapped = NamedTupleWrapped if repeats.endswith("named tuple") else TupleWrapped
+            fetched = fetched.grain(wrapped, identity=f"{wrapped.__name__}@1")
+        repeated = fetched.repeat(2).repeat() if repeats == "two passes, endlessly" else fetched.repeat()
+        chain = repeated.batch(1)
+        data = compile(chain, read="indexed", loading=READ)
+        stream = data.train(DataPartition())
+        try:
+            assert np.asarray(next(stream)["bytes"]).tolist() == [b"payload"]
+        finally:
+            stream.close()
+    assert len(served) == 4
+    # The passes a fetch failed in are counted, as a read that goes on through them is watched by.
+    assert data.statistics()["data/rejected/memory/transient"] == 3
 
 
 @pytest.mark.parametrize("header", ["Location", "URI"])
@@ -241,19 +313,6 @@ def test_an_oversized_object_is_rejected_before_decode(tmp_path):
     path.write_bytes(b"x" * 17)
     result = Fetch(max_bytes=16)({"url": path.as_uri()})
     assert isinstance(result, Rejected) and result.reason == "too_large"
-
-
-def test_an_all_rejected_catalog_exhausts_its_search_budget(tmp_path):
-    pipeline = Pipeline(Memory([{"url": (tmp_path / "missing").as_uri()}])).repeat().filter_map(
-        Fetch(output="image"), DecodeImage("image")).batch(4)
-    data = compile(pipeline, read="indexed", loading=READ,
-                   budget=SearchBudget(consecutive=8))
-    stream = data.train(DataPartition())
-    try:
-        with pytest.raises(ValueError):
-            next(stream)
-    finally:
-        stream.close()
 
 
 @pytest.mark.parametrize("workers", [0, 2])
