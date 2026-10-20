@@ -119,7 +119,7 @@ def test_a_prompt_dataset_trains_as_the_prompt_config_does():
 
     def trained(data):
         objective = GRPOObjective(TinyHead(vocab_size=vocab), 8 + 4 - 1)
-        rollout = SampledRollout(objective, lambda source, text, truth, info: float(len(text)), groups=2,
+        rollout = SampledRollout(objective, lambda text, record: float(len(text)), groups=2,
                                  max_new_tokens=4, sampling=Sampling(temperature=1.0))
         trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0),
                           layout=Layout(min_shard=1, tolerance=1.0), rollout=rollout)
