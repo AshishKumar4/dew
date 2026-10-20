@@ -189,5 +189,5 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Use JAX's own transfer guard on GPUs in place of the steady-state reimplementation. [795]
 - One collective parser (telemetry.instrumentation) and one cache-worker fixture in the tests. [796, 797]
 - Check every family, target row and mode in the kernel-route test, an unexplained route failing, and drop the KV cache's unconditional GPU xfail. [798, 799]
-- Hold MeanFlow's fused attention away from zero initialization, the delta rule's document isolation without exclusions, and the Mamba-2 TPU mesh by its numbers. [789, 790, 791]
+- Hold MeanFlow's fused attention away from zero initialization, the delta rule's document isolation without exclusions, and the Mamba-2 TPU mesh by its numbers. [789, 790]
 - Delete the stock-JAX branches (DEW_UPSTREAM_JAX, the runtime's caching branch) and the step benchmark's re-export facade. [779, 792, 800]
