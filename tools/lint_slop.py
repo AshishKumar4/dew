@@ -38,6 +38,12 @@ Scope is per rule, because the rules are not all about the same thing:
 - SLOP018 and SLOP019 are about `src/<package>`, the code a user's process
   runs: it sleeps, polls and retries only where it deals with what leaves
   the process, and it detects no feature by the exception its absence raises.
+- SLOP020 is about `tests` and `tools`: every accuracy comparison goes through
+  the one assertion of the gate (bible §7, `tests/reference_error.py`), so a
+  float compared within a tolerance anywhere else is a finding. The files that
+  still hold such comparisons are the inventory
+  (`tools/tolerance_inventory.json`), each at its count, lane and date, and it
+  only shrinks.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -70,11 +76,13 @@ from __future__ import annotations
 
 import argparse
 import ast
+import datetime
 import functools
 import hashlib
 import io
 import json
 import re
+import subprocess
 import sys
 import tokenize
 from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
@@ -1737,6 +1745,464 @@ def detections(module: Module) -> Iterator[Finding]:
                           "the version that has it")
 
 
+GATE = frozenset({"tests/reference_error.py", "tests/op_certificates.py", "tests/reference_graph.py",
+                  "tests/reference_trees.py", "tests/residual_orders.py", "tests/test_reference_error.py",
+                  "tests/test_op_certificates.py", "tests/test_reference_orders.py",
+                  "tests/test_reference_graph.py", "tests/test_gate_calibration.py"})
+"""The gate's modules and the tests of the gate itself, the one place a float is compared within a
+bound (bible §7, 2026-10-20): every other comparison goes through its assertion."""
+TOLERANT: dict[str, dict[str, tuple[int | None, float]] | None] = {
+    "numpy.testing.assert_allclose": {"rtol": (2, 1e-7), "atol": (3, 0)},
+    "numpy.allclose": {"rtol": (2, 1e-5), "atol": (3, 1e-8)},
+    "numpy.isclose": {"rtol": (2, 1e-5), "atol": (3, 1e-8)},
+    "jax.numpy.allclose": {"rtol": (2, 1e-5), "atol": (3, 1e-8)},
+    "jax.numpy.isclose": {"rtol": (2, 1e-5), "atol": (3, 1e-8)},
+    "torch.allclose": {"rtol": (2, 1e-5), "atol": (3, 1e-8)},
+    "torch.isclose": {"rtol": (2, 1e-5), "atol": (3, 1e-8)},
+    "math.isclose": {"rel_tol": (None, 1e-9), "abs_tol": (None, 0)},
+    "torch.testing.assert_close": {"rtol": (None, 1.3e-6), "atol": (None, 1e-5)},
+    "pytest.approx": {"rel": (1, 1e-6), "abs": (2, 1e-12)},
+    "numpy.testing.assert_almost_equal": None, "numpy.testing.assert_array_almost_equal": None,
+    "numpy.testing.assert_approx_equal": None, "numpy.testing.assert_array_max_ulp": None,
+    "numpy.testing.assert_array_almost_equal_nulp": None, "dew.accuracy.within": None,
+    "chex.assert_trees_all_close": None, "chex.assert_trees_all_equal_comparator": None,
+}
+"""The APIs that compare floats within a tolerance, as their imports resolve them (lint_scopes), however
+they are imported: each with its tolerances, their positional places (None: keyword only) and defaults,
+where a call can name them all zero and compare exactly (`_exact`), or None where it cannot.
+`assert_array_equal` and `==` compare exactly, and stay."""
+TOLERANT_METHODS = frozenset({"assertAlmostEqual", "assertNotAlmostEqual"})
+"""unittest's, on whatever test case calls them."""
+BOUNDED = frozenset({"numpy.testing.assert_array_less"})
+"""An ordering assertion, a tolerance when what it orders is an error (`_erring`)."""
+MAGNITUDES = frozenset({"abs", "numpy.abs", "numpy.absolute", "numpy.fabs", "jax.numpy.abs",
+                        "jax.numpy.absolute", "torch.abs", "math.fabs", "numpy.linalg.norm",
+                        "jax.numpy.linalg.norm", "torch.linalg.norm", "dew.accuracy.distance",
+                        "reference_error.distance"})
+"""What a hand-written tolerance takes of an error before comparing it with a bound."""
+TOLERANCE_KEYWORDS = frozenset({"atol", "rtol"})
+TOLERANCE_NAME = re.compile(r"(?:^|_)(?:tolerance|tol|atol|rtol)s?$", re.IGNORECASE)
+TIMING = re.compile(r"(?:^|_)(?:elapsed|durations?|seconds|timeout|wall|deadline|took|clock|perf_counter|"
+                    r"monotonic)(?:_|$)", re.IGNORECASE)
+"""Names a comparison of how long something took reads: a timeout is no value comparison."""
+INVENTORY = "tools/tolerance_inventory.json"
+
+
+def _called(node: ast.Call, table: Mapping[str, str]) -> str:
+    """A call's API through the scope's imports, or its bare built-in name (`abs`)."""
+    called = scopes.resolved(node.func, table)
+    if not called and isinstance(node.func, ast.Name):
+        return node.func.id
+    return called
+
+
+INTEGRAL_CALLS = frozenset({"range", "len", "int", "numpy.arange", "jax.numpy.arange", "torch.arange"})
+"""Calls whose values are whole numbers: indices, counts, positions."""
+CARRIED = frozenset({"sum", "max", "min", "abs", "tuple", "list", "sorted", "round"})
+"""Built-ins whose value is whole, or a time, when what they are given is."""
+CLOCKS = frozenset({"time.perf_counter", "time.monotonic", "time.time", "time.process_time",
+                    "time.perf_counter_ns", "time.monotonic_ns", "time.time_ns"})
+"""The clocks a time is read from."""
+
+
+@dataclass
+class _Reading:
+    """What SLOP020 knows of one file: each node's import table, its calls' definitions, and the ids of
+    its functions that return an error (`erring`) or only whole numbers (`counting`)."""
+    tables: Mapping[int, Mapping[str, str]]
+    calls: _Calls
+    erring: set[int]
+    counting: set[int]
+
+
+@dataclass
+class _Scope:
+    """One lexical scope: its nodes, and the names it binds to an error, to whole numbers only, and to
+    a time."""
+    node: ast.AST
+    nodes: list[ast.AST]
+    errors: set[str]
+    integral: set[str]
+    timed: set[str]
+
+
+def _defined(value: ast.Call, scope: _Scope, reading: _Reading, kinds: Set[int]) -> bool:
+    return any(id(definition) in kinds for definition in reading.calls.reached(scope.node, value))
+
+
+def _integral_value(value: ast.AST, integral: Set[str], scope: _Scope, reading: _Reading) -> bool:
+    """Whether `value` is a whole number by how it is made: a literal int, an integral call
+    (`INTEGRAL_CALLS`, `.integers`, a function of the file that returns only whole numbers), a shape,
+    a name bound only to whole numbers, a container or arithmetic of those."""
+    if isinstance(value, ast.Constant):
+        return type(value.value) is int
+    if isinstance(value, ast.Name):
+        return value.id in integral
+    if isinstance(value, ast.Attribute):
+        return value.attr in {"shape", "size", "ndim"}
+    if isinstance(value, ast.Subscript):
+        return _integral_value(value.value, integral, scope, reading)
+    if isinstance(value, ast.UnaryOp):
+        return _integral_value(value.operand, integral, scope, reading)
+    if isinstance(value, ast.IfExp):
+        return all(_integral_value(side, integral, scope, reading) for side in (value.body, value.orelse))
+    if isinstance(value, ast.Compare):
+        return True  # a truth value, a count of one or none
+    if isinstance(value, ast.BoolOp):
+        # `and` and `or` return one of their operands, whole only where each is.
+        return all(_integral_value(operand, integral, scope, reading) for operand in value.values)
+    if isinstance(value, ast.GeneratorExp | ast.ListComp | ast.SetComp):
+        return _integral_value(value.elt, integral, scope, reading)
+    if isinstance(value, ast.List | ast.Tuple | ast.Set):
+        return bool(value.elts) and all(_integral_value(element, integral, scope, reading)
+                                        for element in value.elts)
+    if isinstance(value, ast.BinOp) and not isinstance(value.op, ast.Div):
+        return all(_integral_value(side, integral, scope, reading) for side in (value.left, value.right))
+    if isinstance(value, ast.Call):
+        called = _called(value, reading.tables.get(id(value), {}))
+        counted = isinstance(value.func, ast.Attribute) and value.func.attr == "integers"
+        carried = called in CARRIED and bool(value.args) and all(
+            _integral_value(argument, integral, scope, reading) for argument in value.args)
+        return called in INTEGRAL_CALLS or counted or carried or _defined(value, scope, reading,
+                                                                          reading.counting)
+    return False
+
+
+def _timed_value(value: ast.AST, timed: Set[str], reading: _Reading) -> bool:
+    """Whether `value` is a time: a clock's reading (`CLOCKS`), a wall-clock name, attribute or key
+    (`TIMING`), a name bound to a time, or arithmetic and built-ins (`CARRIED`) of times. An arbitrary
+    call given a time returns no time."""
+    if isinstance(value, ast.Name):
+        return bool(TIMING.search(value.id)) or value.id in timed
+    if isinstance(value, ast.Attribute):
+        return bool(TIMING.search(value.attr))
+    if isinstance(value, ast.Subscript):
+        key = value.slice
+        named = isinstance(key, ast.Constant) and isinstance(key.value, str) and bool(
+            TIMING.search(key.value))
+        return named or _timed_value(value.value, timed, reading)
+    if isinstance(value, ast.UnaryOp):
+        return _timed_value(value.operand, timed, reading)
+    if isinstance(value, ast.BinOp):
+        return any(_timed_value(side, timed, reading) for side in (value.left, value.right))
+    if isinstance(value, ast.GeneratorExp | ast.ListComp | ast.SetComp):
+        return _timed_value(value.elt, timed, reading)
+    if isinstance(value, ast.DictComp):
+        return _timed_value(value.value, timed, reading)
+    if isinstance(value, ast.Call):
+        called = _called(value, reading.tables.get(id(value), {}))
+        method = isinstance(value.func, ast.Attribute) and value.func.attr == "total_seconds"
+        return called in CLOCKS or method or (
+            called in CARRIED and any(_timed_value(argument, timed, reading) for argument in value.args))
+    return False
+
+
+def _erring(value: ast.AST, scope: _Scope, reading: _Reading) -> bool:
+    """Whether `value` is an error: a magnitude (`MAGNITUDES`) of something that is not a whole number,
+    a name the scope bound to an error, or what a function of the file returns of one, the call
+    resolved to its definition (`_Calls.reached`)."""
+    for inner in ast.walk(value):
+        if isinstance(inner, ast.Name) and inner.id in scope.errors:
+            return True
+        if isinstance(inner, ast.Call):
+            called = _called(inner, reading.tables.get(id(inner), {}))
+            if called in MAGNITUDES and not all(_integral_value(argument, scope.integral, scope, reading)
+                                                for argument in inner.args):
+                return True
+            if _defined(inner, scope, reading, reading.erring):
+                return True
+    return False
+
+
+def _bound_names(target: ast.AST) -> list[str]:
+    """The names an assignment's target binds: a subscript or attribute target binds its base."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Tuple | ast.List):
+        return [name for element in target.elts for name in _bound_names(element)]
+    if isinstance(target, ast.Starred | ast.Subscript | ast.Attribute):
+        return _bound_names(target.value)
+    return []
+
+
+def _read_scope(scope_node: ast.AST, reading: _Reading) -> _Scope:
+    """A scope's names: bound only to whole numbers (the greatest set every assignment of keeps), to a
+    time, and to an error (each the least set its assignments make), the integral first."""
+    scope = _Scope(scope_node, list(scopes.own(scope_node)), set(), set(), set())
+    assigned: list[tuple[list[str], ast.AST]] = []
+    for node in scope.nodes:
+        if isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign) and node.value is not None:
+            for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                # `a, b = x, y` binds each name to its own value.
+                if isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple) and \
+                        len(target.elts) == len(node.value.elts):
+                    pairs = zip(target.elts, node.value.elts, strict=True)
+                    assigned += [(_bound_names(name), value) for name, value in pairs]
+                else:
+                    assigned.append((_bound_names(target), node.value))
+    integral = {name for names, _ in assigned for name in names}
+    while True:
+        kept = {name for name in integral
+                if all(_integral_value(value, integral, scope, reading) for names, value in assigned
+                       if name in names)}
+        if kept == integral:
+            break
+        integral = kept
+    scope.integral = integral
+    while True:
+        before = len(scope.errors) + len(scope.timed)
+        for names, value in assigned:
+            if _timed_value(value, scope.timed, reading):
+                scope.timed.update(names)
+            elif _erring(value, scope, reading):
+                scope.errors.update(name for name in names if name not in scope.integral)
+        if len(scope.errors) + len(scope.timed) == before:
+            return scope
+
+
+def _exact(node: ast.Call, called: str) -> bool:
+    """A tolerance call that compares exactly: each of its API's tolerances a literal zero, given by
+    keyword or position, or zero by default."""
+    declared = TOLERANT.get(called)
+    if declared is None:
+        return False
+    named = {keyword.arg for keyword in node.keywords}
+    for name, (place, default) in declared.items():
+        # pytest's approx given only `abs` holds that tolerance alone, its relative one unused.
+        if called == "pytest.approx" and name == "rel" and "abs" in named and "rel" not in named \
+                and len(node.args) <= place:
+            continue
+        given = next((keyword.value for keyword in node.keywords if keyword.arg == name), None)
+        if given is None and place is not None and len(node.args) > place:
+            given = node.args[place]
+        value = given.value if isinstance(given, ast.Constant) else (default if given is None else None)
+        if value != 0:
+            return False
+    return True
+
+
+def _slack(side: ast.AST) -> bool:
+    """Whether a side of an ordering adds a float to what it compares, or scales it by one: `b + 1e-6`,
+    `b * (1 + 1e-6)`, a rounding tolerance on one side of an inequality."""
+    if not isinstance(side, ast.BinOp) or not isinstance(side.op, ast.Add | ast.Sub | ast.Mult):
+        return False
+    return any((isinstance(operand, ast.Constant) and type(operand.value) is float
+                and operand.value != 0 and -1 < operand.value < 1) or _slack(operand)
+               for operand in (side.left, side.right))
+
+
+def _returns(function: ast.AST, reading: _Reading, holds, every: bool) -> bool:
+    """Whether the values `function` returns, at least one, `holds` in its own scope: `every` one of
+    them, or any."""
+    scope = _read_scope(function, reading)
+    returned = [node.value for node in scope.nodes if isinstance(node, ast.Return) and node.value is not None]
+    held = [holds(value, scope) for value in returned]
+    return bool(returned) and (all(held) if every else any(held))
+
+
+def _tolerance_comparisons(module: Module) -> Iterator[tuple[ast.AST, str]]:
+    """Each place a file compares floats within a tolerance, and what it is: a tolerance API that is not
+    told to compare exactly (`_exact`), `atol` or `rtol` handed to any call, an error (`_erring`, through
+    the scope's names and the file's functions) compared with a bound or ordered, a float within a slack,
+    and a name bound to a tolerance; none that compares a time (`_timed_value`)."""
+    tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
+    reading = _Reading(tables, _Calls(module.tree), set(), set())
+    nodes = [module.tree, *(node for node in ast.walk(module.tree) if isinstance(node, scopes.SCOPES))]
+    functions = [node for node in nodes if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)]
+    # A function counts when every value it returns is whole, and errs when any may be an error.
+    for kinds, holds, every in ((reading.counting, lambda value, scope: _integral_value(
+                                     value, scope.integral, scope, reading), True),
+                                (reading.erring, lambda value, scope: _erring(value, scope, reading), False)):
+        while True:
+            found = {id(function) for function in functions if _returns(function, reading, holds, every)}
+            if found <= kinds:
+                break
+            kinds |= found
+    for scope_node in nodes:
+        scope = _read_scope(scope_node, reading)
+        # Every node of a comparison or a tolerance call that compares a time.
+        timed = set()
+        for node in scope.nodes:
+            if isinstance(node, ast.Compare):
+                compared = [node.left, *node.comparators]
+            elif isinstance(node, ast.Call):
+                compared = [*node.args, *(keyword.value for keyword in node.keywords)]
+            else:
+                compared = []
+            if any(_timed_value(side, scope.timed, reading) for side in compared):
+                timed.update(id(inner) for inner in ast.walk(node))
+        for node in scope.nodes:
+            if id(node) in timed:
+                continue
+            if isinstance(node, ast.Call):
+                called = _called(node, tables.get(id(node), {}))
+                method = isinstance(node.func, ast.Attribute) and node.func.attr in TOLERANT_METHODS
+                if (called in TOLERANT or method) and not _exact(node, called):
+                    yield node, f"`{called or node.func.attr}`"
+                elif called in BOUNDED and node.args and _erring(node.args[0], scope, reading):
+                    yield node, f"`{called}` of an error"
+                elif called not in TOLERANT and any(keyword.arg in TOLERANCE_KEYWORDS
+                                                    for keyword in node.keywords):
+                    yield node, "a call given `atol`/`rtol`"
+            elif isinstance(node, ast.Compare) and any(isinstance(op, ast.Lt | ast.LtE | ast.Gt | ast.GtE)
+                                                       for op in node.ops):
+                sides = [node.left, *node.comparators]
+                erring = [side for side in sides if _erring(side, scope, reading)]
+                # A magnitude ordered against zero asks whether it is zero at all: an exact comparison.
+                others = [side for side in sides if side not in erring]
+                zero = bool(others) and all(isinstance(side, ast.Constant) and side.value == 0
+                                            and type(side.value) in (int, float) for side in others)
+                if erring and not zero:
+                    yield node, "an error compared with a bound"
+                elif any(_slack(side) for side in sides):
+                    yield node, "a float compared within a slack"
+            elif isinstance(node, ast.Assign | ast.AnnAssign):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                named = [target for target in targets
+                         if isinstance(target, ast.Name) and TOLERANCE_NAME.search(target.id)]
+                if named:
+                    yield node, f"a tolerance, `{named[0].id}`"
+
+
+def _inventory(checkout: Path) -> dict:
+    """The inventory as it is now: read again whenever the file changes, so one process reading two
+    states of a checkout sees each."""
+    path = checkout / INVENTORY
+    if not path.is_file():
+        return {}
+    stat = path.stat()
+    return _read_inventory(path, stat.st_mtime_ns, stat.st_size)
+
+
+@functools.cache
+def _read_inventory(path: Path, mtime: int, size: int) -> dict:
+    del mtime, size  # the cache's key: the file's state
+    return json.loads(path.read_text())
+
+
+def _git(checkout: Path, *arguments: str) -> str:
+    return subprocess.run(["git", *arguments], cwd=checkout, capture_output=True, text=True,
+                          check=True).stdout
+
+
+@functools.cache
+def _inventory_at(checkout: Path, commit: str) -> dict | None:
+    shown = subprocess.run(["git", "show", f"{commit}:{INVENTORY}"], cwd=checkout, capture_output=True,
+                           text=True, check=False)
+    return json.loads(shown.stdout) if shown.returncode == 0 else None
+
+
+def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict) -> Iterator[str]:
+    """How `commit`'s inventory `mine` is looser than `parent`'s `theirs`: a file added, a count raised,
+    a date moved later, its empty_by later; a file renamed between them carries its entry."""
+    renamed = {}
+    changes = _git(checkout, "diff", "--name-status", "-M", parent, commit, "--", "tests", "tools")
+    for change in changes.splitlines():
+        status, *paths = change.split("\t")
+        if status.startswith("R") and len(paths) == 2:
+            renamed[paths[1]] = paths[0]
+    if mine["empty_by"] > theirs["empty_by"]:
+        yield "moves empty_by later"
+    for name, entry in mine["files"].items():
+        kept = theirs["files"].get(name) or theirs["files"].get(renamed.get(name, ""))
+        if kept is None:
+            yield f"adds {name}"
+        elif entry["comparisons"] > kept["comparisons"] or entry["by"] > kept["by"]:
+            yield f"raises {name}'s count or moves its date"
+
+
+def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
+    """SLOP020's inventory never loosens. HEAD's is held to `base`'s merge-base with HEAD (main's, in
+    CI), and every commit in HEAD's history whose inventory differs from a parent's, merges included
+    (`--full-history`, no simplification), to that parent's (`_loosened`), from the commit that first
+    made it on. That commit has no parent's to keep, and no commit removes it once made. `--ratchet`
+    runs it (CI's lint job, on its whole history); a shallow checkout, or one without git, cannot
+    hold the inventory, and it says so rather than passing."""
+    try:
+        shallow = _git(checkout, "rev-parse", "--is-shallow-repository").strip() == "true"
+        # The walk starts where the inventory was first made: the history before it holds none.
+        made = _git(checkout, "log", "--full-history", "--diff-filter=A", "--reverse", "--format=%P", "HEAD",
+                    "--", INVENTORY).splitlines()
+        before = [f"^{parent}" for parent in (made[0].split() if made else [])]
+        listed = _git(checkout, "rev-list", "--full-history", "--parents", "HEAD", *before, "--", INVENTORY)
+        merged = _git(checkout, "merge-base", "HEAD", base).strip() if base else None
+    except (subprocess.CalledProcessError, FileNotFoundError) as error:
+        yield Finding(INVENTORY, 1, 1, "SLOP020", "holds the inventory to its history, which git cannot "
+                      f"read here ({error}); run with the repository's history")
+        return
+    if shallow:
+        yield Finding(INVENTORY, 1, 1, "SLOP020", "holds the inventory to its history, and this checkout is "
+                      "shallow: fetch it whole (`git fetch --unshallow`)")
+        return
+    head_id = _git(checkout, "rev-parse", "HEAD").strip()
+    head = _inventory_at(checkout, head_id)
+    if merged is not None:
+        kept = _inventory_at(checkout, merged)
+        if kept is not None and head is None:
+            yield Finding(INVENTORY, 1, 1, "SLOP020",
+                          f"HEAD removes the inventory {base}'s {merged[:9]} keeps")
+        elif kept is not None:
+            for why in _loosened(checkout, head_id, merged, head, kept):
+                yield Finding(INVENTORY, 1, 1, "SLOP020", f"HEAD against {base}'s {merged[:9]} {why}")
+    for line in filter(None, listed.splitlines()):
+        commit, *parents = line.split()
+        mine = _inventory_at(checkout, commit)
+        for parent in parents:
+            theirs = _inventory_at(checkout, parent)
+            if theirs is None:
+                continue
+            if mine is None:
+                yield Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} removes the inventory its parent "
+                              f"{parent[:9]} kept; an empty inventory stays, as `files: {{}}`")
+                continue
+            for why in _loosened(checkout, commit, parent, mine, theirs):
+                yield Finding(INVENTORY, 1, 1, "SLOP020",
+                              f"{commit[:9]} against its parent {parent[:9]} {why}")
+
+
+def _checkout(module: Module) -> Path:
+    return Path(module.path.as_posix().removesuffix(module.relative))
+
+
+def tolerances(module: Module) -> Iterator[Finding]:
+    """SLOP020: a float compared within a tolerance outside the gate (`GATE`, `_tolerance_comparisons`).
+    A file the inventory holds may keep its count until its date and the inventory's own (`empty_by`);
+    past either, or above its count, every comparison is reported; below it, the inventory is told to
+    come down, so the count it keeps is the file's and it only shrinks (`ratchet` holds every commit's
+    inventory to its parents')."""
+    if not module.relative.startswith(("tests/", "tools/")) or module.relative in GATE:
+        return
+    found = sorted(_tolerance_comparisons(module),
+                   key=lambda pair: (pair[0].lineno, pair[0].col_offset))
+    inventory = _inventory(_checkout(module))
+    entry = inventory.get("files", {}).get(module.relative)
+    gate = "go through the gate's assertion (tests/reference_error.py)"
+    if entry is None:
+        why = "not in the inventory"
+    else:
+        due = min(datetime.date.fromisoformat(entry["by"]),
+                  datetime.date.fromisoformat(inventory["empty_by"]))
+        if datetime.date.today() > due and not found:
+            yield Finding(module.relative, 1, 1, "SLOP020",
+                          f"{INVENTORY} still holds this file: remove its entry")
+            return
+        if datetime.date.today() > due:
+            why = f"past the inventory's date for it, {due.isoformat()}"
+        elif len(found) > entry["comparisons"]:
+            why = f"the inventory counts {entry['comparisons']}"
+        elif len(found) < entry["comparisons"]:
+            yield Finding(module.relative, 1, 1, "SLOP020",
+                          f"{INVENTORY} counts {entry['comparisons']} tolerance comparisons here and "
+                          f"the file holds {len(found)}: "
+                          + ("remove its entry" if not found else f"lower it to {len(found)}"))
+            return
+        else:
+            return
+    for node, what in found:
+        yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP020",
+                      f"{what} compares floats within a tolerance ({why}); {gate}")
+
+
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size)
 
@@ -1746,6 +2212,7 @@ def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]
     `models`, the package's index, or this file's own without one."""
     rules = (*CONTRACT_RULES, *UNIVERSAL_RULES) if module.is_source else UNIVERSAL_RULES
     rules = (*rules, mocks, wording, skips) if module.relative.startswith("tests/") else (*rules, patches)
+    rules = (*rules, tolerances)
     findings = [finding for rule in rules for finding in rule(module)]
     if module.is_source:
         findings += boundaries(module, models or ModelIndex.build([module]))
@@ -1796,9 +2263,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "package's source, tests, tools, recipes, examples, site, docs/assets and kernels")
     parser.add_argument("--root", type=Path, default=ROOT, help="the checkout (default: Dew's)")
     parser.add_argument("--package", default="dew", help="the package under src/ (default: dew)")
+    parser.add_argument("--ratchet", action="store_true",
+                        help="hold SLOP020's inventory to its git history (`ratchet`), the whole history")
+    parser.add_argument("--base", help="with --ratchet, the branch HEAD's inventory is held to (at their "
+                        "merge-base): origin/main in CI")
     parser.add_argument("--print-roots", action="store_true",
                         help="print the roots it reads by default; tools/pre-commit lints their staged files")
     args = parser.parse_args(argv)
+    if args.ratchet:
+        findings = list(ratchet(args.root.resolve(), args.base))
+        for finding in findings:
+            print(finding)
+        print(f"{len(findings)} findings", file=sys.stderr)
+        return 1 if findings else 0
     if args.print_roots:
         print(" ".join(default_roots(args.package)))
         return 0
@@ -1806,11 +2283,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     counts: dict[str, int] = {}
     files: dict[str, set[str]] = {}
     models = ModelIndex.build(list(collect([f"src/{args.package}"], args.root.resolve(), args.package)))
+    seen = set()
     for module in collect(roots, args.root.resolve(), args.package):
+        seen.add(module.relative)
         for finding in check(module, models):
             print(finding)
             counts[finding.code] = counts.get(finding.code, 0) + 1
             files.setdefault(finding.code, set()).add(finding.path)
+    if not args.roots:
+        # Every file the inventory names is read on a whole run, so one it names that is gone is stale.
+        for relative in sorted(set(_inventory(args.root.resolve()).get("files", {})) - seen):
+            print(Finding(INVENTORY, 1, 1, "SLOP020", f"names {relative}, which is gone: remove its entry"))
+            counts["SLOP020"] = counts.get("SLOP020", 0) + 1
+            files.setdefault("SLOP020", set()).add(INVENTORY)
     for code, count in sorted(counts.items()):
         print(f"{code}: {count} in {len(files[code])} files", file=sys.stderr)
     failures = sum(counts.values())
