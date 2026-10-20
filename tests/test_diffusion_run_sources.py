@@ -554,6 +554,10 @@ def test_a_flow_grpo_runs_rollout_is_its_own_record_beside_the_objective():
         dataclasses.replace(grpo_run(), objective=ObjectiveConfig("diffusion", {}))
     with pytest.raises(ValueError):
         FlowRolloutConfig(reward="no_such_metric")
+    parsed = DiffusionRunConfig.cli(["preset:flow", "--objective", "flow_grpo", "--rollout.reward", "psnr",
+                                     "--rollout.groups", "2", "--rollout.train-steps", "3"])
+    assert parsed.rollout == FlowRolloutConfig(reward="psnr", groups=2, train_steps=3)
+    assert DiffusionRunConfig.from_dict(parsed.to_dict()).rollout == parsed.rollout
 
 
 def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_path):
