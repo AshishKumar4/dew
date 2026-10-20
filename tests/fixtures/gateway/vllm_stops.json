@@ -101,9 +101,9 @@
      },
      "status": 200,
      "response": {
-      "id": "cmpl-ace59546ab29da01",
+      "id": "cmpl-80531ad4d27f1e3d",
       "object": "text_completion",
-      "created": 1792475700,
+      "created": 1792483114,
       "model": "Qwen/Qwen2.5-0.5B-Instruct",
       "choices": [
        {
@@ -416,7 +416,7 @@
        }
       ],
       "service_tier": null,
-      "system_fingerprint": "vllm-0.30.0-1feadc84",
+      "system_fingerprint": "vllm-0.30.0-nohash",
       "usage": {
        "prompt_tokens": 32,
        "total_tokens": 80,
@@ -545,9 +545,9 @@
      },
      "status": 200,
      "response": {
-      "id": "cmpl-a79a73ba1c505799",
+      "id": "cmpl-9085375fd8ab9bbd",
       "object": "text_completion",
-      "created": 1792475701,
+      "created": 1792483115,
       "model": "Qwen/Qwen2.5-0.5B-Instruct",
       "choices": [
        {
@@ -644,7 +644,7 @@
        }
       ],
       "service_tier": null,
-      "system_fingerprint": "vllm-0.30.0-1feadc84",
+      "system_fingerprint": "vllm-0.30.0-nohash",
       "usage": {
        "prompt_tokens": 32,
        "total_tokens": 44,
@@ -737,9 +737,9 @@
      },
      "status": 200,
      "response": {
-      "id": "cmpl-98359fedf3e82e7a",
+      "id": "cmpl-9f85ef96caca03fd",
       "object": "text_completion",
-      "created": 1792475702,
+      "created": 1792483115,
       "model": "Qwen/Qwen2.5-0.5B-Instruct",
       "choices": [
        {
@@ -830,7 +830,7 @@
        }
       ],
       "service_tier": null,
-      "system_fingerprint": "vllm-0.30.0-1feadc84",
+      "system_fingerprint": "vllm-0.30.0-nohash",
       "usage": {
        "prompt_tokens": 32,
        "total_tokens": 43,
@@ -917,9 +917,9 @@
      },
      "status": 200,
      "response": {
-      "id": "cmpl-acdb9096b9d52fa5",
+      "id": "cmpl-954eb30d86a55c79",
       "object": "text_completion",
-      "created": 1792475702,
+      "created": 1792483115,
       "model": "Qwen/Qwen2.5-0.5B-Instruct",
       "choices": [
        {
@@ -999,7 +999,7 @@
        }
       ],
       "service_tier": null,
-      "system_fingerprint": "vllm-0.30.0-1feadc84",
+      "system_fingerprint": "vllm-0.30.0-nohash",
       "usage": {
        "prompt_tokens": 32,
        "total_tokens": 35,
@@ -1014,5 +1014,6 @@
     }
    ]
   }
- ]
+ ],
+ "release": null
 }
