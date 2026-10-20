@@ -18,7 +18,7 @@ import pytest
 
 from dew import position
 from dew.data.cache import Cache
-from dew.data.compile import compile, iterate, validation
+from dew.data.compile import compile, iterate, publish, validation
 from dew.data.dataset import DataPartition, Loading
 from dew.data.mixing import SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import Configured, Pipeline, Rejected, mix
@@ -1039,6 +1039,24 @@ def test_a_token_mixture_weighs_laid_out_windows_by_the_rule_their_documents_wer
 
     left, right = delivered([corpus(0, 1), corpus(1, 5)], role, read)
     assert abs(left - right) <= most + most
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_token_mixture_weighs_a_published_generations_windows_by_its_documents_rule(tmp_path, read):
+    """A generation published from documents counted by a role's rule (`CountTargets(role=1)`)
+    stores a plan of its documents' lengths, which counts every target of a window: its pack lays
+    the documents out as their rows arrive, each window counted by that rule, so two such corpora
+    deliver equal role-1 targets, to within one window of each."""
+    from dew.data.steps.text import CountTargets
+
+    def corpus(source, scored):
+        prefix = Pipeline(roled(source, 7, scored), name=str(source)).filter_map(CountTargets(role=1))
+        cache = Cache(str(tmp_path / f"cache-{source}"), spool_bytes=4 * 1024**2, shard_bytes=256 * 1024)
+        generation = publish(prefix.pack(16, fields=ROLED), cache, read="indexed", loading=READ)
+        return prefix.cache(generation).pack(16, fields=ROLED).map(Sourced(source))
+
+    left, right = delivered([corpus(0, 1), corpus(1, 5)], 1, read)
+    assert abs(left - right) <= 12 + 12
 
 
 @pytest.mark.parametrize("layout", ["windows", "first-fit"])
