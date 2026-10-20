@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, equations, widened
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, widened
 from sharded import assert_sharded
 
 from dew.interop import Pretrained
@@ -630,3 +630,63 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
         return [leaf for leaf in jax.tree.leaves(tree) if np.issubdtype(leaf.dtype, np.floating)]
 
     assert_leaves_as_exact(floating(hosted), floating(resident), floating(truth))
+
+
+QWEN35_SEEDS = 16
+"""The training step's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`."""
+
+
+def qwen35(periods: int, **overrides):
+    """Qwen3.5's tiny decoder, three gated delta-net layers and one attention layer a period,
+    repeated `periods` times, with fresh weights."""
+    config = translate_config(json.loads((FIXTURES / "qwen35-tiny" / "config.json").read_text()))
+    period = tuple(config["layer_types"])
+    fields = {**config, "num_layers": len(period) * periods, "layer_types": period * periods,
+              "attention_impl": "reference", "max_seq_len": 16, **overrides}
+    fields.pop("dtype", None)
+    return models.build("causal_transformer", **fields)
+
+
+def test_a_training_step_scans_a_periodic_stack_as_one_body_and_trains_as_the_loop():
+    """Under `scan_layers`, a training step over resident weights scans a stack whose unlike layers
+    repeat one period (Qwen3.5's three delta-net layers and one attention layer) as one body of
+    the period's layers: the step's program is the same for two periods as for six, where the plain
+    loop traces every layer. The loss, every gradient, and every parameter and moment one AdamW step
+    leaves are as exact as the plain loop's (check 1), both from the loop's own float64 step."""
+    import optax
+
+    deep = qwen35(3)
+    ids = jax.random.randint(jax.random.key(1), (2, 12), 0, deep.vocab_size)
+    variables = deep.init(jax.random.key(0), ids)
+    adamw = optax.adamw(1e-3)
+
+    def stepped(model, variables, ids):
+        def loss(params):
+            logits = model.apply({**variables, "params": params}, ids[:, :-1], train=False)
+            return optax.softmax_cross_entropy_with_integer_labels(logits, ids[:, 1:]).mean()
+        value, gradient = jax.value_and_grad(loss)(variables["params"])
+        updates, moments = adamw.update(gradient, adamw.init(variables["params"]), variables["params"])
+        return {"loss": value, "gradient": gradient,
+                "params": optax.apply_updates(variables["params"], updates), "moments": moments}
+
+    def program(model):
+        held = model.init(jax.random.key(0), ids)
+        return sorted(str(equation.primitive) for equation in equations(jax.make_jaxpr(
+            lambda variables: stepped(model, variables, ids))(held)))
+
+    scanned_program = program(qwen35(2, scan_layers=True))
+    assert scanned_program == program(qwen35(6, scan_layers=True))
+    assert program(qwen35(2)) != program(qwen35(6))
+
+    scanned, plain = deep.clone(scan_layers=True), deep.clone(scan_layers=False)
+
+    def draw(seed):
+        return (jax.random.randint(jax.random.key(seed), (2, 12), 0, deep.vocab_size),)
+
+    def truth(ids):
+        with jax.enable_x64(new_val=True):
+            return stepped(qwen35(3, dtype=jnp.float64), widened(variables), ids)
+
+    assert_as_exact(jax.jit(lambda ids: stepped(scanned, variables, ids)),
+                    jax.jit(lambda ids: stepped(plain, variables, ids)), draw, "a periodic training step",
+                    seeds=QWEN35_SEEDS, truth_fn=truth)
