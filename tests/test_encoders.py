@@ -88,3 +88,63 @@ def test_condition_roundtrip_preserves_nondefault_character_embeddings():
     np.testing.assert_array_equal(contexts[0].hidden, contexts[1].hidden)
     np.testing.assert_array_equal(contexts[0].mask, contexts[1].mask)
     assert contexts[1].hidden.dtype == jnp.bfloat16
+
+
+def swap_two_prompt_tokens(folder, prompt: str) -> None:
+    """Give the first ordinary token `prompt` tokenizes to and the next ordinary one each other's id,
+    in every vocabulary file of the tokenizer in `folder`: the same text then tokenizes to other
+    ids."""
+    import json
+
+    from dew.data.text import load_tokenizer
+
+    tokenizer = load_tokenizer(str(folder))
+    special = set(tokenizer.all_special_ids)
+    first = next(index for index in tokenizer(prompt)["input_ids"] if index not in special)
+    second = next(index for index in range(first + 1, len(tokenizer)) if index not in special)
+    for name in ("tokenizer.json", "vocab.json"):
+        path = folder / name
+        if not path.is_file():
+            continue
+        data = json.loads(path.read_text())
+        vocab = data["model"]["vocab"] if name == "tokenizer.json" else data
+        if isinstance(vocab, list):
+            vocab[first], vocab[second] = vocab[second], vocab[first]
+        else:
+            named = {index: token for token, index in vocab.items()}
+            vocab[named[first]], vocab[named[second]] = second, first
+        path.write_text(json.dumps(data))
+
+
+@pytest.mark.parametrize("family, archive, inside, tokenizer", [
+    ("sd", "tiny_diffusers", "sd", "tokenizer"),
+    ("sd3", "sd3_source", "pipeline", "tokenizer_3"),
+    ("z_image", "z_image_source", "pipeline", "tokenizer"),
+    ("wan", "wan_pipeline", "pipeline", "tokenizer"),
+])
+def test_a_pipelines_conditioner_records_the_tokenizer_files_it_reads(tmp_path, family, archive, inside,
+                                                                       tokenizer):
+    """A published pipeline's text conditioner tokenizes with the tokenizer files it finds and
+    records their hashes, each of its towers' (an SD3's T5 as well as its CLIPs): a pipeline loaded
+    again in the same process after a tokenizer's vocabulary moved two ids tokenizes a caption to
+    other ids, and the identity an exact resume checks those ids against moves with them."""
+    import tarfile
+    from pathlib import Path
+
+    from dew.interop.pretrained import load_diffusion_source
+
+    with tarfile.open(Path(__file__).parent / "fixtures" / f"{archive}.tar.xz") as opened:
+        opened.extractall(tmp_path, filter="data")
+    directory = tmp_path / inside
+
+    def loaded():
+        source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+        encoder = source.inputs.conditions["conditioning"].encoder
+        return [np.asarray(ids) for ids in jax.tree.leaves(encoder.tokenize(["a red bird"]))], \
+            encoder.dependencies()
+
+    (ids, recorded) = loaded()
+    swap_two_prompt_tokens(directory / tokenizer, "a red bird")
+    (moved_ids, moved) = loaded()
+    assert any(not np.array_equal(old, new) for old, new in zip(ids, moved_ids, strict=True)), family
+    assert moved != recorded, family

@@ -703,10 +703,13 @@ class Layout:
         return ((("activation_batch", self.data_axes),) if self.data_axes else ()) + rules
 
     def _refuse_unknown(self, mesh: Mesh | AbstractMesh) -> None:
-        """Refuse rules naming an axis `mesh` lacks, unless it is one of Dew's
-        role axes (`MESH_AXES`), which a mesh without them treats as size 1."""
-        unknown = sorted({axis for _, assignment in self.axis_rules for axis in mesh_axes(assignment)}
-                         - set(mesh.axis_names) - set(MESH_AXES))
+        """Refuse rules naming an axis `mesh` lacks. Dew's own rules (`DEFAULT_RULES`) name its role
+        axes (`MESH_AXES`) for any mesh, and one without such an axis takes it as size 1; a rule of
+        your own names an axis you mean to split over, and one the mesh lacks would split nothing."""
+        defaults = set(_rule_table(DEFAULT_RULES))
+        named = {axis for rule in self.axis_rules for axis in mesh_axes(rule[1])
+                 if rule not in defaults or axis not in MESH_AXES}
+        unknown = sorted(named - set(mesh.axis_names))
         if unknown:
             raise ValueError(f"the rules name the axes {unknown}, which this mesh, with axes "
                              f"{list(mesh.axis_names)}, does not have")
