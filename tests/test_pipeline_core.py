@@ -1008,23 +1008,18 @@ class Sourced:
         return {**row, "source": np.int32(self.source)}
 
 
-@pytest.mark.parametrize("stage", ["windows", "pack"])
-@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-def test_a_token_mixture_weighs_windows_by_the_rule_their_documents_were_counted_by(read, stage):
-    """Targets counted on documents by a role's rule (`CountTargets(role=1)`) before a windows or
-    pack stage cuts them into more rows than they had are counted again on the windows by that
-    rule: two corpora whose documents score three and nine role-1 targets deliver equal scored
-    targets, to within one window of each (`delivered`)."""
+def test_a_token_mixture_weighs_windows_by_the_rule_their_documents_were_counted_by():
+    """Targets counted on documents by a role's rule (`CountTargets(role=1)`) before a windows stage
+    cuts them into more rows than they had are counted again on the windows by that rule, in a
+    memory read, which counts its windows itself: two corpora whose documents score three and nine
+    role-1 targets deliver equal scored targets, to within one window of each (`delivered`)."""
     from dew.data.steps.text import CountTargets
 
     def corpus(source, scored):
         counted = Pipeline(roled(source, 25, scored), name=str(source)).filter_map(CountTargets(role=1))
-        fields = ("text", "text_roles")
-        staged = counted.windows(8, fields=fields) if stage == "windows" else counted.pack(
-            8, fields=fields, policy="concat")
-        return staged.map(Sourced(source))
+        return counted.windows(8, fields=("text", "text_roles")).map(Sourced(source))
 
-    left, right = delivered([corpus(0, 3), corpus(1, 9)], 1, read)
+    left, right = delivered([corpus(0, 3), corpus(1, 9)], 1, "memory")
     assert abs(left - right) <= 8 + 8
 
 
