@@ -544,8 +544,7 @@ class Objective(ABC, Generic[Loss, Effects]):
     can say: a diffusion objective samples with a loaded pipeline's own
     guidance, else its fallback (`RunConfig.recorded`)."""
 
-    def optimizer(self, tx: optax.GradientTransformation, *,
-                  accumulation: int) -> optax.GradientTransformation:
+    def optimizer(self, tx: optax.GradientTransformation) -> optax.GradientTransformation:
         """Return the optimizer the trainer steps this objective's `params` with, built from `tx`.
 
         The default returns `tx` itself. An objective that trains several
@@ -553,12 +552,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         that critiques it, can give each network its own copy of `tx`, with
         its own state and update count, by `optax.multi_transform` over the
         networks. It can then alternate them with `optax.conditionally_mask`,
-        whose count is the trainer's number of committed updates.
-
-        `accumulation` is the trainer's setting. An objective whose loss
-        alternates networks from one update to the next refuses more than one
-        microbatch per update, because an accumulation window would mix the
-        phases.
+        whose count is the trainer's number of committed updates, the clock
+        its loss reads as `Step.updates`: every microbatch an update
+        accumulates is of that update's phase, however many it takes.
         """
         return tx
 

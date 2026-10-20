@@ -11,7 +11,7 @@ An `Objective` defines what a run learns. It creates the variables, computes the
 | `evaluate(variables, batch, step)` | No | Scoring artifacts for a validation batch |
 | `preview(variables, batch, step, *, scored=None)` | No | Display artifacts, once per evaluation event |
 | `ema` | No | An `EMASpec`, or `None` for no moving average |
-| `optimizer(tx, *, accumulation)` | No | The optimizer the trainer steps `params` with; `tx` by default |
+| `optimizer(tx)` | No | The optimizer the trainer steps `params` with; `tx` by default |
 | `averages(update)` | No | Whether an update moves the EMA; every update by default |
 | `program(name, function, *, static_argnames=())` | No; you call it | `function` jitted as the objective's program `name`, compiled again when the trainer replaces its modules |
 
@@ -79,9 +79,9 @@ The state is built in one place, `Trainer.initial_state(initializer=None, key=No
 
 ## Several networks, several optimizers
 
-An objective that trains more than one network can give each network its own optimizer. Two examples are a few-step student trained beside the fake score that criticizes it (rCM, DMD2), and a generator trained beside its discriminator. `optimizer(tx, *, accumulation)` returns the optimizer the trainer steps `params` with, built from the `tx` you gave `Trainer`.
+An objective that trains more than one network can give each network its own optimizer. Two examples are a few-step student trained beside the fake score that criticizes it (rCM, DMD2), and a generator trained beside its discriminator. `optimizer(tx)` returns the optimizer the trainer steps `params` with, built from the `tx` you gave `Trainer`.
 
-In the example below, `optax.multi_transform` gives each network its own copy of `tx`, with its own moments, count and schedule. `optax.conditionally_mask` steps a copy only on its own network's updates, so Adam's momentum cannot move one network during another's update. The mask counts the trainer's committed updates, which at `accumulation=1` is also the `step.step` the loss reads. An objective that alternates refuses a larger accumulation, because one accumulation window would mix the two phases. `averages(update)` says which updates move the EMA:
+In the example below, `optax.multi_transform` gives each network its own copy of `tx`, with its own moments, count and schedule. `optax.conditionally_mask` steps a copy only on its own network's updates, so Adam's momentum cannot move one network during another's update. The mask counts the trainer's committed updates, which the loss reads as `step.updates`, so every microbatch an update accumulates is of that update's phase. `step.step` counts accepted microbatches, the clock a schedule reads. `averages(update)` says which updates move the EMA:
 
 ```python
 import jax
@@ -98,12 +98,10 @@ class Players(Objective):
         return update % 2 == 0
 
     def loss(self, variables, batch, step):
-        return jax.lax.cond(self.generating(step.step), self.generator_loss,
+        return jax.lax.cond(self.generating(step.updates), self.generator_loss,
                             self.discriminator_loss, variables["params"], batch)
 
-    def optimizer(self, tx, *, accumulation):
-        if accumulation > 1:
-            raise ValueError("the players alternate update by update; train with accumulation=1")
+    def optimizer(self, tx):
         return optax.multi_transform(
             {"gen": optax.conditionally_mask(tx, self.generating),
              "disc": optax.conditionally_mask(tx, lambda update: ~self.generating(update))},

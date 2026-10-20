@@ -455,7 +455,7 @@ class Trainer(Generic[Loss, Effects]):
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
         self._config = None if built else optimizer
-        self._optimizer = objective.optimizer(optimizer, accumulation=accumulation) if built else None
+        self._optimizer = objective.optimizer(optimizer) if built else None
         from dew.nn.inputs import request_key
         self.seed = int(key) if isinstance(key, (int, np.integer)) and not isinstance(key, bool) else None
         self.key = request_key(key)
@@ -1461,7 +1461,7 @@ class Trainer(Generic[Loss, Effects]):
         if self._config is None:
             return
         built = self._config.build(updates)
-        self._optimizer = self.objective.optimizer(built, accumulation=self.accumulation)
+        self._optimizer = self.objective.optimizer(built)
 
     def _training_loop(self, plan: _FitPlan, run: _FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,
