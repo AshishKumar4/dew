@@ -198,7 +198,10 @@ def test_a_sequence_split_holds_the_state_in_shares_and_trains_what_one_device_t
     fsdp of as many devices lays it, every device holding the same share, and one step trains what
     one device trains."""
     shardings, _, (loss, trained) = stepped(mesh, devices)
-    grouped, _, _ = stepped(MeshSpec(fsdp=devices), devices)
+    model = tiny(max_seq_len=LENGTH, tie_embeddings=False)
+    params = LMObjective(model, LENGTH).init(jax.random.key(0))["params"]
+    fsdp = MeshSpec(fsdp=devices).build(jax.devices()[:devices])
+    grouped = Layout(min_shard=TINY_SHARD).shardings(fsdp, params)
 
     def shares(placement):
         return [sharding.shard_shape(np.shape(leaf))
