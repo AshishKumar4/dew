@@ -2,7 +2,7 @@
 
 This page records the original API design and how it was built. The statistics-first C01/C02 cutover replaced its scalar-loss, MultiSteps, mutable-router and checkpoint-field examples. Its registry decorators and name records were later replaced by import paths and static aliases (`dew.registry`). For contracts you can run, read the [current core API](../reference/core-api.md) and the [objective guide](../concepts/objectives.md).
 
-Design record, 2026-09-03. The code blocks are design sketches, not runnable code. The examples and ticket states below describe the revisions they cite.
+Design record, 2026-09-03. The code blocks are design sketches, not runnable code. The examples describe the revisions they cite. [Training](training.md), [data](data.md) and [post-training](post-training.md) define the binding topic contracts; the [roadmap](../roadmap.md) owns implementation and qualification work.
 
 ## 0. The decisions
 
@@ -14,7 +14,7 @@ Design record, 2026-09-03. The code blocks are design sketches, not runnable cod
 | 4 | Randomness is a `key` argument. `RandomMarkovState` goes. Step keys are `fold_in(run_key, step)`. | 3.2 |
 | 5 | Effects live in capabilities handed to the trainer (`Tracker`, `Checkpoints`). Constructing anything opens nothing. | 3.4 |
 | 6 | An unknown name or field raises. No dropped keys, no swallowed keyword arguments, no `+suffix` string DSL. | 3.1, 3.9 |
-| 7 | No migrations and no converters. Dew is unpublished; the checkpoint layout, the state tree and the config shape change outright. `CONTRIBUTING.md`'s "frozen" list becomes "frozen at 1.0". | 9, T22 |
+| 7 | No migrations and no converters. Dew is unpublished; the checkpoint layout, the state tree and the config shape change outright. `CONTRIBUTING.md`'s "frozen" list becomes "frozen at 1.0". | [Contribution rules](../../CONTRIBUTING.md#design) |
 | 8 | Diffusion vocabulary stays (`NoiseScheduler`, `PredictionTransform`, the sampler names). Ownership moves into one `Process` value per convention; presets are dataclasses in a registry. | 3.5 |
 | 9 | Discrete diffusion gets its own small algebra in `dew.diffusion.discrete`, shaped like the Gaussian one. It is not a special case of it. | 6.1 |
 | 10 | The objective's loss returns an `Aux` that can carry updated non-parameter collections. That is the one channel for MoE balancing, batch statistics and sown values. | 3.3, 6.2 |
@@ -354,26 +354,12 @@ The mixer keeps its recurrent state in the `cache` collection, exactly as the KV
 
 ### 6.5 What the design does not do
 
-| Need | Status |
+| Need | Boundary |
 | --- | --- |
 | Alternating or multi-optimizer updates (GAN, actor-critic) | Not one `loss`. `Trainer(step=make_my_step)` replaces the compiled step and is the one documented place for a custom step. |
 | Tensor or sequence parallel | `MeshSpec(tensor=N)` and rules are cheap; correct TP needs `with_sharding_constraint` on activations inside each model. Per-architecture work. |
 | Pipeline parallel | Out of scope. |
 | Non-grain data | `Dataset.train` is any callable returning an iterator; without `get_state` the run cannot checkpoint its position and `fit` says so. |
-
-## 7. Order of work
-
-| Wave | Content | Acceptance |
-| --- | --- | --- |
-| 0 | The confirmed bugs, each with the failing test first | Merged: `3d30a35` through `b39c62a` |
-| 1 | `Registry` and decorators for models, presets, samplers, datasets, encoders, metrics; strict `build`; `scan_order` field | `models["x"] is models.X`; unknown key raises; `grep '+hilbert'` empty |
-| 2 | `TrainState`, `Step`, `Aux`, narrowed `Objective`, general `Trainer`, `Tracker`, `Checkpoints`. LM first, then JEPA, then diffusion | `dew.training` imports nothing from `dew.diffusion`, `dew.inputs`, `wandb`; JEPA example imports nothing from diffusion |
-| 3 | `Process`, preset dataclasses, `InputSpec` and `Condition`, pure `sample`, solver protocol, `dew.diffusion.discrete` | sampler tests pass unchanged in value; `grep RandomMarkovState` empty; no default seed anywhere |
-| 4 | `Dataset` value, one dataset registry | one registry; `train/samples_per_sec` uses the real global batch |
-| 5 | `@logical_axes` on models, `Layout` merge, Muon through it | every registered model's parameters are declared or listed as heuristic; a rename of a declared field fails that test |
-| 6 | `Manifest`, pipelines, publish as a recipe step, docs and tutorials on the new surface | `Pipeline.from_run` reproduces training's `Process` exactly |
-
-Waves 1, 4 and 5 are mechanical and go to workhorse agents with a lead review of every diff. Waves 2, 3 and 6 carry the judgement and go to at most three expert agents.
 
 ## 8. How to build against this design
 
@@ -383,48 +369,6 @@ Waves 1, 4 and 5 are mechanical and go to workhorse agents with a lead review of
 - A new metric is a function `(artifact, batch) -> value` behind `@metrics(name)`.
 - A new tracker implements `Tracker` and registers renderers with `singledispatch`.
 - A new recipe is a frozen dataclass implementing Recipe.pipelines(), registered as a dataset alias. All execution goes through Pipeline and compile.
-
-## 9. Tickets
-
-Status: `open`, `done` with the commit, or `held` with the reason. Type: `fix`, `design`, `docs`. Suggested owner: `workhorse` (task agent with lead review) or `expert`.
-
-| # | Type | Owner | Title | Acceptance |
-| --- | --- | --- | --- | --- |
-| T1 | fix | done `911f5ec` | DDPM posterior variance for any schedule | `test_karras_sampler_converges[DDPMSampler]` green |
-| T2 | fix | done `a65d447` | Inference rebuilds the preset with the run's parameters | `test_parse_config_samples_with_the_trained_flow_shift` green |
-| T3 | fix | done `362b75f` | PSNR and SSIM on the objective's scale | perfect reconstruction scores inf and 1.0 |
-| T4 | fix | done `7c2ddd6` | Missing `val.bin` raises | `test_load_data_refuses_a_token_directory_without_a_val_split` green |
-| T5 | fix | done `f3ea98b` | Global batch must split over processes | `test_a_global_batch_that_does_not_split_over_the_processes_is_refused` green |
-| T6 | fix | done `b52c6ec` | No guessed cardinality; `count` validated | `test_a_source_without_a_length_needs_an_explicit_count` green |
-| T7 | fix | done `a6c4e46` | Dead posterior API removed | grep empty |
-| T8 | fix | done `e25bba9` | Sigma integrators refuse non-VE schedules | `test_sigma_integrators_reject_a_vp_schedule` green |
-| T9 | docs | open, workhorse | Time embedding parity note | `flow.py:53` comment corrected; `docs/references.md` states SimpleDiT's embedder is EDM's Fourier one, not DiT's sinusoidal one |
-| T10 | docs | open, workhorse | State the discrete default weighting | `DiscreteNoiseScheduler` docstring says `p2_loss_weight_gamma=1` makes the v preset an x0 loss; the preset docstring too |
-| T11 | fix | done `5ab6400` | Validation samples seeded from the state | `test_validation_samples_follow_the_step` green |
-| T12 | design | wave 2 | Validation options as objective constructor arguments | no `**kwargs` on `fit` |
-| T13 | fix | done `6b747dc` | Validation failures propagate | `test_a_failing_metric_fails_the_validation_pass` green |
-| T14 | fix | done `2cdd7ae` | `parse_config` leaves warning filters alone | `test_parse_config_leaves_warning_filters_untouched` green |
-| T15 | fix | done `7cc6bb3` | Schedule constructors reject unknown keywords | `test_misspelled_keyword_is_rejected` green |
-| T16 | fix | done `8b34869` | `build_model` rejects unknown keys | `test_build_model_rejects_config_keys_the_model_has_no_field_for` green |
-| T17 | fix | done `6ce8bef` | `learn_sigma` removed | grep empty |
-| T18 | design | wave 2, expert | MoE balancing through `Aux.variables` | a from-scratch MoE run logs per-expert load and the DeepSeek bias moves |
-| T19 | design | wave 3, expert | Frozen encoder params placed by the layout | the train step's jaxpr carries no encoder constants |
-| T20 | design | wave 2 | Drop `metrics`, `dynamic_scale`, `rngs`, `best_loss`, `epoch` from the state and checkpoint | checkpoint leaves are `step`, `params`, `opt_state`, `ema`, `key`, `position` |
-| T21 | fix | open, workhorse | `GeneralizedNoiseScheduler.get_schedule_weights` is EDM lambda | base weight is `1/sigma_data**2 + 1/sigma**2`, the KarrasVE override deleted, `CosineGeneralNoiseScheduler` takes `sigma_data` again; test against Karras et al. 2022 Eq. 8 |
-| T22 | docs | open, workhorse | `CONTRIBUTING.md` frozen list becomes "frozen at 1.0"; migrations are not required before that | text changed; `AGENTS.md` mirrors it |
-| T23 | fix | open, workhorse | Text conditioning mean-pools with the attention mask | `ConditioningEmbed` takes the mask; padded rows do not move the vector (numerics change, needs the lead's sign-off on retraining the gallery models) |
-| T24 | design | wave 2 | Rejected dynamic-scale steps | done `d35ee68`; the design keeps that gate |
-| T25 | fix | open, workhorse | `AutoEncoder.__encode__` and `__decode__` become `encode_batch` and `decode_batch` | no invented dunders |
-| T26 | fix | done `5bc43e7` | First throughput tick excludes the compile | `test_the_first_log_tick_measures_steps_not_the_compile` green |
-| T27 | fix | done `9e27b67` | `SimpleTrainer` is not a dataclass | `dataclasses.is_dataclass(SimpleTrainer)` is False |
-| T28 | fix | open, workhorse | `eval/inception.py:48` unpickles weights referencing `numpy.core.numeric` | the network FID test passes under the repo's warnings-as-errors rule |
-| T29 | fix | open, workhorse | `recipes/diffusion/train.py:35` silences all warnings | line removed; any surfaced warning fixed at its source |
-| T30 | fix | open, workhorse | `load_from_checkpoint` restores without sharding args | no orbax "Sharding info not provided" warning in `tests/test_inference.py` |
-| T31 | fix | open, workhorse | `get_dataset_online` dead `method` and `read_buffer_size`; `augmax` in `pyproject.toml` with no importer | parameters and dependency removed |
-| T32 | docs | open, workhorse | `docs/concepts/objectives.md` and `docs/api.md` describe the wave 2 surface once it lands | pages match the code |
-| T33 | design | wave 3 | `dew.diffusion.discrete`: `MaskingSchedule`, `DiscreteProcess`, unmasking solver, `presets.MDLM` | a masked diffusion LM trains on the LM data path with no trainer change |
-| T34 | design | wave 2 | `Trainer(step=...)` escape hatch | a GAN-style alternating step runs on the same checkpoints and tracker |
-| T35 | docs | open, workhorse | `tests/test_architectures.py:290` docstring (done in the docs commit) and `tests/test_parallelism.py:855` pattern note | docstrings describe the raising loop |
 
 ## 10. What may be condensed
 
@@ -449,22 +393,3 @@ Every independent dial stays flat, and that is most of the fields. `qk_norm`, `v
 Deleted rather than grouped: `mlp_ratio` beside `mlp_features`, because the intermediate size is the primitive and the ratio restates it; `profile_steps`, which restates one field of the `ProfileWindow` value the trainer already takes, so the config carries the value; `per_layer_input_dim: int = 0`, whose zero becomes None; and `use_double_wide_mlp`, which today does nothing at all unless layers share their keys and values, so it is refused by name in that combination.
 
 Not condensed, on the second reading: `norm_eps` with the three norm-placement switches, and the attention dials with the head geometry. Each is an independent dial, so each stays a field.
-
-
-## 11. Where the built surface differs from this design
-
-I checked this table against the tree at the time. None of these rows gives up a decision from section 0. Each is a name or a shape that changed during the build.
-
-| Drafted | Built | Why |
-| --- | --- | --- |
-|`Manifest` written next to the checkpoints (3.9)|`RunConfig.save` writes `run.json`, and `RunConfig.load` reads it back into the same class|The resolved config already was the record. A second type holding the same fields would have been the drift section 10 forbids.|
-|`Solver.step(x, t, t_next, denoised, eps, state, key, process)` (3.5)|the same, with the denoiser as the last argument|Heun's corrector and RK4's stages evaluate the model again inside one step. Noted in 3.5 when it was found.|
-|`metrics = Registry[Callable[..., Metric]]` (3.1)|`Registry[Callable[..., Any]]`|A metric is a structural `Protocol`, so the factory's return cannot be spelled as the protocol without making every metric declare it nominally.|
-|`Condition.unconditional: Any` (3.6)|`str | float`|Those are the two things an unconditional branch substitutes today, and `Any` at a public field hides which.|
-|`pipelines.TextToImage.from_run` / `.from_pretrained` (3.10)|both built, plus `dew.io.publish(directory, name, tracker=)` as the one publishing path|Publishing left the trainer, as decision 5 asks; a recipe calls it after `fit`.|
-|`objectives` registry (3.1)|built, with `diffusion`, `masked_diffusion`, `jepa` and `lm` registered|As drafted. Recorded here because the design's example code predates the registry existing.|
-|`Trainer(step=...)` escape hatch (decision 11, T34)|built as `step: Callable[[Objective, GradientTransformation], StepFn] | None`|As drafted. It replaces the compiled body only; a rollout is host-side and effectful, so it is not this seam. `docs/design/post-training.md` section 4 states that boundary.|
-
-Section 10 itself records what it added later and what the second reading narrowed. The ticket table in section 9 records the state at the time of the review and is not maintained against `main`; the suite and `tests/test_api_surface.py` are.
-
-Correction (2026-09-22): three rows of the table above have moved on. The `metrics` registry is now `Registry[Callable[..., Metric], Metric]` (`src/dew/registry.py:479`). `Condition.unconditional` is `str | float | Mapping[str, object]` (`src/dew/inputs/__init__.py:63`). The `objectives` registry also holds `block_diffusion`, `dpo`, `grpo`, `ppo`, `flow_grpo` and `distillation`. `tests/test_api_surface.py` was deleted in `93a8ee10` (2026-09-06), so only the suite checks the surface now. The other rows still hold: `RunConfig.save` and `RunConfig.load` (`src/dew/config/__init__.py:475-488`), `TextToImage.from_run` and `.from_pretrained` (`src/dew/sampling/pipelines.py:156`, `:182`), `dew.io.publish(directory, name, *, tracker)` (`src/dew/io.py:20`), and `Trainer(step=...)` (`src/dew/training/trainer.py:200`).

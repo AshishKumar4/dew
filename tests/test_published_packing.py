@@ -26,7 +26,7 @@ def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tm
     policy = prefix.flat_map(Chunks(9)).pack(9, bins=3)
     generation = publish(policy, Cache(str(tmp_path / "cache"), spool_bytes=4 * 1024**2,
                                       shard_bytes=256 * 1024), read="indexed", loading=READ)
-    warm = compile(Pipeline(source).cache(generation).pack(9, bins=3).shuffle(3).repeat().batch(4),
+    warm = compile(prefix.flat_map(Chunks(9)).cache(generation).pack(9, bins=3).shuffle(3).repeat().batch(4),
                    read="indexed", seed=3, loading=READ)
     cold = compile(policy.shuffle(3).repeat().batch(4), read="memory", seed=3, loading=READ)
     assert warm.plan.lowering == "global"
@@ -126,9 +126,9 @@ def test_a_pack_places_documents_whole_and_refuses_one_its_window_cannot_hold(tm
     assert not isinstance(pinned, (Mixture, Phases))
     generation = filled.publish(_cache_manifest(pinned, prepared.stages, "indexed"), pinned, plan=cut)
     with pytest.raises(ValueError):
-        compile(Pipeline(source).cache(generation).pack(9, bins=3).repeat().batch(4), read="indexed",
+        compile(prefix.cache(generation).pack(9, bins=3).repeat().batch(4), read="indexed",
                 loading=READ)
-    chunked = compile(Pipeline(source).cache(generation).flat_map(Chunks(9)).pack(9, bins=3).repeat()
+    chunked = compile(prefix.cache(generation).flat_map(Chunks(9)).pack(9, bins=3).repeat()
                       .batch(4), read="indexed", loading=READ)
     cold = compile(prefix.flat_map(Chunks(9)).pack(9, bins=3).repeat().batch(4), read="memory", loading=READ)
     left, right = chunked.train(DataPartition()), cold.train(DataPartition())

@@ -16,8 +16,9 @@ Which weights: the parameters whose one use in the loss is that cast
 sums its cotangents where it is used; read through a bf16 copy those sums
 would be bf16 where they are fp32 now, so such a weight keeps its fp32
 read. A call the loss passes the weight into unchanged (`pjit`, a
-rematerialized region, a scan over stacked layers) is followed; any other
-use, a custom VJP's included, keeps it.
+rematerialized region, a scan over stacked layers) is followed, and so is
+the stack a scanned run builds of its layers' weights, whose cast is the
+stack of their casts; any other use, a custom VJP's included, keeps it.
 
 A step that pools several microbatches into one update, by accumulation or
 a batch read in parts, reads one set of copies through its window and
@@ -64,18 +65,59 @@ def _inner(eqn, index: int):
     return inner, inner.invars[index]
 
 
-def _cast_once(var, jaxpr) -> jnp.dtype | None:
-    """The narrower float dtype `var`'s one use in `jaxpr` casts it to, or None."""
-    uses = [(eqn, index) for eqn in jaxpr.eqns for index, operand in enumerate(eqn.invars) if operand is var]
-    if len(uses) != 1 or var in jaxpr.outvars:
+_STACKING = ("stack", "reshape", "expand_dims", "squeeze", "broadcast_in_dim", "concatenate")
+"""The ops a stack of layers builds its operand with, each element of the result one of its
+operands': a cast of the result is the stack of its operands' casts, and its cotangent's slices are
+theirs."""
+
+
+def _uses(var, jaxpr) -> list[tuple]:
+    return [(eqn, index) for eqn in jaxpr.eqns for index, operand in enumerate(eqn.invars) if operand is var]
+
+
+def _read_once(var, jaxpr) -> bool:
+    """Whether `var` is read by one equation of `jaxpr` and returned by none."""
+    return len(_uses(var, jaxpr)) == 1 and var not in jaxpr.outvars
+
+
+def _cast_once(var, jaxpr, weights: frozenset) -> jnp.dtype | None:
+    """The narrower float dtype `var`'s one use in `jaxpr` casts it to, or None: through a call
+    that passes it on (`_inner`), and through the stack a scanned run builds of its layers'
+    weights (`_STACKING`), whose stacked operand the scan slices and casts. A stack of several is
+    followed only where every operand is a weight (`weights`, the variables in `jaxpr` the
+    parameters are bound to) of the one dtype read nowhere else, each copied as the others are: the
+    stack takes one dtype, which a copy of some and not others would split."""
+    if not _read_once(var, jaxpr):
         return None
-    eqn, index = uses[0]
+    eqn, index = _uses(var, jaxpr)[0]
     if eqn.primitive.name == "convert_element_type":
         dtype = jnp.dtype(eqn.params["new_dtype"])
         narrower = jnp.issubdtype(dtype, jnp.floating) and dtype.itemsize < var.aval.dtype.itemsize
         return dtype if narrower else None
+    if eqn.primitive.name in _STACKING and len(eqn.outvars) == 1:
+        stacked = eqn.outvars[0]
+        operands = [operand for operand in eqn.invars if isinstance(operand, core.Var)]
+        sized = [operand.aval for operand in operands if isinstance(operand.aval, ShapedArray)]
+        if not isinstance(stacked.aval, ShapedArray) or len(sized) != len(operands):
+            return None
+        if len(operands) > 1 and not all(operand in weights and aval.dtype == stacked.aval.dtype
+                                         and _read_once(operand, jaxpr)
+                                         for operand, aval in zip(operands, sized, strict=True)):
+            return None
+        # A broadcast that repeats elements would read one weight in many places, whose
+        # cotangents it sums in the weight's dtype.
+        if stacked.aval.size != sum(aval.size for aval in sized):
+            return None
+        return _cast_once(stacked, jaxpr, weights | {stacked})
     called = _inner(eqn, index)
-    return None if called is None else _cast_once(called[1], called[0])
+    if called is None:
+        return None
+    # The weights the callee binds: each of the call's operands that is a weight read by the call
+    # alone, where it is passed on unchanged.
+    inner = frozenset(bound[1] for position, operand in enumerate(eqn.invars)
+                      if isinstance(operand, core.Var) and operand in weights and _read_once(operand, jaxpr)
+                      and (bound := _inner(eqn, position)) is not None)
+    return _cast_once(called[1], called[0], inner)
 
 
 def narrowed_paths(loss, params: Variables, *rest) -> dict[tuple[str, ...], jnp.dtype]:
@@ -84,10 +126,11 @@ def narrowed_paths(loss, params: Variables, *rest) -> dict[tuple[str, ...], jnp.
     dtype. The arguments may be shapes alone."""
     closed = jax.make_jaxpr(loss)(params, *rest)
     leaves = jax.tree_util.tree_flatten_with_path(params)[0]
+    weights = frozenset(closed.jaxpr.invars[:len(leaves)])
     paths = {}
     for (path, leaf), var in zip(leaves, closed.jaxpr.invars[:len(leaves)], strict=True):
         if isinstance(var, core.Var) and jnp.issubdtype(leaf.dtype, jnp.floating):
-            dtype = _cast_once(var, closed.jaxpr)
+            dtype = _cast_once(var, closed.jaxpr, weights)
             if dtype is not None:
                 paths[tuple(key.key for key in path)] = dtype
     return paths

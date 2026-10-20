@@ -961,6 +961,9 @@ def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
     ("in_proj_z",): ("embed", "linear"),
     ("in_proj_b",): ("embed", "kv"),
     ("in_proj_a",): ("embed", "kv"),
+    # Qwen3-Next's checkpoint fuses the same projections (`fused_in_proj`).
+    ("in_proj_qkvz",): ("embed", "linear"),
+    ("in_proj_ba",): ("embed", "kv"),
     ("out_proj",): ("attention", "embed"),
 })
 class GatedDeltaNet(nn.Module):

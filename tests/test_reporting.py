@@ -137,7 +137,8 @@ def test_local_scalar_sink_does_not_enable_preview_computation(tmp_path, preview
         trainer = Trainer(Display(), optax.sgd(.01), key=jax.random.key(0), tracker=sink)
         data = Loader(lambda partition: batches(), lambda partition: iter([next(batches())]), None, 8)
         trainer.fit(data, steps=2, eval_every=1, preview=preview)
-    assert generated == [1, 2]
+    # The pass that warms the evaluations before the first step previews too, and logs nothing.
+    assert generated == [0, 1, 2]
     assert len(list(tmp_path.glob('*.png'))) == 2
 
 
@@ -225,6 +226,45 @@ def test_mlflow_run_holds_the_fit_read_back_with_mlflows_client(tmp_path, monkey
             == {'previews/step-2/preview-2-0.png', 'previews/step-2/preview-2.json'})
     drawn = mlflow.artifacts.download_artifacts(f'{artifacts}/previews/step-2/preview-2-0.png')
     assert Image.open(drawn).size == (8, 8)
+
+
+def test_mlflow_takes_a_metric_named_in_free_text_under_a_name_it_accepts(tmp_path, monkeypatch):
+    """A rollout source's free-text name in a metric's (`math[hard]`, `a/../b`) reaches MLflow as a
+    name it accepts, two such names apart; a name MLflow accepts arrives as it is."""
+    store = mlflow_store(tmp_path, monkeypatch)
+    from dew.training import MLflowTracker
+
+    names = ("rollout/source/openai/gsm8k/reward/mean", "rollout/source/math[hard]/reward/mean",
+             "rollout/source/math(hard)/reward/mean", "rollout/source/a/../b/reward/mean", "..loss",
+             ".../loss")
+    with MLflowTracker('dew-reporting', 'free-text', uri=store) as tracker:
+        tracker.log({name: float(index) for index, name in enumerate(names)}, 1)
+        client, run = tracker.run
+    logged = client.get_run(run).data.metrics
+    from dew.training.tracker import mlflow_name
+
+    assert len({mlflow_name(name) for name in names}) == len(names)
+    assert {mlflow_name(name): index for index, name in enumerate(names)} == logged
+    assert mlflow_name(names[0]) == names[0]
+    # A name already of MLflow's form that another's repair reaches is refused, not merged with it.
+    with MLflowTracker('dew-reporting', 'taken', uri=store) as tracker:
+        tracker.log({"": 1.0}, 1)
+        with pytest.raises(ValueError):
+            tracker.log({mlflow_name(""): 2.0}, 2)
+
+
+def test_the_panel_shows_the_metrics_its_last_interval_reported():
+    """A metric an interval no longer reports, a rollout source absent from its batch, leaves the
+    panel rather than keep showing its last value, and shows its trend again when it returns."""
+    from dew.training.display import TrainingDisplay
+
+    display = TrainingDisplay(total=10)
+    display.interval(1, {"train/loss": 2.0, "rollout/source/a/reward": 1.0})
+    display.interval(2, {"train/loss": 1.5})
+    assert [row.name for _, row in display.rows()] == ["loss"]
+    display.interval(3, {"train/loss": 1.0, "rollout/source/a/reward": 0.5})
+    assert [(row.name, list(row.values)) for _, row in display.rows()] == [
+        ("loss", [2.0, 1.5, 1.0]), ("source/a/reward", [1.0, 0.5])]
 
 
 def test_tensorboard_events_hold_the_fit_read_back_with_the_accumulator(tmp_path):

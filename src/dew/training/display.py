@@ -178,6 +178,42 @@ class Row:
     values: collections.deque
 
 
+# How the display shows the metrics the trainer itself logs; an objective,
+# a rollout and a validation metric declare their own (`Shown`).
+TRAINER_SHOWN = {"loss": Shown(better="lower"),
+                 "learning_rate": Shown(group="optimizer"), "loss_scale": Shown(group="optimizer"),
+                 "accepted": Shown(percent=True, group="optimizer"),
+                 "step_time_ms": Shown(better="lower", group="throughput"),
+                 "samples_per_sec": Shown(better="higher", group="throughput"),
+                 "mfu": Shown(better="higher", percent=True, group="throughput"),
+                 "hfu": Shown(better="higher", percent=True, group="throughput"),
+                 "hlo_flops_util": Shown(better="higher", percent=True, group="throughput"),
+                 **{f"{name}_lower_bound": Shown(better="higher", percent=True, group="throughput")
+                    for name in ("hfu", "hlo_flops_util")}, "unsized_kernels": Shown(group="throughput"),
+                 "tokens": Shown(group="throughput"),
+                 "tokens_per_s": Shown(better="higher", group="throughput"),
+                 "rollout_seconds": Shown(better="lower", group="throughput")}
+
+
+def goodput(wall: float, first_step: float | None, other: float) -> dict[str, float]:
+    """Compute the two goodput numbers from MaxText's report that need no cluster telemetry.
+
+    `first_step` is the time from the start of `fit` to the first step's result:
+    the placement or restore, the first batch, the compile and the step itself.
+    It is None when no step ran. `other` is the time spent outside steps after
+    that: evaluations, checkpoint writes and the wait for them at the end.
+
+    The step fraction is what is left of `wall`. A step's own data stall therefore
+    counts as step time, as it does in MaxText's start-to-start step time.
+    """
+    numbers = {}
+    if first_step is not None:
+        numbers["goodput/time_to_first_step_s"] = first_step
+    steps = wall - (wall if first_step is None else first_step) - other
+    numbers["goodput/step_fraction"] = max(steps, 0.0) / wall if wall > 0 else 0.0
+    return numbers
+
+
 @dataclasses.dataclass
 class TrainingDisplay:
     """The console side of one `Trainer.fit`.
@@ -200,6 +236,9 @@ class TrainingDisplay:
     pace: collections.deque = dataclasses.field(default_factory=lambda: collections.deque(maxlen=24))
     # Metrics by group, then by logged name, in the order first logged.
     groups: dict[str, dict[str, Row]] = dataclasses.field(default_factory=dict)
+    # The names the last interval logged, the rows shown: a metric an interval no longer reports (a
+    # rollout source absent from its batch) keeps its trend for when it returns, not its last value.
+    reported: frozenset[str] = frozenset()
     # Each split's last `TREND` evaluations, in the order they completed,
     # scores only: the trackers keep the previews. A new evaluation rebinds
     # its split's list, so the refresh thread never iterates one that grows.
@@ -285,6 +324,7 @@ class TrainingDisplay:
             if name not in rows:
                 rows[name] = Row(rest or prefix, shown, collections.deque(maxlen=TREND))
             rows[name].values.append(value)
+        self.reported = frozenset(scalars)
         if self.live is None:
             target = "" if self.total is None else f"/{self.total}"
             line = f"step {step}{target}  " + "  ".join(
@@ -378,9 +418,11 @@ class TrainingDisplay:
         return f"{split} (ema)" if self.averaged else split
 
     def rows(self) -> list[tuple[str, Row]]:
-        """The metrics to show as (group, row) pairs, grouped in the order
-        each group was first logged."""
-        return [(group, row) for group, named in list(self.groups.items()) for row in list(named.values())]
+        """The metrics the last interval logged, as (group, row) pairs, grouped in the order each
+        group was first logged."""
+        reported = self.reported
+        return [(group, row) for group, named in list(self.groups.items())
+                for name, row in list(named.items()) if name in reported]
 
     def scores(self, evaluation: Evaluation, *, history: bool = False) -> Text:
         """An evaluation's scores and their change since the previous one,
