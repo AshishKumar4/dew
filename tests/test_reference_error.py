@@ -208,8 +208,9 @@ def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_pa
         assert_as_exact(squared, reference, draw, "recorded", seeds=seeds, truth_fn=truth_fn)
         with pytest.raises(AssertionError):
             indexed_recording(dict(stored), "site", 16)
-        with pytest.raises(AssertionError):
-            indexed_recording({**stored, "site.truth.y": truth.astype(np.float32)}, "site", seeds)
+        for narrow in (np.float32, jnp.bfloat16):
+            with pytest.raises(AssertionError):
+                indexed_recording({**stored, "site.truth.y": truth.astype(narrow)}, "site", seeds)
 
 
 def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path):
