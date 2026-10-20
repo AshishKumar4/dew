@@ -856,9 +856,18 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     its memory: `w`, the gated queries and keys, the memory each chunk enters and the corrected
     values, which fla recomputes in its backward ('delta_memory', as `fla_gdn._rule_fwd` keeps it)."""
     spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
-    kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
     # Named as the gated delta rule's port names them (`fla_gdn._rule_fwd`) for a remat policy.
-    g = checkpoint_name(fla_gdn.chunk_local_cumsum(g, scale=RCP_LN2, **kernels), 'delta_decay')
+    g = checkpoint_name(fla_gdn.chunk_local_cumsum(g, scale=RCP_LN2, chunk=chunk, spans=spans,
+                                                   interpret=interpret), 'delta_decay')
+    return cumulated_fwd(q, k, v, g, beta, h0, spans, scale, chunk, interpret, keep)
+
+
+def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: int, interpret: bool,
+                  keep: bool = True):
+    """`_rule_fwd` from the decay cumulated in base 2 within each chunk (`fla_gdn.chunk_local_cumsum`),
+    which is all the rest of the rule reads of it, as `fla_gdn.cumulated_fwd`: a node of the port's
+    graph and the port's arithmetic on it."""
+    kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
     aqk, akk = intra_solve(q, k, g, beta, scale=scale, **kernels)
     akk = checkpoint_name(akk, 'delta_inverse')
     w, u, kg, qg = recompute_w_u(k, v, beta, akk, g, q if keep else None, **kernels)
