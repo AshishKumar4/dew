@@ -81,9 +81,9 @@ def step_at(index=0, key=1, ema=None) -> Step:
 
 def teacher_outputs(arrays: dict) -> tuple[np.ndarray, np.ndarray]:
     """The teacher's logits and its paired layers' outputs, `[L, B, T, D]`, from the float32
-    forward the objective runs. The fixture's teacher outputs are another XLA's rounding of that
-    forward (they differ by up to 2.7e-6 in states of about 8): fed to the reference, they would
-    leave that rounding in Dew's distance from float64 alone."""
+    forward the objective runs. The fixture stores none: the outputs its generator saw were another
+    XLA's rounding of that forward (up to 2.7e-6 off in states of about 8), which, fed to the
+    reference, would leave that rounding in Dew's distance from float64 alone."""
     from tools.distillation_reference import dew_outputs
 
     teacher = models()[1]
