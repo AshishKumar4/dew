@@ -14,7 +14,7 @@ import contextvars
 import dataclasses
 import inspect
 import logging
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -143,6 +143,18 @@ class GpuTarget:
 # https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
 # https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html
 # https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html
+# Attention and grouped products against tokamax 0.0.15's kernels, bf16, causal 2x4096, 16 query over
+# 8 key heads, fwd/step ms (bench_tokamax.py; float64-gated, every arm within it). A100: width 128,
+# the FA wheel 0.96/4.15, tokamax Triton 1.44/6.73, cuDNN 1.36/5.57; width 64, 0.80/2.44, 0.93/3.55,
+# 0.84/3.44; 8 packed documents, the FA wheel's varlen 0.50/1.44 against tokamax Triton's key ranges
+# 0.52/7.00. H100: width 128, the FA wheel (FA3) 0.30/1.03, tokamax Mosaic 0.37/1.28, Triton
+# 0.55/2.00, cuDNN 0.37/1.28; width 64, 0.25/0.68, 0.30/0.93, 0.40/1.30, 0.30/0.91; packed,
+# 0.17/0.60 against Triton's 0.22/1.88. A10 (sm86), causal 2x2048: width 64, the FA wheel
+# 0.46/1.32, Triton 0.51/1.51, cuDNN 0.58/1.97; width 32, 0.23/0.82, 0.28/0.99, 0.47/1.67. Grouped
+# products, 8192 tokens x 2048 -> 768 over 64 experts: Dew's Pallas grouped matmul 0.60/2.41 on an
+# A100 and 0.27/0.86 on an H100, XLA's ragged dot 7.54/33.99 and 2.62/14.51; tokamax's ragged_dot
+# has no Triton kernel in 0.0.15 and its Mosaic one's backward takes no mixed dtypes. No tokamax
+# implementation is a row's kernel; Dew calls its own through tokamax's Op and tuning.
 TARGETS = {target.generation: target for target in (
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
               aliases=('gpu:t4', 't4')),
@@ -153,7 +165,7 @@ TARGETS = {target.generation: target for target in (
                'rms_norm': 'pallas', 'swiglu': 'pallas', 'gate_up': 'joined', 'delta_gates': 'joined',
                'gated_delta_rule': 'fla', 'ssd': 'pallas'},
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), head_tile=(4096, 8192)),
-    GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'grouped_matmul': 'pallas'},
+    GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'attention_narrow': 'flash', 'grouped_matmul': 'pallas'},
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'attention': 'flash', 'attention_window': 'flash', 'attention_sinks': 'flash',
@@ -280,14 +292,15 @@ def device_generation() -> str:
     return device.platform
 
 
-def measured_kernel(choice: str, default: str) -> str:
-    """The kernel `chosen` names for `choice`, else `KERNELS` on this generation, else `default`."""
+def measured_kernel(choice: str, default: str, *, fastest: str | None = None) -> str:
+    """The kernel `chosen` names for `choice`, else `fastest`, the site's own measurement of a call
+    no row measured (an fp32 SiLU product), else `KERNELS` on this generation, else `default`."""
     from dew import cache
 
     _named((choice,))
     if (kernel := dict(cache.KERNEL_CHOICES.value).get(choice)) is not None:
         return kernel
-    return gpu_target(device_generation()).kernels.get(choice, default)
+    return fastest or gpu_target(device_generation()).kernels.get(choice, default)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -399,6 +412,83 @@ def ran_kernel(choice: str, kernel: str, refusal: str, fastest: str | None = Non
     generation, `fastest`, `chosen` or else the one `KERNELS` names, turned it down for `refusal`,
     reported as `route` reports it."""
     return route(choice, kernel=kernel, preferred=fastest, refusal=refusal).kernel
+
+
+def linear_tangent(forward: Callable, backward: Callable, portable: Callable) -> Callable:
+    """A fused kernel as one function of its operands, differentiated at every order through
+    `portable`, the same arithmetic in XLA, while every level of it runs the kernels.
+    `forward(*operands)` gives the kernel's output and what its backward reads (`saved`, a tree of
+    arrays); `backward(saved, operands, cotangent)` gives the operands' cotangents, a tuple; and
+    `portable(*operands)` gives the output.
+
+    The output's derivative is one custom JVP whose tangent is `portable`'s, evaluated as a
+    `linear_call` that transposes to `backward`: forward mode (`jax.jvp`, `jax.linearize`) takes
+    the portable tangent however a jit or a scan staged the call, and reverse mode runs the
+    backward kernel. The forward and the backward are custom JVPs of their own whose tangents are
+    `portable`'s and its pullback's, so a higher order (`jax.jvp` of `jax.grad`, `jax.grad` of
+    `jax.jvp`) differentiates through XLA while each level's value comes from the kernels; what
+    `saved` holds is a function of the operands, whose tangents carry it. This composes with
+    `jax.vmap` of a gradient and with forward over reverse on Dew's jax build (0.11.2.post5 on),
+    whose `linear_call` batches and carries its residual tangents; a stock jax raises its own
+    error for either."""
+    import jax
+    import jax.numpy as jnp
+    from jax.custom_derivatives import SymbolicZero, linear_call
+
+    @jax.custom_jvp
+    def produced(*operands):
+        return forward(*operands)
+
+    @produced.defjvp
+    def _(primals, tangents):
+        output, saved = produced(*primals)
+        # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
+        return (output, saved), (jax.jvp(portable, primals, tangents)[1], jax.tree.map(jnp.zeros_like, saved))
+
+    @jax.custom_jvp
+    def pulled(saved, operands, cotangent):
+        return backward(saved, operands, cotangent)
+
+    @pulled.defjvp
+    def _(primals, tangents):
+        _, operands, cotangent = primals
+        _, doperands, dcotangent = tangents
+
+        def pullback(operands, cotangent):
+            return jax.vjp(portable, *operands)[1](cotangent)
+
+        return pulled(*primals), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
+
+    @jax.custom_jvp
+    def bounded(*operands):
+        return forward(*operands)[0]
+
+    def bounded_jvp(primals, tangents):
+        output, saved = produced(*primals)
+        # Only the perturbed operands are the linear call's: its transpose takes no known zero.
+        directions, tree = jax.tree.flatten(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
+        live = [index for index, direction in enumerate(directions)
+                if not isinstance(direction, SymbolicZero)]
+        if not live:
+            return output, jax.tree.map(jnp.zeros_like, output)
+
+        def tangent(residuals, moving):
+            operands, _ = residuals
+            whole = [jnp.zeros_like(operand) for operand in jax.tree.leaves(operands)]
+            for index, value in zip(live, moving, strict=True):
+                whole[index] = value
+            return jax.jvp(portable, operands, jax.tree.unflatten(tree, whole))[1]
+
+        def transposed(residuals, cotangent):
+            operands, saved = residuals
+            pulled_back = jax.tree.leaves(pulled(saved, operands, cotangent))
+            return [pulled_back[index] for index in live]
+
+        moving = [directions[index] for index in live]
+        return output, linear_call(tangent, transposed, (primals, saved), moving)
+
+    bounded.defjvp(bounded_jvp, symbolic_zeros=True)
+    return bounded
 
 
 def first_refusal(*checks: tuple[bool, str]) -> str | None:

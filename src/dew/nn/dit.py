@@ -20,6 +20,7 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.dense import Dense
 from dew.records import JSON
 
 from .activations import gelu_exact_torch, gelu_tanh
@@ -153,8 +154,8 @@ class PatchEmbedding(nn.Module):
                  dtype=self.dtype,
                  precision=self.precision)(x)
         if self.bottleneck is not None:
-            x = nn.Dense(self.embedding_dim, dtype=self.dtype, precision=self.precision,
-                         dot_general=float32_dot_general)(x)
+            x = Dense(self.embedding_dim, dtype=self.dtype, precision=self.precision,
+                      dot_general=float32_dot_general)(x)
         # The token count is named, not inferred: a reshape cannot infer it from a batch of no rows,
         # which a shortcut objective's bootstrap slice is below `bootstrap_every` rows.
         return jnp.reshape(x, (batch, x.shape[1] * x.shape[2], self.embedding_dim))
@@ -261,14 +262,14 @@ class ConditioningEmbed(nn.Module):
                 FourierEmbedding(features=self.emb_features, scale=self.time_scale, dtype=self.dtype),
                 TimeProjection(features=self.emb_features * self.mlp_ratio,
                                dtype=self.dtype, precision=self.precision),
-                nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision,
-                         dot_general=float32_dot_general),
+                Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision,
+                      dot_general=float32_dot_general),
             ], name=name)
 
         if self.interval:
             self.duration_embed = time_embedding("duration_embed")
         self.time_embed = time_embedding("time_embed")
-        self.text_proj = nn.Dense(
+        self.text_proj = Dense(
             features=self.emb_features, dtype=self.dtype,
             precision=self.precision, name="text_context_proj", dot_general=float32_dot_general)
 
@@ -324,7 +325,7 @@ class PatchSequenceOutput(nn.Module):
             shift, scale = jnp.split(projected, 2, axis=-1)
             x_out = x_out * (1 + scale) + shift
 
-        x_out = nn.Dense(
+        x_out = Dense(
             features=self.patch_size * self.patch_size * self.output_channels,
             dtype=self.dtype,
             precision=self.precision,

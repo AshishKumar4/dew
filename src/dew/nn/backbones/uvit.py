@@ -12,6 +12,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.nn.dense import Dense, DenseGeneral
+
 from ..attention import LayerNorm
 from ..blocks import sinusoidal_time
 from ..conv import Conv
@@ -137,8 +139,8 @@ class UViT(_TransformerOptions):
         maps = self.projections()
         def dense(name, **options):
             key = 'skip_linear' if name.startswith('skip_linear_') else name
-            return nn.Dense(maps[key][1], dtype=self.dtype, precision=self.precision, name=name, **options,
-                            dot_general=float32_dot_general)
+            return Dense(maps[key][1], dtype=self.dtype, precision=self.precision, name=name, **options,
+                         dot_general=float32_dot_general)
         self.patch_embed = PatchEmbedding(patch_size=self.patch_size, embedding_dim=self.emb_features,
                                           dtype=self.dtype, precision=self.precision, name="patch_embed")
         patches = (self.image_size // self.patch_size) ** 2
@@ -269,7 +271,7 @@ class SimpleUDiT(RematLadder, _TransformerOptions):
         self.down_blocks = [block(name=f"down_block_{i}") for i in range(half_layers)]
         self.mid_block = block(name="mid_block")
         self.up_dense = [
-            nn.DenseGeneral(
+            DenseGeneral(
                 features=self.projections()['up_dense'][1],
                 dtype=self.dtype,
                 precision=self.precision,

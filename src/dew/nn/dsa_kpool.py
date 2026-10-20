@@ -35,6 +35,8 @@ from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.dense import Dense
+
 from .attention import (
     LayerNorm,
     cached_validity,
@@ -96,7 +98,7 @@ class KPoolIndexer(nn.Module):
             raise ValueError(
                 f"the pool budget is index_topk // index_kpool whole pools, so index_topk "
                 f"({self.top_k}) must be divisible by index_kpool ({self.kpool})")
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
         self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
         self.wk = dense(self.head_dim, name='wk')

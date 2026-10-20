@@ -25,6 +25,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.blocks import Modulation, sinusoidal_time
+from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables
@@ -98,9 +99,9 @@ class FluxSingleBlock(nn.Module):
         shift, scale, gate = self._modulation()(conditioning)
         normalized = modulate(layer_norm(self.dtype)(x), shift, scale)
         maps = self.projections()
-        hidden = nn.gelu(nn.Dense(maps['proj_mlp'][1], dtype=self.dtype,
-                                  precision=self.precision, name="proj_mlp",
-                                  dot_general=float32_dot_general)(normalized),
+        hidden = nn.gelu(Dense(maps['proj_mlp'][1], dtype=self.dtype,
+                               precision=self.precision, name="proj_mlp",
+                               dot_general=float32_dot_general)(normalized),
                          approximate=True)
         attended, _ = JointAttention(
             self.heads, self.head_dim, project=False, dtype=self.dtype, precision=self.precision,
@@ -109,9 +110,9 @@ class FluxSingleBlock(nn.Module):
         # The source calls this `proj_out` inside its own block; the tree
         # names it apart from the model's own output projection, whose two
         # sides are the other way round.
-        return x + gate[:, None] * nn.Dense(maps['proj_fused'][1], dtype=self.dtype,
-                                            precision=self.precision, name="proj_fused",
-                                            dot_general=float32_dot_general)(joined)
+        return x + gate[:, None] * Dense(maps['proj_fused'][1], dtype=self.dtype,
+                                         precision=self.precision, name="proj_fused",
+                                         dot_general=float32_dot_general)(joined)
 
 
 @logical_axes({("context_embedder",): (None, "embed"), ("x_embedder",): (None, "embed"),
@@ -211,10 +212,10 @@ class FluxTransformer(TextStream, nn.Module):
         dense = {"dtype": self.dtype, "precision": self.precision}
         # `_prepare_latents`' packing: one position per 2x2 patch, channel-major.
         packed = pixel_unshuffle(x).reshape(x.shape[0], rows * columns, 4 * x.shape[3])
-        image = nn.Dense(self.features, name="x_embedder", **dense, dot_general=float32_dot_general)(packed)
+        image = Dense(self.features, name="x_embedder", **dense, dot_general=float32_dot_general)(packed)
         conditioned = self._conditioning(time, conditioning.guidance, conditioning.pooled)
-        context = nn.Dense(self.features, name="context_embedder", **dense,
-                           dot_general=float32_dot_general)(conditioning.context)
+        context = Dense(self.features, name="context_embedder", **dense,
+                        dot_general=float32_dot_general)(conditioning.context)
         # `FluxPosEmbed` computes its angles in float64 from the static ids.
         tables = axis_tables(flux_positions(rows, columns, context.shape[1]), self.axes_dims_rope, 10000.0,
                              dtype=np.float64)
@@ -232,8 +233,8 @@ class FluxTransformer(TextStream, nn.Module):
         image = joined[:, context.shape[1]:]
         scale, shift = self._output_modulation()(conditioned)
         image = modulate(layer_norm(self.dtype)(image), shift, scale)
-        packed = nn.Dense(self.patch_size ** 2 * self.out_channels, name="proj_out", **dense,
-                          dot_general=float32_dot_general)(image)
+        packed = Dense(self.patch_size ** 2 * self.out_channels, name="proj_out", **dense,
+                       dot_general=float32_dot_general)(image)
         return pixel_shuffle(packed.reshape(packed.shape[0], rows, columns, -1))
 
 

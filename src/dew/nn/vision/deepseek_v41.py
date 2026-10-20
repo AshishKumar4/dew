@@ -13,6 +13,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.nn.activations import gelu_exact
+from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
 from dew.registry import Record
 
@@ -83,7 +84,7 @@ class DeepseekV41ProjectorModule(nn.Module):
         squares = padded.reshape(images, high, ratio, wide, ratio, self.vision_width).transpose(
             0, 1, 3, 5, 2, 4
         )
-        dense = functools.partial(nn.Dense, self.out_width, dtype=self.dtype, precision=self.precision,
+        dense = functools.partial(Dense, self.out_width, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
         aligned = dense(name="w2")(gelu_exact(dense(name="w1")(squares.reshape(images, high, wide, -1))))
         start, newline, end = (

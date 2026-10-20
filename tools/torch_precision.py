@@ -10,6 +10,7 @@ replacements here are the ones several generators make.
 
 import contextlib
 import inspect
+import os
 from collections.abc import Callable
 
 import torch
@@ -67,3 +68,14 @@ def widened_to(to: Callable) -> Callable:
         return to(tensor, *(wide(arg) if isinstance(arg, torch.dtype) else arg for arg in args), **kwargs)
 
     return converted
+
+
+def recorded_matmuls(**solves) -> str:
+    """What a reference's array file records of its run's matmuls (tests/reference_error.py's
+    `PRECISION`): 'ieee' where torch, Triton's default and each of `solves` (its name to the mode it
+    ran, as fla's triangular solves name theirs) keep fp32, else those that do not, which the
+    accuracy rule refuses."""
+    reduced = torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
+    modes = {"torch": "tf32" if reduced else "ieee",
+             "TRITON_F32_DEFAULT": os.environ.get("TRITON_F32_DEFAULT", "tf32"), **solves}
+    return ", ".join(f"{name} {mode}" for name, mode in modes.items() if mode != "ieee") or "ieee"

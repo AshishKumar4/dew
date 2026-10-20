@@ -26,6 +26,7 @@ from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.nn.activations import gelu_exact_torch
 from dew.nn.attention import NormalAttention, l2_normalized
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, decoder_norm
+from dew.nn.dense import Dense
 from dew.nn.flops import attention_flops, projection_flops, real_lengths
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
@@ -137,9 +138,9 @@ class DecisionHead(Head):
             norm_eps=1e-5, dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision,
             name=f"layers_{index}") for index in range(self.layers)]
         self.scorer_norm = _layer_norm(self.dtype, "scorer_norm")
-        self.scorer_hidden = nn.Dense(self.features, dtype=self.dtype, precision=self.precision,
-                                      name="scorer_hidden")
-        self.scorer_out = nn.Dense(1, dtype=self.dtype, precision=self.precision, name="scorer_out")
+        self.scorer_hidden = Dense(self.features, dtype=self.dtype, precision=self.precision,
+                                   name="scorer_hidden")
+        self.scorer_out = Dense(1, dtype=self.dtype, precision=self.precision, name="scorer_out")
 
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table: jax.Array | None = None,
                  train: bool = False) -> jax.Array:
@@ -342,8 +343,8 @@ class JointSchemaHead(Head):
                      + self.layers * fields + scorer + summaries)
 
     def setup(self):
-        def dense(features: int, name: str) -> nn.Dense:
-            return nn.Dense(features, use_bias=False, dtype=self.dtype, precision=self.precision, name=name)
+        def dense(features: int, name: str) -> Dense:
+            return Dense(features, use_bias=False, dtype=self.dtype, precision=self.precision, name=name)
 
         self.hidden_norm = _layer_norm(self.dtype, "hidden_norm")
         self.memory_projection = dense(self.width, "memory_projection")
@@ -361,9 +362,9 @@ class JointSchemaHead(Head):
         self.field_layers = [_FieldLayer(**options, name=f"layers_{index}") for index in range(self.layers)]
         self.field_norm = _layer_norm(self.dtype, "field_norm")
         self.option_norm = _layer_norm(self.dtype, "option_norm")
-        self.scorer_hidden = nn.Dense(self.width, dtype=self.dtype, precision=self.precision,
-                                      name="scorer_hidden")
-        self.scorer_out = nn.Dense(1, dtype=self.dtype, precision=self.precision, name="scorer_out")
+        self.scorer_hidden = Dense(self.width, dtype=self.dtype, precision=self.precision,
+                                   name="scorer_hidden")
+        self.scorer_out = Dense(1, dtype=self.dtype, precision=self.precision, name="scorer_out")
         self.prior_logit_scale = self.param("prior_logit_scale", nn.initializers.zeros_init(), ())
         self.joint_logit_scale = self.param("joint_logit_scale", nn.initializers.zeros_init(), ())
         self.residual_gate = self.param("residual_gate", nn.initializers.zeros_init(), ())
