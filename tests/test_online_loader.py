@@ -9,6 +9,7 @@ import threading
 import time
 from pathlib import Path
 
+import grain.python as grain
 import numpy as np
 import pytest
 from PIL import Image
@@ -85,7 +86,25 @@ def serving(handle):
         server.server_close()
 
 
-@pytest.mark.parametrize("repeats", ["endless", "two passes, endlessly"])
+class TupleWrapped(grain.IterDataset):
+    """A Grain step of the caller's, whose position keeps its parent's in a tuple."""
+
+    def __iter__(self):
+        return TupleWrappedRead(self._parent.__iter__())
+
+
+class TupleWrappedRead(grain.DatasetIterator):
+    def __next__(self):
+        return next(self._parent)
+
+    def get_state(self):
+        return {"parents": (self._parent.get_state(),)}
+
+    def set_state(self, state):
+        self._parent.set_state(state["parents"][0])
+
+
+@pytest.mark.parametrize("repeats", ["endless", "two passes, endlessly", "behind a Grain step"])
 def test_an_endless_read_reads_on_through_passes_whose_fetches_failed_until_one_returns(repeats):
     """A catalog's one url fails for its first three fetches, so each of those passes yields
     nothing; a failed fetch may succeed next time, so the endless read reads on, counting each
@@ -106,7 +125,10 @@ def test_an_endless_read_reads_on_through_passes_whose_fetches_failed_until_one_
 
     with serving(handle) as address:
         fetched = Pipeline(Memory([{"url": f"http://{address}/object"}])).filter_map(Fetch())
-        chain = (fetched.repeat() if repeats == "endless" else fetched.repeat(2).repeat()).batch(1)
+        if repeats == "behind a Grain step":
+            fetched = fetched.grain(TupleWrapped, identity="tuple-wrapped@1")
+        repeated = fetched.repeat(2).repeat() if repeats == "two passes, endlessly" else fetched.repeat()
+        chain = repeated.batch(1)
         data = compile(chain, read="indexed", loading=READ)
         stream = data.train(DataPartition())
         try:
