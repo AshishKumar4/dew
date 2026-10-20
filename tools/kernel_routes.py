@@ -3,8 +3,9 @@
 Each family's committed tiny config (tests/fixtures/hf/<name>/config.json, the first fixture whose
 model_type is one of the family's) is built in bf16 without weights and traced on a CPU within
 `generation.assumed(target)` for each row of `TARGETS` that names a kernel: a training step's gradient,
-a 64-token prefill, and one decode step on the dense cache and on a paged one; a bidirectional family
-(`causal` False) has no causal cache and steps for training alone. A fixture that is a media bundle its
+a 64-token prefill, and one decode step on the dense cache and on a paged one. A bidirectional family
+(`causal` False) prefills through its causal view, as DiffusionGemma's encoder does, and decodes a canvas
+over that frozen prefix (`CausalSelfAttention._step_positions`). A fixture that is a media bundle its
 family reads whole (`hf_decoders.bundles`) is traced as its decoder. Every dispatch reports its
 decision (`generation.route`), and `generation.routes` collects them, so the report shows per family,
 target and mode which kernel each choice runs and why a generic path ran where it did. A family's widths
@@ -78,9 +79,13 @@ def published(config: dict) -> tuple[dict, bool]:
     for name in WIDTHS:
         if text.get(name) and name in fixture:
             fixture[name] = text[name]
-    if "head_dim" not in fixture and fixture.get(heads_key) and text.get(hidden_key) and text.get(heads_key):
+    if text.get(hidden_key) and text.get(heads_key):
+        # A reference that leaves head_dim unset (None) heads at its width over its heads.
         width = text.get("head_dim") or text[hidden_key] // text[heads_key]
-        fixture[hidden_key] = fixture[heads_key] * width
+        if "head_dim" in fixture:
+            fixture["head_dim"] = width
+        elif fixture.get(heads_key):
+            fixture[hidden_key] = fixture[heads_key] * width
     # Widths a config states twice, derived from the ones above.
     if "qk_head_dim" in fixture:
         fixture["qk_head_dim"] = fixture.get("qk_nope_head_dim", 0) + fixture.get("qk_rope_head_dim", 0)
@@ -97,7 +102,7 @@ def audited() -> tuple[str, ...]:
 
 
 LAYOUT_GAPS = {"mla": "ledger 830", "kpool_sparse_attention": "ledger 830",
-               "deepseek_v4": "ledger 831", "llama4": "ledger 784"}
+               "deepseek_v4": "ledger 831", "llama4": "ledger 784", "attention": "ledger 838"}
 """The ledger row of each mixer that takes no cache layout but the default (`MixerRefused` for
 `kv_cache`)."""
 
@@ -143,10 +148,10 @@ def verdict(route) -> str:
     return f"gap: {row}" if row else "undeclared"
 
 
-def model_of(config: dict, mode: str = "train"):
+def model_of(config: dict, mode: str = "train", *, causal: bool | None = None):
     """The family's `CausalTransformer` in bf16 for `mode`: its decoder, a media bundle's
     (`hf_decoders.bundles`, `translate_wrapper_config`) where the fixture is one, on a paged cache for
-    'decode-paged'."""
+    'decode-paged', its attention made `causal` where given."""
     import jax.numpy as jnp
 
     from dew.interop.hf_decoders import bundles, translate_config, translate_wrapper_config
@@ -157,34 +162,40 @@ def model_of(config: dict, mode: str = "train"):
     fields = {**decoder, "dtype": jnp.bfloat16}
     if mode == "decode-paged":
         fields["kv_cache"] = KVCache(page_size=16)
+    if causal is not None:
+        fields["causal"] = causal
     return CausalTransformer(**fields)
 
 
 def traced(config: dict, target: str, mode: str, held: dict | None = None) -> list:
     """Every route the family's `mode` step reports within `assumed(target)`. `held` keeps each
-    target's model, parameters and cache, per cache layout, across a family's modes, which share them."""
+    target's parameter shapes, which no cache layout changes, and each layout's cache across a family's
+    modes. A bidirectional family's cache is its causal view's, which prefills it."""
     import jax
     import jax.numpy as jnp
 
     from dew.nn.kernels import generation
 
     held = {} if held is None else held
-    layout = "paged" if mode == "decode-paged" else "dense"
-    if (target, layout) not in held:
-        model = model_of(config, mode)
-        tokens = jax.ShapeDtypeStruct((BATCH, min(PROMPT, model.max_seq_len - 1)), jnp.int32)
-        # The parameters and the cache are traced outside the routes kept: their own forward passes
-        # are no part of the mode's step.
-        with generation.assumed(target):
-            held[target, layout] = model, tokens, jax.eval_shape(model.init, jax.random.key(0), tokens)
-    model, tokens, variables = held[target, layout]
+    model = model_of(config, mode)
+    if not model.causal and mode == "prefill":
+        model = model_of(config, mode, causal=True)
+    tokens = jax.ShapeDtypeStruct((BATCH, min(PROMPT, model.max_seq_len - 1)), jnp.int32)
     prompt = tokens.shape[1]
-    if mode != "train" and (target, layout, "cache") not in held:
+    # The parameters and the cache are traced outside the routes kept: their own forward passes are no
+    # part of the mode's step.
+    if target not in held:
         with generation.assumed(target):
-            held[target, layout, "cache"] = jax.eval_shape(
-                lambda v: model.apply(v, BATCH, method="init_cache", mutable=["cache"])[1],
+            held[target] = jax.eval_shape(model.init, jax.random.key(0), tokens)
+    variables = held[target]
+    layout = "paged" if mode == "decode-paged" else "dense"
+    if mode != "train" and (target, layout) not in held:
+        writer = model_of(config, mode, causal=True)
+        with generation.assumed(target):
+            held[target, layout] = jax.eval_shape(
+                lambda v: writer.apply(v, BATCH, method="init_cache", mutable=["cache"])[1],
                 variables)["cache"]
-    cache = held.get((target, layout, "cache"))
+    cache = held.get((target, layout))
     with generation.assumed(target), generation.routes() as found:
         if mode == "train":
             def loss(params, rest, ids):
@@ -213,15 +224,11 @@ def cells(names: Iterable[str], targets: Iterable[str] | None = None) -> Iterato
             yield {"family": name, "fixture": None, "error": "no committed tiny fixture"}
             continue
         config, widened = published(json.loads((found / "config.json").read_text()))
-        causal, held = model_of(config).causal, {}
+        held: dict = {}
         for target in audited() if targets is None else targets:
             for mode in MODES:
                 cell = {"family": name, "fixture": found.name, "target": target, "mode": mode,
                         "widths": "reference" if widened else "fixture"}
-                if not causal and mode != "train":
-                    cell["absent"] = "a bidirectional family has no causal cache to prefill or decode"
-                    yield cell
-                    continue
                 try:
                     seen = traced(config, target, mode, held)
                 except MixerRefused as refusal:
@@ -261,7 +268,7 @@ def report(records: list[dict]) -> str:
                              f"{route['verdict']} | {refusal.get('code', '')}: {refusal.get('detail', '')} |")
     lines += ["", "## Not traced", "", "| Family | Target | Mode | Why |", "|---|---|---|---|"]
     lines += [f"| {c['family']} | {c.get('target', '')} | {c.get('mode', '')} | "
-              f"{c.get('error') or c.get('absent') or refused(c['refused'])} |"
+              f"{c.get('error') or refused(c['refused'])} |"
               for c in records if "routes" not in c]
     lines += ["", "## Every cell", "", "| Family | Widths | Target | Mode | Kernels |",
               "|---|---|---|---|---|"]
@@ -289,7 +296,7 @@ def unexplained(cell: dict) -> list[str]:
                 if route["verdict"] in ("undeclared", "unclassified")]
     if "refused" in cell:
         return [] if cell["refused"]["row"] else [refused(cell["refused"])]
-    return [] if "absent" in cell else [cell["error"]]
+    return [cell["error"]]
 
 
 def main(argv: list[str]) -> None:

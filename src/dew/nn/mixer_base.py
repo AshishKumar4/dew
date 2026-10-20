@@ -154,6 +154,10 @@ class MixerRefused(ValueError):
         super().__init__(f"the {kind} mixer has no {', '.join(names)}: {why}")
         self.kind, self.names, self.why = kind, names, why
 
+    def __reduce__(self):
+        # Rebuilt from its own fields, as a pickle or a process boundary carries it.
+        return type(self), (self.kind, self.names, self.why)
+
 
 class MixerBase:
     """One mixer kind's value: its fields, and how it builds its mixer.
