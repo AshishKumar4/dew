@@ -999,7 +999,7 @@ def test_narrow_heads_take_the_kernel_their_target_measured_fastest(generation_n
     (`generation.TARGETS`), tokamax's Triton kernel where the row names none. FlashAttention's own row
     requirement reads the same row, so where the wheel holds code for the GPU the preference is the
     route, an A10's narrow heads included where its attention row names none."""
-    from dew.nn.attention import resolve_implementation
+    from dew.nn.attention import attention_case, resolve_implementation
     from dew.nn.attention_kernels import ATTENTION, kernel_refusals
     from dew.nn.kernels import generation
 
