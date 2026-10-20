@@ -16,7 +16,6 @@ from flax import linen as nn
 from reference_error import (
     assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
-    assert_leaves_as_exact,
 )
 from safetensors.numpy import load_file
 
@@ -70,8 +69,9 @@ def assert_trains_as_peft(adapter, reference, case: str, tmp_path, masks=None):
                    if key.startswith("grad/") and not key.endswith("_f64"))
     exported = peft_factors(adapter, gradient, tmp_path / "gradient")
     assert sorted(exported) == names and len(names) == 12
-    assert_leaves_as_exact(exported, {name: reference[f"grad/{name}"] for name in names},
-                           {name: reference[f"grad/{name}_f64"] for name in names})
+    for name in names:
+        assert_as_exact_as_the_reference(exported[name], reference[f"grad/{name}"], reference[f"grad/{name}_f64"],
+                                         f"gradient {name}")
 
     adamw = OPTIMIZER_MAP["adamw"](ADAMW["lr"], *ADAMW["betas"], ADAMW["eps"],
                                    weight_decay=ADAMW["weight_decay"])
@@ -82,9 +82,9 @@ def assert_trains_as_peft(adapter, reference, case: str, tmp_path, masks=None):
     start = peft_factors(adapter, params["params"], tmp_path / "start")
     stepped = peft_factors(adapter, moving, tmp_path / "stepped")
     # Each factor's move, from the float32 factors both runs start at: exact in float64.
-    assert_leaves_as_exact({name: stepped[name] - start[name] for name in names},
-                           {name: reference[f"stepped/{name}"] - start[name] for name in names},
-                           {name: reference[f"stepped/{name}_f64"] - start[name] for name in names})
+    for name in names:
+        assert_as_exact_as_the_reference(stepped[name] - start[name], reference[f"stepped/{name}"] - start[name],
+                                         reference[f"stepped/{name}_f64"] - start[name], f"update {name}")
 
 
 def assert_loss_over_orders(adapter, objective, params, reference, case: str, masks) -> None:
