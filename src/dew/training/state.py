@@ -48,6 +48,18 @@ class Accumulation:
         return mine == theirs
 
 
+def kept_window(held: Accumulation | None, pending: Accumulation, filled: int | None) -> bool:
+    """Whether a state's window (`held`) is the one a step compiled for `pending`'s shapes reads.
+    One that replays other shapes is replaced by an empty one where `filled`, the microbatches it
+    holds, is 0 or unread (None, a step's shapes alone), and refused while it holds any."""
+    if held is None or held.replays(pending):
+        return held is not None
+    if filled:
+        raise ValueError(f"the state's part-filled accumulation window ({filled} in) holds batches of "
+                         f"other shapes than the step's, which it cannot replay")
+    return False
+
+
 
 @struct.dataclass
 class TrainState:

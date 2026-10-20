@@ -14,7 +14,7 @@ import math
 import statistics
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Concatenate, Protocol, overload
 
@@ -32,6 +32,7 @@ from dew.data.dataset import (
     Closeable,
     DataPartition,
     RampedStream,
+    Stage,
     Stoppable,
     stream_identity,
 )
@@ -473,11 +474,10 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, *, rows: boo
             f"holds a batch that is a multiple of {divisor}")
 
 
-def check_ramp_window(source: RampedStream, window: int) -> None:
+def check_ramp_window(stages: Sequence[Stage], window: int) -> None:
     """Refuse a batch ramp whose stage begins inside an accumulation window of `window` steps that
     replays its batches (a loss of composite statistics): the window's replay slots hold one
     stage's batches, reallocated for the next where a window begins (`Trainer`'s accumulation)."""
-    stages = source.stages
     starts = itertools.accumulate((after.records - stage.records) // stage.batch
                                   for stage, after in itertools.pairwise(stages))
     inside = [(start, stage.batch) for start, stage in zip(starts, stages[1:], strict=True) if start % window]

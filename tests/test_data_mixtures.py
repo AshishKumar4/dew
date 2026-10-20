@@ -1022,8 +1022,9 @@ def test_a_window_that_replays_its_batches_pools_a_ramps_stages_as_batches_of_th
     """A loss of composite statistics replays its window's batches, whose shape a ramp changes at each
     stage; each stage begins where a window does, and the window's replay slots are the new stage's
     from there. Four steps of eight and then sixteen, two to a window, land where a batch of sixteen
-    and then one of thirty-two, the same records in the same order, land, and a run resuming a
-    fixed-batch run's checkpoint, whose window held that run's batches, trains on into the ramp."""
+    and then one of thirty-two, the same records in the same order, land. A run resuming a run of
+    eight-record batches at a window's end trains on into the ramp's stage of sixteen, its window's
+    slots replaced; one resuming a window part filled with batches of thirty-two is refused."""
     records, seed, layout = 4096, 7, Layout(min_shard=1, tolerance=1.0)
     ramp = Ramp(start=8, increment=8, samples=16)
 
@@ -1041,11 +1042,17 @@ def test_a_window_that_replays_its_batches_pools_a_ramps_stages_as_batches_of_th
     for name, value in batched.items():
         np.testing.assert_allclose(pooled[name], value, rtol=1e-5, atol=1e-6, err_msg=name)
 
-    saved = Checkpoints(str(tmp_path / "run"), keep=8)
-    assert int(trainer(saved).fit(indexed_data(256, 16), steps=2, log_every=100).updates) == 1
-    resumed = trainer(Checkpoints(str(tmp_path / "run"), keep=8)).fit(
-        ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
-    assert (int(resumed.step), int(resumed.updates)) == (4, 2)
+    for batch, steps in ((8, 2), (32, 1)):
+        directory = str(tmp_path / f"fixed-{batch}")
+        assert int(trainer(Checkpoints(directory, keep=8)).fit(indexed_data(256, batch), steps=steps,
+                                                               log_every=100).step) == steps
+        resuming = trainer(Checkpoints(directory, keep=8))
+        if steps % 2:
+            with pytest.raises(ValueError, match=r"part-filled accumulation window \(1 in\)"):
+                resuming.fit(ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
+            continue
+        resumed = resuming.fit(ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
+        assert (int(resumed.step), int(resumed.updates)) == (4, 2)
 
 
 def test_a_ramp_stage_inside_a_window_that_replays_its_batches_is_refused_before_the_run_trains():
