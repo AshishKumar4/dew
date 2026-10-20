@@ -70,13 +70,13 @@ class CorpusCounts:
             {name: integer(value, name) for name, value in record(state["rejected"], "rejected").items()}
         )
 
-    def most(self, other: CorpusCounts) -> CorpusCounts:
-        """Each of these counts or `other`'s, whichever is larger: one corpus counted twice."""
+    def followed(self, reader: CorpusCounts) -> CorpusCounts:
+        """These counts of the prefix a memory read ran, followed by `reader`'s of the stages it
+        read after them: the reader delivered the rows and counted those cut short, and the two
+        dropped and chunked apart."""
         return dataclasses.replace(
-            self, attempted=max(self.attempted, other.attempted), accepted=max(self.accepted, other.accepted),
-            truncated=max(self.truncated, other.truncated), chunks=max(self.chunks, other.chunks),
-            chunk_records=max(self.chunk_records, other.chunk_records),
-            rejected=self.rejected | other.rejected)
+            reader, attempted=max(self.attempted, reader.attempted), chunks=self.chunks + reader.chunks,
+            chunk_records=self.chunk_records + reader.chunk_records, rejected=self.rejected + reader.rejected)
 
     def expanded(self, outputs: Sequence[Record]) -> None:
         """Count one chunked document and its fan-out before later stages can reject chunks."""
