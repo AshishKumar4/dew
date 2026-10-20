@@ -331,9 +331,7 @@ class TrainingDisplay:
                       + ", ".join(f"{label} {value}".strip() for label, value in self.header))
             return
         self.phase = "compiling"
-        # A notebook's widget goes when the run ends, for the static frame `close` leaves.
-        self.live = Live(self, console=console, refresh_per_second=8, vertical_overflow="visible",
-                         transient=console.is_jupyter)
+        self.live = Live(self, console=console, refresh_per_second=8, vertical_overflow="visible")
         self.live.start()
         self._logs = display_console(console)
         self._logs.__enter__()
@@ -407,7 +405,9 @@ class TrainingDisplay:
             if self.live is not None:
                 self.ended = True
                 self.live.stop()
-                if self.live.console.is_jupyter:
+                if self.live.ipy_widget is not None:
+                    # A saved notebook and the site keep no widget's state.
+                    self.live.ipy_widget.close()
                     self.live.console.print(self)
         finally:
             self.live = None
