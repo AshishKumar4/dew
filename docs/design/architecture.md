@@ -17,11 +17,12 @@ A model is a plain Flax module. An objective defines variables, loss and validat
 | Compilation cache | `src/dew/cache.py` | Every entry point uses the same cache policy. A program's identity follows its computation and environment. |
 | Data execution | `src/dew/data/pipeline.py`, `analysis.py` and `lowering.py` | One `Dataset` chain, one analyzed plan, and the lowering that plan declares. |
 | Weight layout | `src/dew/interop/` | One reversible source-to-model binding plan serves loading and export. Family adapters describe a source's schema. |
-| Model capabilities | `src/dew/nn/protocols.py` | Objectives, tasks, serving and export ask for capabilities and call through Flax `apply`. They do not inspect model classes or private variable scopes. |
+| Model capabilities | `src/dew/nn/protocols.py` | Objectives, tasks, serving and export ask for capabilities and call through Flax `apply`. |
 | Training state and checkpoints | The training-state schema and `src/dew/checkpoints/` | Save and restore derive fields from the state. Casting and placement happen once. |
 | Run configuration | `RunConfig.record()`, `src/dew/config/__init__.py` | The resolved run configuration is its record. Resume and export read it rather than reconstructing a second configuration. |
 | Outcomes and telemetry | `src/dew/telemetry/records.py` | Trackers, display and reports consume the same outcome records. |
 | Environments and suite selection | Project extras and lock files; `tools/armada/ci.py` | Installers and CI read their package and test selections from these owners. |
+| Reinforcement-learning math | `src/dew/rl` | Pure functions and small pytrees over rollout batches: advantages, surrogates, buffers, environments, rewards; it imports `dew.nn` and `dew.sampling` and nothing from `dew.training`. Nothing under `src/dew` outside `src/dew/rl` and `src/dew/objectives/rl` may import `dew.rl`. A test walks the module tree and asserts it. |
 | Staged training | `Recipe` and `Stage`, `recipes/chain.py` | Stages compose existing data, objectives and rollouts. `Objective.model_variables` defines what passes to the next stage. |
 
 ## Interfaces stay shared
