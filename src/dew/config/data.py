@@ -328,7 +328,7 @@ class _PromptFacts:
         return self.source.supports(read)
 
     def records(self, read: Read):
-        from dew.data.prompts import _ground_truth, _text
+        from dew.data.prompts import _extra_info, _ground_truth, _text
 
         rows = self.source.records(read)
         if read == "memory" and self.width is None and "reward_bytes" not in self._measured:
@@ -343,7 +343,7 @@ class _PromptFacts:
                         for text in (
                             _text(row.get("data_source")),
                             _ground_truth(row, "prompt"),
-                            _text(row.get("extra_info")),
+                            _text(_extra_info(row)),
                         )
                     ),
                     default=1,
