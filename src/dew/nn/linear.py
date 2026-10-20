@@ -620,9 +620,11 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     """The chunked delta rule over [B, S, H, D] operands with the log decay
     `g` `[B, S, H, D]`, D one for a decay per head (the gated delta rule) or
     Dk for one per key dimension (Kimi Delta Attention); returns
-    `(output [B, S, H, Dv], final_state [B, H, Dk, Dv])` in the input dtype,
-    computed in fp32. The references' sequential correction is the inverse
-    `strictly_lower_inverse` builds from its diagonal blocks.
+    `(output [B, S, H, Dv], final_state [B, H, Dk, Dv])`, the output in the
+    queries', keys' and values' common dtype and the memory in at least fp32,
+    as the port returns them (`fla_rule`), computed in at least fp32. The
+    references' sequential correction is the inverse `strictly_lower_inverse`
+    builds from its diagonal blocks.
 
     Only the memory crosses chunks, so only its recurrence runs chunk after
     chunk (`xla_chunk_states`). Each chunk's output, the references'
@@ -640,7 +642,8 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     entered passing through only where no document starts in it. A document
     computes as it would alone.
     """
-    dtype, work = query.dtype, at_least_fp32(query.dtype)
+    dtype = jnp.result_type(query, key, value)
+    work = at_least_fp32(dtype)
     query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
     B, S, H, Dk = key.shape
     Dv = value.shape[-1]
@@ -696,7 +699,7 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     core = (q_c * entering) @ entered + _paired(q_c, k_c, decay) @ v_corrected
     # core: [B, H, NC, C, Dv] -> [B, H, NC*C, Dv] -> [B, S, H, Dv]
     core = jnp.moveaxis(core.reshape(B, H, T, Dv), 1, 2)[:, :S]
-    return core.astype(dtype), state.astype(dtype)
+    return core.astype(dtype), state
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
@@ -892,15 +895,17 @@ def _padded(x, axis: int, size: int):
 
 
 def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None):
-    """One token at a time, the decode path, in fp32 as a lax.scan over the
-    time axis so the state rides the scan the way it rides the decode cache.
+    """One token at a time, the decode path, in at least fp32 as a lax.scan over
+    the time axis so the state rides the scan the way it rides the decode cache,
+    returned as the chunked rule returns them (`chunk_delta_rule`).
 
     `g` is the log decay per key dimension, `[B, S, H, Dk]`, which is
     `recurrent_kimi_delta_attention` (modeling_glm5_next.py:428-478). The
     gated delta rule decays per head, one decay over every key dimension.
     A token `starts` `[B, S]` marks begins a packed document from a zero memory.
     """
-    dtype, work = query.dtype, at_least_fp32(query.dtype)
+    dtype = jnp.result_type(query, key, value)
+    work = at_least_fp32(dtype)
     query, key, value, g, beta = (
         x.astype(work) for x in (query, key, value, g, beta))
     query = query * (key.shape[-1] ** -0.5)
@@ -922,7 +927,7 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None)
         one_token, state.astype(work),
         {name: jnp.moveaxis(x, 1, 0) for name, x in
          (('q', query), ('k', key), ('v', value), ('g', g), ('beta', beta), ('start', starts))})
-    return jnp.moveaxis(out, 0, 1).astype(dtype), state.astype(dtype)
+    return jnp.moveaxis(out, 0, 1).astype(dtype), state
 
 
 def decode_gated_delta_rule(query, key, value, g, beta, state, active=None):

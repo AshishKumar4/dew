@@ -12,11 +12,22 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import NAMES, fla_decay_terms, fla_side, float64_truth, recurrence, rule_math, through
+from delta_rule_support import (
+    NAMES,
+    fla_decay_terms,
+    fla_side,
+    float64_truth,
+    math as portable,
+    recurrence,
+    rule_math,
+    through,
+)
 from jax.core import ShapedArray
 from reference_error import (
     assert_as_exact_as_the_reference,
+    assert_computes_the_oracle,
     assert_leaves_as_exact,
+    chain_roundings,
     equations,
     float64_terms,
     widened,
@@ -24,7 +35,7 @@ from reference_error import (
 from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
 
-from dew.nn import kernels, linear
+from dew.nn import linear
 from dew.nn.kernels import fla_gdn, fla_kda, generation, tuning
 from dew.nn.linear import GatedDeltaNet, fla_rule, l2norm
 from dew.training._lowering import triton_calls
@@ -648,42 +659,120 @@ def test_dews_fla_rule_takes_wide_keys_up_to_fla_s_256_in_bf16(width):
     assert relative(out, want_out) < 2e-2 and relative(final, want_final) < 2e-2
 
 
+ROUTES = {
+    # label: the queries', keys' and values' dtypes, the key width, the values' heads and width, the
+    # mode, whether the GPU's row names the port, and whether the rule takes the port there.
+    "mixed dtypes": ((jnp.bfloat16, jnp.float32, jnp.bfloat16), 64, (2, 64), "reverse", True, True),
+    "bf16 keys 256 wide": ((jnp.bfloat16,) * 3, 256, (2, 64), "reverse", True, True),
+    "forward mode": ((jnp.bfloat16,) * 3, 64, (2, 64), "forward", True, False),
+    "fp32 keys 256 wide": ((jnp.float32,) * 3, 256, (2, 64), "reverse", True, False),
+    "bf16 keys 512 wide": ((jnp.bfloat16,) * 3, 512, (2, 64), "reverse", True, False),
+    "a row naming XLA": ((jnp.bfloat16,) * 3, 64, (2, 64), "reverse", False, False),
+}
+
+
+def routed_operands(dtypes, width, heads, seed=0):
+    """A rule's operands over 128 tokens, one key head serving `heads[0]` value heads `heads[1]` wide,
+    each in its dtype, the decay and memory in fp32, beta in the values' dtype."""
+    keys = jax.random.split(jax.random.key(seed), 6)
+    value_heads, columns = heads
+    q, k = (l2norm(jax.random.normal(key, (1, 128, 1, width))).astype(dtype)
+            for key, dtype in zip(keys[:2], dtypes[:2], strict=True))
+    v = jax.random.normal(keys[2], (1, 128, value_heads, columns)).astype(dtypes[2])
+    g = -jnp.exp(jax.random.normal(keys[3], (1, 128, value_heads)) - 3.0)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, 128, value_heads))).astype(dtypes[2])
+    h0 = 0.1 * jax.random.normal(keys[5], (1, value_heads, width, columns))
+    return q, k, v, g, beta, h0
+
+
+def run_rule(rule, mode, operands, cotangents):
+    """`rule` on `operands` as a layer runs it: its output, final memory and operands' gradients under
+    `cotangents`, or under `jax.jvp` inside `forward_mode_attention` its output, final memory and
+    their tangents along `cotangents`."""
+    from dew.nn.attention import forward_mode_attention
+
+    if mode == "reverse":
+        return through(rule, *cotangents)(*operands)
+    with forward_mode_attention():
+        return jax.jvp(rule, operands, cotangents)
+
+
+def route_cotangents(mode, operands):
+    """The output's and final memory's cotangents, or each operand's tangent under `jax.jvp`."""
+    if mode == "reverse":
+        drawn = jax.random.split(jax.random.key(7), 2)
+        return tuple(jax.random.normal(key, operands[index].shape)
+                     for key, index in zip(drawn, (2, 5), strict=True))
+    return tuple(jax.random.normal(jax.random.fold_in(jax.random.key(7), index), x.shape, x.dtype)
+                 for index, x in enumerate(operands))
+
+
+@pytest.mark.parametrize("label", sorted(ROUTES))
+def test_the_rule_computes_the_route_its_geometry_selects(label):
+    """The rule a layer calls (`linear.chunk_gated_delta_rule`), its output, final memory and every
+    operand's gradient (its tangents under `jax.jvp`), at each geometry the port takes and each it
+    refuses (`port_refusal`): bit for bit the port's (`fla_rule`) where it takes the rule and the
+    portable math's (`chunk_delta_rule`) where it does not. Each route is held to its reference
+    elsewhere, the port to fla's own runs (`test_where_the_rule_takes_the_port_it_is_as_exact_as_fla`
+    here) and the portable math to `torch_chunk_gated_delta_rule`'s (tests/test_linear_attention.py)."""
+    dtypes, width, heads, mode, names_port, ported = ROUTES[label]
+    operands = routed_operands(dtypes, width, heads)
+    cotangents = route_cotangents(mode, operands)
+    with row_names_port(port=names_port):
+        found = run_rule(linear.chunk_gated_delta_rule, mode, operands, cotangents)
+        want = run_rule(fla_rule if ported else portable, mode, operands, cotangents)
+    jax.tree.map(np.testing.assert_array_equal, found, want)
+
+
+@pytest.mark.parametrize("label", sorted(ROUTES))
+def test_both_routes_return_the_operands_common_dtype(label):
+    """One contract whichever route a GPU's row picks: the port (`fla_rule`), at every geometry it takes
+    (`linear.port_refusal`'s widths), and the portable math (`chunk_delta_rule`), at every geometry,
+    return the output in the queries', keys' and values' common dtype, the final memory in at least
+    fp32, and each operand's gradient in its own."""
+    dtypes, width, heads, _, _, _ = ROUTES[label]
+    operands = routed_operands(dtypes, width, heads)
+    cotangents = route_cotangents("reverse", operands)
+    common = jnp.result_type(*dtypes)
+    want = [common, jnp.promote_types(common, jnp.float32), *(jnp.dtype(x.dtype) for x in operands)]
+    widest = fla_gdn.WIDEST_KEYS if common.itemsize == 2 else fla_gdn.WIDEST
+    for rule in (fla_rule, portable) if width <= widest else (portable,):
+        found = [jnp.dtype(x.dtype) for x in through(rule, *cotangents)(*operands)]
+        assert found == want, (rule.__name__, found, want)
+
+
+@pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
+@pytest.mark.parametrize("label", sorted(label for label, route in ROUTES.items() if route[5]))
+def test_where_the_rule_takes_the_port_it_is_as_exact_as_fla(label):
+    """The rule a layer calls (`linear.chunk_gated_delta_rule`) at each geometry the port takes, mixed
+    dtypes and the widest bf16 keys: its output, final memory and every operand's gradient as near the
+    float64 recurrence as fla 0.5.2's own run on the same operands in their common dtype (`fla_side`),
+    each sized by its float64 terms (`float64_truth`)."""
+    dtypes, width, heads, _, _, _ = ROUTES[label]
+    operands = routed_operands(dtypes, width, heads)
+    do, dht = route_cotangents("reverse", operands)
+    with row_names_port():
+        mine = [np.asarray(x, np.float64) for x in through(linear.chunk_gated_delta_rule, do, dht)(*operands)]
+    inputs = (*operands, do, dht)
+    theirs = fla_side(inputs, None, jnp.result_type(*dtypes))
+    for name, dew, fla, value, summed in zip(NAMES, mine, theirs, *float64_truth(inputs, None), strict=True):
+        assert_as_exact_as_the_reference(dew, fla, value, f"{label} {name}", terms=summed)
+
+
 @generation.chosen(gated_delta_rule="fla")
-def test_a_gpu_runs_the_port_for_every_rule_but_forward_mode_float64_and_the_widest_keys():
-    """Every rule a GPU traces runs on the port (`port_refusal`), whatever its chunk size, dtypes,
-    heads or mesh, except inside `jax.jvp`'s traces, which its custom VJP gives no tangent, in
-    float64, whose rule is the reference math itself, and over keys wider than fla's 256 (128 in
-    fp32)."""
-    from dew.nn.attention import FORWARD_MODE
-
-    x = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
-    assert linear.on_the_port(x, x.astype(jnp.float32), jnp.zeros((1, 64, 3, 96), jnp.bfloat16))
-    token = FORWARD_MODE.set(True)
-    try:
-        assert not linear.on_the_port(x, x, x)
-    finally:
-        FORWARD_MODE.reset(token)
+def test_float64_operands_compute_the_recurrence_in_float64():
+    """A float64 rule, which the port refuses, is the portable math in float64: its output, final
+    memory and gradients within float64 rounding of the token recurrence's."""
     with jax.enable_x64(new_val=True):
-        wide = jnp.zeros((1, 64, 1, 64), jnp.float64)
-        assert not linear.on_the_port(wide, wide, wide)
-    keys = jnp.zeros((1, 64, 1, 512), jnp.bfloat16)
-    assert not linear.on_the_port(keys, keys, x)
-    keys = jnp.zeros((1, 64, 1, 256), jnp.float32)
-    assert not linear.on_the_port(keys, keys, keys)
-    assert linear.on_the_port(keys.astype(jnp.bfloat16), keys.astype(jnp.bfloat16), x)
-    with row_names_port(port=False):
-        assert not linear.on_the_port(x, x, x)
-
-
-@pytest.mark.parametrize("generation", sorted(name for name in kernels.TARGETS if name.startswith("sm")))
-def test_the_rule_runs_the_port_exactly_where_the_gpus_target_row_names_it(generation):
-    """Routing reads the row qualification reads (`generation.TARGETS`): a GPU generation whose row
-    names 'fla' for the rule runs the port, and one whose row does not runs the portable math and
-    says why."""
-    x = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
-    with kernels.assumed(generation):
-        ported = linear.on_the_port(x, x, x)
-    assert ported == (kernels.TARGETS[generation].kernels.get("gated_delta_rule") == "fla")
+        operands = widened(routed_operands((jnp.float32,) * 3, 64, (2, 64)))
+        cotangents = tuple(np.asarray(jax.random.normal(jax.random.key(index), shape), np.float64)
+                           for index, shape in enumerate((operands[2].shape, operands[5].shape)))
+        run = through(linear.chunk_gated_delta_rule, *cotangents)
+        roundings = chain_roundings(jax.make_jaxpr(run)(*operands))
+        found = jax.tree.map(np.asarray, run(*operands))
+        truth = jax.tree.map(np.asarray, through(recurrence, *cotangents)(*operands))
+    for index, (mine, exact) in enumerate(zip(found, truth, strict=True)):
+        assert_computes_the_oracle(mine, exact, f"leaf {index}", roundings=roundings)
 
 
 @generation.chosen(gated_delta_rule="fla")
