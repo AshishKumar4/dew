@@ -2397,7 +2397,7 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, params, reader, metrics=metrics, key=key,
                 step=state.step, schedule_step=state.microstep * self.accumulation // state.window_size,
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training,
-                warm=warm)
+                warm=warm, updates=state.updates)
         if not warm:
             # The training values ride along for ranking (`_ranking`); the log interval reports
             # them, so the evaluation's own report leaves them out.

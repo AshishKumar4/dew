@@ -131,6 +131,16 @@ class Step:
     or None when the objective keeps no EMA."""
     training: bool = struct.field(pytree_node=False, default=True)
     """Whether model calls train; static so compiled losses can branch on the mode."""
+    committed: jax.Array | None = None
+    """The updates the run committed before this step's (`TrainState.updates`), or None for a
+    step made outside a run (`updates`)."""
+
+    @property
+    def updates(self) -> jax.Array:
+        """The updates committed before this step's: the clock of an objective that alternates its
+        networks update by update, which an update's accumulated microbatches share. A step made
+        outside a run, where each step is its own update, counts its `step`."""
+        return self.step if self.committed is None else self.committed
 
 
 ROUNDING_STREAM = 0x726F756E

@@ -270,13 +270,12 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         """Return an optimizer that gives the student and the fake score each their own copy of `tx`.
 
         Each copy steps only on its own network's updates, as rCM's two
-        optimizers do. With DMD2 on, an `accumulation` above one raises
-        `ValueError`.
+        optimizers do. The two alternate update by update, and every
+        microbatch an update accumulates is of its update's phase: the loss
+        reads the committed updates (`Step.updates`), the clock these masks
+        count, however many microbatches an update takes.
         """
-        if accumulation > 1 and self.dmd_weight > 0:
-            raise ValueError(
-                "rCM alternates its student and fake-score updates update by update, so an update "
-                "takes one microbatch: train with accumulation=1 and a larger batch")
+        del accumulation
 
         def network(params):
             return {name: FAKE_SCORE if name == FAKE_SCORE else "student" for name in params}
@@ -364,7 +363,7 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         count = samples.shape[0]
         given, blank = self._conditions(variables, batch, drop_key)
         draws = self._draws(step, count, samples.shape)
-        iteration = step.step
+        iteration = step.updates
         warm = iteration < self.tangent_warmup
         student_phase = self._student(iteration)
         effective = self._effective(iteration)
