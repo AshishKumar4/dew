@@ -37,8 +37,8 @@ from .activations import GatedActivation, gated_product, relu2
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels.generation import backend, ran_kernel, triton_runs
-from .kernels.selection import forced
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_refusal, xla_ragged_dot
+from .kernels.selection import forced
 from .precision import at_least_fp32, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
 from .sharding import (
