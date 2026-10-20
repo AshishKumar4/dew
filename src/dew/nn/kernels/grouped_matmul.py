@@ -105,6 +105,11 @@ def _row_tiles(rows: int, groups: int, tile: int) -> float:
     return min(max(expected, least), rows, least + groups)
 
 
+def _routed(rows: int, groups: int) -> float:
+    """The share of `groups` matrices a launch over `rows` rows reads: at most one group a row."""
+    return min(groups, rows) / groups
+
+
 def _warps(rows: int, columns: int, warps: int) -> tuple[int, int]:
     """How Triton lays `warps` warps over a `rows` x `columns` dot (`warpsPerTileV2` in
     lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp): warps along the rows while a warp's 16-row
@@ -219,8 +224,7 @@ class Gmm(_Triton):
 
     def cost(self, ba, config: Tile, target) -> float:
         # A program is one group's chunk of up to `CHUNK_M` rows (ragged_dot.py) by `block_n` columns,
-        # its rows `block_m` at a time; the chunks are grid-ordered before the columns, so each column
-        # block reads the rows again and each chunk its group's matrix.
+        # its rows `block_m` at a time.
         from .ragged_dot import CHUNK_M
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
         (rows, depth), groups = tokens.shape, kernel.shape[0]
@@ -232,9 +236,9 @@ class Gmm(_Triton):
         steps = _row_tiles(rows, groups, config.block_m) * math.ceil(depth / config.block_k) / chunks
         staged = steps * _triton_staged(config.block_m, config.block_n, config.block_k, config.warps,
                                         _facts(target).wgmma) * size
-        moved = columns * rows * depth * size + chunks / max(min(groups, rows), 1) * kernel.size * size
+        moved = rows * depth * size + _routed(rows, groups) * kernel.size * size + rows * width * out
         return cost.seconds(cost.Cost(
-            programs=chunks * columns, device_bytes=moved + rows * width * out,
+            programs=chunks * columns, device_bytes=moved,
             program_flops=flops / (chunks * columns), program_staged=staged,
             resident=self._resident(ba, config, target), mode=_mode(tokens.dtype)), target)
 
@@ -271,8 +275,7 @@ class Tgmm(_Triton):
 
     def cost(self, ba, config: Tile, target) -> float:
         # A program is one group's `block_k` x `block_n` output tile, summed over the group's rows
-        # `block_m` at a time; the groups are grid-ordered first, so each output column block reads
-        # the rows again and each output row block the cotangent.
+        # `block_m` at a time.
         tokens, cotangent, sizes = ba.arguments['tokens'], ba.arguments['cotangent'], ba.arguments['sizes']
         (rows, depth), width, groups = tokens.shape, cotangent.shape[1], sizes.shape[0]
         size, out = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(ba.arguments['out_dtype']).itemsize
@@ -282,7 +285,7 @@ class Tgmm(_Triton):
         flops = 2 * steps * config.block_m * config.block_k * config.block_n
         staged = steps * _triton_staged(config.block_k, config.block_n, config.block_m, config.warps,
                                         _facts(target).wgmma) * size
-        moved = (blocks[1] * rows * depth + blocks[0] * rows * width) * size + groups * depth * width * out
+        moved = rows * (depth + width) * size + groups * depth * width * out
         return cost.seconds(cost.Cost(
             programs=programs, device_bytes=moved, program_flops=flops, program_staged=staged,
             resident=self._resident(ba, config, target), mode=_mode(tokens.dtype)), target)
@@ -348,8 +351,7 @@ class MosaicGmm(_Mosaic):
         return 2 * 2 * min(mosaic_gpu.EPILOGUE, tile.tile_m) * min(mosaic_gpu.EPILOGUE, tile.tile_n)
 
     def cost(self, ba, config: mosaic_gpu.Tiles, target) -> float:
-        # Persistent: each multiprocessor takes output tiles in turn, a band of `width` column tiles
-        # walking the row tiles, so the rows are read once a band and each group's matrix once.
+        # Persistent: each multiprocessor takes output tiles in turn.
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
         (rows, depth), groups = tokens.shape, kernel.shape[0]
         width = kernel.shape[1] if ba.arguments['trans_rhs'] else kernel.shape[2]
@@ -360,10 +362,9 @@ class MosaicGmm(_Mosaic):
         # the left operand (or all of them) and its own columns of the right (or all of them).
         read = 2 * (config.tile_m + config.tile_n) * config.tile_k
         staged = steps * (self.loaded(config) + read) * size + 2 * config.cta_m * config.cta_n * out
-        bands = math.ceil(columns / config.width)
         return cost.seconds(cost.Cost(
             programs=tiles * columns,
-            device_bytes=(bands * rows * depth + kernel.size) * size + rows * width * out,
+            device_bytes=(rows * depth + _routed(rows, groups) * kernel.size) * size + rows * width * out,
             program_flops=2 * config.cta_m * config.cta_n * depth, program_staged=staged,
             mode=_mode(tokens.dtype)), target)
 
@@ -399,8 +400,7 @@ class MosaicTgmm(_Mosaic):
         return 2 * tile.tile_m * tile.tile_n
 
     def cost(self, ba, config: mosaic_gpu.Tiles, target) -> float:
-        # Persistent over each group's output tiles, a band of `width` column tiles walking the row
-        # tiles: a group's rows are read once a band, its cotangent once.
+        # Persistent over each group's output tiles.
         tokens, cotangent, sizes = ba.arguments['tokens'], ba.arguments['cotangent'], ba.arguments['sizes']
         (rows, depth), width, groups = tokens.shape, cotangent.shape[1], sizes.shape[0]
         size, out = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(ba.arguments['out_dtype']).itemsize
@@ -408,8 +408,7 @@ class MosaicTgmm(_Mosaic):
         steps = _row_tiles(rows, groups, config.tile_k) / groups
         read = 2 * (config.tile_m + config.tile_n) * config.tile_k
         staged = steps * (self.loaded(config) + read) * size + config.tile_m * config.cta_n * out
-        bands = math.ceil(width // config.cta_n / config.width)
-        moved = (bands * rows * depth + rows * width) * size + groups * depth * width * out
+        moved = rows * (depth + width) * size + groups * depth * width * out
         return cost.seconds(cost.Cost(
             programs=tiles, device_bytes=moved,
             program_flops=2 * steps * config.tile_k * config.tile_m * config.cta_n, program_staged=staged,
