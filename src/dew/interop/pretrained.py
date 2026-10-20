@@ -333,7 +333,7 @@ class Pretrained:
              revision: str | None = None, gguf_file: str | None = None,
              single_file: str | None = None, dduf_file: str | None = None,
              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-             fallback: str | None = None, weights: bool = True) -> Self:
+             fallback: str | None = None, weights: bool = True, on_host: bool = False) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
         `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
@@ -350,9 +350,13 @@ class Pretrained:
         too, while router, clipping, positional and safety state keep their own FP32
         or integer dtypes.
 
-        Without `mesh` or `layout`, the variables are host arrays. With either, they
-        are placed on that mesh (the default `MeshSpec()` when only `layout` is given)
-        under that layout, one leaf at a time. A decoder's or a diffusion pipeline's
+        A loaded source is ready to run: without `mesh` or `layout` its variables are
+        placed on JAX's default device (`jax.default_device`), as a `jnp` array is. With
+        either, they are placed on that mesh (the default `MeshSpec()` when only `layout`
+        is given) under that layout. Either way they are placed one leaf at a time.
+        `on_host=True` keeps them as host arrays instead, for a caller that places them
+        itself, as a training start or an export does; a host tree passed to a jitted
+        call is copied to the device at each call. A decoder's or a diffusion pipeline's
         leaves are read from the memory-mapped checkpoint one device shard at a time,
         and cast and transposed there (`dew.interop.streaming`), so the host never
         holds the whole translated model. Towers, projectors, a quantized source's
@@ -395,7 +399,7 @@ class Pretrained:
         return cls._load(name_or_dir, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
                          max_seq_len=max_seq_len, revision=revision, gguf_file=gguf_file,
                          single_file=single_file, dduf_file=dduf_file, mesh=mesh, layout=layout,
-                         fallback=fallback, weights=weights)
+                         fallback=fallback, weights=weights, on_host=on_host)
 
     @classmethod
     def _load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
@@ -405,7 +409,7 @@ class Pretrained:
               dduf_file: str | None = None,
               mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None, fallback: str | None = None,
               prepare: Callable[[nn.Module, Variables], Variables] | None = None,
-              weights: bool = True) -> Self:
+              weights: bool = True, on_host: bool = False) -> Self:
         """Share the source reader with inference's pre-placement projection packing."""
         if fallback not in (None, "torchax"):
             raise ValueError(f"fallback={fallback!r} names no loader; the one fallback is 'torchax', "
@@ -418,6 +422,15 @@ class Pretrained:
             raise ValueError(f"fallback='torchax' builds the transformers model the repo's config.json "
                              f"and weights describe, and {' and '.join(selected)} selects another payload; "
                              "load it without fallback")
+        if on_host and (mesh is not None or layout is not None):
+            raise ValueError("on_host keeps the variables as host arrays, and mesh and layout place them; "
+                             "pass one")
+        if weights and not on_host and mesh is None and layout is None:
+            # The variables of a source loaded with no placement go where a jnp array goes.
+            from dew.nn.inputs import default_placement
+            from dew.training.distributed import MeshSpec as DefaultMesh
+
+            mesh = DefaultMesh().build(list(default_placement().device_set))
         streaming = mesh is not None or layout is not None
         if streaming and not weights:
             raise ValueError("a source loaded without its weights has nothing to place; the restore that "

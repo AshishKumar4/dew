@@ -170,3 +170,27 @@ def test_a_host_source_is_placed_holding_one_device_shard_at_a_time():
     placed = place_leaf(source, NamedSharding(mesh, PartitionSpec("fsdp")))
     np.testing.assert_array_equal(np.asarray(placed), source.value)
     assert source.most == 1
+
+
+def test_a_loaded_source_is_ready_to_run_on_the_default_device():
+    """A source loaded without a mesh or layout holds its variables on JAX's default device, as a
+    `jnp` array is held, so a jitted call reads them where they are rather than copying the whole
+    tree from the host at each call; `on_host=True` keeps host arrays, which a mesh or layout
+    beside it contradicts. A load returned host arrays, and a 4.57B model's step moved 9.1 GB
+    each call."""
+    from pathlib import Path
+
+    from dew.interop import Pretrained
+    from dew.nn.inputs import default_placement
+
+    fixture = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
+    loaded = Pretrained.load(fixture, dtype="float32", attention_impl="reference")
+    leaves = jax.tree.leaves(loaded.variables)
+    assert leaves and all(isinstance(leaf, jax.Array) and leaf.devices() == default_placement().device_set
+                          for leaf in leaves)
+    host = Pretrained.load(fixture, dtype="float32", attention_impl="reference", on_host=True)
+    assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(host.variables))
+    for placed, held in zip(leaves, jax.tree.leaves(host.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(placed), held)
+    with pytest.raises(ValueError):
+        Pretrained.load(fixture, on_host=True, mesh=jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)))
