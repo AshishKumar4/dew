@@ -28,7 +28,13 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.objectives import Step
-from dew.objectives.diffusion import Alignment, DiffusionObjective, DiffusionRunConfig, TextCondition
+from dew.objectives.diffusion import (
+    Alignment,
+    DiffusionObjective,
+    DiffusionRunConfig,
+    FlowRolloutConfig,
+    TextCondition,
+)
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, TUNED_WEIGHTS, EndToEnd
 from dew.objectives.rl.flow import FlowGRPOObjective
 from dew.registry import to_record
@@ -504,9 +510,9 @@ def grpo_run(beta: float = 0.0, directory: str = "./checkpoints") -> DiffusionRu
         data=ImageData(source="tfds://oxford_flowers102", image_size=4), preset=Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=directory),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        objective=ObjectiveConfig("flow_grpo",
-                                  {"reward": "psnr", "groups": 2, "rollout_steps": 3, "clip_range": 0.2,
-                                   "beta": beta, "solver": Euler(), "guidance": None, "steps": 2}))
+        objective=ObjectiveConfig("flow_grpo", {"clip_range": 0.2, "beta": beta, "solver": Euler(),
+                                                "guidance": None, "steps": 2}),
+        rollout=FlowRolloutConfig(reward="psnr", groups=2, steps=3))
 
 
 def grpo_step(objective, rollout, **trainer):
@@ -527,12 +533,31 @@ def test_flow_grpo_trains_from_the_run_config_on_a_registered_reward():
     one policy step on the transitions the rollout cut."""
     config = grpo_run()
     objective = config.build()
-    assert isinstance(objective, FlowGRPOObjective)
-    prepared, started, state = grpo_step(objective, objective.rollout())
+    assert isinstance(objective, FlowGRPOObjective) and config.rollout is not None
+    prepared, started, state = grpo_step(objective, config.rollout.build(objective))
     assert prepared["latents"].shape[:2] == (jax.device_count() * 2, 2)
     assert np.all(np.isfinite(prepared["rewards"]))
     assert any(not np.array_equal(after, before) for after, before in zip(
         jax.tree.leaves(state.variables["params"]), started, strict=True))
+
+
+def test_a_flow_grpo_runs_rollout_is_its_own_record_beside_the_objective():
+    """A Flow-GRPO run's rollout is the run's `rollout` record, which the objective's record does
+    not hold: a run naming none states the default, a rollout setting on the objective is no
+    argument of it, and a rollout on a run whose objective trains on its data is refused."""
+    stated = dataclasses.replace(grpo_run(), rollout=None)
+    assert stated.rollout == FlowRolloutConfig()
+    assert DiffusionRunConfig.from_dict(stated.to_dict()).rollout == FlowRolloutConfig()
+    with pytest.raises(ValueError):
+        dataclasses.replace(grpo_run(), objective=ObjectiveConfig("flow_grpo", {"reward": "psnr"}))
+    with pytest.raises(ValueError):
+        dataclasses.replace(grpo_run(), objective=ObjectiveConfig("diffusion", {}))
+    with pytest.raises(ValueError):
+        FlowRolloutConfig(reward="no_such_metric")
+    parsed = DiffusionRunConfig.cli(["preset:flow", "--objective", "flow_grpo", "--rollout.reward", "psnr",
+                                     "--rollout.groups", "2", "--rollout.train-steps", "3"])
+    assert parsed.rollout == FlowRolloutConfig(reward="psnr", groups=2, train_steps=3)
+    assert DiffusionRunConfig.from_dict(parsed.to_dict()).rollout == parsed.rollout
 
 
 def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_path):
@@ -544,8 +569,9 @@ def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_
 
     config = grpo_run(beta=0.1, directory=str(tmp_path))
     objective = config.build()
+    assert isinstance(objective, FlowGRPOObjective) and config.rollout is not None
     checkpoints = Checkpoints(str(tmp_path / "run"))
-    _, started, state = grpo_step(objective, objective.rollout(), checkpoints=checkpoints)
+    _, started, state = grpo_step(objective, config.rollout.build(objective), checkpoints=checkpoints)
     checkpoints.save(1, state, None, {}, artifact=objective.inference_record())
     checkpoints.wait()
     config.save(str(tmp_path / "run"))
@@ -566,8 +592,7 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
 
     source = load_diffusion_source(str(pipelines / "sd3" / "pipeline"), dtype="float32",
                                    attention_impl="xla", size=(16, 16))
-    settings = {"reward": "psnr", "groups": 2, "rollout_steps": 3, "solver": Euler(), "guidance": None,
-                "steps": 2}
+    settings = {"solver": Euler(), "guidance": None, "steps": 2}
     grpo = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
                              variables=source.variables, **settings)
     plain = DiffusionObjective(source, solver=Euler(), guidance=None, steps=2)
