@@ -86,6 +86,30 @@ def native_server():
     server.close()
 
 
+def test_a_native_server_starts_stepping_at_its_first_submission():
+    """Constructing a rollout server starts no thread (api spec A15); the first submission starts
+    its stepping, and a server closed before any submission closes at once."""
+    target = objective()
+    params = target.init(jax.random.key(0))
+    task = TextGeneration(target.model, params, None, sampling=SAMPLING)
+
+    def stepping():
+        return [thread for thread in threading.enumerate() if thread.name == "dew-rollout-server"]
+
+    before = len(stepping())
+    unused = NativeRolloutServer(Server.from_task(task, slots=2, capacity=64))
+    assert len(stepping()) == before
+    unused.close()
+    server = NativeRolloutServer(Server.from_task(task, slots=2, capacity=64))
+    try:
+        assert len(stepping()) == before
+        server.submit([1, 2, 3], 2, key=0).result()
+        assert len(stepping()) == before + 1
+    finally:
+        server.close()
+    assert len(stepping()) == before
+
+
 def test_a_task_whose_criteria_end_draws_before_eos_is_refused():
     """A draw tells EOS from its budget alone; a task whose stop strings or
     criteria would end it on neither cannot back a rollout server."""
