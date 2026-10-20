@@ -3,9 +3,7 @@
 The environment is a guessing game (`openenv_support`) served by `openenv`'s
 `create_fastapi_app` over uvicorn, in-process or as a server process the test
 kills, and each episode opens its own session through `GenericEnvClient`, as
-a trainer reaching a remote environment does. The session's context manager
-re-raises a dropped connection as an infrastructure failure, as the source's
-module says a caller's does. The policy is a bigram model on Dew's own server
+a trainer reaching a remote environment does. The policy is a bigram model on Dew's own server
 whose draws are its argmax: it guesses 3 after the prompt and 7 after the
 environment's hint.
 """
@@ -27,9 +25,8 @@ import pytest
 import uvicorn
 from episode_support import ToolPolicy
 from openenv.core import GenericEnvClient
-from websockets.exceptions import ConnectionClosed
 
-from dew.inference import InfrastructureError, NativeRolloutServer, TextGeneration
+from dew.inference import NativeRolloutServer, TextGeneration
 from dew.inference.serving import Server
 from dew.interop.openenv import OpenEnv, Said
 from dew.objectives.rl import EnvironmentSource, Status, Task, Transcript, pack
@@ -72,11 +69,8 @@ def games(url):
     """The guessing game at `url`, one session an episode, its target the task's id."""
     @contextmanager
     def session(task, identity):
-        try:
-            with GenericEnvClient(base_url=url).sync() as opened:
-                yield opened
-        except ConnectionClosed as error:
-            raise InfrastructureError(f"the OpenEnv session at {url} dropped: {error}") from error
+        with GenericEnvClient(base_url=url).sync() as opened:
+            yield opened
 
     def said(observation):
         return {"role": "user", "content": observation["hint"]}
@@ -130,9 +124,9 @@ def test_an_openenv_reset_that_is_already_done_completes_its_episode_without_a_t
 
 
 def test_a_session_whose_connection_drops_mid_step_is_an_infrastructure_failure(tmp_path):
-    """A server killed while it holds a step: the step's call raises the dropped connection, which
-    the session's context manager re-raises as an infrastructure failure, so the episode is infra
-    and the scheduler retries it rather than the run failing."""
+    """A server killed while it holds a step: the step's call raises the dropped connection as an
+    infrastructure failure, so the episode is infra and the scheduler retries it rather than the
+    run failing."""
     port, stalled = free_port(), tmp_path / "stalled"
     server = subprocess.Popen([sys.executable, str(Path(openenv_support.__file__)), str(port), str(stalled)])
     try:
