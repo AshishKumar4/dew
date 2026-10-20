@@ -8,18 +8,27 @@ Design record, consolidated 2026-10-19. Tests run real use cases through public 
 |---|---|
 | Dense language-model pretraining | Build a decoder, train, save, resume, evaluate, export, reload and generate. |
 | Pretrained fine-tuning | Load a published decoder, train full weights or LoRA, then export and reload both forms. |
-| Structured prediction | Train, evaluate and serve a model with structured records and outputs. |
+| Structured prediction | Train and serve a decision task (dew.decision) |
 | Diffusion training | Train an image or video model, checkpoint, resume, sample and export. |
 | Published diffusion pipelines | Load a text-to-image pipeline and sample with its processor, guidance and solver settings. |
 | Distributed training | Train dense FSDP and expert-sharded MoE models on real meshes. |
 | Online post-training | Collect rollouts, score them, update a policy, save and resume; include language and diffusion RL. |
 | Diffusion language models | Train and sample masked and block-diffusion LMs on the shared LM data path. |
-| Generation and serving | Evaluate, batch, prefill and decode with exact and approximate caches, speculative decoding and quantized weights. |
-| Quantized interchange | Load ModelOpt, compressed-tensors and GGUF checkpoints, then train or serve and export where supported. |
+| Generation and serving | Evaluate and serve an LM: batch generation, paged cache, speculative decoding, quantized serving |
+| Quantized interchange | Load quantized checkpoints (ModelOpt, CT, GGUF) and train or serve them |
 | Representation learning | Train a JEPA encoder and evaluate its representations. |
 | Hybrid and state-space models | Train and decode GDN, KDA and Mamba through their shared components. |
 
-Each scenario runs the lifecycle once and asserts every contract it touches. It checks finite, meaningful updates; resume against uninterrupted execution; packed against separate documents; padded against unpadded rows; sharded against unsharded execution; export and reload; and reference outputs and gradients. Repeated and resumed training, evaluation and sampling check executable reuse across a fresh process through the persistent cache.
+The whole flow, once: load or build the model → train several steps on real-shaped data → checkpoint → resume → evaluate → export → reload → generate or sample. The same run asserts every contract that flow touches. These are the standing contract tests, run inside the scenarios:
+
+- loss decreases, and the gradient is finite;
+- resume equals the uninterrupted run;
+- packed rows equal their documents run separately;
+- right-padded equals unpadded on the real tokens;
+- sharded equals unsharded (on the device mesh of scenario 6 and on CPU multi-device);
+- a repeated or resumed run reuses its compiled programs: a fresh process hits the persistent cache with an identical program fingerprint (training, evaluation, sampling);
+- export then reload is identical;
+- loaded checkpoints match their reference (HF transformers, diffusers) within the float64 gate.
 
 An exact cache's decode agrees with full forward under the numerical rule below. A cache explicitly defined as approximate is compared with the reference implementation's own decode under that same cache. Approximate and exact cache claims remain distinct.
 
@@ -27,9 +36,20 @@ Every Pallas or FFI kernel runs per shard through `tests/sharded.py::assert_runs
 
 ## Settings and devices
 
-Choose a pairwise covering set over precision (fp32, bf16 and qualified fp8), padding and packing, memory-plan choices, devices, quantization, and memory/indexed/streamed data. Implementations come from their registries. A new implementation cannot opt out by being absent from a hand-kept test list.
+Each scenario runs a small covering set over the settings axes, chosen pairwise, so every pair of settings meets once:
 
-The CPU tier uses real architecture configurations at sizes that keep lifecycle checks short, plus small published checkpoints. Multiprocess and multihost behavior uses real processes, readers and meshes. A single-process mesh simulation is useful evidence for that simulation only.
+- precision: fp32, bf16, fp8 where supported;
+- rows: padded, packed;
+- memory: no remat, the planner's rung;
+- devices: 1, 2 (CPU multi-device), the GPU mesh;
+- quantization: none, QAT, PTQ (scenarios 2, 9, 10);
+- data read: memory, indexed, streamed.
+
+Implementations come from their registries. A new implementation cannot opt out by being absent from a hand-kept test list.
+
+**CPU tier (every CI run):** real architectures from their real configs, scaled down (layers, width), plus small real checkpoints that fit (for example SmolLM2-135M). Each scenario takes minutes. Multiprocess and multihost behavior uses real processes, readers and meshes. A single-process mesh simulation is useful evidence for that simulation only.
+
+**GPU validation** (owner, 2026-10-19): every GPU-touching or performance-critical change on main is validated on real GPUs: A100 and H100, plus multi-GPU where it shards or communicates.
 
 The GPU tier uses real checkpoints and representative shapes on each target a change names. A100 and H100 qualify GPU paths; sharding and communication also run on multiple physical GPUs. A compile-only result does not establish runtime correctness. Target-specific FP8 and newer-device paths require the relevant hardware. TPU kernels need real TPU execution for their runtime claims.
 
@@ -39,14 +59,16 @@ The GPU tier uses real checkpoints and representative shapes on each target a ch
 
 There is no independent error floor: no leaf RMS, dtype epsilon allowance, row-size term, reduction-size term or cancellation allowance. A failure is a defect in Dew, the reference arm or the bound's derivation. Find which one. Never widen a tolerance, change the reference to one Dew already matches, drop failing positions or gradients, or compare only argmax when logits disagree.
 
-Reference fixtures record the source implementation, its revision, inputs, precision and generation command. The committed generator uses the reference's public interface. A fixture that cannot be reproduced does not establish parity. Kernel qualification records forward, backward and forward-mode behavior where the consuming objective needs it.
+The committed generator uses the reference's public interface. Kernel qualification records forward, backward and forward-mode behavior where the consuming objective needs it.
 
 ## Tests must catch a defect
 
-A fix includes the behavioral case that fails before it and passes after it. A new contract includes a mutation that breaks it. The failure is observed through the public interface, including at error boundaries; error wording is not the contract.
+A fix includes the behavioral case that fails before it and passes after it. The failure is observed through the public interface, including at error boundaries; error wording is not the contract.
 
 Tests of source strings, prose, constant inventories and isolated scalar values are excluded. Internal mocks are excluded. External network, file and service boundaries can be controlled to exercise interruption, corruption and admission failures, while the code under test runs unchanged.
 
-Use adversarial orders: resume inside a packed window or partial batch, stop a worker, change a mesh, exhaust a finite source, corrupt an unpublished shard, race finalizers, and cancel an active rollout. Check resource release and primary-error preservation through the same lifecycle.
+Check resource release and primary-error preservation through the same lifecycle.
 
-Branch coverage directs scenario settings. Reachable uncovered behavior gets a scenario setting; unreachable behavior is considered for deletion. Delete an isolated test when the scenario already exercises its behavior. Existing flow files compose these scenarios through the same execution helpers, without a second flow framework.
+Run the scenario suite with branch coverage (coverage.py) on armada and publish the per-module report.
+
+Branch coverage directs scenario settings. Uncovered code that a real use case reaches gets a scenario setting. Uncovered code that no real use case reaches is a deletion candidate, decided by the user's surface review. A unit test whose lines the scenarios already cover, and which asserts nothing a scenario doesn't, is deleted. Existing flow files compose these scenarios through the same execution helpers, without a second flow framework.
