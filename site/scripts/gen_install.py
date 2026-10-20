@@ -1,11 +1,12 @@
 """Generate the install facts other files repeat from their owners: the CUDA builds' minima
 (dew.telemetry.builds.CUDA_BUILDS), Dew's package index (dew.telemetry.builds.PACKAGE_INDEX) and
 Dew's least Python (pyproject.toml's requires-python), into the standalone installer, constraints.txt,
-the Colab notebooks' install, docs/installation.md's table and the least Python the README and
-docs/installation.md state."""
+the Colab notebooks' install, the site's scripts that install Dew (site/package.json), docs/installation.md's
+table and the least Python the README and docs/installation.md state."""
 
 import argparse
 import ast
+import json
 import re
 import tomllib
 from pathlib import Path
@@ -43,6 +44,26 @@ def between(text: str, markers: tuple[str, str], lines: list[str]) -> str:
     return before + "\n".join([markers[0], *lines, ""]) + markers[1] + after
 
 
+def indexed(text: str, index: str) -> str:
+    """`text`, a package.json, with every `uv run` of its scripts that installs Dew from the checkout
+    (`--with-editable`) reading Dew's package index, where Dew's JAX build is served."""
+    for script in json.loads(text)["scripts"].values():
+        commands = []
+        for command in script.split(" && "):
+            if "uv run" in command and "--with-editable" in command:
+                command = re.sub(r" --extra-index-url \S+", "", command)
+                command = re.sub(r"(--with-editable \S+)",
+                                 lambda found: f"{found[1]} --extra-index-url {index}", command)
+            commands.append(command)
+        before = json.dumps(script, ensure_ascii=False)
+        after = json.dumps(" && ".join(commands), ensure_ascii=False)
+        if text.count(before) != 1:
+            raise SystemExit(f"gen_install finds the script {before} {text.count(before)} times in "
+                             f"site/package.json")
+        text = text.replace(before, after)
+    return text
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--check", action="store_true", help="Check the generated blocks without writing them.")
@@ -60,11 +81,14 @@ def main() -> None:
                          (REPO / "constraints.txt", ((CONSTRAINT, [f"--extra-index-url {index}"]),)),
                          (REPO / "site/scripts/colab-notebooks.mjs",
                           ((COLAB, [f"const PACKAGE_INDEX = '{index}';"]),)),
+                         (REPO / "site/package.json", ()),
                          (REPO / "docs/installation.md", ((TABLE, table), (LEAST, least))),
                          (REPO / "README.md", ((LEAST, least),))):
         original = generated = path.read_text()
         for markers, lines in blocks:
             generated = between(generated, markers, lines)
+        if path.name == "package.json":
+            generated = indexed(generated, index)
         if generated != original:
             stale.append(str(path.relative_to(REPO)))
             if not args.check:
