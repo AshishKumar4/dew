@@ -98,7 +98,9 @@ def test_a_grid_of_a_million_points_names_each_trial_as_its_product_orders_it():
     def done(count):
         return [TrialFinished(index, str(index), {}, 0.0) for index in range(count)]
 
-    assert search(SPACE, done(3)) == dict(zip(SPACE, list(itertools.product(*SPACE.values()))[3], strict=True))
+    walked = list(itertools.product(*SPACE.values()))
+    assert [search(SPACE, done(index)) for index in range(4)] == [
+        dict(zip(SPACE, point, strict=True)) for point in walked]
     assert search(space, done(123_456)) == {'a': 12, 'b': 34, 'c': 56}
     with pytest.raises(ValueError):
         search(SPACE, done(4))
