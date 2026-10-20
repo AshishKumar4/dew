@@ -266,7 +266,6 @@ def zoo() -> dict[str, Any]:
     diffused = {f"{name}_mdlm": Case("causal_transformer", bidirectional(config),
                                      decoder_objective="mdlm", **lm)
                 for name, config in decoders.items() if name != "hybrid"}
-    images: ImageRows = {"batch_size": 8, "channels": 4, "fsdp_min_param_size": 256}
     return {
         "dense": Case("causal_transformer", dense, **lm),
         "grouped": Case("causal_transformer", {**dense, "norms": GROUPED_NORMS}, **lm),
@@ -289,6 +288,23 @@ def zoo() -> dict[str, Any]:
                        batch_size=8, seq_len=31, fsdp_min_param_size=256),
         **trained,
         **diffused,
+        **_image_zoo(),
+        "multimodal": Case("multimodal_transformer", dense, media={
+            "family": "gemma3", "image_token_id": 511, "images": 1, "pixels": [3, 16, 16],
+            "tower": {"class": "siglip", "fields": {"hidden_size": 32, "intermediate_size": 64, "num_layers": 1,
+                      "num_heads": 4, "image_size": 16, "patch_size": 8}},
+            "projector": {"class": "gemma", "fields": {"text_width": 64, "patches_per_side": 2,
+                          "tokens_per_side": 2}}}, **lm),
+    }
+
+
+def _image_zoo() -> dict[str, Any]:
+    """The zoo's image models (`zoo`): a conditional UNet, EDM2's magnitude-preserving U-Net and an
+    MMDiT (SD3's) denoising latents, and a JEPA encoder predicting its masked patches' features."""
+    from benchmark_cases import Case
+
+    images: ImageRows = {"batch_size": 8, "channels": 4, "fsdp_min_param_size": 256}
+    return {
         "unet": Case("unet_2d_condition", {"stages": [{"features": 32, "heads": 4},
                                                       {"features": 64, "heads": 4}],
                                            "blocks_per_level": 1, "in_channels": 4, "out_channels": 4},
@@ -306,12 +322,6 @@ def zoo() -> dict[str, Any]:
                      predictor={"grid": (4, 4), "emb_features": 32, "predictor_features": 16,
                                 "num_layers": 1, "num_heads": 4, "mlp_ratio": 2},
                      batch_size=8, image_size=16, fsdp_min_param_size=256),
-        "multimodal": Case("multimodal_transformer", dense, media={
-            "family": "gemma3", "image_token_id": 511, "images": 1, "pixels": [3, 16, 16],
-            "tower": {"class": "siglip", "fields": {"hidden_size": 32, "intermediate_size": 64, "num_layers": 1,
-                      "num_heads": 4, "image_size": 16, "patch_size": 8}},
-            "projector": {"class": "gemma", "fields": {"text_width": 64, "patches_per_side": 2,
-                          "tokens_per_side": 2}}}, **lm),
     }
 
 
