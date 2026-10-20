@@ -8,9 +8,8 @@ the chunk recurrence and the hand-written backward pass, and a TPU compiles it.
 
 One driver (`assert_kernel_parity`) holds every case to the same rule: the
 kernel's forward, final state and all five gradients finite and, by
-tests/reference_error.py's rule, no further from the stepwise recurrence in
-float64 (`stepwise_scan`, which shares no line with either chunked path) than
-twice the XLA path's fp32 distance, the XLA path's own arithmetic in float64
+tests/reference_error.py's pooled gate, on par with XLA's distance from the stepwise recurrence in
+float64 (`stepwise_scan`, which shares no line with either chunked path), the XLA path's arithmetic in float64
 first held to the recurrence. The cases (`CASES`): the reference fixture's scan
 at a chunk of 32 (three chunks, a ragged tail) and of 128 (one chunk, mostly
 padding), with and without document resets (`RESET_DECAY` in `A dt`, which the
@@ -26,7 +25,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_computes_the_oracle, assert_leaves_as_exact, float64_terms
+from reference_error import assert_as_exact, assert_computes_the_oracle
+from ssd_support import ssd_orbit
 
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
 from dew.nn.mixers.mamba2 import RESET_DECAY, xla_chunk_scan
@@ -97,55 +97,44 @@ def stepwise_scan(x, b, c, a, state):
     return jnp.moveaxis(ys, 0, 1), final
 
 
-def assert_kernel_parity(operands, chunk_size: int, *, compiled: bool, roundings: int):
-    """The kernel's forward and all five gradients, interpreted or `compiled` for the device this
-    process holds, finite and by the float64 rule against the stepwise recurrence in float64 on the
-    host, the XLA path's fp32 run the reference; the XLA path's own arithmetic in float64 first held
-    to the recurrence (`assert_computes_the_oracle`, `roundings` the steps and widths it sums). An
-    entry sums a chunk's steps of products over the state or the head width, in another order than
-    the XLA path's, so each is held to the rounding of that many reductions."""
+def parity_functions(chunk_size: int, roundings: int):
+    """XLA's output, final state and all five gradients, and its independently checked float64 truth."""
+    def evaluated(scan, operands, seeded):
+        output, backward = jax.vjp(scan, *operands)
+        return dict(zip(("output", "final", "x", "B", "C", "A dt", "state"),
+                        (*output, *backward(seeded)), strict=True))
+
+    xla = jax.jit(lambda operands, seeded: evaluated(
+        lambda *o: xla_chunk_scan(*o, chunk_size), operands, seeded))
+    recurrence = jax.jit(lambda operands, seeded: evaluated(stepwise_scan, operands, seeded))
+
+    def truth(operands, seeded):
+        with jax.default_device(jax.devices("cpu")[0]):
+            exact, twin = recurrence(operands, seeded), xla(operands, seeded)
+        for name in exact:
+            assert_computes_the_oracle(np.asarray(twin[name]), np.asarray(exact[name]), name,
+                                      roundings=roundings)
+        return exact
+
+    return xla, truth, evaluated
+
+
+def assert_kernel_parity(draw, chunk_size: int, *, compiled: bool, roundings: int, seeds: int, label: str):
+    """Every forward and gradient leaf on par over fresh inputs and exact coordinate orbits.
+
+    The float64 XLA scan must still compute the independent recurrence on every draw.
+    """
     platform = jax.default_backend() if compiled else "tpu"
     if compiled:
         # pallas interprets only for a platform the process holds no device of
         assert any(device.platform == platform for device in jax.devices())
 
-    def xla(*operands):
-        return xla_chunk_scan(*operands, chunk_size)
-
     def kernel(*operands):
         return ssd_chunk_scan(*operands, chunk_size, platform)
 
-    seeded = cotangents(*xla(*operands))
-    # The float64 oracle runs on the host: a TPU emulates float64, and a 4096-step scan of it did not
-    # finish in 20 minutes on a v6e. Only the oracle runs with x64 on.
-    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
-        exact = [jnp.asarray(np.asarray(t), jnp.float64) for t in operands]
-        wide_seeds = tuple(jnp.asarray(np.asarray(t), jnp.float64) for t in seeded)
-        truth = jax.jit(stepwise_scan)(*exact)
-        truth_gradients = jax.jit(lambda *o: jax.vjp(stepwise_scan, *o)[1](wide_seeds))(*exact)
-        # The XLA path in float64 and each entry's terms, its own sums (`float64_terms`), each entry's
-        # size where its sum cancels.
-        def twin_and_gradients(*o):
-            return (*xla(*o), *jax.vjp(xla, *o)[1](wide_seeds))
-
-        twin, terms = float64_terms(twin_and_gradients, *exact)
-        truth = [np.asarray(t) for t in (*truth, *truth_gradients)]
-        twin, terms = ([np.asarray(t) for t in values] for values in (twin, terms))
-
-    theirs = jax.jit(xla)(*operands)
-    theirs_gradients = jax.jit(lambda *o: jax.vjp(xla, *o)[1](seeded))(*operands)
-    mine = jax.jit(kernel)(*operands)
-    mine_gradients = jax.jit(lambda *o: jax.vjp(kernel, *o)[1](seeded))(*operands)
-
-    reductions = chunk_size * max(operands[0].shape[-1], operands[1].shape[-1])
-    names = ("output", "final", "x", "B", "C", "A dt", "state")
-    pairs = zip(names, (*mine, *mine_gradients), (*theirs, *theirs_gradients), twin, truth, terms,
-                strict=True)
-    for name, mine, theirs, wide, want, summed in pairs:
-        assert np.all(np.isfinite(np.asarray(mine))), name
-        assert_computes_the_oracle(wide, want, name, roundings=roundings)
-        assert_leaves_as_exact({name: np.asarray(mine)}, {name: np.asarray(theirs)}, {name: want},
-                               reductions=reductions, terms={name: summed})
+    xla, truth, evaluated = parity_functions(chunk_size, roundings)
+    mine = jax.jit(lambda operands, seeded: evaluated(kernel, operands, seeded))
+    assert_as_exact(mine, xla, draw, label, seeds=seeds, truth_fn=truth)
 
 
 def fixture_case(reference, chunk_size: int, resets: bool):
@@ -159,12 +148,12 @@ def fixture_case(reference, chunk_size: int, resets: bool):
     return (x, b, c, a, state), chunk_size, 70 + 6 + 5
 
 
-def shape_case(shape, chunk_size: int):
+def shape_case(shape, chunk_size: int, seed: int = 0):
     """`mixer_operands` at `shape`: a nonzero entering state, steps that decay a chunk's state by
     about e (Mamba-2's small steps; at `mixer_operands`' own a chunk's carry vanishes and its gradient
     with it), and document resets at a chunk's first step and inside one, in chunks apart from ones
     that carry."""
-    x, dt, A, B, C, _, state = mixer_operands(shape)
+    x, dt, A, B, C, _, state = mixer_operands(shape, seed)
     x, b, c, a, state = blocks(x, dt / chunk_size, A, B, C, state, chunk_size)
     # A reset zeroes its chunk's carry, so the chunks it misses keep one.
     if a.shape[0] > 1:
@@ -172,6 +161,39 @@ def shape_case(shape, chunk_size: int):
     if a.shape[1] > chunk_size:
         a = a.at[0, chunk_size].set(RESET_DECAY)
     return (x, b, c, a, state), chunk_size, shape[1] + shape[3] + shape[4]
+
+
+def case_draw(reference, kind, case):
+    """Fresh inputs at each original geometry; exact joint head, P and N permutations.
+
+    The `fixture` cases use recorded input geometry, but regenerate XLA's outputs on every draw.
+    Their reset positions and padding, and the shape cases' carry-preserving steps, stay unchanged.
+    """
+    def draw(seed):
+        if kind == "fixture":
+            chunk, resets = case
+            shape = (*reference["scan.x"].shape, reference["scan.B"].shape[-1],
+                     reference["scan.B"].shape[2])
+            x, dt, A, B, C, _, state = mixer_operands(shape, seed)
+            operands = blocks(x, dt, A, B, C, state, chunk)
+            x, b, c, a, state = operands
+            if resets:
+                a = a.at[0, 7].set(RESET_DECAY).at[1, 20].set(RESET_DECAY)
+                if a.shape[1] > chunk:
+                    a = a.at[0, chunk].set(RESET_DECAY)
+            operands = x, b, c, a, state
+        else:
+            operands, _, _ = shape_case(*case, seed)
+        seeded = cotangents(operands[0], operands[-1], seed)
+        arrays = ssd_orbit(dict(zip(("x", "B", "C", "a", "h0", "dy", "dfinal"),
+                                   (*operands, *seeded), strict=True)), seed)
+        return (tuple(arrays[name] for name in ("x", "B", "C", "a", "h0")),
+                tuple(arrays[name] for name in ("dy", "dfinal")))
+
+    return draw
+
+
+SEEDS = {}
 
 
 on_device = pytest.mark.skipif(jax.default_backend() != "tpu",
@@ -203,4 +225,5 @@ def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled)
         assert ssd_kernel_runs(chunk_size, shape[3], shape[4], jax.default_backend(), dtype=jnp.float32)
     built = fixture_case(reference, *case) if kind == "fixture" else shape_case(*case)
     operands, chunk_size, roundings = built
-    assert_kernel_parity(operands, chunk_size, compiled=compiled, roundings=roundings)
+    assert_kernel_parity(case_draw(reference, kind, case), chunk_size, compiled=compiled,
+                         roundings=roundings, seeds=SEEDS[kind, case], label=f"{kind} {case}")

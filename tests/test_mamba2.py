@@ -21,7 +21,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import decode_through
-from reference_error import FACTOR, assert_as_exact_as_the_reference, widened
+from reference_error import FACTOR, assert_as_exact, assert_as_exact_as_the_reference, widened
+from ssd_support import mamba2_draw
 
 from dew.accuracy import distance
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -120,12 +121,21 @@ def test_a_sequence_split_in_two_carries_its_state_across_the_cut(reference):
              in_float64(chunk_ssd, x, step, A, B, C, D, None, 32), "the cut sequence")
 
 
-def test_the_chunk_size_does_not_change_the_scan(reference):
-    x, step, A, B, C, D = operands(reference)
-    at_32 = chunk_ssd(x, step, A, B, C, D, None, 32)
-    truth = in_float64(chunk_ssd, x, step, A, B, C, D, None, 32)
+CHUNK_SIZE_SEEDS = 0
+
+
+def chunk_size_draw(seed):
+    """Fresh inputs at the fixture geometry under joint head, P-channel and N-coordinate permutations."""
+    arrays = mamba2_draw(seed)
+    arrays["dt"] = jax.nn.softplus(jnp.asarray(arrays["dt"]) + jnp.asarray(arrays["dt_bias"]))
+    return tuple(arrays[name] for name in ("x", "dt", "A", "B", "C", "D"))
+
+
+def test_the_chunk_size_does_not_change_the_scan():
+    at_32 = jax.jit(lambda *inputs: chunk_ssd(*inputs, None, 32))
     for size in (7, 256):
-        as_exact(chunk_ssd(x, step, A, B, C, D, None, size), at_32, truth, f"a chunk of {size}")
+        run = jax.jit(lambda *inputs, size=size: chunk_ssd(*inputs, None, size))
+        assert_as_exact(run, at_32, chunk_size_draw, f"a chunk of {size}", seeds=CHUNK_SIZE_SEEDS)
 
 
 def layer(geometry, **overrides) -> Mamba2:
