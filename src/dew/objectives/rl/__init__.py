@@ -43,6 +43,7 @@ from .sessions import (
                        SessionSource,
                        Status,
                        Task,
+                       Transcript,
                        pack,
 )
 from .sources import EnvironmentSource, PromptSource, prompt_tasks
@@ -87,6 +88,7 @@ __all__ = [
                        "SessionSource",
                        "Status",
                        "Task",
+                       "Transcript",
                        "Transition",
                        "ValueHead",
                        "Verifier",
