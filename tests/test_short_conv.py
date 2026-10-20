@@ -131,29 +131,84 @@ def configs(op) -> list:
                                                   grads), x, weights)
 
 
-def test_the_tuner_reads_times_and_stores_the_convs_launches():
-    """A right-padded delta conv and its gradients, traced as the tuner reads a program: one forward
-    launch and one backward launch a piece, each a tuner op keyed by its pieces; each timed on rows
-    whose every token is real (`KernelOp.operands`), so every token's output and the taps' gradients
-    are written, where the default operands' zero validity masks every token; and a pick for each
-    stored and read back as the tuner stores them, by the same launch and key."""
+def tuned_step():
+    """A right-padded delta conv's pieces and gradients as one jitted step, its operands, and the
+    validity and cotangents it closes over."""
     x, weights, _, kept = operands(2, 37, DELTA, valid=True)
     grads = cotangents(x, DELTA, jnp.bfloat16)
-    found = launches(lambda x, weights: run(kernel_conv, x, weights, None, kept, DELTA, jnp.bfloat16, grads),
-                     x, weights)
-    assert sorted(type(ba.op).__name__ for ba in found) == ["ConvBackward"] * len(DELTA) + ["ConvForward"]
+    step = jax.jit(lambda x, weights: run(kernel_conv, x, weights, None, kept, DELTA, jnp.bfloat16, grads))
+    return step, (x, weights), kept, grads
+
+
+def test_the_tuner_times_each_conv_launch_on_real_tokens():
+    """Each launch the tuner reads from the conv's step is timed on rows whose every token is real
+    (`KernelOp.operands`), so every token's output and the taps' gradients are written, where the
+    default operands' zero validity masks every token: a timing of work the step does."""
+    step, arrays, _, _ = tuned_step()
+    found = launches(step, *arrays)
+    assert found and all(isinstance(ba.op, tuning.KernelOp) for ba in found)
     for ba in found:
         written = timed(ba) if type(ba.op) is short_conv.ConvForward else timed(ba)[1:2]
         for array in written:
             assert np.all(np.any(np.asarray(array, np.float32) != 0, axis=-1)), type(ba.op).__name__
-    timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
-                                   metadata={})
-    keyed = [ba.op.keyed(ba) for ba in found]
-    stored = tokamax.AutotuningResult(jax.devices()[0].device_kind, tuple(
-        (ba, tuning.AutotuningData({ba.heuristics_config: timing})) for ba in keyed))
-    read = tokamax.AutotuningResult.loads(stored.dumps())
-    assert [(type(ba.op), ba.autotuning_cache_key) for ba, _ in read.data] == [
-        (type(ba.op), ba.autotuning_cache_key) for ba in keyed]
+
+
+TUNED = """
+import json, os, sys
+import jax
+import numpy as np
+from reference_error import equations
+from test_short_conv import tuned_step
+from dew import cache
+from dew.nn.kernels import tuning
+step, arrays, _, _ = tuned_step()
+lowered, launches = tuning.tune(lambda: step.lower(*arrays), measure=sys.argv[1] == "measure")
+pieces, grads = lowered.compile()(*arrays)
+np.savez(sys.argv[2], *(np.asarray(array, np.float32) for array in (*pieces, *grads[:2])))
+path = cache.kernel_picks_path(jax.devices()[0].device_kind)
+launched = [[str(eqn.params["name"]), list(eqn.params["grid_mapping"].grid),
+             eqn.params["compiler_params"].num_warps]
+            for eqn in equations(jax.make_jaxpr(step)(*arrays).jaxpr) if eqn.primitive.name == "pallas_call"]
+print(json.dumps([path, os.stat(path).st_mtime_ns, tuning.settled(launches), launched]))
+"""
+
+
+@pytest.mark.gpu(reason="the tuner measures on a GPU")
+def test_a_measured_conv_config_is_reused_by_the_next_process_as_exact_as_xla(tmp_path):
+    """The tuner's explicit pass over a right-padded delta conv's step (`tuning.tune(..., measure=True)`,
+    on a GPU the process has to itself) measures each launch over every config of its space and stores
+    the fastest. A fresh process beside other work, which measures nothing (AUTOTUNE_CACHE_MODE_READ),
+    finds every launch picked, leaves the store as it was, launches the measuring process's grids and
+    warps, and computes its pieces and gradients bitwise; each as XLA computes it, from float64."""
+    from process_support import READ_ONLY, fresh, keeping_picks
+
+    inherited = keeping_picks()
+    if READ_ONLY in inherited:
+        pytest.skip("measuring needs the GPU to itself: gpu-run without -n")
+    cache_dir = tmp_path / "cache"
+    path, stamp, settled, measured = fresh(TUNED, "measure", str(tmp_path / "measured.npz"),
+                                           cache_dir=cache_dir, flags=inherited)
+    assert settled is True and measured
+    with open(path) as file:
+        stored = tokamax.AutotuningResult.loads(file.read())
+    assert stored.data
+    for ba, timings in stored.data:
+        assert len(timings) > 1, type(ba.op)
+        assert all(data.median_evaluation_time_ms > 0 for data in timings.values())
+        assert timings.fastest_config in ba.autotuning_configs
+    assert fresh(TUNED, "read", str(tmp_path / "read.npz"), cache_dir=cache_dir,
+                 flags=f"{inherited} {READ_ONLY}".strip()) == [path, stamp, True, measured]
+    with np.load(tmp_path / "measured.npz") as first, np.load(tmp_path / "read.npz") as second:
+        got = [second[name] for name in second.files]
+        for name in first.files:
+            np.testing.assert_array_equal(second[name], first[name])
+    _, (x, weights), kept, grads = tuned_step()
+    want, want_grads = run(xla_conv1d, x, weights, None, kept, DELTA, jnp.bfloat16, grads)
+    exact, exact_grads = truth(x, weights, None, kept, DELTA, grads)
+    labels = [f"piece {number}" for number in range(len(want))] + ["dx", "dtaps"]
+    for label, mine, theirs, value in zip(labels, got, (*want, *want_grads[:2]), (*exact, *exact_grads[:2]),
+                                          strict=True):
+        assert_follows_xla(jnp.asarray(mine, theirs.dtype), theirs, value, label)
 
 
 @pytest.mark.parametrize("op", [short_conv.ConvForward, short_conv.ConvBackward])
@@ -253,9 +308,10 @@ def test_a_conv_the_kernels_do_not_take_runs_as_the_xla_conv(dtype, out, parts, 
 def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed):
     """A delta net's conv at its training width and length, bf16 projections into the bf16 operands
     fla's rule takes, and fp32 into fp32, whole rows and packed ones: each piece and gradient as exact as
-    XLA's own conv (`assert_as_exact_as_the_reference`), at each launch's heuristic and, at the 0.8b's
-    width, at every config of its space (`tuning.pinned`). Two rows: a row's tokens are the distances'
-    terms, and the 0.8b's eight held 28 GiB of an H100 at the float64 truth, two 7."""
+    XLA's own conv (`assert_as_exact_as_the_reference`), at each launch's heuristic and at every config
+    of its space at that model's shapes (`tuning.pinned`), the space the tuner picks from there. Two
+    rows: a row's tokens are the distances' terms, and the 0.8b's eight held 28 GiB of an H100 at the
+    float64 truth, two 7."""
     (_, length), parts = CONV_SHAPES[model]
     x, weights, _, _ = operands(2, length, parts, dtype=dtype)
     segments = documents(2, length) if packed else None
@@ -266,9 +322,8 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, pa
 
     want, want_grads = run(xla_conv1d, x, weights, None, None, parts, dtype, grads, segments=segments)
     exact, exact_grads = truth(x, weights, None, None, parts, grads, segments=segments)
-    # Every config of each launch's space at the 0.8b's width, the heuristics at the other's.
-    pins = [{}] + ([{op: config} for op in (short_conv.ConvForward, short_conv.ConvBackward)
-                    for config in each_config(op, kernels, x, weights)] if model == "0.8b" else [])
+    pins = [{}] + [{op: config} for op in (short_conv.ConvForward, short_conv.ConvBackward)
+                   for config in each_config(op, kernels, x, weights)]
     for pin in pins:
         with tuning.pinned(pin):
             got, got_grads = kernels(x, weights)
