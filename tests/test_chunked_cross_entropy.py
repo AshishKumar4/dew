@@ -316,7 +316,7 @@ def test_a_heads_terms_and_gradients_are_as_exact_as_logsumexps_over_its_column_
     orders of its columns (the targets relabelled, which reorders every row's sum of exponentials
     and moves no value) as `jax.nn.logsumexp`'s whole logits are (`assert_as_exact_over_orders`).
     A row summed in one loop of XLA's CPU reduction with a combine of its own, and a share divided
-    out and then scaled, held the whole head's state gradient 4.2 times as far."""
+    out and then scaled, held the whole head's state gradient 3.9 times as far."""
     from reference_error import ORDERS, assert_as_exact_over_orders
 
     states, matrix, targets = inputs(vocab=512, features=16, tokens=(4, 5))
