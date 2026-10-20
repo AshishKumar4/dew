@@ -224,6 +224,6 @@ def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled)
         shape, chunk_size = case
         assert ssd_kernel_runs(chunk_size, shape[3], shape[4], jax.default_backend(), dtype=jnp.float32)
     built = fixture_case(reference, *case) if kind == "fixture" else shape_case(*case)
-    operands, chunk_size, roundings = built
+    _, chunk_size, roundings = built
     assert_kernel_parity(case_draw(reference, kind, case), chunk_size, compiled=compiled,
                          roundings=roundings, seeds=SEEDS[kind, case], label=f"{kind} {case}")

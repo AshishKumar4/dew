@@ -25,6 +25,7 @@ def ssd_orbit(arrays, seed):
     }
     result = {}
     for name, value in arrays.items():
+        value = np.asarray(value)
         for axis, order in axes.get(name, ()):
             value = np.take(value, order, axis=axis)
         result[name] = value

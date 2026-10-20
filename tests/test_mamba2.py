@@ -121,7 +121,8 @@ def test_a_sequence_split_in_two_carries_its_state_across_the_cut(reference):
              in_float64(chunk_ssd, x, step, A, B, C, D, None, 32), "the cut sequence")
 
 
-CHUNK_SIZE_SEEDS = 0
+CHUNK_SIZE_SEEDS = 64
+"""Sized by seeds_for against the 32-token XLA chunk scan (2026-10-20, armada)."""
 
 
 def chunk_size_draw(seed):
