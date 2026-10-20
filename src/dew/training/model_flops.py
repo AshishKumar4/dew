@@ -86,6 +86,11 @@ def step_counts(batch: Batch) -> dict[str, jax.Array]:
     return work
 
 
+def batch_tokens(batch: Batch) -> jax.Array:
+    """The real tokens of `batch`'s rows (`TOKENS`), as two uint32 words; none where it carries no count."""
+    return _TokenCount.sum(batch[TOKENS]) if TOKENS in batch else jnp.zeros((2,), jnp.uint32)
+
+
 def model_batch(batch: Batch) -> Batch:
     """The objective sees only its own inputs, not the trainer's accounting columns."""
     return {name: value for name, value in batch.items()
