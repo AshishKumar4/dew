@@ -200,8 +200,8 @@ def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placemen
         first, gradient = np.asarray(start[name], np.float64), gradients[name]
         truth[name] = first - 1e-2 * (gradient / (np.abs(gradient) + 1e-8) + 1e-4 * first)
     for name, true in truth.items():
-        assert_as_exact_as_the_reference(np.asarray(whole_trained[name]), np.asarray(split_trained[name]), true,
-                                         name)
+        assert_as_exact_as_the_reference(np.asarray(whole_trained[name]), np.asarray(split_trained[name]),
+                                         true, name)
 
 
 GEMMA2 = {**TINY, "intermediate_size": 128, "num_key_value_heads": 2, "head_dim": 16, "sliding_window": 32,
