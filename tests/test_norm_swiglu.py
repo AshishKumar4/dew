@@ -114,7 +114,7 @@ def kernels(fn, *args) -> set[str]:
 
 
 SEEDS = {(2, 3, 31): 32, (3, 257, 17): 32, (5, 1000): 32, (2, 3, 4, 31): 64, (2, 64, 16, 128): 8,
-         (2, 1, 16, 128): 32, (7, 1000): 32, (3, 4096): 32, (5, 37): 32, (24576, 1000): 8, (2, 31): 32,
+         (2, 1, 16, 128): 32, (7, 1000): 32, (3, 4096): 32, (5, 37): 32, (24576, 1000): 64, (2, 31): 32,
          "composed": 32}
 """Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
 XLA compared with itself resolves the factor in every output and gradient (2026-10-20, on armada)."""
