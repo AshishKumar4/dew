@@ -90,24 +90,19 @@ class CorpusCounts:
         self.chunks += sum(value is not None and not isinstance(value, Rejected) for value in outputs)
 
 
-@dataclasses.dataclass(frozen=True)
-class SearchBudget:
-    consecutive: int = 10_000
-    warn_over: float = 0.01
+_WARN_OVER = 0.01
+"""The share of a corpus's attempted records it may reject before a run warns, once: a filter that
+drops more than one record in a hundred is worth a look."""
 
-    def __post_init__(self) -> None:
-        if self.consecutive < 1:
-            raise ValueError("rejection search budgets must be positive")
-        if not 0 <= self.warn_over <= 1:
-            raise ValueError("warn_over is a share between zero and one")
-
-
-_DEFAULT_BUDGET = SearchBudget()
+_FIRST_LOGGED_RUN = 1024
+"""The run of rejections in a row a read first logs, then again at each doubling: longer than an
+ordinary filter's runs, so a filter that keeps nothing is named from the first line. An endless
+read reads on through any run; none proves the corpus holds nothing to keep."""
 
 
 class _KeepAccepted:
-    def __init__(self, counts: CorpusCounts, budget: SearchBudget, tokens: Callable[[Batch], int] | None):
-        self.counts, self.budget, self.tokens = counts, budget, tokens
+    def __init__(self, counts: CorpusCounts, tokens: Callable[[Batch], int] | None):
+        self.counts, self.tokens = counts, tokens
         self.consecutive = 0
         self.warned = False
 
@@ -130,23 +125,15 @@ class _KeepAccepted:
         self.counts.rejected[reason] += 1
         self.consecutive += 1
         self._probe()
-        if (
-            not self.warned
-            and sum(self.counts.rejected.values()) / self.counts.attempted > self.budget.warn_over
-        ):
-            _log.warning(
-                "corpus %s rejected more than %.1f%% of attempted records (%s)",
-                self.counts.name,
-                self.budget.warn_over * 100,
-                reason,
-            )
+        if not self.warned and sum(self.counts.rejected.values()) / self.counts.attempted > _WARN_OVER:
+            _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
+                         self.counts.label, _WARN_OVER * 100, reason)
             self.warned = True
-        if self.consecutive >= self.budget.consecutive:
-            raise ValueError(
-                f"corpus {self.counts.name}: rejection search budget exhausted after "
-                f"{self.consecutive} consecutive rejections ({reason}); "
-                "this is not a proof that the corpus is empty"
-            )
+        if self.consecutive >= _FIRST_LOGGED_RUN and not self.consecutive & (self.consecutive - 1):
+            reasons = ", ".join(f"{name} {count}" for name, count in self.counts.rejected.most_common(3))
+            _log.warning("corpus %s rejected its last %d records and has kept %d; the read goes on until "
+                         "one is kept (most rejected: %s)", self.counts.label, self.consecutive,
+                         self.counts.accepted, reasons)
         return False
 
     def _probe(self) -> None:
@@ -234,8 +221,8 @@ class _AcceptedIterator(_CountedIterator[Batch]):
 
 
 class Accepted(pygrain.IterDataset[Batch]):
-    """Grain's filter, with a named search budget and checkpointed counts, which count the corpus's
-    records where it reads them (`records`: no expansion or layout comes before it)."""
+    """Grain's filter, with checkpointed counts, which count the corpus's records where it reads
+    them (`records`: no expansion or layout comes before it)."""
 
     def __init__(
         self,
@@ -244,16 +231,15 @@ class Accepted(pygrain.IterDataset[Batch]):
         label: str,
         *,
         records: bool,
-        budget: SearchBudget = _DEFAULT_BUDGET,
         tokens: Callable[[Batch], int] | None = None,
     ):
         super().__init__(parent)
         self._records, self._name, self._label, self._on_records = parent, name, label, records
-        self._budget, self._tokens = budget, tokens
+        self._tokens = tokens
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         counts = CorpusCounts(self._name, self._label, records=self._on_records)
-        predicate = _KeepAccepted(counts, self._budget, self._tokens)
+        predicate = _KeepAccepted(counts, self._tokens)
         return _AcceptedIterator(iter(self._records.filter(predicate)), predicate)
 
 
@@ -288,8 +274,8 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         self._delivered = [0] * len(parents)
         self._pending: list[Batch | None] = [None] * len(parents)
         self._pending_states: list[Mapping[str, object] | None] = [None] * len(parents)
-        # The corpora whose first row was read ahead, so a rejection budget a corpus exhausts is
-        # met before any row: every corpus at the start, and one that joins a resumed mix.
+        # The corpora whose first row was read ahead: every corpus at the start, and one that joins
+        # a resumed mix.
         self._primed = [False] * len(parents)
 
     def __next__(self) -> Batch:
@@ -372,7 +358,6 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
         names: Sequence[str],
         labels: Sequence[str],
         keys: Sequence[str],
-        budget: SearchBudget = _DEFAULT_BUDGET,
     ):
         if not parents or len(parents) != len(weights) or len(names) != len(parents):
             raise ValueError("token deficit mix needs one weight and name per corpus")
@@ -382,7 +367,7 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
         if any(not math.isfinite(weight) or weight <= 0 for weight in weights):
             raise ValueError("token deficit weights must be finite and positive")
         filtered = tuple(
-            Accepted(parent, name, label, records=False, budget=budget, tokens=tokens)
+            Accepted(parent, name, label, records=False, tokens=tokens)
             for parent, name, label in zip(parents, names, labels, strict=True)
         )
         super().__init__(filtered)
