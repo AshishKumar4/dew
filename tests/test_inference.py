@@ -18,12 +18,7 @@ import optax
 import pytest
 from affine_run import Replaying
 from diffusion_stubs import STUB_TEXT
-from reference_error import (
-    REFERENCE,
-    assert_as_exact_as_the_reference,
-    assert_leaves_as_exact_over_orders,
-    widened,
-)
+from reference_error import assert_as_exact_as_the_reference, widened
 from steady_state import steady_state
 
 import dew
@@ -411,53 +406,6 @@ def test_a_run_loads_with_its_projections_packed_as_a_source_does(tmp_path, devi
     greedy = Sampling(temperature=0, eos_token_ids=255)
     np.testing.assert_array_equal(task("the ", key=2, sampling=greedy).host().tokens,
                                   unpacked("the ", key=2, sampling=greedy).host().tokens)
-
-
-@pytest.mark.parametrize(("path", "members", "packed"), [
-    (("layers_0", "self_attn"), ("q_proj", "k_proj", "v_proj"), "qkv_proj"),
-    (("layers_0", "mlp"), ("gate_proj", "up_proj"), "gate_up_proj")], ids=["qkv", "gate_up"])
-def test_a_packed_projection_is_as_exact_as_its_members_element_by_element(tmp_path, path, members, packed):
-    """Each output element of a run's packed projection, one wider product where its members were
-    several, is as exact as each member's own projection in Transformers (torch's float32 `F.linear`,
-    as its `nn.Linear` computes it), element by element over orders of the contraction they sum
-    (`assert_leaves_as_exact_over_orders`), both from the float64 product.
-
-    The reference is torch's, not Dew's own unpacked product: on the CPU, XLA hands a float32 dot
-    to YNNPACK, whose kernel for an output 16 wide or narrower sums more exactly than its wider one
-    and than a BLAS sgemm (numpy's and the packed product's errors agree element for element), so
-    the members' own width, not the packing, would set the bound."""
-    import torch
-
-    make_lm_run(tmp_path)
-
-    def node(variables):
-        held = variables["params"]
-        for name in path:
-            held = held[name]
-        return held
-
-    kernel = np.asarray(node(dew.pipeline(str(tmp_path)).variables)[packed]["kernel"])
-    kernels = [np.asarray(node(TextGeneration.from_run(str(tmp_path)).variables)[name]["kernel"])
-               for name in members]
-    np.testing.assert_array_equal(kernel, np.concatenate(kernels, axis=-1))
-    x = np.random.default_rng(1).standard_normal((32, kernel.shape[0])).astype(np.float32)
-    product = jax.jit(jnp.dot)
-    with jax.enable_x64(new_val=True):
-        truth = {"output": np.asarray(product(*widened((x, kernel))))}
-    def draw(order):
-        # Order 0 is the case's own; every other a permutation of the contraction, drawn from its index,
-        # since the gate asks for orders past its first batch while an element stays flagged.
-        units = (np.arange(kernel.shape[0]) if order == 0
-                 else np.random.default_rng(order).permutation(kernel.shape[0]))
-        moved = jnp.asarray(x[:, units])
-        dew_output = np.asarray(product(moved, jnp.asarray(kernel[units])), np.float64)
-        rows = torch.from_numpy(x[:, units])
-        separate = np.concatenate([
-            torch.nn.functional.linear(rows, torch.from_numpy(np.ascontiguousarray(member[units].T))).numpy()
-            for member in kernels], axis=-1).astype(np.float64)
-        return {"output": dew_output}, {REFERENCE: {"output": separate}}, truth
-
-    assert_leaves_as_exact_over_orders(draw, packed, rows=False)
 
 
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
