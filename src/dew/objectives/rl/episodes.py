@@ -30,7 +30,17 @@ from dew.objectives.base import Batch, Variables
 from dew.sampling.text import Generation, Sampling
 from dew.training.state import TrainState
 
-from .sessions import OLD_LOG_PROBS_KEY, Call, Session, Status, Transcript, check_credit, pack, sampled_values
+from .sessions import (
+    OLD_LOG_PROBS_KEY,
+    Call,
+    Session,
+    Status,
+    Transcript,
+    check_credit,
+    json_objects,
+    pack,
+    sampled_values,
+)
 
 if TYPE_CHECKING:
     from .journal import EpisodeJournal, JournalRun
@@ -85,9 +95,7 @@ class Observation:
             raise TypeError("observation status must be an EpisodeStatus")
         if self.reward is not None:
             object.__setattr__(self, "reward", finite_reward(self.reward))
-        if not isinstance(self.messages, tuple) or not all(isinstance(message, Mapping)
-                                                           for message in self.messages):
-            raise ValueError("an observation's messages are a tuple of JSON objects")
+        object.__setattr__(self, "messages", json_objects(self.messages, "an observation's messages"))
         if any(type(token) is not int or token < 0 for token in self.context):
             raise ValueError("observation context must contain nonnegative token ids")
         if self.status == EpisodeStatus.RUNNING and not self.context:

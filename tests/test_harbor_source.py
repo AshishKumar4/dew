@@ -796,3 +796,19 @@ def test_an_agent_commands_calls_keep_the_conversation_the_gateway_recorded(tmp_
     assert plain.transcript is None
     assert spoken == Call((1, 2, 10), (5, 6), (-.5, -.25), "tool_calls", 0,
                           transcript=Transcript(tuple(asked), answered))
+
+
+@pytest.mark.parametrize(("field", "value"),
+                         [("messages", {}), ("messages", False), ("response_message", [])])
+def test_a_trace_whose_transcript_is_not_the_gateways_json_leaves_the_trial_infra(tmp_path, field, value):
+    """A gateway trace's messages are a list of objects and its response message an object; a trace
+    holding anything else is unusable, as a trace without ids is, not a call without a transcript."""
+    malformed = trace([1, 2, 10], [5, 6], [-.5, -.25], "stop",
+                      **{"messages": [{"role": "user", "content": "hi"}], field: value})
+    source = HarnessSource(agent_command(tmp_path), fake_gateway(extra=[malformed])[0])
+    try:
+        (future,) = source.submit(Task("adds"), 1, version=0, key=KEY)
+        rollout = future.result()
+    finally:
+        source.close()
+    assert rollout.status is Status.INFRA_ERROR
