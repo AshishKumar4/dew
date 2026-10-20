@@ -328,7 +328,7 @@ def paged_case(**changed):
     ({"groups": 2}, "gathered", "groups"),
     ({"pool": jnp.dtype(jnp.float32), "dtype": jnp.dtype(jnp.float32)}, "gathered", "dtype"),
     ({"value_dim": 64}, "gathered", "widths"),
-    ({"head_dim": 512}, "gathered", "geometry"),
+    ({"head_dim": 512, "value_dim": 512}, "gathered", "geometry"),
     ({"page_size": 64}, "gathered", "geometry"),
     ({"kv_heads": 2, "head_shards": 4}, "gathered", "head_shards"),
     ({"arithmetic": True}, "gathered", "arithmetic"),
