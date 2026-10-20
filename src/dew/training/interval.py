@@ -35,8 +35,11 @@ class Book(NamedTuple):
     `loss` sums the loss since the last checkpoint. `bad_run` is the current
     streak of non-finite losses and `worst_bad_run` the longest since the last
     check. `training` and `tokens` sum the objective's analytical training FLOPs
-    and real tokens, and `norms` and `commits` the committed gradient norms
-    and their count, since the last log.
+    and the real tokens of the updates committed, and `norms` and `commits` the
+    committed gradient norms and their count, since the last log. `pending`
+    holds the real tokens of the accepted microbatches of the window not yet
+    committed, which its commit adds to `tokens`: a rejected microbatch's
+    tokens and an unfinished window's count toward no budget.
     """
 
     loss: jax.Array
@@ -46,35 +49,46 @@ class Book(NamedTuple):
     tokens: jax.Array
     norms: jax.Array
     commits: jax.Array
+    pending: jax.Array
 
 
-def fresh_book(loss: jax.Array) -> Book:
+def fresh_book(loss: jax.Array, pending: int = 0) -> Book:
     """Return the counters a fresh logging interval starts from, on the device the step returns `loss` on.
 
     Counters on any other device would move to the step's devices at every count,
-    and `bookkeep` would compile again.
+    and `bookkeep` would compile again. `pending` is the real tokens of a restored window's
+    accepted microbatches, which its commit counts.
     """
     dtype = jnp.promote_types(loss.dtype, jnp.float32)
     zeros = (np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32),
-             np.zeros((), dtype), np.zeros((2,), np.uint32), np.zeros((), dtype), np.zeros((), np.int32))
+             np.zeros((), dtype), np.zeros((2,), np.uint32), np.zeros((), dtype), np.zeros((), np.int32),
+             _TokenCount.words(pending))
     return Book(*jax.device_put(zeros, loss.sharding))
 
 
 @jax.jit
-def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committed | None, training=0.0,
-             tokens=(0, 0)) -> Book:
+def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committed | None, accepted: jax.Array,
+             training=0.0, tokens=(0, 0)) -> Book:
     """Advance the loop's counters for one step in a single dispatch.
 
     Loss counters and commit telemetry advance together, without reading
-    either on the host between logging ticks.
+    either on the host between logging ticks. An accepted microbatch's real tokens wait in
+    `pending` until its window commits; a step that reports no commit (a step of one's own,
+    `Trainer(step=)`) is its own update.
     """
     bad_run = jnp.where(finite, 0, book.bad_run + 1)
     dtype = jnp.promote_types(loss.dtype, jnp.float32)
     norms, commits = book.norms, book.commits
+    read = jnp.where(accepted, jnp.asarray(tokens, jnp.uint32), jnp.zeros((2,), jnp.uint32))
+    pending = _TokenCount.add(book.pending, read)
+    done = jnp.asarray(a=True)
     if committed is not None:
         norms, commits = norms + committed.norm.astype(dtype), commits + committed.count
+        done = committed.count > 0
+    held = jnp.where(done, jnp.zeros((2,), jnp.uint32), pending)
+    counted = _TokenCount.add(book.tokens, jnp.where(done, pending, jnp.zeros((2,), jnp.uint32)))
     return Book(book.loss + loss.astype(dtype), bad_run, jnp.maximum(book.worst_bad_run, bad_run),
-                book.training + training, _TokenCount.add(book.tokens, tokens), norms, commits)
+                book.training + training, counted, norms, commits, held)
 
 
 @dataclasses.dataclass
@@ -103,6 +117,7 @@ class Interval:
     last_log_time: float
     last_saved: int | None
     tokens_before_log: int = 0
+    pending_before_log: int = 0
     logged_tokens: jax.Array | None = None
     book: Book | None = None
     fresh: Book | None = None
@@ -118,19 +133,22 @@ class Interval:
     compiles: int = 0
 
     def count(self, batch: Batch, flops: StepFlops | None, loss: jax.Array, finite: jax.Array,
-              committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> None:
-        """Add one step: its records, its FLOPs, its loss and its optimizer commit."""
+              committed: Committed | None, accepted: jax.Array,
+              aux: Mapping[str, jax.Array] | None = None) -> None:
+        """Add one step: its records, its FLOPs, its loss, whether its microbatch was accepted and
+        its optimizer commit."""
         self.since_log += 1
         self.steps += 1
         self.samples += rows_of(batch)
         self.flops = None if self.flops is None or flops is None else self.flops + flops
         if self.book is None:
-            self.book = self.fresh = fresh_book(loss)
+            self.fresh = fresh_book(loss)
+            self.book = fresh_book(loss, self.pending_before_log)
         aux = {} if aux is None else aux
         self.model_counted |= TRAINING_FLOPS in aux
         self.tokens_counted |= TOKENS in aux
         assert self.fresh is not None
-        self.book = bookkeep(self.book, loss, finite, committed,
+        self.book = bookkeep(self.book, loss, finite, committed, accepted,
                              aux.get(TRAINING_FLOPS, self.fresh.training), aux.get(TOKENS, self.fresh.tokens))
 
     def streak(self) -> jax.Array | None:
@@ -156,6 +174,20 @@ class Interval:
         counted = [tokens for tokens in (self.logged_tokens, self.book.tokens if self.tokens_counted and
                                          self.book is not None else None) if tokens is not None]
         return self.tokens_before_log + sum(_TokenCount.host(tokens) for tokens in jax.device_get(counted))
+
+    @property
+    def token_control(self) -> dict[str, int]:
+        """The token clock a checkpoint keeps (`Checkpoints.control`): the committed real tokens and
+        those an unfinished window holds, read back as `tokens_before_log` and `pending_before_log`."""
+        return {"tokens": self.real_tokens, "pending_tokens": self.pending_tokens}
+
+    @property
+    def pending_tokens(self) -> int:
+        """The real tokens of the accepted microbatches of the window not yet committed, which a
+        checkpoint keeps beside `real_tokens` so the window's commit after a resume counts them."""
+        if self.book is None:
+            return self.pending_before_log
+        return _TokenCount.host(jax.device_get(self.book.pending))
 
     def take(self, step: int, loss: jax.Array, aux: Mapping[str, jax.Array], accepted: jax.Array,
              copies: tuple[jax.Array | None, jax.Array | None],

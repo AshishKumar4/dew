@@ -379,6 +379,29 @@ def test_prefetch_counts_on_worker_then_step_reduces_global_rows():
     assert threads == ["dew-prefetch"]
 
 
+def test_an_interval_counts_the_tokens_of_committed_updates_alone():
+    """A rejected microbatch's tokens count toward nothing, and an accepted one's wait for its
+    window's commit: the run's tokens are those of the updates it committed, as the spec's budget
+    reads them, with an unfinished window's held apart for a checkpoint to keep."""
+    from dew.training.transaction import Committed
+
+    interval = Interval(last_log_time=0, last_saved=None)
+    loss = jnp.asarray(1.0)
+
+    def step(tokens, accepted, commits):
+        interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss, jnp.asarray(a=True),
+                       Committed(jnp.asarray(0.0), jnp.asarray(commits, jnp.int32)), jnp.asarray(accepted),
+                       {TOKENS: jnp.asarray(_TokenCount.words(tokens))})
+
+    step(5, accepted=False, commits=0)
+    step(4, accepted=True, commits=0)
+    assert (interval.real_tokens, interval.pending_tokens) == (0, 4)
+    step(3, accepted=True, commits=1)
+    assert (interval.real_tokens, interval.pending_tokens) == (7, 0)
+    step(2, accepted=True, commits=0)
+    assert interval.token_control == {"tokens": 7, "pending_tokens": 2}
+
+
 def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
     """A log takes the interval's work and tokens and starts the next
     interval's at zero, and the run's lifetime tokens keep both logs'."""
@@ -388,8 +411,9 @@ def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
     def counted(steps):
         for forward, tokens in steps:
             interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
-                           jnp.asarray(a=True), None, {TRAINING_FLOPS: jnp.asarray(3 * forward),
-                                                      TOKENS: jnp.asarray(_TokenCount.words(tokens))})
+                           jnp.asarray(a=True), None, jnp.asarray(a=True),
+                           {TRAINING_FLOPS: jnp.asarray(3 * forward),
+                            TOKENS: jnp.asarray(_TokenCount.words(tokens))})
 
     counted(((100, 4), (200, 3)))
     assert float(interval.book.training) == 900 and _TokenCount.host(interval.book.tokens) == 7
