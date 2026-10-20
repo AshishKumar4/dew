@@ -122,10 +122,7 @@ positions. Three elements a draw take 256 draws to resolve the factor."""
 def test_a_bias_gradient_is_as_exact_however_its_positions_are_split(site):
     """A bias's gradient sums its cotangents over every position, and is as exact with the batch
     split over eight devices as on one: check 1 over the site's seeds, truth the cotangents' float64
-    sum. A plain reduction is whatever XLA picks for its shape: on the CPU, one device's
-    f32[8,32,32,3] summed through YNNPACK and each device's f32[1,32,32,3] as one sequential chain,
-    5.6 times as far from float64, and a U-ViT's output bias trained on 8 devices 2.75 times as far
-    as on one (ledger 833)."""
+    sum. A plain sum of each device's shard was 5.7 times as far from float64 (ledger 833)."""
     layer, shape, seeds = SPLIT[site]
     variables = layer.init(jax.random.key(0), jnp.zeros(shape, jnp.float32))
     out = jax.eval_shape(layer.apply, variables, jnp.zeros(shape, jnp.float32)).shape

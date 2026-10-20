@@ -45,13 +45,9 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
     at fp32, the gradient sums at fp32 and rounds once into the bias.
 
-    That sum is compensated (`compensated_sum`, through `_spread`), so its exactness is the same on
-    every backend and every split of the positions. A plain one is whatever reduction XLA picks:
-    on the CPU, one device's f32[8,32,32,3] went to a YNNPACK fusion while each of eight devices'
-    f32[1,32,32,3] shards, every dimension within TreeReductionRewriter's window of 32, summed as
-    one sequential chain, 5.6 times as far from float64 over 200 draws, and a U-ViT's output
-    bias trained on 8 devices 2.75 times as far as on one (ledger 833). Compensated, both sit at a
-    quarter of the one device's plain error.
+    That sum is the double-float reduction `compensated_sum` (through `_spread`), not whichever
+    reduction XLA picks for the cotangent's shape: on the CPU a plain one split over eight devices
+    summed each shard as one sequential chain, where one device's went to YNNPACK (ledger 833).
     """
     dtype, wide = jnp.result_type(product, bias), at_least_fp32(bias.dtype)
     # The bias takes the product's rank before the sum, as flax's layers reshape it, so no rank is
@@ -61,17 +57,9 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     return product.astype(dtype) + jnp.asarray(_spread(bias, product.shape)).astype(dtype)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
 def _spread(bias: jax.Array, shape: tuple[int, ...]) -> jax.Array:
-    """`bias` broadcast to `shape`, its tangent the tangent broadcast alike, whose transpose sums
-    every position the bias spread over compensated (`compensated_sum`): a bias's gradient (`biased`)."""
-    return jnp.broadcast_to(bias, shape)
-
-
-@_spread.defjvp
-def _spread_jvp(shape: tuple[int, ...], primals: tuple[jax.Array],
-                tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
-    (bias,), (tangent,) = primals, tangents
+    """`bias` broadcast to `shape`, a linear call whose transpose, a bias's gradient (`biased`), sums
+    every position the bias spread over with `compensated_sum`."""
     spread = tuple(axis for axis, (size, total) in enumerate(zip(bias.shape, shape, strict=True))
                    if size == 1 and total != 1)
 
@@ -81,7 +69,7 @@ def _spread_jvp(shape: tuple[int, ...], primals: tuple[jax.Array],
     def summed(_, cotangent):
         return jnp.reshape(compensated_sum(cotangent, spread), bias.shape)
 
-    return _spread(bias, shape), linear_call(broadcast, summed, (), tangent)
+    return linear_call(broadcast, summed, (), bias)
 
 
 def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
