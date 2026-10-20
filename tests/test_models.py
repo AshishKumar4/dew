@@ -273,9 +273,10 @@ def test_strided_convolutions_keep_nested_vmap_and_its_vjp():
 
 @pytest.mark.parametrize("architecture, extra", [
     ("simple_dit", {}),
+    ("simple_dit", {"patch_bottleneck": 16}),
     ("hybrid_dit", {"ssm_attention_ratio": "all-attn"}),
     ("simple_mmdit", {}),
-], ids=["simple_dit", "hybrid_dit", "simple_mmdit"])
+], ids=["simple_dit", "simple_dit_bottleneck", "hybrid_dit", "simple_mmdit"])
 def test_a_scan_order_is_a_permutation_joint_attention_cannot_see(rng, architecture, extra):
     """The hilbert and zigzag orders share one parameter tree (`hilbert_projection`
     over raw patches) and differ only in the permutation the tokens travel in.
