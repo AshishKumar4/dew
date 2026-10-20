@@ -9,6 +9,7 @@ layers, the Gemma flags) and the param tree the interop map renames.
 
 import functools
 import math
+import re
 from pathlib import Path
 
 import jax
@@ -22,6 +23,7 @@ from reference_error import assert_as_exact_as_the_reference, float64_forward
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.kernels.selection import KernelRefused
 from dew.nn.mixers import AttentionMixer
 
 VOCAB = 37
@@ -261,6 +263,37 @@ def test_decode_cache_matches_the_full_sequence(rng, attention_impl):
     incremental = decode_logits(model, params, prompt, rest)
     assert incremental.shape == (ids.shape[0], SEQ - 3, VOCAB)
     assert jnp.allclose(full[:, 3:], incremental, atol=1e-4)
+
+
+@pytest.mark.gpu(reason="FlashAttention runs on CUDA")
+def test_a_cached_prompt_reads_its_cache_through_flash_where_its_row_names_it(rng, without_deterministic_ops):
+    """A bf16 prompt prefilled into the cache under 'auto' reads it as the documents its tokens end, no
+    mask, which FlashAttention takes where the GPU's row names it for packed documents: the compiled
+    prefill holds its kernel there, and its logits are within tests/reference_error.py's rule of the
+    xla kernel's uncached forward against the float64 forward."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    from dew.nn.kernels.generation import measured_kernel
+
+    model = tiny(dtype=jnp.bfloat16)
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+    prompt = ids[:, :6]
+    cache = model.apply(params, prompt.shape[0], method=CausalTransformer.init_cache,
+                        mutable=['cache'])[1]['cache']
+    prefill = jax.jit(lambda params, cache, prompt: model.apply(
+        {**params, 'cache': cache}, prompt, decode=True, mutable=['cache'])[0])
+    compiled = prefill.lower(params, cache, prompt).compile().as_text()
+    flash = (measured_kernel('attention_packed', 'xla') == 'flash'
+             and measured_kernel('attention', 'cudnn') == 'flash')
+    # FlashAttention-2's and -3's packed calls (dew_flash_attn's custom-call targets).
+    assert bool(re.search(r'dew_flash3?_mha_varlen_fwd', compiled)) == flash
+    found = np.asarray(prefill(params, cache, prompt), np.float64)
+    plain = np.asarray(model.clone(attention_impl='xla').apply(params, prompt), np.float64)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf, np.float64)), params)
+        truth = np.asarray(model.clone(dtype=jnp.float64, attention_impl='reference').apply(wide, prompt))
+    assert_as_exact_as_the_reference(found, plain, truth, "cached prefill")
 
 
 def test_reference_and_xla_kernels_agree_when_causal(rng):
@@ -731,26 +764,52 @@ def test_padding_in_a_packed_row_reaches_no_query(rng):
     assert jnp.all(jnp.isfinite(changed))
 
 
-def test_a_segment_masked_batch_leaves_the_cudnn_kernel(rng, without_deterministic_ops):
-    """cuDNN takes causality as a flag and turns any mask into a materialized
-    bias, so packed batches ride the xla kernel instead. Pinning cudnn here is
-    what proves the routing: the model computes in fp32, which cudnn refuses,
-    so an unpacked batch is refused while a packed one runs."""
-    # The param tree does not depend on the kernel, so the tree comes from a
-    # twin whose init is allowed to run: initialising the cudnn model itself
-    # would trip the same refusal before the test could make its point.
+@pytest.mark.gpu(reason="cuDNN runs on CUDA")
+def test_a_layer_naming_cudnn_takes_a_packed_batch_as_its_document_mask(rng, without_deterministic_ops):
+    """A bf16 model whose layers name cudnn (`attention_impl`) runs a packed batch on cuDNN, its
+    documents reaching the kernel as their mask, an additive bias (`_attention_kernel`), which 'auto'
+    leaves for the cheaper xla kernel: the route says cudnn, and the logits are within
+    tests/reference_error.py's rule of the xla kernel's against the float64 model."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    from dew.nn.kernels.generation import routes
+
+    ids, segment_ids, positions = packed_pair(rng)
+    params = tiny().init(rng, ids)
+    named = tiny(attention_impl='cudnn', dtype=jnp.bfloat16)
+    with routes() as found:
+        logits = np.asarray(named.apply(params, ids, positions=positions, segment_ids=segment_ids),
+                            np.float64)
+    assert {route.kernel for route in found if route.choice == "attention"} == {"cudnn"}
+    plain = np.asarray(tiny(attention_impl='xla', dtype=jnp.bfloat16).apply(
+        params, ids, positions=positions, segment_ids=segment_ids), np.float64)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf, np.float64)), params)
+        truth = np.asarray(tiny(dtype=jnp.float64, attention_impl='reference').apply(
+            wide, ids, positions=positions, segment_ids=segment_ids))
+    assert_as_exact_as_the_reference(logits, plain, truth, "packed cudnn logits")
+
+
+def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what_it_fails(
+        rng, without_deterministic_ops):
+    """A model whose layers name cudnn (`attention_impl`) forces it, so a call cudnn does not take
+    raises, naming every requirement it fails (`dew.nn.kernels.selection.select`), as torch's
+    `sdpa_kernel` does, rather than running another kernel: here an fp32 model, packed or not. A
+    packed batch's documents are no reason, as a named cuDNN takes them as their mask. 'auto' runs
+    both."""
     model = tiny(attention_impl='cudnn')
     ids, segment_ids, positions = packed_pair(rng)
     params = tiny().init(rng, ids)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(KernelRefused) as plain:
         model.apply(params, ids)
-
-    # The fallback is the xla kernel with the packed mask, not a run with the
-    # mask dropped, so the logits are the ones the xla model computes.
-    logits = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
-    assert jnp.array_equal(logits, tiny(attention_impl='xla').apply(
-        params, ids, positions=positions, segment_ids=segment_ids))
+    with pytest.raises(KernelRefused) as packed:
+        model.apply(params, ids, positions=positions, segment_ids=segment_ids)
+    assert plain.value.kernel == packed.value.kernel == "cudnn"
+    assert "dtype" in {refusal.code for refusal in plain.value.refusals}
+    assert "dtype" in {refusal.code for refusal in packed.value.refusals}
+    assert "documents" not in {refusal.code for refusal in packed.value.refusals}
+    tiny().apply(params, ids, positions=positions, segment_ids=segment_ids)
 
 
 def test_metadata_that_restricts_no_visibility_keeps_the_fused_kernel(

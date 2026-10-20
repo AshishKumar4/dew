@@ -298,6 +298,9 @@ class Refusal:
 
     code: str
     detail: str
+    row: str | None = None
+    """The roadmap or ledger row that tracks lifting the limit, 'inherent' where no implementation of the
+    kernel lifts it, None where the site declares neither (`dew.nn.kernels.selection.Requirement`)."""
 
     def __str__(self) -> str:
         return self.detail
@@ -353,9 +356,9 @@ def routes() -> Iterator[list[Route]]:
 
 
 def _site() -> str:
-    """The module and function of the first caller outside this module."""
+    """The module and function of the first caller outside this module and the selector."""
     frame = inspect.currentframe()
-    while frame is not None and frame.f_globals.get('__name__') == __name__:
+    while frame is not None and frame.f_globals.get('__name__') in (__name__, 'dew.nn.kernels.selection'):
         frame = frame.f_back
     return '?' if frame is None else f"{frame.f_globals.get('__name__')}:{frame.f_code.co_qualname}"
 
