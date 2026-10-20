@@ -819,7 +819,7 @@
      "runs": "diffusers"
     }
    ],
-   "note": "Flux's calculate_shift read from the installed pipeline module and the scheduler's _time_shift_exponential."
+   "note": "Flux's calculate_shift read from the installed pipeline module; the test runs the scheduler's time_shift live."
   },
   "flux2_published.npz": {
    "tool": "tools/diffusers_flux2_reference.py",
