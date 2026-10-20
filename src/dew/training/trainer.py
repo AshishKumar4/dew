@@ -132,7 +132,7 @@ from dew.training.distributed import (
     taking_over,
 )
 from dew.training.evaluation import EvalSuite, Evaluation
-from dew.training.interval import Interval, Taken, held
+from dew.training.interval import COMMITTED_TOKENS, Interval, Taken, committed_tokens, held
 from dew.training.memory import (
     climb_to,
     device_tokens,
@@ -995,7 +995,8 @@ class Trainer(Generic[Loss, Effects]):
                     compact_qk(jax.tree.map(zeros, aux.qk_stats))),
                 batches=None if shared else buffer(records),
                 variables=None if mutable is None else buffer(mutable),
-                attempts=None if shared else jnp.zeros((slots,), jnp.int32))
+                attempts=None if shared else jnp.zeros((slots,), jnp.int32),
+                tokens=jnp.zeros((2,), jnp.uint32) if TOKENS in batch else None)
 
         pending = jax.eval_shape(allocate)
         if kept_window(state.accumulation, pending, None if shape_only else int(state.microstep) % window):
@@ -1488,7 +1489,7 @@ class Trainer(Generic[Loss, Effects]):
         run.last_checkpoint = time.perf_counter()
         interval = Interval(time.time(), last_saved=(
             int(state.step) if checkpoints is not None and checkpoints.latest is not None else None),
-            tokens_before_log=int(run.stop_control.pop("tokens", 0)))
+            tokens_before_log=committed_tokens(run.stop_control, plan.tokens))
         if self._opened(plan, run, interval, state, position,
                         resumed=initial is None and interval.last_saved is not None):
             return state
@@ -2189,7 +2190,7 @@ class Trainer(Generic[Loss, Effects]):
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         write = functools.partial(
             checkpoints.save, step, state, position, metadata, share=DataPartition.of(self.device_mesh),
-            ranking=ranking, control={**(control or {}), "tokens": interval.real_tokens},
+            ranking=ranking, control={**(control or {}), COMMITTED_TOKENS: interval.real_tokens},
             weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
             boxed=self._boxed_axes())
         self._report(CheckpointRequested(checkpoints.directory), step, write)
@@ -2215,7 +2216,7 @@ class Trainer(Generic[Loss, Effects]):
         self._display.status("writing a local checkpoint")
         write = functools.partial(
             checkpoints.save_local, step, state, position, share=DataPartition.of(self.device_mesh),
-            control={**(control or {}), "tokens": interval.real_tokens}, rung=self._checkpoint_rung(),
+            control={**(control or {}), COMMITTED_TOKENS: interval.real_tokens}, rung=self._checkpoint_rung(),
             artifact=self._artifact(), boxed=self._boxed_axes())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")

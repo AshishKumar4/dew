@@ -29,6 +29,22 @@ from dew.training.transaction import Committed
 BAD_LOSS_STEPS = 5
 
 
+COMMITTED_TOKENS = "committed_tokens"
+"""The checkpoint control field that holds a run's tokens, those its committed updates trained on."""
+
+
+def committed_tokens(control: dict, budget: int | None) -> int:
+    """The tokens a checkpoint's `control` says its run's committed updates trained on, taken out of
+    it, 0 where it counted none. A checkpoint that counted every step's tokens, a rejected
+    attempt's and an unfinished window's among them (`tokens`, before runs counted commits), cannot
+    resume a run whose length is its tokens (`budget`): its count is not one, and is refused."""
+    legacy = control.pop("tokens", None)
+    if legacy is not None and COMMITTED_TOKENS not in control and budget is not None:
+        raise ValueError(f"this checkpoint counts the {legacy} tokens of every step it read, where a run of "
+                         f"tokens={budget} counts those its committed updates trained on; resume it by "
+                         "steps, or train afresh")
+    return int(control.pop(COMMITTED_TOKENS, 0))
+
 class Book(NamedTuple):
     """The loop's device-side counters.
 
@@ -130,8 +146,11 @@ class Interval:
         self.model_counted |= TRAINING_FLOPS in aux
         self.tokens_counted |= TOKENS in aux
         assert self.fresh is not None
+        # A run's tokens are its committed updates' (`Committed.tokens`); a step of one's own
+        # (`Trainer(step=)`), which reports no commit, is its own update.
+        tokens = aux.get(TOKENS, self.fresh.tokens) if committed is None else committed.tokens
         self.book = bookkeep(self.book, loss, finite, committed,
-                             aux.get(TRAINING_FLOPS, self.fresh.training), aux.get(TOKENS, self.fresh.tokens))
+                             aux.get(TRAINING_FLOPS, self.fresh.training), tokens)
 
     def streak(self) -> jax.Array | None:
         """The longest streak of non-finite losses since the last call, on

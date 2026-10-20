@@ -26,7 +26,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
 from dew.objectives.base import FROZEN, Aux, Batch, Ratio, Step, Variables, merge, with_projected
-from dew.training.model_flops import step_counts
+from dew.training.model_flops import TOKENS, _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
 from dew.training.state import Accumulation, TrainState
 
@@ -41,11 +41,14 @@ class Committed:
     `norm` is optax.global_norm of the native-dtype gradient passed to the
     optimizer, before its transforms such as clipping. Accumulation takes
     the pooled gradient at the window's commit, never each microbatch's
-    norm. Rejected attempts and partial windows contribute zero to both
-    `norm` and `count`; the loop sums them on device until its logging tick.
+    norm. `tokens` is the real tokens the commit's update trained on, the
+    window's accepted microbatches', as two uint32 words. Rejected attempts
+    and partial windows contribute zero to all three; the loop sums them on
+    device until its logging tick.
     """
     norm: jax.Array
     count: jax.Array
+    tokens: jax.Array
 
 
 def _chosen(take, taken, kept):
@@ -458,6 +461,9 @@ class Transaction:
             return committed, native_finite, norm
 
         due = pending.due & pending.active & accepted
+        # The microbatch's real tokens, which its window's commit trains on, the window's before it too.
+        read = _TokenCount.sum(batch[TOKENS]) if TOKENS in batch else jnp.zeros((2,), jnp.uint32)
+        held = read if previous is None or previous.tokens is None else _TokenCount.add(previous.tokens, read)
         if self.size == 1:
             committed, native_finite, norm = commit(numerical)
             numerical = _chosen(due, committed, numerical)
@@ -479,6 +485,8 @@ class Transaction:
             assert candidate is not None
 
             def retain(acc):
+                if acc.tokens is not None:
+                    acc = dataclasses.replace(acc, tokens=_TokenCount.add(acc.tokens, read))
                 if not self.shared:
                     acc = dataclasses.replace(
                         acc,
@@ -515,7 +523,8 @@ class Transaction:
         if scale is not None:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
         counted = due & accepted
-        return advanced, loss, aux, Committed(jnp.where(counted, norm, 0.), counted.astype(jnp.int32))
+        return advanced, loss, aux, Committed(jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
+                                              jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)))
 
     def step(self, *, realize=None, host=False):
         """Build the function that runs one attempt over the shared phases.
