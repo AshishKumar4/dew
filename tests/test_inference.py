@@ -18,7 +18,7 @@ import optax
 import pytest
 from affine_run import Replaying
 from diffusion_stubs import STUB_TEXT
-from reference_error import assert_as_exact_as_the_reference, widened
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
 from steady_state import steady_state
 
 import dew
@@ -406,6 +406,47 @@ def test_a_run_loads_with_its_projections_packed_as_a_source_does(tmp_path, devi
     greedy = Sampling(temperature=0, eos_token_ids=255)
     np.testing.assert_array_equal(task("the ", key=2, sampling=greedy).host().tokens,
                                   unpacked("the ", key=2, sampling=greedy).host().tokens)
+
+
+PACKED = {"qkv": (("layers_0", "self_attn"), ("q_proj", "k_proj", "v_proj"), "qkv_proj"),
+          "gate_up": (("layers_0", "mlp"), ("gate_proj", "up_proj"), "gate_up_proj")}
+PACKED_SEEDS = {"qkv": 16, "gate_up": 16}
+"""Each packed projection's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the
+fewest for which the members' products compared with themselves resolve the factor."""
+
+
+def packed_site(directory, site: str):
+    """A run's packed projection `site` as check 1 reads it: the packed product, its members' products
+    joined, and the draw of 32 standard normal rows a seed gives."""
+    path, members, packed = PACKED[site]
+    make_lm_run(directory)
+
+    def node(variables):
+        held = variables["params"]
+        for name in path:
+            held = held[name]
+        return held
+
+    kernel = np.asarray(node(dew.pipeline(str(directory)).variables)[packed]["kernel"])
+    kernels = [np.asarray(node(TextGeneration.from_run(str(directory)).variables)[name]["kernel"])
+               for name in members]
+    np.testing.assert_array_equal(kernel, np.concatenate(kernels, axis=-1))
+
+    def draw(seed):
+        return (np.random.default_rng(seed).standard_normal((32, kernel.shape[0])).astype(np.float32),)
+
+    whole = jax.jit(lambda x: {"output": jnp.dot(x, kernel)})
+    apart = jax.jit(lambda x: {"output": jnp.concatenate([jnp.dot(x, part) for part in kernels], axis=-1)})
+    return whole, apart, draw
+
+
+@pytest.mark.parametrize("site", sorted(PACKED))
+def test_a_packed_projection_is_as_exact_as_its_members(tmp_path, site):
+    """A run's packed projection, one wider product where its members were several, is as exact as its
+    members' products joined: check 1 over the site's seeds (`assert_as_exact`), truth the members'
+    products in float64."""
+    whole, apart, draw = packed_site(tmp_path, site)
+    assert_as_exact(whole, apart, draw, PACKED[site][2], seeds=PACKED_SEEDS[site])
 
 
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
