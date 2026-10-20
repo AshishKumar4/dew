@@ -40,7 +40,8 @@ def test_a_steps_launches_and_their_timings_round_trip_through_dews_json():
 
 def test_a_timing_mapping_takes_its_fastest_run_and_drops_its_failures():
     def timed(ms):
-        return tokamax.BenchmarkData(compile_time_ms=0.0, lower_time_ms=0.0, evaluation_times_ms=(ms,), metadata={})
+        return tokamax.BenchmarkData(compile_time_ms=0.0, lower_time_ms=0.0, evaluation_times_ms=(ms,),
+                                     metadata={})
 
     fast, slow = timed(1.0), timed(2.0)
     timings = tuning.Timings({"a": slow, "b": fast, "c": ValueError("past the GPU's shared memory")})
