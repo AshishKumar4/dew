@@ -125,6 +125,7 @@ The kernel direction was approved on 2026-10-19:
 - Abort NCCL rendezvous when its HTTP peer fails and preserve requested EOS policies in remote requests. Finish pending subprocess input, retain PRNG implementations during admission, keep dry runs read-only, validate complete host-key markers and share shape-bucket selection. [SRV-1, SRV-2, SRV-5, SRV-6, SRV-7, SRV-8, SRV-9]
 - Reuse shared coordinates for padded rollout positions. [OBJ-13]
 - Serve hybrid and multimodal decoders from a paged cache. Paged admission refuses per-row state other than attention pages, so Qwen3.5's recurrent state and Gemma 3's image groups cannot serve paged. Seat each row's state by row, fresh at a row's start and its own when a piece continues, as vLLM's hybrid cache does; prefix reuse of recurrent state needs its own design. [728]
+- Reuse a prefix for decoders with per-row state: snapshot each row's state at the shared prefix's page-aligned boundary beside its pages and seat a reusing row from it, as vLLM's hybrid prefix caching does; a paged server refuses prefix caching for such decoders today. [760]
 - Run multi-step decode on GPUs. A server with more than one decode step per call fails under checkify's trace of cuDNN attention's shard_map (jax-ml/jax#40907); checkify each step alone and meet the errors after the loop. [733]
 
 The following direction was approved on 2026-10-19:
