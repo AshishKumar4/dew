@@ -39,7 +39,8 @@ class Observe:
     every: int
     call: Callable[[TrainState], Any]
     values: list[tuple[int, Any]] = dataclasses.field(default_factory=list)
-    _seen: set[int] = dataclasses.field(default_factory=set, init=False, repr=False, compare=False)
+    # The step this fit last observed, which a run's last step need not observe again.
+    _last: int | None = dataclasses.field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         if self.every < 1:
@@ -51,7 +52,7 @@ class Observe:
         process holds no value for it, every process alike."""
         agreed_same("observation cadence", lambda: self.every)
         self.values = [(at, value) for at, value in self.values if at <= step]
-        self._seen = set()
+        self._last = None
         missing = all(at != step for at, _ in self.values)
         # Whether to enter the call and its gather is the pool's decision, never one ledger's.
         if complete and agree_process_phase(None, phase="observation at the restored step",
@@ -64,13 +65,19 @@ class Observe:
             self.take(step, state)
 
     def last(self, step: int, state: TrainState) -> None:
-        """The run ended at `step`: observe it unless this fit just did."""
-        if step not in self._seen:
+        """The run ended at `step`, done or stopped by a preemption: observe it unless this fit
+        just did."""
+        if self._last != step:
             self.take(step, state)
 
     def take(self, step: int, state: TrainState) -> None:
-        """`call(state)` on every process, its result copied home and kept as `step`'s value."""
+        """`call(state)` on every process, its result copied home and kept as `step`'s value. A fit's
+        steps only rise past what `opened` kept, so the value is the ledger's new tail or replaces
+        it."""
         value = collective_host(agreed("observation", lambda: self.call(state)), phase="observation")
-        self.values = [*((at, held) for at, held in self.values if at != step), (step, value)]
-        self._seen.add(step)
+        if self.values and self.values[-1][0] == step:
+            self.values[-1] = (step, value)
+        else:
+            self.values.append((step, value))
+        self._last = step
 

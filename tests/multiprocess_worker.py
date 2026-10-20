@@ -624,6 +624,8 @@ def fail_local_save(step: int) -> None:
 
 
 def mode_fit(args) -> dict:
+    import jax
+
     if args.fail_local_save is not None:
         fail_local_save(args.fail_local_save)
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size,
@@ -670,17 +672,15 @@ def mode_fit(args) -> dict:
                         best=Best(counter, mode='max') if args.tokens else None, observe=observe)
     dump_params(args.out.with_suffix(".npz"), state.variables)
     if observe is not None:
-        from dew.coordination import collective_host
-
+        # Each observation is already whole on this host: written as it is, gathered by nothing.
         np.savez(args.out.with_suffix(".observed.npz"), **{
-            f"{step}{name}": leaf for step, variables in observe.values
-            for name, leaf in params_dict(variables).items()})
-        # The returned variables whole on each process, where the dump above holds this one's shards.
-        np.savez(args.out.with_suffix(".whole.npz"),
-                 **params_dict(collective_host(state.variables, phase="returned variables")))
+            f"{step}{jax.tree_util.keystr(path)}": np.asarray(leaf) for step, variables in observe.values
+            for path, leaf in jax.tree_util.tree_flatten_with_path(variables)[0]})
     _, final_position = restored_state(trainer)
     return {
         "step": int(as_numpy(state.step)),
+        "split_between_processes": any(not leaf.is_fully_addressable
+                                       for leaf in jax.tree.leaves(state.variables)),
         "restored_step": restored_step,
         "restored_dataset_state": restored,
         "restored_from": None if restored_step is None else checkpoints.source(restored_step),
