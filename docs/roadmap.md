@@ -111,6 +111,7 @@ The kernel direction was approved on 2026-10-19:
 - Rule on the nine public Dataset members the spec does not name: then, chain, map_with_index, slice, windows, token_split, rebatch, limit and iterate. [811]
 - Chunk a long chat conversation and keep an overlong prompt's tail by default, as the spec says, and carry a row's `ability` into its record's extra_info. [812, 813, 814]
 - Teach only names main has in the post-training and inference docs. [815]
+- Build the data design's remaining contracts: uniform stage errors; a pre-read refusal of a missing artifact; slot maxima shared with `fit`'s separately compiled validation chains; per-member committed-token logging; RL prompt tail cuts counted as truncations; volatility read on every stage kind; and the reader's cache report. [design/data.md]
 
 ## Training and parallelism
 
@@ -133,6 +134,7 @@ The kernel direction was approved on 2026-10-19:
 - Restore a distilled student without its teacher, and count its tokens as the student's. [775, 776]
 - Let rCM accumulate, its phase read from the update clock. [778]
 - Index a sweep's grid lazily. [781]
+- Build the training design's remaining contracts: refusing a split leaf that declares no axes, `Layout.validate(mesh)`'s placement report, a token budget ending at the commit that reaches it, and kernel choices in a run's report. [design/training.md]
 
 ## RL and serving
 
