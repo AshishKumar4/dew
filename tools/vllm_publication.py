@@ -105,8 +105,9 @@ def main() -> None:
     from dew.sampling import Sampling
 
     tokenizer = AutoTokenizer.from_pretrained(args.policy)
-    prompts = [tuple(tokenizer.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True,
-                                                   tokenize=True, return_dict=False)) for text in PROMPTS]
+    prompts = [tuple(tokenizer.apply_chat_template([{"role": "user", "content": text}],
+                                                   add_generation_prompt=True, tokenize=True, return_dict=False))
+               for text in PROMPTS]
     sampling = Sampling(temperature=1.0, eos_token_ids=tokenizer.eos_token_id)
     base = Pretrained.load(args.base, dtype="bfloat16")
     policy = Pretrained.load(args.policy, dtype="bfloat16")
