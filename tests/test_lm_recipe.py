@@ -254,6 +254,7 @@ def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
     """`dew train run.json` and `dew export` each run in a process of their own, which imports what
     the record names and nothing a test happened to import before: the recorded run trains on to
     two steps, and the export reads back as that step's weights, leaf for leaf."""
+    import os
     import subprocess
     import sys
 
@@ -267,8 +268,9 @@ def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
     run, exported = tmp_path / "runs" / "fresh", tmp_path / "exported"
 
     def dew(*arguments: str) -> None:
+        """The command line on this checkout's source, as a fresh interpreter imports it."""
         done = subprocess.run([sys.executable, "-m", "dew.cli.main", *arguments], capture_output=True,
-                              text=True, check=False)
+                              text=True, check=False, env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")})
         assert done.returncode == 0, done.stdout + done.stderr
 
     dew("train", str(run / "run.json"), "--set", "trainer.steps=2")
