@@ -215,6 +215,7 @@ def sweep(name: str, fn, kind: str, config, chunk: int = 1 << 26, limit: int = 1
     value: the node's largest distance in ulps on this GPU and where it sits, over the elements
     whose argument and result are normal, and apart, how many subnormal ones it flushed or missed."""
     worst, where, nonfinite, flushed, subnormal_wrong, started = 0, None, 0, 0, 0, time.time()
+    subnormal_worst, subnormal_at = 0.0, None
     chunk = min(chunk, limit)
     for start in range(0, limit, chunk):
         bits = np.arange(start, start + chunk, dtype=np.uint64).astype(np.uint32)
@@ -230,8 +231,13 @@ def sweep(name: str, fn, kind: str, config, chunk: int = 1 << 26, limit: int = 1
         nonfinite += int(oc.mismatches(native[edge], want[edge], oc.FLOAT32).sum())
         flushed += int((tiny & (native == 0) & (want != 0)).sum())
         subnormal_wrong += int((tiny & oc.mismatches(native, want, oc.FLOAT32)).sum())
+        # Subnormal results in units of fp32's least subnormal, 2^-149: their contract is absolute.
+        steps = np.where(tiny & np.isfinite(want), np.abs(native.astype(np.float64) - want) / 2.0 ** -149, 0)
+        if steps.max() > subnormal_worst:
+            subnormal_worst, subnormal_at = float(steps.max()), float(x[int(steps.argmax())])
     return {"node": name, "max_ulps": worst, "at": where, "nonfinite_mismatch": nonfinite,
             "subnormal_flushed": flushed, "subnormal_mismatch": subnormal_wrong,
+            "subnormal_worst_steps": subnormal_worst, "subnormal_worst_at": subnormal_at,
             "patterns": limit, "seconds": round(time.time() - started, 1)}
 
 
