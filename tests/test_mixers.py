@@ -21,7 +21,18 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_leaves_as_exact, float64_terms
+from reference_error import (
+    ORDERS,
+    REFERENCE,
+    assert_as_exact_over_orders,
+    assert_computes_the_oracle,
+    assert_elements_as_exact,
+    assert_leaves_as_exact,
+    chain_roundings,
+    float64_terms,
+    widened,
+)
+from residual_orders import orders, permuted, residual_width
 
 from dew.nn import linear
 from dew.nn.attention import alibi_bias
@@ -217,12 +228,14 @@ def packed_and_alone(model, variables, tokens, cotangent):
 
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
                "deepseek_v4": ({"rope_head_dim": 8}, {"kinds": {"full_attention": LayerKind(window=8)}}),
-               "kimi_delta_attention": ({"linear_num_heads": 2, "linear_head_dim": 16}, {}),
+               "kimi_delta_attention": ({"linear_num_heads": 4, "linear_head_dim": 16}, {}),
                "gated_delta_net": ({"linear_num_key_heads": 2, "linear_num_value_heads": 4,
                                     "linear_key_head_dim": 16, "linear_value_head_dim": 16}, {})}
 """The fields a kind needs beyond its defaults to build in `tiny`: its own, then the model's. The
 recurrent kinds default to their models' heads (Kimi Linear's 64 of 128, Qwen3.5's 32 of 128), whose
-per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
+per-key pairwise decays alone take 134 MB a chunk in KDA's portable math. Kimi's 4 heads of 16 keep its
+inner width apart from the residual's 32, which a residual order (tests/residual_orders.py) tells its
+undeclared parameters by, its conv's and its decay's bias."""
 
 REFUSED = {"kpool_sparse_attention"}
 """Kinds that refuse packed rows."""
@@ -284,11 +297,17 @@ def test_no_token_reaches_another_document(kind, monkeypatch):
     (`linear.FORGET`). Where the second document starts a chunk, its chunk's prefix is its own and
     the memory before it decays to exactly zero, so on the port it follows a first of a whole chunk
     (`linear.CHUNK_SIZE`), bitwise again. Where it starts mid-chunk the first's decays round its own
-    and the rows differ in their last bits, so there each row is held bitwise to itself with nothing
-    but the decays crossing: every layer's rule run again on the first document's queries, keys,
-    values and betas zero, the second document's tokens taken from that run, the first's from the
-    row's own (`spliced`). A memory, a key or a gate that crossed moves the row from it. The port's
-    documents within a chunk are held at the rule too (test_linear_attention.py).
+    and the rows differ in their last bits, so there each row is held three ways: bit for bit to
+    itself with nothing but the decays crossing (every layer's rule run again on the first document's
+    queries, keys, values and betas zero, the second's tokens from that run, `spliced`); every element
+    from the float64 second document by the element rule (`assert_elements_as_exact`) over draws of
+    rows, the row's own and its changed one first and then first documents of random tokens and 1 to
+    55 tokens long, against the same rows with the first document silent (zero embeddings, so every
+    value it could carry is zero), each draw under an order of the residual stream on both sides
+    (tests/residual_orders.py), each leaf by the K-order rule too; and, on every path, the loss's
+    gradient at every token but the second document's exactly zero, which a decay that carried
+    anything across would move. The port's documents within a chunk are held at the rule too
+    (test_linear_attention.py).
 
     The loss is differentiated at the embedded tokens, not through the lookup: the table's gradient
     adds each position's by a scatter, which a GPU's deterministic XLA (`--xla_gpu_deterministic_ops`)
@@ -310,12 +329,14 @@ def test_no_token_reaches_another_document(kind, monkeypatch):
                 cut = second_documents(model, *DOCUMENTS[:2])
             for name, row in rows.items():
                 assert_equal_rows({name: row, "cut": cut[name]})
+            assert_as_exact_after_any_first_document(model, *DOCUMENTS[:2])
 
 
 def second_documents(model, first, second) -> dict:
     """`model`'s second document of a row of `first` and `second` tokens, then padding, and of the
     same row with the first document's and the padding's tokens changed: its logits, the parameters'
-    gradients of a loss on them alone and its gradient at its embedded tokens, by row."""
+    gradients of a loss on them alone and its gradient at its embedded tokens, by row; the gradient at
+    every other token, exactly zero, is held here."""
     total = first + second + PADDING
     segments = jnp.asarray([[1] * first + [2] * second + [0] * PADDING], jnp.int32)
     positions = jnp.asarray([[*range(first), *range(second)] + [0] * PADDING], jnp.int32)
@@ -335,6 +356,8 @@ def second_documents(model, first, second) -> dict:
         inputs = model.apply(variables, row, method=embedded)
         (_, logits), (grads, at_inputs) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True))(
             variables, inputs)
+        elsewhere = np.asarray(jnp.concatenate([at_inputs[:, :first], at_inputs[:, first + second:]], axis=1))
+        np.testing.assert_array_equal(elsewhere, 0.0, err_msg="the gradient at the other documents' tokens")
         return logits, grads, at_inputs[:, first:first + second]
 
     return {"changed": second_document(changed), "unchanged": second_document(tokens)}
@@ -364,6 +387,103 @@ def spliced(rule, first: int):
         rest, final = rule(cut(query), cut(key), cut(value), g, cut(beta), state, starts=starts)
         return jnp.where(before[..., None, None], out, rest), final
     return run
+
+
+def assert_as_exact_after_any_first_document(model, first, second, total=128):
+    """On the port, every element of the second document of `second_documents`' rows from the float64
+    second document by the element rule, over draws of rows (the row's own and its changed one first,
+    then first documents of random tokens and 1 to `total - second - PADDING` tokens in rows of
+    `total`), against the same rows with the first document silent; each leaf by the K-order rule."""
+    tokens = np.asarray(jax.random.randint(jax.random.key(3), (1, first + second + PADDING), 0, VOCAB))[0]
+    weight = jax.random.normal(jax.random.key(5), (1, first + second + PADDING, VOCAB))
+    drawn, own = weight[:, first:first + second], tokens[first:first + second]
+    variables = model.init(jax.random.key(4), tokens[None])
+
+    def compiled(model=model):
+        """The second document's results as `second_documents`' after a first of `length` tokens,
+        silent where `silent` is set: compiled once a row's length, under the kernel choice it is
+        built in."""
+        @jax.jit
+        def second_document(variables, row, length, silent):
+            place = jnp.arange(row.shape[1])[None]
+            segments = jnp.where(place < length, 1, jnp.where(place < length + second, 2, 0))
+            positions = jnp.where(segments == 1, place, jnp.where(segments == 2, place - length, 0))
+            at = coordinates(segments=segments, positions=positions, max_segments=3)
+            cotangent = jax.lax.dynamic_update_slice(jnp.zeros((*row.shape, VOCAB), drawn.dtype), drawn,
+                                                     (0, length, 0))
+
+            def loss(variables, inputs):
+                logits = model.apply(variables, row, input_embeddings=inputs, coordinates=at)
+                taken = jax.lax.dynamic_slice_in_dim(logits, length, second, 1)
+                return jnp.sum(logits * cotangent), taken
+
+            inputs = model.apply(variables, row, method=embedded)
+            inputs = jnp.where(silent & (segments == 1)[..., None], 0.0, inputs)
+            (_, logits), (grads, at_inputs) = jax.value_and_grad(loss, argnums=(0, 1), has_aux=True)(
+                variables, inputs)
+            return logits, grads, jax.lax.dynamic_slice_in_dim(at_inputs, length, second, 1)
+        return second_document
+
+    units = residual_width(variables)
+
+    def ordered(result, order):
+        """The second document's results with the residual stream's units in `order`."""
+        logits, grads, at_inputs = result
+        return logits, permuted(grads, order), np.take(np.asarray(at_inputs), order, axis=-1)
+
+    with jax.enable_x64(new_val=True):
+        wide = compiled(model.clone(dtype=jnp.float64))
+        exact = wide(widened(variables), tokens[None], first, silent=False)
+        # A residual order is an exact symmetry: the float64 truth run in one is its own units in it.
+        last = orders(units, 2, seed=0)[-1]
+        found = wide(permuted(widened(variables), last), tokens[None], first, silent=False)
+        roundings = chain_roundings(jax.make_jaxpr(wide)(widened(variables), tokens[None], first,
+                                                         silent=False))
+        for (path, leaf), true in zip(jax.tree_util.tree_leaves_with_path(found),
+                                      jax.tree.leaves(ordered(exact, last)), strict=True):
+            assert_computes_the_oracle(np.asarray(leaf), np.asarray(true),
+                                       f"the residual order {jax.tree_util.keystr(path)}",
+                                       roundings=roundings)
+    paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(exact)]
+    second_document = compiled()
+    distances = {"dew": [], REFERENCE: []}
+    kept = np.concatenate([tokens[:first], tokens[first + second:]])
+    originals = [kept, (kept + np.asarray([7] * first + [5] * PADDING)) % VOCAB]
+
+    def batch(stage):
+        """Stage `stage`'s sums of every element's distance from float64 over ORDERS draws of rows,
+        Dew's and the silent ones', each draw under a residual order both sides take, the original
+        rows' the identity."""
+        rng = np.random.default_rng(stage)
+        drawn_orders = orders(units, ORDERS, seed=1000 + stage)
+        drawn_orders[1] = drawn_orders[0] if stage == 0 else drawn_orders[1]
+        sums = {}
+        for draw, order in enumerate(drawn_orders):
+            truth = [np.asarray(leaf, np.float64) for leaf in jax.tree.leaves(ordered(exact, order))]
+            moved = permuted(variables, order)
+            if stage == 0 and draw < len(originals):
+                length, before = first, originals[draw]
+                width = first + second + PADDING
+            else:
+                length = 1 + (draw + 17 * stage) % (total - second - PADDING)
+                before, width = rng.integers(0, VOCAB, total - second), total
+            silence = np.zeros(width - second, int)
+            rows = {"dew": (np.concatenate([before[:length], own, before[length:]]), False),
+                    REFERENCE: (np.concatenate([silence[:length], own, silence[length:]]), True)}
+            for side, (row, silent) in rows.items():
+                found = second_document(moved, jnp.asarray(row)[None], length, silent=silent)
+                errors = [np.abs(np.asarray(leaf, np.float64) - true)
+                          for leaf, true in zip(jax.tree.leaves(found), truth, strict=True)]
+                sums[side] = errors if side not in sums else [
+                    held + error for held, error in zip(sums[side], errors, strict=True)]
+                if stage == 0:
+                    distances[side].append([float(np.sqrt(np.mean(error ** 2))) for error in errors])
+        return sums["dew"], {REFERENCE: sums[REFERENCE]}
+
+    assert_elements_as_exact(batch, "the second document after a first")
+    for index, path in enumerate(paths):
+        assert_as_exact_over_orders([draw[index] for draw in distances["dew"]],
+                                    [draw[index] for draw in distances[REFERENCE]], path)
 
 
 POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "attention_sinks": True,

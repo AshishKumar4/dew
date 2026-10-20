@@ -34,7 +34,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import CHUNKED, math, recurrence, through
+from delta_rule_support import math, recurrence, through
 from flax import linen as nn
 from model_support import decode_through
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms, widened
@@ -192,10 +192,14 @@ def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, 
 def test_the_port_takes_each_packed_tokens_gradients_as_its_document_alone_does(per_key):
     """The port's output at each packed token and its gradients of the token's query, key and decay
     (`linear.fla_rule`, a row of documents as one sequence, each document's first token forgetting the
-    memory by `linear.FORGET`) as near the float64 recurrence run document by document as the port's
-    own with the token's document alone in place, the row's other tokens zero: no token's gradient
-    carries another document's. Per token, these hold what the per-head decay parameters only sum.
-    The port's algorithm is held against fla's own packed sequences (test_fla_gdn, test_fla_kda).
+    memory by `linear.FORGET`) against the port's own with the token's document alone in place: the
+    row's other tokens' queries, keys, values, betas and output gradients zero, their decays kept, so
+    the chunk's prefixes round alike. The output and the query's and key's gradients bit for bit: no
+    token's carries another document's. The decay's gradient within FACTOR of that run's distance from
+    the float64 recurrence run document by document, with no floor: the packed row's takes the later
+    documents' share of its chunk's cumulated gradient away (`linear._forgotten`), one rounding the
+    lone document has nothing to take. Per token, these hold what the per-head decay parameters only
+    sum. The port's algorithm is held against fla's own packed sequences (test_fla_gdn, test_fla_kda).
     Documents of 40, 60, 1, 49, 40, 10 and 56 tokens, one of a single token and resets two apart in
     a chunk."""
     length, heads, width = 256, 2, 64
@@ -223,15 +227,16 @@ def test_the_port_takes_each_packed_tokens_gradients_as_its_document_alone_does(
 
     starts = np.isin(np.arange(length), begins[1:])[None]
     got = jax.jit(taken(on_the_port(starts), v, beta, do))(q, k, g)
-    # Each document alone where the row packed it, a row of its own: every other token zero, so it
-    # carries nothing, and its first token the row's only start but the row's first.
+    # Each document alone where the row packed it, a row of its own: every other token's operands zero
+    # but its decay, so it carries nothing and every chunk's prefix is the row's.
     mine = (document[None, :] == np.arange(len(begins))[:, None])
 
     def alone_in_place(x):
         return jnp.where(mine.reshape(*mine.shape, *(1,) * (x.ndim - 2)), x, 0)
 
-    rows = taken(on_the_port(starts & mine), alone_in_place(v), alone_in_place(beta), alone_in_place(do))
-    each = jax.jit(rows)(*(alone_in_place(x) for x in (q, k, g)))
+    rows = taken(on_the_port(np.repeat(starts, len(begins), axis=0)), alone_in_place(v), alone_in_place(beta),
+                 alone_in_place(do))
+    each = jax.jit(rows)(alone_in_place(q), alone_in_place(k), jnp.repeat(g, len(begins), axis=0))
     reference = {name: value[document, np.arange(length)][None] for name, value in each.items()}
 
     def alone(q, k, v, g, beta):
@@ -245,7 +250,10 @@ def test_the_port_takes_each_packed_tokens_gradients_as_its_document_alone_does(
         want = widened(taken(alone, *wide[3:])(*wide[:3]))
         _, terms = float64_terms(taken(lambda q, k, v, g, beta: math(q, k, v, g, beta, None, starts),
                                        *wide[3:]), *wide[:3])
-    assert_leaves_as_exact(got, reference, want, reductions=CHUNKED, terms=terms)
+    for name in ("out", "q", "k"):
+        np.testing.assert_array_equal(np.asarray(got[name]), np.asarray(reference[name]), err_msg=name)
+    assert_as_exact_as_the_reference(np.asarray(got["g"]), np.asarray(reference["g"]), want["g"],
+                                     "the decay's gradient", terms=terms["g"])
 
 
 @pytest.mark.parametrize("per_key", [False, True], ids=["gated delta net", "Kimi delta attention"])
