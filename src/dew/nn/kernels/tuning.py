@@ -242,8 +242,10 @@ def _kind(ba: tokamax.BoundArguments) -> str:
     """The GPU model the launch `ba` is chosen for, as tokamax reads it for its cache lookups: its
     concrete operands' devices', else the context mesh's (`Trainer.lower_for`'s abstract GPU), else
     the default device's. A traced or keyed launch (`keyed`) names no device of its own."""
+    from jax.core import Tracer
+
     kinds = {device.device_kind for leaf in jax.tree.leaves(dict(ba.arguments))
-             if isinstance(leaf, jax.Array) and not isinstance(leaf, jax.core.Tracer)
+             if isinstance(leaf, jax.Array) and not isinstance(leaf, Tracer)
              for device in leaf.devices()}
     if len(kinds) > 1:
         raise ValueError(f"a launch's operands lie on GPUs of several models: {sorted(kinds)}")
