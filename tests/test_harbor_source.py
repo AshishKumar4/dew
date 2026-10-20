@@ -305,6 +305,30 @@ def test_constructing_a_harness_source_or_a_publication_opens_nothing(tmp_path, 
     publication.load({}, 4)
     assert publication.version == 4 and stamped == [3, 4]
 
+    # A load before the version is first read leaves the launch stamp unsent.
+    loaded = []
+    early = Publication(lambda variables, version: None, version=3, stamp=loaded.append)
+    early.load({}, 5)
+    assert early.version == 5 and loaded == [5]
+
+    # A first read while a load is publishing waits for it, so its stamp cannot land on the load's.
+    pushing, release, raced = threading.Event(), threading.Event(), []
+
+    def push(variables, version):
+        pushing.set()
+        release.wait()
+
+    racing = Publication(push, version=0, stamp=raced.append)
+    loader = threading.Thread(target=racing.load, args=({}, 1))
+    loader.start()
+    pushing.wait()
+    reader = threading.Thread(target=lambda: raced.append(("read", racing.version)))
+    reader.start()
+    release.set()
+    loader.join()
+    reader.join()
+    assert raced == [1, ("read", 1)]
+
 
 def test_each_sample_is_its_own_trial_and_gateway_session(tmp_path, harbor):
     (tmp_path / "task").mkdir()

@@ -499,23 +499,25 @@ class Publication:
         self._weights = weights
         self._stamp = stamp
         self._version = version
-        self._launched = threading.Lock()
+        # One lock orders the launch stamp against a load, so the gateway always ends at the version
+        # the engines hold.
+        self._published = threading.Lock()
         self._launch: int | None = version
 
     @property
     def version(self) -> int:
-        with self._launched:
+        with self._published:
             if self._launch is not None:
                 self._stamped(self._launch)
                 self._launch = None
-        return self._version
+            return self._version
 
     def load(self, variables: Variables, version: int) -> None:
-        self._weights(variables, version)
-        self._stamped(version)
-        with self._launched:
+        with self._published:
+            self._weights(variables, version)
+            self._stamped(version)
             self._launch = None
-        self._version = version
+            self._version = version
 
     def _stamped(self, version: int) -> None:
         stamp = self._stamp
