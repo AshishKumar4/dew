@@ -889,18 +889,46 @@ def test_an_fp32_port_dot_names_its_products_whatever_the_global_precision():
     assert _lowered_dot(unnamed, "default") != _lowered_dot(unnamed, "highest")
 
 
+@pytest.mark.parametrize("packed", [True, False], ids=["packed", "own rows"])
 @pytest.mark.parametrize("read", ["chunks", "spans", "both"])
-def test_a_timed_launch_draws_the_descriptors_it_reads(read):
-    """The tuner times a launch on operands it draws (`_Launch.operands`): a packed launch that reads
-    only chunk descriptors, only sequence ones, or both gets descriptors of its own shapes, as a
-    step's measurement (`tuning.tune(measure=True)`, tools/kernel_picks.py) hands it some of them."""
-    batch, length, documents = 2, 150, 5
-    packed = fla_gdn.sequences(batch, length, jnp.asarray(np.linspace(0, batch * length, documents + 1),
-                                                          jnp.int32))
+def test_a_timed_launch_draws_the_descriptors_it_reads(read, packed):
+    """The tuner times a launch on operands it draws (`_Launch.operands`): a launch that reads only
+    chunk descriptors, only sequence ones, or both, packed or over the rows' own spans, gets
+    descriptors of its own shapes, as a step's measurement (`tuning.tune(measure=True)`,
+    tools/kernel_picks.py) hands it some of them, and valid ones: sequences covering every token in
+    order, none crossing a row, each chunk at most 64 of one sequence's tokens; and the decay cumulated
+    over the drawn chunks bitwise each chunk's run as a row of its own."""
+    batch, length = 2, 150
+    cuts = jnp.asarray([0, 60, 150, 200, 260, 300], jnp.int32)
+    given = fla_gdn.sequences(batch, length, cuts if packed else None)
     query = jax.ShapeDtypeStruct((batch, length, 2, 64), jnp.bfloat16)
-    descriptors = {"chunks": [packed.chunks], "spans": [packed.spans],
-                   "both": [packed.chunks, packed.spans]}[read]
+    descriptors = {"chunks": [given.chunks], "spans": [given.spans],
+                   "both": [given.chunks, given.spans]}[read]
     specs = [query, *(jax.ShapeDtypeStruct(array.shape, array.dtype) for array in descriptors)]
     drawn = fla_gdn.ChunkFwdH().operands(specs, 0)
     assert [array.shape for array in drawn] == [spec.shape for spec in specs]
     assert all(array.dtype == spec.dtype for array, spec in zip(drawn, specs, strict=True))
+    count = given.spans.shape[0]
+    chunks = len(given.chunks)
+    # The descriptors drawn whichever the launch reads: those it reads are these, of these shapes.
+    full = fla_gdn.ChunkFwdH().operands([query, jax.ShapeDtypeStruct((chunks, 4), jnp.int32),
+                                         jax.ShapeDtypeStruct((count, 5), jnp.int32)], 0)
+    for array in drawn[1:]:
+        np.testing.assert_array_equal(np.asarray(array), np.asarray(full[1 if array.shape[-1] == 4 else 2]))
+    spans, chunked = np.asarray(full[2]), np.asarray(full[1])
+    first, lengths = spans[:, 0], spans[:, 1]
+    np.testing.assert_array_equal(first, np.concatenate([[0], np.cumsum(lengths)[:-1]]))
+    assert lengths.sum() == batch * length and (lengths > 0).all()
+    assert (first // length == (first + lengths - 1) // length).all(), "a sequence crosses a row"
+    start, taken = chunked[:, 0], chunked[:, 1]
+    assert ((taken >= 0) & (taken <= 64)).all() and taken.sum() == batch * length
+    owner = np.searchsorted(first, start, side="right") - 1
+    real = taken > 0
+    assert (start[real] + taken[real] <= (first + lengths)[owner[real]]).all(), "a chunk crosses a sequence"
+    g = jax.random.normal(jax.random.key(0), (batch, length, 2))
+    described = fla_gdn.Sequences(jnp.asarray(chunked), jnp.asarray(spans))
+    found = np.asarray(fla_gdn.chunk_local_cumsum(g, spans=described, interpret=True)).reshape(-1, 2)
+    flat = g.reshape(1, batch * length, 2)
+    for begin, size in zip(start[real], taken[real], strict=True):
+        alone = fla_gdn.chunk_local_cumsum(flat[:, begin:begin + size], interpret=True)
+        np.testing.assert_array_equal(found[begin:begin + size], np.asarray(alone)[0], err_msg=f"at {begin}")
