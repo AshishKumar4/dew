@@ -72,7 +72,7 @@ from dew.objectives.base import (
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, PERCEPTUAL, EndToEnd
 from dew.sampling.guidance import CFG, Guidance
-from dew.sampling.pipelines import ImageSettings, TextToImage
+from dew.sampling.pipelines import ImageSettings, TextToImage, sampling_modules
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Consistency, Solver
 
@@ -499,7 +499,10 @@ class DiffusionObjective(Objective[Ratio]):
 
     @property
     def _sample(self):
-        return self.program('sample', self._sample_impl, static_argnames=("count",))
+        return self.program('sample', self._sample_impl, static_argnames=("count",),
+                            holds=tuple(held for held in (self.guidance, self.autoencoder)
+                                        if held is not None),
+                            modules=sampling_modules(self.model, self.guidance, self.autoencoder))
 
     def task_settings(self) -> ImageSettings:
         """The process, input encoders, autoencoder and sampling convention."""
@@ -584,8 +587,7 @@ class DiffusionObjective(Objective[Ratio]):
             held[PERCEPTUAL] = LPIPSNetwork.published()[1]
         return held
 
-    def optimizer(self, tx: optax.GradientTransformation, *,
-                  accumulation: int) -> optax.GradientTransformation:
+    def optimizer(self, tx: optax.GradientTransformation) -> optax.GradientTransformation:
         """Return `tx`, or under `end_to_end` one copy of it per network.
 
         REPA-E updates the model (with its alignment projector), the autoencoder and

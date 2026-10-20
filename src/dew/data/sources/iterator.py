@@ -40,6 +40,9 @@ class Iterated(Dataset):
         if self.replay and self.state is not None:
             raise ValueError("from_iter resumes through state= and load_state= or by replay=True, not both")
 
+    def label(self) -> str:
+        return self.name
+
     def describe(self) -> str:
         return f"iter:{self.name}"
 

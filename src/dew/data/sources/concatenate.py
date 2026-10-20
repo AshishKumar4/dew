@@ -11,7 +11,11 @@ import numpy as np
 
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
-from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
+from dew.data.sources.base import _COUNTS, Read, Shard, ShardManifest, Source, _consumed, tokenizer_contract
+from dew.records import integer
+
+COUNTED = (*_COUNTS, "held_out")
+"""The facts that count a store's records, which a concatenation's sources add."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -30,6 +34,9 @@ class Concatenate(Dataset):
         if not self.sources:
             raise ValueError("concatenation needs at least one source")
 
+    def label(self) -> str:
+        return "+".join(dict.fromkeys(source.label() for source in self.sources))
+
     def describe(self) -> str:
         return "concatenate[" + ",".join(source.describe() for source in self.sources) + "]"
 
@@ -47,10 +54,23 @@ class Concatenate(Dataset):
                                              for source in self.sources])
 
     def metadata(self) -> Mapping[str, object]:
+        """What every source states of its records, as one store's: the counts (`COUNTED`) added
+        where each source states one, the tokenizer contract where the sources that state it agree
+        (`tokenizer_contract`, which refuses two), and any other fact, class names among them,
+        where every source states the one value."""
         stated = [source.metadata() for source in self.sources]
-        rows = [facts.get("rows") for facts in stated]
-        return {"rows": sum(count for count in rows if isinstance(count, int))} if all(
-            isinstance(count, int) for count in rows) else {}
+        contract = tokenizer_contract((source.describe(), facts)
+                                      for source, facts in zip(self.sources, stated, strict=True))
+        facts: dict[str, object] = dict(contract)
+        for key in dict.fromkeys(key for given in stated for key in given):
+            values = [given[key] for given in stated if key in given]
+            if key in COUNTED:
+                if len(values) == len(stated) and all(isinstance(value, int) for value in values):
+                    facts[key] = sum(integer(value, key) for value in values)
+            elif key not in contract and len(values) == len(stated) and all(
+                    value == values[0] for value in values):
+                facts[key] = values[0]
+        return facts
 
     def lengths(self) -> np.ndarray | None:
         lengths = [source.lengths() for source in self.sources]

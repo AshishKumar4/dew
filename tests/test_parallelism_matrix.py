@@ -61,9 +61,12 @@ def references(tmp_path_factory):
     """Each model's one-device reference and fp64 anchor, computed by its
     first layout's test and read by the rest that run in this process: a
     cell is a test of its own, so CI spreads a model's layouts over tasks
-    rather than running them all in one."""
+    rather than running them all in one. Its tool module is the one each
+    test runs: the one-device state the references hold (`_initial`) lives
+    in that module, so a layout's state is checked against it bit for bit
+    rather than drawn again by a module of its own."""
     tool = load("layout_parity")
-    return tool.References(directory=tmp_path_factory.mktemp("layout-references"), prepare=True)
+    return tool, tool.References(directory=tmp_path_factory.mktemp("layout-references"), prepare=True)
 
 
 @pytest.mark.mesh(devices=8)
@@ -73,10 +76,10 @@ def references(tmp_path_factory):
     *(pytest.param(model, layout, 4, id=f"{model}-{layout}-on-four")
       for model, layouts in sorted(CELLS_ON_FOUR.items()) for layout in layouts)])
 def test_each_layout_of_a_model_matches_one_device_or_is_refused(model, layout, devices, references):
-    tool = load("layout_parity")
+    tool, held = references
     with jax.enable_x64(new_val=True):
         rows = tool.run([model], (layout,), dtype="float32", steps=1, anchor=True, mixture={},
-                        objective={}, references=references, speak=lambda line: None,
+                        objective={}, references=held, speak=lambda line: None,
                         keep=lambda rows: None, devices=devices)
     assert tool.verdict(rows) == 0, [
         {key: row.get(key) for key in ("layout", "status", "worst_leaf", "worst_ratio", "loss_error",

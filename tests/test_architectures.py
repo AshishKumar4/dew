@@ -417,7 +417,7 @@ def update_terms(case: Case, tmp_path, initial, steps=2):
 
         def stepped(state):
             for batch in rows:
-                advanced, *_ = body(state, batch, 0)
+                advanced, *_ = body(state, batch, 0, jnp.zeros((2,), jnp.uint32))
                 state = replace(advanced, step=state.step + 1)
             return state
 
@@ -445,7 +445,7 @@ def shard_terms(case: Case, tmp_path, initial):
         body = trainer._step_body(trainer._loss_shape(state, with_rows(np.ones(BATCH, bool))), {}, 1)
 
         def written(valid):
-            advanced, *_ = body(state, with_rows(valid), 0)
+            advanced, *_ = body(state, with_rows(valid), 0, jnp.zeros((2,), jnp.uint32))
             return {name: jax.device_get(jax.tree.map(lambda after, before: after - before,
                                                       getattr(advanced, name), getattr(state, name)))
                     for name in ("variables", "opt_state", "ema")}
