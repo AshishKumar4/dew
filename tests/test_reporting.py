@@ -232,7 +232,6 @@ def test_mlflow_takes_a_metric_named_in_free_text_under_a_name_it_accepts(tmp_pa
     name it accepts, two such names apart; a name MLflow accepts arrives as it is."""
     store = mlflow_store(tmp_path, monkeypatch)
     from dew.training import MLflowTracker
-    from dew.training.tracker import mlflow_name
 
     names = ("rollout/source/openai/gsm8k/reward/mean", "rollout/source/math[hard]/reward/mean",
              "rollout/source/math(hard)/reward/mean", "rollout/source/a/../b/reward/mean")
@@ -240,6 +239,8 @@ def test_mlflow_takes_a_metric_named_in_free_text_under_a_name_it_accepts(tmp_pa
         tracker.log({name: float(index) for index, name in enumerate(names)}, 1)
         client, run = tracker.run
     logged = client.get_run(run).data.metrics
+    from dew.training.tracker import mlflow_name
+
     assert len({mlflow_name(name) for name in names}) == len(names)
     assert {mlflow_name(name): index for index, name in enumerate(names)} == logged
     assert mlflow_name(names[0]) == names[0]
