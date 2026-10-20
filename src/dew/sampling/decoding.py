@@ -27,7 +27,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable, Sequence
-from typing import Protocol, runtime_checkable
+from typing import NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -204,9 +204,17 @@ class LogitsTransform(Protocol):
 
 @runtime_checkable
 class Stopping(Protocol):
-    """A pure per-row finish test over the tokens a step just drew."""
+    """A pure per-row finish test over the tokens a step just drew.
+
+    A criterion that cuts a row short at a length rather than ending it, as
+    `MaxNewTokens` and `MaxLength` do, is a `Truncates`: a row it finishes
+    is not terminated (`Finish`)."""
 
     def __call__(self, state: StepState, tokens: jax.Array, /) -> jax.Array: ...
+
+
+class Truncates:
+    """Marks a stopping criterion that cuts a row short at a length rather than ending it."""
 
 
 @struct.dataclass
@@ -816,8 +824,8 @@ class EndOfSequence:
 
 
 @struct.dataclass
-class MaxNewTokens(_Numerical):
-    """Finishes a row once it has drawn `count` tokens."""
+class MaxNewTokens(_Numerical, Truncates):
+    """Finishes a row once it has drawn `count` tokens, which truncates it."""
 
     count: int = struct.field(pytree_node=False, default=0)
 
@@ -834,8 +842,9 @@ class MaxNewTokens(_Numerical):
 
 
 @struct.dataclass
-class MaxLength(_Numerical):
-    """Finishes a row once prompt and generated tokens reach `length`, as `MaxLengthCriteria`."""
+class MaxLength(_Numerical, Truncates):
+    """Finishes a row once prompt and generated tokens reach `length`, as `MaxLengthCriteria`, which
+    truncates it."""
 
     length: int = struct.field(pytree_node=False, default=0)
 
@@ -1003,16 +1012,47 @@ def chain(transforms: Sequence[LogitsTransform]) -> LogitsChain:
     return LogitsChain(tuple(transforms))
 
 
-def criterion(stopping: Sequence[Stopping]) -> Callable[[StepState, jax.Array], jax.Array]:
-    """The criteria as one callable, combined with OR."""
+class Finish(NamedTuple):
+    """The rows a step's criteria finished, and those of them a criterion ended, as a stop does,
+    rather than one cut short at a length (`Stopping`'s `truncates`): the terminated rows."""
 
-    def finished(state: StepState, tokens: jax.Array) -> jax.Array:
-        done = jnp.zeros(tokens.shape, bool)
-        for stop in stopping:
-            done = done | stop(state, tokens)
-        return done
+    done: jax.Array
+    ended: jax.Array
+
+
+class Finishing(NamedTuple):
+    """A request's criteria as pytrees (`components`), those that end a row apart from those that
+    cut it short at a length, which is told from each criterion as given (`Truncates`) before it is
+    one: a built-in's numbers ride as data (`as_pytree`)."""
+
+    ending: tuple[Stopping, ...]
+    truncating: tuple[Stopping, ...]
+
+    @classmethod
+    def of(cls, criteria: Sequence[Stopping]) -> Finishing:
+        ending = tuple(as_pytree(stop) for stop in criteria if not isinstance(stop, Truncates))
+        return cls(ending, tuple(as_pytree(stop) for stop in criteria if isinstance(stop, Truncates)))
+
+
+def finish(stopping: Finishing) -> Callable[[StepState, jax.Array], Finish]:
+    """The criteria as one callable: which rows any of them finished, and which one that ends a row
+    finished, each combined with OR."""
+
+    def finished(state: StepState, tokens: jax.Array) -> Finish:
+        ended = cut = jnp.zeros(tokens.shape, bool)
+        for stop in stopping.ending:
+            ended = ended | stop(state, tokens)
+        for stop in stopping.truncating:
+            cut = cut | stop(state, tokens)
+        return Finish(ended | cut, ended)
 
     return finished
+
+
+def criterion(stopping: Finishing | Sequence[Stopping]) -> Callable[[StepState, jax.Array], jax.Array]:
+    """The criteria as one callable, combined with OR: which rows any of them finished (`finish`)."""
+    finished = finish(stopping if isinstance(stopping, Finishing) else Finishing(tuple(stopping), ()))
+    return lambda state, tokens: finished(state, tokens).done
 
 
 __all__ = [
@@ -1021,6 +1061,8 @@ __all__ = [
     "EpsilonCutoff",
     "EtaCutoff",
     "ExponentialDecayLengthPenalty",
+    "Finish",
+    "Finishing",
     "ForcedBOS",
     "ForcedEOS",
     "FrequencyPenalty",
@@ -1048,5 +1090,6 @@ __all__ = [
     "TopH",
     "TopK",
     "TopP",
+    "Truncates",
     "Typical",
 ]
