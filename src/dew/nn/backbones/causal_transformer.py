@@ -2256,6 +2256,11 @@ class CausalTransformer(nn.Module):
                 dtype=self.dtype, specs=self.norms)(name='norm')
 
     @nn.nowrap
+    def with_kv_cache(self, layout: KVCache) -> Self:
+        """The same decoder over the cache layout `layout` (`Layered`)."""
+        return self.clone(kv_cache=layout)
+
+    @nn.nowrap
     def with_cache_capacity(self, capacity: int) -> Self:
         """`max_seq_len` is the cache size its layers read (`open_kv_cache`);
         a learned position table it sized keeps its rows."""
