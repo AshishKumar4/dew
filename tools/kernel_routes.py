@@ -4,8 +4,8 @@ Each family's committed tiny config (tests/fixtures/hf/<name>/config.json, the f
 model_type is one of the family's) is built in bf16 without weights and traced on a CPU within
 `generation.assumed(target)` for each row of `TARGETS` that names a kernel: a training step's gradient,
 a 64-token prefill, and one decode step on the dense cache and on a paged one; a bidirectional family
-(`causal` False) has no causal cache and steps for training alone. A fixture holding a vision tower is
-its wrapper's bundle, whose decoder is traced (`translate_wrapper_config`). Every dispatch reports its
+(`causal` False) has no causal cache and steps for training alone. A fixture that is a media bundle its
+family reads whole (`hf_decoders.bundles`) is traced as its decoder. Every dispatch reports its
 decision (`generation.route`), and `generation.routes` collects them, so the report shows per family,
 target and mode which kernel each choice runs and why a generic path ran where it did. A family's widths
 are its fixture's but for its head widths, which are the reference's: transformers' own config defaults for
@@ -144,17 +144,16 @@ def verdict(route) -> str:
 
 
 def model_of(config: dict, mode: str = "train"):
-    """The family's `CausalTransformer` in bf16 for `mode`: its decoder, a bundle's
-    (`translate_wrapper_config`) where the fixture holds a vision tower, on a paged cache for
+    """The family's `CausalTransformer` in bf16 for `mode`: its decoder, a media bundle's
+    (`hf_decoders.bundles`, `translate_wrapper_config`) where the fixture is one, on a paged cache for
     'decode-paged'."""
     import jax.numpy as jnp
 
-    from dew.interop.hf_decoders import translate_config, translate_wrapper_config
+    from dew.interop.hf_decoders import bundles, translate_config, translate_wrapper_config
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.kv_cache import KVCache
 
-    decoder = (translate_wrapper_config(config)["text"] if config.get("vision_config") is not None
-               else translate_config(config))
+    decoder = translate_wrapper_config(config)["text"] if bundles(config) else translate_config(config)
     fields = {**decoder, "dtype": jnp.bfloat16}
     if mode == "decode-paged":
         fields["kv_cache"] = KVCache(page_size=16)
