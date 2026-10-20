@@ -62,7 +62,7 @@ class GridSearch(Search):
         # The product's point at the trial's place, its last field varying fastest, as
         # `itertools.product` orders it, without building the points before it.
         point, place = {}, len(finished)
-        for path, values in reversed(space.items()):
+        for path, values in reversed(list(space.items())):
             place, chosen = divmod(place, len(values))
             point[path] = values[chosen]
         return {path: point[path] for path in space}
