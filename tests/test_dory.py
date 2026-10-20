@@ -13,7 +13,12 @@ import numpy as np
 import optax
 import pytest
 from interop_support import assert_reloads, assert_same_stored_tensors
-from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    assert_rounds_where_the_reference_does,
+    seeds_for,
+)
 from tool_support import load as load_tool
 
 from dew.checkpoints import Checkpoints
@@ -242,18 +247,48 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
     projection, a looped feed-forward and attention gain, an output layer's step and the logit
     gain, as the reference's autograd takes it, within the rule: through every pass, and with the
     loop cut before its last pass, where the input layers still train through what that pass
-    reinjects (Huginn's truncation). Each is named by the export, as the checkpoint stores it."""
+    reinjects (Huginn's truncation). Each draw has fresh token ids and cotangents, with their batch
+    rows permuted together, an exact symmetry of the summed loss. The same torch reference that
+    wrote the fixture runs live in fp32 and float64; every gradient keeps its checkpoint name."""
     loaded = load()
     model = loaded.model.with_passes(loops, backprop_steps=backprop_steps)
-    ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent']
+    tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+    cut = None if backprop_steps is None else loops - backprop_steps
 
-    def loss(params):
-        return jnp.sum(model.apply({**loaded.variables, 'params': params}, ids) * cotangent)
+    def shapes(dtype):
+        return {tensor: jax.ShapeDtypeStruct(tensors[tensor].shape, dtype) for tensor in TOOL.GRADIENTS}
 
-    gradients = loaded.export({'params': jax.grad(loss)(loaded.variables['params'])})
-    for tensor in TOOL.GRADIENTS:
-        assert_as_exact_as_the_reference(gradients[tensor], REFERENCE[f'gradient_{name}/{tensor}'],
-                                         REFERENCE[f'gradient_{name}_f64/{tensor}'], f'{name} {tensor}')
+    def exported(gradients):
+        written = loaded.export({'params': gradients})
+        return {tensor: np.asarray(written[tensor]) for tensor in TOOL.GRADIENTS}
+
+    def dew(ids, cotangent):
+        def loss(params):
+            return jnp.sum(model.apply({**loaded.variables, 'params': params}, ids) * cotangent)
+
+        gradients = jax.grad(loss)(loaded.variables['params'])
+        return jax.pure_callback(exported, shapes(cotangent.dtype), gradients)
+
+    def torch_gradients(ids, cotangent):
+        dtype = TOOL.torch.float64 if cotangent.dtype == np.float64 else TOOL.torch.float32
+        reference = TOOL.DoryReference(loaded.config, tensors, dtype, loops=loops)
+        return reference.gradients(np.asarray(ids), np.asarray(cotangent), TOOL.GRADIENTS, cut=cut)
+
+    def reference(ids, cotangent):
+        return jax.pure_callback(torch_gradients, shapes(cotangent.dtype), ids, cotangent)
+
+    def draw(seed):
+        rng = np.random.default_rng(5 + seed)
+        ids = rng.integers(12, loaded.config['vocab_size'], REFERENCE['input_ids'].shape, dtype=np.int32)
+        cotangent = rng.normal(size=REFERENCE['cotangent'].shape).astype(np.float32)
+        order = rng.permutation(len(ids))
+        return ids[order], cotangent[order]
+
+    dew, reference = jax.jit(dew), jax.jit(reference)
+    label = f'Dory {name} gradients'
+    seeds = seeds_for(reference, draw, label)
+    print(f'SIZED {label}: {seeds}', flush=True)
+    assert_as_exact(dew, reference, draw, label, seeds=seeds)
 
 
 def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_reads():
