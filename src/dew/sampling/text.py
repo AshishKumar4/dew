@@ -849,7 +849,7 @@ _DEFAULT_SAMPLING = Sampling()
 
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             *, key: int | jax.Array | None = None,
+             *, key: int | jax.Array,
              sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, logits: Transforms | None = None,
              stopping: Criteria | None = None, strategy: Strategy | None = None,
              trips: int | None = None) -> Generation:
