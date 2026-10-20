@@ -443,7 +443,7 @@ def indexed_recording(stored, site: str, seeds: int):
 
     inputs, reference, truth = tree("input"), tree("reference"), tree("truth")
     narrow = [name for name, value in truth.items()
-              if np.issubdtype(value.dtype, np.floating) and value.dtype != np.float64]
+              if jnp.issubdtype(value.dtype, jnp.floating) and value.dtype != np.float64]
     if narrow:
         raise AssertionError(f"{site}: the recorded truth {narrow} is not float64; record it in float64, as "
                              f"no later widening recovers what a narrower recording dropped")
