@@ -6,6 +6,7 @@ whose diffusion transformers imported `dew.diffusion`, whose masked-token
 process imported `dew.nn.multimodal` again, half initialized. Imports from
 inside the suite never hit it, since `dew` is already loaded.
 """
+import ast
 import json
 import os
 import subprocess
@@ -116,3 +117,40 @@ print(json.dumps(sorted(training)))
                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
     assert run.returncode == 0, run.stderr
     assert json.loads(run.stdout.splitlines()[-1]) == []
+
+
+def test_only_the_rl_packages_import_dew_rl_and_it_imports_no_training():
+    """`dew.rl` is the RL math every RL objective shares: only `dew.rl` and `dew.objectives.rl`
+    import it, and it imports nothing of `dew.training` (docs/design/architecture.md). The test reads
+    every module's imports, absolute and relative, from its source."""
+    package = SOURCE / "dew"
+
+    def imported(path: Path) -> set[str]:
+        module = ".".join(path.relative_to(SOURCE).with_suffix("").parts)
+        # A relative import resolves from the module's package; an __init__'s module ends in __init__.
+        parts = module.split(".")[:-1]
+        names = set()
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                base = node.module or ""
+                if node.level:
+                    base = ".".join([*parts[: len(parts) - node.level + 1], *([base] if base else [])])
+                names.add(base)
+                names.update(f"{base}.{alias.name}" for alias in node.names)
+        return names
+
+    def within(name: str, prefix: str) -> bool:
+        return name == prefix or name.startswith(prefix + ".")
+
+    importers, trained = [], []
+    for path in sorted(package.rglob("*.py")):
+        module = ".".join(path.relative_to(SOURCE).with_suffix("").parts).removesuffix(".__init__")
+        names = imported(path)
+        rl = within(module, "dew.rl") or within(module, "dew.objectives.rl")
+        if not rl and any(within(name, "dew.rl") for name in names):
+            importers.append(module)
+        if within(module, "dew.rl") and any(within(name, "dew.training") for name in names):
+            trained.append(module)
+    assert importers == [] and trained == []
