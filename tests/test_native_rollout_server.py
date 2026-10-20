@@ -28,6 +28,7 @@ EOS = 12
 BUDGET = 4
 SAMPLING = Sampling(temperature=1.0, eos_token_ids=EOS)
 KEY = jax.random.key(7)
+VOCAB_PIECES = 11
 
 
 def objective():
@@ -116,11 +117,12 @@ def test_a_draw_a_criterion_cuts_short_is_truncated_and_one_the_task_alone_ends_
 
 @pytest.fixture(scope="module")
 def pieces(tmp_path_factory):
-    """A tokenizer of whole pieces, `<eos>` among them, whose ids spell text by joining."""
+    """A tokenizer of whole pieces, `<eos>` among them, whose ids spell text by joining; the letters
+    spell the probe `stop_strings` reads a piece's own text with."""
     from tokenizers import Tokenizer, decoders, models
     from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-    vocabulary = {piece: index for index, piece in enumerate(["<unk>", "<eos>", "st", "op", "a", "yy"])}
+    vocabulary = {piece: index for index, piece in enumerate(["<unk>", "<eos>", "st", "op", "yy", *"abcdef"])}
     backend = Tokenizer(models.BPE(vocabulary, [], unk_token="<unk>"))
     backend.decoder = decoders.Fuse()
     path = tmp_path_factory.mktemp("pieces")
@@ -140,13 +142,13 @@ def test_a_native_draw_ends_on_the_stop_string_it_completes(pieces):
     order = [ids["a"], ids["st"], ids["op"], ids["yy"], ids["<eos>"]]
 
     def scripted():
-        table = np.full((6, 6), -1e4, np.float32)
+        table = np.full((VOCAB_PIECES, VOCAB_PIECES), -1e4, np.float32)
         for before, after in itertools.pairwise(order):
             table[before, after] = 1e4
         table[ids["<eos>"], ids["<eos>"]] = 1e4
         return table
 
-    model = ToolPolicy(vocab_size=6, max_seq_len=64, logits=scripted)
+    model = ToolPolicy(vocab_size=VOCAB_PIECES, max_seq_len=64, logits=scripted)
     params = model.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32))
 
     def drawn(sampling, budget=6):
