@@ -157,58 +157,85 @@ TUNED = """
 import json, os, sys
 import jax
 import numpy as np
-from reference_error import equations
 from test_short_conv import tuned_step
+from tuned import launches
 from dew import cache
 from dew.nn.kernels import tuning
 step, arrays, _, _ = tuned_step()
-lowered, launches = tuning.tune(lambda: step.lower(*arrays), measure=sys.argv[1] == "measure")
+lowered, launched = tuning.tune(lambda: step.lower(*arrays), measure=sys.argv[1] == "measure")
 pieces, grads = lowered.compile()(*arrays)
 np.savez(sys.argv[2], *(np.asarray(array, np.float32) for array in (*pieces, *grads[:2])))
 path = cache.kernel_picks_path(jax.devices()[0].device_kind)
-launched = [[str(eqn.params["name"]), list(eqn.params["grid_mapping"].grid),
-             eqn.params["compiler_params"].num_warps]
-            for eqn in equations(jax.make_jaxpr(step)(*arrays).jaxpr) if eqn.primitive.name == "pallas_call"]
-print(json.dumps([path, os.stat(path).st_mtime_ns, tuning.settled(launches), launched]))
+taken = [repr(ba.op.config) for ba in launches(step, *arrays)]
+print(json.dumps([path, os.stat(path).st_mtime_ns, tuning.settled(launched), taken]))
 """
+"""A process tuning the conv's step, measuring where its first argument says so, its pieces and gradients
+saved to its second: the store's path and time, whether every launch is picked, and each launch's config."""
 
 
 @pytest.mark.gpu(reason="the tuner measures on a GPU")
-def test_a_measured_conv_config_is_reused_by_the_next_process_as_exact_as_xla(tmp_path):
+def test_a_conv_step_launches_the_configs_its_store_holds_as_exact_as_xla(tmp_path):
     """The tuner's explicit pass over a right-padded delta conv's step (`tuning.tune(..., measure=True)`,
-    on a GPU the process has to itself) measures each launch over every config of its space and stores
-    the fastest. A fresh process beside other work, which measures nothing (AUTOTUNE_CACHE_MODE_READ),
-    finds every launch picked, leaves the store as it was, launches the measuring process's grids and
-    warps, and computes its pieces and gradients bitwise; each as XLA computes it, from float64."""
+    on a GPU the process has to itself) measures each launch over every config of its space, stores the
+    fastest and launches it. A fresh process beside other work, which measures nothing
+    (AUTOTUNE_CACHE_MODE_READ), finds every launch picked, leaves the store as it was, launches the
+    stored configs and computes the same pieces and gradients bitwise; and where the store holds a
+    config of each launch's space other than its heuristic, as another pass may leave, the next process
+    launches that. Each process's pieces and gradients are as exact as XLA's conv, from float64."""
     from process_support import READ_ONLY, fresh, keeping_picks
 
     inherited = keeping_picks()
     if READ_ONLY in inherited:
         pytest.skip("measuring needs the GPU to itself: gpu-run without -n")
-    cache_dir = tmp_path / "cache"
-    path, stamp, settled, measured = fresh(TUNED, "measure", str(tmp_path / "measured.npz"),
-                                           cache_dir=cache_dir, flags=inherited)
-    assert settled is True and measured
+    cache_dir, reading = tmp_path / "cache", f"{inherited} {READ_ONLY}".strip()
+    step, (x, weights), kept, grads = tuned_step()
+    keyed = [ba.op.keyed(ba) for ba in launches(step, x, weights)]
+    distinct = {(type(ba.op), ba.autotuning_cache_key): ba for ba in keyed}
+
+    def taking(configs) -> list[str]:
+        """The config each launch of the step takes, from each launch's by key."""
+        return [repr(configs[type(ba.op), ba.autotuning_cache_key]) for ba in keyed]
+
+    path, stamp, settled, taken = fresh(TUNED, "measure", str(tmp_path / "measured.npz"),
+                                        cache_dir=cache_dir, flags=inherited)
     with open(path) as file:
-        stored = tokamax.AutotuningResult.loads(file.read())
-    assert stored.data
-    for ba, timings in stored.data:
-        assert len(timings) > 1, type(ba.op)
+        stored = {(type(ba.op), ba.autotuning_cache_key): timings
+                  for ba, timings in tokamax.AutotuningResult.loads(file.read()).data}
+    assert settled is True and stored.keys() == distinct.keys()
+    for key, timings in stored.items():
+        assert len(timings) > 1, key[0]
         assert all(data.median_evaluation_time_ms > 0 for data in timings.values())
-        assert timings.fastest_config in ba.autotuning_configs
+        assert timings.fastest_config in distinct[key].autotuning_configs
+    fastest = {key: timings.fastest_config for key, timings in stored.items()}
+    assert taken == taking(fastest)
     assert fresh(TUNED, "read", str(tmp_path / "read.npz"), cache_dir=cache_dir,
-                 flags=f"{inherited} {READ_ONLY}".strip()) == [path, stamp, True, measured]
+                 flags=reading) == [path, stamp, True, taken]
     with np.load(tmp_path / "measured.npz") as first, np.load(tmp_path / "read.npz") as second:
-        got = [second[name] for name in second.files]
         for name in first.files:
             np.testing.assert_array_equal(second[name], first[name])
-    _, (x, weights), kept, grads = tuned_step()
+
+    # A config of each space other than its heuristic, stored as the tuner stores its picks.
+    chosen = {key: next(config for config in sorted(ba.autotuning_configs, key=repr)
+                        if config != ba.heuristics_config) for key, ba in distinct.items()}
+    timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
+                                   metadata={})
+    with open(path, "w") as file:
+        file.write(tokamax.AutotuningResult(jax.devices()[0].device_kind, tuple(
+            (ba, tuning.AutotuningData({chosen[key]: timing})) for key, ba in distinct.items())).dumps())
+    _, _, settled, taken = fresh(TUNED, "read", str(tmp_path / "chosen.npz"), cache_dir=cache_dir,
+                                 flags=reading)
+    assert settled is True and taken == taking(chosen)
+
     want, want_grads = run(xla_conv1d, x, weights, None, kept, DELTA, jnp.bfloat16, grads)
     exact, exact_grads = truth(x, weights, None, kept, DELTA, grads)
     labels = [f"piece {number}" for number in range(len(want))] + ["dx", "dtaps"]
-    for label, mine, theirs, value in zip(labels, got, (*want, *want_grads[:2]), (*exact, *exact_grads[:2]),
-                                          strict=True):
-        assert_follows_xla(jnp.asarray(mine, theirs.dtype), theirs, value, label)
+    for run_name in ("read", "chosen"):
+        with np.load(tmp_path / f"{run_name}.npz") as saved:
+            got = [saved[name] for name in saved.files]
+        for label, mine, theirs, value in zip(labels, got, (*want, *want_grads[:2]),
+                                              (*exact, *exact_grads[:2]), strict=True):
+            assert_as_exact_as_the_reference(jnp.asarray(mine, theirs.dtype), theirs, value,
+                                             f"{run_name} {label}")
 
 
 @pytest.mark.parametrize("op", [short_conv.ConvForward, short_conv.ConvBackward])
