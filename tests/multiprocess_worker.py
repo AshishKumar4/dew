@@ -679,7 +679,8 @@ def mode_fit(args) -> dict:
     _, final_position = restored_state(trainer)
     return {
         "step": int(as_numpy(state.step)),
-        "split_between_processes": any(not leaf.is_fully_addressable
+        # A leaf whose shards are this process's and another's, not one replicated over both.
+        "split_between_processes": any(not leaf.is_fully_addressable and not leaf.is_fully_replicated
                                        for leaf in jax.tree.leaves(state.variables)),
         "restored_step": restored_step,
         "restored_dataset_state": restored,
