@@ -63,8 +63,9 @@ import numpy as np
 import tokamax
 from jax.extend.backend import get_default_device
 
-from dew import cache, coordination
+from dew import cache, coordination, records
 from dew.files import write_atomically
+from dew.records import JSON
 
 from . import generation
 
@@ -103,14 +104,16 @@ class Timings(dict):
         return Timings({config: self[config]})
 
 
-type Json = None | bool | int | float | str | list[Json] | dict[str, Json]
-"""A value JSON writes as it is."""
-
 type Rebuilt = Hashable | list | dict
 """What `decoded` rebuilds: an op's field, a launch's argument or a config."""
 
 
-def encoded(value: object) -> Json:
+class Unreadable(ValueError):
+    """A stored launch or timing this checkout cannot rebuild: another checkout's kernel, its fields or
+    its config's, or JSON this module did not write. `_read` keeps such an entry as it is."""
+
+
+def encoded(value: object) -> JSON:
     """`value`, an op's field, a launch's argument or a config, as JSON `decoded` rebuilds equal: a
     scalar, None or string as itself; a shape and dtype, a dtype, a tuple, a list, a mapping, an enum
     member and a dataclass by their parts, a class by its module and name. Anything else, a callable
@@ -138,55 +141,70 @@ def encoded(value: object) -> Json:
     raise TypeError(f"{type(value).__name__} has no JSON form in a kernel's picks: {value!r}")
 
 
-def decoded(value: Json) -> Rebuilt:
-    """What `encoded` wrote, rebuilt: a class it names that this checkout lacks, or JSON it did not
-    write, raises ValueError."""
+def decoded(value: JSON) -> Rebuilt:
+    """What `encoded` wrote, rebuilt. A class it names that this checkout lacks, a dataclass whose
+    stored fields are not this checkout's, or JSON it did not write raises `Unreadable`; whatever the
+    rebuilt classes raise propagates."""
     if isinstance(value, list):
         return [decoded(element) for element in value]
     if not isinstance(value, dict):
         return value
     if "shape" in value:
-        return jax.ShapeDtypeStruct(tuple(_ints(value["shape"])), jnp.dtype(_text(value["dtype"])))
+        return jax.ShapeDtypeStruct(_field(records.integers, value.get("shape"), "shape"),
+                                    _dtype(_field(records.text, value.get("dtype"), "dtype")))
     if "dtype" in value:
-        return jnp.dtype(_text(value["dtype"]))
+        return _dtype(_field(records.text, value.get("dtype"), "dtype"))
     if "enum" in value:
-        return getattr(_located(_text(value["enum"])), _text(value["name"]))
+        members = _located(_field(records.text, value.get("enum"), "enum")).__dict__
+        member = members.get(_field(records.text, value.get("name"), "name"))
+        if not isinstance(member, enum.Enum):
+            raise Unreadable(f"no such member in this checkout: {value!r}")
+        return member
     if "class" in value:
-        return _located(_text(value["class"]))
+        return _located(_field(records.text, value.get("class"), "class"))
     if "dataclass" in value:
-        fields = value["fields"]
-        if not isinstance(fields, dict):
-            raise ValueError(f"a dataclass's fields are no mapping: {fields!r}")
-        return _located(_text(value["dataclass"]))(**{name: decoded(field) for name, field in fields.items()})
+        cls, fields = _located(_field(records.text, value.get("dataclass"), "dataclass")), value.get("fields")
+        if not dataclasses.is_dataclass(cls) or not isinstance(fields, dict) or set(fields) != {
+                field.name for field in dataclasses.fields(cls) if field.init}:
+            raise Unreadable(f"{cls.__qualname__}'s stored fields are not this checkout's: {fields!r}")
+        return cls(**{name: decoded(field) for name, field in fields.items()})
     if "tuple" in value:
-        return tuple(decoded(element) for element in _elements(value["tuple"]))
-    return {_key(decoded(pair[0])): decoded(pair[1]) for pair in map(_elements, _elements(value["mapping"]))}
+        elements = value.get("tuple")
+        if not isinstance(elements, list):
+            raise Unreadable(f"a stored tuple is no list: {elements!r}")
+        return tuple(decoded(element) for element in elements)
+    pairs = value.get("mapping")
+    if not isinstance(pairs, list):
+        raise Unreadable(f"stored JSON this module did not write: {value!r}")
+    rebuilt = {}
+    for pair in pairs:
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise Unreadable(f"a stored mapping's entry is no pair: {pair!r}")
+        rebuilt[_key(decoded(pair[0]))] = decoded(pair[1])
+    return rebuilt
+
+
+def _field[T](reader: Callable[[object, str], T], value: JSON, key: str) -> T:
+    """`value` read by `dew.records`' `reader`; `Unreadable` where it refuses it."""
+    try:
+        return reader(value, key)
+    except ValueError as error:
+        raise Unreadable(str(error)) from error
+
+
+def _dtype(name: str) -> np.dtype:
+    """The dtype `name` names; `Unreadable` where this checkout's NumPy and JAX know none."""
+    try:
+        return jnp.dtype(name)
+    except TypeError as error:
+        raise Unreadable(f"no dtype {name!r} in this checkout") from error
 
 
 def _key(value: Rebuilt) -> Hashable:
     """`value` as a mapping's key or a config, which hash: a list or a mapping does not."""
     if isinstance(value, (list, dict)):
-        raise ValueError(f"expected a hashable value in a kernel's picks: {value!r}")
+        raise Unreadable(f"expected a hashable value in a kernel's picks: {value!r}")
     return value
-
-
-def _text(value: Json) -> str:
-    if not isinstance(value, str):
-        raise ValueError(f"expected a string in a kernel's picks: {value!r}")
-    return value
-
-
-def _elements(value: Json) -> list[Json]:
-    if not isinstance(value, list):
-        raise ValueError(f"expected a list in a kernel's picks: {value!r}")
-    return value
-
-
-def _ints(value: Json) -> list[int]:
-    elements = _elements(value)
-    if not all(isinstance(element, int) for element in elements):
-        raise ValueError(f"expected integers in a kernel's picks: {value!r}")
-    return [int(element) for element in elements if isinstance(element, int)]
 
 
 def _named(cls: type) -> str:
@@ -194,56 +212,59 @@ def _named(cls: type) -> str:
 
 
 def _located(name: str) -> type:
-    """The class `_named` names; ValueError where this checkout has no such class."""
+    """The class `_named` names; `Unreadable` where this checkout has no such class."""
     module, _, qualified = name.partition(":")
     try:
         found: object = importlib.import_module(module)
         for part in qualified.split("."):
             found = getattr(found, part)
     except (ImportError, AttributeError) as error:
-        raise ValueError(f"this checkout has no {name}") from error
+        raise Unreadable(f"this checkout has no {name}") from error
     if not isinstance(found, type):
-        raise ValueError(f"{name} names no class")
+        raise Unreadable(f"{name} names no class")
     return found
 
 
-def _launch_json(ba: tokamax.BoundArguments) -> dict:
+def _launch_json(ba: tokamax.BoundArguments) -> dict[str, JSON]:
     """A launch as JSON: its op as its picks name it (`_identity`) and its arguments."""
     return {"op": encoded(_identity(ba.op)), "arguments": {name: encoded(value)
                                                            for name, value in ba.arguments.items()}}
 
 
-def _launch(entry: dict) -> tokamax.BoundArguments:
-    """The launch `_launch_json` wrote; ValueError where this checkout cannot rebuild it."""
-    try:
-        op = decoded(entry["op"])
-        arguments = {name: decoded(value) for name, value in entry["arguments"].items()}
-    except (TypeError, KeyError) as error:
-        raise ValueError(f"a launch this checkout cannot rebuild: {error}") from error
-    if not isinstance(op, tokamax.Op):
-        raise ValueError(f"a launch's op is no tokamax Op: {op!r}")
-    return tokamax.BoundArguments(op, arguments)
+def _launch(entry: JSON) -> tokamax.BoundArguments:
+    """The launch `_launch_json` wrote; `Unreadable` where this checkout cannot rebuild it: its op's
+    class or fields, or arguments that are not exactly its kernel's parameters (another checkout's
+    signature of it)."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("arguments"), dict):
+        raise Unreadable(f"a stored launch is no mapping of an op and its arguments: {entry!r}")
+    op, stored = decoded(entry.get("op")), entry["arguments"]
+    if not isinstance(op, tokamax.Op) or not isinstance(stored, dict):
+        raise Unreadable(f"a stored launch's op is no tokamax Op: {op!r}")
+    ba = tokamax.BoundArguments(op, {name: decoded(value) for name, value in stored.items()})
+    if set(stored) != set(ba.signature.parameters) - {"config"}:
+        raise Unreadable(f"{type(op).__name__}'s stored arguments are not this checkout's: {sorted(stored)}")
+    return ba
 
 
-def _timings_json(timings: Timings) -> list:
-    """The configs that ran and their times, as JSON (`_timings`)."""
-    return [[encoded(config), {"compile_time_ms": timing.compile_time_ms,
-                               "lower_time_ms": timing.lower_time_ms,
-                               "evaluation_times_ms": list(timing.evaluation_times_ms),
-                               "metadata": encoded(dict(timing.metadata))}]
+def _timings_json(timings: Timings) -> list[JSON]:
+    """The configs that ran and every field of their times, as JSON (`_timings`)."""
+    return [[encoded(config), {field.name: encoded(getattr(timing, field.name))
+                               for field in dataclasses.fields(tokamax.BenchmarkData)}]
             for config, timing in timings.prune_errors().items()]
 
 
-def _timings(entries: list) -> Timings:
-    """The timings `_timings_json` wrote."""
-    measured = {}
-    for config, timing in entries:
-        metadata = decoded(timing["metadata"])
-        if not isinstance(metadata, dict):
-            raise ValueError(f"a timing's metadata is no mapping: {metadata!r}")
-        measured[_key(decoded(config))] = tokamax.BenchmarkData(
-            compile_time_ms=timing["compile_time_ms"], lower_time_ms=timing["lower_time_ms"],
-            evaluation_times_ms=tuple(timing["evaluation_times_ms"]), metadata=metadata)
+def _timings(entries: JSON) -> Timings:
+    """The timings `_timings_json` wrote; `Unreadable` where they are not."""
+    if not isinstance(entries, list):
+        raise Unreadable(f"stored timings are no list: {entries!r}")
+    names = {field.name for field in dataclasses.fields(tokamax.BenchmarkData)}
+    measured: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
+    for pair in entries:
+        if not (isinstance(pair, list) and len(pair) == 2 and isinstance(pair[1], dict)
+                and set(pair[1]) == names):
+            raise Unreadable(f"a stored timing is not this checkout's: {pair!r}")
+        fields = {name: decoded(value) for name, value in pair[1].items()}
+        measured[_key(decoded(pair[0]))] = tokamax.BenchmarkData(**fields)
     return Timings(measured)
 
 
@@ -342,8 +363,9 @@ class KernelOp(tokamax.Op):
         def shaped(name: str, value):
             if name in self.ROWS and value is not None:
                 return _bucketed(jax.ShapeDtypeStruct(value.shape, value.dtype))
+            # NumPy operands (an unpacked delta rule's chunk and span descriptors) key as JAX's do.
             return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
-                                if isinstance(leaf, jax.Array) else leaf, value)
+                                if isinstance(leaf, (jax.Array, np.ndarray)) else leaf, value)
         return tokamax.BoundArguments(_identity(self), {name: shaped(name, value)
                                                         for name, value in ba.arguments.items()})
 
@@ -589,15 +611,11 @@ def _read(path: str) -> tuple[Keyed, list]:
     foreign = []
     for entry in entries:
         try:
-            launches = _keyed([(_launch(entry), _timings(entry["timings"]))])
-        except (ValueError, KeyError, TypeError):
+            launch = _launch(entry), _timings(entry.get("timings") if isinstance(entry, dict) else None)
+        except Unreadable:
             foreign.append(entry)
             continue
-        if any(set(entry["arguments"]) != set(ba.signature.parameters) - {"config"}
-               for ba, _ in launches.values()):
-            foreign.append(entry)
-            continue
-        read.update(launches)
+        read.update(_keyed([launch]))
     return read, foreign
 
 

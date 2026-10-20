@@ -33,7 +33,7 @@ def test_a_steps_launches_and_their_timings_round_trip_through_dews_json():
     for (op, _), (ba, timings) in read.items():
         [config] = timings
         assert config == ba.heuristics_config and timings.fastest_config == config
-        assert timings[config].median_evaluation_time_ms == timing.median_evaluation_time_ms
+        assert timings[config] == timing
         assert isinstance(op, (norm_swiglu.RmsForward, norm_swiglu.RmsBackward, norm_swiglu.SwigluForward,
                                norm_swiglu.SwigluBackward))
 
@@ -48,3 +48,17 @@ def test_a_timing_mapping_takes_its_fastest_run_and_drops_its_failures():
     assert timings.fastest_config == "b"
     assert dict(timings.prune_errors()) == {"a": slow, "b": fast}
     assert dict(timings.prune()) == {"b": fast}
+
+
+def test_a_launch_of_numpy_descriptors_keys_and_round_trips_as_jaxs():
+    """The gated delta rule unpacked passes its chunk and span descriptors as NumPy arrays; each launch
+    keys them as shapes and dtypes (`KernelOp.keyed`), as it does JAX's arrays, so its launches
+    round-trip through Dew's JSON as every other's."""
+    from test_kernel_configs import rule_launches
+
+    from dew.nn.kernels import fla_gdn
+
+    keyed = [ba.op.keyed(ba) for ba in rule_launches(fla_gdn)]
+    again = tuning.loads_launches(tuning.dumps_launches(keyed))
+    assert [(ba.op, ba.autotuning_cache_key) for ba in again] == [
+        (tuning._identity(ba.op), ba.autotuning_cache_key) for ba in keyed]
