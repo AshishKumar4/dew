@@ -13,11 +13,12 @@ interface __BaseEnv_Env {
 	IDLE_SECONDS: "300";
 	IP_WINDOW_SECONDS: "600";
 	IP_STARTS: "10" | "3";
+	MIN_HOSTS: "0" | "2";
 	COORDINATOR: DurableObjectNamespace<import("./src/index").Coordinator>;
-	SHARED: DurableObjectNamespace<import("./src/index").SharedHost> | DurableObjectNamespace<import("./src/index").SharedHost>;
-	POOL: DurableObjectNamespace<import("./src/index").ModelPool> | DurableObjectNamespace<import("./src/index").ModelPool>;
-	SNAPSHOTS: DurableObjectNamespace<import("./src/index").SnapshotRegistry> | DurableObjectNamespace<import("./src/index").SnapshotRegistry>;
-	PREPARER: DurableObjectNamespace<import("./src/index").SnapshotPreparer> | DurableObjectNamespace<import("./src/index").SnapshotPreparer>;
+	SHARED: DurableObjectNamespace<import("./src/index").SharedHost>;
+	POOL: DurableObjectNamespace<import("./src/index").ModelPool>;
+	SNAPSHOTS: DurableObjectNamespace<import("./src/index").SnapshotRegistry>;
+	PREPARER: DurableObjectNamespace<import("./src/index").SnapshotPreparer>;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
@@ -37,6 +38,7 @@ declare namespace Cloudflare {
 		IDLE_SECONDS: "300";
 		IP_WINDOW_SECONDS: "600";
 		IP_STARTS: "10";
+		MIN_HOSTS: "0";
 		COORDINATOR: DurableObjectNamespace<import("./src/index").Coordinator>;
 		SHARED: DurableObjectNamespace<import("./src/index").SharedHost>;
 		POOL: DurableObjectNamespace<import("./src/index").ModelPool>;
@@ -50,5 +52,5 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "SNAPSHOT_COMMIT" | "ALLOWED_ORIGINS" | "TURNSTILE_HOSTNAMES" | "TURNSTILE_TEST_KEYS" | "BUDGET_SECONDS" | "MAX_SESSIONS" | "WALL_SECONDS" | "WARM_SECONDS" | "IDLE_SECONDS" | "IP_WINDOW_SECONDS" | "IP_STARTS">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "SNAPSHOT_COMMIT" | "ALLOWED_ORIGINS" | "TURNSTILE_HOSTNAMES" | "TURNSTILE_TEST_KEYS" | "BUDGET_SECONDS" | "MAX_SESSIONS" | "WALL_SECONDS" | "WARM_SECONDS" | "IDLE_SECONDS" | "IP_WINDOW_SECONDS" | "IP_STARTS" | "MIN_HOSTS">> {}
 }
