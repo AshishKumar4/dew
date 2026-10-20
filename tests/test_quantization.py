@@ -75,6 +75,30 @@ def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
     assert float(jnp.max(jnp.abs(wrapped - plain))) > 1e-2
 
 
+def test_quantized_and_plain_calls_of_one_shape_keep_their_own_products_in_one_process():
+    """`x @ w` is `jnp.matmul`, a jitted function whose trace a quantized call takes under Qwix's
+    interception. Run beside the plain model at the same shapes, in either order, each computes its
+    own product: the plain one after the quantized one is the plain one before it, and a quantized
+    one after a plain one quantizes."""
+    class Product(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            return x @ self.param("kernel", nn.initializers.normal(1.0), (x.shape[-1], 8))
+
+    model = Product()
+    quantized = Quantization().apply(model)
+    variables = model.init(jax.random.key(0), jnp.ones((4, 16)))
+    first, then = (jax.random.normal(jax.random.key(seed), (rows, 16)) for seed, rows in ((1, 4), (2, 5)))
+
+    before = np.asarray(model.apply(variables, first))
+    product = np.asarray(quantized.apply(variables, first))
+    assert not np.array_equal(product, before)
+    np.testing.assert_array_equal(np.asarray(model.apply(variables, first)), before)
+
+    plain = np.asarray(model.apply(variables, then))
+    assert not np.array_equal(np.asarray(quantized.apply(variables, then)), plain)
+
+
 def test_a_pattern_that_matches_nothing_quantizes_nothing():
     """A narrowed pattern is selective: a regex no module path matches runs
     the fp32 numerics bitwise. A pattern that matched everything would move

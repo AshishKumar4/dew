@@ -52,7 +52,7 @@ import importlib
 import inspect
 import math
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -202,12 +202,37 @@ def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Qua
     return wrapped
 
 
+QUANTIZED_TRACE = jax.make_user_context(default_value=None)
+"""The jit cache key of what a quantized model's methods trace under: its provider's kind and spec.
+
+Qwix intercepts `jax.lax.dot_general` by swapping its code while a wrapped method runs, and
+`jnp.matmul`, `jnp.dot` and the other contractions that reach it are jitted, so a trace of one taken
+under the swap holds its quantized product, and JAX's cache would hand it to a later plain call of
+the same shapes (the reverse too: a quantized call reused a plain trace and quantized nothing). In
+this context their traces are kept apart (`jax.make_user_context`)."""
+
+
 def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantization) -> nn.Module:
     """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in the class Qwix
-    makes for the call, a `QuantizedClass` of `spec` (`dew.nn.kernels.options.compiler_options`)."""
-    quantized = _qwix().quantize_model(model, provider, methods=entry_methods(model))
-    type(quantized)._dew_quantization = spec
+    makes for the call, a `QuantizedClass` of `spec` (`dew.nn.kernels.options.compiler_options`),
+    each method tracing what it calls under the key `QUANTIZED_TRACE` gives the provider."""
+    methods = entry_methods(model)
+    quantized = _qwix().quantize_model(model, provider, methods=methods)
+    layer = type(quantized)
+    layer._dew_quantization = spec
+    key = (type(provider).__name__, spec)
+    for name in methods:
+        setattr(layer, name, _keyed(getattr(layer, name), key))
     return quantized
+
+
+def _keyed(method: Callable[..., Any], key: Hashable) -> Callable[..., Any]:
+    """`method` run under `key` in `QUANTIZED_TRACE`."""
+    @functools.wraps(method)
+    def keyed(self, *args, **kwargs):
+        with QUANTIZED_TRACE(key):
+            return method(self, *args, **kwargs)
+    return keyed
 
 
 def _qwix(module: str = "qwix") -> ModuleType:
