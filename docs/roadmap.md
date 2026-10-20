@@ -69,6 +69,7 @@ The kernel direction was approved on 2026-10-19:
 - Profile first compilation separately through lowering and XLA passes. [629]
 - Keep document resets out of recurrence decay prefixes, move decode regrouping into the kernel boundary and finish shared tuner/template coverage. [NNK-4, NNK-8, 597]
 - Take paged attention through the typed kernel selector, so its eligibility is each kernel's own as every other operation's is. [742]
+- Keep each slot's logical key place in a paged KV cache, so chunked and ALiBi attention mask a prompt placed past zero by its places, as on a dense cache. [825]
 - Close the route audit's gaps: rms_norm's inverse rounding and its decode operands, swiglu's dtype and its forward mode, each routed to the kernel its row names. [759]
 - Give the chunked gated delta rule one dtype contract on every route. With mixed operands the port returns their common dtype, while the portable math returns the query's and casts its cotangent to it, so output dtype and gradient precision depend on the GPU row. [730]
 - Move rms_norm and swiglu onto the typed selector, so their routes report and their refusals classify. [762]
@@ -204,3 +205,4 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Check every family, target row and mode in the kernel-route test, an unexplained route failing, and drop the KV cache's unconditional GPU xfail. [798, 799]
 - Hold MeanFlow's fused attention away from zero initialization, the delta rule's document isolation without exclusions, and the Mamba-2 TPU mesh by its numbers. [789, 790]
 - Delete the stock-JAX branches (DEW_UPSTREAM_JAX, the runtime's caching branch) and the step benchmark's re-export facade. [779, 792, 800]
+- Hold the full suite to ten minutes of wall time: shards cut by the last full run's measured per-test times, no single case past a shard's budget, and a new environment warmed before its first full suite. [826]
