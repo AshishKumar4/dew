@@ -11,6 +11,7 @@ from dew.data.cache import Cache
 from dew.data.compile import compile, publish
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline, mix
+from dew.data.sources import Memory
 
 
 @dataclasses.dataclass(frozen=True)
@@ -126,6 +127,47 @@ def test_a_generation_of_documents_counted_by_two_rules_is_packed_as_its_rows_ar
             next(stream)
         finally:
             stream.close()
+
+
+@pytest.mark.parametrize("store", ["generations concatenated", "an export", "memory"])
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_store_of_role_counted_documents_states_its_rule_so_its_pack_counts_by_it(tmp_path, read, store):
+    """Documents counted in role 1, held by stores that state their documents' lengths: two
+    generations concatenated, an export read back, or a store in memory. Each states the rule its
+    rows were counted by, so its pack lays them out as they arrive and counts each window by it,
+    and a token mixture of two such stores, scoring one and five role-1 targets a document,
+    delivers equal role-1 targets to within a window of each."""
+    from dew.data.sinks import export
+    from dew.data.sources import Files
+    from dew.data.sources.concatenate import Concatenate
+    from dew.data.steps.text import CountTargets
+    from dew.data.text import Chunks
+
+    def documents(source, scored):
+        counted = Pipeline(roled(source, 7, scored), name=str(source)).filter_map(CountTargets(role=1))
+        return counted.flat_map(Chunks(16, fields=ROLED))
+
+    def stored(source, scored):
+        if store == "generations concatenated":
+            caches = [Cache(str(tmp_path / f"cache-{source}-{part}"), spool_bytes=4 * 1024**2,
+                            shard_bytes=256 * 1024) for part in range(2)]
+            return Concatenate(tuple(publish(documents(source, scored), cache, read="indexed", loading=READ)
+                                     .source() for cache in caches))
+        rows = list(documents(source, scored))
+        if store == "memory":
+            # Columns with each document's length, which a store in memory states.
+            return Memory({**{name: [row[name] for row in rows] for name in rows[0]},
+                           "length": [len(row["text"]) for row in rows]})
+        export(rows, str(tmp_path / f"export-{source}"), format="array_record", length_field="text")
+        return Files(str(tmp_path / f"export-{source}"))
+
+    def corpus(source, scored):
+        held = stored(source, scored)
+        assert held.metadata()["count_rules"] == [[1, None]]
+        return Pipeline(held, name=str(source)).pack(16, fields=ROLED).map(Sourced(source))
+
+    left, right = delivered([corpus(0, 1), corpus(1, 5)], 1, read)
+    assert abs(left - right) <= 12 + 12
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
