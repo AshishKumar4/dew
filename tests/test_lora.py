@@ -40,10 +40,12 @@ from dew.diffusion.process import DenoisingCondition
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file, write_file
 from dew.lora import Adapter, AdapterBase, LoRA, Target
+from dew.nn.sharding import ADAPTER_RANK, declarations, declared_axes, parameter_path
 from dew.objectives.base import FROZEN, Step, merge, thaw
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training.optim import muon_weight_dimension_numbers
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "lora"
@@ -440,6 +442,38 @@ with torch.no_grad():
     logits = PeftModel.from_pretrained(base, directory).eval()(torch.as_tensor(np.load(sys.argv[2]))).logits
 np.save(directory + "/peft.npy", logits.numpy())
 """
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_adapters_factors_take_their_kernels_axes_on_each_side_of_the_rank(loaded):
+    """Each factor of an adapted projection takes its kernel's axes on its own side of the rank,
+    `lora_A` `[in, r]` the input's and `lora_B` `[r, out]` the output's, and the rank its own axis,
+    which no rule places: over an fsdp mesh `lora_A` splits its input as the kernel does and the
+    rank stays whole, and Muon orthogonalizes each as a matrix from one side to the other. The
+    factors took the module's two kernel axes as they stood, so `lora_B`'s rank was named the
+    kernel's input and split over fsdp."""
+    variables = loaded.variables
+    declared = declarations(variables)
+    factors = {"/".join(parameter_path(path)[-2:]): (path, leaf)
+               for path, leaf in jax.tree_util.tree_leaves_with_path(variables)
+               if parameter_path(path)[-1] in lora.FACTORS and "layers_0" in parameter_path(path)}
+    assert {name: declared_axes(path, leaf.ndim, declared) for name, (path, leaf) in factors.items()} == {
+        "q_proj/lora_A": ("embed", ADAPTER_RANK), "q_proj/lora_B": (ADAPTER_RANK, "heads"),
+        "v_proj/lora_A": ("embed", ADAPTER_RANK), "v_proj/lora_B": (ADAPTER_RANK, "kv"),
+        "down_proj/lora_A": ("mlp", ADAPTER_RANK), "down_proj/lora_B": (ADAPTER_RANK, "embed")}
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    placed = Layout(min_shard=1).shardings(mesh, variables)
+    specs = {"/".join(parameter_path(path)[-2:]): sharding.spec
+             for path, sharding in jax.tree_util.tree_leaves_with_path(placed)
+             if "/".join(parameter_path(path)[-2:]) in factors and "layers_0" in parameter_path(path)}
+    assert specs["q_proj/lora_A"][0] == specs["v_proj/lora_A"][0] == "fsdp", specs
+    assert all(not spec or spec[0] is None for name, spec in specs.items() if name.endswith("lora_B")), specs
+    muon = muon_weight_dimension_numbers(variables["params"])
+    for name, (path, _) in factors.items():
+        numbers = muon
+        for key in path[1:]:
+            numbers = numbers[key.key]
+        assert (numbers.reduction_axis, numbers.output_axis) == ((0,), (1,)), name
 
 
 def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, reference):
