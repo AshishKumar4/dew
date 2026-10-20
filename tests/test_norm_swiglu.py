@@ -136,14 +136,16 @@ def compare(functions, operands, seed, labels, *, coefficient=None, draw=None, s
     """The kernels launched and every output's dtype and accumulation on `operands`; their accuracy
     held by check 1 over `draw`'s `seeds` (`assert_drawn_as_exact`), or, for operands no draw
     redraws (a row of one value, a cotangent at a format's edge), by the one-draw rule on them. Check 1
-    holds the `judged` labels, every label by default."""
+    holds the `judged` labels, every label by default, and the one-draw rule the rest."""
     pallas = functions[1]
     assert kernels(pallas, *operands) & {"rms_norm_forward", "swiglu_forward"}
     differentiated = kernels(functools.partial(evaluated, pallas), operands, seed)
     assert differentiated & {"rms_norm_backward", "swiglu_backward"}
     reference, (truth, terms) = oracles(functions, operands, seed)
     actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
-    gated(labels, actual, reference, truth, terms, seed, coefficient, parity=draw is None)
+    held = () if draw is None else (judged or labels)
+    gated(labels, actual, reference, truth, terms, seed, coefficient,
+          one_draw=[label for label in labels if label not in held])
     if draw is not None:
         def leaves(result):
             return {label: value for label, value in zip(labels, result, strict=True)
@@ -167,9 +169,9 @@ def float64(function, operands, seed):
         return float64_terms(functools.partial(evaluated, function), *widened((operands, seed)))
 
 
-def gated(labels, actual, reference, truth, terms, seed, coefficient, parity=True):
-    """Every output and gradient's dtype and the weight gradient's accumulation, and, where `parity`,
-    each within the one-draw rule."""
+def gated(labels, actual, reference, truth, terms, seed, coefficient, one_draw=None):
+    """Every output and gradient's dtype and the weight gradient's accumulation, and the `one_draw`
+    labels (every label by default) within the one-draw rule."""
     try:
         for label, mine, theirs, want, summed in zip(labels, actual, reference, truth, terms, strict=True):
             if mine is None:
@@ -181,7 +183,7 @@ def gated(labels, actual, reference, truth, terms, seed, coefficient, parity=Tru
                 assert_scale_accumulation(mine, theirs, coefficient, seed)
             elif mine.dtype == jnp.float32 and reference[0].dtype == jnp.float32:
                 assert relative(mine, theirs) < 1e-5, label
-            if parity:
+            if one_draw is None or label in one_draw:
                 assert_as_exact_as_the_reference(mine, theirs, want, label, terms=summed)
     except AssertionError as error:
         report = rounding_report(labels, actual, reference, truth)
@@ -294,8 +296,7 @@ def test_rms_ragged_widths_and_many_rows(dtype, shape):
 def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
     """Repeated tokens hold the row arithmetic fixed while the column sum grows to Qwen3.5-0.8B's size,
     isolating partial-sum error from bf16 midpoint flips: the weight gradient holds check 1 over the
-    step's draws. Its rows are one row repeated, whose output and input gradient
-    `test_rms_ragged_widths_and_many_rows` holds at the same width and functions."""
+    step's draws; the output and input gradient, the full step's launch, hold the one-draw rule."""
     (x, scale), seed = full_step(dtype)
     compare(norm_functions(dtype, offset=True, after_cast=True), (x, scale), seed, ("y", "x", "scale"),
             coefficient=scale_coefficient(x, dtype, after_cast=True),
