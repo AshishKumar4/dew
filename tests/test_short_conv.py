@@ -166,7 +166,7 @@ lowered, launched = tuning.tune(lambda: step.lower(*arrays), measure=sys.argv[1]
 pieces, grads = lowered.compile()(*arrays)
 np.savez(sys.argv[2], *(np.asarray(array, np.float32) for array in (*pieces, *grads[:2])))
 path = cache.kernel_picks_path(jax.devices()[0].device_kind)
-taken = [repr(ba.op.config) for ba in launches(step, *arrays)]
+taken = [repr(ba.op.chosen(ba)) for ba in launches(step, *arrays)]
 print(json.dumps([path, os.stat(path).st_mtime_ns, tuning.settled(launched), taken]))
 """
 """A process tuning the conv's step, measuring where its first argument says so, its pieces and gradients
