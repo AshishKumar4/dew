@@ -153,7 +153,8 @@ def device_tokens[LossT, EffectsT](objective: Objective[LossT, EffectsT], batch:
 
 
 def climb_to[LossT, EffectsT](objective: Objective[LossT, EffectsT], rung: Mapping[str, object]) -> None:
-    """Move `objective` up to the head tile and remat recorded in a checkpoint's `rung` (`Trainer._rung`).
+    """Move `objective` up to the head tile, its fusion and the remat recorded in a checkpoint's `rung`
+    (`Trainer._rung`).
 
     Each setting is raised only where it is below the recorded one
     (`Recomputing.restore_recompute`). This takes the ladder `recompute_more`
@@ -163,6 +164,8 @@ def climb_to[LossT, EffectsT](objective: Objective[LossT, EffectsT], rung: Mappi
     if tile is not None and head_tile_of(objective) is None:
         rows, columns = integers(tile, 'rung head_tile')
         objective.tile_head((rows, columns))
+    if rung.get('head_fused') is False:
+        objective.unfuse_head()
     entries = objective.program_key()
     trained = [index for index, entry in enumerate(entries) if entry.trained]
     recorded = json_value(rung.get("remat"), "rung remat")
@@ -180,9 +183,15 @@ def head_tile_of[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> tupl
     """The tile the vocabulary head the objective trains computes its
     backward in (`ProgramModule.head_tile`), or None for a head that keeps
     its whole logits or an objective that trains no head: what `tile_head`
-    moves and `restore_head_tile` sets."""
+    moves and `restore_head` sets."""
     return next((entry.head_tile for entry in objective.program_key()
                  if entry.trained and entry.head_tile is not None), None)
+
+
+def head_fused_of[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:
+    """Whether the vocabulary head the objective trains takes its gradient in the forward
+    (`ProgramModule.head_fused`): what `unfuse_head` moves and `restore_head` sets."""
+    return any(entry.head_fused for entry in objective.program_key() if entry.trained)
 
 
 def recompute_record[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> JSON:
@@ -198,12 +207,13 @@ def recompute_record[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> 
 def rung_record[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                                  xla_defaults: bool) -> dict[str, JSON]:
     """The rung of the fit ladder a step compiles at, as a checkpoint records
-    it: the objective's head tile, its trained modules' remat
-    (`recompute_record`) and whether the step keeps XLA's default options,
-    the half rung above each. Each decides the program a step runs."""
+    it: the objective's head tile and whether that head is fused, its trained
+    modules' remat (`recompute_record`) and whether the step keeps XLA's
+    default options, the half rung above each. Each decides the program a
+    step runs."""
     tile = head_tile_of(objective)
-    return {'head_tile': None if tile is None else list(tile), 'remat': recompute_record(objective),
-            'xla_defaults': xla_defaults}
+    return {'head_tile': None if tile is None else list(tile), 'head_fused': head_fused_of(objective),
+            'remat': recompute_record(objective), 'xla_defaults': xla_defaults}
 
 
 def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0) -> int | None:
@@ -369,11 +379,16 @@ def recompute_more[LossT, EffectsT](objective: Objective[LossT, EffectsT],
 
     At each remat rung a head that keeps its whole logits for the backward
     pass, or the run's own tile `base`, comes first, then the generation's
-    tile (`LMObjective.head_tile`); after that, each module the objective
-    trains recomputes one rung more (`remat_more`), with the head back at
-    `base`. A tiled head costs less than recomputing more, and more than the
-    whole logits: Llama-3.1-8B at 2 x 4096 on two H100s ran 563.0 ms a step
-    tiled under 'minimal' and 540.0 ms whole, at the same 66.5 GiB peak.
+    tile (`LMObjective.head_tile`), fused where the step takes the head's
+    gradient in its forward, then that tile unfused (`unfuse_head`); after
+    that, each module the objective trains recomputes one rung more
+    (`remat_more`), with the head back at `base`, fused. A tiled head costs
+    less than recomputing more, and more than the whole logits:
+    Llama-3.1-8B at 2 x 4096 on two H100s ran 563.0 ms a step tiled under
+    'minimal' and 540.0 ms whole, at the same 66.5 GiB peak. The fused head
+    is the faster tiled head, its chunk holding a whole vocabulary's logits
+    where a tile holds a tile's: at an 8B's head on an A100 (4096 tokens in
+    one chunk) 58.4 ms against 64.9.
     """
     if head_tile_of(objective) == base:
         moved = objective.tile_head()
@@ -381,11 +396,15 @@ def recompute_more[LossT, EffectsT](objective: Objective[LossT, EffectsT],
             _log.warning("the step does not fit the devices with the whole logits kept; compiling it again "
                          "with %s", moved)
             return True
+    moved = objective.unfuse_head()
+    if moved is not None:
+        _log.warning("the step does not fit the devices with the head fused; compiling it again with %s",
+                     moved)
+        return True
     current = recompute_record(objective)
     if not remat_more(objective):
         return False
-    if head_tile_of(objective) != base:
-        objective.restore_head_tile(base)
+    objective.restore_head(base, fused=True)
     _log.warning("the step does not fit the devices under remat %r; compiling it again under %r",
                  current, recompute_record(objective))
     return True

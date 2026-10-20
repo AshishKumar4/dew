@@ -367,8 +367,9 @@ def run_case(case: Case, tmp_path, fsdp, devices=None, state=None, steps=2):
     assert int(state.step) == steps
     losses = [s["train/loss"] for _, s in tracker.scalars if "train/loss" in s]
     assert len(losses) == steps and all(np.isfinite(loss) for loss in losses), losses
-    # Every pass scores every row with the same EMA weight selection.
-    assert seen == [shape] * steps, seen
+    # Every pass scores every row with the same EMA weight selection, the one that warms the
+    # evaluations before the first step included where one runs before the end.
+    assert seen == [shape] * (steps + (steps > 1)), seen
     scores = [s["val/artifact_spread"] for _, s in tracker.scalars if "val/artifact_spread" in s]
     assert len(scores) == steps and all(np.isfinite(score) for score in scores)
     assert [type(value) for _, value in tracker.artifacts

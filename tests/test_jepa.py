@@ -478,18 +478,26 @@ def test_probe_metrics_score_representations_and_average_over_the_pass():
         LinearProbe(4, steps=200, learning_rate=3e-2)(flipped, None)
 
 
-def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_blocks(mask):
+@pytest.mark.parametrize("weights", ["init", "trainer"])
+def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_blocks(mask, weights):
     """The documented objective, written in numpy over the modules' own
     outputs: the target encoder's whole view, layer-normalized without an
     affine, gathered at each block's indices, against the predictor's
     output for that block from the shared context, squared and averaged.
-    Held to it in float64, as exact as the same composition in float32."""
-    objective = make_objective(mask)
-    params = objective.init(jax.random.PRNGKey(0))
-    batch, step = {"image": images()}, step_with(params)
+    Held to it in float64, as exact as the same composition in float32, on
+    the objective's own initial weights and on a trainer's, whose target
+    encoder reads the averaged copy."""
+    if weights == "init":
+        objective = make_objective(mask)
+        params = averaged = objective.init(jax.random.PRNGKey(0))
+    else:
+        trainer = make_jepa_trainer(mask, learning_rate=3e-3, momentum=(0.9, 0.99), momentum_steps=150)
+        objective, initial = trainer.objective, trainer.initial_state()
+        params, averaged = initial.variables, initial.averaged
+    batch, step = {"image": images()}, step_with(averaged)
     samples = (np.asarray(batch["image"], np.float32) - 127.5) / 127.5
     context_idx, target_idx = objective.mask.sample(jax.random.split(step.key)[0], len(samples))
-    full = np.asarray(objective.encode(part(params, "context_encoder"), jnp.asarray(samples)))
+    full = np.asarray(objective.encode(part(averaged, "context_encoder"), jnp.asarray(samples)))
     context = objective.encode(part(params, "context_encoder"), jnp.asarray(samples), context_idx)
     blocks = mask.num_targets
     repeated = (jnp.repeat(context, blocks, axis=0), jnp.repeat(context_idx, blocks, axis=0))
