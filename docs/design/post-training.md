@@ -91,7 +91,7 @@ Correction (2026-09-22, packed layout): the table above is superseded. `SampledR
 | `extra_info` | bookkeeping | `extra_info`, passed to the reward |
 | `ability` | task category | carried in `extra_info`; Dew dispatches on nothing |
 
-verl's `compute_score(data_source, solution_str, ground_truth, extra_info)` takes the same four things that Dew's callable takes as fields of one record.
+verl's `compute_score(data_source, solution_str, ground_truth, extra_info)` takes the completion and the three fields that Dew's reward takes as one `PromptRecord`; `dew.objectives.rl.verl.verl_reward` and `compute_score` convert between the two at the verl boundary.
 
 ## 2. Why `loss_role` and not `mask=`
 
@@ -150,7 +150,7 @@ Correction (2026-09-22): the call site is now `src/dew/training/trainer.py:751-7
 
 ## 5. Rewards
 
-A reward is a callable from one finished record to a float: `reward(data_source, completion, ground_truth, extra_info) -> float`, the verl signature with the four fields the batch already carries (§1.4). It runs host-side inside the rollout, so no Python callable and no external process is ever reachable from a compiled step. A rule-based verifier, a hosted judge and a scoring model are all the same shape, and a run composes several by summing weighted scores in its own function.
+A reward is a callable from a completion and its prompt's record to a float: `reward(completion, record) -> float`, where `record` is the `PromptRecord` of the three fields the batch already carries (§1.4), the ground truth normalized where the source reads it. A reward reads the fields it needs; verl's four-argument signature lives at the verl boundary (`verl_reward`). It runs host-side inside the rollout, so no Python callable and no external process is ever reachable from a compiled step. A rule-based verifier, a hosted judge and a scoring model are all the same shape, and a run composes several by summing weighted scores in its own function.
 
 ## 6. The language objectives
 
