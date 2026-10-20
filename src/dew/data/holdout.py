@@ -183,7 +183,7 @@ def _unsized_parts(subdivide: Callable[[int], tuple[Shard, ...]], count: int) ->
 
 def _rebased(dataset: Dataset, store: Callable[[Source], Source]) -> Pipeline:
     """`dataset` with each of its stores read through `store`, its steps unchanged."""
-    chain = dataset.chain()
+    chain = dataset._chain()
     source = chain.source
     if isinstance(source, (Mixture, Phases)):
         children = tuple(_rebased(child, store) for child in source.pipelines)

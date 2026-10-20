@@ -53,7 +53,6 @@ from dew.data.pipeline import (
     Pipeline,
     Prefetch,
     RandomMap,
-    Rebatch,
     Repeat,
     Shuffle,
     Slice,
@@ -530,13 +529,8 @@ def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Mani
 def _check_batch(stage: Stage, *, batched: bool, budgeted: bool, name: str) -> tuple[bool, bool]:
     if isinstance(stage, (BatchStage, TokenBudget)):
         if batched:
-            raise ValueError(f"pipeline {name} is already batched; use rebatch")
+            raise ValueError(f"pipeline {name} is already batched")
         return True, isinstance(stage, TokenBudget)
-    if isinstance(stage, Rebatch):
-        if not batched:
-            raise ValueError(f"rebatch in {name} must follow batch")
-        if budgeted:
-            raise ValueError(f"rebatch in {name} changes the fixed token budget; use batch(tokens=)")
     return batched, budgeted
 
 
@@ -844,11 +838,11 @@ def _checked(
             raise ValueError(f"global shuffle in {name} needs an indexed pipeline; give window=")
         if isinstance(stage, Slice) and not indexed and not promotion:
             raise ValueError(f"{type(stage).__name__} in {name} needs an indexed pipeline")
-        streams = isinstance(stage, (Interleave, Rebatch, Workers, BatchStage, TokenBudget)) or (
+        streams = isinstance(stage, (Interleave, Workers, BatchStage, TokenBudget)) or (
             _drops(stage) and index >= eager
         )
         indexed = indexed and not (streams or (isinstance(stage, Artifact) and read != "memory"))
-        shared = _drops(stage) or isinstance(stage, (Interleave, Artifact, Rebatch, TokenBudget))
+        shared = _drops(stage) or isinstance(stage, (Interleave, Artifact, TokenBudget))
         per_share = per_share or shared or (isinstance(stage, Workers) and not batched)
         batched, budgeted = _check_batch(stage, batched=batched, budgeted=budgeted, name=name)
         if isinstance(stage, Workers):
