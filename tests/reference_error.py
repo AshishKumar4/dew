@@ -839,6 +839,128 @@ def assert_elements_as_exact(batch, label: str, *, reference: str = REFERENCE, a
         f"admitted member {bar[at] / ORDERS:.3e} ({report[name]['admitted']})")
 
 
+def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> dict:
+    """A computation held where it rounds (bible §7's source-aware gate; tests/reference_graph.py).
+    `dew`, `reference` and `truth` are `Graph`s of one shape, `truth` the reference's in float64;
+    `inputs` the case's inputs by name, and `orbit(order)` the case's exact symmetries:
+    `(inputs, back)`, order `order`'s permuted inputs and the map that takes outputs back.
+
+    1. Each graph's replay equals its native witness (`Graph.fused`) bit for bit, on order 0's inputs
+       and every order's of the end-to-end check.
+    2. Every node is held on common parents, both the reference's values and Dew's, the float64 truth
+       computed on the same parents widened. A `Sum` or `Online` node is held over ORDERS orders of its
+       own summed axis permuted, an exact symmetry of it that redraws both sides' summation order, by
+       `assert_leaves_as_exact_over_orders`; a `Pointwise` or `Ordered` node, which no orbit of its own
+       redraws, once, each element within FACTOR of the worst of the reference's node and its admitted
+       order-preserving members (within ADMISSION_MARGIN of its RMS), its leaf within FACTOR of the
+       reference's alone. Errors follow `reference_graph.errors`: a NaN anywhere fails, and matching
+       infinities count zero only at a node's sentinel.
+    3. End to end, each output's RMS distance from float64 over ORDERS orders of `orbit` within FACTOR of
+       the reference's alone.
+
+    Returns each node's report (`assert_elements_as_exact`'s) by node and parent bundle. The element
+    rule's calibration at a test's real element count is still open: the report states each node's
+    measured inflation, and no false-failure rate is claimed."""
+    from reference_graph import Ordered, Pointwise
+
+    names = [node.name for node in dew.nodes]
+    assert names == [node.name for node in reference.nodes] == [node.name for node in truth.nodes], (
+        f"{label}: the graphs name other nodes: {names}, {[node.name for node in reference.nodes]}")
+    for graph, side in ((dew, "dew"), (reference, "the reference")):
+        _assert_witness(graph, inputs, f"{label} {side}")
+    bundles = {"reference's parents": reference.replay(inputs), "dew's parents": dew.replay(inputs)}
+    report = {}
+    for name in names:
+        mine, theirs, true = dew.node(name), reference.node(name), truth.node(name)
+        assert type(mine.kind) is type(theirs.kind), f"{label} {name}: {mine.kind} against {theirs.kind}"
+        for bundle, values in bundles.items():
+            parents = {parent: values[parent] for parent in mine.parents}
+            wide = widened(parents)
+            where = f"{label} {name} on {bundle}"
+            if isinstance(mine.kind, (Pointwise, Ordered)):
+                report[name, bundle] = _assert_node_once(mine, theirs, true, parents, wide, where)
+            else:
+                report[name, bundle] = assert_leaves_as_exact_over_orders(
+                    _node_draw(mine, theirs, true, parents, wide, mine.kind.axes), where, rows=False)
+    _assert_end_to_end(dew, reference, truth, inputs, orbit, label)
+    return report
+
+
+def _node_draw(mine, theirs, true, parents, wide, axes):
+    """The over-orders draw of a `Sum` or `Online` node on common `parents`: order `order` permutes each
+    summed parent's axis (`axes`), an exact symmetry of the node, on Dew's node, the reference's and the
+    float64 truth's alike. An element where a side and the truth both hold the node's sentinel is no
+    error there; a side that misses a sentinel the truth holds is NaN there, which fails."""
+    from reference_graph import permuted
+
+    length = int(np.shape(parents[next(iter(axes))])[axes[next(iter(axes))]])
+
+    def draw(order):
+        units = np.arange(length) if order == 0 else np.random.default_rng(order).permutation(length)
+        with jax.enable_x64(new_val=True):
+            exact = np.asarray(true.fn(**permuted(wide, axes, units)), np.float64)
+        found = [np.asarray(node.fn(**permuted(parents, axes, units)), np.float64) for node in (mine, theirs)]
+        if mine.sentinel is not None:
+            held = exact == mine.sentinel
+            found = [np.where(held, np.where(value == mine.sentinel, 0.0, np.nan), value) for value in found]
+            exact = np.where(held, 0.0, exact)
+        return {"node": found[0]}, {REFERENCE: {"node": found[1]}}, {"node": exact}
+    return draw
+
+
+def _assert_witness(graph, inputs, label: str) -> None:
+    """`graph`'s replay equal to its native witness (`Graph.fused`) bit for bit at every value both name."""
+    witnessed, replayed = graph.fused(**inputs), graph.replay(inputs)
+    for name, value in witnessed.items():
+        assert name in replayed, f"{label}: the witness holds {name!r}, which the graph does not name"
+        value, again = np.asarray(value), np.asarray(replayed[name])
+        # Bit for bit: a NaN the witness holds the graph must hold too, and the node checks fail it.
+        assert value.dtype == again.dtype and value.shape == again.shape and np.array_equal(
+            value.view(np.uint8), again.view(np.uint8)), (
+            f"{label}: {name} replayed from the graph differs from the native witness")
+
+
+def _assert_node_once(mine, theirs, true, parents, wide, label: str) -> dict:
+    """A node no orbit of its own redraws, held once on common `parents` (`assert_graph_as_exact`)."""
+    from reference_graph import errors
+
+    with jax.enable_x64(new_val=True):
+        exact = np.asarray(true.fn(**wide), np.float64)
+    ours = errors(mine.fn(**parents), exact, mine.sentinel)
+    members = {REFERENCE: errors(theirs.fn(**parents), exact, mine.sentinel)} | {
+        member: errors(fn(**parents), exact, mine.sentinel) for member, fn in theirs.members.items()}
+    native = float(np.sqrt(np.mean(np.square(members[REFERENCE]))))
+    admitted = [member for member, found in members.items()
+                if member == REFERENCE
+                or float(np.sqrt(np.mean(np.square(found)))) <= ADMISSION_MARGIN * native]
+    assert within(float(np.sqrt(np.mean(np.square(ours)))), FACTOR * native), (
+        f"{label}: dew is {float(np.sqrt(np.mean(np.square(ours)))):.3e} from float64 (rms), the reference "
+        f"{native:.3e} (allowed {FACTOR} times it)")
+    return assert_elements_as_exact(lambda stage: ({"node": ours}, {member: {"node": members[member]}
+                                                                    for member in admitted}), label)
+
+
+def _assert_end_to_end(dew, reference, truth, inputs, orbit, label: str) -> None:
+    """Each output's RMS from float64 over ORDERS orders of `orbit` within FACTOR of the reference's, and
+    each graph's witness equal to its replay at every order (`assert_graph_as_exact`)."""
+    distances = {}
+    for order in range(ORDERS):
+        moved, back = orbit(order)
+        for graph, side in ((dew, "dew"), (reference, "the reference")):
+            _assert_witness(graph, moved, f"{label} {side} at order {order}")
+        outputs = {side: back({name: np.asarray(graph.fused(**moved)[name], np.float64)
+                               for name in graph.outputs})
+                   for side, graph in (("dew", dew), ("reference", reference))}
+        with jax.enable_x64(new_val=True):
+            fused = truth.fused(**widened(moved))
+            exact = back({name: np.asarray(fused[name], np.float64) for name in truth.outputs})
+        for name in dew.outputs:
+            for side in ("dew", "reference"):
+                distances.setdefault((name, side), []).append(distance(outputs[side][name], exact[name]))
+    for name in dew.outputs:
+        assert_as_exact_over_orders(distances[name, "dew"], distances[name, "reference"], f"{label} {name}")
+
+
 def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, roundings: int) -> None:
     """The reference run in float64 within the float64 rounding of the
     computation itself of an independent float64 oracle: FACTOR times
