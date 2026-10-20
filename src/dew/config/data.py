@@ -160,8 +160,7 @@ class TextData(_Loadable):
         if self.token_holdout is not None and self.validation is None:
             if self.token_holdout.fraction is None:
                 raise ValueError("token_holdout needs fraction=")
-            held = train.token_split(self.token_holdout.fraction, held=True)
-            train = train.token_split(self.token_holdout.fraction, held=False)
+            train, held = (part._chain() for part in train.holdout(tokens=self.token_holdout.fraction))
         if self.pack is None:
             train = train.windows(self.seq_len, stride=self.stride)
             held = (
@@ -458,7 +457,7 @@ class ImageData(_Loadable):
                 if augment.jitter:
                     train = train.random_map(images.ColorJitter())
         elif augment is not None:
-            train = train.random_map(images.AugmentationKey()).then(MapBatch(images.DeviceAugment(
+            train = train.random_map(images.AugmentationKey())._then(MapBatch(images.DeviceAugment(
                 self.image_size, crop_scale=augment.crop_scale, flip=augment.flip, jitter=augment.jitter)))
         held = None if held is None else prepared(held, self.image_size)
         return train, held, (EncodeCaptions(),)

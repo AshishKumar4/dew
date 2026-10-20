@@ -100,7 +100,7 @@ def test_lm_packs_documents_into_rows_that_keep_every_target():
     segment, and a decoder trains and validates on them."""
     documents = [{"text": "dew trains jax models " * (1 + index % 4)} for index in range(64)]
     train, held = Memory(documents).holdout(records=8)
-    batch = next(train.pipe(presets.lm, "byte", seq_len=32, batch=8).iterate())
+    batch = next(iter(train.pipe(presets.lm, "byte", seq_len=32, batch=8)))
     laid = batch["text_coordinates"]
     assert batch["text"].shape == laid.segments.shape == laid.positions.shape == (8, 33)
     assert laid.segments.max() > 1
@@ -119,7 +119,7 @@ def test_sft_renders_conversations_and_trains_on_the_assistant_turns():
     conversations = [{"messages": [{"role": "user", "content": f"what is {index} plus one"},
                                    {"role": "assistant", "content": f"{index + 1}"}]} for index in range(32)]
     train, held = Memory(conversations).holdout(records=8)
-    batch = next(train.pipe(presets.sft, str(CHAT), seq_len=48, batch=8).iterate())
+    batch = next(iter(train.pipe(presets.sft, str(CHAT), seq_len=48, batch=8)))
     assert batch["text"].shape == batch["text_roles"].shape == (8, 49)
     assert (batch["text_roles"] == int(Role.ASSISTANT)).any()
     vocab = json.loads((CHAT / "tokenizer.json").read_text())["model"]["vocab"]

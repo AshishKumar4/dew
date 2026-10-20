@@ -271,11 +271,6 @@ class TokenSplit:
 
 
 @dataclasses.dataclass(frozen=True)
-class Rebatch:
-    size: int
-
-
-@dataclasses.dataclass(frozen=True)
 class Prefetch:
     buffer: int
 
@@ -326,7 +321,6 @@ type Stage = (
     | Interleave
     | BatchStage
     | Pack
-    | Rebatch
     | Prefetch
     | Workers
     | Limit
@@ -404,11 +398,11 @@ class Dataset:
     stands or refuses it before a reader opens.
     """
 
-    def then(self, *stages: Stage) -> Pipeline:
+    def _then(self, *stages: Stage) -> Pipeline:
         """This dataset with `stages` after its own."""
-        return dataclasses.replace(self.chain(), stages=(*self.chain().stages, *stages))
+        return dataclasses.replace(self._chain(), stages=(*self._chain().stages, *stages))
 
-    def chain(self) -> Pipeline:
+    def _chain(self) -> Pipeline:
         """This dataset as a store and its stages, a store's being none."""
         from dew.data.sources.base import Source
 
@@ -417,7 +411,8 @@ class Dataset:
         return Pipeline(self)
 
     def holdout(self, fraction: float | None = None, *, key: str | None = None, records: int | None = None,
-                split: str | tuple[str, ...] | None = None, **named: float) -> tuple[Dataset, ...]:
+                split: str | tuple[str, ...] | None = None, tokens: float | None = None,
+                **named: float) -> tuple[Dataset, ...]:
         """This dataset split into the records a run trains on and the ones it
         scores, with the steps it has replayed on each, so hold out before
         preparing.
@@ -431,15 +426,23 @@ class Dataset:
         content. `records=n` holds out the first n records, and
         `split="validation"` the store's own split, or
         `split=("validation", "test")` each of them, in order, after the
-        records the store reads by default.
+        records the store reads by default. `tokens=0.01` holds out the first
+        hundredth of the tokens of the order the steps so far read, cutting at
+        most one document in two, so the parts are disjoint and together the
+        corpus; it reads a finite indexed order, before any repeat.
         """
+        if tokens is not None:
+            if fraction is not None or key is not None or records is not None or split is not None or named:
+                raise ValueError("holdout(tokens=) holds out a share of the tokens alone")
+            chain = self._chain()
+            return chain._then(TokenSplit(tokens, held=False)), chain._then(TokenSplit(tokens, held=True))
         from dew.data.holdout import holdout
 
         return holdout(self, fraction, key=key, records=records, split=split, **named)
 
     def named(self, name: str) -> Pipeline:
         """This dataset under `name`, which its counts log under in a mix."""
-        chain = self.chain()
+        chain = self._chain()
         return dataclasses.replace(chain, name=name)
 
     def pipe[**Options](self, stages: Callable[Concatenate[Dataset, Options], Dataset],
@@ -466,20 +469,20 @@ class Dataset:
             # A device step runs in the compiled training step, after every host step the reader runs:
             # a host step written after one would read what it had not yet made. The objective's own
             # batch steps read the fields it leaves alone, and attach after it (`compile`).
-            written = [stage.step for stage in self.chain().stages if isinstance(stage, MapBatch)] + hosts
+            written = [stage.step for stage in self._chain().stages if isinstance(stage, MapBatch)] + hosts
             first = next((index for index, step in enumerate(written) if isinstance(step, DeviceStep)), None)
             if first is not None and not all(isinstance(step, DeviceStep) for step in written[first:]):
                 raise ValueError(f"{type(written[first]).__name__} runs in the compiled training step, after "
                                  "every host step of the batch; map the host steps before it")
-            return self.then(*(MapBatch(step, identity) for step in hosts))
+            return self._then(*(MapBatch(step, identity) for step in hosts))
         if batched:
-            return self.then(*(Batched(step, batch_size, identity) for step in _columns(steps)))
+            return self._then(*(Batched(step, batch_size, identity) for step in _columns(steps)))
         for step in steps:
             if isinstance(step, pygrain.RandomMapTransform):
                 raise TypeError(f"{_named_step(step)} draws from a generator; apply it with random_map")
             if not isinstance(step, Configured) and _declares_rejects(step):
                 raise TypeError(f"{_named_step(step)} drops records; apply it with filter_map")
-        return self.then(*(step if isinstance(step, Configured) else Map(step, identity) for step in steps))
+        return self._then(*(step if isinstance(step, Configured) else Map(step, identity) for step in steps))
 
     def random_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
         """One record to one, each step drawing from the record's generator
@@ -491,7 +494,7 @@ class Dataset:
         for step in steps:
             if _declares_rejects(step):
                 raise TypeError(f"{_named_step(step)} drops records; apply it with random_filter_map")
-        return self.then(*(RandomMap(step, identity) for step in steps))
+        return self._then(*(RandomMap(step, identity) for step in steps))
 
     def filter_map(self, *steps: RecordStep, identity: str | None = None) -> Pipeline:
         """One record to none or one: each step returns its record's
@@ -502,7 +505,7 @@ class Dataset:
             if isinstance(step, pygrain.RandomMapTransform):
                 raise TypeError(f"{_named_step(step)} draws from a generator; "
                                 "apply it with random_filter_map")
-        return self.then(*(Map(step, identity, rejects=True) for step in steps))
+        return self._then(*(Map(step, identity, rejects=True) for step in steps))
 
     def random_filter_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
         """One record to none or one, each step drawing from the record's
@@ -511,7 +514,7 @@ class Dataset:
         it, counted by reason, as `video.PickClip` drops a clip shorter than
         its window. Its draws are keyed as `random_map`'s are, by the record's
         place in the run's order."""
-        return self.then(*(RandomMap(step, identity, rejects=True) for step in steps))
+        return self._then(*(RandomMap(step, identity, rejects=True) for step in steps))
 
     def map_with_index(
         self, step: Callable[[int, Batch], Batch | Rejected], *, identity: str | None = None
@@ -528,14 +531,14 @@ class Dataset:
         has no single position, so the step is refused there. A step that
         drops rows says so with `rejects = True` and returns `Rejected(reason)`.
         """
-        return self.then(MapWithIndex(step, identity, _declares_rejects(step)))
+        return self._then(MapWithIndex(step, identity, _declares_rejects(step)))
 
     def filter(
         self, predicate: Callable[[Batch], bool], *, reason: str | None = None, identity: str | None = None
     ) -> Pipeline:
         """Keep the records `predicate` accepts; the rest are counted under
         `reason`, by default the predicate's own (`images.MinSide`'s "too_small")."""
-        return self.then(Filter(predicate, reason or _reason(predicate), identity))
+        return self._then(Filter(predicate, reason or _reason(predicate), identity))
 
     def flat_map(self, step: ExpandStep | ColumnStep, *, batched: bool = False,
                  batch_size: int = 1000, identity: str | None = None) -> Pipeline:
@@ -544,10 +547,10 @@ class Dataset:
         and returns columns of any length, the records that replace them."""
         if batched:
             (columns,) = _columns((step,))
-            return self.then(Batched(columns, batch_size, identity, same_rows=False))
+            return self._then(Batched(columns, batch_size, identity, same_rows=False))
         if not _expands(step):
             raise TypeError(f"{_named_step(step)} is not a record expansion function or transform")
-        return self.then(FlatMap(step, identity))
+        return self._then(FlatMap(step, identity))
 
     @property
     def batched(self) -> bool:
@@ -562,16 +565,13 @@ class Dataset:
             raise ValueError("shuffle uses a window or physical shard blocks, not both")
         if block_shards is not None and block_shards < 1:
             raise ValueError("block_shards must be positive")
-        return self.then(Shuffle(seed, window, block_shards))
+        return self._then(Shuffle(seed, window, block_shards))
 
     def repeat(self, epochs: int | None = None) -> Pipeline:
-        return self.then(Repeat(epochs))
-
-    def slice(self, selection: slice) -> Pipeline:
-        return self.then(Slice(selection))
+        return self._then(Repeat(epochs))
 
     def interleave(self, cycle_length: int = 16) -> Pipeline:
-        return self.then(Interleave(cycle_length))
+        return self._then(Interleave(cycle_length))
 
     def batch(
         self,
@@ -584,10 +584,10 @@ class Dataset:
         if (size is None) == (tokens is None):
             raise ValueError("batch needs exactly one of row size or tokens")
         if tokens is not None:
-            return self.then(TokenBudget(tokens, drop_remainder, batch_fn))
+            return self._then(TokenBudget(tokens, drop_remainder, batch_fn))
         if size is None or size < 1:
             raise ValueError("batch size must be positive")
-        return self.then(BatchStage(size, drop_remainder, batch_fn))
+        return self._then(BatchStage(size, drop_remainder, batch_fn))
 
     def pack(
         self,
@@ -606,34 +606,21 @@ class Dataset:
         one value a record has no place in a row of several and is left out.
         A concatenating pack's row starts again `overlap` tokens before a cut
         through a record (`Pack`)."""
-        return self.then(Pack(seq_len, fields, bins, policy, segments, along, overlap))
+        return self._then(Pack(seq_len, fields, bins, policy, segments, along, overlap))
 
     def windows(
         self, seq_len: int, *, stride: int | None = None, fields: tuple[str, ...] = ("text",)
     ) -> Pipeline:
-        return self.then(Windows(seq_len, stride, fields))
-
-    def token_split(self, fraction: float, *, held: bool, fields: tuple[str, ...] = ("text",)) -> Pipeline:
-        """Keep the first `fraction` of the order's tokens (`held=True`) or the
-        rest, cutting at most one document in two, so a held branch and a
-        trained branch over one order are disjoint and together the corpus.
-        It reads a finite indexed order, before any repeat."""
-        return self.then(TokenSplit(fraction, held, fields))
-
-    def rebatch(self, size: int) -> Pipeline:
-        return self.then(Rebatch(size))
+        return self._then(Windows(seq_len, stride, fields))
 
     def prefetch(self, buffer: int = 64) -> Pipeline:
-        return self.then(Prefetch(buffer))
+        return self._then(Prefetch(buffer))
 
     def workers(self, count: int, *, buffer: int = 2) -> Pipeline:
-        return self.then(Workers(count, buffer))
+        return self._then(Workers(count, buffer))
 
     def take(self, count: int) -> Pipeline:
-        return self.then(Limit(count))
-
-    def limit(self, count: int) -> Pipeline:
-        return self.take(count)
+        return self._then(Limit(count))
 
     def cache(self, cache: str | Cache | Generation) -> Pipeline:
         """Fill `cache` with the deterministic record steps before it, or read a
@@ -641,7 +628,7 @@ class Dataset:
         packing in place of a `pack` that follows."""
         from dew.data.cache import Cache
 
-        return self.then(Artifact(Cache(cache) if isinstance(cache, str) else cache))
+        return self._then(Artifact(Cache(cache) if isinstance(cache, str) else cache))
 
     def snapshot(self, url: str, *, format: Literal["array_record", "parquet"] = "array_record",
                  rows_per_shard: int = 100_000) -> Mapping[str, object]:
@@ -651,7 +638,7 @@ class Dataset:
         run that reads the snapshot resumes exactly. Returns the manifest."""
         from dew.data.sinks import export
 
-        chain = self.chain()
+        chain = self._chain()
         return export(chain, url, format=format, rows_per_shard=rows_per_shard)
 
     def rename_columns(self, names: Mapping[str, str]) -> Pipeline:
@@ -682,7 +669,7 @@ class Dataset:
         `FlatMapMapDataset`). The chain after it is read per share and
         checkpoints through Grain's own state; `identity` names it in a run's
         plan, its code and closure by default."""
-        return self.then(Native(function, identity))
+        return self._then(Native(function, identity))
 
     def stats(self, records: int = 1000) -> dict[str, float]:
         """The counts a run logs from a fresh, lazy pass over at most
@@ -691,7 +678,7 @@ class Dataset:
         from dew.data.mixing import state_counts
         from dew.records import record
 
-        chain = self.chain()
+        chain = self._chain()
         if any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):
             raise ValueError("stats counts records; take them before the batch")
         if records < 0:
@@ -711,26 +698,31 @@ class Dataset:
         """Read the stores this way, rather than as they prefer: "memory" holds
         every record and runs the deterministic steps once, "indexed" reads by
         index, "streamed" reads shards in order."""
-        chain = self.chain()
+        chain = self._chain()
         return dataclasses.replace(chain, mode=mode)
 
     def threads(self, count: int) -> Pipeline:
         """Read with `count` threads a worker, rather than the measured default."""
         from dew.data.dataset import Loading
 
-        chain = self.chain()
-        loading = chain.loading or Loading()
-        return dataclasses.replace(chain, loading=dataclasses.replace(
-            loading, threads=count, read_buffer=max(loading.read_buffer, count)))
+        loading = self._chain()._loading or Loading()
+        return self.loading(dataclasses.replace(loading, threads=count,
+                                                read_buffer=max(loading.read_buffer, count)))
 
-    def iterate(self) -> Iterator[Batch]:
+    def loading(self, loading: Loading) -> Pipeline:
+        """Read with these workers, threads and buffers (`Loading`), rather than the measured
+        defaults, recorded with the chain; `threads` sets its read threads alone."""
+        return dataclasses.replace(self._chain(), _loading=loading)
+
+    def __iter__(self) -> Iterator[Batch]:
         """This dataset's records, or its batches where it batches: one pass,
-        or the passes its `repeat` asks for, with training's random draws."""
+        or the passes its `repeat` asks for, with training's random draws
+        (`for record in dataset`)."""
         from dew.data.compile import _batch_steps, _diagnostic
         from dew.data.dataset import take_batch
         from dew.objectives.base import VALID_ROWS
 
-        chain = self.chain()
+        chain = self._chain()
         batched = any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages)
         # Device steps run here, on the batches read, as the compiled training step runs them.
         _, device = _batch_steps(chain)
@@ -751,7 +743,7 @@ class Dataset:
         """Print the first `count` records."""
         from rich.pretty import pprint
 
-        for record in itertools.islice(self.iterate(), count):
+        for record in itertools.islice(self, count):
             pprint({name: _shown(value) for name, value in record.items()} if isinstance(record, Mapping)
                    else record)
 
@@ -764,12 +756,12 @@ class Pipeline(Dataset):
     stages: tuple[Stage, ...] = ()
     name: str | None = None
     mode: Read | None = None
-    loading: Loading | None = None
+    _loading: Loading | None = None
 
-    def then(self, *stages: Stage) -> Pipeline:
+    def _then(self, *stages: Stage) -> Pipeline:
         return dataclasses.replace(self, stages=(*self.stages, *stages))
 
-    def chain(self) -> Pipeline:
+    def _chain(self) -> Pipeline:
         return self
 
 
@@ -807,7 +799,7 @@ def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
     elif by != "records":
         raise ValueError(f"mix weighs records or tokens, not {by!r}")
     shares = (1.0,) * len(datasets) if weights is None else tuple(float(weight) for weight in weights)
-    chains = tuple(dataset.chain() for dataset in datasets)
+    chains = tuple(dataset._chain() for dataset in datasets)
     return Pipeline(Mixture(chains, shares, tokens))
 
 
