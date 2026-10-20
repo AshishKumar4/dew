@@ -11,7 +11,7 @@ import pytest
 from recording import RecordingTracker
 
 from dew import Field, InputSpec, Trainer
-from dew.data import Loading, Memory, images, mix, presets
+from dew.data import Files, Loading, Memory, images, mix, presets
 from dew.data.chat import Role
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
@@ -111,6 +111,30 @@ def test_lm_packs_documents_into_rows_that_keep_every_target():
         metrics=(Perplexity(),))
     finite(logged, "train/loss")
     finite(logged, "val/perplexity")
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_a_run_logs_its_corpus_counts_under_its_name_and_in_one_unit(tmp_path, read):
+    """The landing page's run: passages of tiny Shakespeare, some held out, packed into rows. Its
+    data metrics name the corpus by its file, never by its identity; the records it attempted and
+    accepted are counted in one unit, as integers, and the rows it delivered apart, each passage
+    making several."""
+    passages = [{"text": f"{index}: " + "to be, or not to be, that is the question. " * 6}
+                for index in range(48)]
+    corpus = tmp_path / "tiny-shakespeare.jsonl"
+    corpus.write_text("".join(json.dumps(passage) + "\n" for passage in passages))
+    train, held = Files(str(corpus)).read(read).holdout(0.1)
+    model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=64,
+                              max_seq_len=64)
+    logged = trained(LMObjective(model, seq_len=32), train.pipe(presets.lm, "byte", seq_len=32, batch=8),
+                     held.pipe(presets.lm, "byte", seq_len=32, batch=8))
+    data = {name: value for _, scalars in logged.scalars for name, value in scalars.items()
+            if name.startswith("data/")}
+    assert {name.split("/")[2] for name in data} == {"tiny-shakespeare"}
+    attempted, accepted, rows = (data[f"data/{kind}/tiny-shakespeare"]
+                                 for kind in ("attempted", "accepted", "rows"))
+    assert all(isinstance(count, int) for count in (attempted, accepted, rows))
+    assert 0 < accepted <= attempted < rows
 
 
 def test_sft_renders_conversations_and_trains_on_the_assistant_turns():
