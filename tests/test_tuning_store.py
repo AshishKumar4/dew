@@ -82,3 +82,16 @@ def test_a_launch_of_numpy_descriptors_keys_and_round_trips_as_jaxs():
     again = tuning.loads_launches(tuning.dumps_launches(keyed))
     assert [(ba.op, ba.autotuning_cache_key) for ba in again] == [
         (tuning._identity(ba.op), ba.autotuning_cache_key) for ba in keyed]
+
+
+def test_a_stored_class_this_checkout_lacks_is_unreadable_and_an_imports_own_failure_propagates():
+    """A class name whose module, outer class or class this checkout lacks is `Unreadable`, which the
+    store keeps aside as another checkout's entry; a module that fails as it imports is this
+    checkout's error, and propagates."""
+    import pytest
+
+    for name in ("dew.nn.kernels.removed_module:Kernel", "dew.nn.kernels.tuning:Removed",
+                 "dew.nn.kernels.tuning:RemovedNamespace.Config", "dew.nn.kernels.tuning:Timings.Removed"):
+        with pytest.raises(tuning.Unreadable):
+            tuning._located(name)
+    assert tuning._located("dew.nn.kernels.tuning:Timings") is tuning.Timings
