@@ -349,6 +349,28 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     return objective, state
 
 
+@pytest.mark.parametrize("placed", [False, True])
+def test_a_run_loads_with_its_projections_packed_as_a_source_does(tmp_path, placed):
+    """A run's task reads its decoder's query, key and value projections packed into one kernel,
+    as a source's does, whether its weights load on the host or on a mesh, and draws what the run's
+    unpacked weights draw. A run's reader packed none, so each decode step multiplied three times
+    where a source's multiplied once."""
+    from dew.inference import TextGeneration
+    from dew.sampling import Sampling
+    from dew.training import Layout, MeshSpec
+
+    make_lm_run(tmp_path)
+    mesh = MeshSpec().build(jax.devices()[:1]) if placed else None
+    task = dew.pipeline(str(tmp_path), mesh=mesh, layout=Layout() if placed else None)
+    unpacked = TextGeneration.from_run(str(tmp_path), mesh=mesh)
+    attention = task.variables["params"]["layers_0"]["self_attn"]
+    assert "qkv_proj" in attention and not {"q_proj", "k_proj", "v_proj"} & set(attention)
+    assert "q_proj" in unpacked.variables["params"]["layers_0"]["self_attn"]
+    greedy = Sampling(temperature=0, eos_token_ids=255)
+    np.testing.assert_array_equal(task("the ", key=2, sampling=greedy).host().tokens,
+                                  unpacked("the ", key=2, sampling=greedy).host().tokens)
+
+
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     """A just-trained state is the pipeline: the averaged weights when the
     objective keeps them, the live ones on request, the objective's own
