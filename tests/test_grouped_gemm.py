@@ -247,12 +247,21 @@ def test_an_unseen_gpu_runs_xla_s_grouped_matmul():
     x = jnp.ones((32, 64), jnp.bfloat16)
     w = jnp.ones((4, 64, 128), jnp.float32)
     sizes = jnp.asarray([8, 8, 8, 8], jnp.int32)
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
-    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh), generation.routes() as taken:
+    with generation.assumed("sm100"), generation.routes() as taken:
         jax.jit(lambda x, w: expert_projection(x, w, sizes, jnp.bfloat16, "auto", None)).trace(x, w)
     (route,) = {(route.kernel, route.refusal.detail if route.refusal else None) for route in taken
                 if route.choice == "grouped_matmul"}
     assert route[0] == "xla" and "tensor rate" in route[1]
+
+
+def test_a_block_aligned_launch_counts_the_tiles_its_groups_take():
+    """A block-aligned launch runs each row block once and once more for each group boundary inside a
+    block: one group takes exactly its blocks, many groups at most one more each after the first, and
+    one row a single tile however many groups there are."""
+    assert grouped_matmul._block_tiles(16384, 1, 128) == 128
+    assert grouped_matmul._block_tiles(16384, 128, 128) == 128 + 127
+    assert grouped_matmul._block_tiles(1, 256, 128) == 1
+    assert grouped_matmul._block_tiles(100, 8, 64) == 2 + 7
 
 
 def test_the_cost_model_names_a_fact_its_target_lacks():

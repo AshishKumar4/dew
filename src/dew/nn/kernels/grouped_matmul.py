@@ -108,9 +108,9 @@ def _row_tiles(rows: int, groups: int, tile: int) -> float:
 
 def _block_tiles(rows: int, groups: int, tile: int) -> int:
     """The tiles of `tile` rows block-aligned launches run over `rows` rows in `groups` groups: each
-    block once, and once more for each nonempty group that shares its first block with the group
-    before (`mosaic_gpu.GroupInfo`), at most one a group."""
-    return math.ceil(rows / tile) + min(groups, rows)
+    block once, and once more for each group boundary inside a block (`mosaic_gpu.GroupInfo`), at most
+    one for each group after the first, and never more tiles than rows."""
+    return min(math.ceil(rows / tile) + max(min(groups, rows) - 1, 0), rows)
 
 
 def _routed(rows: int, groups: int) -> float:

@@ -36,7 +36,7 @@ from dew.nn.dense import Dense
 from .activations import GatedActivation, gated_product, relu2
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
-from .kernels.generation import backend, ran_kernel, triton_runs
+from .kernels.generation import backend, ran_kernel, route, triton_runs
 from .kernels.grouped_matmul import grouped_projection, kernel_refusal, ragged_dot_refusal, xla_ragged_dot
 from .kernels.selection import forced
 from .precision import at_least_fp32, rounded_operand
@@ -369,7 +369,7 @@ def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[D
             f"{implementation!r}")
     named = forced('grouped_matmul')
     if named == 'xla' or (named is None and implementation == 'xla'):
-        return 'xla'
+        return route('grouped_matmul', kernel='xla').kernel
     placed = triton_runs() or (implementation == 'pallas' and backend() == 'cpu')
     refusal = ragged_dot_refusal(compute, operands, precision) or (
         kernel_refusal(compute) if placed else "the Pallas kernels need a GPU of sm80 or later")
