@@ -8,6 +8,7 @@ one artifact each to show they got to the end.
 
 import itertools
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -264,15 +265,34 @@ def test_train_flowers_tpu_smoke_samples_a_grid_and_scores_it(tmp_path):
 
 def test_sft_diffusion_gemma_images_smoke_trains_on_two_splits_and_captions_the_third(tmp_path):
     """The image-reading run's arc: the train and validation splits train it,
-    with random crops and flips, and the run read back with `dew.pipeline`
-    captions every image of the test split it never trained on."""
+    with random crops and flips, every step's loss finite and its weights moved
+    from one checkpoint to the next, and the run read back with `dew.pipeline`
+    captions every image of the test split it never trained on, each caption
+    the one the trained model in the run's own process writes for that image."""
+    import pyarrow.parquet as parquet
+
     smoke("sft_diffusion_gemma_images", tmp_path)
 
     report = json.loads((tmp_path / "result.json").read_text())
     assert (report["train_images"], report["test_images"], report["classes"]) == (16, 8, 2)
-    assert 0 <= report["caption_accuracy"] <= 1
+    # The test split shares no image with the two that train.
+    images = {split: {row["bytes"] for row in parquet.read_table(tmp_path / "data" / f"{split}.parquet")
+                      .column("image").to_pylist()} for split in ("train", "validation", "test")}
+    assert len(images["test"]) == 8 and not images["test"] & (images["train"] | images["validation"])
+    run = tmp_path / "checkpoints" / "flowers-caption"
+    journal = [json.loads(row) for row in (run / "tracking" / "scalars.jsonl").read_text().splitlines()]
+    losses = [row["scalars"]["train/loss"] for row in journal if "train/loss" in row["scalars"]]
+    assert len(losses) == 4 and all(math.isfinite(loss) for loss in losses)
+    checkpoints = Checkpoints(str(run))
+    early, _ = checkpoints.restore(step=2)
+    late, _ = checkpoints.restore(step=4)
+    assert (int(early["updates"]), int(late["updates"])) == (2, 4)
+    assert any(not np.array_equal(a, b) for a, b in zip(
+        jax.tree.leaves(early["variables"]["params"]), jax.tree.leaves(late["variables"]["params"]),
+        strict=True))
     captions = [json.loads(row) for row in (tmp_path / "captions.jsonl").read_text().splitlines()]
     assert len(captions) == 8 and {row["label"] for row in captions} == {"pink rose", "yellow tulip"}
+    assert report["restored_matches_live"] is True
 
 
 def test_sft_diffusion_gemma_smoke_writes_an_adapter_and_generates_from_it(tmp_path):
@@ -302,7 +322,7 @@ def test_sft_diffusion_gemma_puts_each_assistant_turn_alone_on_the_canvases(tmp_
     config = example.smoke_config(example.Config(smoke=True, out=tmp_path))
     _, objective = example.adapted_objective(config)
     train, _, _ = example.chat_rows(config, objective).pipelines()
-    rows = list(train)
+    rows = list(train.iterate())
     template = AutoTokenizer.from_pretrained(config.model)
     expected = []
     for turns in example.CONVERSATIONS:
