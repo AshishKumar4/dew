@@ -451,13 +451,12 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
                 d_states, prior + states_tile, start, axis=0)
             if d_cap is not None:
                 d_cap = d_cap + cap_tile
-            return d_states, _compensated(d_matrix, matrix_tile), d_cap, d_tile
+            return d_states, d_matrix + matrix_tile, d_cap, d_tile
 
-        d_states, (d_matrix, lost), d_cap, d_tile = _over_tiles(
-            (d_states, (jnp.zeros((width, features), work),) * 2, d_cap,
+        d_states, d_matrix, d_cap, d_tile = _over_tiles(
+            (d_states, jnp.zeros((width, features), work), d_cap,
              jax.tree.map(lambda terms: jnp.zeros((width,), work), columns)),
             count, token_tile, tokens)
-        d_matrix = d_matrix + lost
         # fp32 until every token tile is in, so a bf16 head does not round
         # once per tile.
         d_table = jax.lax.dynamic_update_slice_in_dim(
@@ -481,15 +480,6 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
 # decorator loses that binding, so it is built by hand.
 _bounded_head = jax.custom_vjp(_bounded_head_impl, nondiff_argnums=(4, 5, 7, 8, 9, 11, 12))
 _bounded_head.defvjp(_bounded_head_fwd, _bounded_head_bwd)
-
-
-def _compensated(total: tuple[jax.Array, jax.Array], term: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`term` added to a sum carried with what its additions rounded away (Neumaier's), so a sum
-    over tiles rounds about as a single product's own accumulation does."""
-    held, lost = total
-    summed = held + term
-    lost = lost + jnp.where(jnp.abs(held) >= jnp.abs(term), (held - summed) + term, (term - summed) + held)
-    return summed, lost
 
 
 def _softmax_cotangent(logits, first, excluded, peaks, masses, labels, d_first, d_partition,
