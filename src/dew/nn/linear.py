@@ -871,8 +871,7 @@ def _blocked_rule(query, key, value, g, beta, state, starts):
     g = _padded(g, 3, blocks[0]) if per_key else g
     value = _padded(value, 3, blocks[1])
     state = _padded(_padded(state, 2, blocks[0]), 3, blocks[1])
-    # A document's first token's decay scales a forgotten memory, so its gradient is exactly zero.
-    g = jnp.where(starts.reshape(B, S, *(1,) * (g.ndim - 2)), jax.lax.stop_gradient(g) + FORGET, g)
+    g = _forgotten(g, starts)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
     out, final = port(query, key, value, g, beta, state, None, scale, CHUNK_SIZE,
                       not generation.triton_runs(), "delta_memory" not in RECOMPUTED.get())
@@ -881,6 +880,46 @@ def _blocked_rule(query, key, value, g, beta, state, starts):
     final = final[:, :, :Dk, :width].reshape(B, Hk, group, Dk, width)[:, :, :served]
     final = jnp.moveaxis(final.reshape(B, Hv, split, Dk, width), 2, 3).reshape(B, Hv, Dk, split * width)
     return out, final[..., :Dv]
+
+
+@jax.custom_vjp
+def _forgotten(g, starts):
+    """The log decay `g` `[B, S, H(, D)]` with each packed document's first token (`starts` `[B, S]`)
+    forgetting the memory (`FORGET`), and a gradient that keeps each document's to itself. A first
+    token's decay scales a forgotten memory, so its gradient is zero. A token's cumulated gradient
+    holds the chunk's later documents' share too, which cancels exactly, their decays entering only
+    as differences among their own, but the port's reverse sum over the chunk
+    (`fla_gdn.chunk_local_cumsum`) carries its rounding to the documents before: it is taken away,
+    the port's gradient at the chunk's next first token, the same sum from there, from every token
+    but the row's first, whose gradient the port takes from the memory (`fla_kda.first_decay_grad`).
+    The gated delta rule's port sums each token's own terms (`fla_gdn._summed_back`), whose share at a
+    first token is exactly zero."""
+    return jnp.where(_along(starts, g), g + FORGET, g)
+
+
+def _along(starts, g):
+    """`starts` `[B, S]` broadcast against `g` `[B, S, ...]`."""
+    return starts.reshape(*starts.shape, *(1,) * (g.ndim - 2))
+
+
+def _forgotten_forward(g, starts):
+    return _forgotten(g, starts), starts
+
+
+def _forgotten_backward(starts, grad):
+    B, S = starts.shape
+    chunks = -(-S // CHUNK_SIZE)
+    marked = jnp.pad(jnp.where(starts, jnp.arange(S), S), ((0, 0), (0, chunks * CHUNK_SIZE - S)),
+                     constant_values=S).reshape(B, chunks, CHUNK_SIZE)
+    # Each token's chunk's first token after it, S where none follows or the token is the row's first.
+    after = jnp.concatenate([marked[..., 1:], jnp.full((B, chunks, 1), S)], axis=-1)
+    after = jax.lax.cummin(after, axis=2, reverse=True).reshape(B, -1)[:, :S].at[:, 0].set(S)
+    later = jnp.take_along_axis(grad, _along(jnp.minimum(after, S - 1), grad), axis=1)
+    kept = grad - jnp.where(_along(after < S, grad), later, 0.0)
+    return jnp.where(_along(starts, grad), 0.0, kept), None
+
+
+_forgotten.defvjp(_forgotten_forward, _forgotten_backward)
 
 
 def _padded(x, axis: int, size: int):

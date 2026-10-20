@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms, widened
+from reference_error import assert_leaves_as_exact, float64_terms
 
 from dew.nn import linear
 from dew.nn.attention import alibi_bias
@@ -280,12 +280,12 @@ def test_no_token_reaches_another_document(kind):
     embedded tokens bitwise as they were. The same program on the same shapes, so any difference is
     information crossing a document boundary. The delta rules run their portable math there, chosen
     through the kernel choice (`chosen`), which restarts each document's decays. Their port runs a
-    row as one sequence, each document's decay prefix shifted by the one before (`linear.FORGET`),
-    so the first document's decays round the second's and no bitwise comparison holds: on the port,
-    every leaf of the changed row is held to the float64 second document within FACTOR of the port's
-    own distance from it on a row whose first document is silent (zero embeddings, so every value it
-    could carry is zero), the same shifted prefix rounded again with nothing to leak and no floor. A
-    memory that crosses the boundary misses by four orders of magnitude or more.
+    row as one sequence, each document's decay prefix shifted by the chunk's before it
+    (`linear.FORGET`), so where the second document starts mid-chunk the first's decays round its
+    own and no bitwise comparison holds; where it starts a chunk, its chunk's prefix is its own and
+    the memory before it decays to exactly zero, so on the port the second document follows a first
+    of a whole chunk (`linear.CHUNK_SIZE`), bitwise again. The port's documents within a chunk are
+    held bitwise at the rule (test_linear_attention.py).
 
     The loss is differentiated at the embedded tokens, not through the lookup: the table's gradient
     adds each position's by a scatter, which a GPU's deterministic XLA (`--xla_gpu_deterministic_ops`)
@@ -295,50 +295,42 @@ def test_no_token_reaches_another_document(kind):
         pytest.skip(f"{kind} refuses packed rows")
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
     model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=128, **overrides)
-    first, second = DOCUMENTS[:2]
-    total = first + second + PADDING
-    segments = jnp.asarray([[1] * first + [2] * second + [0] * PADDING], jnp.int32)
-    positions = jnp.asarray([[*range(first), *range(second)] + [0] * PADDING], jnp.int32)
-    tokens = jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB)
-    changed = tokens.at[:, :first].set((tokens[:, :first] + 7) % VOCAB)
-    changed = changed.at[:, first + second:].set((changed[:, first + second:] + 5) % VOCAB)
-    variables = model.init(jax.random.key(4), tokens)
-    weight = jax.random.normal(jax.random.key(5), (1, total, VOCAB))
-    weight = weight.at[:, :first].set(0).at[:, first + second:].set(0)
-    tokens_at = coordinates(segments=segments, positions=positions, max_segments=3)
 
-    def second_document(row, model=model, variables=variables, silent=False):
-        def loss(variables, inputs):
-            logits = model.apply(variables, row, input_embeddings=inputs, coordinates=tokens_at)
-            return jnp.sum(logits * weight), logits[:, first:first + second]
+    def assert_isolated(first, second):
+        """The second document of a row of `first` and `second` tokens bitwise the same whatever the
+        first's and the padding's tokens."""
+        total = first + second + PADDING
+        segments = jnp.asarray([[1] * first + [2] * second + [0] * PADDING], jnp.int32)
+        positions = jnp.asarray([[*range(first), *range(second)] + [0] * PADDING], jnp.int32)
+        tokens = jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB)
+        changed = tokens.at[:, :first].set((tokens[:, :first] + 7) % VOCAB)
+        changed = changed.at[:, first + second:].set((changed[:, first + second:] + 5) % VOCAB)
+        variables = model.init(jax.random.key(4), tokens)
+        weight = jax.random.normal(jax.random.key(5), (1, total, VOCAB))
+        weight = weight.at[:, :first].set(0).at[:, first + second:].set(0)
+        tokens_at = coordinates(segments=segments, positions=positions, max_segments=3)
 
-        inputs = model.apply(variables, row, method=embedded)
-        if silent:
-            inputs = inputs.at[:, :first].set(0)
-        (_, logits), (grads, at_inputs) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True))(
-            variables, inputs)
-        return logits, grads, at_inputs[:, first:first + second]
+        def second_document(row):
+            def loss(variables, inputs):
+                logits = model.apply(variables, row, input_embeddings=inputs, coordinates=tokens_at)
+                return jnp.sum(logits * weight), logits[:, first:first + second]
+
+            inputs = model.apply(variables, row, method=embedded)
+            (_, logits), (grads, at_inputs) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True))(
+                variables, inputs)
+            return logits, grads, at_inputs[:, first:first + second]
+
+        moved, kept = second_document(changed), second_document(tokens)
+        for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(moved), jax.tree.leaves(kept),
+                                        strict=True):
+            np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
+                                          err_msg=jax.tree_util.keystr(path))
 
     with chosen(gated_delta_rule="xla"):
-        moved, kept = second_document(changed), second_document(tokens)
-    for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(moved), jax.tree.leaves(kept),
-                                    strict=True):
-        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
-                                      err_msg=jax.tree_util.keystr(path))
+        assert_isolated(*DOCUMENTS[:2])
     if kind in DELTA_RULES:
         with chosen(gated_delta_rule="fla"):
-            moved, silent = second_document(changed), second_document(tokens, silent=True)
-        with jax.enable_x64(new_val=True):
-            truth = second_document(tokens, model.clone(dtype=jnp.float64), widened(variables))
-        leaves = zip(jax.tree_util.tree_leaves_with_path(moved), jax.tree.leaves(silent),
-                     jax.tree.leaves(truth), strict=True)
-        for (path, mine), theirs, exact in leaves:
-            mine, theirs, exact = (np.asarray(x, np.float64) for x in (mine, theirs, exact))
-            if np.array_equal(theirs, exact):
-                # The silent row computed it exactly, so the changed one must too.
-                np.testing.assert_array_equal(mine, exact, err_msg=jax.tree_util.keystr(path))
-            else:
-                assert_as_exact_as_the_reference(mine, theirs, exact, jax.tree_util.keystr(path))
+            assert_isolated(linear.CHUNK_SIZE, 128 - linear.CHUNK_SIZE - PADDING)
 
 
 POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "attention_sinks": True,
