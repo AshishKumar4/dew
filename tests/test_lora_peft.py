@@ -4,6 +4,7 @@
 several axes against a float64 oracle of its forward and its factors'
 gradient."""
 
+import contextlib
 import itertools
 from pathlib import Path
 
@@ -12,7 +13,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from reference_error import (
+    assert_as_exact_as_the_reference,
+    assert_as_exact_over_orders,
+    assert_leaves_as_exact,
+)
 from safetensors.numpy import load_file
 
 from dew import lora
@@ -41,11 +46,13 @@ def adapted(case: str):
                      layouts=decoder.layouts), reference
 
 
-def assert_trains_as_peft(adapter, reference, tmp_path):
+def assert_trains_as_peft(adapter, reference, case: str, tmp_path, masks=None):
     """One training step's mean next-token cross entropy and its gradient in all twelve factors, and
     what two steps of Dew's AdamW (`OPTIMIZER_MAP`, at PEFT's run's settings `ADAMW`) move each
     factor by, the factors exported in PEFT's layout (`Adapter.save`): each held to PEFT's float64
-    run by the float64 rule against its float32 one."""
+    run by the float64 rule against its float32 one, each branch's dropout given `masks`, PEFT's
+    run's (`given`). The loss, one number, is held over the case's residual orders
+    (`assert_loss_over_orders`)."""
     from tools.lora_peft_reference import ADAMW
 
     tokens = jnp.asarray(reference["input_ids"])
@@ -53,11 +60,12 @@ def assert_trains_as_peft(adapter, reference, tmp_path):
     params = objective.init(jax.random.key(0))
 
     def loss(moving):
-        stats, _ = objective.loss({**params, "params": moving}, {"text": tokens}, STEP)
+        with given(adapter, masks):
+            stats, _ = objective.loss({**params, "params": moving}, {"text": tokens}, STEP)
         return objective.reduce_loss(stats)[0]
 
-    value, gradient = jax.value_and_grad(loss)(params["params"])
-    assert_as_exact_as_the_reference(np.asarray(value), reference["loss"], reference["loss_f64"], "the loss")
+    gradient = jax.grad(loss)(params["params"])
+    assert_loss_over_orders(adapter, objective, params, reference, case, masks)
     names = sorted(key.removeprefix("grad/") for key in reference
                    if key.startswith("grad/") and not key.endswith("_f64"))
     exported = peft_factors(adapter, gradient, tmp_path / "gradient")
@@ -77,6 +85,52 @@ def assert_trains_as_peft(adapter, reference, tmp_path):
     assert_leaves_as_exact({name: stepped[name] - start[name] for name in names},
                            {name: reference[f"stepped/{name}"] - start[name] for name in names},
                            {name: reference[f"stepped/{name}_f64"] - start[name] for name in names})
+
+
+def assert_loss_over_orders(adapter, objective, params, reference, case: str, masks) -> None:
+    """The training loss over the case's residual orders (`orders.npz`, tools/lora_peft_reference.py's
+    `in_order`), its distance from PEFT's float64 loss, which no order moves, as exact as PEFT's
+    float32 run's over the same orders (`assert_as_exact_over_orders`): one loss against one is a
+    single rounding draw against another, and a draw of PEFT's sits a few ulps from float64 or far
+    nearer by chance. Order 0, the identity, computes the loss the plain run does."""
+    from tools.lora_peft_reference import adapter_orders, in_order
+
+    with np.load(FIXTURES / case / "orders.npz") as recorded:
+        drawn, theirs = recorded["orders"], recorded["loss"]
+    whole, residual_inputs = adapter_orders(adapter)
+    tokens = jnp.asarray(reference["input_ids"])
+
+    def loss(variables, masks):
+        with given(adapter, masks):
+            stats, _ = objective.loss({**params, **variables}, {"text": tokens}, STEP)
+        return objective.reduce_loss(stats)[0]
+
+    mine = []
+    for order in drawn:
+        variables, moved = in_order(adapter, whole, residual_inputs, np.asarray(order, np.int64), masks)
+        mine.append(abs(np.float64(loss(variables, moved)) - np.float64(reference["loss_f64"])))
+    assert mine[0] == abs(np.float64(loss(adapter.variables, masks)) - np.float64(reference["loss_f64"]))
+    assert_as_exact_over_orders(np.asarray(mine), theirs, "the loss")
+
+
+@contextlib.contextmanager
+def given(adapter, masks: dict[str, np.ndarray] | None):
+    """Each target's branch dropout given its mask in `masks`, by PEFT module path
+    (`branch_dropout`), keeping its input where the mask does at 1 / (1 - p) of the rate the
+    branch drops at, as torch's dropout keeps it; no change where `masks` is None."""
+    from tools.lora_peft_reference import branch_dropout
+
+    def dropped(next_fun, args, kwargs, context):
+        owner = branch_dropout(adapter, context)
+        if owner is None:
+            return next_fun(*args, **kwargs)
+        return jnp.where(masks[owner], args[0] / (1 - context.module.rate), 0)
+
+    if masks is None:
+        yield
+        return
+    with nn.intercept_methods(dropped):
+        yield
 
 
 def peft_factors(adapter, factors, directory) -> dict[str, np.ndarray]:
@@ -118,7 +172,7 @@ def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it(tmp_path):
     assert_as_exact_as_the_reference(logits, reference["adapted_logits"], reference["adapted_logits_f64"],
                                      "the adapted logits")
     assert np.abs(reference["adapted_logits_f64"] - reference["base_logits"]).max() > 1
-    assert_trains_as_peft(adapter, reference, tmp_path)
+    assert_trains_as_peft(adapter, reference, "rslora", tmp_path)
 
 
 def test_a_dropout_adapter_trains_as_peft_trains_it_on_the_masks_peft_ran_on(tmp_path):
@@ -126,26 +180,16 @@ def test_a_dropout_adapter_trains_as_peft_trains_it_on_the_masks_peft_ran_on(tmp
     `B A dropout(x)`, and not the base path. Each branch's dropout given the
     mask PEFT's run was given (masks.npz), keeping its input where the mask
     does at 1 / (1 - p) of the rate the branch drops at, as torch's dropout
-    keeps it, the steps' loss, gradients and updates are PEFT's
-    (`assert_trains_as_peft`)."""
-    from tools.lora_peft_reference import MASKS, branch_dropout
+    keeps it (`given`), the steps' loss, gradients and updates are PEFT's
+    (`assert_trains_as_peft`), and every target's branch drops."""
+    from tools.lora_peft_reference import MASKS
 
     adapter, reference = adapted("dropout")
     assert (adapter.rslora, adapter.dropout) == (False, 0.25)
-    with np.load(FIXTURES / "dropout" / MASKS) as given:
-        masks = {name: given[name] for name in given.files}
-    dropped = set()
-
-    def given_masks(next_fun, args, kwargs, context):
-        owner = branch_dropout(adapter, context)
-        if owner is None:
-            return next_fun(*args, **kwargs)
-        dropped.add(owner)
-        return jnp.where(masks[owner], args[0] / (1 - context.module.rate), 0)
-
-    with nn.intercept_methods(given_masks):
-        assert_trains_as_peft(adapter, reference, tmp_path)
-    assert dropped == set(masks) and len(dropped) == 6
+    with np.load(FIXTURES / "dropout" / MASKS) as saved:
+        masks = {name: saved[name] for name in saved.files}
+    assert sorted(masks) == sorted(branch_draws(adapter, reference["input_ids"], STEP)) and len(masks) == 6
+    assert_trains_as_peft(adapter, reference, "dropout", tmp_path, masks)
 
 
 def test_a_training_step_drops_each_branch_input_at_the_adapters_rate():

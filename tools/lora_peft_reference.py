@@ -149,50 +149,72 @@ ORDER_SEED = 6
 
 def write_orders(out: Path) -> None:
     """Each case's base model and adapter written under `out`/<case>/<k>/ in each of `ORDERS`
-    residual orders (tests/residual_orders.py), order 0 the identity: the base through
-    `Pretrained.save`, the adapter through `Adapter.save`, and the dropout case's masks in
-    `MASKS`, a mask's last axis moved with its target's branch input where that input is the
-    residual stream (its `lora_A`'s first declared axis is 'embed')."""
-    import jax
-
+    residual orders (tests/residual_orders.py, `in_order`), order 0 the identity: the base
+    through `Pretrained.save`, the adapter through `Adapter.save`, and the dropout case's masks
+    in `MASKS`."""
     sys.path.insert(0, str(ROOT / "tests"))
     from reference_error import ORDERS
-    from residual_orders import orders, permuted, residual_width
+    from residual_orders import orders, residual_width
 
     from dew.interop.pretrained import Pretrained
-    from dew.lora import FACTORS, LoRA
-    from dew.nn.sharding import declarations, declared_axes, parameter_path
+    from dew.lora import LoRA
 
     decoder = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
     for case in CASES:
         adapter = LoRA.load(decoder.model, decoder.variables, FIXTURE / case / "adapter",
                             layouts=decoder.layouts)
-        # The adapter holds its factors as its parameters and the base as frozen; an order
-        # moves both, so they are permuted as one tree.
-        whole = {"params": _joined(adapter.variables["frozen"], adapter.variables["params"])}
+        whole, residual_inputs = adapter_orders(adapter)
         drawn = orders(residual_width(whole), ORDERS, ORDER_SEED)
         (out / case).mkdir(parents=True, exist_ok=True)
         np.save(out / case / "orders.npy", drawn)
-        declared = declarations(whole["params"])
-        residual_inputs = {
-            "model." + ".".join(parameter_path(path)[:-1]).replace("layers_", "layers.")
-            for path, leaf in jax.tree_util.tree_leaves_with_path(whole["params"])
-            if parameter_path(path)[-1] == "lora_A"
-            and declared_axes(path, leaf.ndim, declared)[0] == "embed"}
         masks = None
         if CASES[case]["lora_dropout"]:
             with np.load(FIXTURE / case / MASKS) as saved:
                 masks = {key: saved[key] for key in saved}
         for k, order in enumerate(drawn):
-            moved = permuted(whole, order)["params"]
-            base = _without(moved, FACTORS)
-            decoder.save(out / case / str(k) / "base", variables={**decoder.variables, "params": base})
-            adapter.save({**adapter.variables, "params": _only(moved, FACTORS), "frozen": base},
-                         out / case / str(k) / "adapter")
-            if masks is not None:
-                np.savez(out / case / str(k) / MASKS, **{
-                    key: mask[..., order] if key in residual_inputs else mask for key, mask in masks.items()})
+            variables, moved_masks = in_order(adapter, whole, residual_inputs, order, masks)
+            decoder.save(out / case / str(k) / "base",
+                         variables={**decoder.variables, "params": variables["frozen"]})
+            adapter.save(variables, out / case / str(k) / "adapter")
+            if moved_masks is not None:
+                np.savez(out / case / str(k) / MASKS, **moved_masks)
         print(f"{out / case}: {len(drawn)} orders, residual branch inputs {sorted(residual_inputs)}")
+
+
+def adapter_orders(adapter) -> tuple[dict, set[str]]:
+    """The adapter's frozen base and its factors as one `{"params": ...}` tree, which an order
+    permutes whole (tests/residual_orders.py, the factors' residual sides read off their declared
+    axes), and the PEFT module paths of the targets whose branch input is the residual stream:
+    those whose `lora_A`'s first declared axis is 'embed'."""
+    import jax
+
+    from dew.nn.sharding import declarations, declared_axes, parameter_path
+
+    whole = {"params": _joined(adapter.variables["frozen"], adapter.variables["params"])}
+    declared = declarations(whole["params"])
+    residual_inputs = {
+        "model." + ".".join(parameter_path(path)[:-1]).replace("layers_", "layers.")
+        for path, leaf in jax.tree_util.tree_leaves_with_path(whole["params"])
+        if parameter_path(path)[-1] == "lora_A" and declared_axes(path, leaf.ndim, declared)[0] == "embed"}
+    return whole, residual_inputs
+
+
+def in_order(adapter, whole: dict, residual_inputs: set[str], order: np.ndarray,
+             masks: dict[str, np.ndarray] | None) -> tuple[dict, dict[str, np.ndarray] | None]:
+    """The adapter's variables with the residual stream's units in `order` (`adapter_orders`),
+    and `masks`, a dropout mask's last axis moved with its target's branch input where that input
+    is the residual stream."""
+    sys.path.insert(0, str(ROOT / "tests"))
+    from residual_orders import permuted
+
+    from dew.lora import FACTORS
+
+    moved = permuted(whole, order)["params"]
+    variables = {**adapter.variables, "params": _only(moved, FACTORS), "frozen": _without(moved, FACTORS)}
+    if masks is None:
+        return variables, None
+    return variables, {key: mask[..., order] if key in residual_inputs else mask
+                       for key, mask in masks.items()}
 
 
 def _without(tree: dict, names) -> dict:
