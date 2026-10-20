@@ -55,6 +55,12 @@ def test_an_overlong_prompt_keeps_its_tail_by_default_and_drop_counts_it_rejecte
     assert int(kept[LENGTH_KEY]) == WINDOW
     np.testing.assert_array_equal(kept[PROMPT_KEY], LONG[-WINDOW:])
     assert int(short[LENGTH_KEY]) == len(IDS)
+    from dew.data import Memory, prompts
+
+    # The chain's own prompt step keeps the tail as the recipe does.
+    step = prompts.encode(TOKENIZER, max_prompt_len=WINDOW)
+    (chained,) = list(Memory([{"prompt": LONG}]).filter_map(step).iterate())
+    np.testing.assert_array_equal(chained[PROMPT_KEY], LONG[-WINDOW:])
     dropping, _, _ = dataclasses.replace(recipe, long="drop").pipelines()
     data = compile(dropping.batch(1), read="memory", loading=Loading(workers=0))
     assert data.records == 1
