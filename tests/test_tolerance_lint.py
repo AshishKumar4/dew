@@ -74,6 +74,20 @@ COMPARISONS = {
     "a range of a power by a named negative": ("import numpy as np\nn = -4\nstep = 2 ** n\n"
                                                "a = np.arange(0, 1, step)\n"
                                                "assert np.max(np.abs(a - 1)) < 1e-6", 1),
+    "a range of a power by arithmetic": ("import numpy as np\na = np.arange(0, 1, 2 ** (0 - 4))\n"
+                                         "assert np.max(np.abs(a - 1)) < 1e-6", 1),
+    "a range of a step bound in a list": ("import numpy as np\nstep, other = [0.1, 2]\n"
+                                          "a = np.arange(0, 1, step)\n"
+                                          "assert np.max(np.abs(a - 1)) < 1e-6", 1),
+    "a range of a step bound in a nested tuple": ("import numpy as np\ncount, (step, other) = 0, (0.1, 2)\n"
+                                                  "a = np.arange(0, 1, step)\n"
+                                                  "assert np.max(np.abs(a - 1)) < 1e-6", 1),
+    "a range of a step a helper is given": ("import numpy as np\n"
+                                            "def grid(step):\n    return np.arange(0, 1, step)\n"
+                                            "def test():\n"
+                                            "    assert np.max(np.abs(grid(0.1) - 1)) < 1e-6", 1),
+    "a range of whole bounds": ("import numpy as np\na = np.arange(2, 10, 3)\n"
+                                "assert np.max(np.abs(a - 1)) < 3", 0),
     "a range of a length": ("import numpy as np\na = np.arange(length)\nassert np.max(np.abs(a - 1)) < 3", 0),
     "a whole number divided in place": ("residual = 1\nresidual /= 2\nassert abs(residual) < 0.6", 1),
     "a whole number to a negative power": ("step = 2 ** -20\nassert abs(step) < 1e-5", 1),

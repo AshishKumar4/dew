@@ -86,7 +86,7 @@ import subprocess
 import sys
 import tokenize
 from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1800,43 +1800,8 @@ def _called(node: ast.Call, table: Mapping[str, str]) -> str:
 INTEGRAL_CALLS = frozenset({"range", "len", "int"})
 """Calls whose values are whole numbers: indices, counts, positions."""
 RANGES = frozenset({"numpy.arange", "jax.numpy.arange", "torch.arange"})
-"""Ranges, whose values are whole unless a bound or step is evidently fractional (`_fractional`) or a
-float dtype is asked: a range of a length is a range of positions."""
-
-
-def _bound_to(name: str, scope) -> list[ast.AST]:
-    """The values the scope binds `name` to (`_Scope.bindings`)."""
-    return [value for names, value in scope.bindings if name in names]
-
-
-def _negative(value: ast.AST, scope, seen: frozenset = frozenset()) -> bool:
-    """Whether `value` is evidently below zero: a negative literal, a negated positive one, or a name the
-    scope binds to one."""
-    if isinstance(value, ast.Constant):
-        return isinstance(value.value, int | float) and not isinstance(value.value, bool) and value.value < 0
-    if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.USub):
-        return isinstance(value.operand, ast.Constant) and isinstance(value.operand.value, int | float) \
-            and value.operand.value > 0
-    if isinstance(value, ast.Name) and value.id not in seen:
-        return any(_negative(bound, scope, seen | {value.id}) for bound in _bound_to(value.id, scope))
-    return False
-
-
-def _fractional(value: ast.AST, scope, seen: frozenset = frozenset()) -> bool:
-    """Whether `value` is evidently no whole number: a float literal, a quotient, a negative or fractional
-    power, a float() call, arithmetic of one, or a name the scope binds to one (its bindings as
-    `_read_scope` reads them: tuples element by element, `x op= v` as `x op v`)."""
-    if isinstance(value, ast.Constant):
-        return type(value.value) is float
-    if isinstance(value, ast.UnaryOp):
-        return _fractional(value.operand, scope, seen)
-    if isinstance(value, ast.BinOp):
-        power = isinstance(value.op, ast.Pow) and _negative(value.right, scope, seen)
-        return isinstance(value.op, ast.Div) or power or any(
-            _fractional(side, scope, seen) for side in (value.left, value.right))
-    if isinstance(value, ast.Name) and value.id not in seen:
-        return any(_fractional(bound, scope, seen | {value.id}) for bound in _bound_to(value.id, scope))
-    return isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "float"
+"""Ranges, whose values are whole where their start and step are (0 and 1 when not given), whatever
+their stop and dtype: a range of a length is a range of positions."""
 
 
 CARRIED = frozenset({"sum", "max", "min", "abs", "tuple", "list", "sorted", "round"})
@@ -1865,11 +1830,31 @@ class _Scope:
     errors: set[str]
     integral: set[str]
     timed: set[str]
-    bindings: list[tuple[list[str], ast.AST]] = field(default_factory=list)
 
 
 def _defined(value: ast.Call, scope: _Scope, reading: _Reading, kinds: Set[int]) -> bool:
     return any(id(definition) in kinds for definition in reading.calls.reached(scope.node, value))
+
+
+def _range_steps(call: ast.Call) -> list[ast.AST]:
+    """What a range's values are whole by: its start and its step, each given by position or keyword,
+    the defaults (0 and 1) whole. One positional argument is the stop."""
+    named = {keyword.arg: keyword.value for keyword in call.keywords}
+    positional = call.args if len(call.args) > 1 else []
+    start = named.get("start", positional[0] if positional else None)
+    step = named.get("step", positional[2] if len(positional) > 2 else None)
+    return [bound for bound in (start, step) if bound is not None]
+
+
+def _pairs(target: ast.AST, value: ast.AST) -> list[tuple[list[str], ast.AST]]:
+    """The names a destructuring assignment binds, each with its own value where the value's shape
+    matches the target's (tuples and lists, nested), else every name with the whole value."""
+    shaped = isinstance(target, ast.Tuple | ast.List) and isinstance(value, ast.Tuple | ast.List)
+    if shaped and len(target.elts) == len(value.elts) and not any(
+            isinstance(element, ast.Starred) for element in (*target.elts, *value.elts)):
+        parts = zip(target.elts, value.elts, strict=True)
+        return [pair for inner, part in parts for pair in _pairs(inner, part)]
+    return [(_bound_names(target), value)]
 
 
 def _integral_value(value: ast.AST, integral: Set[str], scope: _Scope, reading: _Reading) -> bool:
@@ -1901,9 +1886,8 @@ def _integral_value(value: ast.AST, integral: Set[str], scope: _Scope, reading: 
     if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Pow):
         # A whole number to a whole power is whole only where the power is not negative.
         power = value.right
-        return _integral_value(value.left, integral, scope, reading) and _integral_value(
-            power, integral, scope, reading) and not _negative(power, scope) and not (
-            isinstance(power, ast.UnaryOp) and isinstance(power.op, ast.USub))
+        return _integral_value(value.left, integral, scope, reading) and isinstance(power, ast.Constant) \
+            and type(power.value) is int and power.value >= 0
     if isinstance(value, ast.BinOp) and not isinstance(value.op, ast.Div):
         return all(_integral_value(side, integral, scope, reading) for side in (value.left, value.right))
     if isinstance(value, ast.Call):
@@ -1911,9 +1895,8 @@ def _integral_value(value: ast.AST, integral: Set[str], scope: _Scope, reading: 
         counted = isinstance(value.func, ast.Attribute) and value.func.attr == "integers"
         carried = called in CARRIED and bool(value.args) and all(
             _integral_value(argument, integral, scope, reading) for argument in value.args)
-        bounds = [*value.args, *(keyword.value for keyword in value.keywords if keyword.arg != "dtype")]
-        ranged = called in RANGES and not any(_fractional(bound, scope) for bound in bounds) and not any(
-            keyword.arg == "dtype" and "int" not in ast.unparse(keyword.value) for keyword in value.keywords)
+        ranged = called in RANGES and all(_integral_value(bound, integral, scope, reading)
+                                          for bound in _range_steps(value))
         return called in INTEGRAL_CALLS or counted or carried or ranged or _defined(value, scope, reading,
                                                                                     reading.counting)
     return False
@@ -1984,17 +1967,12 @@ def _read_scope(scope_node: ast.AST, reading: _Reading) -> _Scope:
     for node in scope.nodes:
         if isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign) and node.value is not None:
             for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
-                # `a, b = x, y` binds each name to its own value.
-                if isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple) and \
-                        len(target.elts) == len(node.value.elts):
-                    pairs = zip(target.elts, node.value.elts, strict=True)
-                    assigned += [(_bound_names(name), value) for name, value in pairs]
-                elif isinstance(node, ast.AugAssign):
+                if isinstance(node, ast.AugAssign):
                     # `x op= v` binds x to `x op v`, which is what is whole or not.
                     assigned.append((_bound_names(target), ast.BinOp(target, node.op, node.value)))
                 else:
-                    assigned.append((_bound_names(target), node.value))
-    scope.bindings = assigned
+                    # `a, (b, c) = x, [y, z]` binds each name to its own value.
+                    assigned += _pairs(target, node.value)
     integral = {name for names, _ in assigned for name in names}
     while True:
         kept = {name for name in integral
