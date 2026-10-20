@@ -56,7 +56,7 @@ def test_a_fused_multiply_add_off_a_midpoint_rounds_where_float64_does_not():
     a = b = np.array([1 + 2.0 ** -12])
     c = np.array([2.0 ** -80])
     product = Fraction(float(a[0])) ** 2
-    for sign in (1.0, -1.0):
+    for sign in (1, -1):
         exact = product + sign * Fraction(float(c[0]))
         _assert_rounds(oc.exact_fma(a, b, sign * c, oc.FLOAT32), [exact], oc.FLOAT32)
     above = oc.fraction_rounded(product + Fraction(float(c[0])), oc.FLOAT32)
