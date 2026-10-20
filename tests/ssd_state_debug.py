@@ -43,6 +43,21 @@ REPLACEMENTS = {
     "dstate-scale-c": (
         ("(dy * entered[:, None]).T @ c", "dy.T @ (c * entered[:, None])"),
     ),
+    "dstate-dot-transposed": (
+        ("(dy * entered[:, None]).T @ c", "(c.T @ (dy * entered[:, None])).T"),
+    ),
+    "dstate-reduce": (
+        ("(dy * entered[:, None]).T @ c",
+         "jnp.sum((dy * entered[:, None])[:, :, None] * c[:, None, :], axis=0)"),
+    ),
+    "dstate-dot-split": (
+        ("(dy * entered[:, None]).T @ c",
+         "((dy[:32] * entered[:32, None]).T @ c[:32]"
+         " + (dy[32:] * entered[32:, None]).T @ c[32:])"),
+    ),
+    "write-scale-x": (
+        ("x.T @ (b * leaving[:, None])", "(x * leaving[:, None]).T @ b"),
+    ),
     "write-suffix": (
         ("jnp.exp(_last_row(segments))",
          "jnp.exp(jnp.pad(jax.lax.cumsum(a, axis=0, reverse=True)[1:], (0, 1)))"),
