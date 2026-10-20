@@ -957,38 +957,53 @@ def test_cli_token_exports_are_readable_by_the_dispatched_token_source(tmp_path,
     assert actual.tolist() == expected.tolist()
 
 
-def test_a_parquet_object_reads_at_the_version_its_storage_options_name():
-    """An S3 Parquet object named at a version (`version_aware`, `?versionId=`) reads that
-    version's rows, streamed and by index, though the object has been rewritten since: every
-    setting the store was given reaches the reads."""
+@pytest.mark.parametrize("read", ["streamed", "indexed"])
+def test_a_parquet_store_reads_with_the_credentials_its_profile_names(tmp_path, monkeypatch, read):
+    """An S3 Parquet store whose storage options name an AWS profile reads its rows with that
+    profile's credentials, on an endpoint that refuses every other request: every setting the
+    store was given reaches the reads, not only those Arrow's own S3 client can take."""
+    import boto3
     import fsspec
     import pyarrow.parquet as pq
+    import requests
     from moto.server import ThreadedMotoServer
 
     from dew.data.compile import iterate
     from dew.data.pipeline import Pipeline
 
+    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "config"))
     server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
     server.start()
+    _, port = server.get_host_and_port()
+    endpoint = f"http://127.0.0.1:{port}"
+    # The endpoint authenticates every request after the three that make the profile's user.
+    previous = requests.post(f"{endpoint}/moto-api/reset-auth", data=b"3", timeout=30).json()
     try:
-        _, port = server.get_host_and_port()
-        options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}",
-                   "version_aware": True}
-        bucket = "versions-" + uuid4().hex
+        iam = boto3.client("iam", endpoint_url=endpoint, region_name="us-east-1",
+                           aws_access_key_id="setup", aws_secret_access_key="setup")
+        iam.create_user(UserName="reader")
+        iam.put_user_policy(UserName="reader", PolicyName="s3", PolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}))
+        key = iam.create_access_key(UserName="reader")["AccessKey"]
+        (tmp_path / "credentials").write_text(
+            f"[reader]\naws_access_key_id = {key['AccessKeyId']}\n"
+            f"aws_secret_access_key = {key['SecretAccessKey']}\n")
+        monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "credentials"))
+        options = {"profile": "reader", "endpoint_url": endpoint}
+        bucket = "profiles-" + uuid4().hex
         remote = fsspec.filesystem("s3", **options)
         remote.mkdir(bucket)
-        remote.call_s3("put_bucket_versioning", Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
-        for start in (0, 100):
-            written = io.BytesIO()
-            pq.write_table(pa.Table.from_pylist([{"id": start + index} for index in range(5)]), written)
-            remote.pipe(f"{bucket}/rows.parquet", written.getvalue())
-        first = next(version["VersionId"] for version in remote.object_version_info(f"{bucket}/rows.parquet")
-                     if not version["IsLatest"])
-        source = Files(f"s3://{bucket}/rows.parquet?versionId={first}", format="parquet",
-                       storage_options=options)
-        for read in ("streamed", "indexed"):
-            assert sorted(int(row["id"]) for row in iterate(Pipeline(source), read=read)) == list(range(5))
+        written = io.BytesIO()
+        pq.write_table(pa.Table.from_pylist([{"id": index} for index in range(5)]), written)
+        remote.pipe(f"{bucket}/rows.parquet", written.getvalue())
+        source = Files(f"s3://{bucket}/rows.parquet", storage_options=options)
+        assert sorted(int(row["id"]) for row in iterate(Pipeline(source), read=read)) == list(range(5))
     finally:
+        requests.post(f"{endpoint}/moto-api/reset-auth",
+                      data=str(previous["PREVIOUS_INITIAL_NO_AUTH_ACTION_COUNT"]).encode(), timeout=30)
         server.stop()
 
 
