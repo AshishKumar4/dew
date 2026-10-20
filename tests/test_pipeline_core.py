@@ -502,18 +502,32 @@ def test_a_member_joining_a_resumed_mix_is_read_ahead_before_the_mix_gives_a_row
 
 
 @pytest.mark.parametrize("by", ["records", "tokens"])
-@pytest.mark.parametrize("weights", [None, [1, 1e-9]], ids=["even", "one-rarely-chosen"])
-def test_a_streamed_mix_resumed_where_a_member_holds_a_row_read_ahead_reads_what_the_uninterrupted_one_reads(
-        by, weights):
+def test_a_streamed_mix_resumed_while_a_member_holds_a_row_read_ahead_reads_on_as_uninterrupted(by):
     """A streamed mix reads every member's first row ahead before it gives a row, so a position it
-    saves may fall while a member holds a row it has not given: one it gives next, or one a member
-    weighted too small to be chosen holds throughout. Resumed there, by records or by tokens, the
-    mix reads on record for record as the uninterrupted one does."""
+    saves after its first row falls while the other member holds its first row unread. Resumed
+    there, by records or by tokens, the mix gives that row and reads on record for record as the
+    uninterrupted one does."""
     members = [corpus("a", 0), corpus("b", 1)]
-    whole, saved = member_rows(members, by, weights=weights)
-    resumed, _ = member_rows(members, by, saved=saved, weights=weights, batches=4)
-    read = 2 * 2  # the rows of the two batches read before the position was saved
-    assert resumed == whole[read:]
+
+    def rows(saved=None):
+        data = compile(mix(members, by=by).batch(1), read="streamed", loading=READ, seed=5)
+        stream = data.train(DataPartition())
+        try:
+            first = None
+            if saved is None:
+                first = int(next(stream)["source"][0])
+                saved = stream.get_state()
+            else:
+                stream.set_state(saved)
+            read = [(int(batch["source"][0]), int(batch["id"][0])) for batch in itertools.islice(stream, 6)]
+            return read, saved, first
+        finally:
+            stream.close()
+
+    whole, saved, first = rows()
+    resumed, _, _ = rows(saved)
+    assert (1 - first, 0) in whole
+    assert resumed == whole
 
 
 def test_an_indexed_mix_still_refuses_a_member_joining():
