@@ -264,6 +264,70 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
                                   .host().images, expected)
 
 
+def test_an_accumulated_distillation_alternates_its_networks_update_by_update(tmp_path):
+    """An update of rCM takes two microbatches (`accumulation=2`), each of its update's phase: the
+    loss reads the committed updates (`Step.updates`), so a critic update's second microbatch leaves
+    the student's gradient zero, and four updates past a one-update warmup move the student, the
+    student, the fake score and the student, each alone."""
+    import dataclasses
+
+    from diffusion_stubs import batch_for
+
+    from dew.checkpoints import Checkpoints
+    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+    from dew.config.data import ImageData
+    from dew.diffusion.presets import Flow
+    from dew.objectives.base import Step
+    from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
+    from dew.objectives.diffusion.objective import FAKE_SCORE
+    from dew.sampling import Consistency, Euler
+    from dew.training import Trainer
+
+    teacher_run = DiffusionRunConfig(
+        model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
+                                         "dtype": "float32", "attention_impl": "xla"}),
+        data=ImageData(source="tfds://oxford_flowers102", image_size=4), preset=Flow(), val_metrics=(),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
+        text=TextCondition(encoder="char_table", checkpoint="char_table"),
+        objective=ObjectiveConfig("diffusion",
+                                  {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
+    teacher = teacher_run.build()
+    trainer = Trainer(teacher, optax.adam(1e-2), key=jax.random.PRNGKey(3))
+    state = trainer.initial_state()
+    batch = batch_for(teacher, 4)
+    state, *_ = trainer.compile(state, batch)(state, batch)
+    (tmp_path / "teacher").mkdir()
+    checkpoints = Checkpoints(str(tmp_path / "teacher"))
+    checkpoints.save(1, state, None)
+    checkpoints.wait()
+    teacher_run.save(str(tmp_path / "teacher"))
+    task = dataclasses.replace(teacher_run, objective=ObjectiveConfig("rcm", {
+        "teacher_run": str(tmp_path / "teacher"), "solver": Consistency(), "steps": 3, "ema_decay": None,
+        "tangent_warmup": 1, "student_update_freq": 2, "max_simulation_steps": 2})).build()
+
+    trainer = Trainer(task, optax.sgd(1e-2), key=jax.random.PRNGKey(5), accumulation=2)
+    distilled, _, _ = trainer.place()
+    step = trainer.compile(distilled, batch)
+    moved = []
+    for _ in range(4):
+        before = jax.device_get(distilled.variables["params"])
+        for _ in range(2):
+            distilled, *_ = step(distilled, batch)
+        after = jax.device_get(distilled.variables["params"])
+        moved.append(sorted({"critic" if name == FAKE_SCORE else "student" for name in after
+                             if any(not np.array_equal(old, new) for old, new in
+                                    zip(jax.tree.leaves(before[name]), jax.tree.leaves(after[name]),
+                                        strict=True))}))
+    assert int(distilled.updates) == 4
+    assert moved == [["student"], ["student"], ["critic"], ["student"]]
+
+    params = task.init(jax.random.PRNGKey(0))
+    critic = jax.grad(lambda tree: task.loss({**params, "params": tree}, batch, Step(
+        jnp.asarray(5), jax.random.PRNGKey(4), None, committed=jnp.asarray(2)))[0].total)(params["params"])
+    assert all(float(jnp.abs(leaf).sum()) == 0 for name, tree in critic.items() if name != FAKE_SCORE
+               for leaf in jax.tree.leaves(tree))
+
+
 def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_path):
     """`--pretrained <pipeline> --objective rcm` with no teacher run: the
     teacher is the model the run loads, its weights bitwise the source's,

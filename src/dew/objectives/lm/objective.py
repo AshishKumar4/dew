@@ -603,7 +603,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     so the loss's temporaries stay one tile in size whatever the vocabulary.
     """
 
-    counts_tokens: ClassVar[bool] = True
+    counts_tokens = True
 
     loss_role: Role | None = None
     """The role whose targets alone count (`LMObjective`); None counts every target."""

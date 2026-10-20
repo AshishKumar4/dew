@@ -214,6 +214,37 @@ def goodput(wall: float, first_step: float | None, other: float) -> dict[str, fl
     return numbers
 
 
+
+def data_line(counters: Mapping[str, float]) -> Text | None:
+    """A run's data counters (`data/...`) as one line: the rows its readers delivered and the records
+    they rejected, summed over the corpora, with each corpus's rows where a mixture reads more than
+    one (`data/rows/<corpus>`), each reason only where something was rejected for it
+    (`data/rejected/<corpus>/<reason>`), and the share of the rows truncated where any was
+    (`data/truncated/<corpus>`, each corpus's share of its own rows). None where the run reports
+    no rows."""
+    rows = {name.removeprefix("data/rows/"): value for name, value in counters.items()
+            if name.startswith("data/rows/")}
+    if not rows:
+        return None
+    reasons: collections.Counter[str] = collections.Counter()
+    for name, value in counters.items():
+        if name.startswith("data/rejected/"):
+            reasons[name.rpartition("/")[2]] += int(value)
+    delivered = sum(rows.values())
+    line = Text.assemble(("data ", LABEL), (f"{int(delivered):,}", "bold"), (" rows", LABEL),
+                         ("  ·  ", LABEL), (f"{sum(reasons.values()):,}", "bold"), (" rejected", LABEL))
+    if counted := {reason: count for reason, count in reasons.items() if count}:
+        line.append(" (" + ", ".join(f"{reason} {count:,}" for reason, count in counted.items()) + ")", LABEL)
+    truncated = sum(counters.get(f"data/truncated/{corpus}", 0.0) * count for corpus, count in rows.items())
+    if truncated and delivered:
+        line.append("  ·  ", LABEL).append(f"{truncated / delivered:.1%}", "bold").append(" truncated", LABEL)
+    if len(rows) > 1:
+        line.append("  ·  ", LABEL)
+        for index, (corpus, count) in enumerate(rows.items()):
+            line.append("  " if index else "").append(f"{corpus} ", LABEL).append(f"{int(count):,}")
+    return line
+
+
 @dataclasses.dataclass
 class TrainingDisplay:
     """The console side of one `Trainer.fit`.
@@ -239,6 +270,9 @@ class TrainingDisplay:
     # The names the last interval logged, the rows shown: a metric an interval no longer reports (a
     # rollout source absent from its batch) keeps its trend for when it returns, not its last value.
     reported: frozenset[str] = frozenset()
+    # The last interval's data counters (`data/...`, `dew.data.mixing.CorpusCounts.metrics`), shown
+    # as one line (`data_line`) rather than as rows; the trackers keep each of them.
+    corpus_counts: Mapping[str, float] = dataclasses.field(default_factory=dict)
     # Each split's last `TREND` evaluations, in the order they completed,
     # scores only: the trackers keep the previews. A new evaluation rebinds
     # its split's list, so the refresh thread never iterates one that grows.
@@ -317,18 +351,23 @@ class TrainingDisplay:
         """Record one logging interval's scalars, which the host has read."""
         if not self.shown_here:
             return
+        self.corpus_counts = {name: value for name, value in scalars.items() if name.startswith("data/")}
         for name, value in scalars.items():
+            if name in self.corpus_counts:
+                continue
             prefix, _, rest = name.partition("/")
             shown = self.shown.get(rest or prefix, PLAIN)
             rows = self.groups.setdefault(shown.group or prefix, {})
             if name not in rows:
                 rows[name] = Row(rest or prefix, shown, collections.deque(maxlen=TREND))
             rows[name].values.append(value)
-        self.reported = frozenset(scalars)
+        self.reported = frozenset(scalars) - self.corpus_counts.keys()
         if self.live is None:
             target = "" if self.total is None else f"/{self.total}"
             line = f"step {step}{target}  " + "  ".join(
                 f"{row.name} {number(row.values[-1], row.shown)}" for _, row in self.rows())
+            if (counted := data_line(self.corpus_counts)) is not None:
+                line += f"  {counted.plain}"
             if (rate := self.rate()) and self.total is not None and step < self.total:
                 line += f"  {duration((self.total - step) / rate)} left"
             self.note(line)
@@ -498,6 +537,8 @@ class TrainingDisplay:
             parts.append(Text.assemble(bar(fraction, room), "  ", stats))
         else:
             parts += [bar(fraction, inner), stats]
+        if (counted := data_line(self.corpus_counts)) is not None:
+            parts.append(counted)
 
         if rows := self.rows():
             # What the rest of the panel takes: the borders, the header, the

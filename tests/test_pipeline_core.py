@@ -1190,6 +1190,48 @@ def test_an_exact_resume_refuses_a_step_that_makes_other_values():
         other.close()
 
 
+@dataclasses.dataclass(frozen=True)
+class Offset:
+    """Adds each row its entry of a table, which the step holds whole."""
+
+    table: np.ndarray
+
+    def __call__(self, batch):
+        return {**batch, "id": batch["id"] + self.table[batch["id"] % len(self.table)]}
+
+
+def test_an_exact_resume_refuses_a_table_that_differs_where_its_repr_does_not_show():
+    """Two steps whose 1024-entry tables differ at entry 512 alone, which their reprs elide, make
+    other values: an exact resume under one refuses a position saved under the other, and one
+    under the same table restores it."""
+    table = np.zeros(1024, np.int64)
+    edited = table.copy()
+    edited[512] = 1
+    assert repr(Offset(table)) == repr(Offset(edited))
+
+    def reader(values):
+        return compile(Pipeline(source(8)).map(Offset(values)).shuffle(0).repeat().batch(2),
+                       loading=READ).train(DataPartition())
+
+    first = reader(table)
+    try:
+        next(first)
+        state = first.get_state()
+    finally:
+        first.close()
+    same = reader(table.copy())
+    try:
+        same.set_state(state)
+    finally:
+        same.close()
+    other = reader(edited)
+    try:
+        with pytest.raises(ValueError):
+            other.set_state(state)
+    finally:
+        other.close()
+
+
 SHIFTED = """import dataclasses
 
 
