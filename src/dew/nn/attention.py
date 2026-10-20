@@ -1395,7 +1395,7 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
     elif implementation == 'decode':
         starts = key_value_seq_starts
 
-        def decoded(query, key, value):
+        def decoded(query, key, value, *sunk):
             # A Pallas call has no partitioning rule: each shard decodes its own rows and heads.
             def attend(query, key, value, lengths, starts=None, sinks=None):
                 return decode_attention.attend(query, key, value, lengths, starts, softcap=softcap,
@@ -1403,18 +1403,20 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
 
             rows = ("activation_batch",)
             return _per_shard(attend, query, key, value, lengths=(key_value_seq_lengths, rows),
-                              starts=(starts, rows), sinks=(sinks, ("activation_heads",)))
+                              starts=(starts, rows), sinks=(sunk[0] if sunk else None, ("activation_heads",)))
 
-        def folded(query, key, value):
+        def folded(query, key, value, *sunk):
             visible = with_key_starts(with_key_lengths(None, key_value_seq_lengths, key.shape[-3]), starts,
                                       key.shape[-3])
-            if sinks is None and softcap is None:
+            if not sunk and softcap is None:
                 return folded_attention(query, key, value, visible)
             # The folded form has neither; the reference path computes both over the same keys.
-            return reference_attention(query, key, value, mask=visible, sinks=sinks, softcap=softcap)
+            return reference_attention(query, key, value, mask=visible, sinks=sunk[0] if sunk else None,
+                                       softcap=softcap)
 
-        # The kernel has no derivative, so both modes differentiate the folded attention it stands in for.
-        out = forward_differentiable(decoded, folded, query, key, value)
+        # The kernel has no derivative, so both modes differentiate the attention it stands in for, the
+        # sinks among its operands.
+        out = forward_differentiable(decoded, folded, query, key, value, *([] if sinks is None else [sinks]))
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
         # kernel takes the call the two forms agree bitwise.

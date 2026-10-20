@@ -463,21 +463,22 @@ class KVStore:
         return _gather_pages(pool, self._get(TABLE), self.layout.groups)
 
     def case(self, query: jax.Array, *, value_dim: int, softcap: float | None, arithmetic: bool,
-             named: str, windowed: bool = False) -> PagedCase:
+             named: str, windowed: bool = False, sinks: bool = False) -> PagedCase:
         """The `PagedCase` of a decode step's query `[rows, heads, head_dim]` over this pool, its values
         `value_dim` wide, under the layer's `softcap`, its reference-only `arithmetic`
         (`dew.nn.attention.reference_only`) and its `AttentionImpl`, `named`; a `windowed` step reads
-        each row from its window's first key."""
+        each row from its window's first key; a layer with `sinks` has attention sinks."""
         return PagedCase(heads=query.shape[-2], kv_heads=self.kv_heads, head_dim=self.head_dim,
                          value_dim=value_dim, dtype=jnp.dtype(query.dtype), pool=jnp.dtype(self.dtype),
                          page_size=self.layout.page_size, quantized=self.layout.quantized is not None,
                          groups=self.layout.groups, head_shards=_head_shards(query), softcap=softcap,
-                         arithmetic=arithmetic, named=named, windowed=windowed)
+                         arithmetic=arithmetic, named=named, windowed=windowed, sinks=sinks)
 
     def decode(self, query: jax.Array, lengths: jax.Array, softcap: float | None,
-               starts: jax.Array | None = None) -> jax.Array:
+               starts: jax.Array | None = None, sinks: jax.Array | None = None) -> jax.Array:
         """Attend one query per row `[rows, heads, head_dim]` to the first `lengths` slots of that row,
-        from `starts` `[rows]` where given (a window's first slot, which the GPU's kernel reads).
+        from `starts` `[rows]` where given (a window's first slot, which the GPU's kernel reads), with
+        `sinks` `[heads]` where the layer has them (the GPU's kernel applies them).
 
         Decode runs the device's paged kernel, which raises `KernelRefused` where its requirements
         (`PAGED`) turn the step down. The TPU kernel does not scale
@@ -489,14 +490,14 @@ class KVStore:
         query heads read, with every page, as the tables index the whole pool.
         """
         case = self.case(query, value_dim=self.head_dim, softcap=softcap, arithmetic=False, named='auto',
-                         windowed=starts is not None)
+                         windowed=starts is not None, sinks=sinks is not None)
         kernel = 'triton' if backend() == "gpu" else 'tpu'
         if failed := PAGED.kernel(kernel).failed(case):
             raise KernelRefused(PAGED.choice, kernel, [requirement.refusal(case) for requirement in failed])
 
-        def local(query, key, value, lengths, table, *starts):
+        def local(query, key, value, lengths, table, *extras):
             if backend() == "gpu":
-                return gpu_paged(softcap)(query, key, value, table, lengths, *starts)
+                return gpu_paged(softcap, sinks is not None)(query, key, value, table, lengths, *extras)
             from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
 
             scaled = query * jnp.asarray(1.0 / math.sqrt(self.head_dim), query.dtype)
@@ -504,12 +505,14 @@ class KVStore:
                                    pages_per_compute_block=_pages_per_block(table.shape[1]))
 
         given = () if starts is None else (starts,)
+        sunk = () if sinks is None else (sinks,)
         arrays = (query, self._get("cached_key"), self._get("cached_value"), lengths, self._get(TABLE),
-                  *given)
+                  *given, *sunk)
         queries = logical_spec(DECODE_QUERY, query.shape)
         # A spec leaves off trailing whole dimensions.
         rows, heads = (*queries, None, None)[:2]
-        specs = (queries, P(heads), P(heads), P(rows), P(rows), *(P(rows) for _ in given))
+        specs = (queries, P(heads), P(heads), P(rows), P(rows), *(P(rows) for _ in given),
+                 *(P(heads) for _ in sunk))
         return manual_map(local, specs, queries)(*arrays)
 
 
@@ -524,8 +527,8 @@ class PagedCase:
     query's `dtype` and the `pool`'s; its `page_size` (None for a compact cache), whether it is
     `quantized`, its `groups`; how many ways a mesh splits the query heads (`head_shards`); the layer's
     `softcap`; whether its arithmetic is the reference path's alone (`arithmetic`); the
-    `AttentionImpl` it `named`; and whether it reads each row from its window's first key
-    (`windowed`)."""
+    `AttentionImpl` it `named`; whether it reads each row from its window's first key
+    (`windowed`); and whether the layer has attention sinks (`sinks`)."""
 
     heads: int
     kv_heads: int
@@ -541,6 +544,7 @@ class PagedCase:
     arithmetic: bool
     named: str
     windowed: bool = False
+    sinks: bool = False
 
 
 def _paged_layout(device: str) -> tuple[Requirement[PagedCase], ...]:
@@ -588,6 +592,9 @@ TPU_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
     Requirement('windowed', lambda case: not case.windowed,
                 "the TPU paged kernel reads every slot to a row's length, not a window's span",
                 row='roadmap: TPU paged decode over windows'),
+    Requirement('sinks', lambda case: not case.sinks,
+                "jax's TPU paged attention has no sinks; the gathered rows' attention applies them",
+                inherent=True),
 )
 """jax's Pallas TPU paged attention, which applies a logit softcap itself."""
 
@@ -629,49 +636,61 @@ def _gather_pages(pool: jax.Array, table: jax.Array, groups: int) -> jax.Array:
                                      table.shape[1] * pool.shape[2], *pool.shape[3:]), 0, 2)
 
 
-def _gathered_attention(query, key, value, table, lengths, *starts, softcap=None):
+def _extras(extras: tuple, sunk: bool) -> tuple[jax.Array | None, jax.Array | None]:
+    """A paged step's optional operands after its lengths, `(*starts, *sinks)`: each row's first key
+    where a window gives them, then the layer's sinks `[heads]` where it is `sunk`; None for either
+    absent."""
+    starts, sinks = (extras[:-1], extras[-1]) if sunk else (extras, None)
+    return (starts[0] if starts else None), sinks
+
+
+def _gathered_attention(query, key, value, table, lengths, *extras, softcap=None, sunk=False):
     """The paged kernel's arithmetic over the gathered rows, through the attention dispatch: one query a
-    row over the first `lengths` keys of its pages, from its `starts` where a window gives them, its
-    scaled logits bounded by `softcap` where given. An inactive row reads one slot. Its backward is the
-    paged kernel's (`_paged_backward`)."""
+    row over the first `lengths` keys of its pages, from its starts where a window gives them, its
+    scaled logits bounded by `softcap` where given, with its sinks where `sunk` (`_extras`). An inactive
+    row reads one slot. Its backward is the paged kernel's (`_paged_backward`)."""
     from dew.nn.attention import scaled_dot_product_attention
 
+    starts, sinks = _extras(extras, sunk)
     keys, values = _gather_pages(key, table, 1), _gather_pages(value, table, 1)
-    return scaled_dot_product_attention(query[:, None], keys, values, softcap=softcap,
+    return scaled_dot_product_attention(query[:, None], keys, values, softcap=softcap, sinks=sinks,
                                         key_value_seq_lengths=jnp.maximum(lengths, 1),
-                                        key_value_seq_starts=starts[0] if starts else None)[:, 0]
+                                        key_value_seq_starts=starts)[:, 0]
 
 
-def _gathered_tangent(query, key, value, table, lengths, *starts, softcap=None):
+def _gathered_tangent(*operands, softcap=None, sunk=False):
     """`_gathered_attention` traced for forward mode (`forward_mode_attention`): a fused kernel the
     dispatch takes keeps its value and takes its tangent from the reference path's, so `jax.jvp`
     differentiates it at every order, which a reverse-only fused kernel would not."""
     from dew.nn.attention import forward_mode_attention
 
     with forward_mode_attention():
-        return _gathered_attention(query, key, value, table, lengths, *starts, softcap=softcap)
+        return _gathered_attention(*operands, softcap=softcap, sunk=sunk)
 
 
-def _paged_forward(query, key, value, table, lengths, *starts, softcap=None):
-    return decode_attention.attend_paged(query, key, value, table, jnp.maximum(lengths, 1), *starts,
-                                         softcap=softcap), ()
+def _paged_forward(query, key, value, table, lengths, *extras, softcap=None, sunk=False):
+    starts, sinks = _extras(extras, sunk)
+    return decode_attention.attend_paged(query, key, value, table, jnp.maximum(lengths, 1), starts,
+                                         softcap=softcap, sinks=sinks), ()
 
 
-def _paged_backward(saved, operands, cotangent, *, softcap=None):
-    return jax.vjp(functools.partial(_gathered_attention, softcap=softcap), *operands)[1](cotangent)
+def _paged_backward(saved, operands, cotangent, *, softcap=None, sunk=False):
+    pull = jax.vjp(functools.partial(_gathered_attention, softcap=softcap, sunk=sunk), *operands)[1]
+    return pull(cotangent)
 
 
 @functools.cache
-def gpu_paged(softcap: float | None):
+def gpu_paged(softcap: float | None, sunk: bool = False):
     """Dew's Pallas decode kernel over the pages (`decode_attention.attend_paged`) under the layer's
-    `softcap`, its derivatives at every order the gathered attention's (`generation.linear_tangent`):
-    reverse mode runs the backward of whichever kernel the dispatch takes for it
-    (`_gathered_attention`), a call cuDNN's width and determinism limits turn down included, and forward
-    mode takes the forward-mode path's tangent (`_gathered_tangent`), with no context of the caller's.
-    An inactive row reads one slot, so its unused output stays finite."""
-    return generation.linear_tangent(functools.partial(_paged_forward, softcap=softcap),
-                                     functools.partial(_paged_backward, softcap=softcap),
-                                     functools.partial(_gathered_tangent, softcap=softcap))
+    `softcap` and, where `sunk`, its sinks (the last operand, `_extras`), its derivatives at every order
+    the gathered attention's (`generation.linear_tangent`), the sinks' among them: reverse mode runs the
+    backward of whichever kernel the dispatch takes for it (`_gathered_attention`), a call cuDNN's width
+    and determinism limits turn down included, and forward mode takes the forward-mode path's tangent
+    (`_gathered_tangent`), with no context of the caller's. An inactive row reads one slot, so its
+    unused output stays finite."""
+    return generation.linear_tangent(functools.partial(_paged_forward, softcap=softcap, sunk=sunk),
+                                     functools.partial(_paged_backward, softcap=softcap, sunk=sunk),
+                                     functools.partial(_gathered_tangent, softcap=softcap, sunk=sunk))
 
 
 def _pages_per_block(pages: int) -> int:
