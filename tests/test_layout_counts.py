@@ -172,6 +172,28 @@ def test_a_store_of_role_counted_documents_states_its_rule_so_its_pack_counts_by
     assert abs(left - right) <= 12 + 12
 
 
+def test_a_parquet_store_of_token_documents_with_no_counts_is_packed_by_its_lengths(tmp_path):
+    """Parquet token documents with their lengths and no counted targets column hold no count of
+    Dew's, so their pack plans by the lengths, as a global order: a shuffle of its windows reads."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from dew.data.sources import Files
+
+    documents = [np.arange(3 + index % 5, dtype=np.int32) for index in range(24)]
+    table = pa.table({"text": [document.tolist() for document in documents],
+                      "length": [len(document) for document in documents]})
+    pq.write_table(table, tmp_path / "documents.parquet")
+    store = Files(str(tmp_path / "documents.parquet"))
+    assert store.metadata()["count_rules"] == []
+    chain = Pipeline(store).pack(16).shuffle(0).repeat().batch(2)
+    stream = compile(chain, read="indexed", loading=READ).train(DataPartition())
+    try:
+        assert np.asarray(next(stream)["text"]).shape == (2, 16)
+    finally:
+        stream.close()
+
+
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_documents_counted_by_every_target_lay_out_beside_uncounted_ones(read):
     """A layout of documents some of which were counted by every target and some never counted:
