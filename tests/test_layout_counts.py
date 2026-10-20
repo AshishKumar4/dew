@@ -101,7 +101,7 @@ def test_a_crop_after_a_layout_is_counted_as_the_windows_it_leaves(read, counted
 class HalfScored:
     """Counts the targets of a record with an odd id in role 1, and of the rest every target."""
 
-    def map(self, row):
+    def __call__(self, row):
         from dew.data.steps.text import CountTargets
 
         return (CountTargets(role=1) if int(row["id"]) % 2 else CountTargets()).map(row)
