@@ -111,9 +111,10 @@ def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer, shape):
     assert_as_exact_as_the_reference(got, reference.reshape(got.shape), truth, "bias gradient")
 
 
-SPLIT = {"conv": (Conv(3, (3, 3)), (8, 32, 32, 4), 16), "dense": (Dense(3), (8, 32, 32, 4), 16)}
+SPLIT = {"conv": (Conv(3, (3, 3)), (8, 32, 32, 4), 256), "dense": (Dense(3), (8, 32, 32, 4), 256)}
 """Each split bias gradient's layer, input shape and declared seeds for check 1 (`assert_as_exact`),
-sized by `seeds_for`: a U-ViT's output convolution, and a projection over the same positions."""
+sized by `seeds_for` (2026-10-20, on armada): a U-ViT's output convolution, and a projection over the same
+positions. Three elements a draw take 256 draws to resolve the factor."""
 
 
 @pytest.mark.mesh(devices=8)
