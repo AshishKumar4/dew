@@ -574,6 +574,19 @@ def test_a_swiglu_the_kernel_refuses_names_the_requirement_its_dtypes_fail(dtype
     assert (route.refusal.code, route.refusal.row) == (code, row)
 
 
+def test_a_weak_scalar_gate_over_a_bf16_up_takes_the_kernel_its_promotion_prefers():
+    """A weak fp32 scalar gate over a strongly typed bf16 up promotes to bf16 under strict promotion,
+    as the operands' own product does, so the preference reads bf16's row (the kernel on an A100),
+    where promoting the two dtypes alone would raise."""
+    from dew.nn.kernels import generation
+
+    gate, up = jnp.asarray(1.0), jnp.ones((2, 64), jnp.bfloat16)
+    with jax.numpy_dtype_promotion("strict"), generation.assumed("sm80"), generation.routes() as found:
+        assert norm_swiglu.swiglu_kernel("auto", gate, up) == "xla"
+    (route,) = found
+    assert route.preferred == "pallas"
+
+
 @pytest.mark.parametrize("operand", ["scale", "gate"])
 def test_a_norms_fp16_weight_or_gate_cites_the_fp16_qualification(operand):
     """A bf16 norm whose weight or gate is fp16 runs XLA on an A100, refused by the fp16 qualification
