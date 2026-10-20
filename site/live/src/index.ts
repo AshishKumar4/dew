@@ -66,9 +66,9 @@ async function createSession(request: Request, env: Env, ctx: ExecutionContext, 
 	const pool = env.POOL.get(env.POOL.idFromName('global'));
 	const image = await pool.image();
 	// The registry's generation is not this deploy's pinned commit (none, or the last deploy's, which no one warmed
-	// this one from), or the pool does not serve it: this request starts the pinned generation's preparation, leased,
-	// or hands the pool the generation, and the last generation serves meanwhile. Both are read through RPCs every
-	// build of the objects answers alike (README.md).
+	// this one from), or the pool does not serve it, or has no warm host (the preview keeps none): this request
+	// starts the pinned generation's preparation, leased, or hands the pool the generation and asks it for a host,
+	// and the last generation serves meanwhile.
 	const active = await env.SNAPSHOTS.get(env.SNAPSHOTS.idFromName('global')).previous();
 	if (active?.commit !== env.SNAPSHOT_COMMIT || active.snapshot.id !== image) ctx.waitUntil(warm(env));
 	if (!image) {

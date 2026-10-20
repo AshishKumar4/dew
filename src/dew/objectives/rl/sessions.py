@@ -51,6 +51,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.data.tokens import first_fit
+from dew.records import json_value, record as section
 from dew.rl import group_advantage, rloo_advantage
 
 IDS_KEY = "input_ids"
@@ -98,6 +99,10 @@ ESTIMATORS = ("group", "mean", "rloo")
 """Advantage families: `group` centres on the group mean and divides by its
 deviation (GRPO), `mean` only centres (Dr.GRPO), `rloo` subtracts the mean
 of the other members."""
+CREDITS = ("session", "turn")
+"""What an advantage is computed over: `session`, one per session from its
+return, every call alike; `turn`, one per call from the return still ahead of
+it, compared with the group's members' at the same turn."""
 
 
 class Status(Enum):
@@ -144,6 +149,36 @@ def _token_ids(name: str, ids: object) -> None:
 
 
 @dataclass(frozen=True)
+class Transcript:
+    """One call's conversation in the structure the harness spoke it, as JSON.
+
+    `messages` are the chat messages the call was asked with, those the
+    harness sent or those the environment's observations carried so far, and
+    `response` is the message the engine answered with, tool calls included,
+    or None where the source holds no structured answer (its sampled ids
+    are the answer). The call's ids stay its training record: nothing is
+    tokenized from a transcript, and it is kept for reading a session, not
+    for scoring it.
+    """
+
+    messages: tuple[Mapping[str, object], ...]
+    response: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "messages", json_objects(self.messages, "a transcript's messages"))
+        if self.response is not None:
+            object.__setattr__(self, "response", json_objects((self.response,), "a transcript's response")[0])
+
+
+def json_objects(values: object, name: str) -> tuple[Mapping[str, object], ...]:
+    """`values`, a tuple of JSON objects in any `Mapping`, as plain JSON trees (`json_value`), which
+    journals copy and write as they are; ValueError for anything else."""
+    if not isinstance(values, tuple) or not all(isinstance(value, Mapping) for value in values):
+        raise ValueError(f"{name} are a tuple of JSON objects")
+    return tuple(section(json_value(value, name), name) for value in values)
+
+
+@dataclass(frozen=True)
 class Call:
     """One model call as the engine served it.
 
@@ -165,6 +200,10 @@ class Call:
     ids the sampler's top-k/top-p filters kept (vLLM's `sampling_mask`).
     With a support, the behavior log-probability is the filtered one, and
     the trainer renormalizes over the same support. None means no filter.
+
+    `reward` is what the environment paid for this call, a step reward, or
+    None. `transcript` is the call's conversation in the structure the
+    harness spoke it (`Transcript`), where the source has one.
     """
 
     prompt_ids: tuple[int, ...]
@@ -174,6 +213,8 @@ class Call:
     version: int
     routed_experts: np.ndarray | None = field(default=None, compare=False)
     support: tuple[tuple[int, ...], ...] | None = None
+    reward: float | None = None
+    transcript: Transcript | None = None
 
     def __post_init__(self) -> None:
         _token_ids("prompt_ids", self.prompt_ids)
@@ -186,6 +227,9 @@ class Call:
         object.__setattr__(self, "behavior_log_probs", tuple(
             _finite("behavior log-probabilities must be finite numbers", value)
             for value in self.behavior_log_probs))
+        if self.reward is not None:
+            object.__setattr__(self, "reward", _finite("a call's reward is a finite number or None",
+                                                       self.reward))
         if self.finish_reason not in FINISH_REASONS:
             raise ValueError(f"finish_reason must be one of {sorted(FINISH_REASONS)}, "
                              f"got {self.finish_reason!r}")
@@ -381,36 +425,86 @@ def check_estimator(estimator: str) -> None:
         raise ValueError(f"estimator must be one of {ESTIMATORS}, got {estimator!r}")
 
 
-def advantages(sessions: Sequence[Session], estimator: str = "group", *,
-               truncation: str = "mask") -> np.ndarray:
-    """One advantage per session from the rewards of its `(task, group)`.
+def check_credit(credit: str) -> None:
+    """Refuse a credit `advantages` does not assign."""
+    if credit not in CREDITS:
+        raise ValueError(f"credit must be one of {CREDITS}, got {credit!r}")
 
-    The baseline reads the group's trained members only, each at its
-    trained reward. A masked member has no score to compare against, and
-    a group with fewer than two trained members has no baseline, so every
-    member there gets zero.
+
+def advantages(sessions: Sequence[Session], estimator: str = "group", *,
+               truncation: str = "mask", credit: str = "session") -> list[np.ndarray]:
+    """Each session's advantage at each of its calls, from the returns of its `(task, group)`.
+
+    A session's return is the reward it trains on plus every reward its
+    calls earned (`Call.reward`); from a call on, it is that reward plus the
+    rewards of that call and the ones after it. With `credit="session"` the
+    estimator compares sessions' returns and every call of a session takes
+    its session's advantage; with `credit="turn"` it compares the members'
+    returns from their call `t` on, for each turn `t`, and each call takes
+    its own. The baseline reads the trained members only, each at its
+    trained return. A masked member has no score to compare against, and a
+    comparison of fewer than two members has no baseline, so every member
+    there gets zero.
     """
     check_estimator(estimator)
     check_truncation(truncation)
-    members: dict[tuple[str, str], list[int]] = {}
-    rewards_of = [_trained_reward(session, truncation) for session in sessions]
-    for index, session in enumerate(sessions):
-        if rewards_of[index] is not None:
-            members.setdefault((session.task, session.group), []).append(index)
-    per_session = np.zeros(len(sessions), np.float32)
-    by_size: dict[int, list[list[int]]] = {}
-    for group in members.values():
-        if len(group) >= 2:
-            by_size.setdefault(len(group), []).append(group)
+    check_credit(credit)
+    # The trained sessions' returns from each call on, by session.
+    ahead = {index: _returns_ahead(session, reward) for index, session in enumerate(sessions)
+             if (reward := _trained_reward(session, truncation)) is not None}
+    # Who is compared with whom, and the return each one is compared on.
+    compared: dict[tuple[str, str, int], list[tuple[int, int]]] = {}
+    for index in ahead:
+        session = sessions[index]
+        # A session without calls has no turn to compare, and its return stands only for itself.
+        turns = range(len(session.calls)) if credit == "turn" else (0,)
+        for turn in turns:
+            compared.setdefault((session.task, session.group, turn), []).append((index, turn))
+    values = {key: 0.0 for members in compared.values() for key in members}
+    by_size: dict[int, list[list[tuple[int, int]]]] = {}
+    for members in compared.values():
+        if len(members) >= 2:
+            by_size.setdefault(len(members), []).append(members)
     for size, groups in by_size.items():
-        order = [index for group in groups for index in group]
-        rewards = jnp.asarray([rewards_of[index] for index in order], jnp.float32)
+        order = [member for members in groups for member in members]
+        rewards = jnp.asarray([ahead[index][turn] for index, turn in order], jnp.float32)
         if estimator == "rloo":
-            values = rloo_advantage(rewards, size)
+            computed = rloo_advantage(rewards, size)
         else:
-            values = group_advantage(rewards, size, normalise_by_std=estimator == "group")
-        per_session[order] = np.asarray(jax.device_get(values), np.float32)
-    return per_session
+            computed = group_advantage(rewards, size, normalise_by_std=estimator == "group")
+        values.update(zip(order, np.asarray(jax.device_get(computed), np.float32).tolist(), strict=True))
+    per_call = []
+    for index, session in enumerate(sessions):
+        calls = len(session.calls)
+        if index not in ahead:
+            per_call.append(np.zeros(calls, np.float32))
+        elif credit == "turn":
+            per_call.append(np.asarray([values[(index, turn)] for turn in range(calls)], np.float32))
+        else:
+            per_call.append(np.full(calls, values[(index, 0)], np.float32))
+    return per_call
+
+
+def _returns_ahead(session: Session, reward: float) -> list[float]:
+    """From each call on, the session's trained `reward` plus the rewards of that call and every
+    call after it; a session without calls returns `reward` alone, at turn 0."""
+    remaining, returns = reward, []
+    for call in reversed(session.calls):
+        remaining += 0.0 if call.reward is None else call.reward
+        returns.append(remaining)
+    return returns[::-1] or [reward]
+
+
+def _owners(chain: _Chain) -> np.ndarray:
+    """Per chain id, the call it belongs to: its sampled ids, and the prompt ids before them that
+    no earlier call of the chain holds."""
+    owners = np.empty(len(chain.tokens), np.int64)
+    start = 0
+    for call, first, count in chain.members:
+        owners[start:first + count] = call
+        start = first + count
+    owners[start:] = chain.members[-1][0]
+    return owners
 
 
 def _built(sessions: Sequence[Session], width: int, truncation: str) -> list[_Chain]:
@@ -444,7 +538,7 @@ def rows_needed(lengths: Sequence[int], width: int) -> int:
 
 
 def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
-         estimator: str = "group", truncation: str = "mask",
+         estimator: str = "group", truncation: str = "mask", credit: str = "session",
          support_capacity: int | None = None) -> dict[str, np.ndarray]:
     """Strictly merge each trained session's calls, then pack the chains into `[rows, width]`.
 
@@ -458,8 +552,9 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
     the chains of a row from 1, with 0 on padding, and `text_positions`
     counts each chain's positions from 0. `response_mask` is 1 on sampled
     ids alone, and `behavior_log_probs`, `versions` and `call_index` are set
-    on those ids. `advantages` repeats the session's advantage, which
-    `estimator` computes within its `(task, group)`, over its chain tokens.
+    on those ids. `advantages` holds, on each sampled id, its call's
+    advantage, which `estimator` computes within its `(task, group)` over
+    `credit` (`advantages`).
     `session_weights` is one over the session's number of sampled ids on
     each of them and 0 elsewhere. It sums to the number of sessions, so
     `sum(weights * terms) / sum(weights)` is the mean over sessions of each
@@ -486,7 +581,7 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
         raise ValueError("a packed row holds at least two ids")
     if rows is not None and (type(rows) is not int or rows < 1):
         raise ValueError("rows is a positive integer, or None for as many as the chains need")
-    values = advantages(sessions, estimator, truncation=truncation)
+    values = advantages(sessions, estimator, truncation=truncation, credit=credit)
     built = _built(sessions, width, truncation)
     placed = _place([len(chain.tokens) for chain in built], width)
     count = len(placed) if rows is None else rows
@@ -522,7 +617,7 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
             versions[row, span] = chain.versions
             session_index[row, span] = chain.session
             call_index[row, span] = chain.calls
-            advantage[row, span] = values[chain.session]
+            advantage[row, span] = values[chain.session][_owners(chain)]
             weights[row, span] = sampled / max(int(trainable[chain.session]), 1)
             start = stop
     return {

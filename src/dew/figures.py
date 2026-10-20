@@ -9,7 +9,8 @@ SVG, so they play with no script, in an `<img>` too. Each one loops: it builds t
 holds it, and eases back to the start. With reduced motion asked for, only the held picture
 shows.
 
-`curve`, `bars`, `heatmap`, `images` and `tokens` draw the charts the tutorials make from their own runs.
+`curve`, `bars`, `heatmap`, `images`, `points` and `tokens` draw the charts the tutorials make from their own
+runs.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from typing import Literal
 
 import numpy as np
 
-__all__ = ["THEMES", "Figure", "Shape", "bars", "curve", "heatmap", "images", "tokens"]
+__all__ = ["THEMES", "Figure", "Shape", "bars", "curve", "heatmap", "images", "points", "tokens"]
 
 Role = Literal["text", "muted", "rule", "surface", "raised", "accent", "accent_fill", "warm",
                "warm_fill", "tint0", "tint1", "tint2", "tint3", "none"]
@@ -336,10 +337,10 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
     for tick in _ticks(low, high):
         _, tick_y = at(first, tick)
         figure.line(left, tick_y, width - right, tick_y, color="rule", width=1)
-        figure.text(left - 8, tick_y + 5, f"{tick:g}", size=SMALL, color="muted", anchor="end")
+        figure.text(left - 8, tick_y + 5, f"{tick + 0:g}", size=SMALL, color="muted", anchor="end")
     for tick in _ticks(first, final, 4):
         tick_x, _ = at(tick, low)
-        figure.text(tick_x, height - bottom + 20, f"{tick:g}", size=SMALL, color="muted", anchor="middle")
+        figure.text(tick_x, height - bottom + 20, f"{tick + 0:g}", size=SMALL, color="muted", anchor="middle")
     figure.text((left + width - right) / 2, height - 6, x_label, size=TEXT, color="muted", anchor="middle")
     figure.text(left, 20, y_label, size=TEXT, color="muted")
     # Neutral colors only, since warm means wrong; past three series the lines are dashed.
@@ -454,29 +455,108 @@ def heatmap(frames: Sequence[Sequence[Sequence[float]]], *, rows: Sequence[str],
 
 
 def images(frames: Sequence[np.ndarray], *, captions: Sequence[str] = (), columns: int = 8, size: float = 64,
-           seconds: float = 8.0) -> Figure:
+           rows: Sequence[str] = (), seconds: float = 8.0) -> Figure:
     """A grid of photographs that changes from frame to frame: `frames[t]` is frame `t`'s images,
-    uint8 [N, H, W, C], drawn `size` wide in rows of `columns`. `captions[t]` names frame `t`. One
-    frame is a still grid."""
+    uint8 [N, H, W, C], drawn `size` wide in rows of `columns`. `captions[t]` names frame `t`, and
+    `rows[r]` names row `r` at its left. One frame is a still grid."""
     count, shown = len(frames), len(frames[0])
-    rows = -(-shown // columns)
+    lines = -(-shown // columns)
     gap, top = 4, 30 if captions else 4
-    width = columns * (size + gap) + gap
-    height = top + rows * (size + gap) + gap
+    left = (max(len(name) for name in rows) * 0.6 * SMALL + 12) if rows else gap
+    width = left + columns * (size + gap)
+    height = top + lines * (size + gap) + gap
     figure = Figure(width, height, seconds=seconds if count > 1 else 0.0,
                     label=f"{shown} images" + (f" at each of {count} points" if count > 1 else ""))
     times = _frame_times(count, seconds)
+    for row, name in enumerate(rows):
+        figure.text(left - 8, top + row * (size + gap) + size / 2 + 5, name, size=SMALL, color="muted",
+                    anchor="end")
     grids = []
     for batch in frames:
         with figure.group() as grid:
             for index, pixels in enumerate(np.asarray(batch)):
                 row, column = divmod(index, columns)
-                figure.image(gap + column * (size + gap), top + row * (size + gap), size, pixels, photo=True)
+                figure.image(left + column * (size + gap), top + row * (size + gap), size, pixels, photo=True)
         grids.append(grid)
     if count > 1:
         figure.show_in_turn(grids, times)
     if captions:
         _captions(figure, captions, times, width - gap, 20)
+    return figure
+
+
+def points(series: Mapping[str, Sequence[tuple[float, float]]], *, x_label: str, y_label: str,
+           joined: bool = True, moved: Mapping[str, Sequence[tuple[float, float]]] | None = None,
+           captions: Sequence[str] = (), log_x: bool = False, log_y: bool = False, width: float = WIDE,
+           height: float = 300, seconds: float = 8.0) -> Figure:
+    """Dots, one series per entry of `series`, the first in the accent color and the others neutral, as
+    `curve` colors them. Joined, each series is a line through its dots in order, named beside its last
+    dot, dashed past the third, and the series appear one after another. Not joined, the dots are a
+    scatter with the names in a legend; with `moved`, each dot then slides to its place there, and
+    `captions` name the two pictures. With `log_x` or `log_y` that axis is logarithmic."""
+    figure = Figure(width, height, seconds=seconds, label=f"{y_label} against {x_label}")
+    names = list(series)
+    left, bottom, top = 56, 48, 34 if joined else 58
+    right = 20 + 0.6 * SMALL * max(len(name) for name in names) if joined else 20
+    values = {name: np.asarray(dots, float).reshape(-1, 2) for name, dots in series.items()}
+    targets = {name: np.asarray(moved[name], float).reshape(-1, 2) for name in names} if moved else {}
+    every = np.concatenate([*values.values(), *targets.values()])
+    scale = [np.log10 if log else (lambda v: v) for log in (log_x, log_y)]
+    low = [scale[k](every[:, k].min()) for k in (0, 1)]
+    high = [scale[k](every[:, k].max()) for k in (0, 1)]
+    for k in (0, 1):
+        pad = (high[k] - low[k]) * 0.06 or 0.5
+        low[k], high[k] = low[k] - pad, high[k] + pad
+
+    def at(x: float, y: float) -> tuple[float, float]:
+        u = (scale[0](x) - low[0]) / (high[0] - low[0])
+        v = (scale[1](y) - low[1]) / (high[1] - low[1])
+        return left + (width - left - right) * u, height - bottom - (height - top - bottom) * v
+
+    def ticks(k: int) -> np.ndarray:
+        if not (log_x, log_y)[k]:
+            return _ticks(low[k], high[k])
+        # Powers of ten, or 1, 2 and 5 times them where the axis spans less than two decades.
+        decades = np.arange(np.floor(low[k]), np.ceil(high[k]) + 1)
+        steps = (1.0,) if high[k] - low[k] >= 2 else (1.0, 2.0, 5.0)
+        marks = np.array([m * 10.0 ** d for d in decades for m in steps])
+        return marks[(np.log10(marks) >= low[k]) & (np.log10(marks) <= high[k])]
+
+    for tick in ticks(1):
+        _, tick_y = at(every[0, 0], tick)
+        figure.line(left, tick_y, width - right, tick_y, color="rule", width=1)
+        figure.text(left - 8, tick_y + 5, f"{tick + 0:g}", size=SMALL, color="muted", anchor="end")
+    for tick in ticks(0):
+        tick_x, _ = at(tick, every[0, 1])
+        figure.text(tick_x, height - bottom + 20, f"{tick + 0:g}", size=SMALL, color="muted", anchor="middle")
+    figure.text((left + width - right) / 2, height - 6, x_label, size=TEXT, color="muted", anchor="middle")
+    figure.text(left, 20, y_label, size=TEXT, color="muted")
+    colors: tuple[Role, ...] = ("accent", "text", "muted")
+    legend_x = left
+    for index, (name, dots) in enumerate(values.items()):
+        color = colors[index % len(colors)]
+        placed = [at(x, y) for x, y in dots]
+        if not joined:
+            figure.circle(legend_x + 5, 40, 5, fill=color)
+            figure.text(legend_x + 15, 45, name, size=SMALL, color=color)
+            legend_x += 30 + 0.6 * SMALL * len(name)
+            for (x, y), (to_x, to_y) in zip(placed, [at(*dot) for dot in targets.get(name, dots)],
+                                            strict=True):
+                dot = figure.circle(x, y, 3.5, fill=color)
+                if moved:
+                    figure.animate(dot, {seconds * 0.15: {"transform": "translate(0px,0px)"},
+                                         seconds * 0.55: {"transform": f"translate({to_x - x:.1f}px,"
+                                                                       f"{to_y - y:.1f}px)"}})
+            continue
+        with figure.group() as group:
+            figure.polyline(placed, color=color, width=1.25, dash="5 4" if index >= len(colors) else None)
+            for x, y in placed:
+                figure.circle(x, y, 4.5, fill=color)
+            end_x, end_y = placed[-1]
+            figure.text(end_x + 9, end_y + 5, name, size=SMALL, color=color)
+        figure.appear(group, 0.4 + index * min(0.6, seconds * 0.5 / len(values)))
+    if captions:
+        _captions(figure, captions, [0.0, seconds * 0.35][:len(captions)], width - right, 20)
     return figure
 
 

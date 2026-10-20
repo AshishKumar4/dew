@@ -27,15 +27,19 @@ from dew.data.analysis import (
     _at,
     _cache_manifest,
     _capabilities,
+    _configured,
     _cut,
     _identity,
     _leaves,
     _Lowering,
     _manifest,
+    _member_keys,
+    _members,
     _name,
     _preferred_read,
     _promoted,
     _Ran,
+    _stated,
     _steps,
     _until,
     _written,
@@ -60,7 +64,6 @@ from dew.data.pipeline import (
     Artifact,
     Batched,
     BatchStage,
-    Bound,
     Configured,
     Dataset,
     DeviceStep,
@@ -86,7 +89,6 @@ from dew.data.pipeline import (
     Shuffle,
     SingleReader,
     Slice,
-    Stage,
     TokenBudget,
     TokenGeometry,
     Volatile,
@@ -94,7 +96,7 @@ from dew.data.pipeline import (
     Workers,
     _declares_rejects,
 )
-from dew.data.plan import Plan, StepIdentity, fingerprint
+from dew.data.plan import Plan, StepIdentity, fingerprint, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
 from dew.data.steps.generic import Coordinated
@@ -110,12 +112,17 @@ class _OrderFacts(Protocol):
 
 
 def _cache_references(pipeline: Pipeline, read: Read) -> tuple[str, ...]:
-    return tuple(
-        stage.cache.reference(_cache_manifest(source, leaf.stages[:index], read))
-        for leaf, source in _leaves(pipeline)
-        for index, stage in enumerate(leaf.stages)
-        if isinstance(stage, Artifact)
-    )
+    """The caches each corpus of `pipeline` reads through, among its stages as its pipeline wrote
+    them (`_written`), the ones a memory read already ran included, each named against the source
+    it came from."""
+    references = []
+    for leaf, source in _leaves(pipeline):
+        stages, written = _written(source, leaf.stages), source
+        while isinstance(written, _Memory):
+            written = written.original
+        references += [stage.cache.reference(_cache_manifest(written, stages[:index], read))
+                       for index, stage in enumerate(stages) if isinstance(stage, Artifact)]
+    return tuple(references)
 
 
 @dataclasses.dataclass(eq=False)
@@ -193,9 +200,9 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
         if isinstance(source, _Facts):
             return source
         source = _consumed(source, read)
-        # A source may measure a fact as it reads (a prompt's reward bound), so the facts follow the read.
-        held = _PinnedRead(source.records(read)) if read == "memory" else None
-        return _Facts(source, read, source.fingerprint(), source.metadata(), held)
+        records, metadata = _stated(source, read)
+        held = None if records is None else _PinnedRead(records)
+        return _Facts(source, read, source.fingerprint(), metadata, held)
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
         pinned = dict(zip(sources, readers.map(pin, sources.values()), strict=True))
@@ -227,46 +234,6 @@ def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
                         "mixed corpora must share the tokenizer contract"
                     )
                 declared[key] = value
-
-
-def _configured(
-    pipeline: Pipeline,
-    shared: Mapping[str, object],
-    read: Read,
-    scope: Literal["source", "run"] | None = None,
-) -> Pipeline:
-    source = pipeline.source
-    if isinstance(source, (Mixture, Phases)):
-        children = tuple(_configured(child, shared, read, scope) for child in source.pipelines)
-        source = dataclasses.replace(source, pipelines=children)
-        local = shared
-    else:
-        local = source.metadata()
-    stages: list[Stage] = []
-    for stage in pipeline.stages:
-        if not isinstance(stage, Configured) or (scope is not None and stage.scope != scope):
-            stages.append(stage)
-            continue
-        metadata = shared if stage.scope == "run" else local
-        missing = sorted(set(stage.needs) - metadata.keys())
-        if missing:
-            raise ValueError(
-                f"{_name(pipeline)} step {_identity(stage).name} needs metadata {missing}; "
-                "provide producer metadata, recipe fields or read='memory'"
-            )
-        binding = Bound(stage, {key: metadata[key] for key in stage.needs})
-        resolved = stage.factory(metadata)
-        if isinstance(resolved, pygrain.RandomMapTransform) != stage.random:
-            raise ValueError(
-                f"Configured {_identity(stage).name} random={stage.random} disagrees with its step"
-            )
-        if isinstance(resolved, Expansion):
-            stages.append(FlatMap(resolved, configured=binding))
-        elif isinstance(resolved, pygrain.RandomMapTransform):
-            stages.append(RandomMap(resolved, rejects=_declares_rejects(resolved), configured=binding))
-        else:
-            stages.append(Map(resolved, rejects=_declares_rejects(resolved), configured=binding))
-    return dataclasses.replace(pipeline, source=source, stages=tuple(stages))
 
 
 def _row_tokens(pipeline: Pipeline) -> int | None:
@@ -314,6 +281,60 @@ def _windowed(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
     for step in objective.packed:
         windows = windows.map(step)
     return dataclasses.replace(windows, stages=(*windows.stages, *pipeline.stages[at:]))
+
+
+_KEYED_ABOVE = (Map, RandomMap, Filter, BatchStage, Prefetch, Workers, Repeat, Limit, Slice, MapBatch)
+"""The stages above a streamed mix that hold none of its rows across a saved position, so the mix's
+members may be restored by key beneath them: a shuffle's window, a packer's remainder or an
+expansion's tail holds rows of the mix that saved them."""
+
+
+def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) -> dict[str, str]:
+    """What each member of a streamed mix reads and makes, as one digest under its key
+    (`_member_keys`): its order, sources, steps with their code and dependencies, the facts its
+    order rests on and its caches; and under the empty key the same of the mixture's own stages
+    and the compile's host steps. A saved position of the mix keeps each member by its key, so a
+    resume takes a member joining or leaving and compares the others member by member
+    (`dew.data.plan.Plan.check`). Nothing where a resume cannot: a pipeline that mixes nothing, a
+    global order, or a mix beneath a stage that holds its rows (`_KEYED_ABOVE`).
+
+    Each member is read in `train`, the tree the plan's lowering describes (`build`), which a
+    memory read made of the written pipeline and which holds no member that accepted no row; its
+    caches are those of each of its corpora's stages as its pipeline wrote them (`_written`), the
+    ones a memory read already ran among them."""
+    source = train.source
+    if (not isinstance(source, Mixture) or build.global_order
+            or not all(isinstance(stage, _KEYED_ABOVE) for stage in train.stages)):
+        return {}
+
+    def read_of(read: Source) -> Source:
+        while isinstance(read, _Memory):
+            read = read.original
+        return read
+
+    def steps(identities: Sequence[StepIdentity]) -> JSON:
+        return [{**step.semantic(), "modules": list(step.modules)} for step in identities]
+
+    corpora = build.lowering.order["corpora"]
+    if not isinstance(corpora, list):
+        raise TypeError("a mixture's order holds its corpora's orders as a list")
+    members = {"": fingerprint({"steps": steps([*(_identity(stage) for stage in train.stages
+                                                  if not isinstance(stage, (Workers, Prefetch))),
+                                                *(StepIdentity.of(step) for step in host)])})}
+    for index, (key, child) in enumerate(zip(_member_keys(_members(source.pipelines)), source.pipelines,
+                                             strict=True)):
+        sources = [read for _, read in _leaves(child)]
+        identities = [*(_identity(stage) for read in sources for stage in _written(read, ())),
+                      *(_identity(stage) for stage in _steps(child)
+                        if not isinstance(stage, (Workers, Prefetch)))]
+        members[key] = fingerprint({
+            "order": unplaced(json_value(corpora[index], "member order")),
+            "sources": [read_of(read).fingerprint() for read in sources],
+            "steps": steps(identities),
+            "derived": dict(_derived(child, build.child(index))),
+            "cache": list(_cache_references(child, build.read)),
+        })
+    return members
 
 
 def _derived(pipeline: Pipeline, build: _Build) -> Mapping[str, str]:
@@ -545,6 +566,7 @@ def _compiled(
         {"read": read, "seed": seed, **build.lowering.order},
         _derived(train, build),
         cache=_cache_references(original, read),
+        members=_member_manifests(train, build, host),
         volatile=any(
             isinstance(stage.step, Volatile) and stage.step.volatile
             for stage in (*_steps(original), *(stage for source in sources for stage in _written(source, ())))
@@ -1085,8 +1107,12 @@ def publish(
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
 ):
-    """Fill and seal a deterministic prefix, then publish its certified generation."""
+    """Fill and seal a deterministic prefix, then publish its certified
+    generation, unless one is already published under its key (with the plan
+    of a terminal pack), which it returns."""
     from dew.data.cache import Cache
+    from dew.data.generation import Generation
+    from dew.data.packing import PackingPlan, plan_name
 
     if not isinstance(cache, Cache):
         raise TypeError("publish needs a Cache destination")
@@ -1095,8 +1121,6 @@ def publish(
     planned = _at(pipeline.stages, Pack)
     builder = None
     if planned is not None:
-        from dew.data.packing import PackingPlan
-
         packing = pipeline.stages[planned]
         if not isinstance(packing, Pack) or planned != len(pipeline.stages) - 1:
             raise ValueError("publication accepts one terminal packing stage after the cached prefix")
@@ -1106,12 +1130,23 @@ def publish(
     source = pipeline.source
     if isinstance(source, (Mixture, Phases)):
         raise ValueError("configured publication needs one physical source")
-    cached = pipeline.cache(cache)
     manifest = _cache_manifest(source, pipeline.stages, read)
-    iterator = iter(iterate(cached, read=read, loading=loading))
+
+    def published() -> Generation | None:
+        generation = cache.generation(manifest)
+        held = generation is not None and (
+            builder is None or plan_name(builder.pack, "accepted") in generation.manifest["plan"])
+        return generation if held else None
+
+    found = published()
+    if found is not None:
+        return found
+    iterator = iter(iterate(pipeline.cache(cache), read=read, loading=loading))
     try:
         for _ in iterator:
             pass
     finally:
         iterator.close()
-    return cache.publish(manifest, source, plan=builder)
+    # A fill one reader completed publishes itself (`Cache.mapped`).
+    found = published()
+    return cache.publish(manifest, source, plan=builder) if found is None else found

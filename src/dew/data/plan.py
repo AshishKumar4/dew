@@ -73,6 +73,8 @@ class StepIdentity:
 
     @classmethod
     def of(cls, step: object, identity: str | None = None, *, cache: bool = False) -> StepIdentity:
+        """`step`'s identity, refused where a cache keys it (`cache`) and
+        cannot (`keyable`)."""
         kind = step if inspect.isfunction(step) else type(step)
         module = kind.__module__
         name = f"{module}.{kind.__qualname__}"
@@ -82,10 +84,6 @@ class StepIdentity:
         unstable = any(marker in name or marker in config for marker in ("<lambda>", "<locals>", " at 0x"))
         exact = bool(declared) or (not unstable and (frozen or inspect.isfunction(step)))
         external = not module.startswith("dew.")
-        if cache and (
-            not exact or (external and declared is None) or (inspect.isfunction(step) and declared is None)
-        ):
-            raise ValueError(f"cache prefix step {name} needs identity='name@version'")
         path = (
             None if inspect.isbuiltin(step) or kind.__module__ == "builtins" else inspect.getsourcefile(kind)
         )
@@ -104,7 +102,16 @@ class StepIdentity:
         )
         if dependencies and dataclasses.is_dataclass(step) and not isinstance(step, type):
             config = json.dumps(_configuration(step), sort_keys=True)
-        return cls(name, config, exact, modules, declared, dependencies)
+        named = cls(name, config, exact, modules, declared, dependencies)
+        if cache and not named.keyable(function=inspect.isfunction(step), external=external):
+            raise ValueError(f"cache prefix step {name} needs identity='name@version'")
+        return named
+
+    def keyable(self, *, function: bool, external: bool) -> bool:
+        """Whether a cache can key what the step computes: a stable identity,
+        declared wherever the step is a function or its code is outside Dew,
+        which Dew's revision does not name."""
+        return self.exact and not ((external or function) and self.declared is None)
 
     def semantic(self) -> dict[str, JSON]:
         """What the step computes, on any host: its identity without its
@@ -161,6 +168,36 @@ _ENVIRONMENT = ("revision", "lock", "python", "platform", "clean")
 def _changed(saved: Mapping[str, object], current: Mapping[str, object]) -> tuple[str, ...]:
     """The fields of a saved record that `current` does not repeat."""
     return tuple(name for name in sorted(set(saved) | set(current)) if saved.get(name) != current.get(name))
+
+
+def _identities(value: object) -> list[dict[str, JSON]]:
+    if not isinstance(value, list):
+        raise ValueError(f"{value!r}: a manifest's steps are a list of step identities")
+    return [{name: json_value(entry, name) for name, entry in record(step, "step").items()} for step in value]
+
+
+def _semantic(recorded: Mapping[str, object]) -> dict[str, JSON]:
+    """What the rows a manifest's record (`Manifest.record`) names are, on
+    any host: the pinned sources, each step's identity and dependencies
+    (`StepIdentity.semantic`), the tokenizers and the fill."""
+    return {
+        name: [{key: entry for key, entry in step.items() if key != "modules"} for step in _identities(value)]
+        if name == "steps" else json_value(value, name)
+        for name, value in recorded.items()
+        if name not in (*_ENVIRONMENT, "ran")
+    }
+
+
+def _environment(recorded: Mapping[str, object]) -> dict[str, JSON]:
+    """The code and machine that ran a manifest's steps, from its record:
+    Dew's revision and lock, the interpreter, the platform and each external
+    module's bytes, for the steps a memory read ran and then the plan's own.
+    A step states a change to what it computes in its configuration or
+    declared identity; its modules' bytes change with any edit to their
+    files, as Dew's revision does with any edit to Dew."""
+    steps = (*_identities(recorded["ran"]), *_identities(recorded["steps"]))
+    return {**{name: json_value(recorded[name], name) for name in _ENVIRONMENT},
+            "modules": [step["modules"] for step in steps]}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -262,25 +299,10 @@ class Manifest:
         return recorded
 
     def semantic(self) -> dict[str, JSON]:
-        """What the rows are, on any host: the pinned sources, each step's
-        identity and dependencies (`StepIdentity.semantic`), the tokenizers
-        and the fill."""
-        recorded = self.record()
-        recorded["steps"] = [step.semantic() for step in self.steps]
-        return {name: value for name, value in recorded.items() if name not in (*_ENVIRONMENT, "ran")}
+        return _semantic(self.record())
 
     def environment(self) -> dict[str, JSON]:
-        """The code and machine that ran the steps: Dew's revision and lock,
-        the interpreter, the platform and each external module's bytes, for
-        the steps a memory read ran and then the plan's own. A step states a
-        change to what it computes in its configuration or declared identity;
-        its modules' bytes change with any edit to their files, as Dew's
-        revision does with any edit to Dew."""
-        recorded = self.record()
-        return {
-            **{name: recorded[name] for name in _ENVIRONMENT},
-            "modules": [list(step.modules) for step in (*self.ran, *self.steps)],
-        }
+        return _environment(self.record())
 
     @property
     def canonical(self) -> bytes:
@@ -309,16 +331,16 @@ def same_order(saved: str, current: str) -> bool:
     """Whether two orders, as a saved position and a stream state them in JSON, are one order:
     compared without their sources' descriptions, which name where a host mounted them, as a
     pool compares its processes' orders (`Plan.identity`)."""
-    return _unplaced(json.loads(saved)) == _unplaced(json.loads(current))
+    return unplaced(json.loads(saved)) == unplaced(json.loads(current))
 
 
-def _unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
+def unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
     """`order` without its sources' descriptions, which name where a host
     mounted them, its corpora's and phases' included."""
     if isinstance(order, dict):
-        return {name: _unplaced(value) for name, value in order.items() if name != "source"}
+        return {name: unplaced(value) for name, value in order.items() if name != "source"}
     if isinstance(order, list):
-        return [_unplaced(value) for value in order]
+        return [unplaced(value) for value in order]
     return order
 
 
@@ -327,15 +349,8 @@ class Plan:
     """Order-defining fields checked before a restored iterator opens readers.
 
     `version` names how Dew reads a plan into rows, which its fields do not say: a change that
-    makes other rows or draws from the same plan raises it, so a position saved before the change
-    is refused. Version 2 keys each random step by its place in what the run wrote
-    (`dew.data.lowering._Build.stage_seed`), runs a global order's stages after its batch by index
-    and resumes a count inside a batch past that batch's first rows, in the batches' final order.
-    Version 3 keys a mixture member's draws by the name it goes by, or an unnamed one's place among
-    the unnamed, rather than its place among all the members (`dew.data.lowering._member_key`), so
-    a named member joining or leaving leaves the others' draws as they were, and records those
-    names in the order (`dew.data.analysis._members`), so a position is refused where a member was
-    renamed, joined or left."""
+    makes other rows or draws from the same plan raises it, and a position saved under another
+    version is refused."""
 
     lowering: Literal["global", "per-share"]
     manifest: Manifest
@@ -345,7 +360,11 @@ class Plan:
     rejections: Literal["drop", "mask"] = "drop"
     cache: tuple[str, ...] = ()
     volatile: bool = False
-    version: ClassVar[int] = 3
+    members: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    """A mixture's members, each what it reads and runs as one digest under its key, and its own
+    stages under the empty key (`dew.data.analysis._member_manifests`): what a streamed mix's
+    resume reads of a member that joined or left (`check`)."""
+    version: ClassVar[int] = 4
 
     def record(self) -> dict[str, JSON]:
         return {
@@ -359,6 +378,7 @@ class Plan:
             "rejections": self.rejections,
             "cache": list(self.cache),
             "volatile": self.volatile,
+            "members": json_value(self.members, "members"),
             "exact": self.manifest.exact,
         }
 
@@ -369,7 +389,7 @@ class Plan:
         which part differs. The order's sources are named by the manifest's
         content, not by their descriptions: hosts that mount one dataset at
         different paths read the same records."""
-        order = _unplaced(json_value(self.order, "order"))
+        order = unplaced(json_value(self.order, "order"))
         return f"{json.dumps(order, sort_keys=True)} under plan {json.dumps(self.parts(), sort_keys=True)}"
 
     def parts(self) -> dict[str, JSON]:
@@ -405,31 +425,73 @@ class Plan:
             raise ValueError(
                 "data plan contains a step without stable identity; resume='non-exact' is required"
             )
+        edited = self._edited_members(saved)
+        # A mix whose members changed is compared member by member (`_edited_members`): each kept
+        # member's order, sources, steps, facts and caches are its digest's, and the rest is the
+        # mixture's.
+        member_scoped = () if edited is None else ("cache",)
         for name in ("lowering", "rejections", "cache", "volatile"):
-            if current[name] != saved.get(name):
+            if name not in member_scoped and current[name] != saved.get(name):
                 raise ValueError(f"saved data plan {name} changed: {saved.get(name)!r} -> {current[name]!r}")
         # An order is the same wherever its sources are mounted (`same_order`).
-        if _unplaced(json_value(saved.get("order"), "saved order")) != _unplaced(current["order"]):
+        saved_order = unplaced(json_value(saved.get("order"), "saved order"))
+        if edited is None and saved_order != unplaced(current["order"]):
             raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> {current['order']!r}")
         previous = record(saved.get("derived", {}), "saved derived order")
-        for name in sorted(set(previous) | set(self.derived)):
+        for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
             if previous.get(name) != self.derived.get(name):
                 raise ValueError(f"saved data plan derived order {name} changed")
         if self.lowering == "per-share" and current["topology"] != saved.get("topology"):
             raise ValueError("saved per-share data plan topology changed (shares, workers or cycle length)")
         changed = _changed(record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic())
+        if edited is not None:
+            changed = tuple(name for name in changed if name not in ("source", "steps", "tokenizer"))
         if changed:
             raise ValueError(
                 f"saved data plan {', '.join(changed)} changed, so the records the saved position counts "
                 "are not this run's; resume with the sources, steps and tokenizers that wrote it"
             )
-        changes = _changed(
-            record(saved.get("environment"), "saved data environment"), self.manifest.environment()
-        )
+        environment = self.manifest.environment()
+        saved_environment = record(saved.get("environment"), "saved data environment")
+        if edited is not None:
+            environment = {name: value for name, value in environment.items() if name != "modules"}
+            saved_environment = {name: value for name, value in saved_environment.items()
+                                 if name != "modules"}
+        changes = _changed(saved_environment, environment)
         if changes and self.lowering == "per-share":
             raise ValueError(f"saved per-share data environment changed: {', '.join(changes)}")
         if changes:
             _log.warning("data environment changed under an unchanged plan: %s", ", ".join(changes))
         if self.volatile:
             _log.warning("resuming volatile data; fetched outcomes may differ")
-        return changes
+        if edited:
+            _log.warning("resuming a mixture whose members changed: %s", ", ".join(edited))
+        return changes + (edited or ())
+
+    def _edited_members(self, saved: Mapping[str, object]) -> tuple[str, ...] | None:
+        """How a streamed mix's members changed from `saved`'s, which a resume takes: members that
+        joined, which start, members that left, which are dropped, and weights that changed; None
+        where the members and weights are as they were, or the plan keeps no members by key
+        (`dew.data.compile._member_manifests`), whose order is compared whole. Refused where a
+        member kept by both changed what it reads or makes, or where the mixture's own stages, the
+        compile's host steps or the rest of the order changed."""
+        members = record(saved.get("members", {}), "saved members")
+        before = {name: str(value) for name, value in members.items()}
+        order = json_value(saved.get("order"), "saved order")
+        if (self.lowering != "per-share" or not before or not self.members or not isinstance(order, dict)
+                or (before == dict(self.members) and order.get("weights") == self.order.get("weights"))):
+            return None
+        if before.get("") != self.members.get(""):
+            raise ValueError("saved data plan mixture stages changed")
+        kept = (set(before) & set(self.members)) - {""}
+        for key in sorted(kept):
+            if before[key] != self.members[key]:
+                raise ValueError(f"saved data plan member {key} changed what it reads or runs")
+        mixture = ("corpora", "members", "weights")
+        current = {name: json_value(value, name) for name, value in self.order.items() if name not in mixture}
+        before_order = {name: value for name, value in order.items() if name not in mixture}
+        if unplaced(before_order) != unplaced(current):
+            raise ValueError(f"saved data plan order changed: {order!r} -> {self.order!r}")
+        return (*(f"member {key} joined" for key in sorted(set(self.members) - set(before))),
+                *(f"member {key} left" for key in sorted(set(before) - set(self.members))),
+                *(("weights changed",) if order.get("weights") != self.order.get("weights") else ()))
