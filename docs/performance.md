@@ -1988,9 +1988,9 @@ is ahead on each of the three seeds, by 0.016, 0.020 and 0.017. Raising the
 learning rate from each arm's best to 1e-2 costs Muon 0.028 (3.3 times its
 best rate) and AdamW 0.116 (10 times its best rate).
 
-These numbers say nothing about 0.4B parameters. That is the run section 4.9
-of `docs/design/plan.md` asks for, and it needs a v5e-16. The wall-clock
-times are not comparable either, because the runs shared a machine.
+These numbers say nothing about 0.4B parameters. The proposed 0.4B run
+would need a v5e-16; further measurements belong in the [roadmap](roadmap.md).
+The wall-clock times are not comparable either, because the runs shared a machine.
 
 ## Quantized training on the RTX 4080
 

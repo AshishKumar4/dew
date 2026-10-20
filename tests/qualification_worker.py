@@ -27,6 +27,7 @@ from dew.checkpoints import Checkpoints
 from dew.config.data import TextData, loader
 from dew.data import Loading
 from dew.data.dataset import DataPartition, GlobalStream
+from dew.files import write_atomically
 from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -107,7 +108,8 @@ def run(directory: Path, mode: str) -> None:
             if mode == "interrupted" and step == INTERRUPT_STEP:
                 checkpoints.wait()
                 assert checkpoints.latest == CHECKPOINT_STEP, "the interruption missed its checkpoint"
-                (directory / "ready-to-kill").write_text(str(os.getpid()))
+                # Whole or absent: the test polls for the file and reads it at once.
+                write_atomically(directory / "ready-to-kill", str(os.getpid()))
                 threading.Event().wait()
 
     source = Pretrained.load(directory / "source", dtype="float32", attention_impl="xla")

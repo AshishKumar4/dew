@@ -180,7 +180,6 @@ def test_other_names_are_refused_before_reading_a_source(name):
 @pytest.mark.parametrize("version", [None, "1.0.0"])
 def test_named_tfds_reads_the_prepared_fixture_and_refuses_an_oversized_holdout(tmp_path, monkeypatch,
                                                                            version):
-    pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     directory = tmp_path / "cache" / "dew" / "tfds" / "dew_images" / "1.0.0"
     shutil.copytree(FIXTURES / "tfds" / "dew_images" / "1.0.0", directory)

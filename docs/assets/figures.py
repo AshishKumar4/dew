@@ -627,6 +627,148 @@ def rlvr_kl_figure():
     svg.save(HERE / "rlvr-kl.svg")
 
 
+def lm_next_token_figure():
+    """Next-token prediction on one sentence: at each position the model reads the tokens so far, scores
+    every possible next token, and training pushes up the one that actually came next."""
+    sentence = ["Plants", "need", "light", "to", "grow"]
+    # Four candidates at each position, the true next token first, with a model's probabilities before and
+    # after training: made up for the drawing, shaped like a small model's.
+    candidates = [(["need", "are", "and", "can"], [0.18, 0.34, 0.27, 0.21], [0.58, 0.18, 0.12, 0.12]),
+                  (["light", "water", "to", "the"], [0.22, 0.31, 0.27, 0.20], [0.52, 0.30, 0.10, 0.08]),
+                  (["to", "and", "for", "."], [0.24, 0.30, 0.19, 0.27], [0.61, 0.17, 0.12, 0.10]),
+                  (["grow", "live", "make", "be"], [0.20, 0.25, 0.22, 0.33], [0.66, 0.14, 0.08, 0.12])]
+    width, height = 440, 330
+    box_w, gap, left, row_y = 70, 8, 24, 52
+    svg = Figure(width, height, seconds=12, label="Next-token prediction on 'Plants need light to grow'. At "
+                 "each position the model reads the tokens so far and scores the candidates for the next one; "
+                 "training pushes up the token that actually came next.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    svg.text(24, 30, "the model reads the tokens so far", size=13, color="muted")
+    for j, token in enumerate(sentence):
+        x = left + j * (box_w + gap)
+        svg.rect(x, row_y, box_w, 30, fill="raised", stroke="rule", rx=5)
+        svg.text(x + box_w / 2, row_y + 20, token, size=14, mono=True, anchor="middle", color="muted")
+    times = [0.4 + 2.2 * i for i in range(len(candidates))]
+    windows, targets, panels = [], [], []
+    floor, tall, bar_w = 290, 130, 56
+    for i, (names, before, after) in enumerate(candidates):
+        with svg.group() as window:
+            svg.rect(left - 3, row_y - 3, (i + 1) * (box_w + gap) - gap + 6, 36, fill="none", stroke="accent",
+                     rx=7, width=2)
+        windows.append(window)
+        with svg.group() as target:
+            x = left + (i + 1) * (box_w + gap)
+            svg.rect(x, row_y, box_w, 30, fill="accent_fill", stroke="none", rx=5)
+            svg.text(x + box_w / 2, row_y + 20, sentence[i + 1], size=14, mono=True, anchor="middle",
+                     weight=600)
+            svg.text(x + box_w / 2, row_y + 52, "next?", size=12, color="accent", anchor="middle")
+        targets.append(target)
+        with svg.group() as panel:
+            svg.text(24, 132, "P(next token)", size=13, color="muted")
+            svg.line(24, floor, width - 24, floor, color="rule")
+            for k, (name, low, high) in enumerate(zip(names, before, after)):
+                x = 40 + k * 96
+                bar = svg.rect(x, floor - tall, bar_w, tall, fill="accent" if k == 0 else "tint1", stroke="none",
+                               rx=3)
+                start = times[i] + 0.5
+                svg.animate(bar, {start: {"transform": f"scaleY({low:.2f})"},
+                                  start + 1.0: {"transform": f"scaleY({high:.2f})"}}, origin="50% 100%")
+                svg.text(x + bar_w / 2, floor + 22, name, size=14, mono=True, anchor="middle",
+                         color="text" if k == 0 else "muted")
+        panels.append(panel)
+    svg.show_in_turn(windows, times)
+    svg.show_in_turn(targets, times)
+    svg.show_in_turn(panels, times)
+    svg.appear(svg.text(width - 24, 132, "training pushes the true one up", size=13, color="accent",
+                        anchor="end"), 1.4)
+    svg.save(HERE / "lm-next-token.svg")
+
+
+def pretrained_round_trip_figure():
+    """The round trip of a pretrained decoder: load a Hugging Face checkpoint into Dew, check it against
+    transformers, train it, export it, and read the export back with transformers."""
+    width, height = 440, 300
+    svg = Figure(width, height, seconds=12, label="The round trip. A Hugging Face checkpoint loads into Dew, "
+                 "Dew's next-token probabilities match transformers', Dew trains it on Python code, and the "
+                 "export loads back into transformers with the same prediction.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+
+    def station(x, y, title, lines, stroke):
+        svg.rect(x, y, 150, 74, fill="raised", stroke=stroke, rx=8)
+        svg.text(x + 12, y + 24, title, size=14, weight=600)
+        for k, line in enumerate(lines):
+            svg.text(x + 12, y + 44 + 17 * k, line, size=12, mono=True, color="muted")
+
+    station(20, 30, "Hugging Face", ["config.json", "model.safetensors"], "rule")
+    with svg.group() as loaded:
+        svg.arrow(172, 67, 266, 67)
+        svg.text(219, 58, "load", size=13, color="muted", anchor="middle")
+        station(270, 30, "Dew", ["CausalTransformer", "params tree"], "accent")
+    svg.appear(loaded, 0.6)
+    with svg.group() as compared:
+        svg.text(345, 126, "same P(next token)", size=12, color="accent", anchor="middle")
+        svg.text(345, 142, "as transformers", size=12, color="accent", anchor="middle")
+    svg.appear(compared, 2.0)
+    with svg.group() as trained:
+        svg.arrow(345, 150, 345, 192)
+        svg.text(335, 176, "train on Python", size=13, color="muted", anchor="end")
+        station(270, 196, "Dew, trained", ["lower perplexity", "on held-out code"], "accent")
+    svg.appear(trained, 3.4)
+    with svg.group() as exported:
+        svg.arrow(268, 233, 174, 233)
+        svg.text(221, 224, "export", size=13, color="muted", anchor="middle")
+        station(20, 196, "Hugging Face", ["config.json", "model.safetensors"], "rule")
+    svg.appear(exported, 4.8)
+    with svg.group() as read:
+        svg.arrow(95, 192, 95, 108)
+        svg.text(105, 140, "transformers", size=13, color="muted")
+        svg.text(105, 156, "reads it back:", size=13, color="muted")
+        svg.text(105, 172, "same next token", size=13, color="accent", weight=600)
+    svg.appear(read, 6.2)
+    svg.save(HERE / "pretrained-round-trip.svg")
+
+
+def sft_mask_figure():
+    """One conversation through a chat template: the messages, the tokens the template writes with each
+    one's role, and the loss mask, 1 on the assistant's reply and its closing marker."""
+    width, height = 440, 336
+    svg = Figure(width, height, seconds=11, label="A conversation through the chat template. The user's "
+                 "question and the assistant's reply become one row of tokens with their roles, and the loss "
+                 "mask is 1 only on the reply and its end-of-turn marker.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    svg.text(20, 30, "messages", size=13, color="muted")
+    svg.rect(20, 40, 196, 30, fill="tint1", stroke="none", rx=6)
+    svg.text(30, 60, "user: Why is the sky blue?", size=12)
+    svg.rect(226, 40, 196, 30, fill="accent_fill", stroke="none", rx=6)
+    svg.text(236, 60, "assistant: Light scatters.", size=12)
+    rows = [("<|im_start|>", "none"), ("user", "none"), ("Why", "tint1"), ("is", "tint1"), ("the", "tint1"),
+            ("sky", "tint1"), ("blue", "tint1"), ("?", "tint1"), ("<|im_end|>", "none"),
+            ("<|im_start|>", "none"), ("assistant", "none"), ("Light", "accent_fill"),
+            ("scatters", "accent_fill"), (".", "accent_fill"), ("<|im_end|>", "accent_fill")]
+    x, y, line = 20, 112, 0
+    svg.text(20, 100, "tokens the template writes, and the loss mask m under each", size=13, color="muted")
+    placed = []
+    for k, (token, fill) in enumerate(rows):
+        w = 12 + 7.2 * len(token)
+        if x + w > width - 20:
+            x, line = 20, line + 1
+        top = y + line * 66
+        with svg.group() as box:
+            svg.rect(x, top, w, 26, fill=fill, stroke="rule" if fill == "none" else "none", rx=4)
+            svg.text(x + w / 2, top + 18, token, size=12, mono=True, anchor="middle",
+                     color="muted" if fill == "none" else "text")
+        svg.appear(box, 0.6 + 0.12 * k)
+        placed.append((x, top, w, fill == "accent_fill"))
+        x += w + 4
+    for k, (bx, top, w, scored) in enumerate(placed):
+        mark = svg.text(bx + w / 2, top + 44, "1" if scored else "0", size=13, mono=True, anchor="middle",
+                        weight=600 if scored else 400, color="accent" if scored else "muted")
+        svg.appear(mark, 3.8 + 0.1 * k)
+    svg.appear(svg.text(width - 20, height - 14, "only the reply is trained", size=13, color="accent",
+                        anchor="end"), 5.6)
+    svg.save(HERE / "sft-mask.svg")
+
+
 # The flower of tutorials/02: a 64 x 64 sample from a model Dew trained on Oxford Flowers, in [-1, 1].
 def flower() -> np.ndarray:
     tile = Image.open(HERE / "gallery/heun.png").convert("RGB").crop((267, 502, 463, 698))
@@ -758,11 +900,11 @@ def edm_noise_figure():
 
 
 def samplers_paths_figure():
-    """Euler and Heun on the probability-flow ODE of a five-point data set, against its exact path.
+    """Euler and Heun on the probability-flow ODE of a five-point data set, against a fine-step reference path.
 
     The data are five points on a circle, like petals, so the denoiser D(x; sigma), the mean of the data
     under the posterior, has a closed form. Both solvers take three steps down EDM's Karras grid (rho = 7)
-    from sigma = 4, along dx / dsigma = (x - D(x; sigma)) / sigma; the exact path takes 2,000 Heun steps.
+    from sigma = 4, along dx / dsigma = (x - D(x; sigma)) / sigma; the reference path takes 2,000 Heun steps.
     """
     petals = np.stack([np.cos(np.linspace(0, 2 * np.pi, 6)[:5] + 0.3),
                        np.sin(np.linspace(0, 2 * np.pi, 6)[:5] + 0.3)], axis=1)
@@ -796,7 +938,7 @@ def samplers_paths_figure():
         return np.array(path)
 
     start = np.array([1.35, 1.86])
-    exact, coarse = heun(start, grid(2000)), grid(3)
+    reference, coarse = heun(start, grid(2000)), grid(3)
     paths = {"Euler, 3 calls": euler(start, coarse), "Heun, 6 calls": heun(start, coarse)}
     width, height = 440, 320
     view_x, view_y, scale = 150, 205, 88
@@ -805,7 +947,7 @@ def samplers_paths_figure():
         return view_x + scale * point[0], view_y - scale * point[1]
 
     svg = Figure(width, height, seconds=11, label="Five data points on a circle and the paths three solvers take "
-                 "to them from the same starting noise: the exact path, Euler in three steps, which stops short "
+                 "to them from the same starting noise: a fine-step reference path, Euler in three steps, which stops short "
                  "between the points, and Heun in three steps, which lands on one.")
     svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
     # The direction the ODE pushes, at a middling noise level, as faint arrows.
@@ -821,7 +963,7 @@ def samplers_paths_figure():
     svg.text(*at(petals[3] + [-0.1, -0.32]), "data", size=13, color="accent")
     svg.circle(*at(start), 5, fill="text")
     svg.text(at(start)[0] + 10, at(start)[1] + 5, "x_T", size=13, mono=True)
-    svg.draw(svg.polyline([at(p) for p in exact], color="muted", width=1.5, dash=None), 0.4, 2.2)
+    svg.draw(svg.polyline([at(p) for p in reference], color="muted", width=1.5, dash=None), 0.4, 2.2)
     styles = (("text", "5 4", 2.6), ("accent", None, 5.6))
     for (name, path), (color, dash, begin) in zip(paths.items(), styles):
         line = svg.polyline([at(p) for p in path], color=color, width=2, dash=dash)
@@ -829,13 +971,90 @@ def samplers_paths_figure():
         for index, point in enumerate(path[1:]):
             svg.appear(svg.circle(*at(point), 4, fill=color), begin + 0.4 * index, 0.2)
     legend_x = 286
-    rows = [("exact path", "muted", None), *((name, color, dash) for name, (color, dash, _) in
+    rows = [("reference path", "muted", None), *((name, color, dash) for name, (color, dash, _) in
                                              zip(paths, styles))]
     for row, (name, color, dash) in enumerate(rows):
         y = 250 + 24 * row
         svg.line(legend_x, y - 5, legend_x + 20, y - 5, color=color, width=2, dash=dash)
         svg.text(legend_x + 28, y, name, size=13, color=color)
     svg.save(HERE / "samplers-paths.svg")
+
+
+def jepa_step_figure():
+    """One I-JEPA step: the context encoder sees part of a flower, the predictor guesses the embeddings of
+    the hidden blocks, and the target encoder, an average of the context encoder's weights, supplies the
+    embeddings to compare with."""
+    x0 = flower()
+    grid, size = 8, 112
+    patch = size / grid
+    rng = np.random.default_rng(3)
+    target = [(r, c) for r in range(1, 4) for c in range(4, 7)]
+    context = [(r, c) for r in range(grid) for c in range(grid)
+               if (r, c) not in target and rng.random() < 0.45]
+    width, height = 440, 330
+    svg = Figure(width, height, seconds=12, label="One I-JEPA step on a flower. The context encoder sees the "
+                 "unmasked patches, the predictor guesses the embeddings of the hidden block, and the target "
+                 "encoder, an average of the context encoder's weights, reads the whole image and gives the "
+                 "embeddings to match.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    ix, iy = 20, 40
+    svg.text(ix, 28, "the image", size=13, color="muted")
+    svg.image(ix, iy, size, pixels(x0), photo=True)
+    with svg.group() as hidden:
+        for r in range(grid):
+            for c in range(grid):
+                if (r, c) not in context and (r, c) not in target:
+                    svg.rect(ix + c * patch, iy + r * patch, patch, patch, fill="surface", stroke="none", rx=0)
+    svg.appear(hidden, 0.6)
+    with svg.group() as block:
+        top_r, left_c = target[0]
+        svg.rect(ix + left_c * patch, iy + top_r * patch, 3 * patch, 3 * patch, fill="surface", stroke="accent",
+                 rx=2, width=2.5)
+        svg.text(ix + (left_c + 1.5) * patch, iy + (top_r + 1.5) * patch + 5, "?", size=16, weight=600,
+                 color="accent", anchor="middle")
+    svg.appear(block, 1.2)
+    svg.appear(svg.text(ix, iy + size + 20, "context, and a hidden block", size=12, color="muted"), 1.2)
+
+    def chips(x, y, fill):
+        for k in range(4):
+            svg.rect(x + k * 16, y, 13, 13, fill=fill, stroke="none", rx=2)
+
+    def box(x, y, w, title, note, stroke):
+        svg.rect(x, y, w, 46, fill="raised", stroke=stroke, rx=7)
+        svg.text(x + w / 2, y + 20, title, size=13, weight=600, anchor="middle")
+        svg.text(x + w / 2, y + 37, note, size=11, color="muted", anchor="middle")
+
+    with svg.group() as encoded:
+        svg.arrow(ix + size + 6, iy + size * 0.7, 168, 228)
+        box(168, 210, 120, "context encoder", "sees the context", "accent")
+    svg.appear(encoded, 2.0)
+    with svg.group() as predicted:
+        svg.arrow(290, 233, 312, 233)
+        box(314, 210, 106, "predictor", "+ block's positions", "accent")
+        svg.arrow(367, 258, 367, 274)
+        chips(335, 280, "accent_fill")
+        svg.text(367, 314, "guess", size=12, color="accent", anchor="middle")
+    svg.appear(predicted, 3.0)
+    with svg.group() as targeted:
+        # The target encoder reads the whole image, unmasked.
+        svg.image(214, 30, 56, pixels(x0), photo=True)
+        svg.text(242, 100, "whole image", size=11, color="muted", anchor="middle")
+        svg.arrow(272, 58, 310, 62)
+        box(314, 46, 106, "target encoder", "sees everything", "rule")
+        svg.arrow(367, 94, 367, 110)
+        chips(335, 116, "tint1")
+        svg.text(367, 150, "target", size=12, color="muted", anchor="middle")
+    svg.appear(targeted, 4.2)
+    with svg.group() as loss:
+        svg.polyline([(401, 122), (428, 122), (428, 286), (401, 286)], color="accent", width=1.5, dash="4 4")
+        svg.text(424, 190, "loss", size=12, color="accent", anchor="end")
+    svg.appear(loss, 5.4)
+    with svg.group() as average:
+        svg.polyline([(228, 210), (228, 176), (296, 176), (296, 84), (312, 84)], color="muted", width=1.25,
+                     dash="2 4")
+        svg.text(236, 168, "average of weights", size=11, color="muted")
+    svg.appear(average, 6.4)
+    svg.save(HERE / "jepa-step.svg")
 
 
 def cfg_step_figure():
@@ -907,7 +1126,9 @@ FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pip
            "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
            "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure, "edm-step": edm_step_figure,
            "edm-noise": edm_noise_figure, "samplers-paths": samplers_paths_figure,
-           "cfg-step": cfg_step_figure, "cfg-sweep": cfg_sweep_figure}
+           "cfg-step": cfg_step_figure, "cfg-sweep": cfg_sweep_figure, "sft-mask": sft_mask_figure,
+           "pretrained-round-trip": pretrained_round_trip_figure, "jepa-step": jepa_step_figure,
+           "lm-next-token": lm_next_token_figure}
 
 
 if __name__ == "__main__":

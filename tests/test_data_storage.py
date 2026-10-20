@@ -389,9 +389,7 @@ def test_gcs_generation_preconditions_are_sent_to_the_json_api():
 
 @pytest.mark.network
 def test_real_r2_conditional_publication_and_bounded_read(tmp_path):
-    root = os.environ.get("DEW_DATA_TEST_URL")
-    if not root:
-        pytest.skip("DEW_DATA_TEST_URL names a writable remote smoke prefix")
+    root = os.environ["DEW_DATA_TEST_URL"]  # a writable remote smoke prefix
     store = Store(root.rstrip("/") + "/CURRENT")
     first = ('{"generation":"' + uuid4().hex + '"}').encode()
     try:
