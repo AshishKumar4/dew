@@ -214,6 +214,27 @@ def test_a_sequence_split_holds_the_state_in_shares_and_trains_what_one_device_t
     assert_trains_alike((loss, trained), expected)
 
 
+@pytest.mark.mesh(devices=8)
+def test_the_sequence_axis_shares_the_state_beside_every_split_the_rules_give_it():
+    """The state axes split what the rules put on fsdp and leave every other axis's split as it is:
+    a vocabulary of 516 that tensor 4 divides and tensor 4 times sequence 2 does not keeps its
+    table split over tensor, and no leaf's tensor split moves when sequence joins the mesh."""
+    model = tiny(vocab_size=516, emb_features=256, mlp_features=512)
+    params = LMObjective(model, SEQ_LEN).init(jax.random.key(0))["params"]
+
+    def others(placement):
+        """Each leaf's axes past the state axes, by dimension."""
+        specs = [tuple(sharding.spec) + (None,) * 4 for sharding in jax.tree.leaves(placement)]
+        return [[tuple(axis for axis in mesh_axes(entry) if axis not in ("fsdp", "sequence"))
+                 for entry in spec[:4]] for spec in specs]
+
+    tensor = Layout().shardings(MeshSpec(tensor=4).build(jax.devices()[:8]), params)
+    shared = Layout().shardings(MeshSpec(tensor=4, sequence=2).build(jax.devices()[:8]), params)
+    assert others(shared) == others(tensor)
+    assert any("sequence" in mesh_axes(entry)
+               for sharding in jax.tree.leaves(shared) for entry in sharding.spec)
+
+
 NATIVE_RULES = {"embed": ("zero", "zero2"), "mlp": "zero", "heads": "zero", "kv": "zero", "vocab": "zero",
                 "linear": "zero"}
 """A layout of a native mesh's own axes: two fsdp levels, `zero` and
