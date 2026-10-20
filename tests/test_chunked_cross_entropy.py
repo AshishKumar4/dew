@@ -317,7 +317,7 @@ def test_a_heads_terms_and_gradients_are_as_exact_as_logsumexps_over_its_column_
     and moves no value) as `jax.nn.logsumexp`'s whole logits are (`assert_as_exact_over_orders`).
     A row summed in one loop of XLA's CPU reduction with a combine of its own, and a share divided
     out and then scaled, held the whole head's state gradient 3.9 times as far."""
-    from reference_error import ORDERS, assert_as_exact_over_orders
+    from reference_error import ORDERS, assert_as_exact_over_orders, assert_leaves_as_exact, float64_terms
 
     states, matrix, targets = inputs(vocab=512, features=16, tokens=(4, 5))
     states, matrix = eighths(states, matrix)
@@ -337,12 +337,12 @@ def test_a_heads_terms_and_gradients_are_as_exact_as_logsumexps_over_its_column_
         def loss(*arguments):
             losses, log_z = head(*arguments)
             return jnp.sum(losses + 1e-2 * jnp.square(log_z)), (losses, log_z)
-        return jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3), has_aux=True))
+        return jax.grad(loss, argnums=(0, 1, 2, 3), has_aux=True)
 
     with jax.default_matmul_precision('highest'):
-        dew, reference = scored(terms), scored(whole)
+        dew, reference = jax.jit(scored(terms)), jax.jit(scored(whole))
     with jax.enable_x64(new_val=True):
-        exact = scored(whole)
+        exact = jax.jit(scored(whole))
     def back(scored, relabel):
         """The terms and gradients of one order in the columns' own order."""
         (d_states, d_matrix, d_scale, d_bias), outputs = jax.tree.map(
@@ -364,6 +364,14 @@ def test_a_heads_terms_and_gradients_are_as_exact_as_logsumexps_over_its_column_
     for index, name in enumerate(('losses', 'log Z', 'states', 'head', 'scale', 'bias')):
         assert_as_exact_over_orders(np.asarray(distances['dew'])[:, index],
                                     np.asarray(distances['reference'])[:, index], f'{tile} {name}')
+    # The columns' own order, held leaf by leaf and row by row to the terms each leaf sums.
+    with jax.enable_x64(new_val=True):
+        truth, sizes = float64_terms(scored(whole), *(jnp.asarray(term, jnp.float64) for term in
+                                                      (states, matrix, scale, bias)), targets)
+    with jax.default_matmul_precision('highest'):
+        ours, theirs = (jax.tree.map(np.asarray, arm(states, matrix, scale, bias, targets))
+                        for arm in (dew, reference))
+    assert_leaves_as_exact(ours, theirs, truth, reductions=targets.size, terms=sizes)
 
 
 @pytest.mark.mesh(devices=2)
