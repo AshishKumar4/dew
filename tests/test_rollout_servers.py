@@ -96,7 +96,7 @@ def test_a_draw_is_the_reported_ids_and_behavior_likelihoods(provider):
     sent = calls[0]
     assert sent["prompt"] == [[1, 2, 9]] and sent["seed"] == 11 and sent["max_tokens"] == 8
     if provider == "vllm":
-        assert sent["stop_token_ids"] == [EOS] and "stream" not in sent
+        assert sent["stop_token_ids"] == [EOS] and not sent.get("stream")
     else:
         # SGLang draws as the policy without its stops, streamed, and Dew cuts it at the first.
         assert "stop_token_ids" not in sent and sent["ignore_eos"] is True and sent["stream"] is True
