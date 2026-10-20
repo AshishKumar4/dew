@@ -1339,8 +1339,11 @@ def authorities(module: Module) -> Iterator[Finding]:
 EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "requests.", "httpx.",
             "aiohttp.", "grpc.", "huggingface_hub.", "fsspec.", "gcsfs.", "google.", "boto3.", "botocore.",
             "filelock.", "multiprocessing.", "concurrent.futures.ProcessPoolExecutor.", "os.kill.",
-            "os.killpg.", "os.waitpid.", "os.fork.", "os.posix_spawn.", "jax.distributed.")
-"""What leaves the process: a subprocess, the network, a remote service, another process."""
+            "os.killpg.", "os.waitpid.", "os.fork.", "os.posix_spawn.", "jax.distributed.",
+            "IPython.display.display.", "IPython.display.update_display.", "IPython.display.clear_output.")
+"""What leaves the process: a subprocess, the network, a remote service, another process (a
+notebook's frontend, which IPython's display functions publish to over the kernel's socket; its
+representations, such as `HTML`, are built in the process)."""
 
 
 WAITS = {"wait", "wait_for", "join", "get", "put", "acquire"}
