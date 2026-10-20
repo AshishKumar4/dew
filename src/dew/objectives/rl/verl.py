@@ -38,9 +38,9 @@ import numpy as np
 from dew.data.prompts import PromptRecord
 from dew.records import JSON, integer, integers, record as section, text
 
-from .records import real, reals, sequence
+from .records import messages, real, reals, sequence
 from .rollout import Reward
-from .sessions import Call, Session, Status, chains
+from .sessions import Call, Session, Status, Transcript, chains
 
 MEDIA = ("multi_modal_data", "mm_processor_kwargs", "mm_processor_output")
 """The fields that put media into a row's context, which Dew's text trainer
@@ -65,6 +65,8 @@ class _DewCall(TypedDict):
     finish_reason: str
     version: int
     support: list[list[int]] | None
+    reward: float | None
+    transcript: dict[str, object] | None
 
 
 class VerlRow(TypedDict):
@@ -121,6 +123,11 @@ def to_verl(trajectories: Sequence[Session | VerlTrajectory]) -> list[VerlRow]:
                         "finish_reason": call.finish_reason,
                         "version": call.version,
                         "support": None if call.support is None else [list(kept) for kept in call.support],
+                        "reward": call.reward,
+                        "transcript": None if call.transcript is None else {
+                            "messages": [dict(message) for message in call.transcript.messages],
+                            "response": None if call.transcript.response is None
+                            else dict(call.transcript.response)},
                     }
                 )
             versions = [session.calls[index].version for index, _, _ in chain.members]
@@ -186,6 +193,16 @@ def _runs(mask: Sequence[int], offset: int) -> list[tuple[int, int]]:
     return runs
 
 
+def _transcript(value: object) -> Transcript:
+    """A call's transcript as `to_verl` wrote it into `extra_fields.dew.calls`."""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"transcript={value!r}: a call's transcript records its messages and response")
+    written = section(value, "transcript")
+    response = written["response"]
+    return Transcript(messages(written["messages"], "messages"),
+                      None if response is None else section(response, "response"))
+
+
 def _calls(row: Mapping[str, object], version: int | None,
            described: Sequence[Mapping[str, object]] | None) -> tuple[Call, ...]:
     """Rebuild a row's model calls: each run of mask-1 ids is one call's
@@ -233,6 +250,8 @@ def _calls(row: Mapping[str, object], version: int | None,
                 routed_experts=None if record is None else record[:forwarded],
                 support=None if support is None else sequence(
                     support, lambda kept: integers(kept, "support"), "support"),
+                reward=None if meta.get("reward") is None else real(meta["reward"], "reward"),
+                transcript=None if meta.get("transcript") is None else _transcript(meta["transcript"]),
             )
         )
     return tuple(calls)

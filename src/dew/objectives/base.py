@@ -451,6 +451,11 @@ class ProgramModule(NamedTuple):
     trained: bool
     """Whether the step moves the module's parameters, so its backward runs:
     False for a frozen teacher or reference."""
+    head_fused: bool = False
+    """Whether its tiled head takes its gradient in the forward
+    (`chunked.fused_head_loss`), which is faster than the tiled head's
+    backward but holds a chunk of the whole vocabulary's logits beside it,
+    more than a tile (`Objective.unfuse_head`)."""
 
 
 @jax.custom_jvp
@@ -738,10 +743,11 @@ class Objective(ABC, Generic[Loss, Effects]):
         step runs: the program is reused only while they are the same objects, and one over others
         replaces it. Keep only the current specialization, not a history of old models or steps.
         """
-        programs = tuple((program.module, program.head_tile) for program in self.program_key())
+        programs = tuple((program.module, (program.head_tile, program.head_fused))
+                         for program in self.program_key())
         cached = vars(self).get('_program_cache')
         if cached is None or len(cached[0]) != len(programs) or any(
-                module is not was or tile != had for (module, tile), (was, had) in zip(programs, cached[0],
+                module is not was or head != had for (module, head), (was, had) in zip(programs, cached[0],
                                                                                       strict=True)):
             cached = (programs, {})
             self._program_cache = cached
@@ -962,13 +968,25 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
-    def restore_head_tile(self, tile: tuple[int, int] | None) -> None:
-        """Set the head's backward tile to `tile`, None keeping its whole logits.
+    def unfuse_head(self) -> str | None:
+        """Move a tiled head that takes its gradient in the forward to the tiled head's backward.
+
+        The fused head is the faster where it fits; its chunk holds the whole
+        vocabulary's logits, which the tiled head bounds to a tile, so this is
+        the rung of the fit ladder after `tile_head`. The return value
+        describes the move, or is None where nothing moved, as for an
+        objective whose step fuses no head.
+        """
+        return None
+
+    def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
+        """Set the head's backward tile to `tile`, None keeping its whole logits, and whether a tiled
+        head takes its gradient in the forward (`unfuse_head`).
 
         The trainer fits each batch shape it meets on its own, so before it
         compiles a new shape it puts the objective back at the run's own rung,
-        the head tile included (`tile_head` only ever moves up). An objective
-        with no such head has only None to restore."""
+        the head's included (`tile_head` and `unfuse_head` only ever move up).
+        An objective with no such head has only None to restore."""
         if tile is not None:
             raise ValueError(f"{type(self).__name__} has no head to tile, so no tile {tile} to restore")
 

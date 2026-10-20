@@ -68,7 +68,8 @@ def _per_call(rollouts):
     """One chain per row, one row per call: the unmerged layout, each call's
     prompt then its sampled ids, carrying its rollout's advantage."""
     values = advantages(rollouts)
-    calls = [(call, values[index]) for index, rollout in enumerate(rollouts) for call in rollout.calls]
+    calls = [(call, values[index][number]) for index, rollout in enumerate(rollouts)
+             for number, call in enumerate(rollout.calls)]
     shape = (len(calls), WIDTH)
     ids, segments, positions = np.zeros(shape, np.int32), np.zeros(shape, np.int32), np.zeros(shape, np.int32)
     mask, behavior, advantage = (

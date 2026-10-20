@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol, runtime_checkabl
 
 import numpy as np
 
-from dew.data.analysis import _cache_at, _order_at, _preferred_read, _promoted, _until
+from dew.data.analysis import _cache_at, _order_at, _preferred_read, _promoted, _serves, _until
 from dew.data.compile import compile
 from dew.data.dataset import Batch, DataPhase, Loader, Loading, record_argument
 from dew.data.holdout import (
@@ -565,8 +565,11 @@ def loader(
     if held is not None and validation_records is not None:
         held = held.take(validation_records)
     if cache is not None:
-        train = _cached(train, cache)
-        held = None if held is None else _cached(held, cache)
+        train, trained = _cached(train, cache)
+        held, scored = (None, 0) if held is None else _cached(held, cache)
+        if not trained + scored:
+            raise ValueError(f"{cache!r} holds the rows of none of this recipe's corpora; name the Cache "
+                             "it was published to, or publish a branch of this recipe (`dew data publish`)")
     train, held = _promoted(train), None if held is None else _promoted(held)
 
     def compiled(at: Read) -> tuple[Pipeline, ...]:
@@ -622,10 +625,16 @@ def _batched(
     return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:]))
 
 
-def _cached(pipeline: Pipeline, cache: Cache | Generation | str) -> Pipeline:
+def _cached(pipeline: Pipeline, cache: Cache | Generation | str) -> tuple[Pipeline, int]:
+    """`pipeline` with `cache` after the steps a cache can hold, in each of its corpora whose rows
+    it holds (`_serves`: a named generation holds one prefix's), and how many corpora took it."""
     if isinstance(pipeline.source, (Mixture, Phases)):
-        children = tuple(_cached(child, cache) for child in pipeline.source.pipelines)
-        return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
+        cached = [_cached(child, cache) for child in pipeline.source.pipelines]
+        children = tuple(child for child, _ in cached)
+        source = dataclasses.replace(pipeline.source, pipelines=children)
+        return dataclasses.replace(pipeline, source=source), sum(count for _, count in cached)
     at = _cache_at(pipeline.stages)
+    if not _serves(cache, pipeline.source, pipeline.stages[:at]):
+        return pipeline, 0
     prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).cache(cache)
-    return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:]))
+    return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:])), 1
