@@ -376,7 +376,7 @@ class TextToImage:
         prompts: str | Sequence[str | Mapping[str, object]] | None = None,
         *,
         conditions: Mapping[str, Conditioning] | None = None,
-        key: int | jax.Array | None = None,
+        key: int | jax.Array,
         steps: int | None = None,
         unconditional: str | Sequence[str | Mapping[str, object]] | Mapping[str, Conditioning] | None = None,
         image: ArrayLike | None = None,
@@ -681,7 +681,7 @@ class TextToImage:
         steps: int | None = None,
         guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
         solver: Solver | None = None,
-        key: int | jax.Array | None = None,
+        key: int | jax.Array,
         decode: bool = True,
     ) -> Images:
         """Generate images for `prompts`, as `Images` in [-1, 1] of shape `[rows, H, W, C]`.

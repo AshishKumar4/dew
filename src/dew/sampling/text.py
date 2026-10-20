@@ -85,7 +85,7 @@ ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, cova
 
 Transforms = LogitsTransform | Sequence[LogitsTransform]
 Criteria = Stopping | Sequence[Stopping]
-Components = tuple[tuple[LogitsTransform, ...], tuple[Stopping, ...], Strategy]
+Components = tuple[tuple[LogitsTransform, ...], decoding.Finishing, Strategy]
 
 # A resolved component's configuration as every process can spell it: a repr,
 # a number (an array's shape is a tuple of them), or a tuple of either nested
@@ -392,12 +392,15 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
 
 
 def _empty_cache(model: nn.Module, params: Variables, batch: int, ops: DecodeOps) -> Variables:
-    """A zeroed decode cache for `batch` rows, with the drafter's own beside it."""
-    cache = flatten_dict(dict(model.apply(params, batch, method="init_cache", mutable=["cache"])[1]["cache"]))
+    """A zeroed decode cache for `batch` rows, with the drafter's own beside it. A decoder whose every
+    mixer is tokenwise (`MLPMixer`) keeps no cache, and its collection is empty."""
+    def initialized(method: str) -> dict:
+        _, mutated = model.apply(params, batch, method=method, mutable=["cache"])
+        return flatten_dict(dict(mutated["cache"])) if "cache" in mutated else {}
+
+    cache = initialized("init_cache")
     for method in ("init_mtp_cache",) * bool(ops.depths) + ("init_draft_cache",) * (ops.record is not None):
-        cache.update(
-            flatten_dict(dict(model.apply(params, batch, method=method, mutable=["cache"])[1]["cache"]))
-        )
+        cache.update(initialized(method))
     return unflatten_dict(cache)
 
 
@@ -599,7 +602,7 @@ def _block_drafting(model: nn.Module, params: Variables):
 
 def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
               trips: int, budget: jax.Array, pad_id: int, n: int,
-              transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
+              transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
               strategy: Strategy) -> Generation:
     """One fixed compiled loop of `trips` draws; finished rows do not mutate
     their cache state. `budget` is the tokens the request may draw, at most
@@ -625,7 +628,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         step=jnp.zeros(batch, jnp.int32), active=real, keys=keys, prompt_width=width,
         budget=jnp.full(batch, budget, jnp.int32))
     drawn: Draws = strategy(state, start, ops, decoding.chain(transforms),
-                            decoding.criterion(stopping), trips, n)
+                            decoding.finish(stopping), trips, n)
     return Generation(
         jnp.concatenate([prompt, jnp.where(drawn.valid, drawn.tokens, pad_id)], axis=1),
         jnp.sum(drawn.valid, axis=1, dtype=jnp.int32), drawn.terminated,
@@ -700,9 +703,8 @@ def resolve(sampling: Sampling, logits: Transforms | None, stopping: Criteria | 
     termination by accident. No strategy means `Sample`.
     """
     transforms = sampling.transforms() if logits is None else logits
-    return (decoding.components(transforms),
-            (() if stopping is None else decoding.components(stopping))
-            + sampling.criteria(),
+    given = () if stopping is None else tuple(stopping) if isinstance(stopping, Sequence) else (stopping,)
+    return (decoding.components(transforms), decoding.Finishing.of((*given, *sampling.criteria())),
             Sample() if strategy is None else strategies.as_pytree(strategy))
 
 
@@ -818,7 +820,7 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
 
 def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
              budget: jax.Array, trips: int, pad_id: int, n: int,
-             transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
+             transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
              strategy: Strategy) -> tuple[checkify.Error, Generation]:
     """`_generate` with its device checks discharged into a returned error.
 
@@ -850,7 +852,7 @@ _DEFAULT_SAMPLING = Sampling()
 
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             *, key: int | jax.Array | None = None,
+             *, key: int | jax.Array,
              sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, logits: Transforms | None = None,
              stopping: Criteria | None = None, strategy: Strategy | None = None,
              trips: int | None = None) -> Generation:

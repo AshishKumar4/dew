@@ -21,6 +21,7 @@ export const groups = [
 	{
 		items: [
 			{ source: 'docs/index.md', slug: 'docs', label: 'Overview' },
+			{ source: 'docs/roadmap.md', slug: 'roadmap', label: 'Roadmap' },
 			{ source: 'docs/installation.md', slug: 'getting-started/installation', label: 'Installation' },
 			{ source: 'docs/getting-started.md', slug: 'getting-started/quickstart', label: 'Quickstart' },
 			{ source: 'docs/key-concepts.md', slug: 'getting-started/key-concepts', label: 'Key concepts' },
