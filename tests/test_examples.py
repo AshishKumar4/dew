@@ -275,18 +275,27 @@ def test_sft_diffusion_gemma_images_smoke_trains_on_two_splits_and_captions_the_
 
     report = json.loads((tmp_path / "result.json").read_text())
     assert (report["train_images"], report["test_images"], report["classes"]) == (16, 8, 2)
-    # The run trains on the train and validation files and captions the test file, which shares no
-    # image with them: the example's own data spec, read as its run reads it.
+    # The test file shares no image with the two that train, and the run's own batches, read as it
+    # reads them, train on ids of those two alone and caption each test id once.
     example = load("sft_diffusion_gemma_images", "examples")
-    config = example.Config(smoke=True, out=tmp_path)
-    spec = example.data_spec(config, {split: example.Files(str(tmp_path / "data" / f"{split}.parquet"),
-                                                           format="parquet") for split in example.SPLITS})
-    assert [source.url for source in spec.source.sources] == [
-        str(tmp_path / "data" / f"{split}.parquet") for split in ("train", "validation")]
-    assert spec.validation.url == str(tmp_path / "data" / "test.parquet")
-    images = {split: {row["bytes"] for row in parquet.read_table(tmp_path / "data" / f"{split}.parquet")
-                      .column("image").to_pylist()} for split in example.SPLITS}
+    files = {split: tmp_path / "data" / f"{split}.parquet" for split in example.SPLITS}
+    images = {split: {row["bytes"] for row in parquet.read_table(path).column("image").to_pylist()}
+              for split, path in files.items()}
     assert len(images["test"]) == 8 and not images["test"] & (images["train"] | images["validation"])
+    ids = {split: set(parquet.read_table(path).column("image_id").to_pylist())
+           for split, path in files.items()}
+    config = example.sized(example.Config(smoke=True, out=tmp_path))
+    parts = {split: example.Files(str(path), format="parquet") for split, path in files.items()}
+    data = example.caption_data(config, parts, example.class_names(parts))
+    trained = [int(image) for batch in itertools.islice(data.train(DataPartition()), config.steps)
+               for image in np.asarray(batch["image_id"])]
+    assert set(trained) <= ids["train"] | ids["validation"] and set(trained) & ids["validation"]
+    from dew.objectives.base import VALID_ROWS
+
+    captioned = [int(image) for batch in data.val(DataPartition())
+                 for image, real in zip(np.asarray(batch["image_id"]), batch[VALID_ROWS], strict=True)
+                 if real]
+    assert sorted(captioned) == sorted(ids["test"])
     run = tmp_path / "checkpoints" / "flowers-caption"
     journal = [json.loads(row) for row in (run / "tracking" / "scalars.jsonl").read_text().splitlines()]
     losses = [row["scalars"]["train/loss"] for row in journal if "train/loss" in row["scalars"]]
