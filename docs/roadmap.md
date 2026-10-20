@@ -69,6 +69,7 @@ The kernel direction was approved on 2026-10-19:
 - Profile first compilation separately through lowering and XLA passes. [629]
 - Keep document resets out of recurrence decay prefixes, move decode regrouping into the kernel boundary and finish shared tuner/template coverage. [NNK-4, NNK-8, 597]
 - Take paged attention through the typed kernel selector, so its eligibility is each kernel's own as every other operation's is. [742]
+- Keep each slot's logical key place in a paged KV cache, so chunked and ALiBi attention mask a prompt placed past zero by its places, as on a dense cache. [825]
 - Close the route audit's gaps: rms_norm's inverse rounding and its decode operands, swiglu's dtype and its forward mode, each routed to the kernel its row names. [759]
 - Give the chunked gated delta rule one dtype contract on every route. With mixed operands the port returns their common dtype, while the portable math returns the query's and casts its cotangent to it, so output dtype and gradient precision depend on the GPU row. [730]
 - Move rms_norm and swiglu onto the typed selector, so their routes report and their refusals classify. [762]
@@ -76,6 +77,7 @@ The kernel direction was approved on 2026-10-19:
 - Make fused attention the selector's private executor, its second eligibility pass deleted. [765]
 - Capture only the requested step's routes in the route tool. [763]
 - Record in the target table that no Tokamax implementation is any row's kernel, sm86's narrow row on flash. [766]
+- Widen the fused norm and SwiGLU kernels' reach: norms past 8192 features, a norm with an activation epilogue, operands a mesh splits or a varying shard_map holds, and fp16 qualified against the float64 gate. [820, 821, 822, 823]
 
 ## Data
 
@@ -94,12 +96,21 @@ The kernel direction was approved on 2026-10-19:
 - Remove duplicated worker-shutdown policy by using Grain's lifecycle interface. [DAT-10]
 - Qualify URL-caption fetching through `images.fetch` and `video.fetch` against the previous online flow on CC3M and WebVid. [155]
 - Fingerprint a transform's arrays by their content, not their truncated repr. [768]
+- Cache automatically: the deterministic stages before the first random or cross-record step are fingerprinted by content and their output reused on a re-run, with no `cache=`, in a local cache directory with a size cap and eviction; `cache=url` stays for shared or remote caches, and there is an opt-out. [824]
 - Carry the caption tokenizer's content in the text conditioners' dependencies, so an exact resume refuses changed token ids. [769]
 - Let Windows and Pack resume with their row ids. [770]
 - Keep a concatenation's metadata, class names and the tokenizer contract included. [771]
 - Run DeviceAugment in the image pipeline benchmark's device-augment arms. [772]
 - One priming and checkpoint path for mixtures' reads. [773]
-- One public loading route: `loader(spec, ...)`, `_Loadable` deleted. [780]
+- The chain is the one data API; recipes, spec.load and the public loader are removed; run.json records the chain (213). [780]
+- Let the image, language-model and SFT presets take the documented `cache=`. [803]
+- Show a preset's expanded steps in `show()`, and report throughput, token and padding statistics in `stats()`. [804, 805]
+- Fetch images with the documented `threads=`, and prefetch to devices through `fit(device_prefetch=)`. [806, 807]
+- Let `from_grain` and `from_iter` work without undocumented names, and `Memory` read a DataFrame directly. [808, 809]
+- Add presets for prompts, preferences and chat canvases, which the run layer's recipes cover today. [810]
+- Rule on the nine public Dataset members the spec does not name: then, chain, map_with_index, slice, windows, token_split, rebatch, limit and iterate. [811]
+- Chunk a long chat conversation and keep an overlong prompt's tail by default, as the spec says, and carry a row's `ability` into its record's extra_info. [812, 813, 814]
+- Teach only names main has in the post-training and inference docs. [815]
 
 ## Training and parallelism
 
@@ -149,6 +160,9 @@ The following direction was approved on 2026-10-19:
 Keep the existing gateway interface. Miles would currently duplicate it: its trainer requires torch.distributed and its TITO service speaks SGLang's extended chat API. Revisit a Miles dependency if it offers a small standalone session package. Cancellation must stop both the trial's sandbox and a long in-flight engine decode before either is claimed. The gateway leaves the engine decoding when a session is cancelled; rllm-org/rllm#938 cancels the upstream call on client disconnect, and Dew claims engine abort after a GPU receipt once it merges. [729]
 - Let disk banks load packed families whose packing is a view. [786]
 - Keep the TPU command's dry run free of local writes. [777]
+- Start a rollout server's thread and a harness's workers on their first submit, and stamp a publication before its first draw, not in their constructors. [816]
+- Let FlowRollout alone own collection, the Flow objective's reward, group and rollout fields gone. [817]
+- One route to a task: bundles and objectives delegate to dew.pipeline's task factories. [818]
 
 ## Tutorials and docs
 
@@ -172,7 +186,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Establish and triage a daily GPU baseline before it replaces batch qualification. Reproduce reference autotune picks in their recorders and qualify FP8 on suitable hardware. [558, 568, TTC-1]
 - Qualify H100, newer-GPU, TPU and paged-decode shard routes at runtime; compile and interpret checks leave those obligations open.
 - Reconcile requested capabilities with implementation and qualification evidence, and audit upstream reproductions and fixes. [224, 306]
-- The float64 gate is source-aware (approved 2026-10-19). A kernel is a graph of the values it rounds and holds (`dew.nn.kernels.graph`), and the graph's replay must equal the kernel's native witness bit for bit. Each shared reduction is held on common parents over orders of its own summed axis, an exact symmetry that redraws both sides' order. Each pointwise value is held element by element within twice the reference's error, on the reference's parents and on Dew's. Each output's RMS stays within twice the native reference's. Where a reduction is only available whole, a certified ensemble of the reference's summation trees supplies its spread. The element rule's false-failure rate at each test's real element count is still to be calibrated: measured null rates so far run from 0 to about 1e-3 per element on 128- and 256-key accumulators, and no rate is certified. A Sum node is held against a canonical family of summation trees (pairwise, blocked at the kernel's tile, strided at 8 and 16 lanes) as certified members: two trees equally exact on average differ element by element, and against the reference's one tree attention's key sums were flagged on some CPUs and not others. [758] Remove every independent floor and qualify the complete release model's reductions. A tree member materializes every product, so members serve small operators and the graph's nodes; the looped release model is held end to end to vLLM by leaf and row RMS at 2× over 52 residual orders, and element by element through its own graph against Dew's float32 XLA reference. [560, 645, 649, 719, 739]
+- The float64 gate is source-aware (approved 2026-10-19). A kernel is a graph of the values it rounds and holds (`dew.nn.kernels.graph`), and the graph's replay must equal the kernel's native witness bit for bit. Each shared reduction is held on common parents over orders of its own summed axis, an exact symmetry that redraws both sides' order. Each pointwise value is held element by element within twice the reference's error, on the reference's parents and on Dew's. Each output's RMS stays within twice the native reference's. Where a reduction is only available whole, a certified ensemble of the reference's summation trees supplies its spread. The element rule's false-failure rate at each test's real element count is still to be calibrated: measured null rates so far run from 0 to about 1e-3 per element on 128- and 256-key accumulators, and no rate is certified. A Sum node is held against a canonical family of summation trees (pairwise, blocked at the kernel's tile, strided at 8 and 16 lanes) as certified members: two trees equally exact on average differ element by element, and against the reference's one tree attention's key sums were flagged on some CPUs and not others. [758] Pointwise steps, which no orbit redraws, need members the same way before an equally exact implementation passes there. [819] Remove every independent floor and qualify the complete release model's reductions. A tree member materializes every product, so members serve small operators and the graph's nodes; the looped release model is held end to end to vLLM by leaf and row RMS at 2× over 52 residual orders, and element by element through its own graph against Dew's float32 XLA reference. [560, 649, 719, 739]
 - Convert the suite's one-draw float64 comparisons, about 860, to that gate in waves by file group. Each wave is owned by the lane that owns its files, starts with a measured CI cost, and regenerates fixtures at K orders on the VM. Kernels expose their graphs as they move to templates; the black-box flash wheel and cuDNN stay end to end until the attention template replaces them. Move the remaining numerical consumers without filtering outputs or gradients. 294 call sites on main 411fc5964 in twelve file groups; a group draws one compiled program a comparison (orders do not batch under vmap, which changes XLA's arithmetic), and the estimate is about half again the suite's task time, not 52 times. [650, 668, 669, 670, 676, 682, 705, 712, 746, 747, 748, 749, 750, 751, 752, 753, 754, 755, 756, 757]
 - Replace test-policy violations with observable lifecycle and reference behavior:
 
@@ -191,3 +205,4 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Check every family, target row and mode in the kernel-route test, an unexplained route failing, and drop the KV cache's unconditional GPU xfail. [798, 799]
 - Hold MeanFlow's fused attention away from zero initialization, the delta rule's document isolation without exclusions, and the Mamba-2 TPU mesh by its numbers. [789, 790]
 - Delete the stock-JAX branches (DEW_UPSTREAM_JAX, the runtime's caching branch) and the step benchmark's re-export facade. [779, 792, 800]
+- Hold the full suite to ten minutes of wall time: shards cut by the last full run's measured per-test times, no single case past a shard's budget, and a new environment warmed before its first full suite. [826]
