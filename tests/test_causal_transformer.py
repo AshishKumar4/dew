@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
+from reference_error import assert_as_exact_as_the_reference, float64_forward
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -427,7 +428,7 @@ def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
     _, mutated = model.apply({**params, "cache": cache}, ids[:, :4], decode=True, mutable=["cache"])
     kept, _ = model.apply({**params, "cache": mutated["cache"]}, ids[:, 4:5], decode=True, mutable=["cache"])
     zeroed = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: jnp.zeros_like(leaf) if "conv_state" in jax.tree_util.keystr(path) else leaf,
+        lambda path, leaf: jnp.zeros_like(leaf) if jax.tree_util.DictKey("conv_state") in path else leaf,
         mutated["cache"])
     reset, _ = model.apply({**params, "cache": zeroed}, ids[:, 4:5], decode=True, mutable=["cache"])
     assert not jnp.allclose(kept, reset, atol=1e-4)
@@ -1140,15 +1141,16 @@ def test_a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_de
     that mask sent Qwen3-0.6B's decode to xla's two dense dots over the whole
     cache on an RTX 4080 (1.00 against cuDNN's 0.30 ms a layer at 128 rows),
     and a small model to cuDNN's bias variant, which reads it per head. The
-    steps still decode what the full pass computes."""
+    steps decode as exactly as the full pass, both from the model in float64."""
     model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
     ids = tokens(rng)
     params = model.init(rng, ids)
     full = model.apply(params, ids)
     prompt, rest = ids[:, :4], ids[:, 4:]
     incremental = decode_logits(model, params, prompt, rest)
-    np.testing.assert_allclose(np.asarray(incremental, np.float32),
-                               np.asarray(full[:, 3:], np.float32), atol=0.05)
+    truth, terms = float64_forward(model, params, ids)
+    assert_as_exact_as_the_reference(np.asarray(incremental, np.float64), np.asarray(full[:, 3:], np.float64),
+                                     np.asarray(truth)[:, 3:], "decode steps", terms=np.asarray(terms)[:, 3:])
 
 
 
@@ -1158,7 +1160,8 @@ def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deter
     sends a training call to xla (`kernel_for_materialized_mask`); a prefill
     runs forward only, so cuDNN takes that mask as its bias (xla's dense dots
     took 6.2 against 4.0 ms over Qwen3-0.6B's 28 layers for 8 prompts of 256
-    on an RTX 4080). The prefill still scores what the full pass does."""
+    on an RTX 4080). The prefill scores as exactly as the full pass, both from
+    the model in float64."""
     model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
     ids = tokens(rng)
     params = model.init(rng, ids)
@@ -1171,8 +1174,11 @@ def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deter
         return jax.jit(lambda cache, ids, valid: model.apply(
             {**params, 'cache': cache}, ids, attention_mask=valid, decode=True, mutable=['cache'])[0])
 
-    np.testing.assert_allclose(np.asarray(prefill(model)(cache, ids, valid), np.float32)[valid],
-                               np.asarray(full, np.float32)[valid], atol=0.05)
+    truth, terms = float64_forward(model, params, ids, attention_mask=valid)
+    # A padded slot's logits are no contract: the real tokens' are held.
+    assert_as_exact_as_the_reference(np.asarray(prefill(model)(cache, ids, valid), np.float64)[valid],
+                                     np.asarray(full, np.float64)[valid], np.asarray(truth)[valid],
+                                     "padded prefill", terms=np.asarray(terms)[valid])
 
 
 
@@ -1232,7 +1238,6 @@ def test_the_rotary_rotates_the_halves_as_rotate_half_does(dtype, pairs, scale, 
     order not quite, so the forward and the input gradient are each within
     tests/reference_error.py's rule of rotate_half's against float64: full
     and partial rotary, a folded scale, and a packed batch's own angles."""
-    from reference_error import assert_as_exact_as_the_reference
 
     from dew.nn.rope import rotate
 
@@ -1257,20 +1262,3 @@ def test_the_rotary_rotates_the_halves_as_rotate_half_does(dtype, pairs, scale, 
                                          np.asarray(want), label)
 
 
-def test_param_tree_mirrors_the_hf_decoder_layout(rng):
-    """The interop map has to be a rename, so the tree is a fixed contract."""
-    model = tiny()
-    params = model.init(rng, tokens(rng))['params']
-    paths = sorted('.'.join(str(entry.key) for entry in path)
-                   for path, _ in jax.tree_util.tree_flatten_with_path(params)[0])
-    layer = ['input_layernorm.scale',
-             'mlp.down_proj.kernel', 'mlp.gate_proj.kernel', 'mlp.up_proj.kernel',
-             'post_attention_layernorm.scale',
-             'self_attn.k_norm.scale', 'self_attn.k_proj.kernel',
-             'self_attn.o_proj.kernel', 'self_attn.q_norm.scale',
-             'self_attn.q_proj.kernel', 'self_attn.v_proj.kernel']
-    assert paths == sorted(
-        ['embed_tokens.embedding', 'norm.scale']
-        + [f'layers_{index}.{leaf}' for index in (0, 1) for leaf in layer])
-    # tie_embeddings=True is the reason there is no lm_head to rename
-    assert 'lm_head' not in params

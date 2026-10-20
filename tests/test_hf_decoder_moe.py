@@ -4,7 +4,6 @@ routed size, each against transformers' logits (see test_hf_decoders).
 """
 
 import json
-import os
 from pathlib import Path
 
 import jax.numpy as jnp
@@ -246,8 +245,6 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
 
 
 @pytest.mark.network
-@pytest.mark.skipif(not os.environ.get("DEW_NETWORK_TESTS"),
-                    reason="DEW_NETWORK_TESTS=1 downloads openai/gpt-oss-20b")
 def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
     """The released MXFP4 checkpoint through the loader against transformers'
     own dequantized bf16 forward at the same prompt. Tolerance on the top-32
