@@ -895,6 +895,83 @@ def samplers_paths_figure():
     svg.save(HERE / "samplers-paths.svg")
 
 
+def jepa_step_figure():
+    """One I-JEPA step: the context encoder sees part of a flower, the predictor guesses the embeddings of
+    the hidden blocks, and the target encoder, an average of the context encoder's weights, supplies the
+    embeddings to compare with."""
+    x0 = flower()
+    grid, size = 8, 112
+    patch = size / grid
+    rng = np.random.default_rng(3)
+    target = [(r, c) for r in range(1, 4) for c in range(4, 7)]
+    context = [(r, c) for r in range(grid) for c in range(grid)
+               if (r, c) not in target and rng.random() < 0.45]
+    width, height = 440, 330
+    svg = Figure(width, height, seconds=12, label="One I-JEPA step on a flower. The context encoder sees the "
+                 "unmasked patches, the predictor guesses the embeddings of the hidden block, and the target "
+                 "encoder, an average of the context encoder's weights, reads the whole image and gives the "
+                 "embeddings to match.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    ix, iy = 20, 40
+    svg.text(ix, 28, "the image", size=13, color="muted")
+    svg.image(ix, iy, size, pixels(x0), photo=True)
+    with svg.group() as hidden:
+        for r in range(grid):
+            for c in range(grid):
+                if (r, c) not in context and (r, c) not in target:
+                    svg.rect(ix + c * patch, iy + r * patch, patch, patch, fill="surface", stroke="none", rx=0)
+    svg.appear(hidden, 0.6)
+    with svg.group() as block:
+        top_r, left_c = target[0]
+        svg.rect(ix + left_c * patch, iy + top_r * patch, 3 * patch, 3 * patch, fill="surface", stroke="accent",
+                 rx=2, width=2.5)
+        svg.text(ix + (left_c + 1.5) * patch, iy + (top_r + 1.5) * patch + 5, "?", size=16, weight=600,
+                 color="accent", anchor="middle")
+    svg.appear(block, 1.2)
+    svg.appear(svg.text(ix, iy + size + 20, "context, and a hidden block", size=12, color="muted"), 1.2)
+
+    def chips(x, y, fill):
+        for k in range(4):
+            svg.rect(x + k * 16, y, 13, 13, fill=fill, stroke="none", rx=2)
+
+    def box(x, y, w, title, note, stroke):
+        svg.rect(x, y, w, 46, fill="raised", stroke=stroke, rx=7)
+        svg.text(x + w / 2, y + 20, title, size=13, weight=600, anchor="middle")
+        svg.text(x + w / 2, y + 37, note, size=11, color="muted", anchor="middle")
+
+    with svg.group() as encoded:
+        svg.arrow(ix + size + 6, iy + size * 0.7, 168, 228)
+        box(168, 210, 120, "context encoder", "sees the context", "accent")
+    svg.appear(encoded, 2.0)
+    with svg.group() as predicted:
+        svg.arrow(290, 233, 312, 233)
+        box(314, 210, 106, "predictor", "+ block's positions", "accent")
+        svg.arrow(367, 258, 367, 274)
+        chips(335, 280, "accent_fill")
+        svg.text(367, 314, "guess", size=12, color="accent", anchor="middle")
+    svg.appear(predicted, 3.0)
+    with svg.group() as targeted:
+        # The target encoder reads the whole image, unmasked.
+        svg.image(214, 30, 56, pixels(x0), photo=True)
+        svg.text(242, 100, "whole image", size=11, color="muted", anchor="middle")
+        svg.arrow(272, 58, 310, 62)
+        box(314, 46, 106, "target encoder", "sees everything", "rule")
+        svg.arrow(367, 94, 367, 110)
+        chips(335, 116, "tint1")
+        svg.text(367, 150, "target", size=12, color="muted", anchor="middle")
+    svg.appear(targeted, 4.2)
+    with svg.group() as loss:
+        svg.polyline([(401, 122), (428, 122), (428, 286), (401, 286)], color="accent", width=1.5, dash="4 4")
+        svg.text(424, 190, "loss", size=12, color="accent", anchor="end")
+    svg.appear(loss, 5.4)
+    with svg.group() as average:
+        svg.polyline([(228, 210), (228, 176), (296, 176), (296, 84), (312, 84)], color="muted", width=1.25,
+                     dash="2 4")
+        svg.text(236, 168, "average of weights", size=11, color="muted")
+    svg.appear(average, 6.4)
+    svg.save(HERE / "jepa-step.svg")
+
+
 def cfg_step_figure():
     """Classifier-free guidance as arrows: the model's prediction with the caption and without it, the
     difference between them, and the guided prediction that follows the difference further."""
@@ -964,7 +1041,7 @@ FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pip
            "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
            "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure, "edm-step": edm_step_figure,
            "edm-noise": edm_noise_figure, "samplers-paths": samplers_paths_figure,
-           "cfg-step": cfg_step_figure, "cfg-sweep": cfg_sweep_figure,
+           "cfg-step": cfg_step_figure, "cfg-sweep": cfg_sweep_figure, "jepa-step": jepa_step_figure,
            "lm-next-token": lm_next_token_figure}
 
 

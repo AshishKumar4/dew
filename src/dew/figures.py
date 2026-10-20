@@ -337,10 +337,10 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
     for tick in _ticks(low, high):
         _, tick_y = at(first, tick)
         figure.line(left, tick_y, width - right, tick_y, color="rule", width=1)
-        figure.text(left - 8, tick_y + 5, f"{tick:g}", size=SMALL, color="muted", anchor="end")
+        figure.text(left - 8, tick_y + 5, f"{tick + 0:g}", size=SMALL, color="muted", anchor="end")
     for tick in _ticks(first, final, 4):
         tick_x, _ = at(tick, low)
-        figure.text(tick_x, height - bottom + 20, f"{tick:g}", size=SMALL, color="muted", anchor="middle")
+        figure.text(tick_x, height - bottom + 20, f"{tick + 0:g}", size=SMALL, color="muted", anchor="middle")
     figure.text((left + width - right) / 2, height - 6, x_label, size=TEXT, color="muted", anchor="middle")
     figure.text(left, 20, y_label, size=TEXT, color="muted")
     # Neutral colors only, since warm means wrong; past three series the lines are dashed.
@@ -486,17 +486,21 @@ def images(frames: Sequence[np.ndarray], *, captions: Sequence[str] = (), column
 
 
 def points(series: Mapping[str, Sequence[tuple[float, float]]], *, x_label: str, y_label: str,
-           log_x: bool = False, log_y: bool = False, width: float = WIDE, height: float = 300,
-           seconds: float = 8.0) -> Figure:
-    """Dots joined in order, one line per entry of `series`, each named beside its last dot; the first
-    in the accent color, the others neutral and dashed past the third, as `curve` draws them. With
-    `log_x` or `log_y` that axis is logarithmic. The series appear one after another."""
+           joined: bool = True, moved: Mapping[str, Sequence[tuple[float, float]]] | None = None,
+           captions: Sequence[str] = (), log_x: bool = False, log_y: bool = False, width: float = WIDE,
+           height: float = 300, seconds: float = 8.0) -> Figure:
+    """Dots, one series per entry of `series`, the first in the accent color and the others neutral, as
+    `curve` colors them. Joined, each series is a line through its dots in order, named beside its last
+    dot, dashed past the third, and the series appear one after another. Not joined, the dots are a
+    scatter with the names in a legend; with `moved`, each dot then slides to its place there, and
+    `captions` name the two pictures. With `log_x` or `log_y` that axis is logarithmic."""
     figure = Figure(width, height, seconds=seconds, label=f"{y_label} against {x_label}")
     names = list(series)
-    left, bottom, top = 56, 48, 34
-    right = 20 + 0.6 * SMALL * max(len(name) for name in names)
+    left, bottom, top = 56, 48, 34 if joined else 58
+    right = 20 + 0.6 * SMALL * max(len(name) for name in names) if joined else 20
     values = {name: np.asarray(dots, float).reshape(-1, 2) for name, dots in series.items()}
-    every = np.concatenate(list(values.values()))
+    targets = {name: np.asarray(moved[name], float).reshape(-1, 2) for name in names} if moved else {}
+    every = np.concatenate([*values.values(), *targets.values()])
     scale = [np.log10 if log else (lambda v: v) for log in (log_x, log_y)]
     low = [scale[k](every[:, k].min()) for k in (0, 1)]
     high = [scale[k](every[:, k].max()) for k in (0, 1)]
@@ -521,16 +525,29 @@ def points(series: Mapping[str, Sequence[tuple[float, float]]], *, x_label: str,
     for tick in ticks(1):
         _, tick_y = at(every[0, 0], tick)
         figure.line(left, tick_y, width - right, tick_y, color="rule", width=1)
-        figure.text(left - 8, tick_y + 5, f"{tick:g}", size=SMALL, color="muted", anchor="end")
+        figure.text(left - 8, tick_y + 5, f"{tick + 0:g}", size=SMALL, color="muted", anchor="end")
     for tick in ticks(0):
         tick_x, _ = at(tick, every[0, 1])
-        figure.text(tick_x, height - bottom + 20, f"{tick:g}", size=SMALL, color="muted", anchor="middle")
+        figure.text(tick_x, height - bottom + 20, f"{tick + 0:g}", size=SMALL, color="muted", anchor="middle")
     figure.text((left + width - right) / 2, height - 6, x_label, size=TEXT, color="muted", anchor="middle")
     figure.text(left, 20, y_label, size=TEXT, color="muted")
     colors: tuple[Role, ...] = ("accent", "text", "muted")
+    legend_x = left
     for index, (name, dots) in enumerate(values.items()):
         color = colors[index % len(colors)]
         placed = [at(x, y) for x, y in dots]
+        if not joined:
+            figure.circle(legend_x + 5, 40, 5, fill=color)
+            figure.text(legend_x + 15, 45, name, size=SMALL, color=color)
+            legend_x += 30 + 0.6 * SMALL * len(name)
+            for (x, y), (to_x, to_y) in zip(placed, [at(*dot) for dot in targets.get(name, dots)],
+                                            strict=True):
+                dot = figure.circle(x, y, 3.5, fill=color)
+                if moved:
+                    figure.animate(dot, {seconds * 0.15: {"transform": "translate(0px,0px)"},
+                                         seconds * 0.55: {"transform": f"translate({to_x - x:.1f}px,"
+                                                                       f"{to_y - y:.1f}px)"}})
+            continue
         with figure.group() as group:
             figure.polyline(placed, color=color, width=1.25, dash="5 4" if index >= len(colors) else None)
             for x, y in placed:
@@ -538,6 +555,8 @@ def points(series: Mapping[str, Sequence[tuple[float, float]]], *, x_label: str,
             end_x, end_y = placed[-1]
             figure.text(end_x + 9, end_y + 5, name, size=SMALL, color=color)
         figure.appear(group, 0.4 + index * min(0.6, seconds * 0.5 / len(values)))
+    if captions:
+        _captions(figure, captions, [0.0, seconds * 0.35][:len(captions)], width - right, 20)
     return figure
 
 
