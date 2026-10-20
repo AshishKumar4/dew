@@ -235,8 +235,9 @@ def _row_terms(logits, predict: bool) -> tuple[
         return jax.lax.reduce(operands, tuple(initial), combine, (operands[0].ndim - 1,))
 
     def blocked(*operands):
-        return reduced(*(jnp.concatenate(level, axis=-1) if len(level) > 1 else level[0] for level in
-                         zip(*(reduced(*part) for part in _row_blocks(list(operands))), strict=True)))
+        firsts = [reduced(*part) for part in _row_blocks(list(operands))]
+        return reduced(*(jnp.concatenate([first[index] for first in firsts], axis=-1)
+                         for index in range(len(operands))))
 
     terms = jax.lax.platform_dependent(*operands, cpu=blocked, default=reduced)
     return terms[0] + jnp.log(terms[1]), ((terms[0], terms[2]) if predict else None), terms[:2]
