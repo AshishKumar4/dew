@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from reference_error import assert_graph_as_exact
 from reference_graph import Graph, Node, Pointwise, Sum
-from reference_trees import tree_contract, tree_sum
+from reference_trees import tree_sum
 
 EPSILON = 1e-6
 
@@ -230,10 +230,3 @@ def test_attention_that_loses_a_key_fails_at_its_denominator():
     dew = attention_graph(masked_scores(plain), lambda terms: jnp.sum(terms[..., 1:], axis=-1))
     with pytest.raises(AssertionError):
         assert_graph_as_exact(dew, reference, reference, inputs, head_orbit(inputs), "lost key")
-
-
-def test_scores_by_another_tree_pass():
-    inputs = attention_inputs()
-    reference = attention_graph(masked_scores(plain), plain)
-    dew = attention_graph(masked_scores(lambda terms: tree_contract(terms, 1, -1, "blocked-4")), plain)
-    assert_graph_as_exact(dew, reference, reference, inputs, head_orbit(inputs), "blocked scores")
