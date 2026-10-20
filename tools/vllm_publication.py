@@ -55,9 +55,11 @@ def engines(python: str, base: Path, policy: Path, gpu: int, out: Path) -> Itera
     try:
         for name, port in PORTS.items():
             model = policy if name == "reference" else base
+            # Every engine holds bfloat16 weights, the dtype the push sends, so a delivered push
+            # leaves the replicas' weights equal to the reference's.
             command = [python, "-m", "vllm.entrypoints.openai.api_server", "--model", str(model), "--host",
                        "127.0.0.1", "--port", str(port), "--gpu-memory-utilization", "0.25",
-                       "--max-model-len", "2048", "--enforce-eager"]
+                       "--max-model-len", "2048", "--enforce-eager", "--dtype", "bfloat16"]
             if name != "reference":
                 command += ["--weight-transfer-config", json.dumps({"backend": "nccl"})]
             log = (out / f"{name}.log").open("w")
