@@ -42,6 +42,7 @@ Three types, six function shapes.
 |---|---|---|---|
 | `RecordFn` | `(r) -> r` or a `grain.MapTransform` | `map` | exactly 1 |
 | `RandomFn` | `(r, rng) -> r` or a `grain.RandomMapTransform` | `random_map` | exactly 1 |
+| `IndexedFn` | `(index, r) -> r`, `index` the record's position in its source; `-> r \| Rejected` where it declares `rejects = True` | `map_with_index` | exactly 1; 0 or 1 where it declares `rejects` |
 | `Predicate` | `(r) -> bool` | `filter` (a rejected record counts under the predicate's `reason`) | 0 or 1 |
 | `TryFn` | `(r) -> r \| Rejected` | `filter_map` | 0 or 1, with a reason |
 | `RandomTryFn` | `(r, rng) -> r \| Rejected` or a `grain.RandomMapTransform` | `random_filter_map` | 0 or 1, with a reason |
@@ -87,18 +88,18 @@ Preparing a Hub dataset happens on first use, with one log line naming what is p
 
 | Group | Verbs |
 |---|---|
-| Per record | `map`, `random_map`, `filter`, `filter_map`, `random_filter_map`, `flat_map`; `map` and `flat_map` also take `batched=True, batch_size=k` |
+| Per record | `map`, `random_map`, `map_with_index`, `filter`, `filter_map`, `random_filter_map`, `flat_map`; `map` and `flat_map` also take `batched=True, batch_size=k` |
 | Reuse | `pipe(fn, *args, **kwargs)` for [presets](#5-presets) and your own `Dataset -> Dataset` functions; `grain(fn)` for any Grain operation Dew doesn't name; the plan can't see inside `fn`, so the chain after it reads per share and resumes through Grain's own state |
 | Columns | `rename_columns({"old": "new"})`, `select_columns(*names)`, `remove_columns(*names)` (Hugging Face's names) |
 | Other | `take(n)`, `named(name)` |
-| Sequence | `pack(seq_len, fields=, bins=, segments=, policy=, along=)`, the options every read lays out alike; `text.Chunks(length, overlap=)` cuts long documents first; `shuffle` after `pack` orders the windows |
+| Sequence | `pack(seq_len, fields=, bins=, segments=, policy=, along=)`, the options every read lays out alike; `text.Chunks(length, overlap=)` cuts long documents first; `windows(seq_len, stride=)` cuts one stream of tokens across documents at a stride, for perplexity over overlapping windows; `shuffle` after `pack` orders the windows |
 | Order | `shuffle(seed=, window=)`, `repeat(epochs=)` |
 | Combine | `mix(datasets, weights=, by="records" \| "tokens")`, which ends at its first exhausted member, as Grain's does (repeat a member to read on); `concat(datasets)`; `interleave(cycle_length=)` over a store's shards; `schedule([(dataset, tokens), ...])` |
-| Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split="validation" | ("validation", "test"))`, each with `key=` |
+| Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split="validation" | ("validation", "test"))`, each with `key=`; `holdout(tokens=0.01, fields=("text",))`, the first hundredth of a finite order's tokens, its per-token fields cut together |
 | Batch | `batch(n)`, the global training batch; a `map` after it receives the whole batch |
 | Persist | `cache(url)` (write-through accelerator), `snapshot(url)` (a terminal job that seals an immutable generation, read back with `Files(url)`) |
-| Execution | `workers(n)`, `threads(n)`, `prefetch(n)`, `read(mode)` |
-| Look | `take(n).show()`, `stats(records=n)` |
+| Execution | `workers(n)`, `threads(n)`, `prefetch(n)`, `read(mode)`, `loading(Loading(...))` for every read setting at once |
+| Look | `take(n).show()`, `stats(records=n)`, `for record in ds` (one pass, with training's draws) |
 
 Both diagnostics open a fresh reader, never the training stream. `stats` returns counters from at most `n` accepted records and runs before `batch`; `show` also takes batches. Both handle random and repeated chains. Training logs its own live counters, wait time and throughput.
 
