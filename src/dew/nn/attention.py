@@ -25,6 +25,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
+from dew.nn.dense import Dense, DenseGeneral
 from dew.telemetry.devices import deterministic_ops_requested
 
 from .activations import gated_product
@@ -2079,7 +2080,7 @@ def projected_heads(x, name: str, heads: int, head_dim: int, *, flat: bool, bias
 
     `flat` stores the matrix as the published diffusion and vision attentions
     do, `[C, heads * head_dim]`, and splits its product into heads; otherwise
-    it is `[C, heads, head_dim]` (`nn.DenseGeneral`), Dew's own, whose heads a
+    it is `[C, heads, head_dim]` (`DenseGeneral`), Dew's own, whose heads a
     tensor axis splits. A checkpoint's reader maps one layout or the other, so
     each attention keeps its own. `norm` normalizes each head's channels, or
     with `across_heads` each token's whole projection before it splits, as
@@ -2087,10 +2088,10 @@ def projected_heads(x, name: str, heads: int, head_dim: int, *, flat: bool, bias
     """
     width = heads * head_dim
     if flat:
-        projected = nn.Dense(width, use_bias=bias, dtype=dtype, precision=precision, name=name)(x)
+        projected = Dense(width, use_bias=bias, dtype=dtype, precision=precision, name=name)(x)
     else:
-        projected = nn.DenseGeneral((heads, head_dim), use_bias=bias, dtype=dtype, precision=precision,
-                                    name=name)(x)
+        projected = DenseGeneral((heads, head_dim), use_bias=bias, dtype=dtype, precision=precision,
+                                 name=name)(x)
     if norm is not None and across_heads:
         projected = norm(projected.reshape(*x.shape[:-1], width))
     projected = projected.reshape(*x.shape[:-1], heads, head_dim)
@@ -2104,10 +2105,10 @@ def projected_output(attended, name: str, features: int, *, flat: bool, bias: bo
     own: `[heads * head_dim, features]` flat, else `[heads, head_dim, features]`."""
     if flat:
         # The width is named, not inferred: an empty stream (no context tokens) has nothing to infer it from.
-        return nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name)(
+        return Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name)(
             attended.reshape(*attended.shape[:-2], math.prod(attended.shape[-2:])))
-    return nn.DenseGeneral(features, axis=(-2, -1), use_bias=bias, dtype=dtype, precision=precision,
-                           name=name)(attended)
+    return DenseGeneral(features, axis=(-2, -1), use_bias=bias, dtype=dtype, precision=precision,
+                        name=name)(attended)
 
 
 @logical_axes({
@@ -2228,7 +2229,7 @@ class FlaxGEGLU(nn.Module):
         return projection_flops(lengths, *self.projections()["proj"])
 
     def setup(self):
-        self.proj = nn.Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision)
+        self.proj = Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision)
 
     def __call__(self, hidden_states):
         hidden_states = self.proj(hidden_states)
@@ -2265,7 +2266,7 @@ class FlaxFeedForward(nn.Module):
         self.net_0 = FlaxGEGLU(
             self.dim, dtype=self.dtype, precision=self.precision, approximate=self.approximate_gelu
         )
-        self.net_2 = nn.Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.precision)
+        self.net_2 = Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.precision)
         self.dropout_layer = nn.Dropout(self.dropout)
 
     def __call__(self, hidden_states, *, train: bool = False):
@@ -2419,8 +2420,8 @@ class TransformerBlock(nn.Module):
             x = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(x)
 
         def project(features: int, name: str):
-            return nn.Dense(features=features, use_bias=False, precision=self.precision,
-                            dtype=self.dtype, name=name)
+            return Dense(features=features, use_bias=False, precision=self.precision,
+                         dtype=self.dtype, name=name)
 
         if self.use_projection:
             inner_dim = self.heads * self.dim_head
