@@ -239,11 +239,13 @@ def _trace(trace: object, unstamped: int) -> _Trace:
 def _transcript(trace: Mapping[str, object]) -> Transcript | None:
     """The chat messages the harness sent and the message the engine answered, as the gateway kept
     them, or None for a trace that kept no messages."""
-    asked, answered = trace.get("messages") or [], trace.get("response_message") or None
-    if not asked and answered is None:
+    asked, answered = trace.get("messages"), trace.get("response_message")
+    listed = () if asked is None else messages(asked, "messages")
+    # rllm-model-gateway writes an empty object for a response it holds no message of.
+    reply = None if answered is None else section(answered, "response_message") or None
+    if not listed and reply is None:
         return None
-    return Transcript(messages(asked, "messages"),
-                      None if answered is None else section(answered, "response_message"))
+    return Transcript(listed, reply)
 
 
 def calls(traces: Sequence[object], *, unstamped: int) -> Recorded:

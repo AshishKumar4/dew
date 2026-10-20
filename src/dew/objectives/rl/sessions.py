@@ -164,11 +164,25 @@ class Transcript:
     response: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.messages, tuple) or not all(isinstance(message, Mapping)
-                                                           for message in self.messages):
-            raise ValueError("a transcript's messages are a tuple of JSON objects")
-        if self.response is not None and not isinstance(self.response, Mapping):
-            raise ValueError("a transcript's response is a JSON object or None")
+        object.__setattr__(self, "messages", json_objects(self.messages, "a transcript's messages"))
+        if self.response is not None:
+            object.__setattr__(self, "response", json_objects((self.response,), "a transcript's response")[0])
+
+
+def json_objects(values: object, name: str) -> tuple[dict[str, object], ...]:
+    """`values`, a tuple of JSON objects in any `Mapping`, as plain dict trees, which journals copy and
+    write as they are; ValueError for anything else."""
+    if not isinstance(values, tuple) or not all(isinstance(value, Mapping) for value in values):
+        raise ValueError(f"{name} are a tuple of JSON objects")
+    return tuple(_tree(value) for value in values)
+
+
+def _tree(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _tree(entry) for key, entry in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_tree(entry) for entry in value]
+    return value
 
 
 @dataclass(frozen=True)
