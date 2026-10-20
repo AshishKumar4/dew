@@ -421,7 +421,8 @@ def advantages(sessions: Sequence[Session], estimator: str = "group", *,
     for index, (session, returns) in enumerate(zip(sessions, ahead, strict=True)):
         if returns is None:
             continue
-        turns = range(len(returns)) if credit == "turn" else (0,)
+        # A session without calls has no turn to compare, and its return stands only for itself.
+        turns = range(len(session.calls)) if credit == "turn" else (0,)
         for turn in turns:
             compared.setdefault((session.task, session.group, turn), []).append((index, turn))
     values = {key: 0.0 for members in compared.values() for key in members}
