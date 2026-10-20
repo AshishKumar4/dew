@@ -120,6 +120,7 @@ from dew.training.distributed import (
     link_topology,
     microbatch,
     microbatch_shapes,
+    owned,
     placed_bytes,
     placed_held,
     prefetched_bytes,
@@ -543,14 +544,13 @@ class Trainer(Generic[Loss, Effects]):
         It is pure, so `fit` traces it once for its shapes and once, sharded, for its
         values.
 
-        Both inputs default to the run's own, and `place` passes them explicitly so
-        that what it compiles takes them as arguments. A held checkpoint then reaches
-        the device as an argument instead of a constant embedded in the executable.
-        Passing None means "use the configured input", which is what a call without
-        arguments does. This is the only implementation of the state, so a subclass
-        overrides it here and every path sees the override.
+        Both inputs default to the run's own; `place` passes them, so a held checkpoint
+        reaches its compile as an argument, not a constant. The default reads the
+        objective's arrays through a copy (`owned`), as a step donates the state: a source
+        or frozen teacher held on the device is held twice while its caller keeps it, one
+        loaded with `on_host=True` is not. A subclass overrides the state here.
         """
-        initializer = self.objective.initializer if initializer is None else initializer
+        initializer = owned(self.objective.initializer) if initializer is None else initializer
         from dew.nn.inputs import request_key
         key = self.key if key is None else request_key(key)
         init_key, run_key = jax.random.split(key)
