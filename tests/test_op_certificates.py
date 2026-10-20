@@ -119,15 +119,13 @@ def test_a_sum_bound_holds_its_own_worst_case():
 
 
 def _interval_rounded(function, values, fmt: oc.Format) -> np.ndarray:
-    """RN in `fmt` of `function` (an mpmath.iv function) at each value, by interval arithmetic
-    alone, at rising precision."""
-    import mpmath
-
+    """RN in `fmt` of `function` (of mpmath's interval context and an interval) at each value, by
+    interval arithmetic alone, at rising precision."""
     out = []
     for value in values:
         for precision in (96, 192, 384):
-            with mpmath.iv.workprec(precision):
-                ends = function(mpmath.iv.mpf(float(value)))._mpi_
+            with oc.interval_precision(precision) as iv:
+                ends = function(iv, iv.mpf(float(value)))._mpi_
             lower, upper = (oc.fraction_rounded(oc._fraction(end), fmt) for end in ends)
             if lower == upper:
                 out.append(lower)
@@ -148,27 +146,23 @@ def _near_midpoints(values, estimate, fmt: oc.Format, count: int) -> np.ndarray:
 def test_exp_rounds_as_interval_arithmetic_does(fmt):
     """Random arguments over exp's whole range in `fmt`, the ones whose float64 exp lies nearest a
     midpoint (the oracle's interval path), and the edges: underflow to subnormals and zero, overflow."""
-    import mpmath
-
     rng = np.random.default_rng(4)
     values = oc.exact_cast(rng.uniform(-110.0, 90.0, 1 << 20), fmt)
     values = values[np.isfinite(values)]
     hard = _near_midpoints(values, np.exp(values), fmt, 64)
     edges = oc.exact_cast(np.array([-103.97, -103.28, -87.34, -87.33, 88.72, 88.73, 0.0, -0.0, 1e-30]), fmt)
     sample = np.concatenate([values[:2000], hard, edges])
-    expected = _interval_rounded(mpmath.iv.exp, sample, fmt)
+    expected = _interval_rounded(lambda iv, x: iv.exp(x), sample, fmt)
     assert not oc.mismatches(oc.exp_rounded(sample, fmt), expected, fmt).any()
 
 
 @pytest.mark.parametrize("fmt", FORMATS, ids=lambda fmt: fmt.name)
 def test_rsqrt_rounds_as_interval_arithmetic_does(fmt):
-    import mpmath
-
     rng = np.random.default_rng(5)
     values = np.abs(_values(rng, 1 << 20, fmt))
     values = values[values > 0]
     hard = _near_midpoints(values, 1 / np.sqrt(values), fmt, 64)
     least = 2.0 ** (fmt.emin - fmt.precision + 1)
     sample = np.concatenate([values[:2000], hard, [1.0, 4.0, least]])
-    expected = _interval_rounded(lambda x: 1 / mpmath.iv.sqrt(x), sample, fmt)
+    expected = _interval_rounded(lambda iv, x: 1 / iv.sqrt(x), sample, fmt)
     assert not oc.mismatches(oc.rsqrt_rounded(sample, fmt), expected, fmt).any()

@@ -22,6 +22,7 @@ Bounds are computed with outward rounding: γ(k) = ku/(1-ku) in exact rationals,
 float64, and every float64 sum of magnitudes widened by its own worst-case error.
 """
 
+import contextlib
 import dataclasses
 import fractions
 import math
@@ -194,6 +195,19 @@ def _decided(low: np.ndarray, high: np.ndarray, fmt: Format) -> tuple[np.ndarray
     return lower, (lower == upper) | (np.isnan(lower) & np.isnan(upper))
 
 
+@contextlib.contextmanager
+def interval_precision(bits: int):
+    """mpmath's interval context at `bits` of precision, restored after (it has no workprec)."""
+    import mpmath
+
+    held = mpmath.iv.prec
+    mpmath.iv.prec = bits
+    try:
+        yield mpmath.iv
+    finally:
+        mpmath.iv.prec = held
+
+
 def _fraction(raw) -> fractions.Fraction:
     """An mpmath raw mpf (sign, mantissa, exponent, bits) as an exact rational."""
     sign, mantissa, exponent, _ = raw
@@ -206,16 +220,14 @@ def exp_rounded(x, fmt: Format) -> np.ndarray:
     widened by `TRANSCENDENTAL_MARGIN` decides every element whose enclosure rounds one way, and
     mpmath's interval exp at rising precision decides the rest (exp of a nonzero rational is never
     a midpoint, so the precision needed is finite)."""
-    import mpmath
-
     x = np.asarray(x, np.float64)
     estimate = np.exp(x)
     low, high = estimate * (1 - TRANSCENDENTAL_MARGIN), estimate * (1 + TRANSCENDENTAL_MARGIN)
     result, decided = _decided(low, np.where(np.isinf(estimate), estimate, high), fmt)
     for index in np.flatnonzero(~decided):
         for precision in (96, 192, 384, 768):
-            with mpmath.iv.workprec(precision):
-                lower, upper = mpmath.iv.exp(mpmath.iv.mpf(float(x.flat[index])))._mpi_
+            with interval_precision(precision) as iv:
+                lower, upper = iv.exp(iv.mpf(float(x.flat[index])))._mpi_
             lower, upper = (fraction_rounded(_fraction(end), fmt) for end in (lower, upper))
             if lower == upper:
                 result.flat[index] = lower
