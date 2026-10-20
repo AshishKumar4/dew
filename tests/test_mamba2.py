@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 from model_support import decode_through
 from reference_error import FACTOR, assert_as_exact, assert_as_exact_as_the_reference, widened
-from ssd_support import mamba2_draw
+from ssd_support import declared_seeds, indexed_recording, mamba2_draw, mamba2_run
 
 from dew.accuracy import distance
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -31,11 +31,18 @@ from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd, recurrent_ssd
 from dew.objectives.lm import LMObjective
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
+REFERENCE_SEEDS = declared_seeds(FIXTURES / "ssd_seeded.npz")
+"""Sized by seeds_for on the recorded transformers reference; recording date and CPU are in NPZ provenance."""
 
 
 @pytest.fixture(scope="module")
 def reference():
     return dict(np.load(FIXTURES / "ssd.npz"))
+
+
+@pytest.fixture(scope="module")
+def seeded_reference():
+    return dict(np.load(FIXTURES / "ssd_seeded.npz"))
 
 
 @pytest.fixture(scope="module")
@@ -83,24 +90,23 @@ def operands(reference):
     )
 
 
-def test_the_chunked_scan_matches_the_reference(reference):
-    out, final = chunk_ssd(*operands(reference), None, 32)
-    as_exact((out, final), (reference["scan.output"], reference["scan.final"]),
-             (reference["scan.output_f64"], reference["scan.final_f64"]), "the scan")
+def assert_recorded_as_exact(reference, site):
+    """The recorded reference and its torch-float64 truth on each fresh native-input/orbit draw."""
+    draw, recorded, truth = indexed_recording(reference, site, REFERENCE_SEEDS[site])
+    run = jax.jit(lambda index, inputs: mamba2_run(site, inputs))
+    assert_as_exact(run, recorded, draw, f"transformers {site}", seeds=REFERENCE_SEEDS[site], truth_fn=truth)
 
 
-def test_a_carried_state_matches_the_reference(reference):
-    out, final = chunk_ssd(*operands(reference), jnp.asarray(reference["scan.initial"]), 32)
-    as_exact((out, final), (reference["scan.output_carried"], reference["scan.final_carried"]),
-             (reference["scan.output_carried_f64"], reference["scan.final_carried_f64"]), "the carried scan")
+def test_the_chunked_scan_matches_the_reference(seeded_reference):
+    assert_recorded_as_exact(seeded_reference, "scan")
 
 
-def test_one_recurrent_step_matches_selective_state_update(reference):
-    x, step, A, B, C, D = operands(reference)
-    out, final = recurrent_ssd(x[:, :1], step[:, :1], A, B[:, :1], C[:, :1], D,
-                               jnp.asarray(reference["scan.initial"]))
-    as_exact((out[:, 0], final), (reference["step.output"], reference["step.state"]),
-             (reference["step.output_f64"], reference["step.state_f64"]), "the step")
+def test_a_carried_state_matches_the_reference(seeded_reference):
+    assert_recorded_as_exact(seeded_reference, "carried")
+
+
+def test_one_recurrent_step_matches_selective_state_update(seeded_reference):
+    assert_recorded_as_exact(seeded_reference, "step")
 
 
 def test_the_chunked_and_recurrent_forms_agree(reference):

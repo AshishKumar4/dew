@@ -18,6 +18,7 @@ Triton loads, so the fixture is mamba_ssm's algorithm at IEEE products, and reco
 """
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -62,10 +63,66 @@ def operands(rng, batch, tokens, heads, width, groups, state, dtype, documents) 
     }
 
 
+def write_seeded(scan, version, revision):
+    """Indexed fresh-input/head/P/N draws, native mamba_ssm outputs, and the existing XLA float64 truth.
+
+    PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba_ssd_reference.py <checkout> --seeded
+    """
+    import jax
+    import jax.numpy as jnp
+    from reference_error import widened
+    from ssd_reference import provenance, record_case
+    from ssd_support import mamba_ssd_xla, ssd_orbit
+
+    stored = {"precision": np.asarray("ieee")}
+    for case, (*shape, chunk, dtype, documents) in CASES.items():
+        narrow_dtype = jnp.dtype(str(dtype).removeprefix("torch."))
+        exact_run = jax.jit(lambda arrays, chunk=chunk: mamba_ssd_xla(arrays, chunk))
+
+        def draw(seed, shape=shape, dtype=dtype, documents=documents):
+            return ssd_orbit(operands(np.random.default_rng(seed), *shape, dtype, documents), seed)
+
+        def evaluate(arrays, chunk=chunk, dtype=dtype, exact_run=exact_run):
+            cuda = {name: torch.tensor(value, device="cuda") for name, value in arrays.items()}
+            inputs = tuple(cuda[name].to(dtype if name in ("x", "B", "C") else torch.float32)
+                           .requires_grad_() for name in ("x", "dt", "A", "B", "C", "D", "h0"))
+            x, dt, A, Bm, Cm, D, h0 = inputs
+            output, final = scan(x, dt, A, Bm, Cm, chunk, D=D, initial_states=h0,
+                                 seq_idx=cuda.get("seq"), return_final_states=True)
+            grads = torch.autograd.grad((output, final), inputs, (cuda["dy"].to(dtype), cuda["dfinal"]))
+            names = ("y", "final", "x", "dt", "A", "B", "C", "D", "h0")
+            reference = {name: value.detach().float().cpu().numpy() for name, value in
+                         zip(names, (output, final, *grads), strict=True)}
+            with jax.enable_x64(new_val=True):
+                truth = jax.tree.map(np.asarray, exact_run(widened(arrays)))
+            return reference, truth
+
+        stored.update(record_case(
+            case, draw, evaluate,
+            lambda arrays, chunk=chunk, dtype=narrow_dtype: mamba_ssd_xla(arrays, chunk, dtype),
+            truth_proxy=exact_run))
+        stored[f"{case}.chunk"] = np.int32(chunk)
+        stored[f"{case}.dtype"] = np.asarray(str(narrow_dtype))
+    stored["provenance"] = provenance(
+        f"mamba_ssm {version}", revision, torch.cuda.get_device_name(),
+        "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu "
+        "python tools/mamba_ssd_reference.py <checkout> --seeded",
+        truth="Dew's XLA chunk_ssd and all seven gradients in float64")
+    destination = FIXTURE.with_name("ssd_mamba_ssm_seeded.npz")
+    np.savez_compressed(destination, **stored)
+    print(f"wrote {destination.name}", flush=True)
+
+
 def main() -> None:
     sys.path.insert(0, sys.argv[1])
     from mamba_ssm import __version__
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+
+    if sys.argv[2:] == ["--seeded"]:
+        revision = subprocess.run(["git", "-C", sys.argv[1], "rev-parse", "HEAD"], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        write_seeded(mamba_chunk_scan_combined, __version__, revision)
+        return
 
     rng = np.random.default_rng(SEED)
     stored = {}
