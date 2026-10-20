@@ -6,15 +6,12 @@ EMA tree a call returns is a snapshot. A resumed fit drops what a failed run obs
 restored step, and a fit that finds the run complete observes its final state once.
 """
 
-import os
-import signal
-
 import jax
 import numpy as np
 import optax
 import pytest
 from affine_run import Regression, dataset
-from recording import RecordingTracker
+from recording import Preempting
 
 from dew.training import Checkpoints, Layout, Observe, Trainer
 from dew.training.runtime import Preempted
@@ -23,21 +20,6 @@ from dew.training.runtime import Preempted
 def trainer(directory=None, tracker=None) -> Trainer:
     return Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1),
                    checkpoints=None if directory is None else Checkpoints(str(directory)), tracker=tracker)
-
-
-class Preempting(RecordingTracker):
-    """Sends this process the scheduler's SIGTERM when step `at` is logged; the loop reads a
-    step's log once the next is dispatched, so the run stops after step `at` + 1."""
-
-    def __init__(self, at):
-        super().__init__()
-        self.at = at
-
-    def log(self, scalars, step):
-        super().log(scalars, step)
-        if step == self.at:
-            self.at = None
-            os.kill(os.getpid(), signal.SIGTERM)
 
 
 def averaged(state):
