@@ -100,8 +100,9 @@ def test_a_token_only_run_uses_the_schedules_own_horizon(schedule):
 
 def test_a_directory_refuses_another_runs_resume_and_resumes_its_own_on_another_kernel(tmp_path):
     """A checkpoint directory belongs to one run: a decoder of the same shapes and another rotary
-    base is another run, whose resume is refused before its first step; the same decoder computing
-    through another attention kernel is the same run, and resumes."""
+    base is another run, whose resume is refused before its first step, as is one whose layer kind
+    named `precision` rotates by another base; the same decoder computing through another attention
+    kernel, and holding a longer decode cache, is the same run, and resumes."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
 
@@ -114,10 +115,17 @@ def test_a_directory_refuses_another_runs_resume_and_resumes_its_own_on_another_
                 Loader(replayed(lambda partition: itertools.repeat(batch)), None, None, len(batch["text"])),
                 steps=steps, log_every=100, checkpoint_every=1)
 
-    run(1)
+    def kind(base):
+        """One layer of a kind named like a field of how a model computes, rotating by `base`."""
+        return {"layer_types": ("precision",), "kinds": {"precision": LayerKind(rope_theta=base)}}
+
+    run(1, **kind(10000.0))
     with pytest.raises(ValueError):
-        run(2, rope_theta=500.0)
-    assert int(run(2, attention_impl="reference").step) == 2
+        run(2, **kind(10000.0), rope_theta=500.0)
+    with pytest.raises(ValueError):
+        run(2, **kind(500.0))
+    resumed = run(2, **kind(10000.0), attention_impl="reference", max_seq_len=16)
+    assert int(resumed.step) == 2
 
 
 def test_a_token_budget_resumes_its_count_from_the_checkpoint(tmp_path):

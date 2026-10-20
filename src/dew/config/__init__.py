@@ -45,7 +45,7 @@ from etils import epath
 import dew.io
 from dew import registry
 from dew.cache import dew_cache_dir
-from dew.checkpoints import RUN_FILE, Checkpoints, Keep, inference_artifact
+from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.data import Augment, HoldOut, ImageData, RunData, loader
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.coordination import agree_process_phase, agreed, agreed_same
@@ -1330,7 +1330,7 @@ class RunConfig:
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
             if agreed_same("newest checkpoint", lambda: checkpoints.latest) is not None:
                 # Before this run's record replaces the one it would resume.
-                checkpoints.refuse_another_run(inference_artifact(objective))
+                checkpoints.refuse_another_run(objective.training_identity())
 
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""

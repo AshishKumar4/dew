@@ -13,9 +13,11 @@ reports. These values are JAX pytrees.
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import functools
 import math
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -472,6 +474,47 @@ def _ruled_jvp(primals, tangents):
                                     zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
 
 
+
+EXECUTION_FIELDS = frozenset({"dtype", "param_dtype", "precision", "attention_impl", "kv_cache", "remat",
+                              "scan_layers", "bank_layers", "max_seq_len", "context_length"})
+"""The fields of a network that choose how it computes or what it holds for decoding, not what it
+computes over its parameters: a run changes them between a launch and its resume (a kernel for
+another GPU, a dtype, a remat policy, a scan, a decode cache's capacity). A module adds its own
+as a class attribute `execution_fields`. A field whose change also changes the parameters (a
+learned position table's length) the restore's shapes refuse."""
+
+
+def module_identity(value) -> JSON:
+    """`value`, a network or a field of one, as what it computes: a module or dataclass as its
+    class and its fields past `EXECUTION_FIELDS` and its class's `execution_fields`, a quantized
+    module as the module it quantizes (its quantization chooses how it computes), a mapping by its
+    own keys, a sequence entry by entry, a function or class by its import path, an array by its
+    content and anything else by its repr, without addresses."""
+    from flax import linen as nn
+
+    from dew.data.sources.codec import content_fingerprint
+    from dew.registry import import_path
+
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        kind = next((layer for layer in type(value).__mro__ if "_unquantized_type" in vars(layer)), None)
+        kind = type(value) if kind is None else vars(kind)["_unquantized_type"]
+        apart = EXECUTION_FIELDS | set(getattr(kind, "execution_fields", ()))
+        fields = {field.name: module_identity(getattr(value, field.name))
+                  for field in dataclasses.fields(value)
+                  if field.repr and field.name not in apart and field.name not in ("parent", "name")}
+        named = {"name": value.name} if isinstance(value, nn.Module) and value.name is not None else {}
+        return {"class": import_path(kind), "fields": fields, **named}
+    if isinstance(value, Mapping):
+        return {str(key): module_identity(entry) for key, entry in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [module_identity(entry) for entry in value]
+    if isinstance(value, type) or (callable(value) and hasattr(value, "__qualname__")):
+        return import_path(value)
+    if isinstance(value, (np.ndarray, jax.Array)):
+        return content_fingerprint(np.asarray(value)).hex()
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))
 
 class Objective(ABC, Generic[Loss, Effects]):
     """Defines what is learned: the parameters, the loss and what evaluation produces."""
@@ -1137,6 +1180,17 @@ class Objective(ABC, Generic[Loss, Effects]):
     def recorded_model(self) -> nn.Module:
         """The model a saved step's record names (`inference_record`): the objective's own."""
         return self.model
+
+    def training_identity(self) -> JSON:
+        """What this objective trains, which a checkpoint keeps and a resume compares
+        (`Checkpoints.refuse_another_run`): its class and every network its programs run
+        (`program_key`), a frozen teacher's and a critic's among them, each as what it computes
+        (`module_identity`). An objective whose mathematics also sits outside its networks (a
+        diffusion process) adds it."""
+        from dew.registry import import_path
+
+        return {"objective": import_path(type(self)),
+                "networks": [module_identity(program.module) for program in self.program_key()]}
 
     def inference_record(self) -> JSON:
         """Return the model and task settings that let a saved step be rebuilt.

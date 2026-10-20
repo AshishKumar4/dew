@@ -69,7 +69,7 @@ from orbax.checkpoint.checkpoint_manager import AsyncOptions, MultiprocessingOpt
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
 from dew import position, records
-from dew.coordination import broadcast_from_process_zero, from_every_process
+from dew.coordination import agreed_same, broadcast_from_process_zero, from_every_process
 from dew.files import write_atomically
 from dew.hashing import fmix32
 from dew.nn import sharding
@@ -897,33 +897,6 @@ class InferenceRecorded(Protocol):
     def inference_record(self) -> JSON: ...
 
 
-EXECUTION = ("dtype", "param_dtype", "precision", "attention_impl", "remat")
-"""The model fields that choose how a model computes, not what it is, which a run may change
-between one launch and its resume (a kernel for another GPU, a dtype, a remat policy)."""
-
-
-def run_identity(artifact: JSON) -> JSON:
-    """What a checkpoint's inference record says its run is: the objective and the model, without
-    the fields that choose how the model computes (`EXECUTION`); None where the record describes
-    no model (an objective that declares none, or one a record cannot describe)."""
-    match artifact:
-        case {"model": model, **rest}:
-            return {"objective": rest.get("objective"), "model": _computed_apart(model)}
-        case _:
-            return None
-
-
-def _computed_apart(value: JSON) -> JSON:
-    """A model record without the fields that choose how it computes (`EXECUTION`), at any depth."""
-    match value:
-        case dict():
-            return {key: _computed_apart(entry) for key, entry in value.items() if key not in EXECUTION}
-        case list():
-            return [_computed_apart(entry) for entry in value]
-        case _:
-            return value
-
-
 def _differences(here: JSON, there: JSON, path: str = "") -> list[str]:
     """The paths at which two records differ, each with both values."""
     match here, there:
@@ -1052,16 +1025,25 @@ class Checkpoints:
         custom = self._step_metadata(step, local=local).custom_metadata or {}
         return json_value(custom.get('artifact'), 'artifact')
 
-    def refuse_another_run(self, artifact: JSON, step: int | str | None = None) -> None:
-        """Refuse to resume the step at `step` (the latest) as the run `artifact` records, its
-        inference record, where the directory holds another run's: one whose objective or model
-        differs by more than how the model computes (`run_identity`). A directory belongs to one
-        run, and a fresh run takes a new one. A record that describes no model on either side has
-        nothing to compare, and the shapes the restore reads are the check."""
-        here, there = run_identity(artifact), run_identity(self.artifact(step))
-        if here is None or there is None or here == there:
+    def identity(self, step: int | str | None = None) -> JSON:
+        """The selected step's training identity (`Objective.training_identity`), None for a step
+        saved before steps recorded one."""
+        step = self.pinned(step)
+        custom = self._step_metadata(step, local=step == self._local_latest()).custom_metadata or {}
+        return json_value(custom.get('identity'), 'identity')
+
+    def refuse_another_run(self, identity: JSON, step: int | str | None = None) -> None:
+        """Refuse, on every process at once, to resume the step at `step` (the latest) as the run
+        whose training identity is `identity` (`Objective.training_identity`), where the directory
+        holds another run's: one whose objective or networks differ past how they compute. A
+        directory belongs to one run, and a fresh run takes a new one. The processes agree on the
+        identity their step records (`agreed_same`), so a local step of another run on one of them
+        is refused on all; a step saved before steps recorded one has nothing to compare, and the
+        shapes the restore reads are the check."""
+        there = agreed_same("run identity", lambda: self.identity(step))
+        if there is None or identity == there:
             return
-        differences = _differences(here, there)
+        differences = _differences(identity, there)
         raise ValueError(f"{self.directory} holds another run's checkpoints, which this run would "
                          f"resume: {'; '.join(differences[:5])}"
                          f"{f' and {len(differences) - 5} more' if len(differences) > 5 else ''}. "
@@ -1259,6 +1241,7 @@ class Checkpoints:
         primary: str | None = None,
         rung: JSON = None,
         artifact: JSON = None,
+        identity: JSON = None,
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
     ) -> None:
         """Write `state` under `step`, asynchronously.
@@ -1300,7 +1283,7 @@ class Checkpoints:
             self._identify_run()
         if mapping:
             if (saved is not None or share is not None or weights_only or rung is not None
-                    or artifact is not None):
+                    or artifact is not None or identity is not None):
                 raise ValueError("a mapping is saved as it is: it takes no data position, share, "
                                  "weights-only split, rung or artifact, which a train state's save records")
             profiles, state_tree, frozen, deltas = None, dict(state), {}, []
@@ -1339,6 +1322,7 @@ class Checkpoints:
             "weights_only": weights_only,
             "rung": rung,
             "artifact": artifact,
+            "identity": identity,
             "boxed": _boxed_record(boxed),
             "frozen": frozen,
             "tree": mapping,
@@ -1551,6 +1535,7 @@ class Checkpoints:
         control: dict | None = None,
         rung: JSON = None,
         artifact: JSON = None,
+        identity: JSON = None,
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
     ) -> None:
         """Write `state` under `step` to this process's local directory, asynchronously.
@@ -1581,6 +1566,7 @@ class Checkpoints:
                     "control": copy.deepcopy(control or {}),
                     "rung": rung,
                     "artifact": artifact,
+                    "identity": identity,
                     "boxed": _boxed_record(boxed),
                 },
             )

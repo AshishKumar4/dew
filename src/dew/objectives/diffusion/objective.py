@@ -66,11 +66,13 @@ from dew.objectives.base import (
     Variables,
     merge,
     model_rngs,
+    module_identity,
     thaw,
     under,
 )
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, PERCEPTUAL, EndToEnd
+from dew.records import JSON
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.pipelines import ImageSettings, TextToImage
 from dew.sampling.sample import sample
@@ -500,6 +502,10 @@ class DiffusionObjective(Objective[Ratio]):
     @property
     def _sample(self):
         return self.program('sample', self._sample_impl, static_argnames=("count",))
+
+    def training_identity(self) -> JSON:
+        """The objective's networks and the process it trains them under (`Objective.training_identity`)."""
+        return {**super().training_identity(), "process": module_identity(self.process)}
 
     def task_settings(self) -> ImageSettings:
         """The process, input encoders, autoencoder and sampling convention."""

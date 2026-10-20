@@ -716,7 +716,7 @@ class Trainer(Generic[Loss, Effects]):
                 return self._placed_host(initializer, key, shardings), shardings, None
             held = placed_held(initializer, abstract.variables, shardings.variables, self.device_mesh)
             return taking_over(self.initial_state, *held, shardings)(key), shardings, None
-        checkpoints.refuse_another_run(self._artifact(), resume)
+        checkpoints.refuse_another_run(self.objective.training_identity(), resume)
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
         shardings = self.shardings(abstract)
         if self.host_master and FROZEN in abstract.variables:
@@ -743,12 +743,16 @@ class Trainer(Generic[Loss, Effects]):
 
     def _artifact(self) -> JSON:
         """The objective's inference record, which a checkpoint carries for
-        loaders and a resume compares its run with (`Checkpoints.refuse_another_run`). A model
-        or component no record can describe still checkpoints: the record says why, a
+        loaders. Training and resuming never read it, so a model or component
+        no record can describe still checkpoints: the record says why, a
         loader raises that, and the first checkpoint warns it, as it does a
         model defined where no import path reaches it (`__main__`, a function)."""
         artifact = inference_artifact(self.objective)
-        reason = artifact.get('unrecorded') if isinstance(artifact, Mapping) else None
+        match artifact:
+            case {"unrecorded": str(reason)}:
+                pass
+            case _:
+                reason = None
         if reason is not None and reason != self._unrecorded:
             self._unrecorded = reason
             _log.warning("this run's checkpoints resume, but no loader can rebuild their model "
@@ -2187,6 +2191,7 @@ class Trainer(Generic[Loss, Effects]):
             checkpoints.save, step, state, position, metadata, share=DataPartition.of(self.device_mesh),
             ranking=ranking, control={**(control or {}), "tokens": interval.real_tokens},
             weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
+            identity=self.objective.training_identity(),
             boxed=self._boxed_axes())
         self._report(CheckpointRequested(checkpoints.directory), step, write)
         interval.saved(step)
@@ -2212,7 +2217,7 @@ class Trainer(Generic[Loss, Effects]):
         write = functools.partial(
             checkpoints.save_local, step, state, position, share=DataPartition.of(self.device_mesh),
             control={**(control or {}), "tokens": interval.real_tokens}, rung=self._checkpoint_rung(),
-            artifact=self._artifact(), boxed=self._boxed_axes())
+            artifact=self._artifact(), identity=self.objective.training_identity(), boxed=self._boxed_axes())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
         return time.perf_counter() - paused
