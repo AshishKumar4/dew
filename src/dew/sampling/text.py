@@ -599,7 +599,7 @@ def _block_drafting(model: nn.Module, params: Variables):
 
 def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
               trips: int, budget: jax.Array, pad_id: int, n: int,
-              transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
+              transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
               strategy: Strategy) -> Generation:
     """One fixed compiled loop of `trips` draws; finished rows do not mutate
     their cache state. `budget` is the tokens the request may draw, at most
@@ -817,7 +817,7 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
 
 def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
              budget: jax.Array, trips: int, pad_id: int, n: int,
-             transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
+             transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
              strategy: Strategy) -> tuple[checkify.Error, Generation]:
     """`_generate` with its device checks discharged into a returned error.
 
