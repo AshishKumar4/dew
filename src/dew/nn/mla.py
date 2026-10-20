@@ -44,7 +44,7 @@ from dew.nn.kv_cache import KVCache, write_cache
 # contracts from base avoids importing the kind hub back during this module's
 # initialization, so either kind can be the first imported.
 from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general, float32_products
 from dew.nn.rope import YarnScaling, deinterleaved, rotate, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
@@ -122,7 +122,8 @@ def indexer_kl(scores, query, key, keep, scale: float):
 
     def head(summed, projections):
         q, k = projections
-        logits = jnp.where(keep, jnp.einsum('bsd,btd->bst', q, k), masked)
+        product = jnp.einsum('bsd,btd->bst', q, k, precision=float32_products(q.dtype))
+        logits = jnp.where(keep, product, masked)
         return summed + jax.nn.softmax(logits, axis=-1), None
 
     summed, _ = jax.lax.scan(
@@ -175,7 +176,8 @@ class SparseIndexer(nn.Module):
                 f"out of heads of width {self.head_dim}, so the heads have "
                 "to be wider")
         dense = functools.partial(
-            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+            dot_general=float32_dot_general)
         self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
         self.wk = dense(self.head_dim, name='wk')
         # A LayerNorm with weight and bias at a hardcoded 1e-6: the reference
@@ -327,7 +329,7 @@ class MultiHeadLatentAttention(nn.Module):
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         dense = functools.partial(
             nn.Dense, use_bias=self.attention_bias, dtype=self.dtype,
-            precision=self.precision)
+            precision=self.precision, dot_general=float32_dot_general)
         norm = functools.partial(
             RMSNorm, epsilon=self.norm_eps,
             scale_offset=self.scale_offset,
@@ -337,24 +339,25 @@ class MultiHeadLatentAttention(nn.Module):
             # attention_bias says; only the low-rank projections do.
             self.q_proj = nn.Dense(
                 self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
-                precision=self.precision, name='q_proj')
+                precision=self.precision, name='q_proj', dot_general=float32_dot_general)
         else:
             self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
             self.q_a_layernorm = norm(name='q_a_layernorm')
             self.q_b_proj = nn.Dense(
                 self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
-                precision=self.precision, name='q_b_proj')
+                precision=self.precision, name='q_b_proj', dot_general=float32_dot_general)
         self.kv_a_proj_with_mqa = dense(
             self.kv_lora_rank + self.qk_rope_head_dim, name='kv_a_proj_with_mqa')
         self.kv_a_layernorm = norm(name='kv_a_layernorm')
         self.kv_b_proj = nn.Dense(
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             use_bias=False, dtype=self.dtype, precision=self.precision,
-            name='kv_b_proj')
+            name='kv_b_proj', dot_general=float32_dot_general)
         self.o_proj = dense(self.emb_features, name='o_proj')
         if self.output_gate:
             self.g_proj = nn.Dense(self.num_heads * self.v_head_dim, use_bias=False,
-                                   dtype=self.dtype, precision=self.precision, name='g_proj')
+                                   dtype=self.dtype, precision=self.precision, name='g_proj',
+                                   dot_general=float32_dot_general)
         if self.index_n_heads is not None and self.index_head_dim is not None:
             if self.q_lora_rank is None:
                 raise ValueError(

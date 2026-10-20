@@ -36,7 +36,7 @@ from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels.generation import backend, measured_kernel, ran_kernel, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_refusal, xla_ragged_dot
-from .precision import at_least_fp32, rounded_operand
+from .precision import at_least_fp32, float32_dot_general, float32_einsum, float32_products, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
 from .sharding import (
     EXPERT_AXIS,
@@ -313,7 +313,7 @@ class Router(nn.Module):
     def logits(self, x):
         """Each token's gate logit for every expert, in fp32 (`at_least_fp32`):
         `[..., num_experts]`."""
-        return jnp.einsum('...d,de->...e', x.astype(at_least_fp32(x.dtype)), self.kernel,
+        return float32_einsum('...d,de->...e', x.astype(at_least_fp32(x.dtype)), self.kernel,
                           precision=self.precision)
 
     def _activated(self, logits):
@@ -401,10 +401,11 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     float64 sums and three Adam steps on every expert/fsdp layout.
     """
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
-    chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), precision)
+    resolved = float32_products(compute, precision)
+    chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), resolved)
     if chosen == 'pallas' and seen_whole(x) and seen_whole(kernel):
         return grouped_projection(x, kernel, group_sizes, compute, implementation == 'pallas')
-    return _projection(x, kernel, group_sizes, dtype, precision)
+    return _projection(x, kernel, group_sizes, dtype, resolved)
 
 
 @functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4))
@@ -910,7 +911,7 @@ class ExpertMLP(nn.Module):
         wide = at_least_fp32(slots.dtype)
         if self.scale_inputs:
             return jnp.sum(slots.astype(wide), axis=-2).astype(slots.dtype)
-        return jnp.einsum('...ke,...k->...e', slots.astype(wide),
+        return float32_einsum('...ke,...k->...e', slots.astype(wide),
                           weights.astype(wide), precision=self.precision).astype(slots.dtype)
 
     def __call__(self, x: jax.Array, weights: jax.Array, indices: jax.Array) -> jax.Array:
@@ -1038,7 +1039,8 @@ class SparseMLP(nn.Module):
             init_std=self.init_std, output_init_std=self.output_init_std,
             dtype=self.dtype, precision=self.precision, name='experts')
         if self.latent_features is not None:
-            dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                      dot_general=float32_dot_general)
             self.routed_expert_down_proj = dense(self.latent_features, name='routed_expert_down_proj')
             self.routed_expert_up_proj = dense(self.out_features, name='routed_expert_up_proj')
             if self.latent_norm is not None:
@@ -1050,7 +1052,8 @@ class SparseMLP(nn.Module):
             if self.shared_gate:
                 self.shared_expert_gate = nn.Dense(
                     1, use_bias=False, dtype=self.dtype, precision=self.precision,
-                    name='shared_expert_gate', **normal_kernel(self.init_std))
+                    name='shared_expert_gate', **normal_kernel(self.init_std),
+                    dot_general=float32_dot_general)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """The packed groups its shared branch declares (`ProjectionSites`);

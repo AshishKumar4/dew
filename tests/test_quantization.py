@@ -5,10 +5,13 @@ everywhere, since construction never imports it.
 """
 
 import dataclasses
+import functools
 import itertools
 import os
 import subprocess
 import sys
+import types
+from collections.abc import Callable
 from importlib import import_module
 from pathlib import Path
 
@@ -21,10 +24,16 @@ from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound
 
 from dew.config import ObjectiveConfig, OptimConfig
+from dew.lora import _updated as lora_update
+from dew.nn.attention_residuals import depth_mixed
+from dew.nn.blocks import torch_bicubic_resize
+from dew.nn.kv_cache import hadamard, rotated
+from dew.nn.quantizers import nearest_codewords
 from dew.nn.sharding import pipeline_microbatches
+from dew.nn.ssm import diagonal_recurrence
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.quantization import Quantization, quantize_for_serving
+from dew.quantization import UNQUANTIZED, Quantization, quantize_for_serving
 from dew.registry import models
 from dew.training.distributed import Layout, MeshSpec, shard_batch
 
@@ -187,13 +196,12 @@ def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width
                     reason="Dew refuses a grouped quantized convolution on a GPU; "
                            "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
 @pytest.mark.parametrize("groups", [1, 16])
-def test_a_quantized_convolution_keeps_its_calls_precision_and_result_dtype(groups):
-    """A quantized convolution keeps its call's contract, as a quantized matmul does: one pinned at
-    the highest precision, Dew's Conv and lax's alike, has no quantized form and runs unquantized at
-    it, bitwise the float convolution; one that asks for a float32 result from bf16 operands
-    returns float32, within int8's rounding of the float convolution. Before, both quantized and
-    returned the bf16 input's dtype."""
-    pytest.importorskip("qwix")
+def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision_it_pins(groups):
+    """A quantized convolution keeps its call's contract, as a quantized matmul does: one that asks
+    for a float32 result from bf16 operands returns float32, within int8's rounding of the float
+    convolution, where before it returned the bf16 input's dtype; and one pinned at the highest
+    precision, Dew's Conv and lax's alike, quantizes as any other does, a quantized product having
+    no precision to honour, within int8's rounding of the float convolution."""
     from flax import linen as nn
 
     from dew.nn.conv import Conv
@@ -216,8 +224,9 @@ def test_a_quantized_convolution_keeps_its_calls_precision_and_result_dtype(grou
               Native(precision=jax.lax.Precision.HIGHEST))
     for module in pinned:
         variables = module.init(jax.random.key(1), x)
-        np.testing.assert_array_equal(Quantization().apply(module).apply(variables, x),
-                                      module.apply(variables, x))
+        got = Quantization().apply(module).apply(variables, x).astype(jnp.float32)
+        want = module.apply(variables, x).astype(jnp.float32)
+        assert 0.0 < float(jnp.linalg.norm(got - want) / jnp.linalg.norm(want)) < 0.02
     wide = Native(preferred=jnp.float32)
     variables = wide.init(jax.random.key(1), x)
     got = Quantization().apply(wide).apply(variables, x)
@@ -968,23 +977,85 @@ def test_the_trainer_knob_quantizes_what_a_distillation_trains_and_not_its_teach
                                   jax.jit(teacher.apply)(variables, tokens))
 
 
-def test_a_matmul_that_pins_its_precision_runs_unquantized_at_it():
-    """An accumulation precision past the default has no quantized form, so a
-    matmul that pins one, as an fp32 zone does, runs at it unquantized: its
-    output is the unquantized model's, where the default-precision one moves."""
-    pytest.importorskip("qwix")
-    x = jnp.linspace(-2, 2, 16, dtype=jnp.float32).reshape(2, 8).astype(jnp.bfloat16)
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("precision", [None, "highest"])
+def test_a_matmul_quantizes_whatever_precision_it_pins(precision, dtype):
+    """A quantized product has no precision to honour, so a matmul a rule matches quantizes
+    whatever precision it pins: a float32 model's layers pin float32 products
+    (`float32_products`) and quantize as a bfloat16 model's do."""
+    x = jnp.linspace(-2, 2, 16, dtype=jnp.float32).reshape(2, 8).astype(dtype)
+    model = nn.Dense(16, dtype=dtype, param_dtype=dtype, precision=precision)
+    variables = model.init(jax.random.key(0), x)
+    quantized = np.asarray(Quantization().apply(model).apply(variables, x), np.float32)
+    assert not np.array_equal(quantized, np.asarray(model.apply(variables, x), np.float32))
 
-    def outputs(precision):
-        model = nn.Dense(16, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, precision=precision)
-        variables = model.init(jax.random.key(0), x)
-        return (np.asarray(Quantization().apply(model).apply(variables, x), np.float32),
-                np.asarray(model.apply(variables, x), np.float32))
 
-    pinned, plain = outputs("highest")
-    np.testing.assert_array_equal(pinned, plain)
-    quantized, plain = outputs(None)
-    assert not np.array_equal(quantized, plain)
+class Calls(nn.Module):
+    """A model whose call is `function` of its operands, for `Quantization.apply` to wrap."""
+
+    function: Callable[..., jax.Array]
+
+    def __call__(self, *operands):
+        return self.function(*operands)
+
+
+def zone_cases(dtype) -> dict[str, tuple[Callable[..., jax.Array], tuple, dict]]:
+    """Each `UNQUANTIZED` function, its operands in `dtype` and its keywords."""
+    rng = np.random.default_rng(0)
+
+    def normal(*shape):
+        return jnp.asarray(rng.standard_normal(shape), jnp.float32).astype(dtype)
+
+    pole = jnp.exp(jax.lax.complex(-jnp.linspace(0.05, 0.4, 4), jnp.linspace(0.3, 2.0, 4)))
+    # Each row of -1, 0 and 1 sits one step from one codeword and a step and 1/128 across from
+    # another: a gap of 2**-14 in squared distance, which the float scores, sums of multiples of
+    # 2**-14 below 2**7, hold exactly in either dtype, and an int8 product's rounding reorders.
+    whole = np.random.default_rng(1).integers(-1, 2, (64, 32)).astype(np.float32)
+    whole[:, -1] = 0
+    steps = np.eye(32, dtype=np.float32)[np.random.default_rng(2).integers(0, 31, 64)]
+    across = np.eye(32, dtype=np.float32)[-1] / 128
+    rows = jnp.asarray(whole, dtype)
+    codebook = jnp.asarray(np.concatenate([whole + steps, whole - steps + across]), dtype)
+    return {
+        "dew.nn.ssm.diagonal_recurrence": (diagonal_recurrence, (pole, normal(2, 12, 8)), {"chunk": 4}),
+        "dew.nn.attention_residuals.depth_mixed": (
+            depth_mixed, (normal(2, 3, 4, 8), normal(8), normal(2, 3, 4, 8)), {}),
+        "dew.nn.quantizers.nearest_codewords": (nearest_codewords, (rows, codebook), {}),
+        "dew.nn.kv_cache.rotated": (rotated, (normal(2, 4, 8), hadamard(8)), {}),
+        "dew.lora._updated": (lora_update, (normal(8, 6), normal(8, 2), normal(2, 6)), {"scale": 2.0}),
+    }
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("name", sorted(UNQUANTIZED))
+def test_a_function_the_model_keeps_in_float_runs_unquantized(name, dtype):
+    """Each function `UNQUANTIZED` names runs in a quantized model as in the unquantized one,
+    bitwise, in a float32 and a bfloat16 model, where a copy of its code under another name, which
+    the table does not reach, quantizes its products and moves."""
+    function, operands, keywords = zone_cases(dtype)[name]
+    copy = types.FunctionType(function.__code__, function.__globals__, f"{function.__name__}_copy",
+                              function.__defaults__, function.__closure__)
+    copy.__kwdefaults__ = function.__kwdefaults__
+
+    def ran(function, quantize: bool) -> np.ndarray:
+        model = Calls(functools.partial(function, **keywords))
+        # Qwix quantizes a product as it is traced, and jnp.matmul is jitted, so each run traces
+        # afresh: one that reused another's cached trace would take its products, quantized or not.
+        jax.clear_caches()
+        return np.asarray((Quantization().apply(model) if quantize else model).apply({}, *operands))
+
+    plain = ran(function, quantize=False)
+    np.testing.assert_array_equal(ran(function, quantize=True), plain)
+    np.testing.assert_array_equal(ran(copy, quantize=False), plain)
+    assert not np.array_equal(ran(copy, quantize=True), plain)
+
+
+def test_an_einsum_of_three_operands_runs_as_the_unquantized_model_runs_it():
+    """Qwix quantizes a two-operand einsum alone and raises on any other, so the provider runs one
+    of three operands, torch's bicubic resampling among them, as the unquantized model does."""
+    x = jnp.asarray(np.random.default_rng(0).standard_normal((1, 4, 5, 3)), jnp.float32)
+    model = Calls(functools.partial(torch_bicubic_resize, height=7, width=9))
+    np.testing.assert_array_equal(Quantization().apply(model).apply({}, x), model.apply({}, x))
 
 
 def assert_computed_as_on_the_host(run, label: str) -> None:

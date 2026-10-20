@@ -47,6 +47,7 @@ CELLS: dict[str, tuple[str, ...]] = {
     "mmdit": ("tensor4", "fsdp2_tensor2"),
     "dit": ("sequence4", "tensor4", "fsdp2_explicit"),
     "unet": ("tensor4", "fsdp2_tensor2", "sequence4"),
+    "edm2": ("tensor4", "fsdp2_tensor2"),
     "jepa": ("fsdp4", "sequence4", "tensor4", "data4_explicit"),
     "multimodal": ("sequence4", "stage4", "data4_explicit"),
 }

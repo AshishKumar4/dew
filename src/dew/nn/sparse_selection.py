@@ -13,7 +13,7 @@ read, and `sparse_latent_attention` attends it without that mask.
 import jax
 import jax.numpy as jnp
 
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_einsum, float32_products
 from dew.nn.scatter import DROPPED
 
 
@@ -28,13 +28,13 @@ def index_scores(query, keys, weights, precision=None):
     heads, width = query.shape[-2:]
     wide = at_least_fp32(query.dtype)
     shared = 'bshd,btd->bsht' if keys.ndim == 3 else 'bshd,bstd->bsht'
-    scores = jnp.maximum(jnp.einsum(shared, query.astype(wide),
+    scores = jnp.maximum(float32_einsum(shared, query.astype(wide),
                                     keys.astype(wide), precision=precision), 0) * width ** -0.5
     # The head sum as a [1, H] by [H, T] product per query: written as the
     # einsum over the scores first, it ran a third slower forward and backward
     # on an H100 at the V3.2 indexer's 64 heads over 4096 keys.
     weighted = (weights.astype(wide) * heads ** -0.5)[..., None, :]
-    return jnp.matmul(weighted, scores, precision=precision).squeeze(-2)
+    return jnp.matmul(weighted, scores, precision=float32_products(wide, precision)).squeeze(-2)
 
 
 def top_k_selection(scores, keep, top_k: int):
@@ -110,7 +110,7 @@ def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, valu
     nothing reads.
     """
     batch, length, heads, _ = query_nope.shape
-    absorbed = jnp.einsum('bshn,rhn->bshr', query_nope, key_weight.astype(query_nope.dtype),
+    absorbed = float32_einsum('bshn,rhn->bshr', query_nope, key_weight.astype(query_nope.dtype),
                           precision=precision)
     blocks = -(-length // block)
 
@@ -127,17 +127,17 @@ def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, valu
         allowed, at = at >= 0, jnp.maximum(at, 0)
         keys, rots = gathered(latent, at), gathered(rot, at)
         wide = at_least_fp32(q_latent.dtype)
-        logits = (jnp.einsum('bqhr,bqkr->bqhk', q_latent, keys, precision=precision,
+        logits = (float32_einsum('bqhr,bqkr->bqhk', q_latent, keys, precision=precision,
                              preferred_element_type=wide)
-                  + jnp.einsum('bqhp,bqkp->bqhk', q_rot, rots, precision=precision,
+                  + float32_einsum('bqhp,bqkp->bqhk', q_rot, rots, precision=precision,
                                preferred_element_type=wide)) * scale
         logits = jnp.where(allowed[:, :, None, :], logits, jnp.finfo(wide).min)
         weights = jax.nn.softmax(logits, axis=-1).astype(keys.dtype)
-        return jnp.einsum('bqhk,bqkr->bqhr', weights, keys, precision=precision)
+        return float32_einsum('bqhk,bqkr->bqhr', weights, keys, precision=precision)
 
     context = jax.lax.map(attend, tuple(blocked(x) for x in (absorbed, query_rot, indices)))
     context = jnp.moveaxis(context, 0, 1).reshape(batch, blocks * block, heads, -1)[:, :length]
-    return jnp.einsum('bshr,rhv->bshv', context, value_weight.astype(context.dtype),
+    return float32_einsum('bshr,rhv->bshv', context, value_weight.astype(context.dtype),
                       precision=precision)
 
 

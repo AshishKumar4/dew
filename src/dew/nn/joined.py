@@ -15,6 +15,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.core import meta
 
+from dew.nn.precision import float32_dot_general
+
 from ..registry import wrapper_layers
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel
 
@@ -37,8 +39,9 @@ def join_refusal(projections: Sequence[nn.Module]) -> str | None:
     return first_refusal(
         (all(type(projection) is nn.Dense for projection in projections),
          "a projection is not a plain nn.Dense, whose call the join reproduces"),
-        (all(projection.dot_general is None and projection.dot_general_cls is None
-             for projection in projections), "a projection takes its own dot_general"),
+        (all(projection.dot_general in (None, float32_dot_general) and projection.dot_general_cls is None
+             for projection in projections),
+         "a projection takes a dot_general other than the join's (`float32_dot_general`)"),
         (len({(projection.features, projection.use_bias, projection.dtype, projection.precision,
                projection.promote_dtype) for projection in projections}) == 1,
          "the projections differ in width, bias, dtype, precision or promotion"),
@@ -76,7 +79,7 @@ def joined_dense(x: jax.Array, projections: Sequence[nn.Module], *, axis: int) -
     inputs = promoted[0][0]
     # A kernel is [inputs, features]; the stacked axis sits beside its features as it will in the output.
     kernel = jnp.stack([kernel for _, kernel, _ in promoted], axis=axis + 3)
-    y = jax.lax.dot_general(inputs, kernel, (((inputs.ndim - 1,), (0,)), ((), ())),
+    y = float32_dot_general(inputs, kernel, (((inputs.ndim - 1,), (0,)), ((), ())),
                             precision=projections[0].precision)
     if not projections[0].use_bias:
         return y
