@@ -17,7 +17,6 @@ import dataclasses
 import enum
 import functools
 import math
-import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -479,47 +478,61 @@ EXECUTION_FIELDS = frozenset({"dtype", "param_dtype", "precision", "attention_im
                               "scan_layers", "bank_layers", "max_seq_len", "context_length"})
 """The fields of a network that choose how it computes or what it holds for decoding, not what it
 computes over its parameters: a run changes them between a launch and its resume (a kernel for
-another GPU, a dtype, a remat policy, a scan, a decode cache's capacity). A module adds its own
-as a class attribute `execution_fields`. A field whose change also changes the parameters (a
-learned position table's length) the restore's shapes refuse."""
+another GPU, a dtype, a remat policy, a scan, a decode cache's capacity), in any module that has
+them. A field whose change also changes the parameters (a learned position table's length) the
+restore's shapes refuse."""
 
 
-def module_identity(value) -> JSON:
-    """`value`, a network or a field of one, as what it computes: a module or dataclass as its
-    class and its fields past `EXECUTION_FIELDS` and its class's `execution_fields`, a quantized
-    module as the module it quantizes (its quantization chooses how it computes), a mapping by its
-    own keys, a sequence entry by entry, a function or class by its qualified name (`named`), an
-    array by its content and anything else by its repr, without addresses."""
+def module_identity(module: nn.Module) -> JSON:
+    """`module` as what it computes, which a checkpoint keeps (`Objective.training_identity`): its
+    model record (`ModelConfig.from_model`), wrappers such as an adapter's or an input
+    quantization's included, with every field that chooses how it computes at its default, at any
+    depth (`EXECUTION_FIELDS`), and without a training quantization, which chooses how its products
+    compute. A module no record can describe raises as its record does."""
+    from dew.config import ModelConfig
+    from dew.quantization import Quantization
+    from dew.registry import to_record
+
+    record = ModelConfig.from_model(_as_computed(module))
+    kept = tuple(wrapper for wrapper in record.wrappers if not isinstance(wrapper, Quantization))
+    return to_record(dataclasses.replace(record, wrappers=kept), ModelConfig)
+
+
+def _as_computed[Value](value: Value) -> Value:
+    """`value`, a network or a field of one, with each field that chooses how it computes
+    (`EXECUTION_FIELDS`) at its default, in every module and dataclass it holds, mapping values and
+    sequence entries among them."""
     from flax import linen as nn
 
-    from dew.data.sources.codec import content_fingerprint
-
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        kind = next((layer for layer in type(value).__mro__ if "_unquantized_type" in vars(layer)), None)
-        kind = type(value) if kind is None else vars(kind)["_unquantized_type"]
-        apart = EXECUTION_FIELDS | set(getattr(kind, "execution_fields", ()))
-        fields = {field.name: module_identity(getattr(value, field.name))
-                  for field in dataclasses.fields(value)
-                  if field.repr and field.name not in apart and field.name not in ("parent", "name")}
-        named_module = {"name": value.name} if isinstance(value, nn.Module) and value.name is not None else {}
-        return {"class": named(kind), "fields": fields, **named_module}
+        updates = {}
+        for field in dataclasses.fields(value):
+            if not field.init or field.name in ("parent", "name"):
+                continue
+            if field.name in EXECUTION_FIELDS:
+                if field.default is not dataclasses.MISSING:
+                    updates[field.name] = field.default
+                elif field.default_factory is not dataclasses.MISSING:
+                    updates[field.name] = field.default_factory()
+                continue
+            held = getattr(value, field.name)
+            computed = _as_computed(held)
+            if computed is not held:
+                updates[field.name] = computed
+        if not updates:
+            return value
+        if isinstance(value, nn.Module):
+            return value.clone(**updates)
+        return dataclasses.replace(value, **updates)
     if isinstance(value, Mapping):
-        return {str(key): module_identity(entry) for key, entry in value.items()}
+        entries = {key: _as_computed(entry) for key, entry in value.items()}
+        changed = any(entries[key] is not entry for key, entry in value.items())
+        return type(value)(entries) if changed else value
     if isinstance(value, (list, tuple)):
-        return [module_identity(entry) for entry in value]
-    if isinstance(value, type) or (callable(value) and hasattr(value, "__qualname__")):
-        return named(value)
-    if isinstance(value, (np.ndarray, jax.Array)):
-        return content_fingerprint(np.asarray(value)).hex()
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    return re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))
-
-
-def named(value: type | Callable[..., object]) -> str:
-    """A class's or function's module and qualified name, which names one defined in a function or
-    in `__main__` too: an identity compares it, and nothing imports it back."""
-    return f"{value.__module__}.{value.__qualname__}"
+        entries = [_as_computed(entry) for entry in value]
+        changed = any(new is not old for new, old in zip(entries, value, strict=True))
+        return type(value)(entries) if changed else value
+    return value
 
 
 class Objective(ABC, Generic[Loss, Effects]):
@@ -1187,14 +1200,21 @@ class Objective(ABC, Generic[Loss, Effects]):
         """The model a saved step's record names (`inference_record`): the objective's own."""
         return self.model
 
-    def training_identity(self) -> JSON:
+    def training_identity(self) -> dict[str, JSON] | None:
         """What this objective trains, which a checkpoint keeps and a resume compares
         (`Checkpoints.refuse_another_run`): its class and every network its programs run
         (`program_key`), a frozen teacher's and a critic's among them, each as what it computes
         (`module_identity`). An objective whose mathematics also sits outside its networks (a
-        diffusion process) adds it."""
-        return {"objective": named(type(self)),
-                "networks": [module_identity(program.module) for program in self.program_key()]}
+        diffusion process) adds it. None where a record cannot describe the objective or a
+        network (one defined in a function or in `__main__`): the restore's shapes are then the
+        check."""
+        from dew.registry import import_path
+
+        try:
+            return {"objective": import_path(type(self)),
+                    "networks": [module_identity(program.module) for program in self.program_key()]}
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def inference_record(self) -> JSON:
         """Return the model and task settings that let a saved step be rebuilt.

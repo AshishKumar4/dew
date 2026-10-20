@@ -716,7 +716,7 @@ class Trainer(Generic[Loss, Effects]):
                 return self._placed_host(initializer, key, shardings), shardings, None
             held = placed_held(initializer, abstract.variables, shardings.variables, self.device_mesh)
             return taking_over(self.initial_state, *held, shardings)(key), shardings, None
-        checkpoints.refuse_another_run(self.objective.training_identity(), resume)
+        checkpoints.refuse_another_run(self.objective.training_identity, resume)
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
         shardings = self.shardings(abstract)
         if self.host_master and FROZEN in abstract.variables:

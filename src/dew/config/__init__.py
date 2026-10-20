@@ -1330,7 +1330,7 @@ class RunConfig:
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
             if agreed_same("newest checkpoint", lambda: checkpoints.latest) is not None:
                 # Before this run's record replaces the one it would resume.
-                checkpoints.refuse_another_run(objective.training_identity())
+                checkpoints.refuse_another_run(objective.training_identity)
 
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""

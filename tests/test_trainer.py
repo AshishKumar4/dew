@@ -101,17 +101,25 @@ def test_a_token_only_run_uses_the_schedules_own_horizon(schedule):
 def test_a_directory_refuses_another_runs_resume_and_resumes_its_own_on_another_kernel(tmp_path):
     """A checkpoint directory belongs to one run: a decoder of the same shapes and another rotary
     base is another run, whose resume is refused before its first step, as is one whose layer kind
-    named `precision` rotates by another base; the same decoder computing through another attention
-    kernel, and holding a longer decode cache, is the same run, and resumes."""
+    named `precision` rotates by another base, or whose adapter scales by another alpha; the same
+    decoder computing through another attention kernel, and holding a longer decode cache, is the
+    same run, and resumes."""
+    from dew.lora import LoRA
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
 
-    def run(steps, **fields):
+    def run(steps, alpha=None, **fields):
         model = CausalTransformer(**{"vocab_size": 16, "emb_features": 16, "num_layers": 1, "num_heads": 2,
                                      "mlp_features": 32, "max_seq_len": 8, "attention_impl": "xla", **fields})
+        variables = None
+        if alpha is not None:
+            adapter = LoRA(rank=2, modules=("q_proj",), alpha=alpha).apply(
+                model, model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32)), key=0)
+            model, variables = adapter.model, adapter.variables
         batch = {"text": np.tile(np.arange(9, dtype=np.int32) % 16, (jax.device_count(), 1))}
-        with Checkpoints(str(tmp_path / "run")) as checkpoints:
-            return Trainer(LMObjective(model, 8), optax.sgd(0.1), key=0, checkpoints=checkpoints).fit(
+        with Checkpoints(str(tmp_path / ("run" if alpha is None else "adapted"))) as checkpoints:
+            return Trainer(LMObjective(model, 8, variables=variables), optax.sgd(0.1), key=0,
+                           checkpoints=checkpoints).fit(
                 Loader(replayed(lambda partition: itertools.repeat(batch)), None, None, len(batch["text"])),
                 steps=steps, log_every=100, checkpoint_every=1)
 
@@ -128,6 +136,11 @@ def test_a_directory_refuses_another_runs_resume_and_resumes_its_own_on_another_
         run(2, **kind(500.0))
     resumed = run(2, **kind(10000.0), attention_impl="reference", max_seq_len=16)
     assert int(resumed.step) == 2
+    # An adapter's scale is what its model computes too: another alpha is another run.
+    run(1, alpha=4.0)
+    with pytest.raises(ValueError):
+        run(2, alpha=8.0)
+    assert int(run(2, alpha=4.0).step) == 2
 
 
 def test_a_token_budget_resumes_its_count_from_the_checkpoint(tmp_path):

@@ -66,7 +66,6 @@ from dew.objectives.base import (
     Variables,
     merge,
     model_rngs,
-    module_identity,
     thaw,
     under,
 )
@@ -503,9 +502,17 @@ class DiffusionObjective(Objective[Ratio]):
     def _sample(self):
         return self.program('sample', self._sample_impl, static_argnames=("count",))
 
-    def training_identity(self) -> JSON:
+    def training_identity(self) -> dict[str, JSON] | None:
         """The objective's networks and the process it trains them under (`Objective.training_identity`)."""
-        return {**super().training_identity(), "process": module_identity(self.process)}
+        from dew.registry import to_record
+
+        networks = super().training_identity()
+        if networks is None:
+            return None
+        try:
+            return {**networks, "process": to_record(self.process, type(self.process))}
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def task_settings(self) -> ImageSettings:
         """The process, input encoders, autoencoder and sampling convention."""

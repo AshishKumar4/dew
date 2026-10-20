@@ -903,6 +903,9 @@ def _differences(here: JSON, there: JSON, path: str = "") -> list[str]:
         case dict(), dict():
             return [found for key in sorted(set(here) | set(there))
                     for found in _differences(here.get(key), there.get(key), f"{path}.{key}".lstrip("."))]
+        case list(), list() if len(here) == len(there):
+            return [found for index, (mine, theirs) in enumerate(zip(here, there, strict=True))
+                    for found in _differences(mine, theirs, f"{path}[{index}]")]
         case _:
             return [] if here == there else [f"{path}: {there!r} in the directory, {here!r} in this run"]
 
@@ -1032,18 +1035,20 @@ class Checkpoints:
         custom = self._step_metadata(step, local=step == self._local_latest()).custom_metadata or {}
         return json_value(custom.get('identity'), 'identity')
 
-    def refuse_another_run(self, identity: JSON, step: int | str | None = None) -> None:
+    def refuse_another_run(self, identity: Callable[[], JSON], step: int | str | None = None) -> None:
         """Refuse, on every process at once, to resume the step at `step` (the latest) as the run
-        whose training identity is `identity` (`Objective.training_identity`), where the directory
-        holds another run's: one whose objective or networks differ past how they compute. A
-        directory belongs to one run, and a fresh run takes a new one. The processes agree on the
-        identity their step records (`agreed_same`), so a local step of another run on one of them
-        is refused on all; a step saved before steps recorded one has nothing to compare, and the
-        shapes the restore reads are the check."""
-        there = agreed_same("run identity", lambda: self.identity(step))
-        if there is None or identity == there:
+        whose training identity `identity` gives (`Objective.training_identity`), where the
+        directory holds another run's: one whose objective or networks differ past how they
+        compute. A directory belongs to one run, and a fresh run takes a new one. Each process
+        takes both identities, this run's and its step's, and the processes agree on the pair
+        (`agreed_same`) before any of them restores, so a rank that finds another pair, or fails to
+        take one, stops them all. A run or step with no identity (one a record cannot describe, a
+        step saved before steps recorded one) has nothing to compare, and the restore's shapes are
+        the check."""
+        here, there = agreed_same("run identity", lambda: [identity(), self.identity(step)])
+        if here is None or there is None or here == there:
             return
-        differences = _differences(identity, there)
+        differences = _differences(here, there)
         raise ValueError(f"{self.directory} holds another run's checkpoints, which this run would "
                          f"resume: {'; '.join(differences[:5])}"
                          f"{f' and {len(differences) - 5} more' if len(differences) > 5 else ''}. "
