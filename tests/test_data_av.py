@@ -12,12 +12,11 @@ binary on PATH.
 
 import subprocess
 
+import moviepy.config as moviepy_config
 import numpy as np
 import pytest
 
 from dew.data import Memory, audio, video
-
-moviepy_config = pytest.importorskip("moviepy.config", reason="needs the av extra")
 
 FPS = 25
 SAMPLE_RATE = 16000

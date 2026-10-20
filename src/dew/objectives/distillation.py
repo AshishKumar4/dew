@@ -140,9 +140,11 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         return self.student.inference_record()
 
     def program_key(self) -> tuple[ProgramModule, ...]:
-        """The student's modules, then the teacher's, which the step does not train."""
-        return (*self.student.program_key(),
-                *(program._replace(trained=False) for program in self.teacher.program_key()))
+        """The student's modules, then the teacher's, which the step does not train. The step reads
+        both models' whole logits (`predict`), so no head of either is fused."""
+        teacher = (program._replace(trained=False) for program in self.teacher.program_key())
+        return tuple(program._replace(head_fused=False)
+                     for program in (*self.student.program_key(), *teacher))
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         count = len(self.student.program_key())
@@ -153,8 +155,8 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         """Tile the student's head, the vocabulary head this objective trains."""
         return self.student.tile_head(tile)
 
-    def restore_head_tile(self, tile: tuple[int, int] | None) -> None:
-        self.student.restore_head_tile(tile)
+    def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
+        self.student.restore_head(tile, fused=fused)
 
     def held_variables(self) -> Variables | None:
         """Return the student's held tree, if any, with the teacher's under `teacher`."""

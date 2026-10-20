@@ -196,14 +196,25 @@ def _row_terms(logits, predict: bool) -> tuple[
         jax.Array, tuple[jax.Array, jax.Array] | None, tuple[jax.Array, jax.Array]]:
     """Each row's logsumexp, with `predict` its maximum and the first
     column that holds it, and its maximum and the sum of exponentials scaled
-    to it, from one reduction over the row.
+    to it, from one pass over the row.
 
     The running maximum, the sum of exponentials scaled to it and the
     maximum's column ride together through `jax.lax.reduce`, so the row is
-    read once, rather than once for the maximum and again for the sum. On an
-    RTX 4080 (jax 0.11.2), fp32 logits of 4096 x 151936 take 3.9 ms against
-    `jax.nn.logsumexp` and `jnp.argmax`'s 7.6, and 8192 x 50304 2.6 against
-    5.0, with the same columns and logsumexps 1.9e-6 apart."""
+    read once, rather than once for the maximum and again for the sum. As
+    a single reduction over the row, on an RTX 4080 (jax 0.11.2), fp32
+    logits of 4096 x 151936 took 3.9 ms against `jax.nn.logsumexp` and
+    `jnp.argmax`'s 7.6, and 8192 x 50304 2.6 against 5.0.
+
+    On CPU the row reduces in two levels, blocks of about its square root's
+    width and then the blocks' terms (`_row_blocks`): XLA's CPU compiler
+    runs a reduction with a combine of its own as one loop over the row, and
+    over 512 columns that loop's sum of exponentials held a whole head's
+    state gradient 3.9 times as far from float64 as `jax.nn.logsumexp`'s
+    over 52 orders of its columns (tests/test_chunked_cross_entropy.py),
+    where the two levels' loops are each a block long. A GPU reduces a row
+    as a tree of its threads' partial sums already, where a second level is
+    another pass over the row's blocks for nothing, so other backends keep
+    the one reduction."""
     def combine(first, second):
         larger = jnp.maximum(first[0], second[0])
         total = _rescaled(first[0], first[1], larger) + _rescaled(second[0], second[1], larger)
@@ -219,8 +230,30 @@ def _row_terms(logits, predict: bool) -> tuple[
         # A vocabulary column is int32 whatever the run's default integer width.
         operands.append(jax.lax.broadcasted_iota(jnp.int32, logits.shape, axis))
         initial.append(jnp.array(jnp.iinfo(jnp.int32).max, jnp.int32))
-    terms = jax.lax.reduce(tuple(operands), tuple(initial), combine, (axis,))
+
+    def reduced(*operands):
+        return jax.lax.reduce(operands, tuple(initial), combine, (operands[0].ndim - 1,))
+
+    def blocked(*operands):
+        firsts = [reduced(*part) for part in _row_blocks(list(operands))]
+        return reduced(*(jnp.concatenate([first[index] for first in firsts], axis=-1)
+                         for index in range(len(operands))))
+
+    terms = jax.lax.platform_dependent(*operands, cpu=blocked, default=reduced)
     return terms[0] + jnp.log(terms[1]), ((terms[0], terms[2]) if predict else None), terms[:2]
+
+
+def _row_blocks(operands: list[jax.Array]) -> list[list[jax.Array]]:
+    """`operands`, rows over their last axis, as the parts `_row_terms` reduces first, each part's
+    blocks on a new last axis: blocks of the power of two nearest the row's square root in width,
+    and the columns left past the last whole block as one more."""
+    width = operands[0].shape[-1]
+    block = 1 << round(math.log2(width) / 2) if width > 1 else 1
+    whole = width - width % block
+    parts = [[x[..., :whole].reshape(*x.shape[:-1], whole // block, block) for x in operands]]
+    if whole < width:
+        parts.append([x[..., whole:][..., None, :] for x in operands])
+    return parts
 
 
 class _ChunkTerms(NamedTuple):
@@ -314,24 +347,51 @@ def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int
     return (losses, predicted[0] if predict else None, log_z), (peak, mass)
 
 
+def _shared_partition(outputs, normalizer, group: tuple[str, ...]):
+    """A head's outputs and its rows' maximum and sum of exponentials scaled to it, those of the whole
+    row where `group` names the axes the vocabulary is split over (`_vocabulary_split`): the shards'
+    sums moved to the largest maximum and added, and log Z formed from them once. Each shard's softmax
+    then takes its columns' shares against the whole row's maximum and sum, as the whole head's are.
+    The first output must be the target's logit (`picked`), which another shard's columns do not
+    move."""
+    if not group:
+        return outputs, normalizer
+    first, best, log_z = outputs
+    peak, mass = normalizer
+    larger = jax.lax.pmax(peak, group)
+    mass = jax.lax.psum(_rescaled(peak, mass, larger), group)
+    return (first, best, (larger + jnp.log(mass)).reshape(log_z.shape)), (larger, mass)
+
+
+def _shared_cotangents(cotangents, group: tuple[str, ...]):
+    """A head's output cotangents with log Z's summed over `group`: the whole row's log Z is every
+    shard's output (`_shared_partition`), and each device's cotangent of it is that of its own tokens,
+    which the shards' columns all move."""
+    if not group:
+        return cotangents
+    first, best, partition = cotangents
+    return first, best, jax.lax.psum(partition, group)
+
+
 def _bounded_head_impl(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int],
                        softcap, precision: jax.lax.PrecisionLike, predict: bool, temperature: float,
-                       columns: _Columns, picked: bool):
+                       columns: _Columns, picked: bool, group: tuple[str, ...]):
     """Run `_forward` behind a backward that recomputes its logits."""
-    return _forward(hidden, table, targets, excluded, chunks, tile, softcap, precision, predict,
-                    temperature, columns, picked)[0]
+    return _shared_partition(*_forward(hidden, table, targets, excluded, chunks, tile, softcap, precision,
+                                       predict, temperature, columns, picked), group)[0]
 
 
 def _bounded_head_fwd(hidden, table, targets, excluded, chunks, tile, softcap, precision, predict,
-                      temperature, columns, picked):
-    outputs, normalizer = _forward(hidden, table, targets, excluded, chunks, tile, softcap, precision,
-                                   predict, temperature, columns, picked)
+                      temperature, columns, picked, group):
+    outputs, normalizer = _shared_partition(*_forward(
+        hidden, table, targets, excluded, chunks, tile, softcap, precision, predict, temperature, columns,
+        picked), group)
     # The residuals are the inputs and two numbers per token. Everything the
     # backward needs beyond them is a recomputed tile.
     return outputs, (hidden, table, targets, excluded, normalizer, softcap, columns)
 
 
-def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, residuals, cotangents):
+def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, group, residuals, cotangents):
     """Pull the cotangents back through logits recomputed one tile at a time.
 
     The outer loop walks vocabulary tiles carrying `(d_states, d_table,
@@ -345,7 +405,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, res
     hidden, table, targets, excluded, normalizer, softcap, columns = residuals
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
-    loss_cotangent, _, partition_cotangent = cotangents
+    loss_cotangent, _, partition_cotangent = _shared_cotangents(cotangents, group)
     # The logits are recomputed from operands that hold the forward's values,
     # in the forward's column tiles, so they are the logits its normalizer
     # summed: XLA rounds a product of another width otherwise.
@@ -425,7 +485,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, res
 
 # `jax.custom_vjp` is generic in its return type, and a `functools.partial`
 # decorator loses that binding, so it is built by hand.
-_bounded_head = jax.custom_vjp(_bounded_head_impl, nondiff_argnums=(4, 5, 7, 8, 9, 11))
+_bounded_head = jax.custom_vjp(_bounded_head_impl, nondiff_argnums=(4, 5, 7, 8, 9, 11, 12))
 _bounded_head.defvjp(_bounded_head_fwd, _bounded_head_bwd)
 
 
@@ -437,17 +497,21 @@ def _softmax_cotangent(logits, first, excluded, peaks, masses, labels, d_first, 
     output is the target's logit, the share times the partition's alone, plus
     that output's at the target. The share is taken against the whole row's
     maximum and sum of exponentials scaled to it, so a tile needs no
-    renormalisation and every share rounds once, where dividing by an
-    exponentiated log Z would carry log Z's rounding into every share. A
-    target outside the tile one-hots to zero rather than to a wrapped
-    column."""
-    probabilities = jnp.exp(_without(logits, first, excluded) - peaks[:, None]) / masses[:, None]
+    renormalisation, where dividing by an exponentiated log Z would carry log
+    Z's rounding into every share. The cotangent over the sum is one number a
+    row, so each column's exponential rounds once more, in its product with
+    it, as autodiff of `jax.nn.logsumexp` takes it: a share divided out and
+    then scaled rounds twice, which held 61 of a vocabulary-split head's 8192
+    gradient elements more than twice as far from float64 as that
+    reference's over 52 orders of its columns, against 5. A target outside
+    the tile one-hots to zero rather than to a wrapped column."""
+    exponentials = jnp.exp(_without(logits, first, excluded) - peaks[:, None])
     # A target at the excluded column scores a constant +inf, which no logit moves.
     selected = _without(jax.nn.one_hot(labels - first, logits.shape[-1], dtype=logits.dtype), first,
                         excluded, value=0)
     if picked:
-        return d_partition[:, None] * probabilities + d_first[:, None] * selected
-    return (d_first + d_partition)[:, None] * probabilities - d_first[:, None] * selected
+        return exponentials * (d_partition / masses)[:, None] + d_first[:, None] * selected
+    return exponentials * ((d_first + d_partition) / masses)[:, None] - d_first[:, None] * selected
 
 
 def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, predict, temperature,
@@ -470,31 +534,32 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
 
 
 def _whole_head_impl(hidden, table, targets, excluded, softcap, chunks, precision, predict,
-                     temperature, columns, picked):
+                     temperature, columns, picked, group):
     """With nothing to differentiate, the tiled forward: no backward needs
     the whole logits, so an evaluation or a scoring pass stays bounded."""
-    return _forward(hidden, table, targets, excluded, chunks, (1024, table.shape[0]), softcap, precision,
-                    predict, temperature, columns, picked)[0]
+    return _shared_partition(*_forward(hidden, table, targets, excluded, chunks, (1024, table.shape[0]),
+                                       softcap, precision, predict, temperature, columns, picked), group)[0]
 
 
 def _whole_head_fwd(hidden, table, targets, excluded, softcap, chunks, precision, predict, temperature,
-                    columns, picked):
+                    columns, picked, group):
     del chunks
     raw, normalizer, outputs = _whole_head_terms(hidden, table, targets, excluded, softcap, precision,
                                                  predict, temperature, columns, picked)
+    outputs, normalizer = _shared_partition(outputs, normalizer, group)
     # The fp32 product before the per-column terms and the cap is kept, so
     # the backward multiplies nothing it did not have to: the state and head
     # products alone.
     return outputs, (hidden, table, targets, excluded, raw, normalizer, softcap, columns)
 
 
-def _whole_head_bwd(chunks, precision, predict, temperature, picked, residuals, cotangents):
+def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, residuals, cotangents):
     """The same gradient `_bounded_head_bwd` takes tile by tile, from the kept
     logits: the logits' cotangent as `_logits_cotangent` gives it to both
     products, and the head's gradient accumulated in fp32 once."""
     del chunks, predict
     hidden, table, targets, excluded, raw, (peaks, masses), softcap, columns = residuals
-    loss_cotangent, _, partition_cotangent = cotangents
+    loss_cotangent, _, partition_cotangent = _shared_cotangents(cotangents, group)
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     features = table.shape[1]
@@ -512,7 +577,7 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, residuals, 
             None, None, d_cap, d_columns)
 
 
-_whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(5, 6, 7, 8, 10))
+_whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(5, 6, 7, 8, 10, 11))
 _whole_head.defvjp(_whole_head_fwd, _whole_head_bwd)
 
 
@@ -633,12 +698,13 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     table = head.matrix if vocab_major else head.matrix.T
     product = BF16 if rounds_to_bf16(compute, precision) else precision
 
-    def scored(hidden, table, targets, excluded, cap, columns, *, picked: bool = False):
+    def scored(hidden, table, targets, excluded, cap, columns, *, picked: bool = False,
+               group: tuple[str, ...] = ()):
         if tile is None:
             return _whole_head(hidden, table, targets, excluded, cap, chunks, product, predict,
-                               float(temperature), columns, picked)
+                               float(temperature), columns, picked, group)
         return _bounded_head(hidden, table, targets, excluded, chunks, tile, cap, product,
-                             predict, float(temperature), columns, picked)
+                             predict, float(temperature), columns, picked, group)
 
     def column_logits(states, rows, cap, columns):
         """The capped logit of each state against its own row of the head,
@@ -765,17 +831,6 @@ def fused_tokens(tokens: int, vocab: int, tile: tuple[int, int] | None = None) -
     `tile`'s tokens and every token."""
     fitting = 1 << max(FUSED_LOGIT_BYTES // (4 * vocab), 1).bit_length() - 1
     return min(tokens, fitting, tokens if tile is None else tile[0])
-
-
-def fused_chunks(shape: tuple[int, ...], vocab: int, tile: tuple[int, int] | None = None) -> int:
-    """The chunks (`fused_tokens`) `fused_head_loss` cuts one device's share
-    of targets of `shape` into, its tokens split over the mesh in context as
-    `_sharded_head` splits them (`_token_spec`)."""
-    mesh = jax.sharding.get_abstract_mesh()
-    shards = 1 if mesh.empty else math.prod(
-        mesh.shape[axis] for entry in _token_spec(shape) for axis in mesh_axes(entry))
-    tokens = math.prod(shape) // shards
-    return -(-tokens // fused_tokens(tokens, vocab, tile))
 
 
 def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: float = 0.0,
@@ -965,12 +1020,17 @@ def _vocabulary_split(hidden, table, targets, excluded, cap, columns, group: tup
     terms combined over the group, and this device's own tokens returned.
 
     Megatron-LM's parallel cross entropy (Shoeybi et al., 2019). The log
-    partition is the logsumexp of the shards' own, the
-    target's logit the sum of theirs (one shard holds it), the prediction
-    the best of their best columns. Differentiated through the shard_map as
-    written, and correct unchecked: after the combine each device keeps its
-    own tokens, so a psum's cotangent, summed over the group, is every
-    device's share of it, and the gather's transpose scatters the states'
+    partition is formed once from the shards' maxima and sums of
+    exponentials, combined in the head (`_shared_partition`), so each
+    shard's softmax shares round against the whole row's as the whole
+    head's do, where a logsumexp of the shards' own log partitions gave
+    every column of a shard the rounding of that shard's share of the row.
+    The target's logit is the sum of theirs (one shard holds it), the
+    prediction the best of their best columns. Differentiated through the
+    shard_map as written, and correct unchecked: after the combine each
+    device keeps its own tokens, so a psum's cotangent, summed over the
+    group, is every device's share of it, as the head sums log Z's
+    (`_shared_cotangents`), and the gather's transpose scatters the states'
     gradient back to the devices that hold them. The head's gradient never
     leaves its device.
     """
@@ -985,11 +1045,8 @@ def _vocabulary_split(hidden, table, targets, excluded, cap, columns, group: tup
     # Z less it: a shard's softmax then takes the shard's share w of the row's mass and the target's
     # one-hot apart, each from its own term, where the loss's gradient would reach it as
     # (1 + (w - 1)), which rounds away the low bits of a small share.
-    picked, predicted, log_z = head(states, table, labels, local_excluded, cap, columns, picked=True)
-    # Stopped before the max: pmax has no derivative rule, and a stop after it
-    # still differentiates it.
-    peak = jax.lax.pmax(jax.lax.stop_gradient(log_z), group)
-    whole = peak + jnp.log(jax.lax.psum(jnp.exp(log_z - peak), group))
+    picked, predicted, whole = head(states, table, labels, local_excluded, cap, columns, picked=True,
+                                    group=group)
     target = jax.lax.psum(picked, group)
     start = jax.lax.axis_index(group) * count
 
