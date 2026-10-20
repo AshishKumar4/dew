@@ -627,6 +627,104 @@ def rlvr_kl_figure():
     svg.save(HERE / "rlvr-kl.svg")
 
 
+def agent_episode_figure():
+    """A tool-using episode as one sequence: the question, the model's first action (code), the tool's
+    output, the model's answer, then the verifier's one reward, which flows back to the actions alone."""
+    width, height = 440, 290
+    svg = Figure(width, height, seconds=12, label="An agent episode. The model writes code, a tool runs it and "
+                 "answers, the model writes its answer, and the verifier scores the whole episode once; the "
+                 "reward reaches only the tokens the model wrote, not the question or the tool's output.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    segments = [("question", ["Natalia sold", "48 clips…"], "none", False),
+                ("action", ["python call:", "print(48+24)"], "accent_fill", True),
+                ("tool", ["response:", "72"], "tint1", False),
+                ("action", ["So the answer", "is \\boxed{72}."], "accent_fill", True)]
+    widths, y, h = [98, 112, 76, 112], 46, 64
+    svg.text(18, 30, "one episode, read left to right", size=13, color="muted")
+    x, lefts = 18, []
+    for k, ((who, lines, fill, trained), w) in enumerate(zip(segments, widths, strict=True)):
+        with svg.group() as part:
+            svg.rect(x, y, w, h, fill=fill, stroke="rule" if fill == "none" else "none", rx=6)
+            svg.text(x + 8, y + 20, who, size=12, weight=600, color="text" if trained else "muted")
+            for number, line in enumerate(lines):
+                svg.text(x + 8, y + 38 + 14 * number, line, size=12, mono=True,
+                         color="text" if trained else "muted")
+        svg.appear(part, 0.4 + 0.8 * k)
+        lefts.append((x, w, trained))
+        x += w + 6
+    last_x, last_w, _ = lefts[-1]
+    with svg.group() as verdict:
+        svg.arrow(last_x + last_w / 2, y + h + 2, last_x + last_w / 2, 140)
+        svg.rect(last_x - 20, 142, last_w + 20, 40, fill="raised", stroke="text", rx=6)
+        svg.text(last_x - 10 + last_w / 2, 167, "verifier: R = 1", size=12, mono=True, weight=600,
+                 anchor="middle")
+    svg.appear(verdict, 3.8)
+    back_y = 206
+    flow = svg.polyline([(last_x - 20, 162), (28, 162), (28, back_y)], color="accent", width=1.5)
+    svg.draw(flow, 4.6, 5.6)
+    svg.appear(svg.text(36, 154, "one reward for the whole episode", size=12, color="accent"), 4.8)
+    for k, (left, w, trained) in enumerate(lefts):
+        with svg.group() as credit:
+            if trained:
+                svg.rect(left, back_y + 10, w, 28, fill="accent", stroke="none", rx=4)
+                svg.text(left + w / 2, back_y + 29, "trained on A", size=12, color="surface", anchor="middle",
+                         weight=600)
+            else:
+                svg.rect(left, back_y + 10, w, 28, fill="none", stroke="rule", rx=4)
+                svg.text(left + w / 2, back_y + 29, "read only", size=12, color="muted", anchor="middle")
+        svg.appear(credit, 5.8 + 0.3 * k)
+    svg.appear(svg.text(width - 18, height - 16, "only the model's own tokens carry loss", size=12,
+                        color="muted", anchor="end"), 7.2)
+    svg.save(HERE / "agent-episode.svg")
+
+def agent_lanes_figure():
+    """The rollout scheduler between the server and the trainer: it publishes the weights, starts a group of
+    episodes for each task, waits for whole groups, packs them, and hands the batch to the trainer."""
+    width, height = 440, 300
+    svg = Figure(width, height, seconds=12, label="Three lanes. The scheduler publishes the trainer's weights to "
+                 "the server, starts a group of episodes for each task, waits for the whole groups, packs them "
+                 "into a batch and hands it to the trainer, whose update makes the next version of the weights.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    lanes = [("server", 40), ("scheduler", 140), ("trainer", 240)]
+    for name, y in lanes:
+        svg.line(110, y + 20, width - 20, y + 20, color="rule", width=1)
+        svg.text(20, y + 25, name, size=14, weight=600)
+    times = [0.4, 1.6, 3.0, 4.6, 6.0, 7.4]
+    # 1. publish the weights, version 0
+    with svg.group() as publish:
+        svg.arrow(130, 258, 130, 64, color="accent", width=1.5)
+        svg.text(138, 200, "weights v0", size=12, color="accent")
+    svg.appear(publish, times[0])
+    # 2. a group of episodes per task on the server
+    with svg.group() as episodes:
+        for k in range(4):
+            svg.rect(160 + 18 * k, 48 + (k % 2) * 4, 14, 24, fill="accent_fill", stroke="none", rx=3)
+        svg.text(160, 40, "a group of episodes per task", size=12, color="muted")
+    svg.appear(episodes, times[1])
+    # 3. whole groups come back to the scheduler
+    with svg.group() as collected:
+        svg.arrow(240, 76, 240, 146, width=1.25)
+        for k in range(4):
+            svg.rect(200 + 18 * k, 148, 14, 24, fill="accent_fill", stroke="none", rx=3)
+        svg.text(276, 165, "whole groups", size=12, color="muted")
+    svg.appear(collected, times[2])
+    # 4. packed into a batch for the trainer
+    with svg.group() as packed:
+        svg.arrow(262, 176, 300, 246, width=1.25)
+        svg.rect(300, 246, 90, 28, fill="raised", stroke="accent", rx=5)
+        svg.text(345, 265, "packed batch", size=12, anchor="middle")
+    svg.appear(packed, times[3])
+    # 5. the update makes the next version
+    with svg.group() as update:
+        svg.text(345, 290, "update → v1", size=12, color="accent", weight=600, anchor="middle")
+    svg.appear(update, times[4])
+    with svg.group() as again:
+        svg.polyline([(395, 260), (424, 260), (424, 30), (300, 30)], color="accent", width=1.5, dash="4 4")
+        svg.text(418, 150, "next batch", size=12, color="accent", anchor="end")
+    svg.appear(again, times[5])
+    svg.save(HERE / "agent-lanes.svg")
+
+
 def lm_next_token_figure():
     """Next-token prediction on one sentence: at each position the model reads the tokens so far, scores
     every possible next token, and training pushes up the one that actually came next."""
@@ -1128,7 +1226,8 @@ FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pip
            "edm-noise": edm_noise_figure, "samplers-paths": samplers_paths_figure,
            "cfg-step": cfg_step_figure, "cfg-sweep": cfg_sweep_figure, "sft-mask": sft_mask_figure,
            "pretrained-round-trip": pretrained_round_trip_figure, "jepa-step": jepa_step_figure,
-           "lm-next-token": lm_next_token_figure}
+           "lm-next-token": lm_next_token_figure, "agent-episode": agent_episode_figure,
+           "agent-lanes": agent_lanes_figure}
 
 
 if __name__ == "__main__":
