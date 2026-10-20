@@ -363,22 +363,36 @@ def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placem
     The first iteration takes the admission, the draws come back stacked
     `[steps, slots]`, and the host throws the error when it reads them, one
     call later. The state comes back split as it went in.
+
+    Each iteration checks its own draws. jax's checkify cannot carry a check
+    into a shard_map (jax-ml/jax#40907), and every iteration after the first
+    calls the model, which may run one, after the checks of the iteration
+    before it; so the iterations' errors come out of the loop as values and
+    meet in one after it, the first iteration's ahead of the rest.
     """
 
-    def run(params, resident, carried, admission, transforms, stopping, grammar):
-        state, draws = _advanced(model, params, pad_id, placement, joined(resident, carried), admission,
-                                 transforms, stopping, grammar)
-        draws = jax.tree.map(lambda leaf: leaf[None], draws)
-        if steps > 1:
-            def following(state: Slots, _: None) -> tuple[Slots, Draws]:
-                return _advanced(model, params, pad_id, placement, state, None, transforms, stopping, grammar)
+    def advanced(state: Slots, admission: Admission | None) -> tuple[checkify.Error, tuple[Slots, Draws]]:
+        return checkify.checkify(
+            lambda state, admission: _advanced(model, params, pad_id, placement, state, admission, transforms,
+                                               stopping, grammar),
+            errors=checkify.user_checks)(state, admission)
 
-            state, more = jax.lax.scan(following, state, length=steps - 1)
-            draws = jax.tree.map(lambda first, rest: jnp.concatenate([first, rest]), draws, more)
-        return *split_donated(state), draws
+    error, (state, draws) = advanced(joined(resident, carried), admission)
+    draws = jax.tree.map(lambda leaf: leaf[None], draws)
+    if steps > 1:
+        def following(state: Slots, _: None) -> tuple[Slots, tuple[checkify.Error, Draws]]:
+            error, (state, draws) = advanced(state, None)
+            return state, (error, draws)
 
-    return checkify.checkify(run, errors=checkify.user_checks)(
-        params, resident, carried, admission, transforms, stopping, grammar)
+        state, (later, more) = jax.lax.scan(following, state, length=steps - 1)
+        draws = jax.tree.map(lambda first, rest: jnp.concatenate([first, rest]), draws, more)
+
+        def raised(first: checkify.Error, later: checkify.Error) -> None:
+            checkify.check_error(first)
+            checkify.check_error(later)
+
+        error, _ = checkify.checkify(raised, errors=checkify.user_checks)(error, later)
+    return error, (*split_donated(state), draws)
 
 
 Formats = Slots
