@@ -186,7 +186,7 @@ class _TextTowers:
         names = tuple(name for name in self.towers if component_present(index, name))
         if not names:
             raise ValueError("A latent diffusion source needs at least one text encoder")
-        towers, tokenizers, text_params, layouts = _clip_towers(
+        towers, tokenizers, text_params, layouts, pins = _clip_towers(
             directory, names, compute, param_dtype=param_dtype, params=params, lazy=lazy, stored=stored)
         components: dict[str, Mapping[str, object]] = {
             name: _component_config(directory, name) for name in names}
@@ -203,7 +203,8 @@ class _TextTowers:
             towers, tokenizers, names, text_params, str(directory), height, width,
             denoiser.context_width, composition=self.composition, t5=t5,
             guidance=policy.guidance if self.embeds_guidance and not policy.guided else None,
-            aesthetics=bool(index.get("requires_aesthetics_score", False)), param_dtype=param_dtype)
+            aesthetics=bool(index.get("requires_aesthetics_score", False)), param_dtype=param_dtype,
+            tokenizer_files=pins)
         return encoder, layouts, {}, components
 
     def unconditional(self, index: Mapping[str, object]) -> dict:
@@ -719,13 +720,14 @@ def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32",
 
 def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtype: str = "float32",
                  params: Variables | None = None, lazy: bool = False, stored: StoredWeights | None = None):
-    """Build the published CLIP text towers, their tokenizers, their parameters and
-    the layouts those parameters came from."""
+    """Build the published CLIP text towers, their tokenizers, their parameters, the layouts those
+    parameters came from and the tokenizers' files, each pinned as it is loaded."""
     from transformers import CLIPTokenizer
 
+    from dew.data.text import pin_tokenizer
     from dew.nn.text_encoders import translate_config
 
-    towers, tokenizers, layouts = [], [], ()
+    towers, tokenizers, pins, layouts = [], [], [], ()
     bound = {} if params is None else params
     for name in names:
         config = _component_config(directory, name)
@@ -738,9 +740,9 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtyp
         if params is None:
             bound = {**bound, name: tree}
         layouts += recorded
-        tokenizers.append(CLIPTokenizer.from_pretrained(
-            directory / ("tokenizer" + name.removeprefix("text_encoder"))))
-    return tuple(towers), tuple(tokenizers), bound, layouts
+        pins.append(pin_tokenizer(str(directory / ("tokenizer" + name.removeprefix("text_encoder")))))
+        tokenizers.append(CLIPTokenizer.from_pretrained(pins[-1].directory))
+    return tuple(towers), tuple(tokenizers), bound, layouts, tuple(pins)
 
 
 def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dtype: str = "float32",
@@ -752,15 +754,15 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dt
     encoder, a Flux directory's second one; `tokens` is the sequence budget
     the pipeline pads to.
     """
-    from dew.data.text import load_tokenizer
+    from dew.data.text import pin_tokenizer
     from dew.nn.text_encoders import _t5_path, t5_embedding, translate_t5_config
 
     config = _component_config(directory, component)
     tower = translate_t5_config(config).value.clone(dtype=compute)
+    pinned = pin_tokenizer(str(directory / ("tokenizer" + component.removeprefix("text_encoder"))))
     return bind_component(
         directory / component, component, config, tower, lambda name, rank: _t5_path(name),
-        lambda bound: T5Segment(tower, load_tokenizer(str(directory / (
-            "tokenizer" + component.removeprefix("text_encoder")))), component, tokens),
+        lambda bound: T5Segment(tower, pinned.transformers(), component, tokens, files=pinned),
         prefix=("encoders", "conditioning", component), params=params,
         param_dtype=param_dtype, lazy=lazy, validate=t5_embedding, shapes=_shapes(stored, component))
 
@@ -770,18 +772,20 @@ def _wan_conditioning(directory: Path, compute, *, tokens: int, param_dtype: str
                       ) -> tuple[WanConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
     """Build Wan's conditioner: the UMT5 encoder, its tokenizer, the
     parameters and their layouts."""
-    from dew.data.text import load_tokenizer
+    from dew.data.text import pin_tokenizer
     from dew.nn.text_encoders import _t5_path, t5_embedding, translate_t5_config
 
     config = _component_config(directory, "text_encoder")
     if config.get("model_type") != "umt5":
         raise ValueError(f"Wan's text encoder is a umt5 model, not {config.get('model_type')!r}")
     tower = translate_t5_config(config).value.clone(dtype=compute)
+    pinned = pin_tokenizer(str(directory / "tokenizer"))
     encoder, _, layouts, _ = bind_component(
         directory / "text_encoder", "text_encoder", config, tower, lambda name, rank: _t5_path(name),
-        lambda bound: WanConditioner(tower, load_tokenizer(str(directory / "tokenizer")),
+        lambda bound: WanConditioner(tower, pinned.transformers(),
                                      bound if params is not None else {"text_encoder": bound},
-                                     str(directory), tokens=tokens, param_dtype=param_dtype),
+                                     str(directory), tokens=tokens, param_dtype=param_dtype,
+                                     tokenizer_files=pinned),
         prefix=("encoders", "conditioning", "text_encoder"), params=params,
         param_dtype=param_dtype, lazy=lazy, validate=t5_embedding, shapes=_shapes(stored, "text_encoder"))
     return encoder, layouts, {"text_encoder": config}
@@ -901,18 +905,19 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
     processor's tokenizer and chat template, the parameters, their layouts
     and the vision tower as stored, which the text-to-image prompt never
     reads and an export writes back."""
-    from dew.data.text import load_tokenizer
+    from dew.data.text import pin_tokenizer
 
     config = _component_config(directory, "text_encoder")
     record = decoders.translate_config(_qwen_vl_text_config(config))
+    pinned = pin_tokenizer(str(directory / "processor"))
     named = dtype_name(compute)
     if named is None:
         raise ValueError("Qwen-Image's Qwen3-VL encoder computes in a named dtype; pass dtype")
     decoder = from_record(CausalTransformer, {**record, "dtype": named, "attention_impl": attention_impl})
     encoder, layouts, retained = _bind_language_model(
         directory, record, "qwen3", _qwen_text_name,
-        lambda bound: QwenImageConditioner(decoder, load_tokenizer(str(directory / "processor")), bound,
-                                           str(directory), tokens=tokens, param_dtype=param_dtype),
+        lambda bound: QwenImageConditioner(decoder, pinned.transformers(), bound, str(directory),
+                                           tokens=tokens, param_dtype=param_dtype, tokenizer_files=pinned),
         vision=("model.visual.",), param_dtype=param_dtype, params=params, lazy=lazy, stored=stored)
     return encoder, layouts, retained, {"text_encoder": config}
 
@@ -960,10 +965,11 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
     a Mistral-3's vision tower and projector as stored, which a text prompt
     never reads and an export writes back. Z-Image reads the output of the
     encoder's second-to-last layer with the template's thinking on."""
-    from dew.data.text import load_tokenizer
+    from dew.data.text import pin_tokenizer
 
     config = _component_config(directory, "text_encoder")
     kind = records.text(config.get("model_type"), "model_type")
+    pinned = pin_tokenizer(str(directory / "tokenizer"))
     known = _FLUX2_TEXT if pipeline == "flux2" else {"qwen3": _FLUX2_TEXT["qwen3"]}
     if kind not in known:
         raise ValueError(f"The {pipeline} text encoder is one of {sorted(known)}, not {kind!r}")
@@ -988,9 +994,9 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
     encoder, layouts, retained = _bind_language_model(
         directory, record, records.text(text["model_type"], "model_type"), _hidden_states_name(multimodal),
         lambda bound: HiddenStatesConditioner(
-            decoder, load_tokenizer(str(directory / "tokenizer")), bound, str(directory),
+            decoder, pinned.transformers(), bound, str(directory),
             template=template, layers=layers, thinking=pipeline == "z_image", tokens=tokens,
-            guidance=guidance, param_dtype=param_dtype),
+            guidance=guidance, param_dtype=param_dtype, tokenizer_files=pinned),
         vision=_MISTRAL3_VISION if multimodal else (), param_dtype=param_dtype, params=params, lazy=lazy,
         stored=stored)
     return encoder, layouts, retained, {"text_encoder": config}

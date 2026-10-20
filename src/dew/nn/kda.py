@@ -186,7 +186,10 @@ class KimiDeltaAttention(nn.Module):
             query, key, value = (split(part) for part in convolved)
             if S == 1:
                 return recurrent_delta_rule(query, key, value, g, beta, held, starts=starts)
-            return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size, ported=ported,
+            # A held history can make the convolved operands vary where the projections did not, so the
+            # route is asked again of them.
+            return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size,
+                                          ported=ported and on_the_port(query, key, value),
                                           starts=starts, max_segments=tokens.max_segments)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the

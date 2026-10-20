@@ -26,7 +26,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
 from dew.objectives.base import FROZEN, Aux, Batch, Ratio, Step, Variables, merge, with_projected
-from dew.training.model_flops import step_counts
+from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
 from dew.training.state import Accumulation, TrainState
 
@@ -41,11 +41,14 @@ class Committed:
     `norm` is optax.global_norm of the native-dtype gradient passed to the
     optimizer, before its transforms such as clipping. Accumulation takes
     the pooled gradient at the window's commit, never each microbatch's
-    norm. Rejected attempts and partial windows contribute zero to both
-    `norm` and `count`; the loop sums them on device until its logging tick.
+    norm. `tokens` is the real tokens the commit's update trained on, the
+    window's accepted microbatches', as two uint32 words. Rejected attempts
+    and partial windows contribute zero to all three; the loop sums them on
+    device until its logging tick.
     """
     norm: jax.Array
     count: jax.Array
+    tokens: jax.Array
 
 
 def _chosen(take, taken, kept):
@@ -351,7 +354,7 @@ class Transaction:
             **state.variables, **jax.tree.map(lambda x: x[index], previous.variables)}
         step_info = Step((state.microstep - fill + index) // self.split,
                     jax.random.fold_in(state.key, previous.attempts[index]),
-                    with_ema(variables, state.ema))
+                    with_ema(variables, state.ema), committed=state.updates)
         return self.read(variables, state.compute), batch, step_info
 
     def read(self, variables, compute):
@@ -416,7 +419,7 @@ class Transaction:
             return _chosen(native_finite, apply(current), current), native_finite, norm
         return _only_when(native_finite, apply, lambda x: x, current), native_finite, norm
 
-    def finish_attempt(self, state, batch, aux, pending, gradient, attempt):
+    def finish_attempt(self, state, batch, aux, pending, gradient, attempt, tokens):
         """Commit the window when it is due, then advance the state's clocks.
 
         A rejected attempt costs the same trace as an accepted one. With a
@@ -458,6 +461,10 @@ class Transaction:
             return committed, native_finite, norm
 
         due = pending.due & pending.active & accepted
+        # The microbatch's real tokens (`tokens`, two uint32 words), which its window's commit trains on,
+        # the window's accepted ones before it too.
+        read = tokens
+        held = read if previous is None or previous.tokens is None else _TokenCount.add(previous.tokens, read)
         if self.size == 1:
             committed, native_finite, norm = commit(numerical)
             numerical = _chosen(due, committed, numerical)
@@ -479,6 +486,8 @@ class Transaction:
             assert candidate is not None
 
             def retain(acc):
+                if acc.tokens is not None:
+                    acc = dataclasses.replace(acc, tokens=_TokenCount.add(acc.tokens, read))
                 if not self.shared:
                     acc = dataclasses.replace(
                         acc,
@@ -515,7 +524,8 @@ class Transaction:
         if scale is not None:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
         counted = due & accepted
-        return advanced, loss, aux, Committed(jnp.where(counted, norm, 0.), counted.astype(jnp.int32))
+        return advanced, loss, aux, Committed(jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
+                                              jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)))
 
     def step(self, *, realize=None, host=False):
         """Build the function that runs one attempt over the shared phases.
@@ -534,13 +544,15 @@ class Transaction:
         unscale = compile_phase(self.unscaled)
         add = compile_phase(self.add_contribution)
 
-        def run(state, batch, part):
+        def run(state, batch, part, tokens):
             # The `part`th microbatch of the step's batch is attempt step *
             # split + part, with a draw of its own; the objective's schedules
-            # count steps, however many microbatches each is read in.
+            # count steps, however many microbatches each is read in. `tokens`
+            # is its real tokens, which the trainer reads off the accounting
+            # columns the objective's batch no longer holds (`model_batch`).
             attempt = state.step * self.split + part
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
-                             with_ema(state.variables, state.ema))
+                             with_ema(state.variables, state.ema), committed=state.updates)
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             realized = realize(self.read(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
@@ -582,13 +594,13 @@ class Transaction:
                 # its own gradient is ready.
                 aux, pending, gradient = jax.tree.map(
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
-                return finish(state, batch, aux, pending, gradient, attempt)
+                return finish(state, batch, aux, pending, gradient, attempt, tokens)
             if FROZEN not in state.variables:
-                return finish(state, batch, realized.aux, pending, gradient, attempt)
+                return finish(state, batch, realized.aux, pending, gradient, attempt, tokens)
             held = state.variables[FROZEN]
             moving = {name: tree for name, tree in state.variables.items() if name != FROZEN}
             advanced, loss, aux, committed = finish(dataclasses.replace(state, variables=moving), batch,
-                                                    realized.aux, pending, gradient, attempt)
+                                                    realized.aux, pending, gradient, attempt, tokens)
             return (dataclasses.replace(advanced, variables={**advanced.variables, FROZEN: held}),
                     loss, aux, committed)
         return run
