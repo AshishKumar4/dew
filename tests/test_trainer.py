@@ -74,15 +74,17 @@ class TokenRegression(Regression):
 
 
 @pytest.mark.parametrize("log_every", [1, 4])
-@pytest.mark.parametrize("accumulation", [1, 2])
-def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, accumulation):
+@pytest.mark.parametrize(("accumulation", "steps", "logged"), [(1, 3, [8, 16, 24]), (2, 4, [0, 24, 0, 56])])
+def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, accumulation, steps, logged):
+    """Eight rows of lengths 1, 2, 3, 4 a step, without padding: a budget of 30 tokens counts the
+    updates committed, so it ends at the first commit past 30, step 3 (48) one microbatch an update
+    and step 4 (80) two, whose first update commits 24."""
     tracker = RecordingTracker()
     trainer = make_trainer(objective=TokenRegression(), tracker=tracker, accumulation=accumulation)
     state = trainer.fit(dataset(), tokens=30, log_every=log_every)
-    assert int(state.step) == 3  # Eight rows of lengths 1, 2, 3 cross 30 at 48.
+    assert int(state.step) == steps
     if log_every == 1:
-        assert [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars] == [
-            8, 16, 24]
+        assert [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars] == logged
 
 
 def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
@@ -116,10 +118,10 @@ def test_a_token_budget_counts_the_tokens_of_committed_updates(tmp_path):
     first = make_trainer(tmp_path, objective=TokenRegression(), accumulation=2)
     assert int(first.fit(dataset(), steps=3, log_every=1).step) == 3
     assert first.checkpoints.control(3)["tokens"] == 24
-    assert first.checkpoints.control(3)["pending_tokens"] == 12
+    assert first.checkpoints.control(3)["pending_tokens"] == 24
     resumed = make_trainer(tmp_path, objective=TokenRegression(), accumulation=2)
     assert int(resumed.fit(dataset(), steps=4, log_every=1).step) == 4
-    assert resumed.checkpoints.control(4)["tokens"] == 48
+    assert resumed.checkpoints.control(4)["tokens"] == 80
 
 
 def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
