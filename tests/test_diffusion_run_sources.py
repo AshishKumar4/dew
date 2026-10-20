@@ -558,22 +558,60 @@ def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_
                for got, before in zip(restored, started, strict=True))
 
 
-def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipelines):
-    """Flow-GRPO built over a loaded flow pipeline directly, its solver, steps and guidance given and
-    its grid left out, samples its evaluation and published task on the pipeline's own grid, as the
-    denoising objective over it does; `grid=None` asks for the training process's times."""
+def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipelines, tmp_path):
+    """Flow-GRPO built over a published pipeline, its grid left out, evaluates on the pipeline's own
+    grid as the denoising objective over it does, and its published task and the task a saved run
+    restores draw what the pipeline's own task draws from the same noise. `grid=None` evaluates on
+    the training process's times instead, as the denoising objective with that grid does, which
+    the pipeline's grid does not draw. The SDE rollout walks the process's own times either way."""
+    from dew.checkpoints import Checkpoints
     from dew.interop.pretrained import load_diffusion_source
 
-    source = load_diffusion_source(str(pipelines / "sd3" / "pipeline"), dtype="float32",
-                                   attention_impl="xla", size=(16, 16))
+    directory = pipelines / "sd3" / "pipeline"
     settings = {"reward": "psnr", "groups": 2, "rollout_steps": 3, "solver": Euler(), "guidance": None,
                 "steps": 2}
-    grpo = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
-                             variables=source.variables, **settings)
-    plain = DiffusionObjective(source, solver=Euler(), guidance=None, steps=2)
-    assert grpo.grid is not None and plain.grid is not None
-    assert to_record(grpo.grid, type(grpo.grid)) == to_record(plain.grid, type(plain.grid))
-    assert grpo.final_denoise is False
-    unset = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
-                              variables=source.variables, grid=None, **settings)
-    assert unset.grid is None and unset.final_denoise is True
+    source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(16, 16))
+    step = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
+
+    def built(**grid):
+        grpo = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
+                                 variables=source.variables, **settings, **grid)
+        plain = DiffusionObjective(source, solver=Euler(), guidance=None, steps=2, **grid)
+        return grpo, plain
+
+    def started(objective):
+        return Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3)).initial_state()
+
+    def evaluated(objective):
+        state = started(objective)
+        return np.asarray(objective.evaluate(state.variables, batch_for(objective, 16), step).images)
+
+    def rolled(objective):
+        state = started(objective)
+        drawn = objective.rollout()(state, batch_for(objective, 16), jax.random.PRNGKey(2))
+        return np.asarray(drawn["latents"])
+
+    (inherited, plain), (unset, plain_unset) = built(), built(grid=None)
+    on_grid, on_times = evaluated(inherited), evaluated(unset)
+    np.testing.assert_array_equal(on_grid, evaluated(plain))
+    np.testing.assert_array_equal(on_times, evaluated(plain_unset))
+    assert not np.array_equal(on_grid, on_times)
+    np.testing.assert_array_equal(rolled(inherited), rolled(unset))
+
+    prompts = list(PROMPTS[:2])
+    reference = np.asarray(source.text_to_image()(prompts, steps=2, guidance=None, solver=Euler(), key=7))
+    published = np.asarray(inherited.build_task(started(inherited).variables)(prompts, key=7))
+    np.testing.assert_array_equal(published, reference)
+
+    config = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
+                                data=ImageData(source="tfds://oxford_flowers102", image_size=16),
+                                val_metrics=(),
+                                trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
+                                objective=ObjectiveConfig("flow_grpo", settings))
+    saved = config.build()
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, started(saved), None, {}, artifact=saved.inference_record())
+    checkpoints.wait()
+    config.save(str(tmp_path / "run"))
+    restored = np.asarray(TextToImage.from_run(str(tmp_path / "run"))(prompts, key=7))
+    np.testing.assert_array_equal(restored, reference)
