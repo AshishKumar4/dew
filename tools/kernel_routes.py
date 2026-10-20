@@ -136,8 +136,14 @@ def traced(config: dict, target: str, mode: str) -> list:
     model = CausalTransformer(**fields)
     prompt = min(PROMPT, model.max_seq_len - 1)
     tokens = jax.ShapeDtypeStruct((BATCH, prompt), jnp.int32)
-    with generation.assumed(target), generation.routes() as found:
+    # The parameters and the cache are traced outside the routes kept: their own forward passes are
+    # no part of the mode's step.
+    with generation.assumed(target):
         variables = jax.eval_shape(model.init, jax.random.key(0), tokens)
+        if mode != "train":
+            cache = jax.eval_shape(lambda v: model.apply(v, BATCH, method="init_cache", mutable=["cache"])[1],
+                                   variables)["cache"]
+    with generation.assumed(target), generation.routes() as found:
         if mode == "train":
             def loss(params, rest, ids):
                 logits = model.apply({**rest, "params": params}, ids)
@@ -146,8 +152,6 @@ def traced(config: dict, target: str, mode: str) -> list:
             rest = {name: collection for name, collection in variables.items() if name != "params"}
             jax.eval_shape(jax.grad(loss), variables["params"], rest, tokens)
         else:
-            cache = jax.eval_shape(lambda v: model.apply(v, BATCH, method="init_cache", mutable=["cache"])[1],
-                                   variables)["cache"]
             step = jax.ShapeDtypeStruct((BATCH, prompt if mode == "prefill" else 1), jnp.int32)
             jax.eval_shape(lambda v, c, t: model.apply({**v, "cache": c}, t, decode=True, mutable=["cache"]),
                            variables, cache, step)

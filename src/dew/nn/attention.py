@@ -52,7 +52,7 @@ from .flops import attention_flops, cross_attention_flops, projection_flops
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, gpu_placed
-from .kernels.selection import KernelRefused, forced, select
+from .kernels.selection import forced, select
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import asks_default_precision, at_default_precision, at_least_fp32, rounded_to
 from .rope import rotate
@@ -1048,7 +1048,7 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
     another sequence's documents, each document's queries aligned to its last
     keys (`CrossDocuments`), which it orders by id. On a mesh it
     runs per shard (`_per_shard`). What it takes is its requirements'
-    (`attention_kernels.FLASH_SUPPORTS`), which `fused_attention` holds it to."""
+    (`attention_kernels.FLASH_SUPPORTS`), which the selector holds a call to before it runs here."""
     flash = importlib.import_module('dew_flash_attn')
     window = (-1, -1) if sliding_window is None else window_sides(causal, sliding_window)
 
@@ -1324,32 +1324,20 @@ def _dropout_attention(query, key, value, dtype, precision, force_fp32_for_softm
                                dropout_rate=dropout_rate, dropout_rng=dropout_rng)
 
 
-def fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
-                    softcap, sinks, segment_ids, key_value_seq_lengths, max_segments=None):
-    """Run the fused kernel `implementation` names, at the query's head width.
+def _fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
+                     softcap, sinks, segment_ids, key_value_seq_lengths, max_segments=None):
+    """Run the kernel `implementation` names, at the query's head width: the executor of what the
+    attention selector chose (`resolve_implementation`, `_attention_kernel`), which held the call to
+    the kernel's requirements (`attention_kernels.ATTENTION`) before it reaches here.
 
     A narrower value rides in padded and its columns come back out, at no
-    runtime branch. A fused kernel refuses here what its requirements say it
-    cannot take (`attention_kernels.ATTENTION`, `KernelRefused`).
-    `key_value_seq_lengths` reaches cudnn and xla as lengths and 'tpu' as the
-    mask it means.
+    runtime branch. `key_value_seq_lengths` reaches cudnn and xla as lengths
+    and 'tpu' as the mask it means.
     """
     v_head_dim = value.shape[-1]
     if v_head_dim != query.shape[-1]:
         value = widen_value_heads(query, value)
 
-    if implementation in ('cudnn', 'triton', 'flash'):
-        # What the kernel cannot take raises as its requirements say (`attention_kernels.ATTENTION`),
-        # measured ones aside, for a caller that names it here directly as for the selector.
-        case = attention_case(query, key, causal=causal, sliding_window=sliding_window, mask=mask,
-                              bias=bias, softcap=softcap, sinks=sinks, segment_ids=segment_ids,
-                              max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths,
-                              named=implementation)
-        failed = [requirement for requirement in ATTENTION.kernel(implementation).failed(case, forced=True)
-                  if requirement.kind != 'handoff']
-        if failed:
-            raise KernelRefused('attention', implementation,
-                                [requirement.refusal(case) for requirement in failed])
     if implementation == 'cudnn':
         out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
                               key_value_seq_lengths)
@@ -1489,7 +1477,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     packed sequences given `max_segments`; elsewhere segment ids become the
     document mask, and sinks and a softcap run `reference_attention`, since
     `jax.nn.dot_product_attention` has neither (a fused route this host runs as xla
-    included, `_hosted`). The rest goes to `fused_attention`. Key
+    included, `_hosted`). The rest goes to `_fused_attention`. Key
     lengths reach cudnn and xla as they are and every other path as the mask
     they mean, which splash cannot describe, so 'auto' never picks 'tpu' for
     them.
@@ -1516,10 +1504,10 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                                    dtype=dtype, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax)
 
-    return fused_attention(query, key, value, bias, mask, causal, sliding_window,
-                           implementation, softcap=softcap, sinks=sinks,
-                           segment_ids=segment_ids, max_segments=max_segments,
-                           key_value_seq_lengths=lengths)
+    return _fused_attention(query, key, value, bias, mask, causal, sliding_window,
+                            implementation, softcap=softcap, sinks=sinks,
+                            segment_ids=segment_ids, max_segments=max_segments,
+                            key_value_seq_lengths=lengths)
 
 
 def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
@@ -1596,7 +1584,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     fastest for the call where it takes it, else the first that does; a named kernel is forced, and
     raises where it does not take the call (xla handing what it cannot honour to the reference path).
     A call of few positions over key lengths is the decode selector's (`DECODE`), whose decode kernel
-    runs as 'decode' (`fused_attention`); a named xla lowers it there too, as jax.nn's own lowering
+    runs as 'decode' (`_fused_attention`); a named xla lowers it there too, as jax.nn's own lowering
     of a decode step, unless `generation.chosen(decode='xla')` names the folded attention. What runs
     is what this host runs (`_hosted`): xla for a CUDA kernel a step traced for an assumed GPU on a
     CPU reports."""
