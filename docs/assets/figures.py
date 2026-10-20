@@ -636,10 +636,10 @@ def agent_episode_figure():
                  "reward reaches only the tokens the model wrote, not the question or the tool's output.")
     svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
     segments = [("question", ["Natalia sold", "48 clips…"], "none", False),
-                ("action", ["<tool_call>", "print(48+24)"], "accent_fill", True),
+                ("action", ["python call:", "print(48+24)"], "accent_fill", True),
                 ("tool", ["response:", "72"], "tint1", False),
                 ("action", ["So the answer", "is \\boxed{72}."], "accent_fill", True)]
-    widths, y, h = [90, 108, 76, 116], 46, 64
+    widths, y, h = [98, 112, 76, 112], 46, 64
     svg.text(18, 30, "one episode, read left to right", size=13, color="muted")
     x, lefts = 18, []
     for k, ((who, lines, fill, trained), w) in enumerate(zip(segments, widths, strict=True)):
@@ -647,7 +647,7 @@ def agent_episode_figure():
             svg.rect(x, y, w, h, fill=fill, stroke="rule" if fill == "none" else "none", rx=6)
             svg.text(x + 8, y + 20, who, size=12, weight=600, color="text" if trained else "muted")
             for number, line in enumerate(lines):
-                svg.text(x + 8, y + 38 + 14 * number, line, size=11, mono=True,
+                svg.text(x + 8, y + 38 + 14 * number, line, size=12, mono=True,
                          color="text" if trained else "muted")
         svg.appear(part, 0.4 + 0.8 * k)
         lefts.append((x, w, trained))
@@ -673,8 +673,8 @@ def agent_episode_figure():
                 svg.rect(left, back_y + 10, w, 28, fill="none", stroke="rule", rx=4)
                 svg.text(left + w / 2, back_y + 29, "read only", size=12, color="muted", anchor="middle")
         svg.appear(credit, 5.8 + 0.3 * k)
-    svg.appear(svg.text(width - 18, height - 16, "the tool's words never get a gradient", size=12, color="muted",
-                        anchor="end"), 7.2)
+    svg.appear(svg.text(width - 18, height - 16, "only the model's own tokens carry loss", size=12,
+                        color="muted", anchor="end"), 7.2)
     svg.save(HERE / "agent-episode.svg")
 
 def agent_lanes_figure():
