@@ -610,6 +610,45 @@ def test_inside_a_shard_map_that_checks_varying_axes_the_rule_runs_the_portable_
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("kind", ["gated delta net", "Kimi delta attention"])
+def test_a_cached_continuation_whose_history_varies_in_a_checked_map_runs_the_portable_math(kind):
+    """A layer's cached continuation of more than one token inside a `shard_map` that checks varying
+    axes, its input and weights the same on every shard and its conv history each shard's own: the
+    convolved queries, keys and values vary though the projections do not, so the rule runs the
+    portable math there (`port_refusal`'s 'varying'), on the values rounded as the port would take
+    them; its outputs are bitwise those of the same continuation with the row naming XLA, rounded the
+    same way."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    from dew.nn.inputs import MixerCall
+    from dew.nn.kda import KimiDeltaAttention
+
+    layer = (GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
+             if kind == "gated delta net" else
+             KimiDeltaAttention(emb_features=64, num_heads=2, head_dim=64))
+    x = jax.random.normal(jax.random.key(29), (1, 72, 64))
+    variables = layer.init(jax.random.key(30), x)
+    step = MixerCall(decode=True)
+    allocated = layer.apply(variables, x[:, :1], step, mutable=["cache"])[1]
+    # Two shards' histories, each its own prefill.
+    caches = [layer.apply({**variables, **allocated}, x[:, start:start + 8] * scale, step,
+                          mutable=["cache"])[1] for start, scale in ((0, 1.0), (8, -0.5))]
+    held = jax.tree.map(lambda *each: jnp.concatenate(each), *caches)
+    rows = PartitionSpec("data")
+
+    def continued(cache):
+        return layer.apply({**variables, **cache}, x[:, 16:48], step, mutable=["cache"])[0]
+
+    mapped = jax.shard_map(continued, mesh=Mesh(np.asarray(jax.devices()[:2]), ("data",)), in_specs=(rows,),
+                           out_specs=rows, check_vma=True)
+    with row_names_port():
+        got = jax.jit(mapped)(held)
+    with row_names_port(port=False):
+        want = jax.jit(mapped)(held)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
 def row_names_port(*, port: bool = True):
     """Choose the port for the rule where `port`, else XLA; off a GPU the port's kernels interpret."""
     return generation.chosen(gated_delta_rule="fla" if port else "xla")
