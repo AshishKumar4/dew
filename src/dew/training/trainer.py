@@ -829,9 +829,9 @@ class Trainer(Generic[Loss, Effects]):
             self._base_rung = (tuple(entry.module for entry in self.objective.program_key()),
                                head_tile_of(self.objective), self._xla_defaults, self._rung())
         else:
-            modules, tile, defaults, _ = self._base_rung
+            modules, tile, defaults, rung = self._base_rung
             self.objective.substitute(list(modules))
-            self.objective.restore_head_tile(tile)
+            self.objective.restore_head(tile, fused=bool(rung['head_fused']))
             self._xla_defaults = defaults
         recorded = self._resumed_shapes.get(batch_layout(batch))
         if recorded is None:
@@ -1200,7 +1200,7 @@ class Trainer(Generic[Loss, Effects]):
         # Every process runs the plan process zero timed fastest.
         planned = plans[broadcast_from_process_zero(seconds.index(min(seconds)) if seconds else 0)]
         self.objective.substitute(list(planned.modules))
-        self.objective.restore_head_tile(planned.tile)
+        self.objective.restore_head(planned.tile, fused=planned.fused)
         self._xla_defaults = planned.xla_defaults
         chosen = {**self._rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)

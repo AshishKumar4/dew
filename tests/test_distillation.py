@@ -261,6 +261,16 @@ def test_a_validation_pass_scores_with_the_teacher_the_trainer_substituted():
     assert after == scored(built)
 
 
+def test_a_distillation_step_fuses_no_head_and_has_none_to_unfuse():
+    """The step reads the student's whole logits (`predict`), so a tiled student head is no fused
+    head: the program says so and the fit ladder has no rung to unfuse."""
+    student, teacher = (LMObjective(model, SEQ, ema_decay=None, head_tile=(4, 16)) for model in models())
+    objective = DistillationObjective(student, teacher)
+    assert student.program_key()[0].head_fused
+    assert not any(program.head_fused for program in objective.program_key())
+    assert objective.unfuse_head() is None
+
+
 def test_a_layer_the_model_does_not_have_is_named_at_init():
     student = LMObjective(CausalTransformer(**META["student"]), SEQ, ema_decay=None)
     teacher = LMObjective(CausalTransformer(**META["teacher"]), SEQ, ema_decay=None)
