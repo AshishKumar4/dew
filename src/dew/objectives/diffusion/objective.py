@@ -72,7 +72,7 @@ from dew.objectives.base import (
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, PERCEPTUAL, EndToEnd
 from dew.sampling.guidance import CFG, Guidance
-from dew.sampling.pipelines import ImageSettings, TextToImage
+from dew.sampling.pipelines import ImageSettings, TextToImage, sampling_modules
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Consistency, Solver
 
@@ -499,7 +499,8 @@ class DiffusionObjective(Objective[Ratio]):
 
     @property
     def _sample(self):
-        return self.program('sample', self._sample_impl, static_argnames=("count",))
+        return self.program('sample', self._sample_impl, static_argnames=("count",),
+                            modules=sampling_modules(self.model, self.guidance, self.autoencoder))
 
     def task_settings(self) -> ImageSettings:
         """The process, input encoders, autoencoder and sampling convention."""
