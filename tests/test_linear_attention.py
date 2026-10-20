@@ -35,7 +35,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import math, port_reference, recurrence, through
+from delta_rule_support import port_reference, recurrence, through
 from flax import linen as nn
 from model_support import decode_through
 from reference_error import (
@@ -45,7 +45,7 @@ from reference_error import (
     float64_terms,
     widened,
 )
-from reference_trees import sum_family, tree_sum
+from reference_trees import evaluated, sum_family, tree_sum
 from tuned import each_config, launches, timed
 
 from dew.nn import linear
@@ -270,10 +270,11 @@ def test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound()
 
 def port_graph(per_key: bool, shape: tuple[int, ...], scale: float) -> Graph:
     """The delta rule's port as the values it rounds and holds on one sequence of whole chunks, each
-    value laid out a chunk at a time `[B, N, C, H, ...]`: the prefix (`fla_gdn.chunk_local_cumsum`), the inverse (and Kimi's scores) of the
-    intra-chunk solve, `w` and `u`, Kimi's gated keys, the memory each chunk enters, its corrected
-    values and the last, and the output, each node the port's own kernel on its given parents and the
-    witness the port's forward (`_rule_fwd`) exposing what it holds."""
+    value laid out a chunk at a time `[B, N, C, H, ...]`: the prefix (`fla_gdn.chunk_local_cumsum`),
+    the inverse (and Kimi's scores) of the intra-chunk solve, `w` and `u`, Kimi's gated keys, the
+    memory each chunk enters, its corrected values and the last, and the output, each node the port's
+    own kernel on its given parents and the witness the port's forward (`_rule_fwd`) exposing what it
+    holds."""
     batch, count, chunk = shape[:3]
     port = fla_kda if per_key else fla_gdn
     spans = fla_gdn.sequences(batch, count * chunk, chunk=chunk)
@@ -369,10 +370,17 @@ def port_graph(per_key: bool, shape: tuple[int, ...], scale: float) -> Graph:
 
 def reference_graph(dew: Graph, per_key: bool, scale: float) -> Graph:
     """`dew`'s graph with each node the XLA reference's arithmetic (`port_reference`) on the same
-    parents, the prefix's members each of its elements, a sum of its chunk's earlier terms, under the
-    canonical Sum family over a chunk's positions (`reference_trees.sum_family`), and the witness the
-    nodes composed."""
+    parents, each Sum and Ordered node's members that arithmetic with every sum under each tree of the
+    canonical Sum family (`reference_trees.sum_family`, the kernels' 64-wide blocks of keys and of a
+    chunk's positions): the prefix's each of its elements, a sum of its chunk's earlier terms, the
+    others every sum they make (`reference_trees.evaluated`); and the witness the nodes composed."""
     arithmetic = port_reference(per_key, scale)
+    family = sum_family(linear.CHUNK_SIZE)
+
+    def under(fn, parents, tree):
+        """`fn` of the named `parents` with every sum it makes under `tree`."""
+        ordered = evaluated(lambda *values: fn(**dict(zip(parents, values, strict=True))), tree)
+        return lambda **given: ordered(*(given[parent] for parent in parents))
 
     def summed(tree):
         """The prefix with each element its own sum of its chunk's terms up to it under `tree`, the
@@ -388,8 +396,9 @@ def reference_graph(dew: Graph, per_key: bool, scale: float) -> Graph:
 
     nodes = tuple(Node(node.name, node.parents, node.kind,
                        lambda fn=arithmetic[node.name], **given: fn(**given),
-                       members={tree: summed(tree) for tree in sum_family(linear.CHUNK_SIZE)}
-                       if node.name == "prefix" else {})
+                       members={} if isinstance(node.kind, Pointwise) else
+                       {tree: summed(tree) if node.name == "prefix" else
+                        under(arithmetic[node.name], node.parents, tree) for tree in family})
                   for node in dew.nodes)
 
     def fused(**given):
