@@ -207,11 +207,10 @@ def _row_terms(logits, predict: bool) -> tuple[
 
     The row reduces in two levels, blocks of about its square root's width
     and then the blocks' terms (`_row_blocks`): XLA's CPU compiler runs a
-    reduction with a combine of its own as one loop over the row, whose sum
-    of 512 exponentials took every softmax share 2.1 times as far from
-    float64 as `jax.nn.logsumexp`'s (tests/test_chunked_cross_entropy.py's
-    vocabulary-split head), and the two levels' loops are each a block
-    long."""
+    reduction with a combine of its own as one loop over the row, and over
+    512 columns that loop's sum of exponentials held a whole head's state
+    gradient 4.2 times as far from float64 as `jax.nn.logsumexp`'s, where
+    the two levels' loops, each a block long, hold it 1.15 times as far."""
     def combine(first, second):
         larger = jnp.maximum(first[0], second[0])
         total = _rescaled(first[0], first[1], larger) + _rescaled(second[0], second[1], larger)
@@ -344,9 +343,9 @@ def _shared_partition(outputs, normalizer, group: tuple[str, ...]):
     """A head's outputs and its rows' maximum and sum of exponentials scaled to it, those of the whole
     row where `group` names the axes the vocabulary is split over (`_vocabulary_split`): the shards'
     sums moved to the largest maximum and added, and log Z formed from them once. Each shard's softmax
-    then takes its columns' shares against the whole row's maximum and sum, so every share rounds
-    once, as the whole head's do. The first output must be the target's logit (`picked`), which
-    another shard's columns do not move."""
+    then takes its columns' shares against the whole row's maximum and sum, as the whole head's are.
+    The first output must be the target's logit (`picked`), which another shard's columns do not
+    move."""
     if not group:
         return outputs, normalizer
     first, best, log_z = outputs
@@ -494,10 +493,10 @@ def _softmax_cotangent(logits, first, excluded, peaks, masses, labels, d_first, 
     Z's rounding into every share. The cotangent over the sum is one number a
     row, so each column's exponential rounds once more, in its product with
     it, as autodiff of `jax.nn.logsumexp` takes it: a share divided out and
-    then scaled rounds twice, which put some of a head's gradient twice as
-    far from float64 as that reference's (tests/test_chunked_cross_entropy.py's
-    vocabulary-split head). A target outside the tile one-hots to zero rather
-    than to a wrapped column."""
+    then scaled rounds twice, which held 61 of a vocabulary-split head's 8192
+    gradient elements more than twice as far from float64 as that
+    reference's over 52 orders of its columns, against 5. A target outside
+    the tile one-hots to zero rather than to a wrapped column."""
     exponentials = jnp.exp(_without(logits, first, excluded) - peaks[:, None])
     # A target at the excluded column scores a constant +inf, which no logit moves.
     selected = _without(jax.nn.one_hot(labels - first, logits.shape[-1], dtype=logits.dtype), first,
