@@ -30,7 +30,7 @@ from dew.objectives.base import Batch, Variables
 from dew.sampling.text import Generation, Sampling
 from dew.training.state import TrainState
 
-from .sessions import OLD_LOG_PROBS_KEY, Call, Session, Status, pack, sampled_values
+from .sessions import OLD_LOG_PROBS_KEY, Call, Session, Status, check_credit, pack, sampled_values
 
 if TYPE_CHECKING:
     from .journal import EpisodeJournal, JournalRun
@@ -66,16 +66,21 @@ class Observation:
     The harness handles chat formatting, tool-call parsing and context
     compaction. A terminal observation's context may be empty, but a running
     one needs a context. `detail` can hold a verifier result or an artifact
-    reference without encoding it into device arrays.
+    reference without encoding it into device arrays. `reward` is what the
+    environment paid for the action that led here, a step reward, or None
+    where it pays only through the verifier at the end.
     """
 
     context: tuple[int, ...]
     status: EpisodeStatus = EpisodeStatus.RUNNING
     detail: str = ""
+    reward: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, EpisodeStatus):
             raise TypeError("observation status must be an EpisodeStatus")
+        if self.reward is not None:
+            object.__setattr__(self, "reward", finite_reward(self.reward))
         if any(type(token) is not int or token < 0 for token in self.context):
             raise ValueError("observation context must contain nonnegative token ids")
         if self.status == EpisodeStatus.RUNNING and not self.context:
@@ -356,10 +361,14 @@ class EpisodeRollout:
     previous call's context and actions merges into that call's chain, and
     chains share rows of `max_prompt_tokens + max_new_tokens` ids, so set
     the objective's `seq_len` one below that. The batch keeps one row per
-    possible call, so it always fits and its shapes stay fixed. Every action
-    in an episode gets the same group advantage, computed from the episode's
-    final reward; Dew infers no per-turn credit, and truncated episodes are
-    masked. Host records and numeric rows record the trainer's committed
+    possible call, so it always fits and its shapes stay fixed. An episode's
+    return is the verifier's reward plus the step rewards its observations
+    carry (`Observation.reward`). With `credit="session"` every action of
+    an episode gets the group advantage of that return; with
+    `credit="turn"` each turn's actions get the group advantage of the
+    return still ahead of that turn, compared with the group's at the same
+    turn (`sessions.advantages`). Truncated episodes are masked. Host
+    records and numeric rows record the trainer's committed
     update count. Raw and behavior likelihoods come from the actual draws.
 
     `policy.bind` fixes one immutable variables snapshot for the whole
@@ -381,6 +390,7 @@ class EpisodeRollout:
     groups: int = 2
     record: EpisodeRecorder | None = None
     journal: EpisodeJournal | None = None
+    credit: str = "session"
 
     def __post_init__(self) -> None:
         for name in ("max_prompt_tokens", "max_new_tokens", "max_turns"):
@@ -390,6 +400,7 @@ class EpisodeRollout:
             raise ValueError("an episode group needs at least two samples")
         if self.sampling.eos_token_ids is None:
             raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
+        check_credit(self.credit)
 
     def _persist(self, slot: EpisodeProgress, run: JournalRun | None, policy_step: int, binding: str) -> None:
         """Commit one slot's turn and environment snapshot, when a journal is open."""
@@ -739,7 +750,7 @@ class EpisodeRollout:
         sessions = [session_of(episode, group=str(index // self.groups))
                     for index, episode in enumerate(episodes)]
         batch = pack(sessions, self.max_prompt_tokens + self.max_new_tokens,
-                     rows=len(episodes) * self.max_turns)
+                     rows=len(episodes) * self.max_turns, credit=self.credit)
 
         def raw(index: int, number: int) -> tuple[float, ...]:
             likelihoods = episodes[index].transitions[number].action.raw_log_probs
@@ -756,8 +767,9 @@ def session_of(episode: Episode, *, group: str) -> Session:
 
     Each transition's action becomes one call. The call's prompt is the
     action's context, its sampled ids are the action's tokens with their
-    behavior likelihoods, and its finish reason is `stop` when the action
-    ended on EOS and `length` otherwise. An error the environment reports
+    behavior likelihoods, its reward is the step reward the observation after
+    it carries, and its finish reason is `stop` when the action ended on EOS
+    and `length` otherwise. An error the environment reports
     becomes `INFRA_ERROR`, because the verifier's reward, not the status,
     says how well the agent did.
     """
@@ -768,7 +780,8 @@ def session_of(episode: Episode, *, group: str) -> Session:
         EpisodeStatus.CANCELLED: Status.CANCELLED,
     }[episode.status]
     calls = tuple(Call(turn.action.context, turn.action.tokens, turn.action.behavior_log_probs,
-                       "stop" if turn.action.terminated else "length", turn.action.policy_step)
+                       "stop" if turn.action.terminated else "length", turn.action.policy_step,
+                       reward=turn.observation.reward)
                   for turn in episode.transitions)
     identity = episode.identity
     return Session(str(identity.task), group, identity.sample, identity.attempt, calls, status,

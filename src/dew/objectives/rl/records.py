@@ -32,8 +32,10 @@ def reals(value: object, key: str) -> tuple[float, ...]:
 
 def observation_record(value: Mapping[str, object]) -> Observation:
     record = section(value, "observation")
+    reward = record["reward"]
     return Observation(integers(record["context"], "context"),
-                       EpisodeStatus(integer(record["status"], "status")), text(record["detail"], "detail"))
+                       EpisodeStatus(integer(record["status"], "status")), text(record["detail"], "detail"),
+                       None if reward is None else real(reward, "reward"))
 
 
 def action_record(value: Mapping[str, object]) -> Action:
