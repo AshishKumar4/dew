@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import time
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -24,24 +25,33 @@ _REDIRECTS, _HOPS = (301, 302, 303, 307, 308), 10
 
 def _proxy(url: str) -> str | None:
     """The proxy urllib's environment names for `url`, none where its host
-    and port are excluded (NO_PROXY), as urllib decides each hop."""
+    and port are excluded (NO_PROXY), as urllib decides each hop; one named
+    by its authority alone is an HTTP proxy, as urllib reads it."""
     parts = urlsplit(url)
-    excluded = urllib.request.proxy_bypass(parts.netloc)
-    return None if excluded else urllib.request.getproxies().get(parts.scheme)
+    if urllib.request.proxy_bypass(parts.netloc):
+        return None
+    proxy = urllib.request.getproxies().get(parts.scheme)
+    return proxy if proxy is None or "://" in proxy else f"http://{proxy}"
 
 
-async def _get(session: aiohttp.ClientSession, url: str, limit: int, seconds: float) -> tuple[int, bytes]:
-    """The status of a GET of `url` and at most `limit` bytes of its body as
-    its server sent them, read as they arrive, all within `seconds`: every hop
-    of the redirects it follows, each through its own proxy, and the body."""
+async def _get(session: aiohttp.ClientSession, url: str, limit: int,
+               seconds: float) -> tuple[int, bytes, str]:
+    """The status of a GET of `url`, at most `limit` bytes of its body as its
+    server sent them, read as they arrive, and the url it ended at, all within
+    `seconds`: every hop of the redirects it follows (`Location`, else `URI`),
+    each through its own proxy, and the body. A redirect to an FTP url ends
+    it there, unread, for urllib to read."""
     status = 0
     async with asyncio.timeout(seconds):
         for _ in range(_HOPS + 1):
             request = session.get(url, headers=_HEADERS, allow_redirects=False, proxy=_proxy(url))
             async with request as response:
                 status = response.status
-                if status in _REDIRECTS and "Location" in response.headers:
-                    url = urljoin(url, response.headers["Location"])
+                target = response.headers.get("Location") or response.headers.get("URI")
+                if status in _REDIRECTS and target is not None:
+                    url = urljoin(url, target)
+                    if urlsplit(url).scheme == "ftp":
+                        return status, b"", url
                     continue
                 payload = bytearray()
                 if status < 300:
@@ -49,9 +59,9 @@ async def _get(session: aiohttp.ClientSession, url: str, limit: int, seconds: fl
                         payload += chunk
                         if len(payload) >= limit:
                             break
-                return status, bytes(payload[:limit])
+                return status, bytes(payload[:limit]), url
     # Redirected more often than urllib follows.
-    return status, b""
+    return status, b"", url
 
 
 @dataclass(frozen=True)
@@ -105,11 +115,18 @@ class Fetch:
     def _read(self, url: str) -> tuple[int, bytes]:
         """The status and at most `max_bytes` + 1 bytes of `url`; a url urllib
         reads (a file's) has no status but 200."""
-        limit = self.max_bytes + 1
+        limit, deadline = self.max_bytes + 1, time.monotonic() + self.timeout
         if urlsplit(url).scheme in ("http", "https"):
-            # fsspec's own IO loop, where the filesystem keeps its session for every fetch in this process.
+            # fsspec's own IO loop, where the filesystem keeps its session for every fetch in this process;
+            # the fetch's deadline is the only one (aiohttp's defaults bound each hop otherwise).
             loop = get_loop()
-            http = HTTPFileSystem(loop=loop, client_kwargs={"auto_decompress": False})
-            return sync(loop, _get, sync(loop, http.set_session), url, limit, self.timeout)
-        with urllib.request.urlopen(url, timeout=self.timeout) as response:
+            options = {"auto_decompress": False, "timeout": aiohttp.ClientTimeout()}
+            http = HTTPFileSystem(loop=loop, client_kwargs=options)
+            status, payload, url = sync(loop, _get, sync(loop, http.set_session), url, limit, self.timeout)
+            if urlsplit(url).scheme in ("http", "https"):
+                return status, payload
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError(f"no time left to read {url}")
+        with urllib.request.urlopen(url, timeout=left) as response:
             return 200, response.read(limit)
