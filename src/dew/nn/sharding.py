@@ -764,53 +764,30 @@ def declarations(tree) -> dict[Suffix, LogicalAxes]:
     A low-rank factor under a declared module takes its kernel's axes on its
     side of the rank and `ADAPTER_RANK` for the rank (`factor_axes`).
     """
-    leaves = [(parameter_path(path), np.ndim(leaf))
-              for path, leaf in jax.tree_util.tree_leaves_with_path(nn.unbox(tree))]
-    ranks = {names: ndim for names, ndim in leaves if names and names[-1] in LOW_RANK_FACTORS}
     table: dict[Suffix, LogicalAxes] = {}
-    for names, _ in leaves:
+    for path, leaf in jax.tree_util.tree_leaves_with_path(nn.unbox(tree)):
+        names = parameter_path(path)
         if (owned := _matching(_OWNERS, names)) is not None:
             table[names] = _OWNERS[owned][0]
         elif (module := _matching(_OWNERS, names[:-1])) is not None:
             axes = _OWNERS[module][0]
-            if names[-1] in LOW_RANK_FACTORS:
-                axes = factor_axes(axes, names[-1], *(ranks.get((*names[:-1], factor))
-                                                       for factor in LOW_RANK_FACTORS))
-            table[names] = axes
+            factor = names[-1] in LOW_RANK_FACTORS
+            table[names] = factor_axes(axes, names[-1], np.ndim(leaf)) if factor else axes
     return table
 
 
-def factor_axes(kernel: LogicalAxes, factor: str, a_ndim: int | None, b_ndim: int | None) -> LogicalAxes:
-    """The axes of the low-rank `factor` (`LOW_RANK_FACTORS`) of a kernel declared `kernel`, from
-    the ranks of its two factors: `lora_A`'s are the kernel's input axes then `ADAPTER_RANK`,
-    `lora_B`'s `ADAPTER_RANK` then its output axes. Under a scanned run both factors carry the
-    run's leading axis, which the kernel's declaration leaves out, as it does the kernel's."""
-    if a_ndim is None or b_ndim is None:
-        raise ValueError(f"a {factor} declared {kernel} has no {'lora_B' if b_ndim is None else 'lora_A'} "
-                         "beside it to split its kernel's axes at the rank")
-    stacked, odd = divmod(a_ndim + b_ndim - 2 - len(kernel), 2)
-    inputs = a_ndim - 1 - stacked
-    if odd or stacked < 0 or not 0 < inputs < len(kernel):
-        raise ValueError(f"factors of {a_ndim} and {b_ndim} dimensions do not split a kernel "
-                         f"declared {kernel}")
-    return (*kernel[:inputs], ADAPTER_RANK) if factor == "lora_A" else (ADAPTER_RANK, *kernel[inputs:])
-
-
-def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
-    """The axes of the parameter at `path`, or None for an unnamed one: the
-    axes its module boxed on it (`boxed`), matched by its whole path, a
-    variables leaf by its own and a leaf of a tree that mirrors the params
-    collection (an optimizer moment, a gradient) under `params`; else those
-    `declared`, the `declarations` of the tree it is a leaf of, give it.
-    """
-    names = parameter_path(path)
-    held = _BOXED.get()
-    axes = held.get(names) or held.get(("params", *names)) or declared.get(names)
-    if axes is None:
-        return None
-    if ndim > len(axes):
-        raise ValueError(f"{'/'.join(names)} has the axes {axes}, which cannot name its {ndim} dimensions")
-    return axes[len(axes) - ndim:]
+def factor_axes(kernel: LogicalAxes, factor: str, ndim: int) -> LogicalAxes:
+    """The axes of a layer's low-rank `factor` (`LOW_RANK_FACTORS`) of `ndim` dimensions, under a
+    kernel declared `kernel`: `lora_A`'s are the kernel's leading `ndim - 1` axes, its inputs, then
+    `ADAPTER_RANK`; `lora_B`'s `ADAPTER_RANK` then the kernel's trailing `ndim - 1`, its outputs.
+    Read off the factor alone, so a tree holding one factor without the other (an optimizer's
+    masked partition, a parameter group) declares it as the whole adapter does."""
+    sides = ndim - 1
+    if not 0 < sides < len(kernel):
+        raise ValueError(f"a {factor} of {ndim} dimensions does not split a kernel declared {kernel}")
+    if factor == "lora_A":
+        return (*kernel[:sides], ADAPTER_RANK)
+    return (ADAPTER_RANK, *kernel[len(kernel) - sides:])
 
 
 __all__ = ["ADAPTER_RANK", "DATA_AXIS", "FSDP_AXIS", "RESIDUAL", "LayoutRefused", "Link", "LogicalAxes",
