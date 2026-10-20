@@ -32,9 +32,9 @@ SAMPLING = Sampling(temperature=.7, top_k=2, eos_token_ids=EOS, pad_token_id=PAD
 IDENTITY = EpisodeId(task=3, attempt=0, sample=0, seed=(1, 2))
 
 
-def environment(mode: str = "ok", **limits) -> SubprocessEnvironment:
+def environment(mode: str = "ok", *arguments: str, **limits) -> SubprocessEnvironment:
     worker = Path(__file__).with_name("sandbox_square_worker.py")
-    return SubprocessEnvironment((sys.executable, str(worker), mode), SandboxLimits(**limits))
+    return SubprocessEnvironment((sys.executable, str(worker), mode, *arguments), SandboxLimits(**limits))
 
 
 def action(context, *tokens: int) -> Action:
