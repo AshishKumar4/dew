@@ -188,7 +188,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Establish and triage a daily GPU baseline before it replaces batch qualification. Reproduce reference autotune picks in their recorders and qualify FP8 on suitable hardware. [558, 568, TTC-1]
 - Qualify H100, newer-GPU, TPU and paged-decode shard routes at runtime; compile and interpret checks leave those obligations open.
 - Reconcile requested capabilities with implementation and qualification evidence, and audit upstream reproductions and fixes. [224, 306]
-- The float64 gate is the owner's (2026-10-20): each leaf's RMS error within 1.5× the reference's and its worst row within ROW_FACTOR of the reference's, on the same inputs, with no floor; every element within a certified roundoff bound for its own operation on common native inputs (faithful rounding for pointwise steps, a bound for each sum, native probes at opaque kernels), behind one assertion, `assert_as_exact`. [560, 649, 719, 739, 793, 827]
+- The float64 gate is the owner's (2026-10-20): each leaf's RMS error within 1.5× the reference's and its worst row within ROW_FACTOR of the reference's, on the same inputs, with no floor; every element within a certified roundoff bound for its own operation on common native inputs (faithful rounding for pointwise steps, a bound for each sum, native probes at opaque kernels), behind one assertion, `assert_as_exact`. [560, 649, 719, 793, 827]
 - Every accuracy comparison in the tests and tools goes through that assertion; the files that still compare within a tolerance are an inventory that only shrinks, empty by 2026-11-27. [650, 668, 669, 670, 676, 682, 705, 712]
 - Replace test-policy violations with observable lifecycle and reference behavior:
 
