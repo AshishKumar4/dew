@@ -6,7 +6,6 @@ resumed run reads its batches as the run it continues did.
 """
 
 import re
-from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -91,25 +90,25 @@ def test_a_forecast_bounds_a_split_above_by_each_compile_that_read_more_rows():
     a split's headroom from above, each per row, and the half rung's compiles count for a split too."""
     from dew.training.planning import Forecast
 
-    forecast = Forecast(factor=1)
+    # One process: its own headroom is the pool's.
+    forecast = Forecast(factor=1, agree=lambda headroom: headroom is None or headroom >= 0)
     fixed, per_split = 10, 80
     # Room for 40 bytes: the batch whole needs 90 and two microbatches 50, four 30.
     headroom = {split: 40 - (fixed + per_split // split) for split in (1, 2, 4, 8)}
     forecast.measured["rung"] = [(1, fixed + per_split, headroom[1])]
     for split in (2, 4, 8):
-        assert forecast.bound("rung", split) >= headroom[split]
+        bound = forecast.bound("rung", split)
+        assert bound is not None and bound >= headroom[split]
     assert forecast.bound("rung", 1) is None
-    one_process = mock.patch("dew.training.planning.fits_everywhere",
-                             lambda headroom: headroom is None or headroom >= 0)
-    with one_process:
-        # No miss at the rung yet: its half rung is unknown, and nothing is ruled out.
-        assert not forecast.ruled_out("rung", 2)
-        forecast.half_of["rung"] = None
-        assert forecast.bound("rung", 2) < 0 and forecast.ruled_out("rung", 2)
-        assert not forecast.ruled_out("rung", 4) and forecast.likely("rung", 4)
-        forecast.half_of["rung"] = "half"
-        forecast.measured["half"] = [(1, 20, 80)]
-        assert not forecast.ruled_out("rung", 2)
+    # No miss at the rung yet: its half rung is unknown, and nothing is ruled out.
+    assert not forecast.ruled_out("rung", 2)
+    forecast.half_of["rung"] = None
+    bound = forecast.bound("rung", 2)
+    assert bound is not None and bound < 0 and forecast.ruled_out("rung", 2)
+    assert not forecast.ruled_out("rung", 4) and forecast.likely("rung", 4)
+    forecast.half_of["rung"] = "half"
+    forecast.measured["half"] = [(1, 20, 80)]
+    assert not forecast.ruled_out("rung", 2)
 
 
 def test_the_fit_ladder_tiles_the_head_fused_then_unfused_before_it_recomputes_more():
