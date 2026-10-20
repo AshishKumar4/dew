@@ -912,7 +912,7 @@ class Server:
                     self.rows.release(row)
                     del drew[slot]
                     row.ticket._drew(row.tokens)
-                    self._finish(row, terminated=bool(draws.stopped[step, slot]))
+                    self._finish(row, terminated=bool(draws.ended[step, slot]))
         for row in drew.values():
             row.ticket._drew(row.tokens)
 

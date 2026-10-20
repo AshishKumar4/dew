@@ -764,14 +764,13 @@ def _committed(block_size: int, step: StepState, emitted: jax.Array, terminated:
     """
     active = step.active
     limit = jnp.where(active, jnp.minimum(matched + 1, budget - step.step), 0)
-    walked, live, ended, stopped = step, active, terminated, jnp.zeros_like(active)
+    walked, live, ended = step, active, terminated
     for at in range(block_size + 1):
         kept = live & (at < limit)
         walked = walked.commit(emitted[:, at], kept)
         fired = stopping(walked, emitted[:, at])
-        done = fired.done & kept
-        ended, stopped, live = ended | (fired.ended & kept), stopped | done, live & ~done
-    walked = dataclasses.replace(walked, active=active & ~stopped & ~ended & (walked.step < budget))
+        ended, live = ended | (fired.ended & kept), live & ~(fired.done & kept)
+    walked = dataclasses.replace(walked, active=live & ~ended & (walked.step < budget))
     return walked, walked.step - step.step, ended
 
 
