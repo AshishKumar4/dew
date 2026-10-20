@@ -432,16 +432,21 @@ def declared_seeds(path) -> dict[str, int]:
 def indexed_recording(stored, site: str, seeds: int):
     """`assert_as_exact`'s draw, reference and truth for a reference recorded over seeds, where it cannot
     run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.input.<name>`,
-    `<site>.reference.<name>` and `<site>.truth.<name>`, each stacked over the seeds. A draw is
-    `(index, inputs)`, the index an integer `widened` keeps; the reference and the truth read the
-    recorded outputs at it, and Dew's function takes the same two arguments and ignores the index.
-    The recording covers check 1's redraw, (1 + REDRAW) times the declared seeds, so a numerical
-    failure stays a finding rather than running out of recorded seeds."""
+    `<site>.reference.<name>` and `<site>.truth.<name>`, every array stacked over the seeds on its first
+    axis, the truth in float64. A draw is `(index, inputs)`, the index an integer `widened` keeps; the
+    reference and the truth read the recorded outputs at it, and Dew's function takes the same two
+    arguments and ignores the index. The recording covers check 1's redraw, (1 + REDRAW) times the
+    declared seeds, so a numerical failure stays a finding rather than running out of recorded seeds."""
     def tree(kind):
         prefix = f"{site}.{kind}."
         return {name.removeprefix(prefix): value for name, value in stored.items() if name.startswith(prefix)}
 
     inputs, reference, truth = tree("input"), tree("reference"), tree("truth")
+    narrow = [name for name, value in truth.items()
+              if np.issubdtype(value.dtype, np.floating) and value.dtype != np.float64]
+    if narrow:
+        raise AssertionError(f"{site}: the recorded truth {narrow} is not float64; record it in float64, as "
+                             f"no later widening recovers what a narrower recording dropped")
     count = min(len(value) for part in (inputs, reference, truth) for value in part.values())
     if count < (1 + REDRAW) * seeds:
         raise AssertionError(f"{site}: {count} recorded seeds, and check 1 over {seeds} may draw "
