@@ -506,8 +506,9 @@ def rewound(start: Mapping[str, object], current: Mapping[str, object]) -> Mappi
     holds them (`_COUNTER`: its counts, run of rejections and warning): a pass read again goes on
     counting the corpus, where a restored position replaces its counts. Every other part of a
     position is the iterator's own and is left as `start` has it."""
-    parts = _rewound_parts(list(start.values()), [current.get(key, value) for key, value in start.items()])
-    kept = dict(zip(start, parts, strict=True))
+    shared = [key for key in start if key in current]
+    parts = _rewound_parts([start[key] for key in shared], [current[key] for key in shared])
+    kept = {**start, **dict(zip(shared, parts, strict=True))}
     if _COUNTER in start and _COUNTER in current:
         kept[_COUNTER] = current[_COUNTER]
     return kept
