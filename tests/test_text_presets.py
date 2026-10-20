@@ -72,20 +72,23 @@ def test_the_sft_preset_prepares_what_the_chat_recipe_does(long):
 
 
 def test_a_concatenated_conversation_keeps_its_target_across_a_row_end():
-    """Conversations each cut to fit a row and then concatenated: a row end that cuts one keeps its
-    last token again at the next row's start, so every next-token target of every conversation is
-    in some row, in one piece."""
+    """Conversations that each fit a row, concatenated: the first fills less than a row, so the
+    second is cut where that row ends, and the next row starts with the cut's last token again;
+    every next-token target of every conversation is in some row, in one piece."""
     from dew.data import chat
 
     conversations = Memory([{"messages": [{"role": "user", "content": "hello there " * (1 + index)},
                                           {"role": "assistant", "content": "hi " * 3}]}
                             for index in range(5)])
     rendered = [len(np.asarray(row["text"])) for row in conversations.map(chat.template(str(CHAT)))]
-    rows = list(conversations.pipe(presets.sft, str(CHAT), seq_len=20, batch=1, long="truncate",
+    # Rows one token longer than the longest conversation: each fits, and none fills a row alone.
+    seq_len = max(rendered)
+    rows = list(conversations.pipe(presets.sft, str(CHAT), seq_len=seq_len, batch=1, long="truncate",
                                    pack="concat"))
     segments = [np.asarray(row["text_coordinates"].segments)[0] for row in rows]
     held = sum(int(np.count_nonzero((ids[:-1] == ids[1:]) & (ids[:-1] > 0))) for ids in segments)
-    assert held == sum(min(length, 21) - 1 for length in rendered)
+    assert len(rows) > 1
+    assert held == sum(length - 1 for length in rendered)
 
 
 def store_of_documents(directory) -> np.ndarray:
@@ -97,10 +100,11 @@ def store_of_documents(directory) -> np.ndarray:
 
 def test_a_token_stores_windows_are_the_text_recipes(tmp_path):
     """A token store's stream cut into fixed windows two apart, shuffled and repeated as the
-    recipe orders them, read by index: the recipe's plan and batches."""
+    recipe orders them, read by index: the windows written first on the store read its stream by
+    index, so the plan and batches are the recipe's."""
     store_of_documents(tmp_path)
     expected = loader(TextData(str(tmp_path), seq_len=8, stride=2), batch=4, read="indexed", loading=LOADING)
-    chain = TokenFiles(str(tmp_path)).shuffle(0).repeat().pipe(presets.token_windows, 8, stride=2, batch=4)
+    chain = TokenFiles(str(tmp_path)).windows(8, stride=2).shuffle(0).repeat().batch(4)
     built = compile(chain, read="indexed", loading=LOADING)
     assert built.plan.identity() == expected.plan.identity()
     same_batches(expected, built)
@@ -118,14 +122,19 @@ def test_a_token_stores_documents_are_packed_whole(tmp_path):
     assert held == sum(len(document) - 1 for document in documents)
 
 
-def test_a_token_store_that_states_no_document_ends_is_not_packed(tmp_path):
+@pytest.mark.parametrize("composed", ["alone", "concatenated", "mixed"])
+def test_a_token_store_that_states_no_document_ends_is_not_packed(tmp_path, composed):
     """A store with neither a document index nor an EOS token reads as one document, whose pieces
-    no producer made, so packing its documents is refused; its fixed windows still read."""
+    no producer made, so packing its documents is refused, alone or among other sources; its
+    stream still reads as fixed windows."""
+    from dew.data import concat, mix
+
     write_token_corpus(tmp_path, np.arange(64, dtype=np.uint16), None)
     store = TokenFiles(str(tmp_path))
+    chained = {"alone": store, "concatenated": concat([store]), "mixed": mix([store])}[composed]
     with pytest.raises(ValueError):
-        store.pipe(presets.lm, None, seq_len=8, batch=4)
-    rows = list(store.pipe(presets.token_windows, 8, batch=4))
+        chained.pipe(presets.lm, None, seq_len=8, batch=4)
+    rows = list(store.pipe(presets.lm, None, seq_len=8, batch=4, pack=None))
     assert np.asarray(rows[0]["text"]).shape == (4, 9)
 
 
