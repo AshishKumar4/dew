@@ -204,8 +204,6 @@ def test_a_mixture_that_is_not_one_is_refused(count, weights):
 # The mixture through dew.data.load
 # --------------------------------------------------------------------------
 
-datasets = pytest.importorskip("datasets", reason="needs the streaming extra")
-
 
 def rows_dir(root: Path, name: str, first: int, count: int) -> str:
     """A directory of one jsonl file, which `load_dataset` reads as a split."""
