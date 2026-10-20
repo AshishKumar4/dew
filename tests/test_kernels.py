@@ -25,6 +25,7 @@ from test_attention_splash import attention_terms
 from dew.nn import kernels
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention, weighted_values
 from dew.nn.kernels import bf16_dot_runs
+from dew.nn.kernels.selection import KernelRefused
 
 pytestmark = pytest.mark.kernel
 
@@ -94,13 +95,13 @@ def test_flash_through_dews_attention_refuses_rows_it_would_misread(without_dete
         for k, v in malformed:
             with pytest.raises(ValueError):
                 jax.eval_shape(attend('flash', **packed), query, k, v)
-    # Not causal: a causal call over its own documents is square, which the selector holds it to first.
-    with pytest.raises(ValueError, match="document's id"):
-        jax.eval_shape(attend('flash', causal=False, **own), query, normal(1, 64, 2, 64),
-                       normal(1, 64, 2, 64))
-    with pytest.raises(ValueError, match="document's id"):
-        jax.eval_shape(attend('flash', causal=False, **cross), query, normal(1, 32, 2, 64),
-                       normal(1, 32, 2, 64))
+    # Calls the selector gives flash, so the refusal is the packed path's own, not `KernelRefused`: not
+    # causal, since a causal call over its own documents is square.
+    for packed, keys in ((own, 64), (cross, 32)):
+        with pytest.raises(ValueError) as refused:
+            jax.eval_shape(attend('flash', causal=False, **packed), query, normal(1, keys, 2, 64),
+                           normal(1, keys, 2, 64))
+        assert not isinstance(refused.value, KernelRefused)
 
     def exact(pieces):
         """`[o, dq, dk, dv]` from float64 and their `window_terms`, each `(row, slice)` causal alone."""
