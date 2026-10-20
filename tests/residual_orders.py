@@ -33,9 +33,10 @@ COMPOSITE_RESIDUAL_AXES = {("attn_hc", "fn"): 1, ("ffn_hc", "fn"): 1, ("hc_head"
 
 RESIDUAL_NORMS = frozenset({
     "input_layernorm", "post_attention_layernorm", "attention_output_norm", "mlp_output_norm",
-    "post_per_layer_input_norm", "embedding_layernorm", "head_norm", "enorm", "hnorm"})
+    "post_per_layer_input_norm", "embedding_layernorm", "head_norm", "enorm", "hnorm",
+    "final_norm"})
 """The norms over the residual stream a Dew decoder names (backbones/decoder_block.py,
-causal_transformer.py), beside the final `norm` outside every layer; a mixer's own `norm`
+causal_transformer.py; an MTP head's `final_norm`), beside the final `norm` outside every layer; a mixer's own `norm`
 (Mamba-2's, a gated delta rule's) and the query and key norms are over other widths."""
 
 LAYER = re.compile(r"layers(_\d+)?")
