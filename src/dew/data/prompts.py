@@ -75,19 +75,20 @@ def _extra_info(element: Mapping[str, object]) -> JSON:
     """A prompt row's `extra_info`, its `ability` (a verl row's task family) folded in as a field of
     it, as the reward reads it. A row whose `extra_info` is no mapping has no field to carry it in,
     and one whose `extra_info` names another ability contradicts itself: both are refused."""
-    info = json_value(element.get("extra_info"), "prompt extra_info")
+    context = json_value(element.get("extra_info"), "prompt extra_info")
     if "ability" not in element:
-        return info
+        return context
     ability = json_value(element["ability"], "prompt ability")
-    match info:
+    match context:
         case None:
             return {"ability": ability}
         case {"ability": held} if held != ability:
             raise ValueError(f"a prompt row's ability {ability!r} differs from its extra_info's {held!r}")
         case dict():
-            return {**info, "ability": ability}
+            return {**context, "ability": ability}
         case _:
-            raise ValueError(f"a prompt row's extra_info {info!r} is no mapping its ability can join")
+            raise ValueError(f"a prompt row's extra_info {context!r} is no mapping its ability can join")
+
 
 FIELDS = ("prompt", "data_source", "ground_truth", "extra_info", "tools", "reward_model")
 """The fields prompt encoding reads, leaving the others unchanged.
