@@ -14,12 +14,20 @@ export interface Limits {
 	/** At most `ipStarts` sessions per visitor IP in any `ipWindowSeconds`, and `TABS` at once (coordinator.ts). */
 	ipWindowSeconds: number;
 	ipStarts: number;
+	/** Model hosts the pool keeps warm with no session asking: production's, and none on the preview, which its
+	 * deploy's warm and a visitor's request warm for `warmSeconds` (model-pool.ts). */
+	minHosts: number;
 }
 
 export function limitsOf(env: Env): Limits {
 	const read = (name: keyof Env): number => {
 		const value = Number(env[name]);
 		if (!Number.isFinite(value) || value <= 0) throw new Error(`${String(name)} must be a positive number`);
+		return value;
+	};
+	const count = (name: keyof Env): number => {
+		const value = Number(env[name]);
+		if (!Number.isInteger(value) || value < 0) throw new Error(`${String(name)} must be a whole number, zero or more`);
 		return value;
 	};
 	return {
@@ -30,5 +38,6 @@ export function limitsOf(env: Env): Limits {
 		idleSeconds: read('IDLE_SECONDS'),
 		ipWindowSeconds: read('IP_WINDOW_SECONDS'),
 		ipStarts: read('IP_STARTS'),
+		minHosts: count('MIN_HOSTS'),
 	};
 }
