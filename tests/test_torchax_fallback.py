@@ -25,7 +25,7 @@ import pytest
 import torch
 import transformers
 from jax.sharding import PartitionSpec as P
-from reference_error import assert_leaves_as_exact, float64_terms, widened
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms, widened
 
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
@@ -199,8 +199,9 @@ def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placemen
     for name in split_trained:
         first, gradient = np.asarray(start[name], np.float64), gradients[name]
         truth[name] = first - 1e-2 * (gradient / (np.abs(gradient) + 1e-8) + 1e-4 * first)
-    assert_leaves_as_exact(jax.tree.map(np.asarray, whole_trained), jax.tree.map(np.asarray, split_trained),
-                           truth)
+    for name, true in truth.items():
+        assert_as_exact_as_the_reference(np.asarray(whole_trained[name]), np.asarray(split_trained[name]), true,
+                                         name)
 
 
 GEMMA2 = {**TINY, "intermediate_size": 128, "num_key_value_heads": 2, "head_dim": 16, "sliding_window": 32,
