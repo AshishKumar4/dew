@@ -26,9 +26,9 @@ The whole flow, once: load or build the model → train several steps on real-sh
 - packed rows equal their documents run separately;
 - right-padded equals unpadded on the real tokens;
 - sharded equals unsharded (on the device mesh of scenario 6 and on CPU multi-device);
-- a repeated or resumed run reuses its compiled programs: a fresh process hits the persistent cache with an identical program fingerprint (training, evaluation, sampling);
 - export then reload is identical;
 - loaded checkpoints match their reference (HF transformers, diffusers) within the float64 gate.
+- a repeated or resumed run reuses its compiled programs: a fresh process hits the persistent cache with an identical program fingerprint (training, evaluation, sampling).
 
 An exact cache's decode agrees with full forward under the numerical rule below. A cache explicitly defined as approximate is compared with the reference implementation's own decode under that same cache. Approximate and exact cache claims remain distinct.
 

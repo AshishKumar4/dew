@@ -39,7 +39,7 @@ A new family configures the shared attention, MLP, MoE, normalization, position 
 
 Start from the maintained implementation's public interface: JAX, Flax, Optax, Orbax, Grain, Tokamax or the system being integrated. Use it directly when it fits. A replacement needs a reason in the direction (not taste), and a parity list: every capability of the old code mapped to the new code or to a drop the user approved, checked before the old code is deleted.
 
-Before replacing code, map every capability of the old path to the new owner or an explicitly approved removal. A replacement is complete only when its callers move together. Before 1.0, the API changes directly, without aliases, migrations or parallel implementations.
+A replacement is complete only when its callers move together. Before 1.0, the API changes directly, without aliases, migrations or parallel implementations.
 
 Tests enumerate implementations from the registry that declares them. A new implementation joins the standing behavioral contracts in the same change. Its siblings are checked against the same contracts. Performance choices need same-session measurements at real shapes, including compilation cost, and [numerical qualification](testing.md#numerical-accuracy).
 
