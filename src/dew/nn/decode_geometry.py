@@ -70,7 +70,7 @@ def grouped_query(attend, query, key, value):
     row's), reads its key head's keys once a group. cuDNN otherwise padded the lone query to two
     positions and ran each query head on its own, 4.7% slower a layer at 64 rows for the same bits
     (docs/performance.md), and the decode kernel takes as many query heads as key heads
-    (`decode_attention.fits`)."""
+    (`decode_attention.SUPPORTS`)."""
     batch, positions, heads, width = query.shape
     kv_heads = key.shape[-2]
     group = heads // kv_heads
