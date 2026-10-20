@@ -1139,6 +1139,51 @@ def test_a_token_mixture_weighs_a_random_holdout_by_the_rows_it_keeps(held):
     assert data.plan is not None and data.plan.lowering == ("per-share" if held else "global")
 
 
+class Cursor(grain.IterDataset):
+    """A Grain dataset whose position names its own fields as it likes: here the place it has read
+    to, under `counts`."""
+
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def __iter__(self):
+        return CursorRead(self.rows)
+
+
+class CursorRead(grain.DatasetIterator):
+    def __init__(self, rows):
+        super().__init__()
+        self.rows, self.at = rows, 0
+
+    def __next__(self):
+        if self.at == len(self.rows):
+            raise StopIteration
+        self.at += 1
+        return self.rows[self.at - 1]
+
+    def get_state(self):
+        return {"corpus": "cursor", "counts": self.at}
+
+    def set_state(self, state):
+        self.at = state["counts"]
+
+
+def test_a_repeat_rewinds_a_native_grain_position_as_the_dataset_wrote_it():
+    """A repeat that rewinds a pass keeps its corpus's counts, and leaves the rest of the position
+    as the iterators wrote it, a Grain dataset's own fields whatever their names."""
+    from dew.data import from_grain
+
+    rows = [{"id": np.int32(index)} for index in range(2)]
+    data = compile(from_grain(Cursor(rows), "native").take(2).repeat().batch(1), read="streamed",
+                   loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        assert [int(next(stream)["id"][0]) for _ in range(5)] == [0, 1, 0, 1, 0]
+    finally:
+        stream.close()
+
+
 def test_a_read_finds_a_record_after_any_run_of_rejections():
     """A training read reads on through however many rejected records come before one its filter
     keeps: ten thousand and more in a row are no proof the corpus holds none."""
