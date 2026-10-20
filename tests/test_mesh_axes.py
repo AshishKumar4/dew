@@ -300,8 +300,9 @@ def test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device(tm
     misspelt = Layout(rules={**NATIVE_RULES, "embed": "zer0"}, data_axes=layout.data_axes)
     with pytest.raises(ValueError):
         native_trainer(native, misspelt, None, **layers).fit(data, steps=1)
-    # A rule of one's own that names Dew's tensor axis, which this mesh lacks, would split nothing.
-    absent = Layout(rules={**NATIVE_RULES, "mlp": "tensor"}, data_axes=layout.data_axes)
+    # A rule of one's own (none of Dew's: those put the width on fsdp) that names Dew's tensor axis,
+    # which this mesh lacks, would split nothing.
+    absent = Layout(rules={**NATIVE_RULES, "embed": "tensor"}, data_axes=layout.data_axes)
     with pytest.raises(ValueError):
         native_trainer(native, absent, None, **layers).fit(data, steps=1)
 
