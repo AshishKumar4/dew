@@ -60,6 +60,21 @@ def test_fetch_preserves_the_catalog_and_reads_exact_bytes(tmp_path):
     assert row["bytes"] == b"source bytes" and row["caption"] == "the record"
 
 
+def test_a_catalog_fetches_from_any_store_fsspec_reads():
+    """A url of an object store, not only of a web server or a local file, fetches its object's
+    bytes: the fetch reads every url through the store fsspec names for it."""
+    from uuid import uuid4
+
+    import fsspec
+
+    url = f"memory://fetch-{uuid4().hex}/payload"
+    with fsspec.open(url, "wb") as file:
+        file.write(b"stored bytes")
+    row = Fetch()({"url": url, "caption": "the record"})
+    assert not isinstance(row, Rejected)
+    assert row["bytes"] == b"stored bytes" and row["caption"] == "the record"
+
+
 def test_failed_fetches_are_counted_before_batches(tmp_path):
     prefix = catalog(tmp_path)
     rows = [{"url": (tmp_path / "missing").as_uri(), "label": -1},
