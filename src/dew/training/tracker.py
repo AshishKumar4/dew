@@ -356,30 +356,29 @@ class LocalTracker(_OwnedTracker):
         (`loss`). A nonfinite value is left out of its line and counted on the figure; the journal
         keeps it. Raises `KeyError` for a metric the journal never logged, naming those it holds."""
         self._check()
-        from dew.figures import curve
+        return _curves(self._history(), metrics, smooth=smooth, y_label=y_label, y_range=y_range)
+
+    def plot_files(self) -> list[Path]:
+        """Draw each metric in the journal to its own SVG file and return the paths. A file is named
+        for its metric, each character outside `[A-Za-z0-9_.-]` written `-`, with a digest of the
+        whole name, so two names never share a file. The journal is not changed."""
+        self._check()
+        history = self._history()
+        paths = []
+        for name in history:
+            readable = re.sub(r'[^A-Za-z0-9_.-]', '-', name)[:64]
+            path = self.directory / f'{readable}-{hashlib.sha256(name.encode()).hexdigest()[:8]}.svg'
+            _curves(history, (name,)).save(path)
+            paths.append(path)
+        return paths
+
+    def _history(self) -> dict[str, list[tuple[int, float]]]:
+        """Each metric the journal holds, its steps and values in the order logged."""
         history: dict[str, list[tuple[int, float]]] = {}
         for step, values in self.scalars():
             for name, value in values.items():
                 history.setdefault(name, []).append((step, value))
-        names = metrics or tuple(name for name in history if name.count('/') == 1 and name.endswith('/loss'))
-        if missing := [name for name in names if name not in history] or ([] if names else ['train/loss']):
-            raise KeyError(f'the journal logged no {", ".join(missing)}; it holds {sorted(history)}')
-        lasts = {name.rpartition('/')[2] for name in names}
-        label = y_label or (lasts.pop() if len(lasts) == 1 else 'value')
-        return curve({name: [value for _, value in history[name]] for name in names},
-                     x={name: [step for step, _ in history[name]] for name in names},
-                     x_label='step', y_label=label, y_range=y_range, smooth=smooth)
-
-    def plot_files(self) -> list[Path]:
-        """Draw each metric in the journal to `<metric>.svg`, its name's `/` written `-`, and return
-        the paths. The journal is not changed."""
-        self._check()
-        paths = []
-        for name in dict.fromkeys(name for _, values in self.scalars() for name in values):
-            path = self.directory / f'{name.replace("/", "-")}.svg'
-            self.plot(name).save(path)
-            paths.append(path)
-        return paths
+        return history
 
     def close(self) -> None:
         if self._closed:
@@ -402,6 +401,21 @@ class LocalTracker(_OwnedTracker):
         self._files.clear()
         if error is not None:
             raise error
+
+
+def _curves(history: Mapping[str, list[tuple[int, float]]], metrics: tuple[str, ...], *, smooth: int = 1,
+            y_label: str | None = None, y_range: tuple[float, float] | None = None) -> Figure:
+    """`metrics` of a journal's `history` as one curve (`LocalTracker.plot`)."""
+    from dew.figures import curve
+    names = metrics or tuple(name for name in history if name.count('/') == 1 and name.endswith('/loss'))
+    if missing := [name for name in names if name not in history] or ([] if names else ['train/loss']):
+        raise KeyError(f'the journal logged no {", ".join(missing)}; it holds {sorted(history)}')
+    if y_label is None:
+        lasts = {name.rpartition('/')[2] for name in names}
+        y_label = lasts.pop() if len(lasts) == 1 else 'value'
+    return curve({name: [value for _, value in history[name]] for name in names},
+                 x={name: [step for step, _ in history[name]] for name in names},
+                 x_label='step', y_label=y_label, y_range=y_range, smooth=smooth)
 
 
 @functools.singledispatch
