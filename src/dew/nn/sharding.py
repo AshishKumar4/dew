@@ -790,5 +790,22 @@ def factor_axes(kernel: LogicalAxes, factor: str, ndim: int) -> LogicalAxes:
     return (ADAPTER_RANK, *kernel[len(kernel) - sides:])
 
 
+def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
+    """The axes of the parameter at `path`, or None for an unnamed one: the
+    axes its module boxed on it (`boxed`), matched by its whole path, a
+    variables leaf by its own and a leaf of a tree that mirrors the params
+    collection (an optimizer moment, a gradient) under `params`; else those
+    `declared`, the `declarations` of the tree it is a leaf of, give it.
+    """
+    names = parameter_path(path)
+    held = _BOXED.get()
+    axes = held.get(names) or held.get(("params", *names)) or declared.get(names)
+    if axes is None:
+        return None
+    if ndim > len(axes):
+        raise ValueError(f"{'/'.join(names)} has the axes {axes}, which cannot name its {ndim} dimensions")
+    return axes[len(axes) - ndim:]
+
+
 __all__ = ["ADAPTER_RANK", "DATA_AXIS", "FSDP_AXIS", "RESIDUAL", "LayoutRefused", "Link", "LogicalAxes",
            "LogicalAxisRules", "Schedule", "logical_axes", "logical_spec"]
