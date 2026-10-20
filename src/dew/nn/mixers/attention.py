@@ -209,7 +209,7 @@ class CausalSelfAttention(nn.Module):
     """Whether the queries, keys and values project through one kernel,
     `qkv_proj`, at init as from a checkpoint that stores them so (the Qwen 3.5
     and DeepSeek-V4.1 vision towers)."""
-    linear: Callable[..., nn.Dense] = nn.Dense
+    linear: Callable[..., nn.Dense] = functools.partial(nn.Dense, dot_general=float32_dot_general)
     """The projections' module: Gemma 4's vision tower clips their inputs and
     outputs (`dew.nn.vision.gemma4.Gemma4ClippableLinear`)."""
     nope: bool = False
@@ -236,7 +236,7 @@ class CausalSelfAttention(nn.Module):
                 "and are not the keys")
         dense = functools.partial(
             self.linear, use_bias=self.ctx.attention_bias, dtype=self.ctx.dtype, precision=self.ctx.precision,
-            dot_general=float32_dot_general, **normal_kernel(self.ctx.init_std))
+            **normal_kernel(self.ctx.init_std))
         projections = self.projections()
         if self._packed():
             # A Server packs its constant weights once, not on every decode

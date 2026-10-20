@@ -102,7 +102,7 @@ class GatedMLP(nn.Module):
     init_std: float | None = None  # gate/up normal std; None: lecun normal
     output_init_std: float | None = None  # down normal std; None follows init_std
     packed: bool = False
-    linear: Callable[..., nn.Dense] = nn.Dense
+    linear: Callable[..., nn.Dense] = functools.partial(nn.Dense, dot_general=float32_dot_general)
     dropout_rate: float = 0.0
     ngpt: NGPT | None = None
     """The normalized transformer's gains (`dew.nn.ngpt.NGPT`): the gate and the up projection each
@@ -132,7 +132,7 @@ class GatedMLP(nn.Module):
         projections = self.projections()
         dense = functools.partial(
             self.linear, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
-            dot_general=float32_dot_general, **normal_kernel(self.init_std))
+            **normal_kernel(self.init_std))
         if self._gated():
             if self._packed():
                 group = self._group()

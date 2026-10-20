@@ -27,7 +27,7 @@ from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.multimodal import VisionConditioner
-from dew.nn.precision import at_least_fp32, float32_dot_general, float32_products
+from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
 from dew.nn.protocols import OutputTable
 
 if TYPE_CHECKING:
@@ -76,8 +76,8 @@ def soft_embeddings(logits: jax.typing.ArrayLike, embed_weight: jax.typing.Array
     wide = at_least_fp32(logits.dtype)
     probs = jax.nn.softmax(logits.astype(wide), axis=-1)
     table = jnp.asarray(embed_weight)
-    return jnp.einsum('...v,vd->...d', probs, table, preferred_element_type=wide,
-                      precision=float32_products(table.dtype)) * jnp.asarray(scale, wide)
+    mixed = float32_einsum('...v,vd->...d', probs, table, preferred_element_type=wide)
+    return mixed * jnp.asarray(scale, wide)
 
 
 class DiffusionGemma(nn.Module):
