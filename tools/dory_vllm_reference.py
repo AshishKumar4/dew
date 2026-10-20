@@ -16,6 +16,7 @@ build installs exactly its tree: the checkout over the precompiled wheel of its 
     PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py upstream DIR
     PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py orders DIR
     PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py model_orders DIR
+    PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py invariance DIR
     PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py sums DIR
     HF_TOKEN=... PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py publish DIR
 
@@ -45,8 +46,10 @@ run's tokens again through a logits processor that draws them (tools/dory_vllm_f
 the same raw log-probabilities. It keeps each
 order's rows on their columns and each entry of every row's whole vocabulary's absolute distance
 from float64 (`errors`); `model_orders` writes the model code's at the engine's precision on a
-last-loop run's rows past the window (`SHARED`) in their place, and `sums` sums each batch's
-entries. Order zero reproduces the probe's rows bit for bit. `publish` puts the probe and the
+last-loop run's rows past the window (`SHARED`) in their place, `invariance` records the float64
+model code's distance under each order from the identity, and `sums` takes each order's RMS over
+the run and over each row, and sums each batch's entries. Order zero reproduces the probe's rows bit
+for bit. `publish` puts the probe and the
 batches' sums in `DATASET`, at a revision source.json pins with each file's sha256 (`fetched`).
 """
 
@@ -563,58 +566,6 @@ def dew_traces(directory: Path) -> None:
             held.flush()
 
 
-TREES = ('pairwise', 'blocked-32', 'blocked-128')
-"""The ensemble's members besides vLLM, each Dew's same math with every sum under a declared tree
-(tests/reference_trees.py): vLLM's key order is fixed, so the trees are what vary its key sums."""
-
-MEMBERS = ('vllm', *TREES)
-"""The reference's ensemble: an element's reference error is the worst over them."""
-
-
-def trees(directory: Path, runs=None, orders_of: int = ORDERS) -> None:
-    """Each tree member's per-element errors on every run (`runs`, every one by default), summed over
-    each batch's orders (`symmetry`, the same orbit as vLLM's), `absolutes-{run}-{member}-{batch}.npy`
-    `[rows, vocab]` float32, and each order's RMS, `rms-{run}-{member}.npy`: Dew's model at the run's
-    dtype, its attention the XLA math every sum of which the interpreter reaches, decoding the run's
-    tokens as the release test does (tests/test_dory.py `decoding`, `forced`), every sum under the
-    member's tree. Under Dew's
-    environment, on its GPU; `orders_of` below ORDERS times a pilot."""
-    import time
-
-    import jax
-    import test_dory
-
-    from dew.interop import Pretrained
-
-    source = json.loads((FIXTURE / 'source.json').read_text())
-    probe = np.load(FIXTURE / 'probe.npz')
-    config = json.loads((FIXTURE / 'config.json').read_text())
-    for loops, mode, dtype in runs or RUNS:
-        key = name(loops, mode, dtype)
-        truth = np.load(directory / f'upstream-{tag(key)}.npy')
-        loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype=dtype,
-                                 attention_impl='xla')
-        model = test_dory.with_cache(loaded.model.with_passes(loops), mode).with_cache_capacity(CONTEXT)
-        placed = jax.device_put(loaded.variables)
-        for member in TREES:
-            programs = test_dory.decoding(model, member)
-            spread = np.zeros((BATCHES, orders_of))
-            for batch in range(BATCHES):
-                total, began = np.zeros(truth.shape), time.perf_counter()
-                for index in range(orders_of):
-                    ordered = test_dory.symmetric(placed, config, symmetry(config, batch, index))
-                    found = np.concatenate([test_dory.forced(programs, ordered, probe[part],
-                                                             probe[f'{key}/{part}_generated'],
-                                                             prompt_rows=part == 'sentence')
-                                            for part in ('sentence', 'window')])
-                    total += np.abs(found - truth)
-                    spread[batch, index] = np.sqrt(np.mean(np.square(found - truth)))
-                    print(f'{key} {member} order {batch}/{index}: {time.perf_counter() - began:.1f} s',
-                          flush=True)
-                np.save(directory / f'absolutes-{tag(key)}-{member}-{batch}.npy', total.astype(np.float32))
-            np.save(directory / f'rms-{tag(key)}-{member}.npy', spread)
-
-
 def errors(directory: Path, key: str, batch: int, shape: tuple[int, ...] | None = None) -> np.ndarray:
     """Run `key`'s per-order errors in `batch`, `[ORDERS, rows, vocab]` float32 on disk: each entry's
     absolute distance from float64 (`upstream`'s rows) under each order, kept where they are recorded
@@ -726,21 +677,59 @@ def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
 
 
 def sums(directory: Path) -> None:
-    """vLLM's per-element errors on each run summed over each batch's orders,
-    `absolutes-{run}-vllm-{batch}.npy` `[rows, vocab]` float32, and each order's RMS over the run,
-    `rms-{run}-vllm.npy` `[BATCHES, ORDERS]`, which `publish` puts beside the probe with the tree
-    members' (`trees`): the element rule reads each entry's mean over a batch, and admits a member
-    where its RMS is no worse than vLLM's (tests/reference_error.py)."""
+    """vLLM's distances from float64 on each run, which `publish` puts beside the probe: each order's
+    RMS over the run's rows, `rms-{run}-vllm.npy` `[BATCHES, ORDERS]`, and each row's,
+    `rows-{run}-vllm.npy` `[BATCHES, ORDERS, rows]`, the release test's leaf and row rules
+    (tests/reference_error.py's over-orders rules); each row's float64 size, the truth row's RMS,
+    `sizes-{run}.npy` `[rows]`; and each entry's distance summed over a batch's orders,
+    `absolutes-{run}-vllm-{batch}.npy` `[rows, vocab]` float32, for the element rule's calibration and
+    the report, on which nothing is held end to end."""
     for run in RUNS:
-        spread = np.zeros((BATCHES, ORDERS))
+        key = tag(name(*run))
+        truth = np.load(directory / f'upstream-{key}.npy')
+        np.save(directory / f'sizes-{key}.npy', np.sqrt(np.mean(np.square(truth, dtype=np.float64), axis=1)))
+        spread, rows = np.zeros((BATCHES, ORDERS)), np.zeros((BATCHES, ORDERS, len(truth)))
         for batch in range(BATCHES):
             held = errors(directory, name(*run), batch)
             total = np.zeros(held.shape[1:], np.float64)
             for index, order in enumerate(held):
                 total += order
-                spread[batch, index] = np.sqrt(np.mean(np.square(order, dtype=np.float64)))
-            np.save(directory / f'absolutes-{tag(name(*run))}-vllm-{batch}.npy', total.astype(np.float32))
-        np.save(directory / f'rms-{tag(name(*run))}-vllm.npy', spread)
+                squares = np.square(order, dtype=np.float64)
+                spread[batch, index] = np.sqrt(np.mean(squares))
+                rows[batch, index] = np.sqrt(np.mean(squares, axis=1))
+            np.save(directory / f'absolutes-{key}-vllm-{batch}.npy', total.astype(np.float32))
+        np.save(directory / f'rms-{key}-vllm.npy', spread)
+        np.save(directory / f'rows-{key}-vllm.npy', rows)
+
+
+LOOPS = sorted({loops for loops, _, _ in RUNS})
+"""The release's loop counts, each a model `invariance` builds."""
+
+
+def invariance(directory: Path) -> None:
+    """The evidence each order is an exact symmetry: vLLM's own model code in float64 (`model_code`)
+    on the sentence's prompt under every order of every batch (`symmetry`, `permute`), each order's
+    largest distance from the identity's rows over their largest magnitude, which float64 rounding
+    alone moves, `invariance-{loops}.npy` `[BATCHES, ORDERS]` float64 for each loop count."""
+    import torch
+
+    config, tensors = release()
+    probe = np.load(FIXTURE / 'probe.npz')
+    with widened_float():
+        for loops in LOOPS:
+            model, rows = model_code(config, tensors, loops, 'per_loop', torch.float64)
+            identity = rows(probe['sentence'], probe['sentence'][:0], prompt_rows=True)
+            scale, apart = float(np.max(np.abs(identity))), np.zeros((BATCHES, ORDERS))
+            for batch in range(BATCHES):
+                for index in range(ORDERS):
+                    permute(model, config, symmetry(config, batch, index))
+                    found = rows(probe['sentence'], probe['sentence'][:0], prompt_rows=True)
+                    apart[batch, index] = float(np.max(np.abs(found - identity))) / scale
+                print(f'{loops} loops, batch {batch}: worst {apart[batch].max():.2e}', flush=True)
+            np.save(directory / f'invariance-{loops}.npy', apart)
+            del model, rows
+            gc.collect()
+            torch.cuda.empty_cache()
 
 
 def orders(directory: Path) -> None:
@@ -778,8 +767,14 @@ Runs (loop count / cache mode / dtype): {runs}. Each decodes a sentence greedily
   the run's tokens, the truth.
 - `columns-<run>-<batch>.npy`: under each order of a batch, vLLM's rows on the probe columns,
   `[52, rows, 64]` float32.
-- `absolutes-<run>-<batch>.npy`: every entry's absolute distance from the float64 truth summed over
-  a batch's 52 orders, `[rows, vocabulary]` float32.
+- `rms-<run>-vllm.npy`: each order's RMS distance of the run's rows from the float64 truth,
+  `[batches, 52]`; `rows-<run>-vllm.npy`, each row's, `[batches, 52, rows]`; `sizes-<run>.npy`, each
+  truth row's RMS, the row's size. The release test holds Dew's to these, leaf and row.
+- `absolutes-<run>-vllm-<batch>.npy`: every entry's absolute distance from the float64 truth summed
+  over a batch's 52 orders, `[rows, vocabulary]` float32, for calibration and the report.
+- `invariance-<loops>.npy`: under each order, the model code's float64 rows on the sentence's prompt,
+  their largest distance from the identity's over their largest magnitude, `[batches, 52]`: the
+  evidence each order is an exact symmetry.
 
 On a last-loop run's rows past the window these files hold the pull request's model code at the
 engine's precision (bf16, or fp32 with TF32 attention products) instead of the engine, the reference
@@ -794,11 +789,12 @@ sha256.
 
 def files(directory: Path) -> dict[str, Path]:
     """The probe's files by their names in `DATASET`."""
-    names = [*(f'upstream-{tag(name(*run))}.npy' for run in RUNS),
-             *(f'columns-{tag(name(*run))}-{batch}.npy' for run in RUNS for batch in range(BATCHES)),
-             *(f'absolutes-{tag(name(*run))}-{member}-{batch}.npy' for run in RUNS for member in MEMBERS
-               for batch in range(BATCHES)),
-             *(f'rms-{tag(name(*run))}-{member}.npy' for run in RUNS for member in MEMBERS)]
+    keys = [tag(name(*run)) for run in RUNS]
+    names = [*(f'upstream-{key}.npy' for key in keys), *(f'sizes-{key}.npy' for key in keys),
+             *(f'columns-{key}-{batch}.npy' for key in keys for batch in range(BATCHES)),
+             *(f'absolutes-{key}-vllm-{batch}.npy' for key in keys for batch in range(BATCHES)),
+             *(f'rms-{key}-vllm.npy' for key in keys), *(f'rows-{key}-vllm.npy' for key in keys),
+             *(f'invariance-{loops}.npy' for loops in LOOPS)]
     return {'probe.npz': FIXTURE / 'probe.npz', **{file: directory / file for file in names}}
 
 
@@ -854,5 +850,5 @@ if __name__ == '__main__':
         (record_run if stage == 'run' else orders_run)(where, int(sys.argv[3]), sys.argv[4], sys.argv[5])
     else:
         {'record': record, 'truth': truth, 'upstream': upstream, 'orders': orders,
-         'model_orders': model_orders, 'sums': sums, 'trees': trees, 'dew_traces': dew_traces,
+         'model_orders': model_orders, 'invariance': invariance, 'sums': sums, 'dew_traces': dew_traces,
          'publish': publish}[stage](where)

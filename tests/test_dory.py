@@ -16,17 +16,16 @@ import pytest
 from interop_support import assert_reloads, assert_same_stored_tensors
 from reference_error import (
     ORDERS,
-    STAGES,
     assert_as_exact_as_the_reference,
+    assert_as_exact_over_orders,
     assert_computes_the_oracle,
-    assert_elements_as_exact,
     assert_leaves_as_exact_over_orders,
     assert_rounds_where_the_reference_does,
+    assert_rows_as_exact_over_orders,
     chain_roundings,
     float64_forward,
     widened,
 )
-from reference_trees import evaluated
 from tool_support import load as load_tool
 
 from dew.checkpoints import Checkpoints
@@ -42,7 +41,6 @@ from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.inputs import ModelInputs
-from dew.nn.kernels import generation
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mlp import MLPMixer
@@ -634,29 +632,16 @@ def symmetric(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse:
     return permuted({**variables, 'params': params}, residual)
 
 
-def decoding(model: CausalTransformer, tree: str | None = None):
+def decoding(model: CausalTransformer):
     """`model`'s empty cache of one row, its call over a cache, prefilling a prompt or decoding a
     token, and its log-probabilities from logits, each compiled once for every set of weights of its
-    shapes and binding no weights past its call; with `tree`, the call and the log-probabilities as
-    Dew's portable math, every kernel chosen as on a CPU (`generation.assumed`) and every sum under
-    the tree (tests/reference_trees.py): the same math summed in another order. The empty cache sums
-    nothing a row reads."""
-    def staged(function, *, summed: bool = True):
-        if tree is None or not summed:
-            return jax.jit(function)
-
-        def portable(*args):
-            with generation.assumed('cpu'):
-                return function(*args)
-
-        return jax.jit(evaluated(portable, tree))
-
-    opened = staged(lambda variables: model.apply(variables, 1, method=CausalTransformer.init_cache,
-                                                  mutable=['cache'])[1]['cache'], summed=False)
-    step = staged(lambda variables, cache, ids: model.apply({**variables, 'cache': cache}, ids, decode=True,
-                                                            mutable=['cache']))
-    scored = staged(lambda logits: jax.nn.log_softmax(logits.astype(jnp.promote_types(logits.dtype,
-                                                                                         jnp.float32))))
+    shapes and binding no weights past its call."""
+    opened = jax.jit(lambda variables: model.apply(variables, 1, method=CausalTransformer.init_cache,
+                                                   mutable=['cache'])[1]['cache'])
+    step = jax.jit(lambda variables, cache, ids: model.apply({**variables, 'cache': cache}, ids, decode=True,
+                                                             mutable=['cache']))
+    scored = jax.jit(lambda logits: jax.nn.log_softmax(logits.astype(jnp.promote_types(logits.dtype,
+                                                                                          jnp.float32))))
     return opened, step, scored
 
 
@@ -689,11 +674,13 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
     float64 decoding, entry by entry, within the float64 rounding of the computation. At a few
     positions of every run, vLLM's too, one rounding moves the continuation's log-probabilities by
     whole units, so one run against one decides nothing there: each run is held to vLLM's over the
-    orders vLLM ran under (tests/reference_error.py's K-order rule), each row's probe
-    columns overall, row by row and entry by entry, and every entry of every row against vLLM's
-    own, each entry's mean error over a batch of orders within FACTOR of vLLM's, an entry flagged
-    on one batch measured again on the next (tests/reference_error.py's element rule). On a
-    last-loop run's rows past the window, vLLM's engine parts from its own model code
+    orders vLLM ran under (tests/reference_error.py's over-orders rules), every row over the whole
+    vocabulary overall (`assert_as_exact_over_orders`) and row by row (`assert_rows_as_exact_over_orders`,
+    each row sized by the truth row's own RMS), and each row's probe columns overall, row by row and
+    entry by entry. vLLM is an opaque reference no surrogate can witness, so its leaf and row RMS are
+    the end-to-end bar; every element is held through Dory's own graph against Dew's fp32 XLA
+    reference of the same math. On a last-loop run's rows past the window, vLLM's engine parts from
+    its own model code
     (https://github.com/vllm-project/vllm/pull/60149#issuecomment-6270937659): there the reference
     is that model code at the engine's precision under the same orders, so the engine's departure
     widens no bound.
@@ -714,7 +701,6 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
     multiplies a float32 run's linears and attention alike in TF32."""
     source = json.loads((RELEASED / 'source.json').read_text())
     recorder = load_tool('dory_vllm_reference')
-    assert recorder.BATCHES >= STAGES, 'the probe holds fewer batches of orders than the element rule reads'
     assert recorder.ORDERS == ORDERS, 'the probe holds batches of other than the rule\'s orders'
     probe, config = np.load(recorder.fetched('probe.npz')), json.loads((RELEASED / 'config.json').read_text())
     keys = [recorder.name(*run) for run in recorder.RUNS]
@@ -748,31 +734,18 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
             key = recorder.name(loops, mode, run)
             model = with_cache(loaded.model.with_passes(loops), mode).with_cache_capacity(recorder.CONTEXT)
             programs, columns, truth = decoding(model), recorder.columns_of(probe, key), truths[key]
-            placed, draws = jax.device_put(loaded.variables), []
-
-            def batch(index, key=key, programs=programs, columns=columns, truth=truth, placed=placed,
-                      draws=draws):
-                """Batch `index`'s per-entry errors summed over its orders, Dew's and each member's of the
-                reference's ensemble (`recorder.MEMBERS`: vLLM and Dew's same math under each declared
-                summation tree); batch 0's columns kept order by order for the rows' rule."""
-                theirs = np.load(recorder.fetched(f'columns-{recorder.tag(key)}-{index}.npy'))
-                absolutes = np.zeros(truth.shape)
-                for order, reference in enumerate(theirs):
-                    # Each order's weights are reordered where they sit, on the device.
-                    drawn = recorder.symmetry(config, index, order)
-                    found = rows(programs, symmetric(placed, config, drawn), key)
-                    absolutes += np.abs(found - truth)
-                    if index == 0:
-                        draws.append((np.take_along_axis(found, columns, axis=1), reference,
-                                      np.take_along_axis(truth, columns, axis=1)))
-                return absolutes, {member: np.load(recorder.fetched(
-                    f'absolutes-{recorder.tag(key)}-{member}-{index}.npy')) for member in recorder.MEMBERS}
-
-            first = batch(0)
+            placed, draws, distances = jax.device_put(loaded.variables), [], np.zeros((ORDERS, len(truth)))
+            theirs = np.load(recorder.fetched(f'columns-{recorder.tag(key)}-0.npy'))
+            for order, reference in enumerate(theirs):
+                # Each order's weights are reordered where they sit, on the device.
+                found = rows(programs, symmetric(placed, config, recorder.symmetry(config, 0, order)), key)
+                distances[order] = np.sqrt(np.mean(np.square(found - truth), axis=1))
+                draws.append((np.take_along_axis(found, columns, axis=1), reference,
+                              np.take_along_axis(truth, columns, axis=1)))
+            spread = np.load(recorder.fetched(f'rms-{recorder.tag(key)}-vllm.npy'))[0]
+            assert_as_exact_over_orders(np.sqrt(np.mean(np.square(distances), axis=1)), spread,
+                                        f'Dory 4B {key}, every entry')
+            assert_rows_as_exact_over_orders(distances, np.load(recorder.fetched(
+                f'rows-{recorder.tag(key)}-vllm.npy'))[0], f'Dory 4B {key}, row by row',
+                sizes=np.load(recorder.fetched(f'sizes-{recorder.tag(key)}.npy')))
             assert_leaves_as_exact_over_orders(draws, f'Dory 4B {key}, its columns')
-            # A member is admitted where its RMS over every order is no worse than vLLM's.
-            spread = {member: np.sqrt(np.mean(np.square(np.load(recorder.fetched(
-                f'rms-{recorder.tag(key)}-{member}.npy'))))) for member in recorder.MEMBERS}
-            admitted = {'': [member for member in recorder.MEMBERS if spread[member] <= spread['vllm']]}
-            assert_elements_as_exact(lambda index, first=first, batch=batch: batch(index) if index else first,
-                                     f'Dory 4B {key}, every entry', reference='vllm', admitted=admitted)
