@@ -225,10 +225,12 @@ def canvas(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, prompt
            canvas_size: int, batch: int, canvases: int = 1, pad_id: int = 0, messages: str = "messages",
            records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat template, then each
-    assistant turn one row of a block-diffusion objective: its prompt in `prompt_length` tokens and
-    its response in `canvases` canvases of `canvas_size`, ended by the tokenizer's EOS and padded
-    with `pad_id` (`ResponseCanvases`), never packed, in batches of `batch` (`records` and `host`
-    as `images` takes them). A tokenizer with no EOS cannot end a response, and is refused."""
+    assistant turn one row of a block-diffusion objective (`ResponseCanvases`): what comes before
+    it in `prompt_length` tokens, padded with `pad_id`, and its response in `canvases` canvases of
+    `canvas_size`, the tokenizer's EOS filling the rest of its last canvas and `pad_id` the canvases
+    after it; a longer prompt or response keeps its first tokens. Never packed, in batches of
+    `batch` (`records` and `host` as `images` takes them). A tokenizer with no EOS cannot fill a
+    canvas, and is refused."""
     from dew.data.steps.chat import ResponseCanvases
 
     renderer = chat.template(tokenizer, messages=messages)
