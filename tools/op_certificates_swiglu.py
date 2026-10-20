@@ -38,7 +38,7 @@ from dew.nn.kernels import norm_swiglu
 
 INTERPRET = False
 """Whether launches are interpreted (`--interpret`)."""
-CONFIGS = sorted(norm_swiglu._Elementwise()._get_autotuning_configs(None), key=lambda c: (c.block, c.warps))
+CONFIGS = sorted(norm_swiglu._SWIGLU_FORWARD._get_autotuning_configs(None), key=lambda c: (c.block, c.warps))
 
 
 def _kernel(fn, arity: int, outputs: int):
