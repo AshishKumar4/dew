@@ -51,6 +51,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.data.tokens import first_fit
+from dew.records import json_value, record as section
 from dew.rl import group_advantage, rloo_advantage
 
 IDS_KEY = "input_ids"
@@ -169,20 +170,12 @@ class Transcript:
             object.__setattr__(self, "response", json_objects((self.response,), "a transcript's response")[0])
 
 
-def json_objects(values: object, name: str) -> tuple[dict[str, object], ...]:
-    """`values`, a tuple of JSON objects in any `Mapping`, as plain dict trees, which journals copy and
-    write as they are; ValueError for anything else."""
+def json_objects(values: object, name: str) -> tuple[Mapping[str, object], ...]:
+    """`values`, a tuple of JSON objects in any `Mapping`, as plain JSON trees (`json_value`), which
+    journals copy and write as they are; ValueError for anything else."""
     if not isinstance(values, tuple) or not all(isinstance(value, Mapping) for value in values):
         raise ValueError(f"{name} are a tuple of JSON objects")
-    return tuple(_tree(value) for value in values)
-
-
-def _tree(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {key: _tree(entry) for key, entry in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_tree(entry) for entry in value]
-    return value
+    return tuple(section(json_value(value, name), name) for value in values)
 
 
 @dataclass(frozen=True)
