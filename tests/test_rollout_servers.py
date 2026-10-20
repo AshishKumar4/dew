@@ -345,6 +345,32 @@ def test_a_draw_a_stop_string_ends_is_cut_at_the_id_completing_it(provider):
     assert calls[0]["stop"] == ["lo!"]
 
 
+def test_a_stop_strings_id_is_found_where_a_longer_prefix_does_not_extend_a_shorter_ones_text():
+    """A tokenizer's text for a longer prefix need not extend a shorter one's: Transformers' cleanup
+    writes "a" "." as "a." where "a" " " alone is "a ". A stop string the second id completes ends the
+    draw there, though the whole draw's text no longer holds it; ids no prefix decodes to the string
+    the engine named are refused."""
+    pieces = {3: "a", 4: " ", 5: "."}
+
+    def decode(ids):
+        return "".join(pieces[token] for token in ids).replace(" .", ".")
+
+    for drawn, stop, kept in (([3, 4, 5], "a ", (3, 4)), ([3, 5, 5], "a ", None)):
+        completion, _ = engine("vllm", lambda _, drawn=drawn, stop=stop: {
+            **choice("vllm", drawn, [-.5] * len(drawn), "stop"), "stop_reason": stop})
+        server = OpenAIRolloutServer(completion, Sampling(temperature=1.0, eos_token_ids=EOS, stop=(stop,)),
+                                     pushed, decode=decode)
+        try:
+            pending = server.submit([1, 2], 8, key=11)
+            if kept is None:
+                with pytest.raises(ValueError, match="decode"):
+                    pending.result()
+            else:
+                assert pending.result().tokens == kept
+        finally:
+            server.close()
+
+
 def test_sglang_ids_are_read_without_likelihoods():
     completion, _ = engine("sglang", lambda _: {"index": 0, "text": "", "finish_reason": "length",
                                                 "logprobs": None, "token_ids": [3, 5]})
