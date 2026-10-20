@@ -897,6 +897,15 @@ class InferenceRecorded(Protocol):
     def inference_record(self) -> JSON: ...
 
 
+def _comparable(identity: JSON) -> bool:
+    """Whether a training identity says what a run trains: neither missing nor `{"unrecorded": ...}`."""
+    match identity:
+        case None | {"unrecorded": _}:
+            return False
+        case _:
+            return True
+
+
 def _differences(here: JSON, there: JSON, path: str = "") -> list[str]:
     """The paths at which two records differ, each with both values."""
     match here, there:
@@ -1040,16 +1049,16 @@ class Checkpoints:
         whose training identity `identity` gives (`Objective.training_identity`), where the
         directory holds another run's: one whose objective or networks differ past how they
         compute. A directory belongs to one run, and a fresh run takes a new one. Each process
-        takes both identities, this run's and its step's, and the processes agree on the pair
-        (`agreed_same`) before any of them restores, so a rank that finds another pair, or fails to
-        take one, stops them all. A run or step with no identity (one a record cannot describe, a
-        step saved before steps recorded one) has nothing to compare, and the restore's shapes are
-        the check."""
+        takes both identities, this run's and its step's, and the processes agree on each
+        (`agreed_same`) before any of them restores, so a rank that finds another, or fails to
+        take one, stops them all. A run or step with no identity (one a record cannot describe,
+        `{"unrecorded": reason}`, or a step saved before steps recorded one) has nothing to
+        compare, and the restore's shapes are the check."""
         # This run's identity first, agreed apart: the step's lookup below runs collectives of its own,
         # which a rank that failed to build an identity would not join.
         here = agreed_same("run identity", identity)
         there = agreed_same("stored run identity", lambda: self.identity(step))
-        if here is None or there is None or here == there:
+        if not _comparable(here) or not _comparable(there) or here == there:
             return
         differences = _differences(here, there)
         raise ValueError(f"{self.directory} holds another run's checkpoints, which this run would "

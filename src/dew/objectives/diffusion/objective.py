@@ -502,17 +502,17 @@ class DiffusionObjective(Objective[Ratio]):
     def _sample(self):
         return self.program('sample', self._sample_impl, static_argnames=("count",))
 
-    def training_identity(self) -> dict[str, JSON] | None:
+    def training_identity(self) -> dict[str, JSON]:
         """The objective's networks and the process it trains them under (`Objective.training_identity`)."""
-        from dew.registry import to_record
+        from dew.registry import Unrecordable, to_record
 
         networks = super().training_identity()
-        if networks is None:
-            return None
+        if "unrecorded" in networks:
+            return networks
         try:
             return {**networks, "process": to_record(self.process, type(self.process))}
-        except (KeyError, TypeError, ValueError):
-            return None
+        except Unrecordable as unrecordable:
+            return {"unrecorded": str(unrecordable)}
 
     def task_settings(self) -> ImageSettings:
         """The process, input encoders, autoencoder and sampling convention."""

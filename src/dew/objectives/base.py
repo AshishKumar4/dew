@@ -499,7 +499,7 @@ def module_identity(module: nn.Module) -> JSON:
     return to_record(dataclasses.replace(record, wrappers=kept), ModelConfig)
 
 
-def _as_computed[Value](value: Value) -> Value:
+def _as_computed(value):
     """`value`, a network or a field of one, with each field that chooses how it computes
     (`EXECUTION_FIELDS`) at its default, in every module and dataclass it holds, mapping values and
     sequence entries among them."""
@@ -1204,21 +1204,21 @@ class Objective(ABC, Generic[Loss, Effects]):
         """The model a saved step's record names (`inference_record`): the objective's own."""
         return self.model
 
-    def training_identity(self) -> dict[str, JSON] | None:
+    def training_identity(self) -> dict[str, JSON]:
         """What this objective trains, which a checkpoint keeps and a resume compares
         (`Checkpoints.refuse_another_run`): its class and every network its programs run
         (`program_key`), a frozen teacher's and a critic's among them, each as what it computes
         (`module_identity`). An objective whose mathematics also sits outside its networks (a
-        diffusion process) adds it. None where a record cannot describe the objective or a
-        network (one defined in a function or in `__main__`): the restore's shapes are then the
-        check."""
-        from dew.registry import import_path
+        diffusion process) adds it. Where a record cannot describe the objective or a network (one
+        defined in a function or in `__main__`), the identity is `{"unrecorded": reason}`, which
+        compares with nothing: the restore's shapes are then the check, and the step says why."""
+        from dew.registry import Unrecordable, import_path
 
         try:
             return {"objective": import_path(type(self)),
                     "networks": [module_identity(program.module) for program in self.program_key()]}
-        except (KeyError, TypeError, ValueError):
-            return None
+        except Unrecordable as unrecordable:
+            return {"unrecorded": str(unrecordable)}
 
     def inference_record(self) -> JSON:
         """Return the model and task settings that let a saved step be rebuilt.

@@ -136,11 +136,11 @@ def test_a_directory_refuses_another_runs_resume_and_resumes_its_own_on_another_
         run(2, **kind(500.0))
     resumed = run(2, **kind(10000.0), attention_impl="reference", max_seq_len=16)
     assert int(resumed.step) == 2
-    # A learned position table the cache sized is the same table under a longer cache, its rows kept
-    # (`with_cache_capacity`).
-    run(1, directory="learned", position_embedding="learned")
-    assert int(run(2, directory="learned", position_embedding="learned", max_seq_len=16,
-                   position_embedding_size=8).step) == 2
+    # A learned position table the cache sized is the same table under a shorter cache that keeps its
+    # rows (`with_cache_capacity`).
+    run(1, directory="learned", position_embedding="learned", max_seq_len=16)
+    assert int(run(2, directory="learned", position_embedding="learned", max_seq_len=8,
+                   position_embedding_size=16).step) == 2
     # An adapter's scale is what its model computes too: another alpha is another run.
     run(1, alpha=4.0)
     with pytest.raises(ValueError):
