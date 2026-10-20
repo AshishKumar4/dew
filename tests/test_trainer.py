@@ -129,19 +129,27 @@ def test_a_token_budget_counts_the_tokens_of_committed_updates(tmp_path):
 
 def test_a_checkpoint_that_counted_every_steps_tokens_cannot_resume_a_token_budget(tmp_path):
     """A checkpoint whose control counts every step's tokens (`tokens`, as runs counted before they
-    counted commits) holds no committed count, so a run whose length is its tokens refuses to
-    resume from it, and a run of steps resumes."""
+    counted commits) holds no committed count: a run whose length is its tokens refuses to resume
+    from it, and a run of steps resumes and keeps the count unknown in its own checkpoints, so a
+    token budget after it is refused too."""
     first = make_trainer(tmp_path, objective=TokenRegression())
-    first.fit(dataset(), steps=2, log_every=1)
+    first.fit(dataset(), steps=2, log_every=1, checkpoint_every=1)
     first.checkpoints.wait()
     directory = first.checkpoints.directory
+    # The trained step's own state and data position, saved again as step 3 with its token clock
+    # written as the old count.
     old = Checkpoints(directory, keep=3)
-    state = make_trainer(objective=TokenRegression()).initial_state()
-    old.save(3, dataclasses.replace(state, step=jnp.asarray(3)), None, control={"tokens": 24})
+    state, position = old.restore(step=2, share=DataPartition())
+    old.save(3, state, position, share=DataPartition(), control={"tokens": 16})
     old.wait()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="committed"):
         make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=30)
-    assert int(make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), steps=4).step) == 4
+    resumed = make_trainer(tmp_path, objective=TokenRegression())
+    assert int(resumed.fit(dataset(), steps=4, log_every=1, checkpoint_every=1).step) == 4
+    assert "tokens" in resumed.checkpoints.control(4)
+    assert "committed_tokens" not in resumed.checkpoints.control(4)
+    with pytest.raises(ValueError, match="committed"):
+        make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=60)
 
 
 def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):

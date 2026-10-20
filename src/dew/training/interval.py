@@ -33,17 +33,29 @@ COMMITTED_TOKENS = "committed_tokens"
 """The checkpoint control field that holds a run's tokens, those its committed updates trained on."""
 
 
-def committed_tokens(control: dict, budget: int | None) -> int:
+def committed_tokens(control: dict, budget: int | None) -> int | None:
     """The tokens a checkpoint's `control` says its run's committed updates trained on, taken out of
-    it, 0 where it counted none. A checkpoint that counted every step's tokens, a rejected
-    attempt's and an unfinished window's among them (`tokens`, before runs counted commits), cannot
-    resume a run whose length is its tokens (`budget`): its count is not one, and is refused."""
+    it, 0 where it counted none, and None where it cannot say: a checkpoint that counted every
+    step's tokens (`tokens`, before runs counted commits), a rejected attempt's and an unfinished
+    window's among them, or one resumed from such a checkpoint, which keeps the count unknown. A
+    run of steps resumes from it and keeps the count unknown in its own checkpoints; a run whose
+    length is its tokens (`budget`) cannot, and is refused."""
     legacy = control.pop("tokens", None)
-    if legacy is not None and COMMITTED_TOKENS not in control and budget is not None:
-        raise ValueError(f"this checkpoint counts the {legacy} tokens of every step it read, where a run of "
-                         f"tokens={budget} counts those its committed updates trained on; resume it by "
-                         "steps, or train afresh")
-    return int(control.pop(COMMITTED_TOKENS, 0))
+    if COMMITTED_TOKENS in control:
+        return int(control.pop(COMMITTED_TOKENS))
+    if legacy is None:
+        return 0
+    if budget is not None:
+        raise ValueError(f"this checkpoint's run counted every step's tokens, not those its committed "
+                         f"updates trained on, so a run of tokens={budget} cannot resume from it; resume "
+                         "it by steps, or train afresh")
+    return None
+
+
+def known_tokens(count: int | None) -> dict[str, int | bool]:
+    """An interval's starting token clock from a checkpoint's count (`committed_tokens`): the count,
+    or 0 and unknown where the checkpoint could not say."""
+    return {"tokens_before_log": count or 0, "tokens_known": count is not None}
 
 class Book(NamedTuple):
     """The loop's device-side counters.
@@ -119,6 +131,7 @@ class Interval:
     last_log_time: float
     last_saved: int | None
     tokens_before_log: int = 0
+    tokens_known: bool = True
     logged_tokens: jax.Array | None = None
     book: Book | None = None
     fresh: Book | None = None
@@ -167,6 +180,13 @@ class Interval:
         streak = self.streak()
         if streak is not None:
             checked_streak(int(on_host(streak, step)), step, display)
+
+    @property
+    def token_control(self) -> dict[str, int]:
+        """The token clock a checkpoint keeps (`Checkpoints.control`): the committed updates' real
+        tokens, or, where the run resumed a checkpoint that could not say (`committed_tokens`), the
+        count under the field that says so, so every checkpoint after it keeps saying so."""
+        return {COMMITTED_TOKENS if self.tokens_known else "tokens": self.real_tokens}
 
     @property
     def real_tokens(self) -> int:

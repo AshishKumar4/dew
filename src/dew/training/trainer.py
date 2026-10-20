@@ -132,7 +132,7 @@ from dew.training.distributed import (
     taking_over,
 )
 from dew.training.evaluation import EvalSuite, Evaluation
-from dew.training.interval import COMMITTED_TOKENS, Interval, Taken, committed_tokens, held
+from dew.training.interval import Interval, Taken, committed_tokens, held, known_tokens
 from dew.training.memory import (
     climb_to,
     device_tokens,
@@ -149,6 +149,7 @@ from dew.training.model_flops import (
     TOKENS,
     TRAINING_FLOPS,
     _TokenCount,
+    batch_tokens,
     model_batch,
     prepare_counts,
     uncounted,
@@ -1052,7 +1053,7 @@ class Trainer(Generic[Loss, Effects]):
                                split=split).step()
         custom = self.step(self.objective, self.optimizer)
 
-        def run(current, batch, part):
+        def run(current, batch, part, tokens):
             advanced, loss, aux = custom(current, batch)
             return advanced, loss, aux, None
         return run
@@ -1241,7 +1242,7 @@ class Trainer(Generic[Loss, Effects]):
             # return the host-resident ones to pinned host memory.
             micro = microbatch(batch, part, split)
             advanced, loss, aux, committed = body(self._fetched(current, shardings), self._model_batch(micro),
-                                                  part)
+                                                  part, batch_tokens(micro))
             return outcome(current, advanced, loss, aux, committed, batch, part == split - 1)
 
         return jax.jit(step, in_shardings=(shardings, placement, replicated),
@@ -1329,7 +1330,7 @@ class Trainer(Generic[Loss, Effects]):
                         self._ramp and not current.accumulation.replays(prepared.accumulation))):
                     current = self._initialize_accumulation(current, batch, shapes, window=self.accumulation)
                 # The device steps run in the accelerator's forward (`HostExecution`).
-                advanced, loss, aux, committed = body(current, model_batch(batch), 0)
+                advanced, loss, aux, committed = body(current, model_batch(batch), 0, batch_tokens(batch))
                 advanced, *stepped = outcome(current, advanced, loss, aux, committed, batch, 1)
                 # A leaf already where its placement says stays the array it
                 # is: the resident frozen collection crosses no boundary.
@@ -1489,7 +1490,7 @@ class Trainer(Generic[Loss, Effects]):
         run.last_checkpoint = time.perf_counter()
         interval = Interval(time.time(), last_saved=(
             int(state.step) if checkpoints is not None and checkpoints.latest is not None else None),
-            tokens_before_log=committed_tokens(run.stop_control, plan.tokens))
+            **known_tokens(committed_tokens(run.stop_control, plan.tokens)))
         if self._opened(plan, run, interval, state, position,
                         resumed=initial is None and interval.last_saved is not None):
             return state
@@ -2190,7 +2191,7 @@ class Trainer(Generic[Loss, Effects]):
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         write = functools.partial(
             checkpoints.save, step, state, position, metadata, share=DataPartition.of(self.device_mesh),
-            ranking=ranking, control={**(control or {}), COMMITTED_TOKENS: interval.real_tokens},
+            ranking=ranking, control={**(control or {}), **interval.token_control},
             weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
             boxed=self._boxed_axes())
         self._report(CheckpointRequested(checkpoints.directory), step, write)
@@ -2216,7 +2217,7 @@ class Trainer(Generic[Loss, Effects]):
         self._display.status("writing a local checkpoint")
         write = functools.partial(
             checkpoints.save_local, step, state, position, share=DataPartition.of(self.device_mesh),
-            control={**(control or {}), COMMITTED_TOKENS: interval.real_tokens}, rung=self._checkpoint_rung(),
+            control={**(control or {}), **interval.token_control}, rung=self._checkpoint_rung(),
             artifact=self._artifact(), boxed=self._boxed_axes())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
