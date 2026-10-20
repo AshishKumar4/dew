@@ -123,7 +123,10 @@ def test_a_call_runs_the_implementation_estimated_fastest_on_the_device_or_the_o
         with generation.chosen(decode="hopper"), pytest.raises(ValueError):
             choose("decode", implementations, x)
     assert [(route.kernel, route.preferred) for route in found] == [
-        ("doubling", "doubling"), ("slow", "doubling")]
+        ("doubling", "doubling"), ("slow", "slow")]
+    with generation.assumed("sm80"), generation.chosen(decode="doubling"):
+        # A chosen implementation estimates no other, whose cost may need facts the target lacks.
+        assert type(choose("decode", [Unpriced(), Doubling()], x)) is Doubling
     with generation.assumed("sm90"):
         assert type(choose("decode", implementations, x)) is Doubling
         assert type(choose("decode", [Unpriced()], x)) is Unpriced
