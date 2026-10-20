@@ -96,11 +96,13 @@ def _mode(dtype) -> str:
 
 def _row_tiles(rows: int, groups: int, tile: int) -> float:
     """The tiles of `tile` rows that cover `rows` rows split into `groups` contiguous groups, each from
-    its first row, expected over a routing of unknown sizes: every nonempty group (at most `rows`) adds
-    half a partial tile on average, and no count leaves `[ceil(rows / tile), min(rows, ceil(rows / tile)
-    + groups)]`."""
+    its first row, expected over a routing of unknown sizes: each of the nonempty groups (at most
+    `rows`), of `rows / nonempty` rows on average, takes one tile, or a tile per `tile` rows and half a
+    partial tile more; no count leaves `[ceil(rows / tile), min(rows, ceil(rows / tile) + groups)]`."""
     least = math.ceil(rows / tile)
-    return min(max(rows / tile + min(groups, rows) / 2, least), rows, least + groups)
+    nonempty = min(groups, rows)
+    expected = nonempty * max(1.0, rows / (nonempty * tile) + 0.5)
+    return min(max(expected, least), rows, least + groups)
 
 
 def _warps(rows: int, columns: int, warps: int) -> tuple[int, int]:
