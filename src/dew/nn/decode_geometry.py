@@ -25,7 +25,7 @@ def folds(query, key, bias, mask, causal, sliding_window) -> bool:
             and bias is None and not causal and sliding_window is None)
 
 
-def folded_attention(query, key, value, mask=None, precision=None):
+def folded_attention(query, key, value, mask=None):
     """jax.nn's xla attention for query `[B, T, N, D]` over keys and values
     `[B, S, N, D]` of the same heads, with every query head against every
     (key, head) pair, under a boolean `mask` `[B, 1, T | 1, S]` every head
@@ -41,15 +41,14 @@ def folded_attention(query, key, value, mask=None, precision=None):
     operands, the scale after, an fp32 softmax of logits masked to -0.7
     times the largest fp32, probabilities in the value's dtype). Six layers
     of Qwen3.5's decode took 1.21 against 2.48 ms at 128 rows and 0.33
-    against 0.47 at 32 on an RTX 4080 (docs/performance.md). Both products multiply at
-    `precision` where the caller states one, else at the one their dtype takes.
+    against 0.47 at 32 on an RTX 4080 (docs/performance.md).
     """
     batch, positions, heads, width = query.shape
     keys = key.shape[-3]
     wide = jnp.promote_types(query.dtype, jnp.float32)
     logits = jnp.einsum('bxd,byd->bxy', query.reshape(batch, positions * heads, width),
                         key.reshape(batch, keys * heads, width),
-                        precision=operand_precision(query.dtype, precision),
+                        precision=operand_precision(query.dtype),
                         preferred_element_type=wide)
     logits = jnp.diagonal(logits.reshape(batch, positions, heads, keys, heads), axis1=2, axis2=4)
     logits = logits * jnp.asarray(1 / math.sqrt(width), wide)  # [B, T, S, N]
@@ -61,7 +60,7 @@ def folded_attention(query, key, value, mask=None, precision=None):
     spread = jnp.moveaxis(probs, 3, 2)[..., None] * jnp.eye(heads, dtype=probs.dtype)[:, None, :]
     out = jnp.einsum('bxy,byd->bxd', spread.reshape(batch, positions * heads, keys * heads),
                      value.reshape(batch, keys * heads, value.shape[-1]),
-                     precision=float32_products(value.dtype, precision))
+                     precision=float32_products(value.dtype))
     return out.reshape(batch, positions, heads, value.shape[-1])
 
 
@@ -72,7 +71,7 @@ def grouped_query(attend, query, key, value):
     row's), reads its key head's keys once a group. cuDNN otherwise padded the lone query to two
     positions and ran each query head on its own, 4.7% slower a layer at 64 rows for the same bits
     (docs/performance.md), and the decode kernel takes as many query heads as key heads
-    (`decode_attention.fits`)."""
+    (`decode_attention.SUPPORTS`)."""
     batch, positions, heads, width = query.shape
     kv_heads = key.shape[-2]
     group = heads // kv_heads

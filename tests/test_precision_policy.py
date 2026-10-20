@@ -372,15 +372,17 @@ def test_a_projection_factory_keeps_the_contraction_its_caller_gives():
     assert layer.apply(layer.init(jax.random.key(1), x), x).dtype == jnp.float32
 
 
-def test_xla_attention_honours_a_precision_only_where_jax_nn_multiplies_at_it():
-    """jax.nn's xla attention multiplies float32 queries at the precision a caller names (through
-    the matching default_matmul_precision), so 'xla' honours it; a bf16 query's logits take the
-    dot algorithm jax.nn picks for bf16 whatever the config says, so 'xla' refuses a precision
-    past the default there, as every fused kernel does, and the reference path takes it."""
-    query, key, value = jax.random.normal(jax.random.key(1), (3, *BF16_QKV), jnp.float32)
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("precision", [None, jax.lax.Precision.HIGHEST])
+def test_xla_attention_multiplies_float32_products_and_a_stated_precision(dtype, precision):
+    """'xla' attention over float32 queries multiplies float32 products where the caller states no
+    precision, and every product at HIGHEST where it states that, on whichever path computes it;
+    bf16 queries with none stated keep their own."""
+    query, key, value = (part.astype(dtype) for part in
+                         jax.random.normal(jax.random.key(1), (3, *BF16_QKV), jnp.float32))
     precisions = dot_precisions(lambda q, k, v: scaled_dot_product_attention(
-        q, k, v, implementation="xla", precision=jax.lax.Precision.HIGHEST), query, key, value)
-    assert precisions and all(precision == HIGHEST for precision, _ in precisions)
-    narrow = (query.astype(jnp.bfloat16), key.astype(jnp.bfloat16), value.astype(jnp.bfloat16))
-    with pytest.raises(ValueError):
-        scaled_dot_product_attention(*narrow, implementation="xla", precision=jax.lax.Precision.HIGHEST)
+        q, k, v, implementation="xla", precision=precision), query, key, value)
+    if precision is None:
+        assert_float32_products(precisions)
+    else:
+        assert precisions and all(stated == HIGHEST for stated, _ in precisions)
