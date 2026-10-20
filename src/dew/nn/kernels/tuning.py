@@ -152,15 +152,24 @@ class KernelOp(tokamax.Op):
             keyed = self.keyed(ba)
             if (collected := cache.KERNEL_SEEN.value) is not None:
                 collected.found.append((self, keyed))
-            pin = dict(cache.KERNEL_PINS.value).get(type(self))
-            pick = _pick(keyed) or self._nearest(keyed)
-            config = (pin if pin in keyed.autotuning_configs
-                      else ba.heuristics_config if pick is None else pick.fastest_config)
+            config = self._chosen(ba, keyed)
         if cache.KERNEL_LAUNCHES.value:
             # Dew chose the launch for this GPU (`generation`); tokamax's device check would ask
             # each traced array for its devices (`keyed`).
             return tokamax.Op.__call__(self.replace(config=config, bypass_device_check=True), *args, **kwargs)
         return self._fwd(*args, config=config, **kwargs)[0]
+
+    def chosen(self, ba: tokamax.BoundArguments) -> Hashable:
+        """The config a launch of `ba` takes where it traces now: the op's own `config` where it carries
+        one, else a config pinned for its kernel that its key's space holds (`pinned`), else its pick
+        (`_pick`, else `_nearest`), else its own shapes' heuristic."""
+        return self.config if self.config is not None else self._chosen(ba, self.keyed(ba))
+
+    def _chosen(self, ba: tokamax.BoundArguments, keyed: tokamax.BoundArguments) -> Hashable:
+        pin = dict(cache.KERNEL_PINS.value).get(type(self))
+        pick = _pick(keyed) or self._nearest(keyed)
+        return (pin if pin in keyed.autotuning_configs
+                else ba.heuristics_config if pick is None else pick.fastest_config)
 
     def keyed(self, ba: tokamax.BoundArguments) -> tokamax.BoundArguments:
         """`ba` as its key reads it, where its space, heuristic and measurement
