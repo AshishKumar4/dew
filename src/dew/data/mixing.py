@@ -119,12 +119,10 @@ class _KeepAccepted:
             self.counts.accepted += 1
             if not isinstance(element, Rejected):
                 self.counts.truncated += int(bool(element.get("_dew_truncated", False)))
-            self._probe()
             self.consecutive = 0
             return True
         self.counts.rejected[reason] += 1
         self.consecutive += 1
-        self._probe()
         if not self.warned and sum(self.counts.rejected.values()) / self.counts.attempted > _WARN_OVER:
             _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
                          self.counts.label, _WARN_OVER * 100, reason)
@@ -135,14 +133,6 @@ class _KeepAccepted:
                          "one is kept (most rejected: %s)", self.counts.label, self.consecutive,
                          self.counts.accepted, reasons)
         return False
-
-    def _probe(self) -> None:
-        if self.counts.attempted == 16:
-            _log.info(
-                "corpus %s: estimated rejection share over first 16 attempted records %.4f",
-                self.counts.name,
-                sum(self.counts.rejected.values()) / 16,
-            )
 
 
 class _CountedIterator[Element](pygrain.DatasetIterator[Element]):
