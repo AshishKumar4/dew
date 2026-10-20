@@ -107,16 +107,18 @@ def test_vllms_engine_streams_token_ids_as_the_other_engines_do(tmp_path):
     assert record["sweep"][0]["repeats"][0]["output_tokens"] == 4 * 5
 
 
+@pytest.mark.parametrize("kv", ["dense", "paged"])
 @pytest.mark.parametrize("fixture", ["qwen35-tiny-mm", "gemma3-tiny-mm"])
-def test_a_multimodal_model_serves_the_layout_asked_for(tmp_path, fixture):
+def test_a_multimodal_model_serves_the_layout_asked_for(tmp_path, fixture, kv):
     """A multimodal model's wrapper hands the layout asked for to its text decoder, which holds the
-    cache: `--kv dense` serves a Qwen3.5 wrapper and a Gemma 3 one, every requested token."""
+    cache: `--kv dense` and `--kv paged` serve a Qwen3.5 wrapper, whose delta-net layers keep each
+    row's state beside the attention layers' pages, and a Gemma 3 one, every requested token."""
     env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"),
            "XLA_FLAGS": "--xla_force_host_platform_device_count=1"}
     done = subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_lm_serving.py"),
                            "--backend", "dew", "--model", str(ROOT / "tests" / "fixtures" / "hf" / fixture),
                            "--slots", "2", "--requests", "4", "--prompt", "8", "--output", "8",
-                           "--vocab-limit", "200", "--repeats", "1", "--kv", "dense",
+                           "--vocab-limit", "200", "--repeats", "1", "--kv", kv,
                            "--out", str(tmp_path / "out.json")],
                           env=env, cwd=ROOT, capture_output=True, text=True)
     assert done.returncode == 0, done.stderr[-3000:]
