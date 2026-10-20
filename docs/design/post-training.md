@@ -87,6 +87,8 @@ The rollout reads each process's owned prompts and validates them before collect
 
 The adapter owns this mapping. A record that supplies the reference answer both at the top level and under `reward_model` is ambiguous and fails at that boundary.
 
+verl's `compute_score(data_source, solution_str, ground_truth, extra_info)` takes the completion and the three fields that Dew's reward takes as one `PromptRecord`; `dew.objectives.rl.verl.verl_reward` and `compute_score` convert between the two at the verl boundary.
+
 ## 2. The loss role
 
 A loss mask belongs to the objective's targets. `loss_role` names one typed role already present in the batch rather than introducing a second mask configuration. The same `LMObjective` serves pretraining and SFT, and both use the shared scoring and head path.
@@ -119,9 +121,9 @@ The trainer measures host rollout time as `train/rollout_seconds`. The rollout's
 
 ## 5. Rewards
 
-The reward boundary is `reward(data_source, completion, ground_truth, extra_info) -> float`. It runs host-side inside collection. A rule-based verifier, hosted judge and scoring model use the same callable shape; a caller can combine them with weighted scores.
+A reward is a callable from a completion and its prompt's record to a float: `reward(completion, record) -> float`, where `record` is the `PromptRecord` of the three fields the batch already carries (§1.4), the ground truth normalized where the source reads it. A reward reads the fields it needs; verl's four-argument signature lives at the verl boundary (`verl_reward`). It runs host-side inside the rollout, so no Python callable and no external process is ever reachable from a compiled step. A rule-based verifier, a hosted judge and a scoring model are all the same shape, and a run composes several by summing weighted scores in its own function.
 
-The prompt's tokenizer decodes completions before scoring. The verl adapter owns verl's field names and `compute_score` signature. The [roadmap](../roadmap.md#rl-and-serving) records the completion-plus-prompt-record reward interface and per-member reward routing.
+The prompt's tokenizer decodes completions before scoring. The [roadmap](../roadmap.md#rl-and-serving) records per-member reward routing.
 
 ## 6. The language objectives
 

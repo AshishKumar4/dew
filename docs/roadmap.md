@@ -122,7 +122,7 @@ The kernel direction was approved on 2026-10-19:
 
 The following direction was approved on 2026-10-19:
 
-- Score each completion with its prompt record and route mixture members to their own rewards and metrics. Adapt verl's `compute_score` only at the verl boundary.
+- Route mixture members to their own rewards and metrics. Each completion is already scored with its prompt record, with verl's `compute_score` adapted only at the verl boundary.
 - Retain messages, tool calls and tool results beside exact generated ids; add optional per-turn rewards and turn-level advantages.
 - Generalize the rllm-model-gateway interface from Harbor trials to any agent command, then add NeMo Gym and OpenEnv sources.
 - Adapt remote sandbox providers through `Runner` and carry partial episodes across updates and checkpoints.
