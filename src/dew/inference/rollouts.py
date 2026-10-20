@@ -22,7 +22,7 @@ import math
 import os
 import shutil
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -38,7 +38,7 @@ from dew.objectives.base import Variables, thaw
 from dew.records import JSON
 from dew.sampling.text import Generation, Sampling
 
-from .clients import OpenAICompletion, _engine_stops, decode_routed_experts
+from .clients import OpenAICompletion, _choice_tokens, _engine_stops, decode_routed_experts
 from .serving import Server, settled
 
 if TYPE_CHECKING:
@@ -566,7 +566,9 @@ class OpenAIRolloutServer(_RequestServer):
     route, so use `VLLMGenerateServer` for a filtering policy. SGLang's
     `/v1/completions` reports the temperature-scaled distribution before its
     filters, so with SGLang any temperature works but no filter does, and
-    `SGLANG_RETURN_ORIGINAL_LOGPROB` must stay unset. The constructor raises
+    `SGLANG_RETURN_ORIGINAL_LOGPROB` must stay unset. An SGLang draw streams,
+    drawn as the policy without its stops and cut at the first of them
+    (`_streamed`). The constructor raises
     ValueError for the combinations these rules exclude, and for a
     temperature of zero. SGLang honors a seed only under
     `--enable-deterministic-inference`.
@@ -612,7 +614,10 @@ class OpenAIRolloutServer(_RequestServer):
     def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
         import openai
 
+        stops = self._sampling.stops
         try:
+            if self._completion.provider == "sglang":
+                return self._streamed(prompt, budget, seed, version)
             completion = self._completion(
                 [list(prompt)],
                 budget,
@@ -627,7 +632,6 @@ class OpenAIRolloutServer(_RequestServer):
         tokens, probabilities = completion.tokens[0], completion.log_probs[0]
         if tokens is None or probabilities is None:
             raise ValueError(f"the engine reported no sampled token ids; is it {self._completion.provider}?")
-        stops = self._sampling.stops
         terminated = bool(tokens) and tokens[-1] in stops
         reason = completion.finish_reasons[0]
         if reason != ("stop" if terminated else "length") or (not terminated and len(tokens) != budget):
@@ -639,6 +643,60 @@ class OpenAIRolloutServer(_RequestServer):
             raise ValueError("vLLM returned no routed_experts; start it with --enable-return-routed-experts")
         return Draw(prompt, tokens, probabilities, None, terminated, version,
                     routed if self._routing else None).check_stops(stops)
+
+    def _streamed(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
+        """One SGLang draw, streamed, and cut at the policy's first stop.
+
+        SGLang ends a request that names stop ids on its model's EOS ids as
+        well, and its one field that turns those off, `ignore_eos`, turns off
+        the named stops too (sglang/srt/managers/schedule_batch.py:1707-1729
+        at v0.5.20). So the policy is drawn as one without stops, which ends
+        on its budget alone, and the draw is cut where the policy stops: the
+        same distribution, since no later id shapes an earlier one. The draw
+        is streamed so that closing the stream at the stop ends the request
+        there, rather than when the budget runs out: SGLang aborts a request
+        whose client disconnects.
+        """
+        stops = self._sampling.stops
+        tokens: list[int] = []
+        probabilities: list[float] = []
+        reason: str | None = None
+        terminated = False
+        import openai
+
+        with self._completion.stream([list(prompt)], budget, key=seed,
+                                     sampling=replace(self._sampling, eos_token_ids=None), logprobs=0,
+                                     extra_body=self._return_ids) as chunks:
+            for chunk in _engine_chunks(chunks, openai.APIError):
+                for choice in chunk.to_dict()["choices"]:
+                    ids, likelihoods = _choice_tokens(choice)
+                    if ids is None or (ids and likelihoods is None):
+                        raise ValueError("SGLang streamed no sampled token ids; is return_token_ids set?")
+                    for token, likelihood in zip(ids, likelihoods or (), strict=True):
+                        tokens.append(token)
+                        probabilities.append(likelihood)
+                        if token in stops:
+                            terminated = True
+                            break
+                    reason = choice.get("finish_reason") or reason
+                    if terminated:
+                        break
+                if terminated:
+                    break
+        if not terminated and (reason != "length" or len(tokens) != budget):
+            raise ValueError(f"finish reason {reason!r} disagrees with {len(tokens)} streamed ids under a "
+                             f"budget of {budget}")
+        return Draw(prompt, tuple(tokens), tuple(probabilities), None, terminated, version).check_stops(stops)
+
+
+def _engine_chunks[Chunk](chunks: Iterable[Chunk], failure: type[Exception]) -> Iterator[Chunk]:
+    """`chunks` as a stream yields them; a `failure` while it streams (its connection dropped, or
+    the engine's error event, which SGLang sends for an abort, a timeout or an out-of-memory) is
+    an infrastructure failure."""
+    try:
+        yield from chunks
+    except failure as error:
+        raise InfrastructureError(f"the stream failed: {type(error).__name__}: {error}") from error
 
 
 class VLLMGenerateServer(_RequestServer):
