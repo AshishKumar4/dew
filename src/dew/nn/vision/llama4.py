@@ -14,6 +14,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew.nn.attention import LayerNorm
 from dew.nn.inputs import AttentionMetadata
+from dew.nn.precision import float32_dot_general
 from dew.nn.text_encoders import _encoder_layer_path, checked_image, clip_layer
 from dew.nn.vision.vit import MergeProjector
 from dew.registry import Record
@@ -73,7 +74,7 @@ class Llama4VisionTransformer(nn.Module):
                 f"({cfg.patch_size})")
         self.patch_embedding = nn.Dense(
             cfg.hidden_size, use_bias=False, dtype=self.dtype,
-            precision=self.precision, name="patch_embedding")
+            precision=self.precision, name="patch_embedding", dot_general=float32_dot_general)
         self.class_embedding = self.param(
             "class_embedding", nn.initializers.normal(cfg.hidden_size ** -0.5),
             (cfg.hidden_size,))
@@ -164,7 +165,7 @@ class Llama4ProjectorModule(nn.Module):
     def setup(self):
         self.linear = nn.Dense(
             self.text_width, use_bias=False, dtype=self.dtype,
-            precision=self.precision, name="linear")
+            precision=self.precision, name="linear", dot_general=float32_dot_general)
 
     def __call__(self, image_features) -> jax.Array:
         return self.linear(image_features)

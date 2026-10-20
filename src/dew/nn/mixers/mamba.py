@@ -44,7 +44,7 @@ from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general, float32_products
 from dew.nn.sharding import LayoutRefused, logical_axes, rows_like, sequence_shards
 
 CHUNK_SIZE = 64
@@ -92,7 +92,8 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         write = (dt_c * x_c)[..., None] * B_c[:, :, None, :]
         decays, writes = jax.lax.associative_scan(_combine, (decay, write), axis=1)
         states = decays * h[:, None] + writes
-        return states[:, -1], jnp.einsum('bcdn,bcn->bcd', states, C_c)
+        read = jnp.einsum('bcdn,bcn->bcd', states, C_c, precision=float32_products(states.dtype))
+        return states[:, -1], read
 
     final, out = jax.lax.scan(one_chunk, carried, tuple(chunks(t) for t in (x, dt, B, C, resets)))
     out = jnp.moveaxis(out, 0, 1).reshape(batch, length + pad, channels)[:, :length] + x * D
@@ -157,7 +158,8 @@ class Mamba(nn.Module):
     def setup(self):
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
-        dense = functools.partial(nn.Dense, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(nn.Dense, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
         self.in_proj = dense(2 * self.intermediate_size, use_bias=self.use_bias, name='in_proj',
                              **normal_kernel(self.init_std))
         self.conv1d = DepthwiseConv1d(features=self.intermediate_size, kernel=self.conv_kernel,
@@ -242,7 +244,8 @@ class _StepProjection(nn.Module):
             (self.rank, self.features))
         bias = self.param('bias', inverse_softplus_step, (self.features,))
         dtype = self.dtype if self.dtype is not None else raw.dtype
-        widened = jnp.matmul(raw.astype(dtype), kernel.astype(dtype), precision=self.precision)
+        widened = jnp.matmul(raw.astype(dtype), kernel.astype(dtype),
+                             precision=float32_products(dtype, self.precision))
         wide = at_least_fp32(widened.dtype)
         return nn.softplus(widened.astype(wide) + bias.astype(wide))
 

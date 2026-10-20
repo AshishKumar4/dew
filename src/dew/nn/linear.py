@@ -49,7 +49,15 @@ from .inputs import PLAIN_CALL, Coordinates, MixerCall, coordinates_of, valid_or
 from .joined import joined_dense, joins
 from .kernels import generation
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
-from .precision import asks_default_precision, at_least_fp32, compensated_add, compensated_difference
+from .precision import (
+    asks_default_precision,
+    at_least_fp32,
+    compensated_add,
+    compensated_difference,
+    float32_dot_general,
+    float32_matmul,
+    float32_products,
+)
 from .sharding import (
     HEADS,
     MLP_HIDDEN,
@@ -565,7 +573,7 @@ def strictly_lower_inverse(a):
     while size < width:
         pairs = inverse.reshape(*lead, width // (2 * size), 2, size, size)
         first, second = pairs[..., 0, :, :], pairs[..., 1, :, :]
-        joined = second @ diagonal_blocks(2 * size)[..., size:, :size] @ first
+        joined = float32_matmul(float32_matmul(second, diagonal_blocks(2 * size)[..., size:, :size]), first)
         top = jnp.concatenate([first, jnp.zeros_like(first)], -1)
         inverse = jnp.concatenate([top, jnp.concatenate([joined, second], -1)], -2)
         size *= 2
@@ -597,9 +605,9 @@ def xla_chunk_states(key, k_cumdecay, out_vals, gc, last_decay, state, kept=None
     """
     def one_chunk(s, step):
         k_i, kd_i, v_i, gc_i, last_i, kept_i = step
-        v_corrected = v_i - kd_i @ s
+        v_corrected = v_i - float32_matmul(kd_i, s)
         return (s * jnp.swapaxes(jnp.exp(gc_i[..., -1:, :]), -1, -2) * kept_i
-                + jnp.swapaxes(k_i * last_i, -1, -2) @ v_corrected, (s, v_corrected))
+                + float32_matmul(jnp.swapaxes(k_i * last_i, -1, -2), v_corrected), (s, v_corrected))
     kept = jnp.ones((1, 1, gc.shape[2], 1, 1), gc.dtype) if kept is None else kept.astype(gc.dtype)
     final, (entered, corrected) = jax.lax.scan(
         one_chunk, state,
@@ -611,9 +619,10 @@ def _paired(left, right, decay):
     """`sum_d left[s, d] right[t, d] decay[s, t, d]` within each chunk,
     `[..., C, C]`: one decay channel scales the product after it, one per key
     dimension weighs each term of it."""
+    products = float32_products(left.dtype)
     if decay.shape[-1] == 1:
-        return (left @ jnp.swapaxes(right, -1, -2)) * decay[..., 0]
-    return jnp.einsum('...sd,...td,...std->...st', left, right, decay)
+        return jnp.matmul(left, jnp.swapaxes(right, -1, -2), precision=products) * decay[..., 0]
+    return jnp.einsum('...sd,...td,...std->...st', left, right, decay, precision=products)
 
 
 def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *, starts=None):
@@ -676,9 +685,9 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     attn = jnp.where(strict, -_paired(kb_c, k_c, decay), 0.0)
     # The reference's `attn + I` operator after its row correction loop.
     inv = strictly_lower_inverse(attn)
-    out_vals = inv @ vb_c  # the reference's `value = attn @ v_beta`
+    out_vals = float32_matmul(inv, vb_c)  # the reference's `value = attn @ v_beta`
     entering = jnp.exp(gc) if first is None else jnp.exp(gc) * first
-    k_cumdecay = inv @ (kb_c * entering)
+    k_cumdecay = float32_matmul(inv, kb_c * entering)
 
     # A zero state like the values: inside a shard_map that checks varying axes the chunk loop's
     # carry varies as the operands it takes in do.
@@ -693,7 +702,7 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
                                                    kept)
     # decay is zero above the diagonal, so this is the reference's inclusive
     # lower `masked_fill(triu(1), 0)`.
-    core = (q_c * entering) @ entered + _paired(q_c, k_c, decay) @ v_corrected
+    core = float32_matmul(q_c * entering, entered) + float32_matmul(_paired(q_c, k_c, decay), v_corrected)
     # core: [B, H, NC, C, Dv] -> [B, H, NC*C, Dv] -> [B, S, H, Dv]
     core = jnp.moveaxis(core.reshape(B, H, T, Dv), 1, 2)[:, :S]
     return core.astype(dtype), state.astype(dtype)
@@ -1061,7 +1070,8 @@ class GatedDeltaNet(nn.Module):
                 "gate_activation must be 'silu' or 'sigmoid' (the reference's "
                 f"output_gate_type), got {self.gate_activation!r}")
         dense = functools.partial(
-            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+            dot_general=float32_dot_general)
         for name, (_, outputs) in self.projections().items():
             setattr(self, name, dense(outputs, name=name))
         self.conv1d = DepthwiseConv1d(features=self.conv_features,

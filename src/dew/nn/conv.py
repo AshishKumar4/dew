@@ -43,6 +43,8 @@ from jax.interpreters import ad, batching, mlir
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
+from dew.nn.precision import float32_products, products_dtype
+
 from .flops import conv_flops
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, auto_part, logical_spec, mesh_axes
 
@@ -210,7 +212,7 @@ def _conv_general_dilated(
         return jax.lax.conv_general_dilated(
             x, w, window_strides, padding, lhs_dilation=lhs_dilation, rhs_dilation=rhs_dilation,
             dimension_numbers=dimension_numbers, feature_group_count=feature_group_count,
-            batch_group_count=batch_group_count, precision=precision,
+            batch_group_count=batch_group_count, precision=float32_products(products_dtype(x, w), precision),
             preferred_element_type=preferred_element_type, out_sharding=out_sharding)
 
     dilation = (1, 1) if rhs_dilation is None else tuple(rhs_dilation)

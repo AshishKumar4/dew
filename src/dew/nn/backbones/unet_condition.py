@@ -13,7 +13,7 @@ from dew.nn.attention import FlaxFeedForward, GroupNorm, LayerNorm, NormalAttent
 from dew.nn.blocks import ResidualBlock, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.flops import MissingFlopsCount, projection_flops
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general
 
 from .spatial import SpatialCount, SpatialForward, SpatialShape
 
@@ -51,8 +51,10 @@ class _TimeMLP(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(self.features, dtype=self.dtype, precision=self.precision, name="in_proj")(x)
-        return nn.Dense(self.features, dtype=self.dtype, precision=self.precision, name="out_proj")(
+        x = nn.Dense(self.features, dtype=self.dtype, precision=self.precision, name="in_proj",
+                     dot_general=float32_dot_general)(x)
+        return nn.Dense(self.features, dtype=self.dtype, precision=self.precision, name="out_proj",
+                        dot_general=float32_dot_general)(
             nn.silu(x)
         )
 
@@ -127,7 +129,8 @@ class _SpatialAttention(nn.Module):
         batch, height, width, channels = x.shape
         if self.linear_projection:
             x = x.reshape(batch, height * width, channels)
-            x = nn.Dense(channels, dtype=self.dtype, precision=self.precision, name="input")(x)
+            x = nn.Dense(channels, dtype=self.dtype, precision=self.precision, name="input",
+                         dot_general=float32_dot_general)(x)
         else:
             x = Conv(channels, (1, 1), padding="VALID", dtype=self.dtype,
                      precision=self.precision, name="input")(x).reshape(batch, height * width, channels)
@@ -136,7 +139,8 @@ class _SpatialAttention(nn.Module):
                              self.attention_impl, approximate_gelu=self.approximate_gelu,
                              name=f"layer_{index}")(x, context, train=train)
         if self.linear_projection:
-            x = nn.Dense(channels, dtype=self.dtype, precision=self.precision, name="output")(x)
+            x = nn.Dense(channels, dtype=self.dtype, precision=self.precision, name="output",
+                         dot_general=float32_dot_general)(x)
             x = x.reshape(batch, height, width, channels)
         else:
             x = Conv(channels, (1, 1), padding="VALID", dtype=self.dtype, precision=self.precision,

@@ -73,7 +73,15 @@ from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
 from ..ngpt import NGPT, gain, unit
-from ..precision import at_least_fp32, capped_logits, head_dot_general, head_product, scaled, scaled_logits
+from ..precision import (
+    at_least_fp32,
+    capped_logits,
+    float32_dot_general,
+    head_dot_general,
+    head_product,
+    scaled,
+    scaled_logits,
+)
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
 from ..sharding import (
@@ -572,8 +580,8 @@ class CausalTransformer(nn.Module):
 
         `head_dim`, `rope_theta`, `window`, the two rotary ramps, the partial
         rotary and the sinks take the layer kind's resolved values
-        (`kind_of`). Every other field is the
-        model's field of the same name. A kind builds its `DecoderBlock` factory
+        (`kind_of`), and the precision the model's layers take (`products`). Every other field
+        is the model's field of the same name. A kind builds its `DecoderBlock` factory
         from this context and its own record, and `setup` chooses the mixer
         there and nowhere else.
         """
@@ -585,7 +593,8 @@ class CausalTransformer(nn.Module):
             "k_eq_v": self.attention_k_eq_v and kind.window is None,
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
-            "init_std": self.init_stds[0], "output_init_std": self.init_stds[1]}
+            "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
+            "precision": self.precision}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
@@ -1096,7 +1105,7 @@ class CausalTransformer(nn.Module):
             self.per_layer_model_projection = nn.Dense(
                 projections['per_layer_model_projection'][1], use_bias=False,
                 dtype=self.dtype, precision=self.precision,
-                name='per_layer_model_projection')
+                name='per_layer_model_projection', dot_general=float32_dot_general)
             self.per_layer_projection_norm = RMSNorm(
                 epsilon=self.norm_eps, scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype,
@@ -1131,7 +1140,7 @@ class CausalTransformer(nn.Module):
             # Gemma3nTextModel.altup_projections and altup_unembed_projections).
             projection = functools.partial(
                 nn.Dense, use_bias=False, dtype=self.dtype,
-                precision=self.precision)
+                precision=self.precision, dot_general=float32_dot_general)
             self.altup_projections = [
                 projection(projections[f'altup_projections_{index}'][1], name=f'altup_projections_{index}')
                 for index in range(self.altup.num_inputs - 1)]
@@ -1152,7 +1161,8 @@ class CausalTransformer(nn.Module):
         if self.loop is not None and self.loop.exit_gate:
             self.early_exit_gate = nn.Dense(
                 projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
-                name='early_exit_gate', **normal_kernel(self.initializer_range))
+                name='early_exit_gate', **normal_kernel(self.initializer_range),
+                dot_general=float32_dot_general)
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
                 features=projections['lm_head'][1], use_bias=False, dtype=at_least_fp32(self.dtype),
@@ -1162,7 +1172,7 @@ class CausalTransformer(nn.Module):
         if self.head_transform is not None:
             self.head_dense = nn.Dense(
                 projections['head_dense'][1], use_bias=False, dtype=self.dtype, precision=self.precision,
-                name='head_dense', **normal_kernel(self.initializer_range))
+                name='head_dense', **normal_kernel(self.initializer_range), dot_general=float32_dot_general)
             self.head_norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,

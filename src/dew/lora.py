@@ -56,6 +56,7 @@ from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
+from dew.nn.precision import float32_dot_general
 from dew.nn.protocols import (
     Counted,
     CountedConditionedSpatial,
@@ -529,9 +530,9 @@ class _Branch:
         if self.dropout and module.has_rng("dropout"):
             x = nn.Dropout(self.dropout, deterministic=False)(x)
         x, a, b = promote_dtype(x, a, b, dtype=module.dtype)
-        hidden = jax.lax.dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
+        hidden = float32_dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
                                      precision=module.precision)
-        delta = jax.lax.dot_general(hidden, b, (((hidden.ndim - 1,), (0,)), ((), ())),
+        delta = float32_dot_general(hidden, b, (((hidden.ndim - 1,), (0,)), ((), ())),
                                     precision=module.precision)
         return output + jnp.asarray(_scale(target, self.rslora), delta.dtype) * delta
 
