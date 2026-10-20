@@ -88,7 +88,10 @@ class GpuTarget:
     measured to beat the default (`dew.objectives.lm.chunked.chunked_tile`), and
     `wgmma` whether the GPU's matmuls run Hopper's warpgroup MMA, which Pallas
     Triton pipelines by holding every stage of a tile in shared memory
-    (`dew.nn.kernels.grouped_matmul`). This table is the one place a choice is
+    (`dew.nn.kernels.grouped_matmul`). `multiprocessors` is the canonical
+    device's streaming multiprocessors, a real device's own where it reports
+    them (`gpu_target`), which a launch sizes its programs by
+    (`dew.nn.kernels.decode_attention`). This table is the one place a choice is
     keyed on the hardware generation; any other code reads its facts, a library's
     support rule the compute capability (`capability`), and a launch config the
     autotuner (`dew.nn.kernels.tuning`), as tools/lint_slop.py's SLOP016 holds.
@@ -102,6 +105,7 @@ class GpuTarget:
     aliases: tuple[str, ...] = ()
     head_tile: tuple[int, int] | None = None
     wgmma: bool = False
+    multiprocessors: int | None = None
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
@@ -138,6 +142,8 @@ class GpuTarget:
 # RTX3090 71 (GA102 whitepaper), half the fp16-accumulator rate.
 # TPU per-chip bf16: v2/v3 45/123 (two JAX devices/chip, halved); v4 275;
 # v5e 197, v5p459, v6e918 from Google's architecture and generation pages.
+# Streaming multiprocessors of each canonical device: T4 40, A100 108, A10 72, L4 58, H100 SXM 132,
+# RTX PRO 6000 Blackwell Server 188, from NVIDIA's architecture whitepapers and datasheets.
 # Opted-in shared memory per block, in KiB: Turing64, A100163, Ampere/Ada/RTX
 # Blackwell99, Hopper227. The SM reservation is already excluded:
 # https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
@@ -157,21 +163,23 @@ class GpuTarget:
 # implementation is a row's kernel; Dew calls its own through tokamax's Op and tuning.
 TARGETS = {target.generation: target for target in (
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
-              aliases=('gpu:t4', 't4')),
+              aliases=('gpu:t4', 't4'), multiprocessors=40),
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash',
                'attention_packed': 'flash', 'grouped_matmul': 'pallas', 'xla_triton_gemm': 'off',
                'rms_norm': 'pallas', 'swiglu': 'pallas', 'gate_up': 'joined', 'delta_gates': 'joined',
                'gated_delta_rule': 'fla', 'ssd': 'pallas'},
-              {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), head_tile=(4096, 8192)),
+              {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), head_tile=(4096, 8192),
+              multiprocessors=108),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'attention_narrow': 'flash', 'grouped_matmul': 'pallas'},
-              {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}),
+              {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'attention': 'flash', 'attention_window': 'flash', 'attention_sinks': 'flash',
                'grouped_matmul': 'pallas', 'xla_triton_gemm': 'off', 'gated_delta_rule': 'fla'},
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
-               'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), head_tile=(4096, 8192)),
+               'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), head_tile=(4096, 8192),
+              multiprocessors=58),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash', 'attention_packed': 'flash', 'grouped_matmul': 'pallas',
@@ -181,11 +189,11 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
         'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
-        'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12}}, wgmma=True),
+        'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12}}, wgmma=True, multiprocessors=132),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               {'attention': 'flash', 'gated_delta_rule': 'fla'},
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
-              aliases=('gpu:g4', 'g4')),
+              aliases=('gpu:g4', 'g4'), multiprocessors=188),
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
@@ -222,12 +230,13 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
         import jax
         device = jax.devices()[0]
         generation, kind = device_generation(), device.device_kind
-        target = gpu_target(kind)
-        if target.generation == generation:
-            return target
-        canonical = TARGETS.get(generation, GpuTarget(generation, kind))
         real = device.platform == 'gpu' and ASSUMED.get() is None
-        return dataclasses.replace(canonical, device_kind=kind) if real else canonical
+        target = gpu_target(kind)
+        if target.generation != generation:
+            canonical = TARGETS.get(generation, GpuTarget(generation, kind))
+            target = dataclasses.replace(canonical, device_kind=kind) if real else canonical
+        counted = _multiprocessors(device) if real else None
+        return target if counted is None else dataclasses.replace(target, multiprocessors=counted)
     if identifier in TARGETS:
         return TARGETS[identifier]
     for target in TARGETS.values():
@@ -265,6 +274,13 @@ def _compute_capability(device) -> str | None:
     declares no such field, and a CUDA device carries it, so it is read at
     this boundary; a device without one gives None."""
     return getattr(device, 'compute_capability', None)
+
+
+def _multiprocessors(device) -> int | None:
+    """`device`'s streaming multiprocessors. jax's Device declares no such
+    field, and a CUDA device reports them as its cores, so it is read at this
+    boundary; a device without one gives None."""
+    return getattr(device, 'core_count', None)
 
 
 def device_generation() -> str:
