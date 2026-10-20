@@ -50,7 +50,7 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
     gated = jax.ShapeDtypeStruct((batch, length, value_heads), jnp.float32)
     beta = jax.ShapeDtypeStruct(gated.shape, narrow)
     inverse = jax.ShapeDtypeStruct((batch, length, value_heads, chunk), narrow)
-    entered = jax.ShapeDtypeStruct((batch, length // chunk, value_heads, width, columns), narrow)
+    entered = jax.ShapeDtypeStruct((batch * (length // chunk), value_heads, width, columns), narrow)
     state = jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32)
     operands = {
         "chunk_local_cumsum": (gated,),
@@ -93,6 +93,24 @@ def kernel_cases(target: str) -> Iterator[KernelCase]:
 def pairwise(g):
     """`g_s - g_t` for every pair of a chunk's last-axis positions, `[..., C, C]`."""
     return g[..., :, None] - g[..., None, :]
+
+
+def _slotted(passing, rows):
+    """Memories passing between a row's chunks `[B, C - 1, ...]` and a row's own `[B, ...]` at their
+    slots (`fla_gdn.Sequences`): the passing ones row by row, then the rows'."""
+    return jnp.concatenate([passing.reshape(-1, *passing.shape[2:]), rows])
+
+
+def entered_states(per_chunk):
+    """Per-chunk memories `[B, C, HV, K, V]`, each the one a chunk enters, at the slots the port
+    stores them in: each row's chunks' past its first, then each row's initial memory."""
+    return _slotted(per_chunk[:, 1:], per_chunk[:, 0])
+
+
+def left_grads(per_chunk):
+    """Per-chunk memory gradients `[B, C, HV, K, V]`, each of the memory a chunk leaves, at the slots
+    the port stores them in: each row's chunks' but its last, then each row's final memory's."""
+    return _slotted(per_chunk[:, :-1], per_chunk[:, -1])
 
 
 def reference_o(q, k, v, h, g, *, scale: float, chunk: int = 64):

@@ -12,6 +12,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.attention import FlaxFeedForward, GroupNorm, LayerNorm, NormalAttention
 from dew.nn.blocks import ResidualBlock, sinusoidal_time
 from dew.nn.conv import Conv
+from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, projection_flops
 from dew.nn.precision import at_least_fp32
 
@@ -51,8 +52,8 @@ class _TimeMLP(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(self.features, dtype=self.dtype, precision=self.precision, name="in_proj")(x)
-        return nn.Dense(self.features, dtype=self.dtype, precision=self.precision, name="out_proj")(
+        x = Dense(self.features, dtype=self.dtype, precision=self.precision, name="in_proj")(x)
+        return Dense(self.features, dtype=self.dtype, precision=self.precision, name="out_proj")(
             nn.silu(x)
         )
 
@@ -127,7 +128,7 @@ class _SpatialAttention(nn.Module):
         batch, height, width, channels = x.shape
         if self.linear_projection:
             x = x.reshape(batch, height * width, channels)
-            x = nn.Dense(channels, dtype=self.dtype, precision=self.precision, name="input")(x)
+            x = Dense(channels, dtype=self.dtype, precision=self.precision, name="input")(x)
         else:
             x = Conv(channels, (1, 1), padding="VALID", dtype=self.dtype,
                      precision=self.precision, name="input")(x).reshape(batch, height * width, channels)
@@ -136,7 +137,7 @@ class _SpatialAttention(nn.Module):
                              self.attention_impl, approximate_gelu=self.approximate_gelu,
                              name=f"layer_{index}")(x, context, train=train)
         if self.linear_projection:
-            x = nn.Dense(channels, dtype=self.dtype, precision=self.precision, name="output")(x)
+            x = Dense(channels, dtype=self.dtype, precision=self.precision, name="output")(x)
             x = x.reshape(batch, height, width, channels)
         else:
             x = Conv(channels, (1, 1), padding="VALID", dtype=self.dtype, precision=self.precision,

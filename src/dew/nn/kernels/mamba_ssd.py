@@ -678,6 +678,34 @@ class StatePassingBwd(_Launch):
         return (dstates, jnp.sum(dtotal, axis=-1), dinit, converted), None
 
 
+def _block_sum(values, exact: bool):
+    """A `[BM, BN]` block summed to one value as Triton's `tl.sum` sums it on a GPU, a tree over each
+    axis in turn; interpreted (`exact`), that same tree, where XLA's CPU reduction of a block to a scalar
+    adds its entries in sequence and rounds several times more (`D`'s gradient over head-width orders:
+    2 to 7 times a tree's error, mamba_ssm's matching the tree)."""
+    if not exact:
+        return jnp.sum(values)
+    for axis in (1, 0):
+        while values.shape[axis] > 1:
+            left, right = jnp.split(values, 2, axis=axis)
+            values = left + right
+    return values[0, 0]
+
+
+def _tree_sum(values, axes: tuple[int, ...]):
+    """`values` summed over `axes` pairwise, as mamba_ssm's torch sum and XLA's GPU reduction add a
+    kernel's per-block partial sums: a tree on every backend, where XLA's CPU reduction of them runs in
+    sequence."""
+    kept = [axis for axis in range(values.ndim) if axis not in axes]
+    flat = jnp.moveaxis(values, axes, tuple(range(len(axes))))
+    flat = flat.reshape(-1, *(values.shape[axis] for axis in kept))
+    while flat.shape[0] > 1:
+        if flat.shape[0] % 2:
+            flat = jnp.concatenate([flat, jnp.zeros_like(flat[:1])])
+        flat = flat[0::2] + flat[1::2]
+    return flat[0]
+
+
 def _dx_kernel(x_ref, cb_ref, dout_ref, dt_ref, da_ref, d_ref, b_ref, dstates_ref, *refs, batch: int,
                length: int, chunk: int, width: int, bm: int, bn: int, bk: int, exact: bool):
     """mamba_ssm's `_chunk_scan_chunk_state_bwd_dx_kernel` (ssd_combined.py:92-254) for one chunk of one
@@ -720,7 +748,7 @@ def _dx_kernel(x_ref, cb_ref, dout_ref, dt_ref, da_ref, d_ref, b_ref, dstates_re
     dout = _read(dout_ref.at[rows], taken).astype(jnp.float32)
     _write(dx_ref.at[rows], taken, dx + dout * d_ref[h])
     x = _read(x_ref.at[rows], taken).astype(jnp.float32)
-    dd_ref[m, n] = jnp.sum(dout * x)
+    dd_ref[m, n] = _block_sum(dout * x, exact)
     ddt_ref[rows] = jnp.sum(acc * x, axis=1)
 
 
@@ -769,7 +797,7 @@ class ChunkScanChunkStateBwdDx(_Launch):
             compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
             name="mamba_chunk_scan_chunk_state_bwd_dx",
         )(x, cb, dout, dt, da, d, b, dstates, *([] if seq is None else [seq]))
-        return (dx, jnp.sum(ddt, axis=0), jnp.sum(dd, axis=(0, 1, 3, 4))), None
+        return (dx, jnp.sum(ddt, axis=0), _tree_sum(dd, (0, 1, 3, 4))), None
 
 
 def _heads_of(s, g, *, ratio: int, heads: int):

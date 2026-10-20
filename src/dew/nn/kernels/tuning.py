@@ -59,14 +59,13 @@ import jax.numpy as jnp
 import tokamax
 from jax.extend.backend import get_default_device
 
-# tokamax's writer of launches as JSON, public only as a file writer (`bound_args_to_json`).
+# tokamax's writer of launches as JSON, public only as a file writer (`bound_args_to_json`); goes to
+# `tokamax.autotuning.dump_bound_args_to_json` once a tokamax release carries openxla/tokamax#1676.
 from tokamax._src.autotuning.api import dump_bound_args_to_json
 
 # tokamax names the type of one launch's timings by config nowhere public; its picks are read as this type.
+# Goes to `tokamax.autotuning.AutotuningData` once a tokamax release carries openxla/tokamax#1676.
 from tokamax._src.autotuning.autotuner import AutotuningData
-
-# tokamax's own reading of a launch's target GPU model, which its cache lookups key on, public nowhere.
-from tokamax._src.ops.op import infer_device_kind
 
 from dew import cache, coordination
 from dew.files import write_atomically
@@ -242,10 +241,20 @@ def _identity(op: tokamax.Op) -> tokamax.Op:
 
 
 def _kind(ba: tokamax.BoundArguments) -> str:
-    """The GPU model the keyed launch `ba` (`keyed`) is chosen for, as tokamax
-    reads it: the context mesh's (`Trainer.lower_for`'s abstract GPU), else
-    the default device's."""
-    return infer_device_kind(ba) or get_default_device().device_kind
+    """The GPU model the launch `ba` is chosen for, as tokamax reads it for its cache lookups: its
+    concrete operands' devices', else the context mesh's (`Trainer.lower_for`'s abstract GPU), else
+    the default device's. A traced or keyed launch (`keyed`) names no device of its own."""
+    from jax.core import Tracer
+
+    kinds = {device.device_kind for leaf in jax.tree.leaves(dict(ba.arguments))
+             if isinstance(leaf, jax.Array) and not isinstance(leaf, Tracer)
+             for device in leaf.devices()}
+    if len(kinds) > 1:
+        raise ValueError(f"a launch's operands lie on GPUs of several models: {sorted(kinds)}")
+    if kinds:
+        return kinds.pop()
+    device = jax.sharding.get_abstract_mesh().abstract_device
+    return (device or get_default_device()).device_kind
 
 
 def _pick(ba: tokamax.BoundArguments) -> AutotuningData | None:
