@@ -551,12 +551,13 @@ def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
     data = loader(TextData(source=str(tmp_path), pack="first-fit", seq_len=seq_len, packing_bins=1), batch=1,
         read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
-    rows = [batch["text"][0] for batch in data.val(DataPartition())]
-    positions = [batch["text_coordinates"].positions[0] for batch in data.val(DataPartition())]
-    assert len(rows) == 3  # pieces 3 ids apart, one per window
-    np.testing.assert_array_equal(np.concatenate([rows[0], *(row[1:] for row in rows[1:])])[:10],
-                                  [*list(range(10, 19)), 0])
-    np.testing.assert_array_equal(positions[0], [0, 1, 2, 3])
+    batches = list(data.val(DataPartition()))
+    # Pieces 3 ids apart, one per window, each repeating the last id of the one before it.
+    np.testing.assert_array_equal([batch["text"][0] for batch in batches],
+                                  [[10, 11, 12, 13], [13, 14, 15, 16], [16, 17, 18, 0]])
+    for batch in batches:
+        np.testing.assert_array_equal(batch["text_coordinates"].segments[0], [1, 1, 1, 1])
+        np.testing.assert_array_equal(batch["text_coordinates"].positions[0], [0, 1, 2, 3])
 
 
 def test_a_store_packs_its_documents_whole_unless_a_chunk_step_cuts_them(tmp_path):

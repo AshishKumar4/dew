@@ -178,6 +178,42 @@ class Row:
     values: collections.deque
 
 
+# How the display shows the metrics the trainer itself logs; an objective,
+# a rollout and a validation metric declare their own (`Shown`).
+TRAINER_SHOWN = {"loss": Shown(better="lower"),
+                 "learning_rate": Shown(group="optimizer"), "loss_scale": Shown(group="optimizer"),
+                 "accepted": Shown(percent=True, group="optimizer"),
+                 "step_time_ms": Shown(better="lower", group="throughput"),
+                 "samples_per_sec": Shown(better="higher", group="throughput"),
+                 "mfu": Shown(better="higher", percent=True, group="throughput"),
+                 "hfu": Shown(better="higher", percent=True, group="throughput"),
+                 "hlo_flops_util": Shown(better="higher", percent=True, group="throughput"),
+                 **{f"{name}_lower_bound": Shown(better="higher", percent=True, group="throughput")
+                    for name in ("hfu", "hlo_flops_util")}, "unsized_kernels": Shown(group="throughput"),
+                 "tokens": Shown(group="throughput"),
+                 "tokens_per_s": Shown(better="higher", group="throughput"),
+                 "rollout_seconds": Shown(better="lower", group="throughput")}
+
+
+def goodput(wall: float, first_step: float | None, other: float) -> dict[str, float]:
+    """Compute the two goodput numbers from MaxText's report that need no cluster telemetry.
+
+    `first_step` is the time from the start of `fit` to the first step's result:
+    the placement or restore, the first batch, the compile and the step itself.
+    It is None when no step ran. `other` is the time spent outside steps after
+    that: evaluations, checkpoint writes and the wait for them at the end.
+
+    The step fraction is what is left of `wall`. A step's own data stall therefore
+    counts as step time, as it does in MaxText's start-to-start step time.
+    """
+    numbers = {}
+    if first_step is not None:
+        numbers["goodput/time_to_first_step_s"] = first_step
+    steps = wall - (wall if first_step is None else first_step) - other
+    numbers["goodput/step_fraction"] = max(steps, 0.0) / wall if wall > 0 else 0.0
+    return numbers
+
+
 @dataclasses.dataclass
 class TrainingDisplay:
     """The console side of one `Trainer.fit`.

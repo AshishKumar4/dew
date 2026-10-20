@@ -63,8 +63,7 @@ def smoke(name, out, *arguments, offline=True, script=None, smoke_args=True, dev
 def test_readme_demo_resumes_updates_its_policy_freezes_the_reference_and_draws_flow(tmp_path):
     """The public chain restores a real checkpoint and keeps DPO's reference unchanged."""
     out = tmp_path / "demo"
-    finished = smoke("readme_demo", out, "--out", str(out), smoke_args=False)
-    assert "Resumed from step 20" in finished.stdout + finished.stderr
+    smoke("readme_demo", out, "--out", str(out), smoke_args=False)
     summary = json.loads((out / "summary.json").read_text())
     assert summary["language_model"]["first_step"] == 20
     assert summary["language_model"]["resumed_step"] == summary["language_model"]["updates"] == 24
@@ -412,7 +411,7 @@ def test_train_rlvr_turns_smoke_trains_through_environment_source(tmp_path):
 
 
 def test_train_harbor_smoke_trains_on_gateway_recorded_harness_calls(tmp_path):
-    """Two updates of HarborSource trials whose model calls the stand-in gateway records from the policy's
+    """Two updates of Harbor trials whose model calls the stand-in gateway records from the policy's
     own draws; the second trains on sessions submitted one update earlier."""
     smoke("train_harbor", tmp_path)
     summary = json.loads((tmp_path / "summary.json").read_text())
