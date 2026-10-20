@@ -35,12 +35,13 @@ def _proxy(url: str) -> str | None:
 
 
 async def _get(session: aiohttp.ClientSession, url: str, limit: int,
-               seconds: float) -> tuple[int, bytes, str]:
-    """The status of a GET of `url`, at most `limit` bytes of its body as its
-    server sent them, read as they arrive, and the url it ended at, all within
-    `seconds`: every hop of the redirects it follows (`Location`, else `URI`),
-    each through its own proxy, and the body. A redirect to an FTP url ends
-    it there, unread, for urllib to read."""
+               seconds: float) -> tuple[int, bytes, str | None]:
+    """The status of a GET of `url` and at most `limit` bytes of its body as
+    its server sent them, read as they arrive, all within `seconds`: every hop
+    of the redirects it follows (`Location`, else `URI`), each through its own
+    proxy, and the body. As urllib's, a redirect goes on to an HTTP(S) url or
+    ends at an FTP one, returned unread for urllib to read; to any other, or
+    past the hops urllib follows, it ends at its redirect status."""
     status = 0
     async with asyncio.timeout(seconds):
         for _ in range(_HOPS + 1):
@@ -50,18 +51,18 @@ async def _get(session: aiohttp.ClientSession, url: str, limit: int,
                 target = response.headers.get("Location") or response.headers.get("URI")
                 if status in _REDIRECTS and target is not None:
                     url = urljoin(url, target)
-                    if urlsplit(url).scheme == "ftp":
-                        return status, b"", url
-                    continue
+                    scheme = urlsplit(url).scheme
+                    if scheme in ("http", "https"):
+                        continue
+                    return status, b"", url if scheme == "ftp" else None
                 payload = bytearray()
                 if status < 300:
                     async for chunk in response.content.iter_chunked(2**16):
                         payload += chunk
                         if len(payload) >= limit:
                             break
-                return status, bytes(payload[:limit]), url
-    # Redirected more often than urllib follows.
-    return status, b"", url
+                return status, bytes(payload[:limit]), None
+    return status, b"", None
 
 
 @dataclass(frozen=True)
@@ -122,9 +123,10 @@ class Fetch:
             loop = get_loop()
             options = {"auto_decompress": False, "timeout": aiohttp.ClientTimeout()}
             http = HTTPFileSystem(loop=loop, client_kwargs=options)
-            status, payload, url = sync(loop, _get, sync(loop, http.set_session), url, limit, self.timeout)
-            if urlsplit(url).scheme in ("http", "https"):
+            status, payload, ftp = sync(loop, _get, sync(loop, http.set_session), url, limit, self.timeout)
+            if ftp is None:
                 return status, payload
+            url = ftp
         left = deadline - time.monotonic()
         if left <= 0:
             raise TimeoutError(f"no time left to read {url}")
