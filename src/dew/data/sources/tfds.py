@@ -243,6 +243,9 @@ class TFDS(Dataset):
             version=self.version,
         )
 
+    def label(self) -> str:
+        return self.name
+
     def describe(self) -> str:
         return f"tfds:{self.name}/{self.config}:{self.version}:{self.split}:{self.path}"
 

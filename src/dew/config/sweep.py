@@ -12,8 +12,8 @@ and asks it for the next point; it needs `dewml[hpo]`.
 from __future__ import annotations
 
 import dataclasses
-import itertools
 import json
+import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
@@ -55,11 +55,17 @@ class GridSearch(Search):
     than the grid has points raises `ValueError`."""
 
     def __call__(self, space: Space, finished: Sequence[TrialFinished]) -> Point:
-        points = list(itertools.product(*space.values()))
-        if len(finished) >= len(points):
-            raise ValueError(f'the grid holds {len(points)} points and trial '
+        size = math.prod(len(values) for values in space.values())
+        if len(finished) >= size:
+            raise ValueError(f'the grid holds {size} points and trial '
                              f'{len(finished)} was asked for; lower the budget')
-        return dict(zip(space, points[len(finished)], strict=True))
+        # The product's point at the trial's place, its last field varying fastest, as
+        # `itertools.product` orders it, without building the points before it.
+        point, place = {}, len(finished)
+        for path, values in reversed(list(space.items())):
+            place, chosen = divmod(place, len(values))
+            point[path] = values[chosen]
+        return {path: point[path] for path in space}
 
 
 @dataclasses.dataclass(frozen=True)

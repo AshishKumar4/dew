@@ -95,7 +95,8 @@ class Evaluation:
             step: int | jax.Array = 0, averaged: Variables | None = None,
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
             schedule_step: int | jax.Array | None = None, loss: bool = False,
-            training: Mapping[str, jax.Array] | None = None, warm: bool = False) -> Evaluation:
+            training: Mapping[str, jax.Array] | None = None, warm: bool = False,
+            updates: int | jax.Array | None = None) -> Evaluation:
         """Evaluate `variables` on the batches every process can read, without an optimizer or a tracker.
 
         Every process calls this with the same objective, metrics and numerical
@@ -118,7 +119,8 @@ class Evaluation:
         `schedule_step` is the step the objective's schedules read, and defaults to
         `step`. When training attempts were rejected, pass the number of accepted
         microbatches (`TrainState.microstep`, as `fit` does) so the schedule follows
-        only the work training accepted.
+        only the work training accepted. `updates` is the updates training
+        committed (`Step.updates`), and defaults to the schedule's step.
 
         `warm` scores at most `WARM_BATCHES` batches and finalizes no score, so
         the evaluation holds none: a pass over them runs every program a longer
@@ -140,7 +142,7 @@ class Evaluation:
         _agree_configuration(metrics, batches, split, loss=loss, training=training is not None, warm=warm)
         preview_enabled = bool(broadcast_from_process_zero(root and preview))
         event_step, context, event_words, training_scores = _event(
-            key, step, schedule_step, averaged, training)
+            key, step, schedule_step, averaged, training, updates)
         score_key = _folded(context.key, 0x53434F52)
         preview_key = _folded(context.key, 0x50524556)
         scores: dict[str, float] = {}
@@ -245,8 +247,8 @@ def _agree_configuration(
 
 
 def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array | None,
-           averaged: Variables | None, training: Mapping[str, jax.Array] | None = None
-           ) -> tuple[int, Step, tuple[int, ...], dict[str, float]]:
+           averaged: Variables | None, training: Mapping[str, jax.Array] | None = None,
+           updates: int | jax.Array | None = None) -> tuple[int, Step, tuple[int, ...], dict[str, float]]:
     """Draw the event's clocks and RNG, and the identity every rank reports.
 
     The clocks come home through a collective and every rank takes root's,
@@ -255,23 +257,26 @@ def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array
     training step at the same clock drew; a rank whose key differs from its
     peers' is refused, by the identity they compare.
     """
-    step_home, schedule_home, reports = collective_host(
-        (step, step if schedule_step is None else schedule_step, dict(training or {})),
+    scheduled = step if schedule_step is None else schedule_step
+    step_home, schedule_home, updates_home, reports = collective_host(
+        (step, scheduled, scheduled if updates is None else updates, dict(training or {})),
         phase="evaluation clocks",
     )
 
     def root_clocks() -> list | None:
         # Root's clocks as root holds them; a clock root cannot read is refused on every rank.
         schedule = np.asarray(schedule_home)
-        return ([int(step_home), schedule.item(), schedule.dtype.name] if jax.process_index() == 0
-                else None)
+        return ([int(step_home), schedule.item(), schedule.dtype.name, int(updates_home)]
+                if jax.process_index() == 0 else None)
 
-    at, schedule_at, dtype = broadcast_from_process_zero(agreed("evaluation clocks", root_clocks))
+    at, schedule_at, dtype, updates_at = broadcast_from_process_zero(agreed("evaluation clocks", root_clocks))
 
     def event() -> tuple[Step, jax.Array]:
         event_key = _folded(_folded(key, 0x4556414C), at)
         schedule = jax.device_put(np.asarray(schedule_at, np.dtype(dtype)))
-        return Step(step=schedule, key=event_key, ema=averaged), jax.random.key_data(event_key)
+        committed = jax.device_put(np.asarray(updates_at, np.dtype(dtype)))
+        return (Step(step=schedule, key=event_key, ema=averaged, committed=committed),
+                jax.random.key_data(event_key))
 
     context, event_data = agreed("evaluation context", event)
     event_words = agreed_same("evaluation key", lambda: [int(word) for word in np.asarray(collective_host(

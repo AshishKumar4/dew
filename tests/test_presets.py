@@ -11,7 +11,7 @@ import pytest
 from recording import RecordingTracker
 
 from dew import Field, InputSpec, Trainer
-from dew.data import Loading, Memory, images, mix, presets
+from dew.data import Files, Loading, Memory, images, mix, presets
 from dew.data.chat import Role
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
@@ -100,7 +100,7 @@ def test_lm_packs_documents_into_rows_that_keep_every_target():
     segment, and a decoder trains and validates on them."""
     documents = [{"text": "dew trains jax models " * (1 + index % 4)} for index in range(64)]
     train, held = Memory(documents).holdout(records=8)
-    batch = next(train.pipe(presets.lm, "byte", seq_len=32, batch=8).iterate())
+    batch = next(iter(train.pipe(presets.lm, "byte", seq_len=32, batch=8)))
     laid = batch["text_coordinates"]
     assert batch["text"].shape == laid.segments.shape == laid.positions.shape == (8, 33)
     assert laid.segments.max() > 1
@@ -113,13 +113,35 @@ def test_lm_packs_documents_into_rows_that_keep_every_target():
     finite(logged, "val/perplexity")
 
 
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_a_run_logs_its_corpus_counts_under_its_name_and_in_one_unit(tmp_path, read):
+    """The landing page's run: passages of tiny Shakespeare, some held out, packed into rows. Its
+    data metrics name the corpus by its file, never by its identity, and count in one unit each,
+    as integers: the rows it delivered, and its drops by reason."""
+    passages = [{"text": f"{index}: " + "to be, or not to be, that is the question. " * 6}
+                for index in range(48)]
+    corpus = tmp_path / "tiny-shakespeare.jsonl"
+    corpus.write_text("".join(json.dumps(passage) + "\n" for passage in passages))
+    train, held = Files(str(corpus)).read(read).holdout(0.1)
+    model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=64,
+                              max_seq_len=64)
+    logged = trained(LMObjective(model, seq_len=32), train.pipe(presets.lm, "byte", seq_len=32, batch=8),
+                     held.pipe(presets.lm, "byte", seq_len=32, batch=8))
+    data = {name: value for _, scalars in logged.scalars for name, value in scalars.items()
+            if name.startswith("data/")}
+    assert {name.split("/")[2] for name in data} == {"tiny-shakespeare"}
+    counts = [value for name, value in data.items() if name.startswith(("data/rows/", "data/rejected/"))]
+    assert all(isinstance(count, int) for count in counts)
+    assert data["data/rows/tiny-shakespeare"] >= 3 * 8
+
+
 def test_sft_renders_conversations_and_trains_on_the_assistant_turns():
     """Conversations through the tokenizer's chat template pack with each token's speaker beside it,
     and an assistant-only loss trains and validates on them."""
     conversations = [{"messages": [{"role": "user", "content": f"what is {index} plus one"},
                                    {"role": "assistant", "content": f"{index + 1}"}]} for index in range(32)]
     train, held = Memory(conversations).holdout(records=8)
-    batch = next(train.pipe(presets.sft, str(CHAT), seq_len=48, batch=8).iterate())
+    batch = next(iter(train.pipe(presets.sft, str(CHAT), seq_len=48, batch=8)))
     assert batch["text"].shape == batch["text_roles"].shape == (8, 49)
     assert (batch["text_roles"] == int(Role.ASSISTANT)).any()
     vocab = json.loads((CHAT / "tokenizer.json").read_text())["model"]["vocab"]
@@ -130,6 +152,22 @@ def test_sft_renders_conversations_and_trains_on_the_assistant_turns():
                      held.pipe(presets.sft, str(CHAT), seq_len=48, batch=8), metrics=(Perplexity(),))
     finite(logged, "train/loss")
     finite(logged, "val/perplexity")
+
+
+def test_sft_keeps_every_turn_of_a_conversation_longer_than_its_rows():
+    """A conversation longer than a row is cut into pieces that keep every turn (P37), not cut short:
+    the pieces' ids, the boundary each shares with the next once, reassemble to the whole render."""
+    from dew.data.chat import template
+
+    turns = [{"role": role, "content": f"turn {index} of a long talk"}
+             for index in range(12) for role in ("user", "assistant")]
+    whole = next(iter(Memory([{"messages": turns}]).map(template(str(CHAT)))))["text"]
+    assert len(whole) > 49
+    pieces = list(Memory([{"messages": turns}]).pipe(presets.sft, str(CHAT), seq_len=48, batch=1))
+    kept = [row[row_segments > 0] for batch in pieces
+            for row, row_segments in zip(batch["text"], batch["text_coordinates"].segments, strict=True)]
+    rebuilt = np.concatenate([kept[0], *(piece[1:] for piece in kept[1:])])
+    np.testing.assert_array_equal(rebuilt, whole)
 
 
 def sft_tokens(marker, targets, *, empty_rows=0):

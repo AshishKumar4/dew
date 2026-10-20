@@ -106,26 +106,31 @@ def forced(choice: str) -> str | None:
     return dict(cache.KERNEL_CHOICES.value).get(choice)
 
 
-def select[C](op: Op[C], case: C, named: str | None = None) -> Route:
+def select[C](op: Op[C], case: C, named: str | None = None, *, insist: bool = True) -> Route:
     """The kernel `op` runs for `case` on the target, reported as its route: `named` (or the kernel
     `chosen` names) where it takes the case, else the target's preference, else the first of the op's
     kernels that does. A named kernel that does not take the case raises with every requirement it
     fails, its measured ones aside; a generic one hands a case its handoff requirements turn down to
-    the op's next generic kernel."""
-    named = named or forced(op.choice)
-    preferred = named or op.preferred(case)
+    the op's next generic kernel. Without `insist`, `named` is the call's own preference, before
+    `chosen`'s, and one that does not take the case hands it to the op's other kernels, its refusal
+    reported (a norm's or a SiLU product's per-call implementation)."""
+    if named is not None and not insist:
+        preferred, insisted = named, None
+    else:
+        insisted = named or forced(op.choice)
+        preferred = insisted or op.preferred(case)
     first = op.kernel(preferred)
     candidates = [first, *(kernel for kernel in op.kernels if kernel is not first
-                           and (named is None or (first.generic and kernel.generic)))]
+                           and (insisted is None or (first.generic and kernel.generic)))]
     refusal = None
     for kernel in candidates:
-        failed = kernel.failed(case, forced=named is not None)
+        failed = kernel.failed(case, forced=insisted is not None)
         if not failed:
             return generation.route(op.choice, kernel=kernel.name, preferred=preferred, refusal=refusal,
                                     ran=op.hosted(kernel.name))
         if kernel is first:
             refusal = failed[0].refusal(case)
-            if named is not None and any(requirement.kind != 'handoff' for requirement in failed):
+            if insisted is not None and any(requirement.kind != 'handoff' for requirement in failed):
                 raise KernelRefused(op.choice, kernel.name,
                                     [requirement.refusal(case) for requirement in failed])
     raise ValueError(f"no {op.choice} kernel takes this call ({refusal})")
