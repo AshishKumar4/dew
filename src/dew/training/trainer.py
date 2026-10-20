@@ -155,6 +155,7 @@ from dew.training.model_flops import (
     uncounted,
 )
 from dew.training.narrow import narrowed, narrowed_paths
+from dew.training.observe import Observe
 from dew.training.optim import learning_rate, with_rate_scales
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
@@ -295,6 +296,7 @@ class _FitPlan:
     suites: Mapping[str, EvalSuite] = dataclasses.field(default_factory=dict)
     held_best: bool = False  # a restore_best without Checkpoints (`HeldBest`)
     """Every validation split by name, its metrics and cadence resolved."""
+    observe: Observe | None = None
 
     @property
     def validation(self) -> bool:
@@ -1359,6 +1361,7 @@ class Trainer(Generic[Loss, Effects]):
         validation: Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None = None,
         restore_best: bool = False,
         state: TrainState | None = None,
+        observe: Observe | None = None,
     ) -> TrainState:
         """Train until the step or real-token cap is reached, resuming the latest checkpoint.
 
@@ -1403,7 +1406,8 @@ class Trainer(Generic[Loss, Effects]):
         resumes from there.
 
         Previews are generated only when `preview=True` and a tracker receives them;
-        scalar reporting never triggers preview work.
+        scalar reporting never triggers preview work. `observe` takes values of the
+        state at a cadence of its own while the run trains (`Observe`).
 
         The process is readied first (`dew.training.runtime.ready_process`), as
         `prepare_process` readies it: a program that never called that gets Dew's
@@ -1439,7 +1443,7 @@ class Trainer(Generic[Loss, Effects]):
                 checkpoint_every=checkpoint_every, checkpoint_final=checkpoint_final,
                 local_every=None if checkpoints is None else checkpoints.local_every,
                 metrics=metrics, preview=preview, best=selection, stop=stop, suites=suites,
-                held_best=restore_best and checkpoints is None,
+                held_best=restore_best and checkpoints is None, observe=observe,
             )
             trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state)
             # The state a checkpoint would hold: the step rebuilds its narrow copies.
@@ -1657,8 +1661,11 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 "checkpoint_every asks for checkpoints and this trainer has no "
                 "checkpointer; pass Checkpoints(directory) to write any")
-        if (plan.finished(current, interval.real_tokens)
-                and checkpoints is not None and checkpoints.latest is not None):
+        complete = (plan.finished(current, interval.real_tokens) and checkpoints is not None
+                    and checkpoints.latest is not None)
+        if plan.observe:
+            plan.observe.opened(current, state, complete=complete)
+        if complete:
             return True
         if not plan.finished(current, interval.real_tokens):
             partition = DataPartition.of(mesh)
@@ -1754,6 +1761,8 @@ class Trainer(Generic[Loss, Effects]):
         )
         if not ending:
             self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due)
+        if plan.observe:
+            plan.observe.at(current, state)
         # Asked at every step on every process, as JAX's agreement
         # needs; the last step ends the run on its own.
         if run.stopped:
@@ -1764,14 +1773,8 @@ class Trainer(Generic[Loss, Effects]):
             if checkpoints is not None and interval.last_saved != current:
                 self._read_taken(run)
                 run.other += self._saved_checkpoint(
-                    checkpoints,
-                    current,
-                    state,
-                    position,
-                    interval,
-                    training_best=not plan.validation and not plan.best,
-                    control=run.stop_control,
-                )
+                    checkpoints, current, state, position, interval,
+                    training_best=not plan.validation and not plan.best, control=run.stop_control)
             run.preempted = current
             return True
         return False
@@ -1886,6 +1889,8 @@ class Trainer(Generic[Loss, Effects]):
             run.other += run.evaluation.elapsed_seconds
             scores = run.evaluation.scores
         self._saves(plan, run, interval, state, position, scores, evaluation_due=bool(scores), final=True)
+        if plan.observe:
+            plan.observe.last(current, state)
         if checkpoints is not None:
             checkpoints.wait()
 

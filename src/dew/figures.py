@@ -303,32 +303,50 @@ def _ticks(low: float, high: float, count: int = 4) -> np.ndarray:
 
 
 def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
-          x: Sequence[float] | None = None, y_range: tuple[float, float] | None = None, smooth: int = 1,
-          width: float = WIDE, height: float = 290, seconds: float = 8.0) -> Figure:
+          x: Sequence[float] | Mapping[str, Sequence[float]] | None = None,
+          y_range: tuple[float, float] | None = None, smooth: int = 1, width: float = WIDE,
+          height: float = 290, seconds: float = 8.0) -> Figure:
     """Lines over steps that draw themselves, one per entry of `series`, the first in the accent color.
 
-    `x` holds each point's step, as a tracker logged it; without it the points are steps 0, 1, 2 and
-    on. With `smooth` above 1 each line is drawn faint, and its running mean over `smooth` points over it.
+    `x` holds each point's step, as a tracker logged it: one sequence for every series, or a mapping
+    from each series' name to its own steps, as a run's training and validation are logged at
+    different steps. Without it the points are steps 0, 1, 2 and on. With `smooth` above 1 each line
+    is drawn faint, and its running mean over `smooth` points over it. A nonfinite value (a journal
+    keeps NaN and infinities) is left out of its line and of the axes, and the figure says how many
+    were.
     """
     figure = Figure(width, height, seconds=seconds, label=f"{y_label} against {x_label}")
     left, right, bottom = 50, 20, 48
-    values = {name: np.asarray(ys, float) for name, ys in series.items()}
+    drawn_points: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    omitted = 0
+    for name, ys in series.items():
+        values = np.asarray(ys, float)
+        if isinstance(x, Mapping):
+            steps = np.asarray(x[name], float)
+        else:
+            # Steps shared by every series: each takes as many as it has values.
+            steps = np.asarray(range(len(values)) if x is None else x, float)[:len(values)]
+        if len(steps) != len(values):
+            raise ValueError(f"series {name!r} has {len(values)} values and {len(steps)} steps")
+        finite = np.isfinite(values)
+        omitted += int(np.sum(~finite))
+        drawn_points[name] = (steps[finite], values[finite])
     # With several series, a legend fills rows under the label, as many as the names need.
     legend: list[tuple[float, float]] = []
     at_x, at_y = left, 42.0
-    for name in values if len(values) > 1 else ():
+    for name in drawn_points if len(drawn_points) > 1 else ():
         span = 30 + 8 * (len(name) + 5)
         if legend and at_x + span > width - right:
             at_x, at_y = left, at_y + 22
         legend.append((at_x, at_y))
         at_x += span + 16
     top = (legend[-1][1] if legend else 20) + 20
-    every = np.concatenate(list(values.values()))
-    low, high = y_range or (float(every.min()), float(every.max()))
+    every = np.concatenate([ys for _, ys in drawn_points.values()])
+    steps_drawn = np.concatenate([xs for xs, _ in drawn_points.values()])
+    low, high = y_range or ((float(every.min()), float(every.max())) if every.size else (0.0, 1.0))
     if high <= low:
         low, high = low - 0.5, high + 0.5
-    xs = np.asarray(x if x is not None else range(max(len(ys) for ys in values.values())), float)
-    first, final = float(xs[0]), float(xs[-1])
+    first, final = (float(steps_drawn.min()), float(steps_drawn.max())) if steps_drawn.size else (0.0, 1.0)
 
     def at(step: float, y: float) -> tuple[float, float]:
         return (left + (width - left - right) * (step - first) / max(final - first, 1),
@@ -343,9 +361,13 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
         figure.text(tick_x, height - bottom + 20, f"{tick + 0:g}", size=SMALL, color="muted", anchor="middle")
     figure.text((left + width - right) / 2, height - 6, x_label, size=TEXT, color="muted", anchor="middle")
     figure.text(left, 20, y_label, size=TEXT, color="muted")
+    if omitted:
+        values_word = "value" if omitted == 1 else "values"
+        figure.text(width - right, 20, f"{omitted} nonfinite {values_word} left out", size=SMALL,
+                    color="muted", anchor="end")
     # Neutral colors only, since warm means wrong; past three series the lines are dashed.
     colors: tuple[Role, ...] = ("accent", "text", "muted")
-    for index, (name, ys) in enumerate(values.items()):
+    for index, (name, (xs, ys)) in enumerate(drawn_points.items()):
         color = colors[index % len(colors)]
         dash = "6 4" if index >= len(colors) else None
         window = min(smooth, len(ys))
@@ -353,8 +375,8 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
         if window > 1:
             mean = np.convolve(ys, np.ones(window) / window, mode="valid")
             lines = [(ys, 1.0), (np.concatenate([np.full(window - 1, np.nan), mean]), 2.5)]
-        for drawn, stroke in lines:
-            points = [at(step, y) for step, y in zip(xs[:len(drawn)], drawn, strict=True) if np.isfinite(y)]
+        for drawn, stroke in lines if len(ys) else ():
+            points = [at(step, y) for step, y in zip(xs, drawn, strict=True) if np.isfinite(y)]
             line = figure.polyline(points, color=color, width=stroke, dash=dash)
             shade = 0.35 if window > 1 and stroke < 2 else 1
             if dash:
@@ -363,15 +385,14 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
                 figure.draw(line, 0.4, seconds * 0.55)
                 line.style["opacity"] = str(shade)
         # The last value: beside the series' name in a legend, or else at the line's end.
-        last = float(ys[-window:].mean())
+        last = f"{float(ys[-window:].mean()):.2f}" if len(ys) else "none finite"
         if legend:
             at_x, at_y = legend[index]
             figure.line(at_x, at_y - 5, at_x + 18, at_y - 5, color=color, width=2.5, dash=dash)
-            figure.text(at_x + 24, at_y, f"{name} {last:.2f}", size=TEXT, color=color)
-        else:
-            at_x, at_y = at(final, last)
-            end = figure.text(at_x - 4, at_y - 10, f"{last:.2f}", size=TEXT, color=color, weight=600,
-                              anchor="end")
+            figure.text(at_x + 24, at_y, f"{name} {last}", size=TEXT, color=color)
+        elif len(ys):
+            at_x, at_y = at(float(xs[-1]), float(ys[-window:].mean()))
+            end = figure.text(at_x - 4, at_y - 10, last, size=TEXT, color=color, weight=600, anchor="end")
             figure.appear(end, seconds * 0.55)
     return figure
 

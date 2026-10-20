@@ -131,7 +131,6 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `av` | Video readers (moviepy, with ffmpeg) |
 | `vision` | Hugging Face image processors, run with torchvision on the host |
 | `metrics` | SciPy and downloads for image metrics |
-| `plots` | Matplotlib charts in local reports |
 | `wandb`, `mlflow`, `tensorboard` | Experiment trackers |
 | `inference-clients` | The Ollama and OpenAI Python clients, including vLLM-compatible endpoints |
 | `serve` | Starlette and uvicorn, for serving a decision model in Jev's wire format (`examples/serve_decisions.py`) |
