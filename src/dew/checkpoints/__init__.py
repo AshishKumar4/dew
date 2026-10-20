@@ -897,13 +897,14 @@ class InferenceRecorded(Protocol):
     def inference_record(self) -> JSON: ...
 
 
-def _comparable(identity: JSON) -> bool:
-    """Whether a training identity says what a run trains: neither missing nor `{"unrecorded": ...}`."""
+def _compared(identity: JSON) -> JSON:
+    """A training identity as a resume compares it: None where it says nothing of what a run trains,
+    missing or `{"unrecorded": reason}`, whose reason the step keeps."""
     match identity:
-        case None | {"unrecorded": _}:
-            return False
+        case {"unrecorded": _}:
+            return None
         case _:
-            return True
+            return identity
 
 
 def _differences(here: JSON, there: JSON, path: str = "") -> list[str]:
@@ -1056,9 +1057,10 @@ class Checkpoints:
         compare, and the restore's shapes are the check."""
         # This run's identity first, agreed apart: the step's lookup below runs collectives of its own,
         # which a rank that failed to build an identity would not join.
-        here = agreed_same("run identity", identity)
-        there = agreed_same("stored run identity", lambda: self.identity(step))
-        if not _comparable(here) or not _comparable(there) or here == there:
+        # An identity with nothing to compare agrees as None: its reason may name a rank's own objects.
+        here = agreed_same("run identity", lambda: _compared(identity()))
+        there = agreed_same("stored run identity", lambda: _compared(self.identity(step)))
+        if here is None or there is None or here == there:
             return
         differences = _differences(here, there)
         raise ValueError(f"{self.directory} holds another run's checkpoints, which this run would "
