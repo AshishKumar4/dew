@@ -382,6 +382,14 @@ def _name(pipeline: Pipeline) -> str:
     return "mixture" if isinstance(pipeline.source, (Mixture, Phases)) else pipeline.source.describe()
 
 
+def _label(pipeline: Pipeline) -> str:
+    """The short name a corpus's metrics go by: the one it was given (`named`), else its store's
+    (`Source.label`); its identity (`_name`) stays the plan's and the saved position's."""
+    if pipeline.name is not None:
+        return pipeline.name
+    return "mixture" if isinstance(pipeline.source, (Mixture, Phases)) else pipeline.source.label()
+
+
 def _members(pipelines: Sequence[Pipeline]) -> list[str]:
     """The names a mixture's members go by, for their draws and in its plan: the one each was given
     (`Pipeline.named`, as `name:<name>`), else its place among the members given none (`place:0`,
