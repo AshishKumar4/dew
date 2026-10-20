@@ -37,6 +37,7 @@ from dew.config.data import loader
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.objectives.base import Aux, EMASpec, Objective, merge, under
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
+from dew.training.evaluation import WARM_BATCHES
 from dew.training.optim import Cosine, Power
 from dew.training.runtime import Preempted
 from dew.training.state import CHECKPOINTED
@@ -1092,8 +1093,9 @@ def test_eval_every_scores_the_validation_split_and_logs_the_artifacts():
     state = trainer.fit(dataset(val=val_batches(3)), steps=4, log_every=2, eval_every=2,
                         metrics=(Spread(seen),), preview=True)
 
-    # Two passes: at step 2, and at the end of the run.
-    assert seen == [((BATCH, 2), (BATCH, FEATURES))] * 6
+    # The pass that warms the evaluations before the first step scores its first batches, and two
+    # passes the whole split: at step 2, and at the end of the run.
+    assert seen == [((BATCH, 2), (BATCH, FEATURES))] * (WARM_BATCHES + 6)
     scored = [(step, s) for step, s in tracker.scalars if "val/spread" in s]
     assert [step for step, _ in scored] == [2, 4]
     # The pass at the end scores the averaged weights over the whole split, so
