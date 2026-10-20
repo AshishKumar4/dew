@@ -15,8 +15,8 @@ def test_every_route_of_a_family_is_its_targets_kernel_or_explained(family, targ
     """The family's committed fixture, traced for each audited target and every mode (`kernel_routes.cells`):
     each choice takes the target's preferred kernel, or leaves it by a refusal its kernel declares, a
     gap with its row or inherent; a mixer refusing the mode's cache layout names its ledger row
-    (`LAYOUT_GAPS`); a bidirectional family has no causal mode. Any other route, refusal or a family
-    with no fixture fails, each named."""
+    (`LAYOUT_GAPS`). A bidirectional family prefills through its causal view and decodes a canvas over
+    that prefix. Any other route, refusal or a family with no fixture fails, each named."""
     cells = list(kernel_routes.cells([family], [target]))
     assert all(cell["fixture"] is not None for cell in cells), cells[0].get("error")
     assert [cell["mode"] for cell in cells] == list(kernel_routes.MODES)
