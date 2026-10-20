@@ -39,6 +39,28 @@ class Accumulation:
     variables: Variables | None
     attempts: jax.Array | None
 
+    def replays(self, other: Accumulation | None) -> bool:
+        """Whether this window's replay slots hold batches of the shapes `other`'s do, so a step
+        compiled for `other` reads it: a batch ramp's stage changes them, and a pooled mean,
+        which keeps no batch, replays none. A batch's few fields are compared leaf by leaf, without
+        building a tree, as a ramped run's runner does each step."""
+        held, compiled = self.batches, None if other is None else other.batches
+        return jax.tree.structure(held) == jax.tree.structure(compiled) and all(
+            (mine.shape, mine.dtype) == (theirs.shape, theirs.dtype)
+            for mine, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(compiled), strict=True))
+
+
+def kept_window(held: Accumulation | None, pending: Accumulation, filled: int | None) -> bool:
+    """Whether a state's window (`held`) is the one a step compiled for `pending`'s shapes reads.
+    One that replays other shapes is replaced by an empty one where `filled`, the microbatches it
+    holds, is 0 or unread (None, a step's shapes alone), and refused while it holds any."""
+    if held is None or held.replays(pending):
+        return held is not None
+    if filled:
+        raise ValueError(f"the state's part-filled accumulation window ({filled} in) holds batches of "
+                         f"other shapes than the step's, which it cannot replay")
+    return False
+
 
 
 @struct.dataclass

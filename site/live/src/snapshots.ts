@@ -66,9 +66,8 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 
 	/**
 	 * The generation of the registry's pinned commit, or its preparation started: within a second, or once the lease
-	 * a preparation holds ends. The pin is the registry's own deploy's, over `commit`, the caller's (a preview Worker,
-	 * which shares production's registry, or a Worker of the last deploy during the rollout); `commit` where the
-	 * registry has none. Where the pin's last preparation failed, the retry `retry` scheduled keeps its time unless
+	 * a preparation holds ends. The pin is the registry's own deploy's, over `commit`, the caller's (a Worker of the
+	 * last deploy during the rollout); `commit` where the registry has none. Where the pin's last preparation failed, the retry `retry` scheduled keeps its time unless
 	 * `retryNow`, the operator's warm: a visitor's request does not undo the backoff.
 	 */
 	async ensure(commit = this.env.SNAPSHOT_COMMIT, { retryNow = false } = {}): Promise<{

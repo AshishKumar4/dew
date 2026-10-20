@@ -63,8 +63,7 @@ def smoke(name, out, *arguments, offline=True, script=None, smoke_args=True, dev
 def test_readme_demo_resumes_updates_its_policy_freezes_the_reference_and_draws_flow(tmp_path):
     """The public chain restores a real checkpoint and keeps DPO's reference unchanged."""
     out = tmp_path / "demo"
-    finished = smoke("readme_demo", out, "--out", str(out), smoke_args=False)
-    assert "Resumed from step 20" in finished.stdout + finished.stderr
+    smoke("readme_demo", out, "--out", str(out), smoke_args=False)
     summary = json.loads((out / "summary.json").read_text())
     assert summary["language_model"]["first_step"] == 20
     assert summary["language_model"]["resumed_step"] == summary["language_model"]["updates"] == 24

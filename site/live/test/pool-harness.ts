@@ -12,6 +12,12 @@ export class Pool extends ModelPool {
 		for (const host of state.hosts) host.lastUsed = 0;
 		await this.ctx.storage.put('pool', state);
 	}
+	/** The pool as it stands once the host `want` asked for is no longer wanted. */
+	async unwanted() {
+		const state = (await this.ctx.storage.get<any>('pool'))!;
+		state.wanted = 0;
+		await this.ctx.storage.put('pool', state);
+	}
 }
 // A pool of another namespace than POOL, as a Worker's old pool is once POOL moved to another script.
 export class Orphan extends Pool {}
@@ -106,6 +112,18 @@ export default {
 				restarts.push({ idle: await host(idle).restarts(), held: await host(held).restarts(), ready: (await pool.status()).ready });
 			}
 			return Response.json({ restarts });
+		}
+		if (scenario === 'wanted') {
+			await pool.configure(generation);
+			await pool.runAlarm();
+			const unasked = { status: await pool.status(), image: await pool.image() };
+			await pool.want();
+			await pool.runAlarm();
+			const asked = { status: await pool.status(), image: await pool.image() };
+			await pool.unwanted();
+			await pool.idle();
+			await pool.runAlarm();
+			return Response.json({ unasked, asked, after: await pool.status() });
 		}
 		if (scenario === 'older') {
 			await pool.configure({ ...generation, snapshot: { id: 'newer' }, created: generation.created + 1 });
