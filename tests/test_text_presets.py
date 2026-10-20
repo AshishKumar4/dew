@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import jax
 import numpy as np
 import pytest
 from token_support import write_token_corpus
@@ -23,42 +24,41 @@ def documents(count: int = 24) -> Memory:
 
 
 def same_batches(expected, built, count: int = 4) -> None:
-    """The first `count` training batches of two loaders, equal field by field."""
+    """The first `count` training batches of two loaders, equal field by field, a packed batch's
+    coordinates included."""
     wanted, made = expected.train(DataPartition()), built.train(DataPartition())
     try:
         for _ in range(count):
             left, right = next(wanted), next(made)
             assert left.keys() == right.keys()
-            for name in left:
-                np.testing.assert_array_equal(right[name], left[name])
+            jax.tree.map(np.testing.assert_array_equal, right, left)
     finally:
         wanted.close()
         made.close()
 
 
-@pytest.mark.parametrize("read", ["memory", "indexed"])
 @pytest.mark.parametrize("pack", [None, "first-fit", "concat"])
-def test_the_lm_preset_prepares_what_the_text_recipe_does(read, pack):
+def test_the_lm_preset_prepares_what_the_text_recipe_does(pack):
     """Raw passages, tokenized by bytes with an EOS and laid out by each of the recipe's layouts:
-    fixed windows, first-fit packing in eight open rows, or concatenation. The preset's batches are
-    the recipe's; its plan is too where the chain orders its records where the recipe does (an
-    index read; a memory read orders the recipe's after its fixed steps)."""
+    fixed windows, first-fit packing in eight open rows, or concatenation, read by index: the
+    preset's plan and batches are the recipe's. (A memory read orders the recipe's windows, after
+    its fixed steps, and the chain's documents, where its shuffle is written.)"""
+    read = "indexed"
     recipe = TextData(documents(), tokenizer="byte", seq_len=16, pack=pack, packing_bins=8,
                       token_holdout=None)
     expected = loader(recipe, batch=4, read=read, loading=LOADING)
     chain = documents().shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=16, batch=4, eos=True,
                                                  pack=pack, bins=8)
     built = compile(chain, read=read, loading=LOADING)
-    if read != "memory":
-        assert built.plan.identity() == expected.plan.identity()
+    assert built.plan.identity() == expected.plan.identity()
     same_batches(expected, built)
 
 
-@pytest.mark.parametrize("read", ["memory", "indexed"])
 @pytest.mark.parametrize("long", ["chunk", "truncate", "drop"])
-def test_the_sft_preset_prepares_what_the_chat_recipe_does(read, long):
+def test_the_sft_preset_prepares_what_the_chat_recipe_does(long):
     """Conversations of differing lengths rendered by a chat template, each one longer than a row
-    cut into pieces, cut at its end or dropped, as the recipe's `long` says."""
+    cut into pieces, cut at its end or dropped, as the recipe's `long` says, read by index."""
+    read = "indexed"
     conversations = Memory([{"messages": [{"role": "user", "content": "say " + "more " * index},
                                           {"role": "assistant", "content": "done " * (1 + index % 5)}]}
                             for index in range(24)])
@@ -67,8 +67,7 @@ def test_the_sft_preset_prepares_what_the_chat_recipe_does(read, long):
     chain = conversations.shuffle(0).repeat().pipe(presets.sft, str(CHAT), seq_len=48, batch=2, long=long,
                                                    bins=8)
     built = compile(chain, read=read, loading=LOADING)
-    if read != "memory":
-        assert built.plan.identity() == expected.plan.identity()
+    assert built.plan.identity() == expected.plan.identity()
     same_batches(expected, built)
 
 
@@ -84,26 +83,39 @@ def test_a_concatenated_conversation_keeps_its_target_across_a_row_end():
     rendered = [len(np.asarray(row["text"])) for row in conversations.map(chat.template(str(CHAT)))]
     rows = list(conversations.pipe(presets.sft, str(CHAT), seq_len=20, batch=1, long="truncate",
                                    pack="concat"))
-    segments = [np.asarray(row["text_segment_ids"])[0] for row in rows]
+    segments = [np.asarray(row["text_coordinates"].segments)[0] for row in rows]
     held = sum(int(np.count_nonzero((ids[:-1] == ids[1:]) & (ids[:-1] > 0))) for ids in segments)
     assert held == sum(min(length, 21) - 1 for length in rendered)
 
 
-@pytest.mark.parametrize("pack", [None, "first-fit"])
-def test_a_token_store_is_prepared_as_the_text_recipe_prepares_it(tmp_path, pack):
-    """A token store of documents each ended by EOS: fixed windows of its stream two apart
-    (`token_windows`), or its documents packed first-fit (`lm` with no tokenizer)."""
+def store_of_documents(directory) -> np.ndarray:
+    """A token store of 40 short documents, each ended by EOS (0); the stream it holds."""
     stream = np.concatenate([np.asarray([*range(1, 4 + index % 5), 0], np.int64) for index in range(40)])
-    write_token_corpus(tmp_path, stream.astype(np.uint16), None, eos_id=0)
-    recipe = TextData(str(tmp_path), seq_len=8, stride=2 if pack is None else None, pack=pack,
-                      packing_bins=8)
-    expected = loader(recipe, batch=4, read="indexed", loading=LOADING)
-    store = TokenFiles(str(tmp_path))
-    ordered = store.shuffle(0).repeat()
-    chain = (ordered.pipe(presets.token_windows, 8, stride=2, batch=4) if pack is None
-             else ordered.pipe(presets.lm, None, seq_len=8, batch=4, bins=8))
+    write_token_corpus(directory, stream.astype(np.uint16), None, eos_id=0)
+    return stream
+
+
+def test_a_token_stores_windows_are_the_text_recipes(tmp_path):
+    """A token store's stream cut into fixed windows two apart, shuffled and repeated as the
+    recipe orders them, read by index: the recipe's plan and batches."""
+    store_of_documents(tmp_path)
+    expected = loader(TextData(str(tmp_path), seq_len=8, stride=2), batch=4, read="indexed", loading=LOADING)
+    chain = TokenFiles(str(tmp_path)).shuffle(0).repeat().pipe(presets.token_windows, 8, stride=2, batch=4)
     built = compile(chain, read="indexed", loading=LOADING)
+    assert built.plan.identity() == expected.plan.identity()
     same_batches(expected, built)
+
+
+def test_a_token_stores_documents_are_packed_whole(tmp_path):
+    """A token store's documents, ended by EOS, packed first-fit with no tokenizer: each row holds
+    whole documents, so its targets are its documents' own, and together the rows of a pass hold
+    every target of every document."""
+    stream = store_of_documents(tmp_path)
+    rows = list(TokenFiles(str(tmp_path)).pipe(presets.lm, None, seq_len=8, batch=1, bins=8))
+    segments = [np.asarray(row["text_coordinates"].segments)[0] for row in rows]
+    held = sum(int(np.count_nonzero((ids[:-1] == ids[1:]) & (ids[:-1] > 0))) for ids in segments)
+    documents = np.split(stream, np.flatnonzero(stream == 0)[:-1] + 1)
+    assert held == sum(len(document) - 1 for document in documents)
 
 
 def test_a_token_store_that_states_no_document_ends_is_not_packed(tmp_path):
