@@ -473,16 +473,24 @@ def test_a_split_file_pays_its_setup_once_a_group_and_is_not_cut_finer_for_it(ci
     as paid 50 s a group besides their tests. At a 150 s target a group holds 100 s of tests and its
     setup, so the file runs as 2 groups of 150 s, where scaling every test by the file's total would
     cut it in 3 and each would pay the setup again. Measured at that cut, 300 s over 2 groups, the
-    file is cut the same way: its setup is not counted again for the groups it ran as. A setup past
-    half the target leaves each group half the target of tests, not a sliver."""
+    file is cut the same way: its setup is not counted again for the groups it ran as, and it is
+    measured by its rows at that cut, not by a median that remembers other cuts. A setup past half
+    the target leaves each group half the target of tests, not a sliver."""
     tests = [10.0] * 20
     assert ci.split(tests, 400.0, 150.0, cut=4) == [150.0, 150.0]
     assert ci.split(tests, 300.0, 150.0, cut=2) == [150.0, 150.0]
     assert ci.split(tests, 800.0, 150.0, cut=5) == [190.0, 190.0, 180.0]
-    rows = {"3.12:tests/test_split.py#1/4": 100.0, "3.12:tests/test_split.py#4/4": 100.0,
-            "3.14:tests/test_split.py#1/2": 10.0, "3.12:tests/test_other.py": 5.0}
-    assert ci.last_cut({"rows": rows}, "3.12", "tests/test_split.py") == 4
-    assert ci.last_cut({"rows": rows}, "3.12", "tests/test_other.py") == 1
+    # The file's median remembers runs at other cuts; its rows are timed at the cut they name. Here
+    # four runs at 4 groups (400 s) and the last at 2 (300 s, its rows): measured at 2, it stays at 2.
+    rows = {"3.12:tests/test_split.py#1/2": 150.0, "3.12:tests/test_split.py#2/2": 150.0,
+            "3.12:tests/test_split.py#3/4": 100.0, "3.14:tests/test_split.py#1/4": 10.0,
+            "3.12:tests/test_split.py#collect": 1.0, "3.12:tests/test_whole.py": 30.0}
+    timings = {"rows": rows, "files": {"3.12:tests/test_split.py": 400.0}}
+    assert ci.measured_cut(timings, "3.12", "tests/test_split.py") == (300.0, 2)
+    seconds, count = ci.measured_cut(timings, "3.12", "tests/test_split.py")
+    assert ci.split(tests, seconds, 150.0, cut=count) == [150.0, 150.0]
+    assert ci.measured_cut(timings, "3.12", "tests/test_whole.py") == (30.0, 1)
+    assert ci.measured_cut(timings, "3.12", "tests/test_unseen.py") is None
 
 
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
