@@ -803,8 +803,8 @@ def test_stats_bounds_preprocessing_and_counts_only_the_inspected_records(read):
 
     chain = dataclasses.replace(Memory(rows("a", 40)).named("sample"), mode=read, loading=READ)
     counts = chain.map(prepare, identity="stats-prepare@1").filter_map(drop_thirds).stats(10)
-    assert counts["data/accepted/sample"] == 10
-    assert counts["data/attempted/sample"] == 15
+    assert counts["data/rows/sample"] == 10
+    assert counts["data/rows/sample"] + counts["data/rejected/sample/third"] == 15
     assert counts["data/rejected/sample/third"] == 5
     assert processed == list(range(15))
 
@@ -821,8 +821,8 @@ def test_stats_stops_at_a_finite_sources_end(records):
     counts = chain.map(prepare, identity="stats-finite@1").filter_map(drop_thirds).stats(records)
     expected = 0 if records == 0 else 7
     assert processed == list(range(expected))
-    assert counts.get("data/attempted/sample", 0) == expected
-    assert counts.get("data/accepted/sample", 0) == (0 if records == 0 else 4)
+    assert counts.get("data/rows/sample", 0) + counts.get("data/rejected/sample/third", 0) == expected
+    assert counts.get("data/rows/sample", 0) == (0 if records == 0 else 4)
 
 
 @pytest.mark.parametrize("read", [None, "memory", "indexed", "streamed"])
@@ -835,7 +835,7 @@ def test_stats_counts_one_to_one_chains_lazily(read):
 
     chain = dataclasses.replace(Memory(rows("a", 7)).named("sample"), mode=read, loading=READ)
     counts = chain.map(prepare, identity="stats-one-to-one@1").stats(3)
-    assert counts["data/attempted/sample"] == counts["data/accepted/sample"] == 3
+    assert counts["data/rows/sample"] == 3
     assert processed == [0, 1, 2]
 
 
