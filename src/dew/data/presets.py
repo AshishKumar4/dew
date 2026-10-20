@@ -51,9 +51,10 @@ def images(dataset: Dataset, size: int, *, batch: int,
       so a resumed run augments as the uninterrupted one would; an `images.DeviceAugment(size,
       ...)` value sets those three itself. A random step, or a tuple of them, runs on the host
       right after the resize and the caption instead.
-    - `staging_size` resizes to that size instead, for an augmentation that crops to `size`
-      (`augment=True`, a `DeviceAugment`, or a host `images.RandomCrop(size)`); with no
-      augmentation it is not used. `draft` decodes a JPEG at a reduced scale no smaller than that
+    - `staging_size` resizes to that size instead, for an augmentation that crops to `size`:
+      `augment=True` and a `DeviceAugment` do, and host steps return `size` squares, as
+      `images.RandomCrop(size)` and `images.RandomResizedCrop(size)` do. With no augmentation it
+      is not used. `draft` decodes a JPEG at a reduced scale no smaller than that
       size (`images.DecodeImage(at_least=)`).
     - With `rejects=False`, an image that does not decode stops the run instead of being dropped
       and counted.
@@ -80,10 +81,6 @@ def images(dataset: Dataset, size: int, *, batch: int,
     if device is not None and device.size != size:
         raise ValueError(f"the augmentation crops to {device.size} pixels and the images are {size}; give "
                          "DeviceAugment the preset's size")
-    if staging != size and device is None and not any(
-            isinstance(step, image_steps.RandomCrop) and step.size == size for step in on_host):
-        raise ValueError(f"staging_size {staging} needs an augmentation that crops to {size}: augment=True, "
-                         f"images.DeviceAugment({size}, ...) or images.RandomCrop({size}, ...)")
     prepared = _decoded_images(dataset, staging, field=field, at_least=staging if draft else None,
                                rejects=rejects)
     if caption is not None:
@@ -107,25 +104,28 @@ def _finished(prepared: Dataset, *, batch: int, records: int | None, host: tuple
 
 
 def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int,
-       field: str = "text") -> Pipeline:
+       field: str = "text", records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Documents in `field` tokenized, ended by the tokenizer's EOS where it
     has one, cut into pieces that keep every next-token target, and packed
     first-fit into rows of `seq_len + 1` tokens (the last a target), in
-    batches of `batch` rows."""
+    batches of `batch` rows (`records` and `host` as `images` takes them)."""
 
     documents = dataset.map(text_steps.tokenize(tokenizer, field=field))
-    return _next_token_windows(documents, Pack(seq_len + 1)).batch(batch)
+    windows = _next_token_windows(documents, Pack(seq_len + 1))
+    return _finished(windows, batch=batch, records=records, host=host)
 
 
-def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int) -> Pipeline:
+def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int,
+        records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat
     template, each token's speaker kept beside it for an assistant-only loss,
     a longer one cut into pieces of `seq_len + 1` tokens that keep every
     turn, and packed first-fit into rows of that length, in batches of
-    `batch` rows."""
+    `batch` rows (`records` and `host` as `images` takes them)."""
 
-    return _conversation_windows(dataset.map(chat.template(tokenizer)), Pack(seq_len + 1, _CHAT_FIELDS),
-                                 long="chunk").batch(batch)
+    windows = _conversation_windows(dataset.map(chat.template(tokenizer)), Pack(seq_len + 1, _CHAT_FIELDS),
+                                    long="chunk")
+    return _finished(windows, batch=batch, records=records, host=host)
 
 
 _CHAT_FIELDS = ("text", chat.ROLES_KEY)
@@ -155,17 +155,20 @@ def _conversation_windows(rendered: Dataset, pack: Pack, *,
 
 
 def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: int, batch: int,
-          sample_rate: int | None = None) -> Pipeline:
+          sample_rate: int | None = None, records: int | None = None,
+          host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Windows of `seconds` drawn from the media in `mp4`, each record's own
     on every read and resume (`video.PickClip`), as `frames` frames at `fps`
     fitted into `size` squares, in batches of `batch`. With `sample_rate`,
     the window's sound beside them, mono at that rate, filled with silence
     marked invalid where the media has none (`audio.DecodeAudio`). Media shorter
     than the window, or that does not decode, is counted and dropped; the
-    media and its window are read here and leave the record."""
+    media and its window are read here and leave the record. `records` and `host` as `images`
+    takes them."""
 
-    return _clips(dataset, seconds, frames=frames, fps=fps, size=size, sample_rate=sample_rate,
-                  missing="silence").batch(batch)
+    windows = _clips(dataset, seconds, frames=frames, fps=fps, size=size, sample_rate=sample_rate,
+                     missing="silence")
+    return _finished(windows, batch=batch, records=records, host=host)
 
 
 def _decoded_images(rows: Dataset, size: int, *, field: str = "image", at_least: int | None = None,
