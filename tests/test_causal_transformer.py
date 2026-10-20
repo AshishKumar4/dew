@@ -1037,8 +1037,13 @@ def test_an_expert_gated_product_rounds_its_projections_and_product_under_jit(ac
     expert takes the fixture's gate g and up u through projections that sum
     each with an eighth of its bf16 ulp, which rounds back to g and u only
     if the projection's rounding survives, and a down projection that hands
-    the product out unchanged: the MLP's output and its input's gradient
-    must be Torch's product and gradients of the same gate and up."""
+    the product out unchanged: the MLP's output must be Torch's product of the
+    same gate and up, and its input's gradient as exact as Torch's gradients of
+    them (the gate's, a pointwise step, judged by the float64 gate: the fused
+    kernel's fp32 gradient rounds once where Torch rounds the cotangent first,
+    0.74 times Torch's RMS from float64 on this fixture)."""
+    from reference_error import assert_as_exact_as_the_reference
+
     from dew.nn.moe import ExpertMLP
 
     fixture = np.load(Path(__file__).parent / "fixtures" / "gated_product" / "bf16.npz")
@@ -1069,8 +1074,14 @@ def test_an_expert_gated_product_rounds_its_projections_and_product_under_jit(ac
     out, dx = jax.jit(forward_and_backward)(x, slot_cotangent)
     np.testing.assert_array_equal(np.asarray(out, np.float32),
                                   np.hstack([output] + [np.zeros_like(output)] * 3), err_msg="output")
-    np.testing.assert_array_equal(np.asarray(dx, np.float32), np.hstack([d_gate, d_gate, d_up, d_up]),
-                                  err_msg="input gradient")
+    activated = {"swiglu": jax.nn.silu, "geglu": functools.partial(jax.nn.gelu, approximate=True),
+                 "geglu_exact": functools.partial(jax.nn.gelu, approximate=False)}[activation]
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+        exact_gate, exact_up = (np.asarray(value) for value in jax.grad(
+            lambda gate, up: jnp.sum(activated(gate) * up * cotangent.astype(np.float64)), (0, 1))(
+                gate.astype(np.float64), up.astype(np.float64)))
+    torch_dx, exact_dx = (np.hstack([g, g, u, u]) for g, u in ((d_gate, d_up), (exact_gate, exact_up)))
+    assert_as_exact_as_the_reference(np.asarray(dx, np.float64), torch_dx, exact_dx, "input gradient")
 
 
 def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head():
