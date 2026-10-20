@@ -218,8 +218,10 @@ def goodput(wall: float, first_step: float | None, other: float) -> dict[str, fl
 def data_line(counters: Mapping[str, float]) -> Text | None:
     """A run's data counters (`data/...`) as one line: the rows its readers delivered and the records
     they rejected, summed over the corpora, with each corpus's rows where a mixture reads more than
-    one (`data/rows/<corpus>`) and each reason only where something was rejected for it
-    (`data/rejected/<corpus>/<reason>`). None where the run reports no rows."""
+    one (`data/rows/<corpus>`), each reason only where something was rejected for it
+    (`data/rejected/<corpus>/<reason>`), and the share of the rows truncated where any was
+    (`data/truncated/<corpus>`, each corpus's share of its own rows). None where the run reports
+    no rows."""
     rows = {name.removeprefix("data/rows/"): value for name, value in counters.items()
             if name.startswith("data/rows/")}
     if not rows:
@@ -228,15 +230,20 @@ def data_line(counters: Mapping[str, float]) -> Text | None:
     for name, value in counters.items():
         if name.startswith("data/rejected/"):
             reasons[name.rpartition("/")[2]] += int(value)
-    line = Text.assemble(("data ", LABEL), (f"{int(sum(rows.values())):,}", "bold"), (" rows", LABEL),
+    delivered = sum(rows.values())
+    line = Text.assemble(("data ", LABEL), (f"{int(delivered):,}", "bold"), (" rows", LABEL),
                          ("  ·  ", LABEL), (f"{sum(reasons.values()):,}", "bold"), (" rejected", LABEL))
     if counted := {reason: count for reason, count in reasons.items() if count}:
         line.append(" (" + ", ".join(f"{reason} {count:,}" for reason, count in counted.items()) + ")", LABEL)
+    truncated = sum(counters.get(f"data/truncated/{corpus}", 0.0) * count for corpus, count in rows.items())
+    if truncated and delivered:
+        line.append("  ·  ", LABEL).append(f"{truncated / delivered:.1%}", "bold").append(" truncated", LABEL)
     if len(rows) > 1:
         line.append("  ·  ", LABEL)
         for index, (corpus, count) in enumerate(rows.items()):
             line.append("  " if index else "").append(f"{corpus} ", LABEL).append(f"{int(count):,}")
     return line
+
 
 @dataclasses.dataclass
 class TrainingDisplay:
