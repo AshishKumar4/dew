@@ -56,12 +56,14 @@ from dew.nn.inputs import (
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_moments
 from dew.nn.protocols import (
+    AffineHead,
     CountedLogits,
     CountedLogitsTraining,
     CountedPredictions,
     CountedPredictionTraining,
     DecoderTraining,
     LayerStates,
+    OutputTable,
     TokenModel,
 )
 from dew.nn.sharding import LOGITS, constrain
@@ -89,7 +91,6 @@ from dew.objectives.base import (
 from dew.objectives.lm.chunked import (
     chunked_tile,
     final_read,
-    fused_chunks,
     fused_head_loss,
     head_cross_entropy,
     head_table,
@@ -617,6 +618,12 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     """Whether `token_scores` marks each prediction by default (`LMObjective`'s token accuracy).
     A policy or preference loss reports none, and asks for the marks where it scores them."""
 
+    head_fused: bool = True
+    """Whether a tiled head scored for its weighted sums takes their gradient in its forward
+    (`token_scores`' `z_loss`, `LMObjective`'s training loss): the fit ladder turns it off where the
+    fused chunk does not fit (`LMObjective.unfuse_head`), and tiling the head turns it on."""
+
+
     def __init__(self, model, seq_len: int, *, head_chunks: int = 4,
                  head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
                  samples: Samples | None = None, variables: Variables | None | Omitted = OMITTED,
@@ -628,6 +635,11 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         self.seq_len = seq_len
         self.head_chunks = head_chunks
         self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
+        # Each decoder a fused loss traced, by identity, and whether its head was one matrix
+        # (`chunked.head_table`): past a nonlinear head transform, beside an adapter's factors or
+        # in place of a frozen FP8 kernel no matrix is, and no head is fused. A decoder not yet
+        # traced is taken to have one.
+        self._head_matrices: dict[int, tuple[object, bool]] = {}
         self.samples = samples
         self.qk_stats = qk_stats
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
@@ -819,11 +831,13 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         being linear in the per-token cross entropies: a head the model holds
         as a table and tiles (`head_tile`, where its whole logits do not fit)
         then takes them with their gradient in its forward
-        (`chunked.fused_head_loss`), a tile's tokens at most a chunk, and the
-        per-token results carry none. It does so where one device's tokens
-        make more than one chunk (`chunked.fused_chunks`): one chunk holds all
-        their logits, which the tiled head bounds to a tile, so a step the
-        planner tiles to fit keeps the tiled head.
+        (`chunked.fused_head_loss`, while `head_fused`), a tile's tokens at
+        most a chunk, and the per-token results carry none. A chunk scores
+        the whole vocabulary, which the tiled head bounds to a tile, so the
+        fit ladder moves a fused head that does not fit to the tiled head
+        (`LMObjective.unfuse_head`) before it recomputes more: at an 8B's
+        head on an A100 (4096 wide, vocabulary 128256, 4096 tokens in one
+        chunk) the fused head took 58.4 ms against the tiled head's 64.9.
         Where the whole logits fit, they are kept: three products either way,
         and on an H100 the whole head ran Qwen3.5-0.8B's 4 x 3072 step at
         36.1% MFU against the fused head's 34.6%.
@@ -854,10 +868,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
-        head = (head_table(self.model, params) if z_loss is not None and self.head_tile is not None
-                and reads_states(self.model) else None)
-        table = (head if head is not None and fused_chunks(
-            targets.shape, head.matrix.shape[0 if head.vocab_major else -1], self.head_tile) > 1 else None)
+        table = self._fused_head(params) if z_loss is not None else None
         dtype = jnp.promote_types(hidden.dtype, jnp.float32)
         weights = self._row_weights(prepared, roles, dtype)
         total = None
@@ -935,10 +946,22 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         if self.head_tile is not None:
             return None
         self.head_tile = chunked_tile() if tile is None else tile
+        self.head_fused = True
         return f"the head tiled {self.head_tile}"
 
-    def restore_head_tile(self, tile: tuple[int, int] | None) -> None:
+    def _fused_head(self, params) -> OutputTable | None:
+        """The head as the one matrix a summed loss takes its gradient through in the forward
+        (`token_scores`' `z_loss`), None where it keeps the whole logits, is not fused or is no
+        matrix. What the trace finds of the decoder's head is kept (`_head_matrices`)."""
+        if self.head_tile is None or not reads_states(self.model):
+            return None
+        head = head_table(self.model, params)
+        self._head_matrices[id(self.model)] = (self.model, head is not None)
+        return head if self.head_fused else None
+
+    def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
         self.head_tile = tile
+        self.head_fused = fused
 
     def _layer_states(self) -> LayerStates:
         """The model as the reader of its layers' states that a request for `layers` needs."""
@@ -1300,6 +1323,25 @@ class LMObjective(TokenScorer):
         assert self.indexer is not None
         total, mass = self._indexer_term(sown, prepared, batch)
         return Ratio(self.indexer.weight * total, mass), total / jnp.where(mass > 0, mass, 1)
+
+    def program_key(self) -> tuple[ProgramModule, ...]:
+        """The decoder, its head fused where its training loss takes the head's gradient in the
+        forward: a tiled head the model holds as one matrix (`token_scores`' `z_loss`), outside an
+        indexer's warm-up, which scores no head."""
+        model = self.model
+        fused = (self.head_fused and self.head_tile is not None and reads_states(model)
+                 and isinstance(model, AffineHead) and not self._warmup
+                 and self._head_matrices.get(id(model), (None, True))[1])
+        return (ProgramModule(self.model, self.head_tile, trained=True, head_fused=fused),)
+
+    def unfuse_head(self) -> str | None:
+        """Move a tiled head to take its gradient in the backward, and report the move; None where
+        the step's program does not change, a head no step fuses. A tiled head is unfused either
+        way, so a decoder traced later does not fuse a head its rung unfused."""
+        moved = self.program_key()[0].head_fused
+        if self.head_tile is not None:
+            self.head_fused = False
+        return f"the head tiled {self.head_tile}, its gradient taken in the backward" if moved else None
 
     def loss(self, variables, batch, step: Step) -> tuple[Ratio | LMStatistics, Aux[Variables]]:
         if self._warmup:

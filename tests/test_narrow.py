@@ -51,6 +51,62 @@ def test_a_scan_copies_its_stacked_layers_not_its_constants():
     assert paths == {("stacked",): jnp.dtype(jnp.bfloat16)}
 
 
+def test_a_scan_over_a_stack_of_layers_copies_each_layer():
+    """A scanned run stacks its layers' weights, each stored apart, and the scan slices and casts the
+    stack: each layer's weight is read through a copy, whose stack is the stack's cast. A weight that
+    is broadcast into many places sums its cotangents in its own dtype, so it keeps its fp32 read."""
+    def loss(params, x):
+        stacked = jnp.stack([params["first"], params["second"]])
+        repeated = jnp.broadcast_to(params["repeated"], (2, 4, 4))
+
+        def layer(h, weights):
+            w, r = weights
+            return h @ w.astype(jnp.bfloat16) @ r.astype(jnp.bfloat16), None
+        return jnp.sum(jax.lax.scan(layer, x, (stacked, repeated))[0].astype(jnp.float32))
+
+    params = {name: jnp.ones((4, 4), jnp.float32) for name in ("first", "second", "repeated")}
+    paths = narrowed_paths(loss, params, jnp.ones((2, 4), jnp.bfloat16))
+    assert paths == {("first",): jnp.dtype(jnp.bfloat16), ("second",): jnp.dtype(jnp.bfloat16)}
+
+
+def test_a_stack_of_weights_one_of_which_is_read_elsewhere_copies_none():
+    """A stack takes one dtype: where one of its weights is read apart from it, in its own
+    precision, none of the stack's weights is copied, and the loss traces with copies as without."""
+    def loss(params, x):
+        stacked = jax.lax.stack([params["first"], params["second"]])
+
+        def layer(h, w):
+            return h @ w.astype(jnp.bfloat16), None
+        scanned = jax.lax.scan(layer, x, stacked)[0].astype(jnp.float32)
+        return jnp.sum(scanned) + jnp.sum(params["second"])
+
+    params = {name: jnp.ones((4, 4), jnp.float32) for name in ("first", "second")}
+    assert narrowed_paths(loss, params, jnp.ones((2, 4), jnp.bfloat16)) == {}
+
+
+def test_a_stack_inside_a_call_whose_weight_is_read_outside_it_copies_none():
+    """Where a stack sits inside a call and one of its weights is also read outside the call, the
+    weight is read more than once, so no weight of the stack is copied."""
+    joined = jax.jit(lambda a, b: jax.lax.stack([a, b]).astype(jnp.bfloat16))
+
+    def loss(params, x):
+        return jnp.sum(joined(params["a"], params["b"]).astype(jnp.float32)) + jnp.sum(params["b"])
+
+    params = {name: jnp.ones((4, 4), jnp.float32) for name in ("a", "b")}
+    assert narrowed_paths(loss, params, jnp.ones((2, 4), jnp.bfloat16)) == {}
+
+
+def test_a_call_given_a_literal_beside_a_weight_still_copies_the_weight():
+    """A call may take a constant beside a weight; the weight it casts once is copied."""
+    scaled = jax.jit(lambda w, s: jnp.sum(w.astype(jnp.bfloat16)) * s)
+
+    def loss(params, x):
+        return scaled(params["w"], 2.0).astype(jnp.float32)
+
+    params = {"w": jnp.ones((4, 4), jnp.float32)}
+    assert narrowed_paths(loss, params, jnp.ones((2, 4), jnp.bfloat16)) == {("w",): jnp.dtype(jnp.bfloat16)}
+
+
 def _keeping_gradients(optimizer):
     """`optimizer` after a transformation whose state is the last gradient
     the update read, so a run's state holds its gradient as committed."""
@@ -60,7 +116,7 @@ def _keeping_gradients(optimizer):
 
 
 def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1, split=None,
-             mixture=False, rows=8, ragged=False):
+             mixture=False, rows=8, ragged=False, scanned=False):
     """A tied bf16 decoder over fp32 parameters, trained `steps` steps on
     one batch and then `padded` steps on a batch of padding alone, with
     `copies` on or off on this device's generation, on `mesh` with every
@@ -68,14 +124,16 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     microbatches each, over `rows` rows. A `mixture` routes its MLPs over
     four experts under a balance loss. A `ragged` run's even steps end
     every other row in padding, so no two neighbouring microbatches count
-    as many tokens, whether a window reads steps or a step's parts. Returns
-    the state, each step's loss and the trainer."""
+    as many tokens, whether a window reads steps or a step's parts. A
+    `scanned` decoder of four layers runs them as one scan over their
+    stacked weights, each layer's stored apart. Returns the state, each
+    step's loss and the trainer."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import TEXT_KEY, LMObjective
     from dew.training import Layout, MeshSpec, Trainer
-    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, num_kv_heads=1,
-                              mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
-                              tie_embeddings=True, dtype=jnp.bfloat16,
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=4 if scanned else 2, num_heads=2,
+                              num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
+                              tie_embeddings=True, dtype=jnp.bfloat16, scan_layers=scanned,
                               mixture={"experts": 4, "top_k": 2} if mixture else None)
     objective = LMObjective(model, seq_len=8, pad_id=0, aux_loss_alpha=.01 if mixture else None)
     batch = {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(1, 64, (rows, 9)), jnp.int32)}
@@ -138,6 +196,17 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
                                       mesh=mesh)
     names = {"/".join(path) for path in _assert_plain_update(narrow, losses, plain, plain_losses)}
     assert names and all(name.endswith("kernel") and "proj" in name for name in names), names
+
+
+def test_a_scanned_decoder_reads_every_layers_kernels_through_copies_with_the_same_gradients():
+    """A decoder that scans its layers over their stacked weights reads each layer's projection
+    kernels through bf16 copies, stacked as the scan reads them, as an unscanned decoder does: under
+    plain SGD the parameters, the last gradient and the losses are bitwise the in-forward cast's."""
+    narrow, losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, scanned=True)
+    plain, plain_losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=False, scanned=True)
+    names = {"/".join(path) for path in _assert_plain_update(narrow, losses, plain, plain_losses)}
+    layers = {name.split("/")[0] for name in names}
+    assert {f"layers_{index}" for index in range(4)} <= layers, names
 
 
 @pytest.mark.parametrize(("accumulation", "split", "mixture", "fsdp"), [

@@ -5,6 +5,8 @@ from typing import BinaryIO, ClassVar, Literal, TextIO, overload
 class AbstractFileSystem:
     protocol: ClassVar[str | tuple[str, ...]]
     cachable: ClassVar[bool]
+    # The keyword arguments fsspec's constructor was given (`_Cached.__call__`).
+    storage_options: Mapping[str, object]
     def __init__(self, *args: object, **storage_options: object) -> None: ...
     @classmethod
     def _strip_protocol(cls, path: str) -> str: ...

@@ -20,18 +20,35 @@ accelerate==1.15.0
     #   peft
 aiobotocore==3.9.2
     # via s3fs
+aiofile==3.12.3
+    # via py-key-value-aio
 aiofiles==25.1.0
-    # via orbax-checkpoint
+    # via
+    #   daytona
+    #   orbax-checkpoint
 aiohappyeyeballs==2.7.1
     # via aiohttp
 aiohttp==3.14.5
     # via
+    #   dewml (pyproject.toml)
     #   aiobotocore
+    #   aiohttp-retry
     #   cosmic-ray
+    #   daytona
+    #   daytona-analytics-api-client-async
+    #   daytona-api-client-async
+    #   daytona-toolbox-api-client-async
     #   fsspec
     #   gcsfs
     #   mlflow
+    #   modal
+    #   python-socketio
     #   s3fs
+aiohttp-retry==2.9.1
+    # via
+    #   daytona-analytics-api-client-async
+    #   daytona-api-client-async
+    #   daytona-toolbox-api-client-async
 aioitertools==0.13.0
     # via aiobotocore
 aiosignal==1.4.0
@@ -56,12 +73,18 @@ anybadge==1.16.0
     # via cosmic-ray
 anyio==4.15.1
     # via
+    #   gradio
     #   httpx
+    #   httpx-ws
     #   httpx2
     #   jupyter-server
+    #   mcp
     #   mlflow-skinny
     #   openai
+    #   py-key-value-aio
+    #   sse-starlette
     #   starlette
+    #   watchfiles
 appnope==1.0.0 ; sys_platform == 'darwin'
     # via ipykernel
 argon2-cffi==25.1.0
@@ -85,14 +108,24 @@ attrs==26.1.0
     # via
     #   aiohttp
     #   cosmic-ray
+    #   cyclopts
     #   dm-tree
+    #   e2b
     #   jsonschema
     #   jsonschema-path
     #   referencing
+audioop-lts==0.2.2 ; python_full_version >= '3.13'
+    # via gradio
+authlib==1.8.0
+    # via fastmcp-slim
 aws-xray-sdk==2.15.0
     # via moto
+beartype==0.23.1
+    # via py-key-value-aio
 beautifulsoup4==4.15.0
     # via nbconvert
+bidict==0.24.1
+    # via python-socketio
 bleach==6.4.0
     # via nbconvert
 blinker==1.9.0
@@ -106,14 +139,24 @@ botocore==1.43.106
     #   boto3
     #   moto
     #   s3transfer
+bracex==3.1
+    # via wcmatch
+brotli==1.2.0
+    # via gradio
 cachetools==7.2.1
     # via
     #   mlflow-skinny
     #   mlflow-tracing
+    #   py-key-value-aio
+caio==0.12.9
+    # via aiofile
+cbor2==6.1.5
+    # via modal
 certifi==2026.7.22
     # via
     #   httpcore
     #   httpx
+    #   modal
     #   requests
 cffi==2.1.1
     # via
@@ -134,6 +177,7 @@ click==8.5.0
     #   flask
     #   huggingface-hub
     #   mlflow-skinny
+    #   modal
     #   nltk
     #   uvicorn
     #   wandb
@@ -160,6 +204,8 @@ comm==0.2.3
     #   ipywidgets
 compressed-tensors==0.17.1
     # via dewml (pyproject.toml)
+connectrpc==0.11.1
+    # via e2b
 contourpy==1.4.0
     # via matplotlib
 cosmic-ray==8.7.0
@@ -168,12 +214,17 @@ coverage==7.16.2
     # via dewml (pyproject.toml)
 cryptography==50.0.2
     # via
+    #   authlib
     #   google-auth
     #   joserfc
     #   mlflow
     #   moto
+    #   pyjwt
+    #   secretstorage
 cycler==0.12.1
     # via matplotlib
+cyclopts==5.2.0
+    # via fastmcp-slim
 databricks-sdk==0.151.0
     # via
     #   mlflow-skinny
@@ -187,6 +238,20 @@ datasets==5.1.0
     #   dewml (pyproject.toml)
     #   evaluate
     #   lm-eval
+daytona==0.225.0
+    # via dewml (pyproject.toml)
+daytona-analytics-api-client==0.225.0
+    # via daytona
+daytona-analytics-api-client-async==0.225.0
+    # via daytona
+daytona-api-client==0.225.0
+    # via daytona
+daytona-api-client-async==0.225.0
+    # via daytona
+daytona-toolbox-api-client==0.225.0
+    # via daytona
+daytona-toolbox-api-client-async==0.225.0
+    # via daytona
 debugpy==1.8.22
     # via ipykernel
 decorator==5.3.1
@@ -200,8 +265,10 @@ defusedxml==0.7.1
     #   nltk
 deltalake==1.6.6
     # via dewml (pyproject.toml)
-deprecated==3.0.0
-    # via deltalake
+deprecated==1.3.1
+    # via
+    #   daytona
+    #   deltalake
 diffusers==0.34.0
     # via dewml (pyproject.toml)
 dill==0.4.1
@@ -213,20 +280,29 @@ dill==0.4.1
     #   pylint
 dm-tree==0.1.10
     # via tensorflow-datasets
+dnspython==2.9.0
+    # via email-validator
 docker==7.2.0
     # via
     #   mlflow
     #   moto
 docstring-parser==0.18.0
     # via
+    #   cyclopts
     #   simple-parsing
     #   tyro
+e2b==2.55.1
+    # via dewml (pyproject.toml)
+e2b-dockerfile-utils==0.1.0
+    # via e2b
 einops==0.8.2
     # via
     #   dewml (pyproject.toml)
     #   etils
 einshape==1.0
     # via tokamax
+email-validator==2.3.0
+    # via pydantic
 etils==1.14.0
     # via
     #   array-record
@@ -236,6 +312,8 @@ etils==1.14.0
     #   xprof
 evaluate==0.4.6
     # via lm-eval
+exceptiongroup==1.3.1
+    # via fastmcp-slim
 execnet==2.1.2
     # via pytest-xdist
 executing==2.3.0
@@ -243,9 +321,16 @@ executing==2.3.0
 exit-codes==1.3.0
     # via cosmic-ray
 fastapi==0.143.0
-    # via mlflow-skinny
+    # via
+    #   gradio
+    #   mlflow-skinny
+    #   openenv
 fastjsonschema==2.22.2
     # via nbformat
+fastmcp==3.4.8
+    # via openenv
+fastmcp-slim==3.4.8
+    # via fastmcp
 filelock==4.1.1
     # via
     #   dewml (pyproject.toml)
@@ -287,6 +372,7 @@ fsspec==2026.7.0
     #   etils
     #   evaluate
     #   gcsfs
+    #   gradio-client
     #   huggingface-hub
     #   s3fs
     #   torch
@@ -342,6 +428,12 @@ googleapis-common-protos==1.75.5
     #   grpcio-status
     #   opentelemetry-exporter-otlp-proto-http
     #   tensorflow-metadata
+gradio==6.30.0
+    # via openenv
+gradio-client==2.7.2
+    # via
+    #   gradio
+    #   hf-gradio
 grain==0.2.18
     # via dewml (pyproject.toml)
 graphene==3.4.3
@@ -353,6 +445,10 @@ graphql-core==3.2.13
     #   moto
 graphql-relay==3.2.0
     # via graphene
+griffelib==2.3.2
+    # via fastmcp-slim
+groovy==0.1.2
+    # via gradio
 grpc-google-iam-v1==0.14.5
     # via google-cloud-storage-control
 grpcio==1.84.0
@@ -365,6 +461,8 @@ grpcio==1.84.0
     #   tensorboard
 grpcio-status==1.84.0
     # via google-api-core
+grpclib==0.4.9
+    # via modal
 gunicorn==26.2.0 ; sys_platform != 'win32'
     # via mlflow
 gviz-api==1.10.0
@@ -374,16 +472,40 @@ h11==0.16.0
     #   httpcore
     #   httpcore2
     #   uvicorn
+    #   wsproto
+h2==4.4.1
+    # via
+    #   e2b
+    #   grpclib
+hf-gradio==0.4.1
+    # via gradio
 hf-xet==1.7.0 ; platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'
     # via huggingface-hub
+hpack==4.2.0
+    # via h2
 httpcore==1.0.9
-    # via httpx
+    # via
+    #   httpx
+    #   httpx-ws
 httpcore2==2.13.1 ; sys_platform != 'emscripten'
     # via httpx2
 httpx==0.28.1
     # via
+    #   daytona
+    #   e2b
+    #   fastmcp-slim
+    #   gradio
+    #   gradio-client
+    #   httpx-ws
     #   huggingface-hub
+    #   mcp
     #   ollama
+    #   openenv
+    #   safehttpx
+httpx-sse==0.4.3
+    # via mcp
+httpx-ws==0.9.0
+    # via daytona
 httpx2==2.13.1
     # via openai
 httpx2-jsfetch==1.0 ; sys_platform == 'emscripten'
@@ -397,14 +519,20 @@ huggingface-hub==1.33.0
     #   datasets
     #   diffusers
     #   evaluate
+    #   gradio
+    #   gradio-client
+    #   openenv
     #   peft
     #   tokenizers
     #   transformers
 humanize==4.16.0
     # via orbax-checkpoint
+hyperframe==6.1.0
+    # via h2
 idna==3.20
     # via
     #   anyio
+    #   email-validator
     #   httpx
     #   httpx2
     #   jsonschema
@@ -442,8 +570,14 @@ isort==9.0.2
     # via pylint
 itsdangerous==2.2.0
     # via flask
+jaraco-classes==3.4.0
+    # via keyring
+jaraco-context==6.1.2
+    # via keyring
 jaraco-functools==4.6.0
-    # via cheroot
+    # via
+    #   cheroot
+    #   keyring
 jax @ https://github.com/AshishKumar4/jax/archive/7527048f5499b30e97c748d2d1b56056f62917ea.tar.gz
     # via
     #   -c constraints.txt
@@ -463,10 +597,15 @@ jaxtyping==0.3.11
     # via tokamax
 jedi==0.20.0
     # via ipython
+jeepney==0.9.0 ; sys_platform == 'linux'
+    # via
+    #   keyring
+    #   secretstorage
 jinja2==3.1.6
     # via
     #   dewml (pyproject.toml)
     #   flask
+    #   gradio
     #   jupyter-server
     #   lm-eval
     #   nbconvert
@@ -483,7 +622,10 @@ joblib==1.6.0
     #   nltk
     #   scikit-learn
 joserfc==1.7.5
-    # via moto
+    # via
+    #   authlib
+    #   fastmcp-slim
+    #   moto
 jsonpatch==1.35
     # via cfn-lint
 jsonpath-ng==1.10.0
@@ -492,14 +634,20 @@ jsonpointer==3.2.1
     # via
     #   jsonpatch
     #   jsonschema
+jsonref==1.1.0
+    # via fastmcp-slim
 jsonschema==4.26.0
     # via
     #   jupyter-events
+    #   mcp
     #   nbformat
     #   openapi-schema-validator
     #   openapi-spec-validator
+    #   openenv
 jsonschema-path==0.5.0
-    # via openapi-spec-validator
+    # via
+    #   fastmcp-slim
+    #   openapi-spec-validator
 jsonschema-specifications==2025.9.1
     # via
     #   jsonschema
@@ -531,6 +679,8 @@ jupyterlab-pygments==0.3.0
     # via nbconvert
 jupyterlab-widgets==3.0.17
     # via ipywidgets
+keyring==25.7.0
+    # via py-key-value-aio
 kiwisolver==1.5.1
     # via matplotlib
 lark==1.3.1
@@ -552,6 +702,7 @@ markdown-it-py==4.2.0
 markupsafe==3.0.4
     # via
     #   flask
+    #   gradio
     #   jinja2
     #   mako
     #   nbconvert
@@ -573,6 +724,8 @@ mccabe==0.7.0
     # via
     #   flake8
     #   pylint
+mcp==1.30.0
+    # via fastmcp-slim
 mdurl==0.1.2
     # via markdown-it-py
 mistune==3.3.4
@@ -588,9 +741,12 @@ mlflow-skinny==3.17.0
     # via mlflow
 mlflow-tracing==3.17.0
     # via mlflow
+modal==1.6.1
+    # via dewml (pyproject.toml)
 more-itertools==11.1.0
     # via
     #   cheroot
+    #   jaraco-classes
     #   jaraco-functools
     #   lm-eval
 moto==5.2.4
@@ -607,6 +763,7 @@ multidict==6.9.1
     # via
     #   aiobotocore
     #   aiohttp
+    #   grpclib
     #   yarl
 multiprocess==0.70.19
     # via
@@ -653,6 +810,7 @@ numpy==2.5.4
     #   evaluate
     #   flax
     #   gguf
+    #   gradio
     #   grain
     #   imageio
     #   jax
@@ -683,10 +841,16 @@ numpy==2.5.4
     #   treescope
 oauthlib==4.0.0
     # via requests-oauthlib
+obstore==0.11.1
+    # via daytona
 ollama==0.6.3
     # via dewml (pyproject.toml)
 openai==3.29.0
-    # via dewml (pyproject.toml)
+    # via
+    #   dewml (pyproject.toml)
+    #   openenv
+openapi-pydantic==0.6.0
+    # via fastmcp-slim
 openapi-schema-validator==0.9.0
     # via openapi-spec-validator
 openapi-spec-validator==0.9.0
@@ -696,16 +860,23 @@ opencv-python-headless==5.0.0.93
     #   dewml (pyproject.toml)
     #   albucore
     #   albumentations
+openenv==0.9.0
+    # via dewml (pyproject.toml)
 opentelemetry-api==1.45.1
     # via
+    #   daytona
     #   fastapi
+    #   fastmcp-slim
     #   google-api-core
     #   mlflow-skinny
     #   mlflow-tracing
     #   opentelemetry-exporter-http-transport
     #   opentelemetry-exporter-otlp-proto-http
+    #   opentelemetry-instrumentation
+    #   opentelemetry-instrumentation-aiohttp-client
     #   opentelemetry-sdk
     #   opentelemetry-semantic-conventions
+    #   pyqwest
     #   wandb
 opentelemetry-exporter-http-transport==0.66b1
     # via opentelemetry-exporter-otlp-proto-http
@@ -714,7 +885,13 @@ opentelemetry-exporter-otlp-common==0.66b1
 opentelemetry-exporter-otlp-proto-common==1.45.1
     # via opentelemetry-exporter-otlp-proto-http
 opentelemetry-exporter-otlp-proto-http==1.45.1
-    # via wandb
+    # via
+    #   daytona
+    #   wandb
+opentelemetry-instrumentation==0.66b1
+    # via opentelemetry-instrumentation-aiohttp-client
+opentelemetry-instrumentation-aiohttp-client==0.66b1
+    # via daytona
 opentelemetry-proto==1.45.1
     # via
     #   mlflow-skinny
@@ -723,13 +900,19 @@ opentelemetry-proto==1.45.1
     #   opentelemetry-exporter-otlp-proto-http
 opentelemetry-sdk==1.45.1
     # via
+    #   daytona
     #   mlflow-skinny
     #   mlflow-tracing
     #   opentelemetry-exporter-otlp-common
     #   opentelemetry-exporter-otlp-proto-http
     #   wandb
 opentelemetry-semantic-conventions==0.66b1
-    # via opentelemetry-sdk
+    # via
+    #   opentelemetry-instrumentation
+    #   opentelemetry-instrumentation-aiohttp-client
+    #   opentelemetry-sdk
+opentelemetry-util-http==0.66b1
+    # via opentelemetry-instrumentation-aiohttp-client
 opt-einsum==3.4.0
     # via
     #   jax
@@ -744,6 +927,8 @@ orbax-checkpoint==0.12.7
     # via
     #   dewml (pyproject.toml)
     #   flax
+orjson==3.13.0
+    # via gradio
 outlines-core==0.2.14
     # via dewml (pyproject.toml)
 packaging==26.3
@@ -752,7 +937,11 @@ packaging==26.3
     #   accelerate
     #   anybadge
     #   datasets
+    #   e2b
     #   evaluate
+    #   fastmcp-slim
+    #   gradio
+    #   gradio-client
     #   huggingface-hub
     #   ipykernel
     #   jupyter-events
@@ -761,6 +950,8 @@ packaging==26.3
     #   mlflow-skinny
     #   mlflow-tracing
     #   nbconvert
+    #   openenv
+    #   opentelemetry-instrumentation
     #   optuna
     #   peft
     #   pytest
@@ -774,6 +965,7 @@ pandas==3.0.6
     # via
     #   datasets
     #   evaluate
+    #   gradio
     #   mlflow
 pandocfilters==1.5.1
     # via nbconvert
@@ -793,6 +985,7 @@ pillow==11.3.0
     # via
     #   dewml (pyproject.toml)
     #   diffusers
+    #   gradio
     #   imageio
     #   matplotlib
     #   moviepy
@@ -800,6 +993,7 @@ pillow==11.3.0
     #   torchvision
 platformdirs==4.13.0
     # via
+    #   fastmcp-slim
     #   jupyter-core
     #   pylint
     #   wandb
@@ -840,6 +1034,7 @@ protobuf==6.33.6
     #   grpcio-status
     #   mlflow-skinny
     #   mlflow-tracing
+    #   modal
     #   opentelemetry-proto
     #   orbax-checkpoint
     #   proto-plus
@@ -849,6 +1044,12 @@ protobuf==6.33.6
     #   tensorflow-metadata
     #   wandb
     #   xprof
+protobuf-py==0.1.1
+    # via
+    #   connectrpc
+    #   e2b
+protobuf-py-ext==0.1.1 ; (platform_machine == 'arm64' and platform_python_implementation == 'CPython' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (platform_machine == 'x86_64' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (platform_machine == 'AMD64' and platform_python_implementation == 'CPython' and sys_platform == 'win32') or (platform_machine == 'ARM64' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
+    # via protobuf-py
 psutil==7.2.2
     # via
     #   accelerate
@@ -863,6 +1064,8 @@ ptyprocess==0.7.0 ; os_name != 'nt' or (sys_platform != 'emscripten' and sys_pla
     #   terminado
 pure-eval==0.2.4
     # via stack-data
+py-key-value-aio==0.4.6
+    # via fastmcp-slim
 py-partiql-parser==0.6.3
     # via moto
 pyarrow==25.0.1
@@ -883,13 +1086,25 @@ pydantic==2.14.1
     # via
     #   albumentations
     #   compressed-tensors
+    #   daytona
+    #   daytona-analytics-api-client
+    #   daytona-analytics-api-client-async
+    #   daytona-api-client
+    #   daytona-api-client-async
+    #   daytona-toolbox-api-client
+    #   daytona-toolbox-api-client-async
     #   fastapi
+    #   fastmcp-slim
+    #   gradio
+    #   mcp
     #   mlflow-skinny
     #   mlflow-tracing
     #   ollama
     #   openai
+    #   openapi-pydantic
     #   openapi-schema-validator
     #   openapi-spec-validator
+    #   openenv
     #   pydantic-settings
     #   tokamax
     #   wandb
@@ -897,8 +1112,12 @@ pydantic-core==2.50.1
     # via pydantic
 pydantic-settings==2.15.0
     # via
+    #   fastmcp-slim
+    #   mcp
     #   openapi-schema-validator
     #   openapi-spec-validator
+pydub==0.25.1
+    # via gradio
 pyflakes==4.0.3
     # via flake8
 pygments==2.21.0
@@ -908,12 +1127,21 @@ pygments==2.21.0
     #   nbconvert
     #   pytest
     #   rich
+    #   rich-rst
+pyjwt==2.15.1
+    # via mcp
 pylint==4.1.3
     # via dewml (pyproject.toml)
 pyparsing==3.3.3
     # via
     #   matplotlib
     #   moto
+pyperclip==1.11.0
+    # via fastmcp-slim
+pyqwest==0.10.0
+    # via
+    #   connectrpc
+    #   e2b
 pytablewriter==1.2.1
     # via lm-eval
 pytest==9.1.1
@@ -927,6 +1155,13 @@ python-dateutil==2.9.0.post0
     #   aiobotocore
     #   arrow
     #   botocore
+    #   daytona-analytics-api-client
+    #   daytona-analytics-api-client-async
+    #   daytona-api-client
+    #   daytona-api-client-async
+    #   daytona-toolbox-api-client
+    #   daytona-toolbox-api-client-async
+    #   e2b
     #   graphene
     #   jupyter-client
     #   matplotlib
@@ -934,15 +1169,33 @@ python-dateutil==2.9.0.post0
     #   typepy
 python-dotenv==1.2.4
     # via
+    #   daytona
+    #   fastmcp-slim
     #   mlflow-skinny
     #   moviepy
     #   pydantic-settings
+python-engineio==4.14.0
+    # via python-socketio
 python-json-logger==4.2.0
     # via jupyter-events
+python-multipart==0.0.32
+    # via
+    #   daytona
+    #   fastmcp-slim
+    #   gradio
+    #   mcp
+python-socketio==5.17.0
+    # via daytona
 pytz==2026.5
-    # via typepy
+    # via
+    #   gradio
+    #   typepy
 pywin32==312 ; sys_platform == 'win32'
-    # via docker
+    # via
+    #   docker
+    #   mcp
+pywin32-ctypes==0.2.3 ; sys_platform == 'win32'
+    # via keyring
 pywinpty==3.0.5 ; os_name == 'nt' and sys_platform != 'darwin'
     # via
     #   jupyter-server
@@ -954,13 +1207,16 @@ pyyaml==6.0.3
     #   albumentations
     #   cfn-lint
     #   datasets
+    #   fastmcp-slim
     #   flax
     #   gguf
+    #   gradio
     #   huggingface-hub
     #   jsonschema-path
     #   jupyter-events
     #   mlflow-skinny
     #   moto
+    #   openenv
     #   optuna
     #   orbax-checkpoint
     #   peft
@@ -1004,8 +1260,10 @@ requests==2.34.2
     #   jupyter-kernel-gateway
     #   mlflow-skinny
     #   moto
+    #   openenv
     #   opentelemetry-exporter-http-transport
     #   opentelemetry-exporter-otlp-proto-http
+    #   python-socketio
     #   requests-oauthlib
     #   responses
     #   tensorflow-datasets
@@ -1029,8 +1287,16 @@ rich==15.0.0
     # via
     #   dewml (pyproject.toml)
     #   cosmic-ray
+    #   cyclopts
+    #   e2b
+    #   fastmcp-slim
     #   flax
+    #   modal
+    #   openenv
+    #   rich-rst
     #   typer
+rich-rst==2.2.0
+    # via cyclopts
 rouge-score==0.1.2
     # via lm-eval
 rpds-py==2026.9.1
@@ -1045,6 +1311,8 @@ s3transfer==0.19.2
     # via boto3
 sacrebleu==2.6.0
     # via lm-eval
+safehttpx==0.1.7
+    # via gradio
 safetensors==0.8.0
     # via
     #   dewml (pyproject.toml)
@@ -1066,6 +1334,10 @@ scipy==1.18.1
     #   mlflow
     #   scikit-learn
     #   skops
+secretstorage==3.5.0 ; sys_platform == 'linux'
+    # via keyring
+semantic-version==2.10.0
+    # via gradio
 send2trash==2.1.0
     # via jupyter-server
 setuptools==84.0.0
@@ -1078,6 +1350,8 @@ shellingham==1.5.4
     # via typer
 simple-parsing==0.1.9
     # via tensorflow-datasets
+simple-websocket==1.1.0
+    # via python-engineio
 simplejson==4.2.0
     # via orbax-checkpoint
 simsimd==6.5.16
@@ -1108,13 +1382,19 @@ sqlitedict==2.1.0
     # via lm-eval
 sqlparse==0.6.0
     # via mlflow-skinny
+sse-starlette==3.5.0
+    # via mcp
 stack-data==0.6.3
     # via ipython
 starlette==1.7.0
     # via
     #   dewml (pyproject.toml)
     #   fastapi
+    #   fastmcp-slim
+    #   gradio
+    #   mcp
     #   mlflow-skinny
+    #   sse-starlette
 stevedore==5.9.1
     # via cosmic-ray
 stringzilla==5.2.0
@@ -1123,6 +1403,8 @@ sympy==1.14.0
     # via
     #   cfn-lint
     #   torch
+synchronicity==0.12.6
+    # via modal
 tabledata==1.3.5
     # via pytablewriter
 tabulate==0.10.0
@@ -1162,9 +1444,17 @@ tokenizers==0.23.3
 toml==0.10.2
     # via
     #   cosmic-ray
+    #   daytona
+    #   modal
     #   tensorflow-datasets
-tomlkit==0.15.1
-    # via pylint
+tomli==2.5.0
+    # via openenv
+tomli-w==1.2.0
+    # via openenv
+tomlkit==0.14.0
+    # via
+    #   gradio
+    #   pylint
 torch==2.14.1 ; sys_platform == 'darwin'
     # via
     #   dewml (pyproject.toml)
@@ -1245,7 +1535,15 @@ typepy==1.3.5
     #   pytablewriter
     #   tabledata
 typer==0.27.3
-    # via transformers
+    # via
+    #   gradio
+    #   hf-gradio
+    #   openenv
+    #   transformers
+types-certifi==2021.10.8.3
+    # via modal
+types-toml==0.10.8.20260518
+    # via modal
 typing-extensions==4.16.0
     # via
     #   dewml (pyproject.toml)
@@ -1255,28 +1553,46 @@ typing-extensions==4.16.0
     #   anyio
     #   beautifulsoup4
     #   cfn-lint
+    #   daytona
+    #   daytona-analytics-api-client
+    #   daytona-analytics-api-client-async
+    #   daytona-api-client
+    #   daytona-api-client-async
+    #   daytona-toolbox-api-client
+    #   daytona-toolbox-api-client-async
+    #   e2b
     #   etils
+    #   exceptiongroup
     #   fastapi
+    #   fastmcp-slim
     #   flax
+    #   gradio
+    #   gradio-client
     #   graphene
     #   grpcio
     #   httpx2
     #   huggingface-hub
     #   jupyter-client
     #   lm-eval
+    #   mcp
     #   mlflow-skinny
+    #   modal
+    #   obstore
     #   openai
+    #   openenv
     #   opentelemetry-api
     #   opentelemetry-exporter-otlp-proto-http
     #   opentelemetry-sdk
     #   opentelemetry-semantic-conventions
     #   orbax-checkpoint
+    #   py-key-value-aio
     #   pydantic
     #   pydantic-core
     #   referencing
     #   simple-parsing
     #   sqlalchemy
     #   starlette
+    #   synchronicity
     #   torch
     #   typeguard
     #   typing-inspection
@@ -1285,6 +1601,7 @@ typing-extensions==4.16.0
 typing-inspection==0.4.4
     # via
     #   fastapi
+    #   mcp
     #   pydantic
     #   pydantic-settings
 tyro==1.0.16
@@ -1293,13 +1610,18 @@ tzdata==2026.5
     # via
     #   arrow
     #   pandas
+uncalled-for==0.4.1
+    # via fastmcp-slim
 uri-template==1.3.0
     # via jsonschema
 urllib3==2.8.0
     # via
-    #   dewml (pyproject.toml)
     #   botocore
     #   databricks-sdk
+    #   daytona
+    #   daytona-analytics-api-client
+    #   daytona-api-client
+    #   daytona-toolbox-api-client
     #   docker
     #   requests
     #   responses
@@ -1307,7 +1629,11 @@ urllib3==2.8.0
 uvicorn==0.54.0
     # via
     #   dewml (pyproject.toml)
+    #   fastmcp-slim
+    #   gradio
+    #   mcp
     #   mlflow-skinny
+    #   openenv
 uvloop==0.23.0 ; sys_platform != 'win32'
     # via orbax-checkpoint
 wadler-lindig==0.1.7
@@ -1316,6 +1642,12 @@ waitress==3.0.2 ; sys_platform == 'win32'
     # via mlflow
 wandb==0.30.0
     # via dewml (pyproject.toml)
+watchfiles==1.3.0
+    # via
+    #   fastmcp-slim
+    #   modal
+wcmatch==11.1
+    # via e2b
 wcwidth==0.9.2
     # via
     #   ftfy
@@ -1328,9 +1660,14 @@ webencodings==0.6.1
     #   bleach
     #   tinycss2
 websocket-client==1.9.2
-    # via jupyter-server
+    # via
+    #   jupyter-server
+    #   python-socketio
 websockets==17.1
-    # via dewml (pyproject.toml)
+    # via
+    #   dewml (pyproject.toml)
+    #   fastmcp-slim
+    #   openenv
 werkzeug==3.1.9
     # via
     #   flask
@@ -1350,7 +1687,14 @@ wrapt==2.5.0
     #   aws-xray-sdk
     #   deprecated
     #   dm-tree
+    #   opentelemetry-instrumentation
+    #   opentelemetry-instrumentation-aiohttp-client
     #   tensorflow-datasets
+wsproto==1.3.2
+    # via
+    #   daytona
+    #   httpx-ws
+    #   simple-websocket
 xmltodict==1.0.4
     # via moto
 xprof==2.23.1
