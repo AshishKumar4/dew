@@ -362,11 +362,15 @@ def port_reference(per_key: bool, scale: float) -> dict:
         decays = _decays(_keyed(p))
         if p.ndim == 4:
             return jnp.einsum('bnihd,bnjhd->bnhij', left, right) * decays[..., 0]
-        return jnp.einsum('bnihd,bnjhd,bnhijd->bnhij', left, right, decays)
+        # Each key decayed to the row, then the row's products summed, as Dew's portable math pairs them.
+        gated = jnp.moveaxis(right, 3, 2)[:, :, :, None] * decays
+        return jnp.einsum('bnihd,bnhijd->bnhij', left, gated)
 
     def inverse(k, prefix, beta, q=None):
         k, prefix, beta = _widened(k, prefix, beta)
-        return _inverse(_strict(pairs(k, k, prefix) * jnp.moveaxis(beta, 3, 2)[..., None]))
+        if prefix.ndim == 4:
+            return _inverse(_strict(pairs(k, k, prefix) * jnp.moveaxis(beta, 3, 2)[..., None]))
+        return _inverse(_strict(pairs(k * beta[..., None], k, prefix)))
 
     def scores(q, k, prefix, beta):
         q, k, prefix = _widened(q, k, prefix)
