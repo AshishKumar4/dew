@@ -78,21 +78,54 @@ def test_a_token_mixture_weighs_a_published_generations_windows_by_its_documents
     assert abs(left - right) <= 12 + 12
 
 
+@pytest.mark.parametrize("counted", [True, False], ids=["counted", "uncounted"])
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-def test_a_crop_after_a_layout_of_documents_counted_by_every_target_is_counted_again(read):
-    """Documents counted by every target, whose roles a projection leaves out, laid out in windows
-    of four that a crop then cuts to three: each window delivers what the crop left, two targets,
-    as one never counted does, so two such corpora deliver equal targets to within a window."""
+def test_a_crop_after_a_layout_is_counted_as_the_windows_it_leaves(read, counted):
+    """Documents, counted by every target or never, whose roles a projection leaves out, laid out in
+    windows of four that a crop cuts to three, beside a corpus whose windows of four are left
+    whole: each cropped window delivers two targets and each whole one four, and a mixture by
+    tokens weighs them so, so the two deliver equal targets to within a window of each."""
     from dew.data.steps.text import CountTargets, LengthPolicy
 
-    def corpus(source, *, counted):
+    def corpus(source, *, cropped):
         documents = Pipeline(roled(source, 7, 3), name=str(source))
         documents = documents.filter_map(CountTargets()) if counted else documents
-        projected = documents.select_columns("text", "source").windows(4).map(LengthPolicy(3))
-        return projected.map(Sourced(source))
+        windows = documents.select_columns("text", "source").windows(4)
+        return (windows.map(LengthPolicy(3)) if cropped else windows).map(Sourced(source))
 
-    left, right = delivered([corpus(0, counted=True), corpus(1, counted=False)], None, read)
-    assert abs(left - right) <= 2 + 2
+    left, right = delivered([corpus(0, cropped=True), corpus(1, cropped=False)], None, read)
+    assert abs(left - right) <= 2 + 4
+
+
+@dataclasses.dataclass(frozen=True)
+class HalfScored:
+    """Counts the targets of a record with an odd id in role 1, and of the rest every target."""
+
+    def map(self, row):
+        from dew.data.steps.text import CountTargets
+
+        return (CountTargets(role=1) if int(row["id"]) % 2 else CountTargets()).map(row)
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_generation_of_documents_counted_by_two_rules_is_packed_as_its_rows_arrive(tmp_path, read):
+    """A generation whose rows were counted by two rules, every target's and role 1's, states the
+    one it cannot plan by, so a pack of its source does not plan by the documents' lengths: it lays
+    the rows out as they arrive, where a layout holding two rules is refused."""
+    from dew.data.text import Chunks
+
+    documents = (Pipeline(roled(0, 7, 3), name="half").filter_map(HalfScored(), identity="half-scored@1")
+                 .flat_map(Chunks(16, fields=ROLED)))
+    cache = Cache(str(tmp_path / "cache"), spool_bytes=4 * 1024**2, shard_bytes=256 * 1024)
+    generation = publish(documents, cache, read="indexed", loading=READ)
+    assert generation.source().metadata()["count_rules"] == [(1, None)]
+    chain = Pipeline(generation.source()).pack(16, fields=ROLED).repeat().batch(2)
+    with pytest.raises(ValueError):
+        stream = compile(chain, read=read, loading=READ).train(DataPartition())
+        try:
+            next(stream)
+        finally:
+            stream.close()
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
