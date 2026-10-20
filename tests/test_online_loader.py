@@ -85,11 +85,12 @@ def serving(handle):
         server.server_close()
 
 
-def test_an_endless_read_reads_on_through_passes_whose_fetches_failed_until_one_returns():
+@pytest.mark.parametrize("repeats", ["endless", "two passes, endlessly"])
+def test_an_endless_read_reads_on_through_passes_whose_fetches_failed_until_one_returns(repeats):
     """A catalog's one url fails for its first three fetches, so each of those passes yields
     nothing; a failed fetch may succeed next time, so the endless read reads on, counting each
-    failure, and gives the record once the server returns it, where the first empty pass was once
-    refused."""
+    failure through every pass, a finite repeat's within an endless one's too, and gives the record
+    once the server returns it, where the first empty pass was once refused."""
     served = []
 
     def handle(request):
@@ -104,7 +105,8 @@ def test_an_endless_read_reads_on_through_passes_whose_fetches_failed_until_one_
         request.wfile.write(b"payload")
 
     with serving(handle) as address:
-        chain = Pipeline(Memory([{"url": f"http://{address}/object"}])).filter_map(Fetch()).repeat().batch(1)
+        fetched = Pipeline(Memory([{"url": f"http://{address}/object"}])).filter_map(Fetch())
+        chain = (fetched.repeat() if repeats == "endless" else fetched.repeat(2).repeat()).batch(1)
         data = compile(chain, read="indexed", loading=READ)
         stream = data.train(DataPartition())
         try:
