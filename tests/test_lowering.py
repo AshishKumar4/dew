@@ -7,6 +7,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -19,16 +20,20 @@ from dew.nn.kernels.generation import (
     PALLAS_CHOICES,
     TARGETS,
     UNCLASSIFIED,
+    GpuTarget,
     Refusal,
     Route,
     assumed,
     chosen as kernel_choices,
+    device_generation,
+    fp8_tensor_cores,
     gpu_mesh,
     gpu_target,
     measured_kernel,
     refused,
     route,
     routes,
+    runtime_facts,
     triton_runs,
 )
 from dew.training._lowering import triton_kernels
@@ -273,6 +278,42 @@ def test_a_mamba2_layer_lowers_its_ssd_scan_on_each_shard_of_a_tpu_mesh():
     assert len(calls) == 2, calls
     for call in calls:
         assert "tensor<1x128x4x64xf32>" in call or "tensor<1x4x128x64xf32>" in call, call
+
+
+@pytest.mark.parametrize("generation, cores", [
+    ("sm80", False), ("sm86", False), ("sm89", True), ("sm90", True), ("sm100", True), ("sm120", True),
+    ("v6e", False), ("cpu", False)])
+def test_fp8_tensor_cores_are_a_fact_of_the_compute_capability(generation, cores):
+    """Capability 8.9 and later multiplies FP8, whether or not the target table names the generation."""
+    assert fp8_tensor_cores(generation) is cores
+
+
+def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():
+    """A CUDA device of a generation no row names (a B200, sm100) takes its multiprocessors from the
+    device, and Hopper's warpgroup MMA from its capability, 9.0 alone, so a launch sized by them sizes
+    itself rather than taking a default for want of a row."""
+    blackwell = runtime_facts(GpuTarget("sm100", "NVIDIA B200"),
+                              SimpleNamespace(compute_capability="10.0", core_count=148, local_hardware_id=0))
+    hopper = runtime_facts(GpuTarget("sm90", "NVIDIA H100 80GB HBM3"),
+                           SimpleNamespace(compute_capability="9.0", core_count=132, local_hardware_id=0))
+    assert (blackwell.multiprocessors, blackwell.wgmma) == (148, False)
+    assert (hopper.multiprocessors, hopper.wgmma) == (132, True)
+
+
+@pytest.mark.gpu(reason="reads the CUDA driver")
+def test_a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it(monkeypatch):
+    """The default device's shared memory a block and multiprocessors come from its driver and JAX's
+    device, the same with its generation's row removed from the table, and equal to what the row
+    records where it names one."""
+    named = gpu_target()
+    row = TARGETS.get(device_generation())
+    monkeypatch.delitem(TARGETS, device_generation(), raising=False)
+    unnamed = gpu_target()
+    assert unnamed.shared_limit is not None and unnamed.multiprocessors == jax.devices()[0].core_count
+    assert (unnamed.shared_limit, unnamed.multiprocessors, unnamed.wgmma) == (
+        named.shared_limit, named.multiprocessors, named.wgmma)
+    if row is not None and row.shared_limit is not None:
+        assert named.shared_limit == row.shared_limit
 
 
 def test_chosen_kernels_keep_other_choices_and_restore_the_row_after_an_exception():

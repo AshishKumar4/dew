@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
+import functools
 import inspect
 import logging
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -235,8 +236,7 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
         if target.generation != generation:
             canonical = TARGETS.get(generation, GpuTarget(generation, kind))
             target = dataclasses.replace(canonical, device_kind=kind) if real else canonical
-        counted = _multiprocessors(device) if real else None
-        return target if counted is None else dataclasses.replace(target, multiprocessors=counted)
+        return runtime_facts(target, device) if real else target
     if identifier in TARGETS:
         return TARGETS[identifier]
     for target in TARGETS.values():
@@ -281,6 +281,33 @@ def _multiprocessors(device) -> int | None:
     field, and a CUDA device reports them as its cores, so it is read at this
     boundary; a device without one gives None."""
     return getattr(device, 'core_count', None)
+
+
+@functools.cache
+def _shared_memory(ordinal: int) -> int | None:
+    """The shared memory a block of the visible CUDA device `ordinal` may hold, as its driver reports
+    it (`dew.telemetry.devices.SHARED_MEMORY_PER_BLOCK`), or None where no driver answers. JAX's
+    Device reports no such fact."""
+    from dew.telemetry.devices import SHARED_MEMORY_PER_BLOCK, gpu_attribute
+
+    return gpu_attribute(ordinal, SHARED_MEMORY_PER_BLOCK)
+
+
+def runtime_facts(target: GpuTarget, device) -> GpuTarget:
+    """`target` with the facts a real CUDA `device` reports of itself in place of the table's: its
+    multiprocessors, its block's shared memory, and Hopper's warpgroup MMA, which capability 9.0 alone
+    has. A GPU the table does not name so keeps every resource a kernel's requirements read."""
+    capability = _compute_capability(device)
+    facts = {'multiprocessors': _multiprocessors(device),
+             'shared_limit': _shared_memory(device.local_hardware_id)}
+    return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None},
+                               wgmma=capability == '9.0' if capability else target.wgmma)
+
+
+def fp8_tensor_cores(generation: str) -> bool:
+    """Whether a CUDA generation's tensor cores multiply FP8: compute capability 8.9 (Ada) and later."""
+    found = capability(generation)
+    return found is not None and found >= (8, 9)
 
 
 def device_generation() -> str:

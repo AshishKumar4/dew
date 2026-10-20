@@ -716,7 +716,7 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     leaving them at the measurement's agreement.
     """
     from dew import cache, coordination
-    from dew.nn.kernels.generation import device_generation, gpu_target
+    from dew.nn.kernels.generation import device_generation, fp8_tensor_cores
 
     def planned() -> dict:
         return {"tokens": tokens,
@@ -729,7 +729,7 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
         if jax.process_index() != 0:
             return None
         generation = device_generation()
-        if gpu_target(generation).fp8_peak is None:
+        if not fp8_tensor_cores(generation):
             raise ValueError(f"{generation} has no FP8 tensor cores to run a frozen base in FP8 on")
         if not cache.measures_picks():
             raise ValueError("frozen FP8 sites are measured on a GPU the process holds alone, and this "
