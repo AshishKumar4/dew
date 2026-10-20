@@ -65,6 +65,7 @@ class _DewCall(TypedDict):
     finish_reason: str
     version: int
     support: list[list[int]] | None
+    reward: float | None
 
 
 class VerlRow(TypedDict):
@@ -121,6 +122,7 @@ def to_verl(trajectories: Sequence[Session | VerlTrajectory]) -> list[VerlRow]:
                         "finish_reason": call.finish_reason,
                         "version": call.version,
                         "support": None if call.support is None else [list(kept) for kept in call.support],
+                        "reward": call.reward,
                     }
                 )
             versions = [session.calls[index].version for index, _, _ in chain.members]
@@ -233,6 +235,7 @@ def _calls(row: Mapping[str, object], version: int | None,
                 routed_experts=None if record is None else record[:forwarded],
                 support=None if support is None else sequence(
                     support, lambda kept: integers(kept, "support"), "support"),
+                reward=None if meta.get("reward") is None else real(meta["reward"], "reward"),
             )
         )
     return tuple(calls)

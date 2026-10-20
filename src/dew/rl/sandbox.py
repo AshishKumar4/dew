@@ -63,6 +63,7 @@ from typing import Protocol
 from dew.data.prompts import PromptRecord
 from dew.inference.rollouts import InfrastructureError
 from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
+from dew.objectives.rl.records import real
 from dew.records import JSON
 
 
@@ -101,13 +102,11 @@ def _observation(value: object) -> Observation:
     reward = value.get("reward")
     if not isinstance(context, list) or not isinstance(status, str) or not isinstance(detail, str):
         raise ValueError("sandbox observation needs context ids, a status name and string detail")
-    if reward is not None and (isinstance(reward, bool) or not isinstance(reward, (int, float))):
-        raise ValueError(f"a sandbox observation's reward is a number, got {reward!r}")
     try:
         state = EpisodeStatus[status.upper()]
     except KeyError:
         raise ValueError(f"unknown sandbox observation status {status!r}") from None
-    return Observation(tuple(context), state, detail, reward)
+    return Observation(tuple(context), state, detail, None if reward is None else real(reward, "reward"))
 
 
 def launch(command: tuple[str, ...], limits: SandboxLimits, directory: str) -> subprocess.Popen[bytes]:

@@ -160,7 +160,7 @@ def test_step_rewards_credit_each_call_with_the_return_ahead_of_it(credit):
         yield Counter(paid=paid[identity.sample])
 
     episodes = source(Server(), environment)
-    rollouts = [future.result(timeout=10) for future in episodes.submit(Task("3"), 4, version=0, key=KEY)]
+    rollouts = [future.result() for future in episodes.submit(Task("3"), 4, version=0, key=KEY)]
     episodes.close()
     assert [[call.reward for call in rollout.calls] for rollout in rollouts] == [
         list(paid[rollout.sample]) for rollout in rollouts]
@@ -172,6 +172,27 @@ def test_step_rewards_credit_each_call_with_the_return_ahead_of_it(credit):
             expected = ahead[index][at] - np.mean([returns[at] for returns in ahead])
             mine = (batch["session_index"] == index) & (batch["call_index"] == turn)
             assert mine.any() and (batch["advantages"][mine] == np.float32(expected)).all()
+
+
+def test_a_session_ended_at_reset_takes_no_turn_in_the_turn_credit():
+    """An environment whose sample 0 ends at its reset, scored 1 with no call, beside one that
+    takes one call and scores 0: the call has no other call at its turn to compare with, so its
+    turn advantage is zero, while session credit compares the two whole returns."""
+    class Ended:
+        def reset(self):
+            return Observation((), EpisodeStatus.COMPLETED, "solved at reset")
+
+    @contextmanager
+    def environment(task, identity):
+        yield Ended() if identity.sample == 0 else Counter(turns=1)
+
+    episodes = source(Server(), environment, verifier=lambda task, episode: 1.0 - len(episode.transitions))
+    ended, called = [future.result() for future in episodes.submit(Task("3"), 2, version=0, key=KEY)]
+    episodes.close()
+    assert (ended.calls, ended.reward, len(called.calls), called.reward) == ((), 1.0, 1, 0.0)
+    for credit, expected in (("turn", 0.0), ("session", -0.5)):
+        batch = pack([ended, called], 16, rows=1, estimator="mean", credit=credit)
+        assert (batch["advantages"][batch["session_index"] == 1] == np.float32(expected)).all()
 
 
 def test_every_call_of_a_multi_turn_session_carries_its_draws_engine_records():
