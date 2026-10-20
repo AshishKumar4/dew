@@ -1648,6 +1648,9 @@ class _StreamOnly:
     def describe(self):
         return f"stream-only {self.memory.describe()}"
 
+    def label(self):
+        return self.memory.label()
+
     def fingerprint(self):
         return self.memory.fingerprint()
 

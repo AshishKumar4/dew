@@ -725,6 +725,61 @@ def test_chunks_cut_long_documents_keeping_every_target():
     assert [piece["text"].tolist() for piece in pieces] == [[0, 1, 2, 3], [3, 4, 5, 6], [6, 7, 8, 9]]
 
 
+def test_a_mix_counts_each_corpus_under_a_name_of_its_own(tmp_path):
+    """Two unnamed stores share a file name and a third is named as one of theirs would be
+    numbered: each corpus keeps its own counts, the two numbered past the name the third holds."""
+    for part in ("first", "second"):
+        (tmp_path / part).mkdir()
+        (tmp_path / part / "train.jsonl").write_text("".join(f'{{"id": {index}}}\n' for index in range(8)))
+    corpora = [Files(str(tmp_path / part / "train.jsonl")) for part in ("first", "second")]
+    named = Memory([{"id": index} for index in range(8)]).named("train-1")
+    counts = mix([*corpora, named]).stats(records=6)
+    assert {name for name in counts if name.startswith("data/rows/")} == {
+        "data/rows/train-1", "data/rows/train-2", "data/rows/train-3"}
+    assert sum(counts[f"data/rows/train-{place}"] for place in (1, 2, 3)) == 6
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_mixtures_grain_step_drops_rows_it_rejects_and_counts_them(read):
+    """A Grain step after a mix that rejects rows (`Rejected`) has them dropped before the batch
+    and counted under the mixture, beside its corpora's own counts."""
+    from dew.data.pipeline import Rejected
+
+    def odd_rejected(rows):
+        return rows.map(lambda row: Rejected("odd") if int(row["i"]) % 2 else row)
+
+    mixed = mix([Memory(rows("a", 8)).named("a"), Memory(rows("b", 8)).named("b")])
+    chain = mixed.grain(odd_rejected, identity="odd-rejected@1").batch(2)
+    data = compile(chain, read=read, loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        batches = [next(stream) for _ in range(3)]
+    finally:
+        stream.close()
+    assert all(int(value) % 2 == 0 for batch in batches for value in batch["i"])
+    assert data.statistics()["data/rejected/mixture/odd"] > 0
+
+
+def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
+    """A memory read runs a corpus's steps before its repeat and reads the rest as it goes: every
+    row it delivers was cut short after the repeat, so its truncated share is one, whatever the
+    rows the memory read held before."""
+    from dew.data.steps.text import LengthPolicy
+
+    rows = Memory([{"text": np.arange(5, dtype=np.int32)} for _ in range(4)])
+    chain = (rows.repeat(1).map(LengthPolicy(2)).filter(lambda row: True, identity="all@1")
+             .take(1).batch(1))
+    data = compile(chain, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1))
+    stream = data.train(DataPartition())
+    try:
+        assert np.asarray(next(stream)["text"]).tolist() == [[0, 1]]
+    finally:
+        stream.close()
+    counts = data.statistics()
+    assert counts["data/rows/memory"] == 1
+    assert counts["data/truncated/memory"] == 1.0
+
+
 def test_a_character_filter_and_caption_dropout_keep_and_empty_their_records():
     """text.MinChars keeps the texts of at least its count of characters, and text.Dropped empties
     a kept record's caption by the record's own draw: none at p=0, every one at p=1, and at any p
@@ -769,8 +824,8 @@ def test_stats_bounds_preprocessing_and_counts_only_the_inspected_records(read):
 
     chain = dataclasses.replace(Memory(rows("a", 40)).named("sample"), mode=read, loading=READ)
     counts = chain.map(prepare, identity="stats-prepare@1").filter_map(drop_thirds).stats(10)
-    assert counts["data/accepted/sample"] == 10
-    assert counts["data/attempted/sample"] == 15
+    assert counts["data/rows/sample"] == 10
+    assert counts["data/rows/sample"] + counts["data/rejected/sample/third"] == 15
     assert counts["data/rejected/sample/third"] == 5
     assert processed == list(range(15))
 
@@ -787,8 +842,8 @@ def test_stats_stops_at_a_finite_sources_end(records):
     counts = chain.map(prepare, identity="stats-finite@1").filter_map(drop_thirds).stats(records)
     expected = 0 if records == 0 else 7
     assert processed == list(range(expected))
-    assert counts.get("data/attempted/sample", 0) == expected
-    assert counts.get("data/accepted/sample", 0) == (0 if records == 0 else 4)
+    assert counts.get("data/rows/sample", 0) + counts.get("data/rejected/sample/third", 0) == expected
+    assert counts.get("data/rows/sample", 0) == (0 if records == 0 else 4)
 
 
 @pytest.mark.parametrize("read", [None, "memory", "indexed", "streamed"])
@@ -801,7 +856,7 @@ def test_stats_counts_one_to_one_chains_lazily(read):
 
     chain = dataclasses.replace(Memory(rows("a", 7)).named("sample"), mode=read, loading=READ)
     counts = chain.map(prepare, identity="stats-one-to-one@1").stats(3)
-    assert counts["data/attempted/sample"] == counts["data/accepted/sample"] == 3
+    assert counts["data/rows/sample"] == 3
     assert processed == [0, 1, 2]
 
 

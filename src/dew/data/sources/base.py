@@ -12,7 +12,8 @@ find them: a step that needs a global fact reads it here or from config, and
 a streamed source without it is refused before the run opens. `describe` and
 `fingerprint` are its identity: the first is what a saved position names, the
 second what a cache's key and a run's plan record (the URI, the resolved
-revision, each file's size and ETag).
+revision, each file's size and ETag). `label` is the short name a person reads
+in a run's metrics, never its identity.
 """
 
 from __future__ import annotations
@@ -114,6 +115,10 @@ class Source(Protocol):
         """A stable description: store, URI, revision and split, never an address."""
         ...
 
+    def label(self) -> str:
+        """The store's short name in a run's metrics: its dataset, builder or file name."""
+        ...
+
     def fingerprint(self) -> Mapping[str, object]:
         """The store's identity for a cache key and a run's plan: the URI, the
         resolved revision, and each file's size and ETag or generation."""
@@ -140,6 +145,13 @@ class Source(Protocol):
         """Each record's length when the store states it (a producer's index),
         which length grouping ranks by; None when it does not."""
         ...
+
+
+def url_label(url: str) -> str:
+    """The name a store at `url` goes by: its last path part that is no pattern, without extensions
+    (`s3://corpus/forum/*.jsonl` is `forum`, `data/train.jsonl.gz` is `train`)."""
+    parts = [part for part in url.split("://", 1)[-1].split("/") if part and not set(part) & set("*?[{")]
+    return parts[-1].split(".", 1)[0] if parts else url
 
 
 @runtime_checkable

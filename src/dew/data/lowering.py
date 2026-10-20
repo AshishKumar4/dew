@@ -35,6 +35,7 @@ from dew.data.analysis import (
     _drops,
     _identity,
     _in_memory,
+    _label,
     _Lowering,
     _member_keys,
     _name,
@@ -192,6 +193,15 @@ def _position(value: Record) -> int | None:
     return int(value[_POSITION])
 
 
+def _counts_own_rows(pipeline: Pipeline) -> bool:
+    """Whether a per-share read counts `pipeline`'s rows as they leave it: a corpus does, and a
+    mixture does only where a Grain step of its own may drop rows, which no count of its own
+    follows; else its rows are its corpora's, each counted."""
+    if not isinstance(pipeline.source, (Mixture, Phases)):
+        return True
+    return any(isinstance(stage, Native) for stage in pipeline.stages)
+
+
 def _unplaced(value: Record) -> Record:
     if value is None or isinstance(value, (bytes, Rejected)) or _POSITION not in value:
         return value
@@ -266,8 +276,8 @@ class _Rows(gx.FlatMapTransform):
         return tuple(_placed(output, position) for output in outputs)
 
 
-def _expanded(rows: pygrain.IterDataset, stage: FlatMap, name: str) -> pygrain.IterDataset:
-    return (Chunked(rows, name, functools.partial(_Rows, stage)) if isinstance(stage.step, Chunks)
+def _expanded(rows: pygrain.IterDataset, stage: FlatMap, name: str, label: str) -> pygrain.IterDataset:
+    return (Chunked(rows, name, label, functools.partial(_Rows, stage)) if isinstance(stage.step, Chunks)
             else gx.FlatMapIterDataset(rows, _Rows(stage)))
 
 
@@ -327,12 +337,13 @@ class _ShardSteps:
     stages: tuple[Map | MapWithIndex | Filter | FlatMap, ...]
     cached: bool
     name: str
+    label: str
 
     def __call__(self, shard: Shard) -> pygrain.IterDataset:
         rows = self.reader(shard)
         rows = gx.FlatMapIterDataset(rows, _CachedOutputs()) if self.cached else rows
         for stage in self.stages:
-            rows = (_expanded(rows, stage, self.name) if isinstance(stage, FlatMap)
+            rows = (_expanded(rows, stage, self.name, self.label) if isinstance(stage, FlatMap)
                     else rows.map(_Rows(stage)))
         return rows
 
@@ -672,7 +683,7 @@ class _Build:
             checked = primed_maps(mapped)
             return pygrain.MapDataset.mix(checked, _weights(source))
         streams = [
-            Accepted(_as_iter(parent, self.loading), _name(child), budget=self.budget)
+            Accepted(_as_iter(parent, self.loading), _name(child), _label(child), budget=self.budget)
             for parent, child in zip(parents, source.pipelines, strict=True)
         ]
         # A streamed mix saves each member's position under its key, so a member that joins starts
@@ -684,6 +695,7 @@ class _Build:
                 source.weights,
                 tokens=source.tokens,
                 names=[_name(child) for child in source.pipelines],
+                labels=[_label(child) for child in source.pipelines],
                 keys=keys,
                 budget=self.budget,
             )
@@ -718,7 +730,7 @@ class _Build:
         view = self.shared(placed, pipeline, partition)
         rows = cached.iterated(view, pygrain.ReadOptions(self.loading.threads, self.loading.read_buffer))
         flat = gx.FlatMapIterDataset(rows, _CachedOutputs())
-        return Accepted(flat, _name(pipeline), budget=self.budget), cache + 1
+        return Accepted(flat, _name(pipeline), _label(pipeline), budget=self.budget), cache + 1
 
     def sharded(
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int
@@ -739,12 +751,11 @@ class _Build:
         shards = _positioned(shards) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
         local = tuple(stage for stage in written if isinstance(stage, _LOCAL))
-        shards = dataclasses.replace(
-            shards, reader=_ShardSteps(shards.reader, local, cache is not None, _name(pipeline))
-        )
+        steps = _ShardSteps(shards.reader, local, cache is not None, _name(pipeline), _label(pipeline))
+        shards = dataclasses.replace(shards, reader=steps)
         rows = self.streamed(shards, pipeline, partition)
         if cache is not None or any(_drops(stage) for stage in local):
-            rows = Accepted(rows, _name(pipeline), budget=self.budget)
+            rows = Accepted(rows, _name(pipeline), _label(pipeline), budget=self.budget)
         return rows, start if interleave is None else interleave + 1
 
     def shared(
@@ -798,8 +809,9 @@ class _Build:
             rows = self.stage(rows, stage, pipeline, partition, index)
             if index == last:
                 rows = rows.map(_unplaced)
-        if not self.global_order:
-            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), budget=self.budget)
+        if not self.global_order and _counts_own_rows(pipeline):
+            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
+                            budget=self.budget)
         return rows
 
     def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition, at: int) -> Rows:
@@ -874,7 +886,8 @@ class _Build:
         """The windows that hold a target of their token `field`, as a memory read's and a packing
         plan's are (`materialize._targeted`, `packing.plan_windows`): one with nothing to predict
         is counted as zero_targets and left out, so how a run reads does not change its steps."""
-        return Accepted(windows, _name(pipeline), budget=self.budget, tokens=ValidTargets(field))
+        return Accepted(windows, _name(pipeline), _label(pipeline), budget=self.budget,
+                        tokens=ValidTargets(field))
 
     def block_shuffle(self, rows: Rows, stage: Shuffle, pipeline: Pipeline, partition: DataPartition) -> Rows:
         from dew.data.ordering import BlockShuffle
@@ -904,13 +917,14 @@ class _Build:
     ) -> Rows:
         lowered = _Rows(stage)
         if isinstance(stage, FlatMap):
-            rows = _expanded(_as_iter(rows, self.loading), stage, _name(pipeline))
+            rows = _expanded(_as_iter(rows, self.loading), stage, _name(pipeline), _label(pipeline))
         elif isinstance(stage, RandomMap):
             rows = rows.random_map(lowered, seed=self.stage_seed(pipeline, at, partition))
         else:
             rows = rows.map(lowered)
         if isinstance(stage, (Filter, FlatMap)) or stage.rejects:
-            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), budget=self.budget)
+            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
+                            budget=self.budget)
         return rows
 
     def batches(
