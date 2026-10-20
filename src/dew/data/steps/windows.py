@@ -73,6 +73,9 @@ class WindowSource:
     length: int
     stride: int
 
+    def label(self) -> str:
+        return self.original.label()
+
     def describe(self) -> str:
         return f"{self.original.describe()} causal windows={self.length},stride={self.stride}"
 
