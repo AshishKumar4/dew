@@ -27,6 +27,7 @@ from dew.objectives.rl.sessions import (
     Call,
     Session,
     Status,
+    Transcript,
     pack,
 )
 from dew.objectives.rl.verl import compute_score, from_verl, to_verl, verl_reward
@@ -106,15 +107,18 @@ def test_packed_native_rows_match_verls_tensor_mapping():
 
 def test_rollouts_round_trip_through_verl_rows_losslessly():
     """Dew's own metadata restores what verl's fields lack: identity,
-    status, finish reasons, versions and the sampling support, across a
-    rollout whose token history or routing broke the strict chain (three rows)."""
+    status, finish reasons, versions, step rewards, transcripts and the sampling support,
+    across a rollout whose token history or routing broke the strict chain
+    (three rows), and packs to the same batch under either credit."""
     routed = np.arange(4 * 2 * 2).reshape(4, 2, 2) % 5
     calls = (
         Call(
             (1, 2), (3, 4), (-0.5, -0.25), "tool_calls", 3, routed_experts=routed[:3], support=((3, 9), (4,))
         ),
         Call((1, 2, 3, 4, 7), (8,), (-1.0,), "length", 4, routed_experts=routed[:, :, :].repeat(2, 0)[:5]),
-        Call((5, 6), (2,), (-0.125,), "stop", 4),
+        Call((5, 6), (2,), (-0.125,), "stop", 4, reward=0.75, transcript=Transcript(
+            ({"role": "user", "content": "go on"},),
+            {"role": "assistant", "content": "done", "tool_calls": [{"id": "a", "type": "function"}]})),
     )
     rollout = Session("task", "g", 1, 2, calls, Status.COMPLETED, 0.5, {"tests": 0.5}, "log://1")
     failed = Session("task", "g", 2, 0, (Call((1,), (2,), (-3.0,), "abort", 4),), Status.INFRA_ERROR, None)
@@ -126,8 +130,15 @@ def test_rollouts_round_trip_through_verl_rows_losslessly():
     assert rows[1]["extra_fields"]["min_global_steps"] == rows[1]["extra_fields"]["max_global_steps"] == 4
     restored = [trajectory.session for trajectory in from_verl(rows)]
     assert restored == [rollout, failed]
-    for key, value in pack([rollout], 16, support_capacity=4).items():
-        np.testing.assert_array_equal(pack(restored[:1], 16, support_capacity=4)[key], value, err_msg=key)
+    other = Session("task", "g", 3, 0, (Call((1, 2), (3,), (-0.5,), "stop", 4, reward=0.25),),
+                    Status.COMPLETED, 0.0)
+    again = [trajectory.session for trajectory in from_verl(json.loads(json.dumps(to_verl([other]))))]
+    assert again == [other]
+    for credit in ("session", "turn"):
+        packed = pack([rollout, other], 16, support_capacity=4, credit=credit)
+        for key, value in pack([*restored[:1], *again], 16, support_capacity=4, credit=credit).items():
+            np.testing.assert_array_equal(value, packed[key], err_msg=f"{credit} {key}")
+        assert np.any(packed["advantages"] != 0)
     assert SUPPORT_KEY in pack(restored[:1], 16, support_capacity=4)
 
 

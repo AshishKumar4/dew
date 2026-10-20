@@ -52,7 +52,7 @@ import importlib
 import inspect
 import math
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -62,6 +62,7 @@ import numpy as np
 from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
+from dew.cache import QUANTIZED_TRACE
 from dew.nn.fake_quant import correctly_rounded_divide
 from dew.nn.kernels.generation import backend
 from dew.nn.precision import asks_default_precision
@@ -204,10 +205,26 @@ def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Qua
 
 def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantization) -> nn.Module:
     """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in the class Qwix
-    makes for the call, a `QuantizedClass` of `spec` (`dew.nn.kernels.options.compiler_options`)."""
-    quantized = _qwix().quantize_model(model, provider, methods=entry_methods(model))
-    type(quantized)._dew_quantization = spec
+    makes for the call, a `QuantizedClass` of `spec` (`dew.nn.kernels.options.compiler_options`),
+    each method tracing what it calls under the key `QUANTIZED_TRACE` gives the provider."""
+    methods = entry_methods(model)
+    quantized = _qwix().quantize_model(model, provider, methods=methods)
+    layer = type(quantized)
+    layer._dew_quantization = spec
+    key = (type(provider).__name__, spec)
+    for name in methods:
+        setattr(layer, name, _keyed(getattr(layer, name), key))
     return quantized
+
+
+def _keyed[**Arguments, Result](method: Callable[Arguments, Result],
+                                 key: Hashable) -> Callable[Arguments, Result]:
+    """`method` run under `key` in `QUANTIZED_TRACE`."""
+    @functools.wraps(method)
+    def keyed(*args: Arguments.args, **kwargs: Arguments.kwargs) -> Result:
+        with QUANTIZED_TRACE(key):
+            return method(*args, **kwargs)
+    return keyed
 
 
 def _qwix(module: str = "qwix") -> ModuleType:

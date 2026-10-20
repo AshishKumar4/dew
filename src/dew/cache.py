@@ -189,6 +189,15 @@ KERNEL_CHOICES = jax.make_user_context(())
 this thread, keyed on as `KERNEL_TUNES` is, so a program traced before a
 choice traces again within it."""
 
+QUANTIZED_TRACE = jax.make_user_context(default_value=None)
+"""What a quantized model's methods trace under, its provider's kind and spec
+(`dew.quantization`), keyed on as `KERNEL_TUNES` is. Qwix intercepts
+`jax.lax.dot_general` by swapping its code while a wrapped method runs, and
+`jnp.matmul`, `jnp.dot` and the other contractions that reach it are jitted,
+so a trace of one taken under the swap holds its quantized product, which JAX's
+cache would hand a later plain call of the same shapes, and a plain trace a
+quantized call. In this context their traces are kept apart."""
+
 
 def keeps_picks() -> bool:
     """Whether this process reads and stores GPU picks, XLA's and the
