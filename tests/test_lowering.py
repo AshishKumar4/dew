@@ -304,8 +304,10 @@ def test_a_choice_no_dispatch_reads_is_refused_by_name():
 
 def test_a_call_the_dispatch_sends_off_flash_is_logged_at_info_and_a_float32_call_not_at_all():
     """FlashAttention takes no float32 query, so a float32 call declines nothing and says so nowhere; a
-    bf16 call the dispatch sends off the kernel measured fastest is the dispatch's own choice, logged
-    once at INFO, which a run's console does not show."""
+    bf16 call the dispatch sends off the kernel measured fastest for the call's own facts (packed
+    documents with no bound on a row's, on an A100) is the dispatch's own choice, logged once at INFO,
+    which a run's console does not show. The kernel it names is the target's, xla, as cuDNN takes no
+    segment ids."""
     program = textwrap.dedent('''
         import json
         import logging
@@ -321,18 +323,17 @@ def test_a_call_the_dispatch_sends_off_flash_is_logged_at_info_and_a_float32_cal
         logger = logging.getLogger(generation.__name__)
         logger.setLevel(logging.INFO)
         logger.addHandler(Capture())
-        with generation.assumed("sm80"):
-            selected = {}
+        with generation.assumed("sm80"), generation.routes() as found:
             for dtype in (jnp.float32, jnp.bfloat16, jnp.bfloat16):
                 query = jnp.zeros((1, 8, 2, 64), dtype)
-                selected[str(dtype)] = attention.resolve_implementation(
-                    "auto", query, query, segment_ids=jnp.ones((1, 8)), max_segments=2)
-        print(json.dumps({"selected": selected[str(jnp.bfloat16)], "records": records}))
+                attention.resolve_implementation("auto", query, query, segment_ids=jnp.ones((1, 8)))
+        print(json.dumps({"selected": found[-1].kernel, "records": records}))
     ''')
     fresh = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, check=True,
                            timeout=120, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
     logged = json.loads(fresh.stdout)
-    assert logged["records"] == [[logging.INFO, ["attention", logged["selected"], "flash"]]]
+    assert logged["selected"] == "xla"
+    assert logged["records"] == [[logging.INFO, ["attention", "xla", "flash"]]]
 
 
 def test_a_route_records_the_targets_decision_where_its_dispatch_reports_it():
@@ -360,18 +361,40 @@ def test_a_route_records_the_targets_decision_where_its_dispatch_reports_it():
     assert refused((True, "dtype", "a bf16 call")) is None
 
 
-def test_a_dispatch_sending_a_call_off_its_preferred_kernel_reports_the_route():
-    """The attention dispatch, sending a packed bf16 call off the flash kernel an sm80 measured
-    fastest, reports that route from its own function, as the target decides it on this CPU."""
+def test_a_dispatch_sending_a_call_off_its_preferred_kernel_reports_the_route(without_deterministic_ops):
+    """The attention dispatch, sending a packed bf16 call with no bound on a row's documents off the
+    flash kernel an A100 measured fastest, reports through the attention selector the target's route:
+    xla, as cuDNN takes no segment ids, the refusal's code and its declaration (inherent), and xla as
+    what ran, never a host fact as a refusal; a call flash takes reports flash and no refusal."""
     from dew.nn import attention
 
     query = jnp.zeros((1, 8, 2, 64), jnp.bfloat16)
     with assumed("sm80"), routes() as found:
-        selected = attention.resolve_implementation("auto", query, query, segment_ids=jnp.ones((1, 8)),
-                                                    max_segments=2)
-    [taken] = [found_route for found_route in found if found_route.choice == "attention"]
-    assert (taken.kernel, taken.preferred, taken.target) == (selected, "flash", "sm80")
-    assert taken.refusal is not None and taken.site == "dew.nn.attention:resolve_implementation"
+        ran = attention.resolve_implementation("auto", query, query, segment_ids=jnp.ones((1, 8)))
+        attention.resolve_implementation("auto", query, query, segment_ids=jnp.ones((1, 8)), max_segments=2)
+    off, taken = [found_route for found_route in found if found_route.choice == "attention"]
+    assert (off.kernel, off.preferred, off.ran, off.target) == ("xla", "flash", ran, "sm80")
+    assert (off.refusal.code, off.refusal.row) == ("document_bound", "inherent")
+    assert off.site == "dew.nn.attention:resolve_implementation"
+    assert (taken.kernel, taken.preferred, taken.refusal) == ("flash", "flash", None)
+
+
+def test_a_call_off_a_kernel_for_its_cost_is_a_tracked_gap_and_one_past_its_tiles_inherent(
+        without_deterministic_ops):
+    """A packed call past FlashAttention's measured document cap goes off it for its cost, which the route
+    report counts as a gap tracked by its measurement's row, not as a limit; heads wider than any fused
+    kernel tiles are a limit no implementation of flash lifts, inherent (`tools/kernel_routes.verdict`)."""
+    from dew.nn import attention
+    from tools.kernel_routes import verdict
+
+    packed, wide = jnp.zeros((1, 8, 2, 64), jnp.bfloat16), jnp.zeros((1, 8, 2, 512), jnp.bfloat16)
+    with assumed("sm80"), routes() as found:
+        attention.resolve_implementation("auto", packed, packed, segment_ids=jnp.ones((1, 8)),
+                                         max_segments=99)
+        attention.resolve_implementation("auto", wide, wide, causal=True)
+    capped, widest = [found_route for found_route in found if found_route.choice == "attention"]
+    assert capped.refusal.code == "packed_documents" and verdict(capped).startswith("gap: measured")
+    assert widest.refusal.code == "head_dim" and verdict(widest) == "inherent"
 
 
 def test_a_function_traced_before_a_routes_block_reports_its_routes_within_it():

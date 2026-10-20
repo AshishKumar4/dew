@@ -1,11 +1,12 @@
 """Which kernel the 'auto' rule reaches for, and the XLA flags a run passes
 to the backend.
 
-'auto' asks two predicates per trace: `cudnn_runs` for the fused cudnn kernel
-and then `tpu_runs` for the pallas splash kernel. Both read the backend, so
-both selections are testable anywhere by monkeypatching `jax.default_backend`
-and tracing the call without running it. What actually executes on a CUDA
-device skips elsewhere; run that half with
+'auto' is the attention selector's (`dew.nn.attention_kernels.ATTENTION`): each
+kernel's requirements (its `SUPPORTS`) over the call's case, the target's row
+first. The requirements read the target, so selections are testable anywhere
+within `generation.assumed` by tracing the call without running it, and on a
+GPU each requirement is held to the real kernel: a call it declares taken runs,
+a call it refuses raises. What actually executes on a CUDA device runs with
 `JAX_PLATFORMS=cuda python -m pytest tests/test_kernels.py`. The splash
 kernel's own numbers are tests/test_attention_splash.py.
 """
@@ -33,7 +34,7 @@ def test_a_flash_wheel_holds_code_for_its_architectures_major_from_their_minor_u
     sm90 serves an A10, an L4 and an RTX 4080 with sm80's code and an H100 its own, and no Blackwell,
     no part below its minor, and no device that is not a GPU; sm86's code serves an L4 and sm120's
     any later 12.x part."""
-    from dew.nn.attention import flash_built_for
+    from dew.nn.attention_kernels import flash_built_for
 
     built = ("sm80", "sm90")
     assert [flash_built_for(device, built) for device in ("sm80", "sm86", "sm89", "sm90")] == [True] * 4
@@ -52,7 +53,7 @@ def flash_here():
     """dew_flash_attn where the installed wheel holds code for this GPU (the fact `flash_refusal` reads);
     a GPU it was not built for skips by name, where 'auto' runs another kernel."""
     flash = pytest.importorskip("dew_flash_attn")
-    from dew.nn.attention import flash_architectures, flash_built_for
+    from dew.nn.attention_kernels import flash_architectures, flash_built_for
     generation = kernels.device_generation()
     architectures = flash_architectures() or ()
     if not flash_built_for(generation, architectures):
@@ -141,7 +142,7 @@ def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal, hea
     which is also how far the two kernels sit apart at an even length. A pad
     key left unmasked shifts every output by 1/(kv+1) of the value mass, 12%
     at 7 keys, and a pad query row left in the output changes its shape."""
-    from dew.nn.attention import cudnn_max_head_dim
+    from dew.nn.attention_kernels import cudnn_max_head_dim
     if head_dim > cudnn_max_head_dim():
         pytest.skip(f"cudnn takes heads at most {cudnn_max_head_dim()} wide on {kernels.device_generation()}")
     query, _, _ = qkv((2, q_len, 4, head_dim))
@@ -397,7 +398,7 @@ def test_fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementatio
     """At Qwen3.5's grouped causal heads, 8 queries over 2 keys, FlashAttention's and cuDNN's output
     and three input gradients lie within tests/reference_error.py's rule of the xla kernel's, both
     measured from float64; on Hopper that holds FlashAttention-3 and cuDNN's 256-wide heads to it."""
-    from dew.nn.attention import cudnn_max_head_dim
+    from dew.nn.attention_kernels import cudnn_max_head_dim
     if implementation == 'flash':
         flash_here()
         if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
@@ -925,3 +926,73 @@ def test_normal_attention_reads_only_the_keys_its_mask_keeps(implementation):
     assert_as_exact_as_the_reference(np.asarray(module.apply(params, queries, context, mask=kept)),
                                      np.asarray(module.apply(params, queries, context)), truth,
                                      f"{implementation} attention under an all-True mask")
+
+
+def eligibility_cases():
+    """Calls covering each GPU kernel's requirements pairwise: dtypes, head widths, causality, a window,
+    packed documents with and without a bound, a cache call's aligned documents, a softcap and sinks."""
+    return [
+        {"dtype": jnp.bfloat16, "head_dim": 64, "causal": True},
+        {"dtype": jnp.bfloat16, "head_dim": 128, "causal": False, "window": 16},
+        {"dtype": jnp.bfloat16, "head_dim": 256, "causal": True, "window": 16},
+        {"dtype": jnp.float16, "head_dim": 96, "causal": True, "documents": "own", "max_segments": 2},
+        {"dtype": jnp.bfloat16, "head_dim": 64, "causal": True, "documents": "own"},
+        {"dtype": jnp.bfloat16, "head_dim": 128, "causal": True, "documents": "cross", "max_segments": 1,
+         "queries": 8},
+        {"dtype": jnp.bfloat16, "head_dim": 128, "causal": True, "softcap": 30.0},
+        {"dtype": jnp.bfloat16, "head_dim": 64, "causal": True, "sinks": True},
+        {"dtype": jnp.float32, "head_dim": 64, "causal": True},
+        {"dtype": jnp.float32, "head_dim": 72, "causal": False},
+    ]
+
+
+def eligibility_call(dtype, head_dim, causal, window=None, documents=None, max_segments=None, softcap=None,
+                     sinks=False, queries=64):
+    """A call of `eligibility_cases` as `scaled_dot_product_attention`'s arguments."""
+    from dew.nn.documents import CrossDocuments
+
+    rng = np.random.default_rng(head_dim)
+    query = jnp.asarray(rng.normal(size=(2, queries, 4, head_dim)), dtype)
+    key, value = (jnp.asarray(rng.normal(size=(2, 64, 2, head_dim)), dtype) for _ in range(2))
+    segment_ids = None
+    if documents == "own":
+        segment_ids = jnp.asarray(np.repeat([[1] * 40 + [2] * 24], 2, axis=0), jnp.int32)
+    elif documents == "cross":
+        filled = np.arange(64)[None, :] < np.asarray([[30], [64]])
+        segment_ids = CrossDocuments(jnp.ones((2, queries), jnp.int32), jnp.asarray(filled, jnp.int32))
+    return (query, key, value), {"causal": causal, "sliding_window": window, "segment_ids": segment_ids,
+                                 "max_segments": max_segments, "softcap": softcap,
+                                 "sinks": jnp.zeros((4,), jnp.float32) if sinks else None}
+
+
+@pytest.mark.gpu(reason="each requirement is held to the kernel it declares, on this GPU")
+@pytest.mark.parametrize("kernel", ["flash", "triton", "cudnn", "xla"])
+@pytest.mark.parametrize("call", eligibility_cases(),
+                         ids=lambda call: "-".join(f"{name}={value}" for name, value in call.items()))
+def test_a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu(kernel, call,
+                                                                      without_deterministic_ops):
+    """Each GPU kernel's declared requirements (`attention_kernels.ATTENTION`) hold against the kernel
+    itself on this GPU: a call whose capability requirements all hold runs forced on that kernel to a
+    finite output, and one that fails a capability raises `KernelRefused` naming it; measured
+    requirements, which a forced kernel overrides, never stop it."""
+    from dew.nn.attention import attention_case
+    from dew.nn.attention_kernels import ATTENTION
+    from dew.nn.kernels.selection import KernelRefused
+
+    operands, arguments = eligibility_call(**call)
+    case = attention_case(operands[0], operands[1], **arguments)
+    failed = [requirement for requirement in ATTENTION.kernel(kernel).failed(case, forced=True)
+              if requirement.kind == 'capability']
+
+    def run():
+        out = jax.jit(lambda *operands: scaled_dot_product_attention(
+            *operands, implementation=kernel, **arguments))(*operands)
+        return np.asarray(out, np.float32)
+
+    if failed:
+        with pytest.raises(KernelRefused) as refused:
+            run()
+        raised = {refusal.code for refusal in refused.value.refusals}
+        assert {requirement.code for requirement in failed} <= raised
+    else:
+        assert np.all(np.isfinite(run()))
