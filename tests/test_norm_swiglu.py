@@ -534,9 +534,78 @@ def test_a_swiglu_takes_the_kernel_its_target_measured_at_its_width(dtype, named
     assert (route.kernel, route.preferred, route.refusal) == (kernel, kernel, None)
 
 
+@pytest.mark.parametrize("width, dtype, code, row", [
+    (9000, jnp.bfloat16, "width", "ledger 820"),
+    (64, jnp.float16, "fp16", "ledger 823")])
+def test_a_norm_the_kernel_refuses_reports_the_requirement_and_its_row(width, dtype, code, row):
+    """On an A100, a norm the fused kernel does not take runs XLA's arithmetic and reports the
+    requirement it fails (`norm_swiglu.NORM_SUPPORTS`) with the roadmap row that tracks lifting it, or
+    'inherent' where no implementation of the kernel would (`tools/kernel_routes.verdict`); a kernel
+    forced by `chosen` raises naming it, as every selector's forced kernel does."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import KernelRefused
+
+    x = jnp.ones((4, width), dtype)
+    with generation.assumed("sm80"), generation.routes() as found:
+        assert norm_swiglu.rms_kernel("auto", x, None, dtype, fp32_statistics=True) == "xla"
+    (route,) = found
+    assert (route.kernel, route.preferred) == ("xla", "pallas")
+    assert (route.refusal.code, route.refusal.row) == (code, row)
+    forced = generation.chosen(rms_norm="pallas")
+    with generation.assumed("sm80"), forced, pytest.raises(KernelRefused) as refused:
+        norm_swiglu.rms_kernel("auto", x, None, dtype, fp32_statistics=True)
+    assert code in {refusal.code for refusal in refused.value.refusals}
+
+
+@pytest.mark.parametrize("dtypes, code, row", [
+    ((jnp.float32, jnp.bfloat16), "matching", "inherent"), ((jnp.float16, jnp.float16), "fp16", "ledger 823"),
+    ((jnp.float64, jnp.float64), "precision", "inherent")])
+def test_a_swiglu_the_kernel_refuses_names_the_requirement_its_dtypes_fail(dtypes, code, row):
+    """On an A100, a SiLU product named per call onto the kernel runs XLA where its operands' dtypes
+    are not the kernel's, naming what they fail: mixed operands the kernel's one-dtype read, fp16 its
+    qualification (ledger 823), float64 the fp32 the kernel computes in."""
+    from dew.nn.kernels import generation
+
+    with jax.enable_x64(new_val=True):
+        gate, up = (jnp.ones((2, 64), dtype) for dtype in dtypes)
+        with generation.assumed("sm80"), generation.routes() as found:
+            assert norm_swiglu.swiglu_kernel("pallas", gate, up) == "xla"
+    (route,) = found
+    assert (route.refusal.code, route.refusal.row) == (code, row)
+
+
+def test_a_weak_scalar_gate_over_a_bf16_up_takes_the_kernel_its_promotion_prefers():
+    """A weak fp32 scalar gate over a strongly typed bf16 up promotes to bf16 under strict promotion,
+    as the operands' own product does, so the preference reads bf16's row (the kernel on an A100),
+    where promoting the two dtypes alone would raise."""
+    from dew.nn.kernels import generation
+
+    gate, up = jnp.asarray(1.0), jnp.ones((2, 64), jnp.bfloat16)
+    with jax.numpy_dtype_promotion("strict"), generation.assumed("sm80"), generation.routes() as found:
+        assert norm_swiglu.swiglu_kernel("auto", gate, up) == "xla"
+    (route,) = found
+    assert route.preferred == "pallas"
+
+
+@pytest.mark.parametrize("operand", ["scale", "gate"])
+def test_a_norms_fp16_weight_or_gate_cites_the_fp16_qualification(operand):
+    """A bf16 norm whose weight or gate is fp16 runs XLA on an A100, refused by the fp16 qualification
+    (ledger 823), not by the operand's shape."""
+    from dew.nn.kernels import generation
+
+    x, other = jnp.ones((4, 64), jnp.bfloat16), jnp.ones((4, 64), jnp.float16)
+    with generation.assumed("sm80"), generation.routes() as found:
+        if operand == "scale":
+            assert norm_swiglu.rms_kernel("auto", x, other[0], jnp.bfloat16, fp32_statistics=True) == "xla"
+        else:
+            assert norm_swiglu.gated_rms_kernel("auto", x, other, None, jnp.bfloat16, "silu") == "xla"
+    (route,) = found
+    assert (route.refusal.code, route.refusal.row) == ("fp16", "ledger 823")
+
+
 def test_a_swiglu_of_a_bf16_gate_over_an_fp32_up_is_an_fp32_product_xla_takes():
     """Gemma-4's per-layer input gates a bf16 projection over its fp32 input: an fp32 product, which
-    XLA fuses (`_measured_width`), so on an A100 it takes XLA as its own preference, reporting no
+    XLA fuses (`_swiglu_preferred`), so on an A100 it takes XLA as its own preference, reporting no
     refusal, and computes as XLA's product does."""
     from dew.nn.kernels import generation
 
