@@ -395,14 +395,19 @@ def test_a_curve_draws_each_series_at_its_own_steps_from_its_finite_values():
     drawn = figures.curve({"loss": [4.0, math.nan, 2.0, 1.0, math.inf], "other": [math.nan]},
                           x={"loss": [1, 2, 3, 4, 5], "other": [3]}, x_label="step", y_label="loss",
                           smooth=2)
-    (raw, mean) = paths_of(drawn)
-    # Finite values 4, 2, 1 at steps 1, 3, 4; their running mean of two, 3 and 1.5, at steps 3, 4.
-    assert len(raw) == 3 and len(mean) == 2 and raw[0][0] < raw[1][0] < raw[2][0]
-    assert mean[0][0] == raw[1][0] and mean[1][0] == raw[2][0]
-    top, bottom = raw[0][1], raw[2][1]  # 4 is the top of the plot area, 1 its bottom
-    assert bottom > top and mean[0][1] == pytest.approx(bottom + (top - bottom) * (3 - 1) / (4 - 1))
+    raw, mean = paths_of(drawn)
+    # Finite values 4, 2, 1 at steps 1, 3, 4, and their running mean of two, 3 and 1.5, at steps 3
+    # and 4. The plot area runs from x 50 to 440 over steps 1 to 4, the last finite step, and from
+    # y 242 to 62 over values 1 to 4, the finite ones, under the legend's row.
+    assert raw == pytest.approx([(50, 62), (310, 182), (440, 242)], abs=0.01)
+    assert mean == pytest.approx([(310, 122), (440, 212)], abs=0.01)
     assert "3 nonfinite values left out" in texts_of(drawn)
     assert "loss 1.50" in texts_of(drawn) and "other none finite" in texts_of(drawn)
+
+    # One series names its last value at its line's end: 3 at step 10, the plot area's top right.
+    alone = figures.curve({"loss": [1.0, 3.0]}, x=[0, 10], x_label="step", y_label="loss")
+    (end,) = [shape for shape in alone.shapes if shape.tag == "text" and shape.text == "3.00"]
+    assert (float(end.attributes["x"]), float(end.attributes["y"])) == pytest.approx((436, 30), abs=0.01)
 
     shared = figures.curve({"long": [1.0, 2.0, 3.0], "short": [1.0, 3.0]}, x=[10, 20, 30],
                            x_label="step", y_label="value")
