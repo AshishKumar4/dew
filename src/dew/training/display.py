@@ -271,32 +271,33 @@ def goodput(wall: float, first_step: float | None, other: float) -> dict[str, fl
 
 
 def data_line(counters: Mapping[str, float]) -> Text | None:
-    """A run's data counters (`data/...`) as one line: the rows its readers delivered and the records
-    they rejected, summed over the corpora, with each corpus's rows where a mixture reads more than
-    one (`data/rows/<corpus>`), each reason only where something was rejected for it
-    (`data/rejected/<corpus>/<reason>`), and the share of the rows truncated where any was
-    (`data/truncated/<corpus>`, each corpus's share of its own rows). None where the run reports
-    no rows."""
+    """A run's data counters (`data/...`) as one line: the rows each label's reader delivered
+    (`data/rows/<label>`), as they are, since a chain's labels count different stages (a mixture's
+    corpora the rows they fed it, the mixture those a later step kept) and no sum of them is the
+    run's; the records rejected, summed over the labels, with each reason only where something was
+    rejected for it (`data/rejected/<label>/<reason>`); and the share of the rows truncated where
+    any was (`data/truncated/<label>`, each label's share of its own rows). None where the run
+    reports no rows."""
     rows = {name.removeprefix("data/rows/"): value for name, value in counters.items()
             if name.startswith("data/rows/")}
     if not rows:
         return None
+    line = Text("data ", LABEL)
+    for index, (label, count) in enumerate(rows.items()):
+        line.append("  " if index else "").append("" if len(rows) == 1 else f"{label} ", LABEL)
+        line.append(f"{int(count):,}", "bold")
     reasons: collections.Counter[str] = collections.Counter()
     for name, value in counters.items():
         if name.startswith("data/rejected/"):
             reasons[name.rpartition("/")[2]] += int(value)
-    delivered = sum(rows.values())
-    line = Text.assemble(("data ", LABEL), (f"{int(delivered):,}", "bold"), (" rows", LABEL),
-                         ("  ·  ", LABEL), (f"{sum(reasons.values()):,}", "bold"), (" rejected", LABEL))
+    line.append(" rows", LABEL).append("  ·  ", LABEL).append(f"{sum(reasons.values()):,}", "bold")
+    line.append(" rejected", LABEL)
     if counted := {reason: count for reason, count in reasons.items() if count}:
         line.append(" (" + ", ".join(f"{reason} {count:,}" for reason, count in counted.items()) + ")", LABEL)
-    truncated = sum(counters.get(f"data/truncated/{corpus}", 0.0) * count for corpus, count in rows.items())
-    if truncated and delivered:
-        line.append("  ·  ", LABEL).append(f"{truncated / delivered:.1%}", "bold").append(" truncated", LABEL)
-    if len(rows) > 1:
-        line.append("  ·  ", LABEL)
-        for index, (corpus, count) in enumerate(rows.items()):
-            line.append("  " if index else "").append(f"{corpus} ", LABEL).append(f"{int(count):,}")
+    shares = {label: counters[name] for label in rows if (name := f"data/truncated/{label}") in counters}
+    weight = sum(rows[label] for label in shares)
+    if weight and (truncated := sum(share * rows[label] for label, share in shares.items())):
+        line.append("  ·  ", LABEL).append(f"{truncated / weight:.1%}", "bold").append(" truncated", LABEL)
     return line
 
 
