@@ -120,9 +120,9 @@ print(json.dumps(sorted(training)))
 
 
 def test_only_the_rl_packages_import_dew_rl_and_it_imports_no_training():
-    """`dew.rl` is the RL math every RL objective shares: only `dew.rl` and `dew.objectives.rl`
-    import it, and it imports nothing of `dew.training` (docs/design/architecture.md). The test reads
-    every module's imports, absolute and relative, from its source."""
+    """Only `dew.rl` and `dew.objectives.rl` import `dew.rl`, and `dew.rl` imports nothing of
+    `dew.training` (docs/design/architecture.md). The test reads every module's imports, absolute
+    and relative, from its source."""
     package = SOURCE / "dew"
 
     def imported(path: Path) -> set[str]:
