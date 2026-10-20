@@ -12,6 +12,7 @@ import numpy as np
 
 from dew.coordination import agreed
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
+from dew.inference.rollouts import response
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.objectives.base import Shown
 from dew.sampling.text import Sampling
@@ -129,10 +130,8 @@ class SampledRollout:
         lengths, terminated = grouped(generated.lengths), grouped(generated.terminated)
         raw, behavior = grouped(generated.raw_log_probs), grouped(generated.behavior_log_probs)
         def completion(row: int, group: int) -> str:
-            # Without the EOS id a draw ended on, with a stop string it ended on (`Draw.response`).
-            count = int(lengths[row, group])
-            ended = count > 0 and int(sampled[row, group, count - 1]) in self.sampling.stops
-            return self.decode(sampled[row, group, :count - int(ended)].tolist())
+            return self.decode(list(response(sampled[row, group, :int(lengths[row, group])].tolist(),
+                                             self.sampling)))
 
         rewards = np.asarray([[self.reward(completion(row, group), records[row])
                                for group in range(self.groups)] for row in range(rows)], np.float32)
