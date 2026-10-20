@@ -53,6 +53,7 @@ import logging
 import os
 import threading
 import time
+import types
 from collections.abc import Callable, Hashable, Iterator, Mapping
 from typing import ClassVar
 
@@ -223,9 +224,12 @@ def _located(name: str) -> type:
             raise
         raise Unreadable(f"this checkout has no module {module}") from error
     for part in qualified.split("."):
-        found = vars(found).get(part)
+        # A module and each class on the way hold the next part among their own attributes.
+        found = vars(found).get(part) if isinstance(found, (type, types.ModuleType)) else None
+        if found is None:
+            raise Unreadable(f"this checkout has no class {name}")
     if not isinstance(found, type):
-        raise Unreadable(f"this checkout has no class {name}")
+        raise Unreadable(f"{name} names no class in this checkout")
     return found
 
 
