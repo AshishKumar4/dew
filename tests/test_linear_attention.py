@@ -38,7 +38,7 @@ import pytest
 from delta_rule_support import recurrence, through
 from flax import linen as nn
 from model_support import decode_through
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms, widened
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, seeds_for, widened
 from tuned import each_config, launches, timed
 
 from dew.nn import linear
@@ -149,25 +149,36 @@ def test_the_chunked_and_recurrent_forms_agree(reference):
 def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, strong):
     """Packed documents in the chunked rule, one starting on a chunk's first token, one four tokens before a
     chunk's end and one spanning chunks: each document's output, the final memory and every gradient
-    as near the float64 recurrence run document by document as the chunked rule run on each document
-    alone (`assert_leaves_as_exact`), and within 1e-4 of it, the row's first document from the row's
-    memory and every other from zero, for a decay per head (the gated delta net) and per key dimension
-    (Kimi's delta attention), each sized by the packed rule's float64 terms. At a strong decay (-4 a
-    token) the chunk's earlier document sits 96 below its last one's, past exp's fp32 range."""
+    on par with the chunked rule on each document alone, both measured from the float64 recurrence.
+    The first document reads the row's memory and every other starts from zero. Each draw has fresh
+    operands and cotangents, with the key and value dimensions consistently permuted, an exact
+    symmetry of the rule. Decay is per head (the gated delta net) or per key dimension (Kimi delta
+    attention); at a strong decay (-4 a token) an earlier document sits 96 below the last one's,
+    past exp's fp32 range."""
     batch, length, heads, width, chunk = 1, 160, 2, 8, 32
     begins = (0, 32, 60, 110)
     starts = np.zeros((batch, length), bool)
     starts[0, list(begins[1:])] = True
-    keys = jax.random.split(jax.random.key(23), 8)
-    q = l2norm(jax.random.normal(keys[0], (batch, length, heads, width)))
-    k = l2norm(jax.random.normal(keys[1], (batch, length, heads, width)))
-    v = jax.random.normal(keys[2], (batch, length, heads, width))
-    g = (jnp.full((batch, length, heads, decay_width), -4.0) if strong else
-         -jnp.exp(jax.random.normal(keys[3], (batch, length, heads, decay_width)) - 2.0))
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, heads)))
-    h0 = 0.1 * jax.random.normal(keys[5], (batch, heads, width, width))
-    do = jax.random.normal(keys[6], v.shape)
-    dht = 0.1 * jax.random.normal(keys[7], h0.shape)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(23 + seed), 8)
+        q = l2norm(jax.random.normal(keys[0], (batch, length, heads, width)))
+        k = l2norm(jax.random.normal(keys[1], (batch, length, heads, width)))
+        v = jax.random.normal(keys[2], (batch, length, heads, width))
+        g = (jnp.full((batch, length, heads, decay_width), -4.0) if strong else
+             -jnp.exp(jax.random.normal(keys[3], (batch, length, heads, decay_width)) - 2.0))
+        beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, heads)))
+        h0 = 0.1 * jax.random.normal(keys[5], (batch, heads, width, width))
+        do = jax.random.normal(keys[6], v.shape)
+        dht = 0.1 * jax.random.normal(keys[7], h0.shape)
+        rng = np.random.default_rng(seed)
+        key_order, value_order = rng.permutation(width), rng.permutation(width)
+        q, k = (x[..., key_order] for x in (q, k))
+        v, do = (x[..., value_order] for x in (v, do))
+        h0, dht = (x[..., key_order, :][..., value_order] for x in (h0, dht))
+        if decay_width > 1:
+            g = g[..., key_order]
+        return q, k, v, g, beta, h0, do, dht
 
     def packed(*args):
         return chunk_delta_rule(*args, chunk, starts=jnp.asarray(starts))
@@ -175,17 +186,18 @@ def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, 
     def chunked(*args):
         return chunk_delta_rule(*args, chunk)
 
-    got = jax.jit(through(packed, do, dht))(q, k, v, g, beta, h0)
-    alone = jax.jit(through(functools.partial(recurrence, cuts=(begins,), rule=chunked), do, dht))
-    reference = alone(q, k, v, g, beta, h0)
-    with jax.enable_x64(new_val=True):
-        operands = widened((q, k, v, g, beta, h0, do, dht))
-        want = through(functools.partial(recurrence, cuts=(begins,)), *operands[6:])(*operands[:6])
-        want = widened(want)
-        _, terms = float64_terms(through(packed, *operands[6:]), *operands[:6])
-    assert_leaves_as_exact(got, reference, want, reductions=chunk, terms=terms)
-    for name, mine, theirs in zip(("out", "final", "q", "k", "v", "g", "beta", "h0"), got, want, strict=True):
-        assert largest(mine, theirs) < 1e-4 * max(1.0, float(np.max(np.abs(theirs)))), name
+    def evaluated(rule, *inputs):
+        with jax.default_matmul_precision("highest"):
+            return through(rule, *inputs[6:])(*inputs[:6])
+
+    dew = jax.jit(functools.partial(evaluated, packed))
+    reference = jax.jit(functools.partial(
+        evaluated, functools.partial(recurrence, cuts=(begins,), rule=chunked)))
+    truth = jax.jit(functools.partial(evaluated, functools.partial(recurrence, cuts=(begins,))))
+    label = f"packed delta rule {decay_width=} {strong=}"
+    seeds = seeds_for(reference, draw, label, truth_fn=truth)
+    print(f"SIZED {label}: {seeds}", flush=True)
+    assert_as_exact(dew, reference, draw, label, seeds=seeds, truth_fn=truth)
 
 
 @pytest.mark.parametrize("per_key", [False, True], ids=["gated delta net", "Kimi delta attention"])
