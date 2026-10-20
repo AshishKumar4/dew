@@ -86,7 +86,6 @@ The kernel direction was approved on 2026-10-19:
 - Preserve filesystem configuration across the Arrow bridge and compare native readers with the fsspec path. [625]
 - Resolve pinned Hub Parquet bytes through the downloaded snapshot cache when offline. [628]
 - Compare a generation's dependency and prefix fingerprints with the recipe before replacing the live chain. [630]
-- Build the data design's contracts it marks as not built yet: run-layer recipes, `spec.load` and the public `loader` removed for the chain; uniform stage errors; a pre-read refusal of a missing artifact; slot maxima shared with `fit`'s separately compiled validation chains; per-member committed-token logging; RL prompt tail cuts counted as truncations; volatility read on every stage kind; and the reader's cache report. [design/data.md]
 
 ## Training and parallelism
 
@@ -108,7 +107,6 @@ The kernel direction was approved on 2026-10-19:
 - Let `generate` run without a key where its sampling needs none, or require one; its None default is refused today. [745]
 - Keep quantized and plain traces apart. Qwix patches `dot_general` only while a wrapped call traces, so `jnp.matmul`'s jit cache can hold a quantized trace that a later plain call at the same shapes reuses, and the reverse. [736]
 - Bring the vocabulary-split head to the whole head's accuracy. Over exact-symmetry orders it sits 2.3–3.0× the whole head's distance from float64; combining the shards' partial log-sum-exps is the suspected cause. [734]
-- Build the training design's contracts it marks as not built yet: refusing a split leaf that declares no axes, `Layout.validate(mesh)`'s placement report, a token budget ending at the commit that reaches it, and kernel choices in a run's report. [design/training.md]
 - Compile a step lowered by `Trainer(lower_for=)` before allocating training time, carry its executable and tuning picks to the run, and measure the saved startup time. Lowering alone already works. [720]
 
 ## RL and serving
