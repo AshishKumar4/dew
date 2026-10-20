@@ -140,21 +140,21 @@ def test_the_images_preset_prepares_what_the_image_recipe_does(read, case):
     source = Memory(jpegs(24))
     loading = Loading(workers=0, threads=1, read_buffer=2)
     recipe = ImageData(source, image_size=16, augment=augment, classes=("cat", "dog", "owl"),
-                       validation=HoldOut(records=6), **recipe_settings)
+                       validation=HoldOut(fraction=0.25, by="hash"), **recipe_settings)
     recipe_settings["augment"] = backend
-    expected = loader(recipe, batch=4, read=read, loading=loading, validation_records=4)
+    expected = loader(recipe, batch=4, read=read, loading=loading, validation_records=3)
 
     order = {"memory": None, "indexed": None, "streamed": 64}[read]
     caption = preset_settings.pop("caption", images.caption(classes=("cat", "dog", "owl")))
-    train, held = source.holdout(records=6)
+    train, held = source.holdout(0.25)
     common = {"draft": True, "rejects": False, "caption": caption}
     chain = train.shuffle(0, window=order).repeat().pipe(presets.images, 16, batch=4, **common,
                                                          **preset_settings)
-    validation = held.pipe(presets.images, 16, batch=4, records=4, **common)
+    validation = held.pipe(presets.images, 16, batch=4, records=3, **common)
     preset_settings["caption"] = caption
     built = compile(chain, validation=validation, read=read, loading=loading, host=(images.EncodeCaptions(),))
 
-    assert built.plan.semantic() == expected.plan.semantic()
+    assert built.plan.identity() == expected.plan.identity()
     expected_train, built_train = expected.train(DataPartition()), built.train(DataPartition())
     try:
         for _ in range(3):
