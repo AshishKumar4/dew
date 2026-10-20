@@ -141,27 +141,6 @@ def peft_factors(adapter, factors, directory) -> dict[str, np.ndarray]:
             for key, value in load_file(directory / lora.PEFT_WEIGHTS).items()}
 
 
-def branch_draws(adapter, tokens: np.ndarray, step: Step) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    """Each target branch's dropout in the LM objective's training loss over `tokens` at `step`,
-    keyed by the target's PEFT module path (`branch_dropout`): its input and its output."""
-    from tools.lora_peft_reference import branch_dropout
-
-    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
-    params = objective.init(jax.random.key(0))
-    drawn = {}
-
-    def capture(next_fun, args, kwargs, context):
-        output = next_fun(*args, **kwargs)
-        owner = branch_dropout(adapter, context)
-        if owner is not None:
-            drawn[owner] = (np.asarray(args[0]), np.asarray(output))
-        return output
-
-    with nn.intercept_methods(capture):
-        objective.loss(params, {"text": jnp.asarray(tokens)}, step)
-    return drawn
-
-
 def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it(tmp_path):
     """rsLoRA: each target scales by its own alpha over the square root of its
     own rank (layer 1's v_proj at rank 2, down_proj at alpha 3). The adapted
@@ -182,7 +161,7 @@ def test_a_dropout_adapter_trains_as_peft_trains_it_on_the_masks_peft_ran_on(tmp
     does at 1 / (1 - p) of the rate the branch drops at, as torch's dropout
     keeps it (`given`), the steps' loss, gradients and updates are PEFT's
     (`assert_trains_as_peft`), and every target's branch drops."""
-    from tools.lora_peft_reference import MASKS
+    from tools.lora_peft_reference import MASKS, branch_draws
 
     adapter, reference = adapted("dropout")
     assert (adapter.rslora, adapter.dropout) == (False, 0.25)
@@ -198,6 +177,8 @@ def test_a_training_step_drops_each_branch_input_at_the_adapters_rate():
     deviations of (1 - p) n, which a dropout at rate p misses about once in
     5e8 draws, each target's mask its own and each step's its own, and the
     same step the same masks."""
+    from tools.lora_peft_reference import branch_draws
+
     adapter, reference = adapted("dropout")
     tokens, rate = reference["input_ids"], adapter.dropout
     first, again = branch_draws(adapter, tokens, STEP), branch_draws(adapter, tokens, STEP)
