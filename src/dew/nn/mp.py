@@ -30,7 +30,7 @@ import optax
 from flax import linen as nn
 
 from dew.nn.conv import convolution
-from dew.nn.precision import at_least_fp32, float32_matmul
+from dew.nn.precision import at_least_fp32, compensated_sum, float32_matmul
 
 MP_KERNEL = "mp_kernel"
 """The parameter name of a magnitude-preserving weight. Forced weight
@@ -47,6 +47,16 @@ def normalize(x: jax.Array, axes: Sequence[int] | None = None, eps: float = 1e-4
     count = math.prod(x.shape[axis] for axis in axes)
     norm = jnp.sqrt(jnp.sum(jnp.square(x.astype(at_least_fp32(x.dtype))), axis=axes, keepdims=True))
     return x / (eps + norm / math.sqrt(count)).astype(x.dtype)
+
+
+def drawn_kernel(key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+    """A standard normal kernel of `shape` scaled to unit magnitude per output channel, as
+    `normalize` scales it, the same on every layout: its sum of squares is compensated
+    (`compensated_sum`), not whichever reduction XLA picks for the shard a device draws, so a
+    kernel split over its fan-in starts as it does whole."""
+    x = jax.random.normal(key, shape)
+    norm = jnp.sqrt(compensated_sum(jnp.square(x), tuple(range(len(shape) - 1))))
+    return x / (1e-4 + norm / math.sqrt(math.prod(shape[:-1])))
 
 
 def mp_silu(x: jax.Array) -> jax.Array:
@@ -129,7 +139,7 @@ class MPConv(nn.Module):
     @nn.compact
     def __call__(self, x: jax.Array, gain: jax.Array | float = 1.0) -> jax.Array:
         shape = (*self.kernel_size, x.shape[-1], self.features)
-        weight = self.param(MP_KERNEL, lambda key: normalize(jax.random.normal(key, shape)))
+        weight = self.param(MP_KERNEL, lambda key: drawn_kernel(key, shape))
         weight = normalize(weight.astype(at_least_fp32(x.dtype)))
         weight = weight * (gain / math.sqrt(math.prod(shape[:-1])))
         weight = weight.astype(x.dtype)
