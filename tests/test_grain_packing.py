@@ -72,7 +72,7 @@ def test_planned_windows_are_grains_first_fit_windows(window, bins, segments):
                 np.testing.assert_array_equal(value[0], expected[key], err_msg=f"{read} window {index} {key}")
     data = compile(pipeline(documents).batch(1), read="memory", loading=READ)
     (counted,) = data.counts.values()
-    assert counted.accepted == len(targeted)
+    assert counted.rows == len(targeted)
     assert counted.rejected["zero_targets"] == len(reference) - len(targeted)
     # The plan as grain followed it: the chunks in the order it added them, by their first token,
     # and where each window starts in that order.

@@ -686,9 +686,10 @@ class Dataset:
 
     def stats(self, records: int = 1000) -> dict[str, float]:
         """The counts a run logs from a fresh, lazy pass over at most
-        `records` accepted records: attempted, accepted and dropped by reason."""
+        `records` accepted records: records attempted and accepted, rows
+        delivered and drops by reason (`dew.data.mixing.CorpusCounts`)."""
         from dew.data.compile import _diagnostic
-        from dew.data.mixing import state_counts
+        from dew.data.mixing import data_metrics, state_counts
         from dew.records import record
 
         chain = self.chain()
@@ -702,8 +703,7 @@ class Dataset:
         try:
             for _ in reader:
                 pass
-            counted = state_counts(record(reader.get_state(), "diagnostic state"))
-            return {name: value for counts in counted.values() for name, value in counts.metrics().items()}
+            return data_metrics(state_counts(record(reader.get_state(), "diagnostic state")).values())
         finally:
             reader.close()
 

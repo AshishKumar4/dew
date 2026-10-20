@@ -144,6 +144,9 @@ class _Facts:
     """The memory read pinning took, which the compile's memory reads of the source reuse, so its
     facts and the rows a run materializes are one read's."""
 
+    def label(self) -> str:
+        return self.source.label()
+
     def describe(self) -> str:
         return self.source.describe()
 
@@ -520,7 +523,7 @@ def _staged(
         validation = (
             None if validation is None else _materialize(validation, validation_counts, training=False)
         )
-        if validation_counts and not any(count.accepted for count in validation_counts.values()):
+        if validation_counts and not any(count.rows for count in validation_counts.values()):
             validation = None
         _released(branches)
     build = _Build(read, loading, seed, batch, budget, _analyzed(train, read), training=True)

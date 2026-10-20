@@ -261,6 +261,9 @@ class PackedSource:
             plan.refuse_cuts()
         return cls(source, plan)
 
+    def label(self) -> str:
+        return self.documents.label()
+
     def describe(self) -> str:
         return f"{self.documents.describe()} {self.plan.kind} packing={self.plan.pack!r}"
 
