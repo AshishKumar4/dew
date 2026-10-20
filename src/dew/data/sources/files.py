@@ -665,7 +665,9 @@ class Files(Dataset):
                 if self.where is None
                 else {}
             )
-            return {"class_names": names, **counts}
+            # Rows with no counted targets column hold no count of Dew's (`CountRule`).
+            rules = {} if "_dew_valid_targets" in self.arrow.schema.names else {"count_rules": []}
+            return {"class_names": names, **counts, **rules}
         if self.kind in ("jsonl", "text", "csv") and self.supports("indexed"):
             return {"rows": len(_IndexedLines(self))}
         if self.kind == "files":
