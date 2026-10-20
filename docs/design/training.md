@@ -71,13 +71,13 @@ flowchart LR
 
 `microbatches=` for pipeline stages is a Trainer argument (default: one per stage), the same for both mesh forms.
 
-Every placement-relevant leaf declares its logical axes (`Layout.check`). Where the layout splits a leaf, the shared rule table and that leaf's declared axes place it. A leaf with no declared axes, under a sharding that splits it, is refused, with the fix named. A rule of your own that names an axis the mesh lacks is refused too, a role axis among them, since it would split nothing. A placement rule that deviates for one model family is a separate rule (expert parallelism's, tensor parallelism's), never a branch in the default.
+Where the layout splits a leaf, the shared rule table and that leaf's declared logical axes place it; a leaf that declares none falls back to a shape heuristic, and refusing it instead is not built yet. A rule outside Dew's defaults (`DEFAULT_RULES`) that names an axis the mesh lacks is refused, a role axis among them, since it would split nothing; Dew's own rules take a missing role axis as size 1. A placement rule that deviates for one model family is a separate rule (expert parallelism's, tensor parallelism's), never a branch in the default.
 
-On a native mesh, the layout reports what it is about to do before the first step (the [roadmap](../roadmap.md#training-and-data) tracks it as `Layout.validate(mesh)`): which leaves split over which axes, the per-device bytes, the batch split, the collectives each logical axis implies, and an unbound logical axis, which would replicate that dimension. A mismatch between the rules and the mesh's axis names fails there, not in GSPMD.
+On a native mesh, the layout is to report what it is about to do before the first step, as `Layout.validate(mesh)`, which is not built yet: which leaves split over which axes, the per-device bytes, the batch split, the collectives each logical axis implies, and an unbound logical axis, which would replicate that dimension. A mismatch between the rules and the mesh's axis names is to fail there, not in GSPMD.
 
 ## 3. Memory and speed are chosen for you
 
-The memory planner picks, per model, mesh and GPU, the cheapest combination that fits: micro-batch size, rematerialization policy, LM-head tiling and host offload. A compiled program's memory analysis is the bound; its estimates order the candidates. Where nothing fits, `fit` raises naming the largest buffer and the options it tried. The same `batch(1024)` works on one GPU or 256. You override any one of them:
+The memory planner picks, per model, mesh and GPU, the cheapest combination that fits: micro-batch size, rematerialization policy, LM-head tiling and host offload. The planner checks each candidate against its compiled program's memory analysis. Where none fits, `fit` raises naming the split, rematerialization and head options it tried, and the closest candidate's temporary and argument bytes where the analysis gave them. The same `batch(1024)` works on one GPU or 256. You override any one of them:
 
 ```python
 Trainer(objective, opt, key=0, accumulation=4)                    # fix the micro-batch split
@@ -100,7 +100,7 @@ state = trainer.fit(
 )
 ```
 
-- One budget: `steps=`, `epochs=` or `tokens=` (committed valid target tokens, the same clock the data `schedule` reads). A token budget may cut off a partial window, which is discarded.
+- One budget: `steps=`, `epochs=` or `tokens=` (committed valid target tokens, the same clock the data `schedule` reads). A run's tokens grow only at a committed update, so a token budget ends at the first commit that reaches it and leaves no partial window.
 - `validation` is one chain or a dict of named chains, each reported separately.
 - `fit` returns the final `TrainState`. `state=` supplies initial state rather than a continuation; checkpoint restore also restores the data position.
 
@@ -132,7 +132,7 @@ Compiled programs depend only on the model, shapes, dtypes, shardings and config
 
 ## 7. Seeing what happens
 
-Every run logs canonical MFU (analytic model FLOPs on real tokens over wall time) and where step time goes. A model reports its FLOPs through `model_flops`; a model without them reports no MFU rather than an estimate. Each kernel family reports which kernel the plan chose and why, and a run's report names it. Trackers (W&B, MLflow) take the same metrics; the local metric journal is JSONL. The [roadmap](../roadmap.md#kernels-and-performance) tracks a `dew profile` command that reports the step breakdown, chosen kernels and top three losses from the existing attribution tools.
+Every run logs canonical MFU (analytic model FLOPs on real tokens over wall time) and where step time goes. A model reports its FLOPs through `model_flops`; a model without them reports no MFU rather than an estimate. Each kernel dispatch records which kernel it chose and why (`dew.nn.kernels.generation.routes`); collecting those choices into a run's report is not built yet. Trackers (W&B, MLflow) take the same metrics; the local metric journal is JSONL. The [roadmap](../roadmap.md#kernels-and-performance) tracks a `dew profile` command that reports the step breakdown, chosen kernels and top three losses from the existing attribution tools.
 
 ## 8. After training
 
