@@ -27,7 +27,7 @@ from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.multimodal import VisionConditioner
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
 from dew.nn.protocols import OutputTable
 
 if TYPE_CHECKING:
@@ -53,7 +53,7 @@ class SelfConditioning(nn.Module):
             epsilon=self.norm_eps, with_scale=False, dtype=self.dtype,
             name="post_norm")
         dense = functools.partial(nn.Dense, use_bias=False,
-                                  dtype=self.dtype, precision=self.precision)
+                                  dtype=self.dtype, precision=self.precision, dot_general=float32_dot_general)
         self.gate_proj = dense(self.intermediate_size, name="gate_proj")
         self.up_proj = dense(self.intermediate_size, name="up_proj")
         self.down_proj = dense(self.hidden_size, name="down_proj")
@@ -76,8 +76,9 @@ def soft_embeddings(logits: jax.typing.ArrayLike, embed_weight: jax.typing.Array
     logits = jnp.asarray(logits)
     wide = at_least_fp32(logits.dtype)
     probs = jax.nn.softmax(logits.astype(wide), axis=-1)
-    return jnp.einsum('...v,vd->...d', probs, jnp.asarray(embed_weight),
-                      preferred_element_type=wide) * jnp.asarray(scale, wide)
+    table = jnp.asarray(embed_weight)
+    mixed = float32_einsum('...v,vd->...d', probs, table, preferred_element_type=wide)
+    return mixed * jnp.asarray(scale, wide)
 
 
 class DiffusionGemma(nn.Module):

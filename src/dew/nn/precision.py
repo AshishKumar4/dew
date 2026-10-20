@@ -11,6 +11,9 @@ the transpose rules, so the backward follows; jax's own xla attention sets it
 for this reason (jax-ml/jax#24047).
 """
 
+from __future__ import annotations
+
+import contextlib
 import functools
 from collections.abc import Callable
 
@@ -70,18 +73,88 @@ def asks_default_precision(precision: jax.lax.PrecisionLike, *, configured: bool
     return names <= {'DEFAULT'}
 
 
-def bf16_operand_precision(dtype: Dtype | None,
-                           precision: PrecisionLike = None) -> jax.lax.PrecisionLike:
-    """The precision that keeps a bf16 dot bf16 in both directions.
-
-    A caller that asked for more than the default precision keeps what it
-    asked for, and compute in anything but bf16 is left alone. So is a GPU
-    older than sm80, which rejects the algorithm at run time
-    (`dew.nn.kernels.generation.BF16_GPU`).
-    """
-    if not asks_default_precision(precision) or dtype is None:
+def float32_products[P: jax.lax.PrecisionLike](dtype: Dtype | None, precision: P = None
+                                                ) -> P | jax.lax.Precision:
+    """The precision products computed in `dtype` take where none is stated: float32 ones multiply
+    float32 products (`Precision.HIGHEST`), as torch's float32 matmuls do by default; JAX's
+    default runs them in TF32 on a GPU, 2.9e-4 from float64 against 2.9e-7. A stated precision
+    is the caller's own, TF32 (`'tensorfloat32'`) its opt-in; other dtypes keep theirs, and so
+    does an unknown one (None), which leaves the products to resolve it from their own dtype."""
+    if precision is not None or dtype is None or jnp.dtype(dtype) != jnp.float32:
         return precision
-    if jnp.dtype(dtype) != jnp.bfloat16:
+    return jax.lax.Precision.HIGHEST
+
+
+def products_dtype(*operands) -> jnp.dtype | None:
+    """The dtype `operands` multiply in, by jax's implicit promotion; None where an 8-bit float
+    takes part, which jax promotes with nothing and whose product has no precision to resolve."""
+    dtypes = [jnp.dtype(operand.dtype) for operand in operands]
+    if any(jnp.issubdtype(dtype, jnp.floating) and jnp.finfo(dtype).bits < 16 for dtype in dtypes):
+        return None
+    return jnp.result_type(*dtypes)
+
+
+def float32_dot_general(lhs, rhs, dimension_numbers, precision: jax.lax.PrecisionLike = None,
+                        preferred_element_type: DTypeLike | None = None, **kwargs) -> jax.Array:
+    """`jax.lax.dot_general` at the precision its operands' own dtype takes (`float32_products`):
+    the product a flax layer forms (`nn.Dense(dot_general=...)`), resolved where flax has
+    promoted its operands, so a layer of any dtype, unset included, multiplies as it computes."""
+    return jax.lax.dot_general(lhs, rhs, dimension_numbers,
+                               precision=float32_products(products_dtype(lhs, rhs), precision),
+                               preferred_element_type=preferred_element_type, **kwargs)
+
+
+def float32_einsum(subscripts: str, *operands, precision: jax.lax.PrecisionLike = None,
+                   **kwargs) -> jax.Array:
+    """`jnp.einsum` at the precision its operands' own dtype takes (`float32_products`), as
+    `float32_dot_general` is a layer's."""
+    return jnp.einsum(subscripts, *operands,
+                      precision=float32_products(products_dtype(*operands), precision), **kwargs)
+
+
+def float32_matmul(lhs, rhs) -> jax.Array:
+    """`lhs @ rhs` at the precision its operands' own dtype takes (`float32_products`)."""
+    return jnp.matmul(lhs, rhs, precision=float32_products(products_dtype(lhs, rhs)))
+
+
+def float32_conv_general_dilated(lhs, rhs, *args, precision: jax.lax.PrecisionLike = None,
+                                 **kwargs) -> jax.Array:
+    """`jax.lax.conv_general_dilated` at the precision its operands' own dtype takes, as
+    `float32_dot_general` is a product's: a flax convolution's
+    (`nn.Conv(conv_general_dilated=...)`)."""
+    return jax.lax.conv_general_dilated(
+        lhs, rhs, *args, precision=float32_products(products_dtype(lhs, rhs), precision), **kwargs)
+
+
+def configurable_precision(precision: jax.lax.PrecisionLike) -> bool:
+    """Whether `jax.default_matmul_precision` can name `precision`: one precision or dot algorithm
+    preset, unset or default included; not a pair of precisions or a dot algorithm."""
+    return len(precision_names(precision)) <= 1 and not isinstance(precision, jax.lax.DotAlgorithm)
+
+
+def configured_precision(precision: jax.lax.PrecisionLike):
+    """A context in which a product that takes no precision of its own (jax.nn's xla attention)
+    multiplies at `precision`, through `jax.default_matmul_precision`; an unset or default
+    precision changes nothing. A precision no config names (`configurable_precision`) is
+    refused."""
+    if not configurable_precision(precision):
+        raise ValueError(f"precision={precision} has no jax_default_matmul_precision name")
+    names = precision_names(precision)
+    if names <= {'DEFAULT'}:
+        return contextlib.nullcontext()
+    (name,) = names
+    preset = name in jax.lax.DotAlgorithmPreset.__members__
+    return jax.default_matmul_precision(name if preset else name.lower())
+
+
+def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = None) -> jax.lax.PrecisionLike:
+    """The precision a product of `dtype` operands takes: float32 products for float32 operands
+    where none is stated (`float32_products`), and for bf16 operands at the default precision the
+    algorithm that keeps a bf16 dot bf16 in both directions. A caller that asked for more than the
+    default keeps what it asked for, and so does a GPU older than sm80, which rejects the algorithm
+    at run time (`dew.nn.kernels.generation.BF16_GPU`)."""
+    precision = float32_products(dtype, precision)
+    if dtype is None or jnp.dtype(dtype) != jnp.bfloat16 or not asks_default_precision(precision):
         return precision
     # Imported here: dew.nn.kernels imports this module.
     from .kernels.generation import bf16_dot_runs
@@ -106,7 +179,7 @@ def fp32_result_dot_general(precision: PrecisionLike = None):
         del precision, preferred_element_type  # this head's policy, not the layer's
         return jax.lax.dot_general(
             lhs, rhs, dimension_numbers,
-            precision=bf16_operand_precision(lhs.dtype, requested),
+            precision=operand_precision(lhs.dtype, requested),
             preferred_element_type=at_least_fp32(lhs.dtype))
 
     return dot_general
@@ -260,8 +333,8 @@ def _rounded_operand_jvp(dtype: Dtype, primals: tuple[jax.Array],
 
 def rounds_to_bf16(dtype: Dtype | None, precision: PrecisionLike = None) -> bool:
     """Whether an fp32-result product under this compute dtype and precision
-    multiplies bf16 operands (`bf16_operand_precision`)."""
-    return bf16_operand_precision(dtype, precision) is jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+    multiplies bf16 operands (`operand_precision`)."""
+    return operand_precision(dtype, precision) is jax.lax.DotAlgorithmPreset.BF16_BF16_F32
 
 
 def bf16_logits(logits: jax.Array) -> jax.Array:
@@ -297,9 +370,9 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
     promotes the states to at least fp32. Under bf16 compute at the default
     precision both operands multiply as bf16 and the logits are bf16 values
     (`head_product`); otherwise the product is the layer's own, in the
-    operands' dtype.
+    operands' dtype, at the precision that dtype takes (`float32_products`).
     """
-    resolved = bf16_operand_precision(dtype, precision)
+    resolved = operand_precision(dtype, precision)
     rounds = rounds_to_bf16(dtype, precision)
 
     def dot_general(lhs, rhs, dimension_numbers, precision=None,
@@ -307,7 +380,8 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
         del precision, preferred_element_type  # this head's policy, not the layer's
         if rounds:
             rhs = _algorithm_operand(rhs)
-        logits = jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=resolved,
+        logits = jax.lax.dot_general(lhs, rhs, dimension_numbers,
+                                     precision=float32_products(products_dtype(lhs, rhs), resolved),
                                      preferred_element_type=at_least_fp32(lhs.dtype))
         return bf16_logits(logits) if rounds else logits
 
@@ -355,7 +429,7 @@ def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
         return bf16_logits(logits)
     wide = at_least_fp32(hidden.dtype)
     return jnp.einsum(subscripts, hidden.astype(wide), head,
-                      precision=precision, preferred_element_type=wide)
+                      precision=float32_products(wide, precision), preferred_element_type=wide)
 
 
 def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Output]:

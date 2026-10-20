@@ -18,7 +18,7 @@ from .blocks import normal_kernel
 from .flops import projection_flops
 from .joined import joined_dense, joins
 from .ngpt import NGPT, gain, unit
-from .precision import at_least_fp32, sqrt_or_zero
+from .precision import at_least_fp32, float32_dot_general, sqrt_or_zero
 from .protocols import ProjectionGroup
 from .sharding import MLP_HIDDEN, constrain, logical_axes
 
@@ -102,7 +102,7 @@ class GatedMLP(nn.Module):
     init_std: float | None = None  # gate/up normal std; None: lecun normal
     output_init_std: float | None = None  # down normal std; None follows init_std
     packed: bool = False
-    linear: Callable[..., nn.Dense] = nn.Dense
+    linear: Callable[..., nn.Dense] = functools.partial(nn.Dense, dot_general=float32_dot_general)
     dropout_rate: float = 0.0
     ngpt: NGPT | None = None
     """The normalized transformer's gains (`dew.nn.ngpt.NGPT`): the gate and the up projection each

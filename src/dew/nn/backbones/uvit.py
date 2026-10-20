@@ -25,7 +25,7 @@ from ..dit import (
     remat_block,
 )
 from ..flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
-from ..precision import at_least_fp32
+from ..precision import at_least_fp32, float32_dot_general
 from ..rope import rotary_freqs
 from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
 
@@ -136,7 +136,8 @@ class UViT(_TransformerOptions):
         maps = self.projections()
         def dense(name, **options):
             key = 'skip_linear' if name.startswith('skip_linear_') else name
-            return nn.Dense(maps[key][1], dtype=self.dtype, precision=self.precision, name=name, **options)
+            return nn.Dense(maps[key][1], dtype=self.dtype, precision=self.precision, name=name, **options,
+                            dot_general=float32_dot_general)
         if self.scan_order == "hilbert":
             self.hilbert_proj = dense("hilbert_projection")
         else:
@@ -274,7 +275,7 @@ class SimpleUDiT(RematLadder, _TransformerOptions):
                 features=self.projections()['hilbert_projection'][1],
                 dtype=self.dtype,
                 precision=self.precision,
-                name="hilbert_projection"
+                name="hilbert_projection", dot_general=float32_dot_general
             )
         self.conditioning = self._conditioning(self.emb_features, text_pooling=self.text_pooling)
 
@@ -286,7 +287,7 @@ class SimpleUDiT(RematLadder, _TransformerOptions):
                 features=self.projections()['up_dense'][1],
                 dtype=self.dtype,
                 precision=self.precision,
-                name=f"up_dense_{i}"
+                name=f"up_dense_{i}", dot_general=float32_dot_general
             ) for i in range(half_layers)
         ]
         self.up_blocks = [block(name=f"up_block_{i}") for i in range(half_layers)]

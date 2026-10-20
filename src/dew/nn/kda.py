@@ -49,7 +49,7 @@ from .linear import (
     recurrent_delta_rule,
 )
 from .mixer_base import MixerBase, MixerContext
-from .precision import at_least_fp32
+from .precision import at_least_fp32, float32_dot_general
 from .sharding import logical_axes
 
 
@@ -115,7 +115,8 @@ class KimiDeltaAttention(nn.Module):
                 + delta_flops(lengths, self.num_heads, self.head_dim, self.head_dim))
 
     def setup(self):
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
         self.q_proj = dense(self.qkv_features, name='q_proj')
         self.k_proj = dense(self.qkv_features, name='k_proj')
         self.v_proj = dense(self.qkv_features, name='v_proj')

@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_as_exact_as_the_reference, float64_forward
+from reference_error import assert_as_exact_as_the_reference, float64_forward, widened
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -1263,21 +1263,24 @@ def test_right_padded_rows_attend_causally_with_no_mask(rng, causal):
     """Rows declared right-padded reach the attention kernel as an unpadded
     call does, causal with no mask, which keeps 'auto' on its fused kernel
     (a mask sends it to xla's dense dots, `_restricts_visibility`); their
-    real tokens' states are the masked call's. A bidirectional layer's real
-    queries read the padding after them, so it keeps the mask."""
+    real tokens' states are as exact as the masked call's, both from the
+    masked call's in float64. A bidirectional layer's real queries read the
+    padding after them, so it keeps the mask."""
     model = tiny(causal=causal)
     ids = tokens(rng)
     params = model.init(rng, ids)
     valid = jnp.arange(SEQ)[None, :] < jnp.asarray([[7], [SEQ]])
 
-    def states(**declared):
-        return model.apply(params, ids, attention_mask=valid,
-                           method=CausalTransformer.hidden_states, **declared)
+    def states(model, params, **declared):
+        states = model.apply(params, ids, attention_mask=valid, method=CausalTransformer.hidden_states,
+                             **declared)
+        return np.asarray(states, np.float64)[np.asarray(valid)]
 
-    masked = states()
-    declared = states(right_padded=True)
-    np.testing.assert_allclose(np.asarray(declared)[np.asarray(valid)], np.asarray(masked)[np.asarray(valid)],
-                               atol=1e-6)
+    masked = states(model, params)
+    declared = states(model, params, right_padded=True)
+    with jax.enable_x64(new_val=True):
+        truth = states(model.clone(dtype=jnp.float64), widened(params))
+    assert_as_exact_as_the_reference(declared, masked, truth, "right-padded states")
 
 
 def _rotate_half_reference(x, freqs_cos, freqs_sin, scale=None):

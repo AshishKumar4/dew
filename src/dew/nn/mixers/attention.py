@@ -51,7 +51,7 @@ from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotat
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain, unit
-from dew.nn.precision import at_least_fp32, rounded_to, scaled
+from dew.nn.precision import at_least_fp32, float32_dot_general, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import (
     LongRopeScaling,
@@ -210,7 +210,7 @@ class CausalSelfAttention(nn.Module):
     """Whether the queries, keys and values project through one kernel,
     `qkv_proj`, at init as from a checkpoint that stores them so (the Qwen 3.5
     and DeepSeek-V4.1 vision towers)."""
-    linear: Callable[..., nn.Dense] = nn.Dense
+    linear: Callable[..., nn.Dense] = functools.partial(nn.Dense, dot_general=float32_dot_general)
     """The projections' module: Gemma 4's vision tower clips their inputs and
     outputs (`dew.nn.vision.gemma4.Gemma4ClippableLinear`)."""
     nope: bool = False
