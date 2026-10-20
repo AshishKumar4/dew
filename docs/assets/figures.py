@@ -627,6 +627,63 @@ def rlvr_kl_figure():
     svg.save(HERE / "rlvr-kl.svg")
 
 
+def lm_next_token_figure():
+    """Next-token prediction on one sentence: at each position the model reads the tokens so far, scores
+    every possible next token, and training pushes up the one that actually came next."""
+    sentence = ["Plants", "need", "light", "to", "grow"]
+    # Four candidates at each position, the true next token first, with a model's probabilities before and
+    # after training: made up for the drawing, shaped like a small model's.
+    candidates = [(["need", "are", "and", "can"], [0.18, 0.34, 0.27, 0.21], [0.58, 0.18, 0.12, 0.12]),
+                  (["light", "water", "to", "the"], [0.22, 0.31, 0.27, 0.20], [0.52, 0.30, 0.10, 0.08]),
+                  (["to", "and", "for", "."], [0.24, 0.30, 0.19, 0.27], [0.61, 0.17, 0.12, 0.10]),
+                  (["grow", "live", "make", "be"], [0.20, 0.25, 0.22, 0.33], [0.66, 0.14, 0.08, 0.12])]
+    width, height = 440, 330
+    box_w, gap, left, row_y = 70, 8, 24, 52
+    svg = Figure(width, height, seconds=12, label="Next-token prediction on 'Plants need light to grow'. At "
+                 "each position the model reads the tokens so far and scores the candidates for the next one; "
+                 "training pushes up the token that actually came next.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    svg.text(24, 30, "the model reads the tokens so far", size=13, color="muted")
+    for j, token in enumerate(sentence):
+        x = left + j * (box_w + gap)
+        svg.rect(x, row_y, box_w, 30, fill="raised", stroke="rule", rx=5)
+        svg.text(x + box_w / 2, row_y + 20, token, size=14, mono=True, anchor="middle", color="muted")
+    times = [0.4 + 2.2 * i for i in range(len(candidates))]
+    windows, targets, panels = [], [], []
+    floor, tall, bar_w = 290, 130, 56
+    for i, (names, before, after) in enumerate(candidates):
+        with svg.group() as window:
+            svg.rect(left - 3, row_y - 3, (i + 1) * (box_w + gap) - gap + 6, 36, fill="none", stroke="accent",
+                     rx=7, width=2)
+        windows.append(window)
+        with svg.group() as target:
+            x = left + (i + 1) * (box_w + gap)
+            svg.rect(x, row_y, box_w, 30, fill="accent_fill", stroke="none", rx=5)
+            svg.text(x + box_w / 2, row_y + 20, sentence[i + 1], size=14, mono=True, anchor="middle",
+                     weight=600)
+            svg.text(x + box_w / 2, row_y + 52, "next?", size=12, color="accent", anchor="middle")
+        targets.append(target)
+        with svg.group() as panel:
+            svg.text(24, 132, "P(next token)", size=13, color="muted")
+            svg.line(24, floor, width - 24, floor, color="rule")
+            for k, (name, low, high) in enumerate(zip(names, before, after)):
+                x = 40 + k * 96
+                bar = svg.rect(x, floor - tall, bar_w, tall, fill="accent" if k == 0 else "tint1", stroke="none",
+                               rx=3)
+                start = times[i] + 0.5
+                svg.animate(bar, {start: {"transform": f"scaleY({low:.2f})"},
+                                  start + 1.0: {"transform": f"scaleY({high:.2f})"}}, origin="50% 100%")
+                svg.text(x + bar_w / 2, floor + 22, name, size=14, mono=True, anchor="middle",
+                         color="text" if k == 0 else "muted")
+        panels.append(panel)
+    svg.show_in_turn(windows, times)
+    svg.show_in_turn(targets, times)
+    svg.show_in_turn(panels, times)
+    svg.appear(svg.text(width - 24, 132, "training pushes the true one up", size=13, color="accent",
+                        anchor="end"), 1.4)
+    svg.save(HERE / "lm-next-token.svg")
+
+
 # The flower of tutorials/02: a 64 x 64 sample from a model Dew trained on Oxford Flowers, in [-1, 1].
 def flower() -> np.ndarray:
     tile = Image.open(HERE / "gallery/heun.png").convert("RGB").crop((267, 502, 463, 698))
@@ -907,7 +964,8 @@ FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pip
            "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
            "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure, "edm-step": edm_step_figure,
            "edm-noise": edm_noise_figure, "samplers-paths": samplers_paths_figure,
-           "cfg-step": cfg_step_figure, "cfg-sweep": cfg_sweep_figure}
+           "cfg-step": cfg_step_figure, "cfg-sweep": cfg_sweep_figure,
+           "lm-next-token": lm_next_token_figure}
 
 
 if __name__ == "__main__":
