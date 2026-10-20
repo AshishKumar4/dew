@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
+import { limitsOf } from './limits';
 import type { SnapshotGeneration } from './snapshots';
 
-const MIN_HOSTS = 2;
 const HOST_CAPACITY = 8;
 const TARGET_LOAD = 2;
 const CHECK_MS = 30_000;
@@ -20,6 +20,8 @@ interface Pool {
 	serving?: string;
 	hosts: Host[];
 	sessions: Record<string, string>;
+	/** Until when a host is wanted though no session holds one (`want`): the pool keeps at least one warm till then. */
+	wanted?: number;
 }
 
 export class ModelPool extends DurableObject<Env> {
@@ -46,19 +48,32 @@ export class ModelPool extends DurableObject<Env> {
 		});
 	}
 
+	/**
+	 * Keep a host warm for the next `WARM_SECONDS` though no session holds one: the operator's warm and a visitor's
+	 * request that finds no warm host ask it, so a pool whose minimum is none (the preview's) starts one when asked.
+	 */
+	async want(): Promise<void> {
+		await this.ctx.storage.transaction(async (storage) => {
+			const pool = (await storage.get<Pool>('pool')) ?? { hosts: [], sessions: {} };
+			pool.wanted = Date.now() + limitsOf(this.env).warmSeconds * 1000;
+			await storage.put('pool', pool);
+			await storage.setAlarm(Date.now() + 1000);
+		});
+	}
+
 	async status(): Promise<{ generation: string | null; ready: number; starting: number; active: number; minimum: number;
 		hosts: Record<string, Record<string, unknown> | null> }> {
 		const pool = await this.state();
 		const ready = pool.hosts.filter((host) => host.ready);
 		const health = await Promise.all(ready.map((host) => this.env.SHARED.get(this.env.SHARED.idFromName(host.id)).health()));
 		return { generation: pool.serving ?? null, ready: ready.length,
-			starting: pool.hosts.filter((host) => !host.ready).length, active: Object.keys(pool.sessions).length, minimum: MIN_HOSTS,
+			starting: pool.hosts.filter((host) => !host.ready).length, active: Object.keys(pool.sessions).length,
+			minimum: limitsOf(this.env).minHosts,
 			hosts: Object.fromEntries(ready.map((host, index) => [host.id, health[index]])) };
 	}
 
 	/**
-	 * The image a new session runs on, where a ready host of the serving generation has room. Workers of other builds
-	 * call it (the preview's, by script_name), so its reply keeps its shape: an RPC here is only ever extended.
+	 * The image a new session runs on, where a ready host of the serving generation has room.
 	 */
 	async image(): Promise<string | null> {
 		const pool = await this.state();
@@ -90,7 +105,7 @@ export class ModelPool extends DurableObject<Env> {
 		}
 	}
 
-	/** The sessions the pool's hosts hold, which each Worker's Coordinator counts as running. */
+	/** The sessions the pool's hosts hold, which the Worker's Coordinator counts as running. */
 	async held(): Promise<string[]> {
 		return Object.keys((await this.state()).sessions);
 	}
@@ -192,7 +207,9 @@ export class ModelPool extends DurableObject<Env> {
 				return;
 			}
 			pool = await this.state();
-			const target = Math.max(MIN_HOSTS, Math.ceil(Object.keys(pool.sessions).length / TARGET_LOAD));
+			const { minHosts } = limitsOf(this.env);
+			const wanted = (pool.wanted ?? 0) > Date.now() ? 1 : 0;
+			const target = Math.max(minHosts, wanted, Math.ceil(Object.keys(pool.sessions).length / TARGET_LOAD));
 			const generation = pool.desired!;
 			await this.ctx.storage.transaction(async (storage) => {
 				const current = (await storage.get<Pool>('pool'))!;
@@ -223,7 +240,9 @@ export class ModelPool extends DurableObject<Env> {
 					host.ready = health.find((checked) => checked.id === host.id)?.ready ?? false;
 					if (host.ready) delete host.missed;
 				}
-				if (current.hosts.filter((host) => host.ready && host.generation.snapshot.id === current.desired?.snapshot.id).length >= MIN_HOSTS) {
+				// A generation serves once it has its minimum of ready hosts, and one at least, which a pool of none needs too.
+				const ready = current.hosts.filter((host) => host.ready && host.generation.snapshot.id === current.desired?.snapshot.id);
+				if (ready.length >= Math.max(minHosts, 1)) {
 					current.serving = current.desired!.snapshot.id;
 				}
 				await storage.put('pool', current);
