@@ -31,6 +31,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.blocks import sinusoidal_time
+from dew.nn.dense import Dense
 from dew.nn.flops import (
     MissingFlopsCount,
     attention_flops,
@@ -77,8 +78,8 @@ def _rotary_positions(lengths: jax.Array, text: int, rows: int, columns: int) ->
     return jnp.concatenate([frame[..., None], jnp.broadcast_to(grid, (batch, *grid.shape))], axis=-1)
 
 
-def _dense(features: int, name: str, dtype, precision) -> nn.Dense:
-    return nn.Dense(features, use_bias=False, dtype=dtype, precision=precision, name=name)
+def _dense(features: int, name: str, dtype, precision) -> Dense:
+    return Dense(features, use_bias=False, dtype=dtype, precision=precision, name=name)
 
 
 def _per_rows(x, values, image: int, apply):

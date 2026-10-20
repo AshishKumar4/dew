@@ -64,6 +64,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.attention import FORWARD_MODE, repeat_kv_heads, unweighted_rmsnorm
 from dew.nn.blocks import normal_kernel
+from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels import mamba_ssd
@@ -418,7 +419,7 @@ class Mamba2(nn.Module):
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
         dense = functools.partial(
-            nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision
+            Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision
         )
         self.in_proj = dense(
             2 * self.intermediate_size + 2 * self.n_groups * self.state_size + self.num_heads,
