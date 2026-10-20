@@ -20,7 +20,7 @@ from dew import position
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, validation
 from dew.data.dataset import DataPartition, Loading
-from dew.data.mixing import SearchBudget, TokenDeficit, token_weights
+from dew.data.mixing import SearchBudget, TokenDeficit, state_counts, token_weights
 from dew.data.pipeline import Configured, Pipeline, Rejected, mix
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources import Files, Memory
@@ -499,6 +499,35 @@ def test_a_member_joining_a_resumed_mix_is_read_ahead_before_the_mix_gives_a_row
                 .filter(lambda row: False, identity="none@1").repeat())
     with pytest.raises(ValueError):
         member_rows([corpus("a", 0), hopeless], saved=saved, weights=[1, 1e-9], batches=1)
+
+
+@pytest.mark.parametrize("by", ["records", "tokens"])
+def test_a_streamed_mix_resumed_while_a_member_holds_a_row_read_ahead_reads_on_as_uninterrupted(by):
+    """A streamed mix reads every member's first row ahead before it gives a row, so a position it
+    saves after its first row falls while the other member holds its first row unread. Resumed
+    there, by records or by tokens, the mix gives that row and reads on record for record as the
+    uninterrupted one does."""
+    members = [corpus("a", 0), corpus("b", 1)]
+
+    def rows(saved=None):
+        data = compile(mix(members, by=by).batch(1), read="streamed", loading=READ, seed=5)
+        stream = data.train(DataPartition())
+        try:
+            first = None
+            if saved is None:
+                first = int(next(stream)["source"][0])
+                saved = stream.get_state()
+            else:
+                stream.set_state(saved)
+            read = [(int(batch["source"][0]), int(batch["id"][0])) for batch in itertools.islice(stream, 6)]
+            return read, saved, first
+        finally:
+            stream.close()
+
+    whole, saved, first = rows()
+    resumed, _, _ = rows(saved)
+    assert (1 - first, 0) in whole
+    assert resumed == whole
 
 
 def test_an_indexed_mix_still_refuses_a_member_joining():
@@ -1144,9 +1173,9 @@ def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation()
                               budget=SearchBudget(consecutive=5)))
     with pytest.raises(ValueError):
         next(reader)
-    counts = reader.get_state()["parents"]["all-zero"]["counts"]
-    assert counts["attempted"] == 5
-    assert counts["rejected"] == {"zero_targets": 5}
+    counts = state_counts(reader.get_state())["all-zero"]
+    assert counts.attempted == 5
+    assert counts.rejected == {"zero_targets": 5}
     reader.close()
 
 
