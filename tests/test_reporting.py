@@ -281,7 +281,7 @@ def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counte
                          "data/truncated/tiny-shakespeare": 0.0})
     assert [row.name for _, row in display.rows()] == ["loss"]
     data_line = shown.data_line
-    line = data_line(display.data)
+    line = data_line(display.corpus_counts)
     assert line is not None and line.plain == "data 4,824 rows  ·  0 rejected"
     mixture = data_line({"data/rows/web": 3000.0, "data/rows/code": 1824.0,
                          "data/rejected/web/too_long": 2.0, "data/rejected/code/too_long": 1.0,
