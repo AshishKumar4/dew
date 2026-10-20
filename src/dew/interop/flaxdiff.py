@@ -44,12 +44,17 @@ if TYPE_CHECKING:
 # conditioning embed and the output head.
 _MOVED = {"time_embed": ("conditioning", "time_embed"),
           "text_proj": ("conditioning", "text_context_proj"),
+          "hilbert_projection": ("patch_embed", "Conv_0"),
           "final_norm": ("output", "final_norm"),
           "final_proj": ("output", "final_proj")}
 _MLP_LAYERS = {"layers_0": "up_proj", "layers_2": "down_proj"}
+# FlaxDiff projected a scan order's raw patches with this dense layer, `[p * p * C, D]` in patchify's
+# (row, column, channel) order; Dew embeds every order through the patch convolution, whose
+# `[p, p, C, D]` kernel is that matrix reshaped, and gathers the tokens after.
+_SCAN_PROJECTION = "hilbert_projection"
 _HYBRID_MOVED = {"time_embed": ("conditioning", "time_embed"),
                  "text_context_proj": ("conditioning", "text_context_proj"),
-                 "hilbert_projection": ("embed", "hilbert_projection"),
+                 "hilbert_projection": ("embed", "patch_embed", "Conv_0"),
                  "patch_embed": ("embed", "patch_embed"),
                  "final_norm": ("output", "final_norm"),
                  "final_proj": ("output", "final_proj")}
@@ -198,7 +203,11 @@ def _gated(tree, mlp: bool = False):
 def _variables(weights: Mapping, model: Mapping[str, object],
                moved: Mapping[str, tuple[str, ...]], jax_version: str) -> dict:
     params: dict = {}
+    patch = records.integer(model["patch_size"], "patch_size")
     for name, value in weights.items():
+        if name == _SCAN_PROJECTION:
+            kernel = np.asarray(value["kernel"])
+            value = {**value, "kernel": kernel.reshape(patch, patch, -1, kernel.shape[-1])}
         *parents, leaf = moved.get(name, (name,))
         branch = params
         for parent in parents:
