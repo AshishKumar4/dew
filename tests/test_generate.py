@@ -32,6 +32,21 @@ def tiny(**overrides):
 
 
 
+def test_every_native_sampler_declares_the_key_it_requires():
+    """A native draw needs its key, so the samplers declare it required rather than defaulting it
+    to a None that the request refuses (`request_key`): leaving it out is a TypeError at the call."""
+    import inspect
+
+    from dew.diffusion.block import BlockProcess
+    from dew.diffusion.discrete import DiscreteProcess
+    from dew.sampling.pipelines import TextToImage
+
+    for function in (generate, BlockProcess.generate, DiscreteProcess.generate, TextToImage.prepare,
+                     TextToImage.__call__):
+        key = inspect.signature(function).parameters["key"]
+        assert key.default is inspect.Parameter.empty, function.__qualname__
+
+
 def test_a_pattern_and_its_kinds_from_json_can_generate(rng):
     """A run record hands the pattern as a list and each kind as a record,
     the form a config parses to."""
