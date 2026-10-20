@@ -102,6 +102,9 @@ def replayed(record, drawn):
     def network(request):
         exchange = next(exchanges)
         assert json.loads(request.content) == exchange["request"], exchange["path"]
+        if "stream" in exchange:
+            return httpx2.Response(exchange["status"], text=exchange["stream"],
+                                   headers={"Content-Type": "text/event-stream"})
         return httpx2.Response(exchange["status"], json=exchange["response"])
 
     client = openai.OpenAI(base_url="http://fixture/v1", api_key="fixture", max_retries=0,
@@ -114,12 +117,12 @@ def replayed(record, drawn):
 @pytest.mark.parametrize("provider", ["vllm", "sglang"])
 def test_a_draw_ends_on_the_policys_stops_as_the_engine_drew_it(provider):
     """Draws Dew's rollout server made on vLLM 0.30.0 and SGLang 0.5.20 serving Qwen2.5-0.5B-Instruct
-    on an A100 (tools/gateway_capture.py, 2026-10-20), replayed request by request: Dew sends each
-    engine the request it sent it then, and reads its answer as it did. A policy with no stop runs
-    to its budget past the model's own EOS on both engines. vLLM ends a draw on the policy's stop
-    alone, drawing past the model's EOS ids where the policy names one of them or another id.
-    SGLang ends on its model's EOS under any stop, so a draw that ends on an EOS the policy does
-    not name is refused, not read as a stop."""
+    (tools/gateway_capture.py), replayed request by request: Dew sends each engine the request it
+    sent it then, and reads its answer as it did, SGLang's as the events it streamed. A policy with
+    no stop runs to its budget past the model's own EOS ids on both engines, and a policy with one
+    ends on it alone, drawn past the model's EOS ids where the policy names one of them or another
+    id: vLLM stops on the policy's ids by itself, and SGLang, which would also end on its model's
+    EOS, draws as the policy without stops while Dew cuts its stream at the policy's first."""
     record = json.loads((CAPTURED / f"{provider}_stops.json").read_text())
     native = set(record["native_eos"])
     unstopped, at_eos, past_eos = record["draws"]
@@ -127,12 +130,7 @@ def test_a_draw_ends_on_the_policys_stops_as_the_engine_drew_it(provider):
     for drawn in record["draws"]:
         server, exchanges = replayed(record, drawn)
         try:
-            future = server.submit(record["prompt"], record["budget"], key=drawn["seed"])
-            if "refused" in drawn:
-                with pytest.raises(ValueError):
-                    future.result()
-                continue
-            draw = future.result()
+            draw = server.submit(record["prompt"], record["budget"], key=drawn["seed"]).result()
         finally:
             server.close()
         assert next(exchanges, None) is None
@@ -141,12 +139,9 @@ def test_a_draw_ends_on_the_policys_stops_as_the_engine_drew_it(provider):
         assert draw.terminated == bool(stops) and not any(token in stops for token in draw.tokens[:-1])
         assert draw.terminated or len(draw.tokens) == record["budget"]
     assert any(token in native for token in unstopped["tokens"][:-1])
-    if provider == "vllm":
-        for stopped in (at_eos, past_eos):
-            assert stopped["tokens"][-1] == stopped["eos"]
-            assert any(token in native - {stopped["eos"]} for token in stopped["tokens"][:-1])
-    else:
-        assert "refused" in at_eos and "refused" in past_eos
+    for stopped in (at_eos, past_eos):
+        assert stopped["tokens"][-1] == stopped["eos"]
+        assert any(token in native - {stopped["eos"]} for token in stopped["tokens"][:-1])
 
 
 def test_a_draw_in_flight_across_a_push_keeps_its_submission_version():

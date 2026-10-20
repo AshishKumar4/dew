@@ -23,7 +23,9 @@ ends on its own EOS: under a policy with no stop, one that stops at the model's 
 stops at a token the model draws after its EOS (the first such seed's). Write them as
 `{engine}_stops.json` with the model's EOS ids and what each draw gave: its ids and whether it
 ended on a stop, or the error Dew raised. It also records the engine's raw answer to a draw from
-the same seed that stops at a string its answer reaches (`stop_strings`).
+the same seed that stops at a string its answer reaches (`stop_strings`), and on SGLang, which Dew
+streams, how many ids the engine generated for a draw under a long budget that Dew's server cut at
+an early stop (`release`).
 """
 
 from __future__ import annotations
@@ -61,6 +63,8 @@ RETURN_IDS = {"vllm": {"return_tokens_as_token_ids": True, "return_token_ids": T
               "sglang": {"return_token_ids": True}}
 """The fields that make each engine's completions route answer with its sampled ids."""
 STOPS_BUDGET = 48
+RELEASE_BUDGET = 2048
+"""The budget of the streamed draw whose early stop shows whether closing a stream ends SGLang's request."""
 """Tokens a stops draw may take: the answer, its EOS and what the model draws after it."""
 
 
@@ -77,7 +81,7 @@ def engine(name: str, bin: Path) -> list[str]:
     if name == "sglang":
         return [str(bin / "python"), "-m", "sglang.launch_server", "--model-path", MODEL, "--host", "127.0.0.1",
                 "--port", "8011", "--context-length", "4096", "--mem-fraction-static", "0.6",
-                "--tool-call-parser", "qwen25"]
+                "--tool-call-parser", "qwen25", "--enable-metrics"]
     return [str(bin / "python"), "-m", "vllm.entrypoints.openai.api_server", "--model", MODEL, "--host",
             "127.0.0.1", "--port", "8011", "--max-model-len", "4096", "--gpu-memory-utilization", "0.6",
             "--enable-auto-tool-choice", "--tool-call-parser", "hermes", "--enforce-eager"]
@@ -162,10 +166,14 @@ class _Recorded(BaseHTTPRequestHandler):
         raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         answer = httpx.request(method, ENGINE + self.path, content=raw, timeout=900,
                                headers={"Content-Type": self.headers.get("Content-Type", "application/json")})
+        kind = answer.headers.get("Content-Type", "application/json")
+        # A streamed answer is kept as the server-sent events it was, a whole one as its JSON.
+        streamed = kind.startswith("text/event-stream")
         self.server.exchanges.append({"path": self.path, "request": json.loads(raw) if raw else None,
-                                      "status": answer.status_code, "response": answer.json()})
+                                      "status": answer.status_code,
+                                      **({"stream": answer.text} if streamed else {"response": answer.json()})})
         self.send_response(answer.status_code)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(answer.content)))
         self.end_headers()
         self.wfile.write(answer.content)
@@ -226,8 +234,26 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
             "seed": seed, "logprobs": 0, "stop": [stop], **RETURN_IDS[name]})
         return {"stop": stop, "seed": seed, "exchanges": list(proxy.exchanges)}
 
+    def released(seed: int, stop: int) -> dict:
+        """A streamed draw straight to SGLang under a long budget, stopped at `stop`: how many ids the
+        engine generated for it, which says whether closing the stream at the stop ended the request."""
+        direct = OpenAICompletion(MODEL, openai.OpenAI(base_url=f"{ENGINE}/v1", api_key="capture", max_retries=0),
+                                  provider=name)
+        server = OpenAIRolloutServer(direct, Sampling(temperature=1.0, eos_token_ids=stop), published)
+        before = _metric("sglang:generation_tokens_total")
+        try:
+            drawn = server.submit(prompt, RELEASE_BUDGET, key=seed).result()
+        finally:
+            server.close()
+        deadline = time.monotonic() + 120
+        while _metric("sglang:num_running_reqs") > 0 and time.monotonic() < deadline:
+            time.sleep(0.5)
+        return {"budget": RELEASE_BUDGET, "stop": stop, "seed": seed, "drawn": len(drawn.tokens),
+                "terminated": drawn.terminated, "generated": _metric("sglang:generation_tokens_total") - before}
+
     draws: list[dict] = []
     stopped: list[dict] = []
+    release: dict | None = None
     with served(name, bin, out):
         try:
             # The first seed whose unstopped draw ends its answer on the model's EOS and goes on to a
@@ -251,11 +277,20 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
             stop = next((piece for piece in pieces if piece), None)
             if stop is not None:
                 stopped.append(raw(seed, stop))
+            if name == "sglang":
+                release = released(seed, later[0])
         finally:
             proxy.shutdown()
             (out / f"{name}_stops.json").write_text(json.dumps(
                 {"engine": name, "model": MODEL, "native_eos": native, "prompt": prompt, "budget": STOPS_BUDGET,
-                 "draws": draws, "stop_strings": stopped}, indent=1))
+                 "draws": draws, "stop_strings": stopped, "release": release}, indent=1))
+
+
+def _metric(name: str) -> float:
+    """The engine's Prometheus series `name`, summed over its labels."""
+    text = httpx.get(f"{ENGINE}/metrics", timeout=30).text
+    return sum(float(line.rsplit(" ", 1)[1]) for line in text.splitlines()
+               if line.startswith((f"{name}{{", f"{name} ")))
 
 
 def _answers(url: str) -> bool:
