@@ -421,6 +421,42 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
                          f"{most} seeds at {wide[:4]}; give the site larger inputs or fewer shared factors")
 
 
+def declared_seeds(path) -> dict[str, int]:
+    """Each site's declared seed count in a recording of a reference over seeds (`indexed_recording`):
+    its `<site>.seeds`, written at record time by `seeds_for` on the recorded reference."""
+    with np.load(path) as stored:
+        return {name.removesuffix(".seeds"): int(stored[name]) for name in stored.files
+                if name.endswith(".seeds")}
+
+
+def indexed_recording(stored, site: str, seeds: int):
+    """`assert_as_exact`'s draw, reference and truth for a reference recorded over seeds, where it cannot
+    run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.input.<name>`,
+    `<site>.reference.<name>` and `<site>.truth.<name>`, each stacked over the seeds. A draw is
+    `(index, inputs)`, the index an integer `widened` keeps; the reference and the truth read the
+    recorded outputs at it, and Dew's function takes the same two arguments and ignores the index.
+    The recording covers check 1's redraw, (1 + REDRAW) times the declared seeds, so a numerical
+    failure stays a finding rather than running out of recorded seeds."""
+    def tree(kind):
+        prefix = f"{site}.{kind}."
+        return {name.removeprefix(prefix): value for name, value in stored.items() if name.startswith(prefix)}
+
+    inputs, reference, truth = tree("input"), tree("reference"), tree("truth")
+    count = min(len(value) for part in (inputs, reference, truth) for value in part.values())
+    if count < (1 + REDRAW) * seeds:
+        raise AssertionError(f"{site}: {count} recorded seeds, and check 1 over {seeds} may draw "
+                             f"{(1 + REDRAW) * seeds}; record (1 + REDRAW) times the declared seeds")
+
+    def draw(seed):
+        return np.int32(seed), {name: value[seed] for name, value in inputs.items()}
+
+    def lookup(values):
+        return jax.jit(lambda index, inputs: {name: jnp.asarray(value)[index]
+                                            for name, value in values.items()})
+
+    return draw, lookup(reference), lookup(truth)
+
+
 def assert_no_less_exact(dew, reference, truth, label: str) -> None:
     """An unchanged computation has no larger float64 distance than its source."""
     mine, theirs = distance(dew, truth), distance(reference, truth)

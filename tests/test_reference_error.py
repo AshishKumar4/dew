@@ -11,7 +11,9 @@ from reference_error import (
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_leaves_as_exact,
+    declared_seeds,
     distance,
+    indexed_recording,
     seeds_for,
 )
 
@@ -184,3 +186,23 @@ def test_check_one_holds_a_row_of_float64_zero_to_the_references_own():
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(zero_row(1e-12), zero_row(0.0), _draw, "zero row", seeds=8)
     assert raised.type is AssertionError
+
+
+def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_path):
+    """A reference recorded over (1 + REDRAW)·K seeds: each draw reads its seed's inputs, the reference
+    and truth read their recorded outputs at it, and check 1 judges Dew against them; a recording too
+    short for the redraw is refused before anything is judged."""
+    rng = np.random.default_rng(9)
+    count, seeds = 40, 8
+    x = rng.normal(size=(count, 32)).astype(np.float32)
+    truth = np.tanh(x.astype(np.float64))
+    path = tmp_path / "recorded.npz"
+    np.savez(path, **{"site.input.x": x, "site.reference.y": np.tanh(x),
+                      "site.truth.y": truth, "site.seeds": np.int64(seeds)})
+    assert declared_seeds(path) == {"site": seeds}
+    with np.load(path) as stored:
+        draw, reference, truth_fn = indexed_recording(dict(stored), "site", seeds)
+        assert_as_exact(jax.jit(lambda index, inputs: {"y": jnp.tanh(inputs["x"])}), reference, draw,
+                        "recorded", seeds=seeds, truth_fn=truth_fn)
+        with pytest.raises(AssertionError):
+            indexed_recording(dict(stored), "site", 16)
