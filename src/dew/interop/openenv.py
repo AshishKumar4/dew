@@ -23,11 +23,17 @@ and the environment's action type:
 
 Each step's reward becomes that turn's step reward (`Observation.reward`), so
 a verifier that returns 0 trains on the environment's rewards alone, and a
-`done` result completes the episode. The messages each observation holds
-become the episode's transcript (`Observation.messages`). Dew imports nothing
-of OpenEnv: `session(task, identity)` opens the caller's client, a context
-manager whose exit closes the session, and the protocols below are what Dew
-reads of it.
+`done` result completes the episode, a reset's too, before any turn. The
+messages each observation holds become the episode's transcript
+(`Observation.messages`).
+
+Dew imports nothing of OpenEnv. `session(task, identity)` opens the caller's
+client, a context manager whose exit closes the session, and the protocols
+below are what Dew reads of it. A failure of the session's transport is an
+infrastructure failure, which the source retries; the session's context
+manager says which: with `GenericEnvClient`, it re-raises the
+`websockets.exceptions.ConnectionClosed` a dropped connection raises as an
+`dew.inference.InfrastructureError`.
 """
 
 from __future__ import annotations
@@ -41,11 +47,11 @@ from dew.objectives.rl.episodes import Action, EpisodeId, EpisodeStatus, Observa
 from dew.objectives.rl.sessions import Task
 
 
-class StepResult(Protocol):
+class StepResult[ObservationT](Protocol):
     """What an OpenEnv session answers a reset or a step with (`openenv.core.StepResult`)."""
 
     @property
-    def observation(self) -> object: ...
+    def observation(self) -> ObservationT: ...
 
     @property
     def reward(self) -> float | None: ...
@@ -54,12 +60,12 @@ class StepResult(Protocol):
     def done(self) -> bool: ...
 
 
-class Session(Protocol):
+class Session[ObservationT, ActionT](Protocol):
     """One open OpenEnv session, as `EnvClient.sync()` serves it."""
 
-    def reset(self, **options: object) -> StepResult: ...
+    def reset(self, **options: object) -> StepResult[ObservationT]: ...
 
-    def step(self, action: object) -> StepResult: ...
+    def step(self, action: ActionT) -> StepResult[ObservationT]: ...
 
 
 @dataclass(frozen=True)
@@ -71,7 +77,7 @@ class Said:
 
 
 @dataclass(frozen=True)
-class OpenEnv:
+class OpenEnv[ObservationT, ActionT]:
     """Runs each episode in its own OpenEnv session (an environment factory for `EnvironmentSource`).
 
     `session(task, identity)` opens it, `options(task, identity)` are its
@@ -79,30 +85,32 @@ class OpenEnv:
     adapters the module docstring describes.
     """
 
-    session: Callable[[Task, EpisodeId], contextlib.AbstractContextManager[Session]]
-    prompt: Callable[[object], Said]
-    reply: Callable[[object], Said]
-    action: Callable[[tuple[int, ...]], object]
+    session: Callable[[Task, EpisodeId], contextlib.AbstractContextManager[Session[ObservationT, ActionT]]]
+    prompt: Callable[[ObservationT], Said]
+    reply: Callable[[ObservationT], Said]
+    action: Callable[[tuple[int, ...]], ActionT]
     options: Callable[[Task, EpisodeId], Mapping[str, object]] = field(default=lambda task, identity: {})
 
     @contextlib.contextmanager
-    def __call__(self, task: Task, identity: EpisodeId) -> Iterator[_Episode]:
+    def __call__(self, task: Task, identity: EpisodeId) -> Iterator[_Episode[ObservationT, ActionT]]:
         with self.session(task, identity) as opened:
             yield _Episode(self, opened, self.options(task, identity))
 
 
 @dataclass
-class _Episode:
+class _Episode[ObservationT, ActionT]:
     """One episode's OpenEnv session as an `Environment`."""
 
-    adapters: OpenEnv
-    session: Session
+    adapters: OpenEnv[ObservationT, ActionT]
+    session: Session[ObservationT, ActionT]
     options: Mapping[str, object]
 
     def reset(self) -> Observation:
         result = self.session.reset(**self.options)
         said = self.adapters.prompt(result.observation)
-        return Observation(said.ids, messages=said.messages)
+        if result.done:
+            return Observation((), EpisodeStatus.COMPLETED, reward=result.reward, messages=said.messages)
+        return Observation(said.ids, reward=result.reward, messages=said.messages)
 
     def step(self, action: Action) -> Observation:
         result = self.session.step(self.adapters.action(action.tokens))
