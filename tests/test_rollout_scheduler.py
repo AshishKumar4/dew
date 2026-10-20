@@ -350,11 +350,12 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
         np.testing.assert_array_equal(got, want)
     np.testing.assert_array_equal(trained, np.arange(tasks))
     np.testing.assert_array_equal(again, np.arange(tasks, 2 * tasks))
-    # Each batch trains its three admitted groups' two sessions each, every call drawn under the
-    # version its call published: the resumed batch from fresh submissions alone.
+    # Each batch trains its three admitted groups' two sessions each (a session's weights sum to
+    # one), every call drawn under the version its call published: the resumed batch from fresh
+    # submissions alone.
     for batch, version in ((packed, 0), (repacked, 1)):
         sampled = batch["response_mask"] > 0
-        assert len(np.unique(batch["session_index"][sampled])) == 6 * batches
+        assert round(float(np.sum(batch["session_weights"], dtype=np.float64))) == 6 * batches
         assert set(np.unique(batch["versions"][sampled])) == {version}
     [before, after] = records
     # Each batch admits groups 0, 2 and 3 of every five and abandons group 1. Cancelled: group 1's
