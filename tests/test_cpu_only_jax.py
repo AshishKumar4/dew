@@ -112,23 +112,31 @@ except CPUOnlyJax as refused:
 """
 
 
-def machine(directory, driver: str, cuda: int | None, installed: tuple[str, ...]) -> dict[str, str]:
+def machine(directory, driver: str, library: int | str, installed: tuple[str, ...]) -> dict[str, str]:
     """A process environment on a machine with an NVIDIA GPU of SM 9.0 on `driver` (a stand-in
-    nvidia-smi), whose user-mode driver library reports CUDA `cuda` (a stand-in libcuda.so.1, ahead
-    of any on the loader's path), and with JAX's CUDA builds `installed`, each a plugin that opens
-    no GPU, as one does on a host it cannot start on; JAX itself is the environment's."""
-    library = directory / "driver"
-    library.mkdir()
-    (library / "driver.c").write_text(DRIVER.format(version=cuda or 0, status=0 if cuda else 999))
-    subprocess.run(["cc", "-shared", "-fPIC", "-o", str(library / "libcuda.so.1"),
-                    str(library / "driver.c")], check=True)
+    nvidia-smi), whose user-mode driver library (a stand-in libcuda.so.1 ahead of any on the
+    loader's path) reports the CUDA version `library`, or fails to (`"error"`), or does not load
+    (`"unloadable"`), and whose JAX's CUDA builds are `installed` alone (a `jax_plugins` package
+    ahead of the environment's), each a plugin that opens no GPU, as one does on a host it cannot
+    start on."""
+    driven = directory / "driver"
+    driven.mkdir()
+    if library == "unloadable":
+        (driven / "libcuda.so.1").write_bytes(b"not a shared object")
+    else:
+        version, status = (0, 999) if library == "error" else (library, 0)
+        (driven / "driver.c").write_text(DRIVER.format(version=version, status=status))
+        subprocess.run(["cc", "-shared", "-fPIC", "-o", str(driven / "libcuda.so.1"),
+                        str(driven / "driver.c")], check=True)
     plugins = directory / "plugins"
+    (plugins / "jax_plugins").mkdir(parents=True)
+    (plugins / "jax_plugins" / "__init__.py").write_text("")
     for build in installed:
-        (plugins / "jax_plugins" / f"xla_{build}").mkdir(parents=True)
+        (plugins / "jax_plugins" / f"xla_{build}").mkdir()
         (plugins / "jax_plugins" / f"xla_{build}" / "__init__.py").write_text("def initialize():\n    pass\n")
     env = {key: value for key, value in os.environ.items() if key != "JAX_PLATFORMS"}
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    loader = os.pathsep.join(filter(None, (str(library), os.environ.get("LD_LIBRARY_PATH"))))
+    loader = os.pathsep.join(filter(None, (str(driven), os.environ.get("LD_LIBRARY_PATH"))))
     env.update(PATH=stand_in(directory, f"{driver}, 9.0\\n"), CUDA_VISIBLE_DEVICES="999",
                LD_LIBRARY_PATH=loader,
                PYTHONPATH=os.pathsep.join(filter(None, (os.path.join(root, "src"), str(plugins),
@@ -136,17 +144,19 @@ def machine(directory, driver: str, cuda: int | None, installed: tuple[str, ...]
     return env
 
 
-@pytest.mark.parametrize("driver, cuda, installed, runs, install", [
-    ("580.82.07", 13000, ("cuda13",), ("cuda13",), None),    # a driver that runs CUDA 13.0 itself
-    ("580.82.07", 13000, ("cuda12",), ("cuda12",), None),    # CUDA 13.0 runs the cuda12 build too
-    ("570.124.06", 13000, ("cuda13",), ("cuda13",), None),   # an older one under NVIDIA's cuda-compat
-    ("570.124.06", 12080, ("cuda13",), (), "cuda12"),        # the same driver without it: CUDA 12.8
+@pytest.mark.parametrize("driver, library, installed, runs, install", [
+    ("580.82.07", 13000, ("cuda13",), ("cuda13",), None),     # a driver that runs CUDA 13.0 itself
+    ("580.82.07", 13000, ("cuda12",), ("cuda12",), None),     # CUDA 13.0 runs the cuda12 build too
+    ("570.124.06", 13000, ("cuda13",), ("cuda13",), None),    # an older one under NVIDIA's cuda-compat
+    ("570.124.06", 13000, (), (), "cuda13"),                  # which installs the newer build
+    ("570.124.06", 12080, ("cuda13",), (), "cuda12"),         # the same driver without it: CUDA 12.8
     ("570.124.06", 12080, ("cuda12",), ("cuda12",), None),
-    ("580.82.07", 13000, (), (), "cuda13"),                  # no CUDA build of JAX installed
-    ("580.82.07", None, ("cuda13",), (), None),              # a driver library that reports no CUDA
+    ("580.82.07", 13000, (), (), "cuda13"),                   # no CUDA build of JAX installed
+    ("580.82.07", "error", ("cuda13",), (), None),            # a driver library that reports no CUDA
+    ("580.82.07", "unloadable", ("cuda13",), (), None),       # and one that does not load
 ])
 def test_a_runs_setup_reads_the_machines_driver_and_builds_and_names_the_build_that_runs(
-        tmp_path, driver, cuda, installed, runs, install):
+        tmp_path, driver, library, installed, runs, install):
     """A run's setup (`prepare_process`) in a fresh process on a machine with an NVIDIA GPU whose JAX
     opens none reads the driver from nvidia-smi, the CUDA version from the user-mode driver library
     and the builds of JAX installed, and stops with what it found: the installed builds that run
@@ -154,8 +164,9 @@ def test_a_runs_setup_reads_the_machines_driver_and_builds_and_names_the_build_t
     driver's own, or a 570's under cuda-compat) and a CUDA 12.8 driver runs the cuda12 build alone,
     and where none does, the build to install, none where no driver library reports a version."""
     done = subprocess.run([sys.executable, "-c", SETUP], capture_output=True, text=True,
-                          env=machine(tmp_path, driver, cuda, installed), timeout=300)
+                          env=machine(tmp_path, driver, library, installed), timeout=300)
     assert done.returncode == REFUSED, done.stderr[-2000:]
+    cuda = library if isinstance(library, int) else None
     assert json.loads(done.stdout.splitlines()[-1]) == {"cuda": cuda, "runs": list(runs), "install": install}
 
 
