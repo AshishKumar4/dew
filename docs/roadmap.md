@@ -106,6 +106,8 @@ The kernel direction was approved on 2026-10-19:
 - Let `from_grain` and `from_iter` work without undocumented names, and `Memory` read a DataFrame directly. [808, 809]
 - Add presets for prompts, preferences, chat canvases and records, which the run layer's recipes cover today. [810]
 - Rule on the nine public Dataset members the spec does not name: then, chain, map_with_index, slice, windows, token_split, rebatch, limit and iterate. [811]
+- Chunk a long chat conversation and keep an overlong prompt's tail by default, as the spec says, and carry a row's `ability` into its record's extra_info. [812, 813, 814]
+- Teach only names main has in the post-training and inference docs. [815]
 
 ## Training and parallelism
 
@@ -155,6 +157,9 @@ The following direction was approved on 2026-10-19:
 Keep the existing gateway interface. Miles would currently duplicate it: its trainer requires torch.distributed and its TITO service speaks SGLang's extended chat API. Revisit a Miles dependency if it offers a small standalone session package. Cancellation must stop both the trial's sandbox and a long in-flight engine decode before either is claimed. The gateway leaves the engine decoding when a session is cancelled; rllm-org/rllm#938 cancels the upstream call on client disconnect, and Dew claims engine abort after a GPU receipt once it merges. [729]
 - Let disk banks load packed families whose packing is a view. [786]
 - Keep the TPU command's dry run free of local writes. [777]
+- Start a rollout server's thread and a harness's workers on their first submit, and stamp a publication before its first draw, not in their constructors. [816]
+- Let FlowRollout alone own collection, the Flow objective's reward, group and rollout fields gone. [817]
+- One route to a task: bundles and objectives delegate to dew.pipeline's task factories. [818]
 
 ## Tutorials and docs
 
