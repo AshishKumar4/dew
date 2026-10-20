@@ -22,7 +22,7 @@ A model is a plain Flax module. An objective defines variables, loss and validat
 | Run configuration | `RunConfig.record()`, `src/dew/config/__init__.py` | The resolved run configuration is its record. Resume and export read it rather than reconstructing a second configuration. |
 | Outcomes and telemetry | `src/dew/telemetry/records.py` | Trackers, display and reports consume the same outcome records. |
 | Environments and suite selection | Project extras and lock files; `tools/armada/ci.py` | Installers and CI read their package and test selections from these owners. |
-| Reinforcement-learning math | `src/dew/rl` | Pure functions and small pytrees over rollout batches: advantages, surrogates, buffers, environments, rewards; it imports `dew.nn` and `dew.sampling` and nothing from `dew.training`. Nothing under `src/dew` outside `src/dew/rl` and `src/dew/objectives/rl` may import `dew.rl`. A test walks the module tree and asserts it. |
+| Reinforcement-learning imports | `src/dew/rl` | `dew.rl` imports nothing from `dew.training`. Nothing under `src/dew` outside `src/dew/rl` and `src/dew/objectives/rl` may import `dew.rl`. A test walks the module tree and asserts it. |
 | Staged training | `Recipe` and `Stage`, `recipes/chain.py` | Stages compose existing data, objectives and rollouts. `Objective.model_variables` defines what passes to the next stage. |
 
 ## Interfaces stay shared
