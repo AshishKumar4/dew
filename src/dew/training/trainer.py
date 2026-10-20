@@ -495,7 +495,6 @@ class Trainer(Generic[Loss, Effects]):
         self._display = TrainingDisplay()
         self._count_work = False
         self._refusal: str | None = None
-        self._unavailable_noted = False
         # The fit ladder's rung beyond the objective's own head and remat: a
         # step that fit only under XLA's default options keeps them for later
         # compiles. A resumed run starts at its checkpoint's rung, and says so
@@ -1646,7 +1645,7 @@ class Trainer(Generic[Loss, Effects]):
         # On a device with a known peak, the run counts its batches' work
         # for train/mfu while they can be counted (`_counted_batch`).
         self._count_work = gpu_target(started.device_kind).bf16_peak is not None
-        self._refusal, self._unavailable_noted = None, False
+        self._refusal = None
         self._report(started, current)
         if plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
@@ -2099,8 +2098,8 @@ class Trainer(Generic[Loss, Effects]):
 
         The count is the capability: from the first batch whose work the
         model or objective cannot declare (`MissingFlopsCount`, as a media
-        row's tower), this process counts no more, keeps the count's reason
-        for the log's note, and trains on. Its batches keep their work
+        row's tower), this process counts no more, says why in the debug
+        log, and trains on. Its batches keep their work
         columns, as unknown work (`uncounted`), so every process runs one
         step program and the step's global sum leaves train/mfu unreported
         pool-wide. One thread prepares batches, the prefetch worker or a
@@ -2112,6 +2111,7 @@ class Trainer(Generic[Loss, Effects]):
                 return prepare_counts(self.objective, batch, count_model=True)
             except MissingFlopsCount as missing:
                 self._refusal = str(missing)
+                _log.debug("train/mfu is not reported for %s: %s", type(self.objective).__name__, missing)
         counted = prepare_counts(self.objective, batch, count_model=False)
         return counted if self._refusal is None else uncounted(counted)
 
@@ -2251,13 +2251,8 @@ class Trainer(Generic[Loss, Effects]):
         def report() -> None:
             if jax.process_index() != 0:
                 return
+            # A work count a process refused (`_counted_batch`) is NaN here, and train/mfu absent.
             work = None if read.training is None else float(read.training)
-            if work is not None and not math.isfinite(work) and not self._unavailable_noted:
-                # A process refused a count (`_counted_batch`) and the global
-                # sum carried it here: this thread alone says so, once.
-                self._unavailable_noted = True
-                reason = self._refusal or "another process's batch could not be counted"
-                self._display.note(f"train/mfu is unavailable for {type(self.objective).__name__}: {reason}")
             scalars = {"train/loss": float(read.loss),
                        **{f"train/{k}": float(v) for k, v in read.aux.items()},
                        **self._throughput(elapsed, counts.since_log, counts.samples, counts.flops,
