@@ -9,7 +9,8 @@ SVG, so they play with no script, in an `<img>` too. Each one loops: it builds t
 holds it, and eases back to the start. With reduced motion asked for, only the held picture
 shows.
 
-`curve`, `bars`, `heatmap` and `tokens` draw the charts the tutorials make from their own runs.
+`curve`, `bars`, `heatmap`, `images`, `points` and `tokens` draw the charts the tutorials make from their own
+runs.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from typing import Literal
 
 import numpy as np
 
-__all__ = ["THEMES", "Figure", "Shape", "bars", "curve", "heatmap", "tokens"]
+__all__ = ["THEMES", "Figure", "Shape", "bars", "curve", "heatmap", "images", "points", "tokens"]
 
 Role = Literal["text", "muted", "rule", "surface", "raised", "accent", "accent_fill", "warm",
                "warm_fill", "tint0", "tint1", "tint2", "tint3", "none"]
@@ -175,16 +176,21 @@ class Figure:
                                  "text-anchor": anchor},
                         {"fill": self.palette[color], "font-family": family}, words)
 
-    def image(self, x: float, y: float, size: float, pixels: np.ndarray) -> Shape:
-        """A uint8 image, [H, W] or [H, W, C], as a PNG drawn `size` wide, with its pixels kept sharp."""
+    def image(self, x: float, y: float, size: float, pixels: np.ndarray, *, photo: bool = False) -> Shape:
+        """A uint8 image, [H, W] or [H, W, C], drawn `size` wide: a PNG with its pixels kept sharp, or
+        with `photo` a WebP at quality 90 and smoothed, a fraction of a photograph's PNG."""
         from PIL import Image
 
         buffer = io.BytesIO()
-        Image.fromarray(pixels).save(buffer, format="PNG")
+        if photo:
+            Image.fromarray(pixels).save(buffer, format="WEBP", quality=90)
+        else:
+            Image.fromarray(pixels).save(buffer, format="PNG")
         encoded = base64.b64encode(buffer.getvalue()).decode()
+        kind = "webp" if photo else "png"
         return self.add("image", {"x": x, "y": y, "width": size, "height": size,
-                                  "href": f"data:image/png;base64,{encoded}"},
-                        {"image-rendering": "pixelated"})
+                                  "href": f"data:image/{kind};base64,{encoded}"},
+                        {} if photo else {"image-rendering": "pixelated"})
 
     @contextmanager
     def group(self, x: float = 0, y: float = 0) -> Iterator[Shape]:
@@ -297,42 +303,44 @@ def _ticks(low: float, high: float, count: int = 4) -> np.ndarray:
 
 
 def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
-          y_range: tuple[float, float] | None = None, smooth: int = 1, width: float = WIDE,
-          height: float = 290, seconds: float = 8.0) -> Figure:
+          x: Sequence[float] | None = None, y_range: tuple[float, float] | None = None, smooth: int = 1,
+          width: float = WIDE, height: float = 290, seconds: float = 8.0) -> Figure:
     """Lines over steps that draw themselves, one per entry of `series`, the first in the accent color.
 
-    With `smooth` above 1 each line is drawn faint, and its running mean over `smooth` steps over it.
+    `x` holds each point's step, as a tracker logged it; without it the points are steps 0, 1, 2 and
+    on. With `smooth` above 1 each line is drawn faint, and its running mean over `smooth` points over it.
     """
     figure = Figure(width, height, seconds=seconds, label=f"{y_label} against {x_label}")
     left, right, bottom = 50, 20, 48
     values = {name: np.asarray(ys, float) for name, ys in series.items()}
     # With several series, a legend fills rows under the label, as many as the names need.
     legend: list[tuple[float, float]] = []
-    x, y = left, 42.0
+    at_x, at_y = left, 42.0
     for name in values if len(values) > 1 else ():
         span = 30 + 8 * (len(name) + 5)
-        if legend and x + span > width - right:
-            x, y = left, y + 22
-        legend.append((x, y))
-        x += span + 16
+        if legend and at_x + span > width - right:
+            at_x, at_y = left, at_y + 22
+        legend.append((at_x, at_y))
+        at_x += span + 16
     top = (legend[-1][1] if legend else 20) + 20
     every = np.concatenate(list(values.values()))
     low, high = y_range or (float(every.min()), float(every.max()))
     if high <= low:
         low, high = low - 0.5, high + 0.5
-    steps = max(len(ys) for ys in values.values())
+    xs = np.asarray(x if x is not None else range(max(len(ys) for ys in values.values())), float)
+    first, final = float(xs[0]), float(xs[-1])
 
     def at(step: float, y: float) -> tuple[float, float]:
-        return (left + (width - left - right) * step / max(steps - 1, 1),
+        return (left + (width - left - right) * (step - first) / max(final - first, 1),
                 height - bottom - (height - top - bottom) * (y - low) / (high - low))
 
     for tick in _ticks(low, high):
-        _, y = at(0, tick)
-        figure.line(left, y, width - right, y, color="rule", width=1)
-        figure.text(left - 8, y + 5, f"{tick:g}", size=SMALL, color="muted", anchor="end")
-    for tick in _ticks(0, steps - 1, 4):
-        x, _ = at(tick, low)
-        figure.text(x, height - bottom + 20, f"{tick:g}", size=SMALL, color="muted", anchor="middle")
+        _, tick_y = at(first, tick)
+        figure.line(left, tick_y, width - right, tick_y, color="rule", width=1)
+        figure.text(left - 8, tick_y + 5, f"{tick + 0:g}", size=SMALL, color="muted", anchor="end")
+    for tick in _ticks(first, final, 4):
+        tick_x, _ = at(tick, low)
+        figure.text(tick_x, height - bottom + 20, f"{tick + 0:g}", size=SMALL, color="muted", anchor="middle")
     figure.text((left + width - right) / 2, height - 6, x_label, size=TEXT, color="muted", anchor="middle")
     figure.text(left, 20, y_label, size=TEXT, color="muted")
     # Neutral colors only, since warm means wrong; past three series the lines are dashed.
@@ -346,7 +354,7 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
             mean = np.convolve(ys, np.ones(window) / window, mode="valid")
             lines = [(ys, 1.0), (np.concatenate([np.full(window - 1, np.nan), mean]), 2.5)]
         for drawn, stroke in lines:
-            points = [at(step, y) for step, y in enumerate(drawn) if np.isfinite(y)]
+            points = [at(step, y) for step, y in zip(xs[:len(drawn)], drawn, strict=True) if np.isfinite(y)]
             line = figure.polyline(points, color=color, width=stroke, dash=dash)
             shade = 0.35 if window > 1 and stroke < 2 else 1
             if dash:
@@ -357,12 +365,13 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
         # The last value: beside the series' name in a legend, or else at the line's end.
         last = float(ys[-window:].mean())
         if legend:
-            x, y = legend[index]
-            figure.line(x, y - 5, x + 18, y - 5, color=color, width=2.5, dash=dash)
-            figure.text(x + 24, y, f"{name} {last:.2f}", size=TEXT, color=color)
+            at_x, at_y = legend[index]
+            figure.line(at_x, at_y - 5, at_x + 18, at_y - 5, color=color, width=2.5, dash=dash)
+            figure.text(at_x + 24, at_y, f"{name} {last:.2f}", size=TEXT, color=color)
         else:
-            x, y = at(steps - 1, last)
-            end = figure.text(x - 4, y - 10, f"{last:.2f}", size=TEXT, color=color, weight=600, anchor="end")
+            at_x, at_y = at(final, last)
+            end = figure.text(at_x - 4, at_y - 10, f"{last:.2f}", size=TEXT, color=color, weight=600,
+                              anchor="end")
             figure.appear(end, seconds * 0.55)
     return figure
 
@@ -445,27 +454,133 @@ def heatmap(frames: Sequence[Sequence[Sequence[float]]], *, rows: Sequence[str],
     return figure
 
 
+def images(frames: Sequence[np.ndarray], *, captions: Sequence[str] = (), columns: int = 8, size: float = 64,
+           rows: Sequence[str] = (), seconds: float = 8.0) -> Figure:
+    """A grid of photographs that changes from frame to frame: `frames[t]` is frame `t`'s images,
+    uint8 [N, H, W, C], drawn `size` wide in rows of `columns`. `captions[t]` names frame `t`, and
+    `rows[r]` names row `r` at its left. One frame is a still grid."""
+    count, shown = len(frames), len(frames[0])
+    lines = -(-shown // columns)
+    gap, top = 4, 30 if captions else 4
+    left = (max(len(name) for name in rows) * 0.6 * SMALL + 12) if rows else gap
+    width = left + columns * (size + gap)
+    height = top + lines * (size + gap) + gap
+    figure = Figure(width, height, seconds=seconds if count > 1 else 0.0,
+                    label=f"{shown} images" + (f" at each of {count} points" if count > 1 else ""))
+    times = _frame_times(count, seconds)
+    for row, name in enumerate(rows):
+        figure.text(left - 8, top + row * (size + gap) + size / 2 + 5, name, size=SMALL, color="muted",
+                    anchor="end")
+    grids = []
+    for batch in frames:
+        with figure.group() as grid:
+            for index, pixels in enumerate(np.asarray(batch)):
+                row, column = divmod(index, columns)
+                figure.image(left + column * (size + gap), top + row * (size + gap), size, pixels, photo=True)
+        grids.append(grid)
+    if count > 1:
+        figure.show_in_turn(grids, times)
+    if captions:
+        _captions(figure, captions, times, width - gap, 20)
+    return figure
+
+
+def points(series: Mapping[str, Sequence[tuple[float, float]]], *, x_label: str, y_label: str,
+           joined: bool = True, moved: Mapping[str, Sequence[tuple[float, float]]] | None = None,
+           captions: Sequence[str] = (), log_x: bool = False, log_y: bool = False, width: float = WIDE,
+           height: float = 300, seconds: float = 8.0) -> Figure:
+    """Dots, one series per entry of `series`, the first in the accent color and the others neutral, as
+    `curve` colors them. Joined, each series is a line through its dots in order, named beside its last
+    dot, dashed past the third, and the series appear one after another. Not joined, the dots are a
+    scatter with the names in a legend; with `moved`, each dot then slides to its place there, and
+    `captions` name the two pictures. With `log_x` or `log_y` that axis is logarithmic."""
+    figure = Figure(width, height, seconds=seconds, label=f"{y_label} against {x_label}")
+    names = list(series)
+    left, bottom, top = 56, 48, 34 if joined else 58
+    right = 20 + 0.6 * SMALL * max(len(name) for name in names) if joined else 20
+    values = {name: np.asarray(dots, float).reshape(-1, 2) for name, dots in series.items()}
+    targets = {name: np.asarray(moved[name], float).reshape(-1, 2) for name in names} if moved else {}
+    every = np.concatenate([*values.values(), *targets.values()])
+    scale = [np.log10 if log else (lambda v: v) for log in (log_x, log_y)]
+    low = [scale[k](every[:, k].min()) for k in (0, 1)]
+    high = [scale[k](every[:, k].max()) for k in (0, 1)]
+    for k in (0, 1):
+        pad = (high[k] - low[k]) * 0.06 or 0.5
+        low[k], high[k] = low[k] - pad, high[k] + pad
+
+    def at(x: float, y: float) -> tuple[float, float]:
+        u = (scale[0](x) - low[0]) / (high[0] - low[0])
+        v = (scale[1](y) - low[1]) / (high[1] - low[1])
+        return left + (width - left - right) * u, height - bottom - (height - top - bottom) * v
+
+    def ticks(k: int) -> np.ndarray:
+        if not (log_x, log_y)[k]:
+            return _ticks(low[k], high[k])
+        # Powers of ten, or 1, 2 and 5 times them where the axis spans less than two decades.
+        decades = np.arange(np.floor(low[k]), np.ceil(high[k]) + 1)
+        steps = (1.0,) if high[k] - low[k] >= 2 else (1.0, 2.0, 5.0)
+        marks = np.array([m * 10.0 ** d for d in decades for m in steps])
+        return marks[(np.log10(marks) >= low[k]) & (np.log10(marks) <= high[k])]
+
+    for tick in ticks(1):
+        _, tick_y = at(every[0, 0], tick)
+        figure.line(left, tick_y, width - right, tick_y, color="rule", width=1)
+        figure.text(left - 8, tick_y + 5, f"{tick + 0:g}", size=SMALL, color="muted", anchor="end")
+    for tick in ticks(0):
+        tick_x, _ = at(tick, every[0, 1])
+        figure.text(tick_x, height - bottom + 20, f"{tick + 0:g}", size=SMALL, color="muted", anchor="middle")
+    figure.text((left + width - right) / 2, height - 6, x_label, size=TEXT, color="muted", anchor="middle")
+    figure.text(left, 20, y_label, size=TEXT, color="muted")
+    colors: tuple[Role, ...] = ("accent", "text", "muted")
+    legend_x = left
+    for index, (name, dots) in enumerate(values.items()):
+        color = colors[index % len(colors)]
+        placed = [at(x, y) for x, y in dots]
+        if not joined:
+            figure.circle(legend_x + 5, 40, 5, fill=color)
+            figure.text(legend_x + 15, 45, name, size=SMALL, color=color)
+            legend_x += 30 + 0.6 * SMALL * len(name)
+            for (x, y), (to_x, to_y) in zip(placed, [at(*dot) for dot in targets.get(name, dots)],
+                                            strict=True):
+                dot = figure.circle(x, y, 3.5, fill=color)
+                if moved:
+                    figure.animate(dot, {seconds * 0.15: {"transform": "translate(0px,0px)"},
+                                         seconds * 0.55: {"transform": f"translate({to_x - x:.1f}px,"
+                                                                       f"{to_y - y:.1f}px)"}})
+            continue
+        with figure.group() as group:
+            figure.polyline(placed, color=color, width=1.25, dash="5 4" if index >= len(colors) else None)
+            for x, y in placed:
+                figure.circle(x, y, 4.5, fill=color)
+            end_x, end_y = placed[-1]
+            figure.text(end_x + 9, end_y + 5, name, size=SMALL, color=color)
+        figure.appear(group, 0.4 + index * min(0.6, seconds * 0.5 / len(values)))
+    if captions:
+        _captions(figure, captions, [0.0, seconds * 0.35][:len(captions)], width - right, 20)
+    return figure
+
+
 def tokens(rows: Sequence[Sequence[str]], *, fills: Sequence[Sequence[Role]], notes: Sequence[str] = (),
-           header: str = "", cell: float = 27, seconds: float = 0.0) -> Figure:
-    """Rows of token boxes, `fills[i][j]` filling token j of row i ("none" leaves it an outline), with
-    `notes[i]` beside row i. With `seconds`, the rows appear one after another."""
-    longest = max(len(row) for row in rows)
-    left, top, gap = 12, 34 if header else 12, 6
-    note_x = left + longest * cell + 16
-    width = note_x + (max(len(note) for note in notes) * 8.6 if notes else 0) + 12
+           cell: float = 27, seconds: float = 0.0) -> Figure:
+    """Rows of token boxes, each as wide as its text and at least `cell`, `fills[i][j]` filling token j
+    of row i ("none" leaves it an outline), with `notes[i]` beside row i. With `seconds`, the rows
+    appear one after another."""
+    # A monospace character is about 0.6 of the font size wide.
+    boxes = [[max(cell, 0.6 * TEXT * len(token) + 14) for token in row] for row in rows]
+    left, top, gap = 12, 12, 6
+    note_x = left + max(sum(row) for row in boxes) + 16
+    width = note_x + (max(len(note) for note in notes) * 0.6 * SMALL if notes else 0) + 12
     height = top + len(rows) * (cell + gap) + 6
     figure = Figure(width, height, seconds=seconds, label="token rows")
-    if header:
-        figure.text(note_x, 20, header, size=SMALL, color="muted", mono=True)
     for i, row in enumerate(rows):
         with figure.group() as group:
-            y = top + i * (cell + gap)
-            for j, token in enumerate(row):
-                fill = fills[i][j]
+            y, x = top + i * (cell + gap), left
+            for token, fill, box in zip(row, fills[i], boxes[i], strict=True):
                 outline: Role = "rule" if fill == "none" else "none"
-                figure.rect(left + j * cell, y, cell - 4, cell, fill=fill, stroke=outline, rx=4)
-                figure.text(left + j * cell + (cell - 4) / 2, y + cell / 2 + 5, token, size=TEXT, mono=True,
+                figure.rect(x, y, box - 4, cell, fill=fill, stroke=outline, rx=4)
+                figure.text(x + (box - 4) / 2, y + cell / 2 + 5, token, size=TEXT, mono=True,
                             anchor="middle", color="muted" if fill == "none" else "text")
+                x += box
             if notes:
                 figure.text(note_x, y + cell / 2 + 5, notes[i], size=SMALL, mono=True)
         if seconds:

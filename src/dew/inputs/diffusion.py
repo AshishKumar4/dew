@@ -13,11 +13,13 @@ from typing import TYPE_CHECKING, ClassVar, Literal
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs.encoders import ConditionEncoder, ConditionWork
 from dew.nn.blocks import torch_nearest_resize
 from dew.nn.flops import counted_flops, projection_flops
+from dew.nn.protocols import LayerStates
 from dew.nn.safety import CLIPSafetyHead
 from dew.nn.text_encoders import CLIPTextTransformer, CLIPTowerOutput, T5EncoderTransformer
 from dew.objectives.base import Variables
@@ -350,16 +352,14 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
                 destination / ("tokenizer" + self.t5.name.removeprefix("text_encoder")))
 
 
-def _residual_states(decoder, ids):
-    """The last decoder layer's output, before the final norm.
-
-    `QwenImage21Pipeline` reads `hidden_states[-1]` with the norm hooked out,
-    since that is what the transformer was trained on. The layers read the
-    embeddings the decoder's forward gives them, scaled by its own
-    `scaled_embeddings`; the decoders this reads run one residual stream.
-    """
-    return decoder.stack(decoder.scaled_embeddings(decoder.token_embeddings(ids)), train=False,
-                         decode=False, per_layer_input=None)
+def _layer_states(tower: nn.Module, params, ids, layers: Sequence[int], **fields) -> list[jax.Array]:
+    """The residual states of `tower`'s `layers` (0-based; -1 the last) over `ids`, each layer's
+    output before the final norm, from its canonical forward (`LayerStates`)."""
+    if not isinstance(tower, LayerStates):
+        raise TypeError(f"{type(tower).__name__} keeps no layer states (dew.nn.protocols.LayerStates)")
+    _, kept = tower.apply(params, ids, method="hidden_states", capture_intermediates=tower.capture_layers,
+                          mutable=list(tower.layer_collections), **fields)
+    return [tower.layer_state(kept, layer) for layer in layers]
 
 
 @dataclass(eq=False)
@@ -456,8 +456,10 @@ class QwenImageConditioner(_LanguageText):
         return ConditionWork(count, np.maximum(lengths - self.drop, 0), spans, self.tower.emb_features)
 
     def encode(self, params, tokens) -> DenoisingCondition:
-        states = jnp.asarray(self.tower.apply({"params": params["text_encoder"]["params"]},
-                                              jnp.asarray(tokens["input_ids"]), method=_residual_states))
+        # `QwenImage21Pipeline` reads `hidden_states[-1]` with the norm hooked out, since that is
+        # what its transformer was trained on: the last layer's output.
+        (states,) = _layer_states(self.tower, {"params": params["text_encoder"]["params"]},
+                                  jnp.asarray(tokens["input_ids"]), (-1,))
         valid = jnp.asarray(tokens["attention_mask"], bool)[:, self.drop:]
         context = jnp.where(valid[..., None], states[:, self.drop:], 0)
         return DenoisingCondition(context, mask=valid)
@@ -537,17 +539,16 @@ class HiddenStatesConditioner(_LanguageText):
                              self.tower.emb_features * len(self.layers))
 
     def encode(self, params, tokens) -> DenoisingCondition:
-        from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
-
         ids = jnp.asarray(tokens["input_ids"])
         # The pipelines call their encoder without position ids, so transformers numbers every slot,
         # the right padding included, by its index; Dew would rank the real tokens and hold the pads.
-        _, kept = self.tower.apply(
-            {"params": params["text_encoder"]["params"]}, ids,
-            attention_mask=jnp.asarray(tokens["attention_mask"], bool),
-            positions=jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape), method="hidden_states",
-            capture_intermediates=layer_outputs, mutable=[INTERMEDIATES])
-        states = [layer_output(kept[INTERMEDIATES], layer - 1) for layer in self.layers]
+        if any(layer < 1 for layer in self.layers):
+            raise ValueError(f"layers {self.layers} count decoder layers from 1; the embeddings, k = 0, "
+                             "are no layer's output")
+        states = _layer_states(self.tower, {"params": params["text_encoder"]["params"]}, ids,
+                               [layer - 1 for layer in self.layers],
+                               attention_mask=jnp.asarray(tokens["attention_mask"], bool),
+                               positions=jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape))
         guidance = None if self.guidance is None else jnp.asarray(tokens["guidance"], jnp.float32)
         return DenoisingCondition(jnp.concatenate(states, axis=-1),
                                   mask=jnp.asarray(tokens["attention_mask"], bool), guidance=guidance)

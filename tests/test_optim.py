@@ -15,8 +15,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from jax.extend.core import ClosedJaxpr, Jaxpr, Literal
 from jax.sharding import NamedSharding, PartitionSpec as P
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, equations
 
 from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -664,12 +665,13 @@ def bf16_state_adamw(**kwargs):
 def test_bf16_state_takes_optax_adamw_steps_from_the_fp32_moments():
     """The update is computed from the fp32 moments before they are rounded.
     The first starts from zero moments, which bf16 holds exactly, so it is
-    optax's own AdamW update, its options (nesterov, eps_root, b2) included,
-    to fp32 rounding; the second is optax's to the rounding of the bf16 state."""
+    the fp32-state AdamW update (`OPTIMIZER_MAP`), its options (nesterov,
+    eps_root, b2) included, to fp32 rounding; the second is that update to the
+    rounding of the bf16 state."""
     params = decoder_params()
     grads = jax.tree.map(lambda p: jax.random.normal(jax.random.key(1), p.shape) * 1e-2, params)
     opts = {'nesterov': True, 'eps_root': 1e-8}
-    reference = optax.adamw(LR, b2=0.99, weight_decay=0.0, **opts)
+    reference = OPTIMIZER_MAP['adamw'](LR, b2=0.99, weight_decay=0.0, **opts)
     solver = bf16_state_adamw(b2=0.99, optimizer_opts=opts)
     expected_state, state = reference.init(params), solver.init(params)
     for rtol, atol in ((1e-6, 0.0), (1e-2, 1e-7)):
@@ -704,11 +706,23 @@ def test_bf16_state_keeps_the_second_moments_small_increments():
     assert have == pytest.approx(want, rel=1e-2)
 
 
-def test_every_optimizer_the_config_names_is_built():
-    assert set(OPTIMIZER_MAP) == set(typing.get_args(Optimizer))
+def program_of(closed) -> tuple:
+    """A traced program as its equations' primitives and parameters, in order, and every constant it
+    holds, its literals and its captured arrays: two traces are one program where these agree."""
+    def constants(values):
+        return tuple((np.asarray(value).dtype, np.asarray(value).tobytes()) for value in values)
+
+    steps = []
+    for equation in equations(closed.jaxpr):
+        literals = [operand.val for operand in equation.invars if isinstance(operand, Literal)]
+        # The sub-programs a parameter holds are walked as equations of their own.
+        params = tuple(sorted((name, value) for name, value in equation.params.items()
+                              if not isinstance(value, (Jaxpr, ClosedJaxpr))))
+        steps.append((equation.primitive.name, params, constants(literals)))
+    return tuple(steps), constants(closed.consts)
 
 
-@pytest.mark.parametrize("optimizer", ["adam", "adamw", "lamb", "muon", "muonclip"])
+@pytest.mark.parametrize("optimizer", typing.get_args(Optimizer))
 @pytest.mark.parametrize("form", ["constant", "schedule", "groups"])
 def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
     """Two runs at different rates of one schedule's shape, a group's
@@ -731,7 +745,7 @@ def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
     for rate in (1e-3, 4e-3):
         solver = config(rate).build(10)
         state = solver.init(params)
-        programs.append(jax.jit(solver.update).lower(grads, state, params).as_text())
+        programs.append(program_of(jax.make_jaxpr(solver.update)(grads, state, params)))
         updates.append(solver.update(grads, state, params)[0])
     assert programs[0] == programs[1]
     assert any(not np.array_equal(left, right) for left, right in
@@ -781,3 +795,31 @@ def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimi
                 schedule.schedule(10)(jnp.asarray(step, jnp.float64)))
         assert abs(float(learning_rate(state)) - exact) <= 2.4e-7 * (abs(exact) + scale)
         params = optax.apply_updates(params, updates)
+
+
+def test_adamw_steps_land_as_near_float64_as_torchs():
+    """Three AdamW steps from zero parameters, where each update is the rate times the gradient's
+    sign, land as near their float64 values as torch's AdamW does (`reference_error`): the bias
+    corrections are formed in double, as torch forms them, where optax's own forms 1 - b2**count
+    from b2 rounded to float32 first, 1.3e-5 off at the first step (google-deepmind/optax#1827)."""
+    import torch
+
+    rate, decay, b1, b2, eps = 1e-3, 1e-2, 0.9, 0.999, 1e-8
+    grads = [np.random.default_rng(step).normal(size=4096).astype(np.float32) for step in range(3)]
+    params, first, second = np.zeros(4096), np.zeros(4096), np.zeros(4096)
+    for count, grad in enumerate(grads, start=1):
+        grad = grad.astype(np.float64)
+        first, second = b1 * first + (1 - b1) * grad, b2 * second + (1 - b2) * grad ** 2
+        clean = first / (1 - b1 ** count) / (np.sqrt(second / (1 - b2 ** count)) + eps)
+        params = params - rate * (clean + decay * params)
+    tensor = torch.zeros(4096, dtype=torch.float32, requires_grad=True)
+    torch_adamw = torch.optim.AdamW([tensor], lr=rate, betas=(b1, b2), eps=eps, weight_decay=decay)
+    solver = OPTIMIZER_MAP['adamw'](rate, b1=b1, b2=b2, eps=eps, weight_decay=decay)
+    ours = jnp.zeros(4096, jnp.float32)
+    state = solver.init(ours)
+    for grad in grads:
+        tensor.grad = torch.from_numpy(grad)
+        torch_adamw.step()
+        updates, state = solver.update(jnp.asarray(grad), state, ours)
+        ours = optax.apply_updates(ours, updates)
+    assert_as_exact_as_the_reference(np.asarray(ours), tensor.detach().numpy(), params, "adamw steps")

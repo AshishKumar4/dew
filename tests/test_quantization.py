@@ -24,9 +24,9 @@ from dew.config import ObjectiveConfig, OptimConfig
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from dew.quantization import Quantization, quantize_for_serving
 from dew.registry import models
 from dew.training.distributed import Layout, MeshSpec, shard_batch
-from dew.training.quantization import Quantization, quantize_for_serving
 
 import_module("dew.nn.backbones")  # registers the fixture kind
 
@@ -73,6 +73,34 @@ def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
     manual = jax.jit(reference.apply)(variables, ids)
     assert float(jnp.max(jnp.abs(wrapped - manual))) == 0.0
     assert float(jnp.max(jnp.abs(wrapped - plain))) > 1e-2
+
+
+def test_quantized_and_plain_calls_of_one_shape_keep_their_own_products_in_one_process():
+    """`x @ w` is `jnp.matmul`, a jitted function whose trace a quantized call takes under Qwix's
+    interception. Beside the plain model at the same shapes, in either order and each shape's first
+    call cold, each computes its own product: a plain call after a quantized one is the plain
+    product (`lax.dot_general`'s, which no jitted contraction serves), and a quantized call after a
+    plain one quantizes."""
+    pytest.importorskip("qwix")
+
+    class Product(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            return x @ self.param("kernel", nn.initializers.normal(1.0), (x.shape[-1], 8))
+
+    model = Product()
+    quantized = Quantization().apply(model)
+    variables = model.init(jax.random.key(0), jnp.ones((1, 16)))
+    kernel = variables["params"]["kernel"]
+
+    def plain(x):
+        return np.asarray(jax.lax.dot_general(x, kernel, (((1,), (0,)), ((), ()))))
+
+    first, then = (jax.random.normal(jax.random.key(seed), (rows, 16)) for seed, rows in ((1, 4), (2, 5)))
+    assert not np.array_equal(np.asarray(quantized.apply(variables, first)), plain(first))
+    np.testing.assert_array_equal(np.asarray(model.apply(variables, first)), plain(first))
+    np.testing.assert_array_equal(np.asarray(model.apply(variables, then)), plain(then))
+    assert not np.array_equal(np.asarray(quantized.apply(variables, then)), plain(then))
 
 
 def test_a_pattern_that_matches_nothing_quantizes_nothing():
@@ -301,7 +329,7 @@ import numpy as np
 import qwix
 
 from dew.nn.conv import Conv
-from dew.training.quantization import Quantization
+from dew.quantization import Quantization
 
 dtype = sys.argv[1]
 # Without the bias, which the quantization leaves alone and a bf16
@@ -464,8 +492,8 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
     import functools
 
     from dew.inference import TextGeneration
+    from dew.quantization import entry_methods
     from dew.sampling import Sampling
-    from dew.training.quantization import entry_methods
 
     qwix = pytest.importorskip("qwix")
     model = tiny()
@@ -544,7 +572,7 @@ def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_
     and the VAE keep their weights, leaf for leaf."""
     import functools
 
-    from dew.training.quantization import entry_methods
+    from dew.quantization import entry_methods
 
     qwix = pytest.importorskip("qwix")
     task = flux_task
@@ -587,8 +615,8 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
     import functools
 
     from dew.inference import TextGeneration
+    from dew.quantization import entry_methods
     from dew.sampling import Sampling
-    from dew.training.quantization import entry_methods
 
     qwix = pytest.importorskip("qwix")
     model = tiny()

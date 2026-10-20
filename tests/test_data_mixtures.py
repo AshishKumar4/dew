@@ -204,8 +204,6 @@ def test_a_mixture_that_is_not_one_is_refused(count, weights):
 # The mixture through dew.data.load
 # --------------------------------------------------------------------------
 
-datasets = pytest.importorskip("datasets", reason="needs the streaming extra")
-
 
 def rows_dir(root: Path, name: str, first: int, count: int) -> str:
     """A directory of one jsonl file, which `load_dataset` reads as a split."""
@@ -1018,23 +1016,51 @@ def test_a_window_across_a_ramp_stage_pools_its_records_as_one_batch_of_them(tmp
         np.testing.assert_allclose(pooled[name], value, rtol=1e-5, atol=1e-6, err_msg=name)
 
 
-def test_a_ramp_is_refused_with_a_window_that_replays_its_batches(tmp_path):
+def test_a_window_that_replays_its_batches_pools_a_ramps_stages_as_batches_of_their_records(tmp_path):
     """A loss of composite statistics replays its window's batches, whose shape a ramp changes at each
-    stage: a ramp with such a window is refused before the run trains, whether the run starts there
-    or resumes a checkpoint whose saved window holds the batches of a fixed-batch run."""
-    layout, ramp = Layout(min_shard=1, tolerance=1.0), Ramp(start=8, increment=8, samples=16)
+    stage; each stage begins where a window does, and the window's replay slots are the new stage's
+    from there. Four steps of eight and then sixteen, two to a window, land where a batch of sixteen
+    and then one of thirty-two, the same records in the same order, land. A run resuming the ramp
+    where its stage of sixteen begins trains on, the window its checkpoint held, of eight-record
+    slots, replaced; one handed a window part filled with batches of thirty-two is refused."""
+    records, seed, layout = 4096, 7, Layout(min_shard=1, tolerance=1.0)
+    ramp = Ramp(start=8, increment=8, samples=16)
 
-    def trainer(checkpoints: Checkpoints | None = None) -> Trainer:
-        return Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2, layout=layout,
-                       checkpoints=checkpoints)
+    def trainer(checkpoints: Checkpoints | None = None, accumulation: int = 2) -> Trainer:
+        return Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0), accumulation=accumulation,
+                       layout=layout, checkpoints=checkpoints)
 
-    saved = Checkpoints(str(tmp_path / "run"), keep=8)
-    assert int(trainer(saved).fit(indexed_data(256, 16), steps=2, log_every=100).updates) == 1
+    state = trainer().fit(ramped(indexed_data(records, 16, seed), ramp), steps=4, log_every=100)
+    stitched = [trainer(Checkpoints(str(tmp_path / "stitched"), keep=8), accumulation=1).fit(
+        stitched_data(records, batch, seed), steps=stage + 1, log_every=100, checkpoint_every=None)
+        for stage, batch in enumerate([16, 32])][-1]
+    assert int(state.step) == 4 and int(state.updates) == int(stitched.updates) == 2
+    pooled, batched = parameters(state), parameters(stitched)
+    assert set(pooled) == set(batched)
+    for name, value in batched.items():
+        np.testing.assert_allclose(pooled[name], value, rtol=1e-5, atol=1e-6, err_msg=name)
+
+    directory = str(tmp_path / "ramp")
+    staged = trainer(Checkpoints(directory, keep=8)).fit(ramped(indexed_data(256, 16), ramp), steps=2,
+                                                         log_every=100)
+    assert staged.accumulation is not None and jax.tree.leaves(staged.accumulation.batches)[0].shape[1] == 8
+    resumed = trainer(Checkpoints(directory, keep=8)).fit(ramped(indexed_data(256, 16), ramp), steps=4,
+                                                          log_every=100)
+    assert (int(resumed.step), int(resumed.updates)) == (4, 2)
+    part_filled = trainer().fit(indexed_data(256, 32), steps=1, log_every=100)
     with pytest.raises(ValueError):
-        trainer(Checkpoints(str(tmp_path / "run"), keep=8)).fit(
-            ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
+        trainer().fit(ramped(indexed_data(256, 16), ramp), steps=4, log_every=100, state=part_filled)
+
+
+def test_a_ramp_stage_inside_a_window_that_replays_its_batches_is_refused_before_the_run_trains():
+    """A stage of one step begins inside a window of two, whose replay slots would hold batches of two
+    shapes: the run is refused at its first compile, before any step runs."""
+    trainer = Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+                      layout=Layout(min_shard=1, tolerance=1.0), checkpoints=None)
     with pytest.raises(ValueError):
-        trainer().fit(ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
+        trainer.fit(ramped(indexed_data(256, 16), Ramp(start=8, increment=8, samples=8)), steps=4,
+                    log_every=100)
+    assert trainer.executable is None
 
 
 @pytest.mark.mesh
@@ -1175,6 +1201,26 @@ def test_one_corpus_starts_past_its_offset_as_a_mixed_one_does():
 
 def _plus_one(batch):
     return {**batch, "x": batch["x"] + 1}
+
+
+def _missing_field(row):
+    return {"x": row["absent"]}
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_mixed_corpus_whose_first_record_fails_raises_its_own_error(read):
+    """A mixture reads each corpus's first record before it mixes: one whose step fails there
+    raises its own error, a KeyError here, with its own traceback, where it was once rewritten
+    into a ValueError naming the corpus."""
+    broken = Pipeline(Memory([{"x": np.int32(0)}] * 4, identity="broken")).map(_missing_field)
+    plain = Pipeline(Memory([{"x": np.int32(1)}] * 4, identity="plain"))
+    stream = compile(mix([broken.repeat(), plain.repeat()]).batch(2), read=read, loading=READ).train(
+        DataPartition())
+    try:
+        with pytest.raises(KeyError):
+            next(stream)
+    finally:
+        stream.close()
 
 
 def test_a_mixture_refuses_a_batched_member_rather_than_drop_its_stages():

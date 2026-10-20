@@ -17,7 +17,7 @@ import enum
 import functools
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
@@ -42,6 +42,7 @@ from typing_extensions import TypeIs, TypeVar
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import compensated_sum
+from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.records import JSON
 
 if TYPE_CHECKING:
@@ -50,7 +51,7 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
     from jax.typing import DTypeLike
 
-    from dew.data.pipeline import ObjectiveData
+    from dew.data.pipeline import DeviceStep, ObjectiveData
     from dew.data.text import Tokenizer
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
     from dew.inputs import InputSpec
@@ -138,7 +139,7 @@ ROUNDING_STREAM = 0x726F756E
 
 def training_rngs(key: jax.Array) -> dict[str, jax.Array]:
     """The RNG streams a model draws from `key` in a training pass: `dropout`,
-    and `stochastic_rounding`, which a `dew.training.Quantization` with
+    and `stochastic_rounding`, which a `dew.quantization.Quantization` with
     `bwd_stochastic_rounding` rounds its gradients from.
 
     The rounding stream is a fold of `key`, so its draws are not dropout's.
@@ -350,6 +351,35 @@ def part(variables: Variables, name: str) -> Variables:
     return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
 
 
+def projected_parts(params: Variables, owners: Mapping[str, ProjectsParameters | nn.Module | HiddenStates], *,
+                    updated: bool) -> Variables:
+    """`params` with each part `owners` names projected by its owner's constraint
+    (`dew.nn.protocols.ProjectsParameters`, which an objective's `projected` also
+    answers), where the tree holds that part and the owner declares one; the rest
+    as they are. The projection of an objective that nests several networks'
+    parameters under their names (`joined`)."""
+    projected = {}
+    for name, tree in params.items():
+        owner = owners.get(name)
+        projects = isinstance(owner, ProjectsParameters)
+        projected[name] = owner.projected(tree, updated=updated) if projects else tree
+    return projected
+
+
+def with_projected(variables: Variables, project: Callable[[Variables], Variables]) -> Variables:
+    """`variables` with its `params` collection as `project` returns it. A tree may hold none: flax
+    leaves an empty collection out, so a parameter-free model's tree is `{}` or its state alone."""
+    return {name: project(tree) if name == "params" else tree for name, tree in variables.items()}
+
+
+def projected_draw(owner: nn.Module, variables: Variables) -> Variables:
+    """A module's freshly drawn tree as training stores it: its parameters projected
+    once by `owner`'s constraint (`updated=True`), as is where it declares none."""
+    if not isinstance(owner, ProjectsParameters):
+        return variables
+    return with_projected(variables, functools.partial(owner.projected, updated=True))
+
+
 def joined(parts: Mapping[str, Variables]) -> Variables:
     """Nest each module's tree under its name in every collection it holds;
     the inverse of `part`."""
@@ -421,6 +451,11 @@ class ProgramModule(NamedTuple):
     trained: bool
     """Whether the step moves the module's parameters, so its backward runs:
     False for a frozen teacher or reference."""
+    head_fused: bool = False
+    """Whether its tiled head takes its gradient in the forward
+    (`chunked.fused_head_loss`), which is faster than the tiled head's
+    backward but holds a chunk of the whole vocabulary's logits beside it,
+    more than a tile (`Objective.unfuse_head`)."""
 
 
 @jax.custom_jvp
@@ -664,7 +699,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         split or whole; otherwise `fresh_variables` draws one. A held tree
         without `params` is refused, unless the objective holds parts a draw
         goes beside. `complete_variables` then adds what the objective's own
-        modules need. An objective of several networks overrides this whole.
+        modules need, and the whole tree's parameters are projected once
+        (`projected`, `updated=True`), which leaves held parts that satisfy
+        the model's constraint as they are and brings drawn ones to it. An
+        objective of several networks overrides this whole.
         """
         held = self.held_variables() if variables is None else variables
         if held is not None and "params" in held:
@@ -674,7 +712,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         else:
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
-        return self.complete_variables(key, tree)
+        tree = self.complete_variables(key, tree)
+        return with_projected(tree, functools.partial(self.projected, updated=True))
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         """Draw the tree training starts from when none is held.
@@ -690,7 +729,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         add: a loss head, a projector, a phase's split. The default adds nothing."""
         return tree
 
-    def program(self, name: str, function: Callable, *, static_argnames: tuple[str, ...] = ()):
+    def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
+                holds: tuple[DeviceStep, ...] = ()):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
 
@@ -699,12 +739,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         change a tiled head, and `substitute` may quantize it at the same shapes. Argument shapes
         alone cannot identify those programs, nor can they the pipeline's microbatch count, the
         layout's rules or the links a model decides from. `name` names everything else the program
-        fixes. Keep only the current specialization, not a history of old models.
+        fixes. `holds` are the objects `function` runs beyond the modules, as the device steps a host
+        step runs: the program is reused only while they are the same objects, and one over others
+        replaces it. Keep only the current specialization, not a history of old models or steps.
         """
-        programs = tuple((program.module, program.head_tile) for program in self.program_key())
+        programs = tuple((program.module, (program.head_tile, program.head_fused))
+                         for program in self.program_key())
         cached = vars(self).get('_program_cache')
         if cached is None or len(cached[0]) != len(programs) or any(
-                module is not was or tile != had for (module, tile), (was, had) in zip(programs, cached[0],
+                module is not was or head != had for (module, head), (was, had) in zip(programs, cached[0],
                                                                                       strict=True)):
             cached = (programs, {})
             self._program_cache = cached
@@ -712,14 +755,17 @@ class Objective(ABC, Generic[Loss, Effects]):
         # The options follow where the program runs (`compiler_options`), so they key it too.
         options = compiler_options(*(module for module, _ in programs))
         key = (name, trace_context(), tuple(options.items()))
-        if key not in cached[1]:
+        held = cached[1].get(key)
+        if held is None or len(held[0]) != len(holds) or any(
+                now is not was for now, was in zip(holds, held[0], strict=True)):
             # A fresh callable gives JAX a fresh trace even for the same bound method.
             @functools.wraps(function)
             def run(*args, **kwargs):
                 return function(*args, **kwargs)
 
-            cached[1][key] = jax.jit(run, static_argnames=static_argnames, compiler_options=options)
-        return cached[1][key]
+            held = (holds, jax.jit(run, static_argnames=static_argnames, compiler_options=options))
+            cached[1][key] = held
+        return held[1]
 
     @property
     def _validation_loss(self):
@@ -759,7 +805,23 @@ class Objective(ABC, Generic[Loss, Effects]):
         return self.loss(variables, batch, replace(step, training=False))
 
     def _check_validation_loss(self) -> None:
-        """Refuse a validation loss this objective cannot define, before fit places its state."""
+        """Refuse a validation loss this objective does not define (`validation_loss_refusal`),
+        before fit places its state."""
+        if (refusal := self.validation_loss_refusal) is not None:
+            raise ValueError(refusal)
+
+    @property
+    def validation_loss_refusal(self) -> str | None:
+        """Why this objective defines no validation loss, None where `validation_loss` scores
+        held-out rows, which a validation pass then records whatever else reads it: the one
+        policy of whether an objective has a validation loss, which an objective that scores
+        held-out rows otherwise overrides."""
+        return None
+
+    @property
+    def defines_validation_loss(self) -> bool:
+        """Whether `validation_loss` scores held-out rows (`validation_loss_refusal`)."""
+        return self.validation_loss_refusal is None
 
     @staticmethod
     def row_mean(values: jax.Array, batch: Batch, axis: int | tuple[int, ...] | None = None, *,
@@ -906,15 +968,40 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
-    def restore_head_tile(self, tile: tuple[int, int] | None) -> None:
-        """Set the head's backward tile to `tile`, None keeping its whole logits.
+    def unfuse_head(self) -> str | None:
+        """Move a tiled head that takes its gradient in the forward to the tiled head's backward.
+
+        The fused head is the faster where it fits; its chunk holds the whole
+        vocabulary's logits, which the tiled head bounds to a tile, so this is
+        the rung of the fit ladder after `tile_head`. The return value
+        describes the move, or is None where nothing moved, as for an
+        objective whose step fuses no head.
+        """
+        return None
+
+    def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
+        """Set the head's backward tile to `tile`, None keeping its whole logits, and whether a tiled
+        head takes its gradient in the forward (`unfuse_head`).
 
         The trainer fits each batch shape it meets on its own, so before it
         compiles a new shape it puts the objective back at the run's own rung,
-        the head tile included (`tile_head` only ever moves up). An objective
-        with no such head has only None to restore."""
+        the head's included (`tile_head` and `unfuse_head` only ever move up).
+        An objective with no such head has only None to restore."""
         if tile is not None:
             raise ValueError(f"{type(self).__name__} has no head to tile, so no tile {tile} to restore")
+
+    def projected(self, params: Variables, *, updated: bool) -> Variables:
+        """Return the stored parameters a training step reads and updates: the trainable `params`
+        projected by the model's constraint (`dew.nn.protocols.ProjectsParameters`), as is where the
+        model declares none.
+
+        A step's forward reads `projected(params, updated=False)`, and its update applies to them,
+        which the optimizer sees; the step stores the updated ones `projected(..., updated=True)`.
+        The tree a run starts from is projected once with `updated=True` (`init`). The default
+        projects the `model` this objective trains; an objective that trains several networks
+        projects each one's own tree (`projected_parts`)."""
+        model = vars(self).get("model")
+        return model.projected(params, updated=updated) if isinstance(model, ProjectsParameters) else params
 
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
         """Return replacement nonparameter collections computed from one accepted window's `effects`.

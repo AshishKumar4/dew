@@ -22,16 +22,23 @@ support and which they prefer.
 from __future__ import annotations
 
 import dataclasses
+import inspect
+import itertools
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import Protocol, get_args, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, get_args, runtime_checkable
 
+import grain.python as pygrain
+
+from dew.data.dataset import Records
 from dew.data.pipeline import (
     Artifact,
     Batched,
     BatchStage,
+    Bound,
     Configured,
+    Expansion,
     Filter,
     FlatMap,
     Interleave,
@@ -51,15 +58,22 @@ from dew.data.pipeline import (
     Shuffle,
     Slice,
     Stage,
+    Step,
     TokenBudget,
     TokenSplit,
     Windows,
     Workers,
+    _declares_rejects,
 )
-from dew.data.plan import Manifest, StepIdentity
-from dew.data.sources.base import READS, Read, Source
+from dew.data.plan import Manifest, StepIdentity, _changed, _semantic
+from dew.data.sources.base import READS, Read, Source, _consumed
+from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
-from dew.records import record
+from dew.records import json_value, record
+
+if TYPE_CHECKING:
+    from dew.data.cache import Cache
+    from dew.data.generation import Generation
 
 _STAGES = get_args(Stage.__value__)
 
@@ -84,12 +98,35 @@ class _RestrictedReads(Protocol):
     refusal: str
 
 
+@dataclasses.dataclass(frozen=True)
+class _Members:
+    """A concatenation's stores that cannot take a read, each prepared by its own preparer
+    (`_provisioner`), so the concatenation takes it once they have."""
+
+    concatenation: Concatenate
+    preparers: tuple[_Provisionable, ...]
+
+    def can_provision(self, read: Read) -> bool:
+        return True
+
+    def provision(self) -> Source:
+        for preparer in self.preparers:
+            preparer.provision()
+        return self.concatenation
+
+
 def _provisioner(source: Source, read: Read) -> _Provisionable | None:
-    """The source that can prepare `read`, through any split or slice wrapping it."""
+    """The source that can prepare `read`, through any split or slice wrapping it; for a
+    concatenation, each of its stores that cannot take `read` yet, all of which must prepare it."""
     while isinstance(source, _Wrapping) and not isinstance(source, _Provisionable):
         if isinstance(source, _RestrictedReads) and read not in source.reads:
             return None
         source = source.source
+    if isinstance(source, Concatenate):
+        preparers = [_provisioner(member, read) for member in source.sources if not member.supports(read)]
+        if not preparers or any(preparer is None for preparer in preparers):
+            return None
+        return _Members(source, tuple(preparer for preparer in preparers if preparer is not None))
     return source if isinstance(source, _Provisionable) and source.can_provision(read) else None
 
 
@@ -106,11 +143,91 @@ def _in_memory(source: Source) -> bool:
     return isinstance(_store(source), Memory)
 
 
+def _stated(source: Source, read: Read) -> tuple[Records | None, Mapping[str, object]]:
+    """The records a memory read of `source` holds, then its metadata, read
+    in that order: a source may measure a fact as it reads (a prompt's
+    reward bound), so its facts follow the read."""
+    held = source.records(read) if read == "memory" else None
+    return held, source.metadata()
+
+
+def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest:
+    """The manifest of what a cache after `prefix` over `source` holds, as a
+    publication records it (`dew.data.compile.publish`): the source as `read`
+    consumes it, and the configured steps bound to the facts it states."""
+    consumed = _consumed(source, read)
+    pipeline = Pipeline(consumed, tuple(prefix))
+    if any(isinstance(stage, Configured) for stage in prefix):
+        pipeline = _configured(pipeline, _stated(consumed, read)[1], read)
+    return _cache_manifest(consumed, pipeline.stages, read)
+
+
+def _in_place(generation: Generation, source: Source | Mixture | Phases,
+              prefix: Sequence[Stage]) -> tuple[Source | None, tuple[str, ...]]:
+    """The rows of `generation` in place of `prefix` over `source`, or None
+    and the fields of its manifest that differ: in place of the source it
+    was published from, `source` itself or one its holdout selections select
+    from, read as it was filled, under the selections above that source
+    (`rebased`). Its rows are its source, steps, tokenizers and fill
+    (`Manifest.semantic`); the code and machine that filled it
+    (`Manifest.environment`) do not change them. A step bound to the whole
+    run's facts (scope='run') binds to another run's facts in a generation
+    than in this run, and a step no cache can key (`_keyed`) is in no
+    generation's prefix, so no generation stands for either."""
+    from dew.data.holdout import rebased, selecting
+
+    dependency = record(generation.manifest["dependency"], "generation dependency")
+    fill = record(dependency.get("fill", {}), "generation fill")
+    if fill.get("read") not in READS:
+        return None, ("fill",)
+    read = READS[READS.index(fill["read"])]
+    published = dependency.get("source")
+    stored = next((candidate for candidate in selecting(source)
+                   if not isinstance(candidate, (Mixture, Phases))
+                   and json_value(_consumed(candidate, read).fingerprint(), "source") == published), None)
+    if stored is None:
+        return None, ("source",)
+    unkeyed = [_identity(stage).name for stage in prefix if not _keyed(stage)
+               or (isinstance(stage, Configured) and stage.scope == "run")]
+    if unkeyed:
+        return None, (f"steps ({', '.join(unkeyed)} bind to one run's facts or have no "
+                      "identity='name@version', which no generation holds)",)
+    changed = _changed(_semantic(dependency), _prefix_manifest(stored, prefix, read).semantic())
+    if changed:
+        return None, changed
+    return rebased(source, generation.source(), under=stored), ()
+
+
+def _serves(cache: Cache | Generation | str, source: Source | Mixture | Phases,
+            prefix: Sequence[Stage]) -> bool:
+    """Whether `cache` after `prefix` over `source` holds the rows those
+    steps make: a cache fills what they make, and a named generation holds
+    the rows of the one prefix it was published from (`_in_place`)."""
+    from dew.data.generation import Generation
+
+    return not isinstance(cache, Generation) or _in_place(cache, source, prefix)[0] is not None
+
+
+def _standing_in(generation: Generation, pipeline: Pipeline, source: Source | Mixture | Phases,
+                 prefix: Sequence[Stage]) -> Source:
+    """The rows of `generation` in place of `prefix` over `source`
+    (`_in_place`). A generation holding other rows than the steps before it
+    make is refused, naming what differs."""
+    replacement, changed = _in_place(generation, source, prefix)
+    if replacement is None:
+        raise ValueError(
+            f"generation {generation.url} does not hold the rows the steps before it in {_name(pipeline)} "
+            f"make: their {', '.join(changed)} differ; cache it after the source and steps it was published "
+            "from, or read it as a source of its own (`Pipeline(generation.source())`)"
+        )
+    return replacement
+
+
 def _promoted(pipeline: Pipeline) -> Pipeline:
     """The pipeline as the run reads it. Each published generation it caches
-    is read as a source, in place of the steps the generation already ran,
-    with its published packing in place of the pack stage that follows it.
-    A first-fit pack of tokens alone directly on a source that reads its
+    is read as a source, in place of the steps the generation already ran
+    (`_standing_in`), with its published packing in place of the pack stage
+    that follows it. A first-fit pack of tokens alone directly on a source that reads its
     documents by index and states their lengths reads that source's planned windows
     (`PackedSource.planned`), by the plan a published generation stores, so
     the windows are indexed and the order is global in every read; a chunk
@@ -118,8 +235,7 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     and the plan then cuts them, which it otherwise refuses. A source read
     only as a stream, such as one filtered by a predicate, is packed as its
     rows arrive."""
-    from dew.data.generation import Generation
-    from dew.data.holdout import rebased
+    from dew.data.generation import Generation, _GenerationSource
     from dew.data.packing import PackedSource, chunks_for, plan_name
 
     def cutting(stages: Sequence[Stage]) -> int | None:
@@ -134,15 +250,14 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         source = dataclasses.replace(source, pipelines=tuple(_promoted(child) for child in source.pipelines))
     for index, stage in enumerate(stages):
         if isinstance(stage, Artifact) and isinstance(stage.cache, Generation):
-            generation = stage.cache.source()
-            source, stages = rebased(source, generation), stages[index + 1 :]
+            source, stages = _standing_in(stage.cache, pipeline, source, stages[:index]), stages[index + 1 :]
             plans = record(stage.cache.manifest.get("plan", {}), "published plans")
             overlap = cutting(stages)
             at = int(overlap is not None)
             packing = stages[at] if len(stages) > at else None
             # A published plan cuts a document as a window-long chunk step without overlap does.
-            if (source is generation and isinstance(packing, Pack) and plan_name(packing, "accepted") in plans
-                    and overlap in (None, 0)):
+            if (isinstance(source, _GenerationSource) and isinstance(packing, Pack)
+                    and plan_name(packing, "accepted") in plans and overlap in (None, 0)):
                 source = PackedSource.published(source, stage.cache, packing, chunked=overlap is not None)
                 stages = stages[at + 1 :]
             break
@@ -267,10 +382,32 @@ def _name(pipeline: Pipeline) -> str:
     return "mixture" if isinstance(pipeline.source, (Mixture, Phases)) else pipeline.source.describe()
 
 
+def _members(pipelines: Sequence[Pipeline]) -> list[str]:
+    """The names a mixture's members go by, for their draws and in its plan: the one each was given
+    (`Pipeline.named`, as `name:<name>`), else its place among the members given none (`place:0`,
+    `place:1`, ...), which no mount, read or preparation of its source changes; the two kinds never
+    meet, whatever a name holds. A member keeps its draws and its place across a member joining or
+    leaving by its name; one without keeps them while no other unnamed member joins or leaves ahead
+    of it."""
+    unnamed = itertools.count()
+    return [f"name:{pipeline.name}" if pipeline.name is not None else f"place:{next(unnamed)}"
+            for pipeline in pipelines]
+
+
+def _member_keys(members: Sequence[str]) -> list[str]:
+    """Each mixture member's key: the name it goes by (`_members`), as the plan's order records it
+    for every read alike, with its place among the members of that name, so two such members are
+    apart. A member's draws and its saved position are keyed by it, so adding or removing another
+    member leaves them as they were."""
+    return [f"{sum(earlier == name for earlier in members[:index])}:{name}"
+            for index, name in enumerate(members)]
+
+
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
-    """What a stage runs, as the plan's manifest and a cache's key record it.
-    A cache stage is its kind alone. The plan names the rows a cache serves
-    by their key (`Cache.reference`), and where the cache lives is no part of
+    """What a stage runs, as the plan's manifest and a cache's key record it,
+    refused for a cache's key where none can key it (`StepIdentity.of`). A
+    cache stage is its kind alone. The plan names the rows a cache serves by
+    their key (`Cache.reference`), and where the cache lives is no part of
     the data, so a run resumes against the same rows cached anywhere. A step
     a `Configured` stage resolved names its factory by what it computes and
     carries the factory's modules after its own."""
@@ -300,6 +437,71 @@ def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
         shape = f"[batched {stage.size}, {'same rows' if stage.same_rows else 'any rows'}]"
         return dataclasses.replace(step, name=step.name + shape, config=step.config + shape)
     return StepIdentity.of(stage)
+
+
+def _configured(
+    pipeline: Pipeline,
+    shared: Mapping[str, object],
+    read: Read,
+    scope: Literal["source", "run"] | None = None,
+) -> Pipeline:
+    source = pipeline.source
+    if isinstance(source, (Mixture, Phases)):
+        children = tuple(_configured(child, shared, read, scope) for child in source.pipelines)
+        source = dataclasses.replace(source, pipelines=children)
+        local = shared
+    else:
+        local = source.metadata()
+    stages: list[Stage] = []
+    for stage in pipeline.stages:
+        if not isinstance(stage, Configured) or (scope is not None and stage.scope != scope):
+            stages.append(stage)
+            continue
+        metadata = shared if stage.scope == "run" else local
+        missing = sorted(set(stage.needs) - metadata.keys())
+        if missing:
+            raise ValueError(
+                f"{_name(pipeline)} step {_identity(stage).name} needs metadata {missing}; "
+                "provide producer metadata, recipe fields or read='memory'"
+            )
+        binding = Bound(stage, {key: metadata[key] for key in stage.needs})
+        resolved = stage.factory(metadata)
+        if isinstance(resolved, pygrain.RandomMapTransform) != stage.random:
+            raise ValueError(
+                f"Configured {_identity(stage).name} random={stage.random} disagrees with its step"
+            )
+        if isinstance(resolved, Expansion):
+            stages.append(FlatMap(resolved, configured=binding))
+        elif isinstance(resolved, pygrain.RandomMapTransform):
+            stages.append(RandomMap(resolved, rejects=_declares_rejects(resolved), configured=binding))
+        else:
+            stages.append(Map(resolved, rejects=_declares_rejects(resolved), configured=binding))
+    return dataclasses.replace(pipeline, source=source, stages=tuple(stages))
+
+
+def _keyed(stage: Stage) -> bool:
+    """Whether a cache can key what `stage` runs (`StepIdentity.keyable`):
+    the steps `_identity` names it by, a configured one's factory included,
+    as `_identity(stage, cache=True)` refuses them."""
+    if isinstance(stage, Artifact):
+        return True
+    if isinstance(stage, Configured):
+        return _step_keyed(stage.factory)
+    if isinstance(stage, (Map, RandomMap, FlatMap)) and stage.configured is not None:
+        return _step_keyed(stage.step, stage.identity) and _keyed(stage.configured.step)
+    if isinstance(stage, (Map, RandomMap, MapWithIndex, FlatMap, MapBatch, Batched)):
+        return _step_keyed(stage.step, stage.identity)
+    if isinstance(stage, Filter):
+        return _step_keyed(stage.predicate, stage.identity)
+    if isinstance(stage, Native):
+        return _step_keyed(stage.function, stage.identity)
+    return True
+
+
+def _step_keyed(step: Step, identity: str | None = None) -> bool:
+    function = inspect.isfunction(step)
+    external = not (step if function else type(step)).__module__.startswith("dew.")
+    return StepIdentity.of(step, identity).keyable(function=function, external=external)
 
 
 def _manifest(
@@ -354,8 +556,9 @@ stream whose shards reshuffle each epoch."""
 
 def _cacheable(stage: Stage) -> bool:
     """Whether a cache can hold what `stage` makes: a deterministic record
-    step, or a configured one, which binds to such a step."""
-    return isinstance(stage, (*_LOCAL, Configured)) and not _random(stage)
+    step, or a configured one, which binds to such a step, that a cache can
+    key (`_keyed`)."""
+    return isinstance(stage, (*_LOCAL, Configured)) and not _random(stage) and _keyed(stage)
 
 
 def _cache_at(stages: Sequence[Stage]) -> int:
@@ -512,6 +715,7 @@ def _analyzed(
     if isinstance(source, Phases):
         order: Mapping[str, object] = {
             "phases": [child.order for child in children],
+            "members": _members(source.pipelines),
             "until_steps": list(source.until_steps),
         }
     else:
@@ -520,6 +724,7 @@ def _analyzed(
             **(
                 {
                     "corpora": [child.order for child in children],
+                    "members": _members(source.pipelines),
                     "weights": list(source.weights),
                     "shares": "tokens" if source.tokens is not None else "accepted rows",
                 }
@@ -554,12 +759,20 @@ def _analyzed(
 def _states_its_targets(pipeline: Pipeline) -> bool:
     """Whether a corpus a mixture weighs by tokens delivers the rows its source's stated rows and
     valid targets count, so a weight from them holds its share of the targets (`token_weights`):
-    a source that states them, whose epoch reads every row alike: no slice, limit or token split
-    before its repeat takes a part of them. Any other corpus's targets are counted as its rows
-    arrive (`TokenDeficit`)."""
-    source, epoch = pipeline.source, pipeline.stages[: _until(pipeline.stages, (Repeat,))]
+    a source that states them, whose stages only order, repeat and place those rows
+    (`_KEEPS_TARGETS`), and after its repeat may take a window of the repeated rows, as a phase
+    does. A step still to run over them, a random crop or a filter, before its repeat or after
+    it, or a slice, limit or token split that takes a part of one epoch, delivers other rows than
+    the stated ones, so that corpus's targets are counted as its rows arrive (`TokenDeficit`)."""
+    source, at = pipeline.source, _until(pipeline.stages, (Repeat,))
     return (not isinstance(source, (Mixture, Phases)) and "valid_targets" in source.metadata()
-            and not any(isinstance(stage, (Slice, Limit, TokenSplit)) for stage in epoch))
+            and all(isinstance(stage, _KEEPS_TARGETS) for stage in pipeline.stages[:at])
+            and all(isinstance(stage, (*_KEEPS_TARGETS, Slice, Limit)) for stage in pipeline.stages[at:]))
+
+
+_KEEPS_TARGETS = (Shuffle, Repeat, Prefetch, Workers, Interleave, Artifact)
+"""The stages that order, repeat or place a corpus's rows, each row and its targets as they
+arrive; a mixture's members are not batched, so these are all a member's stages may be."""
 
 
 def _cut(lowering: _Lowering, per_share: bool) -> _Lowering:
@@ -622,11 +835,11 @@ def _checked(
                 raise ValueError(
                     f"cache prefix in {name} contains random step {random}; cache before stochastic steps"
                 )
+            for earlier in prefix:
+                _identity(earlier, cache=True)
             mixed = isinstance(pipeline.source, (Mixture, Phases))
             if not mixed and _cache_at(pipeline.stages[:index]) < index:
                 raise ValueError(f"cache prefix in {name} must hold only deterministic record steps")
-            for earlier in prefix:
-                _identity(earlier, cache=True)
         if isinstance(stage, Shuffle) and stage.window is None and not indexed and not promotion:
             raise ValueError(f"global shuffle in {name} needs an indexed pipeline; give window=")
         if isinstance(stage, Slice) and not indexed and not promotion:

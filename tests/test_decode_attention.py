@@ -10,8 +10,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound
+from test_attention_splash import attention_terms
 
-from dew.nn.attention import folded_attention, scaled_dot_product_attention, with_key_lengths
+from dew.nn.attention import attention_case, scaled_dot_product_attention, with_key_lengths
+from dew.nn.attention_kernels import DECODE, kernel_refusals
+from dew.nn.decode_geometry import folded_attention
+from dew.nn.kernels.generation import chosen
 
 pytestmark = pytest.mark.kernel
 
@@ -73,7 +77,7 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
     query = jnp.asarray(rng.normal(size=(rows, 4, 2, 256)), dtype)
     key = jnp.asarray(rng.normal(size=(rows, capacity, 2, 256)) * 0.3, dtype)
     value = jnp.asarray(rng.normal(size=(rows, capacity, 2, 256)), dtype)
-    assert decode_attention.fits(query, key)
+    assert kernel_refusals(DECODE, "decode", attention_case(query, key, key_value_seq_lengths=lengths)) == []
     # The kernel at the default precision, which the GPU lane otherwise sets to the highest
     # (tests/lane_environment.py): its fp32 products must be fp32 ones whatever the default.
     with jax.default_matmul_precision("default"):
@@ -92,12 +96,13 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
 
 
 def decode_step(lengths):
-    """fp32 attention of a decode step's grouped query (`CausalSelfAttention._decode_attention`) over
-    key lengths on 'xla', which the decode kernel takes on a GPU (`decode_attention.fits`), and the
-    folded attention it stands in for over the prefix those lengths mean."""
+    """fp32 attention of a decode step's grouped query (`decode_geometry.grouped_query`) over key
+    lengths through the decode kernel, chosen for the decode selector (`attention_kernels.DECODE`),
+    which takes it on a GPU (`decode_attention.SUPPORTS`), and the folded attention it stands in for
+    over the prefix those lengths mean."""
     def attended(query, key, value):
-        return scaled_dot_product_attention(query, key, value, implementation='xla',
-                                            key_value_seq_lengths=lengths)
+        with chosen(decode="decode"):
+            return scaled_dot_product_attention(query, key, value, key_value_seq_lengths=lengths)
 
     def folded(query, key, value):
         return folded_attention(query, key, value, with_key_lengths(None, lengths, key.shape[-3]))
@@ -127,19 +132,132 @@ def test_attention_the_decode_kernel_takes_lowers_for_the_gpu_differentiated_in_
         assert triton_kernels(lowered) == {"decode_attention": 1}
 
 
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_grouped_query_in_its_own_layout_reaches_the_decode_kernel(generation):
+    """A decode step's query of 4 heads over 2 key heads, called in the layer's own `[B, 1, N, D]`
+    layout with key lengths: the core reads each key head's query heads as its query positions
+    (`decode_geometry.grouped_query`), so the decode kernel takes it, lowered for the GPU on this CPU."""
+    from dew.nn.kernels.generation import assumed, gpu_mesh
+    from dew.training._lowering import triton_kernels
+
+    query = jax.ShapeDtypeStruct((2, 1, 4, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, 64, 2, 64), jnp.bfloat16)
+
+    def attend(query, key, value):
+        with chosen(decode="decode"):
+            return scaled_dot_product_attention(query, key, value,
+                                                key_value_seq_lengths=jnp.asarray([1, 20], jnp.int32))
+
+    mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(attend).trace(query, key, key).lower(lowering_platforms=("cuda",))
+    assert triton_kernels(lowered) == {"decode_attention": 1}
+
+
+@pytest.mark.parametrize("implementation", ["xla", "reference"])
+def test_a_grouped_query_attends_as_its_heads_do_alone(implementation):
+    """Grouped in the core, a lone query of 8 heads over 2 key heads with key lengths gives each head's
+    attention over its key head's keys, within tests/reference_error.py's rule of the reference over
+    the key heads repeated, against float64."""
+    from dew.nn.attention import reference_attention, repeat_kv_heads
+
+    rng = np.random.default_rng(3)
+    lengths = jnp.asarray([1, 9, 32], jnp.int32)
+    query, key, value = (jnp.asarray(rng.normal(size=shape), jnp.float32)
+                         for shape in ((3, 1, 8, 32), (3, 32, 2, 32), (3, 32, 2, 32)))
+    found = scaled_dot_product_attention(query, key, value, implementation=implementation,
+                                         key_value_seq_lengths=lengths)
+
+    def alone(query, key, value):
+        mask = (jnp.arange(key.shape[1]) < lengths[:, None])[:, None, None, :]
+        return reference_attention(query, repeat_kv_heads(key, 8), repeat_kv_heads(value, 8), mask=mask)
+
+    with jax.enable_x64(new_val=True):
+        truth = alone(*(jnp.asarray(x, jnp.float64) for x in (query, key, value)))
+    assert_as_exact_as_the_reference(np.asarray(found), np.asarray(alone(query, key, value)),
+                                     np.asarray(truth), f"grouped {implementation}")
+
+
+def test_a_lone_query_whose_heads_do_not_group_is_refused_by_name():
+    """A lone query of 5 heads over 3 key heads is no grouped query: the core leaves it as it is, and
+    the kernel refuses its head counts, as it refuses them in any call."""
+    query = jnp.zeros((1, 1, 5, 16), jnp.float32)
+    key = jnp.zeros((1, 8, 3, 16), jnp.float32)
+    with pytest.raises(ValueError):
+        scaled_dot_product_attention(query, key, key, implementation="reference",
+                                     key_value_seq_lengths=jnp.asarray([4], jnp.int32))
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("kv_heads", [2, 1])
+def test_a_grouped_query_keeps_the_tensor_axis_split(kv_heads):
+    """Over a tensor axis of two, a lone query of 8 heads over 2 key heads, or over 1 that the core
+    repeats to the axis's 2 as each shard would hold it, is grouped per shard: each device's program
+    does half the work of the call off the mesh, by XLA's own count on the reference path (no Pallas
+    call, whose work XLA does not count), and attends as that call does."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training import MeshSpec
+
+    rng = np.random.default_rng(4)
+    lengths = jnp.asarray([5, 32], jnp.int32)
+    query, key, value = (jnp.asarray(rng.normal(size=shape), jnp.float32)
+                         for shape in ((2, 1, 8, 32), (2, 32, kv_heads, 32), (2, 32, kv_heads, 32)))
+
+    def attend(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation="reference",
+                                            key_value_seq_lengths=lengths)
+
+    def flops(compiled):
+        analysis = compiled.cost_analysis()
+        return (analysis[0] if isinstance(analysis, list) else analysis)["flops"]
+
+    whole = jax.jit(attend).lower(query, key, value).compile()
+    mesh = MeshSpec(tensor=2).build(jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        heads = NamedSharding(mesh, PartitionSpec(None, None, "tensor"))
+        placed = [jax.device_put(x, heads if x.shape[2] % 2 == 0 else NamedSharding(mesh, PartitionSpec()))
+                  for x in (query, key, value)]
+        compiled = jax.jit(attend).lower(*placed).compile()
+        split = compiled(*placed)
+    np.testing.assert_allclose(np.asarray(split), np.asarray(whole(query, key, value)), atol=1e-6, rtol=1e-6)
+    assert flops(compiled) <= 0.6 * flops(whole), (flops(compiled), flops(whole))
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_grouped_query_over_one_key_head_reaches_the_decode_kernel_on_each_tensor_shard(generation):
+    """Lowered for the GPU over a tensor axis of two, a lone query of 8 heads over a single key head,
+    which the core repeats to the axis's two, reaches the decode kernel, which reads each row's keys
+    to its length alone, on each shard's group."""
+    from dew.nn.kernels.generation import assumed, gpu_mesh
+    from dew.training._lowering import triton_kernels
+
+    query = jax.ShapeDtypeStruct((2, 1, 8, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, 256, 1, 64), jnp.bfloat16)
+
+    def attend(query, key, value):
+        with chosen(decode="decode"):
+            return scaled_dot_product_attention(query, key, value,
+                                                key_value_seq_lengths=jnp.asarray([1, 20], jnp.int32))
+
+    mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:2]), ("tensor",)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(attend).trace(query, key, key).lower(lowering_platforms=("cuda",))
+    assert triton_kernels(lowered) == {"decode_attention": 1}
+
+
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
 def test_attention_the_decode_kernel_takes_differentiates_as_the_folded_attention():
     """A decode step's attention, its value the kernel's, differentiates as the folded attention it
     stands in for, in both modes: the value, query, key and value gradients, and the tangent, within
     tests/reference_error.py's rule of the folded attention's against float64 attention."""
-    from dew.nn.kernels import decode_attention
-
     rng = np.random.default_rng(1)
     lengths = jnp.asarray([1, 20, 64], jnp.int32)
     attended, folded = decode_step(lengths)
     query, key, value, *tangents = (jnp.asarray(rng.normal(size=shape), jnp.float32) for shape in (
         (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64), (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64)))
-    assert decode_attention.fits(query, key)
+    assert kernel_refusals(DECODE, "decode", attention_case(query, key, key_value_seq_lengths=lengths)) == []
     cotangent = jnp.asarray(rng.normal(size=query.shape), jnp.float32)
 
     def derivatives(attend, *arrays):
@@ -201,6 +319,7 @@ def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes
     def step(params, cache, tokens):
         return model.apply({**params, "cache": cache}, tokens, decode=True, mutable=["cache"])
 
+    # A model naming xla lowers its decode step through the decode kernel, jax.nn's lowering of it.
     with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(step).trace(placed(params), placed(cache), placed(tokens, "data" if "data" in axes
                                                                             else None))
@@ -273,8 +392,9 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
 
         def step(query, key, value, lengths):
             def loss(query, key, value):
-                return scaled_dot_product_attention(query, key, value, implementation='xla',
-                                                    key_value_seq_lengths=lengths).astype(jnp.float32).sum()
+                with chosen(decode="decode"):
+                    out = scaled_dot_product_attention(query, key, value, key_value_seq_lengths=lengths)
+                return out.astype(jnp.float32).sum()
             return jax.value_and_grad(loss, argnums=(0, 1, 2))(query, key, value)
         return step, (query, cache, cache, lengths)
 
@@ -292,3 +412,110 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
     assert not failures(found), "\n".join(failures(found))
     # Each case lowered to a kernel Triton compiled, which takes shared memory.
     assert all(record["shared"] > 0 for record in found), found
+
+
+def cache_call(window=None):
+    """A cache call of 6 tokens over 16 slots: row 0 left-padded by 2 after an empty cache, row 1
+    right-padded by 1 after 3 held tokens, row 2 with a hole after 7, and row 3 all padding; the
+    tokens' slots (`open_kv_cache`'s positions, -1 for padding), the slots filled after the call, and
+    the cache's mask over them (`causal_attention_mask`), a window's where given."""
+    from dew.nn.attention import causal_attention_mask
+
+    held = np.array([0, 3, 7, 5])
+    valid = np.array([[0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 0], [1, 1, 0, 1, 1, 1], [0, 0, 0, 0, 0, 0]], bool)
+    positions = np.where(valid, held[:, None] + np.cumsum(valid, axis=1) - 1, -1)
+    filled = np.arange(16)[None, :] < (held + valid.sum(axis=1))[:, None]
+    return (jnp.asarray(positions, jnp.int32), jnp.asarray(filled),
+            causal_attention_mask(positions, 16, window, key_valid=filled))
+
+
+def cache_documents(positions, filled):
+    """A cache call's tokens as one document a row whose last keys they are (`CrossDocuments`)."""
+    from dew.nn.documents import CrossDocuments
+
+    return CrossDocuments(jnp.asarray(positions >= 0, jnp.int32), jnp.asarray(filled, jnp.int32))
+
+
+@pytest.mark.parametrize("window", [None, 4])
+def test_a_cache_calls_documents_aligned_to_their_last_keys_are_its_mask(window):
+    """A cache call's tokens, as one document a row whose last keys they are (`CrossDocuments`
+    under causality and a window, `cross_document_mask`), see the keys the cache's own mask over its
+    slots gives them, row by row, left, right and inner padding alike."""
+    from dew.nn.documents import cross_document_mask
+
+    positions, filled, mask = cache_call(window)
+    aligned = cross_document_mask(cache_documents(positions, filled), causal=True, sliding_window=window)
+    np.testing.assert_array_equal(np.asarray(aligned), np.asarray(mask))
+
+
+@pytest.mark.parametrize("implementation", ["xla", "reference"])
+@pytest.mark.parametrize("window", [None, 4])
+def test_a_cache_call_read_as_documents_attends_as_its_mask(implementation, window):
+    """Attention of a cache call over its documents (causal, windowed, `CrossDocuments`) is bitwise
+    the attention over the cache's mask on the kernels that build it, a padding row's output zero."""
+    positions, filled, mask = cache_call(window)
+    rng = np.random.default_rng(7)
+    query = jnp.asarray(rng.normal(size=(4, 6, 2, 32)), jnp.float32)
+    key, value = (jnp.asarray(rng.normal(size=(4, 16, 2, 32)), jnp.float32) for _ in range(2))
+    read = scaled_dot_product_attention(query, key, value, implementation=implementation, causal=True,
+                                        sliding_window=window, segment_ids=cache_documents(positions, filled),
+                                        max_segments=1)
+    masked = scaled_dot_product_attention(query, key, value, implementation=implementation, mask=mask)
+    np.testing.assert_array_equal(np.asarray(read), np.asarray(masked))
+    np.testing.assert_array_equal(np.asarray(read[3]), 0)
+
+
+@pytest.mark.gpu(reason="FlashAttention runs on CUDA")
+@pytest.mark.parametrize("window", [None, 4])
+def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask(without_deterministic_ops,
+                                                                                 window):
+    """FlashAttention chosen for a cache call (`generation.chosen`) reads its documents as its packed
+    sequences, the queries put in id order and back: its output and its query, key and value
+    gradients are within tests/reference_error.py's rule of jax.nn's xla attention over the cache's
+    mask, against float64, padding rows zero."""
+    from dew.nn.attention_kernels import ATTENTION
+
+    positions, filled, mask = cache_call(window)
+    rng = np.random.default_rng(8)
+    query = jnp.asarray(rng.normal(size=(4, 6, 2, 64)), jnp.bfloat16)
+    key, value = (jnp.asarray(rng.normal(size=(4, 16, 2, 64)), jnp.bfloat16) for _ in range(2))
+    cotangent = jnp.asarray(rng.normal(size=(4, 6, 2, 64)) * np.asarray(positions >= 0)[:, :, None, None],
+                            jnp.float32)
+    documents = cache_documents(positions, filled)
+
+    def pulled(attend, *operands):
+        wide = jnp.promote_types(operands[0].dtype, jnp.float32)
+        out, pull = jax.vjp(lambda *operands: attend(*operands).astype(wide), *operands)
+        return out, *pull(cotangent.astype(out.dtype))
+
+    def flash(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation="flash", causal=True,
+                                            sliding_window=window, segment_ids=documents, max_segments=1)
+
+    def plain(query, key, value):
+        out = jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")
+        return out * jnp.asarray(positions >= 0, out.dtype)[:, :, None, None]
+
+    def truth(query, key, value):
+        logits = jnp.where(mask, jnp.einsum("btnd,bsnd->bnts", query, key) / 8.0, -jnp.inf)
+        seen = jnp.isfinite(logits).any(-1, keepdims=True)
+        probs = jnp.where(seen, jax.nn.softmax(jnp.where(seen, logits, 0.0), axis=-1), 0.0)
+        return jnp.einsum("bnts,bsnd->btnd", probs, value)
+
+    with chosen(attention="flash", attention_packed="flash", attention_window="flash"):
+        case = attention_case(query, key, causal=True, sliding_window=window, segment_ids=documents,
+                              max_segments=1)
+        assert kernel_refusals(ATTENTION, "flash", case) == []
+        found = pulled(flash, query, key, value)
+    reference = pulled(plain, query, key, value)
+    with jax.enable_x64(new_val=True):
+        exact = pulled(truth, *(jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value)))
+    # Each row sized by the float64 terms of its sums as the suite's flash gradients are
+    # (`attention_terms`): a query that keeps one key has a gradient that cancels to zero, which a
+    # flash kernel forms from its rounded output.
+    terms = attention_terms(query, key, value, cotangent, mask)
+    for name, mine, theirs, true, summed in zip(("out", "query", "key", "value"), found, reference, exact,
+                                                terms, strict=True):
+        assert_as_exact_as_the_reference(np.asarray(mine, np.float64), np.asarray(theirs, np.float64),
+                                         np.asarray(true), f"window {window} {name}",
+                                         terms=np.asarray(summed))

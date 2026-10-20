@@ -19,8 +19,8 @@ import tomllib
 import urllib.parse
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import BinaryIO, Protocol, TypedDict, runtime_checkable
+from pathlib import Path, PurePosixPath
+from typing import BinaryIO, NamedTuple, Protocol, TypedDict, runtime_checkable
 
 import fsspec
 from filelock import FileLock, Timeout
@@ -28,7 +28,8 @@ from fsspec.implementations.cached import CachingFileSystem, WholeFileCacheFileS
 from fsspec.implementations.local import LocalFileSystem
 from fsspec.spec import AbstractFileSystem
 from gcsfs import GCSFileSystem
-from huggingface_hub import HfFileSystem
+from huggingface_hub import HfFileSystem, parse_hf_uri, try_to_load_from_cache
+from huggingface_hub.file_download import REGEX_COMMIT_HASH
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
@@ -306,6 +307,10 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         }
 
 
+# Registered as this module loads, which reads no configuration, so `dewcache::` URLs open through
+# fsspec itself from the moment the data layer is imported.
+fsspec.register_implementation("dewcache", BoundedFileCache, clobber=True)
+
 _MEMORY_LOCK = threading.RLock()
 
 
@@ -357,6 +362,18 @@ class Versioned:
     version: str
 
 
+class Readable(NamedTuple):
+    """Where an object's bytes are read (`Store.readable`): the filesystem,
+    the object's path on it, and, where a copy is read (a Hub revision's
+    downloaded snapshot), the directory the copy's own paths start at; the
+    names above it are the copy's location's, not the object's. None where
+    the object is read in place."""
+
+    fs: AbstractFileSystem
+    path: str
+    root: str | None
+
+
 @dataclass(frozen=True)
 class Store:
     """An object URL with compare-and-swap publication and verified uploads.
@@ -385,6 +402,23 @@ class Store:
             if cache not in layers[:-1]:
                 options.pop(cache, None)
         return fsspec.core.url_to_fs(self.url, **options)
+
+    def readable(self) -> Readable:
+        """Where this object's bytes are read: a Hub repository's file at a
+        commit is read from huggingface_hub's own cache where that holds it, as
+        huggingface_hub reads its files, so a downloaded revision reads offline
+        (HF_HUB_OFFLINE) and without a request online; any other object, and a
+        Hub file the cache lacks, where `resolve` places it."""
+        fs, path = self.resolve()
+        if isinstance(fs, HfFileSystem):
+            uri = parse_hf_uri(f"hf://{path}")
+            if uri.revision is not None and REGEX_COMMIT_HASH.fullmatch(uri.revision):
+                held = try_to_load_from_cache(uri.id, uri.path_in_repo, revision=uri.revision,
+                                              repo_type=uri.type)
+                if isinstance(held, str):
+                    depth = len(PurePosixPath(uri.path_in_repo).parts)
+                    return Readable(LocalFileSystem(), held, str(Path(held).parents[depth - 1]))
+        return Readable(fs, path, None)
 
     def cached(self) -> Store:
         if self.url.startswith("dewcache::"):
@@ -533,16 +567,19 @@ class Store:
         if isinstance(fs, S3FileSystem):
             from fsspec.asyn import sync
 
-            async def read_s3() -> Versioned:
-                bucket, key, _ = fs.split_path(path)
-                response = await fs._call_s3("get_object", Bucket=bucket, Key=key)
-                async with response["Body"] as body:
-                    return Versioned(await body.read(), response["ETag"])
-
             loop = fs.loop
             if loop is None:
                 raise ValueError("Dew storage needs synchronous S3 filesystem options")
-            return sync(loop, read_s3)
+            bucket, key, _ = fs.split_path(path)
+            # The filesystem's own request: its configured request settings (an SSE-C key) and its
+            # error translation (a missing object raises FileNotFoundError) apply.
+            response = fs.call_s3("get_object", Bucket=bucket, Key=key)
+
+            async def read_body() -> bytes:
+                async with response["Body"] as body:
+                    return await body.read()
+
+            return Versioned(sync(loop, read_body), response["ETag"])
         if scheme in ("gs", "gcs"):
             metadata = fs.info(path)
             version = str(metadata["generation"])
@@ -625,7 +662,9 @@ class Store:
             return version
         if isinstance(fs, GCSFileSystem):
             bucket, key, _ = fs.split_path(path)
-            endpoint = f"{fs._location}/upload/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/o"
+            # The JSON API's upload root beside the API root the filesystem reads (`base`).
+            location = fs.base.removesuffix("storage/v1/")
+            endpoint = f"{location}upload/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/o"
             try:
                 outcome = fs.call(
                     "POST",
@@ -677,10 +716,9 @@ class Store:
 
 @functools.cache
 def _registered() -> None:
-    """Register Dew's filesystems with fsspec, once, as the first store resolves: the bounded cache
-    (`dewcache`) and the profiles the storage config names (DEW_STORAGE_CONFIG, else
-    ~/.config/dew/storage.toml)."""
-    fsspec.register_implementation("dewcache", BoundedFileCache, clobber=True)
+    """Register the profiles the storage config names (DEW_STORAGE_CONFIG, else
+    ~/.config/dew/storage.toml) with fsspec, once, as the first store resolves: the configuration is
+    read where it is first used, so a broken one fails that store, not the import."""
     config = Path(os.environ.get("DEW_STORAGE_CONFIG", "~/.config/dew/storage.toml")).expanduser()
     if config.is_file():
         for name, values in tomllib.loads(config.read_text()).items():

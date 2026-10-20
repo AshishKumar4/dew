@@ -140,9 +140,11 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         return self.student.inference_record()
 
     def program_key(self) -> tuple[ProgramModule, ...]:
-        """The student's modules, then the teacher's, which the step does not train."""
-        return (*self.student.program_key(),
-                *(program._replace(trained=False) for program in self.teacher.program_key()))
+        """The student's modules, then the teacher's, which the step does not train. The step reads
+        both models' whole logits (`predict`), so no head of either is fused."""
+        teacher = (program._replace(trained=False) for program in self.teacher.program_key())
+        return tuple(program._replace(head_fused=False)
+                     for program in (*self.student.program_key(), *teacher))
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         count = len(self.student.program_key())
@@ -153,8 +155,8 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         """Tile the student's head, the vocabulary head this objective trains."""
         return self.student.tile_head(tile)
 
-    def restore_head_tile(self, tile: tuple[int, int] | None) -> None:
-        self.student.restore_head_tile(tile)
+    def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
+        self.student.restore_head(tile, fused=fused)
 
     def held_variables(self) -> Variables | None:
         """Return the student's held tree, if any, with the teacher's under `teacher`."""
@@ -265,6 +267,11 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
 
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
         return self.student.apply_effects(self.student_variables(variables), effects)
+
+    def projected(self, params: Variables, *, updated: bool) -> Variables:
+        """The student's projection of its own parameters; the feature projections as they are."""
+        own = self.student_variables({"params": params})["params"]
+        return {**params, **self.student.projected(own, updated=updated)}
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None:
         return self.student.evaluate(self.student_variables(params), batch, self._student_step(step))

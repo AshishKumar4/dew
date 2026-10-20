@@ -15,10 +15,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from reference_error import assert_leaves_as_exact
 
-from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk
-from dew.nn.mlp import GatedMLP
+from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock
+from dew.nn.mlp import GatedMLP, gaussian_topk
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gemma3n"
 HIDDEN, COPIES = 32, 4
@@ -71,6 +71,203 @@ def test_altup_predicts_and_corrects_like_the_reference():
     assert float(np.max(np.abs(predictions - tensors["predictions"]))) < 1e-5
     assert float(np.max(np.abs(corrected - tensors["corrected"]))) < 1e-5
     assert float(np.max(np.abs(scaled - tensors["scaled"]))) < 1e-5
+
+
+def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
+    """A training step with half of the prediction coefficients past
+    `coef_clip`, two of them at 1e10. The reference clamps the stored
+    prediction weight before its product, so the forward reads the clamped
+    values and the gradient reaches every one of them, while the correction
+    clamps inside its product, which zeroes the clamped ones' gradient. The
+    outputs and the gradients of all five AltUp leaves are as exact as the
+    reference's, both measured from the reference in float64."""
+    import contextlib
+
+    import torch
+    from transformers import Gemma3nTextConfig
+    from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextAltUp
+
+    from tools.diffusers_wan_reference import float64
+
+    tensors = fixture()
+    clip = float(np.median(np.abs(tensors["altup.prediction_coefs.weight"])))
+    assert np.abs(tensors["altup.correction_coefs.weight"]).max() > clip
+    tensors["altup.prediction_coefs.weight"][[0, 1], [0, 1]] = 1e10, -1e10
+    stream, activated = tensors["stream"], tensors["activated"]
+    draws = np.random.default_rng(0)
+    cotangents = [draws.standard_normal(shape).astype(np.float32)
+                  for shape in (stream.shape, stream.shape, activated.shape)]
+    config = Gemma3nTextConfig(hidden_size=HIDDEN, num_hidden_layers=1, altup_num_inputs=COPIES,
+                               altup_coef_clip=clip)
+    names = ("correction_coefs", "prediction_coefs", "modality_router")
+
+    def reference(dtype):
+        # The float64 truth runs under `float64`, the norm's and the router's float32 pins included.
+        with float64() if dtype == torch.float64 else contextlib.nullcontext():
+            altup = Gemma3nTextAltUp(config).to(dtype).train()
+            with torch.no_grad():
+                for name in names:
+                    getattr(altup, name).weight.copy_(torch.from_numpy(tensors[f"altup.{name}.weight"]))
+                altup.router_norm.weight.copy_(torch.from_numpy(tensors["altup.router_norm.weight"]))
+                altup.correct_output_scale.copy_(torch.from_numpy(tensors["altup.correct_output_scale"]))
+            predictions = altup.predict(torch.tensor(stream, dtype=dtype))
+            corrected = altup.correct(predictions, torch.tensor(activated, dtype=dtype))
+            outputs = (predictions, corrected, altup.scale_corrected_output(corrected[0]))
+            sum((output * torch.tensor(cotangent, dtype=dtype)).sum()
+                for output, cotangent in zip(outputs, cotangents, strict=True)).backward()
+        return {"outputs": [output.detach().numpy() for output in outputs], "params": {"altup": {
+            **{name: {"kernel": getattr(altup, name).weight.grad.numpy().T} for name in names},
+            "router_norm": {"scale": altup.router_norm.weight.grad.numpy()},
+            "correct_output_scale": altup.correct_output_scale.grad.numpy()}}}
+
+    def loss(params):
+        outputs = Steps(AltUp(num_inputs=COPIES, coef_clip=clip)).apply(
+            {"params": params}, jnp.asarray(stream), jnp.asarray(activated), train=True)
+        terms = [jnp.sum(output * cotangent) for output, cotangent in zip(outputs, cotangents, strict=True)]
+        return sum(terms), outputs
+
+    (_, outputs), gradient = jax.value_and_grad(loss, has_aux=True)(altup_variables(tensors)["params"])
+    dew = jax.tree.map(np.asarray, {"outputs": list(outputs), "params": gradient})
+    assert_leaves_as_exact(dew, reference(torch.float32), reference(torch.float64),
+                           reductions=stream.shape[1] * stream.shape[2])
+
+
+def clipped_gemma3n():
+    """The gemma3n-tiny decoder with its AltUp clip at the median prediction
+    coefficient, so half of every layer's coefficients start past it, and its
+    loaded source and clip."""
+    import dataclasses
+
+    from dew.interop import Pretrained
+
+    directory = Path(__file__).resolve().parent / "fixtures" / "hf" / "gemma3n-tiny"
+    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    layers = [tree["altup"]["prediction_coefs"]["kernel"] for name, tree in loaded.variables["params"].items()
+              if name.startswith("layers_")]
+    clip = float(np.median(np.abs(np.concatenate([np.ravel(kernel) for kernel in layers]))))
+    return loaded, loaded.model.clone(altup=dataclasses.replace(loaded.model.altup, coef_clip=clip)), clip
+
+
+@pytest.mark.parametrize("decay", [0.0, 0.1])
+def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference_does(decay):
+    """A training step of the gemma3n-tiny decoder through the Trainer, with half of every
+    layer's AltUp prediction coefficients past `coef_clip`, against the reference's step from
+    the same weights: torch's optimizer over Gemma3nForCausalLM in train mode, whose forward
+    clamps the stored prediction weight in place, so its update, weight decay included, applies
+    to the clamped weight (a coefficient at 2 under a clip of 1, gradient 1 and SGD at 0.1
+    stores 0.9, not 1.9). Every stored parameter after the step is as exact as the reference's
+    float32 step, row by row, both measured from its float64 step. The steps after it, under
+    SGD or AdamW, read and update the projected weights the same way, bit for bit
+    (`test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_ones`); an
+    AdamW step itself is not held to torch's here, since optax forms Adam's bias corrections
+    in float32 (`1 - 0.999 ** t`), 6.4e-6 off at the first step, where torch forms them in
+    float64."""
+    import optax
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+    from tools.diffusers_wan_reference import float64
+
+    loaded, model, clip = clipped_gemma3n()
+    directory = loaded.source
+    ids = np.load(directory / "input_ids.npy").astype(np.int32)
+    rows = ids[np.arange(jax.device_count()) % len(ids)]
+    rate = 0.1
+    tx = optax.chain(optax.add_decayed_weights(decay), optax.sgd(rate))
+    trainer = Trainer(LMObjective(model, rows.shape[1] - 1, head_chunks=1, variables=loaded.variables), tx,
+                      key=jax.random.key(0))
+    state, _, _ = trainer.place()
+    state, *_ = trainer.compile(state, {"text": rows})(state, {"text": rows})
+    trained = loaded.export({**loaded.variables, "params": state.variables["params"]})
+    dew = {name: np.asarray(tensor, np.float32) for name, tensor in trained.items()}
+
+    def reference(dtype):
+        hf_config = AutoConfig.from_pretrained(directory)
+        hf_config.altup_coef_clip = clip
+        reference = AutoModelForCausalLM.from_pretrained(directory, config=hf_config,
+                                                         attn_implementation="eager").float()
+        if dtype == torch.float64:
+            with float64():
+                wide = AutoModelForCausalLM.from_config(hf_config, dtype=torch.float64,
+                                                        attn_implementation="eager")
+                wide.load_state_dict(reference.state_dict())
+            reference = wide
+        reference.train()
+        solver = torch.optim.SGD(reference.parameters(), lr=rate, weight_decay=decay)
+        tokens = torch.from_numpy(rows).long()
+        with float64() if dtype == torch.float64 else torch.enable_grad():
+            reference(input_ids=tokens, labels=tokens).loss.backward()
+            solver.step()
+        state_dict = reference.state_dict()
+        return {name: state_dict[name].detach().numpy() for name in dew}
+
+    assert_leaves_as_exact(dew, reference(torch.float32), reference(torch.float64))
+
+
+@pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
+@pytest.mark.parametrize("objective", ["lm", "grpo", "ppo"])
+def test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_ones(objective, optimizer):
+    """The reference clamps the stored prediction weight in place before each forward, so
+    training steps from AltUp coefficients past `coef_clip` are the steps from the clamped ones,
+    every later step reading the clamp of what the step before it stored. Dew's two steps, SGD's
+    and AdamW's, its decay included, are, bit for bit, under an LM loss, whose forward trains
+    the model, under GRPO's, whose token scores read it without training, and under PPO's, whose
+    critic is a value head over its own Gemma 3n: each step reads the coefficients and updates
+    them as each network's constraint projects them (`Objective.projected`)."""
+    import dataclasses
+
+    import optax
+    from objective_cases import SEQ_LEN, packed
+
+    from dew.objectives.lm import LMObjective
+    from dew.objectives.rl import GRPOObjective, PPOObjective, ValueHead
+    from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
+    from dew.objectives.rl.sessions import RESPONSE_MASK_KEY
+    from dew.training import Trainer
+
+    loaded, model, clip = clipped_gemma3n()
+
+    def stepped(start):
+        if objective == "lm":
+            task = LMObjective(model, SEQ_LEN, head_chunks=1, variables=loaded.variables)
+            batch = {"text": np.tile(np.arange(1, SEQ_LEN + 2, dtype=np.int32), (jax.device_count(), 1))}
+        else:
+            def build(seq_len):
+                if objective == "grpo":
+                    return GRPOObjective(model, seq_len, variables=loaded.variables)
+                return PPOObjective(model, seq_len, critic=ValueHead(model), variables=loaded.variables)
+
+            task, rows = packed(build)
+            if objective == "ppo":
+                # The rollout's critic values and returns, on the response tokens.
+                mask = np.asarray(rows[RESPONSE_MASK_KEY], np.float32)
+                rows = {**rows, OLD_VALUES_KEY: 0.5 * mask, RETURNS_KEY: mask}
+            # Every device takes a row: the packed rows repeat, as a loader cycles them.
+            every = np.arange(jax.device_count())
+            batch = jax.tree.map(lambda leaf: np.asarray(leaf)[every % len(leaf)], rows)
+        tx = optax.sgd(0.1) if optimizer == "sgd" else optax.adamw(1e-2, weight_decay=0.1)
+        trainer = Trainer(task, tx, key=jax.random.key(0))
+        state, _, _ = trainer.place()
+
+        def started(path, leaf):
+            names = tuple(getattr(key, "key", None) for key in path[-3:])
+            return (jax.device_put(start(leaf), leaf.sharding)
+                    if names == ("altup", "prediction_coefs", "kernel") else leaf)
+
+        moved = jax.tree_util.tree_map_with_path(started, state.variables)
+        state = dataclasses.replace(state, variables=moved)
+        step = trainer.compile(state, batch)
+        for _ in range(2):
+            state, *_ = step(state, batch)
+        return jax.tree.map(np.asarray, state.variables["params"])
+
+    beyond = stepped(lambda kernel: 10 * kernel)
+    clamped = stepped(lambda kernel: jnp.clip(10 * kernel, -clip, clip))
+    assert jax.tree.structure(beyond) == jax.tree.structure(clamped)
+    for ours, theirs in zip(jax.tree.leaves(beyond), jax.tree.leaves(clamped), strict=True):
+        np.testing.assert_array_equal(ours, theirs)
 
 
 def test_the_laurel_block_matches_the_reference():
@@ -151,50 +348,85 @@ def test_the_sparse_mlp_trains_on_padded_rows_as_the_reference_does():
                            reductions=hidden.shape[0] * hidden.shape[1])
 
 
-@pytest.mark.parametrize("sparsity", [0.9, 0.95, 0.99])
-def test_gaussian_topk_is_as_exact_as_the_references(sparsity):
-    """Gemma 3n's sparse gate over 256 rows of 2048 normal activations: Dew's
-    fp32 is within tests/reference_error.py's rule of the reference's fp32
-    (Gemma3nTextMLP._gaussian_topk), both from the reference in float64, which
-    keeps the reference's fp32 cutoff multiplier. Dew's multiplier from jax's
-    fp32 erfinv, two ulps off at 0.95, was 3.77 and 6.33 times the reference's
-    distance at 0.95 and 0.9, and 1.10 and 1.15 once formed as the reference's."""
+def sparse_mlps(sparsity: float, width: int, rows: int, dtype, hidden: int = HIDDEN):
+    """The reference's public `Gemma3nTextMLP` and Dew's `GatedMLP` at `sparsity` over the
+    same random weights, `width` gate activations a row of `hidden` features, and `rows`
+    random inputs."""
     import torch
     from transformers import Gemma3nTextConfig
     from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextMLP
 
-    rows = np.random.default_rng(0).standard_normal((256, 2048)).astype(np.float32)
-    config = Gemma3nTextConfig(hidden_size=HIDDEN, intermediate_size=rows.shape[1], num_hidden_layers=1,
+    draws = np.random.default_rng(0)
+    names = ("gate_proj", "up_proj", "down_proj")
+    shapes = {"gate_proj": (width, hidden), "up_proj": (width, hidden), "down_proj": (hidden, width)}
+    weights = {name: (draws.standard_normal(shape) / np.sqrt(shape[1])).astype(np.float32)
+               for name, shape in shapes.items()}
+    inputs = draws.standard_normal((rows, hidden)).astype(np.float32)
+    config = Gemma3nTextConfig(hidden_size=hidden, intermediate_size=width, num_hidden_layers=1,
+                               num_attention_heads=1, num_key_value_heads=1, head_dim=max(hidden, 2),
                                activation_sparsity_pattern=[sparsity])
-    mlp = Gemma3nTextMLP(config, layer_idx=0)
 
-    def reference(dtype):
-        return mlp._gaussian_topk(torch.tensor(rows, dtype=dtype)).numpy()
+    def reference(torch_dtype, cotangent=None):
+        mlp = Gemma3nTextMLP(config, layer_idx=0).to(torch_dtype)
+        with torch.no_grad():
+            for name in names:
+                getattr(mlp, name).weight.copy_(torch.from_numpy(weights[name]))
+        x = torch.tensor(inputs).to(torch_dtype).requires_grad_()
+        output = mlp(x)
+        if cotangent is None:
+            return {"output": output.detach().float().numpy()}
+        (output * torch.tensor(cotangent, dtype=torch_dtype)).sum().backward()
+        return {"output": output.detach().numpy(), "input": x.grad.numpy(),
+                **{name: getattr(mlp, name).weight.grad.numpy().T for name in names}}
 
-    dew = jax.jit(lambda x: gaussian_topk(x, sparsity))(jnp.asarray(rows))
-    assert_as_exact_as_the_reference(np.asarray(dew), reference(torch.float32), reference(torch.float64),
-                                     f"the gate at sparsity {sparsity}")
+    model = GatedMLP(hidden_features=width, out_features=hidden, activation="geglu",
+                     activation_sparsity=sparsity, dtype=dtype)
+    params = {name: {"kernel": jnp.asarray(weights[name].T, dtype)} for name in names}
+    return reference, model, params, jnp.asarray(inputs, dtype)
+
+
+@pytest.mark.parametrize("sparsity", [0.9, 0.95, 0.99])
+def test_the_sparse_mlp_is_as_exact_as_the_reference_at_each_sparsity(sparsity):
+    """Gemma 3n's sparse MLP through the reference's public forward and backward, 256 rows of
+    2048 gate activations, at each sparsity a released pattern uses or bounds: Dew's fp32
+    output and gradients are within tests/reference_error.py's rule of the reference's fp32,
+    both from the reference in float64. The gate's cutoff multiplier is the reference's (its
+    fp32 icdf); jax's own fp32 erfinv lands two ulps from it at 0.95. Four features a row keep
+    the projections' own rounding below the cutoff's, which a wide row hides: that multiplier
+    put the down projection's gradient 3.4 and 2.4 times the reference's distance at 0.9 and
+    0.95, and the right one 1.0 and 1.1."""
+    import torch
+
+    reference, model, params, hidden = sparse_mlps(sparsity, 2048, 256, jnp.float32, hidden=4)
+    cotangent = np.random.default_rng(1).standard_normal((256, 4)).astype(np.float32)
+
+    def loss(params, x):
+        output = model.apply({"params": params}, x)
+        return jnp.sum(output * cotangent), output
+
+    (_, output), (kernels, inputs) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(params, hidden)
+    dew = {"output": output, "input": inputs, **{name: kernel["kernel"] for name, kernel in kernels.items()}}
+    ours, theirs, truth = (jax.tree.map(np.asarray, dew), reference(torch.float32, cotangent),
+                           reference(torch.float64, cotangent))
+    # The output and the input's gradient sum over the 2048 activations; a kernel's gradient over the rows.
+    for names, reductions in ((("output", "input"), 2048), (("gate_proj", "up_proj", "down_proj"), 256)):
+        assert_leaves_as_exact(*({name: tree[name] for name in names} for tree in (ours, theirs, truth)),
+                               reductions=reductions)
 
 
 @pytest.mark.parametrize("sparsity", [1e-9, 1 - 1e-9])
-def test_gaussian_topk_takes_the_references_cutoff_at_the_ends_of_its_domain(sparsity):
-    """A sparsity whose fp32 argument 2p - 1 rounds to -1 or 1 takes the
-    reference's infinite cutoff multiplier (torch's icdf there): every value
-    kept as infinity below, and none kept above, bit for bit as the
-    reference's gate in fp32 and bf16, which both take the fp32 argument. A
-    float64 model forms its own float64 argument, which these do not end."""
+def test_the_sparse_mlp_takes_the_references_cutoff_at_the_ends_of_its_domain(sparsity):
+    """A sparsity whose fp32 argument 2p - 1 rounds to -1 or 1 takes the reference's infinite
+    cutoff multiplier (torch's icdf there): above, the gate keeps nothing and the MLP outputs
+    zeros; below, it keeps every activation as infinity, which the down projection sums to
+    NaN. Dew's MLP outputs the reference's, bit for bit, in fp32 and bf16, which both take the
+    fp32 argument. A float64 model forms its own float64 argument, which these do not end."""
     import torch
-    from transformers import Gemma3nTextConfig
-    from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextMLP
 
-    rows = np.random.default_rng(0).standard_normal((4, 64)).astype(np.float32)
-    config = Gemma3nTextConfig(hidden_size=HIDDEN, intermediate_size=rows.shape[1], num_hidden_layers=1,
-                               activation_sparsity_pattern=[sparsity])
-    mlp = Gemma3nTextMLP(config, layer_idx=0)
     for torch_dtype, dtype in ((torch.float32, jnp.float32), (torch.bfloat16, jnp.bfloat16)):
-        dew = jax.jit(lambda x: gaussian_topk(x, sparsity))(jnp.asarray(rows, dtype))
-        theirs = mlp._gaussian_topk(torch.tensor(rows).to(torch_dtype)).float().numpy()
-        np.testing.assert_array_equal(np.asarray(dew, np.float32), theirs)
+        reference, model, params, hidden = sparse_mlps(sparsity, 64, 4, dtype)
+        dew = jax.jit(lambda params, x, model=model: model.apply({"params": params}, x))(params, hidden)
+        np.testing.assert_array_equal(np.asarray(dew, np.float32), reference(torch_dtype)["output"])
 
 
 @pytest.mark.parametrize("sparsity", [0.5, 0.95])

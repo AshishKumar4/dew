@@ -1,6 +1,7 @@
 """PPO actor/critic math against pinned verl and a real episode training run."""
 
 import itertools
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -21,11 +22,12 @@ from episode_support import (
     verify,
 )
 from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 from rl_support import clipped_surrogate, token_mean
 
 from dew.data.dataset import Loader
 from dew.objectives.base import Ratio, Step, part
-from dew.objectives.rl import EpisodeRollout, PPOObjective, PPORollout, ValueHead
+from dew.objectives.rl import EpisodeRollout, EpisodeStatus, PPOObjective, PPORollout, ValueHead
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
 from dew.objectives.rl.sessions import BEHAVIOR_LOG_PROBS_KEY, OLD_LOG_PROBS_KEY
 from dew.rl import clipped_value_loss_terms, gae, token_log_ratio
@@ -104,6 +106,49 @@ def test_episode_gae_crosses_turns_without_discounting_observations_or_padding()
     before = no_kl.scalar_loss(state.variables, batch, info)[0]
     after = no_kl.scalar_loss(state.variables, changed, info)[0]
     assert abs(float(before - after)) > .001
+
+
+def episode_returns(rewards, values, gamma, lam, dtype):
+    """verl's masked GAE returns over one episode's action ids in draw order, in `dtype`: each
+    id's `rewards` and the critic's `values`, with no bootstrap after the last."""
+    rewards, values = np.asarray(rewards, dtype), np.asarray(values, dtype)
+    advantage, following, out = dtype(0), dtype(0), np.zeros_like(values)
+    for t in range(len(values) - 1, -1, -1):
+        delta = rewards[t] + dtype(gamma) * following - values[t]
+        advantage = delta + dtype(gamma * lam) * advantage
+        out[t], following = advantage + values[t], values[t]
+    return out
+
+
+def test_each_step_reward_lands_on_the_last_action_of_the_call_it_paid_for():
+    """A square tool that pays 0.5 for its tool step and 0.25 for the answer step, beside the
+    verifier's reward: GAE's returns over each episode's actions are verl's with each step reward
+    on the last action id of its call and the verifier's on the episode's last, as exact against
+    float64 as the same recursion in float32."""
+    trainer, rollout = build_ppo()
+    rollout = replace(rollout, episodes=replace(rollout.episodes, environment=Harness(paid=(0.5, 0.25))))
+    state = trainer.initial_state()
+    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    episodes = rollout.episodes.collect(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    mine, reference, truth = [], [], []
+    for index, episode in enumerate(episodes):
+        ids = [(turn, position) for turn, transition in enumerate(episode.transitions)
+               for position in range(len(transition.action.tokens))]
+        rows = [index * TURNS + turn for turn, _ in ids]
+        if episode.status is not EpisodeStatus.COMPLETED:
+            continue
+        rewards = np.zeros(len(ids))
+        for turn, transition in enumerate(episode.transitions):
+            last = max(at for at, (call, _) in enumerate(ids) if call == turn)
+            rewards[last] += transition.observation.reward
+        rewards[-1] += episode.reward
+        values = per_call(batch, OLD_VALUES_KEY, episodes)[rows, [position for _, position in ids]]
+        mine.append(per_call(batch, RETURNS_KEY, episodes)[rows, [position for _, position in ids]])
+        reference.append(episode_returns(rewards, values, rollout.gamma, rollout.lam, np.float32))
+        truth.append(episode_returns(rewards, values, rollout.gamma, rollout.lam, np.float64))
+    assert mine
+    assert_as_exact_as_the_reference(np.concatenate(mine), np.concatenate(reference), np.concatenate(truth),
+                                     "episode returns with step rewards")
 
 
 def test_episode_advantages_hold_at_values_and_rewards_far_above_them():

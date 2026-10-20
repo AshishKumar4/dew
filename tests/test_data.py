@@ -574,7 +574,6 @@ def _voxceleb_tree(root, split="train", identities=("id00012", "id00015")):
 
 
 def test_local_videos_lists_every_file_under_the_directory(tmp_path):
-    pytest.importorskip("moviepy.config", reason="needs the av extra")
     clips = _voxceleb_tree(tmp_path)
     (tmp_path / "extra.webm").write_bytes(b"")
 
@@ -601,7 +600,6 @@ def test_a_video_recipe_reads_frames_and_the_sound_around_them_at_its_audio_mode
     side, at the rate the audio model's extractor reads: a 48 kHz model's record holds 1920 samples
     a frame where a 16 kHz one holds 640. The audio model featurizes the sound when a run encodes
     it, so the record holds the waveform."""
-    pytest.importorskip("moviepy.config", reason="needs the av extra")
     from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
 
     clips = _voxceleb_tree(tmp_path)
@@ -629,7 +627,6 @@ def test_a_video_recipe_reads_the_same_batches_at_any_worker_count_and_after_a_r
     """Clips whose frames and sound count up, so every drawn window shows: two workers give the
     batches the main process gives, and a reader resumed from a saved position continues with the
     batches an uninterrupted one reads, windows included."""
-    pytest.importorskip("moviepy.config", reason="needs the av extra")
     from test_data_av import _mux
     from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
 
@@ -1235,7 +1232,7 @@ def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path
 
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
-        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
 # ---------------------------------------------------------------------------------
@@ -1285,6 +1282,47 @@ def test_columns_rows_and_a_torch_dataset_are_the_same_records():
         for name in ("index", "x"):
             assert other[name].dtype == first[name].dtype
             np.testing.assert_array_equal(first[name], other[name])
+
+
+def test_a_torch_dataset_streams_the_records_it_indexes_and_resumes():
+    """A map-style torch dataset streams as consecutive ranges of the records it indexes, as a
+    memory source does: a streamed pass holds every record once, and a streamed run resumed after
+    two batches reads the batches the uninterrupted one reads."""
+    import torch
+
+    tensors = torch.utils.data.TensorDataset(torch.arange(12))
+    source = Torch(tensors, fields=("index",), identity="indices@1")
+    reading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
+    from dew.data.compile import validation
+    from dew.data.pipeline import Pipeline
+
+    passed = validation(Pipeline(source).batch(4), batch=4, read="streamed", loading=reading)(DataPartition())
+    try:
+        assert sorted(int(value) for batch in passed for value in batch["index"]) == list(range(12))
+    finally:
+        passed.close()
+
+    def opened():
+        return loader(RecordsData(source=source), batch=4, seed=0, read="streamed", loading=reading).train(
+            DataPartition())
+
+    whole = opened()
+    try:
+        expected = [np.asarray(next(whole)["index"]).tolist() for _ in range(6)]
+    finally:
+        whole.close()
+    stopped = opened()
+    try:
+        head = [np.asarray(next(stopped)["index"]).tolist() for _ in range(2)]
+        saved = stopped.get_state()
+    finally:
+        stopped.close()
+    resumed = opened()
+    try:
+        resumed.set_state(saved)
+        assert head + [np.asarray(next(resumed)["index"]).tolist() for _ in range(4)] == expected
+    finally:
+        resumed.close()
 
 
 def test_a_torchvision_style_dataset_reads_its_tuples_as_named_fields():
@@ -1437,4 +1475,4 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
 
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
-        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))

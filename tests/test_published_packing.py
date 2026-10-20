@@ -26,7 +26,7 @@ def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tm
     policy = prefix.flat_map(Chunks(9)).pack(9, bins=3)
     generation = publish(policy, Cache(str(tmp_path / "cache"), spool_bytes=4 * 1024**2,
                                       shard_bytes=256 * 1024), read="indexed", loading=READ)
-    warm = compile(Pipeline(source).cache(generation).pack(9, bins=3).shuffle(3).repeat().batch(4),
+    warm = compile(prefix.flat_map(Chunks(9)).cache(generation).pack(9, bins=3).shuffle(3).repeat().batch(4),
                    read="indexed", seed=3, loading=READ)
     cold = compile(policy.shuffle(3).repeat().batch(4), read="memory", seed=3, loading=READ)
     assert warm.plan.lowering == "global"
@@ -57,6 +57,38 @@ def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tm
     # The shares' rows interleave into the whole batch's, leaf by leaf (a window's coordinates too).
     jax.tree.map(lambda first, second, whole: np.testing.assert_array_equal(
         np.stack([first, second], axis=1).reshape(whole.shape), whole), shares[0], shares[1], expected)
+
+
+def test_a_recipe_given_a_published_packing_reads_the_windows_its_memory_read_packs(tmp_path):
+    """A typed recipe given a generation published from its own windows and packing reads that
+    plan, shuffled as its default order: the same batches, leaf by leaf, as the recipe packing in
+    memory, and a resume at a saved position reads on as the uninterrupted run does."""
+    from dew.config.data import TextData, loader
+
+    source = Memory(tuple({"text": "x" * size} for size in SIZES))
+    recipe = TextData(source=source, seq_len=8, pack="first-fit", packing_bins=3, eos=False,
+                      token_holdout=None)
+    train, _, _ = recipe.pipelines()
+    published = publish(train, Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
+    warm = loader(recipe, batch=2, seed=3, cache=published, read="indexed", loading=READ)
+    cold = loader(recipe, batch=2, seed=3, read="memory", loading=READ)
+    assert "packing" in warm.plan.manifest.source["sources"][0]
+    left, right = warm.train(DataPartition()), cold.train(DataPartition())
+    try:
+        for ours, packed in zip(itertools.islice(left, 4), itertools.islice(right, 4), strict=True):
+            assert jax.tree.structure(ours) == jax.tree.structure(packed)
+            jax.tree.map(np.testing.assert_array_equal, ours, packed)
+        saved = left.get_state()
+        expected = next(left)
+    finally:
+        left.close()
+        right.close()
+    resumed = warm.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        jax.tree.map(np.testing.assert_array_equal, next(resumed), expected)
+    finally:
+        resumed.close()
 
 
 def test_a_pack_places_documents_whole_and_refuses_one_its_window_cannot_hold(tmp_path):
@@ -94,9 +126,9 @@ def test_a_pack_places_documents_whole_and_refuses_one_its_window_cannot_hold(tm
     assert not isinstance(pinned, (Mixture, Phases))
     generation = filled.publish(_cache_manifest(pinned, prepared.stages, "indexed"), pinned, plan=cut)
     with pytest.raises(ValueError):
-        compile(Pipeline(source).cache(generation).pack(9, bins=3).repeat().batch(4), read="indexed",
+        compile(prefix.cache(generation).pack(9, bins=3).repeat().batch(4), read="indexed",
                 loading=READ)
-    chunked = compile(Pipeline(source).cache(generation).flat_map(Chunks(9)).pack(9, bins=3).repeat()
+    chunked = compile(prefix.cache(generation).flat_map(Chunks(9)).pack(9, bins=3).repeat()
                       .batch(4), read="indexed", loading=READ)
     cold = compile(prefix.flat_map(Chunks(9)).pack(9, bins=3).repeat().batch(4), read="memory", loading=READ)
     left, right = chunked.train(DataPartition()), cold.train(DataPartition())

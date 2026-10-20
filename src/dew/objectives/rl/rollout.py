@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.coordination import agreed
-from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
+from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.objectives.base import Shown
 from dew.sampling.text import Sampling
@@ -28,11 +28,13 @@ from .sessions import (
     sampled_values,
 )
 
-type Reward = Callable[[str, str, str, str], float]
-"""A function that scores `(data_source, completion, ground_truth, extra_info)` and returns the reward."""
+type Reward = Callable[[str, PromptRecord], float]
+"""A function that scores a completion against its prompt's `PromptRecord` and returns the reward.
 
-def prompt_rows(batch) -> tuple[np.ndarray, np.ndarray, list[str], list[str], list[str]]:
-    """Read one host prompt batch: left-padded ids, lengths and the three reward strings.
+verl's four-argument `compute_score` enters through `dew.objectives.rl.verl.verl_reward`."""
+
+def prompt_rows(batch) -> tuple[np.ndarray, np.ndarray, list[PromptRecord]]:
+    """Read one host prompt batch: left-padded ids, lengths and each row's `PromptRecord`.
 
     Every row needs a length between one and the width. The strings arrive
     as fixed-width UTF-8 byte rows stored as int32.
@@ -46,7 +48,8 @@ def prompt_rows(batch) -> tuple[np.ndarray, np.ndarray, list[str], list[str], li
     if (prompt_lengths.shape != (rows,) or not np.issubdtype(prompt_lengths.dtype, np.integer)
             or np.any(prompt_lengths < 1) or np.any(prompt_lengths > width)):
         raise ValueError("prompt_length must contain one valid integer length per row")
-    return prompts, prompt_lengths, sources, truths, infos
+    records = [PromptRecord(*fields) for fields in zip(sources, truths, infos, strict=True)]
+    return prompts, prompt_lengths, records
 
 
 @dataclasses.dataclass(frozen=True)
@@ -89,13 +92,10 @@ class SampledRollout:
     def _prepared(self, batch, key: jax.Array):
         """Validate one prompt batch and build the inputs generation reads.
 
-        Returns the prompt ids, their lengths, the decoded source, truth
-        and info strings the reward is called with, and the `ModelInputs`
-        the policy is given.
+        Returns the prompt ids, their lengths, the `PromptRecord` each row's
+        reward is called with, and the `ModelInputs` the policy is given.
         """
-        if key.shape != ():
-            raise ValueError("key must be a single JAX PRNG key")
-        prompts, prompt_lengths, sources, truths, infos = prompt_rows(batch)
+        prompts, prompt_lengths, records = prompt_rows(batch)
         width = prompts.shape[1]
         # The lengths are already here on the host, so a batch of whole
         # prompts states its validity by carrying none.
@@ -103,7 +103,7 @@ class SampledRollout:
         inputs = ModelInputs(jnp.asarray(prompts), {
             "attention_mask": jnp.arange(width)[None, :] >= width - jnp.asarray(prompt_lengths)[:, None]
         } if padded else {})
-        return prompts, prompt_lengths, sources, truths, infos, inputs
+        return prompts, prompt_lengths, records, inputs
 
     def __call__(self, state, batch, key: jax.Array) -> dict[str, np.ndarray]:
         """Draw `groups` completions per prompt and pack them as GRPO rows.
@@ -117,7 +117,7 @@ class SampledRollout:
         # Validation completes on every rank before generation enters collectives.
         prepared = (agreed("rollout input preparation", lambda: self._prepared(batch, key))
                     if mesh_of(state.variables) is not None else self._prepared(batch, key))
-        prompts, prompt_lengths, sources, truths, infos, inputs = prepared
+        prompts, prompt_lengths, records, inputs = prepared
         rows, width = prompts.shape
         generated = self.objective.policy(state.variables, self.sampling)(
             inputs, self.max_new_tokens, key=key, n=self.groups).host()
@@ -128,11 +128,12 @@ class SampledRollout:
         sampled = grouped(generated.tokens[:, width:])
         lengths, terminated = grouped(generated.lengths), grouped(generated.terminated)
         raw, behavior = grouped(generated.raw_log_probs), grouped(generated.behavior_log_probs)
-        rewards = np.asarray([
-            [self.reward(sources[row], self.decode(sampled[row, group,
-                         :int(lengths[row, group]) - int(terminated[row, group])].tolist()),
-                         truths[row], infos[row]) for group in range(self.groups)]
-            for row in range(rows)], np.float32)
+        def completion(row: int, group: int) -> str:
+            end = int(lengths[row, group]) - int(terminated[row, group])
+            return self.decode(sampled[row, group, :end].tolist())
+
+        rewards = np.asarray([[self.reward(completion(row, group), records[row])
+                               for group in range(self.groups)] for row in range(rows)], np.float32)
         sessions, version = [], int(state.updates)
         for row in range(rows):
             prompt = tuple(int(token) for token in prompts[row, width - int(prompt_lengths[row]):])
