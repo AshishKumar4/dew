@@ -1,4 +1,5 @@
-"""Timing calls: `benchmark` runs each call so many times and keeps the wall time of each run.
+"""Wall-clock timing of calls: `samples`, which every benchmark tool in Dew measures with, and
+`benchmark`, which lays out many calls' timings as a table.
 
 A run is timed from the call to the moment its output is ready on the devices
 (`jax.block_until_ready`), so an asynchronous dispatch is timed as the work it
@@ -14,6 +15,7 @@ import html
 import statistics
 import time
 from collections.abc import Callable, Hashable, Mapping
+from typing import Any
 
 import jax
 
@@ -35,9 +37,10 @@ class Benchmark:
     def _grid(self) -> tuple[list[str], list[tuple[str, list[float | None]]]]:
         """The column names and each row's medians: a grid for pair labels, one column otherwise."""
         labels = list(self.seconds)
-        if labels and all(isinstance(label, tuple) and len(label) == 2 for label in labels):
-            rows = list(dict.fromkeys(label[0] for label in labels))
-            columns = list(dict.fromkeys(label[1] for label in labels))
+        pairs = [label for label in labels if isinstance(label, tuple) and len(label) == 2]
+        if labels and len(pairs) == len(labels):
+            rows = list(dict.fromkeys(row for row, _ in pairs))
+            columns = list(dict.fromkeys(column for _, column in pairs))
             return [str(column) for column in columns], [
                 (str(row), [self.median((row, column)) if (row, column) in self.seconds else None
                             for column in columns]) for row in rows]
@@ -75,27 +78,52 @@ class Benchmark:
         return self.table()
 
 
-def benchmark(calls: Mapping[Hashable, Callable[[], object]], *, warmup: int = 1,
+def samples[T](fn: Callable[..., T], *args, warmup: int = 3, repeats: int = 10,
+               calls: int = 1) -> list[float]:
+    """Seconds per call of `fn(*args)`, one sample a synchronized group of
+    `calls` calls, after `warmup` groups. With one call a group each sample is
+    a call's latency, and its result is released before the next call starts,
+    so no two calls' outputs are ever held at once; more calls a group queue
+    their dispatches and synchronize once, which measures throughput. The
+    caller takes the statistic and units it reports."""
+    for _ in range(warmup):
+        jax.block_until_ready(fn(*args))
+    measured = []
+    for _ in range(repeats):
+        start = time.perf_counter()
+        outputs = fn(*args)
+        for _ in range(calls - 1):
+            outputs = fn(*args)
+        jax.block_until_ready(outputs)
+        measured.append((time.perf_counter() - start) / calls)
+        del outputs
+    return measured
+
+
+def benchmark(calls: Mapping[Hashable, Callable[[], Any]], *, warmup: int = 1,
               repeats: int = 3) -> Benchmark:
-    """Run each of `calls`, in order, `warmup` times untimed and then `repeats` times timed, each
-    run from the call until its output is ready (`jax.block_until_ready`), and return the runs'
-    seconds and each call's last output (`Benchmark`). Raises `ValueError` for no timed run or a
-    negative warm-up."""
+    """Time each of `calls`, in order, `repeats` times after `warmup` untimed runs (`samples`), and
+    return the runs' seconds and each call's last output (`Benchmark`); no two of a call's outputs
+    are held at once. Raises `ValueError` for no timed run or a negative warm-up."""
     if repeats < 1 or warmup < 0:
         raise ValueError(f"a benchmark times at least one run after none or more warm-ups, not "
                          f"repeats={repeats} and warmup={warmup}")
     seconds: dict[Hashable, tuple[float, ...]] = {}
-    outputs: dict[Hashable, object] = {}
+    outputs: dict[Hashable, Any] = {}
     for label, call in calls.items():
-        for _ in range(warmup):
-            jax.block_until_ready(call())
-        runs = []
-        for _ in range(repeats):
-            began = time.perf_counter()
-            output = jax.block_until_ready(call())
-            runs.append(time.perf_counter() - began)
-        seconds[label], outputs[label] = tuple(runs), output
+        ran = 0
+
+        def kept(label=label, call=call):
+            # The last run's output stays: `samples` releases each one before the next run.
+            nonlocal ran
+            ran += 1
+            output = call()
+            if ran == warmup + repeats:
+                outputs[label] = output
+            return output
+
+        seconds[label] = tuple(samples(kept, warmup=warmup, repeats=repeats))
     return Benchmark(seconds, outputs)
 
 
-__all__ = ["Benchmark", "benchmark"]
+__all__ = ["Benchmark", "benchmark", "samples"]
