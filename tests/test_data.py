@@ -980,6 +980,9 @@ class _Lazy:
     def describe(self):
         return describe(self.values)
 
+    def label(self):
+        return "lazy"
+
     def fingerprint(self):
         return {"source": describe(self.values), "records": len(self.values)}
 

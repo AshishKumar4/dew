@@ -318,6 +318,9 @@ class _PromptFacts:
     def _measured(self) -> dict[str, int]:
         return {}
 
+    def label(self) -> str:
+        return self.source.label()
+
     def describe(self) -> str:
         return self.source.describe()
 

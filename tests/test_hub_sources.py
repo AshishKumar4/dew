@@ -95,7 +95,8 @@ def moving_hub_conversion(monkeypatch, tmp_path, request):
 def test_a_split_saved_as_arrow_streams_its_parquet_conversion(monkeypatch):
     """A dataset repo's `.arrow` files are what `save_to_disk` and `push_to_hub` write, Arrow's
     stream format, which no file reader opens; a split that holds only those streams its Parquet
-    conversion, and a pinned revision without one is prepared rather than streamed."""
+    conversion, and a pinned revision without one is prepared rather than streamed. The read's
+    metrics go by the repository's name, not the conversion's files it reads."""
     from types import SimpleNamespace
 
     import pyarrow.parquet as pq
@@ -133,10 +134,11 @@ def test_a_split_saved_as_arrow_streams_its_parquet_conversion(monkeypatch):
                         lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
     monkeypatch.setattr(HfFileSystem, "info", header)
     monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, **kwargs: io.BytesIO(payloads[path]))
-    reader = compile(Pipeline(Hub("owner/data")).batch(4), read="streamed",
-                     loading=Loading(workers=0)).train(DataPartition())
+    data = compile(Pipeline(Hub("owner/data")).batch(4), read="streamed", loading=Loading(workers=0))
+    reader = data.train(DataPartition())
     try:
         assert [int(value) for _ in range(3) for value in next(reader)["id"]] == list(range(12))
+        assert {name.split("/")[2] for name in data.statistics()} == {"data"}
     finally:
         reader.close()
     assert Hub("owner/data", revision="original").streamed is None

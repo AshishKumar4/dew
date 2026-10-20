@@ -143,6 +143,12 @@ class _Facts:
     held: _PinnedRead | None = None
     """The memory read pinning took, which the compile's memory reads of the source reuse, so its
     facts and the rows a run materializes are one read's."""
+    stated_label: str = ""
+    """The source's name as it was written, before a read put another in its place (a Hub split's
+    Parquet files, `Consumed`), which the run's metrics go by."""
+
+    def label(self) -> str:
+        return self.stated_label
 
     def describe(self) -> str:
         return self.source.describe()
@@ -199,10 +205,11 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
     def pin(source: Source) -> _Facts:
         if isinstance(source, _Facts):
             return source
+        label = source.label()
         source = _consumed(source, read)
         records, metadata = _stated(source, read)
         held = None if records is None else _PinnedRead(records)
-        return _Facts(source, read, source.fingerprint(), metadata, held)
+        return _Facts(source, read, source.fingerprint(), metadata, held, label)
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
         pinned = dict(zip(sources, readers.map(pin, sources.values()), strict=True))
