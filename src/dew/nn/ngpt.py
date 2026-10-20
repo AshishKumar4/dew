@@ -4,7 +4,8 @@ sphere, each sublayer's output joining the residual by a learned step along the 
 NVIDIA's Dory (vllm-project/vllm#60149, vllm/model_executor/models/dory.py at 55076950) is the
 reference these follow, rounding for rounding: a unit norm reduces in fp32 and returns its input's
 dtype (`justnorm`), and the residual's step norms both ends in that dtype before it takes the step
-in fp32 (`slerp_norm`).
+in fp32 (`slerp_norm`). Each fp32 is at least fp32 (`at_least_fp32`): a float64 model computes in
+float64 throughout.
 """
 
 import dataclasses
@@ -12,6 +13,8 @@ import math
 
 import jax
 import jax.numpy as jnp
+
+from dew.nn.precision import at_least_fp32
 
 EPSILON = 1e-6
 """The floor under a unit norm's squared length (dory.py's EPS)."""
@@ -69,7 +72,7 @@ class NGPT:
 def unit(x: jax.Array) -> jax.Array:
     """`x` over its L2 length along the last axis, reduced in fp32 and returned in `x`'s dtype:
     `x * rsqrt(sum(x**2) + 1e-6)`, Dory's `justnorm`."""
-    wide = x.astype(jnp.float32)
+    wide = x.astype(at_least_fp32(x.dtype))
     return (wide * jax.lax.rsqrt(jnp.sum(jnp.square(wide), axis=-1, keepdims=True) + EPSILON)).astype(x.dtype)
 
 
@@ -77,13 +80,14 @@ def stepped(residual: jax.Array, branch: jax.Array, alpha: jax.Array, scale: flo
     """The residual after a sublayer's `branch` joins it: both ends unit-normed in the residual's
     dtype, a step of `|alpha * scale|` from the residual toward the branch in fp32, and the result
     unit-normed back to the residual's dtype (Dory's `slerp_alpha`)."""
-    start = unit(residual).astype(jnp.float32)
-    end = unit(branch).astype(jnp.float32)
-    rate = jnp.abs(alpha.astype(jnp.float32) * scale)
+    wide = at_least_fp32(residual.dtype)
+    start = unit(residual).astype(wide)
+    end = unit(branch).astype(wide)
+    rate = jnp.abs(alpha.astype(wide) * scale)
     return unit(start + rate * (end - start)).astype(residual.dtype)
 
 
 def gain(scale: jax.Array, factor: float) -> jax.Array:
     """A learned per-feature gain stored at the initializer's scale, as the fp32 multiplier it
     stands for: `scale * factor` (nGPT's s_qk, s_u, s_v and s_z, and Dory's output-gate scale)."""
-    return scale.astype(jnp.float32) * factor
+    return scale.astype(at_least_fp32(scale.dtype)) * factor

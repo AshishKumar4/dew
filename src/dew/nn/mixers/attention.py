@@ -302,7 +302,7 @@ class CausalSelfAttention(nn.Module):
         learned gain, in fp32 and back to its dtype (dory.py:139-149)."""
         heads = gain(self.sqk, ngpt.query(self.ctx.head_dim))
         heads = heads.reshape(self.ctx.num_heads, self.ctx.head_dim)
-        query = (jnp.square(heads) * unit(query).astype(jnp.float32)).astype(query.dtype)
+        query = (jnp.square(heads) * unit(query).astype(at_least_fp32(query.dtype))).astype(query.dtype)
         return query, unit(key)
 
     @property
@@ -1117,9 +1117,9 @@ class CausalSelfAttention(nn.Module):
             # nGPT scales the gate's logits by the square of their learned gain, gates in fp32 and
             # unit-norms the gated heads together (dory.py:154-157).
             scale = gain(self.s_gate, self.ctx.ngpt.gate(self.ctx.emb_features))
-            logits = gate.astype(jnp.float32) * jnp.square(scale).reshape(self.ctx.num_heads,
-                                                                           self.ctx.head_dim)
-            attention = (attention.astype(jnp.float32) * jax.nn.sigmoid(logits)).astype(attention.dtype)
+            wide = at_least_fp32(attention.dtype)
+            logits = gate.astype(wide) * jnp.square(scale).reshape(self.ctx.num_heads, self.ctx.head_dim)
+            attention = (attention.astype(wide) * jax.nn.sigmoid(logits)).astype(attention.dtype)
         elif gate is not None:
             # The branch multiplies by the sigmoid of its gate, then projects
             # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
