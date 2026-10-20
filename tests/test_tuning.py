@@ -208,7 +208,7 @@ def test_a_launch_is_resolved_and_described_without_asking_a_traced_array_for_it
 
 
 DISTINCT = """
-import json
+import json, logging
 import jax, tokamax
 from test_tuning import loss, operands, step
 from dew.nn.kernels import generation, tuning
@@ -223,10 +223,22 @@ def described(launches):
                   for ba in tokamax.autotuning.bound_args_from_json(launches))
 
 
+class Told(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append([record.levelname, record.getMessage()])
+
+
+told = Told()
+logging.getLogger(tuning.__name__).addHandler(told)
+logging.getLogger(tuning.__name__).setLevel(logging.DEBUG)
 with generation.assumed("sm80"):
     _, two = tuning.tune(lambda: jax.make_jaxpr(jax.grad(layers, argnums=(0, 1, 2, 3, 4)))(*operands(15)))
     _, one = tuning.tune(lambda: jax.make_jaxpr(step())(*operands(15)))
-print(json.dumps([described(two), described(one)]))
+print(json.dumps([described(two), described(one), told.records]))
 """
 
 
@@ -234,9 +246,12 @@ def test_a_step_settles_each_distinct_launch_once(tmp_path):
     """Two layers of one shape launch the same four kernels at the same keys.
     Tuned as on a GPU, the two-layer step's launches are the one layer's,
     each once: the pool decides each distinct launch once, and a measuring
-    pass measures it once, not once a layer."""
-    two, one = fresh(DISTINCT, cache_dir=tmp_path / "cache", flags=keeping_picks())
+    pass measures it once, not once a layer. With no picks stored, the process
+    says so once, as information: a heuristic config is a working default,
+    which a notebook's output should not flag as a fault."""
+    two, one, told = fresh(DISTINCT, cache_dir=tmp_path / "cache", flags=keeping_picks())
     assert len(one) == 4 and two == one
+    assert [level for level, message in told if "have no config measured" in message] == ["INFO"]
 
 
 @pytest.mark.parametrize("stores, rows, norms", [
