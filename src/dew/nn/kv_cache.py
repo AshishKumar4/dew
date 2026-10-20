@@ -59,7 +59,9 @@ POSITION = "next_position"
 which for a text row is its cursor's count of tokens."""
 ROW_CURSORS = frozenset({CURSOR, POSITION})
 """The per-row cursors a paged server seats a row at, from the row's own place in its pages."""
-POOLED = frozenset({"cached_key", "cached_value", "key_scale", "value_scale"})
+PLACES = "cached_places"
+"""Each cached key's place, kept beside the key where a chunk or ALiBi reads it (`Append.places`)."""
+POOLED = frozenset({"cached_key", "cached_value", "key_scale", "value_scale", PLACES})
 """The leaves a paged cache keeps in its shared pool rather than per row."""
 
 _LIMITS = {"int8": 127.0, "float8_e4m3fn": float(jnp.finfo(jnp.float8_e4m3fn).max)}
@@ -309,10 +311,12 @@ class KVStore:
 
     @classmethod
     def open(cls, module: nn.Module, layout: KVCache, rows: int, capacity: int, kv_heads: int,
-             head_dim: int, dtype: jnp.dtype, *, value_dim: int | None = None) -> KVStore:
+             head_dim: int, dtype: jnp.dtype, *, value_dim: int | None = None,
+             places: bool = False) -> KVStore:
         """Declare the module's cache variables, allocating them on first use, and return the store.
 
-        Values are `value_dim` wide, None for the keys' `head_dim`. A paged
+        Values are `value_dim` wide, None for the keys' `head_dim`. `places`
+        also keeps each token's place beside its key (`Append.places`). A paged
         layout raises `ValueError` when `capacity` is not a multiple of
         `page_size`, or when `rows` does not split into the pool's groups.
         """
@@ -337,6 +341,10 @@ class KVStore:
         if layout.quantized is not None:
             for name in ("key_scale", "value_scale"):
                 module.variable("cache", name, jnp.ones, shape[:-1], jnp.float32)
+        if places:
+            # A scale's storage with one head: every key head of a token sits at its place.
+            held = (*shape[:2], 1) if layout.page_size is None else (1, *shape[1:3])
+            module.variable("cache", PLACES, jnp.zeros, held, jnp.int32)
         return store
 
     @property
@@ -382,6 +390,15 @@ class KVStore:
 
     def read(self) -> tuple[jax.Array, jax.Array]:
         return self._read("cached_key", "key_scale"), self._read("cached_value", "value_scale")
+
+    def write_places(self, places: jax.Array, positions: jax.Array) -> None:
+        """Keep the tokens' `places` `[rows, tokens]` at their slots `positions`, where their keys go."""
+        self._put(PLACES, self._written(self._get(PLACES), places[..., None].astype(jnp.int32), positions))
+
+    def read_places(self) -> jax.Array:
+        """Every slot's kept place, `[rows, capacity]`."""
+        held = self._get(PLACES)
+        return (held if self.layout.page_size is None else self._gathered(held))[..., 0]
 
     def write_tokens(self, key: jax.Array, value: jax.Array, rows: jax.Array, positions: jax.Array) -> None:
         """Write keys and values `[tokens, kv_heads, head_dim]`, each at its own row and slot.
@@ -584,6 +601,20 @@ class Append:
         """Return `query` `[..., head_dim]` in the basis that the stored keys are in."""
         rotation = self.store.rotation
         return query if rotation is None else rotated(query, rotation)
+
+    def places(self, places: jax.Array) -> jax.Array:
+        """Store the call's token places beside its keys and return every slot's, `[rows, capacity]`.
+
+        `places` are `[rows, tokens]` or one vector the rows share. A chunk
+        and ALiBi read a cached key at the place the call that wrote it
+        counted its token at (`dew.nn.inputs.counted_places`). A caller may
+        place a row's tokens anywhere, so a slot is no place of its own, and a
+        paged pool keeps the places in its pages, which a shared prefix's
+        pages then carry.
+        """
+        if self.allocated:
+            self.store.write_places(jnp.broadcast_to(places, self.positions.shape), self.positions)
+        return self.store.read_places()
 
 
 def gather_cache_rows(cache, rows):

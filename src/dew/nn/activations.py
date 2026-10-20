@@ -188,14 +188,18 @@ def gated_product(activation: GatedActivation, *, implementation: str = 'auto',
     activate = _gate_function(activation, implementation)
     rounded_product = _recomputed(_rounded(activate))
 
+    def portable(gate: jax.Array, up: jax.Array) -> jax.Array:
+        if jnp.finfo(jnp.result_type(gate, up)).bits >= 32:
+            return activate(gate) * up
+        return rounded_product(gate, up)
+
     def product(gate: jax.Array, up: jax.Array) -> jax.Array:
         chosen = 'xla' if activation != 'swiglu' else norm_swiglu.swiglu_kernel(
             implementation, gate, up, axes=axes)
         if chosen == 'pallas':
-            return norm_swiglu.swiglu(gate, up, axes=axes)
-        if jnp.finfo(jnp.result_type(gate, up)).bits >= 32:
-            return activate(gate) * up
-        return rounded_product(gate, up)
+            # Every order of its derivative is the portable product's; every level runs the kernels.
+            return norm_swiglu.swiglu(gate, up, portable, axes=axes)
+        return portable(gate, up)
 
     return product
 
@@ -211,13 +215,16 @@ def packed_gated_product(activation: str, *, implementation: str = 'auto',
     rounded = _rounded(activate)
     rounded_product = _recomputed(lambda gate_up: rounded(gate_up[..., 0, :], gate_up[..., 1, :]))
 
+    def portable(gate_up: jax.Array) -> jax.Array:
+        if jnp.finfo(gate_up.dtype).bits >= 32:
+            return activate(gate_up[..., 0, :]) * gate_up[..., 1, :]
+        return rounded_product(gate_up)
+
     def product(gate_up: jax.Array) -> jax.Array:
         chosen = 'xla' if activation != 'swiglu' else norm_swiglu.packed_swiglu_kernel(
             implementation, gate_up, axes=axes)
         if chosen == 'pallas':
-            return norm_swiglu.packed_swiglu(gate_up, axes=axes)
-        if jnp.finfo(gate_up.dtype).bits >= 32:
-            return activate(gate_up[..., 0, :]) * gate_up[..., 1, :]
-        return rounded_product(gate_up)
+            return norm_swiglu.packed_swiglu(gate_up, portable, axes=axes)
+        return portable(gate_up)
 
     return product

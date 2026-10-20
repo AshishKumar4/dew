@@ -25,6 +25,8 @@ from flax import linen as nn
 
 from dew.nn.attention import l2_normalized
 from dew.nn.blocks import torch_bicubic_resize
+from dew.nn.conv import Conv
+from dew.nn.dense import Dense
 from dew.objectives.base import Batch, Objective, Variables
 
 ALIGNMENT = "alignment_projector"
@@ -52,14 +54,14 @@ class Projector(nn.Module):
     @nn.compact
     def __call__(self, tokens: jax.Array) -> jax.Array:
         if self.kind == "mlp":
-            hidden = nn.silu(nn.Dense(self.width)(tokens))
-            hidden = nn.silu(nn.Dense(self.width)(hidden))
-            return nn.Dense(self.features)(hidden)
+            hidden = nn.silu(Dense(self.width)(tokens))
+            hidden = nn.silu(Dense(self.width)(hidden))
+            return Dense(self.features)(hidden)
         batch, count, width = tokens.shape
         side = math.isqrt(count)
         if side * side != count:
             raise ValueError(f"a convolution projector needs a square token grid, not {count} tokens")
-        grid = nn.Conv(self.features, (self.kernel_size, self.kernel_size), padding="SAME")(
+        grid = Conv(self.features, (self.kernel_size, self.kernel_size), padding="SAME")(
             tokens.reshape(batch, side, side, width))
         return grid.reshape(batch, count, self.features)
 

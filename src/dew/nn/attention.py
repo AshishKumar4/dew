@@ -24,6 +24,8 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
+from dew.nn.dense import Dense, DenseGeneral
+
 from .activations import gated_product
 from .attention_kernels import (
     ATTENTION,
@@ -50,7 +52,7 @@ from .flops import attention_flops, cross_attention_flops, projection_flops
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, gpu_placed
-from .kernels.selection import KernelRefused, forced, select
+from .kernels.selection import forced, select
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
     asks_default_precision,
@@ -402,12 +404,15 @@ def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset:
     """
     chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics, branch=branch,
                                     axes=axes, activated=activation is not None)
+    def portable(x, branch, scale):
+        stream = x if branch is None else x + branch
+        return stream, _xla_rms_normalized(stream, scale, epsilon, dtype, scale_offset, scale_after_cast,
+                                           fp32_statistics, activation)
+
     if chosen == 'pallas':
         return norm_swiglu.stream_rms_norm(x, branch, scale, epsilon, dtype, scale_offset, scale_after_cast,
-                                           axes=axes)
-    stream = x if branch is None else x + branch
-    return stream, _xla_rms_normalized(stream, scale, epsilon, dtype, scale_offset, scale_after_cast,
-                                       fp32_statistics, activation)
+                                           portable, axes=axes)
+    return portable(x, branch, scale)
 
 
 def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str, *,
@@ -419,13 +424,17 @@ def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str,
     pass; XLA's arithmetic is the portable path and the oracle. `axes`, the
     inputs' logical axes, place the kernel's rows on a mesh.
     """
+    def portable(x, gate, scale):
+        wide = at_least_fp32(x.dtype)
+        y = unweighted_rmsnorm(x.astype(wide), epsilon, implementation='xla')
+        y = y if scale is None else y * scale.astype(wide)
+        gate = gate.astype(wide)
+        return (y * (jax.nn.silu(gate) if activation == 'silu' else jax.nn.sigmoid(gate))).astype(dtype)
+
     chosen = norm_swiglu.gated_rms_kernel(implementation, x, gate, scale, dtype, activation, axes=axes)
     if chosen == 'pallas':
-        return norm_swiglu.gated_rms_norm(x, gate, scale, epsilon, dtype, activation, axes=axes)
-    wide = at_least_fp32(x.dtype)
-    y = unweighted_rmsnorm(x.astype(wide), epsilon, implementation='xla') * scale.astype(wide)
-    gate = gate.astype(wide)
-    return (y * (jax.nn.silu(gate) if activation == 'silu' else jax.nn.sigmoid(gate))).astype(dtype)
+        return norm_swiglu.gated_rms_norm(x, gate, scale, epsilon, dtype, activation, portable, axes=axes)
+    return portable(x, gate, scale)
 
 
 def _moment_normalized(x, scale, bias, axes: tuple[int, ...], epsilon: float, requested):
@@ -488,12 +497,16 @@ def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
 
     The reduction runs in fp32 and the inverse deviation is cast back
     before it multiplies, which is what `DeepseekV4UnweightedRMSNorm`
-    (modeling_deepseek_v4.py:66-72) and its GLM twin do. The fused RMSNorm
-    rounds the normalized activation instead, so this variant refuses it
-    through the kernel table and retains XLA's input-dtype product and VJP.
+    (modeling_deepseek_v4.py:66-72) and its GLM twin do; the fused RMSNorm
+    takes it where the target's row names it, rounding the inverse as they do
+    (`norm_swiglu.rms_norm`'s `inverse_rounded`).
     """
-    norm_swiglu.rms_kernel(implementation, x, None, x.dtype, fp32_statistics=True,
-                           inverse_after_cast=True)
+    if norm_swiglu.rms_kernel(implementation, x, None, x.dtype, fp32_statistics=True) == 'pallas':
+        def portable(x, scale):
+            return unweighted_rmsnorm(x, eps, implementation='xla')
+
+        return norm_swiglu.rms_norm(x, None, eps, x.dtype, offset=False, after_cast=False, portable=portable,
+                                    inverse_rounded=True)
     fp32 = x.astype(at_least_fp32(x.dtype))
     inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
     return x * inverse.astype(x.dtype)
@@ -645,7 +658,7 @@ _DEFAULT_CACHE = KVCache()
 
 
 def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = _DEFAULT_CACHE,
-                  value_dim: int | None = None):
+                  value_dim: int | None = None, places: bool = False):
     """Fixed-size K/V with a cursor and cached validity for each batch row.
 
     Returns [B, S] compact slot positions and a writer. Invalid tokens have
@@ -654,7 +667,8 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     slots which the caller excludes with `cached_validity`. `layout` chooses the
     storage behind the slots, dense or paged, full or quantized
     (`dew.nn.kv_cache`); the slots and the cursor are the same for all. Values
-    are `value_dim` wide, None for the keys' width.
+    are `value_dim` wide, None for the keys' width. `places` also keeps each
+    token's place beside its key (`dew.nn.kv_cache.Append.places`).
     """
     shards = sequence_shards()
     if shards > 1:
@@ -666,7 +680,8 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     batch, length, heads, head_dim = key.shape
     if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
-    store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype, value_dim=value_dim)
+    store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype, value_dim=value_dim,
+                         places=places)
     positions, allocated = cache_positions(module, batch, length, valid)
     return positions, Append(store, positions, allocated)
 
@@ -1045,7 +1060,7 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
     another sequence's documents, each document's queries aligned to its last
     keys (`CrossDocuments`), which it orders by id. On a mesh it
     runs per shard (`_per_shard`). What it takes is its requirements'
-    (`attention_kernels.FLASH_SUPPORTS`), which `fused_attention` holds it to."""
+    (`attention_kernels.FLASH_SUPPORTS`), which the selector holds a call to before it runs here."""
     flash = importlib.import_module('dew_flash_attn')
     window = (-1, -1) if sliding_window is None else window_sides(causal, sliding_window)
 
@@ -1321,32 +1336,20 @@ def _dropout_attention(query, key, value, dtype, precision, force_fp32_for_softm
                                dropout_rate=dropout_rate, dropout_rng=dropout_rng)
 
 
-def fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
-                    softcap, sinks, segment_ids, key_value_seq_lengths, max_segments=None):
-    """Run the fused kernel `implementation` names, at the query's head width.
+def _fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
+                     softcap, sinks, segment_ids, key_value_seq_lengths, max_segments=None):
+    """Run the kernel `implementation` names, at the query's head width: the executor of what the
+    attention selector chose (`resolve_implementation`, `_attention_kernel`), which held the call to
+    the kernel's requirements (`attention_kernels.ATTENTION`) before it reaches here.
 
     A narrower value rides in padded and its columns come back out, at no
-    runtime branch. A fused kernel refuses here what its requirements say it
-    cannot take (`attention_kernels.ATTENTION`, `KernelRefused`).
-    `key_value_seq_lengths` reaches cudnn and xla as lengths and 'tpu' as the
-    mask it means.
+    runtime branch. `key_value_seq_lengths` reaches cudnn and xla as lengths
+    and 'tpu' as the mask it means.
     """
     v_head_dim = value.shape[-1]
     if v_head_dim != query.shape[-1]:
         value = widen_value_heads(query, value)
 
-    if implementation in ('cudnn', 'triton', 'flash'):
-        # What the kernel cannot take raises as its requirements say (`attention_kernels.ATTENTION`),
-        # measured ones aside, for a caller that names it here directly as for the selector.
-        case = attention_case(query, key, causal=causal, sliding_window=sliding_window, mask=mask,
-                              bias=bias, softcap=softcap, sinks=sinks, segment_ids=segment_ids,
-                              max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths,
-                              named=implementation)
-        failed = [requirement for requirement in ATTENTION.kernel(implementation).failed(case, forced=True)
-                  if requirement.kind != 'handoff']
-        if failed:
-            raise KernelRefused('attention', implementation,
-                                [requirement.refusal(case) for requirement in failed])
     if implementation == 'cudnn':
         out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
                               key_value_seq_lengths)
@@ -1489,7 +1492,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     packed sequences given `max_segments`; elsewhere segment ids become the
     document mask, and sinks and a softcap run `reference_attention`, since
     `jax.nn.dot_product_attention` has neither (a fused route this host runs as xla
-    included, `_hosted`). The rest goes to `fused_attention`. Key
+    included, `_hosted`). The rest goes to `_fused_attention`. Key
     lengths reach cudnn and xla as they are and every other path as the mask
     they mean, which splash cannot describe, so 'auto' never picks 'tpu' for
     them.
@@ -1516,10 +1519,10 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                                    dtype=dtype, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax)
 
-    return fused_attention(query, key, value, bias, mask, causal, sliding_window,
-                           implementation, softcap=softcap, sinks=sinks,
-                           segment_ids=segment_ids, max_segments=max_segments,
-                           key_value_seq_lengths=lengths)
+    return _fused_attention(query, key, value, bias, mask, causal, sliding_window,
+                            implementation, softcap=softcap, sinks=sinks,
+                            segment_ids=segment_ids, max_segments=max_segments,
+                            key_value_seq_lengths=lengths)
 
 
 def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
@@ -1596,7 +1599,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     fastest for the call where it takes it, else the first that does; a named kernel is forced, and
     raises where it does not take the call (xla handing what it cannot honour to the reference path).
     A call of few positions over key lengths is the decode selector's (`DECODE`), whose decode kernel
-    runs as 'decode' (`fused_attention`); a named xla lowers it there too, as jax.nn's own lowering
+    runs as 'decode' (`_fused_attention`); a named xla lowers it there too, as jax.nn's own lowering
     of a decode step, unless `generation.chosen(decode='xla')` names the folded attention. What runs
     is what this host runs (`_hosted`): xla for a CUDA kernel a step traced for an assumed GPU on a
     CPU reports."""
@@ -1885,7 +1888,7 @@ def projected_heads(x, name: str, heads: int, head_dim: int, *, flat: bool, bias
 
     `flat` stores the matrix as the published diffusion and vision attentions
     do, `[C, heads * head_dim]`, and splits its product into heads; otherwise
-    it is `[C, heads, head_dim]` (`nn.DenseGeneral`), Dew's own, whose heads a
+    it is `[C, heads, head_dim]` (`DenseGeneral`), Dew's own, whose heads a
     tensor axis splits. A checkpoint's reader maps one layout or the other, so
     each attention keeps its own. `norm` normalizes each head's channels, or
     with `across_heads` each token's whole projection before it splits, as
@@ -1893,11 +1896,11 @@ def projected_heads(x, name: str, heads: int, head_dim: int, *, flat: bool, bias
     """
     width = heads * head_dim
     if flat:
-        projected = nn.Dense(width, use_bias=bias, dtype=dtype, precision=precision, name=name,
-                             dot_general=float32_dot_general)(x)
+        projected = Dense(width, use_bias=bias, dtype=dtype, precision=precision, name=name,
+                          dot_general=float32_dot_general)(x)
     else:
-        projected = nn.DenseGeneral((heads, head_dim), use_bias=bias, dtype=dtype, precision=precision,
-                                    name=name, dot_general=float32_dot_general)(x)
+        projected = DenseGeneral((heads, head_dim), use_bias=bias, dtype=dtype, precision=precision,
+                                 name=name, dot_general=float32_dot_general)(x)
     if norm is not None and across_heads:
         projected = norm(projected.reshape(*x.shape[:-1], width))
     projected = projected.reshape(*x.shape[:-1], heads, head_dim)
@@ -1911,11 +1914,11 @@ def projected_output(attended, name: str, features: int, *, flat: bool, bias: bo
     own: `[heads * head_dim, features]` flat, else `[heads, head_dim, features]`."""
     if flat:
         # The width is named, not inferred: an empty stream (no context tokens) has nothing to infer it from.
-        return nn.Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name,
-                        dot_general=float32_dot_general)(
+        return Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name,
+                     dot_general=float32_dot_general)(
             attended.reshape(*attended.shape[:-2], math.prod(attended.shape[-2:])))
-    return nn.DenseGeneral(features, axis=(-2, -1), use_bias=bias, dtype=dtype, precision=precision,
-                           name=name, dot_general=float32_dot_general)(attended)
+    return DenseGeneral(features, axis=(-2, -1), use_bias=bias, dtype=dtype, precision=precision,
+                        name=name, dot_general=float32_dot_general)(attended)
 
 
 @logical_axes({
@@ -2036,8 +2039,8 @@ class FlaxGEGLU(nn.Module):
         return projection_flops(lengths, *self.projections()["proj"])
 
     def setup(self):
-        self.proj = nn.Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision,
-                             dot_general=float32_dot_general)
+        self.proj = Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision,
+                          dot_general=float32_dot_general)
 
     def __call__(self, hidden_states):
         hidden_states = self.proj(hidden_states)
@@ -2074,8 +2077,8 @@ class FlaxFeedForward(nn.Module):
         self.net_0 = FlaxGEGLU(
             self.dim, dtype=self.dtype, precision=self.precision, approximate=self.approximate_gelu
         )
-        self.net_2 = nn.Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.precision,
-                              dot_general=float32_dot_general)
+        self.net_2 = Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.precision,
+                           dot_general=float32_dot_general)
         self.dropout_layer = nn.Dropout(self.dropout)
 
     def __call__(self, hidden_states, *, train: bool = False):
@@ -2229,8 +2232,8 @@ class TransformerBlock(nn.Module):
             x = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(x)
 
         def project(features: int, name: str):
-            return nn.Dense(features=features, use_bias=False, precision=self.precision,
-                            dtype=self.dtype, name=name, dot_general=float32_dot_general)
+            return Dense(features=features, use_bias=False, precision=self.precision,
+                         dtype=self.dtype, name=name, dot_general=float32_dot_general)
 
         if self.use_projection:
             inner_dim = self.heads * self.dim_head

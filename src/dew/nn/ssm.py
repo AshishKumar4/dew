@@ -13,6 +13,8 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.dense import Dense
+
 from .conv import Conv
 from .flops import conv_flops, projection_flops
 from .precision import at_least_fp32, float32_dot_general, float32_products
@@ -272,8 +274,8 @@ class BidirectionalS5Layer(nn.Module):
                           for name in ("s5_forward", "s5_backward"))
         y_fwd, y_bwd = _directions(u, operators, (False, True), dtype)
         y_cat = jnp.concatenate([y_fwd, y_bwd], axis=-1)  # [B, S, 2F]
-        return nn.Dense(features=self.features, dtype=self.dtype, name="out_proj",
-                        dot_general=float32_dot_general)(y_cat)
+        return Dense(features=self.features, dtype=self.dtype, name="out_proj",
+                     dot_general=float32_dot_general)(y_cat)
 
 
 class SpatialFusionConv(nn.Module):

@@ -897,10 +897,6 @@ def test_the_readers_of_one_share_train_on_the_rows_its_first_reader_sampled(tmp
 
 
 @pytest.mark.mesh(devices=2)
-@pytest.mark.xfail(os.environ.get("DEW_UPSTREAM_JAX") == "1", strict=True, reason=(
-    "jax-ml/jax#40940 on a jax release, which CI's package job runs this on: when it passes "
-    "there, constraints.txt's patched jax and dew.training.runtime's refusal of the cache "
-    "(_pool_keys_alike) can go"))
 def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
     """A pool runs twice over one persistent compilation cache, and the second
     run loads its step on every process. jax 0.11.2 keyed an executable by the
@@ -910,9 +906,8 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
     and 2 loaded the step on one process and compiled it on the other, whose
     sharded autotuning then waited for ever for its peer's share. Each process
     here reports a fingerprint of its own, as those two did, whatever devices
-    the run has; the jax constraints.txt names hashes the fingerprints of
-    every process a computation spans. CI's package job runs this on PyPI's
-    jax (DEW_UPSTREAM_JAX=1), where it fails until a release has the fix."""
+    the run has; Dew's JAX build (constraints.txt) hashes the fingerprints of
+    every process a computation spans."""
     cache, records = tmp_path / "cache", tmp_path / "records"
     program = (
         "import json, sys\n"

@@ -113,12 +113,10 @@ def test_a_head_reads_every_row_of_the_battery_from_the_tool_it_names(gate, tmp_
 
 
 
-def test_each_tree_runs_in_the_environment_its_own_lock_installs(gate, tmp_path, monkeypatch):
-    """A head that changes a locked wheel (a kernel's new version) is measured with it: each tree's
-    rows run in the Python of the environment its own lock installs, by its own installer, and two
-    trees whose locks agree share one environment, built once."""
-    from types import SimpleNamespace
-
+def standing_in_environments(gate, monkeypatch) -> tuple[list, list]:
+    """Every tool of the battery stood in (`standing_in`), each environment's build too. Returns each
+    environment the installer built, as (tree, its Python), and each row process, as (tree, command,
+    environment), the compile cache it names made."""
     standing_in(gate, monkeypatch, passed=True)
     measured_row = gate.subprocess.run
     built, rows = [], []
@@ -131,11 +129,24 @@ def test_each_tree_runs_in_the_environment_its_own_lock_installs(gate, tmp_path,
         elif command[0] == "sh":
             built.append((Path(kwargs["cwd"]), Path(command[command.index("--python") + 1])))
         else:
-            rows.append((Path(kwargs["cwd"]), Path(command[0])))
+            env = kwargs.get("env", {})
+            if "JAX_COMPILATION_CACHE_DIR" in env:
+                Path(env["JAX_COMPILATION_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+            rows.append((Path(kwargs.get("cwd") or "."), command, env))
             return measured_row(command, **kwargs)
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(gate.subprocess, "run", child)
+    return built, rows
+
+
+def test_each_tree_runs_in_the_environment_its_own_lock_installs(gate, tmp_path, monkeypatch):
+    """A head that changes a locked wheel (a kernel's new version) is measured with it: each tree's
+    rows run in the Python of the environment its own lock installs, by its own installer, and two
+    trees whose locks agree share one environment, built once."""
+    from types import SimpleNamespace
+
+    built, rows = standing_in_environments(gate, monkeypatch)
     locks = [path.name for path in (ROOT / "locks").glob("*.txt")]
     trees = {name: tmp_path / name for name in ("main", "head")}
     for tree, wheel_version in zip(trees.values(), ("0.3.3", "0.3.4"), strict=True):
@@ -158,13 +169,13 @@ def test_each_tree_runs_in_the_environment_its_own_lock_installs(gate, tmp_path,
 
     pythons = gated(tmp_path / "apart")
     assert pythons.keys() == set(trees.values()) and len(set(pythons.values())) == 2
-    assert {tree for tree, _ in rows} == set(trees.values())
-    assert all(python == pythons[tree] for tree, python in rows)
+    assert {tree for tree, _, _ in rows} == set(trees.values())
+    assert all(Path(command[0]) == pythons[tree] for tree, command, _ in rows)
 
     for lock in locks:
         shutil.copy(trees["main"] / "locks" / lock, trees["head"] / "locks" / lock)
     (shared,) = gated(tmp_path / "shared").values()
-    assert len(built) == 1 and {python for _, python in rows} == {shared}
+    assert len(built) == 1 and {Path(command[0]) for _, command, _ in rows} == {shared}
 
 
 PROJECT = """[build-system]
@@ -280,6 +291,50 @@ def test_a_tree_compiles_once_into_its_own_cache_and_later_rounds_load_from_it(g
     assert child(None) == (0, 0)
 
 
+def locked_tree(tree: Path) -> Path:
+    """A tree whose locks name numpy alone, which the install script builds an environment for."""
+    (tree / "locks").mkdir(parents=True)
+    for lock in (ROOT / "locks").glob("*.txt"):
+        (tree / "locks" / lock.name).write_text("numpy\n")
+    (tree / "tools").mkdir()
+    shutil.copy(ROOT / "tools" / "install_environment.sh", tree / "tools")
+    (tree / ".python-version").write_text("3.12\n")
+    return tree
+
+
+def test_one_tree_against_itself_under_a_setting_sets_it_in_the_heads_processes_alone(
+        gate, tmp_path, monkeypatch):
+    """`--head-env` with one tree as base and head: every process of the head holds the setting, its rows'
+    and the device-kind probe of its hardware row alike, every process of the base keeps the caller's,
+    and the results and the table name it."""
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("XLA_FLAGS", "--xla_dump_to=/caller")
+    monkeypatch.setenv("JAX_COMPILATION_CACHE_DIR", str(tmp_path / "caller"))
+    _, rows = standing_in_environments(gate, monkeypatch)
+    tree = locked_tree(tmp_path / "main")
+    out = tmp_path / "gate.json"
+    off = "--xla_gpu_enable_command_buffer="
+    args = SimpleNamespace(base=f"main={tree}", head=f"buffers-off={tree}", rounds=2,
+                           only=["serve", "lm-dense", "reference"], claim=False, model="unused",
+                           flowers="unused", torch_python="", out=str(out),
+                           environments=str(tmp_path / "environments"), head_env=[f"XLA_FLAGS={off}"])
+    assert gate.run(args) == 0
+    sides: dict[str, set] = {}
+    for _, command, env in rows:
+        # A row's process names its side's cache; the head's device-kind probe, for its hardware row, is
+        # told by its command, as it keeps the caller's cache.
+        probe = command[1] == "-c" and "device_kind" in command[2]
+        side = "probe" if probe else Path(env["JAX_COMPILATION_CACHE_DIR"]).name
+        sides.setdefault(side, set()).add(env["XLA_FLAGS"])
+    assert sides == {"base": {"--xla_dump_to=/caller"}, "head": {off}, "probe": {off}}
+    results = json.loads(out.read_text())
+    assert results["head settings"] == {"XLA_FLAGS": off}
+    table = tmp_path / "gate.md"
+    assert gate.report(SimpleNamespace(results=out, table=str(table), claim=False)) == 0
+    assert f"buffers-off ran with XLA_FLAGS='{off}'" in table.read_text()
+
+
 def test_a_gate_keeps_each_trees_compiles_apart_and_judges_compile_rows_on_the_first_round(
         gate, tmp_path, monkeypatch):
     """A run gives each tree a cache of its own beside its results (made where absent), removes them at
@@ -287,30 +342,15 @@ def test_a_gate_keeps_each_trees_compiles_apart_and_judges_compile_rows_on_the_f
     and keeps the first round's seconds and the later rounds' apart."""
     from types import SimpleNamespace
 
-    standing_in(gate, monkeypatch, passed=True)
-    measured_row = gate.subprocess.run
-    caches = []
-
-    def child(command, **kwargs):
-        if command[0] == "nvidia-smi":
-            return subprocess.CompletedProcess(command, 0, "580.82.07, 9.0\n", "")
-        if command[0] == "uv":
-            (Path(command[-1]) / "bin").mkdir(parents=True)
-            return subprocess.CompletedProcess(command, 0, "", "")
-        if command[0] == "sh":
-            return subprocess.CompletedProcess(command, 0, "", "")
-        if "JAX_COMPILATION_CACHE_DIR" in kwargs.get("env", {}):
-            caches.append((Path(kwargs["cwd"]).name, kwargs["env"]["JAX_COMPILATION_CACHE_DIR"]))
-            Path(kwargs["env"]["JAX_COMPILATION_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
-        return measured_row(command, **kwargs)
-
-    monkeypatch.setattr(gate.subprocess, "run", child)
-    trees = gate_trees(tmp_path)
+    _, rows = standing_in_environments(gate, monkeypatch)
+    trees = {name: locked_tree(tmp_path / name) for name in ("main", "head")}
     out = tmp_path / "not" / "yet" / "gate.json"
     args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=3,
                            only=["lm-dense 4x1024"], claim=False, model="unused", flowers="unused",
                            torch_python="", out=str(out), environments=str(tmp_path / "environments"))
     assert gate.run(args) == 0
+    caches = [(tree.name, env["JAX_COMPILATION_CACHE_DIR"]) for tree, _, env in rows
+              if "JAX_COMPILATION_CACHE_DIR" in env]
     by_tree = {tree: {cache for name, cache in caches if name == tree} for tree in trees}
     assert all(len(found) == 1 for found in by_tree.values()) and by_tree["main"] != by_tree["head"]
     assert {Path(cache).name for found in by_tree.values() for cache in found} == {"base", "head"}
@@ -323,48 +363,23 @@ def test_a_gate_keeps_each_trees_compiles_apart_and_judges_compile_rows_on_the_f
     assert gate.report(SimpleNamespace(results=out, table=None, claim=False)) == 0
 
 
-def gate_trees(tmp_path: Path) -> dict[str, Path]:
-    """A base and a head tree, each with the locks, installer and Python version a gate run reads."""
-    trees = {name: tmp_path / name for name in ("main", "head")}
-    for tree in trees.values():
-        (tree / "locks").mkdir(parents=True)
-        for lock in (ROOT / "locks").glob("*.txt"):
-            (tree / "locks" / lock.name).write_text("numpy\n")
-        (tree / "tools").mkdir()
-        shutil.copy(ROOT / "tools" / "install_environment.sh", tree / "tools")
-        (tree / ".python-version").write_text("3.12\n")
-    return trees
-
-
 def test_a_probe_measuring_compiles_alone_runs_in_the_first_round_alone(gate, tmp_path, monkeypatch):
     """A probe whose every row is a first round's compile, the Server's program by program, runs once
     per tree: a later round would recompile it uncached and read nothing. Each of its programs is a
     row of its own, and the whole warm is shown beside them, ungated."""
     from types import SimpleNamespace
 
-    commands = standing_in(gate, monkeypatch, passed=True)
-    measured_row = gate.subprocess.run
-
-    def child(command, **kwargs):
-        if command[0] == "nvidia-smi":
-            return subprocess.CompletedProcess(command, 0, "580.82.07, 9.0\n", "")
-        if command[0] == "uv":
-            (Path(command[-1]) / "bin").mkdir(parents=True)
-        if command[0] in ("uv", "sh"):
-            return subprocess.CompletedProcess(command, 0, "", "")
-        return measured_row(command, **kwargs)
-
-    monkeypatch.setattr(gate.subprocess, "run", child)
-    trees = gate_trees(tmp_path)
+    _, rows = standing_in_environments(gate, monkeypatch)
+    trees = {name: locked_tree(tmp_path / name) for name in ("main", "head")}
     out = tmp_path / "gate.json"
     args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=3,
                            only=["compile serve"], claim=False, model="unused", flowers="unused",
                            torch_python="", out=str(out), environments=str(tmp_path / "environments"))
     assert gate.run(args) == 0
-    served = [command for command in commands if Path(command[1]).name == "benchmark_serving_compile.py"]
+    served = [command for _, command, _ in rows if Path(command[1]).name == "benchmark_serving_compile.py"]
     assert len(served) == len(trees)
-    rows = {row.name: row for probe in gate.PROBES for row in probe.rows if "compile serve" in row.name}
-    assert sorted(name for name, row in rows.items() if row.gated) == sorted(
+    gated = {row.name: row for probe in gate.PROBES for row in probe.rows if "compile serve" in row.name}
+    assert sorted(name for name, row in gated.items() if row.gated) == sorted(
         f"compile serve dory-1.0-4b {program}"
         for program in ("construction", "admission 1", "admission 2", "admission 4", "admission 8"))
-    assert not rows["compile serve dory-1.0-4b warm 16 slots"].gated
+    assert not gated["compile serve dory-1.0-4b warm 16 slots"].gated
