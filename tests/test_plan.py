@@ -6,6 +6,7 @@ resumed run reads its batches as the run it continues did.
 """
 
 import re
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -62,6 +63,53 @@ def test_the_plan_takes_the_least_recomputation_then_the_fewest_microbatches(fit
     split = planned([1, 2, 4, 8], first, fits, climb)
     assert (None if split is None else (rung[0], split)) == plan
     assert compiled == asked
+
+
+@pytest.mark.parametrize("ruled_out, likely, asked", [
+    # A split its compiles bound to miss is not asked, and the bisection passes over it.
+    (lambda split: split == 2, lambda split: False, [1, 8, 4]),
+    # Past a miss, the first split likely to fit is asked in place of the largest.
+    (lambda split: False, lambda split: split >= 4, [1, 4, 2]),
+    # Every split above the batch whole bound to miss: the rung is climbed without a compile there.
+    (lambda split: split > 1, lambda split: False, [1]),
+])
+def test_the_search_spares_the_compiles_its_measurements_answer(ruled_out, likely, asked):
+    """Four microbatches fit, two do not: the plan is four however many compiles find it."""
+    compiled = []
+
+    def fits(split):
+        compiled.append(split)
+        return split >= 4
+
+    split = planned([1, 2, 4, 8], 0, fits, lambda: False, ruled_out, likely)
+    assert compiled == asked
+    assert split == (None if asked == [1] else 4)
+
+
+def test_a_forecast_bounds_a_split_above_by_each_compile_that_read_more_rows():
+    """A microbatch's temporaries a fixed part beside a part per row: a compile at fewer splits bounds
+    a split's headroom from above, each per row, and the half rung's compiles count for a split too."""
+    from dew.training.planning import Forecast
+
+    forecast = Forecast(factor=1)
+    fixed, per_split = 10, 80
+    # Room for 40 bytes: the batch whole needs 90 and two microbatches 50, four 30.
+    headroom = {split: 40 - (fixed + per_split // split) for split in (1, 2, 4, 8)}
+    forecast.measured["rung"] = [(1, fixed + per_split, headroom[1])]
+    for split in (2, 4, 8):
+        assert forecast.bound("rung", split) >= headroom[split]
+    assert forecast.bound("rung", 1) is None
+    one_process = mock.patch("dew.training.planning.fits_everywhere",
+                             lambda headroom: headroom is None or headroom >= 0)
+    with one_process:
+        # No miss at the rung yet: its half rung is unknown, and nothing is ruled out.
+        assert not forecast.ruled_out("rung", 2)
+        forecast.half_of["rung"] = None
+        assert forecast.bound("rung", 2) < 0 and forecast.ruled_out("rung", 2)
+        assert not forecast.ruled_out("rung", 4) and forecast.likely("rung", 4)
+        forecast.half_of["rung"] = "half"
+        forecast.measured["half"] = [(1, 20, 80)]
+        assert not forecast.ruled_out("rung", 2)
 
 
 def test_the_fit_ladder_tiles_the_head_fused_then_unfused_before_it_recomputes_more():
@@ -377,7 +425,8 @@ DELTA = {"mixer": mixers.build("gated_delta_net", linear_num_key_heads=2, linear
 def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monkeypatch):
     """With room for four microbatches when a delta rule recomputes its memory alone, which no
     recomputation needs more than, the plan is four at that half rung: no plan splits the batch further
-    at a rung where the half rung fits it, and the search asks each split there after it misses."""
+    at a rung where the half rung fits it, and the search asks each split there after it misses, but
+    those its compiles bound to miss at both rungs."""
     half = "all_but_delta_memory"
     free(monkeypatch, needs(monkeypatch, lm(split=4, remat=half, **DELTA)))
     trainer = lm(**DELTA)
@@ -386,7 +435,7 @@ def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
     assert trainer.objective.model.remat == REMAT_POLICIES[half]
     assert [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]] == [
-        (1, None, False), (1, "all_but_delta_memory", False), (32, None, True), (4, None, False),
+        (1, None, False), (1, "all_but_delta_memory", False), (4, None, False),
         (4, "all_but_delta_memory", True), (2, "all_but_delta_memory", False),
         (1, "minimal_with_conv", False)]
 
@@ -394,26 +443,29 @@ def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further
 def test_a_plan_at_no_recomputation_times_its_frontier_past_the_half_rung(monkeypatch):
     """An A100's plan: no recomputation fits the batch at four microbatches and the half rung never
     fits it in fewer, so the plan is four at no recomputation, and the frontier, the batch whole one
-    rung up, is asked at the first rung past the half rung, whose every split asked missed."""
+    rung up, is asked at the first rung past the half rung, whose every split asked missed. The batch
+    whole and the half rung's miss bound two microbatches to miss at both: their compiles are spared,
+    and the split they left likely to fit is asked first."""
     free(monkeypatch, needs(monkeypatch, lm(split=4, **DELTA)))
     trainer = lm(**DELTA)
     state, _, _ = trainer.place()
     trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, None)
     assert [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]] == [
-        (1, None, False), (1, "all_but_delta_memory", False), (32, None, True), (4, None, True),
-        (2, None, False), (2, "all_but_delta_memory", False), (1, "minimal_with_conv", False)]
+        (1, None, False), (1, "all_but_delta_memory", False), (4, None, True),
+        (1, "minimal_with_conv", False)]
 
 
-def test_a_decoder_without_a_half_rung_asks_the_splits_it_did(monkeypatch):
-    """Without a delta rule no rung is a half rung: the search asks the batch whole, the largest split,
-    and halves the range, each at no recomputation, and the frontier one rung up."""
+def test_a_decoder_without_a_half_rung_asks_the_splits_its_compiles_leave_open(monkeypatch):
+    """Without a delta rule no rung is a half rung: the search asks the batch whole, then the split its
+    miss left likely to fit, at no recomputation, the splits between bound to miss uncompiled, and the
+    frontier one rung up."""
     free(monkeypatch, needs(monkeypatch, lm(split=4)))
     trainer = lm()
     state, _, _ = trainer.place()
     trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
     assert [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]] == [
-        (1, None, False), (32, None, True), (4, None, True), (2, None, False), (1, "minimal", False)]
+        (1, None, False), (4, None, True), (1, "minimal", False)]
 
 
 def test_the_timer_steps_the_state_it_was_given_and_hands_back_a_fresh_copy():
