@@ -48,10 +48,11 @@ PROMPT, BATCH = 64, 2
 """The prompt and batch each mode traces; a fixture whose positions are fewer takes all but its last."""
 
 
-def _layers(config: dict) -> int:
-    """The decoder layers a committed config states, its text model's where it nests one."""
+def _layers(config: dict) -> float:
+    """The decoder layers a committed config states, its text model's where it nests one; a config that
+    states none (a vision tower's) counts as endless, so a decoder's stands for its family."""
     text = config.get("text_config") or config
-    return text.get("num_hidden_layers") or text.get("num_layers") or 0
+    return text.get("num_hidden_layers") or text.get("num_layers") or float("inf")
 
 
 @functools.cache
@@ -96,7 +97,10 @@ def published(config: dict) -> tuple[dict, bool]:
     if "head_dim" not in fixture and fixture.get(heads_key) and text.get(hidden_key) and text.get(heads_key):
         width = text.get("head_dim") or text[hidden_key] // text[heads_key]
         fixture[hidden_key] = fixture[heads_key] * width
-    # Widths a config states twice, derived from the ones above.
+    # Widths a config states twice, derived from the ones above: a state-space mixer's inner width is
+    # its heads' (`expand` hidden widths, Mamba 2's `validate_architecture`).
+    if "expand" in fixture and fixture.get("num_heads") and fixture.get("head_dim"):
+        fixture[hidden_key] = fixture["num_heads"] * fixture["head_dim"] // fixture["expand"]
     if "qk_head_dim" in fixture:
         fixture["qk_head_dim"] = fixture.get("qk_nope_head_dim", 0) + fixture.get("qk_rope_head_dim", 0)
     if "word_embed_proj_dim" in fixture:
