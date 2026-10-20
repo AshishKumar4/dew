@@ -503,8 +503,8 @@ def rewound(start: object, current: object) -> object:
         if _COUNTER in start and _COUNTER in current:
             kept[_COUNTER] = current[_COUNTER]
         return kept
-    if isinstance(start, list) and isinstance(current, list) and len(start) == len(current):
-        return [rewound(value, now) for value, now in zip(start, current, strict=True)]
+    if isinstance(start, (list, tuple)) and isinstance(current, (list, tuple)) and len(start) == len(current):
+        return type(start)(rewound(value, now) for value, now in zip(start, current, strict=True))
     return start
 
 
