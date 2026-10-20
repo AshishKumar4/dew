@@ -113,16 +113,14 @@ def branch_dropout(adapter, context) -> str | None:
     return "model." + ".".join(module.path[:-1]).replace("layers_", "layers.")
 
 
-def dew_masks(adapter, tokens: np.ndarray) -> dict[str, np.ndarray]:
-    """The keep mask each target's branch dropout draws in the LM objective's first training
-    loss over `tokens` (`Step(0, key(1))`), read through Flax's method interception and keyed by
-    the target's PEFT module path: `[batch, inputs, width]`, the objective reading every token
-    but the last. A kept entry is one the dropout passed, as no input entry is zero."""
+def branch_draws(adapter, tokens: np.ndarray, step) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Each target branch's dropout in the LM objective's training loss over `tokens` at `step`,
+    keyed by the target's PEFT module path (`branch_dropout`): its input and its output, read
+    through Flax's method interception, the objective reading every token but the last."""
     import jax
     import jax.numpy as jnp
     from flax import linen as nn
 
-    from dew.objectives.base import Step
     from dew.objectives.lm import LMObjective
 
     objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
@@ -133,15 +131,31 @@ def dew_masks(adapter, tokens: np.ndarray) -> dict[str, np.ndarray]:
         output = next_fun(*args, **kwargs)
         owner = branch_dropout(adapter, context)
         if owner is not None:
-            if not np.all(np.asarray(args[0]) != 0):
-                raise ValueError("a zero in a branch's input hides whether the dropout kept it")
-            drawn[owner] = np.asarray(output) != 0
+            drawn[owner] = (np.asarray(args[0]), np.asarray(output))
         return output
 
     with nn.intercept_methods(capture):
-        objective.loss(params, {"text": jnp.asarray(tokens)},
-                       Step(step=jnp.int32(0), key=jax.random.key(1), ema=None))
+        objective.loss(params, {"text": jnp.asarray(tokens)}, step)
     return drawn
+
+
+def dew_masks(adapter, tokens: np.ndarray) -> dict[str, np.ndarray]:
+    """The keep mask each target's branch dropout draws in the LM objective's first training
+    loss over `tokens` (`Step(0, key(1))`, `branch_draws`), keyed by the target's PEFT module
+    path: `[batch, inputs, width]`. A kept entry is one the dropout passed, as no input entry is
+    zero."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.objectives.base import Step
+
+    masks = {}
+    for owner, (x, output) in branch_draws(adapter, tokens, Step(step=jnp.int32(0), key=jax.random.key(1),
+                                                                 ema=None)).items():
+        if not np.all(x != 0):
+            raise ValueError("a zero in a branch's input hides whether the dropout kept it")
+        masks[owner] = output != 0
+    return masks
 
 
 ORDER_SEED = 6
@@ -190,8 +204,9 @@ def adapter_orders(adapter) -> tuple[dict, set[str]]:
     import jax
 
     from dew.nn.sharding import declarations, declared_axes, parameter_path
+    from dew.objectives.base import thaw
 
-    whole = {"params": _joined(adapter.variables["frozen"], adapter.variables["params"])}
+    whole = thaw(adapter.variables)
     declared = declarations(whole["params"])
     residual_inputs = {
         "model." + ".".join(parameter_path(path)[:-1]).replace("layers_", "layers.")
@@ -209,34 +224,13 @@ def in_order(adapter, whole: dict, residual_inputs: set[str], order: np.ndarray,
     from residual_orders import permuted
 
     from dew.lora import FACTORS
+    from dew.objectives.base import freeze
 
-    moved = permuted(whole, order)["params"]
-    variables = {**adapter.variables, "params": _only(moved, FACTORS), "frozen": _without(moved, FACTORS)}
+    variables = freeze(permuted(whole, order), lambda path: path[-1] in FACTORS)
     if masks is None:
         return variables, None
     return variables, {key: mask[..., order] if key in residual_inputs else mask
                        for key, mask in masks.items()}
-
-
-def _without(tree: dict, names) -> dict:
-    """`tree` without the leaves `names` holds at any depth."""
-    return {key: _without(value, names) if isinstance(value, dict) else value
-            for key, value in tree.items() if key not in names}
-
-
-def _only(tree: dict, names) -> dict:
-    """`tree`'s leaves named one of `names`, at any depth, and the dicts that hold them."""
-    kept = {key: value if key in names else _only(value, names)
-            for key, value in tree.items() if key in names or isinstance(value, dict)}
-    return {key: value for key, value in kept.items() if not isinstance(value, dict) or value}
-
-
-def _joined(one: dict, other: dict) -> dict:
-    """Two trees with disjoint leaves joined into one."""
-    joined = dict(one)
-    for key, value in other.items():
-        joined[key] = _joined(joined[key], value) if isinstance(value, dict) and key in joined else value
-    return joined
 
 
 def record_orders(drawn: Path) -> None:
