@@ -99,9 +99,11 @@ def test_compiled_samples_follow_the_autoencoder_they_decode_with():
     objective built over it does."""
     from test_autoencoder import IMAGE_SIZE, tiny_vae
 
+    from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
+
     first = tiny_vae()
-    scaled = tiny_vae(latent_scale=2.0, params=first.params)
-    assert scaled.model == first.model
+    scaled = StableDiffusionVAE(model=first.model, params=first.params, dtype=jnp.float32, latent_scale=2.0)
+    assert scaled.model is first.model
     inputs = InputSpec(Field("image", (IMAGE_SIZE, IMAGE_SIZE, 3)))
 
     def built(autoencoder):
