@@ -27,10 +27,14 @@ ended on a stop, or the error Dew raised.
 
 from __future__ import annotations
 
+import os
+
+# The engines hold the GPU; the capture's own JAX draws keys alone, on the host.
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import argparse
 import contextlib
 import json
-import os
 import subprocess
 import threading
 import time
@@ -202,7 +206,7 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
             drawn = server.submit(prompt, STOPS_BUDGET, key=seed).result()
             outcome = {"tokens": list(drawn.tokens), "terminated": drawn.terminated}
         except ValueError as error:
-            outcome = {"refused": type(error).__name__}
+            outcome = {"refused": f"{type(error).__name__}: {error}"}
         finally:
             server.close()
         return {"eos": eos, "seed": seed, "exchanges": list(proxy.exchanges), **outcome}
