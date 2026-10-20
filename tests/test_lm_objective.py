@@ -671,14 +671,24 @@ def test_z_loss_gradient_carries_the_reference_factor():
     def draw(seed):
         return objective.init(jax.random.key(seed))["params"], np.asarray(token_batch(seed=seed)[TEXT_KEY])
 
+    def programs(forward):
+        # The forward and its pullback compiled once each, the oracle's cotangent between them.
+        apply = jax.jit(lambda p, ids: forward.apply({"params": p}, ids))
+        pull = jax.jit(lambda p, ids, cotangent: jax.vjp(lambda p: forward.apply({"params": p}, ids), p)[1](
+            cotangent)[0])
+        return apply, pull
+
+    compiled = {np.dtype(np.float32): programs(model),
+                np.dtype(np.float64): programs(model.clone(dtype=jnp.float64))}
+
     def reference(params, tokens):
         wide = jax.tree.leaves(params)[0].dtype == np.float64
-        forward = model.clone(dtype=jnp.float64) if wide else model
+        apply, pull = compiled[np.dtype(np.float64 if wide else np.float32)]
         ids = jnp.asarray(tokens[:, :-1], jnp.int32)
-        logits, pullback = jax.vjp(lambda p: forward.apply({"params": p}, ids), params)
-        _, _, cotangent = z_loss_reference(np.asarray(logits), tokens[:, 1:], np.ones(tokens[:, 1:].shape),
-                                           coefficient, dtype=None if wide else np.float32)
-        return pullback(jnp.asarray(cotangent))[0]
+        _, _, cotangent = z_loss_reference(np.asarray(apply(params, ids)), tokens[:, 1:],
+                                           np.ones(tokens[:, 1:].shape), coefficient,
+                                           dtype=None if wide else np.float32)
+        return pull(params, ids, jnp.asarray(cotangent))
 
     @jax.jit
     def dew(params, tokens):
