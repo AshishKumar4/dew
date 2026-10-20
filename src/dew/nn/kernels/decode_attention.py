@@ -232,19 +232,19 @@ def _space(programs: int, steps: int, processors: int | None) -> set[Split]:
     return {Split(splits) for splits in SPLITS if splits <= min(steps, processors)}
 
 
-RESIDENT = 4
+RESIDENT = 6
 """Programs a multiprocessor runs at once that a launch without a pick fills (`_heuristic`)."""
 
 
 def _heuristic(programs: int, steps: int, processors: int | None) -> Split:
     """The most slices of the launch's space (`_space`) whose programs fill at most `RESIDENT` a
     multiprocessor. A program of `WARPS` warps over `BLOCK` keys a step leaves a multiprocessor room
-    for several, which hide each other's reads: on an H100 the fastest of `SPLITS` over 60 shapes of
-    Qwen3-0.6B's and Qwen3.5-0.8B's dense and paged decode (1 to 32 rows, 8K to 128K keys) ran about
-    four programs a multiprocessor, Qwen3-0.6B at 2 rows over 131072 keys 0.220 ms at 32 slices
-    against 0.527 at the 8 of FlashAttention 2's rule (the fewest whose waves run within 85% of the
-    best count's). This rule's pick ran within 1.01x of the fastest over the 60 (geometric mean,
-    1.22x at worst), FlashAttention 2's within 1.35x (2.44x at worst)."""
+    for several, which hide each other's reads. Over 60 shapes of Qwen3-0.6B's and Qwen3.5-0.8B's dense
+    and paged decode (1 to 32 rows, 8K to 128K keys) timed at every count of `SPLITS`, this rule's pick
+    ran within 1.010x of the fastest on an H100 (geometric mean; 1.22x at worst) and 1.037x on an A100
+    (1.83x), the same for any `RESIDENT` from 5 to 7; FlashAttention 2's rule (the fewest whose waves
+    run within 85% of the best count's) within 1.35x (2.44x) and 1.06x (1.83x). On the H100, Qwen3-0.6B
+    at 2 rows over 131072 keys took 0.220 ms at this rule's 32 slices against 0.527 at FA2's 8."""
     counts = sorted(split.splits for split in _space(programs, steps, processors))
     if processors is None:
         return Split(counts[0])

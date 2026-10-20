@@ -192,7 +192,7 @@ def test_the_decode_kernels_launches_are_the_tuners():
 def test_a_launch_without_a_pick_takes_a_config_of_its_keys_space():
     """33 rows of 2 key heads over 1024 keys, traced as on an A100 (108 multiprocessors) on any host:
     the key counts 64 rows, whose 128 programs fill most of the GPU, so its space holds one slice
-    alone, and the launch takes it without a pick, though its own 66 programs would have taken 4."""
+    alone, and the launch takes it without a pick, though its own 66 programs would have taken 8."""
     from tuned import launches
 
     from dew.nn.kernels import decode_attention
@@ -207,16 +207,16 @@ def test_a_launch_without_a_pick_takes_a_config_of_its_keys_space():
         keyed = ba.op.keyed(ba)
         assert keyed.autotuning_configs == {decode_attention.Split(1)}
         assert ba.heuristics_config in keyed.autotuning_configs
-    assert decode_attention._heuristic(66, 32, 108) == decode_attention.Split(4)
+    assert decode_attention._heuristic(66, 32, 108) == decode_attention.Split(8)
 
 
 @pytest.mark.parametrize("processors, programs, steps, splits", [
     (None, 2, 128, 1), (108, 128, 128, 1), (108, 2, 128, 32), (132, 16, 128, 32), (132, 32, 4096, 16),
     (132, 64, 4096, 8), (108, 2, 4, 4)])
-def test_a_launch_without_a_measurement_fills_four_programs_a_multiprocessor(processors, programs, steps,
-                                                                             splits):
+def test_a_launch_without_a_measurement_fills_six_programs_a_multiprocessor(processors, programs, steps,
+                                                                            splits):
     """The heuristic (`_heuristic`): no slices on a device of no known multiprocessors or where the
-    programs fill most of them; else the most whose programs fill at most four a multiprocessor, at most
+    programs fill most of them; else the most whose programs fill at most six a multiprocessor, at most
     one a step: two programs over 108 multiprocessors take 32, sixteen over 132 take 32, and 32 and 64
     take 16 and 8, the H100's fastest for Qwen3-0.6B's 4 and 8 rows over 131072 keys; four steps take
     at most 4."""
