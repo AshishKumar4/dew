@@ -240,13 +240,18 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
         direct = OpenAICompletion(MODEL, openai.OpenAI(base_url=f"{ENGINE}/v1", api_key="capture", max_retries=0),
                                   provider=name)
         server = OpenAIRolloutServer(direct, Sampling(temperature=1.0, eos_token_ids=stop), published)
-        before = _metric("sglang:generation_tokens_total")
+        # The tokenizer counts a request's generated tokens as it collects the request, finished or
+        # aborted, which is when it counts the request itself (sglang/srt/managers/tokenizer_manager.py
+        # at v0.5.20), so the draw's tokens are counted once the request count moves past its baseline.
+        requests, before = _metric("sglang:num_requests_total"), _metric("sglang:generation_tokens_total")
         try:
             drawn = server.submit(prompt, RELEASE_BUDGET, key=seed).result()
         finally:
             server.close()
         deadline = time.monotonic() + 120
-        while _metric("sglang:num_running_reqs") > 0 and time.monotonic() < deadline:
+        while _metric("sglang:num_requests_total") <= requests:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"{name} counted no finished request 120 s after the released draw closed")
             time.sleep(0.5)
         return {"budget": RELEASE_BUDGET, "stop": stop, "seed": seed, "drawn": len(drawn.tokens),
                 "terminated": drawn.terminated, "generated": _metric("sglang:generation_tokens_total") - before}
@@ -287,10 +292,15 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
 
 
 def _metric(name: str) -> float:
-    """The engine's Prometheus series `name`, summed over its labels."""
-    text = httpx.get(f"{ENGINE}/metrics", timeout=30).text
-    return sum(float(line.rsplit(" ", 1)[1]) for line in text.splitlines()
-               if line.startswith((f"{name}{{", f"{name} ")))
+    """The engine's Prometheus series `name`, summed over its labels; an engine that exports no such
+    series raises, rather than reading as zero."""
+    response = httpx.get(f"{ENGINE}/metrics", timeout=30)
+    response.raise_for_status()
+    values = [float(line.rsplit(" ", 1)[1]) for line in response.text.splitlines()
+              if line.startswith((f"{name}{{", f"{name} "))]
+    if not values:
+        raise RuntimeError(f"the engine exports no {name} series")
+    return sum(values)
 
 
 def _answers(url: str) -> bool:

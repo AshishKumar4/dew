@@ -131,6 +131,84 @@ def replayed(record, drawn):
     return server, exchanges
 
 
+def wire_log_probs(exchanges) -> list[float]:
+    """The sampled ids' log-probabilities an engine sent over `exchanges`, in the order it sent them:
+    a response's whole list, or each streamed event's in turn."""
+    probabilities = []
+    for exchange in exchanges:
+        if "stream" in exchange:
+            events = [json.loads(line.removeprefix("data: ")) for line in exchange["stream"].splitlines()
+                      if line.startswith("data: {")]
+        else:
+            events = [exchange["response"]]
+        for event in events:
+            for choice in event["choices"]:
+                probabilities += (choice.get("logprobs") or {}).get("token_logprobs") or []
+    return probabilities
+
+
+class Streamed(httpx2.SyncByteStream):
+    """An event stream that records how much of it was read and whether it was closed."""
+
+    def __init__(self, events: list[dict]):
+        self.events, self.sent, self.closed = events, 0, False
+
+    def __iter__(self):
+        for event in self.events:
+            self.sent += 1
+            yield f"data: {json.dumps(event)}\n\n".encode()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def sglang_event(ids, logprobs, reason=None) -> dict:
+    """One streamed SGLang completion event, its ids and log-probabilities sliced as it slices them."""
+    return {"id": "fixture", "model": "tiny", "created": 1, "object": "text_completion", "choices": [{
+        "index": 0, "text": "", "token_ids": ids, "finish_reason": reason,
+        "logprobs": {"tokens": [""] * len(logprobs), "token_logprobs": logprobs, "top_logprobs": [],
+                     "text_offset": [-1] * len(logprobs)}}]}
+
+
+def streamed_server(stream: Streamed):
+    """An SGLang rollout server under a policy that stops at EOS, whose engine streams `stream`."""
+    transport = httpx2.MockTransport(lambda request: httpx2.Response(
+        200, stream=stream, headers={"Content-Type": "text/event-stream"}))
+    client = openai.OpenAI(base_url="http://fixture/v1", api_key="fixture", max_retries=0,
+                           http_client=httpx2.Client(transport=transport))
+    return OpenAIRolloutServer(OpenAICompletion("tiny", client, provider="sglang"),
+                               Sampling(eos_token_ids=EOS), pushed)
+
+
+def test_an_sglang_stream_is_cut_at_the_stop_however_its_events_split_ids_and_likelihoods():
+    """SGLang's events slice a draw's ids and log-probabilities apart: a stop arrives with ids after it
+    and its log-probability an event later, under no id. The draw ends at the stop with each id's own
+    likelihood, read by position, and the stream is closed there with its tail unread. An error event
+    mid-stream (SGLang's abort) is an infrastructure failure, the stream closed all the same."""
+    stream = Streamed([sglang_event([3, 5], [-.5]), sglang_event([EOS, 11, 12], [-1.]),
+                       sglang_event([], [-.25, -2., -3.]), sglang_event([13], [-4.]),
+                       sglang_event([14], [-5.], "length")])
+    server = streamed_server(stream)
+    try:
+        draw = server.submit([1, 2], 8, key=0).result()
+    finally:
+        server.close()
+    assert draw.tokens == (3, 5, EOS) and draw.behavior_log_probs == (-.5, -1., -.25) and draw.terminated
+    assert stream.closed and stream.sent < len(stream.events)
+
+    from dew.inference import InfrastructureError
+
+    failing = Streamed([sglang_event([3], [-.5]), {"error": {"message": "aborted", "type": "abort"}},
+                        sglang_event([EOS], [-1.])])
+    server = streamed_server(failing)
+    try:
+        with pytest.raises(InfrastructureError):
+            server.submit([1, 2], 8, key=0).result()
+    finally:
+        server.close()
+    assert failing.closed
+
+
 @pytest.mark.parametrize("provider", ["vllm", "sglang"])
 def test_a_draw_ends_on_the_policys_stops_as_the_engine_drew_it(provider):
     """Draws Dew's rollout server made on vLLM 0.30.0 and SGLang 0.5.20 serving Qwen2.5-0.5B-Instruct
@@ -152,6 +230,8 @@ def test_a_draw_ends_on_the_policys_stops_as_the_engine_drew_it(provider):
             server.close()
         assert next(exchanges, None) is None
         assert (list(draw.tokens), draw.terminated) == (drawn["tokens"], drawn["terminated"])
+        # The behavior likelihoods are the engine's own, in the order it sent them, up to the stop.
+        assert list(draw.behavior_log_probs) == wire_log_probs(drawn["exchanges"])[:len(draw.tokens)]
         stops = () if drawn["eos"] is None else (drawn["eos"],)
         assert draw.terminated == bool(stops) and not any(token in stops for token in draw.tokens[:-1])
         assert draw.terminated or len(draw.tokens) == record["budget"]
