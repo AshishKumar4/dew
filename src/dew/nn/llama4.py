@@ -16,7 +16,6 @@ from collections.abc import Callable
 
 from flax import linen as nn
 
-from dew.nn.kv_cache import KVCache
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 
@@ -29,8 +28,8 @@ class Llama4Mixer(MixerBase):
     local kind with the chunk (`LayerKind.chunk`, the config's
     `attention_chunk_size`) and the global kind without rope; the other
     fields are the config's. The head geometry, rope base and its llama3
-    ramp, bias, norm epsilon, chunk and kernel choice come from the backbone
-    through the context.
+    ramp, bias, norm epsilon, chunk, cache layout and kernel choice come from
+    the backbone through the context.
     """
 
     residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'o_proj', 'context')
@@ -54,7 +53,6 @@ class Llama4Mixer(MixerBase):
             "partial_rotary_factor": ctx.partial_rotary_factor,
             "output_gate": ctx.output_gate,
             "scale_offset": ctx.scale_offset,
-            "kv_cache": ctx.kv_cache != KVCache(),
         }, "it norms queries and keys with its own scale-free L2 norm under use_qk_norm, scales by "
            "1/sqrt(head_dim), rotates whole interleaved pairs and attends by chunk rather than by window")
         if ctx.attention_chunk is not None and ctx.attention_chunk < 1:
@@ -63,17 +61,9 @@ class Llama4Mixer(MixerBase):
         if ctx.attention_chunk is not None and not self.use_rope:
             raise ValueError("Llama 4 chunks its rotated local layers only; a global layer without rope "
                              "attends the whole sequence")
-        # The fields of the layer's context the reference reads, the rest at their defaults; its
-        # scale-free L2 norm is qk_norm where the rotated kind asks for it.
-        own = MixerContext(
-            emb_features=ctx.emb_features, num_heads=ctx.num_heads, num_kv_heads=ctx.num_kv_heads,
-            head_dim=ctx.head_dim, max_seq_len=ctx.max_seq_len, causal=ctx.causal, rope_theta=ctx.rope_theta,
-            rope_scaling=ctx.rope_scaling, qk_norm=self.use_rope and self.use_qk_norm,
-            attention_chunk=ctx.attention_chunk, norm_eps=ctx.norm_eps, attention_bias=ctx.attention_bias,
-            dtype=ctx.dtype, precision=ctx.precision, attention_impl=ctx.attention_impl,
-            force_fp32_for_softmax=ctx.force_fp32_for_softmax, attn_logit_softcap=ctx.attn_logit_softcap,
-            value_scale=ctx.value_scale, o_proj_bias=ctx.o_proj_bias,
-            attention_dropout_rate=ctx.attention_dropout_rate)
+        # The layer's context with the reference's per-head, scale-free L2 norm as qk_norm where the
+        # rotated kind asks for it.
+        own = dataclasses.replace(ctx, qk_norm=self.use_rope and self.use_qk_norm, qk_norm_scope='head')
         return functools.partial(
             CausalSelfAttention, ctx=own, nope=not self.use_rope, rotary_pairs='adjacent',
             qk_norm_weight=False,
