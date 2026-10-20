@@ -240,15 +240,15 @@ def test_a_non_finite_reward_stops_the_run_instead_of_being_retried():
 
 class Recording(RolloutScheduler):
     """The scheduler, keeping each call's state, task batch and the batch it returns to the step.
-    Its first call runs once `ahead()` returns."""
+    Its first call runs once `before_first()` returns."""
 
-    def __init__(self, *arguments, ahead, **options):
+    def __init__(self, *arguments, before_first, **options):
         super().__init__(*arguments, **options)
-        self.ahead, self.calls = ahead, []
+        self.before_first, self.calls = before_first, []
 
     def __call__(self, state, batch, key):
         if not self.calls:
-            self.ahead()
+            self.before_first()
         packed = super().__call__(state, batch, key)
         self.calls.append((leaves(state), np.asarray(batch["task_id"]), packed))
         return packed
@@ -324,7 +324,7 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
             registered.add(int(np.asarray(batch["task_id"])[0]) // tasks)
             progress.notify_all()
 
-    def ahead():
+    def drawn_ahead():
         # The first call starts once the stream has registered the batch after it, so it draws
         # that batch ahead of its update.
         with progress:
@@ -371,9 +371,9 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
     # A straggler holds its worker until it is cancelled, and up to three batches' sessions run at
     # once (the first fit's batch drawn ahead, and the resumed fit's two).
     checkpoints = str(tmp_path / "run")
-    with rig(faulty, fives, tasks=tasks, log=records.append, workers=9 * tasks,
-             scheduler=functools.partial(Recording, ahead=ahead), registered=seen, **options) as (
-            _, fit, recording, watched, _):
+    recording = functools.partial(Recording, before_first=drawn_ahead)
+    with rig(faulty, fives, tasks=tasks, log=records.append, workers=9 * tasks, scheduler=recording,
+             registered=seen, **options) as (_, fit, recording, watched, _):
         first = fit(1, Checkpoints(checkpoints))
         # The batch the first fit drew ahead has started its first attempts before the resume.
         watched.wait(lambda: sum(batch == 1 for batch in firsts.values()) == 3 * batches)
