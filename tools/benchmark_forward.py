@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.nn.kernels.tuning import samples
+from dew.telemetry.benchmark import samples
 
 
 def _siglip() -> tuple[nn.Module, tuple[int, ...]]:
