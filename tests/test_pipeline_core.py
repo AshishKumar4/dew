@@ -20,7 +20,7 @@ from dew import position
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, validation
 from dew.data.dataset import DataPartition, Loading
-from dew.data.mixing import SearchBudget, TokenDeficit, token_weights
+from dew.data.mixing import TokenDeficit, token_weights
 from dew.data.pipeline import Configured, Pipeline, Rejected, mix
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources import Files, Memory
@@ -63,6 +63,16 @@ class Shift:
 class Targets:
     def __call__(self, row):
         return int(row["targets"])
+
+
+@dataclasses.dataclass(frozen=True)
+class Kept:
+    """Keeps the record whose id is `id` and no other."""
+
+    id: int
+
+    def __call__(self, row):
+        return int(row["id"]) == self.id
 
 
 @dataclasses.dataclass(frozen=True)
@@ -489,16 +499,10 @@ def test_a_streamed_mix_beneath_a_shuffle_refuses_a_member_joining():
 
 def test_a_member_joining_a_resumed_mix_is_read_ahead_before_the_mix_gives_a_row():
     """A member that joins a resumed mix has its first row read ahead before the mix gives one, as
-    every member has at the start, so a member whose every row is rejected exhausts its budget at
-    once rather than after the others have run on."""
+    every member has at the start, and resumes beside the others however small its weight."""
     _, saved = member_rows([corpus("a", 0)])
-    # A member that joins and can give rows resumes beside the other.
     rows, _ = member_rows([corpus("a", 0), corpus("b", 1)], saved=saved, weights=[1, 1e-9], batches=1)
     assert rows
-    hopeless = (Pipeline(roled(1, 6, 2, count=8), name="b")
-                .filter(lambda row: False, identity="none@1").repeat())
-    with pytest.raises(ValueError):
-        member_rows([corpus("a", 0), hopeless], saved=saved, weights=[1, 1e-9], batches=1)
 
 
 def test_an_indexed_mix_still_refuses_a_member_joining():
@@ -1135,19 +1139,16 @@ def test_a_token_mixture_weighs_a_random_holdout_by_the_rows_it_keeps(held):
     assert data.plan is not None and data.plan.lowering == ("per-share" if held else "global")
 
 
-def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation():
-    parents = [grain.MapDataset.source([{"targets": count}]).repeat().to_iter_dataset()
-               for count in (0, 4)]
-    reader = iter(TokenDeficit(parents, [1, 1], tokens=Targets(), names=["all-zero", "useful"],
-                              labels=["all-zero", "useful"],
-                              keys=["all-zero", "useful"],
-                              budget=SearchBudget(consecutive=5)))
-    with pytest.raises(ValueError):
-        next(reader)
-    counts = reader.get_state()["parents"]["all-zero"]["counts"]
-    assert counts["attempted"] == 5
-    assert counts["rejected"] == {"zero_targets": 5}
-    reader.close()
+def test_a_read_finds_a_record_after_any_run_of_rejections():
+    """A training read reads on through however many rejected records come before one its filter
+    keeps: ten thousand and more in a row are no proof the corpus holds none."""
+    rows = Memory([{"id": index} for index in range(10_001)])
+    reader = compile(Pipeline(rows).filter(Kept(10_000)).batch(1), read="indexed",
+                     loading=Loading(workers=0, threads=1, read_buffer=1)).train(DataPartition())
+    try:
+        assert next(reader)["id"].tolist() == [10_000]
+    finally:
+        reader.close()
 
 
 def test_authoritative_zero_target_count_is_refused_before_division():
@@ -1529,23 +1530,15 @@ def test_block_shuffle_is_a_complete_bounded_physical_order_and_resumes():
     changed.close()
 
 
-@pytest.mark.parametrize("tiny_targets", [0, 1], ids=["broken", "working"])
-def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row(tiny_targets):
-    """A share weighted too small to be chosen is still probed first: one
-    whose rows hold no targets exhausts its budget before the mixture
-    emits a row, and one whose rows hold one lets it."""
+def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row():
+    """A share weighted too small to be chosen is still read ahead before the mixture emits a row,
+    and its first row lets it."""
     parents = [grain.MapDataset.source([{"targets": 3}]).repeat().to_iter_dataset(),
-               grain.MapDataset.source([{"targets": tiny_targets}]).repeat().to_iter_dataset()]
+               grain.MapDataset.source([{"targets": 1}]).repeat().to_iter_dataset()]
     reader = iter(TokenDeficit(parents, [1, 1e-9], tokens=Targets(), names=["normal", "tiny"],
-                              labels=["normal", "tiny"],
-                              keys=["normal", "tiny"],
-                              budget=SearchBudget(consecutive=3)))
+                              labels=["normal", "tiny"], keys=["normal", "tiny"]))
     try:
-        if tiny_targets:
-            next(reader)
-            return
-        with pytest.raises(ValueError):
-            next(reader)
+        assert next(reader) == {"targets": 3}
     finally:
         reader.close()
 
