@@ -589,8 +589,9 @@ def dew_traces(directory: Path) -> None:
 
 def permute(model, config: dict, drawn: dict[str, np.ndarray]) -> np.ndarray:
     """vLLM's `model` under the symmetries `drawn` (`symmetry`), each parameter set in place from the
-    model's own weights as it loaded them, which the first call keeps in host memory, so a float64
-    model and its copy need not share a 40 GB GPU: each attention's
+    model's own weights as it loaded them, which the first call keeps in pinned host memory, so a
+    float64 model and its copy need not share a 40 GB GPU: each copied back to its device and
+    reordered there along each axis in turn, one parameter's gather at a time: each attention's
     fused query, key and value rows, output gate rows and gains, output columns; each feed-forward's
     fused gate and up rows, gains and down columns (`maps`); then every parameter's one axis of the
     residual width, as tests/residual_orders.py reorders Dew's. Returns the embeddings' first row, by
@@ -600,15 +601,18 @@ def permute(model, config: dict, drawn: dict[str, np.ndarray]) -> np.ndarray:
     import torch
 
     if not hasattr(model, 'dory_loaded'):
-        model.dory_loaded = {name: parameter.detach().to('cpu', copy=True)
-                             for name, parameter in model.named_parameters()}
+        def kept(parameter):
+            copy = parameter.detach().to('cpu', copy=True)
+            return copy.pin_memory() if parameter.is_cuda else copy
+
+        model.dory_loaded = {name: kept(parameter) for name, parameter in model.named_parameters()}
     loaded, found = model.dory_loaded, maps(config, drawn)
-    hidden, residual = config['hidden_size'], torch.as_tensor(drawn['residual'])
+    hidden, residual = config['hidden_size'], drawn['residual']
     heads, kv, width = config['num_attention_heads'], config['num_key_value_heads'], config['head_dim']
     queries, keys = heads * width, kv * width
     with torch.no_grad():
         for name, parameter in model.named_parameters():
-            value = loaded[name]
+            parameter.copy_(loaded[name], non_blocking=True)
             layer = re.search(r'\.layers\.(\d+)\.', name)
             layer = None if layer is None else int(layer.group(1))
             rows = columns = None
@@ -628,15 +632,12 @@ def permute(model, config: dict, drawn: dict[str, np.ndarray]) -> np.ndarray:
                 rows = found['mlp'][layer]
             elif name.endswith('down_proj.weight'):
                 columns = found['mlp'][layer]
-            if rows is not None:
-                value = value.index_select(0, torch.as_tensor(rows, device=value.device))
-            if columns is not None:
-                value = value.index_select(1, torch.as_tensor(columns, device=value.device))
-            axes = [axis for axis, size in enumerate(value.shape) if size == hidden]
-            if axes:
-                (axis,) = axes
-                value = value.index_select(axis, residual.to(value.device))
-            parameter.copy_(value)
+            # A parameter holds the residual width along one axis at most.
+            (width,) = [axis for axis, size in enumerate(parameter.shape) if size == hidden] or [None]
+            for axis, order in ((0, rows), (1, columns), (width, residual)):
+                if axis is not None and order is not None:
+                    taken = torch.as_tensor(order, device=parameter.device)
+                    parameter.copy_(parameter.index_select(axis, taken))
     return model.backbone.embeddings.weight[0].float().cpu().numpy()
 
 
