@@ -5,6 +5,7 @@ GPU that a process has to itself (dew.nn.kernels.tuning)."""
 
 import ast
 import dataclasses
+import functools
 import json
 import os
 import shutil
@@ -374,8 +375,10 @@ def test_a_config_failing_for_more_than_its_shared_memory_stops_the_measurement(
     broken_config = sorted(norm.autotuning_configs, key=repr)[0]
 
     class Broken(norm_swiglu.RmsForward):
-        """The norm's forward, raising for one config of its space."""
+        """The norm's forward, raising for one config of its space. Its signature is the norm's, which
+        tokamax reads to bind the launch's operands."""
 
+        @functools.wraps(norm_swiglu.RmsForward._fwd)
         def _fwd(self, *args, config, **kwargs):
             if config == broken_config:
                 raise KernelBug
