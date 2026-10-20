@@ -449,14 +449,13 @@ def advantages(sessions: Sequence[Session], estimator: str = "group", *,
     check_estimator(estimator)
     check_truncation(truncation)
     check_credit(credit)
-    trained = [_trained_reward(session, truncation) for session in sessions]
-    ahead = [None if reward is None else _returns_ahead(session, reward)
-             for session, reward in zip(sessions, trained, strict=True)]
+    # The trained sessions' returns from each call on, by session.
+    ahead = {index: _returns_ahead(session, reward) for index, session in enumerate(sessions)
+             if (reward := _trained_reward(session, truncation)) is not None}
     # Who is compared with whom, and the return each one is compared on.
     compared: dict[tuple[str, str, int], list[tuple[int, int]]] = {}
-    for index, (session, returns) in enumerate(zip(sessions, ahead, strict=True)):
-        if returns is None:
-            continue
+    for index in ahead:
+        session = sessions[index]
         # A session without calls has no turn to compare, and its return stands only for itself.
         turns = range(len(session.calls)) if credit == "turn" else (0,)
         for turn in turns:
@@ -477,7 +476,7 @@ def advantages(sessions: Sequence[Session], estimator: str = "group", *,
     per_call = []
     for index, session in enumerate(sessions):
         calls = len(session.calls)
-        if ahead[index] is None:
+        if index not in ahead:
             per_call.append(np.zeros(calls, np.float32))
         elif credit == "turn":
             per_call.append(np.asarray([values[(index, turn)] for turn in range(calls)], np.float32))
