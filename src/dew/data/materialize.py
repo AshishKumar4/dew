@@ -209,7 +209,7 @@ def _memory_stages(
             derived["windows"] = fingerprint([windows.size, stage.seq_len, stage.stride])
             rows, targets = _targeted([((index,), windows[index]) for index in range(len(windows))], counter,
                                       stage.fields[0], rule)
-            counted = _recounted(rows, stage.fields[0], counted)
+            counted = _recounted(rows, stage.fields[0], rule)
         elif isinstance(stage, Pack):
             from dew.data.packing import _Held, _PackedRows, refuse_overlong
 
@@ -244,7 +244,7 @@ def _memory_stages(
             ids = f"{stage.fields[0]}_segment_ids"
             documents = max((int(np.asarray(record(value, "packed window")[ids]).max(initial=0))
                              for _, value in rows), default=0)
-            counted = _recounted(rows, stage.fields[0], counted)
+            counted = _recounted(rows, stage.fields[0], rule)
         else:
             expanded: list[tuple[tuple[int, ...], Record]] = []
             expanded_counts: dict[tuple[int, ...], int] = {}
@@ -310,11 +310,12 @@ def _count_rule(rows: list[tuple[tuple[int, ...], Record]]) -> CountRule | None:
 
 
 def _recounted(rows: list[tuple[tuple[int, ...], Record]], field: str,
-               counted: dict[tuple[int, ...], int] | None) -> dict[tuple[int, ...], int] | None:
-    """Where the documents' targets were tracked (`counted`), those of the windows a pack or windows
-    stage made of them (`_targeted`), by the windows' own ids: a document's count describes no
-    window, and its id names another one."""
-    if counted is None:
+               rule: CountRule | None) -> dict[tuple[int, ...], int] | None:
+    """The targets of the windows a pack or windows stage made (`_targeted`), by the windows' own
+    ids, where their documents were counted by a rule the windows carry; windows of documents
+    counted by every target, or never, carry no count, and their own tokens count them, after any
+    crop as before it."""
+    if rule is None:
         return None
     return {identifier: ValidTargets(field)(record(value, "packed window")) for identifier, value in rows}
 
