@@ -324,8 +324,9 @@ def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
     do a residual `branch` the stream's own add would broadcast or cast and
     an activation after the norm. `axes`, `x`'s logical axes, places the
     kernel on a mesh (`_placed`)."""
-    return _selected(NORM, norm_case(implementation, x, scale, dtype, axes, branch=branch, activated=activated,
-                                     fp32_statistics=fp32_statistics), implementation)
+    case = norm_case(implementation, x, scale, dtype, axes, branch=branch, activated=activated,
+                     fp32_statistics=fp32_statistics)
+    return _selected(NORM, case, implementation)
 
 
 def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str, *, axes=None) -> str:
