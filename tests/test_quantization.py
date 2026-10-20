@@ -979,10 +979,15 @@ def zone_cases(dtype) -> dict[str, tuple[Callable[..., jax.Array], tuple, dict]]
         return jnp.asarray(rng.standard_normal(shape), jnp.float32).astype(dtype)
 
     pole = jnp.exp(jax.lax.complex(-jnp.linspace(0.05, 0.4, 4), jnp.linspace(0.3, 2.0, 4)))
-    # Each row sits between two codewords whose distances differ by a part in ten thousand, a gap an
-    # int8 product's rounding reorders.
-    rows, offsets = normal(64, 32), normal(64, 32)
-    codebook = jnp.concatenate([rows + offsets, rows - 1.0001 * offsets])
+    # Each integer row sits one step from one codeword and a step and 1/128 across from another: a
+    # gap of 2**-14 in squared distance, which the float products resolve exactly in either dtype and
+    # an int8 product's rounding reorders.
+    whole = np.random.default_rng(1).integers(-8, 9, (64, 32)).astype(np.float32)
+    whole[:, -1] = 0
+    steps = np.eye(32, dtype=np.float32)[np.random.default_rng(2).integers(0, 31, 64)]
+    across = np.eye(32, dtype=np.float32)[-1] / 128
+    rows = jnp.asarray(whole, dtype)
+    codebook = jnp.asarray(np.concatenate([whole + steps, whole - steps + across]), dtype)
     return {
         "dew.nn.ssm.diagonal_recurrence": (diagonal_recurrence, (pole, normal(2, 12, 8)), {"chunk": 4}),
         "dew.nn.attention_residuals.depth_mixed": (
