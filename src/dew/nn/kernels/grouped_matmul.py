@@ -163,9 +163,9 @@ class _Triton(_GroupedLaunch):
     config_cls: ClassVar[type[Tile]] = Tile
 
     def eligible(self, ba, target) -> bool:
-        tokens = ba.arguments['tokens']
-        return ((ba.arguments['interpret'] or generation.capability(target.generation) is not None)
-                and _rated(target, tokens.dtype))
+        # Every CUDA GPU the dispatcher sends the kernels to (`dew.nn.moe.grouped_matmul_kernel`), and
+        # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes.
+        return _rated(target, ba.arguments['tokens'].dtype)
 
     def space(self, ba) -> tuple[Tile, ...]:
         return TILES
@@ -224,7 +224,10 @@ class Gmm(_Triton):
 
     def cost(self, ba, config: Tile, target) -> float:
         # A program is one group's chunk of up to `CHUNK_M` rows (ragged_dot.py) by `block_n` columns,
-        # its rows `block_m` at a time.
+        # its rows `block_m` at a time, each row tile loading the group's `depth` x `block_n` block
+        # again. Programs run chunks before columns, so each column block reads the rows again. The
+        # rereads come from device memory, not the L2: so counted, the bytes alone gave an H100's time
+        # for every tile of Qwen3-30B-A3B's gate_up within 10% (GMM-h100-3).
         from .ragged_dot import CHUNK_M
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
         (rows, depth), groups = tokens.shape, kernel.shape[0]
@@ -232,11 +235,12 @@ class Gmm(_Triton):
         size, out = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(ba.arguments['out_dtype']).itemsize
         chunks = _row_tiles(rows, groups, CHUNK_M)
         columns = math.ceil(width / config.block_n)
-        flops = 2 * _row_tiles(rows, groups, config.block_m) * config.block_m * depth * width
-        steps = _row_tiles(rows, groups, config.block_m) * math.ceil(depth / config.block_k) / chunks
+        tiles = _row_tiles(rows, groups, config.block_m)
+        flops = 2 * tiles * config.block_m * depth * width
+        steps = tiles * math.ceil(depth / config.block_k) / chunks
         staged = steps * _triton_staged(config.block_m, config.block_n, config.block_k, config.warps,
                                         _facts(target).wgmma) * size
-        moved = rows * depth * size + _routed(rows, groups) * kernel.size * size + rows * width * out
+        moved = (columns * rows * depth + tiles * depth * width) * size + rows * width * out
         return cost.seconds(cost.Cost(
             programs=chunks * columns, device_bytes=moved,
             program_flops=flops / (chunks * columns), program_staged=staged,
@@ -275,7 +279,8 @@ class Tgmm(_Triton):
 
     def cost(self, ba, config: Tile, target) -> float:
         # A program is one group's `block_k` x `block_n` output tile, summed over the group's rows
-        # `block_m` at a time.
+        # `block_m` at a time; each output column block reads the rows again, and each output row
+        # block the cotangent, from device memory (`Gmm.cost`).
         tokens, cotangent, sizes = ba.arguments['tokens'], ba.arguments['cotangent'], ba.arguments['sizes']
         (rows, depth), width, groups = tokens.shape, cotangent.shape[1], sizes.shape[0]
         size, out = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(ba.arguments['out_dtype']).itemsize
@@ -285,7 +290,7 @@ class Tgmm(_Triton):
         flops = 2 * steps * config.block_m * config.block_k * config.block_n
         staged = steps * _triton_staged(config.block_k, config.block_n, config.block_m, config.warps,
                                         _facts(target).wgmma) * size
-        moved = rows * (depth + width) * size + groups * depth * width * out
+        moved = (blocks[1] * rows * depth + blocks[0] * rows * width) * size + groups * depth * width * out
         return cost.seconds(cost.Cost(
             programs=programs, device_bytes=moved, program_flops=flops, program_staged=staged,
             resident=self._resident(ba, config, target), mode=_mode(tokens.dtype)), target)
