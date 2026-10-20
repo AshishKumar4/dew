@@ -558,8 +558,8 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
     stored pick it reads, or none for the heuristic, which every process
     launches there (`_NEAREST`) and none stores, so the launch stays
     unmeasured. Each distinct launch is decided, and measured, once. Returns
-    how many still have no pick, which the process says once, with how to
-    measure them."""
+    how many still have no pick, which the process logs once at INFO, with how
+    to measure them."""
     found = _distinct(found)
     if not found:
         return 0
@@ -613,7 +613,9 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
     unmeasured = sum(_pick(ba) is None for _, ba in found)
     if unmeasured and kind not in _told:
         _told.add(kind)
-        _log.warning("%d kernel launches have no config measured on %s, so they run the nearest measured "
+        # A heuristic config is a working default, not a fault, so the note is information, not a
+        # warning: a run asks for measured picks itself (`Trainer(tune_kernels=True)`).
+        _log.info("%d kernel launches have no config measured on %s, so they run the nearest measured "
                      "shape's or their heuristic: measure them on a GPU to yourself with "
                      "Trainer(tune_kernels=True) or `python tools/kernel_picks.py`", unmeasured, kind)
     return unmeasured
