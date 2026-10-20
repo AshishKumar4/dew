@@ -10,6 +10,7 @@ import numpy as np
 import optax
 import pytest
 from recording import RecordingTracker
+from reference_error import assert_as_exact_as_the_reference
 
 import dew.config
 from dew.config import OptimConfig, RunConfig, TrainerConfig, Wandb
@@ -205,9 +206,26 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
 
     sink = RecordingTracker()
     weight = np.asarray(fit(4, sink=sink).variables['params']['weight'])
-    # Against float64 truth: four complex64 updates of weights below 5 in magnitude round within
-    # sqrt(4) eps32 |t|_rms = 9.2e-7 each part; the bound is twice that.
-    np.testing.assert_allclose(weight, target * (1 - 0.8 ** 4), rtol=0, atol=1.9e-6)
+
+    # The same four updates in Optax's own loop over the same batch, complex64 as the trainer's, and
+    # the closed form in complex128, which both are held to, real and imaginary parts alike.
+    @jax.jit
+    def update(weight, state):
+        grads = jax.grad(lambda w: ComplexSquared().loss({'params': {'weight': w}}, batch, None)[0])(weight)
+        updates, state = optax.sgd(.1).update(grads, state, weight)
+        return optax.apply_updates(weight, updates), state
+
+    reference = jnp.zeros(2, jnp.complex64)
+    state = optax.sgd(.1).init(reference)
+    for _ in range(4):
+        reference, state = update(reference, state)
+
+    def parts(value):
+        value = np.asarray(value)
+        return np.stack([value.real, value.imag]).astype(np.float64)
+
+    assert_as_exact_as_the_reference(parts(weight), parts(reference), parts(target * (1 - 0.8 ** 4)),
+                                     "complex descent")
     norms = {step: scalars['train/grad_norm'] for step, scalars in sink.scalars
              if 'train/grad_norm' in scalars}
     assert norms[accumulation] == pytest.approx(np.sqrt(120.))
