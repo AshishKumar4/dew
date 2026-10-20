@@ -693,9 +693,8 @@ class CausalSelfAttention(nn.Module):
                         valid=None if attention_metadata is None else attention_metadata.valid,
                         layout=self.ctx.kv_cache, places=self._reads_places)
             elif self.ctx.kv_cache != KVCache():
-                raise ValueError(
-                    "a bidirectional canvas reads its encoder prefix as dense, full-precision "
-                    "keys; it takes the default kv_cache layout")
+                self.ctx.refuse("attention", {"kv_cache": True}, "a bidirectional canvas reads its "
+                                "encoder prefix as dense, full-precision keys")
             elif self.ctx.kv_shared:
                 raise ValueError(
                     "a bidirectional canvas over a cache shares no keys across "
