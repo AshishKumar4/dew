@@ -26,7 +26,7 @@ import pytest
 from diffusion_stubs import StubText
 from flax import linen as nn
 from recording import RecordingTracker
-from reference_error import assert_leaves_as_exact, float64_terms
+from reference_error import assert_as_exact_as_the_reference, float64_terms
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig
@@ -564,7 +564,7 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     four ways, the optimizer's state and the EMA with it) train the same
     steps from the same state: each layout's variables, momentum and EMA
     are as near a float64 run as one device's are
-    (`assert_leaves_as_exact`), so their summing a batch's rows and
+    (`assert_as_exact_as_the_reference`), so their summing a batch's rows and
     positions in other orders is the only difference, where a layout that
     dropped or repeated a row would fail by orders of magnitude. After one
     step every row is held to its own size; after two each tensor is, as a
@@ -603,9 +603,7 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         terms = raised(terms, decay_invariants(case, tmp_path, initial, steps))
         for layout in layouts:
             for name in ("variables", "opt_state", "ema"):
-                assert_leaves_as_exact(*jax.device_get((getattr(layout, name), getattr(alone, name))),
-                                       getattr(exact, name), reductions=reductions,
-                                       terms=getattr(terms, name), rows=rows)
+                assert_as_exact_as_the_reference(*jax.device_get((getattr(layout, name), getattr(alone, name))), getattr(exact, name), 'as_near', terms=getattr(terms, name))
         return layouts
 
     as_near(1, rows=True)

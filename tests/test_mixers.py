@@ -22,7 +22,7 @@ import pytest
 from delta_rule_support import DECAY_SUMS, port_formula
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_leaves_as_exact, float64_terms
+from reference_error import assert_as_exact_as_the_reference, float64_terms
 
 from dew.nn import linear
 from dew.nn.attention import alibi_bias
@@ -259,9 +259,7 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
         alone64 = documents_alone(model.clone(dtype=jnp.float64), tokens)
         (truth, truth_grads), (terms, terms_grads) = float64_terms(
             functools.partial(pulled, alone64), wide, jnp.asarray(cotangent, jnp.float64))
-    assert_leaves_as_exact({"logits": packed, "grads": packed_grads}, {"logits": alone, "grads": alone_grads},
-                           {"logits": truth, "grads": truth_grads}, reductions=sum(DOCUMENTS),
-                           terms={"logits": terms, "grads": terms_grads})
+    assert_as_exact_as_the_reference({"logits": packed, "grads": packed_grads}, {"logits": alone, "grads": alone_grads}, {"logits": truth, "grads": truth_grads}, 'test_a_packed_row_computes_what_its_documents_compute_alone', terms={"logits": terms, "grads": terms_grads})
 
 
 def embedded(module, tokens):
@@ -330,7 +328,7 @@ def test_no_token_reaches_another_document(kind, monkeypatch):
                                                   for path, leaf in jax.tree_util.tree_leaves_with_path(tree))
                     if not any(decay in name for decay in DECAY_SUMS)}
 
-        assert_leaves_as_exact(held(moved), held(formula), held(truth))
+        assert_as_exact_as_the_reference(held(moved), held(formula), held(truth), 'test_no_token_reaches_another_document')
         return
     for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(moved),
                                     jax.tree.leaves(second_document(tokens)), strict=True):

@@ -26,7 +26,7 @@ import re
 import jax
 import numpy as np
 from jax.sharding import NamedSharding
-from reference_error import assert_leaves_as_exact
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.telemetry.instrumentation import custom_call_kind, hlo_instructions
 from dew.training.distributed import parameter_axes
@@ -122,7 +122,7 @@ def tpu_lowering(fn, args, mesh: jax.sharding.Mesh) -> str:
 
 def assert_runs_per_shard(fn, args, specs, mesh, truth, *, moves=()) -> None:
     """The custom-kernel contract (module docstring): `fn(*args)` with `args` placed on `mesh` by
-    `specs` (PartitionSpecs) is within the float64 gate (`assert_leaves_as_exact`) of `fn` on one
+    `specs` (PartitionSpecs) is within the float64 gate (`assert_as_exact_as_the_reference`) of `fn` on one
     device, both measured from `truth`, the float64 tree of `fn`'s outputs; its compiled step holds
     no collective that moves entries between devices (`MOVES`) beyond the ops `moves` names (a
     sequence split's intended exchange), which XLA, unable to split an opaque call, would otherwise
@@ -139,7 +139,7 @@ def assert_runs_per_shard(fn, args, specs, mesh, truth, *, moves=()) -> None:
     assert not moved, f"the step moves operands between devices: {moved}"
     copies = boundary_copies(text)
     assert not copies, f"XLA re-lays out arrays at the kernel's boundary: {copies}"
-    assert_leaves_as_exact(jax.tree.map(np.asarray, split), jax.tree.map(np.asarray, whole), truth)
+    assert_as_exact_as_the_reference(jax.tree.map(np.asarray, split), jax.tree.map(np.asarray, whole), truth, 'assert_runs_per_shard')
 
 
 VIEWS = frozenset({"bitcast", "get-tuple-element", "tuple", "parameter"})

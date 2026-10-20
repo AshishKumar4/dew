@@ -37,7 +37,7 @@ import pytest
 from delta_rule_support import CHUNKED, port_formula, recurrence, through
 from flax import linen as nn
 from model_support import decode_through
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms, widened
+from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
 from tuned import each_config, launches, timed
 
 from dew.nn import linear
@@ -149,7 +149,7 @@ def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, 
     """Packed documents in the chunked rule, one starting on a chunk's first token, one four tokens before a
     chunk's end and one spanning chunks: each document's output, the final memory and every gradient
     as near the float64 recurrence run document by document as the chunked rule run on each document
-    alone (`assert_leaves_as_exact`), and within 1e-4 of it, the row's first document from the row's
+    alone (`assert_as_exact_as_the_reference`), and within 1e-4 of it, the row's first document from the row's
     memory and every other from zero, for a decay per head (the gated delta net) and per key dimension
     (Kimi's delta attention), each sized by the packed rule's float64 terms. At a strong decay (-4 a
     token) the chunk's earlier document sits 96 below its last one's, past exp's fp32 range."""
@@ -182,7 +182,7 @@ def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, 
         want = through(functools.partial(recurrence, cuts=(begins,)), *operands[6:])(*operands[:6])
         want = widened(want)
         _, terms = float64_terms(through(packed, *operands[6:]), *operands[:6])
-    assert_leaves_as_exact(got, reference, want, reductions=chunk, terms=terms)
+    assert_as_exact_as_the_reference(got, reference, want, 'test_the_chunked_rule_runs_packed_documents_as_each_runs_alone', terms=terms)
     for name, mine, theirs in zip(("out", "final", "q", "k", "v", "g", "beta", "h0"), got, want, strict=True):
         assert largest(mine, theirs) < 1e-4 * max(1.0, float(np.max(np.abs(theirs)))), name
 
@@ -236,7 +236,7 @@ def test_the_port_takes_each_packed_tokens_gradients_as_its_formula_does(per_key
         wide = widened((q, k, g))
         want = widened(taken(alone)(*wide))
         _, terms = float64_terms(taken(packed(port_formula)), *wide)
-    assert_leaves_as_exact(got, formula, want, reductions=CHUNKED, terms=terms)
+    assert_as_exact_as_the_reference(got, formula, want, 'test_the_port_takes_each_packed_tokens_gradients_as_its_formula_does', terms=terms)
 
 
 def test_strong_decay_has_the_same_finite_gradient_in_both_forms():

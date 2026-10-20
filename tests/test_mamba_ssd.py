@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_leaves_as_exact, float64_terms, ieee_fixture, widened
+from reference_error import assert_as_exact_as_the_reference, float64_terms, ieee_fixture, widened
 from sharded import assert_runs_per_shard
 from tuned import each_config
 
@@ -127,7 +127,7 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
     for leaves, reductions in ((set(ported) - everywhere, chunk), (everywhere, batch * length)):
         mine, theirs, true, summed = ({name: tree[name] for name in sorted(leaves)}
                                       for tree in (ported, reference, truth, terms))
-        assert_leaves_as_exact(mine, theirs, true, reductions=reductions, terms=summed)
+        assert_as_exact_as_the_reference(mine, theirs, true, 'test_the_port_is_as_exact_as_mamba_ssm', terms=summed)
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])

@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_computes_the_oracle, assert_leaves_as_exact, float64_terms
+from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle, float64_terms
 
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
 from dew.nn.mixers.mamba2 import RESET_DECAY, xla_chunk_scan
@@ -144,8 +144,7 @@ def assert_kernel_parity(operands, chunk_size: int, *, compiled: bool, roundings
     for name, mine, theirs, wide, want, summed in pairs:
         assert np.all(np.isfinite(np.asarray(mine))), name
         assert_computes_the_oracle(wide, want, name, roundings=roundings)
-        assert_leaves_as_exact({name: np.asarray(mine)}, {name: np.asarray(theirs)}, {name: want},
-                               reductions=reductions, terms={name: summed})
+        assert_as_exact_as_the_reference({name: np.asarray(mine)}, {name: np.asarray(theirs)}, {name: want}, 'assert_kernel_parity', terms={name: summed})
 
 
 def fixture_case(reference, chunk_size: int, resets: bool):

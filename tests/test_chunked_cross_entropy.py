@@ -84,10 +84,10 @@ def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float
     product, about nine times the bias's in size, and over its 37 entries the
     whole head's own rounding draw falls anywhere from 0.4 to 3.7 times the
     fused head's (twelve seeds, 2026-10-18), so it is held to the rule with the
-    order floor of its 10-term sum (`assert_leaves_as_exact`): at this seed the
+    order floor of its 10-term sum (`assert_as_exact_as_the_reference`): at this seed the
     fused head is 1.05e-6 from float64 against 4.1e-7 and a floor of 3.6e-6, an
     fp32 unit of entries near 9.5."""
-    from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms
+    from reference_error import assert_as_exact_as_the_reference, float64_terms
 
     states, matrix, targets = inputs(vocab=37, features=16, tokens=(2, 5), dtype=dtype)
     # Sums exact in any order, so the chunks' products are the whole head's.
@@ -126,8 +126,7 @@ def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float
     for label, mine, theirs, true in held:
         if label != 'scale':
             assert_as_exact_as_the_reference(mine, theirs, true, f'{dtype} {softcap} fused {label}')
-    assert_leaves_as_exact(gradients[2], expected_gradients[2], exact_gradients[2], reductions=targets.size,
-                           terms=sizes[2])
+    assert_as_exact_as_the_reference(gradients[2], expected_gradients[2], exact_gradients[2], 'test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float64_rule', terms=sizes[2])
 
 
 @pytest.mark.parametrize('kind', ['nvfp4', 'fp8'])
@@ -267,11 +266,11 @@ def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(til
     """Split over the vocabulary on a mesh, the head's loss and its gradients
     for the states, the head, the per-token scale and the bias are as close to
     float64 as one device's whole logits, under the rule with the order floor
-    of the 20 tokens each column's gradients sum (`assert_leaves_as_exact`),
+    of the 20 tokens each column's gradients sum (`assert_as_exact_as_the_reference`),
     and no collective carries an array the head's size: each device's columns,
     scale and bias stay in its shard."""
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from reference_error import assert_leaves_as_exact, float64_terms
+    from reference_error import assert_as_exact_as_the_reference, float64_terms
 
     from dew.training import MeshSpec
 
@@ -303,8 +302,7 @@ def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(til
     with jax.enable_x64(new_val=True):
         exact, sizes = float64_terms(jax.value_and_grad(whole, argnums=(0, 1, 2, 3)),
                                      *(jnp.asarray(term, jnp.float64) for term in terms))
-    assert_leaves_as_exact(jax.tree.map(np.asarray, split), reference, exact, reductions=targets.size,
-                           terms=sizes)
+    assert_as_exact_as_the_reference(jax.tree.map(np.asarray, split), reference, exact, 'test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule', terms=sizes)
     moved = [math.prod(shape) for _, shapes in collectives(program) for shape in shapes]
     assert moved and max(moved) < matrix.size // 2, moved
 

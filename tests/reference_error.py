@@ -62,13 +62,17 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
+import statistics
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from dew.accuracy import distance, reduction_bound, within
 
-FACTOR = 2.0
+FACTOR = 1.5
+"""How far Dew's RMS error from float64 may sit from the reference's, on the same inputs (the
+owner's gate, bible §7, 2026-10-20): within 1.5 times it, with no floor of any kind."""
 
 ROW_FACTOR = 4.0
 """How far Dew's worst row may sit from float64 against the reference's worst
@@ -196,17 +200,31 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str
 
 
 def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms=None) -> None:
-    """Dew within FACTOR times the reference's RMS distance from float64, and
-    its rows within ROW_FACTOR times the reference's (`rows_over`), each
-    sized by its float64 `terms` where they are given (`float64_terms`)."""
-    mine, theirs = distance(dew, truth), distance(reference, truth)
-    assert theirs > 0, f"{label}: the reference equals float64, so it measures nothing"
-    assert within(mine, FACTOR * theirs), (
-        f"{label}: dew is {mine:.3e} from float64 (rms), the reference {theirs:.3e} "
-        f"(ratio {mine / theirs:.2f}, allowed {FACTOR})")
-    over = rows_over(dew, reference, truth, terms)
-    assert not over, f"{label}: " + "; ".join(over)
-
+    """Each leaf of `dew` within FACTOR times the matching leaf of `reference`'s RMS distance from
+    float64 (`truth`), the trees alike (an array is a tree of one leaf), and its rows within
+    ROW_FACTOR times the reference's (`rows_over`), each row sized by its float64 `terms` where
+    they are given (`float64_terms`). There is no floor of any kind (bible §7, 2026-10-20): a leaf
+    the reference holds exactly, Dew must hold exactly. A leaf too small for its ratio to resolve
+    FACTOR at FALSE_FAILURE is refused as underpowered (`underpowered`), with the size it needs:
+    a comparison is sized to its own noise, never given a wider bar."""
+    paths = jax.tree_util.tree_leaves_with_path(dew)
+    sizes = [None] * len(paths) if terms is None else jax.tree.leaves(terms)
+    leaves = list(zip(paths, jax.tree.leaves(reference), jax.tree.leaves(truth), sizes, strict=True))
+    measured = [distance(theirs, true) for _, theirs, true, _ in leaves]
+    assert any(theirs > 0 for theirs in measured), (
+        f"{label}: the reference equals float64, so it measures nothing")
+    over = []
+    for ((path, mine), theirs, true, summed), their_distance in zip(leaves, measured, strict=True):
+        name = label + jax.tree_util.keystr(path)
+        my_distance = distance(mine, true)
+        if not within(my_distance, FACTOR * their_distance):
+            over.append(f"{name}: dew is {my_distance:.3e} from float64 (rms), the reference "
+                        f"{their_distance:.3e} (ratio {my_distance / max(their_distance, 1e-300):.2f}, "
+                        f"allowed {FACTOR})")
+        elif their_distance > 0 and (short := underpowered(mine, theirs, true)):
+            over.append(f"{name}: {short}")
+        over += [f"{name}: {row}" for row in rows_over(mine, theirs, true, summed)]
+    assert not over, "\n".join(over)
 
 
 def assert_no_less_exact(dew, reference, truth, label: str) -> None:
@@ -214,45 +232,6 @@ def assert_no_less_exact(dew, reference, truth, label: str) -> None:
     mine, theirs = distance(dew, truth), distance(reference, truth)
     assert within(mine, theirs), (
         f"{label}: {mine:.3e} from float64 (rms), the unchanged source {theirs:.3e}")
-
-
-def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None,
-                           rows: bool = True) -> None:
-    """Each leaf of the tree `dew` within FACTOR times the matching leaf of
-    `reference`'s RMS distance from float64 (`truth`), the three trees alike.
-
-    A port that sums `reductions` terms the reference sums in another order
-    rounds by up to sqrt(reductions) float32 units of what it sums in RMS,
-    so the reference's distance counts as at least that: one draw of
-    rounding below it is luck, not a bar, and a leaf that lost a term still
-    fails by orders of magnitude. What a leaf sums is its own float64 size,
-    or, where `terms` gives the tree of each leaf's terms (`float64_terms`),
-    the larger of that and their root sum of squares, the size of the
-    partial sums a reordered sum rounds. A leaf whose sum cancels, as a key
-    bias's gradient does under the softmax's shift invariance, is held to
-    its terms' rounding, not to its own near-zero size; one whose terms'
-    signs are independent keeps about its own. Each leaf's rows are held to
-    the reference's too (`rows_over`), unless `rows` is false: after a
-    second training step a row inherits the first step's rounding through
-    the parameters it reads, which its own terms do not see, so such a
-    comparison holds each tensor alone and its first step holds the rows."""
-    unit = float(np.finfo(np.float32).eps)
-    spread = np.sqrt(reductions)
-    sizes = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
-    over = []
-    leaves = zip(jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
-                 sizes, strict=True)
-    for (path, mine), theirs, true, summed in leaves:
-        scale = max(distance(true, 0), distance(summed, 0))
-        bar = FACTOR * max(distance(theirs, true), spread * unit * scale)
-        if not within(distance(mine, true), bar):
-            over.append(f"{jax.tree_util.keystr(path)}: {distance(mine, true):.3e} from float64 (rms), "
-                        f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
-        # Each row over its own terms where they are given, the order floor in those units.
-        over += [f"{jax.tree_util.keystr(path)}: {row}"
-                 for row in (rows_over(mine, theirs, true, None if terms is None else summed, spread * unit)
-                             if rows else ())]
-    assert not over, "\n".join(over)
 
 
 SUMS = frozenset({"dot_general", "ragged_dot_general", "reduce_sum", "conv_general_dilated", "cumsum",
@@ -510,11 +489,12 @@ def _or_size(energy, value):
 
 
 FALSE_FAILURE = 1e-6
-"""The chance a port exactly as exact as its reference fails the K-order
-rule. The suite holds about 150 rules and CI runs it some tens of times a
-day, so this is one false failure in a few hundred days."""
+"""The chance a port exactly as exact as its reference fails a comparison,
+one draw or over orders. The suite holds about a thousand compared leaves
+and CI runs it some tens of times a day, so this is one false failure in a
+few months."""
 
-ORDERS = 52
+ORDERS = 142
 """The rounding orders the K-order rule takes on each side: the fewest K
 for which a mean of K squared distances over another such mean exceeds
 FACTOR^2 with probability at most FALSE_FAILURE when both are equally exact.
@@ -522,9 +502,40 @@ A squared RMS of Gaussian roundings is a weighted sum of one-degree
 chi-squares, whose spread is widest when one direction carries all of it,
 as a training step's can (Kimi Linear's updated logits spread like 3 to 5
 degrees, where one draw against one exceeds the factor about 10% of the
-time). At one degree the ratio is F(K, K), and F(52, 52) passes 4 with
-probability 8e-7; any larger spread in degrees is more concentrated still,
-so K holds for any computation (tests/test_bf16_reference.py derives it)."""
+time). At one degree the ratio is F(K, K), and F(142, 142) passes 1.5^2
+with probability 9.9e-7 (F(141, 141) with 1.1e-6); any larger spread in
+degrees is more concentrated still, so K holds for any computation. At the
+earlier factor of 2, 52 orders held F(K, K) past 4 at 8e-7."""
+
+Z = statistics.NormalDist().inv_cdf(1 - FALSE_FAILURE)
+"""How many of its own spreads a ratio of equally exact errors may sit above one, in log, before
+FALSE_FAILURE of comparisons pass that far by chance (4.75)."""
+
+
+def underpowered(dew, reference, truth) -> str | None:
+    """Why one draw of this comparison cannot resolve FACTOR at FALSE_FAILURE, or None.
+
+    The ratio of two RMS errors over N elements is noisy: its log has a spread the elements' squared
+    errors give by the delta method, half the root of the sum over elements of
+    (a_i / sum a - b_i / sum b)^2, a and b each side's squared errors, which is 1/sqrt(N) for
+    independent Gaussian roundings and zero where both sides round alike. Elements whose errors
+    share an upstream rounding (a row's sum) only widen it, so this is the least the spread is.
+    Where Z of it exceeds log FACTOR, two equally exact implementations part by more than FACTOR
+    at more than FALSE_FAILURE, and the comparison is refused with what it needs: about that
+    ratio squared times its elements, or the comparison drawn over ORDERS orders
+    (`assert_as_exact_over_orders`), whose spread falls as 1/sqrt(K)."""
+    truth = np.asarray(truth, np.float64)
+    mine = np.square(np.asarray(dew, np.float64) - truth).ravel()
+    theirs = np.square(np.asarray(reference, np.float64) - truth).ravel()
+    if not (mine.sum() > 0 and theirs.sum() > 0):
+        return None
+    spread = 0.5 * float(np.sqrt(np.sum(np.square(mine / mine.sum() - theirs / theirs.sum()))))
+    if Z * spread <= np.log(FACTOR):
+        return None
+    need = (Z * spread / np.log(FACTOR)) ** 2
+    return (f"underpowered: one draw's ratio spreads {spread:.3f} in log over its {mine.size} elements, "
+            f"so FACTOR {FACTOR} at {FALSE_FAILURE:g} needs about {need:.1f} times as many independent "
+            f"elements, or the comparison over {ORDERS} orders where an orbit exists")
 
 
 def assert_as_exact_over_orders(dew, reference, label: str) -> None:

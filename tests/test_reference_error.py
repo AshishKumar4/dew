@@ -3,7 +3,7 @@ must refuse, and the rounding it must admit."""
 
 import numpy as np
 import pytest
-from reference_error import FACTOR, assert_as_exact_as_the_reference, assert_leaves_as_exact, distance
+from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 
 
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
@@ -17,7 +17,7 @@ def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
     with pytest.raises(AssertionError):
         assert_as_exact_as_the_reference(dew, reference, truth, "small row")
     with pytest.raises(AssertionError):
-        assert_leaves_as_exact({"rows": dew}, {"rows": reference}, {"rows": truth})
+        assert_as_exact_as_the_reference({"rows": dew}, {"rows": reference}, {"rows": truth}, 'test_a_small_row_beside_large_ones_is_held_to_its_own_size')
 
 
 def test_a_row_that_cancels_is_held_to_what_it_sums():
@@ -39,10 +39,10 @@ def test_a_row_that_cancels_is_held_to_what_it_sums():
         return truth + noise
 
     reference, further = rounded(), rounded(10.0)
-    assert_leaves_as_exact({"dq": rounded()}, {"dq": reference}, {"dq": truth}, terms={"dq": terms})
+    assert_as_exact_as_the_reference({"dq": rounded()}, {"dq": reference}, {"dq": truth}, 'test_a_row_that_cancels_is_held_to_what_it_sums 1', terms={"dq": terms})
     assert distance(further, truth) <= FACTOR * distance(reference, truth)
     with pytest.raises(AssertionError):
-        assert_leaves_as_exact({"dq": further}, {"dq": reference}, {"dq": truth}, terms={"dq": terms})
+        assert_as_exact_as_the_reference({"dq": further}, {"dq": reference}, {"dq": truth}, 'test_a_row_that_cancels_is_held_to_what_it_sums 2', terms={"dq": terms})
 
 
 def test_a_row_of_float64_zero_is_held_to_the_references_own_row():
