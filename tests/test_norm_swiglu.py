@@ -16,6 +16,7 @@ Forwards retain each model's cast sites. Small-shape c53 fixtures also hold
 the fused VJPs to Liger's measured float64 distances.
 """
 
+import contextlib
 import functools
 import json
 
@@ -178,6 +179,64 @@ def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("case", ["random-2x3x31", "random-3x257x17", "random-5x2x128", "aligned-1x128",
+                                  "large-1x128", "small-1x128"])
+def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(dtype, case):
+    """`attention.unweighted_rmsnorm` fused (`norm_swiglu.rms_norm`'s `inverse_rounded`): the inverse RMS
+    reduced in fp32 and rounded to the input's dtype before it multiplies, as DeepSeek-V4's and GLM's
+    unweighted norms round it, and its reverse rounded where XLA's is; its output and input gradient
+    within the float64 gate of XLA's, random rows, a row of 1.5 under a cotangent of ones, whose two
+    gradient contributions cancel, and rows of 0.5 under cotangents of 1.5 * 2**119, finite through
+    XLA's transposes, and of a subnormal (2**-140 in fp32, 2**-130 in bf16), which they do not halve."""
+    def unweighted(x):
+        return attention.unweighted_rmsnorm(x, 1e-6, implementation="xla")
+
+    def fused(x):
+        return norm_swiglu.rms_norm(x, None, 1e-6, x.dtype, offset=False, after_cast=False,
+                                    portable=lambda x, scale: unweighted(x), inverse_rounded=True)
+
+    kind, shape = case.split("-")
+    shape = tuple(int(size) for size in shape.split("x"))
+    if kind == "aligned":
+        x, seed = jnp.full(shape, 1.5, dtype), jnp.ones(shape, dtype)
+    elif kind in ("large", "small"):
+        cotangent = 1.5 * 2.0 ** 119 if kind == "large" else 2.0 ** (-140 if dtype == jnp.float32 else -130)
+        x, seed = jnp.full(shape, 0.5, dtype), jnp.full(shape, cotangent, dtype)
+    else:
+        x = jax.random.normal(jax.random.key(26), shape).astype(dtype)
+        seed = jax.random.normal(jax.random.key(27), shape).astype(dtype)
+    compare((unweighted, fused, unweighted), (x,), seed, ("y", "x"))
+
+
+def test_an_unweighted_norm_takes_the_fused_kernel_and_keeps_a_staged_jvp():
+    """Traced for an A100, whose row names the fused RMSNorm, `unweighted_rmsnorm` (Mamba2's,
+    Nemotron-H's, DeepSeek-V4's and GLM-5's) takes the kernel, differentiated as one custom JVP
+    (`generation.linear_tangent`): a jvp of a jit that staged it is the portable norm's, and its
+    gradient runs the kernel's backward."""
+    from dew.nn.kernels import generation
+
+    x = jax.random.normal(jax.random.key(28), (4, 64)).astype(jnp.bfloat16)
+    tangent = jax.random.normal(jax.random.key(29), (4, 64)).astype(jnp.bfloat16)
+    with generation.assumed("sm80"), generation.routes() as found:
+        jax.make_jaxpr(lambda x: attention.unweighted_rmsnorm(x, 1e-6))(x)
+    (route,) = [route for route in found if route.choice == "rms_norm"]
+    assert (route.kernel, route.preferred, route.refusal) == ("pallas", "pallas", None)
+
+    def norm(implementation):
+        return jax.jit(lambda x: attention.unweighted_rmsnorm(x, 1e-6, implementation=implementation))
+
+    staged = jax.jvp(norm("pallas"), (x,), (tangent,))
+    portable = jax.jvp(norm("xla"), (x,), (tangent,))
+    np.testing.assert_array_equal(np.asarray(staged[1]), np.asarray(portable[1]))
+
+    def pulled(x):
+        return jax.grad(lambda x: norm("pallas")(x).astype(jnp.float32).sum())(x)
+
+    assert "rms_norm_backward" in kernels(pulled, x)
+    assert pulled(x).dtype == x.dtype
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(7, 1000), (3, 4096), (3, 257, 17)])
 def test_rms_ragged_widths_and_many_rows(dtype, shape):
     operands, seed = norm_operands(shape, dtype, jnp.float32)
@@ -328,10 +387,14 @@ def test_stream_seam_takes_the_add_and_the_stream_cotangent(joined, dtype, shape
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(2, 3, 4, 31), (2, 64, 16, 128)])
-def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, shape):
+@pytest.mark.parametrize("gate_dtype", ["same", jnp.bfloat16])
+def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, shape, gate_dtype):
     """Qwen3-Next's gated norm: the kernel's output and its input, gate and
-    weight gradients each within the gate of XLA's float64 distance."""
+    weight gradients each within the gate of XLA's float64 distance, its
+    gate in the input's dtype or in bf16 beside an fp32 input, as a decode
+    step's recurrence hands it over."""
     x, gate, dy = (jax.random.normal(jax.random.key(index), shape).astype(dtype) for index in (51, 52, 53))
+    gate = gate if gate_dtype == "same" else gate.astype(gate_dtype)
     scale = 0.7 + 0.2 * jax.random.normal(jax.random.key(54), shape[-1:])
     operands = (x, gate, scale)
 
@@ -349,6 +412,48 @@ def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, 
                                                  strict=True):
         assert mine.dtype == theirs.dtype, label
         assert_as_exact_as_the_reference(mine, theirs, want, label, terms=summed)
+
+
+@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+@pytest.mark.parametrize("output", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("shape", [(2, 3, 4, 31), (2, 1, 16, 128)])
+def test_a_decode_steps_gated_norm_of_an_fp32_input_by_a_bf16_gate_holds_the_float64_gate(activation, output,
+                                                                                           shape):
+    """A decode step's gated norm (Qwen3-Next's, Kimi's): the recurrence's fp32 output gated by its bf16
+    projection, the gate read in fp32 as XLA widens it, cast once to `output`; its output and its input,
+    gate and weight gradients, each in its operand's dtype, within the float64 gate of XLA's."""
+    x, gate, dy = (jax.random.normal(jax.random.key(index), shape) for index in (61, 62, 63))
+    gate, dy = gate.astype(jnp.bfloat16), dy.astype(output)
+    scale = 0.7 + 0.2 * jax.random.normal(jax.random.key(64), shape[-1:])
+    operands = (x, gate, scale)
+
+    def gated(implementation, dtype):
+        return lambda x, gate, scale: gated_rms_normalized(x, gate, scale, 1e-6, dtype, activation,
+                                                           implementation=implementation)
+
+    fused = gated("pallas", output)
+    assert "rms_norm_forward" in kernels(fused, *operands)
+    assert "rms_norm_backward" in kernels(functools.partial(evaluated, fused), operands, dy)
+    reference = jax.jit(functools.partial(evaluated, gated("xla", output)))(operands, dy)
+    actual = jax.jit(functools.partial(evaluated, fused))(operands, dy)
+    truth, terms = float64(gated("xla", jnp.float64), operands, dy)
+    for label, mine, theirs, want, summed in zip(("y", "x", "gate", "scale"), actual, reference, truth, terms,
+                                                 strict=True):
+        assert mine.dtype == theirs.dtype, label
+        assert_as_exact_as_the_reference(mine, theirs, want, label, terms=summed)
+
+
+def test_a_decode_steps_gated_norm_takes_the_fused_kernel_where_its_row_names_it():
+    """Traced for an A100, whose row names the fused RMSNorm, the gated norm of a decode step (Qwen3-Next's,
+    Kimi's): an fp32 recurrence output gated by its bf16 projection reports the kernel, not a refusal."""
+    from dew.nn.kernels import generation
+
+    x, gate, scale = jnp.ones((2, 4, 128), jnp.float32), jnp.ones((2, 4, 128), jnp.bfloat16), jnp.ones((128,))
+    with generation.assumed("sm80"), generation.routes() as found:
+        jax.make_jaxpr(lambda x, gate, scale: gated_rms_normalized(
+            x, gate, scale, 1e-6, jnp.bfloat16, "silu"))(x, gate, scale)
+    (route,) = [route for route in found if route.choice == "rms_norm"]
+    assert (route.kernel, route.preferred, route.refusal) == ("pallas", "pallas", None)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -407,6 +512,108 @@ def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
             assert norm_swiglu.swiglu_kernel("pallas", gate, up) == "xla"
             np.testing.assert_array_equal(gated_product("swiglu", implementation="pallas")(gate, up),
                                           gated_product("swiglu", implementation="xla")(gate, up))
+
+
+@pytest.mark.parametrize("named", [None, "chosen", "call"])
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("packed", [False, True])
+def test_a_swiglu_takes_the_kernel_its_target_measured_at_its_width(dtype, named, packed):
+    """On an A100's row (`generation.assumed`), a bf16 SiLU product with no kernel named takes the
+    Pallas kernel the row measured, and an fp32 one, which no row measured and XLA fuses with its
+    neighbours, takes XLA as its own preference; a kernel named by `chosen` or per call runs at
+    either width. Each product, apart or packed, reports the route it took."""
+    from dew.nn.kernels import generation, norm_swiglu
+
+    operands = (jnp.ones((2, 2, 4096), dtype),) if packed else (jnp.ones((2, 4096), dtype),) * 2
+    resolve = norm_swiglu.packed_swiglu_kernel if packed else norm_swiglu.swiglu_kernel
+    kernel = "pallas" if named or dtype == jnp.bfloat16 else "xla"
+    named_by = generation.chosen(swiglu="pallas") if named == "chosen" else contextlib.nullcontext()
+    with generation.assumed("sm80"), named_by, generation.routes() as found:
+        assert resolve("pallas" if named == "call" else "auto", *operands) == kernel
+    (route,) = found
+    assert (route.kernel, route.preferred, route.refusal) == (kernel, kernel, None)
+
+
+@pytest.mark.parametrize("width, dtype, code, row", [
+    (9000, jnp.bfloat16, "width", "ledger 820"),
+    (64, jnp.float16, "fp16", "ledger 823")])
+def test_a_norm_the_kernel_refuses_reports_the_requirement_and_its_row(width, dtype, code, row):
+    """On an A100, a norm the fused kernel does not take runs XLA's arithmetic and reports the
+    requirement it fails (`norm_swiglu.NORM_SUPPORTS`) with the roadmap row that tracks lifting it, or
+    'inherent' where no implementation of the kernel would (`tools/kernel_routes.verdict`); a kernel
+    forced by `chosen` raises naming it, as every selector's forced kernel does."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import KernelRefused
+
+    x = jnp.ones((4, width), dtype)
+    with generation.assumed("sm80"), generation.routes() as found:
+        assert norm_swiglu.rms_kernel("auto", x, None, dtype, fp32_statistics=True) == "xla"
+    (route,) = found
+    assert (route.kernel, route.preferred) == ("xla", "pallas")
+    assert (route.refusal.code, route.refusal.row) == (code, row)
+    forced = generation.chosen(rms_norm="pallas")
+    with generation.assumed("sm80"), forced, pytest.raises(KernelRefused) as refused:
+        norm_swiglu.rms_kernel("auto", x, None, dtype, fp32_statistics=True)
+    assert code in {refusal.code for refusal in refused.value.refusals}
+
+
+@pytest.mark.parametrize("dtypes, code, row", [
+    ((jnp.float32, jnp.bfloat16), "matching", "inherent"), ((jnp.float16, jnp.float16), "fp16", "ledger 823"),
+    ((jnp.float64, jnp.float64), "precision", "inherent")])
+def test_a_swiglu_the_kernel_refuses_names_the_requirement_its_dtypes_fail(dtypes, code, row):
+    """On an A100, a SiLU product named per call onto the kernel runs XLA where its operands' dtypes
+    are not the kernel's, naming what they fail: mixed operands the kernel's one-dtype read, fp16 its
+    qualification (ledger 823), float64 the fp32 the kernel computes in."""
+    from dew.nn.kernels import generation
+
+    with jax.enable_x64(new_val=True):
+        gate, up = (jnp.ones((2, 64), dtype) for dtype in dtypes)
+        with generation.assumed("sm80"), generation.routes() as found:
+            assert norm_swiglu.swiglu_kernel("pallas", gate, up) == "xla"
+    (route,) = found
+    assert (route.refusal.code, route.refusal.row) == (code, row)
+
+
+def test_a_weak_scalar_gate_over_a_bf16_up_takes_the_kernel_its_promotion_prefers():
+    """A weak fp32 scalar gate over a strongly typed bf16 up promotes to bf16 under strict promotion,
+    as the operands' own product does, so the preference reads bf16's row (the kernel on an A100),
+    where promoting the two dtypes alone would raise."""
+    from dew.nn.kernels import generation
+
+    gate, up = jnp.asarray(1.0), jnp.ones((2, 64), jnp.bfloat16)
+    with jax.numpy_dtype_promotion("strict"), generation.assumed("sm80"), generation.routes() as found:
+        assert norm_swiglu.swiglu_kernel("auto", gate, up) == "xla"
+    (route,) = found
+    assert route.preferred == "pallas"
+
+
+@pytest.mark.parametrize("operand", ["scale", "gate"])
+def test_a_norms_fp16_weight_or_gate_cites_the_fp16_qualification(operand):
+    """A bf16 norm whose weight or gate is fp16 runs XLA on an A100, refused by the fp16 qualification
+    (ledger 823), not by the operand's shape."""
+    from dew.nn.kernels import generation
+
+    x, other = jnp.ones((4, 64), jnp.bfloat16), jnp.ones((4, 64), jnp.float16)
+    with generation.assumed("sm80"), generation.routes() as found:
+        if operand == "scale":
+            assert norm_swiglu.rms_kernel("auto", x, other[0], jnp.bfloat16, fp32_statistics=True) == "xla"
+        else:
+            assert norm_swiglu.gated_rms_kernel("auto", x, other, None, jnp.bfloat16, "silu") == "xla"
+    (route,) = found
+    assert (route.refusal.code, route.refusal.row) == ("fp16", "ledger 823")
+
+
+def test_a_swiglu_of_a_bf16_gate_over_an_fp32_up_is_an_fp32_product_xla_takes():
+    """Gemma-4's per-layer input gates a bf16 projection over its fp32 input: an fp32 product, which
+    XLA fuses (`_swiglu_preferred`), so on an A100 it takes XLA as its own preference, reporting no
+    refusal, and computes as XLA's product does."""
+    from dew.nn.kernels import generation
+
+    gate, up = jnp.ones((2, 63, 8), jnp.bfloat16), jnp.ones((2, 63, 8), jnp.float32)
+    with generation.assumed("sm80"), generation.routes() as found:
+        assert norm_swiglu.swiglu_kernel("auto", gate, up) == "xla"
+    (route,) = found
+    assert (route.kernel, route.preferred, route.refusal) == ("xla", "xla", None)
 
 
 @pytest.mark.gpu
@@ -472,12 +679,114 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
         assert relative(mine, theirs) < 1e-6
 
 
-def test_norm_jvp_without_a_context_uses_xla():
+def fused_function(name, implementation):
+    """A fused kernel's public function by `name`, over (x, other, scale) or (gate, up), its operands
+    `fused_operands`: each of the norms, the inverse-rounded one and a gated one without a weight
+    ('weightless') among them, and both SiLU products."""
+    if name == "swiglu":
+        return gated_product("swiglu", implementation=implementation)
+    if name == "packed":
+        return lambda gate, up: packed_gated_product("swiglu", implementation=implementation)(
+            jnp.stack([gate, up], -2))
+    if name == "rms":
+        return lambda x, other, scale: rms_normalized(x, scale, 1e-5, x.dtype, scale_offset=True,
+                                                      scale_after_cast=True, fp32_statistics=True,
+                                                      implementation=implementation)
+    if name == "stream":
+        return lambda x, other, scale: stream_rms_normalized(
+            x, other, scale, 1e-5, x.dtype, scale_offset=False, scale_after_cast=False, fp32_statistics=True,
+            implementation=implementation)
+    if name == "unweighted":
+        return lambda x, other, scale: attention.unweighted_rmsnorm(x, 1e-6, implementation=implementation)
+    return lambda x, other, scale: gated_rms_normalized(x, other, scale, 1e-6, x.dtype, "silu",
+                                                        implementation=implementation)
+
+
+def fused_operands(name, dtype):
+    """`fused_function(name)`'s operands at `dtype`, a bf16 weight where the norm takes one."""
+    first, second = (jax.random.normal(jax.random.key(index), (4, 96)).astype(dtype) for index in (76, 77))
+    if name in ("swiglu", "packed"):
+        return first, second
+    if name == "weightless":
+        return first, second, None
+    return first, second, (0.7 + 0.2 * jax.random.normal(jax.random.key(79), (96,))).astype(jnp.bfloat16)
+
+
+@pytest.mark.parametrize("composition", ["jvp_grad", "grad_jvp", "jvp_staged", "vmap_grad"])
+@pytest.mark.parametrize("name, dtype", [("swiglu", jnp.bfloat16), ("packed", jnp.float32),
+                                         ("rms", jnp.bfloat16), ("stream", jnp.float32),
+                                         ("unweighted", jnp.bfloat16), ("gated", jnp.float32),
+                                         ("weightless", jnp.bfloat16)])
+def test_a_fused_kernel_differentiates_at_every_order_through_its_portable_arithmetic(name, dtype,
+                                                                                     composition):
+    """Each fused norm and SiLU product (interpreted here) differentiated at a second order, forward
+    over reverse and reverse over forward, staged by a jit, and a gradient mapped over rows, by the
+    first operand alone and under a score that squares the output, so the cotangent varies: each is the
+    portable arithmetic's own composition, within the float64 gate of it, while the first level's value
+    and, where the composition takes a gradient of the call, its backward run the kernels."""
+    operands = fused_operands(name, dtype)
+    tangent = jax.random.normal(jax.random.key(78), operands[0].shape).astype(dtype)
+
+    def composed(implementation):
+        fused = fused_function(name, implementation)
+
+        def score(first, *rest):
+            out = fused(first, *rest)
+            return sum(jnp.square(leaf.astype(jnp.float32)).sum() for leaf in jax.tree.leaves(out))
+
+        def run(first, tangent, *rest):
+            if composition == "jvp_grad":
+                return jax.jvp(lambda first: jax.grad(score)(first, *rest), (first,), (tangent,))[1]
+            if composition == "grad_jvp":
+                def along(first):
+                    return jax.jvp(lambda first: score(first, *rest), (first,), (tangent,))[1]
+
+                return jax.grad(along)(first)
+            if composition == "jvp_staged":
+                return jax.jvp(jax.jit(lambda first: fused(first, *rest)), (first,), (tangent,))[1]
+            # The rows map, a norm's weight is every row's.
+            return jax.vmap(jax.grad(score), in_axes=(0, 0, None)[:1 + len(rest)])(first, *rest)
+
+        return run
+
+    forward = "swiglu_forward" if name in ("swiglu", "packed") else "rms_norm_forward"
+    launched = kernels(composed("pallas"), operands[0], tangent, *operands[1:])
+    assert forward in launched
+    if composition in ("jvp_grad", "vmap_grad"):
+        assert forward.replace("forward", "backward") in launched
+    found = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
+                         jax.jit(composed("pallas"))(operands[0], tangent, *operands[1:]))
+    reference = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
+                             jax.jit(composed("xla"))(operands[0], tangent, *operands[1:]))
+    with jax.enable_x64(new_val=True):
+        wide = [None if leaf is None else jnp.asarray(np.asarray(leaf, np.float64))
+                for leaf in (operands[0], tangent, *operands[1:])]
+        truth = jax.tree.map(np.asarray, composed("xla")(*wide))
+    for mine, theirs, want in zip(jax.tree.leaves(found), jax.tree.leaves(reference), jax.tree.leaves(truth),
+                                  strict=True):
+        if np.array_equal(theirs, want):
+            # Exact by construction (a stream's tangent is its addends'): Dew must be exact too.
+            np.testing.assert_array_equal(mine, want)
+        else:
+            assert_as_exact_as_the_reference(mine, theirs, want, f"{name} {composition}")
+
+
+def test_a_fused_norms_jvp_is_its_kernels_value_and_the_portable_tangent():
+    """`jax.jvp` through the fused norm, with no forward-mode context, staged by a jit or not: its
+    value is the kernel's own output, and its tangent within the float64 gate of the XLA norm's
+    (`generation.linear_tangent`)."""
     x = jax.random.normal(jax.random.key(75), (2, 31))
-    xla, pallas, _ = norm_functions(jnp.float32, offset=True, after_cast=True)
-    for mine, theirs in zip(jax.jvp(lambda x: pallas(x, None), (x,), (x,)),
-                            jax.jvp(lambda x: xla(x, None), (x,), (x,)), strict=True):
-        np.testing.assert_array_equal(mine, theirs)
+    direction = jax.random.normal(jax.random.key(74), (2, 31))
+    xla, pallas, exact = norm_functions(jnp.float32, offset=True, after_cast=True)
+    fused = jax.jit(lambda x: pallas(x, None))
+    want = jax.jit(lambda x: jax.jvp(lambda x: xla(x, None), (x,), (direction,))[1])(x)
+    with jax.enable_x64(new_val=True):
+        truth = np.asarray(jax.jvp(lambda x: exact(x, None), (jnp.asarray(np.asarray(x, np.float64)),),
+                                   (jnp.asarray(np.asarray(direction, np.float64)),))[1])
+    for norm in (lambda x: pallas(x, None), fused):
+        value, tangent = jax.jvp(norm, (x,), (direction,))
+        np.testing.assert_array_equal(value, fused(x))
+        assert_as_exact_as_the_reference(np.asarray(tangent), np.asarray(want), truth, "jvp")
 
 
 # Same-session c53, A100-SXM4-40GB, Liger 0.8.4 / torch 2.11.0+cu130:

@@ -30,6 +30,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.nn.dense import Dense
+
 from ..attention import LayerNorm
 from ..dit import (
     ModulatedBlock,
@@ -248,8 +250,8 @@ class JepaPredictor(_JepaStackOptions):
                 + projection_flops(target_lengths, self.predictor_features, self.emb_features))
 
     def setup(self):
-        self.proj_in = nn.Dense(features=self.predictor_features, dtype=self.dtype,
-                                precision=self.precision, name="proj_in")
+        self.proj_in = Dense(features=self.predictor_features, dtype=self.dtype,
+                             precision=self.precision, name="proj_in")
         self.mask_token = self.param(
             "mask_token", nn.initializers.normal(0.02), (1, 1, self.predictor_features))
         stack = FactorizedTokenStack if self.factorized else TokenStack
@@ -258,8 +260,8 @@ class JepaPredictor(_JepaStackOptions):
             **self._stack_options(),
         )
         self.norm = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
-        self.proj_out = nn.Dense(features=self.emb_features, dtype=self.dtype,
-                                 precision=self.precision, name="proj_out")
+        self.proj_out = Dense(features=self.emb_features, dtype=self.dtype,
+                              precision=self.precision, name="proj_out")
 
     def __call__(self, context, context_idx, target_idx, train: bool = False):
         """Map context embeddings [B, (T,) N_ctx, F] to predictions [B, (T,) N_tgt, F]."""
@@ -283,7 +285,7 @@ class JepaPredictor(_JepaStackOptions):
         return _projected(self.proj_out, self.norm(tokens[..., -num_target_tokens:, :]))
 
 
-def _projected(dense: nn.Dense, x: jax.Array) -> jax.Array:
+def _projected(dense: Dense, x: jax.Array) -> jax.Array:
     """`dense(x)` over `[batch, ..., tokens, width]`, run where
     `down_projection` places a projection of `x` to `dense.features`: its
     positions spread over the tensor axis, or whole on every shard."""

@@ -14,6 +14,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.dense import Dense
 from dew.objectives.base import merge
 
 from ..attention import NormalAttention, RMSNorm
@@ -64,7 +65,7 @@ class TemporalBlock(nn.Module):
             name="temporal_attention",
         )(h, freqs_cis=freqs_cis)
         # zero-init gate: identity at init, so inflation preserves the 2D model
-        h = nn.Dense(
+        h = Dense(
             features=C, dtype=self.dtype, precision=self.precision,
             kernel_init=nn.initializers.zeros, name="temporal_out")(h)
 
