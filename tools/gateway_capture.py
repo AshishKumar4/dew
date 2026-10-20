@@ -22,7 +22,8 @@ request Dew sends and the engine's answer, for a chat prompt the model answers i
 ends on its own EOS: under a policy with no stop, one that stops at the model's EOS, and one that
 stops at a token the model draws after its EOS (the first such seed's). Write them as
 `{engine}_stops.json` with the model's EOS ids and what each draw gave: its ids and whether it
-ended on a stop, or the error Dew raised.
+ended on a stop, or the error Dew raised. It also records the engine's raw answer to a draw from
+the same seed that stops at a string its answer reaches (`stop_strings`).
 """
 
 from __future__ import annotations
@@ -56,6 +57,9 @@ TOOLS = [{"type": "function", "function": {
     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}]
 KEPT = ("prompt_token_ids", "completion_token_ids", "logprobs", "finish_reason", "weight_version", "timestamp",
         "latency_ms")
+RETURN_IDS = {"vllm": {"return_tokens_as_token_ids": True, "return_token_ids": True},
+              "sglang": {"return_token_ids": True}}
+"""The fields that make each engine's completions route answer with its sampled ids."""
 STOPS_BUDGET = 48
 """Tokens a stops draw may take: the answer, its EOS and what the model draws after it."""
 
@@ -211,12 +215,26 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
             server.close()
         return {"eos": eos, "seed": seed, "exchanges": list(proxy.exchanges), **outcome}
 
+    def raw(seed: int, stop: str) -> dict:
+        """The engine's own answer, through the proxy, to a draw from the same seed that stops at the
+        string `stop`: which ids it returns and how it says the string matched."""
+        proxy.exchanges.clear()
+        httpx.post(f"http://{PROXY[0]}:{PROXY[1]}/v1/completions", timeout=900, json={
+            "model": MODEL, "prompt": [list(prompt)], "max_tokens": STOPS_BUDGET, "temperature": 1.0,
+            "seed": seed, "logprobs": 0, "stop": [stop], **RETURN_IDS[name]})
+        return {"stop": stop, "seed": seed, "exchanges": list(proxy.exchanges)}
+
+    draws: list[dict] = []
+    stopped: list[dict] = []
     with served(name, bin, out):
         try:
             # The first seed whose unstopped draw ends its answer on the model's EOS and goes on to a
             # token that is no EOS, which the third policy stops at.
             for seed in range(16):
                 unstopped = draw(None, seed)
+                if "tokens" not in unstopped:
+                    draws.append(unstopped)
+                    raise RuntimeError(f"{name} refused a draw without stops: {unstopped['refused']}")
                 after = next((index for index, token in enumerate(unstopped["tokens"][:-1]) if token in native),
                              None)
                 later = [] if after is None else [token for token in unstopped["tokens"][after + 1:]
@@ -226,11 +244,16 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
             else:
                 raise RuntimeError(f"{name} drew no token past its EOS in 16 seeds")
             draws = [unstopped, draw(native[0], seed), draw(later[0], seed)]
+            # A stop string the same seed's answer reaches a few tokens in.
+            pieces = [tokenizer.decode([token]).strip() for token in unstopped["tokens"][2:after]]
+            stop = next((piece for piece in pieces if piece), None)
+            if stop is not None:
+                stopped.append(raw(seed, stop))
         finally:
             proxy.shutdown()
-    (out / f"{name}_stops.json").write_text(json.dumps(
-        {"engine": name, "model": MODEL, "native_eos": native, "prompt": prompt, "budget": STOPS_BUDGET,
-         "draws": draws}, indent=1))
+            (out / f"{name}_stops.json").write_text(json.dumps(
+                {"engine": name, "model": MODEL, "native_eos": native, "prompt": prompt, "budget": STOPS_BUDGET,
+                 "draws": draws, "stop_strings": stopped}, indent=1))
 
 
 def _answers(url: str) -> bool:
