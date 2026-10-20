@@ -43,7 +43,7 @@ from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import compensated_sum
 from dew.nn.protocols import HiddenStates, ProjectsParameters
-from dew.records import JSON
+from dew.records import JSON, strings
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -55,7 +55,9 @@ if TYPE_CHECKING:
     from dew.data.text import Tokenizer
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
     from dew.inputs import InputSpec
+    from dew.nn.autoencoders import AutoEncoder
     from dew.nn.backbones.decoder_stack import DecoderBank
+    from dew.sampling.guidance import Guidance
     from dew.sampling.pipelines import TextToImage
     from dew.training.distributed import Layout, MeshSpec
     from dew.training.state import TrainState
@@ -131,6 +133,16 @@ class Step:
     or None when the objective keeps no EMA."""
     training: bool = struct.field(pytree_node=False, default=True)
     """Whether model calls train; static so compiled losses can branch on the mode."""
+    committed: jax.Array | None = None
+    """The updates the run committed before this step's (`TrainState.updates`), or None for a
+    step made outside a run (`updates`)."""
+
+    @property
+    def updates(self) -> jax.Array:
+        """The updates committed before this step's: the clock of an objective that alternates its
+        networks update by update, which an update's accumulated microbatches share. A step made
+        outside a run, where each step is its own update, counts its `step`."""
+        return self.step if self.committed is None else self.committed
 
 
 ROUNDING_STREAM = 0x726F756E
@@ -293,6 +305,25 @@ def merge(tree: Variables, overlay: Variables) -> Variables:
 
 TEACHER = "teacher"
 """The collection of a distilling objective's frozen teacher variables."""
+
+UNREAD = "unread"
+"""The field of an inference record naming the parts of the run's tree its model does not read
+(`without`), which a loader leaves unrestored (`Objective._saved_variables`): a distillation's
+teacher and projections beside the student it saves."""
+
+
+def without(tree: Variables, paths: Sequence[Sequence[str]]) -> Variables:
+    """`tree` without the subtree at each of `paths`, a path the tree does not hold left as it is."""
+    kept = dict(tree)
+    for path in paths:
+        name, *rest = path
+        if name in kept:
+            if rest:
+                held = kept[name]
+                kept[name] = without(held, [rest]) if isinstance(held, Mapping) else held
+            else:
+                del kept[name]
+    return kept
 
 FROZEN = "frozen"
 """The name of the collection where a partially trained run keeps its frozen weights.
@@ -534,8 +565,7 @@ class Objective(ABC, Generic[Loss, Effects]):
     can say: a diffusion objective samples with a loaded pipeline's own
     guidance, else its fallback (`RunConfig.recorded`)."""
 
-    def optimizer(self, tx: optax.GradientTransformation, *,
-                  accumulation: int) -> optax.GradientTransformation:
+    def optimizer(self, tx: optax.GradientTransformation) -> optax.GradientTransformation:
         """Return the optimizer the trainer steps this objective's `params` with, built from `tx`.
 
         The default returns `tx` itself. An objective that trains several
@@ -543,12 +573,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         that critiques it, can give each network its own copy of `tx`, with
         its own state and update count, by `optax.multi_transform` over the
         networks. It can then alternate them with `optax.conditionally_mask`,
-        whose count is the trainer's number of committed updates.
-
-        `accumulation` is the trainer's setting. An objective whose loss
-        alternates networks from one update to the next refuses more than one
-        microbatch per update, because an accumulation window would mix the
-        phases.
+        whose count is the trainer's number of committed updates, the clock
+        its loss reads as `Step.updates`: every microbatch an update
+        accumulates is of that update's phase, however many it takes.
         """
         return tx
 
@@ -593,8 +620,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return self.variables
 
-    counts_tokens: ClassVar[bool] = False
-    """Whether the objective supplies real token lengths for throughput telemetry."""
+    counts_tokens: bool = False
+    """Whether the objective supplies real token lengths (`real_lengths`), for throughput telemetry
+    and a run whose length is its tokens (`Trainer.fit(tokens=)`); an objective over another's
+    batches, a distillation's, counts as that one does."""
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real row (or packed-segment) lengths, read before device placement.
@@ -730,7 +759,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         return tree
 
     def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
-                holds: tuple[DeviceStep, ...] = ()):
+                holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (),
+                modules: tuple[nn.Module, ...] = ()):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
 
@@ -740,8 +770,11 @@ class Objective(ABC, Generic[Loss, Effects]):
         alone cannot identify those programs, nor can they the pipeline's microbatch count, the
         layout's rules or the links a model decides from. `name` names everything else the program
         fixes. `holds` are the objects `function` runs beyond the modules, as the device steps a host
-        step runs: the program is reused only while they are the same objects, and one over others
-        replaces it. Keep only the current specialization, not a history of old models or steps.
+        step runs or a sample's guidance and autoencoder, whose numbers it bakes in: the program is
+        reused only while they are the same objects, and one over others replaces it. `modules` are
+        the networks it runs beside the objective's own, an autoguide's or an autoencoder's: they key
+        it as `holds` do, and its options cover them. Keep only the current specialization, not a
+        history of old models or steps.
         """
         programs = tuple((program.module, (program.head_tile, program.head_fused))
                          for program in self.program_key())
@@ -753,17 +786,18 @@ class Objective(ABC, Generic[Loss, Effects]):
             self._program_cache = cached
         from dew.nn.sharding import trace_context
         # The options follow where the program runs (`compiler_options`), so they key it too.
-        options = compiler_options(*(module for module, _ in programs))
+        options = compiler_options(*(module for module, _ in programs), *modules)
         key = (name, trace_context(), tuple(options.items()))
         held = cached[1].get(key)
-        if held is None or len(held[0]) != len(holds) or any(
-                now is not was for now, was in zip(holds, held[0], strict=True)):
+        kept = (*holds, *modules)
+        if held is None or len(held[0]) != len(kept) or any(
+                now is not was for now, was in zip(kept, held[0], strict=True)):
             # A fresh callable gives JAX a fresh trace even for the same bound method.
             @functools.wraps(function)
             def run(*args, **kwargs):
                 return function(*args, **kwargs)
 
-            held = (holds, jax.jit(run, static_argnames=static_argnames, compiler_options=options))
+            held = (kept, jax.jit(run, static_argnames=static_argnames, compiler_options=options))
             cached[1][key] = held
         return held[1]
 
@@ -1103,9 +1137,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         from dew.checkpoints import Checkpoints
 
         with Checkpoints(directory) as checkpoints:
+            step = checkpoints.pinned(step)
+            record = checkpoints.artifact(step)
+            unread = record.get(UNREAD, []) if isinstance(record, Mapping) else []
+            if not isinstance(unread, list):
+                raise ValueError(f"{UNREAD} must be a list of paths")
             variables = checkpoints.variables(
                 step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
-                param_dtype=param_dtype, parameter_roots=parameter_roots)
+                param_dtype=param_dtype, parameter_roots=parameter_roots,
+                unread=tuple(strings(path, UNREAD) for path in unread))
         return cls._model_tree(variables)
 
     @classmethod
