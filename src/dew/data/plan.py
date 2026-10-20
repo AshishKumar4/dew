@@ -11,7 +11,8 @@ import logging
 import platform
 import re
 import subprocess
-from collections.abc import Callable, Mapping, Sequence
+import types
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
@@ -162,8 +163,8 @@ def _configuration(step: DataclassInstance) -> dict[str, JSON]:
     return configured
 
 
-type StepField = (JSON | np.ndarray | jax.Array | np.generic | DataclassInstance | Callable[..., object]
-                  | Sequence[StepField] | Mapping[str, StepField])
+type StepField = (JSON | np.ndarray | jax.Array | np.generic | DataclassInstance | types.FunctionType
+                  | types.BuiltinFunctionType | Sequence[StepField] | Mapping[str, StepField])
 """The width of what a frozen step's field holds, as `_configured` reads it: any other value is
 recorded by its repr."""
 
