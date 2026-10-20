@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 import jax
 import numpy as np
 
+from dew.data.sources.codec import content_fingerprint
 from dew.records import JSON, json_value, record
 
 _log = logging.getLogger(__name__)
@@ -164,9 +165,9 @@ def _configuration(step: DataclassInstance) -> dict[str, JSON]:
 
 
 type StepField = (JSON | np.ndarray | jax.Array | np.generic | DataclassInstance | types.FunctionType
-                  | types.BuiltinFunctionType | Sequence[StepField] | Mapping[str, StepField])
-"""The width of what a frozen step's field holds, as `_configured` reads it: any other value is
-recorded by its repr."""
+                  | types.BuiltinFunctionType | slice | Path | Sequence[StepField] | Mapping[str, StepField])
+"""The width of what a frozen step's field holds, as `_configured` reads it: any value past it reads
+as its repr, as one within it that holds no array does."""
 
 
 def _configured(value: StepField) -> JSON:
@@ -182,7 +183,8 @@ def _configured(value: StepField) -> JSON:
         if isinstance(value, Mapping):
             return {repr(name): _configured(entry) for name, entry in value.items()}
         if isinstance(value, (np.ndarray, jax.Array)):
-            return {"array": fingerprint(np.asarray(value))}
+            # Its dtype by name and structure, which a dtype's code (`|V1` for both float8s) is not.
+            return {"array": content_fingerprint(np.asarray(value)).hex()}
     return re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))
 
 

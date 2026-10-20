@@ -998,22 +998,45 @@ def test_a_token_mixture_weighs_a_cropped_corpus_by_the_targets_left_after_the_c
     assert abs(left - right) <= sum(int(Scored(role)(row)["targets"]) for row in rows)
 
 
+@dataclasses.dataclass(frozen=True)
+class Sourced:
+    """Labels a row with its corpus, which a windows or pack stage leaves out of its windows."""
+
+    source: int
+
+    def __call__(self, row):
+        return {**row, "source": np.int32(self.source)}
+
+
 @pytest.mark.parametrize("stage", ["windows", "pack"])
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-def test_a_corpus_counted_before_its_windows_reads_the_windows_and_their_targets(read, stage):
-    """Targets counted on each document (`CountTargets`) before a windows or pack stage cuts it into
-    more rows than it had describe none of those rows: the read gives each window and the corpus
-    the windows' targets, all of the documents' that a window scores."""
+def test_a_token_mixture_weighs_windows_by_the_rule_their_documents_were_counted_by(read, stage):
+    """Targets counted on documents by a role's rule (`CountTargets(role=1)`) before a windows or
+    pack stage cuts them into more rows than they had are counted again on the windows by that
+    rule: two corpora whose documents score three and nine role-1 targets deliver equal scored
+    targets, to within one window of each (`delivered`)."""
     from dew.data.steps.text import CountTargets
 
-    counted = Pipeline(roled(0, 25, 22, count=4), name="long").filter_map(CountTargets())
-    staged = counted.windows(8) if stage == "windows" else counted.pack(8, policy="concat")
-    stream = compile(staged.batch(1), read=read, loading=READ).train(DataPartition())
-    try:
-        windows = [next(stream)["text"] for _ in range(8)]
-    finally:
-        stream.close()
-    assert all(np.shape(window)[-1] >= 8 for window in windows)
+    def corpus(source, scored):
+        counted = Pipeline(roled(source, 25, scored), name=str(source)).filter_map(CountTargets(role=1))
+        fields = ("text", "text_roles")
+        staged = counted.windows(8, fields=fields) if stage == "windows" else counted.pack(
+            8, fields=fields, policy="concat")
+        return staged.map(Sourced(source))
+
+    left, right = delivered([corpus(0, 3), corpus(1, 9)], 1, read)
+    assert abs(left - right) <= 8 + 8
+
+
+def test_windows_that_drop_the_roles_their_documents_were_counted_in_are_refused():
+    """A windows stage that leaves out the roles a count was taken in (`CountTargets(role=1)`) gives
+    windows no rule can count again, and a memory read refuses them before any batch."""
+    from dew.data.steps.text import CountTargets
+
+    counted = Pipeline(roled(0, 25, 3), name="dropped").filter_map(CountTargets(role=1))
+    with pytest.raises(ValueError):
+        compile(mix([counted.windows(8).map(Sourced(0)).repeat()], by="tokens").batch(2), read="memory",
+                loading=READ).train(DataPartition())
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])

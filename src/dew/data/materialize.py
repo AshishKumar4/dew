@@ -203,9 +203,10 @@ def _memory_stages(
                 tuple(record(value, "window document") for _, value in rows), stage
             )
             derived["windows"] = fingerprint([windows.size, stage.seq_len, stage.stride])
+            rule = _count_rule(rows)
             rows, targets = _targeted([((index,), windows[index]) for index in range(len(windows))], counter,
                                       stage.fields[0])
-            counted = _recounted(rows, stage.fields[0], counted)
+            counted = _recounted(rows, stage.fields[0], counted, rule)
         elif isinstance(stage, Pack):
             from dew.data.packing import _Held, _PackedRows, refuse_overlong
 
@@ -213,6 +214,7 @@ def _memory_stages(
                 [list(identifier) for identifier, _ in rows]
             )
             kept = Fields(stage.packed)
+            rule = _count_rule(rows)
             documents = tuple(kept.map(record(value, "packing document")) for _, value in rows)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
             refuse_overlong(sizes, stage, source.describe())
@@ -237,7 +239,7 @@ def _memory_stages(
             ids = f"{stage.fields[0]}_segment_ids"
             documents = max((int(np.asarray(record(value, "packed window")[ids]).max(initial=0))
                              for _, value in rows), default=0)
-            counted = _recounted(rows, stage.fields[0], counted)
+            counted = _recounted(rows, stage.fields[0], counted, rule)
         else:
             expanded: list[tuple[tuple[int, ...], Record]] = []
             expanded_counts: dict[tuple[int, ...], int] = {}
@@ -273,14 +275,33 @@ def _memory_stages(
                          documents)
 
 
+def _count_rule(rows: list[tuple[tuple[int, ...], Record]]) -> tuple[int | None, int | None]:
+    """The role and pad id the documents' targets were counted by (`CountTargets`), which a pack or
+    windows stage drops with the rest of their bookkeeping; none where nothing counted them.
+    Documents counted by two rules are refused: their windows' targets have no one rule."""
+    rules = {(value.get("_dew_target_role"), value.get("_dew_target_pad")) for _, value in rows
+             if isinstance(value, Mapping) and "_dew_valid_targets" in value}
+    if len(rules) > 1:
+        raise ValueError(f"the documents' targets were counted by {len(rules)} rules, (role, pad_id) "
+                         f"{sorted(rules, key=repr)}, and the windows made of them hold one")
+    return next(iter(rules), (None, None))
+
+
 def _recounted(rows: list[tuple[tuple[int, ...], Record]], field: str,
-               counted: dict[tuple[int, ...], int] | None) -> dict[tuple[int, ...], int] | None:
+               counted: dict[tuple[int, ...], int] | None,
+               rule: tuple[int | None, int | None]) -> dict[tuple[int, ...], int] | None:
     """Where the documents' targets were counted (`counted`), those of the windows a pack or
-    windows stage made of them, by the windows' own ids: a document's count describes no window,
-    and its id names another one."""
+    windows stage made of them, by the windows' own ids and the documents' rule (`_count_rule`):
+    a document's count describes no window, and its id names another one."""
     if counted is None:
         return None
-    return {identifier: ValidTargets(field)(record(value, "packed window")) for identifier, value in rows}
+    role, pad_id = rule
+    roles = f"{field}_roles"
+    if role is not None and any(roles not in record(value, "packed window") for _, value in rows):
+        raise ValueError(f"the documents' targets were counted in role {role}, and the windows made of "
+                         f"them drop {roles!r}; keep it among the stage's fields")
+    count = ValidTargets(field, role=role, pad_id=pad_id, measured=False)
+    return {identifier: count(record(value, "packed window")) for identifier, value in rows}
 
 
 def _targeted(

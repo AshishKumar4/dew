@@ -11,10 +11,10 @@ import numpy as np
 
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
-from dew.data.sources.base import TOKENIZER_CONTRACT, Read, Shard, ShardManifest, Source, _consumed
+from dew.data.sources.base import _COUNTS, Read, Shard, ShardManifest, Source, _consumed, tokenizer_contract
 from dew.records import integer
 
-COUNTED = ("rows", "valid_targets", "held_out")
+COUNTED = (*_COUNTS, "held_out")
 """The facts that count a store's records, which a concatenation's sources add."""
 
 
@@ -52,23 +52,20 @@ class Concatenate(Dataset):
 
     def metadata(self) -> Mapping[str, object]:
         """What every source states of its records, as one store's: the counts (`COUNTED`) added
-        where each source states one, the tokenizer contract (`TOKENIZER_CONTRACT`) where the
-        sources that state it agree, and any other fact, class names among them, where every
-        source states the one value. Sources that state two tokenizer contracts make no one
-        store, and are refused."""
+        where each source states one, the tokenizer contract where the sources that state it agree
+        (`tokenizer_contract`, which refuses two), and any other fact, class names among them,
+        where every source states the one value."""
         stated = [source.metadata() for source in self.sources]
-        facts: dict[str, object] = {}
+        contract = tokenizer_contract((source.describe(), facts)
+                                      for source, facts in zip(self.sources, stated, strict=True))
+        facts: dict[str, object] = dict(contract)
         for key in dict.fromkeys(key for given in stated for key in given):
             values = [given[key] for given in stated if key in given]
             if key in COUNTED:
                 if len(values) == len(stated) and all(isinstance(value, int) for value in values):
                     facts[key] = sum(integer(value, key) for value in values)
-            elif any(value != values[0] for value in values):
-                if key in TOKENIZER_CONTRACT:
-                    raise ValueError(f"{self.describe()} joins stores of {key} {values[0]!r} and "
-                                     f"{next(value for value in values if value != values[0])!r}, whose "
-                                     "token ids mean different things")
-            elif key in TOKENIZER_CONTRACT or len(values) == len(stated):
+            elif key not in contract and len(values) == len(stated) and all(
+                    value == values[0] for value in values):
                 facts[key] = values[0]
         return facts
 
