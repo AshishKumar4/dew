@@ -304,6 +304,17 @@ def runtime_facts(target: GpuTarget, device) -> GpuTarget:
                                wgmma=capability == '9.0' if capability else target.wgmma)
 
 
+SHARED_BUDGET = 99 * 1024
+"""The shared memory a block holds where a target reports none: the least of any CUDA GPU Dew's Pallas
+launches run on (sm86, sm89 and sm120 hold 99 KiB), so a launch sized by it fits wherever it runs."""
+
+
+def shared_budget(target: GpuTarget) -> int:
+    """The shared memory, in bytes, a program on `target` may stage: the block's own, which a real
+    device reports (`runtime_facts`), else `SHARED_BUDGET`."""
+    return target.shared_limit or SHARED_BUDGET
+
+
 def fp8_tensor_cores(generation: str) -> bool:
     """Whether a CUDA generation's tensor cores multiply FP8: compute capability 8.9 (Ada) and later."""
     found = capability(generation)
