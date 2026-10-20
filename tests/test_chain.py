@@ -179,7 +179,7 @@ def test_a_grpo_stage_scores_decoded_text_and_stops_at_the_tokenizer_eos(tmp_pat
                        logits=functools.partial(leaning, tokenizer.vocab_size, letter, tokenizer.eos_id))
     read = []
 
-    def reward(source, text, truth, info):
+    def reward(text, record):
         read.append(text)
         return float(len(text))
 
