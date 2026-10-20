@@ -1039,23 +1039,28 @@ def test_an_expert_gated_product_rounds_its_projections_and_product_under_jit(ac
     projection's rounding survives, and a down projection that hands the
     product out unchanged: on the fixture's g and u the MLP's output must be
     Torch's product, and over drawn ones its input's gradient as exact as
-    Torch's arithmetic (`_torch_gated_gradients`) by the float64 gate: the
-    fused kernel rounds the gate's gradient once from fp32, where Torch
-    rounds the cotangent first."""
+    Torch's (`_torch_gated_gradients`) by the float64 gate: the fused kernel
+    rounds the gate's gradient once from fp32, where Torch rounds the
+    cotangent first."""
     from reference_error import assert_as_exact
 
     fixture = np.load(Path(__file__).parent / "fixtures" / "gated_product" / "bf16.npz")
-    gate, up, cotangent, output = (
+    gate, up, cotangent, output, d_gate, d_up = (
         np.asarray(fixture[f"{activation}/{key}"], np.float32).reshape(GATED_SHAPE)
-        for key in ("gate", "up", "cotangent", "output"))
+        for key in ("gate", "up", "cotangent", "output", "d_gate", "d_up"))
+    fixed = tuple(jnp.asarray(value, jnp.bfloat16) for value in (gate, up, cotangent))
     expert = _expert_gated(activation)
-    out, _ = jax.jit(expert)(*(jnp.asarray(value, jnp.bfloat16) for value in (gate, up, cotangent)))
+    out, _ = jax.jit(expert)(*fixed)
     np.testing.assert_array_equal(np.asarray(out, np.float32),
                                   np.hstack([output] + [np.zeros_like(output)] * 3), err_msg="output")
+    reference = functools.partial(_torch_gated_gradients, activation)
+    # The reference arm is Torch's own: on the fixture it gives the gradients Torch recorded there.
+    for got, want in zip(reference(*fixed), (d_gate, d_gate, d_up, d_up), strict=True):
+        np.testing.assert_array_equal(np.asarray(got, np.float32), want)
 
     def draw(seed):
         if seed == 0:
-            return tuple(jnp.asarray(value, jnp.bfloat16) for value in (gate, up, cotangent))
+            return fixed
         rng = np.random.default_rng(seed)
         # The fixture's laws: gate 3 N(0, 1), up and cotangent N(0, 1).
         return tuple(jnp.asarray(scale * rng.standard_normal(GATED_SHAPE), jnp.bfloat16)
@@ -1067,16 +1072,16 @@ def test_an_expert_gated_product_rounds_its_projections_and_product_under_jit(ac
         d_gate, d_up = jax.grad(lambda gate, up: jnp.sum(activated(gate) * up * cotangent), (0, 1))(gate, up)
         return d_gate, d_gate, d_up, d_up
 
-    assert_as_exact(jax.jit(lambda *inputs: _blocks(expert(*inputs)[1])),
-                    jax.jit(functools.partial(_torch_gated_gradients, activated)), draw,
+    assert_as_exact(jax.jit(lambda *inputs: _blocks(expert(*inputs)[1])), reference, draw,
                     f"{activation} input gradient", seeds=GATED_SEEDS, truth_fn=truth)
 
 
 GATED_SHAPE = (16, 128)
 GATED_SEEDS = 8
-"""The gated product's declared draws (`reference_error.seeds_for` of Torch's arithmetic on them)."""
+"""The gated product's declared draws (`reference_error.seeds_for` of Torch's gradients on them)."""
 GATED_ACTIVATIONS = {"swiglu": jax.nn.silu, "geglu": functools.partial(jax.nn.gelu, approximate=True),
                      "geglu_exact": functools.partial(jax.nn.gelu, approximate=False)}
+"""Each gated activation's float64 truth."""
 
 
 def _expert_gated(activation):
@@ -1113,15 +1118,20 @@ def _blocks(dx):
     return tuple(jnp.split(dx, 4, axis=1))
 
 
-def _torch_gated_gradients(activated, gate, up, cotangent):
-    """Torch's gradients of a bf16 gated product, `activated(gate)` rounded to bf16 times up: the up's,
-    the cotangent times that rounded activation, rounded; the gate's, the cotangent times up rounded to
-    bf16 first, then times the activation's slope in fp32 and rounded (the reference's arithmetic,
-    tools/gated_product_reference.py), each in the gradient's four blocks."""
-    gate, up, cotangent = (value.astype(jnp.float32) for value in (gate, up, cotangent))
-    value, slope = jax.jvp(activated, (gate,), (jnp.ones_like(gate),))
-    d_up = (cotangent * value.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
-    d_gate = ((cotangent * up).astype(jnp.bfloat16).astype(jnp.float32) * slope).astype(jnp.bfloat16)
+def _torch_gated_gradients(activation, gate, up, cotangent):
+    """Torch's gradients of its bf16 gated product `act(gate) * up` (transformers' gated MLP, as
+    tools/gated_product_reference.py runs it), in the input gradient's four blocks."""
+    import torch
+    import torch.nn.functional as F
+
+    act = {"swiglu": F.silu, "geglu": functools.partial(F.gelu, approximate="tanh"),
+           "geglu_exact": F.gelu}[activation]
+    gate, up, cotangent = (torch.from_numpy(np.asarray(value, np.float32)).bfloat16()
+                           for value in (gate, up, cotangent))
+    gate.requires_grad_()
+    up.requires_grad_()
+    (act(gate) * up).backward(cotangent)
+    d_gate, d_up = (jnp.asarray(value.grad.float().numpy(), jnp.bfloat16) for value in (gate, up))
     return d_gate, d_gate, d_up, d_up
 
 
