@@ -343,6 +343,7 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table(page_size):
     gathered rows against float64: rows reading 1 key, a page, one past a
     block, and every page."""
     from dew.nn.kernels import decode_attention
+    from dew.nn.kv_cache import PAGED, PagedCase
 
     rng = np.random.default_rng(0)
     per_row, kv_heads, heads, width = 6, 8, 16, 128
@@ -355,7 +356,10 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table(page_size):
     query = jnp.asarray(rng.normal(size=(rows, heads, width)), jnp.bfloat16)
     key_pages = jnp.asarray(rng.normal(size=(kv_heads, count, page_size, width)) * 0.3, jnp.bfloat16)
     value_pages = jnp.asarray(rng.normal(size=(kv_heads, count, page_size, width)), jnp.bfloat16)
-    assert decode_attention.fits_paged(query, key_pages)
+    case = PagedCase(heads=heads, kv_heads=kv_heads, head_dim=width, value_dim=width, dtype=query.dtype,
+                     pool=key_pages.dtype, page_size=page_size, quantized=False, groups=1, head_shards=1,
+                     softcap=None, arithmetic=False, named="auto")
+    assert PAGED.kernel("triton").failed(case) == []
     out = jax.jit(decode_attention.attend_paged)(query, key_pages, value_pages, table, lengths)
     key, value = (jnp.moveaxis(pages[:, table].reshape(kv_heads, rows, capacity, width), 0, 2)
                   for pages in (key_pages, value_pages))

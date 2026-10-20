@@ -43,7 +43,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import backend
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Requirement
 from dew.nn.scatter import DROPPED
@@ -545,24 +545,11 @@ def _paged_layout(device: str) -> tuple[Requirement[PagedCase], ...]:
     )
 
 
-def _fits_triton(case: PagedCase) -> bool:
-    from dew.nn.kernels import decode_attention
-
-    group = case.heads // case.kv_heads
-    return (case.heads % case.kv_heads == 0 and group <= decode_attention.QUERIES
-            and case.head_dim & (case.head_dim - 1) == 0 and 16 <= case.head_dim <= 256
-            and case.page_size is not None and case.page_size & (case.page_size - 1) == 0
-            and case.page_size <= decode_attention.BLOCK)
-
-
 TRITON_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
     Requirement('capability', lambda case: generation.triton_runs(),
                 "the paged decode kernel needs a GPU of sm80 or later", inherent=True),
     *_paged_layout('GPU'),
-    Requirement('geometry', _fits_triton,
-                "the paged decode kernel reads at most `QUERIES` query heads a key head, a power-of-two "
-                "width from 16 to 256 and a power-of-two page of at most `BLOCK` keys",
-                row='roadmap: decode kernel widths'),
+    decode_attention.PAGED_GEOMETRY,
     Requirement('softcap', lambda case: case.softcap is None,
                 "the GPU paged decode kernel applies no logit softcap",
                 row='roadmap: paged decode softcap on GPU'),
@@ -618,7 +605,8 @@ def _gather_pages(pool: jax.Array, table: jax.Array, groups: int) -> jax.Array:
 
 def _gathered_attention(query, key, value, table, lengths):
     """The paged kernel's arithmetic over the gathered rows, through the attention dispatch: one query a
-    row over the first `lengths` keys of its pages. An inactive row reads one slot."""
+    row over the first `lengths` keys of its pages. An inactive row reads one slot. Its backward is
+    the paged kernel's (`_paged_backward`)."""
     from dew.nn.attention import scaled_dot_product_attention
 
     keys, values = _gather_pages(key, table, 1), _gather_pages(value, table, 1)
@@ -626,9 +614,17 @@ def _gathered_attention(query, key, value, table, lengths):
                                         key_value_seq_lengths=jnp.maximum(lengths, 1))[:, 0]
 
 
-def _paged_forward(query, key, value, table, lengths):
-    from dew.nn.kernels import decode_attention
+def _gathered_tangent(query, key, value, table, lengths):
+    """`_gathered_attention` traced for forward mode (`forward_mode_attention`): a fused kernel the
+    dispatch takes keeps its value and takes its tangent from the reference path's, so `jax.jvp`
+    differentiates it at every order, which a reverse-only fused kernel would not."""
+    from dew.nn.attention import forward_mode_attention
 
+    with forward_mode_attention():
+        return _gathered_attention(query, key, value, table, lengths)
+
+
+def _paged_forward(query, key, value, table, lengths):
     return decode_attention.attend_paged(query, key, value, table, jnp.maximum(lengths, 1)), ()
 
 
@@ -636,11 +632,12 @@ def _paged_backward(saved, operands, cotangent):
     return jax.vjp(_gathered_attention, *operands)[1](cotangent)
 
 
-_gpu_paged = generation.linear_tangent(_paged_forward, _paged_backward, _gathered_attention)
+_gpu_paged = generation.linear_tangent(_paged_forward, _paged_backward, _gathered_tangent)
 """Dew's Pallas decode kernel over the pages (`decode_attention.attend_paged`), its derivatives at
-every order the gathered attention's (`_gathered_attention`, `generation.linear_tangent`): reverse
-mode runs whichever kernel the dispatch takes for it, which reads what cuDNN's width and determinism
-limits turn down, and forward mode needs no context. An inactive row reads one slot, so its unused
+every order the gathered attention's (`generation.linear_tangent`): reverse mode runs the backward of
+whichever kernel the dispatch takes for it (`_gathered_attention`), a call cuDNN's width and
+determinism limits turn down included, and forward mode takes the forward-mode path's tangent
+(`_gathered_tangent`), with no context of the caller's. An inactive row reads one slot, so its unused
 output stays finite."""
 
 
