@@ -53,8 +53,9 @@ def main() -> None:
 
     source = ROOT / "tests/fixtures/hf" / args.family / "config.json"
     config = narrow(json.loads(source.read_text()), args.hidden)
+    # The model's length leaves room for the Server's rounding of its capacity to its cache's pages.
     model = models.build("causal_transformer", hf_decoders.translate_config(config)).clone(
-        dtype=jnp.bfloat16, max_seq_len=args.prompt + args.output)
+        dtype=jnp.bfloat16, max_seq_len=2 * (args.prompt + args.output))
     variables = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     variables = jax.tree.map(
         lambda leaf: leaf.astype(jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
