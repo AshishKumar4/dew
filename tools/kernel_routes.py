@@ -72,9 +72,10 @@ def fixtures() -> dict[str, Path]:
 
 WIDTHS = ("head_dim", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim", "kv_lora_rank",
           "global_head_dim", "index_head_dim", "partial_rotary_factor", "linear_key_head_dim",
-          "linear_value_head_dim")
-"""The head widths a family's reference config states, which kernels' shape rules read, and the rotary
-fraction of a head, which is stated against its width."""
+          "linear_value_head_dim", "mamba_head_dim", "state_size", "ssm_state_size", "chunk_size")
+"""The head and state widths a family's reference config states, which kernels' shape rules read (a
+state-space scan's state and chunk among them), and the rotary fraction of a head, which is stated
+against its width."""
 
 
 def published(config: dict) -> tuple[dict, bool]:
@@ -101,6 +102,8 @@ def published(config: dict) -> tuple[dict, bool]:
     # its heads' (`expand` hidden widths, Mamba 2's `validate_architecture`).
     if "expand" in fixture and fixture.get("num_heads") and fixture.get("head_dim"):
         fixture[hidden_key] = fixture["num_heads"] * fixture["head_dim"] // fixture["expand"]
+    if "rotary_dim" in fixture and fixture.get("partial_rotary_factor") and fixture.get("head_dim"):
+        fixture["rotary_dim"] = int(fixture["head_dim"] * fixture["partial_rotary_factor"])
     if "qk_head_dim" in fixture:
         fixture["qk_head_dim"] = fixture.get("qk_nope_head_dim", 0) + fixture.get("qk_rope_head_dim", 0)
     if "word_embed_proj_dim" in fixture:
