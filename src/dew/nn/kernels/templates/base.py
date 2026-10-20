@@ -53,10 +53,8 @@ class Template(tuning.KernelOp):
         space = tuple(self.space(ba))
         fits = tuple(config for config in space if self.staged_bytes(ba, config) <= budget)
         if not fits:
-            least = min((self.staged_bytes(ba, config) for config in space), default=None)
-            raise ValueError(f"{type(self).__name__}'s programs stage at least {least} bytes of shared "
-                             f"memory for this call, past the {budget} a block of {target.generation} "
-                             "holds")
+            raise Unfitted(type(self).__name__, min((self.staged_bytes(ba, config) for config in space),
+                                                     default=None), budget, target.generation)
         return fits
 
     def estimate(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[float, Hashable]:
@@ -72,6 +70,20 @@ class Template(tuning.KernelOp):
 
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Hashable:
         return self.estimate(ba, generation.gpu_target())[1]
+
+
+class Unfitted(ValueError):
+    """A call no config of a launch holds: its programs stage at least `least` bytes of shared memory
+    (None where the launch declares no config), past the `budget` a block of `generation` holds."""
+
+    def __init__(self, launch: str, least: int | None, budget: int, generation: str):
+        super().__init__(f"{launch}'s programs stage at least {least} bytes of shared memory for this "
+                         f"call, past the {budget} a block of {generation} holds")
+        self.launch, self.least, self.budget, self.generation = launch, least, budget, generation
+
+    def __reduce__(self):
+        # Rebuilt from its own fields, as a pickle or a process boundary carries it.
+        return type(self), (self.launch, self.least, self.budget, self.generation)
 
 
 def choose(choice: str, implementations: Sequence[Template], *args, **kwargs) -> Template:

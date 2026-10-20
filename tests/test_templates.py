@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import pytest
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates.base import Template, choose
+from dew.nn.kernels.templates.base import Template, Unfitted, choose
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -75,9 +75,10 @@ def test_a_target_that_reports_no_block_takes_the_least_any_gpu_holds():
 
 def test_a_call_no_config_holds_is_refused_naming_its_bytes_and_the_budget():
     op = Doubling()
-    with generation.assumed("sm86"), pytest.raises(ValueError) as refused:
+    with generation.assumed("sm86"), pytest.raises(Unfitted) as refused:
         op._get_heuristics_config(bound(op, width=8192))
-    assert "262144" in str(refused.value) and str(99 * 1024) in str(refused.value)
+    assert (refused.value.least, refused.value.budget, refused.value.generation) == (
+        262144, 99 * 1024, "sm86")
 
 
 @dataclasses.dataclass(frozen=True)
