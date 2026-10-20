@@ -677,12 +677,61 @@ def agent_episode_figure():
                         anchor="end"), 7.2)
     svg.save(HERE / "agent-episode.svg")
 
+def agent_lanes_figure():
+    """The rollout scheduler between the server and the trainer: it publishes the weights, starts a group of
+    episodes for each task, waits for whole groups, packs them, and hands the batch to the trainer."""
+    width, height = 440, 300
+    svg = Figure(width, height, seconds=12, label="Three lanes. The scheduler publishes the trainer's weights to "
+                 "the server, starts a group of episodes for each task, waits for the whole groups, packs them "
+                 "into a batch and hands it to the trainer, whose update makes the next version of the weights.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    lanes = [("server", 40), ("scheduler", 140), ("trainer", 240)]
+    for name, y in lanes:
+        svg.line(110, y + 20, width - 20, y + 20, color="rule", width=1)
+        svg.text(20, y + 25, name, size=14, weight=600)
+    times = [0.4, 1.6, 3.0, 4.6, 6.0, 7.4]
+    # 1. publish the weights, version 0
+    with svg.group() as publish:
+        svg.arrow(130, 258, 130, 64, color="accent", width=1.5)
+        svg.text(138, 200, "weights v0", size=12, color="accent")
+    svg.appear(publish, times[0])
+    # 2. a group of episodes per task on the server
+    with svg.group() as episodes:
+        for k in range(4):
+            svg.rect(160 + 18 * k, 48 + (k % 2) * 4, 14, 24, fill="accent_fill", stroke="none", rx=3)
+        svg.text(160, 40, "a group of episodes per task", size=12, color="muted")
+    svg.appear(episodes, times[1])
+    # 3. whole groups come back to the scheduler
+    with svg.group() as collected:
+        svg.arrow(240, 76, 240, 146, width=1.25)
+        for k in range(4):
+            svg.rect(200 + 18 * k, 148, 14, 24, fill="accent_fill", stroke="none", rx=3)
+        svg.text(276, 165, "whole groups", size=12, color="muted")
+    svg.appear(collected, times[2])
+    # 4. packed into a batch for the trainer
+    with svg.group() as packed:
+        svg.arrow(262, 176, 300, 246, width=1.25)
+        svg.rect(300, 246, 90, 28, fill="raised", stroke="accent", rx=5)
+        svg.text(345, 265, "packed batch", size=12, anchor="middle")
+    svg.appear(packed, times[3])
+    # 5. the update makes the next version
+    with svg.group() as update:
+        svg.text(345, 290, "update → v1", size=12, color="accent", weight=600, anchor="middle")
+    svg.appear(update, times[4])
+    with svg.group() as again:
+        svg.polyline([(395, 260), (424, 260), (424, 30), (300, 30)], color="accent", width=1.5, dash="4 4")
+        svg.text(418, 150, "next batch", size=12, color="accent", anchor="end")
+    svg.appear(again, times[5])
+    svg.save(HERE / "agent-lanes.svg")
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
            "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
            "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure,
-           "agent-episode": agent_episode_figure}
+           "agent-episode": agent_episode_figure,
+           "agent-lanes": agent_lanes_figure}
 
 
 if __name__ == "__main__":
