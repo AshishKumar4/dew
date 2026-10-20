@@ -133,9 +133,13 @@ test = [
     "diffusers==0.34.0",
     # tests/test_wan_source.py cleans prompts as Wan's pipelines do (the wan extra).
     "dewml[wan]",
+    # tests/test_tools.py imports FlaxDiff's reference, whose hilbert module imports matplotlib.
+    "matplotlib",
     # tests/test_live_bridge.py runs the live bridge (site/live/container) over real sockets, on the
     # release its container installs (the live extra).
     "dewml[live]",
+    # tests/test_notebook_display.py executes a notebook in a Jupyter kernel and reads it back saved.
+    "dewml[notebooks]",
     # Every decoder and MoE parity number is calibrated against this exact
     # release: the fixtures record it (tests/fixtures/hf/*/meta.json), the
     # tests cite its line numbers, and a resolve that moved it would compare
@@ -171,8 +175,6 @@ mutation = ["cosmic-ray==8.7.0"]
 av = ["moviepy"]
 # FID's Inception weight download
 metrics = ["requests"]
-# Explicit LocalTracker.plot()/plots=True rendering.
-plots = ["matplotlib"]
 wandb = ["wandb"]
 # MLflowTracker: a run in a tracking store, local file store included.
 mlflow = ["mlflow"]
@@ -235,10 +237,11 @@ torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
 # it under constraints.txt, locked in locks/ (tools/lock_environment.sh).
-ci = ["dewml[test,av,tfds,metrics,plots,inference-clients,serve,environments,vision,augment,quantization,profile,torchax,gguf]",
+ci = ["dewml[test,av,tfds,metrics,inference-clients,serve,environments,vision,augment,quantization,profile,torchax,gguf]",
       "flake8"]
 # The tutorial notebooks' environment outside Colab: the extras they import and a Jupyter kernel.
-tutorials = ["dewml[streaming,interop,plots,notebooks]"]
+# Tutorial 01, Diffusion from scratch, draws with matplotlib, which Colab installs.
+tutorials = ["dewml[streaming,interop,notebooks]", "matplotlib"]
 # Execute notebooks through a Jupyter kernel of the selected interpreter.
 notebooks = ["nbclient", "nbformat", "ipykernel"]
 

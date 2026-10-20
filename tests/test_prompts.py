@@ -59,7 +59,7 @@ def test_an_overlong_prompt_keeps_its_tail_by_default_and_drop_counts_it_rejecte
 
     # The chain's own prompt step keeps the tail as the recipe does.
     step = prompts.encode(TOKENIZER, max_prompt_len=WINDOW)
-    (chained,) = list(Memory([{"prompt": LONG}]).filter_map(step).iterate())
+    (chained,) = list(Memory([{"prompt": LONG}]).filter_map(step))
     np.testing.assert_array_equal(chained[PROMPT_KEY], LONG[-WINDOW:])
     dropping, _, _ = dataclasses.replace(recipe, long="drop").pipelines()
     data = compile(dropping.batch(1), read="memory", loading=Loading(workers=0))
