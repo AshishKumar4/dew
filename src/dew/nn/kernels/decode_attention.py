@@ -30,28 +30,55 @@ denominator, three roundings where this has one.
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from .generation import triton_runs
+from .selection import Requirement
+
+if TYPE_CHECKING:
+    from dew.nn.attention_kernels import AttentionCase
 
 BLOCK = 32
 """Keys a step of the loop reads."""
 QUERIES = 16
 """Query positions a program holds: the fewest a tensor-core dot takes."""
 WARPS = 4
+DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
+"""The dtypes it attends in: its products' own precision, accumulated in fp32."""
 
 
-def fits(query: jax.Array, key: jax.Array) -> bool:
-    """Whether the kernel takes this `[B, T, N, D]` query over `[B, S, N, D]`
-    keys: a GPU Dew's Triton kernels run on (`triton_runs`), at most
-    `QUERIES` positions, a power-of-two width up to 256, and a capacity of
-    whole blocks."""
-    positions, width = query.shape[1], query.shape[-1]
-    return (triton_runs() and positions <= QUERIES and width & (width - 1) == 0
-            and 16 <= width <= 256 and key.shape[1] % BLOCK == 0 and query.dtype == key.dtype)
+def _power_width(case: AttentionCase) -> bool:
+    return case.head_dim & (case.head_dim - 1) == 0 and 16 <= case.head_dim <= 256
+
+
+_Need = Requirement["AttentionCase"]
+"""A requirement of an `AttentionCase`, the decode selector's case."""
+
+SUPPORTS = (
+    _Need('capability', lambda case: triton_runs(), "the decode kernel needs a GPU of sm80 or later",
+          inherent=True),
+    _Need('queries', lambda case: case.queries <= QUERIES,
+          lambda case: f"the call has {case.queries} query positions, past the {QUERIES} a program holds",
+          inherent=True),
+    _Need('width', _power_width,
+          lambda case: f"the heads are {case.head_dim} wide, not a power of two from 16 to 256",
+          row='roadmap: decode kernel widths'),
+    _Need('capacity', lambda case: case.keys % BLOCK == 0,
+          lambda case: f"the cache holds {case.keys} keys, not whole blocks of {BLOCK}",
+          row='roadmap: decode kernel capacities'),
+    _Need('dtype', lambda case: case.dtype == case.key_dtype and case.dtype in DTYPES,
+          lambda case: f"the queries are {case.dtype} over {case.key_dtype} keys; the kernel takes one of "
+                       "fp32, bf16 and fp16 on both, float64 going to the reference path", inherent=True),
+    _Need('arithmetic', lambda case: not case.arithmetic,
+          "the call asks for arithmetic only the reference path computes", inherent=True),
+)
+"""The decode kernel's requirements of a call the decode selector serves (`dew.nn.attention_kernels.DECODE`,
+over an `AttentionCase`): a GPU Dew's Triton kernels run on, at most `QUERIES` positions, a
+power-of-two width from 16 to 256, a capacity of whole blocks and one of its dtypes on both sides."""
 
 
 FULL = jax.lax.Precision.HIGHEST
