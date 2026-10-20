@@ -12,7 +12,6 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
-import functools
 import inspect
 import logging
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -283,14 +282,12 @@ def _multiprocessors(device) -> int | None:
     return getattr(device, 'core_count', None)
 
 
-@functools.cache
-def _shared_memory(ordinal: int) -> int | None:
-    """The shared memory a block of the visible CUDA device `ordinal` may hold, as its driver reports
-    it (`dew.telemetry.devices.SHARED_MEMORY_PER_BLOCK`), or None where no driver answers. JAX's
-    Device reports no such fact."""
-    from dew.telemetry.devices import SHARED_MEMORY_PER_BLOCK, gpu_attribute
-
-    return gpu_attribute(ordinal, SHARED_MEMORY_PER_BLOCK)
+def _shared_memory(device) -> int | None:
+    """The shared memory, in bytes, a block of `device` may hold once a kernel opts in. jax's Device
+    declares no such field, and a CUDA device reports it among its attributes as XLA describes it
+    (`shared_memory_per_block_optin`), so it is read at this boundary; a device without one gives
+    None."""
+    return getattr(device, 'shared_memory_per_block_optin', None)
 
 
 def runtime_facts(target: GpuTarget, device) -> GpuTarget:
@@ -298,8 +295,7 @@ def runtime_facts(target: GpuTarget, device) -> GpuTarget:
     multiprocessors, its block's shared memory, and Hopper's warpgroup MMA, which capability 9.0 alone
     has. A GPU the table does not name so keeps every resource a kernel's requirements read."""
     capability = _compute_capability(device)
-    facts = {'multiprocessors': _multiprocessors(device),
-             'shared_limit': _shared_memory(device.local_hardware_id)}
+    facts = {'multiprocessors': _multiprocessors(device), 'shared_limit': _shared_memory(device)}
     return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None},
                                wgmma=capability == '9.0' if capability else target.wgmma)
 
