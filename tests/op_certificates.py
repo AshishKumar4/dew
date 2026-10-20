@@ -271,7 +271,7 @@ EXP_BOUND = 2.0 ** -80
 """A relative bound on `_exp_enclosed`'s error, from its terms (the arithmetic's 2^-89 and below):
 - the reduced argument r = x - k·ln 2 for fp32 or bf16 x in [-110, 90]: x - k·_LN2_HI is exact
   (k·_LN2_HI is exact for |k| <= 160, and the difference is exact by Sterbenz at every k = ±1 edge and
-  beyond, and is x for k = 0); |x - k·_LN2_HI| / |k·_LN2_LO| >= 6.3e5 (fp32) and 1.9e10 (bf16), so
+  beyond, and is x for k = 0); |x - k·_LN2_HI| / |k·_LN2_LO| >= 6e5 (fp32) and 1e10 (bf16), so
   `_fast_two_sum`'s precondition holds; k·_LN2_LO is within 2^-53 of itself, |k·_LN2_LO| <= 160·2^-44,
   and _LN2_LO within 2^-98 of ln 2 - _LN2_HI: r is within 2^-89 of the exact x - k·ln 2, |r| <= 0.3466,
   so exp(r) within 2^-88.9 relative;
