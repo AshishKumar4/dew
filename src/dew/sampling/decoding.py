@@ -27,7 +27,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable, Sequence
-from typing import Protocol, runtime_checkable
+from typing import ClassVar, NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -204,7 +204,11 @@ class LogitsTransform(Protocol):
 
 @runtime_checkable
 class Stopping(Protocol):
-    """A pure per-row finish test over the tokens a step just drew."""
+    """A pure per-row finish test over the tokens a step just drew.
+
+    A criterion that cuts a row short at a length rather than ending it, as
+    `MaxNewTokens` and `MaxLength` do, says so with a class attribute
+    `truncates = True`: a row it finishes is not terminated (`Finish`)."""
 
     def __call__(self, state: StepState, tokens: jax.Array, /) -> jax.Array: ...
 
@@ -817,8 +821,9 @@ class EndOfSequence:
 
 @struct.dataclass
 class MaxNewTokens(_Numerical):
-    """Finishes a row once it has drawn `count` tokens."""
+    """Finishes a row once it has drawn `count` tokens, which truncates it."""
 
+    truncates: ClassVar[bool] = True
     count: int = struct.field(pytree_node=False, default=0)
 
     def __post_init__(self) -> None:
@@ -835,8 +840,10 @@ class MaxNewTokens(_Numerical):
 
 @struct.dataclass
 class MaxLength(_Numerical):
-    """Finishes a row once prompt and generated tokens reach `length`, as `MaxLengthCriteria`."""
+    """Finishes a row once prompt and generated tokens reach `length`, as `MaxLengthCriteria`, which
+    truncates it."""
 
+    truncates: ClassVar[bool] = True
     length: int = struct.field(pytree_node=False, default=0)
 
     def __post_init__(self) -> None:
@@ -1003,16 +1010,34 @@ def chain(transforms: Sequence[LogitsTransform]) -> LogitsChain:
     return LogitsChain(tuple(transforms))
 
 
-def criterion(stopping: Sequence[Stopping]) -> Callable[[StepState, jax.Array], jax.Array]:
-    """The criteria as one callable, combined with OR."""
+class Finish(NamedTuple):
+    """The rows a step's criteria finished, and those of them a criterion ended, as a stop does,
+    rather than one cut short at a length (`Stopping`'s `truncates`): the terminated rows."""
 
-    def finished(state: StepState, tokens: jax.Array) -> jax.Array:
-        done = jnp.zeros(tokens.shape, bool)
+    done: jax.Array
+    ended: jax.Array
+
+
+def finish(stopping: Sequence[Stopping]) -> Callable[[StepState, jax.Array], Finish]:
+    """The criteria as one callable: which rows any of them finished, and which a criterion that
+    does not truncate finished, each combined with OR."""
+
+    def finished(state: StepState, tokens: jax.Array) -> Finish:
+        done = ended = jnp.zeros(tokens.shape, bool)
         for stop in stopping:
-            done = done | stop(state, tokens)
-        return done
+            fired = stop(state, tokens)
+            done = done | fired
+            if not getattr(type(stop), "truncates", False):
+                ended = ended | fired
+        return Finish(done, ended)
 
     return finished
+
+
+def criterion(stopping: Sequence[Stopping]) -> Callable[[StepState, jax.Array], jax.Array]:
+    """The criteria as one callable, combined with OR: which rows any of them finished (`finish`)."""
+    finished = finish(stopping)
+    return lambda state, tokens: finished(state, tokens).done
 
 
 __all__ = [
@@ -1021,6 +1046,7 @@ __all__ = [
     "EpsilonCutoff",
     "EtaCutoff",
     "ExponentialDecayLengthPenalty",
+    "Finish",
     "ForcedBOS",
     "ForcedEOS",
     "FrequencyPenalty",
