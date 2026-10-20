@@ -37,7 +37,7 @@ from .activations import GatedActivation, gated_product, relu2
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels.generation import backend, ran_kernel, triton_runs
-from .kernels.grouped_matmul import grouped_projection, ragged_dot_refusal, xla_ragged_dot
+from .kernels.grouped_matmul import grouped_projection, kernel_refusal, ragged_dot_refusal, xla_ragged_dot
 from .kernels.selection import forced
 from .precision import at_least_fp32, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
@@ -356,9 +356,10 @@ def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[D
     `generation.chosen(grouped_matmul=...)` decides first: 'xla' runs XLA, and a kernel's name
     ('triton', 'mosaic_gpu') runs the kernels, each launch that implementation, or raises where they
     cannot take the call. Otherwise 'xla' runs XLA, and 'auto' and 'pallas' the kernels where they run
-    on a GPU of sm80 or later (or, for 'pallas', interpreted on a CPU) and compute the product exactly
-    (`ragged_dot_refusal`); elsewhere, a TPU's call above all, both run XLA, which `ran_kernel` reports
-    with the reason. XLA's ragged dot runs a product over every expert, 70 to 200 times the
+    on a GPU of sm80 or later whose generation states the tensor rate their cost model reads (or, for
+    'pallas', interpreted on a CPU) and compute the product exactly (`ragged_dot_refusal`);
+    elsewhere, a TPU's call above all, both run XLA, which `ran_kernel` reports with the reason.
+    XLA's ragged dot runs a product over every expert, 70 to 200 times the
     kernels' time on an H100 at Qwen3-30B-A3B's and Kimi Linear's experts (GMM-h100-2), so where the
     kernels run they are the choice. `operands` are the input and kernel dtypes as stored.
     """
@@ -371,7 +372,7 @@ def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[D
         return 'xla'
     placed = triton_runs() or (implementation == 'pallas' and backend() == 'cpu')
     refusal = ragged_dot_refusal(compute, operands, precision) or (
-        None if placed else "the Pallas kernels need a GPU of sm80 or later")
+        kernel_refusal(compute) if placed else "the Pallas kernels need a GPU of sm80 or later")
     if refusal is None:
         return 'pallas'
     if named is not None:

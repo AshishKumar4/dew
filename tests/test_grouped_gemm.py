@@ -3,6 +3,7 @@
 rounded operands; the MoE dispatcher's routes to each implementation; the products' dtypes as the
 kernels write them; and the cost model (`dew.nn.kernels.templates.cost`) on analytic launches."""
 
+import dataclasses
 import functools
 import itertools
 
@@ -171,13 +172,12 @@ def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         fits = launch.fitting(launch.bind(*args, **options), generation.gpu_target())
-        # Every block shape at its first schedule, and every schedule at the first block shape: what
-        # the lowering depends on (shared memory, the snake's index arithmetic), each value once.
-        first = fits[0]
-        covering = {config for config in fits if (config.stages, config.grid_block_n)
-                    == (first.stages, first.grid_block_n) or (config.block_m, config.block_n)
-                    == (first.block_m, first.block_n)}
-        assert len(covering) > 1
+        # A fitting tile of every block shape and of every schedule: what the lowering depends on
+        # (shared memory, the snake's index arithmetic), each value once.
+        covering = set({(c.block_m, c.block_n): c for c in reversed(fits)}.values())
+        covering |= set({(c.stages, c.grid_block_n): c for c in reversed(fits)}.values())
+        assert {(c.block_m, c.block_n) for c in covering} == {(c.block_m, c.block_n) for c in fits}
+        assert {(c.stages, c.grid_block_n) for c in covering} == {(c.stages, c.grid_block_n) for c in fits}
         for config in sorted(covering, key=repr):
             jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
                 lowering_platforms=("cuda",))
@@ -211,23 +211,48 @@ def test_the_kernels_write_each_product_in_its_own_dtype():
     assert ((4, DEPTH, WIDTH), jnp.dtype(jnp.float32)) in written
 
 
-def test_the_cost_model_charges_the_programs_each_wave_has():
-    """Full waves charge every resident program; a last wave short of every multiprocessor only the
-    programs it has, so room for a second program costs nothing where the launch has none."""
+def test_the_cost_model_charges_each_multiprocessor_its_programs_in_turn():
+    """A multiprocessor does its programs' work one after another: a launch of one program per
+    multiprocessor takes one program's time, one more program a second, and the device bytes bound it
+    from below."""
     target = generation.TARGETS["sm90"]
     program = 4096 * 1000 / (target.tensor_rate("16bit") * target.clock_hz)
 
-    def seconds(programs, resident):
-        return cost.seconds(cost.Cost(programs=programs, device_bytes=0, program_flops=4096 * 1000,
-                                      resident=resident), target)
+    def seconds(programs, device_bytes=0.0):
+        work = cost.Cost(programs=programs, device_bytes=device_bytes, program_flops=4096 * 1000)
+        return cost.seconds(work, target)
 
     sms = target.multiprocessors
-    assert seconds(0, 1) == 0
-    assert seconds(sms, 1) == pytest.approx(program)
-    assert seconds(sms, 2) == pytest.approx(program)
-    assert seconds(sms + 1, 1) == pytest.approx(2 * program)
-    assert seconds(2 * sms, 2) == pytest.approx(2 * program)
-    assert seconds(2 * sms + 1, 2) == pytest.approx(3 * program)
+    assert seconds(0) == 0
+    assert seconds(sms) == pytest.approx(program)
+    assert seconds(sms + 1) == pytest.approx(2 * program)
+    assert seconds(1, device_bytes=target.memory_bandwidth) == pytest.approx(1.0)
+
+
+def test_a_mig_slice_keeps_its_generations_tensor_rate():
+    """A SKU's catalogued peak lowers its generation's rate where its multiprocessors and clock would
+    exceed it (a GeForce part's half-rate accumulation) and never raises it: an A100 slice reporting 14
+    of its 108 multiprocessors keeps 2048 FLOPs a clock each."""
+    a100 = generation.TARGETS["sm80"]
+    assert a100.tensor_rate("16bit") == pytest.approx(2048, rel=1e-3)
+    assert dataclasses.replace(a100, multiprocessors=14).tensor_rate("16bit") == 2048
+    rtx4080 = dataclasses.replace(generation.TARGETS["sm89"], device_kind="NVIDIA GeForce RTX 4080",
+                                  multiprocessors=76, clock_hz=2.505e9)
+    assert rtx4080.tensor_rate("16bit") == pytest.approx(512, rel=1e-2)
+
+
+def test_an_unseen_gpu_runs_xla_s_grouped_matmul():
+    """A GPU generation that states no tensor rate (an sm100 the table does not name) runs an expert
+    projection on XLA's ragged dot, its route saying why, with no estimate asked of the kernels."""
+    x = jnp.ones((32, 64), jnp.bfloat16)
+    w = jnp.ones((4, 64, 128), jnp.float32)
+    sizes = jnp.asarray([8, 8, 8, 8], jnp.int32)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh), generation.routes() as taken:
+        jax.jit(lambda x, w: expert_projection(x, w, sizes, jnp.bfloat16, "auto", None)).trace(x, w)
+    (route,) = {(route.kernel, route.refusal.detail if route.refusal else None) for route in taken
+                if route.choice == "grouped_matmul"}
+    assert route[0] == "xla" and "tensor rate" in route[1]
 
 
 def test_the_cost_model_names_a_fact_its_target_lacks():
