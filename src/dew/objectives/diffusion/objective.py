@@ -587,8 +587,7 @@ class DiffusionObjective(Objective[Ratio]):
             held[PERCEPTUAL] = LPIPSNetwork.published()[1]
         return held
 
-    def optimizer(self, tx: optax.GradientTransformation, *,
-                  accumulation: int) -> optax.GradientTransformation:
+    def optimizer(self, tx: optax.GradientTransformation) -> optax.GradientTransformation:
         """Return `tx`, or under `end_to_end` one copy of it per network.
 
         REPA-E updates the model (with its alignment projector), the autoencoder and
