@@ -168,7 +168,9 @@ class CausalTransformer(nn.Module):
 
     With `scan_layers`, each run of like layers (layers whose resolved specs
     give the same parameter shapes and computation) runs as one scanned body,
-    so compile time stops growing with depth. The variables tree stays the
+    and over weights resident on the device each run of layers that repeat one
+    period of specs does (`scan_decode`), so compile time stops growing with
+    depth. The variables tree stays the
     unscanned one (`StackView`). `init` always draws a run of like layers under
     the scan, once per run. When the mesh has a stage axis larger than one, the
     stack runs as a pipeline.
@@ -373,7 +375,7 @@ class CausalTransformer(nn.Module):
     resident on the device runs each run of layers that repeat one period of specs as one body
     (`scan_groups(periodic=True)` over `scan_keys`, so a period repeats its layers' specs and
     variable structures): Qwen3.5's `[linear, linear, linear, full]` x 6 is one body of four
-    layers, so a step's program grows with the period, not the depth. Training scans only
+    layers, so a step's program grows with the period, not the depth. Any other call scans so
     under `scan_layers`."""
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is also how many layers its
@@ -1927,10 +1929,14 @@ class CausalTransformer(nn.Module):
                 return run(self, view, x, train, decode, per_layer_input, attention_metadata)
         banked = () if self.is_initializing() else self.banked_collections()
         # Weights a step reads a layer at a time (banked, streamed from disk or held in host memory)
-        # keep the runs their banks hold; a decode step over resident ones scans by period.
-        periodic = decode and stages == 1 and not (
+        # keep the runs their banks hold. A stack over resident ones scans by period: a decode
+        # step whatever `scan_layers` says (`scan_decode`), any other call under `scan_layers`,
+        # so a stack of unlike layers that repeat (Qwen3.5's three delta-net layers and one
+        # attention layer) traces and lowers one period, not every layer.
+        resident = stages == 1 and not (
             banked or 'streaming' in self.variables or on_host(self.variables.get('params', {})))
-        scanned = self.scan_layers or (periodic and self.scan_decode)
+        periodic = resident and ((decode and self.scan_decode) or self.scan_layers)
+        scanned = self.scan_layers or periodic
         if self.is_initializing() or (stages == 1 and not scanned):
             return run_stack(
                 self.layers, self.block, self.specs,
@@ -1941,7 +1947,7 @@ class CausalTransformer(nn.Module):
             if span is not None and banked:
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                     f"by run holds whole runs; {list(banked)} arrived banked")
-            if periodic and self.scan_decode:
+            if periodic:
                 groups = tuple((first + start, count) for start, count in scan_groups(
                     self.scan_keys[first:end], self.bank_layers, periodic=True))
             else:
