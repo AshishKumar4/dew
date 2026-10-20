@@ -63,6 +63,15 @@ def changed(written, held, at: str = "") -> list[str]:
     return [] if written == held else [at]
 
 
+def test_the_live_sampler_asks_for_the_revision_the_live_image_serves():
+    """The live editor's cell (site/src/data/sampler.py) names the revision the live image pins: the
+    image serves that revision alone and refuses a page that asks for another, so a cell left on an
+    earlier revision fails every unedited Run."""
+    repo, revision = LIVE_PIN.read_text().strip().split("@")
+    cell = (ROOT / "site" / "src" / "data" / "sampler.py").read_text()
+    assert f'TextToImage.from_pretrained("{repo}", revision="{revision}")' in cell
+
+
 @pytest.mark.parametrize("live", [False, pytest.param(True, marks=pytest.mark.network)])
 def test_the_published_run_reads_back_as_it_was_written(live):
     """dewml/hybrid-dit-176m's run.json, as the revision the live image pins
