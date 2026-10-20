@@ -11,10 +11,10 @@ warm it with one chat request (SGLang compiles for minutes on its first one, sta
 the gateway's 5 s probe).
 
 `gateway`: start the gateway (sync_traces, health_check_interval 60) and wait until
-`dew.interop.harbor.Gateway.ready` passes; run one three-turn tool-calling session and one prompt
+`dew.interop.gateway.Gateway.ready` passes; run one three-turn tool-calling session and one prompt
 past the context length through /sessions/{sid}/v1; write the session's traces as
 `{engine}_session_traces.json` and the overflow's as `{engine}_overflow_trace.json`, keeping only
-the fields `dew.interop.harbor.calls` reads. The fixtures committed were captured on a Colab L4 on
+the fields `dew.interop.gateway.calls` reads. The fixtures committed were captured on a Colab L4 on
 2026-09-23.
 
 `stops`: draw from the engine through Dew's `OpenAIRolloutServer`, behind a proxy that records each
@@ -47,7 +47,7 @@ from pathlib import Path
 
 import httpx
 
-from dew.interop.harbor import Gateway
+from dew.interop.gateway import Gateway
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 ENGINE, GATEWAY, PROXY = "http://127.0.0.1:8011", "http://127.0.0.1:9090", ("127.0.0.1", 8012)
@@ -58,14 +58,14 @@ TOOLS = [{"type": "function", "function": {
     "name": "bash", "description": "Run a bash command.",
     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}]
 KEPT = ("prompt_token_ids", "completion_token_ids", "logprobs", "finish_reason", "weight_version", "timestamp",
-        "latency_ms")
+        "latency_ms", "messages", "response_message")
 RETURN_IDS = {"vllm": {"return_tokens_as_token_ids": True, "return_token_ids": True},
               "sglang": {"return_token_ids": True}}
 """The fields that make each engine's completions route answer with its sampled ids."""
 STOPS_BUDGET = 48
+"""Tokens a stops draw may take: the answer, its EOS and what the model draws after it."""
 RELEASE_BUDGET = 2048
 """The budget of the streamed draw whose early stop shows whether closing a stream ends SGLang's request."""
-"""Tokens a stops draw may take: the answer, its EOS and what the model draws after it."""
 
 
 def venv(root: Path, name: str) -> Path:

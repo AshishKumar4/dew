@@ -340,6 +340,22 @@ type Stage = (
     | Batched
 )
 
+type Step = (
+    RecordStep
+    | RandomStep
+    | ExpandStep
+    | HostStep
+    | DeviceStep
+    | ColumnStep
+    | Callable[[int, Batch], Batch | Rejected]
+    | Callable[[Batch], bool]
+    | Callable[[pygrain.MapDataset | pygrain.IterDataset], pygrain.MapDataset | pygrain.IterDataset]
+    | Callable[[Mapping[str, object]], RecordStep | pygrain.RandomMapTransform | Expansion]
+)
+"""What a stage runs and its identity names (`dew.data.plan.StepIdentity`): a record, random,
+indexed, expanding, batch or column step, a predicate, a Grain function or a configured step's
+factory."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Mixture:
