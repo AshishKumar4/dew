@@ -812,6 +812,10 @@ there: the engine's last-loop cache parts from the model code past the window
 
 Dew's `tests/fixtures/hf/dory-1.0-4b/source.json` pins this repository's revision and each file's
 sha256.
+
+These files are the model's outputs and Dew's measurements of them, released under Apache-2.0. The
+model itself is released under OpenMDW-1.1 (https://openmdw.ai/license/1-1/), which places no
+restriction on its outputs; no part of its weights or other model materials is in this repository.
 """
 """The dataset card `publish` writes beside the files."""
 
