@@ -17,8 +17,8 @@ from reference_error import assert_as_exact_as_the_reference
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import counted_places
-from dew.nn.kv_cache import KVCache
 from dew.nn.kernels import bf16_dot_runs
+from dew.nn.kv_cache import KVCache
 from dew.nn.local_attention import local_attention
 
 
