@@ -1018,23 +1018,45 @@ def test_a_window_across_a_ramp_stage_pools_its_records_as_one_batch_of_them(tmp
         np.testing.assert_allclose(pooled[name], value, rtol=1e-5, atol=1e-6, err_msg=name)
 
 
-def test_a_ramp_is_refused_with_a_window_that_replays_its_batches(tmp_path):
+def test_a_window_that_replays_its_batches_pools_a_ramps_stages_as_batches_of_their_records(tmp_path):
     """A loss of composite statistics replays its window's batches, whose shape a ramp changes at each
-    stage: a ramp with such a window is refused before the run trains, whether the run starts there
-    or resumes a checkpoint whose saved window holds the batches of a fixed-batch run."""
-    layout, ramp = Layout(min_shard=1, tolerance=1.0), Ramp(start=8, increment=8, samples=16)
+    stage; each stage begins where a window does, and the window's replay slots are the new stage's
+    from there. Four steps of eight and then sixteen, two to a window, land where a batch of sixteen
+    and then one of thirty-two, the same records in the same order, land, and a run resuming a
+    fixed-batch run's checkpoint, whose window held that run's batches, trains on into the ramp."""
+    records, seed, layout = 4096, 7, Layout(min_shard=1, tolerance=1.0)
+    ramp = Ramp(start=8, increment=8, samples=16)
 
-    def trainer(checkpoints: Checkpoints | None = None) -> Trainer:
-        return Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2, layout=layout,
-                       checkpoints=checkpoints)
+    def trainer(checkpoints: Checkpoints | None = None, accumulation: int = 2) -> Trainer:
+        return Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0), accumulation=accumulation,
+                       layout=layout, checkpoints=checkpoints)
+
+    state = trainer().fit(ramped(indexed_data(records, 16, seed), ramp), steps=4, log_every=100)
+    stitched = [trainer(Checkpoints(str(tmp_path / "stitched"), keep=8), accumulation=1).fit(
+        stitched_data(records, batch, seed), steps=stage + 1, log_every=100, checkpoint_every=None)
+        for stage, batch in enumerate([16, 32])][-1]
+    assert int(state.step) == 4 and int(state.updates) == int(stitched.updates) == 2
+    pooled, batched = parameters(state), parameters(stitched)
+    assert set(pooled) == set(batched)
+    for name, value in batched.items():
+        np.testing.assert_allclose(pooled[name], value, rtol=1e-5, atol=1e-6, err_msg=name)
 
     saved = Checkpoints(str(tmp_path / "run"), keep=8)
     assert int(trainer(saved).fit(indexed_data(256, 16), steps=2, log_every=100).updates) == 1
-    with pytest.raises(ValueError):
-        trainer(Checkpoints(str(tmp_path / "run"), keep=8)).fit(
-            ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
-    with pytest.raises(ValueError):
-        trainer().fit(ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
+    resumed = trainer(Checkpoints(str(tmp_path / "run"), keep=8)).fit(
+        ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
+    assert (int(resumed.step), int(resumed.updates)) == (4, 2)
+
+
+def test_a_ramp_stage_inside_a_window_that_replays_its_batches_is_refused_before_the_run_trains():
+    """A stage of one step begins inside a window of two, whose replay slots would hold batches of two
+    shapes: the run is refused at its first compile, naming the stage and its step."""
+    trainer = Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+                      layout=Layout(min_shard=1, tolerance=1.0), checkpoints=None)
+    with pytest.raises(ValueError, match="the stage of 16 records a step begins at step 1"):
+        trainer.fit(ramped(indexed_data(256, 16), Ramp(start=8, increment=8, samples=8)), steps=4,
+                    log_every=100)
+    assert trainer.executable is None
 
 
 @pytest.mark.mesh

@@ -39,6 +39,14 @@ class Accumulation:
     variables: Variables | None
     attempts: jax.Array | None
 
+    def replays(self, other: Accumulation | None) -> bool:
+        """Whether this window's replay slots hold batches of the shapes `other`'s do, so a step
+        compiled for `other` reads it: a batch ramp's stage changes them, and a pooled mean,
+        which keeps no batch, replays none."""
+        mine, theirs = (jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), held)
+                        for held in (self.batches, None if other is None else other.batches))
+        return mine == theirs
+
 
 
 @struct.dataclass
