@@ -84,6 +84,9 @@ class Torch(Dataset):
     identity: str | None = None
     facts: Mapping[str, object] | None = None
 
+    def label(self) -> str:
+        return self.identity or "torch"
+
     def describe(self) -> str:
         return f"torch:{self.identity or repr(TorchRecords(self.dataset, self.fields))}:{self.fields}"
 

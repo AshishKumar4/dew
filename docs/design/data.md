@@ -42,6 +42,7 @@ Three types, six function shapes.
 |---|---|---|---|
 | `RecordFn` | `(r) -> r` or a `grain.MapTransform` | `map` | exactly 1 |
 | `RandomFn` | `(r, rng) -> r` or a `grain.RandomMapTransform` | `random_map` | exactly 1 |
+| `IndexedFn` | `(index, r) -> r`, `index` the record's position in its source; `-> r \| Rejected` where it declares `rejects = True` | `map_with_index` | exactly 1; 0 or 1 where it declares `rejects` |
 | `Predicate` | `(r) -> bool` | `filter` (a rejected record counts under the predicate's `reason`) | 0 or 1 |
 | `TryFn` | `(r) -> r \| Rejected` | `filter_map` | 0 or 1, with a reason |
 | `RandomTryFn` | `(r, rng) -> r \| Rejected` or a `grain.RandomMapTransform` | `random_filter_map` | 0 or 1, with a reason |
@@ -87,18 +88,18 @@ Preparing a Hub dataset happens on first use, with one log line naming what is p
 
 | Group | Verbs |
 |---|---|
-| Per record | `map`, `random_map`, `filter`, `filter_map`, `random_filter_map`, `flat_map`; `map` and `flat_map` also take `batched=True, batch_size=k` |
+| Per record | `map`, `random_map`, `map_with_index`, `filter`, `filter_map`, `random_filter_map`, `flat_map`; `map` and `flat_map` also take `batched=True, batch_size=k` |
 | Reuse | `pipe(fn, *args, **kwargs)` for [presets](#5-presets) and your own `Dataset -> Dataset` functions; `grain(fn)` for any Grain operation Dew doesn't name; the plan can't see inside `fn`, so the chain after it reads per share and resumes through Grain's own state |
 | Columns | `rename_columns({"old": "new"})`, `select_columns(*names)`, `remove_columns(*names)` (Hugging Face's names) |
 | Other | `take(n)`, `named(name)` |
-| Sequence | `pack(seq_len, fields=, bins=, segments=, policy=, along=)`, the options every read lays out alike; `text.Chunks(length, overlap=)` cuts long documents first; `shuffle` after `pack` orders the windows |
+| Sequence | `pack(seq_len, fields=, bins=, segments=, policy=, along=)`, the options every read lays out alike; `text.Chunks(length, overlap=)` cuts long documents first; `windows(seq_len, stride=)` cuts one stream of tokens across documents at a stride, for perplexity over overlapping windows; `shuffle` after `pack` orders the windows |
 | Order | `shuffle(seed=, window=)`, `repeat(epochs=)` |
 | Combine | `mix(datasets, weights=, by="records" \| "tokens")`, which ends at its first exhausted member, as Grain's does (repeat a member to read on); `concat(datasets)`; `interleave(cycle_length=)` over a store's shards; `schedule([(dataset, tokens), ...])` |
-| Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split="validation" | ("validation", "test"))`, each with `key=` |
+| Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split="validation" | ("validation", "test"))`, each with `key=`; `holdout(tokens=0.01, fields=("text",))`, the first hundredth of a finite order's tokens, its per-token fields cut together |
 | Batch | `batch(n)`, the global training batch; a `map` after it receives the whole batch |
 | Persist | `cache(url)` (write-through accelerator), `snapshot(url)` (a terminal job that seals an immutable generation, read back with `Files(url)`) |
-| Execution | `workers(n)`, `threads(n)`, `prefetch(n)`, `read(mode)` |
-| Look | `take(n).show()`, `stats(records=n)` |
+| Execution | `workers(n)`, `threads(n)`, `prefetch(n)`, `read(mode)`, `loading(Loading(...))` for every read setting at once |
+| Look | `take(n).show()`, `stats(records=n)`, `for record in ds` (one pass, with training's draws) |
 
 Both diagnostics open a fresh reader, never the training stream. `stats` returns counters from at most `n` accepted records and runs before `batch`; `show` also takes batches. Both handle random and repeated chains. Training logs its own live counters, wait time and throughput.
 
@@ -295,7 +296,7 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 
 | Preset | Reads per record | Writes per batch |
 |---|---|---|
-| `images(ds, size, *, batch, augment=False, crop_scale=(1, 1), cache=None)` | `image`: encoded bytes or uint8 `[H, W, 3]` | `image` uint8 `[B, size, size, 3]` |
+| `images(ds, size, *, batch, augment=False, crop_scale=(1, 1), field="image", staging_size=None, draft=False, rejects=True, caption=None, cache=None, records=None, host=())` | `field`: encoded bytes or uint8 `[H, W, 3]` | `image` uint8 `[B, size, size, 3]`; with `caption`, `caption` |
 | `lm(ds, tokenizer, *, seq_len, batch, field="text", cache=None)` | `text`: a string | `text` int32 `[B, seq_len + 1]`; `text_coordinates`, the windows' documents (`dew.nn.inputs.Coordinates`) |
 | `sft(ds, tokenizer, *, seq_len, batch, cache=None)` | `messages`: chat turns | the `lm` fields and `text_roles` int32 `[B, seq_len + 1]` |
 | `clips(ds, seconds, *, frames, fps, size, batch, sample_rate=None)` | `mp4`: bytes | `video` uint8 `[B, frames, size, size, 3]`; with `sample_rate`, `audio` float32 `[B, samples]` and `audio_valid` bool `[B, samples]` |
@@ -303,7 +304,10 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 - A `lm` or `sft` row holds `seq_len` inputs and their next-token targets.
 - `images` and `clips` pass every other field through, stacked per batch: `label` becomes `[B]`, `caption` a list of `B` strings.
 - `lm` and `sft` pack several documents into one row, so a per-document field has no row to land in. They keep only the fields they write. To pack a per-token field of your own along, write the chain with `pack(fields=)`.
-- `augment=True` crops to `crop_scale` of the area, flips and colour-jitters on the accelerator, as in [Augmenting on the GPU](#augmenting-on-the-gpu). `augment=` also takes your own random step, such as `images.Albumentations(aug)`, which runs on the host right after the resize.
+- `augment=True` crops to `crop_scale` of the area, flips and colour-jitters on the accelerator, as in [Augmenting on the GPU](#augmenting-on-the-gpu); an `images.DeviceAugment(size, crop_scale=, flip=, jitter=)` value sets those itself. `augment=` also takes your own random step or a tuple of them, such as `images.Albumentations(aug)` or `images.RandomCrop(size, scale=)`, which run on the host right after the resize.
+- `staging_size=` resizes to a larger square first, for an augmentation that crops to `size`; `draft=True` decodes a JPEG at a reduced scale no smaller than it. `rejects=False` stops the run on an image that does not decode instead of counting and dropping it.
+- `caption=images.caption(...)` writes each record's caption after the resize, with the source's class names (`class_names.label` in its metadata) where it names none; with `templates=` it draws one per record.
+- `records=n` keeps `n` prepared records before the batch, as a validation split's `take(n)`; `host=` steps read each batch on the host, before any step on the accelerator. Every preset takes both.
 - `cache=url` caches the preset's fixed steps (decode and resize, or tokenize). Augmentation, packing and batching run after the cache.
 
 ### Where the rest of the chain goes
@@ -436,7 +440,7 @@ A callable without a stable identity makes exact replay unavailable. A declared 
 
 Rejecting stages drop records before mixing and count them by source and reason. Mixture shares count accepted records or committed valid target tokens, as requested. Packing happens per source before token-weighted mixing. With an authoritative per-source valid-token count (a cache generation's index, or a producer's), the lowering weights each source's windows by `weight / mean valid targets a window` from those counts, and pins the counts in the plan. Without one, a checkpointed deficit scheduler selects the source furthest below its requested share; ties go to the lower source index. The deficit rule needs no estimate and no warm-up: the shares hold exactly at every window boundary, to within one window's tokens. It is deterministic, since the counts come from the data, and its state is the per-source delivered counts, saved in the iterator's state beside the sources'. Zero-target windows are rejected before the mix so they cannot stall that scheduler. Each member draws its randomness under its `named()` key; an unnamed member goes by its place among the unnamed members, and two members of one name by their order. A per-share mixture whose later stages keep each member's state (no shuffle window or packer above the mix) resumes across an edit of its member list, each named member at its own position; a global order, or a chain that buffers mixed records, resumes only an unchanged list. Per-member attempted, accepted and rejected-by-reason counts log under that name; per-member committed tokens do not yet.
 
-An epoch budget needs an authoritative accepted count. A finite exhausted source proves emptiness; a diagnostic sample estimates rejection rates only. A rejection limit, where one is part of an external read policy, reports exhausted work rather than claiming the corpus is empty. Padding or masking a rejected record requires an objective whose loss, gradients, metrics, mutable collections and effects all honor validity, including an all-masked batch.
+An epoch budget needs an authoritative accepted count. A finite exhausted source proves emptiness; a diagnostic sample estimates rejection rates only. No count of rejections or of empty shards refuses a read: an endless read reads on through any run of them, logging the corpus, its run and its most frequent reasons at each doubling, and its data metrics show the rows it delivered. An endless read is refused only where it is certain to read nothing forever: a share that holds no rows, a store whose shards state they hold none, or a repeated stream whose pass yields nothing with no step before the repeat that drops a row. Padding or masking a rejected record requires an objective whose loss, gradients, metrics, mutable collections and effects all honor validity, including an all-masked batch.
 
 Long text is chunked before packing. A long conversation is chunked by default, every turn kept; truncating or filtering it is an explicit preparation choice, and every per-position field is cut with the ids it describes. An over-length RL prompt keeps its tail by default; filtering it is an explicit choice, counted as a rejection under its reason. `JointLayout` cuts a decision row's state to `max_state_tokens`, when set, and to the room the framing, media and schema leave; it keeps the schema whole and drops a row that still passes `max_len`. `MarkerLayout` and `StateFirstLayout` also cut question instructions and option text. Each source reports `data/truncated/<source>`, the share of records a preparation stage marked cut (an RL prompt's tail cut is not marked yet); `data/rejected/<source>/<reason>`; and `data/chunks_per_record/<source>` for chunked text. A read warns when a source's rejected share passes `warn_over=` (1% by default).
 
