@@ -957,6 +957,41 @@ def test_cli_token_exports_are_readable_by_the_dispatched_token_source(tmp_path,
     assert actual.tolist() == expected.tolist()
 
 
+def test_a_parquet_object_reads_at_the_version_its_storage_options_name():
+    """An S3 Parquet object named at a version (`version_aware`, `?versionId=`) reads that
+    version's rows, streamed and by index, though the object has been rewritten since: every
+    setting the store was given reaches the reads."""
+    import fsspec
+    import pyarrow.parquet as pq
+    from moto.server import ThreadedMotoServer
+
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    try:
+        _, port = server.get_host_and_port()
+        options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}",
+                   "version_aware": True}
+        bucket = "versions-" + uuid4().hex
+        remote = fsspec.filesystem("s3", **options)
+        remote.mkdir(bucket)
+        remote.call_s3("put_bucket_versioning", Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+        for start in (0, 100):
+            written = io.BytesIO()
+            pq.write_table(pa.Table.from_pylist([{"id": start + index} for index in range(5)]), written)
+            remote.pipe(f"{bucket}/rows.parquet", written.getvalue())
+        first = next(version["VersionId"] for version in remote.object_version_info(f"{bucket}/rows.parquet")
+                     if not version["IsLatest"])
+        source = Files(f"s3://{bucket}/rows.parquet?versionId={first}", format="parquet",
+                       storage_options=options)
+        for read in ("streamed", "indexed"):
+            assert sorted(int(row["id"]) for row in iterate(Pipeline(source), read=read)) == list(range(5))
+    finally:
+        server.stop()
+
+
 def test_a_token_export_reads_through_the_storage_options_it_is_given(tmp_path):
     """A committed token export that only its storage options reach, an S3 endpoint of its own,
     reads its manifest, metadata and tokens through them, as its shards and index do."""
