@@ -81,6 +81,7 @@ if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
         LocalTracker,
         MeshSpec,
         MLflowTracker,
+        Observe,
         Plateau,
         ProfileWindow,
         TensorBoardTracker,
@@ -95,6 +96,7 @@ __version__ = "0.1.0"
 
 _EXPORTS = {
     "Best": "dew.training", "Keep": "dew.training", "Plateau": "dew.training", "EvalSuite": "dew.training",
+    "Observe": "dew.training",
     "Trainer": "dew.training", "TrainState": "dew.training", "Step": "dew.training",
     "Aux": "dew.training", "EMASpec": "dew.training", "MeshSpec": "dew.training",
     "Layout": "dew.training", "Checkpoints": "dew.training", "Tracker": "dew.training",
@@ -150,6 +152,7 @@ __all__ = [
     "Mean",
     "MeshSpec",
     "Objective",
+    "Observe",
     "Plateau",
     "Process",
     "ProfileWindow",
