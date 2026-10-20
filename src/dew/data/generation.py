@@ -18,7 +18,7 @@ import numpy as np
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Record, Rejected
 from dew.data.retention import LocalRetention
-from dew.data.sources.base import Read, ShardManifest, Source, _indexed_manifest, _uncounted
+from dew.data.sources.base import Read, ShardManifest, Source, _indexed_manifest, _uncounted, url_label
 from dew.data.sources.codec import decode, fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords
@@ -474,6 +474,9 @@ class Generation:
 @dataclass(frozen=True)
 class _GenerationSource:
     generation: Generation
+
+    def label(self) -> str:
+        return url_label(self.generation.url)
 
     def describe(self) -> str:
         return f"generation:{self.generation.url}"

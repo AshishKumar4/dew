@@ -22,7 +22,7 @@ from collections.abc import Mapping, Sequence
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.analysis import _analyzed, _identity, _name
+from dew.data.analysis import _analyzed, _identity, _label, _name, _reshapes
 from dew.data.dataset import Batch, Records
 from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _TokenSplit
 from dew.data.mixing import CorpusCounts
@@ -64,6 +64,9 @@ class _Memory:
     documents: int | None = None
     """The most documents a window holds where `ran` packs them, which its
     batches declare (`Coordinates.max_segments`)."""
+
+    def label(self) -> str:
+        return self.original.label()
 
     def describe(self) -> str:
         return self.original.describe()
@@ -123,9 +126,9 @@ def _materialize(
         return _memory_mixture(pipeline, pipeline.source, counts, training=training)
     source = pipeline.source
     stored = source.records("memory")
-    counter = counts.setdefault(_name(pipeline), CorpusCounts(_name(pipeline)))
+    counter = counts.setdefault(_name(pipeline), CorpusCounts(_name(pipeline), _label(pipeline)))
     if not isinstance(source, _Memory):
-        counter.attempted = len(stored)
+        counter.attempted, counter.records = len(stored), True
     lowering = _analyzed(pipeline, "memory", validation=not training)
     rows, consumed = _memory_inputs(pipeline, source, stored, counter, lowering.cache)
     return _memory_stages(
@@ -185,7 +188,10 @@ def _memory_stages(
         if isinstance(source, _Memory) and source.target_counts is not None
         else None
     )
+    accepted: int | None = None
     for stage in pipeline.stages[consumed:eager]:
+        if accepted is None and _reshapes(stage):
+            accepted = _records(rows)
         if isinstance(stage, TokenSplit):
             split = _TokenSplit(pygrain.MapDataset.source([value for _, value in rows]), stage)
             if counted is not None:
@@ -262,6 +268,8 @@ def _memory_stages(
             if counts_targets or counted is not None:
                 counted = expanded_counts
         consumed += 1
+    if counter.records and not isinstance(source, _Memory):
+        counter.accepted = _records(rows) if accepted is None else accepted
     if counted is not None:
         targets = {"valid_targets": sum(counted.values())}
     if targets is not None and targets["valid_targets"] == 0 and training:
@@ -269,6 +277,11 @@ def _memory_stages(
     inputs = source.inputs if isinstance(source, _Memory) else len(stored)
     return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, targets, counted,
                          documents)
+
+
+def _records(rows: list[tuple[tuple[int, ...], Record]]) -> int:
+    """How many of the source's records `rows` came from: each row's id begins with its record's."""
+    return len({identifier[0] for identifier, _ in rows})
 
 
 def _targeted(
@@ -358,7 +371,7 @@ def _memory_order(
     derived["fanouts"] = fingerprint(fanouts)
     if lengths is not None:
         derived["lengths"] = fingerprint(lengths)
-    counter.accepted = len(rows)
+    counter.rows = len(rows)
     counter.truncated = sum(
         bool(value.get("_dew_truncated", False)) for _, value in rows if not isinstance(value, bytes)
     )

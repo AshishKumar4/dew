@@ -750,7 +750,8 @@ def test_a_validation_pass_starts_at_most_one_worker_per_batch(monkeypatch):
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
     corpora = [grain.MapDataset.source([{"id": tag, "targets": targets}]).repeat().to_iter_dataset()
                for tag, targets in [(0, 2), (1, 7)]]
-    mix = TokenDeficit(corpora, [1, 3], tokens=Targets(), names=["short", "long"], keys=["short", "long"])
+    mix = TokenDeficit(corpora, [1, 3], tokens=Targets(), names=["short", "long"], labels=["short", "long"],
+                       keys=["short", "long"])
     reader = iter(mix)
     delivered = [0, 0]
     for row in itertools.islice(reader, 100):
@@ -1138,6 +1139,7 @@ def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation()
     parents = [grain.MapDataset.source([{"targets": count}]).repeat().to_iter_dataset()
                for count in (0, 4)]
     reader = iter(TokenDeficit(parents, [1, 1], tokens=Targets(), names=["all-zero", "useful"],
+                              labels=["all-zero", "useful"],
                               keys=["all-zero", "useful"],
                               budget=SearchBudget(consecutive=5)))
     with pytest.raises(ValueError):
@@ -1535,6 +1537,7 @@ def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row(tiny_
     parents = [grain.MapDataset.source([{"targets": 3}]).repeat().to_iter_dataset(),
                grain.MapDataset.source([{"targets": tiny_targets}]).repeat().to_iter_dataset()]
     reader = iter(TokenDeficit(parents, [1, 1e-9], tokens=Targets(), names=["normal", "tiny"],
+                              labels=["normal", "tiny"],
                               keys=["normal", "tiny"],
                               budget=SearchBudget(consecutive=3)))
     try:
