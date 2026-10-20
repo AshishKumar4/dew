@@ -25,6 +25,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.conv import Conv
+from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32
 from dew.nn.scan_orders import unpatchify
@@ -173,7 +174,7 @@ class SD3Transformer(TextStream, nn.Module):
         conditioned = (embedding(times, self.features, "timestep_embedder", **dense)
                        + embedding(conditioning.pooled, self.features, "text_embedder", **dense))
 
-        context = nn.Dense(self.caption_projection_dim, name="context_embedder", **dense)(
+        context = Dense(self.caption_projection_dim, name="context_embedder", **dense)(
             conditioning.context)
         dual = set(self.dual_attention_layers)
         for index in range(self.num_layers):
@@ -185,7 +186,7 @@ class SD3Transformer(TextStream, nn.Module):
 
         scale, shift = self._output_modulation()(conditioned)
         image = modulate(layer_norm(self.dtype)(image), shift, scale)
-        image = nn.Dense(patch * patch * self.out_channels, name="proj_out", **dense)(image)
+        image = Dense(patch * patch * self.out_channels, name="proj_out", **dense)(image)
         return unpatchify(image, patch, rows * patch, columns * patch, self.out_channels)
 
 

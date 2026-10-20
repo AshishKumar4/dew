@@ -37,6 +37,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.dense import Dense
+
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .linear import (
@@ -45,7 +47,7 @@ from .linear import (
     RMSNormGated,
     chunk_gated_delta_rule,
     held_scan,
-    port_refusal,
+    on_the_port,
     recurrent_delta_rule,
 )
 from .mixer_base import MixerBase, MixerContext
@@ -115,7 +117,7 @@ class KimiDeltaAttention(nn.Module):
                 + delta_flops(lengths, self.num_heads, self.head_dim, self.head_dim))
 
     def setup(self):
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
         self.q_proj = dense(self.qkv_features, name='q_proj')
         self.k_proj = dense(self.qkv_features, name='k_proj')
         self.v_proj = dense(self.qkv_features, name='v_proj')
@@ -184,15 +186,15 @@ class KimiDeltaAttention(nn.Module):
             query, key, value = (split(part) for part in convolved)
             if S == 1:
                 return recurrent_delta_rule(query, key, value, g, beta, held, starts=starts)
-            return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size,
-                                          projected=projected.dtype if ported else None, starts=starts)
+            return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size, ported=ported,
+                                          starts=starts, max_segments=tokens.max_segments)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
         # allocation-only call returns before any state is written. The conv
         # normalises the queries and keys (`l2norm`) and rounds once, to the
         # dtype the rule takes: the projections' where the port runs it, as
         # fla's layer hands them over, the wide one for the math.
-        ported = S > 1 and port_refusal(*(split(part) for part in jnp.split(projected, 3, axis=-1))) is None
+        ported = S > 1 and on_the_port(*(split(part) for part in jnp.split(projected, 3, axis=-1)))
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         out = held_scan(self, projected, taps, None, scan,
                         (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,
