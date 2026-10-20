@@ -692,6 +692,20 @@ def _block_sum(values, exact: bool):
     return values[0, 0]
 
 
+def _tree_sum(values, axes: tuple[int, ...]):
+    """`values` summed over `axes` pairwise, as mamba_ssm's torch sum and XLA's GPU reduction add a
+    kernel's per-block partial sums: a tree on every backend, where XLA's CPU reduction of them runs in
+    sequence."""
+    kept = [axis for axis in range(values.ndim) if axis not in axes]
+    flat = jnp.moveaxis(values, axes, tuple(range(len(axes))))
+    flat = flat.reshape(-1, *(values.shape[axis] for axis in kept))
+    while flat.shape[0] > 1:
+        if flat.shape[0] % 2:
+            flat = jnp.concatenate([flat, jnp.zeros_like(flat[:1])])
+        flat = flat[0::2] + flat[1::2]
+    return flat[0]
+
+
 def _dx_kernel(x_ref, cb_ref, dout_ref, dt_ref, da_ref, d_ref, b_ref, dstates_ref, *refs, batch: int,
                length: int, chunk: int, width: int, bm: int, bn: int, bk: int, exact: bool):
     """mamba_ssm's `_chunk_scan_chunk_state_bwd_dx_kernel` (ssd_combined.py:92-254) for one chunk of one
@@ -783,7 +797,7 @@ class ChunkScanChunkStateBwdDx(_Launch):
             compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
             name="mamba_chunk_scan_chunk_state_bwd_dx",
         )(x, cb, dout, dt, da, d, b, dstates, *([] if seq is None else [seq]))
-        return (dx, jnp.sum(ddt, axis=0), jnp.sum(dd, axis=(0, 1, 3, 4))), None
+        return (dx, jnp.sum(ddt, axis=0), _tree_sum(dd, (0, 1, 3, 4))), None
 
 
 def _heads_of(s, g, *, ratio: int, heads: int):
