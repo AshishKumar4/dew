@@ -109,6 +109,19 @@ def test_a_token_budget_resumes_its_count_from_the_checkpoint(tmp_path):
     assert int(complete.fit(dataset(), tokens=30).step) == 3
 
 
+def test_a_token_budget_counts_the_tokens_of_committed_updates(tmp_path):
+    """Under an accumulation of two, a run's tokens are those of the updates it committed: a run
+    stopped inside a window counts none of its batch, and its resume counts that batch at the
+    window's commit, once (spec training §3)."""
+    first = make_trainer(tmp_path, objective=TokenRegression(), accumulation=2)
+    assert int(first.fit(dataset(), steps=3, log_every=1).step) == 3
+    assert first.checkpoints.control(3)["tokens"] == 24
+    assert first.checkpoints.control(3)["pending_tokens"] == 12
+    resumed = make_trainer(tmp_path, objective=TokenRegression(), accumulation=2)
+    assert int(resumed.fit(dataset(), steps=4, log_every=1).step) == 4
+    assert resumed.checkpoints.control(4)["tokens"] == 48
+
+
 def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
     make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), steps=2, tokens=30)
     trainer = make_trainer(tmp_path, objective=TokenRegression())
