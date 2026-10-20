@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
+import threading
 from collections.abc import Callable, Mapping
 
 import grain.experimental as experimental
 import grain.python as grain
 
+from dew.records import boolean, record
+
 from .dataset import DataPartition, Loading
 from .sources.base import Shard, ShardManifest
+
+_log = logging.getLogger(__name__)
+
+_FIRST_LOGGED_EMPTY = 1024
+"""The run of empty shards in a row a read first logs, then again at each doubling: more than a
+sharded store holds by accident, so a store of empty files is named from the first line."""
 
 
 def streamed(
@@ -20,15 +30,19 @@ def streamed(
     cycle_length: int = 16,
     loading: Loading,
     epochs: int | None = 1,
-    empty_shard_budget: int = 4096,
     name: str | None = None,
 ) -> grain.IterDataset:
+    """The shards of `manifest` read `epochs` times over (endlessly where None), this share's part
+    of them interleaved `cycle_length` at a time. An endless read of a store whose shards all state
+    they hold no row is refused, as it would read nothing forever; any other run of empty shards is
+    read through, logged at each doubling (`_FIRST_LOGGED_EMPTY`)."""
     if cycle_length < 1:
         raise ValueError("interleave cycle_length must be positive")
+    described = name or (manifest.shards[0].uri if manifest.shards else "a stream")
+    if epochs is None and all(shard.rows == 0 for shard in manifest.shards):
+        raise ValueError(f"{described} holds no rows, so reading it endlessly reads nothing forever")
     if not manifest.shards:
         return grain.MapDataset.source(()).to_iter_dataset()
-    if empty_shard_budget < 1:
-        raise ValueError("empty_shard_budget must be positive")
     workers = loading.workers if isinstance(loading.workers, int) else 1
     required = partition.count * max(workers, 1)
     shards = manifest.shards
@@ -45,117 +59,88 @@ def streamed(
     if epochs != 1:
         root = root.repeat(epochs)
     root = root[partition.index :: partition.count]
-    return _ShardPass(
-        root, manifest.reader, cycle_length, loading, empty_shard_budget, name or shards[0].uri
-    )
-
-
-@dataclasses.dataclass(frozen=True)
-class _EmptyShard:
-    pass
+    return _ShardPass(root, manifest.reader, cycle_length, loading, described)
 
 
 class _ShardPass(grain.IterDataset):
-    def __init__(
-        self,
-        root: grain.MapDataset,
-        reader: Callable[[Shard], grain.IterDataset],
-        cycle: int,
-        loading: Loading,
-        budget: int,
-        name: str,
-    ):
+    def __init__(self, root: grain.MapDataset, reader: Callable[[Shard], grain.IterDataset], cycle: int,
+                 loading: Loading, name: str):
         super().__init__(root)
         self.root, self.reader = root, reader
-        self.cycle, self.loading, self.budget, self.name = cycle, loading, budget, name
+        self.cycle, self.loading, self.name = cycle, loading, name
 
     def set_slice(self, selection: slice, sequential_slice: bool = False) -> None:
         self.root = self.root[selection]
 
     def __iter__(self) -> grain.DatasetIterator:
-        parent = experimental.InterleaveIterDataset(
-            self.root.map(_GuardedReader(self.reader)),
+        empty = _EmptyRun(self.name)
+        return experimental.InterleaveIterDataset(
+            self.root.map(_Reader(self.reader, empty)),
             cycle_length=self.cycle,
             num_make_iter_threads=max(self.loading.threads, 1),
             make_iter_buffer_size=self.loading.read_buffer,
-        )
-        return _BudgetIterator(parent.__iter__(), self.name, self.budget)
+        ).__iter__()
+
+
+class _EmptyRun:
+    """How many shards in a row one read found empty, which it logs at each doubling. Grain reads
+    each shard on a prefetch thread of its own, so the count is kept under a lock."""
+
+    def __init__(self, name: str):
+        self.name, self.count = name, 0
+        self.lock = threading.Lock()
+
+    def ended(self, yielded: bool) -> None:
+        with self.lock:
+            self.count = 0 if yielded else self.count + 1
+            count = self.count
+        if count >= _FIRST_LOGGED_EMPTY and not count & (count - 1):
+            _log.warning("%s: its last %d shards held no row; the read goes on to the next", self.name, count)
 
 
 @dataclasses.dataclass(frozen=True)
-class _GuardedReader:
+class _Reader:
+    """A shard's reader, its rows watched for a run of empty shards (`_EmptyRun`)."""
+
     reader: Callable[[Shard], grain.IterDataset]
+    empty: _EmptyRun
 
     def __call__(self, shard: Shard) -> grain.IterDataset:
-        return _GuardedShard(self.reader(shard))
+        return _Watched(self.reader(shard), self.empty)
 
 
-class _GuardedShard(grain.IterDataset):
-    def __init__(self, parent: grain.IterDataset):
+class _Watched(grain.IterDataset):
+    """One shard's rows, telling `empty` whether it held any as it ends."""
+
+    def __init__(self, parent: grain.IterDataset, empty: _EmptyRun):
         super().__init__(parent)
-        self.input_parent = parent
+        self.input_parent, self.empty = parent, empty
 
     def __iter__(self) -> grain.DatasetIterator:
-        return _ShardIterator(self.input_parent.__iter__())
+        return _WatchedIterator(self.input_parent.__iter__(), self.empty)
 
 
-class _ShardIterator(grain.DatasetIterator):
-    def __init__(self, parent: grain.DatasetIterator):
+class _WatchedIterator(grain.DatasetIterator):
+    def __init__(self, parent: grain.DatasetIterator, empty: _EmptyRun):
         super().__init__(parent)
-        self.input_parent = parent
+        self.input_parent, self.empty = parent, empty
         self.yielded = False
-        self.reported = False
 
     def __next__(self):
         try:
             row = next(self.input_parent)
         except StopIteration:
-            if not self.yielded and not self.reported:
-                self.reported = True
-                return _EmptyShard()
+            self.empty.ended(self.yielded)
             raise
         self.yielded = True
         return row
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parent": self.input_parent.get_state(), "yielded": self.yielded, "reported": self.reported}
+        return {"parent": self.input_parent.get_state(), "yielded": self.yielded}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        parent, yielded, reported = state["parent"], state["yielded"], state["reported"]
-        if not isinstance(parent, Mapping) or not isinstance(yielded, bool) or not isinstance(reported, bool):
-            raise ValueError("invalid physical shard reader state")
-        self.input_parent.set_state(parent)
-        self.yielded, self.reported = yielded, reported
-
-    def close(self) -> None:
-        self.input_parent.close()
-
-
-class _BudgetIterator(grain.DatasetIterator):
-    def __init__(self, parent: grain.DatasetIterator, name: str, limit: int):
-        super().__init__(parent)
-        self.input_parent, self.name, self.limit = parent, name, limit
-        self.empty = 0
-
-    def __next__(self):
-        while isinstance(row := next(self.input_parent), _EmptyShard):
-            self.empty += 1
-            if self.empty >= self.limit:
-                raise ValueError(
-                    f"source {self.name} exhausted its search budget of {self.limit} empty shards"
-                )
-        self.empty = 0
-        return row
-
-    def get_state(self) -> Mapping[str, object]:
-        return {"parent": self.input_parent.get_state(), "empty_shards": self.empty}
-
-    def set_state(self, state: Mapping[str, object]) -> None:
-        parent, empty = state["parent"], state["empty_shards"]
-        if not isinstance(parent, Mapping) or not isinstance(empty, int) or empty < 0:
-            raise ValueError("invalid empty-shard search state")
-        self.input_parent.set_state(parent)
-        self.empty = empty
+        self.input_parent.set_state(record(state["parent"], "shard position"))
+        self.yielded = boolean(state["yielded"], "shard yielded")
 
     def close(self) -> None:
         self.input_parent.close()
