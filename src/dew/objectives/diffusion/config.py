@@ -450,8 +450,9 @@ class DiffusionRunConfig(RunConfig):
         objective = run.build()
         dataset = run.loader(objective.data())
         metrics = run.build_eval_metrics(dataset.val is not None)
-        flow = isinstance(objective, FlowGRPOObjective) and run.rollout is not None
-        rollout = run.rollout.build(objective) if flow else None
+        rollout = None
+        if isinstance(objective, FlowGRPOObjective) and run.rollout is not None:
+            rollout = run.rollout.build(objective)
         return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=metrics,
                                                     rollout=rollout))
 
