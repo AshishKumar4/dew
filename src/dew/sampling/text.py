@@ -85,7 +85,7 @@ ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, cova
 
 Transforms = LogitsTransform | Sequence[LogitsTransform]
 Criteria = Stopping | Sequence[Stopping]
-Components = tuple[tuple[LogitsTransform, ...], tuple[Stopping, ...], Strategy]
+Components = tuple[tuple[LogitsTransform, ...], decoding.Finishing, Strategy]
 
 # A resolved component's configuration as every process can spell it: a repr,
 # a number (an array's shape is a tuple of them), or a tuple of either nested
@@ -599,7 +599,7 @@ def _block_drafting(model: nn.Module, params: Variables):
 
 def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
               trips: int, budget: jax.Array, pad_id: int, n: int,
-              transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
+              transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
               strategy: Strategy) -> Generation:
     """One fixed compiled loop of `trips` draws; finished rows do not mutate
     their cache state. `budget` is the tokens the request may draw, at most
@@ -625,7 +625,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         step=jnp.zeros(batch, jnp.int32), active=real, keys=keys, prompt_width=width,
         budget=jnp.full(batch, budget, jnp.int32))
     drawn: Draws = strategy(state, start, ops, decoding.chain(transforms),
-                            decoding.criterion(stopping), trips, n)
+                            decoding.finish(stopping), trips, n)
     return Generation(
         jnp.concatenate([prompt, jnp.where(drawn.valid, drawn.tokens, pad_id)], axis=1),
         jnp.sum(drawn.valid, axis=1, dtype=jnp.int32), drawn.terminated,
@@ -700,9 +700,8 @@ def resolve(sampling: Sampling, logits: Transforms | None, stopping: Criteria | 
     termination by accident. No strategy means `Sample`.
     """
     transforms = sampling.transforms() if logits is None else logits
-    return (decoding.components(transforms),
-            (() if stopping is None else decoding.components(stopping))
-            + sampling.criteria(),
+    given = () if stopping is None else tuple(stopping) if isinstance(stopping, Sequence) else (stopping,)
+    return (decoding.components(transforms), decoding.Finishing.of((*given, *sampling.criteria())),
             Sample() if strategy is None else strategies.as_pytree(strategy))
 
 
@@ -818,7 +817,7 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
 
 def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
              budget: jax.Array, trips: int, pad_id: int, n: int,
-             transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
+             transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
              strategy: Strategy) -> tuple[checkify.Error, Generation]:
     """`_generate` with its device checks discharged into a returned error.
 

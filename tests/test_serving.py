@@ -158,6 +158,27 @@ def _host_loaded(dtype="float32"):
     return loaded.text_generation(sampling=Sampling(temperature=0, eos_token_ids=None))
 
 
+def test_a_served_length_limit_truncates_a_request_as_a_direct_call_does():
+    """A task whose criteria cut a request short at a length (`MaxNewTokens`) before its budget
+    finishes it unterminated through a server, as the task's own call does, and a task that ends
+    it on a criterion of its own finishes it terminated through both."""
+    from dew.sampling import Sampling, decoding
+
+    def at_two(state, tokens):
+        return state.step >= 2
+
+    prompt = np.asarray([1, 2, 3], np.int32)
+    for stopping, terminated in (((decoding.MaxNewTokens(2),), False), ((at_two,), True)):
+        bound = dataclasses.replace(task(Sampling(temperature=0, eos_token_ids=None)), stopping=stopping)
+        direct = bound(prompt[None], 8, key=0)
+        server = Server.from_task(bound, slots=2, capacity=32)
+        ticket = server.submit(prompt, 8, key=0)
+        server.run()
+        served = ticket.result()
+        assert direct.lengths.tolist() == served.lengths.tolist() == [2]
+        assert direct.terminated.tolist() == served.terminated.tolist() == [terminated]
+
+
 def test_a_server_over_loaded_weights_places_them_once():
     """`Pretrained.load` returns its weights in host memory, which a task keeps as given and places
     on the device once, at its first generation, as decoding reads them (`resident`); a server over
