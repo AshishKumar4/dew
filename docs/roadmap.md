@@ -100,6 +100,12 @@ The kernel direction was approved on 2026-10-19:
 - Run DeviceAugment in the image pipeline benchmark's device-augment arms. [772]
 - One priming and checkpoint path for mixtures' reads. [773]
 - One public loading route: `loader(spec, ...)`, `_Loadable` deleted. [780]
+- Let the image, language-model and SFT presets take the documented `cache=`. [803]
+- Show a preset's expanded steps in `show()`, and report throughput, token and padding statistics in `stats()`. [804, 805]
+- Fetch images with the documented `threads=`, and prefetch to devices through `fit(device_prefetch=)`. [806, 807]
+- Let `from_grain` and `from_iter` work without undocumented names, and `Memory` read a DataFrame directly. [808, 809]
+- Add presets for prompts, preferences, chat canvases and records, which the run layer's recipes cover today. [810]
+- Rule on the nine public Dataset members the spec does not name: then, chain, map_with_index, slice, windows, token_split, rebatch, limit and iterate. [811]
 
 ## Training and parallelism
 
