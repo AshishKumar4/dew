@@ -235,8 +235,7 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
         if target.generation != generation:
             canonical = TARGETS.get(generation, GpuTarget(generation, kind))
             target = dataclasses.replace(canonical, device_kind=kind) if real else canonical
-        counted = _multiprocessors(device) if real else None
-        return target if counted is None else dataclasses.replace(target, multiprocessors=counted)
+        return runtime_facts(target, device) if real else target
     if identifier in TARGETS:
         return TARGETS[identifier]
     for target in TARGETS.values():
@@ -281,6 +280,45 @@ def _multiprocessors(device) -> int | None:
     field, and a CUDA device reports them as its cores, so it is read at this
     boundary; a device without one gives None."""
     return getattr(device, 'core_count', None)
+
+
+def _shared_memory(device) -> int | None:
+    """The shared memory, in bytes, a block of `device` may hold once a kernel opts in. jax's Device
+    declares no such field, and a CUDA device reports it among its attributes as XLA describes it
+    (`shared_memory_per_block_optin`), so it is read at this boundary; a device without one gives
+    None."""
+    return getattr(device, 'shared_memory_per_block_optin', None)
+
+
+def runtime_facts(target: GpuTarget, device) -> GpuTarget:
+    """`target` with the facts a real CUDA `device` reports of itself in place of the table's: its
+    multiprocessors, its block's shared memory, and Hopper's warpgroup MMA, which capability 9.0 alone
+    has. A GPU the table does not name so keeps every resource a kernel's requirements read."""
+    capability = _compute_capability(device)
+    facts = {'multiprocessors': _multiprocessors(device), 'shared_limit': _shared_memory(device)}
+    return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None},
+                               wgmma=capability == '9.0' if capability else target.wgmma)
+
+
+SHARED_BUDGET = 99 * 1024
+"""The shared memory a block holds where a target reports none: the least of any CUDA GPU Dew's Pallas
+launches run on (sm86, sm89 and sm120 hold 99 KiB), so a launch sized by it fits wherever it runs."""
+
+
+def shared_budget(target: GpuTarget) -> int:
+    """The shared memory, in bytes, a program on `target` may stage: the block's own, which a real
+    device reports (`runtime_facts`), else `SHARED_BUDGET`. A target that is no GPU (a CPU, which
+    interprets the kernels) holds the A100's, the generation interpretation stands for, so its tests
+    run the tiles an A100 takes."""
+    if capability(target.generation) is None:
+        return TARGETS['sm80'].shared_limit or SHARED_BUDGET
+    return target.shared_limit or SHARED_BUDGET
+
+
+def fp8_tensor_cores(generation: str) -> bool:
+    """Whether a CUDA generation's tensor cores multiply FP8: compute capability 8.9 (Ada) and later."""
+    found = capability(generation)
+    return found is not None and found >= (8, 9)
 
 
 def device_generation() -> str:
