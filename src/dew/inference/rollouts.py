@@ -134,27 +134,19 @@ def response(tokens: Sequence[int], sampling: Sampling) -> tuple[int, ...]:
 
 def through_stop(tokens: Sequence[int], decode: Callable[[Sequence[int]], str],
                  strings: Sequence[str]) -> int:
-    """How many of `tokens` a draw that a stop string ended keeps: the engines end a draw in the step
-    whose text first holds one of `strings`, so the draw keeps the first of the last run of prefixes
-    whose decoded text holds one.
+    """The length of the shortest prefix of `tokens` whose decoded text holds one of `strings`: where a
+    draw that a stop string ended ends, as the engines end one in the step whose text first holds it.
 
-    Prefixes are decoded whole, from the end back, since a tokenizer's text for a longer prefix need not
-    extend a shorter one's (Transformers' cleanup turns " ." into ".") and ids that decode to nothing
-    may sit inside a string; the decodes are the ids past the stop and the run's own. Raises ValueError
-    where no prefix holds one: the engine and the tokenizer disagree."""
-    def holds(count: int) -> bool:
+    Every prefix is decoded whole, from the first, since a tokenizer's text for a longer prefix need
+    not extend a shorter one's (Transformers' cleanup turns " ." into "."), and ids that decode to
+    nothing may sit inside a string. Raises ValueError where no prefix holds one: the engine and the
+    tokenizer disagree."""
+    for count in range(1, len(tokens) + 1):
         text = decode(tokens[:count])
-        return any(string in text for string in strings)
-
-    kept = len(tokens)
-    while kept > 0 and not holds(kept):
-        kept -= 1
-    if kept == 0:
-        raise ValueError(f"the engine ended the draw on one of {list(strings)}, which no prefix of its "
-                         f"{len(tokens)} ids decodes to; is `decode` the served model's tokenizer?")
-    while kept > 1 and holds(kept - 1):
-        kept -= 1
-    return kept
+        if any(string in text for string in strings):
+            return count
+    raise ValueError(f"the engine ended the draw on one of {list(strings)}, which no prefix of its "
+                     f"{len(tokens)} ids decodes to; is `decode` the served model's tokenizer?")
 
 def check_ending(tokens: Sequence[int], terminated: bool, sampling: Sampling) -> None:
     """Raise ValueError unless a draw of `tokens` that `terminated` or not ends as `sampling` ends one.
