@@ -212,9 +212,9 @@ def _row_terms(logits, predict: bool) -> tuple[
     state gradient 3.9 times as far from float64 as `jax.nn.logsumexp`'s
     over 52 orders of its columns (tests/test_chunked_cross_entropy.py),
     where the two levels' loops are each a block long. A GPU reduces a row
-    as a tree of its threads' partial sums already, and there the two levels
-    took the tiled head's forward from 11.9 to 15.0 ms on an A100 (4096
-    tokens, 151936 columns), so other backends keep the one reduction."""
+    as a tree of its threads' partial sums already, where a second level is
+    another pass over the row's blocks for nothing, so other backends keep
+    the one reduction."""
     def combine(first, second):
         larger = jnp.maximum(first[0], second[0])
         total = _rescaled(first[0], first[1], larger) + _rescaled(second[0], second[1], larger)
