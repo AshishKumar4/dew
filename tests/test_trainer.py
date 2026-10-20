@@ -111,7 +111,7 @@ def test_a_directory_refuses_another_runs_resume_and_resumes_its_own_on_another_
         batch = {"text": np.tile(np.arange(9, dtype=np.int32) % 16, (jax.device_count(), 1))}
         return Trainer(LMObjective(model, 8), optax.sgd(0.1), key=0,
                        checkpoints=Checkpoints(str(tmp_path / "run"))).fit(
-            Loader(lambda partition: itertools.repeat(batch), None, None, len(batch["text"])),
+            Loader(replayed(lambda partition: itertools.repeat(batch)), None, None, len(batch["text"])),
             steps=steps, log_every=100, checkpoint_every=1)
 
     run(1)
