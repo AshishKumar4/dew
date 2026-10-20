@@ -656,7 +656,8 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
     # over those weights, run there too, draws what it does.
     restored = TextToImage.from_run(str(tmp_path / "run"))
     published_variables = saved.pipeline(initial).variables
-    for got, want in zip(jax.tree.leaves(restored.variables), jax.tree.leaves(published_variables), strict=True):
+    for got, want in zip(jax.tree.leaves(restored.variables), jax.tree.leaves(published_variables),
+                         strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     np.testing.assert_array_equal(
         restored(prompts, key=7).host().images,
