@@ -271,25 +271,6 @@ def primary_context(ordinal: int) -> tuple[ctypes.CDLL, ctypes.c_void_p, ctypes.
     return cuda, context, device
 
 
-SHARED_MEMORY_PER_BLOCK = 97
-"""`CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` (cuda.h): the shared memory one block may
-hold once a kernel opts in, in bytes, the most a Pallas launch's tiles may stage."""
-
-
-def gpu_attribute(ordinal: int, attribute: int) -> int | None:
-    """The CUDA driver's `attribute` (a `CUdevice_attribute`, e.g. `SHARED_MEMORY_PER_BLOCK`) of the
-    visible GPU `ordinal`, or None where no driver answers."""
-    try:
-        cuda = ctypes.CDLL("libcuda.so.1")
-    except OSError as error:  # ctypes' answer for a library the loader does not find
-        _log.debug("no CUDA driver library loads: %s", error)
-        return None
-    device, value = ctypes.c_int(), ctypes.c_int()
-    if cuda.cuInit(0) or cuda.cuDeviceGet(ctypes.byref(device), ordinal):
-        return None
-    return None if cuda.cuDeviceGetAttribute(ctypes.byref(value), attribute, device) else value.value
-
-
 def gpu_free_bytes(ordinal: int) -> int | None:
     """The bytes the CUDA driver reports free on the visible GPU `ordinal`,
     every process's allocations counted, or None where no driver answers.
