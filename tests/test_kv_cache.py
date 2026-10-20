@@ -158,8 +158,11 @@ def test_a_quantized_read_is_the_rotated_write_within_the_formats_rounding(quant
 @pytest.mark.gpu(reason="the paged BF16 decode kernel needs CUDA sm80+")
 @pytest.mark.skipif(not bf16_dot_runs(), reason="the paged BF16 decode kernel needs CUDA sm80+")
 @pytest.mark.parametrize("width", [64, 256])
-def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(without_deterministic_ops, width):
-    """Over reordered and shared pages and distinct key counts, the Pallas
+@pytest.mark.parametrize("windowed", [False, True], ids=["prefix", "window"])
+def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(without_deterministic_ops, width,
+                                                                             windowed):
+    """Over reordered and shared pages and distinct key counts, from each
+    row's first key under a window where `windowed`, the Pallas
     kernel's value is as exact as the gathered attention's through the
     dispatch, measured from float64, and its gradients and its jvp are that
     attention's (`_gathered_attention`, in forward mode `_gathered_tangent`):
@@ -170,16 +173,17 @@ def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(with
     v = jax.random.normal(jax.random.key(5), k.shape, jnp.bfloat16)
     table = jnp.asarray([[2, 0], [0, 3]], jnp.int32)
     lengths = jnp.asarray([21, 32], jnp.int32)
+    starts = (jnp.asarray([5, 17], jnp.int32),) if windowed else ()
 
     def old(q, k, v):
-        return _gathered_attention(q, k, v, table, lengths)
+        return _gathered_attention(q, k, v, table, lengths, *starts)
 
     def loss(function, q, k, v):
         out = function(q, k, v)
         return jnp.sum(out.astype(jnp.float32) ** 2), out
 
     def native(q, k, v):
-        return _gpu_paged(q, k, v, table, lengths)
+        return _gpu_paged(q, k, v, table, lengths, *starts)
     (_, out), gradients = jax.jit(jax.value_and_grad(lambda q, k, v: loss(native, q, k, v),
                                                      argnums=(0, 1, 2), has_aux=True))(q, k, v)
     (_, prior), previous = jax.jit(jax.value_and_grad(lambda q, k, v: loss(old, q, k, v),
@@ -189,7 +193,7 @@ def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(with
     direction = jax.random.normal(jax.random.key(6), q.shape, jnp.bfloat16)
     np.testing.assert_array_equal(
         jax.jit(lambda q: jax.jvp(lambda q: native(q, k, v), (q,), (direction,))[1])(q),
-        jax.jit(lambda q: jax.jvp(lambda q: _gathered_tangent(q, k, v, table, lengths), (q,),
+        jax.jit(lambda q: jax.jvp(lambda q: _gathered_tangent(q, k, v, table, lengths, *starts), (q,),
                                   (direction,))[1])(q))
 
     with jax.enable_x64():
@@ -197,6 +201,7 @@ def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(with
             return scaled_dot_product_attention(
                 q[:, None], _gather_pages(k, table, 1), _gather_pages(v, table, 1),
                 implementation="reference", key_value_seq_lengths=lengths,
+                key_value_seq_starts=starts[0] if starts else None,
                 precision=jax.lax.Precision.HIGHEST, force_fp32_for_softmax=False)[:, 0]
 
         def reference_loss(q, k, v):
@@ -353,6 +358,22 @@ def test_the_paged_selector_reads_a_gpu_steps_pool_through_its_kernel_where_its_
         assert select(PAGED, paged_case(**changed)).kernel == kernel
     (route,) = found
     assert (route.refusal.code if route.refusal else None) == code
+
+
+def test_a_windowed_step_reads_its_pool_through_the_gpus_kernel_and_the_tpus_gather():
+    """A windowed decode step's paged pool (`PagedCase.windowed`): the GPU's paged kernel reads each
+    row from its window's first key, so an A100 takes it; the TPU's reads every slot to a row's length,
+    so a TPU's step reads the gathered rows, through the layer's attention and its window."""
+    from dew.nn.kernels.generation import assumed, routes
+    from dew.nn.kernels.selection import select
+    from dew.nn.kv_cache import PAGED
+
+    with assumed("sm80"):
+        assert select(PAGED, paged_case(windowed=True)).kernel == "triton"
+    with assumed("v6e"), routes() as found:
+        assert select(PAGED, paged_case(windowed=True)).kernel == "gathered"
+    (route,) = found
+    assert route.refusal.code == "windowed"
 
 
 def test_a_tpu_steps_paged_pool_takes_its_kernel_with_a_softcap_the_gpus_turns_down():

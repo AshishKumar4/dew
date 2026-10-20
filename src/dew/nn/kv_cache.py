@@ -446,18 +446,21 @@ class KVStore:
         return _gather_pages(pool, self._get(TABLE), self.layout.groups)
 
     def case(self, query: jax.Array, *, value_dim: int, softcap: float | None, arithmetic: bool,
-             named: str) -> PagedCase:
+             named: str, windowed: bool = False) -> PagedCase:
         """The `PagedCase` of a decode step's query `[rows, heads, head_dim]` over this pool, its values
         `value_dim` wide, under the layer's `softcap`, its reference-only `arithmetic`
-        (`dew.nn.attention.reference_only`) and its `AttentionImpl`, `named`."""
+        (`dew.nn.attention.reference_only`) and its `AttentionImpl`, `named`; a `windowed` step reads
+        each row from its window's first key."""
         return PagedCase(heads=query.shape[-2], kv_heads=self.kv_heads, head_dim=self.head_dim,
                          value_dim=value_dim, dtype=jnp.dtype(query.dtype), pool=jnp.dtype(self.dtype),
                          page_size=self.layout.page_size, quantized=self.layout.quantized is not None,
                          groups=self.layout.groups, head_shards=_head_shards(query), softcap=softcap,
-                         arithmetic=arithmetic, named=named)
+                         arithmetic=arithmetic, named=named, windowed=windowed)
 
-    def decode(self, query: jax.Array, lengths: jax.Array, softcap: float | None) -> jax.Array:
-        """Attend one query per row `[rows, heads, head_dim]` to the first `lengths` slots of that row.
+    def decode(self, query: jax.Array, lengths: jax.Array, softcap: float | None,
+               starts: jax.Array | None = None) -> jax.Array:
+        """Attend one query per row `[rows, heads, head_dim]` to the first `lengths` slots of that row,
+        from `starts` `[rows]` where given (a window's first slot, which the GPU's kernel reads).
 
         Decode runs the device's paged kernel, which raises `KernelRefused` where its requirements
         (`PAGED`) turn the step down. The TPU kernel does not scale
@@ -468,25 +471,29 @@ class KVStore:
         queries, lengths and page tables, and the key heads of the pool its
         query heads read, with every page, as the tables index the whole pool.
         """
-        case = self.case(query, value_dim=self.head_dim, softcap=softcap, arithmetic=False, named='auto')
+        case = self.case(query, value_dim=self.head_dim, softcap=softcap, arithmetic=False, named='auto',
+                         windowed=starts is not None)
         kernel = 'triton' if backend() == "gpu" else 'tpu'
         if failed := PAGED.kernel(kernel).failed(case):
             raise KernelRefused(PAGED.choice, kernel, [requirement.refusal(case) for requirement in failed])
 
-        def local(query, key, value, lengths, table):
+        def local(query, key, value, lengths, table, *starts):
             if backend() == "gpu":
-                return _gpu_paged(query, key, value, table, lengths)
+                return _gpu_paged(query, key, value, table, lengths, *starts)
             from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
 
             scaled = query * jnp.asarray(1.0 / math.sqrt(self.head_dim), query.dtype)
             return paged_attention(scaled, key, value, lengths, table, attn_logits_soft_cap=softcap,
                                    pages_per_compute_block=_pages_per_block(table.shape[1]))
 
-        arrays = (query, self._get("cached_key"), self._get("cached_value"), lengths, self._get(TABLE))
+        given = () if starts is None else (starts,)
+        arrays = (query, self._get("cached_key"), self._get("cached_value"), lengths, self._get(TABLE),
+                  *given)
         queries = logical_spec(DECODE_QUERY, query.shape)
         # A spec leaves off trailing whole dimensions.
         rows, heads = (*queries, None, None)[:2]
-        return manual_map(local, (queries, P(heads), P(heads), P(rows), P(rows)), queries)(*arrays)
+        specs = (queries, P(heads), P(heads), P(rows), P(rows), *(P(rows) for _ in given))
+        return manual_map(local, specs, queries)(*arrays)
 
 
 DECODE_QUERY = ("activation_batch", "activation_heads", None)
@@ -499,8 +506,9 @@ class PagedCase:
     query's `heads` over the pool's `kv_heads`, `head_dim` wide with values `value_dim` wide; the
     query's `dtype` and the `pool`'s; its `page_size` (None for a compact cache), whether it is
     `quantized`, its `groups`; how many ways a mesh splits the query heads (`head_shards`); the layer's
-    `softcap`; whether its arithmetic is the reference path's alone (`arithmetic`); and the
-    `AttentionImpl` it `named`."""
+    `softcap`; whether its arithmetic is the reference path's alone (`arithmetic`); the
+    `AttentionImpl` it `named`; and whether it reads each row from its window's first key
+    (`windowed`)."""
 
     heads: int
     kv_heads: int
@@ -515,6 +523,7 @@ class PagedCase:
     softcap: float | None
     arithmetic: bool
     named: str
+    windowed: bool = False
 
 
 def _paged_layout(device: str) -> tuple[Requirement[PagedCase], ...]:
@@ -562,6 +571,9 @@ TPU_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
     Requirement('capability', lambda case: generation.backend() == 'tpu',
                 "the paged attention kernel runs on a TPU", inherent=True),
     *_paged_layout('TPU'),
+    Requirement('windowed', lambda case: not case.windowed,
+                "the TPU paged kernel reads every slot to a row's length, not a window's span",
+                row='roadmap: TPU paged decode over windows'),
 )
 """jax's Pallas TPU paged attention, which applies a logit softcap itself."""
 
@@ -603,29 +615,30 @@ def _gather_pages(pool: jax.Array, table: jax.Array, groups: int) -> jax.Array:
                                      table.shape[1] * pool.shape[2], *pool.shape[3:]), 0, 2)
 
 
-def _gathered_attention(query, key, value, table, lengths):
+def _gathered_attention(query, key, value, table, lengths, *starts):
     """The paged kernel's arithmetic over the gathered rows, through the attention dispatch: one query a
-    row over the first `lengths` keys of its pages. An inactive row reads one slot. Its backward is
-    the paged kernel's (`_paged_backward`)."""
+    row over the first `lengths` keys of its pages, from its `starts` where a window gives them. An
+    inactive row reads one slot. Its backward is the paged kernel's (`_paged_backward`)."""
     from dew.nn.attention import scaled_dot_product_attention
 
     keys, values = _gather_pages(key, table, 1), _gather_pages(value, table, 1)
     return scaled_dot_product_attention(query[:, None], keys, values,
-                                        key_value_seq_lengths=jnp.maximum(lengths, 1))[:, 0]
+                                        key_value_seq_lengths=jnp.maximum(lengths, 1),
+                                        key_value_seq_starts=starts[0] if starts else None)[:, 0]
 
 
-def _gathered_tangent(query, key, value, table, lengths):
+def _gathered_tangent(query, key, value, table, lengths, *starts):
     """`_gathered_attention` traced for forward mode (`forward_mode_attention`): a fused kernel the
     dispatch takes keeps its value and takes its tangent from the reference path's, so `jax.jvp`
     differentiates it at every order, which a reverse-only fused kernel would not."""
     from dew.nn.attention import forward_mode_attention
 
     with forward_mode_attention():
-        return _gathered_attention(query, key, value, table, lengths)
+        return _gathered_attention(query, key, value, table, lengths, *starts)
 
 
-def _paged_forward(query, key, value, table, lengths):
-    return decode_attention.attend_paged(query, key, value, table, jnp.maximum(lengths, 1)), ()
+def _paged_forward(query, key, value, table, lengths, *starts):
+    return decode_attention.attend_paged(query, key, value, table, jnp.maximum(lengths, 1), *starts), ()
 
 
 def _paged_backward(saved, operands, cotangent):

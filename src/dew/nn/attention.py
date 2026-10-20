@@ -219,7 +219,8 @@ def combined_attention_mask(query_length: int, key_length: int, causal: bool,
 
 
 def visible_rows(query_length: int, key_length: int, causal: bool, sliding_window: int | None,
-                 mask=None, segment_ids=None, key_value_seq_lengths=None) -> jax.Array | None:
+                 mask=None, segment_ids=None, key_value_seq_lengths=None,
+                 key_value_seq_starts=None) -> jax.Array | None:
     """Whether each query row sees a key, `[B or 1, Q, H or 1, 1]` over the
     output, or None where every row does.
 
@@ -227,11 +228,13 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
     on every implementation (`scaled_dot_product_attention`): a softmax over
     no keys has no value, and a kernel left to it returns the mean of the
     values or, in Splash's backward, gradients from a uniform weight over
-    masked keys. Causality, a window, key lengths and segment ids decide a
-    row from its index; an explicit mask is reduced over its keys, folded
-    with them (`combined_attention_mask`).
+    masked keys. Causality, a window, key lengths and starts and segment ids
+    decide a row from its index; an explicit mask is reduced over its keys,
+    folded with them (`combined_attention_mask`).
     """
-    if isinstance(segment_ids, CrossDocuments) and mask is None and key_value_seq_lengths is None:
+    starts = None if key_value_seq_starts is None else jnp.asarray(key_value_seq_starts)
+    if (isinstance(segment_ids, CrossDocuments) and mask is None and key_value_seq_lengths is None
+            and starts is None):
         # A query of another sequence's documents sees a key where its document holds one: the
         # keys' ids run in ascending order, padding after them, so each query's id is searched in
         # its row's keys rather than compared with every key.
@@ -244,7 +247,7 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
             seen &= aligned_places(segment_ids) > -sliding_window
         return seen[:, :, None, None]
     if (mask is not None or isinstance(segment_ids, CrossDocuments)
-            or (segment_ids is not None and key_value_seq_lengths is not None)):
+            or (segment_ids is not None and (key_value_seq_lengths is not None or starts is not None))):
         if isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None):
             # Aligned to each document's last keys, which the mask carries in their place.
             visible = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
@@ -255,22 +258,34 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
                 visible = with_documents(visible, segment_ids)
         if key_value_seq_lengths is not None:
             visible = with_key_lengths(visible, key_value_seq_lengths, key_length)
+        visible = with_key_starts(visible, starts, key_length)
         assert visible is not None
         rows = jnp.any(visible, -1)
         rows = rows.reshape((1,) * (3 - rows.ndim) + rows.shape)
         return jnp.swapaxes(rows, -1, -2)[..., None]
     # The keys row i may see run from 0 to the last one; causality keeps 0 in
-    # reach, and a window ends `left` keys before the row.
-    left = None if sliding_window is None else window_sides(causal, sliding_window)[0]
-    if key_value_seq_lengths is None:
+    # reach, and a window ends `left` keys before the row. A row's start must
+    # lie at or before the last key it may see: the last, the row itself
+    # under causality, or `right` keys past it under a two-sided window.
+    left, right = (None, None) if sliding_window is None else window_sides(causal, sliding_window)
+    rows = np.arange(query_length)[None]
+    if key_value_seq_lengths is None and starts is None:
         last = np.full((1, 1), key_length - 1)
-        reach = (last >= 0) if left is None else (np.arange(query_length)[None] - left <= last)
+        reach = (last >= 0) if left is None else (rows - left <= last)
         if segment_ids is None:
             return None if reach.all() else jnp.asarray(reach)[:, :, None, None]
         return (jnp.asarray(reach) & (jnp.asarray(segment_ids) != 0))[:, :, None, None]
-    last = jnp.asarray(key_value_seq_lengths)[:, None] - 1
-    reach = (last >= 0) if left is None else (jnp.arange(query_length)[None] - left <= last)
-    return reach[:, :, None, None]
+    last = (jnp.full((1, 1), key_length - 1) if key_value_seq_lengths is None
+            else jnp.asarray(key_value_seq_lengths)[:, None] - 1)
+    reach = (last >= 0) if left is None else (rows - left <= last)
+    if starts is not None:
+        seen = last
+        if causal:
+            seen = jnp.minimum(seen, rows)
+        elif right is not None:
+            seen = jnp.minimum(seen, rows + right)
+        reach = reach & (starts[:, None] <= seen)
+    return jnp.asarray(reach)[:, :, None, None]
 
 
 def with_key_lengths(mask: jax.Array | None, lengths: jax.Array, key_length: int) -> jax.Array:
@@ -278,6 +293,16 @@ def with_key_lengths(mask: jax.Array | None, lengths: jax.Array, key_length: int
     where there was no mask. This is the mask a `key_value_seq_lengths`
     call means on the paths whose kernel takes no lengths."""
     kept = (jnp.arange(key_length) < lengths[:, None])[:, None, None, :]
+    return kept if mask is None else jnp.logical_and(mask, kept)
+
+
+def with_key_starts(mask: jax.Array | None, starts: jax.Array | None, key_length: int) -> jax.Array | None:
+    """`mask` narrowed to each row's keys from `starts[b]`, `[B, 1, 1, K]` where there was no mask:
+    the mask a `key_value_seq_starts` call means on the paths whose kernel takes no starts. None
+    starts leave `mask` as it is."""
+    if starts is None:
+        return mask
+    kept = (jnp.arange(key_length) >= jnp.asarray(starts)[:, None])[:, None, None, :]
     return kept if mask is None else jnp.logical_and(mask, kept)
 
 
@@ -1216,7 +1241,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  causal=False, sliding_window=None, mask=None, bias=None,
                                  sinks=None, softcap=None, segment_ids=None, max_segments=None,
                                  key_value_seq_lengths=None, dropout_rate=0.0,
-                                 dropout_rng=None, deterministic=True, key_segment_ids=None):
+                                 dropout_rng=None, deterministic=True, key_segment_ids=None,
+                                 key_value_seq_starts=None):
     """Attend over [B, S, H, D] queries, keys and values: [B, S, H, Dv] out.
 
     `implementation` names the kernel (`AttentionImpl`, dispatched by
@@ -1241,7 +1267,10 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     order (a cache call's tokens, appended after the keys their row held).
     `key_value_seq_lengths` `[B]` ends each row's keys, which cuDNN skips; a
     mask that only ends rows early costs cuDNN a dense bias per head, so pass
-    lengths for right padding.
+    lengths for right padding. `key_value_seq_starts` `[B]`, below the
+    lengths, starts each row's keys there: a windowed decode step's cache,
+    which the decode kernel reads from the window's first block
+    (`decode_attention.attend`) and every other path as the mask they mean.
 
     A mesh sequence axis above one runs `sequence_parallel_attention`. Active
     dropout runs `reference_attention`, independently per row, head and
@@ -1263,6 +1292,10 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         aligned = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
         mask = aligned if mask is None else jnp.logical_and(aligned, mask)
         causal, sliding_window, segment_ids = False, None, None
+    if key_value_seq_starts is not None and ((dropout_rate and not deterministic) or shards > 1):
+        # Only a single device's decode kernel reads starts; elsewhere they are the mask they mean.
+        mask = with_key_starts(mask, key_value_seq_starts, key.shape[-3])
+        key_value_seq_starts = None
     if dropout_rate and not deterministic:
         out = _dropout_attention(
             query, key, value, dtype, precision, force_fp32_for_softmax, implementation,
@@ -1293,7 +1326,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     else:
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
                      mask=mask, bias=bias, sinks=sinks, segment_ids=segment_ids,
-                     max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths)
+                     max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths,
+                     key_value_seq_starts=key_value_seq_starts)
     return checkpoint_name(out, 'attention_output')
 
 
@@ -1325,14 +1359,16 @@ def _dropout_attention(query, key, value, dtype, precision, force_fp32_for_softm
 
 
 def fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
-                    softcap, sinks, segment_ids, key_value_seq_lengths, max_segments=None):
+                    softcap, sinks, segment_ids, key_value_seq_lengths, max_segments=None,
+                    key_value_seq_starts=None):
     """Run the fused kernel `implementation` names, at the query's head width.
 
     A narrower value rides in padded and its columns come back out, at no
     runtime branch. A fused kernel refuses here what its requirements say it
     cannot take (`attention_kernels.ATTENTION`, `KernelRefused`).
     `key_value_seq_lengths` reaches cudnn and xla as lengths and 'tpu' as the
-    mask it means.
+    mask it means; `key_value_seq_starts` reaches the decode kernel alone
+    (`_attention_kernel` folds them into the mask elsewhere).
     """
     v_head_dim = value.shape[-1]
     if v_head_dim != query.shape[-1]:
@@ -1358,17 +1394,20 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
     elif implementation == 'flash':
         out = flash_attention(query, key, value, causal, sliding_window, sinks, segment_ids, max_segments)
     elif implementation == 'decode':
+        starts = key_value_seq_starts
+
         def decoded(query, key, value):
             # A Pallas call has no partitioning rule: each shard decodes its own rows and heads.
-            def attend(query, key, value, lengths):
-                return decode_attention.attend(query, key, value, lengths)
+            def attend(query, key, value, lengths, starts=None):
+                return decode_attention.attend(query, key, value, lengths, starts)
 
-            rows = (key_value_seq_lengths, ("activation_batch",))
-            return _per_shard(attend, query, key, value, lengths=rows)
+            rows = ("activation_batch",)
+            return _per_shard(attend, query, key, value, lengths=(key_value_seq_lengths, rows),
+                              starts=(starts, rows))
 
         def folded(query, key, value):
-            return folded_attention(query, key, value,
-                                    with_key_lengths(None, key_value_seq_lengths, key.shape[-3]))
+            return folded_attention(query, key, value, with_key_starts(
+                with_key_lengths(None, key_value_seq_lengths, key.shape[-3]), starts, key.shape[-3]))
 
         # The kernel has no derivative, so both modes differentiate the folded attention it stands in for.
         out = forward_differentiable(decoded, folded, query, key, value)
@@ -1417,7 +1456,8 @@ def forward_mode_attention():
 def attention_kernel(query, key, value, dtype=None, precision=None,
                      force_fp32_for_softmax=True, implementation='auto',
                      causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
-                     softcap=None, segment_ids=None, max_segments=None, key_value_seq_lengths=None):
+                     softcap=None, segment_ids=None, max_segments=None, key_value_seq_lengths=None,
+                     key_value_seq_starts=None):
     """Dispatch one whole-sequence attention call to the kernel it names,
     differentiable in forward mode under `forward_mode_attention`.
 
@@ -1437,21 +1477,26 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         key, value = split_with_queries(key, value, tensor_shards(query))
         return grouped_query(functools.partial(
             attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
-            implementation=implementation, softcap=softcap, key_value_seq_lengths=key_value_seq_lengths),
+            implementation=implementation, softcap=softcap, key_value_seq_lengths=key_value_seq_lengths,
+            key_value_seq_starts=key_value_seq_starts),
             query, key, value)
     lengths = (None if key_value_seq_lengths is None
                else jnp.asarray(key_value_seq_lengths, jnp.int32))
+    starts = None if key_value_seq_starts is None else jnp.asarray(key_value_seq_starts, jnp.int32)
     masked = mask if lengths is None else with_key_lengths(mask, lengths, key.shape[-3])
+    masked = with_key_starts(masked, starts, key.shape[-3])
     resolved = resolve_implementation(
         implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
         causal=causal, sliding_window=sliding_window, mask=mask, bias=bias,
-        segment_ids=segment_ids, max_segments=max_segments, key_value_seq_lengths=lengths)
+        segment_ids=segment_ids, max_segments=max_segments, key_value_seq_lengths=lengths,
+        key_value_seq_starts=starts)
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
-        segment_ids=segment_ids, max_segments=max_segments, lengths=lengths)
-    live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths)
+        segment_ids=segment_ids, max_segments=max_segments, lengths=lengths, starts=starts)
+    live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths,
+                        starts)
     if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu'):
         return _read_nothing(call(query, key, value, bias=bias, sinks=sinks, implementation=resolved), live)
 
@@ -1481,10 +1526,10 @@ def forward_differentiable(value, tangent, *arrays):
 
 def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, precision,
                       force_fp32_for_softmax, causal, sliding_window, mask, masked, softcap,
-                      segment_ids, max_segments, lengths):
+                      segment_ids, max_segments, lengths, starts):
     """Run one whole-sequence attention call on the kernel `attention_kernel` resolved.
 
-    `masked` is `mask` with the key `lengths` in it. Splash takes sinks, a
+    `masked` is `mask` with the key `lengths` and `starts` in it. Splash takes sinks, a
     softcap and packed segment ids itself, and flash takes the ids as its
     packed sequences given `max_segments`; elsewhere segment ids become the
     document mask, and sinks and a softcap run `reference_attention`, since
@@ -1492,7 +1537,8 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     included, `_hosted`). The rest goes to `fused_attention`. Key
     lengths reach cudnn and xla as they are and every other path as the mask
     they mean, which splash cannot describe, so 'auto' never picks 'tpu' for
-    them.
+    them. Key starts reach the decode kernel as they are and every other path
+    as the mask they mean.
     """
     # Another sequence's documents under causality or a window align each document's queries with
     # its last keys (`CrossDocuments`), which splash does not; elsewhere the mask carries them.
@@ -1516,10 +1562,13 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                                    dtype=dtype, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax)
 
+    if implementation != 'decode':
+        mask = with_key_starts(mask, starts, key.shape[-3])
+        starts = None
     return fused_attention(query, key, value, bias, mask, causal, sliding_window,
                            implementation, softcap=softcap, sinks=sinks,
                            segment_ids=segment_ids, max_segments=max_segments,
-                           key_value_seq_lengths=lengths)
+                           key_value_seq_lengths=lengths, key_value_seq_starts=starts)
 
 
 def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
@@ -1558,7 +1607,8 @@ def _xla_kernel_chains(query, key) -> bool:
 
 def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_softmax=True, softcap=None,
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,
-                   max_segments=None, key_value_seq_lengths=None, named: str = 'auto') -> AttentionCase:
+                   max_segments=None, key_value_seq_lengths=None, key_value_seq_starts=None,
+                   named: str = 'auto') -> AttentionCase:
     """The `AttentionCase` of a call `scaled_dot_product_attention` takes under the `named`
     `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
@@ -1569,7 +1619,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         causal=bool(causal), window=sliding_window,
         documents=None if segment_ids is None else 'cross' if cross else 'own',
         aligned=cross and (causal or sliding_window is not None), max_segments=max_segments,
-        lengths=key_value_seq_lengths is not None, mask=mask is not None, bias=bias is not None,
+        lengths=key_value_seq_lengths is not None, starts=key_value_seq_starts is not None,
+        mask=mask is not None, bias=bias is not None,
         sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query) or _xla_kernel_chains(query, key),
@@ -1590,7 +1641,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
 def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
                            force_fp32_for_softmax=True, softcap=None, sinks=None, causal=False,
                            sliding_window=None, mask=None, bias=None, segment_ids=None, max_segments=None,
-                           key_value_seq_lengths=None) -> str:
+                           key_value_seq_lengths=None, key_value_seq_starts=None) -> str:
     """The kernel an `AttentionImpl` names for this call on this host, as the attention selector
     reports it (`select`, over `attention_case`): 'auto' takes the kernel the target's row measured
     fastest for the call where it takes it, else the first that does; a named kernel is forced, and
@@ -1606,7 +1657,8 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
                           force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
                           causal=causal, sliding_window=sliding_window, mask=mask, bias=bias,
                           segment_ids=segment_ids, max_segments=max_segments,
-                          key_value_seq_lengths=key_value_seq_lengths, named=implementation)
+                          key_value_seq_lengths=key_value_seq_lengths,
+                          key_value_seq_starts=key_value_seq_starts, named=implementation)
     if not (decodes(case) and implementation in ('auto', 'cudnn', 'xla')):
         return select(ATTENTION, case, None if implementation == 'auto' else implementation).ran
     named = {'auto': None, 'cudnn': 'cudnn'}.get(implementation)

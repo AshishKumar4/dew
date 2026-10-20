@@ -4,18 +4,29 @@ A serving step decodes every slot of its cache. jax.nn's xla attention, and
 the folded form that reads the cache in its own layout
 (`dew.nn.decode_geometry.folded_attention`), compute every row over the cache's
 whole capacity, idle rows and the slots past a row's length included.
-Each program here takes one row and one key head, and reads only the blocks
-of keys below the row's length, with an online softmax over them (flash
-decoding without splits). Six of Qwen3.5-0.8B's 256-wide layers at a
-384-slot capacity, 128 rows with 16 drawing, took 0.28 ms against the folded
-form's 1.12 and jax.nn's 2.40 on an RTX 4080, and 0.20 against 0.33 and 0.41
-at 32 rows (docs/performance.md). Its body is whole-block arithmetic and
-dots, so a Mosaic GPU port takes it as is.
+Each program here takes one row, one key head and one of the slices its keys
+are cut into (`Split`), and reads only the blocks of the row's span of
+keys, from its first (a sliding window's, where the layer has one) to its
+length, with an online softmax over them: flash decoding. A windowed layer's
+decode had built a mask instead and run jax.nn's xla attention, which
+transposed the whole cache at every step: 5.5 of an H100's 21.8 ms decode
+step of a 4B model with 42 windowed layers at 64 slots. One slice a row
+writes the output itself; more write each slice's fp32 sums, its running
+maximum and its softmax's total, which XLA combines (`_combined`). A decode
+step of a few rows over a long context launches rows x heads programs, two
+for one row of Qwen3.5's attention on a GPU of 108 or 132 multiprocessors;
+slices fill the GPU, and the tuner picks how many (`DecodeAttention`). Six
+of Qwen3.5-0.8B's 256-wide layers at a 384-slot capacity, 128 rows with 16
+drawing, took 0.28 ms against the folded form's 1.12 and jax.nn's 2.40 on an
+RTX 4080, and 0.20 against 0.33 and 0.41 at 32 rows (docs/performance.md).
+Its body is whole-block arithmetic and dots, so a Mosaic GPU port takes it
+as is.
 
 The arithmetic is jax.nn's but for the order of its sums: fp32 logits of
 the operands, the scale after, an fp32 softmax, its probabilities in the
 value's dtype for the value product, which accumulates in fp32 and is
-normalized at the end rather than before the product. Both products name
+normalized at the end rather than before the product, the slices' sums
+combined in fp32 before it. Both products name
 the highest precision, so fp32 operands multiply in IEEE fp32 whatever the
 default precision, where Triton's default is one TF32 product.
 
@@ -25,18 +36,22 @@ pages through its page table. JAX's GPU paged kernel
 (`jax.experimental.pallas.ops.gpu.paged_attention`) stores its unnormalized
 sums and its split partials in the query's dtype and divides by a bf16
 denominator, three roundings where this has one.
+
+A row reads at least one key: an idle slot reads its first.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from .generation import triton_runs
+from . import tuning
+from .generation import gpu_target, triton_runs
 from .selection import Requirement
 
 if TYPE_CHECKING:
@@ -50,6 +65,19 @@ QUERIES = 16
 WARPS = 4
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 """The dtypes it attends in: its products' own precision, accumulated in fp32."""
+
+SPLITS = (1, 2, 4, 8, 16, 32)
+"""The slices a launch may cut each row's keys into (`Split`), each held to the float64 gate on the GPU."""
+
+EMPTY = float(jnp.finfo(jnp.float32).min)
+"""A slice's running maximum before it reads a key: an empty slice's weighs nothing (`_combined`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Split:
+    """A decode launch's config: the slices each row's keys are cut into, a program each, in whole
+    steps of the loop."""
+    splits: int
 
 
 def _widths(head_dim: int) -> bool:
@@ -91,44 +119,77 @@ FULL = jax.lax.Precision.HIGHEST
 """Each product's precision: IEEE fp32 for fp32 operands, and bf16's or fp16's own product for those."""
 
 
-def _attend(query: jax.Array, length: jax.Array, read, block: int, scale: float) -> jax.Array:
-    """`query` `[QUERIES, D]` over the first `length` keys, `block` at a time,
-    `read(step)` giving a step's keys and values `[block, D]`: an online
-    softmax, normalized at the end."""
+def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
+    """`a @ b` in fp32 at `FULL` precision; interpreted, the CPU's own fp32 product."""
+    if interpret:
+        return jnp.dot(a, b, preferred_element_type=jnp.float32)
     from jax.experimental.pallas import triton as plgpu
 
+    return plgpu.dot(a, b, precision=FULL).astype(jnp.float32)
+
+
+def _attend(query: jax.Array, span: tuple, read, block: int, scale: float, steps,
+            interpret: bool) -> tuple:
+    """`query` `[QUERIES, D]` over the keys of `steps`, a range of the loop's
+    steps of `block` keys, those of the row's `span` (its first key and its
+    length) alone, `read(step)` giving a step's keys and values `[block, D]`:
+    an online softmax's fp32 sums `[QUERIES, D]`, its running maximum and its
+    total `[QUERIES]`, unnormalized."""
     width = query.shape[-1]
+    first_key, length = span
 
     def body(step, carry):
         out, peak, total = carry
         key, value = read(step)
-        logits = plgpu.dot(query, key.T, precision=FULL).astype(jnp.float32) * scale  # [QUERIES, block]
-        reads = step * block + jnp.arange(block) < length
+        logits = _dot(query, key.T, interpret) * scale  # [QUERIES, block]
+        index = step * block + jnp.arange(block)
+        reads = (index >= first_key) & (index < length)
         logits = jnp.where(reads[None, :], logits, -0.7 * float(jnp.finfo(jnp.float32).max))
         new_peak = jnp.maximum(peak, logits.max(axis=-1))
         correction = jnp.exp(peak - new_peak)
         weights = jnp.exp(logits - new_peak[:, None])
-        product = plgpu.dot(weights.astype(value.dtype), value, precision=FULL).astype(jnp.float32)
+        product = _dot(weights.astype(value.dtype), value, interpret)
         out = correction[:, None] * out + product
         return out, new_peak, correction * total + weights.sum(axis=-1)
 
-    start = (jnp.zeros((QUERIES, width), jnp.float32),
-             jnp.full((QUERIES,), float(jnp.finfo(jnp.float32).min), jnp.float32),
+    start = (jnp.zeros((QUERIES, width), jnp.float32), jnp.full((QUERIES,), EMPTY, jnp.float32),
              jnp.zeros((QUERIES,), jnp.float32))
-    out, _, total = jax.lax.fori_loop(0, pl.cdiv(length, block), body, start)
-    return out / total[:, None]
+    first, last = steps
+    return jax.lax.fori_loop(first, last, body, start)
 
 
-def _kernel(lengths_ref, query_ref, key_ref, value_ref, out_ref, *, scale: float):
+def _slice(span: tuple, block: int, split, splits: int) -> tuple:
+    """The loop's steps of slice `split` of `splits` over a row's `span` of keys (its first and its
+    length): whole steps of `block` keys, as even as they cut, the last slices empty where the span
+    holds fewer steps than slices."""
+    first, last = span[0] // block, pl.cdiv(span[1], block)
+    per = pl.cdiv(last - first, splits)
+    begin = first + split * per
+    return begin, jnp.minimum(begin + per, last)
+
+
+def _write(out_refs, out, peak, total):
+    """The row's output normalized where one slice reads it all, else the slice's sums."""
+    if len(out_refs) == 1:
+        out_refs[0][...] = (out / total[:, None]).astype(out_refs[0].dtype)
+    else:
+        for ref, value in zip(out_refs, (out, peak, total), strict=True):
+            ref[...] = value
+
+
+def _kernel(spans_ref, query_ref, key_ref, value_ref, *out_refs, scale: float, splits: int,
+            interpret: bool):
     def read(step):
         keys = pl.ds(step * BLOCK, BLOCK)
         return key_ref[keys, :], value_ref[keys, :]
 
-    out_ref[...] = _attend(query_ref[...], lengths_ref[0], read, BLOCK, scale).astype(out_ref.dtype)
+    span = spans_ref[0], spans_ref[1]
+    steps = _slice(span, BLOCK, pl.program_id(2), splits)
+    _write(out_refs, *_attend(query_ref[...], span, read, BLOCK, scale, steps, interpret))
 
 
-def _paged_kernel(lengths_ref, table_ref, query_ref, key_ref, value_ref, out_ref, *, pages: int,
-                  scale: float):
+def _paged_kernel(spans_ref, table_ref, query_ref, key_ref, value_ref, *out_refs, pages: int, scale: float,
+                  splits: int, interpret: bool):
     page_size, width = key_ref.shape[-2:]
 
     def read(step):
@@ -136,30 +197,197 @@ def _paged_kernel(lengths_ref, table_ref, query_ref, key_ref, value_ref, out_ref
         return (key_ref[held].reshape(pages * page_size, width),
                 value_ref[held].reshape(pages * page_size, width))
 
-    out = _attend(query_ref[...], lengths_ref[0], read, pages * page_size, scale)
-    out_ref[...] = out.astype(out_ref.dtype)
+    span = spans_ref[0], spans_ref[1]
+    steps = _slice(span, pages * page_size, pl.program_id(2), splits)
+    _write(out_refs, *_attend(query_ref[...], span, read, pages * page_size, scale, steps, interpret))
 
 
-def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Array) -> jax.Array:
-    """Attention of `query` `[B, T, N, D]` over the first `lengths` `[B]` of
-    `key` and `value` `[B, S, N, D]` (the same heads), `[B, T, N, D]` out.
-    Its Pallas call has no derivative: `dew.nn.attention` differentiates it as
-    the folded attention it stands in for."""
-    from jax.experimental.pallas import triton as plgpu
+def _combined(sums, peaks, totals, axis: int):
+    """The slices' sums `[..., splits, ..., QUERIES, D]` along `axis`, their running maxima and totals
+    `[..., splits, ..., QUERIES]`, as the normalized output in fp32: each slice weighed by its maximum's
+    distance below the largest, so an empty slice (`EMPTY`) weighs nothing."""
+    peak = jnp.max(peaks, axis=axis, keepdims=True)
+    weights = jnp.exp(peaks - peak)
+    out = jnp.sum(weights[..., None] * sums, axis=axis)
+    return out / jnp.sum(weights * totals, axis=axis)[..., None]
 
-    batch, positions, heads, width = query.shape
+
+def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, specs):
+    """The launch's outputs and their blocks: the output `shape` in `dtype` for one slice, else the
+    slices' fp32 sums, maxima and totals with a slices axis at `at` (`spec` and `specs` the blocks)."""
+    if splits == 1:
+        return jax.ShapeDtypeStruct(shape, dtype), spec
+    split = (*shape[:at], splits, *shape[at:])
+    return ([jax.ShapeDtypeStruct(split, jnp.float32), jax.ShapeDtypeStruct(split[:-1], jnp.float32),
+             jax.ShapeDtypeStruct(split[:-1], jnp.float32)], specs)
+
+
+def _space(programs: int, steps: int, processors: int | None) -> set[Split]:
+    """The slices a launch of `programs` programs a slice over `steps` steps of the loop may take on a
+    GPU of `processors` multiprocessors (`GpuTarget.multiprocessors`): one where the programs already
+    fill most of them or none are known, as FlashAttention 2 rules (csrc/flash_attn/flash_api.cpp,
+    `num_splits_heuristic`), else any of `SPLITS` up to one a step. A pick measured where few programs
+    ran is never reused where many do (`KernelOp._stored_nearest`)."""
+    if not processors or programs >= 0.8 * processors:
+        return {Split(1)}
+    return {Split(splits) for splits in SPLITS if splits <= min(steps, processors)}
+
+
+def _heuristic(programs: int, steps: int, processors: int | None) -> Split:
+    """FlashAttention 2's split heuristic over the launch's space (`_space`): the fewest slices whose
+    waves of programs run within 85% of the best such count's efficiency."""
+    counts = sorted(split.splits for split in _space(programs, steps, processors))
+    if processors is None or len(counts) == 1:
+        return Split(counts[0])
+
+    def efficiency(splits: int) -> float:
+        waves = programs * splits / processors
+        return waves / math.ceil(waves)
+
+    best = max(map(efficiency, counts))
+    return Split(next(splits for splits in counts if efficiency(splits) >= 0.85 * best))
+
+
+@dataclasses.dataclass(frozen=True)
+class DecodeAttention(tuning.KernelOp):
+    """`attend`'s launch over a contiguous cache: programs a row, a head and a slice, timed with every
+    row reading its whole capacity (`operands`), where slices matter most."""
+
+    config_cls: ClassVar[type[Split]] = Split
+    ROWS: ClassVar[tuple[str, ...]] = ('query', 'key', 'value', 'spans')
+
+    def _fwd(self, query: jax.Array, key: jax.Array, value: jax.Array, spans: jax.Array, *, interpret: bool,
+             config: Split, return_residuals: bool = False):
+        from jax.experimental.pallas import triton as plgpu
+
+        batch, _, heads, width = query.shape
+        splits = config.splits
+        keyed = pl.BlockSpec((None, key.shape[1], None, width), lambda row, head, split: (row, 0, head, 0))
+        queried = pl.BlockSpec((None, QUERIES, None, width), lambda row, head, split: (row, 0, head, 0))
+        summed = pl.BlockSpec((None, None, QUERIES, None, width),
+                              lambda row, head, split: (row, split, 0, head, 0))
+        reduced = pl.BlockSpec((None, None, QUERIES, None), lambda row, head, split: (row, split, 0, head))
+        out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried,
+                                        [summed, reduced, reduced])
+        out = pl.pallas_call(
+            lambda *refs: _kernel(*refs, scale=1 / math.sqrt(width), splits=splits, interpret=interpret),
+            grid=(batch, heads, splits),
+            in_specs=[pl.BlockSpec((None, 2), lambda row, head, split: (row, 0)), queried, keyed, keyed],
+            out_specs=out_specs,
+            out_shape=out_shape,
+            compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
+            interpret=interpret, name="decode_attention",
+        )(spans, query, key, value)
+        return (out if splits == 1 else _combined(*out, axis=1).astype(query.dtype)), None
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        """Normal floats, each row's span its whole capacity."""
+        arrays = super().operands(specs, seed)
+        return [*arrays[:3], _whole(specs[3].shape[0], specs[1].shape[1])]
+
+    def _get_heuristics_config(self, ba) -> Split:
+        # At its key's shapes, as its space is (`KernelOp.keyed`), so the pick lies in that space.
+        return _heuristic(*self._launch(self.keyed(ba)))
+
+    def _get_autotuning_configs(self, ba) -> set[Split]:
+        return _space(*self._launch(ba))
+
+    @staticmethod
+    def _launch(ba) -> tuple[int, int, int | None]:
+        """Its programs a slice, a row's steps of the loop, and the GPU's multiprocessors."""
+        query = ba.arguments['query']
+        return (query.shape[0] * query.shape[2], pl.cdiv(ba.arguments['key'].shape[1], BLOCK),
+                gpu_target().multiprocessors)
+
+
+@dataclasses.dataclass(frozen=True)
+class PagedDecodeAttention(tuning.KernelOp):
+    """`attend_paged`'s launch: programs a row, a key head and a slice, timed with every row reading
+    its whole table (`operands`)."""
+
+    config_cls: ClassVar[type[Split]] = Split
+    ROWS: ClassVar[tuple[str, ...]] = ('query', 'table', 'spans')
+
+    def _fwd(self, query: jax.Array, key_pages: jax.Array, value_pages: jax.Array, table: jax.Array,
+             spans: jax.Array, *, interpret: bool, config: Split, return_residuals: bool = False):
+        from jax.experimental.pallas import triton as plgpu
+
+        rows, kv_heads, _, width = query.shape
+        count, page_size = key_pages.shape[1:3]
+        splits, pages = config.splits, BLOCK // page_size
+        pooled = pl.BlockSpec((None, count, page_size, width), lambda row, head, split: (head, 0, 0, 0))
+        queried = pl.BlockSpec((None, None, QUERIES, width), lambda row, head, split: (row, head, 0, 0))
+        summed = pl.BlockSpec((None, None, None, QUERIES, width),
+                              lambda row, head, split: (row, head, split, 0, 0))
+        reduced = pl.BlockSpec((None, None, None, QUERIES), lambda row, head, split: (row, head, split, 0))
+        out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried,
+                                        [summed, reduced, reduced])
+        out = pl.pallas_call(
+            lambda *refs: _paged_kernel(*refs, pages=pages, scale=1 / math.sqrt(width), splits=splits,
+                                        interpret=interpret),
+            grid=(rows, kv_heads, splits),
+            in_specs=[pl.BlockSpec((None, 2), lambda row, head, split: (row, 0)),
+                      pl.BlockSpec((None, table.shape[1]), lambda row, head, split: (row, 0)),
+                      queried, pooled, pooled],
+            out_specs=out_specs,
+            out_shape=out_shape,
+            compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
+            interpret=interpret, name="paged_decode_attention",
+        )(spans, table, query, key_pages, value_pages)
+        return (out if splits == 1 else _combined(*out, axis=2).astype(query.dtype)), None
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        """Normal floats, each row's table naming pages of the pool in turn and its span the whole
+        table."""
+        arrays = super().operands(specs, seed)
+        (rows, per_row), count, page_size = specs[3].shape, specs[1].shape[1], specs[1].shape[2]
+        table = (jnp.arange(rows * per_row, dtype=jnp.int32) % count).reshape(rows, per_row)
+        return [*arrays[:3], table, _whole(rows, per_row * page_size)]
+
+    def _get_heuristics_config(self, ba) -> Split:
+        # At its key's shapes, as its space is (`KernelOp.keyed`), so the pick lies in that space.
+        return _heuristic(*self._launch(self.keyed(ba)))
+
+    def _get_autotuning_configs(self, ba) -> set[Split]:
+        return _space(*self._launch(ba))
+
+    @staticmethod
+    def _launch(ba) -> tuple[int, int, int | None]:
+        """Its programs a slice, a row's steps of the loop over its table, `BLOCK` keys a step, and the
+        GPU's multiprocessors."""
+        query = ba.arguments['query']
+        steps = pl.cdiv(ba.arguments['table'].shape[1], BLOCK // ba.arguments['key_pages'].shape[2])
+        return query.shape[0] * query.shape[1], steps, gpu_target().multiprocessors
+
+
+_DECODE = DecodeAttention()
+_PAGED_DECODE = PagedDecodeAttention()
+
+
+def _whole(rows: int, keys: int) -> jax.Array:
+    """`rows` spans of every one of `keys` keys."""
+    return jnp.stack([jnp.zeros(rows, jnp.int32), jnp.full(rows, keys, jnp.int32)], axis=1)
+
+
+def _spans(lengths: jax.Array, starts: jax.Array | None) -> jax.Array:
+    """Each row's first key and its length, `[rows, 2]` int32."""
+    lengths = jnp.asarray(lengths, jnp.int32)
+    starts = jnp.zeros_like(lengths) if starts is None else jnp.asarray(starts, jnp.int32)
+    return jnp.stack([starts, lengths], axis=1)
+
+
+def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Array, starts=None, *,
+           interpret: bool = False) -> jax.Array:
+    """Attention of `query` `[B, T, N, D]` over the keys from `starts` `[B]`
+    (0 where None) to `lengths` `[B]` of `key` and `value` `[B, S, N, D]` (the
+    same heads), `[B, T, N, D]` out, `interpret` running it on the CPU. A row
+    reads only the blocks its keys fill, so a window over a long cache costs
+    the window. Each row's start is below its length. Its Pallas call has no
+    derivative: `dew.nn.attention` differentiates it as the folded attention
+    it stands in for."""
+    positions = query.shape[1]
     padded = jnp.pad(query, ((0, 0), (0, QUERIES - positions), (0, 0), (0, 0)))
-    keyed = pl.BlockSpec((None, key.shape[1], None, width), lambda row, head: (row, 0, head, 0))
-    queried = pl.BlockSpec((None, QUERIES, None, width), lambda row, head: (row, 0, head, 0))
-    out = pl.pallas_call(
-        lambda *refs: _kernel(*refs, scale=1 / math.sqrt(width)),
-        grid=(batch, heads),
-        in_specs=[pl.BlockSpec((None, 1), lambda row, head: (row, 0)), queried, keyed, keyed],
-        out_specs=queried,
-        out_shape=jax.ShapeDtypeStruct(padded.shape, query.dtype),
-        compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
-        name="decode_attention",
-    )(jnp.asarray(lengths, jnp.int32)[:, None], padded, key, value)
+    out = _DECODE(padded, key, value, _spans(lengths, starts), interpret=interpret)
     return out[:, :positions]
 
 
@@ -178,30 +406,18 @@ selector's GPU kernel declares (`dew.nn.kv_cache.TRITON_PAGED_SUPPORTS`)."""
 
 
 def attend_paged(query: jax.Array, key_pages: jax.Array, value_pages: jax.Array, table: jax.Array,
-                 lengths: jax.Array) -> jax.Array:
-    """Attention of one query a row `[rows, heads, D]` over the first `lengths`
-    `[rows]` keys of that row's pages, `table` `[rows, per_row]` naming them in
-    the `[kv_heads, pages, page_size, D]` pools; a query head reads the key head
-    it shares with `heads // kv_heads` others. `[rows, heads, D]` out."""
-    from jax.experimental.pallas import triton as plgpu
-
+                 lengths: jax.Array, starts=None, *, interpret: bool = False) -> jax.Array:
+    """Attention of one query a row `[rows, heads, D]` over the keys from
+    `starts` `[rows]` (0 where None) to `lengths` `[rows]` of that row's pages,
+    `table` `[rows, per_row]` naming them in the `[kv_heads, pages, page_size,
+    D]` pools; a query head reads the key head it shares with `heads //
+    kv_heads` others. `[rows, heads, D]` out, `interpret` running it on the
+    CPU."""
     rows, heads, width = query.shape
-    kv_heads, count, page_size, _ = key_pages.shape
+    kv_heads, _, page_size, _ = key_pages.shape
     group, pages = heads // kv_heads, BLOCK // page_size
     grouped = jnp.pad(query.reshape(rows, kv_heads, group, width),
                       ((0, 0), (0, 0), (0, QUERIES - group), (0, 0)))
     table = jnp.pad(table, ((0, 0), (0, -table.shape[1] % pages)))
-    pooled = pl.BlockSpec((None, count, page_size, width), lambda row, head: (head, 0, 0, 0))
-    queried = pl.BlockSpec((None, None, QUERIES, width), lambda row, head: (row, head, 0, 0))
-    out = pl.pallas_call(
-        lambda *refs: _paged_kernel(*refs, pages=pages, scale=1 / math.sqrt(width)),
-        grid=(rows, kv_heads),
-        in_specs=[pl.BlockSpec((None, 1), lambda row, head: (row, 0)),
-                  pl.BlockSpec((None, table.shape[1]), lambda row, head: (row, 0)),
-                  queried, pooled, pooled],
-        out_specs=queried,
-        out_shape=jax.ShapeDtypeStruct(grouped.shape, query.dtype),
-        compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
-        name="paged_decode_attention",
-    )(jnp.asarray(lengths, jnp.int32)[:, None], table, grouped, key_pages, value_pages)
+    out = _PAGED_DECODE(grouped, key_pages, value_pages, table, _spans(lengths, starts), interpret=interpret)
     return out[:, :, :group].reshape(rows, heads, width)
