@@ -275,6 +275,17 @@ def _another_subscriber(error: RuntimeError) -> bool:
     return "another subscriber" in str(error)
 
 
+def _detach(profiler, evicting: jax.stages.Compiled, flush: jax.Array) -> None:
+    """Detach CUPTI from the process with a finalizing read of `evicting`, so a profiler can subscribe
+    after; where one already holds it (`_another_subscriber`), there is nothing of the tuner's to
+    detach."""
+    try:
+        _kernel_times(profiler.Cupti(), evicting, flush)
+    except RuntimeError as error:
+        if not _another_subscriber(error):
+            raise
+
+
 def _resource_exhausted(error: Exception) -> bool:
     """Whether a config failed for a block past the GPU's own resources, the failures a config of a
     launch's space may meet on a GPU it was not declared for: its shared memory as XLA's compile
@@ -323,17 +334,13 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
     read = {}
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
         futures = {config: pool.submit(compiled, config) for config in ba.autotuning_configs}
-    # One CUPTI subscription reads every run, the flush's own first. CUPTI
-    # takes one subscriber, so beside an open profile capture none is
-    # measured and the launch keeps its heuristic until a later compile.
+    # CUPTI reads every run, the flush's own first, subscribing for each and
+    # unsubscribing after. It takes one subscriber, so where a profile capture
+    # holds it, from the first run or any later one, the launch keeps its
+    # heuristic until a later compile.
     cupti = profiler.Cupti(finalize=False)
     try:
         flushes = {name for name, _ in _kernel_times(cupti, evicting, flush)}
-    except RuntimeError as error:
-        if not _another_subscriber(error):
-            raise
-        return AutotuningData(dict.fromkeys(ba.autotuning_configs, error))
-    try:
         for config, future in futures.items():
             try:
                 executable, lowering, compiling = future.result()
@@ -344,9 +351,12 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
                 timings[config] = error
                 continue
             read[config] = runs, lowering, compiling
+    except RuntimeError as error:
+        if not _another_subscriber(error):
+            raise
+        return AutotuningData(dict.fromkeys(ba.autotuning_configs, error))
     finally:
-        # A finalizing read detaches the subscription, so a profiler can subscribe after.
-        _kernel_times(profiler.Cupti(), evicting, flush)
+        _detach(profiler, evicting, flush)
     for config, (runs, lowering, compiling) in read.items():
         times = tuple(sum(milliseconds for name, milliseconds in run if name not in flushes) for run in runs)
         timings[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
