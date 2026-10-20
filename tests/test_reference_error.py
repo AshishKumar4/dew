@@ -144,11 +144,16 @@ def test_check_one_holds_dew_exact_where_the_reference_is_exact_on_every_seed():
     assert raised.type is AssertionError
 
 
-def test_check_one_fails_a_value_that_is_not_finite():
-    """A NaN in Dew's leaf fails, whatever the pooled errors would read."""
-    poisoned = jax.jit(lambda x, w: {"y": jnp.dot(x, w, precision="highest").at[0, 0].set(jnp.nan)})
+@pytest.mark.parametrize("rank", [1, 2])
+def test_check_one_fails_a_value_that_is_not_finite(rank):
+    """A NaN in Dew's leaf fails, whatever the pooled errors would read, a vector's (which has no rows
+    to catch it) as a matrix's."""
+    def shaped(fn):
+        return jax.jit(lambda x, w: {"y": fn(x, w)["y"].reshape(-1) if rank == 1 else fn(x, w)["y"]})
+
+    poisoned = shaped(lambda x, w: {"y": jnp.dot(x, w, precision="highest").at[0, 0].set(jnp.nan)})
     with pytest.raises(AssertionError) as raised:
-        assert_as_exact(poisoned, _product, _draw, "poisoned", seeds=8)
+        assert_as_exact(poisoned, shaped(_product), _draw, "poisoned", seeds=8)
     assert raised.type is AssertionError
 
 
