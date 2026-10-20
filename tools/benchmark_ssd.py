@@ -34,8 +34,8 @@ import jax.numpy as jnp
 import tyro
 
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
-from dew.nn.kernels.tuning import samples
 from dew.nn.mixers.mamba2 import xla_chunk_scan
+from dew.telemetry.benchmark import samples
 
 IMPLEMENTATIONS = ('xla', 'kernel')
 

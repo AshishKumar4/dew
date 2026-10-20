@@ -95,6 +95,110 @@ def test_images_apply_a_user_random_step_on_the_host_right_after_resize():
         np.testing.assert_array_equal(augmented[name], equivalent[name])
 
 
+def jpegs(count: int) -> list[dict]:
+    """`count` labelled photographs of 40 by 48 pixels, encoded as JPEG bytes."""
+    import io
+
+    from PIL import Image
+
+    rng = np.random.default_rng(3)
+    encoded = []
+    for index in range(count):
+        picture = io.BytesIO()
+        Image.fromarray(rng.integers(0, 256, (40, 48, 3), np.uint8)).save(picture, format="JPEG")
+        encoded.append({"image": picture.getvalue(), "label": index % 3, "description": f"picture {index}"})
+    return encoded
+
+
+def kept_captions(captions):
+    """The captions a batch holds, kept as an array to compare."""
+    return {"caption": np.asarray(captions)}
+
+
+IMAGE_RECIPES = {
+    # Each case: the recipe's settings, and the preset settings that prepare its records alike.
+    "device augmentation from a staged size": (
+        {"staging_size": 24, "augment": "device"},
+        {"staging_size": 24, "augment": images.DeviceAugment(16, crop_scale=(0.6, 1.0), flip=True,
+                                                             jitter=False)}),
+    "host crops from a staged size": (
+        {"staging_size": 24, "augment": "host"},
+        {"staging_size": 24, "augment": images.RandomCrop(16, scale=(0.6, 1.0), flip=True)}),
+    "drawn caption templates, no augmentation": (
+        {"caption_templates": ("a {label}", "a photo of {}"), "augment": None},
+        {"caption": images.caption(templates=("a {label}", "a photo of {}"), classes=("cat", "dog", "owl"))}),
+    "a caption column": (
+        {"caption_columns": ("description",), "augment": None},
+        {"caption": images.caption(columns=("description",), classes=("cat", "dog", "owl"))}),
+}
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+@pytest.mark.parametrize("case", list(IMAGE_RECIPES))
+def test_the_images_preset_prepares_what_the_image_recipe_does(read, case):
+    """The image recipe's training and validation chains, rebuilt with the preset and the recipe's
+    own settings: the same training batches and validation batches, and where the chain orders its
+    records where the recipe does, the same plan. A memory read orders the recipe's records after
+    its fixed steps and the chain's where they are written, before the preset: the same rows, in
+    a plan that records the order's place. The captions each writes are kept and compared."""
+    from dew.config.data import Augment, ImageData, loader
+    from dew.data.holdout import HoldOut
+
+    recipe_settings, preset_settings = IMAGE_RECIPES[case]
+    backend = recipe_settings.pop("augment")
+    augment = None if backend is None else Augment(backend=backend, crop_scale=(0.6, 1.0), flip=True,
+                                                   jitter=False)
+    source = Memory(jpegs(24))
+    # A hash holdout reads every row to place it, as a stream does; an index read holds out records.
+    holdout = HoldOut(fraction=0.25, by="hash") if read == "streamed" else HoldOut(records=6)
+    loading = Loading(workers=0, threads=1, read_buffer=2)
+    recipe = ImageData(source, image_size=16, augment=augment, classes=("cat", "dog", "owl"),
+                       validation=holdout, **recipe_settings)
+    recipe_settings["augment"] = backend
+    host = (images.EncodeCaptions(kept_captions),)
+    expected = loader(recipe, batch=4, read=read, loading=loading, validation_records=3, host=host)
+
+    order = {"memory": None, "indexed": None, "streamed": 64}[read]
+    caption = preset_settings.pop("caption", images.caption(classes=("cat", "dog", "owl")))
+    train, held = source.holdout(0.25) if read == "streamed" else source.holdout(records=6)
+    common = {"draft": True, "rejects": False, "caption": caption}
+    chain = train.shuffle(0, window=order).repeat().pipe(presets.images, 16, batch=4, **common,
+                                                         **preset_settings)
+    validation = held.pipe(presets.images, 16, batch=4, records=3, **common)
+    preset_settings["caption"] = caption
+    built = compile(chain, validation=validation, read=read, loading=loading, host=host)
+
+    if read != "memory":
+        assert built.plan.identity() == expected.plan.identity()
+    expected_train, built_train = expected.train(DataPartition()), built.train(DataPartition())
+    try:
+        for _ in range(3):
+            wanted, made = next(expected_train), next(built_train)
+            assert wanted.keys() == made.keys()
+            for name in wanted:
+                np.testing.assert_array_equal(made[name], wanted[name])
+    finally:
+        expected_train.close()
+        built_train.close()
+    scored = [list(loader_part.val(DataPartition())) for loader_part in (expected, built)]
+    assert len(scored[0]) == len(scored[1]) == 1
+    for name in scored[0][0]:
+        np.testing.assert_array_equal(scored[1][0][name], scored[0][0][name])
+
+
+@pytest.mark.parametrize("crop", ["random resized crop", "own crop"])
+def test_images_staged_larger_are_cropped_to_size_by_a_host_step(crop):
+    """Images staged at 24 pixels reach a host crop that returns 16-pixel squares, whichever step
+    it is: the preset's batches hold what the crop made."""
+
+    def corner(record, rng):
+        return {**record, "image": record["image"][:16, :16]}
+
+    step = images.RandomResizedCrop(16) if crop == "random resized crop" else corner
+    batch = first_batch(Memory(jpegs(8)).pipe(presets.images, 16, batch=4, staging_size=24, augment=step))
+    assert batch["image"].shape == (4, 16, 16, 3)
+
+
 def test_lm_packs_documents_into_rows_that_keep_every_target():
     """Byte documents longer and shorter than a row pack into 33-token rows, each document its own
     segment, and a decoder trains and validates on them."""
