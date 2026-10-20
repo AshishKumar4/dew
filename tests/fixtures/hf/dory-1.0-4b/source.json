@@ -1,4 +1,39 @@
 {
   "repo": "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",
-  "revision": "b366b87f762ea334ba3eb55912031baba1515810"
+  "revision": "b366b87f762ea334ba3eb55912031baba1515810",
+  "probe": {
+    "reference": "vllm-project/vllm#60149 at shan18/vllm 55076950b6c155f384d6766d63563c3bc20a0e3f, installed by vLLM's Python-only build over https://wheels.vllm.ai/153a17166e5d07bc38184dedeea542d2e8885e55/vllm-0.32.0rc1.dev307%2Bg153a17166-cp38-abi3-manylinux_2_28_x86_64.whl",
+    "vllm": "0.1.dev23236+g55076950b",
+    "torch": "2.14.0+cu130",
+    "cuda": "13.0",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "truth": "the pull request's model code in float64 (upstream), tools/dory_reference.py held to it",
+    "recorder": "tools/dory_vllm_reference.py",
+    "dataset": "dewml/dory-1.0-4b-vllm-reference",
+    "revision": "5bdcb24fb71596a967da284af874452e40cc6a07",
+    "files": {
+      "probe.npz": "450633424efb49730580cf31ec10926b61a6916e6f85b073ee84701e49e7ff18",
+      "orders.npy": "356f96bcdf86749623fea4fbda9ad424a4b94b68cde845e5bfdec82d835a6d42",
+      "orders-1-per_loop-bfloat16.npz": "aff5983ff0f211b5682defd2965b4307d9a2d9d6fc6ec93449afea763c81f1bc",
+      "upstream-1-per_loop-bfloat16.npy": "da6098626c1f8c82dff0e31e841addc36afc5a4a46be37da0b143581341fc505",
+      "orders-1-last_loop-bfloat16.npz": "aff5983ff0f211b5682defd2965b4307d9a2d9d6fc6ec93449afea763c81f1bc",
+      "upstream-1-last_loop-bfloat16.npy": "da6098626c1f8c82dff0e31e841addc36afc5a4a46be37da0b143581341fc505",
+      "orders-2-per_loop-bfloat16.npz": "15ad5156daa656ab178bd6b9cc7091d7ba0e4cf394e3e26135b118e60f3139bd",
+      "upstream-2-per_loop-bfloat16.npy": "617b7719d5e874f2cbc0bac308858e323b82272cdf56709c75985805eac53b47",
+      "orders-2-last_loop-bfloat16.npz": "25ca457ec10a7d24e61f3f067d19c00caaf5815f0b5f18f39fe8132e2d37e9c6",
+      "upstream-2-last_loop-bfloat16.npy": "6b0f5ba82f0ca247c98d48781fa87d9c46904791c4933324592103ab5a4e3f57",
+      "orders-4-per_loop-bfloat16.npz": "19b8a7e2d19f7b7dd9e099591ab3c4d1efc7732f71b51d6657a61de7e206f985",
+      "upstream-4-per_loop-bfloat16.npy": "7f5d894bac2754e43da5a4f591e5e00775e9d47d69c332189fa2403d363531dc",
+      "orders-4-last_loop-bfloat16.npz": "309c06ca8aea771eb49de5ee45856412f409f022be30eefdf8e285d3872188c8",
+      "upstream-4-last_loop-bfloat16.npy": "30c7dc2070d3ff6156b4ba7c3fbcc6b08af91dd906cfe0934800384b41999674",
+      "orders-2-per_loop-float32.npz": "1a4eb777888de7097612925a32679989b61a2a806d18d35cc7a4ae60acee8a90",
+      "upstream-2-per_loop-float32.npy": "1b7636c73f9dc3f1a12fda8cbbc9deaf247e6297917f2a99128b1f550ab28407",
+      "orders-2-last_loop-float32.npz": "4f2381fdd25a3268c5072818504551c431f499be6d056825c08f65cfdb3bfba1",
+      "upstream-2-last_loop-float32.npy": "6b0f5ba82f0ca247c98d48781fa87d9c46904791c4933324592103ab5a4e3f57",
+      "model-1-last_loop-bfloat16.npz": "541c37f79d56d89200dd59f629fd0600e142f8f87b8685888747951b97e85bf6",
+      "model-2-last_loop-bfloat16.npz": "c523bfb5d697322f384f213bcb2489f983d1fceb8e21f8725db4e04775780a7f",
+      "model-4-last_loop-bfloat16.npz": "1061bc53c8c4174b60defe477a5ccde13d93334b8752dddda4072ccf63a40ad3",
+      "model-2-last_loop-float32.npz": "b2cc9c4b939df7b8e32e442b3b2af266eee396fd67e6f7d39747b200ba11dd9e"
+    }
+  }
 }

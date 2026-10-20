@@ -18,8 +18,9 @@ layers, attentions and MLPs alternating as the release's do, over a width
 of 32 with a window of 5, its middle four layers looped, a tokenizer of the
 release's kind, fp32 and float64 logits at one, two and four loops and of
 the variant configs, both caches' greedy continuations with each step's
-logits, packed documents, prompts of two lengths, and the gradients of a
-loss over the logits through the loop and through its last pass alone.
+logits, packed documents, prompts of two lengths, and every tensor's
+gradient of a loss over the logits through the loop and through its last
+pass alone.
 """
 
 from __future__ import annotations
@@ -251,12 +252,28 @@ class DoryReference:
     def decode(self, prompt, steps: int):
         """Greedy decoding of one prompt, cached as `recurrent_kv_cache_mode` says: the tokens and
         each step's logits, the prompt's last first."""
+        tokens, rows = self.decoded(prompt, steps, lambda step, logits: int(logits.argmax()))
+        return np.asarray(tokens), np.stack([row[-1] for row in rows])
+
+    def forced(self, prompt, tokens, prompt_rows: bool = True):
+        """The logits of each position of `prompt` followed by `tokens`, the prompt prefilled and
+        each of `tokens` but the last decoded a step at a time, cached as
+        `recurrent_kv_cache_mode` says, as a run that drew `tokens` computed them: the prompt's
+        rows (those before its last alone where `prompt_rows` is False), then a row a token."""
+        _, rows = self.decoded(prompt, len(tokens), lambda step, logits: int(tokens[step]))
+        first = rows[0] if prompt_rows else rows[0][-1:]
+        return np.concatenate([first, *rows[1:]])
+
+    def decoded(self, prompt, steps: int, choose):
+        """`steps` tokens after `prompt`, each `choose(step, its logits)`, cached as
+        `recurrent_kv_cache_mode` says: the tokens and each call's logits, the prompt's call's a
+        row a prompt position, a decoding call's one row."""
         caches: dict = {}
         tokens, seen = list(prompt), []
         ids, positions = torch.as_tensor(np.asarray(prompt)), torch.arange(len(prompt))
         with torch.no_grad():
-            for _ in range(steps):
-                logits = self.logits(self.hidden(ids, positions, caches))[-1]
+            for step in range(steps):
+                logits = self.logits(self.hidden(ids, positions, caches))
                 for key, own in caches.pop('pending').items():
                     # A later write of the same key (the last loop's) replaces the earlier
                     # pass's entries for the step's tokens; the held earlier tokens stay.
@@ -264,9 +281,9 @@ class DoryReference:
                     caches[key] = own if held is None else tuple(
                         torch.cat([old, new]) for old, new in zip(held, own, strict=True))
                 seen.append(logits.cpu().numpy())
-                tokens.append(int(logits.argmax()))
+                tokens.append(choose(step, logits[-1]))
                 ids, positions = torch.as_tensor(tokens[-1:]), torch.as_tensor([len(tokens) - 1])
-        return np.asarray(tokens), np.stack(seen)
+        return tokens, seen
 
 
 def random_tensors(config: dict, seed: int) -> dict[str, np.ndarray]:
@@ -323,11 +340,6 @@ document's start in every row."""
 RAGGED = (3, 7)
 """The lengths of two prompts decoded side by side."""
 
-GRADIENTS = ('backbone.embeddings.weight', 'backbone.layers.0.mixer.g_proj.weight',
-             'backbone.layers.3.mixer.up_proj.weight', 'backbone.layers.4.mixer.sqk',
-             'backbone.layers.7.mlp_alpha', 'lm_head.logit_scale')
-"""Tensors whose gradients the fixture keeps: the embeddings, an input layer's output-gate
-projection, a looped feed-forward and attention gain, an output layer's step and the logit gain."""
 
 SPECIALS = ('<unk>', '<s>', '</s>', '[INST]', '[/INST]', '[AVAILABLE_TOOLS]', '[/AVAILABLE_TOOLS]',
             '[TOOL_RESULTS]', '[/TOOL_RESULTS]', '[TOOL_CALLS]', '<|im_start|>', '<|im_end|>')
@@ -410,7 +422,7 @@ def write_tiny() -> None:
     for name, loops, cut in (('trained', 2, None), ('truncated', 3, 2)):
         for suffix, dtype in (('', torch.float32), ('_f64', torch.float64)):
             gradients = DoryReference(CONFIG, tensors, dtype, loops).gradients(ids, arrays['cotangent'],
-                                                                               GRADIENTS, cut)
+                                                                               sorted(tensors), cut)
             for tensor, gradient in gradients.items():
                 arrays[f'gradient_{name}{suffix}/{tensor}'] = gradient
     np.savez(FIXTURE / 'reference.npz', **arrays)

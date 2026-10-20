@@ -1,6 +1,7 @@
-"""Dory, NVIDIA's looped nGPT, against vLLM's forward (vllm-project/vllm#60149, dory.py at
-55076950): tools/dory_reference.py transcribes it and writes tests/fixtures/hf/dory-tiny, and
-tests/fixtures/hf/dory-1.0-4b holds the released config."""
+"""Dory, NVIDIA's looped nGPT, against vLLM's (vllm-project/vllm#60149 at 55076950):
+tools/dory_reference.py transcribes its forward and writes tests/fixtures/hf/dory-tiny, the CPU
+tests' reference, and tests/fixtures/hf/dory-1.0-4b holds the released config and what vLLM's
+own engine computes of the release on a GPU (tools/dory_vllm_reference.py)."""
 
 import dataclasses
 import itertools
@@ -13,7 +14,18 @@ import numpy as np
 import optax
 import pytest
 from interop_support import assert_reloads, assert_same_stored_tensors
-from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does
+from reference_error import (
+    ORDERS,
+    assert_as_exact_as_the_reference,
+    assert_as_exact_over_orders,
+    assert_computes_the_oracle,
+    assert_leaves_as_exact_over_orders,
+    assert_rounds_where_the_reference_does,
+    assert_rows_as_exact_over_orders,
+    chain_roundings,
+    float64_forward,
+    widened,
+)
 from tool_support import load as load_tool
 
 from dew.checkpoints import Checkpoints
@@ -24,7 +36,6 @@ from dew.decision.data import Decisions
 from dew.inference import TextGeneration
 from dew.inference.serving import Server
 from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
-from dew.interop.safetensors_io import read_file
 from dew.interop.sources import load_shards
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -83,6 +94,46 @@ def assert_parity(logits, name: str, label: str) -> None:
 
 
 @pytest.mark.parametrize('loops', [1, 2, 4])
+def test_dorys_float64_forward_computes_the_transcriptions_function(loops):
+    """Dew's forward in float64, every nGPT gain, norm and step as wide as its inputs, sits within
+    float64 rounding of the transcription's float64 logits at each loop count: Dew's own float64
+    run, the truth a float64 comparison of Dory reads, computes vLLM's function."""
+    loaded = load()
+    model, ids = loaded.model.with_passes(loops), REFERENCE['input_ids']
+    truth, _ = float64_forward(model, loaded.variables, ids)
+    with jax.enable_x64(new_val=True):
+        wide = model.clone(dtype=jnp.float64)
+        roundings = chain_roundings(jax.make_jaxpr(wide.apply)(widened(loaded.variables), ids))
+    assert_computes_the_oracle(np.asarray(truth), REFERENCE[f'logits_{loops}_f64'], f'{loops} loops',
+                               roundings=roundings)
+
+
+def test_the_release_tests_symmetries_keep_dorys_function_and_redraw_its_sums():
+    """The orders the release is held to vLLM under (tools/dory_vllm_reference.py's `symmetry`: the
+    residual stream's units, each feed-forward's hidden units, each attention's heads and value
+    dimensions) on the tiny Dory: each taken back gives the weights' own bits; under each, Dew's float64
+    logits sit within float64 rounding of the identity's, so each is the same function; and the fp32
+    logits move, so each redraws the rounding."""
+    loaded, ids = load(), REFERENCE['input_ids']
+    config = json.loads((TINY / 'config.json').read_text())
+    recorder = load_tool('dory_vllm_reference')
+    exact, _ = float64_forward(loaded.model, loaded.variables, ids)
+    plain = np.asarray(loaded.model.apply(loaded.variables, ids))
+    with jax.enable_x64(new_val=True):
+        wide = loaded.model.clone(dtype=jnp.float64)
+        roundings = chain_roundings(jax.make_jaxpr(wide.apply)(widened(loaded.variables), ids))
+    for index in range(3):
+        drawn = recorder.symmetry(config, 1, index)
+        ordered = symmetric(loaded.variables, config, drawn)
+        jax.tree.map(np.testing.assert_array_equal,
+                     symmetric(ordered, config, drawn, inverse=True), loaded.variables)
+        found, _ = float64_forward(loaded.model, ordered, ids)
+        assert_computes_the_oracle(np.asarray(found), np.asarray(exact), f'order {index} in float64',
+                                   roundings=roundings)
+        assert not np.array_equal(np.asarray(loaded.model.apply(ordered, ids)), plain), index
+
+
+@pytest.mark.parametrize('loops', [1, 2, 4])
 def test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop_count(loops):
     """The tiny Dory's logits with its recurrent block run once, twice (its own count) and four
     times, as vLLM's forward computes them, within tests/reference_error.py's rule of its fp32 run
@@ -119,8 +170,10 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode):
     ('per_loop'), or one a recurrent layer that each pass overwrites ('last_loop', a pass reading
     its own keys for the step's tokens and the last pass's for the earlier ones). The tokens are
     the reference's and each step's logits within the rule of its fp32 decode against float64.
-    A per-pass cache is the full forward's: the uncached logits of the whole continuation hold to
-    the same rule at the positions each step decoded."""
+    A per-pass cache is exact, the full forward's: the uncached logits of the whole continuation
+    hold to the same rule at the positions each step decoded, and the cached steps to the rule of
+    those uncached logits. A last-loop cache is the model's own approximation, held to the
+    reference's decoding under it."""
     loaded = load()
     model = with_cache(loaded.model, mode)
     expected = REFERENCE[f'generated_{mode}']
@@ -140,6 +193,7 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode):
     if mode == 'per_loop':
         whole = np.asarray(model.apply(variables, jnp.asarray(expected[None, :-1])))[0, 5:]
         assert_as_exact_as_the_reference(whole, reference, truth, "Dory's forward over its continuation")
+        assert_as_exact_as_the_reference(steps, whole, truth, "Dory's per-pass cache against its forward")
 
 
 @pytest.mark.parametrize('attention_impl', ['xla', 'reference'])
@@ -238,11 +292,11 @@ def test_a_shared_loop_cache_takes_each_prompt_whole(options):
 
 @pytest.mark.parametrize(('name', 'loops', 'backprop_steps'), [('trained', 2, None), ('truncated', 3, 1)])
 def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_steps):
-    """The gradient of a loss over the logits in the embeddings, an input layer's output-gate
-    projection, a looped feed-forward and attention gain, an output layer's step and the logit
-    gain, as the reference's autograd takes it, within the rule: through every pass, and with the
-    loop cut before its last pass, where the input layers still train through what that pass
-    reinjects (Huginn's truncation). Each is named by the export, as the checkpoint stores it."""
+    """The gradient of a loss over the logits in every tensor of the checkpoint, as the
+    reference's autograd takes it, within the rule: through every pass, and with the loop cut
+    before its last pass, where the input layers still train through what that pass reinjects
+    (Huginn's truncation). Each is named by the export, as the checkpoint stores it, and the
+    export names every tensor the reference does."""
     loaded = load()
     model = loaded.model.with_passes(loops, backprop_steps=backprop_steps)
     ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent']
@@ -251,7 +305,9 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
         return jnp.sum(model.apply({**loaded.variables, 'params': params}, ids) * cotangent)
 
     gradients = loaded.export({'params': jax.grad(loss)(loaded.variables['params'])})
-    for tensor in TOOL.GRADIENTS:
+    tensors = {key.split('/', 1)[1] for key in REFERENCE.files if key.startswith(f'gradient_{name}/')}
+    assert set(gradients) == tensors
+    for tensor in sorted(tensors):
         assert_as_exact_as_the_reference(gradients[tensor], REFERENCE[f'gradient_{name}/{tensor}'],
                                          REFERENCE[f'gradient_{name}_f64/{tensor}'], f'{name} {tensor}')
 
@@ -298,20 +354,54 @@ def train(objective, directory: Path, steps: int):
     return jax.device_get(state.variables)
 
 
+def peft_merged(checkpoint: Path, adapter: Path) -> dict[str, np.ndarray]:
+    """The checkpoint's tensors with the adapter at `adapter` merged in by PEFT itself: its LoRA
+    layers injected by the adapter's own config into a torch module of the checkpoint's linear
+    projections under their checkpoint names, the saved factors loaded as PEFT loads them, and each
+    layer's merge."""
+    import torch
+    from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
+    from peft.tuners.lora import LoraLayer
+    from safetensors.numpy import load_file
+
+    tensors = load_file(str(checkpoint / 'model.safetensors'))
+    base = torch.nn.Module()
+    for name, value in tensors.items():
+        *path, leaf, kind = name.split('.')
+        if kind != 'weight' or value.ndim != 2 or leaf == 'embeddings':
+            continue
+        parent = base
+        for part in path:
+            if not hasattr(parent, part):
+                parent.add_module(part, torch.nn.Module())
+            parent = getattr(parent, part)
+        linear = torch.nn.Linear(value.shape[1], value.shape[0], bias=False)
+        linear.weight.data = torch.as_tensor(value)
+        parent.add_module(leaf, linear)
+    model = inject_adapter_in_model(LoraConfig.from_pretrained(str(adapter)), base)
+    saved = load_file(str(adapter / 'adapter_model.safetensors'))
+    set_peft_model_state_dict(model, {name.removeprefix('base_model.model.'): torch.as_tensor(value)
+                                      for name, value in saved.items()})
+    merged = dict(tensors)
+    for name, module in model.named_modules():
+        if isinstance(module, LoraLayer) and module.lora_A:
+            module.merge()
+            merged[f'{name}.weight'] = module.base_layer.weight.detach().numpy()
+    targets = {name.removeprefix('base_model.model.').split('.lora_')[0] + '.weight' for name in saved}
+    assert {name for name in merged if merged[name] is not tensors[name]} == targets
+    return merged
+
+
 def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     """A rank-2 adapter on all eight projections of every layer, the attention's output gate
     (`g_proj`) apart from the feed-forward's `gate_proj`: one step moves every B factor, so the
     loss reaches each projection; a run resumed after its first step ends where two uninterrupted
-    steps end; the factors save as PEFT names them and load back; and the merged checkpoint
-    reloads to the adapted model's logits."""
+    steps end; the saved factors load back to the same logits; PEFT, the saved adapter's consumer,
+    merges it into the checkpoint's projections by their names, and the transcription over that
+    merge computes the adapted model's logits within the rule of its own run against float64; and
+    the merged checkpoint reloads to the adapted model's logits within the same rule."""
     loaded = load()
     adapted = loaded.adapt(LoRA(rank=2, modules=PROJECTIONS), key=0)
-    targets = {'/'.join(module[1:]) for module in adapted.adapter.targets}
-    sites = {'mlp': ('gate_proj', 'up_proj', 'down_proj'),
-             'attention': ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj')}
-    assert targets == {f'layers_{layer}/self_attn/{site}'
-                       for layer, kind in enumerate(loaded.model.per_layer_types)
-                       for site in sites['mlp' if kind == 'mlp' else 'attention']}
 
     def objective():
         return LMObjective(adapted.model, 8, variables=adapted.variables)
@@ -329,16 +419,21 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     jax.tree.map(np.testing.assert_array_equal, resumed['params'], whole['params'])
 
     adapted.adapter.save(resumed, tmp_path / 'adapter')
-    saved, _ = read_file(tmp_path / 'adapter' / 'adapter_model.safetensors')
-    assert 'base_model.model.backbone.layers.0.mixer.g_proj.lora_A.weight' in saved
-    assert 'base_model.model.backbone.layers.1.mixer.gate_proj.lora_B.weight' in saved
     again = LoRA.load(loaded.model, loaded.variables, tmp_path / 'adapter', layouts=loaded.layouts)
     ids = REFERENCE['input_ids']
     logits = np.asarray(adapted.model.apply(resumed, ids))
     np.testing.assert_array_equal(np.asarray(again.model.apply(again.variables, ids)), logits)
+    import torch
+
+    config, peft = json.loads((TINY / 'config.json').read_text()), peft_merged(TINY, tmp_path / 'adapter')
+    assert_as_exact_as_the_reference(logits, TOOL.DoryReference(config, peft, torch.float32).forward(ids),
+                                     TOOL.DoryReference(config, peft, torch.float64).forward(ids),
+                                     'the adapter as PEFT merges it')
     adapted.save(tmp_path / 'merged', variables=resumed)
     merged = Pretrained.load(tmp_path / 'merged', dtype='float32', attention_impl='xla')
-    np.testing.assert_allclose(np.asarray(merged.model.apply(merged.variables, ids)), logits, atol=1e-5)
+    truth, terms = float64_forward(adapted.model, resumed, ids)
+    assert_as_exact_as_the_reference(np.asarray(merged.model.apply(merged.variables, ids)), logits,
+                                     np.asarray(truth), 'the merged adapter', terms=np.asarray(terms))
 
 
 INTENT = Choice('which team?', {'billing': 'payments', 'technical': 'outages', 'sales': 'pricing'})
@@ -379,17 +474,6 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
     reloaded = objective.saved_task.from_run(str(tmp_path))('charged twice', asked)
     for answer, again in zip(live.values(), reloaded.values(), strict=True):
         np.testing.assert_array_equal(answer.probabilities, again.probabilities)
-
-
-def test_a_dory_config_loads_as_its_looped_ngpt():
-    """The config's fields land where Dory computes them: a block a layer, an attention alone or
-    an MLP in the mixer's slot, the loop over the recurrent ones, reinjecting, and the cache mode."""
-    model = load().model
-    assert model.num_layers == 8 and model.ngpt is not None and not model.pre_norms and not model.mlp_features
-    assert model.loop is not None and model.loop.layers == (2, 6) and model.loop.steps == 2
-    assert model.loop.reinject and not model.loop.shared_cache
-    assert model.per_layer_types == ('sliding_attention', 'mlp', 'full_attention', 'mlp') * 2
-    assert isinstance(model.kind_of('mlp').mixer, MLPMixer)
 
 
 DORY_FIELDS = ('vocab_size', 'hidden_size', 'num_hidden_layers', 'intermediate_size', 'num_attention_heads',
@@ -467,15 +551,13 @@ def test_a_dory_written_from_dew_alone_reloads_as_itself(tmp_path):
         PretrainedDecoder.from_model(loaded.model.clone(loop=None), loaded.variables)
 
 
-def test_an_mlp_mixer_takes_ngpts_gains_and_what_ngpt_does_not_reach_is_refused():
-    """nGPT's arithmetic lives in the attention and the dense gated feed-forward. An MLP in the
-    mixer's slot takes the feed-forward's gains; routed experts, a gated delta net, a prediction
-    depth and an MLP mixer's own experts, which would compute without them, are refused."""
+def test_what_ngpts_arithmetic_does_not_reach_is_refused():
+    """nGPT's arithmetic lives in the attention and the dense gated feed-forward, in a block's
+    feed-forward or in the mixer's slot, where each of Dory's MLP layers computes it (the reference
+    tests above). Routed experts, a gated delta net, a prediction depth and an MLP mixer's own
+    experts, which would compute without it, are refused."""
     model = load().model
     ids = jnp.asarray(REFERENCE['input_ids'])
-    mixed = model.clone(mixer=MLPMixer(intermediate_size=48, activation='swiglu'))
-    tree = mixed.init(jax.random.key(0), ids)['params']
-    assert set(tree['layers_0']['self_attn']) >= {'suv_gate', 'suv_up'}
     delta = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8,
                                linear_value_head_dim=8)
     routed = MLPMixer(intermediate_size=48, activation='swiglu', mixture=Mixture(experts=4))
@@ -506,3 +588,164 @@ def test_a_saved_checkpoint_reloads_bit_for_bit(tmp_path):
     assert_same_stored_tensors(load_shards(tmp_path), load_shards(TINY))
     assert json.loads((tmp_path / 'config.json').read_text())['model_type'] == 'dory'
     assert_reloads(loaded, tmp_path, REFERENCE['input_ids'])
+
+
+# Each parameter a symmetry reorders, by its name in an attention or a feed-forward layer: the map
+# (tools/dory_vllm_reference.py's `maps`) and the axis it reorders.
+SYMMETRIC = {'attention': {'q_proj': ('query', 1), 'k_proj': ('key', 1), 'v_proj': ('value', 1),
+                           'gate_proj': ('output', 1), 's_gate': ('output', 0), 'sqk': ('query', 0),
+                           'o_proj': ('output', 0)},
+             'mlp': {'gate_proj': ('mlp', 1), 'up_proj': ('mlp', 1), 'suv_gate': ('mlp', 0),
+                     'suv_up': ('mlp', 0), 'down_proj': ('mlp', 0)}}
+
+
+def symmetric(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse: bool = False):
+    """`variables` under the symmetries `drawn` (tools/dory_vllm_reference.py's `symmetry`), or taken
+    back from them where `inverse`: each attention's and feed-forward's parameters along the axes it
+    reorders (`SYMMETRIC`), then the residual stream's units (tests/residual_orders.py), each leaf
+    where it is, a device array on its device."""
+    from residual_orders import permuted
+
+    found = load_tool('dory_vllm_reference').maps(config, drawn)
+    if inverse:
+        found = {part: {layer: np.argsort(order) for layer, order in by.items()}
+                 for part, by in found.items()}
+    kinds = config['layer_types']
+
+    def reorder(path, leaf):
+        names = [getattr(entry, 'key', None) for entry in path]
+        if not names[0].startswith('layers_'):
+            return leaf
+        layer = int(names[0].removeprefix('layers_'))
+        parameter = names[-2] if names[-1] == 'kernel' else names[-1]
+        named = SYMMETRIC['mlp' if kinds[layer] == 'mlp' else 'attention'].get(parameter)
+        if named is None:
+            return leaf
+        part, axis = named
+        order = found[part][layer]
+        if isinstance(leaf, jax.Array):
+            return jnp.take(leaf, jnp.asarray(order), axis=axis)
+        return np.take(np.asarray(leaf), order, axis=axis)
+
+    params = jax.tree_util.tree_map_with_path(reorder, variables['params'])
+    residual = np.argsort(drawn['residual']) if inverse else drawn['residual']
+    return permuted({**variables, 'params': params}, residual)
+
+
+def decoding(model: CausalTransformer):
+    """`model`'s empty cache of one row, its call over a cache, prefilling a prompt or decoding a
+    token, and its log-probabilities from logits, each compiled once for every set of weights of its
+    shapes and binding no weights past its call."""
+    opened = jax.jit(lambda variables: model.apply(variables, 1, method=CausalTransformer.init_cache,
+                                                   mutable=['cache'])[1]['cache'])
+    step = jax.jit(lambda variables, cache, ids: model.apply({**variables, 'cache': cache}, ids, decode=True,
+                                                             mutable=['cache']))
+    scored = jax.jit(lambda logits: jax.nn.log_softmax(logits.astype(jnp.promote_types(logits.dtype,
+                                                                                          jnp.float32))))
+    return opened, step, scored
+
+
+def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> np.ndarray:
+    """Dew's log-probabilities at each position of `prompt` followed by `tokens`, the prompt
+    prefilled and each token but the last decoded a step at a time through the cache (`programs`,
+    `decoding`'s), as a run that drew `tokens` computes them: the prompt's rows (its last alone
+    where `prompt_rows` is False), then a row a token."""
+    opened, step, scored = programs
+    logits, written = step(variables, opened(variables), jnp.asarray(prompt[None]))
+    rows = [logits[0] if prompt_rows else logits[0, -1:]]
+    for token in tokens[:-1]:
+        logits, written = step(variables, written['cache'], jnp.asarray([[token]]))
+        rows.append(logits[0])
+    return np.asarray(scored(jnp.concatenate(rows)))
+
+
+@pytest.mark.network
+@pytest.mark.gpu(reason='the 4B release, held to vLLM running it on a GPU')
+def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loop_count():
+    """NVIDIA-Nemotron-Labs-Dory1.0-4B at source.json's revision against vLLM's own engine running
+    it (tools/dory_vllm_reference.py, its provenance in source.json, its probe in the dataset that
+    pins), in bf16 at one, two and four loops and in fp32 at two, through each cache: the
+    log-probabilities of a sentence's prompt and of the 256 tokens vLLM drew greedily after it,
+    each decoded a step at a time, and of 64 tokens drawn after 1100 random ids, past the
+    1024-token window, every entry of every row.
+
+    The float64 truth is vLLM's own model code run in float64 on the same tokens, which the
+    transcription tools/dory_reference.py (the CPU tests' reference) is held to, and Dew's own
+    float64 decoding, entry by entry, within the float64 rounding of the computation. At a few
+    positions of every run, vLLM's too, one rounding moves the continuation's log-probabilities by
+    whole units, so one run against one decides nothing there: each run is held to vLLM's over the
+    orders vLLM ran under (tests/reference_error.py's over-orders rules), every row over the whole
+    vocabulary overall (`assert_as_exact_over_orders`) and row by row (`assert_rows_as_exact_over_orders`,
+    each row sized by the truth row's own RMS), and each row's probe columns overall, row by row and
+    entry by entry. vLLM is an opaque reference no surrogate can witness, so its leaf and row RMS are
+    the end-to-end bar; every element is held through Dory's own graph against Dew's fp32 XLA
+    reference of the same math. On a last-loop run's rows past the window, vLLM's engine parts from
+    its own model code
+    (https://github.com/vllm-project/vllm/pull/60149#issuecomment-6270937659): there the reference
+    is that model code at the engine's precision under the same orders, so the engine's departure
+    widens no bound.
+
+    The orders are the exact symmetries both engines hold the release under, on the same prompts
+    (tools/dory_vllm_reference.py's `symmetry`): the residual stream's units, each feed-forward's
+    hidden units, each attention's heads and value dimensions. They redraw 90 to 99.5% of the
+    release's summed terms. The rest no order moves on either side, so neither error there is calibrated: the
+    queries' and keys' products over a head's dimensions (RoPE's frequency pairs), the softmax's and
+    the values' sums over the keys (the key order), the queries' and keys' unit norms, and the
+    log-softmax over the vocabulary. A failure that persists there is a finding about those sums, to
+    diagnose, not a draw.
+
+    Each arm's precision: the engine computes a bf16 run in bf16 over fp32 accumulation, and an
+    fp32 run with its linears at "highest" (VLLM_FLOAT32_MATMUL_PRECISION's default) and its
+    Triton attention's products in TF32; the model-code arm takes the same, bf16 throughout or
+    fp32 with TF32 attention products. Dew leaves each product to JAX's default, which on this GPU
+    multiplies a float32 run's linears and attention alike in TF32."""
+    source = json.loads((RELEASED / 'source.json').read_text())
+    recorder = load_tool('dory_vllm_reference')
+    assert recorder.ORDERS == ORDERS, 'the probe holds batches of other than the rule\'s orders'
+    probe, config = np.load(recorder.fetched('probe.npz')), json.loads((RELEASED / 'config.json').read_text())
+    keys = [recorder.name(*run) for run in recorder.RUNS]
+    truths = {key: np.load(recorder.fetched(f'upstream-{recorder.tag(key)}.npy')) for key in keys}
+
+    def rows(programs, variables, key):
+        """Every row of run `key`, decoded as the run decoded it."""
+        return np.concatenate([forced(programs, variables, probe[part], probe[f'{key}/{part}_generated'],
+                                      prompt_rows=part == 'sentence') for part in ('sentence', 'window')])
+
+    loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype='float32')
+    with jax.enable_x64(new_val=True):
+        variables = jax.device_put(widened(loaded.variables))
+        for loops, mode, run in recorder.RUNS:
+            key = recorder.name(loops, mode, run)
+            wide = with_cache(loaded.model.with_passes(loops), mode).clone(dtype=jnp.float64)
+            length = len(probe['window']) + len(probe[f'{key}/window_generated'])
+            scored = jax.make_jaxpr(lambda held, ids, at=wide: jax.nn.log_softmax(at.apply(held, ids)))
+            roundings = chain_roundings(scored(variables, jnp.zeros((1, length), jnp.int32)))
+            for part in ('', '_full'):
+                assert_computes_the_oracle(probe[f'{key}/truth{part}'], probe[f'{key}/upstream{part}'],
+                                           f'the transcription in float64, {key}{part}', roundings=roundings)
+            mine = rows(decoding(wide.with_cache_capacity(recorder.CONTEXT)), variables, key)
+            assert_computes_the_oracle(mine, truths[key], f'Dew in float64, {key}', roundings=roundings)
+        del variables
+    for dtype in ('bfloat16', 'float32'):
+        loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype=dtype)
+        for loops, mode, run in recorder.RUNS:
+            if run != dtype:
+                continue
+            key = recorder.name(loops, mode, run)
+            model = with_cache(loaded.model.with_passes(loops), mode).with_cache_capacity(recorder.CONTEXT)
+            programs, columns, truth = decoding(model), recorder.columns_of(probe, key), truths[key]
+            placed, draws, distances = jax.device_put(loaded.variables), [], np.zeros((ORDERS, len(truth)))
+            theirs = np.load(recorder.fetched(f'columns-{recorder.tag(key)}-0.npy'))
+            for order, reference in enumerate(theirs):
+                # Each order's weights are reordered where they sit, on the device.
+                found = rows(programs, symmetric(placed, config, recorder.symmetry(config, 0, order)), key)
+                distances[order] = np.sqrt(np.mean(np.square(found - truth), axis=1))
+                draws.append((np.take_along_axis(found, columns, axis=1), reference,
+                              np.take_along_axis(truth, columns, axis=1)))
+            spread = np.load(recorder.fetched(f'rms-{recorder.tag(key)}-vllm.npy'))[0]
+            assert_as_exact_over_orders(np.sqrt(np.mean(np.square(distances), axis=1)), spread,
+                                        f'Dory 4B {key}, every entry')
+            assert_rows_as_exact_over_orders(distances, np.load(recorder.fetched(
+                f'rows-{recorder.tag(key)}-vllm.npy'))[0], f'Dory 4B {key}, row by row',
+                sizes=np.load(recorder.fetched(f'sizes-{recorder.tag(key)}.npy')))
+            assert_leaves_as_exact_over_orders(draws, f'Dory 4B {key}, its columns')
