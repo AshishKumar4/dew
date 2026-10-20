@@ -535,9 +535,9 @@ def _as_computed(value):
         # A model record holds plain mappings (`dict`, or Flax's `FrozenDict` from older code).
         return (FrozenDict(entries) if isinstance(value, FrozenDict) else entries) if changed else value
     if isinstance(value, (list, tuple)):
-        items = [_as_computed(entry) for entry in value]
-        changed = any(new is not old for new, old in zip(items, value, strict=True))
-        return (tuple(items) if isinstance(value, tuple) else items) if changed else value
+        computed = [_as_computed(entry) for entry in value]
+        changed = any(new is not old for new, old in zip(computed, value, strict=True))
+        return (tuple(computed) if isinstance(value, tuple) else computed) if changed else value
     return value
 
 
