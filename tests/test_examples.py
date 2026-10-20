@@ -411,7 +411,7 @@ def test_train_rlvr_turns_smoke_trains_through_environment_source(tmp_path):
 
 
 def test_train_harbor_smoke_trains_on_gateway_recorded_harness_calls(tmp_path):
-    """Two updates of HarborSource trials whose model calls the stand-in gateway records from the policy's
+    """Two updates of Harbor trials whose model calls the stand-in gateway records from the policy's
     own draws; the second trains on sessions submitted one update earlier."""
     smoke("train_harbor", tmp_path)
     summary = json.loads((tmp_path / "summary.json").read_text())
