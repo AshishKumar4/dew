@@ -3,12 +3,14 @@
 rounded operands; the MoE dispatcher's routes to each implementation; the products' dtypes as the
 kernels write them; and the cost model (`dew.nn.kernels.templates.cost`) on analytic launches."""
 
+import functools
 import itertools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import Mesh
 from reference_error import assert_as_exact_as_the_reference, equations
 
 from dew.nn.kernels import generation, grouped_matmul
@@ -69,26 +71,26 @@ def xla_products(x, w, dy, sizes, dtype, kernel_dtype):
 @pytest.mark.parametrize("sizes", list(SIZES), ids=list(SIZES))
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
 def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes, dtype):
-    """Each warpgroup split and both orientations of the forward, and the kernel gradient, interpreted on
-    a CPU: every product as exact as XLA's ragged dot from float64 sums of the same rounded operands,
-    unrouted rows and empty groups exactly zero."""
+    """Both orientations of the forward, and the kernel gradient, interpreted on a CPU, at row blocks
+    groups share and blocks of their own: every product as exact as XLA's ragged dot from float64 sums of
+    the same rounded operands, unrouted rows and empty groups exactly zero."""
     sizes = SIZES[sizes]
     x, w, dy, group = operands(sizes, dtype)
     truth = float64_products(x, w, dy, group)
     reference = xla_products(x, w, dy, sizes, dtype, jnp.float32)
-    interpret = grouped_matmul.INTERPRETED
     arrays = [jnp.asarray(value, dtype) for value in (x, w, dy)]
     group_sizes = jnp.asarray(sizes, jnp.int32)
-    for split, transpose in itertools.product("mn", (False, True)):
-        tiles = mosaic_gpu.Tiles(tile_m=64, tile_n=64, tile_k=64, stages=2, split=split, width=1)
+    for block_m, transpose in itertools.product((64, 128), (False, True)):
+        tiles = mosaic_gpu.Tiles(block_m, 64, 64, 2, 1)
         matrix = jnp.swapaxes(arrays[1], 1, 2) if transpose else arrays[1]
         got = mosaic_gpu.gmm(arrays[0], matrix, group_sizes, tiles=tiles, transpose_rhs=transpose,
-                             out_dtype=dtype, multiprocessors=1, interpret=interpret)
-        check(got, reference[0], truth[0], group, f"forward split={split} transpose={transpose}")
-    tiles = mosaic_gpu.Tiles(tile_m=64, tile_n=64, tile_k=64, stages=2, split="n", width=1)
-    got = mosaic_gpu.tgmm(arrays[0], arrays[2], group_sizes, tiles=tiles, out_dtype=jnp.float32,
-                          multiprocessors=1, interpret=interpret)
-    check(got, reference[2], truth[2], None, "kernel gradient")
+                             out_dtype=dtype, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
+        check(got, reference[0], truth[0], group, f"forward block_m={block_m} transpose={transpose}")
+    for block_k in (64, 128):
+        tiles = mosaic_gpu.Tiles(64, 64, block_k, 2, 1)
+        got = mosaic_gpu.tgmm(arrays[0], arrays[2], group_sizes, tiles=tiles, out_dtype=jnp.float32,
+                              multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
+        check(got, reference[2], truth[2], None, f"kernel gradient block_k={block_k}")
 
 
 def check(got, reference, truth, group, label):
@@ -110,7 +112,7 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out():
     reference = xla_products(x, w, dy, sizes, jnp.bfloat16, jnp.float32)[2]
     dirty_x, dirty_dy = x.copy(), dy.copy()
     dirty_x[group < 0], dirty_dy[group < 0] = np.inf, np.nan
-    tiles = mosaic_gpu.Tiles(tile_m=64, tile_n=64, tile_k=64, stages=2, split="n", width=1)
+    tiles = mosaic_gpu.Tiles(64, 64, 64, 2, 1)
     interpret = grouped_matmul.INTERPRETED
     got = mosaic_gpu.tgmm(jnp.asarray(dirty_x, jnp.bfloat16), jnp.asarray(dirty_dy, jnp.bfloat16),
                           jnp.asarray(sizes, jnp.int32), tiles=tiles, out_dtype=jnp.float32,
@@ -147,6 +149,31 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
                                          (forward, input_gradient, kernel_gradient), strict=True):
         assert_as_exact_as_the_reference(np.asarray(got, np.float64), np.asarray(theirs, np.float64), truth,
                                           label)
+
+
+@pytest.mark.parametrize("launch", [grouped_matmul.MosaicGmm(), grouped_matmul.MosaicGmmTransposed(),
+                                    grouped_matmul.MosaicTgmm()], ids=lambda launch: type(launch).__name__)
+def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
+    """Each tile the Mosaic GPU launches may pick at an expert layer's shapes lowers for an H100 on the
+    CPU, as a GPU session's compile would, the tiles that fit an H100's block (`Template.fitting`) at
+    least: the interpreter takes kernels Mosaic GPU's layout inference refuses."""
+    rows, depth, width, groups = 2048, 768, 1536, 8
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes, matrices = jax.ShapeDtypeStruct((groups,), jnp.int32), bf16((groups, depth, width))
+    if isinstance(launch, grouped_matmul.MosaicTgmm):
+        args, options = (bf16((rows, depth)), bf16((rows, width)), sizes), {"out_dtype": "float32"}
+    elif isinstance(launch, grouped_matmul.MosaicGmmTransposed):
+        args, options = (bf16((rows, width)), matrices, sizes), {"trans_rhs": True}
+    else:
+        args, options = (bf16((rows, depth)), matrices, sizes), {"trans_rhs": False}
+    options = {"out_dtype": "bfloat16", **options, "interpret": False}
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        fits = launch.fitting(launch.bind(*args, **options), generation.gpu_target())
+        assert len(fits) > 1
+        for config in fits:
+            jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
+                lowering_platforms=("cuda",))
 
 
 def test_a_forced_implementation_runs_or_says_why_it_cannot():
