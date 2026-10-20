@@ -17,6 +17,15 @@ Each case writes PEFT's adapter directory, the fixture's input ids, the
 base and adapted logits, the mean next-token cross entropy and its
 gradient with respect to every adapter factor, and every factor after two
 torch AdamW steps (`ADAMW`) on that loss, in float32 and in float64.
+
+The loss is one number, so one run of it against PEFT's is one rounding draw
+against another. `orders.npz` beside each case holds PEFT's float32 loss's
+distance from its float64 one over the K-order rule's residual orders
+(tests/reference_error.py, `ORDERS`): Dew writes the base model and the adapter
+in each order (`write_orders`, tests/residual_orders.py, the factors' residual
+sides read off their declared axes), with the dropout case's masks moved with
+the branch inputs that carry the residual, and PEFT's run reads them back
+(`record_orders`).
 The dropout case reads its masks, one per target keyed by the target's
 PEFT module path, from `masks.npz` beside it, which Dew writes first over
 the committed adapter (`masks`, in Dew's environment); the PEFT run (the
@@ -25,6 +34,8 @@ those masks:
 
     PYTHONPATH=src python tools/lora_peft_reference.py masks
     ~/.cache/dew/reference-venvs/peft/bin/python tools/lora_peft_reference.py
+    PYTHONPATH=src python tools/lora_peft_reference.py write-orders <dir>
+    ~/.cache/dew/reference-venvs/peft/bin/python tools/lora_peft_reference.py orders <dir>
 """
 
 from __future__ import annotations
@@ -130,6 +141,95 @@ def dew_masks(adapter, tokens: np.ndarray) -> dict[str, np.ndarray]:
         objective.loss(params, {"text": jnp.asarray(tokens)},
                        Step(step=jnp.int32(0), key=jax.random.key(1), ema=None))
     return drawn
+
+
+ORDER_SEED = 6
+"""The seed of the residual orders `write_orders` draws."""
+
+
+def write_orders(out: Path) -> None:
+    """Each case's base model and adapter written under `out`/<case>/<k>/ in each of `ORDERS`
+    residual orders (tests/residual_orders.py), order 0 the identity: the base through
+    `Pretrained.save`, the adapter through `Adapter.save`, and the dropout case's masks in
+    `MASKS`, a mask's last axis moved with its target's branch input where that input is the
+    residual stream (its `lora_A`'s first declared axis is 'embed')."""
+    import jax
+
+    sys.path.insert(0, str(ROOT / "tests"))
+    from reference_error import ORDERS
+    from residual_orders import orders, permuted, residual_width
+
+    from dew.interop.pretrained import Pretrained
+    from dew.lora import FACTORS, LoRA
+    from dew.nn.sharding import declarations, declared_axes, parameter_path
+
+    decoder = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    for case in CASES:
+        adapter = LoRA.load(decoder.model, decoder.variables, FIXTURE / case / "adapter",
+                            layouts=decoder.layouts)
+        drawn = orders(residual_width(adapter.variables), ORDERS, ORDER_SEED)
+        (out / case).mkdir(parents=True, exist_ok=True)
+        np.save(out / case / "orders.npy", drawn)
+        declared = declarations(adapter.variables["params"])
+        residual_inputs = {
+            "model." + ".".join(parameter_path(path)[:-1]).replace("layers_", "layers.")
+            for path, leaf in jax.tree_util.tree_leaves_with_path(adapter.variables["params"])
+            if parameter_path(path)[-1] == "lora_A"
+            and declared_axes(path, leaf.ndim, declared)[0] == "embed"}
+        masks = None
+        if CASES[case]["lora_dropout"]:
+            with np.load(FIXTURE / case / MASKS) as saved:
+                masks = {key: saved[key] for key in saved}
+        for k, order in enumerate(drawn):
+            variables = permuted(adapter.variables, order)
+            base = {**variables, "params": _without(variables["params"], FACTORS)}
+            decoder.save(out / case / str(k) / "base", variables=base)
+            adapter.save(variables, out / case / str(k) / "adapter")
+            if masks is not None:
+                np.savez(out / case / str(k) / MASKS, **{
+                    key: mask[..., order] if key in residual_inputs else mask for key, mask in masks.items()})
+        print(f"{out / case}: {len(drawn)} orders, residual branch inputs {sorted(residual_inputs)}")
+
+
+def _without(tree: dict, names) -> dict:
+    """`tree` without the leaves `names` holds at any depth."""
+    return {key: _without(value, names) if isinstance(value, dict) else value
+            for key, value in tree.items() if key not in names}
+
+
+def record_orders(drawn: Path) -> None:
+    """PEFT's float32 loss over each case's residual orders under `drawn` (`write_orders`), its
+    distance from the case's float64 loss, written to the case's `orders.npz` beside the orders.
+    A permutation of the residual stream leaves the loss exact, so every order's truth is the
+    identity's; order 0 must reproduce the case's recorded float32 loss bit for bit."""
+    from reference_releases import require
+
+    require("peft")
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+
+    input_ids = torch.from_numpy(np.load(LLAMA / "input_ids.npy")).long()
+    for case, settings in CASES.items():
+        with np.load(FIXTURE / case / "reference.npz") as stored:
+            recorded, truth = stored["loss"], np.float64(stored["loss_f64"])
+        drawn_orders = np.load(drawn / case / "orders.npy")
+        distances = []
+        for k in range(len(drawn_orders)):
+            base = AutoModelForCausalLM.from_pretrained(drawn / case / str(k) / "base", dtype=torch.float32)
+            model = PeftModel.from_pretrained(base, drawn / case / str(k) / "adapter", is_trainable=True)
+            masks = None
+            if settings["lora_dropout"]:
+                with np.load(drawn / case / str(k) / MASKS) as saved:
+                    masks = {key: saved[key] for key in saved}
+            loss = run_at(model, input_ids, torch.float32, masks, settings["lora_dropout"])["loss"]
+            if k == 0:
+                assert np.array_equal(loss, recorded), "order 0 must reproduce the case's recorded loss"
+            distances.append(abs(np.float64(loss) - truth))
+        np.savez(FIXTURE / case / "orders.npz",
+                 orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
+                 loss=np.asarray(distances))
+        print(f"{case}: {len(distances)} orders, loss distances / order 0's",
+              np.round(np.asarray(distances) / distances[0], 2))
 
 
 def write_masks() -> None:
@@ -239,4 +339,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    write_masks() if sys.argv[1:] == ["masks"] else main()
+    if sys.argv[1:] == ["masks"]:
+        write_masks()
+    elif sys.argv[1:2] == ["write-orders"]:
+        write_orders(Path(sys.argv[2]))
+    elif sys.argv[1:2] == ["orders"]:
+        record_orders(Path(sys.argv[2]))
+    else:
+        main()
