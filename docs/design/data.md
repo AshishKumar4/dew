@@ -294,7 +294,7 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 
 | Preset | Reads per record | Writes per batch |
 |---|---|---|
-| `images(ds, size, *, batch, augment=False, crop_scale=(1, 1), cache=None)` | `image`: encoded bytes or uint8 `[H, W, 3]` | `image` uint8 `[B, size, size, 3]` |
+| `images(ds, size, *, batch, augment=False, crop_scale=(1, 1), field="image", staging_size=None, draft=False, rejects=True, caption=None, cache=None, records=None, host=())` | `field`: encoded bytes or uint8 `[H, W, 3]` | `image` uint8 `[B, size, size, 3]`; with `caption`, `caption` |
 | `lm(ds, tokenizer, *, seq_len, batch, field="text", cache=None)` | `text`: a string | `text` int32 `[B, seq_len + 1]`; `text_coordinates`, the windows' documents (`dew.nn.inputs.Coordinates`) |
 | `sft(ds, tokenizer, *, seq_len, batch, cache=None)` | `messages`: chat turns | the `lm` fields and `text_roles` int32 `[B, seq_len + 1]` |
 | `clips(ds, seconds, *, frames, fps, size, batch, sample_rate=None)` | `mp4`: bytes | `video` uint8 `[B, frames, size, size, 3]`; with `sample_rate`, `audio` float32 `[B, samples]` and `audio_valid` bool `[B, samples]` |
@@ -302,7 +302,10 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 - A `lm` or `sft` row holds `seq_len` inputs and their next-token targets.
 - `images` and `clips` pass every other field through, stacked per batch: `label` becomes `[B]`, `caption` a list of `B` strings.
 - `lm` and `sft` pack several documents into one row, so a per-document field has no row to land in. They keep only the fields they write. To pack a per-token field of your own along, write the chain with `pack(fields=)`.
-- `augment=True` crops to `crop_scale` of the area, flips and colour-jitters on the accelerator, as in [Augmenting on the GPU](#augmenting-on-the-gpu). `augment=` also takes your own random step, such as `images.Albumentations(aug)`, which runs on the host right after the resize.
+- `augment=True` crops to `crop_scale` of the area, flips and colour-jitters on the accelerator, as in [Augmenting on the GPU](#augmenting-on-the-gpu); an `images.DeviceAugment(size, crop_scale=, flip=, jitter=)` value sets those itself. `augment=` also takes your own random step or a tuple of them, such as `images.Albumentations(aug)` or `images.RandomCrop(size, scale=)`, which run on the host right after the resize.
+- `staging_size=` resizes to a larger square first, for an augmentation that crops to `size`; `draft=True` decodes a JPEG at a reduced scale no smaller than it. `rejects=False` stops the run on an image that does not decode instead of counting and dropping it.
+- `caption=images.caption(...)` writes each record's caption after the resize, with the source's class names (`class_names.label` in its metadata) where it names none; with `templates=` it draws one per record.
+- `records=n` keeps `n` prepared records before the batch, as a validation split's `take(n)`; `host=` steps read each batch on the host, before any step on the accelerator. Every preset takes both.
 - `cache=url` caches the preset's fixed steps (decode and resize, or tokenize). Augmentation, packing and batching run after the cache.
 
 ### Where the rest of the chain goes

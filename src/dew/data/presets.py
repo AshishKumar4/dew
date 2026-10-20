@@ -107,24 +107,27 @@ def _finished(prepared: Dataset, *, batch: int, records: int | None, host: tuple
 
 
 def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int,
-       field: str = "text") -> Pipeline:
+       field: str = "text", records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Documents in `field` tokenized, ended by the tokenizer's EOS where it
     has one, cut into pieces that keep every next-token target, and packed
     first-fit into rows of `seq_len + 1` tokens (the last a target), in
-    batches of `batch` rows."""
+    batches of `batch` rows (`records` and `host` as `images` takes them)."""
 
     documents = dataset.map(text_steps.tokenize(tokenizer, field=field))
-    return _next_token_windows(documents, Pack(seq_len + 1)).batch(batch)
+    windows = _next_token_windows(documents, Pack(seq_len + 1))
+    return _finished(windows, batch=batch, records=records, host=host)
 
 
-def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int) -> Pipeline:
+def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int,
+        records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat
     template, each token's speaker kept beside it for an assistant-only loss,
     cut to `seq_len + 1` tokens and packed first-fit into rows of that
-    length, in batches of `batch` rows."""
+    length, in batches of `batch` rows (`records` and `host` as `images` takes them)."""
 
-    return _conversation_windows(dataset.map(chat.template(tokenizer)), Pack(seq_len + 1, _CHAT_FIELDS),
-                                 long="truncate").batch(batch)
+    windows = _conversation_windows(dataset.map(chat.template(tokenizer)), Pack(seq_len + 1, _CHAT_FIELDS),
+                                    long="truncate")
+    return _finished(windows, batch=batch, records=records, host=host)
 
 
 _CHAT_FIELDS = ("text", chat.ROLES_KEY)
@@ -154,17 +157,20 @@ def _conversation_windows(rendered: Dataset, pack: Pack, *,
 
 
 def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: int, batch: int,
-          sample_rate: int | None = None) -> Pipeline:
+          sample_rate: int | None = None, records: int | None = None,
+          host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Windows of `seconds` drawn from the media in `mp4`, each record's own
     on every read and resume (`video.PickClip`), as `frames` frames at `fps`
     fitted into `size` squares, in batches of `batch`. With `sample_rate`,
     the window's sound beside them, mono at that rate, filled with silence
     marked invalid where the media has none (`audio.DecodeAudio`). Media shorter
     than the window, or that does not decode, is counted and dropped; the
-    media and its window are read here and leave the record."""
+    media and its window are read here and leave the record. `records` and `host` as `images`
+    takes them."""
 
-    return _clips(dataset, seconds, frames=frames, fps=fps, size=size, sample_rate=sample_rate,
-                  missing="silence").batch(batch)
+    windows = _clips(dataset, seconds, frames=frames, fps=fps, size=size, sample_rate=sample_rate,
+                     missing="silence")
+    return _finished(windows, batch=batch, records=records, host=host)
 
 
 def _decoded_images(rows: Dataset, size: int, *, field: str = "image", at_least: int | None = None,
