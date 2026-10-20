@@ -275,7 +275,7 @@ def _another_subscriber(error: RuntimeError) -> bool:
     return "another subscriber" in str(error)
 
 
-def _resource_exhausted(error: jax.errors.JaxRuntimeError) -> bool:
+def _resource_exhausted(error: Exception) -> bool:
     """Whether a config's compile failed for a block past the GPU's shared memory, XLA's
     "RESOURCE_EXHAUSTED: Shared memory size limit exceeded", the one failure a config of a launch's
     space may meet on a GPU it was not declared for; any other failure, device memory's included, is
