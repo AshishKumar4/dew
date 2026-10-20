@@ -305,27 +305,27 @@ def test_an_accumulated_distillation_alternates_its_networks_update_by_update(tm
         "teacher_run": str(tmp_path / "teacher"), "solver": Consistency(), "steps": 3, "ema_decay": None,
         "tangent_warmup": 1, "student_update_freq": 2, "max_simulation_steps": 2})).build()
 
-    params = task.init(jax.random.PRNGKey(0))
-    critic = jax.grad(lambda tree: task.loss({**params, "params": tree}, batch, Step(
-        jnp.asarray(5), jax.random.PRNGKey(4), None, committed=jnp.asarray(2)))[0].total)(params["params"])
-    assert all(float(jnp.abs(leaf).sum()) == 0 for name, tree in critic.items() if name != FAKE_SCORE
-               for leaf in jax.tree.leaves(tree))
-
     trainer = Trainer(task, optax.sgd(1e-2), key=jax.random.PRNGKey(5), accumulation=2)
     distilled = trainer.initial_state()
     step = trainer.compile(distilled, batch)
     moved = []
     for _ in range(4):
-        before = distilled.variables["params"]
+        before = jax.device_get(distilled.variables["params"])
         for _ in range(2):
             distilled, *_ = step(distilled, batch)
-        after = distilled.variables["params"]
+        after = jax.device_get(distilled.variables["params"])
         moved.append(sorted({"critic" if name == FAKE_SCORE else "student" for name in after
-                             if any(not np.array_equal(np.asarray(old), np.asarray(new)) for old, new in
+                             if any(not np.array_equal(old, new) for old, new in
                                     zip(jax.tree.leaves(before[name]), jax.tree.leaves(after[name]),
                                         strict=True))}))
     assert int(distilled.updates) == 4
     assert moved == [["student"], ["student"], ["critic"], ["student"]]
+
+    params = task.init(jax.random.PRNGKey(0))
+    critic = jax.grad(lambda tree: task.loss({**params, "params": tree}, batch, Step(
+        jnp.asarray(5), jax.random.PRNGKey(4), None, committed=jnp.asarray(2)))[0].total)(params["params"])
+    assert all(float(jnp.abs(leaf).sum()) == 0 for name, tree in critic.items() if name != FAKE_SCORE
+               for leaf in jax.tree.leaves(tree))
 
 
 def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_path):
