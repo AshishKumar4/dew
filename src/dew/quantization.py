@@ -217,12 +217,13 @@ def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantizat
     return quantized
 
 
-def _keyed(method: Callable[..., Any], key: Hashable) -> Callable[..., Any]:
+def _keyed[**Arguments, Result](method: Callable[Arguments, Result],
+                                 key: Hashable) -> Callable[Arguments, Result]:
     """`method` run under `key` in `QUANTIZED_TRACE`."""
     @functools.wraps(method)
-    def keyed(self, *args, **kwargs):
+    def keyed(*args: Arguments.args, **kwargs: Arguments.kwargs) -> Result:
         with QUANTIZED_TRACE(key):
-            return method(self, *args, **kwargs)
+            return method(*args, **kwargs)
     return keyed
 
 
