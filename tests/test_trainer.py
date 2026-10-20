@@ -139,7 +139,7 @@ def test_a_checkpoint_that_counted_every_steps_tokens_cannot_resume_a_token_budg
     # The trained step's own state and data position, saved again as step 3 with its token clock
     # written as the old count.
     old = Checkpoints(directory, keep=3)
-    state, position = old.restore(jax.tree.map(np.asarray, trained), step=2, share=DataPartition())
+    state, position = old.restore(trained, step=2, share=DataPartition())
     old.save(3, state, position, share=DataPartition(), control={"tokens": 16})
     old.wait()
     with pytest.raises(ValueError, match="committed"):
