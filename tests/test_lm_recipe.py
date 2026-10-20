@@ -269,8 +269,9 @@ def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
 
     def dew(*arguments: str) -> None:
         """The command line on this checkout's source, as a fresh interpreter imports it."""
+        environment = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")}
         done = subprocess.run([sys.executable, "-m", "dew.cli.main", *arguments], capture_output=True,
-                              text=True, check=False, env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")})
+                              text=True, check=False, env=environment)
         assert done.returncode == 0, done.stdout + done.stderr
 
     dew("train", str(run / "run.json"), "--set", "trainer.steps=2")
