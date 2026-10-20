@@ -95,15 +95,15 @@ def test_a_launch_clips_its_blocks_to_the_operands():
 def test_the_kernel_cases_lower_each_kernel_on_abstract_operands(target):
     """The compile gate's cases (`kernel_cases`) hold each kernel the gated delta rule launches forward
     and backward, at both dtypes at every compiled shape the dtype takes (fp32 keys at most
-    `fla_gdn.WIDEST` wide), the cumsum reversed too, each once, on abstract operands of that shape
-    lowered as on the GPU."""
+    `fla_gdn.WIDEST` wide), the decay prefix (`recurrence.cumulated`) reversed too, each once, on
+    abstract operands of that shape lowered as on the GPU."""
     cases = list(support.kernel_cases(target))
     names = [case.name.split("/") for case in cases]
     assert len({tuple(name) for name in names}) == len(names)
     assert all(name[0] == target for name in names)
     covered = {(kernel, dtype, shape, *reverse) for _, kernel, dtype, _, shape, *reverse in names}
     launched = {ba.op.NAME for ba in rule_launches(fla_gdn)}
-    reversals = {kernel: [(), ("reverse",)] if kernel == "chunk_local_cumsum" else [()]
+    reversals = {kernel: [(), ("reverse",)] if kernel == "cumulated" else [()]
                  for kernel in launched}
     assert covered == {(kernel, dtype, shape, *reverse)
                        for kernel in launched for dtype in ("bfloat16", "float32")
