@@ -114,7 +114,13 @@ def evaluated(function, tree: str):
     """`function` with every sum it makes under `tree` (`tree_sum`): its traced jaxpr evaluated with
     each `dot_general` a `tree_contract` and each `reduce_sum` a `tree_sum`, the jaxprs scan, while,
     cond, jit and the custom-derivative calls hold evaluated alike, and every other primitive as it is.
-    A forward only: the same math as `function`, its reductions' order the tree's."""
+    A forward only: the same math as `function`, its reductions' order the tree's.
+
+    Each dot's products are materialized before the tree sums them, an [M, N, K] array for an
+    [M, K] by [K, N] product, so an evaluated function costs K times its dots' memory and runs far
+    slower than the function: members are for small operators and the graph gate's nodes, not
+    model-scale ensembles (a 4B decoder's forward under "pairwise" took 577 s an order on an H100
+    and ran out of memory in its log-softmax)."""
     def run(*args):
         closed, shapes = jax.make_jaxpr(function, return_shape=True)(*args)
         found = _evaluate(closed.jaxpr, closed.consts, jax.tree.leaves(args), tree)

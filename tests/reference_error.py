@@ -687,18 +687,20 @@ def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> d
     2. Every node is held on common parents, both the reference's values and Dew's, the float64 truth
        computed on the same parents widened. A `Sum` or `Online` node is held over ORDERS orders of its
        own summed axis permuted, an exact symmetry of it that redraws both sides' summation order, by
-       `assert_leaves_as_exact_over_orders`; a `Pointwise` or `Ordered` node, which no orbit of its own
-       redraws, once, each element within FACTOR of the worst of the reference's node and its admitted
-       order-preserving members (within ADMISSION_MARGIN of its RMS), its leaf within FACTOR of the
-       reference's alone. Errors follow `reference_graph.errors`: a NaN anywhere fails, and matching
-       infinities count zero only at a node's sentinel.
+       `assert_leaves_as_exact_over_orders`, its permuted output axes taken back (`Sum.follows`); an
+       `Ordered` node so over its declared orbit with its order-preserving members beside the
+       reference; a `Pointwise` node, or an `Ordered` one with no orbit, once, each element within
+       FACTOR of the worst of the reference's node and its admitted members (within ADMISSION_MARGIN
+       of its RMS), its leaf within FACTOR of the reference's alone. Errors follow
+       `reference_graph.errors`: a NaN anywhere fails, and matching infinities count zero only at a
+       node's sentinel.
     3. End to end, each output's RMS distance from float64 over ORDERS orders of `orbit` within FACTOR of
        the reference's alone.
 
     Returns each node's report (`assert_elements_as_exact`'s) by node and parent bundle. The element
     rule's calibration at a test's real element count is still open: the report states each node's
     measured inflation, and no false-failure rate is claimed."""
-    from dew.nn.kernels.graph import Ordered, Pointwise
+    from dew.nn.kernels.graph import Pointwise
 
     names = [node.name for node in dew.nodes]
     assert names == [node.name for node in reference.nodes] == [node.name for node in truth.nodes], (
@@ -714,34 +716,48 @@ def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> d
             parents = {parent: values[parent] for parent in mine.parents}
             wide = widened(parents)
             where = f"{label} {name} on {bundle}"
-            if isinstance(mine.kind, (Pointwise, Ordered)):
+            if isinstance(mine.kind, Pointwise) or not mine.kind.axes:
                 report[name, bundle] = _assert_node_once(mine, theirs, true, parents, wide, where)
             else:
                 report[name, bundle] = assert_leaves_as_exact_over_orders(
-                    _node_draw(mine, theirs, true, parents, wide, mine.kind.axes), where, rows=False)
+                    _node_draw(mine, theirs, true, parents, wide, mine.kind), where, rows=False)
     _assert_end_to_end(dew, reference, truth, inputs, orbit, label)
     return report
 
 
-def _node_draw(mine, theirs, true, parents, wide, axes):
-    """The over-orders draw of a `Sum` or `Online` node on common `parents`: order `order` permutes each
-    summed parent's axis (`axes`), an exact symmetry of the node, on Dew's node, the reference's and the
-    float64 truth's alike. An element where a side and the truth both hold the node's sentinel is no
-    error there; a side that misses a sentinel the truth holds is NaN there, which fails."""
+def _node_draw(mine, theirs, true, parents, wide, kind):
+    """The over-orders draw of a node on common `parents` whose `kind` names an orbit: order `order`
+    permutes each named parent's axis (`kind.axes`), an exact symmetry of the node, on Dew's node, the
+    reference's, its members (an `Ordered` node's) and the float64 truth's alike, and takes the output
+    axes the permutation carries (`kind.follows`) back, so an element is the same element at every
+    order. An element where a side and the truth both hold the node's sentinel is no error there; a
+    side that misses a sentinel the truth holds is NaN there, which fails."""
     from reference_graph import permuted
 
+    axes = kind.axes
     length = int(np.shape(parents[next(iter(axes))])[axes[next(iter(axes))]])
+    sides = {"dew": mine.fn, REFERENCE: theirs.fn, **theirs.members}
 
     def draw(order):
         units = np.arange(length) if order == 0 else np.random.default_rng(order).permutation(length)
+        back = np.argsort(units)
+
+        def restored(value):
+            value = np.asarray(value, np.float64)
+            for axis in kind.follows:
+                value = np.take(value, back, axis=axis)
+            return value
+
         with jax.enable_x64(new_val=True):
-            exact = np.asarray(true.fn(**permuted(wide, axes, units)), np.float64)
-        found = [np.asarray(node.fn(**permuted(parents, axes, units)), np.float64) for node in (mine, theirs)]
+            exact = restored(true.fn(**permuted(wide, axes, units)))
+        found = {side: restored(fn(**permuted(parents, axes, units))) for side, fn in sides.items()}
         if mine.sentinel is not None:
             held = exact == mine.sentinel
-            found = [np.where(held, np.where(value == mine.sentinel, 0.0, np.nan), value) for value in found]
+            found = {side: np.where(held, np.where(value == mine.sentinel, 0.0, np.nan), value)
+                     for side, value in found.items()}
             exact = np.where(held, 0.0, exact)
-        return {"node": found[0]}, {REFERENCE: {"node": found[1]}}, {"node": exact}
+        dew = found.pop("dew")
+        return {"node": dew}, {side: {"node": value} for side, value in found.items()}, {"node": exact}
     return draw
 
 
@@ -758,7 +774,11 @@ def _assert_witness(graph, inputs, label: str) -> None:
 
 
 def _assert_node_once(mine, theirs, true, parents, wide, label: str) -> dict:
-    """A node no orbit of its own redraws, held once on common `parents` (`assert_graph_as_exact`)."""
+    """A node no orbit of its own redraws, held once on common `parents` (`assert_graph_as_exact`): one
+    draw on each side, so its element rule's confirmations re-read the same values and an element
+    flagged once stays flagged. A pointwise node is deterministic there, as it should be; an `Ordered`
+    node held once between equally exact sides flags about one element in twenty at FACTOR 2, which
+    is why an `Ordered` node declares its orbit wherever it has one."""
     from reference_graph import errors
 
     with jax.enable_x64(new_val=True):
