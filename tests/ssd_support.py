@@ -3,7 +3,6 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import REDRAW
 
 from dew.nn.mixers.mamba2 import chunk_ssd, recurrent_ssd
 
@@ -91,32 +90,3 @@ def mamba_ssd_xla(arrays, chunk, dtype=None):
                               jnp.asarray(arrays["dy"], dtype), jnp.asarray(arrays["dfinal"]))
 
 
-def declared_seeds(path):
-    """Each site's declared K, written by seeds_for on the recorded reference, with provenance in NPZ."""
-    with np.load(path) as stored:
-        return {name.removesuffix(".seeds"): int(stored[name]) for name in stored.files
-                if name.endswith(".seeds")}
-
-
-def indexed_recording(stored, site, seeds):
-    """An indexed native-input draw, recorded reference and recorded float64 truth for the gate.
-
-    Integer indices survive widening. Every stored input and output must cover the current gate's
-    redraw, so a numerical failure remains a finding rather than an exhausted fixture.
-    """
-    def tree(kind):
-        prefix = f"{site}.{kind}."
-        return {name.removeprefix(prefix): value for name, value in stored.items() if name.startswith(prefix)}
-
-    inputs, reference, truth = tree("input"), tree("reference"), tree("truth")
-    count = min(len(value) for part in (inputs, reference, truth) for value in part.values())
-    assert count >= (1 + REDRAW) * seeds
-
-    def draw(seed):
-        return np.int32(seed), {name: value[seed] for name, value in inputs.items()}
-
-    def lookup(values):
-        return jax.jit(lambda index, inputs: {name: jnp.asarray(value)[index]
-                                            for name, value in values.items()})
-
-    return draw, lookup(reference), lookup(truth)

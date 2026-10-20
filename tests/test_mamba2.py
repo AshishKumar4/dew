@@ -21,8 +21,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import decode_through
-from reference_error import FACTOR, assert_as_exact, assert_as_exact_as_the_reference, widened
-from ssd_support import declared_seeds, indexed_recording, mamba2_draw, mamba2_run
+from reference_error import (
+    FACTOR,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    declared_seeds,
+    indexed_recording,
+    widened,
+)
+from ssd_support import mamba2_draw, mamba2_run
 
 from dew.accuracy import distance
 from dew.nn.backbones.causal_transformer import CausalTransformer

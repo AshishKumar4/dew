@@ -14,9 +14,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, ieee_fixture, widened
+from reference_error import assert_as_exact, declared_seeds, ieee_fixture, indexed_recording, widened
 from sharded import assert_runs_per_shard
-from ssd_support import declared_seeds, indexed_recording, ssd_value_and_grad
+from ssd_support import ssd_value_and_grad
 from tuned import each_config
 
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
