@@ -93,8 +93,10 @@ class NotebookPanel:
 
         self.renderable = renderable
         self.console = console
-        # Each frame is rendered here and exported as the HTML and text rich prints in a notebook.
-        self._frames = Console(record=True, file=io.StringIO(), width=console.width, height=console.height,
+        # Each frame is rendered here and exported as the HTML and text rich prints in a notebook;
+        # the console's own output is emptied after each, which the export does not read.
+        self._sink = io.StringIO()
+        self._frames = Console(record=True, file=self._sink, width=console.width, height=console.height,
                                color_system="truecolor", force_terminal=True, force_jupyter=False)
         self._shown = self._frame()
         self._handle = DisplayHandle()
@@ -104,6 +106,8 @@ class NotebookPanel:
 
     def _frame(self) -> dict[str, str]:
         self._frames.print(self.renderable)
+        self._sink.seek(0)
+        self._sink.truncate()
         text = self._frames.export_text(clear=False)
         return {"text/html": self._frames.export_html(code_format=JUPYTER_HTML_FORMAT, inline_styles=True),
                 "text/plain": text}
