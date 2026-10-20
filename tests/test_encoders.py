@@ -88,3 +88,33 @@ def test_condition_roundtrip_preserves_nondefault_character_embeddings():
     np.testing.assert_array_equal(contexts[0].hidden, contexts[1].hidden)
     np.testing.assert_array_equal(contexts[0].mask, contexts[1].mask)
     assert contexts[1].hidden.dtype == jnp.bfloat16
+
+
+@pytest.mark.parametrize("family, archive, inside, tokenizer", [
+    ("sd", "tiny_diffusers", "sd", "tokenizer"),
+    ("sd3", "sd3_source", "pipeline", "tokenizer_3"),
+    ("z_image", "z_image_source", "pipeline", "tokenizer"),
+    ("wan", "wan_pipeline", "pipeline", "tokenizer"),
+])
+def test_a_pipelines_conditioner_records_the_tokenizer_files_it_reads(tmp_path, family, archive, inside,
+                                                                       tokenizer):
+    """A published pipeline's text conditioner records the hashes of the tokenizer files it loaded,
+    each of its towers' (an SD3's T5 as well as its CLIPs), so the identity an exact resume checks
+    a caption's ids against changes with a tokenizer file."""
+    import tarfile
+    from pathlib import Path
+
+    from dew.interop.pretrained import load_diffusion_source
+
+    with tarfile.open(Path(__file__).parent / "fixtures" / f"{archive}.tar.xz") as opened:
+        opened.extractall(tmp_path, filter="data")
+    directory = tmp_path / inside
+
+    def recorded():
+        source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+        return source.inputs.conditions["conditioning"].dependencies()
+
+    published = recorded()
+    config = directory / tokenizer / "tokenizer_config.json"
+    config.write_text(config.read_text() + "\n")
+    assert recorded() != published, family
