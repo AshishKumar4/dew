@@ -186,3 +186,13 @@ def test_the_exp_enclosure_holds_its_proven_bound():
         worst = max(abs((wide(high) + wide(low)) / mpmath.exp(wide(v)) - 1)
                     for v, high, low in zip(x, hi, lo, strict=True))
     assert worst <= oc.EXP_BOUND, float(worst)
+
+
+def test_ln2_is_what_the_oracle_takes_it_for():
+    """The 100 digits of ln 2 the exp oracle reduces by lie within 2^-330 of an exact enclosure of
+    ln 2, so they are no premise; its high part and its rest are the ones its bound reads."""
+    low, high = oc.ln2_enclosure()
+    assert high - low < fractions.Fraction(2) ** -340
+    assert low - fractions.Fraction(2) ** -330 <= oc._LN2 <= high + fractions.Fraction(2) ** -330
+    assert oc._LN2_HI.hex() == "0x1.62e42fefa3a00p-1"
+    assert oc._LN2_LO.hex() == "-0x1.0ca86c3898d00p-49"

@@ -238,8 +238,8 @@ def _dd_mul(a_hi, a_lo, b_hi, b_lo):
 
 
 def _dd_add(a_hi, a_lo, b_hi, b_lo):
-    """A double-double sum, within 3·2^-106 of the exact one relative to it, whatever the operands'
-    signs (Joldes, Muller and Popescu 2017, AccurateDWPlusDW: 3u^2 + 13u^3)."""
+    """A double-double sum, within 4·2^-106 of the exact one relative to it, whatever the operands'
+    signs (Joldes, Muller and Popescu 2017, AccurateDWPlusDW: 3u^2 + 13u^3 < 4u^2)."""
     total, error = two_sum(a_hi, b_hi)
     low, low_error = two_sum(a_lo, b_lo)
     total, error = _fast_two_sum(total, error + low)
@@ -248,28 +248,42 @@ def _dd_add(a_hi, a_lo, b_hi, b_lo):
 
 _LN2 = fractions.Fraction(
     "0.6931471805599453094172321214581765680755001343602552541206800094933936219696947156058633269964186875")
-"""ln 2 to 100 digits (OEIS A002162), 2^-330 from it, far below every bound here."""
+"""ln 2 to 100 digits (OEIS A002162), within 2^-330 of it, far below every bound here; the tests hold it
+to an exact enclosure of ln 2 = 2 atanh(1/3) (`ln2_enclosure`)."""
 _LN2_HI = float(fractions.Fraction(round(_LN2 * 2 ** 44), 2 ** 44))
-"""ln 2 to 44 fractional bits: k·_LN2_HI is exact in float64 for |k| <= 2^8."""
+"""ln 2 to 44 fractional bits, 0x1.62e42fefa3a00p-1: k·_LN2_HI is exact in float64 for |k| <= 160."""
 _LN2_LO = float(_LN2 - fractions.Fraction(_LN2_HI))
+"""The rest of ln 2, -0x1.0ca86c3898d00p-49."""
 _TAYLOR = 24
 _COEFFICIENTS = [(float(c), float(c - fractions.Fraction(float(c))))
                  for c in (fractions.Fraction(1, math.factorial(n)) for n in range(_TAYLOR + 1))]
 """1/n! for n <= _TAYLOR as double-doubles, each within 2^-106 of it relative to it."""
 EXP_BOUND = 2.0 ** -80
 """A relative bound on `_exp_enclosed`'s error, from its terms (the arithmetic's 2^-89 and below):
-- the reduced argument r = x - k·ln 2 for fp32 x in [-110, 90]: x - k·_LN2_HI is exact (k·_LN2_HI has 52
-  bits at most, and the difference is exact by Sterbenz for k != 0 and is x for k = 0); k·_LN2_LO is
-  within 2^-53 of itself, |k·_LN2_LO| <= 160·2^-44, and _LN2_LO within 2^-98 of ln 2 - _LN2_HI: r is
-  within 2^-89 of the exact x - k·ln 2, so exp(r) within 2^-88.9 relative;
+- the reduced argument r = x - k·ln 2 for fp32 or bf16 x in [-110, 90]: x - k·_LN2_HI is exact
+  (k·_LN2_HI is exact for |k| <= 160, and the difference is exact by Sterbenz at every k = ±1 edge and
+  beyond, and is x for k = 0); |x - k·_LN2_HI| / |k·_LN2_LO| >= 6.3e5 (fp32) and 1.9e10 (bf16), so
+  `_fast_two_sum`'s precondition holds; k·_LN2_LO is within 2^-53 of itself, |k·_LN2_LO| <= 160·2^-44,
+  and _LN2_LO within 2^-98 of ln 2 - _LN2_HI: r is within 2^-89 of the exact x - k·ln 2, |r| <= 0.3466,
+  so exp(r) within 2^-88.9 relative;
 - the Taylor remainder at |r| <= 0.347 after 25 terms: 0.347^25/25!·e^0.347 < 2^-118;
-- the double-double Horner evaluation, 25 steps each of one product (7u^2) and one sum (3u^2 relative
-  to it; each step adds 1/n! to a value at most 0.347/(n + 1)·e^0.347 of it, so no step cancels and
-  every partial value stays within a factor 1.6 of its leading term), with 2^-106 coefficient
-  roundings: below 25·(7 + 3 + 1)·1.6·2^-106 < 2^-97;
+- the double-double Horner evaluation, 25 steps each of one product (7u^2) and one sum (4u^2 relative
+  to it), with 2^-106 coefficient roundings. Each step adds c_n = 1/n! to r times a partial value at
+  most 0.347/(n + 1)·e^0.347 of it, so there is no severe cancellation: for r < 0 every partial value
+  P_n >= 0.653·c_n, so c_n/P_n <= 1/0.653 < 1.6, and for r >= 0 the sum has one sign. Below
+  25·(7 + 4 + 1)·1.6·2^-106 < 2^-97;
 - scaling by 2^k is exact (the results stay normal in float64).
 Total below 2^-88; the bound is 2^-80 to keep 2^8 of slack. Measured against mpmath at 300 bits on
 3,000 fp32 arguments over the range: 2^-94.7 at worst (tests/test_op_certificates.py holds it)."""
+
+
+def ln2_enclosure(terms: int = 110) -> tuple[fractions.Fraction, fractions.Fraction]:
+    """Exact rationals around ln 2 = 2 atanh(1/3) = 2 Σ (1/3)^(2k+1) / (2k+1): the series to `terms`
+    terms, and that plus a bound on the rest, 2 (1/3)^(2n+1) / (2n+1) / (1 - 1/9) for n = `terms`."""
+    third = fractions.Fraction(1, 3)
+    partial = 2 * sum(third ** (2 * k + 1) / (2 * k + 1) for k in range(terms))
+    rest = 2 * third ** (2 * terms + 1) / (2 * terms + 1) / (1 - third ** 2)
+    return partial, partial + rest
 
 
 def _exp_enclosed(x):
