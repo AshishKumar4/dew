@@ -906,25 +906,33 @@ def run_identity(artifact: JSON) -> JSON:
     """What a checkpoint's inference record says its run is: the objective and the model, without
     the fields that choose how the model computes (`EXECUTION`); None where the record describes
     no model (an objective that declares none, or one a record cannot describe)."""
-    if not isinstance(artifact, Mapping) or "model" not in artifact:
-        return None
+    match artifact:
+        case {"model": model, **rest}:
+            return {"objective": rest.get("objective"), "model": _computed_apart(model)}
+        case _:
+            return None
 
-    def kept(value: JSON) -> JSON:
-        if isinstance(value, Mapping):
-            return {key: kept(entry) for key, entry in value.items() if key not in EXECUTION}
-        if isinstance(value, list):
-            return [kept(entry) for entry in value]
-        return value
 
-    return {"objective": artifact.get("objective"), "model": kept(json_value(artifact["model"], "model"))}
+def _computed_apart(value: JSON) -> JSON:
+    """A model record without the fields that choose how it computes (`EXECUTION`), at any depth."""
+    match value:
+        case dict():
+            return {key: _computed_apart(entry) for key, entry in value.items() if key not in EXECUTION}
+        case list():
+            return [_computed_apart(entry) for entry in value]
+        case _:
+            return value
 
 
 def _differences(here: JSON, there: JSON, path: str = "") -> list[str]:
     """The paths at which two records differ, each with both values."""
-    if isinstance(here, Mapping) and isinstance(there, Mapping):
-        return [found for key in sorted(set(here) | set(there), key=str)
-                for found in _differences(here.get(key), there.get(key), f"{path}.{key}".lstrip("."))]
-    return [] if here == there else [f"{path}: {there!r} in the directory, {here!r} in this run"]
+    match here, there:
+        case dict(), dict():
+            return [found for key in sorted(set(here) | set(there))
+                    for found in _differences(here.get(key), there.get(key), f"{path}.{key}".lstrip("."))]
+        case _:
+            return [] if here == there else [f"{path}: {there!r} in the directory, {here!r} in this run"]
+
 
 class Checkpoints:
     """Manages the checkpoints of one run in one directory.
