@@ -200,3 +200,33 @@ def test_a_loaded_source_is_ready_to_run_on_the_default_device():
         np.testing.assert_array_equal(np.asarray(placed), held)
     with pytest.raises(ValueError):
         Pretrained.load(fixture, on_host=True, mesh=jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)))
+
+
+@pytest.mark.parametrize("where", ["device", "host"])
+def test_a_source_trained_from_keeps_its_arrays_after_the_step_donates_the_state(where):
+    """A step donates the state it is given, and a run's state holds buffers of its own: a source
+    loaded on the device and trained from, its state resident or held on the host, has every array
+    readable and unchanged after the step, placed as `fit` places it or built eagerly. The eager
+    state was the source's own arrays, which the step deleted."""
+    from pathlib import Path
+
+    import jax.numpy as jnp
+    import optax
+
+    from dew.interop import Pretrained
+    from dew.objectives.lm import LMObjective
+    from dew.training import Layout, Trainer
+
+    fixture = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
+    loaded = Pretrained.load(fixture, dtype="float32", attention_impl="reference")
+    before = jax.device_get(loaded.variables)
+    layout = Layout(host=("variables",) if where == "host" else (), min_shard=1, tolerance=1.)
+    trainer = Trainer(LMObjective(loaded, 8, ema_decay=None), optax.sgd(0.1), key=jax.random.key(5),
+                      layout=layout)
+    batch = {"text": jnp.tile(jnp.arange(1, 10, dtype=jnp.int32)[None], (jax.device_count(), 1))}
+    states = [trainer.place()[0]] + ([trainer.initial_state()] if where == "device" else [])
+    for state in states:
+        stepped, *_ = trainer.compile(state, batch)(state, batch)
+        jax.block_until_ready(stepped)
+        for leaf, held in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(before), strict=True):
+            np.testing.assert_array_equal(np.asarray(leaf), held)
