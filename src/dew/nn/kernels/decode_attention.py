@@ -232,19 +232,24 @@ def _space(programs: int, steps: int, processors: int | None) -> set[Split]:
     return {Split(splits) for splits in SPLITS if splits <= min(steps, processors)}
 
 
+RESIDENT = 4
+"""Programs a multiprocessor runs at once that a launch without a pick fills (`_heuristic`)."""
+
+
 def _heuristic(programs: int, steps: int, processors: int | None) -> Split:
-    """FlashAttention 2's split heuristic over the launch's space (`_space`): the fewest slices whose
-    waves of programs run within 85% of the best such count's efficiency."""
+    """The most slices of the launch's space (`_space`) whose programs fill at most `RESIDENT` a
+    multiprocessor. A program of `WARPS` warps over `BLOCK` keys a step leaves a multiprocessor room
+    for several, which hide each other's reads: on an H100 the fastest of `SPLITS` over 60 shapes of
+    Qwen3-0.6B's and Qwen3.5-0.8B's dense and paged decode (1 to 32 rows, 8K to 128K keys) ran about
+    four programs a multiprocessor, Qwen3-0.6B at 2 rows over 131072 keys 0.220 ms at 32 slices
+    against 0.527 at the 8 of FlashAttention 2's rule (the fewest whose waves run within 85% of the
+    best count's). This rule's pick ran within 1.01x of the fastest over the 60 (geometric mean,
+    1.22x at worst), FlashAttention 2's within 1.35x (2.44x at worst)."""
     counts = sorted(split.splits for split in _space(programs, steps, processors))
-    if processors is None or len(counts) == 1:
+    if processors is None:
         return Split(counts[0])
-
-    def efficiency(splits: int) -> float:
-        waves = programs * splits / processors
-        return waves / math.ceil(waves)
-
-    best = max(map(efficiency, counts))
-    return Split(next(splits for splits in counts if efficiency(splits) >= 0.85 * best))
+    return Split(max((splits for splits in counts if programs * splits <= RESIDENT * processors),
+                     default=counts[0]))
 
 
 @dataclasses.dataclass(frozen=True)
