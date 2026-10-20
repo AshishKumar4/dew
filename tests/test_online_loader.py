@@ -87,8 +87,9 @@ def serving(handle):
 
 def test_an_endless_read_reads_on_through_passes_whose_fetches_failed_until_one_returns():
     """A catalog's one url fails for its first three fetches, so each of those passes yields
-    nothing; a failed fetch may succeed next time, so the endless read reads on and gives the
-    record once the server returns it, where the first empty pass was once refused."""
+    nothing; a failed fetch may succeed next time, so the endless read reads on, counting each
+    failure, and gives the record once the server returns it, where the first empty pass was once
+    refused."""
     served = []
 
     def handle(request):
@@ -104,12 +105,15 @@ def test_an_endless_read_reads_on_through_passes_whose_fetches_failed_until_one_
 
     with serving(handle) as address:
         chain = Pipeline(Memory([{"url": f"http://{address}/object"}])).filter_map(Fetch()).repeat().batch(1)
-        stream = compile(chain, read="indexed", loading=READ).train(DataPartition())
+        data = compile(chain, read="indexed", loading=READ)
+        stream = data.train(DataPartition())
         try:
             assert np.asarray(next(stream)["bytes"]).tolist() == [b"payload"]
         finally:
             stream.close()
     assert len(served) == 4
+    # The passes a fetch failed in are counted, as a read that goes on through them is watched by.
+    assert data.statistics()["data/rejected/memory/transient"] == 3
 
 
 @pytest.mark.parametrize("header", ["Location", "URI"])
