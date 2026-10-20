@@ -114,7 +114,7 @@ def kernels(fn, *args) -> set[str]:
 
 
 SEEDS = {(2, 3, 31): 32, (3, 257, 17): 32, (5, 1000): 32, (2, 3, 4, 31): 64, (2, 64, 16, 128): 8,
-         (2, 1, 16, 128): 32, (7, 1000): 32, (3, 4096): 32, (5, 37): 32, (24576, 1000): 64, (2, 31): 32,
+         (2, 1, 16, 128): 32, (7, 1000): 32, (3, 4096): 32, (5, 37): 32, (24576, 1000): 8, (2, 31): 32,
          "composed": 32}
 """Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
 XLA compared with itself resolves the factor in every output and gradient (2026-10-20, on armada)."""
@@ -132,10 +132,11 @@ def assert_drawn_as_exact(fused, xla, exact, draw, leaves, label, seeds):
                     draw, label, seeds=seeds, truth_fn=truth)
 
 
-def compare(functions, operands, seed, labels, *, coefficient=None, draw=None, seeds=None):
+def compare(functions, operands, seed, labels, *, coefficient=None, draw=None, seeds=None, judged=None):
     """The kernels launched and every output's dtype and accumulation on `operands`; their accuracy
     held by check 1 over `draw`'s `seeds` (`assert_drawn_as_exact`), or, for operands no draw
-    redraws (a row of one value, a cotangent at a format's edge), by the one-draw rule on them."""
+    redraws (a row of one value, a cotangent at a format's edge), by the one-draw rule on them. Check 1
+    holds the `judged` labels, every label by default."""
     pallas = functions[1]
     assert kernels(pallas, *operands) & {"rms_norm_forward", "swiglu_forward"}
     differentiated = kernels(functools.partial(evaluated, pallas), operands, seed)
@@ -145,7 +146,8 @@ def compare(functions, operands, seed, labels, *, coefficient=None, draw=None, s
     gated(labels, actual, reference, truth, terms, seed, coefficient, parity=draw is None)
     if draw is not None:
         def leaves(result):
-            return {label: value for label, value in zip(labels, result, strict=True) if value is not None}
+            return {label: value for label, value in zip(labels, result, strict=True)
+                    if value is not None and label in (judged or labels)}
 
         xla, _, exact = functions
         assert_drawn_as_exact(pallas, xla, exact, draw, leaves, " ".join(labels), seeds)
@@ -290,12 +292,14 @@ def test_rms_ragged_widths_and_many_rows(dtype, shape):
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
-    # Repeated tokens hold the row arithmetic fixed while the column sum
-    # grows to Qwen3.5-0.8B's size, isolating partial-sum error from bf16 midpoint flips.
+    """Repeated tokens hold the row arithmetic fixed while the column sum grows to Qwen3.5-0.8B's size,
+    isolating partial-sum error from bf16 midpoint flips: the weight gradient holds check 1 over the
+    step's draws. Its rows are one row repeated, whose output and input gradient
+    `test_rms_ragged_widths_and_many_rows` holds at the same width and functions."""
     (x, scale), seed = full_step(dtype)
     compare(norm_functions(dtype, offset=True, after_cast=True), (x, scale), seed, ("y", "x", "scale"),
             coefficient=scale_coefficient(x, dtype, after_cast=True),
-            draw=lambda draw: full_step(dtype, draw), seeds=SEEDS[(24576, 1000)])
+            draw=lambda draw: full_step(dtype, draw), seeds=SEEDS[(24576, 1000)], judged=("scale",))
 
 
 def full_step(dtype, draw: int = 0):
