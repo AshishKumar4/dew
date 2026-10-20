@@ -31,6 +31,7 @@ from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
+from dew.telemetry.instrumentation import COLLECTIVES
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import shard_batch
 
@@ -361,7 +362,7 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
         result = jax.device_get(executable(*inputs))
         flops = compiled_flops(executable)
         assert flops is not None
-        moved = sharded.collective_bytes(executable.as_text(), sharded.COLLECTIVE_OPS)
+        moved = sharded.collective_bytes(executable.as_text(), COLLECTIVES)
         return result, flops * sequence * tensor, moved
 
     expected, _, _ = compiled(1, 1, Link(None, None, "cpu"))
@@ -802,10 +803,16 @@ custom_call_target="__gpu$xla.gpu.triton"
 
 
 def test_an_async_collective_counts_its_results_not_its_operands():
-    """An async `-start` names `(operands, results)`; only the results are the collective's bytes."""
-    text = """  %ag = ((bf16[4,8]{1,0}), bf16[8,8]{1,0}) all-gather-start(bf16[4,8]{1,0} %x), dimensions={0}
+    """An async pair counts once, by its `-done`, which holds what moved: its `-start` names
+    `(operands, results)`. Each result's bytes are as XLA sizes them, an fp8 element's one byte."""
+    text = """ENTRY %main (x: bf16[4,8], y: f32[16], z: f32[8], w: f8e4m3fn[2,8]) -> f32[8] {
+  %ag = ((bf16[4,8]{1,0}), bf16[8,8]{1,0}) all-gather-start(bf16[4,8]{1,0} %x), dimensions={0}
+  %agd = bf16[8,8]{1,0} all-gather-done(((bf16[4,8]{1,0}), bf16[8,8]{1,0}) %ag)
   %rs = (f32[16]{0}, f32[8]{0}) reduce-scatter-start(f32[16]{0} %y), dimensions={0}
-  %ar = f32[8]{0} all-reduce(f32[8]{0} %z), to_apply=%add"""
+  %rsd = f32[8]{0} reduce-scatter-done((f32[16]{0}, f32[8]{0}) %rs)
+  %ar = f32[8]{0} all-reduce(f32[8]{0} %z), to_apply=%add
+  ROOT %wg = f8e4m3fn[8,8]{1,0} all-gather(f8e4m3fn[2,8]{1,0} %w), dimensions={0}
+}"""
     assert sharded.collectives(text) == [("all-gather", [(8, 8)]), ("reduce-scatter", [(8,)]),
-                                         ("all-reduce", [(8,)])]
-    assert sharded.collective_bytes(text, sharded.COLLECTIVE_OPS) == 128 + 32 + 32
+                                         ("all-reduce", [(8,)]), ("all-gather", [(8, 8)])]
+    assert sharded.collective_bytes(text, COLLECTIVES) == 128 + 32 + 32 + 64

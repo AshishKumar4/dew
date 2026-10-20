@@ -21,14 +21,13 @@ hold; the third needs the GPU.
 """
 
 import math
-import re
 
 import jax
 import numpy as np
 from jax.sharding import NamedSharding
 from reference_error import assert_leaves_as_exact
 
-from dew.telemetry.instrumentation import custom_call_kind, hlo_instructions
+from dew.telemetry.instrumentation import collective, custom_call_kind, hlo_instructions
 from dew.training.distributed import parameter_axes
 
 
@@ -48,52 +47,19 @@ def assert_sharded(tree, mesh: jax.sharding.Mesh) -> None:
     assert not missing, f"no parameter is split over {sorted(missing)}, so this mesh runs as data parallelism"
 
 
-COLLECTIVE_OPS = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "collective-permute")
-COLLECTIVE = re.compile(
-    r"^\s*(?:ROOT\s+)?%\S+\s+=\s+(?P<shape>.+?)\s+"
-    rf"(?P<op>{'|'.join(COLLECTIVE_OPS)})(?P<start>-start)?\(")
-ARRAY = re.compile(r"[a-z]+\d*\[([\d,]*)\]")
-TYPED = re.compile(r"([a-z]+\d*)\[([\d,]*)\]")
-ITEMSIZE = {"pred": 1, "s8": 1, "u8": 1, "bf16": 2, "f16": 2, "f32": 4, "s32": 4, "u32": 4, "f64": 8,
-            "s64": 8}
-
-
-def _result(match) -> str:
-    """A collective's result shape: an async `-start`'s is the last member of its `(operands,
-    results)` tuple (SwiftHeron's 8B FSDP step counted its all-gathers' inputs too, 1.5x)."""
-    shape = match["shape"]
-    if not match["start"]:
-        return shape
-    depth = 0
-    for index in range(len(shape) - 2, 0, -1):
-        depth += {")": 1, "]": 1, "}": 1, "(": -1, "[": -1, "{": -1}.get(shape[index], 0)
-        if depth == 0 and shape[index] == ",":
-            return shape[index + 1:-1]
-    return shape
-
-
 def collectives(text: str) -> list[tuple[str, list[tuple[int, ...]]]]:
-    """`(op, result shapes)` of every collective in compiled HLO `text`."""
-    found = []
-    for line in text.splitlines():
-        match = COLLECTIVE.match(line)
-        if match:
-            shapes = [tuple(int(size) for size in dims.split(",") if size)
-                      for dims in ARRAY.findall(_result(match))]
-            found.append((match["op"], shapes))
-    return found
+    """`(op, result shapes)` of every collective in compiled HLO `text`, read by the profiler's own
+    parser (`hlo_instructions`): an async pair once, by its `-done`, which holds what moved."""
+    return [(kind, list(instruction.shapes)) for instruction in hlo_instructions(text).values()
+            if (kind := collective(instruction.op)) and not instruction.op.endswith("-start")]
 
 
 def collective_bytes(text: str, ops) -> int:
-    """Bytes of the results of every collective among `ops` in compiled HLO `text`: a measure no
-    combining of collectives into one, or flattening of their operands, changes."""
-    total = 0
-    for line in text.splitlines():
-        match = COLLECTIVE.match(line)
-        if match and match["op"] in ops:
-            total += sum(ITEMSIZE[dtype] * math.prod(int(size) for size in dims.split(",") if size)
-                         for dtype, dims in TYPED.findall(_result(match)))
-    return total
+    """Bytes of the results of every collective among `ops` in compiled HLO `text`, as XLA sizes
+    them (`HloInstruction.buffers`): a measure no combining of collectives into one, or flattening
+    of their operands, changes."""
+    return sum(sum(instruction.buffers) for instruction in hlo_instructions(text).values()
+               if collective(instruction.op) in ops and not instruction.op.endswith("-start"))
 
 
 MOVES = ("all-gather", "all-to-all", "collective-permute")
