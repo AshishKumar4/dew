@@ -15,7 +15,7 @@ from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition, GlobalStream
 from dew.data.pipeline import Configured, ObjectiveData, Rejected
-from dew.data.plan import Manifest, StepIdentity
+from dew.data.plan import Manifest
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
@@ -39,8 +39,9 @@ def test_a_mix_reads_memory_grain_and_files_members_at_their_shares(tmp_path):
         origins = np.concatenate([batch["origin"] for batch in itertools.islice(stream, 32)])
     finally:
         stream.close()
-    shares = {origin: float(np.mean(origins == origin)) for origin in ("memory", "grain", "files")}
-    assert shares == pytest.approx({"memory": 0.5, "grain": 0.25, "files": 0.25}, abs=0.05)
+    # A mix places each member's records at its exact share of every prefix of the order, 2:1:1 here.
+    counts = {origin: int(np.sum(origins == origin)) for origin in ("memory", "grain", "files")}
+    assert counts == {"memory": 128, "grain": 64, "files": 64}
 
 
 @pytest.fixture
@@ -265,10 +266,17 @@ class ConfigureFetch:
         return FetchLike()
 
 
-def fetched_generation(source, directory):
+def fetched_generation(chain, directory):
+    """The fetch outcomes of `chain`, sealed as the generation of its prefix: the keyed
+    manifest publication records, filled once through the cache."""
+    from dew.data.analysis import _cache_manifest
+    from dew.data.compile import _prepared
+
+    (prepared,) = _prepared((chain,), "indexed", provision=False)
+    source = prepared.source
     cache = Cache((directory / "fetched").as_uri())
     fetch = FetchLike()
-    manifest = Manifest(source.fingerprint(), (StepIdentity.of(fetch),))
+    manifest = _cache_manifest(source, prepared.stages, "indexed")
     stored = cache.mapped(grain.MapDataset.source(source.records("indexed")), manifest,
                           transform=lambda index, row: (fetch(row),))
     try:
@@ -298,7 +306,7 @@ def test_eager_fetch_keeps_a_memory_plan_volatile_until_its_generation_is_sealed
         reader.close()
     with pytest.raises(ValueError):
         data.train(DataPartition(readers=2))
-    generation = fetched_generation(source, tmp_path)
+    generation = fetched_generation(chain, tmp_path)
     sealed = compile(chain.cache(generation).batch(2), read="memory", loading=READ)
     assert not sealed.plan.volatile
     readers = [sealed.train(DataPartition(readers=2, reader=index)) for index in range(2)]
@@ -321,12 +329,12 @@ def test_a_sealed_generation_keeps_its_holdout_selection_in_training_and_validat
     from dew.data.holdout import HoldOut
 
     source = Memory(rows("fetched", 64))
-    generation = fetched_generation(source, tmp_path)
+    generation = fetched_generation(source.filter_map(FetchLike()), tmp_path)
     if selection == "random":
         holdout = HoldOut(records=5, by="random", seed=37)
-        train, held, _ = RecordsData(generation.source(), validation=holdout).pipelines()
-        data = loader(RecordsData(source, validation=holdout), cache=generation,
-                      batch=2, read=read, loading=READ)
+        recipe = RecordsData(generation.source(), validation=holdout)
+        train, held, _ = recipe.pipelines()
+        data = loader(recipe, batch=2, read=read, loading=READ)
     else:
         cached = source.filter_map(FetchLike()).cache(generation)
         train, held = (cached.holdout(0.25, key="i") if selection == "fraction"
@@ -452,8 +460,10 @@ def test_stats_counts_a_fresh_pass_and_mix_weighs_tokens():
         origins = np.concatenate([next(reader)["origin"] for _ in range(40)])
     finally:
         reader.close()
-    # Three-token records carry two targets, nine-token records eight: equal targets, four short to one long.
-    assert np.mean(origins == "short") == pytest.approx(0.8, abs=0.05)
+    # Three-token records carry two targets, nine-token records eight. The member furthest below its
+    # share of the targets goes next, ties to the first: one short record, then a long one and four
+    # short ones in turn, so 1 + 63 * 4 + 3 of the 320 records are short.
+    assert int(np.sum(origins == "short")) == 256
 
 
 class Countdown:
@@ -581,7 +591,8 @@ def test_a_hugging_face_stream_resumes_exactly_and_its_own_shuffle_is_refused():
     opening at its own position; a stream that shuffles through Hugging Face's buffer, whose
     rows that state leaves out, is refused, also under a later map, and so is one with no name
     to tell it from another stream."""
-    datasets = pytest.importorskip("datasets")
+    import datasets
+
     stream = datasets.IterableDataset.from_generator(lambda: ({"i": i} for i in range(40)))
     source = from_hf(stream, name="counting@1")
     reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
@@ -623,7 +634,8 @@ def hf_file_rows(shards: list[str]):
 def test_hugging_face_stream_shares_are_disjoint_and_resume_exactly(shard_count, workers):
     """Physical shards and undersharded streams cover every record once across two shares,
     with independent openings and exact per-share resumes, also through real workers."""
-    datasets = pytest.importorskip("datasets")
+    import datasets
+
     stream = datasets.IterableDataset.from_generator(hf_rows, gen_kwargs={"shards": list(range(shard_count))})
     source = from_hf(stream, name=f"sharded-{shard_count}@1")
     chain = (source.map(lambda row: {**row, "twice": 2 * row["i"]}, identity="twice@1")
@@ -666,11 +678,11 @@ def test_hugging_face_stream_shares_are_disjoint_and_resume_exactly(shard_count,
 @pytest.mark.parametrize("shares", [1, 2])
 def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, shares):
     """A native-shard fill publishes; a row-wise node split refuses without reopening the store."""
+    import datasets
+
     from dew.data.cache import Cache
-    from dew.data.plan import Manifest
     from dew.data.shards import streamed
 
-    datasets = pytest.importorskip("datasets")
     path = tmp_path / "records.jsonl"
     path.write_text("".join(json.dumps({"i": index}) + "\n" for index in range(12)))
     stream = datasets.IterableDataset.from_generator(hf_file_rows, gen_kwargs={"shards": [str(path)]})
