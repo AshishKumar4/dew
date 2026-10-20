@@ -32,7 +32,6 @@ from __future__ import annotations
 import atexit
 import dataclasses
 import functools
-import gc
 import itertools
 import re
 import shutil
@@ -1016,17 +1015,6 @@ def cells(supported: bool) -> list:
             for method in METHODS for family in ALL
             if method.reads <= family.facts and method.within(family)
             and (method.needs <= family.facts) is supported and (supported or method.refuse is not None)]
-
-
-@pytest.fixture(autouse=True)
-def release_compilations():
-    """conftest's release after every test here rather than at the file's
-    end. This file alone compiles some 200 cells' executables, whose code
-    reached 62,146 of the 65,530 memory mappings armada's containers allow
-    (vm.max_map_count) before the next compile aborted."""
-    yield
-    jax.clear_caches()
-    gc.collect()
 
 
 @pytest.mark.parametrize("method, family", cells(supported=True))
