@@ -157,7 +157,7 @@ class DiscreteProcess:
         return DiscreteDenoiser(self, model, params, inputs, mutable_mask)
 
     def generate(self, model: nn.Module, variables: Variables, inputs: ModelInputs | jax.typing.ArrayLike,
-                 max_new_tokens: int, *, key: int | jax.Array | None = None,
+                 max_new_tokens: int, *, key: int | jax.Array,
                  n: int = 1, steps: int = MDLM_STEPS, solver: Unmask | None = None,
                  eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration:
         """Generate `max_new_tokens` tokens after each prompt with native MDLM.
