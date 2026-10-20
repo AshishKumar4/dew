@@ -205,13 +205,16 @@ def _row_terms(logits, predict: bool) -> tuple[
     logits of 4096 x 151936 took 3.9 ms against `jax.nn.logsumexp` and
     `jnp.argmax`'s 7.6, and 8192 x 50304 2.6 against 5.0.
 
-    The row reduces in two levels, blocks of about its square root's width
-    and then the blocks' terms (`_row_blocks`): XLA's CPU compiler runs a
-    reduction with a combine of its own as one loop over the row, and over
-    512 columns that loop's sum of exponentials held a whole head's state
-    gradient 3.9 times as far from float64 as `jax.nn.logsumexp`'s over 52
-    orders of its columns (tests/test_chunked_cross_entropy.py), where the
-    two levels' loops are each a block long."""
+    On CPU the row reduces in two levels, blocks of about its square root's
+    width and then the blocks' terms (`_row_blocks`): XLA's CPU compiler
+    runs a reduction with a combine of its own as one loop over the row, and
+    over 512 columns that loop's sum of exponentials held a whole head's
+    state gradient 3.9 times as far from float64 as `jax.nn.logsumexp`'s
+    over 52 orders of its columns (tests/test_chunked_cross_entropy.py),
+    where the two levels' loops are each a block long. A GPU reduces a row
+    as a tree of its threads' partial sums already, and there the two levels
+    took the tiled head's forward from 11.9 to 15.0 ms on an A100 (4096
+    tokens, 151936 columns), so other backends keep the one reduction."""
     def combine(first, second):
         larger = jnp.maximum(first[0], second[0])
         total = _rescaled(first[0], first[1], larger) + _rescaled(second[0], second[1], larger)
@@ -228,11 +231,14 @@ def _row_terms(logits, predict: bool) -> tuple[
         operands.append(jax.lax.broadcasted_iota(jnp.int32, logits.shape, axis))
         initial.append(jnp.array(jnp.iinfo(jnp.int32).max, jnp.int32))
 
-    def reduced(operands):
-        return jax.lax.reduce(tuple(operands), tuple(initial), combine, (operands[0].ndim - 1,))
+    def reduced(*operands):
+        return jax.lax.reduce(operands, tuple(initial), combine, (operands[0].ndim - 1,))
 
-    terms = reduced([jnp.concatenate(level, axis=-1) if len(level) > 1 else level[0]
-                     for level in zip(*(reduced(part) for part in _row_blocks(operands)), strict=True)])
+    def blocked(*operands):
+        return reduced(*(jnp.concatenate(level, axis=-1) if len(level) > 1 else level[0] for level in
+                         zip(*(reduced(*part) for part in _row_blocks(list(operands))), strict=True)))
+
+    terms = jax.lax.platform_dependent(*operands, cpu=blocked, default=reduced)
     return terms[0] + jnp.log(terms[1]), ((terms[0], terms[2]) if predict else None), terms[:2]
 
 
