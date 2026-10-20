@@ -612,8 +612,7 @@ class _PassesIterator(pygrain.DatasetIterator):
 
     def set_state(self, state) -> None:
         # Right after a pass ends, this is the repeat rewinding it, which keeps the corpus's counts.
-        self._rows.set_state(record(rewound(state, self._rows.get_state()), "rewound pass") if self._ended
-                             else state)
+        self._rows.set_state(rewound(state, self._rows.get_state()) if self._ended else state)
         self._yielded, self._ended = not self._ended, False
 
 
