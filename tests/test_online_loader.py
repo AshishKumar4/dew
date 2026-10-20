@@ -86,15 +86,17 @@ def serving(handle):
         server.server_close()
 
 
-def test_a_fetch_follows_a_redirect_and_keeps_the_bytes_the_server_sent():
-    """A fetch follows its server's redirect and keeps the body as sent, compressed bytes and
-    all: its digest names those bytes, and its size limit counts them, not their inflation."""
+@pytest.mark.parametrize("header", ["Location", "URI"])
+def test_a_fetch_follows_a_redirect_and_keeps_the_bytes_the_server_sent(header):
+    """A fetch follows its server's redirect, named by `Location` or by `URI`, and keeps the body
+    as sent, compressed bytes and all: its digest names those bytes, and its size limit counts
+    them, not their inflation."""
     body = gzip.compress(b"x" * 4096)
 
     def handle(request):
         if request.path == "/moved":
             request.send_response(302)
-            request.send_header("Location", "/object")
+            request.send_header(header, "/object")
             request.end_headers()
             return
         request.send_response(200)
@@ -130,6 +132,26 @@ def test_a_fetch_reaches_a_host_its_environment_excludes_from_its_proxy(monkeypa
         monkeypatch.setenv("no_proxy", address)
         row = Fetch()({"url": f"http://{address}/object"})
     assert not isinstance(row, Rejected) and row["bytes"] == b"direct" and proxied == []
+
+
+def test_a_fetch_goes_through_the_proxy_its_environment_names_by_its_authority(monkeypatch):
+    """A proxy the environment names by host and port alone carries the fetch, as an HTTP proxy."""
+    proxied = []
+
+    def proxy(request):
+        proxied.append(request.path)
+        request.send_response(200)
+        request.send_header("Content-Length", "7")
+        request.end_headers()
+        request.wfile.write(b"relayed")
+
+    with serving(proxy) as relay:
+        monkeypatch.setenv("http_proxy", relay)
+        monkeypatch.delenv("no_proxy", raising=False)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        row = Fetch()({"url": "http://catalog.invalid/object"})
+    assert not isinstance(row, Rejected) and row["bytes"] == b"relayed"
+    assert proxied == ["http://catalog.invalid/object"]
 
 
 def test_a_fetch_ends_at_its_timeout_however_long():
