@@ -1,3 +1,6 @@
+--index-url https://pypi.org/simple
+--extra-index-url https://pypi.dewml.dev/simple
+
 absl-py==2.5.1
     # via
     #   array-record
@@ -444,7 +447,7 @@ itsdangerous==2.2.0
     # via flask
 jaraco-functools==4.6.0
     # via cheroot
-jax @ https://github.com/AshishKumar4/jax/archive/7527048f5499b30e97c748d2d1b56056f62917ea.tar.gz
+jax==0.11.2.post5
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
