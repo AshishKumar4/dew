@@ -358,7 +358,8 @@ def stream_seam(implementation: str, dtype, joined: bool, offset: bool = True, a
     return seam
 
 
-SEEDS = {(2, 3, 31): 32, (3, 257, 17): 8, (5, 1000): 8, (2, 3, 4, 31): 64, (2, 64, 16, 128): 8}
+SEEDS = {(2, 3, 31): 32, (3, 257, 17): 32, (5, 1000): 32, (2, 3, 4, 31): 64, (2, 64, 16, 128): 8,
+         (2, 1, 16, 128): 32}
 """Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
 XLA compared with itself resolves the factor in every output and gradient (2026-10-20, on armada)."""
 
@@ -447,26 +448,29 @@ def test_a_decode_steps_gated_norm_of_an_fp32_input_by_a_bf16_gate_holds_the_flo
                                                                                            shape):
     """A decode step's gated norm (Qwen3-Next's, Kimi's): the recurrence's fp32 output gated by its bf16
     projection, the gate read in fp32 as XLA widens it, cast once to `output`; its output and its input,
-    gate and weight gradients, each in its operand's dtype, within the float64 gate of XLA's."""
-    x, gate, dy = (jax.random.normal(jax.random.key(index), shape) for index in (61, 62, 63))
-    gate, dy = gate.astype(jnp.bfloat16), dy.astype(output)
-    scale = 0.7 + 0.2 * jax.random.normal(jax.random.key(64), shape[-1:])
-    operands = (x, gate, scale)
+    gate and weight gradients, each in its operand's dtype, on par with XLA's over the shape's seeds."""
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(61), seed), 4)
+        x, gate, dy = (jax.random.normal(key, shape) for key in keys[:3])
+        scale = 0.7 + 0.2 * jax.random.normal(keys[3], shape[-1:])
+        return (x, gate.astype(jnp.bfloat16), scale), dy.astype(output)
 
     def gated(implementation, dtype):
         return lambda x, gate, scale: gated_rms_normalized(x, gate, scale, 1e-6, dtype, activation,
                                                            implementation=implementation)
 
+    def leaves(result):
+        return dict(zip(("y", "x", "gate", "scale"), result, strict=True))
+
+    operands, dy = draw(0)
     fused = gated("pallas", output)
     assert "rms_norm_forward" in kernels(fused, *operands)
     assert "rms_norm_backward" in kernels(functools.partial(evaluated, fused), operands, dy)
-    reference = jax.jit(functools.partial(evaluated, gated("xla", output)))(operands, dy)
     actual = jax.jit(functools.partial(evaluated, fused))(operands, dy)
-    truth, terms = float64(gated("xla", jnp.float64), operands, dy)
-    for label, mine, theirs, want, summed in zip(("y", "x", "gate", "scale"), actual, reference, truth, terms,
-                                                 strict=True):
-        assert mine.dtype == theirs.dtype, label
-        assert_as_exact_as_the_reference(mine, theirs, want, label, terms=summed)
+    reference = jax.jit(functools.partial(evaluated, gated("xla", output)))(operands, dy)
+    assert [value.dtype for value in actual] == [value.dtype for value in reference]
+    assert_drawn_as_exact(fused, gated("xla", output), gated("xla", jnp.float64), draw, leaves,
+                          "decode gated norm", SEEDS[shape])
 
 
 def test_a_decode_steps_gated_norm_takes_the_fused_kernel_where_its_row_names_it():
