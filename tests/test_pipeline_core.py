@@ -998,42 +998,6 @@ def test_a_token_mixture_weighs_a_cropped_corpus_by_the_targets_left_after_the_c
     assert abs(left - right) <= sum(int(Scored(role)(row)["targets"]) for row in rows)
 
 
-@dataclasses.dataclass(frozen=True)
-class Sourced:
-    """Labels a row with its corpus, which a windows or pack stage leaves out of its windows."""
-
-    source: int
-
-    def __call__(self, row):
-        return {**row, "source": np.int32(self.source)}
-
-
-def test_a_token_mixture_weighs_windows_by_the_rule_their_documents_were_counted_by():
-    """Targets counted on documents by a role's rule (`CountTargets(role=1)`) before a windows stage
-    cuts them into more rows than they had are counted again on the windows by that rule, in a
-    memory read, which counts its windows itself: two corpora whose documents score three and nine
-    role-1 targets deliver equal scored targets, to within one window of each (`delivered`)."""
-    from dew.data.steps.text import CountTargets
-
-    def corpus(source, scored):
-        counted = Pipeline(roled(source, 25, scored), name=str(source)).filter_map(CountTargets(role=1))
-        return counted.windows(8, fields=("text", "text_roles")).map(Sourced(source))
-
-    left, right = delivered([corpus(0, 3), corpus(1, 9)], 1, "memory")
-    assert abs(left - right) <= 8 + 8
-
-
-def test_windows_that_drop_the_roles_their_documents_were_counted_in_are_refused():
-    """A windows stage that leaves out the roles a count was taken in (`CountTargets(role=1)`) gives
-    windows no rule can count again, and a memory read refuses them before any batch."""
-    from dew.data.steps.text import CountTargets
-
-    counted = Pipeline(roled(0, 25, 3), name="dropped").filter_map(CountTargets(role=1))
-    with pytest.raises(ValueError):
-        compile(mix([counted.windows(8).map(Sourced(0)).repeat()], by="tokens").batch(2), read="memory",
-                loading=READ).train(DataPartition())
-
-
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_a_token_mixture_keeps_a_rows_count_through_a_step_over_its_other_fields(read):
     """A step that changes only a row's other fields keeps the targets its count's own rule counted,

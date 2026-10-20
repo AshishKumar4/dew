@@ -11,7 +11,6 @@ import logging
 import platform
 import re
 import subprocess
-import types
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
@@ -164,17 +163,11 @@ def _configuration(step: DataclassInstance) -> dict[str, JSON]:
     return configured
 
 
-type StepField = (JSON | np.ndarray | jax.Array | np.generic | DataclassInstance | types.FunctionType
-                  | types.BuiltinFunctionType | slice | Path | Sequence[StepField] | Mapping[str, StepField])
-"""The width of what a frozen step's field holds, as `_configured` reads it: any value past it reads
-as its repr, as one within it that holds no array does."""
-
-
-def _configured(value: StepField) -> JSON:
-    """A step's field as its configuration records it: a dataclass by its own fields, a value that
-    holds an array entry by entry with the array by its fingerprint, which its repr rounds to eight
-    digits and cuts short past a thousand entries, and anything else by its repr, without
-    addresses."""
+def _configured(value) -> JSON:
+    """A step's field, any value, as its configuration records it: a dataclass by its own fields, a
+    value that holds an array entry by entry with the array by its fingerprint, which its repr
+    rounds to eight digits and cuts short past a thousand entries, and anything else by its repr,
+    without addresses."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return _configuration(value)
     if _holds_arrays(value):
@@ -188,7 +181,7 @@ def _configured(value: StepField) -> JSON:
     return re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))
 
 
-def _holds_arrays(value: StepField) -> bool:
+def _holds_arrays(value) -> bool:
     """Whether `value`, a step or a field of one, holds an array, whose repr does not spell it out
     (`_configured`)."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
