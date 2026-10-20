@@ -131,8 +131,8 @@ def release_compilations():
 def released_past_budget():
     """A test that leaves the process past `MAPPINGS_BUDGET` mappings releases them as it ends, so no file
     compiles its way to the limit: test_serving.py alone reached 64,581 of armada's 65,530 and failed its
-    next compile ("LLVM compilation error: Cannot allocate memory"), and test_capability_matrix.py's 200
-    cells 62,146. Reading the list takes a few milliseconds at the budget."""
+    next compile ("LLVM compilation error: Cannot allocate memory"); held to the budget it peaked at
+    32,683 and passed. Reading the list takes a few milliseconds at the budget."""
     yield
     if MAPPINGS_BUDGET is not None:
         with MAPPINGS.open("rb") as mapped:

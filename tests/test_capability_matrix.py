@@ -32,6 +32,7 @@ from __future__ import annotations
 import atexit
 import dataclasses
 import functools
+import gc
 import itertools
 import re
 import shutil
@@ -1015,6 +1016,19 @@ def cells(supported: bool) -> list:
             for method in METHODS for family in ALL
             if method.reads <= family.facts and method.within(family)
             and (method.needs <= family.facts) is supported and (supported or method.refuse is not None)]
+
+
+@pytest.fixture(autouse=True)
+def release_compilations():
+    """conftest's release after every test here rather than past its budget
+    of mappings (`released_past_budget`): this file's 167 cells each compile
+    their own executables, which no later cell reuses, and in one process the
+    file took 2,457 s releasing after each against 3,101 s holding them to
+    the budget (33,491 mappings, 4.6 against 2.9 GB resident), on an armada
+    container."""
+    yield
+    jax.clear_caches()
+    gc.collect()
 
 
 @pytest.mark.parametrize("method, family", cells(supported=True))
