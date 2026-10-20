@@ -11,7 +11,11 @@ import numpy as np
 
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
-from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed
+from dew.data.sources.base import TOKENIZER_CONTRACT, Read, Shard, ShardManifest, Source, _consumed
+from dew.records import integer
+
+COUNTED = ("rows", "valid_targets", "held_out")
+"""The facts that count a store's records, which a concatenation's sources add."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,10 +51,26 @@ class Concatenate(Dataset):
                                              for source in self.sources])
 
     def metadata(self) -> Mapping[str, object]:
+        """What every source states of its records, as one store's: the counts (`COUNTED`) added
+        where each source states one, the tokenizer contract (`TOKENIZER_CONTRACT`) where the
+        sources that state it agree, and any other fact, class names among them, where every
+        source states the one value. Sources that state two tokenizer contracts make no one
+        store, and are refused."""
         stated = [source.metadata() for source in self.sources]
-        rows = [facts.get("rows") for facts in stated]
-        return {"rows": sum(count for count in rows if isinstance(count, int))} if all(
-            isinstance(count, int) for count in rows) else {}
+        facts: dict[str, object] = {}
+        for key in dict.fromkeys(key for given in stated for key in given):
+            values = [given[key] for given in stated if key in given]
+            if key in COUNTED:
+                if len(values) == len(stated) and all(isinstance(value, int) for value in values):
+                    facts[key] = sum(integer(value, key) for value in values)
+            elif any(value != values[0] for value in values):
+                if key in TOKENIZER_CONTRACT:
+                    raise ValueError(f"{self.describe()} joins stores of {key} {values[0]!r} and "
+                                     f"{next(value for value in values if value != values[0])!r}, whose "
+                                     "token ids mean different things")
+            elif key in TOKENIZER_CONTRACT or len(values) == len(stated):
+                facts[key] = values[0]
+        return facts
 
     def lengths(self) -> np.ndarray | None:
         lengths = [source.lengths() for source in self.sources]

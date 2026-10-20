@@ -98,7 +98,7 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import Plan, StepIdentity, fingerprint, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
-from dew.data.sources.base import Read, ShardManifest, Source, _consumed
+from dew.data.sources.base import TOKENIZER_CONTRACT, Read, ShardManifest, Source, _consumed
 from dew.data.steps.generic import Coordinated
 from dew.records import JSON, integer, json_value, record
 
@@ -224,7 +224,7 @@ def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
     for pipeline in pipelines:
         for leaf, source in _leaves(pipeline):
             metadata = source.metadata()
-            for key in ("tokenizer", "vocab_size", "eos_id", "tokenizer_revision"):
+            for key in TOKENIZER_CONTRACT:
                 if key not in metadata:
                     continue
                 value = json_value(metadata[key], key)
