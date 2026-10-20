@@ -116,7 +116,8 @@ def main(config: Config) -> dict:
         gateway = Gateway(config.gateway, sandbox_url=config.sandbox_gateway)
         push = SafetensorsReload(source, config.served, config.engines, config.engine)
         push.write(source.variables)
-        # The engines launch on --served now; the Publication below stamps the gateway at once.
+        # The engines launch on --served now; the Publication below stamps the gateway when the
+        # scheduler first reads its version, before its first draw.
         gateway.ready(config.ready_timeout)
     trials = HarnessSource(Harbor(harbor=harbor, model=config.harness_model, trials=config.out / "trials",
                                   agent=config.agent,
