@@ -221,12 +221,13 @@ class _Statistics:
         self._published.append(stream._statistics)
 
     def __call__(self) -> Mapping[str, float]:
-        """The metrics of every corpus, each counter the larger of the compile's and the readers'."""
-        merged = dict(self._counts)
-        for published in self._published:
-            for name, counts in published.counts.items():
-                merged[name] = counts if name not in merged else merged[name].most(counts)
-        return data_metrics(merged.values())
+        """The metrics of every corpus: the counts of the prefix a memory read ran, followed by
+        those the latest reader published of the rest (`CorpusCounts.followed`), which a reader
+        restored from another's position carries on from."""
+        read = {name: counts for published in self._published for name, counts in published.counts.items()}
+        merged = {name: counts.followed(read.pop(name)) if name in read else counts
+                  for name, counts in self._counts.items()}
+        return data_metrics([*merged.values(), *read.values()])
 
 
 @dataclasses.dataclass(frozen=True)
