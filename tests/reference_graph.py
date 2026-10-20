@@ -1,91 +1,10 @@
-"""A computation as a graph of the values it rounds and holds, for the float64 gate's source-aware
-check (bible §7; tests/reference_error.py `assert_graph_as_exact`).
+"""The float64 gate's arithmetic on a kernel's graph (src/dew/nn/kernels/graph.py): each element's
+distance from float64 with the node's sentinel and NaN rules, and the permutation of a node's summed
+axis that is its orbit (tests/reference_error.py `assert_graph_as_exact`)."""
 
-A kernel is checked where it rounds. Each `Node` is one value the kernel rounds and holds (an
-accumulator, a stored max, a cast), computed from its parents' values by the kernel's own arithmetic:
-a template's stage by construction, or a native probe of a hand kernel with its parents overridden.
-A cut never falls inside a fused multiply-add. `Graph.fused` is the kernel as a caller runs it, which
-the graph's replay must equal bit for bit.
-
-A node's kind says how its own rounding is redrawn:
-
-- `Sum(axes)`: a genuine sum or sum-product of fixed operands (a dot, p·v, a GEMM accumulator, a row's
-  sum of squares); permuting the summed axis of its operands (`axes`, each parent's) is an exact
-  symmetry of the node, and the node's orbit;
-- `Online(axes)`: an online reduction that rescales its accumulator (flash attention's running max and
-  sum over key tiles), whose keys, permuted with their mask, are an exact symmetry of its math;
-- `Ordered()`: a recurrence whose terms do not commute; no orbit of its own, its spread is the
-  reference ensemble's;
-- `Pointwise()`: no sum; checked once, element by element.
-
-A node's `sentinel` is the one non-finite value its math defines (attention's empty row holds a max of
--inf): where Dew and float64 both hold it, the element's error is zero. Any other non-finite value,
-and any NaN, fails.
-"""
-
-import dataclasses
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 
 import numpy as np
-
-
-@dataclasses.dataclass(frozen=True)
-class Sum:
-    """A sum over one axis of some parents, given as a parent's name to its summed axis."""
-    axes: Mapping[str, int]
-
-
-@dataclasses.dataclass(frozen=True)
-class Online:
-    """An online reduction over one axis of some parents (keys, their values and their mask)."""
-    axes: Mapping[str, int]
-
-
-@dataclasses.dataclass(frozen=True)
-class Ordered:
-    """A reduction whose terms do not commute."""
-
-
-@dataclasses.dataclass(frozen=True)
-class Pointwise:
-    """No sum: arithmetic element by element."""
-
-
-@dataclasses.dataclass(frozen=True)
-class Node:
-    """One value the kernel rounds and holds: its name, its parents' names, its kind, `fn` computing it
-    from the parents' values (keyword arguments by name), its sentinel (`sentinel`) if its math defines
-    one, and, on a reference's `Ordered` node, `members`: other order-preserving ways the reference
-    computes the same value (another chunk size of a scan), its ensemble there."""
-    name: str
-    parents: tuple[str, ...]
-    kind: Sum | Online | Ordered | Pointwise
-    fn: Callable
-    sentinel: float | None = None
-    members: Mapping[str, Callable] = dataclasses.field(default_factory=dict)
-
-
-@dataclasses.dataclass(frozen=True)
-class Graph:
-    """A computation's inputs, its nodes in an order each node's parents come before it, its outputs
-    (nodes' names), and `fused`, the native witness: the production path from the inputs (keyword
-    arguments) to its outputs and every intermediate and operand it holds that the graph names, by
-    name, which the graph's replay must equal bit for bit. A backward is a graph of its own, its
-    inputs the common forward's saved values and a fixed cotangent."""
-    inputs: tuple[str, ...]
-    nodes: tuple[Node, ...]
-    outputs: tuple[str, ...]
-    fused: Callable
-
-    def node(self, name: str) -> Node:
-        return next(node for node in self.nodes if node.name == name)
-
-    def replay(self, inputs: Mapping[str, object]) -> dict[str, np.ndarray]:
-        """Every value of the graph, its nodes run in turn from `inputs`."""
-        values = dict(inputs)
-        for node in self.nodes:
-            values[node.name] = node.fn(**{parent: values[parent] for parent in node.parents})
-        return values
 
 
 def errors(value, truth, sentinel: float | None) -> np.ndarray:

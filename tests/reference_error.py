@@ -841,7 +841,8 @@ def assert_elements_as_exact(batch, label: str, *, reference: str = REFERENCE, a
 
 def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> dict:
     """A computation held where it rounds (bible §7's source-aware gate; tests/reference_graph.py).
-    `dew`, `reference` and `truth` are `Graph`s of one shape, `truth` the reference's in float64;
+    `dew`, `reference` and `truth` are `Graph`s (src/dew/nn/kernels/graph.py) of one shape, `truth`
+    the reference's in float64;
     `inputs` the case's inputs by name, and `orbit(order)` the case's exact symmetries:
     `(inputs, back)`, order `order`'s permuted inputs and the map that takes outputs back.
 
@@ -861,7 +862,7 @@ def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> d
     Returns each node's report (`assert_elements_as_exact`'s) by node and parent bundle. The element
     rule's calibration at a test's real element count is still open: the report states each node's
     measured inflation, and no false-failure rate is claimed."""
-    from reference_graph import Ordered, Pointwise
+    from dew.nn.kernels.graph import Ordered, Pointwise
 
     names = [node.name for node in dew.nodes]
     assert names == [node.name for node in reference.nodes] == [node.name for node in truth.nodes], (
