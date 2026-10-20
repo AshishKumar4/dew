@@ -965,25 +965,28 @@ def test_a_parquet_store_reads_with_the_credentials_its_profile_names(tmp_path, 
     import boto3
     import fsspec
     import pyarrow.parquet as pq
-    import requests
+    from moto.core import set_initial_no_auth_action_count
     from moto.server import ThreadedMotoServer
 
     from dew.data.compile import iterate
     from dew.data.pipeline import Pipeline
 
-    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
+    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE",
+                 "AWS_DEFAULT_PROFILE"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
     monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "config"))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "credentials"))
     server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
     server.start()
     _, port = server.get_host_and_port()
     endpoint = f"http://127.0.0.1:{port}"
+
     # The endpoint authenticates every request after the three that make the profile's user.
-    previous = requests.post(f"{endpoint}/moto-api/reset-auth", data=b"3", timeout=30).json()
-    try:
-        iam = boto3.client("iam", endpoint_url=endpoint, region_name="us-east-1",
-                           aws_access_key_id="setup", aws_secret_access_key="setup")
+    @set_initial_no_auth_action_count(3)
+    def read_through_the_profile():
+        iam = boto3.Session().client("iam", endpoint_url=endpoint, region_name="us-east-1",
+                                     aws_access_key_id="setup", aws_secret_access_key="setup")
         # The endpoint's users outlive it in this process, so each test names its own.
         user = "reader-" + uuid4().hex
         iam.create_user(UserName=user)
@@ -993,7 +996,6 @@ def test_a_parquet_store_reads_with_the_credentials_its_profile_names(tmp_path, 
         (tmp_path / "credentials").write_text(
             f"[reader]\naws_access_key_id = {key['AccessKeyId']}\n"
             f"aws_secret_access_key = {key['SecretAccessKey']}\n")
-        monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "credentials"))
         options = {"profile": "reader", "endpoint_url": endpoint}
         bucket = "profiles-" + uuid4().hex
         remote = fsspec.filesystem("s3", **options)
@@ -1002,10 +1004,41 @@ def test_a_parquet_store_reads_with_the_credentials_its_profile_names(tmp_path, 
         pq.write_table(pa.Table.from_pylist([{"id": index} for index in range(5)]), written)
         remote.pipe(f"{bucket}/rows.parquet", written.getvalue())
         source = Files(f"s3://{bucket}/rows.parquet", storage_options=options)
-        assert sorted(int(row["id"]) for row in iterate(Pipeline(source), read=read)) == list(range(5))
+        return sorted(int(row["id"]) for row in iterate(Pipeline(source), read=read))
+
+    try:
+        assert read_through_the_profile() == list(range(5))
     finally:
-        requests.post(f"{endpoint}/moto-api/reset-auth",
-                      data=str(previous["PREVIOUS_INITIAL_NO_AUTH_ACTION_COUNT"]).encode(), timeout=30)
+        server.stop()
+
+
+def test_an_anonymous_storage_profile_reads_parquet_though_it_names_keys():
+    """A storage profile over S3 that reads anonymously reads a Parquet store's rows, though it
+    names keys too, which an anonymous client does not sign with."""
+    import fsspec
+    import pyarrow.parquet as pq
+    from moto.server import ThreadedMotoServer
+
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+    from dew.data.storage import _profile
+
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    try:
+        _, port = server.get_host_and_port()
+        endpoint = f"http://127.0.0.1:{port}"
+        bucket = "public-" + uuid4().hex
+        remote = fsspec.filesystem("s3", key="testing", secret="testing", endpoint_url=endpoint)
+        remote.mkdir(bucket)
+        written = io.BytesIO()
+        pq.write_table(pa.Table.from_pylist([{"id": index} for index in range(5)]), written)
+        remote.pipe(f"{bucket}/rows.parquet", written.getvalue())
+        _profile("publics3", "s3a", {"key": "unused", "secret": "unused", "anon": True,
+                                     "endpoint_url": endpoint})
+        source = Files(f"publics3://{bucket}/rows.parquet")
+        assert sorted(int(row["id"]) for row in iterate(Pipeline(source), read="streamed")) == list(range(5))
+    finally:
         server.stop()
 
 

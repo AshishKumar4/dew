@@ -75,10 +75,11 @@ def _arrow_filesystem(fs: AbstractFileSystem) -> pafs.FileSystem:
         return pafs.LocalFileSystem()
     if isinstance(fs, S3FileSystem) and _native_s3(fs):
         endpoint = urlsplit(fs.endpoint_url or fs.client_kwargs.get("endpoint_url") or "")
+        # An anonymous s3fs keeps keys it does not sign with, which Arrow's client refuses beside anonymity.
         return pafs.S3FileSystem(
-            access_key=fs.key,
-            secret_key=fs.secret,
-            session_token=fs.token,
+            access_key=None if fs.anon else fs.key,
+            secret_key=None if fs.anon else fs.secret,
+            session_token=None if fs.anon else fs.token,
             anonymous=fs.anon,
             region=fs.client_kwargs.get("region_name"),
             endpoint_override=endpoint.netloc or None,
@@ -116,11 +117,13 @@ def _native_s3(fs: S3FileSystem) -> bool:
 
 
 def _native_gcs(fs: GCSFileSystem) -> bool:
-    """Whether Arrow's GCS client carries every setting `fs` reads with: the
-    default or anonymous credentials, the project and the endpoint, and
-    nothing it cannot express, such as other credentials, requester pays,
+    """Whether Arrow's GCS client carries every setting `fs` reads with:
+    anonymity, or the default credentials at full access, the project and
+    the endpoint, and nothing it cannot express, such as other credentials
+    (the instance's own, forced), narrower scopes, requester pays,
     checksums, timeouts, session arguments or object versions."""
-    return (fs.credentials.method in ("google_default", "cloud", "anon")
+    return ((fs.credentials.method == "anon"
+             or (fs.credentials.method == "google_default" and fs.credentials.access == "full_control"))
             and not (fs.requester_pays or fs.session_kwargs or fs.version_aware)
             and fs.consistency in (None, "none")
             and fs.requests_timeout is None and fs.timeout is None)
