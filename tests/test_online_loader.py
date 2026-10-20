@@ -1,6 +1,12 @@
 """URL fetches use the ordinary pipeline worker and rejection paths."""
 
+import contextlib
+import gzip
+import hashlib
+import http.server
 import itertools
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +64,154 @@ def test_fetch_preserves_the_catalog_and_reads_exact_bytes(tmp_path):
     row = Fetch()({"url": path.as_uri(), "caption": "the record"})
     assert not isinstance(row, Rejected)
     assert row["bytes"] == b"source bytes" and row["caption"] == "the record"
+
+
+@contextlib.contextmanager
+def serving(handle):
+    """A local HTTP server answering each GET with `handle(request)`, and its address."""
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            handle(self)
+
+        def log_message(self, *arguments):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize("header", ["Location", "URI"])
+def test_a_fetch_follows_a_redirect_and_keeps_the_bytes_the_server_sent(header):
+    """A fetch follows its server's redirect, named by `Location` or by `URI`, and keeps the body
+    as sent, compressed bytes and all: its digest names those bytes, and its size limit counts
+    them, not their inflation."""
+    body = gzip.compress(b"x" * 4096)
+
+    def handle(request):
+        if request.path == "/moved":
+            request.send_response(302)
+            request.send_header(header, "/object")
+            request.end_headers()
+            return
+        request.send_response(200)
+        request.send_header("Content-Encoding", "gzip")
+        request.send_header("Content-Length", str(len(body)))
+        request.end_headers()
+        request.wfile.write(body)
+
+    with serving(handle) as address:
+        row = Fetch(max_bytes=len(body))({"url": f"http://{address}/moved"})
+    assert not isinstance(row, Rejected)
+    assert row["bytes"] == body and row["content_sha256"] == hashlib.sha256(body).hexdigest()
+
+
+@pytest.mark.parametrize("hops", [0, 10])
+def test_a_redirect_to_a_local_file_is_not_followed(tmp_path, hops):
+    """A server's redirect to a file on this host is never followed, first or past the hops a
+    fetch follows: the fetch is dropped, and the file's bytes never enter a record."""
+    secret = tmp_path / "secret"
+    secret.write_bytes(b"local bytes")
+
+    def handle(request):
+        step = int(request.path.strip("/") or 0)
+        request.send_response(302)
+        request.send_header("Location", secret.as_uri() if step >= hops else f"/{step + 1}")
+        request.end_headers()
+
+    with serving(handle) as address:
+        fetched = Fetch()({"url": f"http://{address}/0"})
+    assert isinstance(fetched, Rejected) and not fetched.permanent
+
+
+def test_a_fetch_reaches_a_host_its_environment_excludes_from_its_proxy(monkeypatch):
+    """A host and port the environment excludes from its proxy (NO_PROXY) is fetched directly,
+    though a proxy is named for its scheme: the proxy never sees the request."""
+    proxied = []
+
+    def proxy(request):
+        proxied.append(request.path)
+        request.send_response(502)
+        request.end_headers()
+
+    def origin(request):
+        request.send_response(200)
+        request.send_header("Content-Length", "6")
+        request.end_headers()
+        request.wfile.write(b"direct")
+
+    with serving(proxy) as relay, serving(origin) as address:
+        monkeypatch.setenv("http_proxy", f"http://{relay}")
+        monkeypatch.setenv("no_proxy", address)
+        row = Fetch()({"url": f"http://{address}/object"})
+    assert not isinstance(row, Rejected) and row["bytes"] == b"direct" and proxied == []
+
+
+def test_a_fetch_goes_through_the_proxy_its_environment_names_by_its_authority(monkeypatch):
+    """A proxy the environment names by host and port alone carries the fetch, as an HTTP proxy."""
+    proxied = []
+
+    def proxy(request):
+        proxied.append(request.path)
+        request.send_response(200)
+        request.send_header("Content-Length", "7")
+        request.end_headers()
+        request.wfile.write(b"relayed")
+
+    with serving(proxy) as relay:
+        monkeypatch.setenv("http_proxy", relay)
+        monkeypatch.delenv("no_proxy", raising=False)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        row = Fetch()({"url": "http://catalog.invalid/object"})
+    assert not isinstance(row, Rejected) and row["bytes"] == b"relayed"
+    assert proxied == ["http://catalog.invalid/object"]
+
+
+def test_a_file_that_keeps_arriving_past_the_timeout_is_dropped(tmp_path):
+    """A file read by urllib whose bytes keep arriving, each well inside its timeout, until after
+    it has passed (a pipe its writer trickles into) is dropped as transient, as a slow server is."""
+    import os
+
+    pipe = tmp_path / "pipe"
+    os.mkfifo(pipe)
+
+    def trickle():
+        with open(pipe, "wb") as writer:
+            for _ in range(15):
+                writer.write(b"x")
+                writer.flush()
+                time.sleep(0.1)
+
+    writer = threading.Thread(target=trickle, daemon=True)
+    writer.start()
+    fetched = Fetch(timeout=1.0)({"url": pipe.as_uri()})
+    writer.join()
+    assert isinstance(fetched, Rejected) and not fetched.permanent
+
+
+def test_a_fetch_ends_at_its_timeout_however_long():
+    """A fetch's timeout ends it when it passes, at five seconds and over as below: a body that
+    would finish half a second later is dropped as transient by then."""
+    def handle(request):
+        request.send_response(200)
+        request.send_header("Content-Length", "11")
+        request.end_headers()
+        for _ in range(11):
+            request.wfile.write(b"x")
+            request.wfile.flush()
+            time.sleep(0.5)
+
+    with serving(handle) as address:
+        began = time.monotonic()
+        fetched = Fetch(timeout=5.0)({"url": f"http://{address}/"})
+        waited = time.monotonic() - began
+    assert isinstance(fetched, Rejected) and not fetched.permanent
+    assert waited < 5.4
 
 
 def test_failed_fetches_are_counted_before_batches(tmp_path):
