@@ -428,21 +428,23 @@ def test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_ste
 
 
 @pytest.mark.parametrize("decode_steps", [1, 4])
-def test_a_step_whose_model_has_no_distribution_stops_the_server(decode_steps):
-    """A bigram policy whose prompt's last id leads to a uniform row and every other id to a row
-    of NaNs, so the step after the first draw has no distribution to score, which the device
-    checks. The server raises that check and stops, whether the failing step is a call of its
-    own or a later step of the call that admitted the row."""
+def test_a_step_whose_draw_has_no_distribution_stops_the_server(decode_steps):
+    """A bigram policy that draws 5 after every id but 5, after which every score is 3e38, which
+    a temperature of 0.5 doubles past float32's range: the step after the first draw has no
+    distribution to draw from, which the device checks. The server raises that check and stops,
+    whether the failing step is a call of its own or a later step of the call that admitted the
+    row."""
     vocab = 16
 
     def logits():
-        table = np.full((vocab, vocab), np.nan, np.float32)
-        table[3] = 0.0
+        table = np.full((vocab, vocab), -3e38, np.float32)
+        table[:, 5] = 0.0
+        table[5] = 3e38
         return table
 
     model = ToolPolicy(vocab_size=vocab, max_seq_len=64, logits=logits)
     params = model.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32))
-    bound = TextGeneration(model, params, None, sampling=Sampling(temperature=1.0, eos_token_ids=None))
+    bound = TextGeneration(model, params, None, sampling=Sampling(temperature=0.5, eos_token_ids=None))
     server = Server.from_task(bound, slots=2, capacity=64, decode_steps=decode_steps)
     server.submit(np.asarray([1, 2, 3], np.int32), 4, key=0)
     with pytest.raises(checkify.JaxRuntimeError):
