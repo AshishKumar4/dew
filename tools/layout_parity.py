@@ -208,7 +208,8 @@ def zoo() -> dict[str, Any]:
     (`_dpo`), GRPO over rollouts with a KL to the frozen reference (`_grpo`)
     and, made bidirectional, masked diffusion (`_mdlm`), which the hybrid's
     Mamba-2 refuses on one device (its recurrence runs one way). The other families
-    train their own: a conditional UNet and an MMDiT (SD3's) denoise latents,
+    train their own: a conditional UNet, EDM2's magnitude-preserving U-Net
+    and an MMDiT (SD3's) denoise latents,
     a JEPA encoder predicts its masked patches' features, and a decoder reads
     an image through a vision tower (`multimodal`), each with heads and
     tokens every layout above divides."""
@@ -291,6 +292,9 @@ def zoo() -> dict[str, Any]:
         "unet": Case("unet_2d_condition", {"stages": [{"features": 32, "heads": 4},
                                                       {"features": 64, "heads": 4}],
                                            "blocks_per_level": 1, "in_channels": 4, "out_channels": 4},
+                     image_size=16, **images),
+        "edm2": Case("edm2_unet", {"model_channels": 32, "channel_mult": [1, 2], "num_blocks": 1,
+                                   "attn_resolutions": [8], "channels_per_head": 16, "output_channels": 4},
                      image_size=16, **images),
         "mmdit": Case("sd3_transformer", {"in_channels": 4, "out_channels": 4, "num_layers": 2, "heads": 4,
                                           "head_dim": 8, "joint_attention_dim": 16,
