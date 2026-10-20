@@ -410,9 +410,9 @@ def test_a_run_loads_with_its_projections_packed_as_a_source_does(tmp_path, devi
 
 PACKED = {"qkv": (("layers_0", "self_attn"), ("q_proj", "k_proj", "v_proj"), "qkv_proj"),
           "gate_up": (("layers_0", "mlp"), ("gate_proj", "up_proj"), "gate_up_proj")}
-PACKED_SEEDS = {"qkv": 16, "gate_up": 16}
+PACKED_SEEDS = {"qkv": 8, "gate_up": 8}
 """Each packed projection's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the
-fewest for which the members' products compared with themselves resolve the factor."""
+fewest for which the members' products compared with themselves resolve the factor (2026-10-20, on armada)."""
 
 
 def packed_site(directory, site: str):
