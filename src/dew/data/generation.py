@@ -183,8 +183,8 @@ def _publish(
         metadata["zero_target_windows"] = targets.count(0)
     # The rules other than every target's that the rows' targets were counted by, which a plan of
     # their lengths cannot count (`dew.data.analysis._ruled`).
-    metadata["count_rules"] = sorted({tuple(entry["rule"]) for entry in dense if entry["rule"] is not None},
-                                     key=repr)
+    distinct = {tuple(entry["rule"]) for entry in dense if entry["rule"] is not None}
+    metadata["count_rules"] = [list(rule) for rule in sorted(distinct, key=repr)]
     referenced = {entry["shard"] for entry in completions.values()}
     definition = {
         "schema": 1,
