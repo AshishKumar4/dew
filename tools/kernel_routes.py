@@ -160,23 +160,31 @@ def model_of(config: dict, mode: str = "train"):
     return CausalTransformer(**fields)
 
 
-def traced(config: dict, target: str, mode: str) -> list:
-    """Every route the family's `mode` step reports within `assumed(target)`."""
+def traced(config: dict, target: str, mode: str, held: dict | None = None) -> list:
+    """Every route the family's `mode` step reports within `assumed(target)`. `held` keeps each
+    target's model, parameters and cache, per cache layout, across a family's modes, which share them."""
     import jax
     import jax.numpy as jnp
 
     from dew.nn.kernels import generation
 
-    model = model_of(config, mode)
-    prompt = min(PROMPT, model.max_seq_len - 1)
-    tokens = jax.ShapeDtypeStruct((BATCH, prompt), jnp.int32)
-    # The parameters and the cache are traced outside the routes kept: their own forward passes are
-    # no part of the mode's step.
-    with generation.assumed(target):
-        variables = jax.eval_shape(model.init, jax.random.key(0), tokens)
-        if mode != "train":
-            cache = jax.eval_shape(lambda v: model.apply(v, BATCH, method="init_cache", mutable=["cache"])[1],
-                                   variables)["cache"]
+    held = {} if held is None else held
+    layout = "paged" if mode == "decode-paged" else "dense"
+    if (target, layout) not in held:
+        model = model_of(config, mode)
+        tokens = jax.ShapeDtypeStruct((BATCH, min(PROMPT, model.max_seq_len - 1)), jnp.int32)
+        # The parameters and the cache are traced outside the routes kept: their own forward passes
+        # are no part of the mode's step.
+        with generation.assumed(target):
+            held[target, layout] = model, tokens, jax.eval_shape(model.init, jax.random.key(0), tokens)
+    model, tokens, variables = held[target, layout]
+    prompt = tokens.shape[1]
+    if mode != "train" and (target, layout, "cache") not in held:
+        with generation.assumed(target):
+            held[target, layout, "cache"] = jax.eval_shape(
+                lambda v: model.apply(v, BATCH, method="init_cache", mutable=["cache"])[1],
+                variables)["cache"]
+    cache = held.get((target, layout, "cache"))
     with generation.assumed(target), generation.routes() as found:
         if mode == "train":
             def loss(params, rest, ids):
@@ -192,9 +200,10 @@ def traced(config: dict, target: str, mode: str) -> list:
     return found
 
 
-def cells(names: Iterable[str]) -> Iterator[dict]:
-    """One record per family, target and mode: its routes, deduplicated; the mixer's refusal of the
-    mode's cache layout, with its row; or why none was traced."""
+def cells(names: Iterable[str], targets: Iterable[str] | None = None) -> Iterator[dict]:
+    """One record per family, target (every audited one where None) and mode: its routes,
+    deduplicated; the mixer's refusal of the mode's cache layout, with its row; or why none was
+    traced."""
     from dew.nn.mixer_base import MixerRefused
 
     present = fixtures()
@@ -204,8 +213,8 @@ def cells(names: Iterable[str]) -> Iterator[dict]:
             yield {"family": name, "fixture": None, "error": "no committed tiny fixture"}
             continue
         config, widened = published(json.loads((found / "config.json").read_text()))
-        causal = model_of(config).causal
-        for target in audited():
+        causal, held = model_of(config).causal, {}
+        for target in audited() if targets is None else targets:
             for mode in MODES:
                 cell = {"family": name, "fixture": found.name, "target": target, "mode": mode,
                         "widths": "reference" if widened else "fixture"}
@@ -214,7 +223,7 @@ def cells(names: Iterable[str]) -> Iterator[dict]:
                     yield cell
                     continue
                 try:
-                    seen = traced(config, target, mode)
+                    seen = traced(config, target, mode, held)
                 except MixerRefused as refusal:
                     cell["refused"] = {"mixer": refusal.kind, "fields": list(refusal.names),
                                        "row": LAYOUT_GAPS.get(refusal.kind) if refusal.names == ("kv_cache",)
