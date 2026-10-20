@@ -33,8 +33,8 @@ def _rss_gb() -> float:
 
 def main() -> None:
     repo, shard_size, out = sys.argv[1], sys.argv[2], Path(sys.argv[3])
-    loaded = Pretrained.load(repo, revision=sys.argv[4] if len(sys.argv) > 4 else None, param_dtype="bfloat16",
-                             mesh=MeshSpec())
+    revision = sys.argv[4] if len(sys.argv) > 4 else None
+    loaded = Pretrained.load(repo, revision=revision, param_dtype="bfloat16", mesh=MeshSpec())
     before = _rss_gb()
     highest = [before]
     done = threading.Event()
@@ -59,8 +59,8 @@ def main() -> None:
     files = sorted(out.rglob("*.safetensors"))
     print(json.dumps({"repo": repo, "max_shard_size": shard_size, "rss_before_gb": round(before, 2),
                       "rss_peak_during_save_gb": round(highest[0], 2),
-                      "rise_gb": round(highest[0] - before, 2), "traced_peak_gb": round(traced / 2**30, 3),
-                      "seconds": round(seconds, 1),
+                      "rise_gb": round(highest[0] - before, 2),
+                      "traced_peak_gb": round(traced / 2**30, 3), "seconds": round(seconds, 1),
                       "shards": len(files), "weights_gb": round(sum(f.stat().st_size for f in files) / 2**30, 2)}))
 
 
