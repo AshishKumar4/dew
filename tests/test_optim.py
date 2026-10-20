@@ -15,8 +15,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from jax.extend.core import ClosedJaxpr, Jaxpr, Literal
 from jax.sharding import NamedSharding, PartitionSpec as P
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, equations
 
 from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -705,11 +706,23 @@ def test_bf16_state_keeps_the_second_moments_small_increments():
     assert have == pytest.approx(want, rel=1e-2)
 
 
-def test_every_optimizer_the_config_names_is_built():
-    assert set(OPTIMIZER_MAP) == set(typing.get_args(Optimizer))
+def program_of(closed) -> tuple:
+    """A traced program as its equations' primitives and parameters, in order, and every constant it
+    holds, its literals and its captured arrays: two traces are one program where these agree."""
+    def constants(values):
+        return tuple((np.asarray(value).dtype, np.asarray(value).tobytes()) for value in values)
+
+    steps = []
+    for equation in equations(closed.jaxpr):
+        literals = [operand.val for operand in equation.invars if isinstance(operand, Literal)]
+        # The sub-programs a parameter holds are walked as equations of their own.
+        params = tuple(sorted((name, value) for name, value in equation.params.items()
+                              if not isinstance(value, (Jaxpr, ClosedJaxpr))))
+        steps.append((equation.primitive.name, params, constants(literals)))
+    return tuple(steps), constants(closed.consts)
 
 
-@pytest.mark.parametrize("optimizer", ["adam", "adamw", "lamb", "muon", "muonclip"])
+@pytest.mark.parametrize("optimizer", typing.get_args(Optimizer))
 @pytest.mark.parametrize("form", ["constant", "schedule", "groups"])
 def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
     """Two runs at different rates of one schedule's shape, a group's
@@ -732,7 +745,7 @@ def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
     for rate in (1e-3, 4e-3):
         solver = config(rate).build(10)
         state = solver.init(params)
-        programs.append(jax.jit(solver.update).lower(grads, state, params).as_text())
+        programs.append(program_of(jax.make_jaxpr(solver.update)(grads, state, params)))
         updates.append(solver.update(grads, state, params)[0])
     assert programs[0] == programs[1]
     assert any(not np.array_equal(left, right) for left, right in
