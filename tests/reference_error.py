@@ -378,7 +378,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                               f"give the site larger inputs or more seeds (`seeds_for`)")
         elif ratio > PARITY:
             over.append(f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the reference's over "
-                        f"{count} seeds (allowed {PARITY})")
+                        f"{count} seeds, {CONFIDENCE:.1%} interval [{low:.3f}, {high:.3f}] "
+                        f"(allowed {PARITY})")
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
         if not within(my_row, ROW_FACTOR * their_row):
             over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
