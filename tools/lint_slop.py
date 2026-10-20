@@ -1340,9 +1340,10 @@ EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "re
             "aiohttp.", "grpc.", "huggingface_hub.", "fsspec.", "gcsfs.", "google.", "boto3.", "botocore.",
             "filelock.", "multiprocessing.", "concurrent.futures.ProcessPoolExecutor.", "os.kill.",
             "os.killpg.", "os.waitpid.", "os.fork.", "os.posix_spawn.", "jax.distributed.",
-            "IPython.display.")
+            "IPython.display.display.", "IPython.display.update_display.", "IPython.display.clear_output.")
 """What leaves the process: a subprocess, the network, a remote service, another process (a
-notebook's frontend, which IPython's display messages reach over the kernel's socket)."""
+notebook's frontend, which IPython's display functions publish to over the kernel's socket; its
+representations, such as `HTML`, are built in the process)."""
 
 
 WAITS = {"wait", "wait_for", "join", "get", "put", "acquire"}
