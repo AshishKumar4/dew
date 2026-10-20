@@ -184,7 +184,8 @@ def test_an_sglang_stream_is_cut_at_the_stop_however_its_events_split_ids_and_li
     """SGLang's events slice a draw's ids and log-probabilities apart: a stop arrives with ids after it
     and its log-probability an event later, under no id. The draw ends at the stop with each id's own
     likelihood, read by position, and the stream is closed there with its tail unread. An error event
-    mid-stream (SGLang's abort) is an infrastructure failure, the stream closed all the same."""
+    mid-stream (SGLang's abort) or a dropped connection is an infrastructure failure, the stream closed
+    all the same."""
     stream = Streamed([sglang_event([3, 5], [-.5]), sglang_event([EOS, 11, 12], [-1.]),
                        sglang_event([], [-.25, -2., -3.]), sglang_event([13], [-4.]),
                        sglang_event([14], [-5.], "length")])
@@ -207,6 +208,27 @@ def test_an_sglang_stream_is_cut_at_the_stop_however_its_events_split_ids_and_li
     finally:
         server.close()
     assert failing.closed
+
+    # A connection lost mid-stream is the engine's failure too, which openai 3.14 and later raise as
+    # an API connection error.
+    reset = Reset([sglang_event([3], [-.5]), sglang_event([5], [-1.])])
+    server = streamed_server(reset)
+    try:
+        with pytest.raises(InfrastructureError):
+            server.submit([1, 2], 8, key=0).result()
+    finally:
+        server.close()
+    assert reset.closed
+
+
+class Reset(Streamed):
+    """An event stream whose connection drops after its first event."""
+
+    def __iter__(self):
+        for event in self.events[:1]:
+            self.sent += 1
+            yield f"data: {json.dumps(event)}\n\n".encode()
+        raise httpx2.ReadError("connection reset by peer")
 
 
 @pytest.mark.parametrize("provider", ["vllm", "sglang"])
