@@ -357,7 +357,7 @@ def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width()
     from dew.registry import mixers
 
     mixer = mixers.build("kimi_delta_attention", linear_num_heads=2, linear_head_dim=16)
-    model = CausalTransformer(**{**TINY_DECODER, "max_seq_len": 128}, mixer=mixer)
+    model = CausalTransformer(**{**TINY_DECODER, "vocab_size": 16, "max_seq_len": 128}, mixer=mixer)
     ids = jnp.array([[2, 7, 11, 3, 5, 1, 9, 4]], jnp.int32)
     variables = model.init(jax.random.key(4), ids)
     with jax.enable_x64(new_val=True):
