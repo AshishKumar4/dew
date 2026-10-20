@@ -136,6 +136,16 @@ def _placed(resident: jax.Array, incoming: jax.Array, rows: jax.Array, groups: i
     return from_words(placed.reshape(words.shape), resident.dtype)
 
 
+def _taken(resident: jax.Array, rows: jax.Array, groups: int) -> jax.Array:
+    """`resident`'s rows at `rows`, group by group, as `_placed` writes them; a row at the
+    group's size reads zeros."""
+    def take(resident: jax.Array, rows: jax.Array) -> jax.Array:
+        return jnp.take(resident, rows, axis=0, mode="fill", fill_value=0)
+
+    taken = jax.vmap(take)(grouped(resident, 0, groups), grouped(rows, 0, groups))
+    return taken.reshape(rows.shape[0], *resident.shape[1:])
+
+
 def _seated(state: Slots, decoder: DecoderState, real: jax.Array, admission: Admission, groups: int) -> Slots:
     """`state` with the prefilled cache, and the rows whose prompt ended seated to draw."""
     capacity = state.tokens.shape[1] // 2
@@ -206,20 +216,31 @@ class Paged:
 
         The piece runs over the shared pool with the page table and cursor the
         host supplies per row, so it reads earlier pieces and shared prefix
-        pages and writes its keys to the row's own pages; per-row leaves and
-        logits are scattered back to the rows' slots.
+        pages and writes its keys to the row's own pages. Any other per-row
+        state (a recurrent mixer's memory, image groups) comes from the row's
+        slot for a piece that continues the row, and fresh, as the model
+        allocates it, for one that starts it. Per-row leaves and logits are
+        scattered back to the rows' slots.
         """
-        def view(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array) -> jax.Array:
+        rows = admission.cursors.shape[0]
+        allocated = model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"]
+        continues = admission.cursors > 0
+
+        def view(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array, fresh: jax.Array) -> jax.Array:
             name = leaf_name(path)
             if name == TABLE:
                 return admission.tables
             if name in ROW_CURSORS:
                 # A text row's next position is its count of tokens (`dew.nn.kv_cache.POSITION`).
                 return admission.cursors
-            return leaf
+            if name in POOLED:
+                return leaf
+            held = _taken(leaf, admission.slots, self.groups)
+            return jnp.where(continues.reshape(rows, *(1,) * (held.ndim - 1)), held, fresh)
 
+        cache = jax.tree_util.tree_map_with_path(view, state.decoder.cache, allocated)
         fresh, real = prefill_state(model, params, admission.prompts, decode_ops(model, params, pad_id, None),
-                               cache=jax.tree_util.tree_map_with_path(view, state.decoder.cache))
+                                    cache=cache)
 
         def merged(path: tuple[jax.tree_util.KeyEntry, ...], resident: jax.Array,
                    updated: jax.Array) -> jax.Array:

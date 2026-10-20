@@ -593,6 +593,47 @@ def test_a_multimodal_model_serves_over_its_language_models_cache(options):
         np.testing.assert_array_equal(served.host().tokens[:, :walked.shape[1]], walked)
 
 
+def hybrid_task():
+    """Qwen3.5's stack at toy size: two gated-delta-net layers, whose recurrent memory and conv
+    tail are each row's own state, and one full-attention layer, whose keys a paged server pages."""
+    model = CausalTransformer(
+        vocab_size=VOCAB, emb_features=16, num_layers=3, num_heads=2, num_kv_heads=2, head_dim=8,
+        mlp_features=32, max_seq_len=128, dtype="float32",
+        layer_types=("linear_attention",) * 2 + ("full_attention",),
+        kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
+            "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
+            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}})
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    return TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=EOS))
+
+
+@pytest.mark.parametrize("options", [
+    {}, {"kv_cache": KVCache(page_size=4, pages=64)},
+    {"kv_cache": KVCache(page_size=4, pages=64), "chunk": 3},
+], ids=["dense", "paged", "paged-chunked"])
+def test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages(options):
+    """A paged server keeps the attention layer's keys in its pool and each row's recurrent state
+    in the row's slot: a row starts from a fresh state, wherever a former occupant left its own,
+    and a prompt prefilled three tokens a step continues the state its earlier pieces left. Every
+    row is the lone task call's."""
+    bound = hybrid_task()
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    _, tickets = served_alongside(bound, **options)
+    for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), lone)
+
+
+def test_a_shared_prefix_is_refused_where_rows_hold_state_beside_their_pages():
+    """A shared prefix's pages hold its keys and nothing of the recurrent state its prompt left,
+    so a row reusing them would start that state from nothing: the server refuses the prefix
+    cache for such a stack rather than serve it."""
+    with pytest.raises(ValueError):
+        Server.from_task(hybrid_task(), slots=4, capacity=128, kv_cache=KVCache(page_size=4, pages=64),
+                         prefix_cache=True)
+
+
 def served_alongside(bound, slots=4, admission=2, **options):
     """Every prompt submitted at once, plus the longest again once it is done,
     through a server with `options`; returns the server and the tickets."""
