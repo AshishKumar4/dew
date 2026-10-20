@@ -74,5 +74,3 @@ class Observe:
         self.values = [*((at, held) for at, held in self.values if at != step), (step, value)]
         self._seen.add(step)
 
-
-__all__ = ["Observe"]
