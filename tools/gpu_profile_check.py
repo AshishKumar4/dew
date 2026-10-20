@@ -44,7 +44,7 @@ def capture(out: Path) -> dict:
     from trace_window import busy_time, device_events
 
     import dew
-    from dew.nn.kernels.tuning import samples
+    from dew.telemetry.benchmark import samples
     from dew.telemetry.profile import attributed_ops
 
     def layers(x, weights):

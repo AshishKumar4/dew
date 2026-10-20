@@ -32,7 +32,7 @@ from dew.data.pipeline import Dataset
 from dew.data.storage import Readable, Store, content_version, local
 from dew.records import integer, record
 
-from .base import Read, Shard, ShardManifest, preparing
+from .base import Read, Shard, ShardManifest, preparing, url_label
 from .index import ArrayIndex
 
 type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record", "files", "webdataset"]
@@ -260,6 +260,9 @@ class Files(Dataset):
         if not found:
             raise FileNotFoundError(f"source {self.url!r} matched no {self.kind} files")
         return tuple(found)
+
+    def label(self) -> str:
+        return url_label(self.url if isinstance(self.url, str) else self.url[0])
 
     def describe(self) -> str:
         return f"files:{self.kind}:{self.url}"
