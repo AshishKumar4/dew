@@ -63,7 +63,7 @@ Each `MeshSpec` field sets how many devices one axis gets, and the `data` axis g
 | `expert` | `expert` | The expert dimension of mixture-of-experts layers, and batch rows |
 | `fsdp` | `fsdp` | Parameter dimensions the layout assigns to it, and batch rows |
 | `tensor` | `tensor` | The MLP hidden width, attention heads and vocabulary (Megatron's split) |
-| `sequence` | `sequence` | Token positions, for sequence-parallel attention |
+| `sequence` | `sequence` | Token positions, for sequence-parallel attention, and with `fsdp` the parameter dimensions the layout assigns to `fsdp` |
 | `stage` | `stage` | The decoder's layer stack, into pipeline stages |
 
 ```python
@@ -84,7 +84,7 @@ print(dict(MeshSpec(fsdp=4, sequence=2).build().shape))
 
 ### A native mesh
 
-`Trainer(mesh=...)`, `Checkpoints.variables(mesh=...)`, `dew.pipeline(..., mesh=...)` and `Pretrained.load(..., mesh=...)` also take a `jax.sharding.Mesh` you build yourself, with axes of any names. `Layout.rules` maps the model's logical axes onto them, and `Layout(data_axes=...)` names the axes a batch's rows split over, which the run's data shares, its batch placement and its row counts read (`dew.nn.sharding.batch_axes` under the layout's rules, which the trainer puts in context). A rule that names an axis the mesh lacks is refused by name, except Dew's own role axes, which a mesh without them treats as size 1. The data, sequence and stage axes never hold a parameter. The expert exchange, sequence-parallel attention, the pipeline and the tensor-parallel heuristics run on the axes named `expert`, `sequence`, `stage` and `tensor`; any other axis, a second fsdp level or a context axis, holds parameters and rows as your rules place them.
+`Trainer(mesh=...)`, `Checkpoints.variables(mesh=...)`, `dew.pipeline(..., mesh=...)` and `Pretrained.load(..., mesh=...)` also take a `jax.sharding.Mesh` you build yourself, with axes of any names. `Layout.rules` maps the model's logical axes onto them, and `Layout(data_axes=...)` names the axes a batch's rows split over, which the run's data shares, its batch placement and its row counts read (`dew.nn.sharding.batch_axes` under the layout's rules, which the trainer puts in context). A rule that names an axis the mesh lacks is refused by name, except Dew's own role axes, which a mesh without them treats as size 1. The data and stage axes never hold a parameter. The expert exchange, sequence-parallel attention, the pipeline and the tensor-parallel heuristics run on the axes named `expert`, `sequence`, `stage` and `tensor`; any other axis, a second fsdp level or a context axis, holds parameters and rows as your rules place them.
 
 ```python
 from dew.training import Layout
@@ -114,9 +114,11 @@ Modules declare logical axes such as `embed`, `mlp`, `heads`, `kv`, `vocab` and 
 | `host_parameters` | `()` | Globs of variables an inference placement keeps in pinned host memory |
 | `frozen_whole` | `False` | Keep the frozen collection (a LoRA run's base) whole over `fsdp`, split only over the other axes its rules give it |
 
-A parameter that no module declares logical axes for is split on its largest dimension that the `fsdp` size divides. `Layout.check` raises `LayoutRefused` when more than `tolerance` of the shardable elements stay replicated, and it lists the largest replicated parameters. Raising `tolerance` only hides the problem, so fix the placement. A rule that puts a parameter on `data`, `sequence` or `stage` is refused.
+A parameter that no module declares logical axes for is split on its largest dimension that the `fsdp` size divides. `Layout.check` raises `LayoutRefused` when more than `tolerance` of the shardable elements stay replicated, and it lists the largest replicated parameters. Raising `tolerance` only hides the problem, so fix the placement. A rule that puts a parameter on `data` or `stage` is refused.
 
-`frozen_whole` is for a frozen base that fits on each device. A frozen leaf has no gradient and no optimizer state, so splitting it over `fsdp` saves only its memory while the step gathers it whole forward and again backward. With `frozen_whole=True` each device keeps it whole instead (a `tensor` split stays), `Layout.check` counts none of its leaves, and a leaf `host_parameters` also names is kept whole in pinned host memory.
+The `sequence` axis's devices compute their own positions with the same weights, as `fsdp`'s compute their own rows, so the two hold the training state between them. Whatever the rules put on `fsdp` is split over `fsdp` and `sequence` together wherever their product divides that dimension and the pair leaves the other axes' splits as they are, and over `fsdp` alone otherwise. On `MeshSpec(fsdp=2, sequence=2)` a parameter the pair splits lies on each device as on `MeshSpec(fsdp=4)`, a quarter of it, and so do its optimizer moments, its EMA copy and its gradient; on `MeshSpec(sequence=N)` an N-th. Parameters below `min_shard` stay replicated, and `frozen_whole` keeps the frozen collection whole over both. A step reads such a weight as it reads an `fsdp` split. torchtitan's FSDP shards over its `dp_shard` and `cp` axes together in the same way. `Layout.check` counts the axes the rules name, so a `sequence` size that divides none of a parameter's dimensions leaves that parameter whole over `sequence` without a refusal.
+
+`frozen_whole` is for a frozen base that fits on each device. A frozen leaf has no gradient and no optimizer state, so splitting it over `fsdp` and `sequence` saves only its memory while the step gathers it whole forward and again backward. With `frozen_whole=True` each device keeps it whole over both instead (a `tensor` split stays), `Layout.check` counts none of its leaves, and a leaf `host_parameters` also names is kept whole in pinned host memory.
 
 Optimizer moments and EMA copies have the same shapes as their parameters and are placed the same way. When a checkpoint is restored, Dew builds the restore template for the layout you asked for, so a run can resume on a different mesh as long as the parameter names and shapes match the saved state.
 

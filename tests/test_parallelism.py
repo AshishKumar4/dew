@@ -27,6 +27,7 @@ from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator, shard_batch
+from dew.training.evaluation import WARM_BATCHES
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -570,8 +571,9 @@ def test_fit_end_to_end_with_validation_and_metrics(tmp_path, fsdp_size):
     assert int(state.step) == 2
     sharded = [x for x in jax.tree.leaves(state.ema) if 'fsdp' in str(x.sharding.spec)]
     assert bool(sharded) == (fsdp_size > 1)
-    # A pass after step 1 and one at the end, two batches each.
-    assert seen == [((BATCH, 3), (BATCH, RES, RES, 3))] * 4
+    # The pass that warms the evaluations before the first step, then one after step 1 and one
+    # at the end, two batches each.
+    assert seen == [((BATCH, 3), (BATCH, RES, RES, 3))] * (WARM_BATCHES + 4)
     scores = [s["val/sample_range"] for _, s in tracker.scalars if "val/sample_range" in s]
     assert len(scores) == 2 and all(np.isfinite(score) and score > 0 for score in scores)
     assert [step for step, value in tracker.artifacts if isinstance(value, Representations)] == [1, 2]
