@@ -2,7 +2,7 @@
 
 This page records the original API design and how it was built. The statistics-first C01/C02 cutover replaced its scalar-loss, MultiSteps, mutable-router and checkpoint-field examples. Its registry decorators and name records were later replaced by import paths and static aliases (`dew.registry`). For contracts you can run, read the [current core API](../reference/core-api.md) and the [objective guide](../concepts/objectives.md).
 
-Design record, 2026-09-03. The code blocks are design sketches, not runnable code. The examples describe the revisions they cite. [Training](training.md), [data](data.md) and [post-training](post-training.md) define the binding topic contracts; the [roadmap](../roadmap.md) owns implementation and qualification work.
+Design record, 2026-09-03. The code blocks are design sketches, not runnable code. The examples describe the revisions they cite.
 
 ## 0. The decisions
 
