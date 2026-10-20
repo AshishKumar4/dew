@@ -180,11 +180,12 @@ jobs:
     # A straggler at the end runs again (task.speculative). Tasks share XLA's
     # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
     # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets.
-    # Every task runs on one CPU model, AMD EPYC 25/17, which most of the
-    # fleet's hosts have (task.cpu: armada replaces a container that starts on
-    # another before it takes a task). Over the 16 runs before 2026-10-20 15:00
-    # a test took a median 2.0 times as long on 25/1 hosts and 1.35 on 26/17,
-    # and those hosts' tasks were a run's slowest.
+    # Every suite task runs on AMD EPYC 25/17 (task.cpu): armada replaces a
+    # container on another CPU model before it takes a task. Of 1,264 containers
+    # in the 16 runs before 2026-10-20 15:00, 1,025 landed on 25/17.
+    # Per-test median time ratios against 25/17 were 2.0 on 25/1 and 1.35 on
+    # 26/17. In dew-20261020144644-dceff433, the three tasks on 25/1 were
+    # the run's three slowest.
     # This job sends the commit, waits, and prints each red row's output; a
     # failed test, a test skipped on a missing import and a file left
     # unreported each fail it. A commit armada already graded green, as one
