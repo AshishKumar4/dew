@@ -35,8 +35,9 @@ from dew.inference import Draw, VLLMGenerateServer
 from dew.objectives.rl.episodes import EpisodeStatus, Observation
 from dew.objectives.rl.records import episode_from_record
 from dew.objectives.rl.rollout import prompt_tasks
-from dew.objectives.rl.sessions import Status, Task, Transcript, pack
+from dew.objectives.rl.sessions import Status, Task, Transcript, pack, session_metrics
 from dew.objectives.rl.sources import EnvironmentSource, PromptSource
+from dew.objectives.rl.verl import from_verl, to_verl
 from dew.rl.sandbox import ContainerRunner, SandboxFleet
 from dew.sampling import Sampling
 
@@ -531,11 +532,14 @@ def test_a_transforming_server_with_or_without_raw_likelihoods_runs_and_records_
     np.testing.assert_array_equal(batch["behavior_log_probs"][batch["response_mask"] > 0], -.5)
 
 
+def text(value):
+    """One prompt row's UTF-8 field, as a prompt batch stores it."""
+    row = np.zeros((1, 8), np.int32)
+    row[0, :len(value)] = list(value.encode())
+    return row
+
+
 def prompt_batch():
-    def text(value):
-        row = np.zeros((1, 8), np.int32)
-        row[0, :len(value)] = list(value.encode())
-        return row
     return {"prompt": np.asarray([[0, 0, 1, 2]], np.int32), "prompt_length": np.asarray([2], np.int32),
             "data_source": text("math"), "ground_truth": text("5"), "extra_info": text("")}
 
@@ -560,6 +564,31 @@ def test_the_prompt_source_scores_decoded_text_without_eos_and_masks_the_budget_
     assert long.submit(task, 1, version=0, key=KEY)[0].result(timeout=10).status == Status.TRUNCATED
     prompts.close()
     long.close()
+
+
+def test_a_prompt_sessions_source_is_its_data_source_and_the_metrics_report_each():
+    """A prompt's `data_source` names its session's source; sessions from two sources report each
+    one's reward mean and status shares beside the batch's, and a verl export keeps the source."""
+    def batch(source, answer):
+        rows = prompt_batch()
+        return {**rows, "data_source": text(source), "ground_truth": text(answer)}
+
+    [math], [code] = prompt_tasks(batch("math", "5")), prompt_tasks(batch("code", "6"))
+    prompts = PromptSource(Server(), lambda completion, record: float(completion == record.ground_truth),
+                           decode=lambda ids: " ".join(map(str, ids)), max_new_tokens=4)
+    try:
+        submitted = [future for task in (math, code)
+                     for future in prompts.submit(task, 2, version=0, key=KEY)]
+        sessions = [future.result() for future in submitted]
+    finally:
+        prompts.close()
+    expected = [("math", 1.0)] * 2 + [("code", 0.0)] * 2
+    assert [(session.source, session.reward) for session in sessions] == expected
+    metrics = session_metrics(sessions, pack(sessions, 16))
+    assert (metrics["source/math/reward/mean"], metrics["source/code/reward/mean"]) == (1.0, 0.0)
+    assert metrics["source/math/status/completed"] == metrics["source/code/status/completed"] == 1.0
+    assert metrics["reward/mean"] == 0.5
+    assert [trajectory.session for trajectory in from_verl(json.loads(json.dumps(to_verl(sessions))))] == sessions
 
 
 def test_the_prompt_sources_calls_carry_the_draws_routing_into_the_packed_batch():
