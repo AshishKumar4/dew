@@ -319,7 +319,8 @@ def _attention_preferred(case: AttentionCase) -> str:
     xla for a query no fused kernel takes the dtype of, else its row's ('attention', cuDNN by
     default), and the narrow heads' row's ('attention_narrow') for heads at most 64 wide with no
     window, mask, bias, documents or key lengths: by default tokamax's Triton kernel, measured faster
-    than cuDNN there on an L4 and an RTX 4080; the A100's and H100's rows name flash."""
+    than cuDNN there on an L4 and an RTX 4080; the A10's, A100's and H100's rows name flash, measured
+    faster than both (`generation.TARGETS`)."""
     backend = generation.backend()
     if backend != 'gpu':
         return 'tpu' if backend == 'tpu' else 'xla'
