@@ -637,9 +637,9 @@ def agent_episode_figure():
     svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
     segments = [("question", ["Natalia sold", "48 clips…"], "none", False),
                 ("action", ["<tool_call>", "print(48+24)"], "accent_fill", True),
-                ("tool", ["<tool_", "response>72"], "tint1", False),
+                ("tool", ["response:", "72"], "tint1", False),
                 ("action", ["So the answer", "is \\boxed{72}."], "accent_fill", True)]
-    widths, y, h = [90, 108, 96, 116], 46, 64
+    widths, y, h = [90, 108, 76, 116], 46, 64
     svg.text(18, 30, "one episode, read left to right", size=13, color="muted")
     x, lefts = 18, []
     for k, ((who, lines, fill, trained), w) in enumerate(zip(segments, widths, strict=True)):
