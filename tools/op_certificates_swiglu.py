@@ -81,10 +81,10 @@ def probe(fn, operands, config, dtypes=(jnp.float32,)):
 # Each node: its name, its parents, the operation as the kernel writes it, and its contract: "exact"
 # (RN of the exact result, the oracle named) or "ulps" (the correctly rounded value, the oracle named).
 FORWARD = [
-    ("neg", ("g",), lambda g: -g, ("exact", "neg")),
+    ("neg", ("g",), lambda g: -g, ("exact", "neg")),  # Pallas lowers -g as 0 - g: -(+0) is +0
     ("e", ("neg",), jnp.exp, ("ulps", "exp")),
     ("d", ("e",), lambda e: 1 + e, ("exact", "add1")),
-    ("s", ("d",), lambda d: 1 / d, ("exact", "recip")),
+    ("s", ("d",), lambda d: 1 / d, ("ulps", "recip")),  # div.full.f32 on an A100, not div.rn
     ("a", ("g", "s"), lambda g, s: g * s, ("exact", "mul")),
 ]
 """The forward's sigmoid and its product with the gate, as Pallas lowers `jax.nn.sigmoid`
@@ -104,7 +104,7 @@ BACKWARD = [
 def oracle(kind: str, parents, fmt=oc.FLOAT32):
     x = [np.asarray(parent, np.float64) for parent in parents]
     return {
-        "neg": lambda: -x[0],
+        "neg": lambda: oc.exact_add(np.zeros_like(x[0]), -x[0], fmt),
         "add1": lambda: oc.exact_add(np.ones_like(x[0]), x[0], fmt),
         "rsub1": lambda: oc.exact_add(np.ones_like(x[0]), -x[0], fmt),
         "recip": lambda: oc.exact_div(np.ones_like(x[0]), x[0], fmt),
