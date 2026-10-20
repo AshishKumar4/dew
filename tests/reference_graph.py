@@ -2,10 +2,11 @@
 distance from float64 with the node's sentinel and NaN rules, and the permutation of a node's summed
 axis that is its orbit (tests/reference_error.py `assert_graph_as_exact`).
 
-No asserted test relies on the gate's attention key-sum nodes (a denominator or an accumulator summed
-over keys) until ledger row 758 closes: equally exact key sums are flagged at every stage on some
-workers (2 of 768 elements at 48 keys on an x86-64-v3 worker, none on x86-64-v4), the rate and its
-root cause not yet measured per worker ISA."""
+A Sum node's members are the canonical Sum family (reference_trees.sum_family), declared on the
+reference's node beside it and certified at the paired 5% margin (reference_error.admitted_members):
+two trees equally exact on average differ in expected error element by element, so a node held
+against the reference's one tree flags equally exact code on the workers whose tree is luckier there
+(ledger 758: attention's key sums, 2 of 768 elements on AVX2, none on AVX-512)."""
 
 from collections.abc import Mapping
 
