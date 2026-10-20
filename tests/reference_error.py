@@ -217,12 +217,13 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
     for ((path, mine), theirs, true, summed), their_distance in zip(leaves, measured, strict=True):
         name = label + jax.tree_util.keystr(path)
         my_distance = distance(mine, true)
-        if not within(my_distance, FACTOR * their_distance):
+        # A leaf one draw cannot resolve is underpowered whatever its ratio, which says nothing of it.
+        if their_distance > 0 and (short := underpowered(mine, theirs, true)):
+            over.append(f"{name}: {short}")
+        elif not within(my_distance, FACTOR * their_distance):
             over.append(f"{name}: dew is {my_distance:.3e} from float64 (rms), the reference "
                         f"{their_distance:.3e} (ratio {my_distance / max(their_distance, 1e-300):.2f}, "
                         f"allowed {FACTOR})")
-        elif their_distance > 0 and (short := underpowered(mine, theirs, true)):
-            over.append(f"{name}: {short}")
         over += [f"{name}: {row}" for row in rows_over(mine, theirs, true, summed)]
     assert not over, "\n".join(over)
 
@@ -311,11 +312,12 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     itself resolves FACTOR; jit the two functions so every seed reuses one compiled program.
 
     A leaf passes when its pooled ratio (`_pooled`) is at most FACTOR and its seeds resolve it: the
-    ratio's CONFIDENCE bootstrap interval over them no wider than FACTOR. An unresolved leaf is
-    inconclusive, never a pass: its site takes larger inputs or more seeds; one whose whole interval
-    lies over FACTOR is over it, resolved or not. A leaf over FACTOR is drawn again over REDRAW times
-    as many further declared seeds, and fails if it is still over: a finding in the code or the
-    reference arm. A leaf the reference holds exactly on every seed, Dew must too.
+    ratio's CONFIDENCE bootstrap interval over them no wider than FACTOR, or lying wholly at or under
+    it. An interval that straddles FACTOR and is wider than it is inconclusive, never a pass: its site
+    takes larger inputs or more seeds; one lying wholly over FACTOR is over it, however wide. A leaf
+    over FACTOR is drawn again over REDRAW times as many further declared seeds, and fails if it is
+    still over: a finding in the code or the reference arm. A leaf the reference holds exactly on
+    every seed, Dew must too.
 
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
@@ -331,8 +333,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                 over.append(f"{leaf}: the reference equals float64 on every seed and dew does not")
             continue
         low, high = _interval(a, b)
-        # A ratio whose whole interval lies over FACTOR is over it however wide the interval.
-        if low <= FACTOR and not _resolves(low, high):
+        # Decided where the whole interval lies on one side of FACTOR, however wide; straddling it, an
+        # interval wider than FACTOR cannot tell an equally exact computation from one FACTOR off.
+        if low <= FACTOR < high and not _resolves(low, high):
             over.append(f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s {CONFIDENCE:.1%} interval "
                         f"over {seeds} seeds is [{low:.3f}, {high:.3f}], wider than {FACTOR}; give the site "
                         f"larger inputs or more seeds (`seeds_for`)")
