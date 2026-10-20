@@ -39,6 +39,10 @@ REGISTERS = 64 * 1024
 """32-bit registers per multiprocessor, the same 64 K from compute capability 5.0 to 12.x (CUDA C++
 Programming Guide, "Technical Specifications per Compute Capability")."""
 
+THREAD_REGISTERS = 255
+"""32-bit registers one thread may hold, compute capabilities 5.0 to 12.x (the same table); what a
+kernel needs past them it spills to memory."""
+
 RESERVED_SHARED = 1024
 """Shared memory the driver reserves for each resident block, from compute capability 8.0 on (CUDA C++
 Programming Guide, "Shared Memory" of compute capabilities 8.x and 9.0): a multiprocessor holds the
@@ -65,7 +69,7 @@ def resident(target: generation.GpuTarget, staged: int, threads: int, registers:
     being fitted to a block (`Template.fitting`)."""
     shared = generation.shared_budget(target) + RESERVED_SHARED
     by_shared = shared // (staged + RESERVED_SHARED)
-    by_registers = REGISTERS // (threads * min(registers, 255))
+    by_registers = REGISTERS // (threads * min(registers, THREAD_REGISTERS))
     return max(1, min(by_shared, by_registers))
 
 
