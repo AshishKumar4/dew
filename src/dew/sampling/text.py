@@ -392,12 +392,14 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
 
 
 def _empty_cache(model: nn.Module, params: Variables, batch: int, ops: DecodeOps) -> Variables:
-    """A zeroed decode cache for `batch` rows, with the drafter's own beside it."""
-    cache = flatten_dict(dict(model.apply(params, batch, method="init_cache", mutable=["cache"])[1]["cache"]))
+    """A zeroed decode cache for `batch` rows, with the drafter's own beside it. A decoder whose every
+    mixer is tokenwise (`MLPMixer`) keeps no cache, and its collection is empty."""
+    def initialized(method: str) -> dict:
+        return flatten_dict(dict(model.apply(params, batch, method=method, mutable=["cache"])[1].get("cache", {})))
+
+    cache = initialized("init_cache")
     for method in ("init_mtp_cache",) * bool(ops.depths) + ("init_draft_cache",) * (ops.record is not None):
-        cache.update(
-            flatten_dict(dict(model.apply(params, batch, method=method, mutable=["cache"])[1]["cache"]))
-        )
+        cache.update(initialized(method))
     return unflatten_dict(cache)
 
 
