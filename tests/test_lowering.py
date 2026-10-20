@@ -218,7 +218,9 @@ def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generati
     through its portable arithmetic (`generation.linear_tangent`)."""
     with routes() as taken:
         lowered = _experts_lowered(generation, 'auto')
-    kernels = {route.kernel for route in taken if route.choice == 'grouped_matmul'}
+    # The layer's own launches, as traced for `generation`; its initialization runs on the CPU.
+    kernels = {route.kernel for route in taken
+               if route.choice == 'grouped_matmul' and route.target == generation}
     grouped = {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}
     assert kernels and kernels <= {'triton', 'mosaic_gpu'}
     lowered_grouped = set(triton_kernels(lowered)) & grouped
