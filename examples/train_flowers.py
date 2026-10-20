@@ -2,6 +2,13 @@
 
 CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda python examples/train_flowers.py \\
     --data ~/.cache/dew/datasets/oxford_flowers102/2.1.1 --steps 1000
+
+It trains on every record: no split is held out, and nothing is scored. With `--profile N` it is a
+profiling run, which traces N steps into `<output>/profile` after two warm-up steps and draws no
+samples:
+
+CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda python examples/train_flowers.py \\
+    --data ~/.cache/dew/datasets/oxford_flowers102/2.1.1 --steps 50 --profile 20
 """
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,10 +24,12 @@ from dew.artifacts import uint8_pixels
 from dew.config import OptimConfig
 from dew.config.data import Augment, ImageData, loader
 from dew.data import TFDS, Loading
+from dew.data.dataset import Loader
 from dew.diffusion.presets import EDM
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
 from dew.sampling import Heun
+from dew.training import ProfileWindow
 
 
 @dataclass
@@ -29,16 +38,25 @@ class Config:
     output: Path = Path("runs/flowers64")
     steps: int = 1000
     batch: int = 16
+    image_size: int = 64
+    profile: int = 0  # steps to trace; above 0 the run only profiles and draws no samples
 
 
-def main(config: Config):
-    data = loader(ImageData(
+def flowers(config: Config) -> ImageData:
+    """Every training record of the prepared split; none is held out."""
+    return ImageData(
         source=TFDS("oxford_flowers102", split="train", path=str(config.data.expanduser())),
-        image_size=64,
+        image_size=config.image_size,
         caption_templates=("a photo of a {}",),
         augment=Augment(flip=True, jitter=True),
-    ), batch=config.batch, read="memory",
-        loading=Loading(workers=2, threads=2, read_buffer=16, worker_buffer=2))
+        validation=None,
+    )
+
+
+def main(config: Config, data: Loader | None = None):
+    if data is None:
+        data = loader(flowers(config), batch=config.batch, read="memory",
+                      loading=Loading(workers=2, threads=2, read_buffer=16, worker_buffer=2))
     model = SimpleDiT(
         patch_size=4,
         emb_features=128,
@@ -50,13 +68,15 @@ def main(config: Config):
     objective = DiffusionObjective(
         model,
         EDM(regime="pixel"),
-        InputSpec(Field("image", (64, 64, 3))),
+        InputSpec(Field("image", (config.image_size, config.image_size, 3))),
     )
     trainer = Trainer(
         objective,
         OptimConfig(learning_rate=2e-4),
         key=jax.random.key(0),
         checkpoints=Checkpoints(str(config.output / "checkpoints")),
+        profile=(ProfileWindow(str(config.output / "profile"), steps=config.profile)
+                 if config.profile else None),
     )
     state = trainer.fit(
         data,
@@ -64,10 +84,13 @@ def main(config: Config):
         log_every=20,
         checkpoint_every=200,
     )
+    if config.profile:
+        print(f"Wrote a {config.profile}-step trace to {config.output / 'profile'}")
+        return state
 
     process = objective.process
     denoise = process.denoiser(model, state.averaged, conditions={})
-    noise = process.noise(jax.random.key(1), (8, 64, 64, 3))
+    noise = process.noise(jax.random.key(1), (8, config.image_size, config.image_size, 3))
     images = sample(
         denoise,
         noise,
