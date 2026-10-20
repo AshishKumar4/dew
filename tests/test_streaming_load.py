@@ -220,7 +220,8 @@ def test_a_source_trained_from_keeps_its_arrays_after_the_step_donates_the_state
     fixture = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
     loaded = Pretrained.load(fixture, dtype="float32", attention_impl="reference")
     before = jax.device_get(loaded.variables)
-    layout = Layout(host=("variables",) if where == "host" else (), min_shard=1, tolerance=1.)
+    # The default layout replicates a small source's leaves, so its placed state can share their buffers.
+    layout = Layout(host=("variables",)) if where == "host" else Layout()
     trainer = Trainer(LMObjective(loaded, 8, ema_decay=None), optax.sgd(0.1), key=jax.random.key(5),
                       layout=layout)
     batch = {"text": jnp.tile(jnp.arange(1, 10, dtype=jnp.int32)[None], (jax.device_count(), 1))}
