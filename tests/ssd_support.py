@@ -81,7 +81,7 @@ def ssd_value_and_grad(scan, operands, dy, dfinal):
 
 
 def mamba_ssd_xla(arrays, chunk, dtype=None):
-    """The mamba_ssm recorder's XLA sizing proxy and float64 truth, with optional native input casts."""
+    """The recorder's XLA sizing proxy and float64 cross-check, with optional native input casts."""
     operands = tuple(jnp.asarray(arrays[name], dtype if name in ("x", "B", "C") else None)
                      for name in ("x", "dt", "A", "B", "C", "D", "h0"))
     seq = arrays.get("seq")

@@ -17,6 +17,7 @@ Triton loads, so the fixture is mamba_ssm's algorithm at IEEE products, and reco
 (`reference_error.PRECISION`).
 """
 
+import itertools
 import os
 import subprocess
 import sys
@@ -63,14 +64,53 @@ def operands(rng, batch, tokens, heads, width, groups, state, dtype, documents) 
     }
 
 
-def write_seeded(scan, version, revision):
-    """Indexed fresh-input/head/P/N draws, native mamba_ssm outputs, and the existing XLA float64 truth.
+def minimal_truth(minimal, arrays, chunk):
+    """The upstream minimal reference in float64, composed over every native document and input.
+
+    Expanding grouped B/C only copies shared coordinates. Documents reset to zero, and padding with
+    zero-dt steps writes nothing and decays by exp(0)=1, so the final state and every native output
+    are unchanged. The artificial padding is removed before applying the original cotangents.
+    """
+    names = ("x", "dt", "A", "B", "C", "D", "h0")
+    inputs = tuple(torch.tensor(arrays[name], dtype=torch.float64, device="cuda", requires_grad=True)
+                   for name in names)
+    x, dt, A, Bm, Cm, D, h0 = inputs
+    batch, length, heads, _ = x.shape
+    Bm, Cm = (value.repeat_interleave(heads // value.shape[2], dim=2) for value in (Bm, Cm))
+    seq = arrays.get("seq")
+    rows, finals = [], []
+    for row in range(batch):
+        cuts = ([0, length] if seq is None else
+                [0, *(1 + np.flatnonzero(seq[row, 1:] != seq[row, :-1])), length])
+        outputs = []
+        for start, end in itertools.pairwise(cuts):
+            reset = seq is not None and (start > 0 or seq[row, 0] > 0)
+            initial = h0[row:row + 1, None] * (0 if reset else 1)
+            values = (x[row:row + 1, start:end] * dt[row:row + 1, start:end, :, None],
+                      A * dt[row:row + 1, start:end], Bm[row:row + 1, start:end], Cm[row:row + 1, start:end])
+            pad = (chunk - (end - start) % chunk) % chunk
+            blocked = tuple(torch.nn.functional.pad(value, (0, 0) * (value.ndim - 2) + (0, pad))
+                            for value in values)
+            output, final = minimal(*blocked, chunk, initial_states=initial)
+            outputs.append(output[:, :end - start] + x[row:row + 1, start:end] * D[None, None, :, None])
+        rows.append(torch.cat(outputs, dim=1))
+        finals.append(final)
+    output, final = torch.cat(rows, dim=0), torch.cat(finals, dim=0)
+    cotangents = tuple(torch.tensor(arrays[name], dtype=torch.float64, device="cuda")
+                       for name in ("dy", "dfinal"))
+    grads = torch.autograd.grad((output, final), inputs, cotangents)
+    return {name: value.detach().cpu().numpy() for name, value in
+            zip(("y", "final", *names), (output, final, *grads), strict=True)}
+
+
+def write_seeded(scan, minimal, version, revision):
+    """Indexed fresh-input/head/P/N draws with native mamba_ssm outputs and independent float64 truth.
 
     PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba_ssd_reference.py <checkout> --seeded
     """
     import jax
     import jax.numpy as jnp
-    from reference_error import widened
+    from reference_error import assert_computes_the_oracle, chain_roundings, widened
     from ssd_reference import provenance, record_case
     from ssd_support import mamba_ssd_xla, ssd_orbit
 
@@ -82,7 +122,10 @@ def write_seeded(scan, version, revision):
         def draw(seed, shape=shape, dtype=dtype, documents=documents):
             return ssd_orbit(operands(np.random.default_rng(seed), *shape, dtype, documents), seed)
 
-        def evaluate(arrays, chunk=chunk, dtype=dtype, exact_run=exact_run):
+        with jax.enable_x64(new_val=True):
+            roundings = chain_roundings(jax.make_jaxpr(exact_run)(widened(draw(0))))
+
+        def evaluate(arrays, chunk=chunk, dtype=dtype, exact_run=exact_run, roundings=roundings):
             cuda = {name: torch.tensor(value, device="cuda") for name, value in arrays.items()}
             inputs = tuple(cuda[name].to(dtype if name in ("x", "B", "C") else torch.float32)
                            .requires_grad_() for name in ("x", "dt", "A", "B", "C", "D", "h0"))
@@ -93,8 +136,12 @@ def write_seeded(scan, version, revision):
             names = ("y", "final", "x", "dt", "A", "B", "C", "D", "h0")
             reference = {name: value.detach().float().cpu().numpy() for name, value in
                          zip(names, (output, final, *grads), strict=True)}
+            truth = minimal_truth(minimal, arrays, chunk)
             with jax.enable_x64(new_val=True):
-                truth = jax.tree.map(np.asarray, exact_run(widened(arrays)))
+                twin = jax.tree.map(np.asarray, exact_run(widened(arrays)))
+            for name in truth:
+                assert_computes_the_oracle(twin[name], truth[name], f"mamba_ssm float64 {name}",
+                                          roundings=roundings)
             return reference, truth
 
         stored.update(record_case(
@@ -107,7 +154,8 @@ def write_seeded(scan, version, revision):
         f"mamba_ssm {version}", revision, torch.cuda.get_device_name(),
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu "
         "python tools/mamba_ssd_reference.py <checkout> --seeded",
-        truth="Dew's XLA chunk_ssd and all seven gradients in float64")
+        truth="mamba_ssm.modules.ssd_minimal.ssd_minimal_discrete in torch float64, per padded document",
+        cross_check="Dew XLA float64; assert_computes_the_oracle with its traced chain_roundings")
     destination = FIXTURE.with_name("ssd_mamba_ssm_seeded.npz")
     np.savez_compressed(destination, **stored)
     print(f"wrote {destination.name}", flush=True)
@@ -119,9 +167,11 @@ def main() -> None:
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
     if sys.argv[2:] == ["--seeded"]:
+        from mamba_ssm.modules.ssd_minimal import ssd_minimal_discrete
+
         revision = subprocess.run(["git", "-C", sys.argv[1], "rev-parse", "HEAD"], check=True,
                                   capture_output=True, text=True).stdout.strip()
-        write_seeded(mamba_chunk_scan_combined, __version__, revision)
+        write_seeded(mamba_chunk_scan_combined, ssd_minimal_discrete, __version__, revision)
         return
 
     rng = np.random.default_rng(SEED)
