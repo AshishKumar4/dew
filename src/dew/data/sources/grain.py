@@ -24,6 +24,9 @@ class Grain(Dataset):
     dataset: grain.MapDataset | grain.IterDataset
     name: str
 
+    def label(self) -> str:
+        return self.name
+
     def describe(self) -> str:
         return f"grain:{self.name}"
 
