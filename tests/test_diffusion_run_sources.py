@@ -19,7 +19,7 @@ import numpy as np
 import optax
 import pytest
 from diffusion_stubs import PROMPTS, batch_for
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact
 
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
 from dew.config.data import ImageData
@@ -420,6 +420,15 @@ def flux_shift(tokens: int, constants: str = "flux") -> float:
     return math.exp(SHIFTS[f"{constants}/mu"][list(SHIFTS["tokens"]).index(tokens)])
 
 
+SHIFT_SEEDS = 16
+"""Check 1's declared seeds for the shifted noise levels, sized by `seeds_for` (2026-10-21, on armada)."""
+
+
+def shift_times(seed: int) -> tuple[np.ndarray]:
+    """99 times in (0, 1), float32, as a schedule's grid holds them."""
+    return (np.random.default_rng(seed).uniform(0.005, 0.995, size=99).astype(np.float32),)
+
+
 @pytest.mark.parametrize("constants,fields", [
     ("flux", {}),
     ("long", {"max_tokens": 8192, "max_shift": 0.9}),
@@ -428,20 +437,32 @@ def test_the_resolution_shift_and_the_noise_levels_it_maps_to_are_diffusers(cons
     """At every token count, `ResolutionShift` and a loaded dynamic-shift
     scheduler file are exp(calculate_shift) to the bit, and the flow schedule
     at that shift maps each time to the noise level Diffusers'
-    `_time_shift_exponential` gives it at mu, held to the float64 rule, for
-    Flux's constants and a pipeline with another slope and span."""
+    `FlowMatchEulerDiscreteScheduler.time_shift` gives it at mu, run here, on
+    par with it over drawn times (check 1), for Flux's constants and a
+    pipeline with another slope and span."""
+    from diffusers import FlowMatchEulerDiscreteScheduler
+
     top_shift, top = fields.get("max_shift", 1.15), fields.get("max_tokens", 4096)
     loaded = SourceSchedule.from_config({
         "_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000,
         "use_dynamic_shifting": True, "base_shift": 0.5, "max_shift": top_shift,
         "base_image_seq_len": 256, "max_image_seq_len": top})
+    shifts = {}
     for index, tokens in enumerate(SHIFTS["tokens"]):
         shift = ResolutionShift(tokens=int(tokens), **fields).shift()
         assert shift == flux_shift(int(tokens), constants)
         assert loaded.training_process(int(tokens)).schedule.shift == shift
-        sigma = FlowMatchingScheduler(shift=shift).rates(SHIFTS["times"])[1]
-        assert_as_exact_as_the_reference(sigma, SHIFTS[f"{constants}/sigmas"][index],
-                                         SHIFTS[f"{constants}/sigmas_f64"][index], f"{constants} at {tokens}")
+        shifts[f"{tokens} tokens"] = (shift, float(SHIFTS[f"{constants}/mu"][index]))
+    scheduler = FlowMatchEulerDiscreteScheduler(use_dynamic_shifting=True)
+
+    def dew(times):
+        return {name: FlowMatchingScheduler(shift=shift).rates(times)[1]
+                for name, (shift, _) in shifts.items()}
+
+    def diffusers(times):
+        return {name: scheduler.time_shift(mu, 1.0, times) for name, (_, mu) in shifts.items()}
+
+    assert_as_exact(dew, diffusers, shift_times, f"{constants} noise levels", seeds=SHIFT_SEEDS)
 
 
 def test_a_pretrained_run_stores_its_pipelines_weights_in_the_dtype_it_names(pipelines):
