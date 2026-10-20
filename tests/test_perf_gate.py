@@ -45,6 +45,7 @@ def standing_in(gate, monkeypatch, *, passed: bool) -> list:
     outputs = {
         "benchmark_step.py": lambda command: [{"ms_per_step": 5.0, "compile_seconds": 30.0}],
         "benchmark_forward.py": lambda command: {after(command, "--cases"): 5.0},
+        "benchmark_serving_compile.py": lambda command: {"warm_seconds": 40.0},
         "benchmark_lm_serving.py": lambda command: {"sweep": [
             {"slots": int(slots), "repeats": [{"output_tokens_per_second": rate} for rate in (5.0, 6.0)]}
             for slots in after(command, "--slots").split(",")]},

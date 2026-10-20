@@ -20,8 +20,8 @@ regression.
 
 The battery is the training step (a dense and an MoE decoder, a DiT, an
 MM-DiT, FLUX.2 and Wan), the forward pass of three vision towers and the SD
-VAE's decoder, LM serving at 32 and 128 slots, attention forward and
-backward, the image input pipeline and a checkpoint's save and restore.
+VAE's decoder, LM serving at 32 and 128 slots, a full-depth Dory server's warm compile,
+attention forward and backward, the image input pipeline and a checkpoint's save and restore.
 docs/performance.md, "The performance gate", says how it runs before main
 takes a commit.
 """
@@ -203,6 +203,13 @@ PROBES = [
           lambda args, out: ["--backend", "dew", "--model", args.model, "--slots", ",".join(map(str, SLOTS)),
                              "--repeats", "5", "--out", str(out)],
           lambda _, out: _served(out)),
+    # The Server's warm compiles over a full-depth Dory 1.0 at a narrow width: a program's compile grows
+    # with its layers, and XLA's fusion of nGPT's per-layer normalization grew quadratically with them
+    # (ledger 635).
+    Probe((Row("compile serve dory-1.0-4b layers 16 slots", "s", "benchmark_serving_compile.py",
+               floor=COMPILE_FLOOR, first_round=True),),
+          lambda _, out: ["--family", "dory-1.0-4b", "--slots", "16", "--json-out", str(out)],
+          lambda _, out: (json.loads(out.read_text())["warm_seconds"],)),
     Probe(tuple(Row(f"attention {implementation} S=2048 D=128 causal fwd+bwd", "ms", "benchmark_attention.py")
                 for implementation in ATTENTION),
           lambda _, out: ["--implementations", *ATTENTION, "--sequence-lengths", "2048", "--head-dims", "128",
