@@ -115,6 +115,8 @@ def test_a_directory_refuses_another_runs_resume_and_resumes_its_own_on_another_
                 Loader(replayed(lambda partition: itertools.repeat(batch)), None, None, len(batch["text"])),
                 steps=steps, log_every=100, checkpoint_every=1)
 
+    from dew.nn.backbones.layer_plan import LayerKind
+
     def kind(base):
         """One layer of a kind named like a field of how a model computes, rotating by `base`."""
         return {"layer_types": ("precision",), "kinds": {"precision": LayerKind(rope_theta=base)}}

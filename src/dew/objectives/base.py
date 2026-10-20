@@ -488,12 +488,11 @@ def module_identity(value) -> JSON:
     """`value`, a network or a field of one, as what it computes: a module or dataclass as its
     class and its fields past `EXECUTION_FIELDS` and its class's `execution_fields`, a quantized
     module as the module it quantizes (its quantization chooses how it computes), a mapping by its
-    own keys, a sequence entry by entry, a function or class by its import path, an array by its
-    content and anything else by its repr, without addresses."""
+    own keys, a sequence entry by entry, a function or class by its qualified name (`named`), an
+    array by its content and anything else by its repr, without addresses."""
     from flax import linen as nn
 
     from dew.data.sources.codec import content_fingerprint
-    from dew.registry import import_path
 
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         kind = next((layer for layer in type(value).__mro__ if "_unquantized_type" in vars(layer)), None)
@@ -502,19 +501,26 @@ def module_identity(value) -> JSON:
         fields = {field.name: module_identity(getattr(value, field.name))
                   for field in dataclasses.fields(value)
                   if field.repr and field.name not in apart and field.name not in ("parent", "name")}
-        named = {"name": value.name} if isinstance(value, nn.Module) and value.name is not None else {}
-        return {"class": import_path(kind), "fields": fields, **named}
+        named_module = {"name": value.name} if isinstance(value, nn.Module) and value.name is not None else {}
+        return {"class": named(kind), "fields": fields, **named_module}
     if isinstance(value, Mapping):
         return {str(key): module_identity(entry) for key, entry in value.items()}
     if isinstance(value, (list, tuple)):
         return [module_identity(entry) for entry in value]
     if isinstance(value, type) or (callable(value) and hasattr(value, "__qualname__")):
-        return import_path(value)
+        return named(value)
     if isinstance(value, (np.ndarray, jax.Array)):
         return content_fingerprint(np.asarray(value)).hex()
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     return re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))
+
+
+def named(value: type | Callable[..., object]) -> str:
+    """A class's or function's module and qualified name, which names one defined in a function or
+    in `__main__` too: an identity compares it, and nothing imports it back."""
+    return f"{value.__module__}.{value.__qualname__}"
+
 
 class Objective(ABC, Generic[Loss, Effects]):
     """Defines what is learned: the parameters, the loss and what evaluation produces."""
@@ -1187,9 +1193,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         (`program_key`), a frozen teacher's and a critic's among them, each as what it computes
         (`module_identity`). An objective whose mathematics also sits outside its networks (a
         diffusion process) adds it."""
-        from dew.registry import import_path
-
-        return {"objective": import_path(type(self)),
+        return {"objective": named(type(self)),
                 "networks": [module_identity(program.module) for program in self.program_key()]}
 
     def inference_record(self) -> JSON:
