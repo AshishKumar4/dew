@@ -196,14 +196,14 @@ def _row_terms(logits, predict: bool) -> tuple[
         jax.Array, tuple[jax.Array, jax.Array] | None, tuple[jax.Array, jax.Array]]:
     """Each row's logsumexp, with `predict` its maximum and the first
     column that holds it, and its maximum and the sum of exponentials scaled
-    to it, from one reduction over the row.
+    to it, from one pass over the row.
 
     The running maximum, the sum of exponentials scaled to it and the
     maximum's column ride together through `jax.lax.reduce`, so the row is
-    read once, rather than once for the maximum and again for the sum. On an
-    RTX 4080 (jax 0.11.2), fp32 logits of 4096 x 151936 take 3.9 ms against
-    `jax.nn.logsumexp` and `jnp.argmax`'s 7.6, and 8192 x 50304 2.6 against
-    5.0, with the same columns and logsumexps 1.9e-6 apart.
+    read once, rather than once for the maximum and again for the sum. As
+    a single reduction over the row, on an RTX 4080 (jax 0.11.2), fp32
+    logits of 4096 x 151936 took 3.9 ms against `jax.nn.logsumexp` and
+    `jnp.argmax`'s 7.6, and 8192 x 50304 2.6 against 5.0.
 
     The row reduces in two levels, blocks of about its square root's width
     and then the blocks' terms (`_row_blocks`): XLA's CPU compiler runs a
