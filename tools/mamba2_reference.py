@@ -181,7 +181,7 @@ def write_seeded() -> None:
 
     PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded
     """
-    from ssd_reference import provenance, record_case
+    from recorded_references import provenance, record_case
     from ssd_support import mamba2_draw, mamba2_run
 
     def reference(site, arrays):

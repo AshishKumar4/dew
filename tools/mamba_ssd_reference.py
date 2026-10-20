@@ -110,8 +110,8 @@ def write_seeded(scan, minimal, version, revision):
     """
     import jax
     import jax.numpy as jnp
+    from recorded_references import provenance, record_case
     from reference_error import assert_computes_the_oracle, chain_roundings, widened
-    from ssd_reference import provenance, record_case
     from ssd_support import mamba_ssd_xla, ssd_orbit
 
     stored = {"precision": np.asarray("ieee")}
