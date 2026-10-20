@@ -142,6 +142,8 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
         assert_as_exact(dew, reference, errors, "straddling", seeds=8, truth_fn=truth)
     with pytest.raises(Inconclusive):
         assert_as_exact(_reordered, _product, _draw, "two seeds", seeds=2)
+    # And seeds_for never declares fewer, whatever it is asked to start from.
+    assert seeds_for(_product, _draw, "product", start=1) >= 8
 
 
 def test_check_one_holds_dew_exact_where_the_reference_is_exact_on_every_seed():
