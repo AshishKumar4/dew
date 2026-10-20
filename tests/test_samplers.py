@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from diffusion_support import relative_gap, walk
+from diffusion_support import SourceOracle, relative_gap, walk
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
 
@@ -740,3 +740,165 @@ def test_the_closing_denoise_is_edms_last_euler_step_onto_sigma_zero(name):
     closed = sample(edm_grid(steps).denoiser(EDMOracle(), {}, {}), x_T, solver=solver,
                     key=jax.random.PRNGKey(7), times=np.arange(steps, 0, -1, dtype=np.float32))
     assert_as_exact_as_the_reference(closed, EDM[f"{name}.result32"], EDM[f"{name}.result"], name)
+
+
+class UnitEpsilon(nn.Module):
+    """An epsilon prediction of one everywhere, so a transfer's eps term is its whole coefficient."""
+
+    @nn.compact
+    def __call__(self, x, temb):
+        return jnp.ones_like(x)
+
+
+def test_a_pndm_transfer_at_a_small_signal_stays_finite():
+    """PNDM's transfer between two levels of a schedule whose signal is small, alpha^2 of 2^-100 and
+    2^-80, here a beta table of halves, is DDIM's in float64 to float32's rounding: the root its
+    denominator takes of three variances is a product of roots, whose product of the three would
+    round to zero and blow the step up by six orders."""
+    from dew.diffusion.schedules import DiscreteNoiseScheduler
+
+    process = Process(DiscreteNoiseScheduler(np.full(100, 0.5)), EpsilonPredictionTransform())
+    x_T = jnp.ones((1, 3), jnp.float32)
+    stepped = np.asarray(walk(PNDM(skip_prk_steps=True), process, UnitEpsilon(), x_T, [99, 79]))[-1]
+    alpha2_t, alpha2_s = 0.5 ** 100, 0.5 ** 80
+    sigma2_t, sigma2_s = 1 - alpha2_t, 1 - alpha2_s
+    denominator = alpha2_t * np.sqrt(sigma2_s) + np.sqrt(alpha2_t * sigma2_t * alpha2_s)
+    expected = np.sqrt(alpha2_s / alpha2_t) - (alpha2_s - alpha2_t) / denominator
+    np.testing.assert_allclose(stepped, np.full((1, 3), expected), rtol=1e-5)
+
+
+def test_an_euler_step_near_pure_noise_on_a_variance_preserving_schedule_rounds_as_ddim():
+    """An Euler step from pure noise (alpha 0) to a level whose signal is 2^-11.5 and whose noise is
+    an ulp below one is DDIM's step, alpha_s x_0 + sigma_s (x - alpha_t x_0) / sigma_t, to float32's
+    rounding: the secant coefficient the source's x + derivative dt reads there is near 5800,
+    whose products lose the low bits of x that the step keeps."""
+    from dew.sampling.solvers.sigma import _euler_step
+
+    x, denoised = jnp.full((1, 1), np.float32(1.0001)), jnp.ones((1, 1), jnp.float32)
+    alpha_s, sigma_s = np.float32(np.sqrt(2.0 ** -23)), np.float32(1 - 2.0 ** -24)
+    stepped = np.asarray(_euler_step(x, denoised, (jnp.float32(0), jnp.float32(1)),
+                                     (jnp.asarray(alpha_s), jnp.asarray(sigma_s)))[0])
+    exact = float(alpha_s) + float(sigma_s) * float(np.float32(1.0001))
+    assert abs(float(stepped[0, 0]) - exact) <= np.spacing(np.float32(exact))
+
+
+@pytest.mark.parametrize("case", FAMILIES)
+def test_ddim_at_eta_one_steps_from_the_ddpm_posterior_on_every_gaussian_process(case):
+    """DDIM at eta 1 draws its step from the forward posterior q(x_s | x_t, x_0) of the process it
+    walks, variance preserving, exploding or a rectified flow: its mean alpha_s x_0 +
+    alpha_t sigma_s^2 / (alpha_s sigma_t) eps and its standard deviation sigma_s sigma_{t|s} /
+    sigma_t, with sigma_{t|s}^2 = sigma_t^2 - (alpha_t / alpha_s)^2 sigma_s^2. DDIM's own form,
+    alpha_s x_0 + sqrt(sigma_s^2 - std^2) eps + std z, is that posterior in float64. Each row steps
+    over its own interval of the process's grid, as the walk passes a row's times, so the
+    coefficients' roundings are many: Dew's step is as near the float64 posterior as DDIM's form
+    written plainly in float32 is. Over one interval shared by every row, the coefficients round
+    once and the distance is that one rounding's: over each of a 65-point grid's 63 intervals
+    apart, Dew's step against the plain form has a median ratio of 1.00 on every process and
+    passes 2 on 2 to 3% of them, a single draw the rule's estimate does not rest on. The
+    variance-preserving special case of the deviation drew no noise on a variance-exploding
+    process and the wrong amount on a flow."""
+    build, shape, _ = PROCESS_CASES[case]
+    process, model = build()
+    grid = np.asarray(process.times(65))
+    rows = np.random.default_rng(6).integers(0, len(grid) - 2, 512)
+    t, t_next = jnp.asarray(grid[rows]), jnp.asarray(grid[rows + 1])
+    x_T = jax.random.normal(jax.random.key(4), (len(rows), *shape), jnp.float32) * 2
+    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *shape)), jnp.ones((1,)))
+    denoise = process.denoiser(model, params, {})
+    key = jax.random.key(5)
+    denoised, eps = denoise(x_T, t)
+    solver = DDIM(eta=1.0)
+    stepped = np.asarray(jax.jit(lambda: solver.step(x_T, t, t_next, denoised, eps, (), key, process,
+                                                      denoise)[0])())
+    denoised, eps = np.asarray(denoised), np.asarray(eps)
+    noise = np.asarray(jax.random.normal(key, x_T.shape))
+    target = t - process.sampler_schedule.step_interval(t, t_next)
+    rates = [np.asarray(rate, np.float64).reshape((-1,) + (1,) * len(shape))
+             for time in (t, target) for rate in process.sampler_schedule.rates(time)]
+
+    def deviation(dtype):
+        a_t, s_t, a_s, s_s = (rate.astype(dtype) for rate in rates)
+        return a_t, s_t, a_s, s_s, s_s / s_t * np.sqrt(s_t ** 2 - (a_t / a_s) ** 2 * s_s ** 2)
+
+    def ddim(dtype):
+        _, _, a_s, s_s, std = deviation(dtype)
+        return (a_s * denoised.astype(dtype) + np.sqrt(s_s ** 2 - std ** 2) * eps.astype(dtype)
+                + std * noise.astype(dtype))
+
+    a_t, s_t, a_s, s_s, std = deviation(np.float64)
+    posterior = a_s * denoised + a_t * s_s ** 2 / (a_s * s_t) * eps + std * noise
+    assert np.all(std > 0)
+    # The two forms are one in float64, to its rounding of each term.
+    scale = float(np.abs(posterior).max())
+    np.testing.assert_allclose(ddim(np.float64), posterior, rtol=1e-12, atol=1e-12 * scale)
+    assert_as_exact_as_the_reference(stepped, ddim(np.float32), posterior,
+                                     f"DDIM at eta 1 on the {case} process")
+
+
+@pytest.mark.parametrize("solver", [DDIM(eta=1.0), DDPM("small"), DDPM("large")],
+                         ids=["ddim", "ddpm-small", "ddpm-large"])
+def test_a_step_between_equal_levels_draws_no_noise(solver):
+    """A step between two equal levels of a variance-exploding process, as a grid's plateau holds,
+    has a transition of no variance: its draw is multiplied by exactly zero, so two draws give one
+    result, compiled as a walk compiles it."""
+    process, model = karras_process()
+    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4)), jnp.ones((1,)))
+    denoise = process.denoiser(model, params, {})
+    x = jax.random.normal(jax.random.key(2), (8, 4), jnp.float32)
+    level = jnp.full((8,), 0.4, jnp.float32)
+
+    # The two levels are separate inputs, equal only in their values, as two positions of a walk's
+    # grid are, so the compiled step computes each from its own rates.
+    @jax.jit
+    def stepped(t, t_next, key):
+        denoised, eps = denoise(x, t)
+        state = solver.init(x, jnp.stack([t[0], t_next[0]]), process, key=key)
+        return solver.step(x, t, t_next, denoised, eps, state, key, process, denoise)[0]
+
+    first, second = (np.asarray(stepped(level, jnp.array(level), jax.random.key(seed))) for seed in (3, 4))
+    np.testing.assert_array_equal(first, second)
+
+
+def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
+    """DDIM at eta 1 over a variance-preserving source grid walks as Diffusers 0.34.0's
+    `DDIMScheduler(eta=1)` given the same draws (`variance_noise`): each walked latent is as near
+    the source's float64 walk as its own float32 walk is (`float64_scheduler`)."""
+    import contextlib
+
+    import torch
+    from diffusers.schedulers import scheduling_ddim
+    from tool_support import load
+
+    from dew.diffusion.schedules.source import SourceSchedule
+    from dew.nn.inputs import request_key
+
+    config = {"_class_name": "DDIMScheduler", "num_train_timesteps": 1000, "beta_start": 0.00085,
+              "beta_end": 0.012, "beta_schedule": "scaled_linear", "clip_sample": False,
+              "set_alpha_to_one": False, "timestep_spacing": "trailing"}
+    schedule = SourceSchedule.from_config(config)
+    process, times = schedule.sampling(6)
+    initial = np.random.default_rng(9).normal(size=(2, 3, 64)).astype(np.float32)
+    denoise = process.denoiser(SourceOracle(), {}, {})
+    _, walked = sample(denoise, jnp.asarray(initial), solver=DDIM(eta=1.0), key=3, times=times,
+                       final_denoise=False, record=lambda x, _: x)
+    draws = [np.asarray(jax.random.normal(jax.random.fold_in(request_key(3), index), initial.shape))
+             for index in range(len(walked))]
+
+    precision = load("diffusers_wan_reference")
+    reference = []
+    for dtype in (torch.float32, torch.float64):
+        wide = dtype == torch.float64
+        with precision.float64_scheduler(scheduling_ddim) if wide else contextlib.nullcontext():
+            source = scheduling_ddim.DDIMScheduler.from_config(config)
+            source.set_timesteps(6)
+            x = torch.tensor(initial, dtype=dtype)
+            latents = []
+            for time, draw in zip(source.timesteps, draws, strict=True):
+                prediction = torch.sin(source.scale_model_input(x, time)) * 0.07 + time * 0.001
+                x = source.step(prediction, time, x, eta=1.0,
+                                variance_noise=torch.tensor(draw, dtype=dtype)).prev_sample
+                latents.append(x.numpy().copy())
+        reference.append(np.stack(latents))
+    for index, actual in enumerate(walked):
+        assert_as_exact_as_the_reference(actual, reference[0][index], reference[1][index],
+                                         f"DDIM at eta 1, step {index}")

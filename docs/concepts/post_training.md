@@ -99,6 +99,8 @@ Trained 10 steps in 0:00:03: first step after 2.58 s, then 29.9 step/s
 10.5% of the wall time in steps, final loss 0.008948
 ```
 
+`DPOObjective` and `GRPOObjective` score tokens through `TokenScorer`, the scoring machinery `LMObjective` also builds on. Besides their own loss arguments they take its options: `head_chunks`, `head_tile`, `samples`, `variables`, `qk_stats` and `processor`. The language-model loss's own options (`ema_decay`, `pad_id`, `token_accuracy`, `loss_role`, `mtp_weight`, `z_loss`, the MoE balance and router terms, `indexer`) are `LMObjective`'s alone.
+
 `Preferences.seq_len` is the full row width; shorter rows are padded to it, and the objective scores one position fewer because of the next-token shift.
 
 ### Reinforcement learning with a reward function
@@ -116,7 +118,7 @@ prompt_batch = {
 }
 
 
-def reward(data_source, completion, ground_truth, extra_info):
+def reward(completion, record):
     return sum(character.isalpha() for character in completion) / 8
 
 
@@ -261,12 +263,13 @@ data = loader(PromptData(source=({"prompt": "dew"},) * 8, tokenizer="byte", max_
             batch=8, read="memory", loading=Loading(workers=0))
 ```
 
-The prompt loader produces left-padded `prompt` IDs of shape `[B, P]` and `prompt_length` of shape `[B]`, where `P` is `max_prompt_len` (default 128). A prompt that is too long is cut from the front, so its end is kept. The metadata columns are stored as fixed-width UTF-8 byte arrays, and `SampledRollout` turns them back into strings for the reward:
+The prompt loader produces left-padded `prompt` IDs of shape `[B, P]` and `prompt_length` of shape `[B]`, where `P` is `max_prompt_len` (default 128). A prompt that is too long is cut from the front, so its end is kept. The metadata columns are stored as fixed-width UTF-8 byte arrays, and `SampledRollout` turns them back into each row's `PromptRecord` for the reward:
 
 ```text
-reward(data_source: str, completion: str,
-       ground_truth: str, extra_info: str) -> float
+reward(completion: str, record: PromptRecord) -> float
 ```
+
+`PromptRecord` (`dew.objectives.rl`) holds the row's `data_source`, its `ground_truth` as the source normalized it, and its `extra_info`, each the empty string where the row has none; a reward reads the fields it needs. A verl `compute_score(data_source, solution_str, ground_truth, extra_info)` enters through `dew.objectives.rl.verl.verl_reward`, and `compute_score(reward)` there hands a Dew reward to verl.
 
 Pick a reward whose score can be checked independently of training; for an exact-answer task, compare the decoded completion with the ground truth under a normalization rule you write down. `SampledRollout.decode` defaults to token IDs separated by spaces, not natural-language text, so a reward that reads text needs the tokenizer's decode function.
 
@@ -456,9 +459,9 @@ Two sources run on a `RolloutServer`. `PromptSource(server, reward, decode=..., 
 - `ProcessRunner` starts the program through the `SubprocessEnvironment` launcher: RLIMIT_CPU, RLIMIT_AS, no core dumps, its own session, SIGKILL on parent death and a minimal environment. The process group is killed at the wall deadline, on excess output, and after exit. It keeps your user, filesystem and network, so a program can read and reach whatever you can.
 - `ContainerRunner(image, runtime="docker")` runs each program in a fresh container with no network, a read-only root, the job directory mounted read-only at `/work`, all capabilities dropped, `no-new-privileges`, an unprivileged user, and memory, CPU-share, process-count and CPU-time limits. The container is killed by name at the deadline. Use this runner for untrusted code.
 
-A reward is a `Reward` callable, `(data_source, completion, ground_truth, extra_info) -> float`, that the recipe supplies, and it works with both `SampledRollout` and `PromptSource`. `examples/train_rlvr.py` defines `CodeReward(fleet)`, which extracts the last fenced `python` block from a completion and runs it once per test case. Its ground truth is a JSON list of `{"stdin", "stdout"}` cases, and the reward is the fraction of cases whose stdout matches line by line (`outputs_match`), or all-or-nothing with `all_or_nothing=True`.
+A reward is a `Reward` callable, `(completion, record) -> float`, that the recipe supplies, and it works with both `SampledRollout` and `PromptSource`. `examples/train_rlvr.py` defines `CodeReward(fleet)`, which extracts the last fenced `python` block from a completion and runs it once per test case. The record's ground truth is a JSON list of `{"stdin", "stdout"}` cases, and the reward is the fraction of cases whose stdout matches line by line (`outputs_match`), or all-or-nothing with `all_or_nothing=True`.
 
-`MathReward()` in `dew.rl.sandbox` reads the last `\boxed{}` answer and compares it with the reference as an exact rational, so `0.5`, `1/2` and `\frac{1}{2}` agree. `PromptSource` scores each completion on a thread pool as its draw finishes, so verification overlaps generation and the update.
+`MathReward()` in `dew.rl.sandbox` reads the last `\boxed{}` answer and compares it with the record's reference as an exact rational, so `0.5`, `1/2` and `\frac{1}{2}` agree. `PromptSource` scores each completion on a thread pool as its draw finishes, so verification overlaps generation and the update.
 
 `tests/test_fleet.py` runs real programs through each verdict, including a forked child that must die at the timeout and, when Docker and `python:3.12-slim` are present, a container that must have no network and a read-only mount. `tests/test_rollout_scheduler.py` runs a `Trainer` with lag through multi-turn environments on the native server, retries the samples whose sandboxed environments ran past their wall clock, and stops on a non-finite reward. `tests/test_distribution.py` runs the scheduler on a two-process pool against one process (`tests/scheduler_worker.py`). No test exercises `oversample`, `admit` or resume. `tests/test_rollout_sources.py` checks both sources' statuses, Dew's own sandbox past its wall clock, contract errors and cancellation. `tests/test_rollout_servers.py` checks the vLLM and SGLang requests and responses against each engine's wire format, the version of a draw in flight across a push, a safetensors reload read back by `Pretrained.load`, and reloads refused on both engines, by status or by a 200 that says `success: false`.
 

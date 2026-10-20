@@ -11,7 +11,7 @@ import numpy as np
 from dew.data.pipeline import Dataset
 
 from ..dataset import Batch, Records, describe
-from .base import Read, ShardManifest
+from .base import Read, ShardManifest, _indexed_manifest
 
 if TYPE_CHECKING:
     from torch.utils.data import Dataset as TorchDataset
@@ -98,16 +98,16 @@ class Torch(Dataset):
         }
 
     def supports(self, read: Read) -> bool:
-        return read != "streamed"
+        return True
 
     def records(self, read: Read) -> Records:
-        if not self.supports(read):
-            raise ValueError(f"{self.describe()} cannot read streamed; torch map-style records need an index")
         indexed = TorchRecords(self.dataset, self.fields)
         return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
 
     def manifest(self) -> ShardManifest:
-        raise ValueError(f"{self.describe()} has no physical shard manifest; use memory or indexed reads")
+        """The map-style records as a stream of consecutive index ranges (`_indexed_manifest`), as a
+        memory source streams."""
+        return _indexed_manifest(self, "torch", self.describe(), 1024)
 
     def metadata(self) -> Mapping[str, object]:
         return {**(self.facts or {}), "rows": len(self.records("indexed"))}

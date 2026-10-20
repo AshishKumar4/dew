@@ -47,13 +47,8 @@ def run():
         from dew.training import prepare_process
         prepare_process(multi_host=False)
         return
-    import jax
-    import optax
-    from affine_run import Regression, batches
-    from dew.data.dataset import Loader
-    from dew.training import Trainer
-    Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0)).fit(
-        Loader(lambda partition: batches(), None, None, 8), steps=1, log_every=1)
+    from affine_run import fit_one_step
+    fit_one_step()
 
 
 from dew.telemetry.devices import CPUOnlyJax

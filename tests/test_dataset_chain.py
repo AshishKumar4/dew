@@ -495,6 +495,60 @@ def test_an_iterator_resumes_through_its_own_state_or_by_replaying():
             resumed.close()
 
 
+def test_a_replayed_stream_checks_the_model_inputs_its_batch_holds():
+    """A replayed stream (`replayed`) is guarded at its position by a digest of the batch there,
+    which reads a Dew dataclass's fields as the codec does: a stream whose model inputs there
+    changed, and nothing else, is refused, and one that replays them resumes after them."""
+    from dew.data.dataset import Replayed
+    from dew.nn.inputs import ModelInputs
+
+    def opened(offset):
+        def batches():
+            return iter([{"inputs": ModelInputs(tokens=np.arange(4, dtype=np.int32) + offset + index,
+                                                conditioning={"mask": np.ones(4, bool)})}
+                         for index in range(3)])
+        return batches
+
+    stopped = Replayed(opened(0))
+    next(stopped), next(stopped)
+    saved = stopped.get_state()
+    with pytest.raises(ValueError):
+        Replayed(opened(10)).set_state(saved)
+    resumed = Replayed(opened(0))
+    resumed.set_state(saved)
+    np.testing.assert_array_equal(next(resumed)["inputs"].tokens, np.arange(4) + 2)
+
+
+FIRST, SECOND = float("nan"), float("nan")
+"""Two keys of one repr that a mapping holds apart."""
+
+
+@pytest.mark.parametrize(("saved", "replayed", "same"), [
+    ({1: np.zeros(2)}, {"1": np.zeros(2)}, False),
+    ({FIRST: 1, SECOND: 2}, {FIRST: 5, SECOND: 2}, False),
+    ({"phase": 1 + 2j}, {"phase": 9 + 8j}, False),
+    ({"pixels": np.arange(6.).reshape(2, 3)},
+     {"pixels": np.asfortranarray(np.arange(6.).reshape(2, 3))}, True),
+], ids=["key-type", "same-repr-keys", "complex", "storage-order"])
+def test_a_replayed_stream_reads_its_batch_by_content(saved, replayed, same):
+    """A replayed stream's digest reads what its batch holds: a mapping's every key as itself, a
+    complex scalar by value and an array by its elements, in whichever order it is stored. A
+    stream whose batch changed at the saved position is refused; one that holds the same content
+    resumes."""
+    from dew.data.dataset import Replayed
+
+    stopped = Replayed(lambda: iter([saved, saved]))
+    next(stopped)
+    state = stopped.get_state()
+    resumed = Replayed(lambda: iter([replayed, replayed]))
+    if same:
+        resumed.set_state(state)
+        assert next(resumed).keys() == replayed.keys()
+    else:
+        with pytest.raises(ValueError):
+            resumed.set_state(state)
+
+
 def test_an_iterator_without_a_position_or_a_declared_replay_does_not_resume():
     """A stateless iterator that declares no replay reads and reports how far
     it read, but refuses to resume, where one that declares either resumes

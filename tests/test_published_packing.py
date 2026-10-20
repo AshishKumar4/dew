@@ -59,6 +59,38 @@ def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tm
         np.stack([first, second], axis=1).reshape(whole.shape), whole), shares[0], shares[1], expected)
 
 
+def test_a_recipe_given_a_published_packing_reads_the_windows_its_memory_read_packs(tmp_path):
+    """A typed recipe given a generation published from its own windows and packing reads that
+    plan, shuffled as its default order: the same batches, leaf by leaf, as the recipe packing in
+    memory, and a resume at a saved position reads on as the uninterrupted run does."""
+    from dew.config.data import TextData, loader
+
+    source = Memory(tuple({"text": "x" * size} for size in SIZES))
+    recipe = TextData(source=source, seq_len=8, pack="first-fit", packing_bins=3, eos=False,
+                      token_holdout=None)
+    train, _, _ = recipe.pipelines()
+    published = publish(train, Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
+    warm = loader(recipe, batch=2, seed=3, cache=published, read="indexed", loading=READ)
+    cold = loader(recipe, batch=2, seed=3, read="memory", loading=READ)
+    assert "packing" in warm.plan.manifest.source["sources"][0]
+    left, right = warm.train(DataPartition()), cold.train(DataPartition())
+    try:
+        for ours, packed in zip(itertools.islice(left, 4), itertools.islice(right, 4), strict=True):
+            assert jax.tree.structure(ours) == jax.tree.structure(packed)
+            jax.tree.map(np.testing.assert_array_equal, ours, packed)
+        saved = left.get_state()
+        expected = next(left)
+    finally:
+        left.close()
+        right.close()
+    resumed = warm.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        jax.tree.map(np.testing.assert_array_equal, next(resumed), expected)
+    finally:
+        resumed.close()
+
+
 def test_a_pack_places_documents_whole_and_refuses_one_its_window_cannot_hold(tmp_path):
     """Without a chunk step before it, a first-fit pack refuses a document longer than its
     window where a memory read packs it and where its plan is published; a plan published

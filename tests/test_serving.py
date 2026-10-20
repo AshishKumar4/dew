@@ -113,6 +113,91 @@ def test_a_server_holds_its_weights_at_decoding_storage_and_reloads_into_it():
         assert_same_generation(actual, expected)
 
 
+def test_a_dropped_server_frees_its_weights_without_a_collection():
+    """A server and its task, once their last references go, free their weights, the packed copy
+    the server serves included, with the cyclic collector off: reading which projections the
+    model packs binds it over the weights' shapes, since flax's bound tree is cyclic and, bound
+    over the weights themselves, would keep them alive until a full collection."""
+    import gc
+    from collections import Counter
+
+    def live() -> Counter:
+        return Counter(tuple(array.shape) for array in jax.live_arrays())
+
+    def serve() -> Counter:
+        # Drawn under jit, as a run draws them: an eager `init` leaves its own cyclic scope
+        # holding what it drew, which is flax's to drop, not the server's.
+        model = decoder().clone(max_seq_len=128)
+        params = jax.jit(model.init)(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+        bound = TextGeneration(model, params, RunProcessor(Digits()),
+                               sampling=Sampling(temperature=0, eos_token_ids=None))
+        server = Server.from_task(bound, slots=2, capacity=128)
+        server(["12", "34"], 3, key=0)
+        return Counter(tuple(leaf.shape) for leaf in jax.tree.leaves(bound.variables))
+
+    gc.collect()
+    gc.disable()
+    try:
+        before = live()
+        weights = serve()
+        after = live()
+    finally:
+        gc.enable()
+    kept = {shape: after[shape] - before[shape] for shape in weights if after[shape] > before[shape]}
+    assert not kept, kept
+
+
+def _host_loaded(dtype="float32"):
+    from pathlib import Path
+
+    from dew.interop import Pretrained
+
+    loaded = Pretrained.load(Path(__file__).parent / "fixtures/hf/phi-tiny", dtype=dtype,
+                             attention_impl="xla", max_seq_len=64)
+    assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(loaded.variables["params"]))
+    return loaded.text_generation(sampling=Sampling(temperature=0, eos_token_ids=None))
+
+
+def test_a_server_over_loaded_weights_places_them_once():
+    """`Pretrained.load` returns its weights in host memory, which a task keeps as given and places
+    on the device once, at its first generation, as decoding reads them (`resident`); a server over
+    the task serves that same device copy. Decode steps after a request's admission move nothing
+    from the host, and the server draws the task's tokens."""
+    bound = _host_loaded()
+    server = Server.from_task(bound, slots=2, capacity=32)
+    assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(bound.variables["params"]))
+    for placed, served in zip(jax.tree.leaves(bound.placed), jax.tree.leaves(server.variables), strict=True):
+        assert isinstance(placed, jax.Array) and placed is served
+    prompt = np.asarray([1, 2, 3], np.int32)
+    ticket = server.submit(prompt, 8, key=0)
+    server.step()  # admits the request, whose rows move to the device
+    with guarded():
+        server.step()
+        server.step()
+    server.run()
+    assert_same_generation(ticket.result(), bound(prompt[None], 8, key=0))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_task_places_loaded_weights_on_the_default_device_as_its_compute_reads_them():
+    """A task over host weights places them where JAX's default device is, committed there, and
+    in the storage decoding reads (`decoding_storage`), cast on the host: a bfloat16 load's float32
+    masters reach the device as the host's own bfloat16 rounding of them, no float32 copy."""
+    from dew.interop.weights import decoding_storage
+
+    with jax.default_device(jax.devices()[1]):
+        bound = _host_loaded("bfloat16")
+        placed = bound.placed
+    assert {leaf.devices().pop() for leaf in jax.tree.leaves(placed)} == {jax.devices()[1]}
+    # Committed there, so a call made outside the context runs on them rather than moving them.
+    assert all(leaf.committed for leaf in jax.tree.leaves(placed))
+    cast = decoding_storage(bound.model, bound.variables)
+    for leaf, host in zip(jax.tree.leaves(placed), jax.tree.leaves(cast), strict=True):
+        assert leaf.dtype == host.dtype
+        np.testing.assert_array_equal(np.asarray(leaf), host)
+    assert jnp.dtype(jnp.bfloat16) in {leaf.dtype for leaf in jax.tree.leaves(placed)}
+
+
 def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
     """Serving holds the same weight bytes; reloading casts and repacks the trained tree."""
     from flax.core import freeze
@@ -235,7 +320,7 @@ def test_reload_normalizes_source_precision_before_concatenating_projections():
 
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
 def test_quantized_weights_serve_the_same_greedy_text_as_the_task(dtype):
-    from dew.training.quantization import Quantization
+    from dew.quantization import Quantization
 
     pytest.importorskip("qwix")
     bound = task().quantized(Quantization(dtype=dtype, weight_only=True))
@@ -451,6 +536,33 @@ def test_a_prompt_past_the_bucket_under_the_capacity_is_served_as_the_task_serve
     ticket = server.submit(prompt, 50, key=0)
     server.run()
     assert_same_generation(ticket.result(), bound(prompt, 50, key=0))
+
+
+@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
+                         ids=["dense", "paged"])
+def test_a_multimodal_model_serves_over_its_language_models_cache(options):
+    """A wrapper that conditions its language model on images, as Qwen3.5 and Gemma 3 load,
+    holds its cache in that language model, whose layout a server replaces through the wrapper
+    (`Layered.with_kv_cache`), dense or paged: every served row of a text prompt is the greedy
+    continuation a fresh full forward gives at each token, and the lone task call's."""
+    from model_support import greedy_walk
+    from tiny_models import build_model, tiny_inputs
+
+    model = build_model("multimodal_transformer", dtype="float32").with_cache_capacity(128)
+    args, fields = tiny_inputs("multimodal_transformer", jax.random.key(0))
+    params = model.init(jax.random.key(1), *args, **fields)
+    bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    _, tickets = served_alongside(bound, **options)
+    for ticket, lone, prompt, budget in zip(tickets, [*alone, alone[2]], [*PROMPTS, PROMPTS[2]],
+                                            [*BUDGETS, BUDGETS[2]], strict=True):
+        served = ticket.result()
+        assert_same_generation(served, lone)
+        ids = np.asarray([Digits().encode(prompt)], np.int32)
+        # A generation's tokens are the prompt and its continuation.
+        walked = greedy_walk(model, params, ids, budget)
+        np.testing.assert_array_equal(served.host().tokens[:, :walked.shape[1]], walked)
 
 
 def served_alongside(bound, slots=4, admission=2, **options):

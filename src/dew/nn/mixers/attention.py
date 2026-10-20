@@ -36,7 +36,16 @@ from dew.nn.attention import (
 from dew.nn.blocks import normal_kernel
 from dew.nn.documents import with_documents
 from dew.nn.flops import attention_flops, projection_flops
-from dew.nn.inputs import PLAIN_CALL, Admitted, AttentionMetadata, MixerCall, coordinates_of, counted_places
+from dew.nn.inputs import (
+    PLAIN_CALL,
+    Admitted,
+    AttentionMetadata,
+    Coordinates,
+    MixerCall,
+    coordinates_of,
+    counted_places,
+    document_reach,
+)
 from dew.nn.kernels.generation import backend
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.local_attention import local_attention
@@ -44,7 +53,15 @@ from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain, unit
 from dew.nn.precision import at_least_fp32, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
-from dew.nn.rope import axis_halves, axis_tables, mrope_tables, rotary_freqs, rotate, yarn_rope_freqs
+from dew.nn.rope import (
+    LongRopeScaling,
+    axis_halves,
+    axis_tables,
+    mrope_tables,
+    rotary_freqs,
+    rotate,
+    yarn_rope_freqs,
+)
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
 
 
@@ -416,17 +433,23 @@ class CausalSelfAttention(nn.Module):
             value = self.values_norm(value)
         return constrain(key, KV_HEADS), constrain(value, KV_HEADS)
 
-    def _rotary_angles(self, rotary_positions, heads: jax.Array):
+    def _rotary_angles(self, rotary_positions, heads: jax.Array, tokens: Coordinates | None = None,
+                       places=None):
         """Build the rotary cos and sin this layer rotates its heads by, in
         the arithmetic `rotate` rotates `heads` in, rounded to `heads`'
         dtype under `MixerContext.narrow_rotary_tables` (`rounded_to`, which
-        compilation keeps)."""
-        tables = self._rotary_tables(rotary_positions, at_least_fp32(heads.dtype))
+        compilation keeps). Under LongRoPE an uncached call's packed `tokens`
+        give each document's furthest place (`document_reach` over `places`),
+        which it picks its factors by, so a document rotates as it does alone."""
+        longrope = isinstance(self.ctx.rope_scaling, LongRopeScaling)
+        reach = (None if not longrope or tokens is None or tokens.segments is None
+                 else document_reach(tokens.segments, tokens.valid, places))
+        tables = self._rotary_tables(rotary_positions, at_least_fp32(heads.dtype), reach)
         if not self.ctx.narrow_rotary_tables:
             return tables
         return rounded_to(tables[0], heads.dtype), rounded_to(tables[1], heads.dtype)
 
-    def _rotary_tables(self, rotary_positions, dtype):
+    def _rotary_tables(self, rotary_positions, dtype, reach=None):
         """The rotary cos and sin at `dtype`. Interleaved mRoPE, YaRN and the
         plain rope each build their own angles; YaRN rotates whole heads at
         its own frequencies, so it takes neither a partial rotary nor a
@@ -445,7 +468,7 @@ class CausalSelfAttention(nn.Module):
             return rotary_freqs(
                 rotary_positions, self.ctx.head_dim, self.ctx.rope_theta, rot_dim=self._rot_dim(),
                 partial_rotary_type=self.ctx.partial_rotary_type, rope_scaling=self.ctx.rope_scaling,
-                dtype=dtype)
+                dtype=dtype, reach=reach)
         if self.ctx.partial_rotary_factor is not None or self.ctx.rope_scaling is not None:
             raise ValueError(
                 "yarn rotates whole heads at its own frequencies, so it takes "
@@ -590,7 +613,8 @@ class CausalSelfAttention(nn.Module):
                 query = query * (scale[..., None, None] if scale.ndim == 2
                                  else scale[None, :, None, None]).astype(query.dtype)
         else:
-            freqs_cos, freqs_sin = self._rotary_angles(rotary_positions, query)
+            uncached = None if decode else tokens
+            freqs_cos, freqs_sin = self._rotary_angles(rotary_positions, query, uncached, places)
             # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
             # query carries the ratio to the scale the checkpoint asks for.
             query = rotate(
@@ -986,24 +1010,16 @@ class CausalSelfAttention(nn.Module):
         query is padding reads one key, so its (unused) output stays finite
         as the masked kernels leave it.
         """
-        rows = query.shape[0]
         reads = jnp.maximum(positions + 1, 1)
-        # Each group's query heads read the same keys, so they go in as
-        # that key head's query positions: one pass over the group's keys
-        # where cuDNN otherwise padded the lone query to two and ran each
-        # query head on its own, 4.7% less a layer at 64 rows and the
-        # same bits (docs/performance.md).
-        heads, kv_heads = query.shape[-2], key.shape[-2]
-        group = heads // kv_heads
-        grouped = query.reshape(rows, kv_heads, group, query.shape[-1]).transpose(0, 2, 1, 3)
+        # The core reads each key head's query heads as its query positions
+        # (`decode_geometry.grouped_query`).
         attention = scaled_dot_product_attention(
-            grouped, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
+            query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
             implementation=self.ctx.attention_impl, causal=False,
             softcap=self.ctx.attn_logit_softcap,
             key_value_seq_lengths=reads.astype(jnp.int32))
-        return checkpoint_name(
-            attention.transpose(0, 2, 1, 3).reshape(rows, 1, heads, attention.shape[-1]), 'context')
+        return checkpoint_name(attention, 'context')
 
     def _page_kernel_runs(self, query) -> bool:
         """Whether a decode step may read a paged pool through its device's
