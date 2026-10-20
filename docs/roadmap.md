@@ -185,7 +185,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Reconcile requested capabilities with implementation and qualification evidence, and audit upstream reproductions and fixes. [224, 306]
 - The float64 gate is the owner's (2026-10-20): each leaf's RMS error within 1.5× the reference's and its worst row within ROW_FACTOR of the reference's, on the same inputs, with no floor; every element within a certified roundoff bound for its own operation on common native inputs (faithful rounding for pointwise steps, a bound for each sum, native probes at opaque kernels), behind one assertion, `assert_as_exact`. [560, 649, 719, 793, 827]
 - Every accuracy comparison in the tests and tools goes through that assertion; the files that still compare within a tolerance are an inventory that only shrinks, empty by 2026-11-27. [650, 668, 669, 670, 676, 682, 705, 712]
-- Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients, ragged decision options, distillation's cosine and L2 losses, and Z-Image's padded flow. [833, 835, 836, 837]
+- Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients, distillation's cosine and L2 losses, and Z-Image's padded flow. [833, 836, 837]
 - Replace test-policy violations with observable lifecycle and reference behavior:
 
   - Training, sampling and objectives: [651, 652, 653, 654, 657, 658, 663, 667, 679, 680, 686, 687, 688, 692, 695, 698, 701, 702, 707, 708].
@@ -200,7 +200,6 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Judge an image model's layout parity under a sequence split, where its gradients' sums over spatial positions reassociate (edm2's sequence-split cell). [827]
 - Use JAX's supported persistent cache in the remote-cache tests, with handling narrowed to transport errors. [794]
 - Use JAX's own transfer guard on GPUs in place of the steady-state reimplementation, and guard CPU arrays' reads to numpy in JAX itself (jax-ml/jax#16602). [795, 801]
-- One collective parser (telemetry.instrumentation) and one cache-worker fixture in the tests. [796, 797]
 - Check every family, target row and mode in the kernel-route test, an unexplained route failing, and drop the KV cache's unconditional GPU xfail. [798, 799]
 - Hold MeanFlow's fused attention away from zero initialization, the delta rule's document isolation without exclusions, and the Mamba-2 TPU mesh by its numbers. [789, 790]
 - Delete the step benchmark's re-export facade. [800]
