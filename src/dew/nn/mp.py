@@ -29,7 +29,8 @@ import numpy as np
 import optax
 from flax import linen as nn
 
-from dew.nn.precision import at_least_fp32
+from dew.nn.conv import convolution
+from dew.nn.precision import at_least_fp32, float32_matmul
 
 MP_KERNEL = "mp_kernel"
 """The parameter name of a magnitude-preserving weight. Forced weight
@@ -108,7 +109,8 @@ class MPConv(nn.Module):
     An empty `kernel_size` makes it a dense layer. This is Eq. 47 of the
     EDM2 paper. The weight is `mp_kernel`, with the spatial axes first, then
     the input and output channels. A convolution pads to keep the size, as
-    the reference's odd kernels do.
+    the reference's odd kernels do, and runs as `Conv`'s does
+    (`dew.nn.conv.convolution`).
     """
 
     features: int
@@ -132,10 +134,8 @@ class MPConv(nn.Module):
         weight = weight * (gain / math.sqrt(math.prod(shape[:-1])))
         weight = weight.astype(x.dtype)
         if not self.kernel_size:
-            return x @ weight
-        pad = [(size // 2, size // 2) for size in self.kernel_size]
-        return jax.lax.conv_general_dilated(x, weight, (1,) * len(self.kernel_size), pad,
-                                            dimension_numbers=("NHWC", "HWIO", "NHWC"))
+            return float32_matmul(x, weight)
+        return convolution(x, weight, [(size // 2, size // 2) for size in self.kernel_size])
 
 
 class Uncertainty(nn.Module):

@@ -12,6 +12,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew.nn.activations import HIDDEN_ACT
 from dew.nn.attention import RMSNorm
+from dew.nn.precision import float32_dot_general
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.registry import Record
 
@@ -106,7 +107,7 @@ class MuseGlimmerProjectorModule(nn.Module):
                                  activation_after=True, dtype=self.dtype, precision=self.precision,
                                  name="adapter")(image_features)
         projected = nn.Dense(self.text_width, use_bias=False, dtype=self.dtype, precision=self.precision,
-                             name="projection")(adapted)
+                             name="projection", dot_general=float32_dot_general)(adapted)
         return RMSNorm(epsilon=self.norm_eps, with_scale=False, dtype=self.dtype, name="norm")(projected)
 
 

@@ -21,7 +21,7 @@ from dew.nn.activations import GatedActivation
 from dew.nn.attention import RMSNorm
 from dew.nn.flops import projection_flops
 from dew.nn.moe import ExpertMLP, chosen_experts, renormalized_softmax
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.protocols import Routes
 from dew.nn.sharding import logical_axes
 
@@ -48,7 +48,7 @@ class Gemma4TextRouter(nn.Module):
         scale = self.param('scale', nn.initializers.ones, (hidden,), jnp.float32)
         scaled = normed * (scale * (hidden ** -0.5)).astype(normed.dtype)
         logits = nn.Dense(self.num_experts, use_bias=False, dtype=self.dtype,
-                          precision=self.precision, name='proj')(scaled)
+                          precision=self.precision, name='proj', dot_general=float32_dot_general)(scaled)
         logits = logits.astype(at_least_fp32(logits.dtype))
         indices = chosen_experts(lambda: jax.lax.top_k(jax.nn.softmax(logits, axis=-1), self.top_k)[1],
                                  (*logits.shape[:-1], self.top_k), routes)

@@ -36,7 +36,7 @@ from ..inputs import LayerInputs, MixerCall, PredictionPhase
 from ..linear import recomputing
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
-from ..precision import scaled
+from ..precision import float32_dot_general, scaled
 from ..protocols import ProjectionGroup, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
 
@@ -669,7 +669,8 @@ class DecoderBlock(nn.Module):
             self.output_scalar = self.param("layer_scalar", nn.initializers.ones, (1,), jnp.float32)
         if self.per_layer_input_dim:
             dense = functools.partial(
-                nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+                nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                dot_general=float32_dot_general)
             self.per_layer_input_gate = dense(projections['per_layer_input_gate'][1],
                                               name='per_layer_input_gate')
             self.per_layer_projection = dense(projections['per_layer_projection'][1],
@@ -1143,7 +1144,7 @@ class MTPBlock(nn.Module):
         maps = self.projections()
         def dense(name):
             return nn.Dense(maps[name][1], use_bias=False, dtype=self.dtype,
-                            precision=self.precision, name=name)
+                            precision=self.precision, name=name, dot_general=float32_dot_general)
         if self.hyper_connections is None:
             self.eh_proj = dense('eh_proj')
         else:

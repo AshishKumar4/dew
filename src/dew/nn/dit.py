@@ -28,7 +28,7 @@ from .blocks import FourierEmbedding, TimeProjection, modulation
 from .conv import Conv
 from .flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
 from .mlp import GatedMLP
-from .precision import at_least_fp32, fp32_result_dot_general
+from .precision import at_least_fp32, float32_dot_general, fp32_result_dot_general
 from .rope import rotary_freqs
 from .scan_orders import (
     ScanOrder,
@@ -142,7 +142,8 @@ class PatchEmbedding(nn.Module):
                  dtype=self.dtype,
                  precision=self.precision)(x)
         if self.bottleneck is not None:
-            x = nn.Dense(self.embedding_dim, dtype=self.dtype, precision=self.precision)(x)
+            x = nn.Dense(self.embedding_dim, dtype=self.dtype, precision=self.precision,
+                         dot_general=float32_dot_general)(x)
         # The token count is named, not inferred: a reshape cannot infer it from a batch of no rows,
         # which a shortcut objective's bootstrap slice is below `bootstrap_every` rows.
         return jnp.reshape(x, (batch, x.shape[1] * x.shape[2], self.embedding_dim))
@@ -212,7 +213,7 @@ class PatchSequenceEmbed(nn.Module):
                 features=self.emb_features,
                 dtype=self.dtype,
                 precision=self.precision,
-                name="hilbert_projection",
+                name="hilbert_projection", dot_general=float32_dot_general,
             )
 
     def __call__(self, x):
@@ -271,7 +272,8 @@ class ConditioningEmbed(nn.Module):
                 FourierEmbedding(features=self.emb_features, scale=self.time_scale, dtype=self.dtype),
                 TimeProjection(features=self.emb_features * self.mlp_ratio,
                                dtype=self.dtype, precision=self.precision),
-                nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision),
+                nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision,
+                         dot_general=float32_dot_general),
             ], name=name)
 
         if self.interval:
@@ -279,7 +281,7 @@ class ConditioningEmbed(nn.Module):
         self.time_embed = time_embedding("time_embed")
         self.text_proj = nn.Dense(
             features=self.emb_features, dtype=self.dtype,
-            precision=self.precision, name="text_context_proj")
+            precision=self.precision, name="text_context_proj", dot_general=float32_dot_general)
 
     def __call__(self, temb, textcontext: TextContext | None = None, duration=None):
         cond_emb = self.time_embed(temb)
