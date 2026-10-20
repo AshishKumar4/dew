@@ -77,9 +77,12 @@ def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
 
 def test_quantized_and_plain_calls_of_one_shape_keep_their_own_products_in_one_process():
     """`x @ w` is `jnp.matmul`, a jitted function whose trace a quantized call takes under Qwix's
-    interception. Run beside the plain model at the same shapes, in either order, each computes its
-    own product: the plain one after the quantized one is the plain one before it, and a quantized
-    one after a plain one quantizes."""
+    interception. Beside the plain model at the same shapes, in either order and each shape's first
+    call cold, each computes its own product: a plain call after a quantized one is the plain
+    product (`lax.dot_general`'s, which no jitted contraction serves), and a quantized call after a
+    plain one quantizes."""
+    pytest.importorskip("qwix")
+
     class Product(nn.Module):
         @nn.compact
         def __call__(self, x):
@@ -87,16 +90,17 @@ def test_quantized_and_plain_calls_of_one_shape_keep_their_own_products_in_one_p
 
     model = Product()
     quantized = Quantization().apply(model)
-    variables = model.init(jax.random.key(0), jnp.ones((4, 16)))
+    variables = model.init(jax.random.key(0), jnp.ones((1, 16)))
+    kernel = variables["params"]["kernel"]
+
+    def plain(x):
+        return np.asarray(jax.lax.dot_general(x, kernel, (((1,), (0,)), ((), ()))))
+
     first, then = (jax.random.normal(jax.random.key(seed), (rows, 16)) for seed, rows in ((1, 4), (2, 5)))
-
-    before = np.asarray(model.apply(variables, first))
-    product = np.asarray(quantized.apply(variables, first))
-    assert not np.array_equal(product, before)
-    np.testing.assert_array_equal(np.asarray(model.apply(variables, first)), before)
-
-    plain = np.asarray(model.apply(variables, then))
-    assert not np.array_equal(np.asarray(quantized.apply(variables, then)), plain)
+    assert not np.array_equal(np.asarray(quantized.apply(variables, first)), plain(first))
+    np.testing.assert_array_equal(np.asarray(model.apply(variables, first)), plain(first))
+    np.testing.assert_array_equal(np.asarray(model.apply(variables, then)), plain(then))
+    assert not np.array_equal(np.asarray(quantized.apply(variables, then)), plain(then))
 
 
 def test_a_pattern_that_matches_nothing_quantizes_nothing():
