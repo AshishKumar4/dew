@@ -550,9 +550,9 @@ def test_a_norm_the_kernel_refuses_reports_the_requirement_and_its_row(width, dt
     (route,) = found
     assert (route.kernel, route.preferred) == ("xla", "pallas")
     assert (route.refusal.code, route.refusal.row) == (code, row)
-    with generation.assumed("sm80"), generation.chosen(rms_norm="pallas"):
-        with pytest.raises(KernelRefused) as refused:
-            norm_swiglu.rms_kernel("auto", x, None, dtype, fp32_statistics=True)
+    forced = generation.chosen(rms_norm="pallas")
+    with generation.assumed("sm80"), forced, pytest.raises(KernelRefused) as refused:
+        norm_swiglu.rms_kernel("auto", x, None, dtype, fp32_statistics=True)
     assert code in {refusal.code for refusal in refused.value.refusals}
 
 
