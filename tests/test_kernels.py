@@ -63,24 +63,68 @@ def flash_here():
 
 
 @on_gpu
-def test_flash_refuses_keys_and_values_of_another_batch_rank_or_width():
-    """The wheel's kernels read every key and value stride off the query's batch and width, so keys or
-    values of another batch, rank or width would be read past their end: each is refused by name,
-    batched and packed, before the kernel runs."""
-    flash = flash_here()
-    query = jnp.ones((2, 32, 2, 64), jnp.bfloat16)
-    for key, value in ((jnp.ones((1, 32, 2, 64), jnp.bfloat16),) * 2,
-                       (jnp.ones((2, 32, 2, 32), jnp.bfloat16),) * 2,
-                       (jnp.ones((2, 32, 2, 64), jnp.bfloat16), jnp.ones((2, 16, 2, 64), jnp.bfloat16)),
-                       (jnp.ones((2, 32, 4, 64), jnp.bfloat16),) * 2):
-        with pytest.raises(ValueError):
-            flash.flash_mha(query, key, value)
-    packed = jnp.ones((64, 2, 64), jnp.bfloat16)
-    offsets = jnp.asarray([0, 32, 64], jnp.int32)
-    for shape in ((64, 2, 32), (2, 32, 2, 64)):
-        other = jnp.ones(shape, jnp.bfloat16)
-        with pytest.raises(ValueError):
-            flash.flash_mha_varlen(packed, other, other, offsets, 32)
+def test_flash_through_dews_attention_refuses_rows_it_would_misread(without_deterministic_ops):
+    """Through Dew's attention (`scaled_dot_product_attention`, 'flash'), keys and values of another
+    batch, width, length or head count than the query's are refused as the call traces, before any
+    kernel runs, dense and packed. Packing flattens the rows into one run of tokens, where keys of one
+    row of 64 beside queries of two rows of 32, or another sequence's keys of one row of 32 beside
+    their ids of two rows of 16, flatten to as many tokens and would be read as the next row's: the
+    call names the ids. Each well-formed twin, dense with grouped heads and packed, gives its output
+    and gradients within tests/reference_error.py's rule of the xla kernel's, both measured from
+    float64 per row or document."""
+    flash_here()
+    rng = np.random.default_rng(31)
+
+    def normal(*shape):
+        return jnp.asarray(rng.normal(size=shape), jnp.bfloat16)
+
+    query, cotangent = normal(2, 32, 4, 64), normal(2, 32, 4, 64)
+    key, value = normal(2, 32, 2, 64), normal(2, 32, 2, 64)
+    own = {"segment_ids": jnp.asarray(documents([[20, 12, 0], [9, 23, 0]])), "max_segments": 2}
+    cross = {"segment_ids": own["segment_ids"], "max_segments": 2,
+             "key_segment_ids": jnp.asarray(documents([[10, 6, 0], [4, 12, 0]]))}
+
+    def attend(implementation, causal=True, **packed):
+        return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
+                                                            causal=causal, **packed)
+
+    malformed = [(normal(1, 32, 2, 64),) * 2, (normal(2, 32, 2, 32),) * 2, (key, normal(2, 16, 2, 64)),
+                 (normal(2, 32, 3, 64),) * 2]
+    for packed in ({}, own):
+        for k, v in malformed:
+            with pytest.raises(ValueError):
+                jax.eval_shape(attend('flash', **packed), query, k, v)
+    with pytest.raises(ValueError, match="document's id"):
+        jax.eval_shape(attend('flash', **own), query, normal(1, 64, 2, 64), normal(1, 64, 2, 64))
+    with pytest.raises(ValueError, match="document's id"):
+        jax.eval_shape(attend('flash', causal=False, **cross), query, normal(1, 32, 2, 64),
+                       normal(1, 32, 2, 64))
+
+    def exact(pieces):
+        """`[o, dq, dk, dv]` from float64 and their `window_terms`, each `(row, slice)` causal alone."""
+        truth = [np.zeros(x.shape, np.float64) for x in (query, query, key, value)]
+        terms = [np.zeros(x.shape, np.float64) for x in (query, query, key, value)]
+        with jax.enable_x64(new_val=True):
+            for row, piece in pieces:
+                parts = [x[row, piece] for x in (query, key, value, cotangent)]
+                wide = [jnp.asarray(np.asarray(x, np.float64)) for x in parts]
+                for whole, part in zip(truth, output_and_gradients(
+                        lambda q, k, v: float64_attention(q, k, v, causal=True), wide[3], *wide[:3]),
+                        strict=True):
+                    whole[row, piece] = part
+                for whole, part in zip(terms, window_terms(*parts, causal=True), strict=True):
+                    whole[row, piece] = part
+        return truth, terms
+
+    rows = [(0, slice(0, 32)), (1, slice(0, 32))]
+    documents_ = [(0, slice(0, 20)), (0, slice(20, 32)), (1, slice(0, 9)), (1, slice(9, 32))]
+    for packed, pieces in (({}, rows), (own, documents_)):
+        fused = output_and_gradients(jax.jit(attend('flash', **packed)), cotangent, query, key, value)
+        reference = output_and_gradients(jax.jit(attend('xla', **packed)), cotangent, query, key, value)
+        truth, terms = exact(pieces)
+        for name, index in (("o", 0), ("dq", 1), ("dk", 2), ("dv", 3)):
+            assert_as_exact_as_the_reference(fused[index], reference[index], truth[index],
+                                             f"{name} {'packed' if packed else 'dense'}", terms=terms[index])
 
 
 def qkv(shape, seed=0):
