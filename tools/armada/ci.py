@@ -17,9 +17,9 @@ as groups of its tests (`groups`, tools/armada/split.py): runs of consecutive
 tests in node-id order, each as light as that many runs let it be, a heavier
 test alone. Each group also pays the file's setup (its module's fixtures,
 imports and compiles), which is what armada measured the file at beyond its
-tests' times in tests/test_durations.json, shared among the groups it last ran
-as, so the file takes the fewest groups whose heaviest, setup included, holds
-to `target` (`split`). A file weighs armada's
+tests' times in tests/test_durations.json, at the cut its rows were last timed
+at and shared among that cut's groups (`measured_cut`), so the file takes the
+fewest groups whose heaviest, setup included, holds to `target` (`split`). A file weighs armada's
 median of its last green runs, else its tests' sum in
 tests/test_durations.json, else the mean. Each entry names its rows, one a
 file (or a file's group), so armada grades a task that leaves one out as not
@@ -355,7 +355,7 @@ def groups(seconds: list[float], count: int) -> list[range]:
 
 
 def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> list[float]:
-    """The weights of the groups a file of `seconds`, last run as `cut` groups, runs as. Of those
+    """The weights of the groups a file that took `seconds` as `cut` groups runs as. Of those
     seconds, what its recorded `tests`' times leave is what each group paid besides its tests (its
     module's fixtures, imports and compiles, which a test's least recorded time does not hold), so
     each group weighs its tests plus that setup. The file is cut (`groups`) into the fewest runs
@@ -373,13 +373,25 @@ def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> li
     return [sum(tests[run.start:run.stop]) + setup for run in groups(tests, count) if run]
 
 
-def last_cut(timings: dict, python: str, name: str) -> int:
-    """How many groups `name` ran as under `python` in the runs `timings` holds: the count its
-    rows' splits name (`row`), the most if they differ, else one."""
-    counts = [int(split_.split("/")[1]) for row_name in timings.get("rows", {})
-              for python_, name_, split_ in [parsed_row(row_name)]
-              if (python_, name_) == (python, name) and "/" in split_]
-    return max(counts, default=1)
+def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | None:
+    """What `name` took under `python` at the cut its rows in `timings` name, and that cut's count:
+    its groups' rows summed where every group of a count has its row (the most groups if several
+    counts do), else its whole row, else None. A row's median is measured at the cut its name
+    holds, unlike the file's median, which mixes the cuts of the runs it remembers."""
+    whole, counts = None, {}
+    for row_name, seconds in timings.get("rows", {}).items():
+        python_, name_, split_ = parsed_row(row_name)
+        if (python_, name_) != (python, name) or split_ == COLLECT:
+            continue
+        if not split_:
+            whole = seconds
+            continue
+        index, count = (int(part) for part in split_.split("/"))
+        counts.setdefault(count, {})[index] = seconds
+    complete = [count for count, held in counts.items() if len(held) == count]
+    if complete:
+        return sum(counts[max(complete)].values()), max(complete)
+    return None if whole is None else (whole, 1)
 
 
 APART = re.compile(r"\bpytest\.mark\.torchax\b")
@@ -416,8 +428,10 @@ def plan(target: float, timings: dict) -> list[dict]:
             ([name], "", target) for name, seconds in timed.items() if seconds is None]
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
-                cut = split(recorded.get(name, []), seconds, target, last_cut(timings, python, name))
-                tasks += [([name], f"{group}/{len(cut)}", weight)
+                at, count = measured_cut(timings, python, name) or (seconds, 1)
+                cut = split(recorded.get(name, []), at, target, count)
+                # A file one group holds runs whole, alone, under its own row.
+                tasks += [([name], f"{group}/{len(cut)}" if len(cut) > 1 else "", weight)
                           for group, weight in enumerate(cut, start=1)]
         light = {name: seconds for name, seconds in timed.items()
                  if seconds is not None and seconds <= target}
