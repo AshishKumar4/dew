@@ -25,7 +25,6 @@ from dew.nn.attention import (
     causal_attention_mask,
     chunk_mask,
     combined_attention_mask,
-    cudnn_runs,
     cudnn_takes_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
@@ -47,8 +46,8 @@ from dew.nn.inputs import (
     counted_places,
     document_reach,
 )
-from dew.nn.kernels.generation import backend
-from dew.nn.kv_cache import PLACES, TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
+from dew.nn.kernels.selection import select
+from dew.nn.kv_cache import PAGED, PLACES, TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain, unit
@@ -922,8 +921,7 @@ class CausalSelfAttention(nn.Module):
         # A chunk, window or metadata mask replaces `cursor` and keeps the gather.
         plain_step = (append is not None and mask is cursor and S == 1 and sinks is None
                       and bias is None and not sowing)
-        if (append is not None and plain_step and self._page_kernel_runs(query)
-                and append.store.kernel(query[:, 0])):
+        if append is not None and plain_step and self._pages(append.store, query[:, 0]):
             attention = self._paged(append, query, jnp.asarray(positions).reshape(B, S)[:, 0])
         elif plain_step:
             attention = self._decode_attention(query, key, value, jnp.asarray(positions).reshape(B, S)[:, 0])
@@ -983,7 +981,7 @@ class CausalSelfAttention(nn.Module):
         prompt = positions[rows:].reshape(pieces, width)
         index.value = (index.value + (positions[:rows] >= 0)).at[admitted.slots].set(
             admitted.cursors + jnp.sum(prompt >= 0, axis=1, dtype=jnp.int32), mode="drop")
-        if self._page_kernel_runs(query) and store.kernel(query[0, :rows]):
+        if self._pages(store, query[0, :rows]):
             decoded = store.decode(query[0, :rows], held_reads(index.value, positions[:rows]),
                                    self.ctx.attn_logit_softcap)
             decoded = checkpoint_name(decoded[:, None], 'context')
@@ -1034,20 +1032,17 @@ class CausalSelfAttention(nn.Module):
             key_value_seq_lengths=reads.astype(jnp.int32))
         return checkpoint_name(attention, 'context')
 
-    def _page_kernel_runs(self, query) -> bool:
-        """Whether a decode step may read a paged pool through its device's
-        paged kernel (`KVStore.decode`) rather than the gathered rows. The
-        paged kernels read keys and values of one width, so narrower values
-        take the gathered rows, which the attention core widens. Neither
-        device's paged kernel performs what only the reference path does
-        (`reference_only`), so such a step takes the gathered rows, where an
-        explicit kernel refuses it by name."""
-        if self.value_dim != self.ctx.head_dim or reference_only(
-                query, self.ctx.dtype, self.ctx.precision, self.ctx.force_fp32_for_softmax):
+    def _pages(self, store, query) -> bool:
+        """Whether a decode step's query `[rows, heads, head_dim]` reads the paged pool `store` through
+        its device's paged kernel (`KVStore.decode`), as the paged selector chooses it (`PAGED`), rather
+        than the gathered rows through the layer's attention; a compact cache keeps no pages."""
+        if store.layout.page_size is None:
             return False
-        if backend() != 'gpu':
-            return self.ctx.attention_impl in ('auto', 'tpu')
-        return self.ctx.attention_impl in ('auto', 'cudnn') and cudnn_runs(query, self.ctx.attn_logit_softcap)
+        case = store.case(query, value_dim=self.value_dim, softcap=self.ctx.attn_logit_softcap,
+                          arithmetic=reference_only(query, self.ctx.dtype, self.ctx.precision,
+                                                    self.ctx.force_fp32_for_softmax),
+                          named=self.ctx.attention_impl)
+        return select(PAGED, case).kernel != 'gathered'
 
     def _decode_masks(self, positions, key_length: int) -> tuple[jax.Array, jax.Array]:
         """The cursor mask over the cache's filled slots, and the layer's decode mask.

@@ -43,7 +43,9 @@ import jax.numpy as jnp
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
+from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import backend
+from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Requirement
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import logical_spec, manual_map, mesh_axes
 
@@ -460,49 +462,33 @@ class KVStore:
         """Every row's slots of `pool` `[heads, pages, page_size, ...]`, as `[rows, capacity, heads, ...]`."""
         return _gather_pages(pool, self._get(TABLE), self.layout.groups)
 
-    def kernel(self, query: jax.Array) -> bool:
-        """Return whether a decode query `[rows, heads, head_dim]` can read a
-        full-precision BF16 page pool natively.
-
-        The TPU kernel reads bfloat16 and casts other page dtypes (its int8
-        path broadcasts the scales to full width first), so a float32 or
-        quantized pool uses the gather. On a GPU, decode reads the pages
-        through Dew's Pallas decode kernel where it fits the query's heads
-        over the pool's and the page (`decode_attention.fits_paged`). A
-        grouped pool also uses the gather, which keeps each group's pages
-        where they are, and so does a mesh splitting the query heads past the
-        pool's key heads: either device's kernel runs per shard (`decode`),
-        each holding the pool's key heads its query heads read.
-        """
-        page_size = self.layout.page_size
-        if (page_size is None or self.layout.quantized is not None
-                or self.layout.groups != 1 or self.dtype != jnp.bfloat16
-                or self.kv_heads % _head_shards(query)):
-            return False
-        if backend() == "tpu":
-            return True
-        if backend() != "gpu":
-            return False
-        from dew.nn.attention import FORWARD_MODE
-        from dew.nn.kernels import decode_attention
-
-        pages = jax.ShapeDtypeStruct((self.kv_heads, 1, page_size, self.head_dim), self.dtype)
-        return decode_attention.fits_paged(query, pages) and not FORWARD_MODE.get()
+    def case(self, query: jax.Array, *, value_dim: int, softcap: float | None, arithmetic: bool,
+             named: str) -> PagedCase:
+        """The `PagedCase` of a decode step's query `[rows, heads, head_dim]` over this pool, its values
+        `value_dim` wide, under the layer's `softcap`, its reference-only `arithmetic`
+        (`dew.nn.attention.reference_only`) and its `AttentionImpl`, `named`."""
+        return PagedCase(heads=query.shape[-2], kv_heads=self.kv_heads, head_dim=self.head_dim,
+                         value_dim=value_dim, dtype=jnp.dtype(query.dtype), pool=jnp.dtype(self.dtype),
+                         page_size=self.layout.page_size, quantized=self.layout.quantized is not None,
+                         groups=self.layout.groups, head_shards=_head_shards(query), softcap=softcap,
+                         arithmetic=arithmetic, named=named)
 
     def decode(self, query: jax.Array, lengths: jax.Array, softcap: float | None) -> jax.Array:
         """Attend one query per row `[rows, heads, head_dim]` to the first `lengths` slots of that row.
 
-        Decode runs the device's paged kernel. The TPU kernel does not scale
+        Decode runs the device's paged kernel, which raises `KernelRefused` where its requirements
+        (`PAGED`) turn the step down. The TPU kernel does not scale
         the logits, so the query is multiplied by 1/sqrt(head_dim) first, the
         same scale every other attention path applies. A Mosaic kernel cannot
         be partitioned automatically, and neither can the GPU's Pallas kernel,
         so on a mesh each runs per shard (`manual_map`): each holds its rows'
         queries, lengths and page tables, and the key heads of the pool its
         query heads read, with every page, as the tables index the whole pool.
-        On a GPU, a `softcap` raises `ValueError`.
         """
-        if backend() == "gpu" and softcap is not None:
-            raise ValueError("the GPU paged decode kernel does not apply a logit softcap")
+        case = self.case(query, value_dim=self.head_dim, softcap=softcap, arithmetic=False, named='auto')
+        kernel = 'triton' if backend() == "gpu" else 'tpu'
+        if failed := PAGED.kernel(kernel).failed(case):
+            raise KernelRefused(PAGED.choice, kernel, [requirement.refusal(case) for requirement in failed])
 
         def local(query, key, value, lengths, table):
             if backend() == "gpu":
@@ -524,6 +510,101 @@ DECODE_QUERY = ("activation_batch", "activation_heads", None)
 """The logical axes of a decode query `[rows, heads, head_dim]`."""
 
 
+@dataclasses.dataclass(frozen=True)
+class PagedCase:
+    """A decode step over a paged pool as the paged selector reads it (`PAGED`, `KVStore.case`): the
+    query's `heads` over the pool's `kv_heads`, `head_dim` wide with values `value_dim` wide; the
+    query's `dtype` and the `pool`'s; its `page_size` (None for a compact cache), whether it is
+    `quantized`, its `groups`; how many ways a mesh splits the query heads (`head_shards`); the layer's
+    `softcap`; whether its arithmetic is the reference path's alone (`arithmetic`); and the
+    `AttentionImpl` it `named`."""
+
+    heads: int
+    kv_heads: int
+    head_dim: int
+    value_dim: int
+    dtype: jnp.dtype
+    pool: jnp.dtype
+    page_size: int | None
+    quantized: bool
+    groups: int
+    head_shards: int
+    softcap: float | None
+    arithmetic: bool
+    named: str
+
+
+def _paged_layout(device: str) -> tuple[Requirement[PagedCase], ...]:
+    """What either device's paged kernel needs of the pool and the step: pages of bf16, unquantized and
+    ungrouped, keys and values of one width, a mesh's query-head split within the pool's key heads,
+    and arithmetic other than the reference path's."""
+    return (
+        Requirement('pages', lambda case: case.page_size is not None, "the cache keeps no pages",
+                    inherent=True),
+        Requirement('quantized', lambda case: not case.quantized,
+                    f"the {device} kernel reads bf16 pages; a quantized pool is read through the gather, "
+                    "which dequantizes it", row='roadmap: paged decode over quantized pools'),
+        Requirement('groups', lambda case: case.groups == 1,
+                    "a grouped pool keeps each group's pages where they are, which the gather reads",
+                    row='roadmap: paged decode over grouped pools'),
+        Requirement('dtype', lambda case: case.pool == jnp.bfloat16 and case.dtype == case.pool,
+                    lambda case: f"the {device} kernel reads a bf16 query over bf16 pages, not "
+                                 f"{case.dtype} over {case.pool}", inherent=True),
+        Requirement('widths', lambda case: case.value_dim == case.head_dim,
+                    "the paged kernels read keys and values of one width; narrower values take the "
+                    "gathered rows, which the attention core widens", inherent=True),
+        Requirement('head_shards', lambda case: case.kv_heads % case.head_shards == 0,
+                    "a mesh splits the query heads past the pool's key heads, whose pages the kernel reads "
+                    "per shard", inherent=True),
+        Requirement('arithmetic', lambda case: not case.arithmetic,
+                    "the step asks for arithmetic only the reference path computes (`reference_only`)",
+                    inherent=True),
+    )
+
+
+TRITON_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
+    Requirement('capability', lambda case: generation.triton_runs(),
+                "the paged decode kernel needs a GPU of sm80 or later", inherent=True),
+    *_paged_layout('GPU'),
+    decode_attention.PAGED_GEOMETRY,
+    Requirement('softcap', lambda case: case.softcap is None,
+                "the GPU paged decode kernel applies no logit softcap",
+                row='roadmap: paged decode softcap on GPU'),
+)
+"""Dew's Pallas paged decode kernel (`decode_attention.attend_paged`). Its derivatives at every order
+are the gathered attention's, through the attention dispatch (`_gpu_paged`), so neither a backward's
+kernel nor forward mode limits it."""
+
+TPU_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
+    Requirement('capability', lambda case: generation.backend() == 'tpu',
+                "the paged attention kernel runs on a TPU", inherent=True),
+    *_paged_layout('TPU'),
+)
+"""jax's Pallas TPU paged attention, which applies a logit softcap itself."""
+
+
+def _paged_preferred(case: PagedCase) -> str:
+    """The device's paged kernel where the layer's `AttentionImpl` leaves the choice to it ('auto', or the
+    fused kernel the device's own decode would take, 'cudnn' or 'tpu'), else the gathered rows through
+    the layer's own kernel."""
+    device = generation.backend()
+    if device == 'gpu' and case.named in ('auto', 'cudnn'):
+        return 'triton'
+    if device == 'tpu' and case.named in ('auto', 'tpu'):
+        return 'tpu'
+    return 'gathered'
+
+
+PAGED: Op[PagedCase] = Op('paged_decode', (
+    Kernel('triton', TRITON_PAGED_SUPPORTS),
+    Kernel('tpu', TPU_PAGED_SUPPORTS),
+    Kernel('gathered', (), generic=True),
+), _paged_preferred)
+"""The paged selector: a decode step over a paged pool reads it through its device's paged kernel where
+that kernel's requirements hold (`TRITON_PAGED_SUPPORTS`, `TPU_PAGED_SUPPORTS`), else the gathered rows
+through the layer's attention (`CausalSelfAttention._decode_attention`)."""
+
+
 def _head_shards(query: jax.Array) -> int:
     """How many ways the mesh splits a decode query's heads."""
     mesh = jax.sharding.get_abstract_mesh()
@@ -539,36 +620,42 @@ def _gather_pages(pool: jax.Array, table: jax.Array, groups: int) -> jax.Array:
                                      table.shape[1] * pool.shape[2], *pool.shape[3:]), 0, 2)
 
 
-@jax.custom_vjp
-def _gpu_paged(query: jax.Array, key: jax.Array, value: jax.Array,
-               table: jax.Array, lengths: jax.Array) -> jax.Array:
-    """Dew's Pallas decode kernel over the pages (`decode_attention.attend_paged`),
-    differentiated as the gathered attention is. An inactive row reads one
-    slot, so its unused output stays finite."""
-    from dew.nn.kernels import decode_attention
+def _gathered_attention(query, key, value, table, lengths):
+    """The paged kernel's arithmetic over the gathered rows, through the attention dispatch: one query a
+    row over the first `lengths` keys of its pages. An inactive row reads one slot. Its backward is
+    the paged kernel's (`_paged_backward`)."""
+    from dew.nn.attention import scaled_dot_product_attention
 
-    return decode_attention.attend_paged(query, key, value, table, jnp.maximum(lengths, 1))
-
-
-def _gpu_paged_fwd(query, key, value, table, lengths):
-    return _gpu_paged(query, key, value, table, lengths), (query, key, value, table, lengths)
+    keys, values = _gather_pages(key, table, 1), _gather_pages(value, table, 1)
+    return scaled_dot_product_attention(query[:, None], keys, values,
+                                        key_value_seq_lengths=jnp.maximum(lengths, 1))[:, 0]
 
 
-def _gpu_paged_bwd(saved, cotangent):
-    from dew.nn.attention import cudnn_attention
+def _gathered_tangent(query, key, value, table, lengths):
+    """`_gathered_attention` traced for forward mode (`forward_mode_attention`): a fused kernel the
+    dispatch takes keeps its value and takes its tangent from the reference path's, so `jax.jvp`
+    differentiates it at every order, which a reverse-only fused kernel would not."""
+    from dew.nn.attention import forward_mode_attention
 
-    query, key, value, table, lengths = saved
-
-    def gathered(q, k, v):
-        return cudnn_attention(q[:, None], _gather_pages(k, table, 1), _gather_pages(v, table, 1),
-                                bias=None, mask=None, causal=False, sliding_window=None,
-                                key_value_seq_lengths=jnp.maximum(lengths, 1))[:, 0]
-
-    _, backward = jax.vjp(gathered, query, key, value)
-    return (*backward(cotangent), None, None)
+    with forward_mode_attention():
+        return _gathered_attention(query, key, value, table, lengths)
 
 
-_gpu_paged.defvjp(_gpu_paged_fwd, _gpu_paged_bwd)
+def _paged_forward(query, key, value, table, lengths):
+    return decode_attention.attend_paged(query, key, value, table, jnp.maximum(lengths, 1)), ()
+
+
+def _paged_backward(saved, operands, cotangent):
+    return jax.vjp(_gathered_attention, *operands)[1](cotangent)
+
+
+_gpu_paged = generation.linear_tangent(_paged_forward, _paged_backward, _gathered_tangent)
+"""Dew's Pallas decode kernel over the pages (`decode_attention.attend_paged`), its derivatives at
+every order the gathered attention's (`generation.linear_tangent`): reverse mode runs the backward of
+whichever kernel the dispatch takes for it (`_gathered_attention`), a call cuDNN's width and
+determinism limits turn down included, and forward mode takes the forward-mode path's tangent
+(`_gathered_tangent`), with no context of the caller's. An inactive row reads one slot, so its unused
+output stays finite."""
 
 
 def _pages_per_block(pages: int) -> int:
