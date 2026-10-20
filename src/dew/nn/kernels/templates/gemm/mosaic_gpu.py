@@ -23,7 +23,9 @@ over the multiprocessors, a planar snake over the output tiles. A tile is a bloc
 one group, a block two groups share running once for each, and a tile stores only its group's rows, in
 a power-of-two ladder of TMA stores. Changed for Dew, each marked `# Dew:`:
 
-- the rows past the routed ones are one more group, whose tiles store zeros, so they come back zero;
+- the rows past the routed ones are one more group, whose tiles store zeros, so they come back zero,
+  and a grid slot past the last tile, which upstream ran on group 0's matrix and stored nothing of,
+  multiplies nothing;
 - each writes the output dtype it is asked for (fp32 for a kernel gradient), not the operands';
 - `tgmm` zeroes the neighbouring groups' rows of both operands by selection, where upstream
   multiplied one operand by a mask, which kept a neighbour's NaN or infinity (NaN * 0);
@@ -136,8 +138,9 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
             group_info = GroupInfo.create(rows_per_expert_gmem, block_m, mi)
 
             def acc_scope(acc_ref):
-                # Dew: the unrouted rows' tiles multiply nothing, their accumulator stays zero.
-                @pl.when(group_info.group_id < g)
+                # Dew: the unrouted rows' tiles multiply nothing, their accumulator stays zero, and a grid
+                # slot past the last tile no group has (GroupInfo's group 0, no rows) multiplies nothing.
+                @pl.when((group_info.group_id < g) & (group_info.actual_size > 0))
                 def _():
                     plgpu.emit_pipeline(
                         lambda _, lhs_smem, rhs_smem: plgpu.wgmma(

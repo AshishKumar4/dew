@@ -21,7 +21,7 @@ from tuned import each_config
 from dew.nn.activations import exact_gelu
 from dew.nn.gpt_oss import GptOssExperts
 from dew.nn.kernels import grouped_matmul, tuning
-from dew.nn.kernels.generation import chosen as kernel_choices, gpu_target, triton_runs
+from dew.nn.kernels.generation import chosen as kernel_choices, gpu_target, routes, triton_runs
 from dew.nn.moe import ExpertMLP, expert_dispatch, expert_projection
 from dew.training import MeshSpec
 
@@ -192,9 +192,9 @@ HOPPER = pytest.mark.skipif(not (triton_runs() and gpu_target().wgmma),
 @pytest.mark.skipif(not triton_runs(), reason="needs a GPU the Pallas kernels compile for")
 @pytest.mark.parametrize("kernel,width,features", [
     (grouped_matmul.Gmm, 192, 320), (grouped_matmul.GmmTransposed, 192, 320), (grouped_matmul.Tgmm, 192, 320),
-    pytest.param(grouped_matmul.MosaicGmm, 256, 512, marks=HOPPER),
-    pytest.param(grouped_matmul.MosaicGmmTransposed, 256, 512, marks=HOPPER),
-    pytest.param(grouped_matmul.MosaicTgmm, 256, 512, marks=HOPPER)])
+    pytest.param(grouped_matmul.MosaicGmm, 384, 768, marks=HOPPER),
+    pytest.param(grouped_matmul.MosaicGmmTransposed, 384, 768, marks=HOPPER),
+    pytest.param(grouped_matmul.MosaicTgmm, 384, 768, marks=HOPPER)])
 def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width, features):
     """Each tile the tuner may pick for a launch, of the implementation the
     launch is forced to, over groups ragged against every tile size, one
@@ -202,39 +202,78 @@ def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width,
     projection over an fp32 master hold check 1 against XLA's ragged dot,
     from float64 sums of the same bf16 operands, over the site's draws. The
     space declares only tiles proven here. Triton's widths are ragged
-    against its tiles, which mask them; Mosaic's divide its tiles, which it
-    needs."""
-    sizes = np.array([0, 70, 1, 129, 100, 0], np.int32)
-    rows, group = int(sizes.sum()), np.repeat(np.arange(len(sizes)), sizes)
+    against its tiles, which mask them; Mosaic's divide by every tile width
+    of its space (64, 128 and 192), which it needs."""
+    with kernel_choices(grouped_matmul=kernel.name):
+        configs = each_config(kernel, _tile_gate_arm('pallas'), *_tile_gate_draw(width, features)(0))
+    assert len(configs) > 1
+    for config in configs:
+        _assert_tile_gate(kernel, config, width, features)
+
+
+def test_the_tile_gate_fails_a_launch_off_by_a_rounding():
+    """The tile gate on the CPU's interpreted Triton launch passes it and fails it with its forward off
+    by one part in 2^7, an error no rounding of its sums makes: the reference arm is XLA's, not the
+    launch under test."""
+    width, features = 64, 128
+    draw = _tile_gate_draw(width, features)
+    with kernel_choices(grouped_matmul='triton'):
+        config, *_ = each_config(grouped_matmul.Gmm, _tile_gate_arm('pallas'), *draw(0))
+    _assert_tile_gate(grouped_matmul.Gmm, config, width, features)
+    with pytest.raises(AssertionError, match="y"):
+        _assert_tile_gate(grouped_matmul.Gmm, config, width, features, fault=1 + 2.0 ** -7)
+
+
+TILE_SIZES = np.array([0, 70, 1, 129, 100, 0], np.int32)
+"""The tile gate's groups: ragged against every tile, one empty, one of a single row."""
+
+
+def _tile_gate_draw(width, features):
+    rows = int(TILE_SIZES.sum())
 
     def draw(seed):
         rng = np.random.default_rng(seed)
         return (jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16),
-                jnp.asarray(rng.normal(size=(len(sizes), width, features)) / np.sqrt(width), jnp.float32),
+                jnp.asarray(rng.normal(size=(len(TILE_SIZES), width, features)) / np.sqrt(width),
+                            jnp.float32),
                 jnp.asarray(rng.normal(size=(rows, features)), jnp.bfloat16))
+    return draw
 
-    def projected(implementation):
-        def run(x, kernel_matrix, dy):
-            y, pull = jax.vjp(lambda x, k: expert_projection(x, k, jnp.asarray(sizes), jnp.bfloat16,
-                                                             implementation, None), x, kernel_matrix)
-            return (y, *pull(dy))
-        return run
+
+def _tile_gate_arm(implementation, fault=1.0):
+    """A bf16 projection's output and both gradients through `implementation` ('pallas' with the CPU's
+    interpreter), its output times `fault`."""
+    def run(x, kernel_matrix, dy):
+        y, pull = jax.vjp(lambda x, k: expert_projection(x, k, jnp.asarray(TILE_SIZES), jnp.bfloat16,
+                                                         implementation, None), x, kernel_matrix)
+        return ((y.astype(jnp.float32) * fault).astype(y.dtype), *pull(dy))
+    return run
+
+
+def _assert_tile_gate(kernel, config, width, features, fault=1.0):
+    """Check 1 of `kernel`'s launch at `config` against XLA's ragged dot, which runs under its own choice
+    so the forced kernel never reaches it."""
+    group = np.repeat(np.arange(len(TILE_SIZES)), TILE_SIZES)
 
     def truth(x, kernel_matrix, dy):
         # The products of the operands as the projection rounds them, in float64.
         x, kernel_matrix, dy = (np.asarray(value, np.float64) for value in (x, rounded(kernel_matrix), dy))
         return (np.einsum('ri,rio->ro', x, kernel_matrix[group]),
                 np.einsum('ro,rio->ri', dy, kernel_matrix[group]),
-                np.stack([x[group == expert].T @ dy[group == expert] for expert in range(len(sizes))]))
+                np.stack([x[group == expert].T @ dy[group == expert] for expert in range(len(TILE_SIZES))]))
 
-    reference = jax.jit(projected('xla'))
-    with kernel_choices(grouped_matmul=kernel.name):
-        configs = each_config(kernel, projected('pallas'), *draw(0))
-        assert len(configs) > 1
-        for config in configs:
-            with tuning.pinned({kernel: config}):
-                assert_as_exact(jax.jit(projected('pallas')), reference, draw,
-                                f"{kernel.__name__} at {config}", seeds=TILE_SEEDS, truth_fn=truth)
+    draw, xla = _tile_gate_draw(width, features), jax.jit(_tile_gate_arm('xla'))
+
+    def reference(*inputs):
+        with kernel_choices(grouped_matmul='xla'):
+            return xla(*inputs)
+
+    with kernel_choices(grouped_matmul='xla'), routes() as taken:
+        xla(*draw(0))
+    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'xla'}
+    with kernel_choices(grouped_matmul=kernel.name), tuning.pinned({kernel: config}):
+        assert_as_exact(jax.jit(_tile_gate_arm('pallas', fault)), reference, draw,
+                        f"{kernel.__name__} at {config}", seeds=TILE_SEEDS, truth_fn=truth)
 
 
 TILE_SEEDS = 8

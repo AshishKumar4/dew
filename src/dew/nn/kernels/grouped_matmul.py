@@ -83,9 +83,10 @@ MOSAIC_TILES = tuple(mosaic_gpu.Tiles(*shape) for shape in itertools.product(
 (`ragged_dot_mgpu.main`), where an H100's fastest lie (GMM-h100-3). Where the cost model ties, the first
 wins."""
 
-INTERPRETED = plgpu.InterpretGPUParams(out_of_bounds_reads="uninitialized", uninitialized_memory="zero")
-"""How a CPU interprets the Mosaic GPU launches: a read past an operand's rows gives zeros, as the TMA
-loads they stand for do."""
+INTERPRETED = plgpu.InterpretGPUParams(out_of_bounds_reads="uninitialized")
+"""How a CPU interprets the Mosaic GPU launches: a read past an operand's rows, which a TMA load zeroes,
+gives the poison every buffer starts with (NaN), as an output a kernel fails to store does, so the
+interpreter shows both."""
 
 
 def _mode(dtype) -> str:
@@ -103,6 +104,13 @@ def _row_tiles(rows: int, groups: int, tile: int) -> float:
     nonempty = min(groups, rows)
     expected = nonempty * max(1.0, rows / (nonempty * tile) + 0.5)
     return min(max(expected, least), rows, least + groups)
+
+
+def _block_tiles(rows: int, groups: int, tile: int) -> int:
+    """The tiles of `tile` rows block-aligned launches run over `rows` rows in `groups` groups: each
+    block once, and once more for each nonempty group that shares its first block with the group
+    before (`mosaic_gpu.GroupInfo`), at most one a group."""
+    return math.ceil(rows / tile) + min(groups, rows)
 
 
 def _routed(rows: int, groups: int) -> float:
@@ -202,10 +210,6 @@ class _Triton(_GroupedLaunch):
     def loaded(tile: Tile) -> int:
         """The elements of both operand tiles one depth step loads."""
 
-    def _resident(self, ba, config: Tile, target) -> int:
-        accumulator = config.block_m * config.block_n // (32 * config.warps)
-        return cost.resident(target, self.staged_bytes(ba, config), 32 * config.warps, accumulator + 64)
-
 
 @dataclasses.dataclass(frozen=True)
 class Gmm(_Triton):
@@ -244,7 +248,7 @@ class Gmm(_Triton):
         return cost.seconds(cost.Cost(
             programs=chunks * columns, device_bytes=moved,
             program_flops=flops / (chunks * columns), program_staged=staged,
-            resident=self._resident(ba, config, target), mode=_mode(tokens.dtype)), target)
+            mode=_mode(tokens.dtype)), target)
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array, *, out_dtype: str,
              trans_rhs: bool, interpret: bool, config: Tile, return_residuals: bool = False):
@@ -293,7 +297,7 @@ class Tgmm(_Triton):
         moved = (blocks[1] * rows * depth + blocks[0] * rows * width) * size + groups * depth * width * out
         return cost.seconds(cost.Cost(
             programs=programs, device_bytes=moved, program_flops=flops, program_staged=staged,
-            resident=self._resident(ba, config, target), mode=_mode(tokens.dtype)), target)
+            mode=_mode(tokens.dtype)), target)
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array, *, out_dtype: str,
              interpret: bool, config: Tile, return_residuals: bool = False):
@@ -358,7 +362,7 @@ class MosaicGmm(_Mosaic):
         (rows, depth), groups = tokens.shape, kernel.shape[0]
         width = kernel.shape[1] if ba.arguments['trans_rhs'] else kernel.shape[2]
         size, out = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(ba.arguments['out_dtype']).itemsize
-        tiles, columns = _row_tiles(rows, groups, config.block_m), width // config.block_n
+        tiles, columns = _block_tiles(rows, groups, config.block_m), width // config.block_n
         # The rows are read once a band; a group's matrix once for the row tiles of it in flight.
         bands = math.ceil(columns / config.grid_block_n)
         in_flight = max(1.0, _facts(target).multiprocessors / config.grid_block_n)
@@ -401,7 +405,7 @@ class MosaicTgmm(_Mosaic):
         in_flight = max(1.0, _facts(target).multiprocessors / config.grid_block_n)
         moved = ((bands * rows * depth + math.ceil(blocks[0] / in_flight) * rows * width) * size
                  + groups * depth * width * out)
-        steps = _row_tiles(rows, groups, config.block_k) / groups
+        steps = _block_tiles(rows, groups, config.block_k) / groups
         return self._cost(ba, config, target, groups * blocks[0] * blocks[1], steps, moved)
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array, *, out_dtype: str,
@@ -418,8 +422,16 @@ def _facts(target: generation.GpuTarget) -> generation.GpuTarget:
 
 def _rated(target: generation.GpuTarget, dtype) -> bool:
     """Whether `target` states the tensor rate a launch over `dtype` operands is costed by: a generation
-    that states none runs XLA's grouped matmul, needing no estimate."""
+    that states none runs XLA's grouped matmul, needing no estimate (`kernel_refusal`)."""
     return _facts(target).tensor_rate(_mode(dtype)) is not None
+
+
+def kernel_refusal(compute: Dtype) -> str | None:
+    """Why the kernels do not run a product computed in `compute` on this target, its generation stating
+    no tensor rate for it (an unseen GPU's), or None where one of them does."""
+    target = generation.gpu_target()
+    return None if _rated(target, compute) else (
+        f"{target.generation} states no {_mode(compute)} tensor rate, which the kernels' cost model reads")
 
 
 _GMMS = (MosaicGmm(), Gmm())

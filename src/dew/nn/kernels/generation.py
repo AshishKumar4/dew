@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
+import functools
 import inspect
 import logging
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -138,14 +139,15 @@ class GpuTarget:
 
     def tensor_rate(self, mode: str) -> float | None:
         """Dense tensor-core FLOPs per clock per multiprocessor in arithmetic `mode`, or None where
-        the generation states none: the generation's, scaled to the SKU's catalogued dense bf16 peak
-        where `dense_peaks` holds one, which is how a GeForce part's half-rate fp32 accumulation
-        reads."""
+        the generation states none: the generation's, lowered where the SKU's catalogued dense bf16 peak
+        is below what its multiprocessors and clock give at that rate, as a GeForce part's half-rate
+        fp32 accumulation reads. A part reporting fewer multiprocessors than its catalogue counts (a
+        MIG slice) keeps the generation's rate: the catalogue never raises it."""
         rate = self.tensor_rates.get(mode)
         peak = self.bf16_peak
         if rate is None or not (peak and self.multiprocessors and self.clock_hz):
             return rate
-        return rate * peak / (self.tensor_rates['16bit'] * self.multiprocessors * self.clock_hz)
+        return rate * min(1.0, peak / (self.tensor_rates['16bit'] * self.multiprocessors * self.clock_hz))
 
 
 # CUDA datasheets give sparse tensor peaks; the dense figures below are half.
@@ -317,18 +319,19 @@ def _shared_memory(device) -> int | None:
     return getattr(device, 'shared_memory_per_block_optin', None)
 
 
-def _clocks(device) -> dict[str, float]:
-    """`device`'s multiprocessor clock and device-memory bandwidth (twice the memory clock times the
-    bus's bytes, as CUDA's deviceQuery derives it), which jax's Device does not carry, from the CUDA
-    driver (`dew.telemetry.devices.gpu_attribute`); none where no driver loads."""
+@functools.cache
+def _clocks(ordinal: int) -> tuple[tuple[str, float], ...]:
+    """The visible GPU `ordinal`'s multiprocessor clock and device-memory bandwidth (twice the memory
+    clock times the bus's bytes, as CUDA's deviceQuery derives it), which jax's Device does not carry,
+    from the CUDA driver (`dew.telemetry.devices.gpu_attribute`), read once a process; none where no
+    driver loads."""
     from dew.telemetry.devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, MEMORY_CLOCK_RATE, gpu_attribute
 
-    ordinal = device.local_hardware_id
     clock, memory_clock, bus = (gpu_attribute(ordinal, attribute)
                                 for attribute in (CLOCK_RATE, MEMORY_CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH))
     if clock is None or memory_clock is None or bus is None:
-        return {}
-    return {'clock_hz': clock * 1e3, 'memory_bandwidth': 2 * memory_clock * 1e3 * bus / 8}
+        return ()
+    return ('clock_hz', clock * 1e3), ('memory_bandwidth', 2 * memory_clock * 1e3 * bus / 8)
 
 
 def runtime_facts(target: GpuTarget, device) -> GpuTarget:
@@ -338,7 +341,7 @@ def runtime_facts(target: GpuTarget, device) -> GpuTarget:
     every resource a kernel's requirements and cost read."""
     capability = _compute_capability(device)
     facts = {'multiprocessors': _multiprocessors(device), 'shared_limit': _shared_memory(device),
-             **_clocks(device)}
+             **dict(_clocks(device.local_hardware_id))}
     return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None},
                                wgmma=capability == '9.0' if capability else target.wgmma)
 
