@@ -196,3 +196,13 @@ def test_ln2_is_what_the_oracle_takes_it_for():
     assert low - fractions.Fraction(2) ** -330 <= oc._LN2 <= high + fractions.Fraction(2) ** -330
     assert oc._LN2_HI.hex() == "0x1.62e42fefa3a00p-1"
     assert oc._LN2_LO.hex() == "-0x1.0ca86c3898d00p-49"
+
+
+def test_an_intervals_ends_come_back_exact_and_signed():
+    """`interval_ends` returns an interval's ends exactly, at the interval's precision, with their signs:
+    a negative interval's ends are negative, and a 96-bit interval keeps its 96 bits."""
+    with oc.interval_precision(96) as iv:
+        assert oc.interval_ends(iv.mpf([-2, -1]), 96) == (Fraction(-2), Fraction(-1))
+        assert oc.interval_ends(iv.mpf([-2.5, 1.25]), 96) == (Fraction(-5, 2), Fraction(5, 4))
+        low, high = oc.interval_ends(iv.exp(iv.mpf(0.5)), 96)
+    assert 0 < high - low < Fraction(2) ** -90

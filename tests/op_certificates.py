@@ -205,13 +205,15 @@ def interval_precision(bits: int):
 def interval_ends(interval, bits: int) -> tuple[fractions.Fraction, fractions.Fraction]:
     """An mpmath interval's two ends as exact rationals, through mpmath's public interface: each end
     (`.a`, `.b`) read as an mpf at the `bits` the interval was computed at, so exactly, then its
-    mantissa and exponent (`.man`, `.exp`)."""
+    mantissa's magnitude and exponent (`.man`, `.exp`) and its sign."""
     import mpmath
 
     def exact(end) -> fractions.Fraction:
         with mpmath.workprec(bits):
             value = mpmath.mpf(end)
-        return fractions.Fraction(int(value.man)) * fractions.Fraction(2) ** int(value.exp)
+        # `.man` is the mantissa's magnitude: the sign is the value's own.
+        magnitude = fractions.Fraction(int(value.man)) * fractions.Fraction(2) ** int(value.exp)
+        return -magnitude if value < 0 else magnitude
 
     return exact(interval.a), exact(interval.b)
 
