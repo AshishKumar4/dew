@@ -20,10 +20,11 @@ def test_a_steady_state_counts_the_programs_it_compiles():
 
 @pytest.mark.gpu(reason="JAX's guard refuses a device-to-host read only where it copies, on a GPU")
 def test_a_guarded_block_refuses_an_implicit_read_and_takes_an_explicit_one():
-    """`jax.device_get` is the read a caller asks for by name; `float` of an array is an implicit one,
-    which the guard refuses."""
-    total = jax.jit(jnp.sum)(jnp.arange(4.0))
+    """`float` of an array is an implicit read, which the guard refuses; `jax.device_get` is the read
+    a caller asks for by name. Each reads an array of its own: a read leaves the array's host copy
+    cached, and a later read of that copy moves nothing for the guard to see."""
+    total, other = (jax.jit(jnp.sum)(jnp.arange(4.0) * scale) for scale in (1.0, 2.0))
     with guarded():
-        assert float(jax.device_get(total)) == 6.0
         with pytest.raises(RuntimeError):
             float(total)
+        assert float(jax.device_get(other)) == 12.0
