@@ -1596,7 +1596,7 @@ def mode_rollout(args) -> dict:
     eos = int(np.asarray(greedy.tokens)[0, 4])
     sampling = Sampling(temperature=0, eos_token_ids=eos, pad_token_id=12)
     objective = GRPOObjective(model, seq_len=7, variables=params)
-    rollout = SampledRollout(objective, lambda source, text, truth, info: float(len(text)),
+    rollout = SampledRollout(objective, lambda text, record: float(len(text)),
                              groups=2, max_new_tokens=4, sampling=sampling)
     trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.key(5),
                       mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
