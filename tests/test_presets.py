@@ -132,6 +132,22 @@ def test_sft_renders_conversations_and_trains_on_the_assistant_turns():
     finite(logged, "val/perplexity")
 
 
+def test_sft_keeps_every_turn_of_a_conversation_longer_than_its_rows():
+    """A conversation longer than a row is cut into pieces that keep every turn (P37), not cut short:
+    the pieces' ids, the boundary each shares with the next once, reassemble to the whole render."""
+    from dew.data.chat import template
+
+    turns = [{"role": role, "content": f"turn {index} of a long talk"}
+             for index in range(12) for role in ("user", "assistant")]
+    whole = next(Memory([{"messages": turns}]).map(template(str(CHAT))).iterate())["text"]
+    assert len(whole) > 49
+    pieces = list(Memory([{"messages": turns}]).pipe(presets.sft, str(CHAT), seq_len=48, batch=1).iterate())
+    kept = [row[row_segments > 0] for batch in pieces
+            for row, row_segments in zip(batch["text"], batch["text_coordinates"].segments, strict=True)]
+    rebuilt = np.concatenate([kept[0], *(piece[1:] for piece in kept[1:])])
+    np.testing.assert_array_equal(rebuilt, whole)
+
+
 def sft_tokens(marker, targets, *, empty_rows=0):
     """Equal-length tokenized conversations with `targets` assistant tokens per accepted row."""
     roles = np.full(9, int(Role.USER), np.int8)

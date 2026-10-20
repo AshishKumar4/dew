@@ -92,6 +92,36 @@ def test_compiled_samples_follow_the_substituted_denoiser():
     np.testing.assert_array_equal(after, expected)
 
 
+def test_compiled_samples_follow_the_autoencoder_they_decode_with():
+    """The sample program runs the autoencoder beside the denoiser, whose scale it bakes in, so it
+    keys on the autoencoder as on the denoiser (`sampling_modules`): an objective given another
+    autoencoder over the same network, scaled apart, decodes its samples with that one, as an
+    objective built over it does."""
+    from test_autoencoder import IMAGE_SIZE, tiny_vae
+
+    from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
+
+    first = tiny_vae()
+    scaled = StableDiffusionVAE(model=first.model, params=first.params, dtype=jnp.float32, latent_scale=2.0)
+    assert scaled.model is first.model
+    inputs = InputSpec(Field("image", (IMAGE_SIZE, IMAGE_SIZE, 3)))
+
+    def built(autoencoder):
+        return DiffusionObjective(Zero(), presets.Flow(), inputs, autoencoder=autoencoder, guidance=None,
+                                  steps=2)
+
+    objective = built(first)
+    variables = objective.init(jax.random.key(0))
+    batch = {"image": jnp.zeros((2, IMAGE_SIZE, IMAGE_SIZE, 3))}
+    step = Step(jnp.array(0), jax.random.key(1), None)
+    before = objective.evaluate(variables, batch, step).images
+    objective.autoencoder = scaled
+    after = objective.evaluate(variables, batch, step).images
+    expected = built(scaled).evaluate(variables, batch, step).images
+    assert not np.allclose(before, expected)
+    np.testing.assert_array_equal(after, expected)
+
+
 def test_a_preset_builds_the_same_loss_and_images_as_its_process():
     from dew.sampling import TextToImage
 

@@ -14,9 +14,12 @@ The plan prints a task matrix for each Python CI proves. Whole test files are
 packed heaviest first into the lightest of the tasks, each near `target`
 seconds, so a task imports only its own modules. A file heavier than that runs
 as groups of its tests (`groups`, tools/armada/split.py): runs of consecutive
-tests in node-id order, as many as it takes to hold each to `target` by their
-times in tests/test_durations.json, a heavier test alone, and each as light as
-that many runs let it be. A file weighs armada's
+tests in node-id order, each as light as that many runs let it be, a heavier
+test alone. Each group also pays the file's setup (its module's fixtures,
+imports and compiles), which is what armada measured the file at beyond its
+tests' times in tests/test_durations.json, at the cut its rows were last timed
+at and shared among that cut's groups (`measured_cut`), so the file takes the
+fewest groups whose heaviest, setup included, holds to `target` (`split`). A file weighs armada's
 median of its last green runs, else its tests' sum in
 tests/test_durations.json, else the mean. Each entry names its rows, one a
 file (or a file's group), so armada grades a task that leaves one out as not
@@ -351,16 +354,56 @@ def groups(seconds: list[float], count: int) -> list[range]:
     return [range(bounds[index], bounds[index + 1]) for index in range(count)]
 
 
-def split(tests: list[float], seconds: float, target: float) -> list[float]:
-    """The weights of the groups a file of `seconds` runs as: its recorded `tests`' times scaled to
-    `seconds`, cut (`groups`) into as many runs as it takes to hold each to `target`, a heavier test
-    alone. A file with no recorded time runs as equal counts of its tests."""
+def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> list[float]:
+    """The weights of the groups a file that took `seconds` as `cut` groups runs as. Of those
+    seconds, what its recorded `tests`' times leave is what each group paid besides its tests (its
+    module's fixtures, imports and compiles, which a test's least recorded time does not hold), so
+    each group weighs its tests plus that setup. The file is cut (`groups`) into the fewest runs
+    whose tests fit what the setup leaves of `target`, at least half of it, so a file whose setup
+    is most of a group is not cut into slivers that each pay it again; a heavier test runs alone.
+    Counting the setup once a group, rather than scaling every test by the file's total, keeps a
+    file from being cut finer each run for the setup its last cut added. A file keeps the cut it
+    ran as while that cut's heaviest group, setup included, stays within `KEPT` of `target`:
+    a group's compiled programs are cached under its cut (tests/remote_cache.py), so a new cut
+    compiles every group from nothing, and the setup that measures moves the next cut again
+    (armada dew-20261020144644-dceff433: a new cut fetched no programs, and 14 of its 20 split
+    files would have been cut again). A file with no recorded time runs as equal counts of its
+    tests."""
     if sum(tests) <= 0:
         count = math.ceil(seconds / target)
         return [seconds / count] * count
-    scale = seconds / sum(tests)
-    count = len(starts(milliseconds(tests), round(target / scale * 1000)))
-    return [sum(tests[run.start:run.stop]) * scale for run in groups(tests, count) if run]
+    setup = max(seconds - sum(tests), 0.0) / cut
+    if cut > 1 and max(sum(tests[run.start:run.stop]) for run in groups(tests, cut)) + setup <= KEPT * target:
+        count = cut
+    else:
+        room = max(target - setup, target / 2)
+        count = len(starts(milliseconds(tests), round(room * 1000)))
+    return [sum(tests[run.start:run.stop]) + setup for run in groups(tests, count) if run]
+
+
+KEPT = 1.5
+"""How far past the target a split file's heaviest group may run before the file is cut again."""
+
+
+def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | None:
+    """What `name` took under `python` at the cut its rows in `timings` name, and that cut's count:
+    its groups' rows summed where every group of a count has its row (the most groups if several
+    counts do), else its whole row, else None. A row's median is measured at the cut its name
+    holds, unlike the file's median, which mixes the cuts of the runs it remembers."""
+    whole, counts = None, {}
+    for row_name, seconds in timings.get("rows", {}).items():
+        python_, name_, split_ = parsed_row(row_name)
+        if (python_, name_) != (python, name) or split_ == COLLECT:
+            continue
+        if not split_:
+            whole = seconds
+            continue
+        index, count = (int(part) for part in split_.split("/"))
+        counts.setdefault(count, {})[index] = seconds
+    complete = [count for count, held in counts.items() if len(held) == count]
+    if complete:
+        return sum(counts[max(complete)].values()), max(complete)
+    return None if whole is None else (whole, 1)
 
 
 APART = re.compile(r"\bpytest\.mark\.torchax\b")
@@ -397,8 +440,10 @@ def plan(target: float, timings: dict) -> list[dict]:
             ([name], "", target) for name, seconds in timed.items() if seconds is None]
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
-                cut = split(recorded.get(name, []), seconds, target)
-                tasks += [([name], f"{group}/{len(cut)}", weight)
+                at, count = measured_cut(timings, python, name) or (seconds, 1)
+                cut = split(recorded.get(name, []), at, target, count)
+                # A file one group holds runs whole, alone, under its own row.
+                tasks += [([name], f"{group}/{len(cut)}" if len(cut) > 1 else "", weight)
                           for group, weight in enumerate(cut, start=1)]
         light = {name: seconds for name, seconds in timed.items()
                  if seconds is not None and seconds <= target}

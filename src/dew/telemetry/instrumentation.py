@@ -131,6 +131,8 @@ class _Instruction:
     each a great many times."""
     buffers: tuple[int, ...] = ()
     """A collective's result, each array's bytes (`_buffers`); empty for any other op."""
+    shapes: tuple[tuple[int, ...], ...] = ()
+    """A collective's result, each array's dimensions, as `buffers` sizes them; empty for any other op."""
 
 
 @dataclass
@@ -216,9 +218,12 @@ def _parse(text: str | Iterable[str]) -> tuple[dict[str, _Computation], str | No
         attributes, metadata = _without_metadata(attributes)
         traced = tuple(sys.intern(f"{op_name} {file}:{line}".strip() if file else op_name)
                        for op_name, file, line in _TRACED.findall(metadata) if op_name)
-        buffers = _buffers(match.group('shape')) if collective(match.group('op')) else ()
+        moved = collective(match.group('op'))
+        buffers = _buffers(match.group('shape')) if moved else ()
+        shapes = tuple(tuple(int(d) for d in each.split(',') if d)
+                       for _, each, _ in _ARRAY.findall(match.group('shape'))) if moved else ()
         computation.instructions[name] = _Instruction(match.group('op'), dims, operands, attributes,
-                                                      recomputed, traced, buffers)
+                                                      recomputed, traced, buffers, shapes)
         if stripped.startswith('ROOT'):
             computation.root = name
         literal = _INTEGER.match(match.group('rest'))
@@ -402,6 +407,8 @@ class HloInstruction:
     buffers: tuple[int, ...]
     """A collective's result, each array's bytes: an async pair's `-done` holds
     what moved, its `-start` what it read as well. Empty for any other op."""
+    shapes: tuple[tuple[int, ...], ...]
+    """A collective's result, each array's dimensions, as `buffers` sizes them."""
 
 
 def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
@@ -454,7 +461,8 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             flops = _instruction_flops(instruction, computation.shapes) + sum(each for _, _, each in called)
             found[name] = HloInstruction(instruction.op, target.group(1) if target else '',
                                          tuple(instruction.operands), ops, instruction.recomputed, names,
-                                         reads, flops, weights.get(called_as, 0.0), instruction.buffers)
+                                         reads, flops, weights.get(called_as, 0.0), instruction.buffers,
+                                         instruction.shapes)
     computations.clear()
     return found
 
