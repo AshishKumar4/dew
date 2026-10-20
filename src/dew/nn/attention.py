@@ -56,6 +56,7 @@ from .precision import (
     asks_default_precision,
     at_default_precision,
     at_least_fp32,
+    configured_precision,
     float32_dot_general,
     float32_einsum,
     float32_products,
@@ -1246,8 +1247,6 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     can save it instead of replaying the kernel (`remat_block` in dit.py).
     """
     shards = sequence_shards()
-    if implementation in ('auto', 'xla', 'reference'):  # a named fused kernel runs its own arithmetic
-        precision = float32_products(query.dtype if dtype is None else dtype, precision)
     if not 0 <= dropout_rate < 1:
         raise ValueError(f"dropout_rate must be within [0, 1), got {dropout_rate}")
     if key_segment_ids is not None:
@@ -1378,11 +1377,14 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
     elif implementation == 'xla':
         # A window of (l, r) keeps the l keys before the query and the r after
         # it on both the xla and the cudnn path, the sides `window_sides` counts.
-        out = jax.nn.dot_product_attention(
-            query, key, value, bias=bias, mask=mask, is_causal=causal,
-            key_value_seq_lengths=key_value_seq_lengths,
-            local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
-            implementation='xla')
+        # jax.nn's products take the precision their dtype does (`float32_products`) through the
+        # matmul config, which it reads for float32 operands.
+        with configured_precision(float32_products(query.dtype)):
+            out = jax.nn.dot_product_attention(
+                query, key, value, bias=bias, mask=mask, is_causal=causal,
+                key_value_seq_lengths=key_value_seq_lengths,
+                local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
+                implementation='xla')
     else:  # 'tpu'
         if key_value_seq_lengths is not None:
             mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
