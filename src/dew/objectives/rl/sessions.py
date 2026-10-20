@@ -148,6 +148,30 @@ def _token_ids(name: str, ids: object) -> None:
 
 
 @dataclass(frozen=True)
+class Transcript:
+    """One call's conversation in the structure the harness spoke it, as JSON.
+
+    `messages` are the chat messages the call was asked with, those the
+    harness sent or those the environment's observations carried so far, and
+    `response` is the message the engine answered with, tool calls included,
+    or None where the source holds no structured answer (its sampled ids
+    are the answer). The call's ids stay its training record: nothing is
+    tokenized from a transcript, and it is kept for reading a session, not
+    for scoring it.
+    """
+
+    messages: tuple[Mapping[str, object], ...]
+    response: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.messages, tuple) or not all(isinstance(message, Mapping)
+                                                           for message in self.messages):
+            raise ValueError("a transcript's messages are a tuple of JSON objects")
+        if self.response is not None and not isinstance(self.response, Mapping):
+            raise ValueError("a transcript's response is a JSON object or None")
+
+
+@dataclass(frozen=True)
 class Call:
     """One model call as the engine served it.
 
@@ -169,6 +193,10 @@ class Call:
     ids the sampler's top-k/top-p filters kept (vLLM's `sampling_mask`).
     With a support, the behavior log-probability is the filtered one, and
     the trainer renormalizes over the same support. None means no filter.
+
+    `reward` is what the environment paid for this call, a step reward, or
+    None. `transcript` is the call's conversation in the structure the
+    harness spoke it (`Transcript`), where the source has one.
     """
 
     prompt_ids: tuple[int, ...]
@@ -179,6 +207,7 @@ class Call:
     routed_experts: np.ndarray | None = field(default=None, compare=False)
     support: tuple[tuple[int, ...], ...] | None = None
     reward: float | None = None
+    transcript: Transcript | None = None
 
     def __post_init__(self) -> None:
         _token_ids("prompt_ids", self.prompt_ids)

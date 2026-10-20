@@ -16,7 +16,9 @@ as recorded, and the version the gateway stamped when the request arrived
 (the publication sets that stamp; see `Publication`). The gateway extracts
 vLLM's ids and SGLang's prompt ids. SGLang's sampled ids
 (`choices[0].response_token_ids`) are read from the raw response the
-gateway keeps. `engine_failure` and `refused_prompt` read what the engine
+gateway keeps, and each call's `Transcript` from the chat messages the
+harness sent and the message the engine answered, which the gateway records
+beside the ids. `engine_failure` and `refused_prompt` read what the engine
 itself said of a session, which every harness's verdict weighs the same way
 (`dew.interop.harness`).
 """
@@ -25,12 +27,14 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from dew.inference.clients import decode_routed_experts
-from dew.objectives.rl.sessions import Call
+from dew.objectives.rl.records import messages
+from dew.objectives.rl.sessions import Call, Transcript
+from dew.records import record as section
 
 if TYPE_CHECKING:
     import httpx
@@ -227,8 +231,19 @@ def _trace(trace: object, unstamped: int) -> _Trace:
     call = Call(_ids("prompt ids", prompt), _ids("sampled ids", sampled),
                 tuple(number("a log-probability", value) for value in likelihoods),
                 str(trace.get("finish_reason")), unstamped if version is None else version,
-                routed_experts=None if routed is None else decode_routed_experts(routed))
+                routed_experts=None if routed is None else decode_routed_experts(routed),
+                transcript=_transcript(trace))
     return _Trace(arrival, call, "")
+
+
+def _transcript(trace: Mapping[str, object]) -> Transcript | None:
+    """The chat messages the harness sent and the message the engine answered, as the gateway kept
+    them, or None for a trace that kept no messages."""
+    asked, answered = trace.get("messages") or [], trace.get("response_message") or None
+    if not asked and answered is None:
+        return None
+    return Transcript(messages(asked, "messages"),
+                      None if answered is None else section(answered, "response_message"))
 
 
 def calls(traces: Sequence[object], *, unstamped: int) -> Recorded:
