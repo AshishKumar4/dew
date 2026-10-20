@@ -21,8 +21,15 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_leaves_as_exact, float64_terms
+from reference_error import (
+    ORDERS,
+    assert_as_exact_over_orders,
+    assert_leaves_as_exact,
+    float64_terms,
+    widened,
+)
 
+from dew.accuracy import distance
 from dew.nn import linear
 from dew.nn.attention import alibi_bias
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -281,11 +288,17 @@ def test_no_token_reaches_another_document(kind):
     information crossing a document boundary. The delta rules run their portable math there, chosen
     through the kernel choice (`chosen`), which restarts each document's decays. Their port runs a
     row as one sequence, each document's decay prefix shifted by the chunk's before it
-    (`linear.FORGET`), so where the second document starts mid-chunk the first's decays round its
-    own and no bitwise comparison holds; where it starts a chunk, its chunk's prefix is its own and
-    the memory before it decays to exactly zero, so on the port the second document follows a first
-    of a whole chunk (`linear.CHUNK_SIZE`), bitwise again. The port's documents within a chunk are
-    held bitwise at the rule (test_linear_attention.py).
+    (`linear.FORGET`). Where the second document starts a chunk, its chunk's prefix is its own and
+    the memory before it decays to exactly zero, so on the port it follows a first of a whole chunk
+    (`linear.CHUNK_SIZE`), bitwise again. Where it starts mid-chunk the first's decays round its own,
+    fixed for a row, and no bitwise comparison holds: there it is held by the K-order rule over ORDERS
+    first documents of DOCUMENTS[0] tokens, the row's own and its changed one among them, each a draw
+    of that rounding, against ORDERS rows
+    whose first document is silent (zero embeddings, so every value it could carry is zero) and 1 to
+    ORDERS tokens long, the second starting as many places into its chunk, each a draw with nothing
+    to leak; both from the float64 second document, with no floor. A memory that crosses misses by
+    four orders of magnitude. The port's documents within a chunk are held bitwise at the rule too,
+    their decays fixed (test_linear_attention.py).
 
     The loss is differentiated at the embedded tokens, not through the lookup: the table's gradient
     adds each position's by a scatter, which a GPU's deterministic XLA (`--xla_gpu_deterministic_ops`)
@@ -326,11 +339,71 @@ def test_no_token_reaches_another_document(kind):
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
                                           err_msg=jax.tree_util.keystr(path))
 
+    def assert_as_exact_after_any_document(first, second, total=128):
+        """On the port, the second document of a row of `first` and `second` tokens (`assert_isolated`'s)
+        after its own first document, its changed one and others of random tokens, by the K-order rule
+        against after silent ones of 1 to ORDERS tokens, all from the float64 second document."""
+        variables = model.init(jax.random.key(4), jnp.zeros((1, total), jnp.int32))
+        drawn = jax.random.normal(jax.random.key(5), (1, second, VOCAB))
+        tokens = np.asarray(jax.random.randint(jax.random.key(3), (1, first + second + PADDING), 0, VOCAB))[0]
+        own = tokens[first:first + second]
+        firsts = [tokens[:first], (tokens[:first] + 7) % VOCAB,
+                  *(np.asarray(jax.random.randint(jax.random.key(100 + draw), (first,), 0, VOCAB))
+                    for draw in range(ORDERS - 2))]
+
+        def compiled(model=model):
+            """The second document's logits, the parameters' gradients of a loss on them alone and its
+            gradient at its embedded tokens, after a first of `length` tokens, silent where `silent` is
+            set: compiled once, under the kernel choice it is built in."""
+            @jax.jit
+            def second_document(variables, row, length, silent):
+                place = jnp.arange(total)[None]
+                segments = jnp.where(place < length, 1, jnp.where(place < length + second, 2, 0))
+                positions = jnp.where(segments == 1, place, jnp.where(segments == 2, place - length, 0))
+                at = coordinates(segments=segments, positions=positions, max_segments=3)
+                weight = jnp.zeros((1, total, VOCAB), drawn.dtype)
+                weight = jax.lax.dynamic_update_slice(weight, drawn, (0, length, 0))
+
+                def loss(variables, inputs):
+                    logits = model.apply(variables, row, input_embeddings=inputs, coordinates=at)
+                    return jnp.sum(logits * weight), jax.lax.dynamic_slice_in_dim(logits, length, second, 1)
+
+                inputs = model.apply(variables, row, method=embedded)
+                inputs = jnp.where(silent & (segments == 1)[..., None], 0.0, inputs)
+                (_, logits), (grads, at_inputs) = jax.value_and_grad(loss, argnums=(0, 1), has_aux=True)(
+                    variables, inputs)
+                return logits, grads, jax.lax.dynamic_slice_in_dim(at_inputs, length, second, 1)
+            return second_document
+
+        def row(before):
+            padding = np.zeros(total - len(before) - second, int)
+            return jnp.asarray(np.concatenate([before, own, padding]))[None]
+
+        with jax.enable_x64(new_val=True):
+            truth = jax.tree.leaves(compiled(model.clone(dtype=jnp.float64))(
+                widened(variables), row(firsts[0]), first, silent=False))
+        second_document = compiled()
+        distances = {}
+        silences = [np.zeros(length, int) for length in range(1, ORDERS + 1)]
+        for side, draws in (("dew", [(before, False) for before in firsts]),
+                            ("silent", [(before, True) for before in silences])):
+            for before, silent in draws:
+                found = second_document(variables, row(before), len(before), silent=silent)
+                leaves = zip(jax.tree_util.tree_leaves_with_path(found), truth, strict=True)
+                for (path, leaf), exact in leaves:
+                    distances.setdefault((side, jax.tree_util.keystr(path)), []).append(
+                        distance(np.asarray(leaf, np.float64), np.asarray(exact, np.float64)))
+        for (side, path), found in distances.items():
+            if side == "dew":
+                assert_as_exact_over_orders(found, distances["silent", path],
+                                            f"after a first document {path}")
+
     with chosen(gated_delta_rule="xla"):
         assert_isolated(*DOCUMENTS[:2])
     if kind in DELTA_RULES:
         with chosen(gated_delta_rule="fla"):
             assert_isolated(linear.CHUNK_SIZE, 128 - linear.CHUNK_SIZE - PADDING)
+            assert_as_exact_after_any_document(*DOCUMENTS[:2])
 
 
 POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "attention_sinks": True,
