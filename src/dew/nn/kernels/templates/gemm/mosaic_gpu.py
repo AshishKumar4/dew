@@ -222,13 +222,21 @@ def _ladder(value, rows, out, slots, epi_m: int, epi_n: int) -> None:
             offset = jnp.int32(0)
             size = epi_m
             while size:
-                plgpu.copy_smem_to_gmem(
-                    slots.at[slot].at[pl.ds(offset, size)],
-                    out.at[pl.ds(epi_row * epi_m + offset, size), pl.ds(epi_column * epi_n, epi_n)],
-                    predicate=(stored & size) != 0, commit_group=False)
+                _store_rows(slots.at[slot], out, epi_row * epi_m, epi_column * epi_n, offset, size,
+                            (stored & size) != 0)
                 offset = offset + (stored & size)
                 size //= 2
             plgpu.commit_smem_to_gmem_group()
+
+
+def _store_rows(slot, out, row, column, offset, size: int, stored) -> None:
+    """Where `stored`, copy `size` rows of `slot` from `offset` to `out` at (`row` + `offset`, `column`),
+    uncommitted."""
+    @pl.when(stored)
+    def _():
+        plgpu.copy_smem_to_gmem(slot.at[pl.ds(offset, size)],
+                                out.at[pl.ds(row + offset, size), pl.ds(column, slot.shape[1])],
+                                commit_group=False)
 
 
 def tgmm(tokens: jax.Array, cotangent: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, out_dtype,
