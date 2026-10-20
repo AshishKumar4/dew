@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, read_transformer, z_image_fields, z_image_path
@@ -113,10 +113,7 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
     tensors = {layout.name.removeprefix("transformer/"): layout for layout in layouts}
     assert {key.removeprefix(f"{name}.grad_param.") for key in arrays
             if key.startswith(f"{name}.grad_param.")} == set(tensors)
-    assert_leaves_as_exact(
-        {tensor: -np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()},
-        {tensor: arrays[f"{name}.grad_param.{tensor}"] for tensor in tensors},
-        {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors})
+    assert_as_exact_as_the_reference({tensor: -np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()}, {tensor: arrays[f"{name}.grad_param.{tensor}"] for tensor in tensors}, {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors}, 'test_the_flow_and_its_gradients_match_the_source')
 
 
 @pytest.fixture(scope="module")

@@ -535,7 +535,7 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
     and reuse give the resident stack's state, its routing exactly, and its logits, scores
     and cache as exact as the resident's own, both measured from the resident stack in
     float64 (tests/reference_error.py), the two paths compiling the same layers apart."""
-    from reference_error import assert_leaves_as_exact
+    from reference_error import assert_as_exact_as_the_reference
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import Mixture
@@ -582,4 +582,4 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
     def floating(tree):
         return [leaf for leaf in jax.tree.leaves(tree) if np.issubdtype(leaf.dtype, np.floating)]
 
-    assert_leaves_as_exact(floating(hosted), floating(resident), floating(truth))
+    assert_as_exact_as_the_reference(floating(hosted), floating(resident), floating(truth), 'test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_resident_one')

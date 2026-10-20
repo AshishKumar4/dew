@@ -14,13 +14,7 @@ import numpy as np
 import pytest
 from delta_rule_support import NAMES, fla_decay_terms, fla_side, float64_truth, recurrence, rule_math, through
 from jax.core import ShapedArray
-from reference_error import (
-    assert_as_exact_as_the_reference,
-    assert_leaves_as_exact,
-    equations,
-    float64_terms,
-    widened,
-)
+from reference_error import assert_as_exact_as_the_reference, equations, float64_terms, widened
 from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
 
@@ -752,7 +746,7 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
         wide = layer.clone(dtype=jnp.float64)
         truth, terms = float64_terms(jax.grad(lambda params: jnp.sum(wide.apply(params, x) ** 2)),
                                      jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params))
-    assert_leaves_as_exact(got, want, truth, terms=terms)
+    assert_as_exact_as_the_reference(got, want, truth, 'test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient', terms=terms)
     if jax.default_backend() != "gpu":
         for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(got), jax.tree.leaves(want),
                                         strict=True):

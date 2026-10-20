@@ -19,7 +19,7 @@ import optax
 import pytest
 from affine_run import dataset
 from recording import RecordingTracker
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, widened
+from reference_error import assert_as_exact_as_the_reference, widened
 
 from dew.artifacts import TokenScores
 from dew.data.chat import ROLES_KEY, Role
@@ -655,7 +655,7 @@ def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
 def test_z_loss_gradient_carries_the_reference_factor():
     """The oracle's logit gradient, `(1 + 2 z log Z) softmax - onehot`, pulled
     back through the model, holds the objective's parameter gradient as near
-    float64 as the oracle's own float32 run is (`assert_leaves_as_exact`):
+    float64 as the oracle's own float32 run is (`assert_as_exact_as_the_reference`):
     the truth pulls the float64 oracle at the float64 forward's logits back
     through that forward, the reference pulls the float32 oracle at the
     float32 logits back in float32."""
@@ -682,7 +682,7 @@ def test_z_loss_gradient_carries_the_reference_factor():
         truth = jax.tree.map(np.asarray, truth)
     actual = jax.grad(lambda p: objective.scalar_loss({"params": p}, batch, step_at())[0])(params["params"])
 
-    assert_leaves_as_exact(actual, reference, truth)
+    assert_as_exact_as_the_reference(actual, reference, truth, 'test_z_loss_gradient_carries_the_reference_factor')
 
 
 def test_router_z_loss_adds_each_routers_mean_squared_log_partition():

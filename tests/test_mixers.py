@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_leaves_as_exact, float64_terms
+from reference_error import assert_as_exact_as_the_reference, float64_terms
 
 from dew.nn import linear
 from dew.nn.attention import alibi_bias
@@ -258,9 +258,7 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
         alone64 = documents_alone(model.clone(dtype=jnp.float64), tokens)
         (truth, truth_grads), (terms, terms_grads) = float64_terms(
             functools.partial(pulled, alone64), wide, jnp.asarray(cotangent, jnp.float64))
-    assert_leaves_as_exact({"logits": packed, "grads": packed_grads}, {"logits": alone, "grads": alone_grads},
-                           {"logits": truth, "grads": truth_grads}, reductions=sum(DOCUMENTS),
-                           terms={"logits": terms, "grads": terms_grads})
+    assert_as_exact_as_the_reference({"logits": packed, "grads": packed_grads}, {"logits": alone, "grads": alone_grads}, {"logits": truth, "grads": truth_grads}, 'test_a_packed_row_computes_what_its_documents_compute_alone', terms={"logits": terms, "grads": terms_grads})
 
 
 def embedded(module, tokens):

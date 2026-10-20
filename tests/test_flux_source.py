@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import extract_fixture, packed, unpacked
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux_fields, flux_path, read_transformer
@@ -95,11 +95,8 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
         prefix = f"{name}.grad_param."
         tensors = [key[len(prefix):] for key in arrays.files if key.startswith(prefix)]
         assert tensors
-        assert_leaves_as_exact(
-            {tensor: np.asarray(layout["transformer/" + tensor].export({"params": gradients[0]}))
-             for tensor in tensors},
-            {tensor: arrays[prefix + tensor] for tensor in tensors},
-            {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors})
+        assert_as_exact_as_the_reference({tensor: np.asarray(layout["transformer/" + tensor].export({"params": gradients[0]}))
+             for tensor in tensors}, {tensor: arrays[prefix + tensor] for tensor in tensors}, {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors}, 'test_native_flux_matches_the_source_forward_and_every_gradient')
 
 
 @pytest.fixture(scope="module")

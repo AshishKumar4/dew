@@ -12,7 +12,7 @@ import numpy as np
 import optax
 import pytest
 from recording import RecordingTracker
-from reference_error import assert_leaves_as_exact, float64_terms
+from reference_error import assert_as_exact_as_the_reference, float64_terms
 
 from dew.config.data import loader
 from dew.data import Loading
@@ -299,8 +299,8 @@ def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True) -
     assert packed_grads, "no gradient leaf held"
     # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
     # another order than the rows alone.
-    assert_leaves_as_exact(packed, logits, truth, reductions=objective.layout.max_len, terms=truth)
-    assert_leaves_as_exact(packed_grads, grads, truth_grads, reductions=batch["tokens"].size, terms=terms)
+    assert_as_exact_as_the_reference(packed, logits, truth, 'assert_rows_decided_alone 1', terms=truth)
+    assert_as_exact_as_the_reference(packed_grads, grads, truth_grads, 'assert_rows_decided_alone 2', terms=terms)
 
 
 def test_a_decision_run_steps_one_program_over_rows_of_every_length():

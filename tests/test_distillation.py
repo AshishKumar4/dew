@@ -23,7 +23,7 @@ import numpy as np
 import optax
 import pytest
 from flax.traverse_util import unflatten_dict
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, widened
+from reference_error import assert_as_exact_as_the_reference, widened
 
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -126,7 +126,7 @@ def widened_outputs(model, trainable, ids):
 @pytest.mark.parametrize("kind", ["cosine", "l2"])
 def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
     """Loss and every reported term as near float64 as the reference's own
-    float32 run is (`assert_leaves_as_exact`): the truth runs the reference in
+    float32 run is (`assert_as_exact_as_the_reference`): the truth runs the reference in
     float64 on the student's float64 forward, the reference in float32 on its
     float32 one. Each is one number reduced from every logit, which Dew sums
     in another order, so the reference's distance counts as at least that
@@ -153,15 +153,14 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
         return {metric: np.float64(values[name]) for metric, name in named.items()}
 
     dew = {metric: np.float64(reported[metric]) for metric in named}
-    assert_leaves_as_exact(dew, terms(rounded_terms), terms(truth_terms),
-                           reductions=int(np.size(arrays["student_logits"])), rows=False)
+    assert_as_exact_as_the_reference(dew, terms(rounded_terms), terms(truth_terms), 'test_the_loss_and_its_terms_match_the_maxtext_reference')
 
 
 @pytest.mark.parametrize("kind", ["cosine", "l2"])
 def test_the_student_gradient_matches_the_reference_cotangents(kind):
     """The gradient with respect to every trainable leaf, the projections
     included, as near float64 as the reference's own float32 run is
-    (`assert_leaves_as_exact`): the truth pulls the reference's float64
+    (`assert_as_exact_as_the_reference`): the truth pulls the reference's float64
     cotangents at the student's float64 forward back through that forward,
     and the reference pulls its float32 cotangents at the float32 forward
     back through the student in float32. The student's logits are as near
@@ -187,7 +186,7 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
 
     assert jax.tree.structure(actual) == jax.tree.structure(truth)
     assert all(float(np.abs(leaf).max()) > 0 for leaf in jax.tree.leaves(truth))
-    assert_leaves_as_exact(actual, reference, truth)
+    assert_as_exact_as_the_reference(actual, reference, truth, 'test_the_student_gradient_matches_the_reference_cotangents')
 
 
 # --------------------------------------------------------------------------

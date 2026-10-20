@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew import lora
@@ -55,9 +55,7 @@ def assert_trains_as_peft(adapter, reference, tmp_path):
     names = sorted(key.removeprefix("grad/") for key in reference
                    if key.startswith("grad/") and not key.endswith("_f64"))
     assert sorted(exported) == names and len(names) == 12
-    assert_leaves_as_exact({name: np.asarray(exported[name]) for name in names},
-                           {name: reference[f"grad/{name}"] for name in names},
-                           {name: reference[f"grad/{name}_f64"] for name in names})
+    assert_as_exact_as_the_reference({name: np.asarray(exported[name]) for name in names}, {name: reference[f"grad/{name}"] for name in names}, {name: reference[f"grad/{name}_f64"] for name in names}, 'assert_trains_as_peft')
 
 
 def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it(tmp_path):

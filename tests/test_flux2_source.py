@@ -24,7 +24,7 @@ import numpy as np
 import pytest
 import tool_support
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux2_fields, flux2_path, read_transformer
@@ -96,10 +96,7 @@ def test_the_forward_and_every_gradient_match_the_source(source, arrays, record,
     held(grad_latent, "grad_latent")
     held(grad_context, "grad_context")
     tensors = {layout.name.removeprefix("transformer/"): layout for layout in layouts}
-    assert_leaves_as_exact(
-        {tensor: np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()},
-        {tensor: arrays[f"{name}.grad_param.{tensor}"] for tensor in tensors},
-        {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors})
+    assert_as_exact_as_the_reference({tensor: np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()}, {tensor: arrays[f"{name}.grad_param.{tensor}"] for tensor in tensors}, {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors}, 'test_the_forward_and_every_gradient_match_the_source')
 
 
 def nhwc(array):

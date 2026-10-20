@@ -1,9 +1,11 @@
 """The float64 accuracy rule (tests/reference_error.py) on comparisons whose answer is known: what it
 must refuse, and the rounding it must admit."""
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import FACTOR, assert_as_exact_as_the_reference, assert_leaves_as_exact, distance
+from reference_error import FACTOR, assert_as_exact, assert_as_exact_as_the_reference, distance, seeds_for
 
 
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
@@ -17,7 +19,7 @@ def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
     with pytest.raises(AssertionError):
         assert_as_exact_as_the_reference(dew, reference, truth, "small row")
     with pytest.raises(AssertionError):
-        assert_leaves_as_exact({"rows": dew}, {"rows": reference}, {"rows": truth})
+        assert_as_exact_as_the_reference({"rows": dew}, {"rows": reference}, {"rows": truth}, "row tree")
 
 
 def test_a_row_that_cancels_is_held_to_what_it_sums():
@@ -39,10 +41,12 @@ def test_a_row_that_cancels_is_held_to_what_it_sums():
         return truth + noise
 
     reference, further = rounded(), rounded(10.0)
-    assert_leaves_as_exact({"dq": rounded()}, {"dq": reference}, {"dq": truth}, terms={"dq": terms})
+    assert_as_exact_as_the_reference({"dq": rounded()}, {"dq": reference}, {"dq": truth}, "rounded",
+                                     terms={"dq": terms})
     assert distance(further, truth) <= FACTOR * distance(reference, truth)
     with pytest.raises(AssertionError):
-        assert_leaves_as_exact({"dq": further}, {"dq": reference}, {"dq": truth}, terms={"dq": terms})
+        assert_as_exact_as_the_reference({"dq": further}, {"dq": reference}, {"dq": truth}, "further",
+                                         terms={"dq": terms})
 
 
 def test_a_row_of_float64_zero_is_held_to_the_references_own_row():
@@ -62,3 +66,71 @@ def test_a_row_of_float64_zero_is_held_to_the_references_own_row():
     assert distance(dew, truth) <= FACTOR * distance(reference, truth)
     with pytest.raises(AssertionError):
         assert_as_exact_as_the_reference(dew, reference, truth, "zero row")
+
+
+def _draw(seed):
+    """A product's operands, fresh for each seed and the same on every run."""
+    rng = np.random.default_rng(seed)
+    return rng.normal(size=(64, 256)).astype(np.float32), rng.normal(size=(256, 32)).astype(np.float32)
+
+
+@jax.jit
+def _product(x, w):
+    return {"y": jnp.dot(x, w, precision="highest")}
+
+
+@jax.jit
+def _reordered(x, w):
+    """The same sum in another order: its terms reversed, so it rounds at other partial sums."""
+    return {"y": jnp.dot(x[:, ::-1], w[::-1], precision="highest")}
+
+
+@jax.jit
+def _lost_term(x, w):
+    return {"y": jnp.dot(x[:, :-1], w[:-1], precision="highest")}
+
+
+@jax.jit
+def _bf16_operands(x, w):
+    return {"y": jnp.dot(x.astype(jnp.bfloat16), w.astype(jnp.bfloat16),
+                         preferred_element_type=jnp.float32)}
+
+
+def test_check_one_passes_an_equally_exact_sum_over_the_seeds_its_own_reference_resolves():
+    """The product summed in reverse rounds as exactly as the reference, by other partial sums: over the
+    seeds the reference compared with itself needs (`seeds_for`), its pooled RMS error sits within
+    FACTOR of the reference's, every run alike."""
+    seeds = seeds_for(_product, _draw, "product")
+    assert_as_exact(_reordered, _product, _draw, "reordered", seeds=seeds)
+    assert_as_exact(_reordered, _product, _draw, "reordered", seeds=seeds)
+
+
+@pytest.mark.parametrize("wrong", [_lost_term, _bf16_operands], ids=["lost term", "bf16 operands"])
+def test_check_one_fails_a_sum_that_differs_rather_than_rounds(wrong):
+    """A lost term, and operands rounded to bf16, put the pooled ratio far past FACTOR, and drawing
+    REDRAW times as many seeds again does not bring it back."""
+    with pytest.raises(AssertionError, match="times the reference's"):
+        assert_as_exact(wrong, _product, _draw, "wrong", seeds=seeds_for(_product, _draw, "product"))
+
+
+def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
+    """One element over two seeds: its pooled ratio's interval is wider than FACTOR, so the site is
+    inconclusive, never passed, however its draws fell."""
+    def total(fn):
+        return jax.jit(lambda x, w: {"sum": jnp.sum(fn(x, w)["y"])})
+
+    with pytest.raises(AssertionError, match="inconclusive"):
+        assert_as_exact(total(_reordered), total(_product), _draw, "one element", seeds=2)
+
+
+def test_check_one_holds_dew_exact_where_the_reference_is_exact_on_every_seed():
+    """Integer-valued operands make the reference's product exact on every seed: Dew must be too."""
+    def integral(seed):
+        rng = np.random.default_rng(seed)
+        return (rng.integers(-4, 5, (16, 8)).astype(np.float32),
+                rng.integers(-4, 5, (8, 4)).astype(np.float32))
+
+    shifted = jax.jit(lambda x, w: {"y": jnp.dot(x, w) + 2.0 ** -20})
+    exact = jax.jit(lambda x, w: {"y": jnp.dot(x, w)})
+    with pytest.raises(AssertionError, match="equals float64 on every seed"):
+        assert_as_exact(shifted, exact, integral, "shifted", seeds=8)
