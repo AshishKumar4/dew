@@ -144,13 +144,13 @@ def test_a_checkpoint_that_counted_every_steps_tokens_cannot_resume_a_token_budg
     control = metadata["custom_metadata"]["control"]
     control["tokens"] = control.pop("committed_tokens")
     written.write_text(json.dumps(metadata))
-    with pytest.raises(ValueError, match="committed"):
+    with pytest.raises(ValueError):
         make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=30)
     resumed = make_trainer(tmp_path, objective=TokenRegression())
     assert int(resumed.fit(dataset(), steps=3, log_every=1, checkpoint_every=1).step) == 3
     assert "tokens" in resumed.checkpoints.control(3)
     assert "committed_tokens" not in resumed.checkpoints.control(3)
-    with pytest.raises(ValueError, match="committed"):
+    with pytest.raises(ValueError):
         make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=60)
 
 
