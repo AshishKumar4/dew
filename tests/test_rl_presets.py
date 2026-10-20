@@ -3,32 +3,16 @@
 import dataclasses
 from pathlib import Path
 
-import jax
-import numpy as np
 import pytest
 from test_data import _voxceleb_tree
+from test_text_presets import same_batches
 
 from dew.config.data import ChatCanvasData, PreferenceData, VideoData, loader
 from dew.data import Loading, Memory, presets
 from dew.data.compile import compile
-from dew.data.dataset import DataPartition
 
 CHAT = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat"
 LOADING = Loading(workers=0, threads=1, read_buffer=2)
-
-
-def same_training(expected, built, count: int = 3) -> None:
-    """The plans two loaders agree on and their first `count` training batches, field by field."""
-    assert built.plan.identity() == expected.plan.identity()
-    wanted, made = expected.train(DataPartition()), built.train(DataPartition())
-    try:
-        for _ in range(count):
-            left, right = next(wanted), next(made)
-            assert left.keys() == right.keys()
-            jax.tree.map(np.testing.assert_array_equal, right, left)
-    finally:
-        wanted.close()
-        made.close()
 
 
 def test_the_preferences_preset_prepares_what_the_preference_recipe_does():
@@ -40,7 +24,9 @@ def test_the_preferences_preset_prepares_what_the_preference_recipe_does():
                     for index in range(12)])
     expected = loader(PreferenceData(pairs, seq_len=6, pad_id=7), batch=4, read="indexed", loading=LOADING)
     chain = pairs.shuffle(0).repeat().pipe(presets.preferences, seq_len=6, batch=4, pad_id=7)
-    same_training(expected, compile(chain, read="indexed", loading=LOADING))
+    built = compile(chain, read="indexed", loading=LOADING)
+    assert built.plan.identity() == expected.plan.identity()
+    same_batches(expected, built, 3)
 
 
 def test_the_canvas_preset_prepares_what_the_chat_canvas_recipe_does():
@@ -54,7 +40,9 @@ def test_the_canvas_preset_prepares_what_the_chat_canvas_recipe_does():
     expected = loader(recipe, batch=2, read="indexed", loading=LOADING)
     chain = conversations.shuffle(0).repeat().pipe(presets.canvas, str(CHAT), prompt_length=24, canvas_size=8,
                                                    batch=2, canvases=2, messages="talk")
-    same_training(expected, compile(chain, read="indexed", loading=LOADING))
+    built = compile(chain, read="indexed", loading=LOADING)
+    assert built.plan.identity() == expected.plan.identity()
+    same_batches(expected, built, 3)
 
 
 def test_a_canvas_needs_a_tokenizer_that_ends_a_response():
@@ -94,12 +82,4 @@ def test_the_clips_preset_prepares_what_the_video_recipe_does(tmp_path, monkeypa
              .pipe(presets.clips, 4 / FPS, frames=4, fps=FPS, size=16, batch=2, sample_rate=16000,
                    margin=1 / FPS, context=1 / FPS, missing="reject", rejects=False))
     built = compile(chain, read="indexed", loading=LOADING, host=recipe.pipelines()[2])
-    wanted, made = expected.train(DataPartition()), built.train(DataPartition())
-    try:
-        for _ in range(2):
-            left, right = next(wanted), next(made)
-            assert left.keys() == right.keys()
-            jax.tree.map(np.testing.assert_array_equal, right, left)
-    finally:
-        wanted.close()
-        made.close()
+    same_batches(expected, built, 2)
