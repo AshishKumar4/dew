@@ -23,6 +23,12 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Route V4 through the shared attention core and preserve the reference's AltUp projection semantics. [NNF-2, NNF-4]
 - Skip quantized payload decoding for shapes-only resumes. Bind diffusion components from lazy tensor sources, including VAE running statistics. [INT-4]
 - Process media chat through NumPy-capable processor paths without importing PyTorch. [721]
+- Let an FP8 frozen base differentiate in forward mode through the shared tangent boundary, keeping its reverse kernel, and test MeanFlow over it. [782]
+- Take the grouped convolution's backward off Qwix's private modules: its public provider API, or an upstream Qwix fix carried meanwhile. [783]
+- Let Llama 4's mixer take any KV cache, its context derived from the caller's, not rebuilt. [784]
+- Route MPConv through Conv's shared operand path after its normalization. [785]
+- One patch projection for every scan order in DiT, UViT and SimpleUDiT, the tokens permuted after it. [787]
+- Build Llama 4's vision adapter from MergeProjector. [788]
 
 ## Kernels and performance
 
@@ -35,7 +41,7 @@ The kernel direction was approved on 2026-10-19:
    - Chunked linear recurrence covering fused decode, delta rules, GDN, KDA, SSD and short convolution.
    - GEMM with prologue and epilogue hooks, including grouped MoE products, bias and SwiGLU.
 
-   Build on upstream Tokamax's public API, with no fork. A template replaces a kernel only when it matches or beats it on each target's numerical gate, step time and compile time. Until then the cut-down selector serves as the interim, and it is removed as the templates take over. Forward-mode AD is part of every template's acceptance, qualified through MeanFlow and consistency objectives. Follow the upstream issues while qualifying on public APIs: openxla/tokamax#1666 (serializing bound arguments, the autotuning data type and device-kind inference), #1667 (forward-mode differentiation through Ops), #1668 (registering third-party implementations, recording fallbacks and eligibility by device kind) and #1669 (exporting the Op classes, attention's Mask and residuals). [715, 716, 717, 718]
+   Build on upstream Tokamax's public API, with no fork. A template replaces a kernel only when it matches or beats it on each target's numerical gate, step time and compile time. Until then the cut-down selector serves as the interim, and it is removed as the templates take over. Forward-mode AD is part of every template's acceptance, qualified through MeanFlow and consistency objectives. Follow the upstream issues while qualifying on public APIs: openxla/tokamax#1666 (serializing bound arguments, the autotuning data type and device-kind inference), #1667 (forward-mode differentiation through Ops), #1668 (registering third-party implementations, recording fallbacks and eligibility by device kind) and #1669 (exporting the Op classes, attention's Mask and residuals). [715, 716, 717]
 
    Tuning's two private Tokamax imports, `dump_bound_args_to_json` and `AutotuningData`, move to `tokamax.autotuning` once a release carries openxla/tokamax#1676. [738]
 
@@ -52,7 +58,7 @@ The kernel direction was approved on 2026-10-19:
 - Revisit host dispatch and command-buffer address updates when device time approaches the currently hidden host cost. [569]
 - Fold shared-mean gradient accumulation into weight-gradient work where it pays. [563]
 - Reassess gated RMSNorm fusion only against a measured gain; the existing output kernels already use most memory bandwidth. [566]
-- Retain bank pack/unpack JIT callables, measure reuse across restore and reload, and key reuse on explicit static inputs. [128, 133, 430]
+- Measure bank reuse across restore and reload, and key reuse on explicit static inputs. [133, 430]
 - Qualify AutoPGLE with the AOT-compiled step. Expose one actionable report from existing XProf exports and attribution. [433, 211]
 - File a minimal reproduction for persistent-cache metadata read failures and retire the containment when a qualified JAX release fixes them. [356]
 - Revisit residual certification and Crouzeix bounds only if a profiled solve or accuracy defect needs them; no speedup has been established. [477]
@@ -65,6 +71,11 @@ The kernel direction was approved on 2026-10-19:
 - Take paged attention through the typed kernel selector, so its eligibility is each kernel's own as every other operation's is. [742]
 - Close the route audit's gaps: rms_norm's inverse rounding and its decode operands, swiglu's dtype and its forward mode, each routed to the kernel its row names. [759]
 - Give the chunked gated delta rule one dtype contract on every route. With mixed operands the port returns their common dtype, while the portable math returns the query's and casts its cotangent to it, so output dtype and gradient precision depend on the GPU row. [730]
+- Move rms_norm and swiglu onto the typed selector, so their routes report and their refusals classify. [762]
+- Let tuning take only the declared resource-exhaustion and profiler-subscription errors for an unusable config. [764]
+- Make fused attention the selector's private executor, its second eligibility pass deleted. [765]
+- Capture only the requested step's routes in the route tool. [763]
+- Record in the target table that no Tokamax implementation is any row's kernel, sm86's narrow row on flash. [766]
 
 ## Data
 
@@ -82,10 +93,13 @@ The kernel direction was approved on 2026-10-19:
 - Compare augmentation policies on fixed data and measure worker scaling when a corpus has one physical shard. [234, 573]
 - Remove duplicated worker-shutdown policy by using Grain's lifecycle interface. [DAT-10]
 - Qualify URL-caption fetching through `images.fetch` and `video.fetch` against the previous online flow on CC3M and WebVid. [155]
-- Reuse a published cache generation by its dependency key and publish complete fills atomically through the existing `Cache`. [622]
-- Preserve filesystem configuration across the Arrow bridge and compare native readers with the fsspec path. [625]
-- Resolve pinned Hub Parquet bytes through the downloaded snapshot cache when offline. [628]
-- Compare a generation's dependency and prefix fingerprints with the recipe before replacing the live chain. [630]
+- Fingerprint a transform's arrays by their content, not their truncated repr. [768]
+- Carry the caption tokenizer's content in the text conditioners' dependencies, so an exact resume refuses changed token ids. [769]
+- Let Windows and Pack resume with their row ids. [770]
+- Keep a concatenation's metadata, class names and the tokenizer contract included. [771]
+- Run DeviceAugment in the image pipeline benchmark's device-augment arms. [772]
+- One priming and checkpoint path for mixtures' reads. [773]
+- One public loading route: `loader(spec, ...)`, `_Loadable` deleted. [780]
 
 ## Training and parallelism
 
@@ -105,12 +119,15 @@ The kernel direction was approved on 2026-10-19:
 - Find the tiled chunked head's residual: at token tile 2, about 40 of 8192 head-gradient elements sit more than twice as far from float64 as the whole-logits reference; at tile 20 there are none. [737]
 - Let `generate` run without a key where its sampling needs none, or require one; its None default is refused today. [745]
 - Compile a step lowered by `Trainer(lower_for=)` before allocating training time, carry its executable and tuning picks to the run, and measure the saved startup time. Lowering alone already works. [720]
+- One sampling-module inventory for objective evaluation and TextToImage, so quantized guidance and autoencoders get their compiler options. [774]
+- Restore a distilled student without its teacher, and count its tokens as the student's. [775, 776]
+- Let rCM accumulate, its phase read from the update clock. [778]
+- Index a sweep's grid lazily. [781]
 
 ## RL and serving
 
 - After the MFU work, add the approved environment/world-model scope: a Playground/MJX adapter, device replay, Dreamer v3 and v4, and a world-model tutorial. [532]
 - After the MFU work, implement DiffusionNFT and compare it with FlowGRPO under matched conditions. [533]
-- Exercise rollout oversampling, admission, stragglers, infrastructure failures and restore through a real source. [557]
 - Qualify two-engine vLLM/NCCL weight publication and policy-version stamps on real GPUs. [579]
 - Replace `ContainerRunner` through Harbor's public environment interface once it preserves exit reasons and resource limits. [605]
 - Add stop strings while preserving terminal versus truncated semantics across rollout servers. [607]
@@ -120,9 +137,7 @@ The kernel direction was approved on 2026-10-19:
 - Hold mesh-serving outputs to the shared float64 rule. [636]
 - Abort NCCL rendezvous when its HTTP peer fails and preserve requested EOS policies in remote requests. Finish pending subprocess input, retain PRNG implementations during admission, keep dry runs read-only, validate complete host-key markers and share shape-bucket selection. [SRV-1, SRV-2, SRV-5, SRV-6, SRV-7, SRV-8, SRV-9]
 - Reuse shared coordinates for padded rollout positions. [OBJ-13]
-- Serve hybrid and multimodal decoders from a paged cache. Paged admission refuses per-row state other than attention pages, so Qwen3.5's recurrent state and Gemma 3's image groups cannot serve paged. Seat each row's state by row, fresh at a row's start and its own when a piece continues, as vLLM's hybrid cache does; prefix reuse of recurrent state needs its own design. [728]
 - Reuse a prefix for decoders with per-row state: snapshot each row's state at the shared prefix's page-aligned boundary beside its pages and seat a reusing row from it, as vLLM's hybrid prefix caching does; a paged server refuses prefix caching for such decoders today. [760]
-- Run multi-step decode on GPUs. A server with more than one decode step per call fails under checkify's trace of cuDNN attention's shard_map (jax-ml/jax#40907); checkify each step alone and meet the errors after the loop. [733]
 
 The following direction was approved on 2026-10-19:
 
@@ -132,6 +147,8 @@ The following direction was approved on 2026-10-19:
 - Adapt remote sandbox providers through `Runner` and carry partial episodes across updates and checkpoints.
 
 Keep the existing gateway interface. Miles would currently duplicate it: its trainer requires torch.distributed and its TITO service speaks SGLang's extended chat API. Revisit a Miles dependency if it offers a small standalone session package. Cancellation must stop both the trial's sandbox and a long in-flight engine decode before either is claimed. The gateway leaves the engine decoding when a session is cancelled; rllm-org/rllm#938 cancels the upstream call on client disconnect, and Dew claims engine abort after a GPU receipt once it merges. [729]
+- Let disk banks load packed families whose packing is a view. [786]
+- Keep the TPU command's dry run free of local writes. [777]
 
 ## Tutorials and docs
 
@@ -163,7 +180,14 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
   - Model loading, adapters and exports: [675, 677, 681, 691, 699, 700, 703, 704].
   - Attention, convolution and tuning: [655, 656, 674, 689, 690, 696].
   - Recurrences and looped models: [659, 660, 661, 662, 664, 665, 678, 706, 711].
-  - Data and packing: [683, 684, 685, 694].
+  - Data and packing: [694].
   - Printed programs and assertion-only pins in the remaining lanes' files, Training's done: [709, 710].
 - Make float32 numpy references independent of the worker's OpenBLAS kernels, which round differently on x86-64-v3 and v4, without pinning the weaker one. [744]
 - Dew requires its own JAX build, installed from pypi.dewml.dev, with no stock-JAX routes or version gates. The fork AshishKumar4/jax follows upstream releases by CI and carries a patch stack, each patch sent upstream and dropped at the fork's first rebase onto a release that contains it: the compilation cache-key fixes for jax-ml/jax#40940 and #41502 (jax-ml/jax#41776, #41777), and `linear_call`'s batching and forward-mode rules (jax-ml/jax#41782, #41780). Before Dew moves to JAX 0.12, its XLA:CPU narrow float32 dots, which sum K in one sequential chain about twice as far from float64 as 0.11.2's partial sums, need a fix or an upstream report. [713, 714, 731, 732, 743]
+- Judge layout parity through the shared gate, its own order policy and floor deleted. [793]
+- Use JAX's supported persistent cache in the remote-cache tests, with handling narrowed to transport errors. [794]
+- Use JAX's own transfer guard on GPUs in place of the steady-state reimplementation. [795]
+- One collective parser (telemetry.instrumentation) and one cache-worker fixture in the tests. [796, 797]
+- Check every family, target row and mode in the kernel-route test, an unexplained route failing, and drop the KV cache's unconditional GPU xfail. [798, 799]
+- Hold MeanFlow's fused attention away from zero initialization, the delta rule's document isolation without exclusions, and the Mamba-2 TPU mesh by its numbers. [789, 790, 791]
+- Delete the stock-JAX branches (DEW_UPSTREAM_JAX, the runtime's caching branch) and the step benchmark's re-export facade. [779, 792, 800]
