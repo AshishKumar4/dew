@@ -2,7 +2,7 @@
 with hand-written reverse passes.
 
 The kernels follow linkedin/Liger-Kernel's ops/rms_norm.py, ops/fused_add_rms_norm.py
-and ops/swiglu.py: save only a row's inverse RMS, accumulate weight gradients
+and ops/swiglu.py: save only a row's mean square, accumulate weight gradients
 per program, and recompute sigmoid from the two narrow SwiGLU inputs in
 reverse. The gated norm is Qwen3-Next's output norm (fla's FusedRMSNormGated
 computes the same function).
@@ -459,9 +459,9 @@ def activation_and_slope(gate, activation: str) -> tuple[jax.Array, jax.Array]:
     return gate * sigmoid, sigmoid + gate * slope
 
 
-def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inverse_ref, *, row_block: int,
-                 epsilon: float, offset: bool, stored, after_cast: bool, inverse_rounded: bool,
-                 activation: str, interpret: bool):
+def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, mean_square_ref, *,
+                 row_block: int, epsilon: float, offset: bool, stored, after_cast: bool,
+                 inverse_rounded: bool, activation: str, interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
     row = pl.program_id(0) * row_block + jnp.arange(row_block)
@@ -474,7 +474,8 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inve
         x = _round(x + branch.astype(jnp.float32), stream_ref.dtype, interpret)
         plgpu.store(stream_ref.at[at], x.astype(stream_ref.dtype), mask=mask)
     # XLA's mean multiplies by the fp32 reciprocal, not an fp32 division.
-    inverse = jax.lax.rsqrt(jnp.sum(x * x, axis=1) * (1.0 / width) + epsilon)
+    mean_square = jnp.sum(x * x, axis=1) * (1.0 / width) + epsilon
+    inverse = jax.lax.rsqrt(mean_square)
     y = x * _rounded_inverse(inverse, inverse_rounded, y_ref.dtype, interpret)[:, None]
     if scale_ref is not None:
         if after_cast:
@@ -485,7 +486,7 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, inve
         y = y * activation_and_slope(plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32),
                                      activation)[0]
     plgpu.store(y_ref.at[at], y.astype(y_ref.dtype), mask=mask)
-    plgpu.store(inverse_ref.at[row], inverse, mask=row < rows)
+    plgpu.store(mean_square_ref.at[row], mean_square, mask=row < rows)
 
 
 def _rounded_inverse(inverse, rounded: bool, dtype, interpret: bool):
@@ -494,14 +495,13 @@ def _rounded_inverse(inverse, rounded: bool, dtype, interpret: bool):
     return _round(inverse, dtype, interpret) if rounded else inverse
 
 
-def _rsqrt_slope(x, inverse, epsilon: float, width: int):
-    """The derivative of each row's inverse RMS by its mean square, as XLA's rsqrt transposes it:
-    `-0.5 * (inverse / (mean(x * x) + epsilon))`, the mean square recomputed as the forward formed it.
-    Where the direct and reduced cotangents cancel, this keeps the inverse's one rounding in both;
-    the cube of the inverse took it three times (a row of 0.5 under cotangents of 1.5 * 2**119 came
-    out 4 times XLA's distance from float64, TIER13 on an A100 and an H100). `width` is the row's own,
-    not its padded block's."""
-    return -0.5 * (inverse / (jnp.sum(x * x, axis=1) * (1.0 / width) + epsilon))
+def _rsqrt_slope(inverse, mean_square):
+    """The derivative of each row's inverse RMS by its mean square (with epsilon), as XLA's rsqrt
+    transposes it: `-0.5 * (inverse / mean_square)`, both the forward's own values. Where the direct
+    and reduced cotangents cancel, this keeps the inverse's one rounding in both; the cube of the
+    inverse took it three times (a row of 0.5 under cotangents of 1.5 * 2**119 came out 4 times XLA's
+    distance from float64, TIER13 on an A100 and an H100)."""
+    return -0.5 * (inverse / mean_square)
 
 
 def _rounded_inverse_cotangent(m, x, multiplier, slope, narrow, width: int, interpret: bool):
@@ -530,8 +530,8 @@ def _pairwise(values, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
     return values.reshape(values.shape[1:]), lost.reshape(lost.shape[1:])
 
 
-def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, dx_ref, dgate_ref, partial_ref,
-                  correction_ref, *, row_block: int, epsilon: float, offset: bool, stored, after_cast: bool,
+def _rms_backward(x_ref, scale_ref, gate_ref, mean_square_ref, dy_ref, stream_ref, dx_ref, dgate_ref,
+                  partial_ref, correction_ref, *, row_block: int, offset: bool, stored, after_cast: bool,
                   inverse_rounded: bool, activation: str, interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
@@ -553,7 +553,9 @@ def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, d
         x = streamed(x_ref).astype(jnp.float32)
         dy = streamed(dy_ref).astype(jnp.float32)
         ds = None if stream_ref is None else streamed(stream_ref)
-        inverse = plgpu.load(inverse_ref.at[row], mask=row < rows, other=0)
+        # The forward's mean square, and its inverse root as the forward took it.
+        mean_square = plgpu.load(mean_square_ref.at[row], mask=row < rows, other=1)
+        inverse = jax.lax.rsqrt(mean_square)
         # The rounded inverse multiplies the input; the rounding passes its cotangent on unchanged.
         multiplier = _rounded_inverse(inverse, inverse_rounded, dy_ref.dtype, interpret)
         normalized = x * multiplier[:, None]
@@ -567,7 +569,7 @@ def _rms_backward(x_ref, scale_ref, gate_ref, inverse_ref, dy_ref, stream_ref, d
                         eviction_policy="evict_first")
             dy = dy * activated
         m = dy * weight
-        slope = _rsqrt_slope(x, inverse, epsilon, width)
+        slope = _rsqrt_slope(inverse, mean_square)
         if inverse_rounded:
             dx = _rounded_inverse_cotangent(m, x, multiplier, slope, dy_ref.dtype, width, interpret)
         else:
@@ -623,7 +625,7 @@ class _Norm(NamedTuple):
 class RmsForward(tuning.KernelOp):
     """The norm's forward launch over `[rows, width]` (`_rms_forward`): the
     normed rows, the stream `x + branch` where a branch joins, and each
-    row's inverse RMS."""
+    row's mean square with epsilon, whose inverse root the norm multiplies by."""
 
     config_cls: ClassVar[type[RowsConfig]] = RowsConfig
     ROWS: ClassVar[tuple[str, ...]] = ('x', 'branch', 'gate')
@@ -660,26 +662,26 @@ class RmsBackward(tuning.KernelOp):
     compensated partial sums of the weight's."""
 
     config_cls: ClassVar[type[ReverseConfig]] = ReverseConfig
-    ROWS: ClassVar[tuple[str, ...]] = ('x', 'gate', 'inverse', 'dy', 'ds')
+    ROWS: ClassVar[tuple[str, ...]] = ('x', 'gate', 'mean_square', 'dy', 'ds')
 
-    def _fwd(self, x: jax.Array, scale: jax.Array | None, gate: jax.Array | None, inverse: jax.Array,
-             dy: jax.Array, ds: jax.Array | None, *, epsilon: float, offset: bool, stored: str,
-             after_cast: bool, inverse_rounded: bool, activation: str, interpret: bool, config: ReverseConfig,
+    def _fwd(self, x: jax.Array, scale: jax.Array | None, gate: jax.Array | None, mean_square: jax.Array,
+             dy: jax.Array, ds: jax.Array | None, *, offset: bool, stored: str, after_cast: bool,
+             inverse_rounded: bool, activation: str, interpret: bool, config: ReverseConfig,
              return_residuals: bool = False):
         rows, width = x.shape
         groups = max(1, min(config.programs, pl.cdiv(rows, config.rows)))
         partial = None if scale is None else jax.ShapeDtypeStruct((groups, width), jnp.float32)
         return pl.pallas_call(
-            functools.partial(_rms_backward, row_block=config.rows, epsilon=epsilon, offset=offset,
-                              stored=jnp.dtype(stored), after_cast=after_cast,
-                              inverse_rounded=inverse_rounded, activation=activation, interpret=interpret),
+            functools.partial(_rms_backward, row_block=config.rows, offset=offset, stored=jnp.dtype(stored),
+                              after_cast=after_cast, inverse_rounded=inverse_rounded, activation=activation,
+                              interpret=interpret),
             grid=(groups,),
             out_shape=(jax.ShapeDtypeStruct((rows, width), x.dtype),
                        None if gate is None else jax.ShapeDtypeStruct((rows, width), gate.dtype),
                        partial, partial),
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=1),
             interpret=interpret, name="rms_norm_backward",
-        )(x, scale, gate, inverse, dy, ds), None
+        )(x, scale, gate, mean_square, dy, ds), None
 
     def _get_heuristics_config(self, ba) -> ReverseConfig:
         rows, width = ba.arguments['x'].shape
@@ -701,22 +703,22 @@ def _flat(value):
     return None if value is None else value.reshape(math.prod(value.shape[:-1]), value.shape[-1])
 
 
-def _rms_with_inverse(x, branch, scale, gate, norm: _Norm):
-    """`(stream, y)` and the per-row inverse RMS, the stream `x + branch`, or `x` itself."""
-    y, stream, inverse = _RMS_FORWARD(_flat(x), _flat(branch), scale, _flat(gate), **norm._asdict())
-    return (x if branch is None else stream.reshape(x.shape), y.reshape(x.shape)), inverse
+def _rms_with_mean_square(x, branch, scale, gate, norm: _Norm):
+    """`(stream, y)` and each row's mean square with epsilon, the stream `x + branch`, or `x` itself."""
+    y, stream, mean_square = _RMS_FORWARD(_flat(x), _flat(branch), scale, _flat(gate), **norm._asdict())
+    return (x if branch is None else stream.reshape(x.shape), y.reshape(x.shape)), mean_square
 
 
-def _rms_backward_call(stream, scale, gate, inverse, dy, ds, norm: _Norm):
+def _rms_backward_call(stream, scale, gate, mean_square, dy, ds, norm: _Norm):
     """The stream's cotangent (the norm's plus `ds`, None for none), the
     gate's and the weight's."""
     if dy is None:
         zeros = [None if value is None else jnp.zeros_like(value) for value in (stream, gate, scale)]
         return (zeros[0] if ds is None else ds), zeros[1], zeros[2]
     dx, dgate, partial, correction = _RMS_BACKWARD(
-        _flat(stream), scale, _flat(gate), inverse, _flat(dy), _flat(ds), epsilon=norm.epsilon,
-        offset=norm.offset, stored=norm.stored, after_cast=norm.after_cast,
-        inverse_rounded=norm.inverse_rounded, activation=norm.activation, interpret=norm.interpret)
+        _flat(stream), scale, _flat(gate), mean_square, _flat(dy), _flat(ds), offset=norm.offset,
+        stored=norm.stored, after_cast=norm.after_cast, inverse_rounded=norm.inverse_rounded,
+        activation=norm.activation, interpret=norm.interpret)
     dscale = None if scale is None else _scale_sum(partial, correction)
     return dx.reshape(stream.shape), None if gate is None else dgate.reshape(gate.shape), dscale
 
@@ -766,13 +768,13 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
     norm = _norm(epsilon, dtype, offset, after_cast, scale)
 
     def forward(x, branch, scale):
-        outputs, inverse = _rms_with_inverse(x, branch, scale, None, norm)
-        return outputs, (outputs[0], inverse)
+        outputs, mean_square = _rms_with_mean_square(x, branch, scale, None, norm)
+        return outputs, (outputs[0], mean_square)
 
     def backward(saved, operands, cotangents):
-        stream, inverse = saved
+        stream, mean_square = saved
         ds, dy = map(_cotangent, cotangents)
-        dstream, _, dscale = _rms_backward_call(stream, operands[2], None, inverse, dy, ds, norm)
+        dstream, _, dscale = _rms_backward_call(stream, operands[2], None, mean_square, dy, ds, norm)
         # The sum's two addends share its cotangent: one buffer, read by both.
         return dstream, dstream, dscale
 
@@ -788,12 +790,12 @@ def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, po
     norm = _norm(epsilon, dtype, offset, after_cast, scale)._replace(inverse_rounded=inverse_rounded)
 
     def forward(x, scale):
-        (_, y), inverse = _rms_with_inverse(x, None, scale, None, norm)
-        return y, inverse
+        (_, y), mean_square = _rms_with_mean_square(x, None, scale, None, norm)
+        return y, mean_square
 
-    def backward(inverse, operands, dy):
+    def backward(mean_square, operands, dy):
         x, scale = operands
-        dx, _, dscale = _rms_backward_call(x, scale, None, inverse, dy, None, norm)
+        dx, _, dscale = _rms_backward_call(x, scale, None, mean_square, dy, None, norm)
         return dx, dscale
 
     local = generation.linear_tangent(forward, backward, _stored(portable, norm, 1))
@@ -808,12 +810,12 @@ def gated_rms_norm(x, gate, scale, epsilon: float, dtype, activation: str, porta
     norm = _norm(epsilon, dtype, offset=False, after_cast=False, scale=scale, activation=activation)
 
     def forward(x, gate, scale):
-        (_, y), inverse = _rms_with_inverse(x, None, scale, gate, norm)
-        return y, inverse
+        (_, y), mean_square = _rms_with_mean_square(x, None, scale, gate, norm)
+        return y, mean_square
 
-    def backward(inverse, operands, dy):
+    def backward(mean_square, operands, dy):
         x, gate, scale = operands
-        return _rms_backward_call(x, scale, gate, inverse, dy, None, norm)
+        return _rms_backward_call(x, scale, gate, mean_square, dy, None, norm)
 
     local = generation.linear_tangent(forward, backward, _stored(portable, norm, 2))
     return _per_shard(local, axes, (x, gate, _widened(scale)), (False, False, True))
