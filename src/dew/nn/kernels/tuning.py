@@ -59,10 +59,12 @@ import jax.numpy as jnp
 import tokamax
 from jax.extend.backend import get_default_device
 
-# tokamax's writer of launches as JSON, public only as a file writer (`bound_args_to_json`).
+# tokamax's writer of launches as JSON, public only as a file writer (`bound_args_to_json`); goes to
+# `tokamax.autotuning.dump_bound_args_to_json` once a tokamax release carries openxla/tokamax#1676.
 from tokamax._src.autotuning.api import dump_bound_args_to_json
 
 # tokamax names the type of one launch's timings by config nowhere public; its picks are read as this type.
+# Goes to `tokamax.autotuning.AutotuningData` once a tokamax release carries openxla/tokamax#1676.
 from tokamax._src.autotuning.autotuner import AutotuningData
 
 from dew import cache, coordination
