@@ -145,29 +145,39 @@ def test_the_decode_kernel_reads_each_row_to_its_length_at_every_config(dtype, w
                                          f"decode kernel, {config}")
 
 
-SINKS = (0.5, -1.0)
-"""Two heads' sink logits, one above the rows' logits' scale and one below."""
+SINKS = (0.5, -1.0, 2.0, -3.0)
+"""Four query heads' sink logits, around and past the rows' logits' scale."""
 SOFTCAP = 0.5
 """A softcap near the scaled logits' spread, where `tanh` bends them."""
+
+
+def grouped_case(dtype):
+    """`dense_case`'s keys, lengths and capacity under 2 query positions of 4 query heads, a key head's
+    pair reading it as gpt-oss's 64 read their 8."""
+    (_, key, value, lengths), _ = dense_case(dtype)
+    query = jnp.asarray(np.random.default_rng(1).normal(size=(key.shape[0], 2, 4, key.shape[-1])), dtype)
+    return query, key, value, lengths
 
 
 @pytest.mark.parametrize("hooks", [{"sinks": True}, {"softcap": True}, {"sinks": True, "softcap": True}],
                          ids=["sinks", "softcap", "both"])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, hooks):
-    """Sinks (one value-free logit a head in each row's softmax) and a logit softcap
-    (`cap · tanh(logit / cap)`) inside the decode kernel: each row read to its length at each config of
-    its space, the sink carried by the first slice alone so the combine counts it once, and within
-    tests/reference_error.py's rule of the reference path's attention over the same keys, which
-    computes both, against float64. The idle row of one key keeps its sink's share. The dispatch
-    takes such a call to the decode kernel where it runs (`decodes`)."""
-    from tuned import each_config
+    """Sinks (one value-free logit a query head in each row's softmax) and a logit softcap
+    (`cap · tanh(logit / cap)`) inside the decode kernel, over query heads grouped on their key heads:
+    each row read to its length at each config of its space, the sink carried by the first slice alone
+    so the combine counts it once, within tests/reference_error.py's rule of the reference path's
+    attention over the same keys, against float64 (`exact_attention`). The idle row of one key keeps
+    its sink's share. The dispatch takes such a call to the decode kernel where it runs (`decodes`),
+    and the tuner times its launch on the sinks too (`timed`)."""
+    from test_attention_splash import exact_attention
+    from tuned import each_config, launches, timed
 
     from dew.nn.attention import reference_attention
     from dew.nn.attention_kernels import decodes
     from dew.nn.kernels import decode_attention, tuning
 
-    arrays, _ = dense_case(dtype)
+    arrays = grouped_case(dtype)
     query, key, value, lengths = arrays
     sinks = jnp.asarray(SINKS, jnp.float32) if hooks.get("sinks") else None
     softcap = SOFTCAP if hooks.get("softcap") else None
@@ -176,17 +186,10 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
         assert decodes(case)
         assert kernel_refusals(DECODE, "decode", case) == [] or not ON_GPU
     read = spanned(jnp.zeros_like(lengths), lengths, key.shape[1])
-    q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
-    logits = np.einsum('btnd,bsnd->bnts', q, k) / 16.0
-    logits = np.where(read, logits if softcap is None else softcap * np.tanh(logits / softcap), -np.inf)
-    peak = logits.max(-1, keepdims=True)
-    if sinks is not None:
-        peak = np.maximum(peak, np.asarray(sinks, np.float64)[None, :, None, None])
-    weights = np.exp(logits - peak)
-    total = weights.sum(-1, keepdims=True)
-    if sinks is not None:
-        total = total + np.exp(np.asarray(sinks, np.float64)[None, :, None, None] - peak)
-    truth = np.einsum('bnts,bsnd->btnd', weights / total, v)
+    with jax.enable_x64(new_val=True):
+        wide = [None if x is None else jnp.asarray(np.asarray(x, np.float64))
+                for x in (query, key, value, sinks)]
+        truth = np.asarray(exact_attention(*wide, softcap=softcap, mask=read))
     with jax.default_matmul_precision("float32"):
         plain = reference_attention(query, key, value, mask=jnp.asarray(read), sinks=sinks, softcap=softcap)
 
@@ -196,6 +199,9 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
 
     with on_the_gpu():
         found = each_config(decode_attention.DecodeAttention, attend, *arrays)
+        [launch] = launches(attend, *arrays)
+        # The tuner's operands keep the sinks, which the launch reads after the rows' spans.
+        assert np.asarray(timed(launch), np.float32).shape[-1] == key.shape[-1]
     assert len(found) > 1
     for config in found:
         pin = tuning.pinned({decode_attention.DecodeAttention: config})
@@ -204,6 +210,75 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
         assert out.shape == plain.shape and out.dtype == plain.dtype
         assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
                                          f"decode kernel with {sorted(hooks)}, {config}")
+
+
+@pytest.mark.parametrize("softcap", [None, SOFTCAP], ids=["plain", "softcap"])
+def test_a_decode_steps_sinks_take_their_gradient_and_tangent_through_the_dispatch(softcap):
+    """A grouped decode step with sinks through Dew's attention (`scaled_dot_product_attention`) routes
+    to the decode kernel, the sinks an operand of its derivative: traced, the gradient and the tangent
+    with respect to them take that route; on a GPU each is within tests/reference_error.py's rule of the
+    reference path's against float64 (`exact_attention`)."""
+    from test_attention_splash import exact_attention
+
+    from dew.nn.kernels import generation
+
+    query, key, value, lengths = grouped_case(jnp.float32)
+    sinks = jnp.asarray(SINKS, jnp.float32)
+    read = spanned(jnp.zeros_like(lengths), lengths, key.shape[1])
+
+    def attend(implementation):
+        return lambda sinks: scaled_dot_product_attention(
+            query, key, value, sinks=sinks, softcap=softcap, key_value_seq_lengths=lengths,
+            implementation=implementation)
+
+    def grad(implementation):
+        return jax.grad(lambda sinks: jnp.sum(attend(implementation)(sinks) ** 2))
+
+    def tangent(implementation):
+        return lambda sinks: jax.jvp(attend(implementation), (sinks,), (jnp.ones_like(sinks),))[1]
+
+    with on_the_gpu(), generation.routes() as found:
+        jax.make_jaxpr(grad("auto"))(sinks)
+        jax.make_jaxpr(tangent("auto"))(sinks)
+    assert {(route.choice, route.kernel) for route in found if route.choice == "decode"} == {
+        ("decode", "decode")}
+    if not ON_GPU:
+        return
+    with jax.enable_x64(new_val=True):
+        wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, sinks)]
+
+        def exact(sinks):
+            return exact_attention(*wide[:3], sinks, softcap=softcap, mask=read)
+
+        exact_grad = jax.grad(lambda s: jnp.sum(exact(s) ** 2))(wide[3])
+        exact_tangent = jax.jvp(exact, (wide[3],), (jnp.ones_like(wide[3]),))[1]
+    with jax.default_matmul_precision("default"):
+        got = jax.jit(grad("auto"))(sinks), jax.jit(tangent("auto"))(sinks)
+    with jax.default_matmul_precision("float32"):
+        want = jax.jit(grad("reference"))(sinks), jax.jit(tangent("reference"))(sinks)
+    for label, mine, theirs, truth in zip(("gradient", "tangent"), got, want, (exact_grad, exact_tangent),
+                                          strict=True):
+        assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), np.asarray(truth),
+                                         f"the sinks' {label} through the decode kernel")
+
+
+@pytest.mark.parametrize("target", ["sm80", "sm90"])
+@pytest.mark.parametrize("mode, choice, kernel", [("decode", "decode", "decode"),
+                                                  ("decode-paged", "paged_decode", "triton")])
+def test_a_gpt_oss_decode_step_reads_its_sinks_in_the_decode_kernels(target, mode, choice, kernel):
+    """gpt-oss's decode step (its committed tiny config at the released head width, 4 query heads over
+    2 key heads, sinks on every layer), traced as the GPU takes it (`tools/kernel_routes.traced`): its
+    attention runs Dew's decode kernel over a compact cache and its paged kernel over a paged one,
+    which apply the sinks, where it had taken the reference path."""
+    import json
+    from pathlib import Path
+
+    from tools import kernel_routes
+
+    fixture = Path(__file__).parent / "fixtures" / "hf" / "gpt-oss-tiny" / "config.json"
+    config, _ = kernel_routes.published(json.loads(fixture.read_text()))
+    seen = kernel_routes.traced(config, target, mode)
+    assert {route.kernel for route in seen if route.choice == choice} == {kernel}
 
 
 def test_the_decode_kernels_launches_are_the_tuners():
