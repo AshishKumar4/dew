@@ -6,10 +6,10 @@ Builds the family's committed config (tests/fixtures/hf/<family>/config.json), e
 released width, over random weights, and times the Server's warm (first) compile of every step
 program a run of `--slots` slots compiles: its construction's decode step (`Server.__init__`
 compiles it to choose the resident layouts), then each power-of-two admission width's prefill
-(`Server.admission`). The record holds the wall seconds of construction (`construction_seconds`), of each admission width's
-first round (`by_admission_width`) and of the whole warm (`warm_seconds`), which compiles fill (the
-steps themselves run in a fraction of a second), and the device they compiled for. Nothing is read
-from or written to a compilation cache.
+(`Server.admission`). The record holds the wall seconds of construction (`construction_seconds`),
+of each admission width's first round (`by_admission_width`) and of the whole warm
+(`warm_seconds`), which compiles fill (the steps themselves run in a fraction of a second), and
+the device they compiled for. Nothing is read from or written to a compilation cache.
 """
 
 from __future__ import annotations
