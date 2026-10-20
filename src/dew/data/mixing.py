@@ -390,7 +390,7 @@ class _PrimeReads:
     def __init__(self, parents: Sequence[pygrain.DatasetIterator[Batch]]):
         self.parents = tuple(parents)
         self.pending: dict[int, Batch] = {}
-        self.before: dict[int, Mapping[str, object]] = {}
+        # Each corpus's captured position, before the row it holds read ahead while it holds one.
         self.states: dict[int, Mapping[str, object]] = {}
         # The corpora whose first row was read ahead: every corpus at the start, and one that joins
         # a resumed mix, before the mix gives a row.
@@ -404,25 +404,23 @@ class _PrimeReads:
                 self.states.pop(corpus, None)
                 before = parent.get_state()
                 self.pending[corpus] = next(parent)
-                self.before[corpus] = before
+                self.states[corpus] = before
                 self.primed.add(corpus)
         self.states.pop(index, None)
         if index in self.pending:
-            self.before.pop(index, None)
             return self.pending.pop(index)
         return next(self.parents[index])
 
     def state(self, index: int) -> Mapping[str, object]:
         """The position of corpus `index`: before its row read ahead while it holds one."""
         if index not in self.states:
-            before = self.before.get(index)
-            self.states[index] = self.parents[index].get_state() if before is None else before
+            self.states[index] = self.parents[index].get_state()
         return self.states[index]
 
     def restore(self, index: int, state: Mapping[str, object], primed: bool) -> None:
         self.parents[index].set_state(state)
-        for held in (self.pending, self.before, self.states):
-            held.pop(index, None)
+        self.pending.pop(index, None)
+        self.states.pop(index, None)
         if primed:
             self.primed.add(index)
         else:
