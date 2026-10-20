@@ -6,7 +6,7 @@ model calls, and Dew trains on them.
     JAX_PLATFORMS=cpu python examples/train_harbor.py --smoke --out /tmp/harbor-smoke
 
 Each update draws `--prompts` Harbor tasks and runs `--groups` trials of
-each through `HarborSource`: Harbor starts the task's sandbox and the
+each through `HarnessSource(Harbor(...))`: Harbor starts the task's sandbox and the
 harness (mini-swe-agent by default), the harness's model calls go through
 rllm-model-gateway to the engines, and the gateway's traces become the
 session's calls. `RolloutScheduler` admits complete groups at most
@@ -49,7 +49,9 @@ from dew.data import HFTokenizer
 from dew.data.dataset import Loader
 from dew.inference import NativeRolloutServer, Publication, SafetensorsReload, Server, TextGeneration
 from dew.interop import PretrainedDecoder
-from dew.interop.harbor import HARBOR_KEY, Gateway, HarborSource
+from dew.interop.gateway import Gateway
+from dew.interop.harbor import HARBOR_KEY, Harbor
+from dew.interop.harness import HarnessSource
 from dew.objectives.rl import GRPOObjective, RolloutScheduler, SchedulerRecord
 from dew.objectives.rl.scheduler import task_ids
 from dew.objectives.rl.sessions import Task
@@ -116,10 +118,11 @@ def main(config: Config) -> dict:
         push.write(source.variables)
         # The engines launch on --served now; the Publication below stamps the gateway at once.
         gateway.ready(config.ready_timeout)
-    trials = HarborSource(gateway, harbor=harbor, model=config.harness_model, trials=config.out / "trials",
-                          agent=config.agent, environment={"OPENAI_API_KEY": "none", "MSWEA_API_KEY": "none"},
-                          arguments=config.harbor_arguments, workers=config.workers,
-                          ready_timeout=config.ready_timeout)
+    trials = HarnessSource(Harbor(harbor=harbor, model=config.harness_model, trials=config.out / "trials",
+                                  agent=config.agent,
+                                  environment={"OPENAI_API_KEY": "none", "MSWEA_API_KEY": "none"},
+                                  arguments=config.harbor_arguments),
+                           gateway, workers=config.workers, ready_timeout=config.ready_timeout)
     # The trainer shows each call's rollout metrics as rollout/<name>; the
     # records are kept for the summary written below.
     history: list[SchedulerRecord] = []
@@ -179,7 +182,7 @@ with open(os.path.join(trial, "result.json"), "w") as out:
 
 
 class SmokeGateway(ThreadingHTTPServer):
-    """rllm-model-gateway's routes a HarborSource reads, over Dew's own server as the engine."""
+    """rllm-model-gateway's routes a HarnessSource reads, over Dew's own server as the engine."""
 
     def __init__(self, policy: NativeRolloutServer, words):
         super().__init__(("127.0.0.1", 0), _SmokeRoutes)

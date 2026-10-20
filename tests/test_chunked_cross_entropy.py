@@ -309,6 +309,63 @@ def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(til
     assert moved and max(moved) < matrix.size // 2, moved
 
 
+@pytest.mark.parametrize('tile', [None, (2, 64)], ids=['whole', 'tiled'])
+def test_a_heads_terms_and_gradients_are_as_exact_as_logsumexps_over_its_column_orders(tile):
+    """One device's head over 512 columns: each token's loss and log Z, and the gradients of a loss
+    of both for the states, the head, the scale and the bias, are as close to float64 over the
+    orders of its columns (the targets relabelled, which reorders every row's sum of exponentials
+    and moves no value) as `jax.nn.logsumexp`'s whole logits are (`assert_as_exact_over_orders`).
+    A row summed in one loop of XLA's CPU reduction with a combine of its own, and a share divided
+    out and then scaled, held the whole head's state gradient 3.9 times as far."""
+    from reference_error import ORDERS, assert_as_exact_over_orders
+
+    states, matrix, targets = inputs(vocab=512, features=16, tokens=(4, 5))
+    states, matrix = eighths(states, matrix)
+    scale, bias = columns(512)
+
+    def terms(states, matrix, scale, bias, targets):
+        head = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale)
+        losses, _, log_z = chunked_cross_entropy(states, head, targets, 4, tile=tile)
+        return losses, log_z
+
+    def whole(states, matrix, scale, bias, targets):
+        logits = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale).logits(states)
+        log_z = jax.nn.logsumexp(logits, axis=-1)
+        return log_z - jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0], log_z
+
+    def scored(head):
+        def loss(*arguments):
+            losses, log_z = head(*arguments)
+            return jnp.sum(losses + 1e-2 * jnp.square(log_z)), (losses, log_z)
+        return jax.grad(loss, argnums=(0, 1, 2, 3), has_aux=True)
+
+    with jax.default_matmul_precision('highest'):
+        dew, reference = jax.jit(scored(terms)), jax.jit(scored(whole))
+    with jax.enable_x64(new_val=True):
+        exact = jax.jit(scored(whole))
+    def back(scored, relabel):
+        """The terms and gradients of one order in the columns' own order."""
+        (d_states, d_matrix, d_scale, d_bias), outputs = jax.tree.map(
+            lambda leaf: np.asarray(leaf, np.float64), scored)
+        return (*outputs, d_states, d_matrix[:, relabel], d_scale[relabel], d_bias[relabel])
+
+    distances = {'dew': [], 'reference': []}
+    for order in range(ORDERS):
+        columns_in = np.random.default_rng(order).permutation(512) if order else np.arange(512)
+        relabel = np.argsort(columns_in)
+        drawn = (states, matrix[:, columns_in], scale[columns_in], bias[columns_in], relabel[targets])
+        with jax.enable_x64(new_val=True):
+            true = back(exact(*(jnp.asarray(term, jnp.float64) for term in drawn[:4]), drawn[4]), relabel)
+        with jax.default_matmul_precision('highest'):
+            for name, arm in (('dew', dew), ('reference', reference)):
+                got = back(arm(*drawn), relabel)
+                distances[name].append([np.sqrt(np.mean(np.square(a - b))) for a, b in zip(got, true,
+                                                                                           strict=True)])
+    for index, name in enumerate(('losses', 'log Z', 'states', 'head', 'scale', 'bias')):
+        assert_as_exact_over_orders(np.asarray(distances['dew'])[:, index],
+                                    np.asarray(distances['reference'])[:, index], f'{tile} {name}')
+
+
 @pytest.mark.mesh(devices=2)
 def test_vocabulary_split_slices_the_bias_with_its_table_columns():
     from dew.objectives.lm import LMObjective
