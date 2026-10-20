@@ -42,6 +42,7 @@ from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.inputs import ModelInputs
+from dew.nn.kernels import generation
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mlp import MLPMixer
@@ -636,13 +637,22 @@ def symmetric(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse:
 def decoding(model: CausalTransformer, tree: str | None = None):
     """`model`'s empty cache of one row, its call over a cache, prefilling a prompt or decoding a
     token, and its log-probabilities from logits, each compiled once for every set of weights of its
-    shapes and binding no weights past its call; with `tree`, every sum each makes under it
-    (tests/reference_trees.py), the same math summed in another order."""
-    def staged(function):
-        return jax.jit(function if tree is None else evaluated(function, tree))
+    shapes and binding no weights past its call; with `tree`, the call and the log-probabilities as
+    Dew's portable math, every kernel chosen as on a CPU (`generation.assumed`) and every sum under
+    the tree (tests/reference_trees.py): the same math summed in another order. The empty cache sums
+    nothing a row reads."""
+    def staged(function, *, summed: bool = True):
+        if tree is None or not summed:
+            return jax.jit(function)
+
+        def portable(*args):
+            with generation.assumed('cpu'):
+                return function(*args)
+
+        return jax.jit(evaluated(portable, tree))
 
     opened = staged(lambda variables: model.apply(variables, 1, method=CausalTransformer.init_cache,
-                                                  mutable=['cache'])[1]['cache'])
+                                                  mutable=['cache'])[1]['cache'], summed=False)
     step = staged(lambda variables, cache, ids: model.apply({**variables, 'cache': cache}, ids, decode=True,
                                                             mutable=['cache']))
     scored = staged(lambda logits: jax.nn.log_softmax(logits.astype(jnp.promote_types(logits.dtype,
