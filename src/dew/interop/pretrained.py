@@ -167,6 +167,23 @@ def _share_quantized_aliases(tensors: dict[str, np.ndarray], aliases: tuple[tupl
                 tensors[name] = value
 
 
+def on_default_device(variables: Variables) -> Variables:
+    """`variables` with each host leaf on JAX's default device as a `jnp` array is, uncommitted, so a
+    jitted call reads it where it is and a placement moves it, one leaf at a time: each host leaf
+    is released once its device copy is written back in its place."""
+    def placed(node):
+        if not isinstance(node, Mapping):
+            return jax.device_put(node) if isinstance(node, (np.ndarray, np.generic)) else node
+        # A freshly loaded tree's nodes are its own plain dicts, written in place so that no host leaf
+        # outlives its device copy; any other mapping is rebuilt.
+        held = node if type(node) is dict else dict(node)
+        for name in list(held):
+            held[name] = placed(held[name])
+        return held
+
+    return placed(variables)
+
+
 @dataclass(frozen=True)
 class Pretrained:
     """A native model with explicit variables and its checkpoint's host processor.
@@ -351,7 +368,8 @@ class Pretrained:
         or integer dtypes.
 
         A loaded source is ready to run: without `mesh` or `layout` its variables are
-        placed on JAX's default device (`jax.default_device`), as a `jnp` array is. With
+        placed on JAX's default device (`jax.default_device`), uncommitted, as a `jnp`
+        array is, so a call or a placement over other devices still takes them. With
         either, they are placed on that mesh (the default `MeshSpec()` when only `layout`
         is given) under that layout. Either way they are placed one leaf at a time.
         `on_host=True` keeps them as host arrays instead, for a caller that places them
@@ -425,12 +443,6 @@ class Pretrained:
         if on_host and (mesh is not None or layout is not None):
             raise ValueError("on_host keeps the variables as host arrays, and mesh and layout place them; "
                              "pass one")
-        if weights and not on_host and mesh is None and layout is None:
-            # The variables of a source loaded with no placement go where a jnp array goes.
-            from dew.nn.inputs import default_placement
-            from dew.training.distributed import MeshSpec as DefaultMesh
-
-            mesh = DefaultMesh().build(list(default_placement().device_set))
         streaming = mesh is not None or layout is not None
         if streaming and not weights:
             raise ValueError("a source loaded without its weights has nothing to place; the restore that "
@@ -471,6 +483,8 @@ class Pretrained:
         if not weights:
             loaded = replace(loaded, variables=jax.tree.map(
                 lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), loaded.variables))
+        elif not streaming and not on_host:
+            loaded = replace(loaded, variables=on_default_device(loaded.variables))
         return loaded
 
     @property

@@ -173,9 +173,10 @@ def test_a_host_source_is_placed_holding_one_device_shard_at_a_time():
 
 
 def test_a_loaded_source_is_ready_to_run_on_the_default_device():
-    """A source loaded without a mesh or layout holds its variables on JAX's default device, as a
-    `jnp` array is held, so a jitted call reads them where they are rather than copying the whole
-    tree from the host at each call; `on_host=True` keeps host arrays, which a mesh or layout
+    """A source loaded without a mesh or layout holds its variables on JAX's default device,
+    uncommitted, as a `jnp` array is held, so a jitted call reads them where they are rather than
+    copying the whole tree from the host at each call, and a call or placement over every device
+    still takes them; `on_host=True` keeps host arrays, which a mesh or layout
     beside it contradicts. A load returned host arrays, and a 4.57B model's step moved 9.1 GB
     each call."""
     from pathlib import Path
@@ -187,7 +188,12 @@ def test_a_loaded_source_is_ready_to_run_on_the_default_device():
     loaded = Pretrained.load(fixture, dtype="float32", attention_impl="reference")
     leaves = jax.tree.leaves(loaded.variables)
     assert leaves and all(isinstance(leaf, jax.Array) and leaf.devices() == default_placement().device_set
-                          for leaf in leaves)
+                          and not leaf.committed for leaf in leaves)
+    # Uncommitted, as a jnp array is: a call placed on every device takes it where it is.
+    mesh = jax.sharding.Mesh(np.array(jax.devices()), ("data",))
+    spread = jax.jit(lambda leaf: leaf * 2, out_shardings=jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec()))(leaves[0])
+    np.testing.assert_array_equal(np.asarray(spread), 2 * np.asarray(leaves[0]))
     host = Pretrained.load(fixture, dtype="float32", attention_impl="reference", on_host=True)
     assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(host.variables))
     for placed, held in zip(leaves, jax.tree.leaves(host.variables), strict=True):

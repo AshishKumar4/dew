@@ -425,7 +425,7 @@ def _saved_processor(settings: TextSettings | MaskedSettings | BlockSettings,
 
 def resident(model: nn.Module, variables: Variables) -> Variables:
     """`variables` as decoding reads them (`decoding_storage`), each leaf held in host memory, as
-    `Pretrained.load` returns them without a mesh, cast on the host and then placed on the device
+    `Pretrained.load(on_host=True)` returns them, cast on the host and then placed on the device
     once: replicated on the mesh the tree's arrays sit on, or committed to this process's default
     device as it is now (`jax.default_device`), so a later call made elsewhere runs where the
     weights are rather than moving them. A jax.Array stays where it is, a pinned-host bank's among
