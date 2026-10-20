@@ -11,6 +11,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, projection_flops
 from dew.nn.moe import (
     Routes,
@@ -133,7 +134,7 @@ class GptOssMLP(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array, routes: Routes | None = None) -> jax.Array:
-        logits = nn.Dense(self.num_local_experts, use_bias=True, dtype=self.dtype,
+        logits = Dense(self.num_local_experts, use_bias=True, dtype=self.dtype,
                            precision=self.precision, name="router")(x)
         k = self.num_experts_per_tok
         indices = chosen_experts(lambda: jax.lax.top_k(logits, k)[1], (*logits.shape[:-1], k), routes)
