@@ -1088,6 +1088,15 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
         return jnp.take_along_axis(out, back[:, :, None, None], axis=1)
 
     queries, keys = (None, None) if segment_ids is None else document_ids(segment_ids)
+    if queries is not None and keys is not None and (
+            query.shape[:-2] != queries.shape or key.shape[:-2] != keys.shape
+            or value.shape[:-2] != keys.shape):
+        # Packed rows run flattened into one run of tokens, where rows of another count or length can
+        # flatten to as many tokens and be read as the next row's.
+        raise ValueError(
+            f"packed flash attention reads each token by its document's id: queries {query.shape[:-2]} "
+            f"beside ids {queries.shape}, keys {key.shape[:-2]} and values {value.shape[:-2]} beside ids "
+            f"{keys.shape}")
     return _per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)),
                       segment_ids=(queries, ("activation_batch", None)),
                       key_segment_ids=(keys if isinstance(segment_ids, CrossDocuments) else None,
