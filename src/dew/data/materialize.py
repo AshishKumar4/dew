@@ -205,6 +205,7 @@ def _memory_stages(
             derived["windows"] = fingerprint([windows.size, stage.seq_len, stage.stride])
             rows, targets = _targeted([((index,), windows[index]) for index in range(len(windows))], counter,
                                       stage.fields[0])
+            counted = _recounted(rows, stage.fields[0], counted)
         elif isinstance(stage, Pack):
             from dew.data.packing import _Held, _PackedRows, refuse_overlong
 
@@ -236,6 +237,7 @@ def _memory_stages(
             ids = f"{stage.fields[0]}_segment_ids"
             documents = max((int(np.asarray(record(value, "packed window")[ids]).max(initial=0))
                              for _, value in rows), default=0)
+            counted = _recounted(rows, stage.fields[0], counted)
         else:
             expanded: list[tuple[tuple[int, ...], Record]] = []
             expanded_counts: dict[tuple[int, ...], int] = {}
@@ -269,6 +271,16 @@ def _memory_stages(
     inputs = source.inputs if isinstance(source, _Memory) else len(stored)
     return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, targets, counted,
                          documents)
+
+
+def _recounted(rows: list[tuple[tuple[int, ...], Record]], field: str,
+               counted: dict[tuple[int, ...], int] | None) -> dict[tuple[int, ...], int] | None:
+    """Where the documents' targets were counted (`counted`), those of the windows a pack or
+    windows stage made of them, by the windows' own ids: a document's count describes no window,
+    and its id names another one."""
+    if counted is None:
+        return None
+    return {identifier: ValidTargets(field)(record(value, "packed window")) for identifier, value in rows}
 
 
 def _targeted(

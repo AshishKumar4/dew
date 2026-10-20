@@ -998,6 +998,24 @@ def test_a_token_mixture_weighs_a_cropped_corpus_by_the_targets_left_after_the_c
     assert abs(left - right) <= sum(int(Scored(role)(row)["targets"]) for row in rows)
 
 
+@pytest.mark.parametrize("stage", ["windows", "pack"])
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_corpus_counted_before_its_windows_reads_the_windows_and_their_targets(read, stage):
+    """Targets counted on each document (`CountTargets`) before a windows or pack stage cuts it into
+    more rows than it had describe none of those rows: the read gives each window and the corpus
+    the windows' targets, all of the documents' that a window scores."""
+    from dew.data.steps.text import CountTargets
+
+    counted = Pipeline(roled(0, 25, 22, count=4), name="long").filter_map(CountTargets())
+    staged = counted.windows(8) if stage == "windows" else counted.pack(8, policy="concat")
+    stream = compile(staged.batch(1), read=read, loading=READ).train(DataPartition())
+    try:
+        windows = [next(stream)["text"] for _ in range(8)]
+    finally:
+        stream.close()
+    assert all(np.shape(window)[-1] >= 8 for window in windows)
+
+
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_a_token_mixture_keeps_a_rows_count_through_a_step_over_its_other_fields(read):
     """A step that changes only a row's other fields keeps the targets its count's own rule counted,
