@@ -301,17 +301,17 @@ def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():
 
 
 @pytest.mark.gpu(reason="reads a CUDA device's attributes")
-def test_a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it(monkeypatch):
-    """The default device's shared memory a block and multiprocessors come from JAX's device, the same
-    with its generation's row removed from the table, and equal to what the row records where it
-    names one."""
+def test_a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it():
+    """The default device's shared memory a block and multiprocessors come from JAX's device: a bare
+    target of its generation, holding none of the table's resources, takes the same ones the
+    default device's target reports, and the row's own where the table records them."""
+    device = jax.devices()[0]
     named = gpu_target()
-    row = TARGETS.get(device_generation())
-    monkeypatch.delitem(TARGETS, device_generation(), raising=False)
-    unnamed = gpu_target()
-    assert unnamed.shared_limit is not None and unnamed.multiprocessors == jax.devices()[0].core_count
-    assert (unnamed.shared_limit, unnamed.multiprocessors, unnamed.wgmma) == (
+    bare = runtime_facts(GpuTarget(device_generation(), device.device_kind), device)
+    assert bare.shared_limit is not None and bare.multiprocessors == device.core_count
+    assert (bare.shared_limit, bare.multiprocessors, bare.wgmma) == (
         named.shared_limit, named.multiprocessors, named.wgmma)
+    row = TARGETS.get(device_generation())
     if row is not None and row.shared_limit is not None:
         assert named.shared_limit == row.shared_limit
 
