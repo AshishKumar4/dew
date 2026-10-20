@@ -4,9 +4,14 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
-from dew.config import ObjectiveConfig
+import jax
+import jax.numpy as jnp
+import pytest
+
+from dew.config import ModelConfig, ObjectiveConfig
 from dew.inputs import Field, InputSpec
-from dew.registry import Aliases
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.registry import Aliases, resolve_dtype
 
 if TYPE_CHECKING:
     pass
@@ -101,14 +106,6 @@ def supervised(loss: dict) -> ObjectiveConfig:
 def test_a_float64_model_records_its_dtype_and_the_name_needs_x64():
     """A model computing in float64 records its dtype by name and rebuilds from it where JAX
     computes in float64; without x64 the name is refused, since JAX would narrow it to float32."""
-    import jax
-    import jax.numpy as jnp
-    import pytest
-
-    from dew.config import ModelConfig
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.registry import resolve_dtype
-
     model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=1, mlp_features=8,
                               max_seq_len=4, dtype=jnp.float64)
     with jax.enable_x64(new_val=True):
