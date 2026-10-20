@@ -42,10 +42,12 @@ class Accumulation:
     def replays(self, other: Accumulation | None) -> bool:
         """Whether this window's replay slots hold batches of the shapes `other`'s do, so a step
         compiled for `other` reads it: a batch ramp's stage changes them, and a pooled mean,
-        which keeps no batch, replays none."""
-        mine, theirs = (jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), held)
-                        for held in (self.batches, None if other is None else other.batches))
-        return mine == theirs
+        which keeps no batch, replays none. A batch's few fields are compared leaf by leaf, without
+        building a tree, as a ramped run's runner does each step."""
+        held, compiled = self.batches, None if other is None else other.batches
+        return jax.tree.structure(held) == jax.tree.structure(compiled) and all(
+            (mine.shape, mine.dtype) == (theirs.shape, theirs.dtype)
+            for mine, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(compiled), strict=True))
 
 
 def kept_window(held: Accumulation | None, pending: Accumulation, filled: int | None) -> bool:

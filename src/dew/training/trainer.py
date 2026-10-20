@@ -1222,12 +1222,12 @@ class Trainer(Generic[Loss, Effects]):
             lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
         # The check reads the state's arguments as already on the devices. The copies and accumulators
         # `run` builds on the first call are not yet, so they count with the prefetched batches beside
-        # the step, a ramp stage's window beside the last's, which the state it steps from holds.
+        # the step, a ramp stage's window too, which `run` builds beside the last, already resident.
         last = state.accumulation
         rebuilt = last is not None and not last.replays(prepared.accumulation)
         built = [(prepared.compute, state.compute), (prepared.accumulation, None if rebuilt else last)]
-        fresh = [field for field, kept in built if kept is None and field is not None]
-        held = prefetched_bytes(batch, placement) + placed_bytes(fresh + ([last] if rebuilt else []))
+        held = prefetched_bytes(batch, placement) + placed_bytes(
+            [field for field, kept in built if kept is None and field is not None])
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
         lower = functools.partial(jitted.lower, prepared, batch, part)
