@@ -14,7 +14,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from episode_support import ToolPolicy
 from flax import linen as nn
+from jax.experimental import checkify
 from model_support import Digits, decoder, serving_task as task
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
@@ -425,6 +427,32 @@ def test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_ste
         np.testing.assert_array_equal(mine.host().tokens, theirs.host().tokens)
 
 
+@pytest.mark.parametrize("decode_steps", [1, 4])
+def test_a_step_whose_draw_has_no_distribution_stops_the_server(decode_steps):
+    """A bigram policy that draws 5 after every id but 5, after which every score is 3e38, which
+    a temperature of 0.5 doubles past float32's range: the step after the first draw has no
+    distribution to draw from, which the device checks. The server raises that check and stops,
+    whether the failing step is a call of its own or a later step of the call that admitted the
+    row."""
+    vocab = 16
+
+    def logits():
+        table = np.full((vocab, vocab), -3e38, np.float32)
+        table[:, 5] = 0.0
+        table[5] = 3e38
+        return table
+
+    model = ToolPolicy(vocab_size=vocab, max_seq_len=64, logits=logits)
+    params = model.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32))
+    bound = TextGeneration(model, params, None, sampling=Sampling(temperature=0.5, eos_token_ids=None))
+    server = Server.from_task(bound, slots=2, capacity=64, decode_steps=decode_steps)
+    server.submit(np.asarray([1, 2, 3], np.int32), 4, key=0)
+    with pytest.raises(checkify.JaxRuntimeError):
+        server.run()
+    with pytest.raises(RuntimeError):
+        server.step()
+
+
 def test_a_request_admitted_mid_flight_draws_what_it_draws_alone():
     bound = task()
     server = Server.from_task(bound, slots=4, capacity=128, admission=2)
@@ -670,13 +698,15 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
 
 
 @pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("decode_steps", [1, 4])
 @pytest.mark.parametrize("dispatch", ["global"])
-def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
+def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode_steps):
     """A mixture layer on an expert mesh can run its dispatch in a shard_map,
     and jax's checkify cannot carry a device check into one (jax-ml/jax#40907).
-    The server's step runs the model before its draws check anything, and a
-    pool smaller than every row's capacity checks nothing on the device, so
-    either dispatch serves what the global one draws alone on one device.
+    The server's step runs the model before its draws check anything, each of
+    a call's steps checks its own draws, and a pool smaller than every row's
+    capacity checks nothing on the device, so either dispatch serves what the
+    global one draws alone on one device, one step a call or several.
     TextGeneration, whose loop carries each draw's checks into the next
     step's model call, refuses the exchange."""
     def generation(dispatch, params):
@@ -694,7 +724,8 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
     served = generation(
         dispatch, place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0))
     )
-    server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32))
+    server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32),
+                                       decode_steps=decode_steps)
     assert_sharded(served.variables["params"], server.mesh)
     assert server.groups == jax.device_count()
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
