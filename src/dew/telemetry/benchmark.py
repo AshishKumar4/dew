@@ -15,7 +15,6 @@ import html
 import statistics
 import time
 from collections.abc import Callable, Hashable, Mapping
-from typing import Any
 
 import jax
 
@@ -100,7 +99,7 @@ def samples[T](fn: Callable[..., T], *args, warmup: int = 3, repeats: int = 10,
     return measured
 
 
-def benchmark(calls: Mapping[Hashable, Callable[[], Any]], *, warmup: int = 1,
+def benchmark(calls: Mapping[Hashable, Callable[[], object]], *, warmup: int = 1,
               repeats: int = 3) -> Benchmark:
     """Time each of `calls`, in order, `repeats` times after `warmup` untimed runs (`samples`), and
     return the runs' seconds and each call's last output (`Benchmark`); no two of a call's outputs
@@ -109,7 +108,7 @@ def benchmark(calls: Mapping[Hashable, Callable[[], Any]], *, warmup: int = 1,
         raise ValueError(f"a benchmark times at least one run after none or more warm-ups, not "
                          f"repeats={repeats} and warmup={warmup}")
     seconds: dict[Hashable, tuple[float, ...]] = {}
-    outputs: dict[Hashable, Any] = {}
+    outputs: dict[Hashable, object] = {}
     for label, call in calls.items():
         ran = 0
 
