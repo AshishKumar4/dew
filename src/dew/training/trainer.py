@@ -1488,8 +1488,7 @@ class Trainer(Generic[Loss, Effects]):
         run.last_checkpoint = time.perf_counter()
         interval = Interval(time.time(), last_saved=(
             int(state.step) if checkpoints is not None and checkpoints.latest is not None else None),
-            tokens_before_log=int(run.stop_control.pop("tokens", 0)),
-            pending_before_log=int(run.stop_control.pop("pending_tokens", 0)))
+            tokens_before_log=int(run.stop_control.pop("tokens", 0)))
         if self._opened(plan, run, interval, state, position,
                         resumed=initial is None and interval.last_saved is not None):
             return state
@@ -1562,7 +1561,7 @@ class Trainer(Generic[Loss, Effects]):
                 run.current += 1
                 self._display.step(run.current)
                 seen += 1
-                interval.count(batch, measured_flops, loss, finite, committed, accepted, aux)
+                interval.count(batch, measured_flops, loss, finite, committed, aux)
                 if run.first_step is None:
                     loss.block_until_ready()
                     run.first_step = time.perf_counter() - run.started
@@ -2190,7 +2189,7 @@ class Trainer(Generic[Loss, Effects]):
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         write = functools.partial(
             checkpoints.save, step, state, position, metadata, share=DataPartition.of(self.device_mesh),
-            ranking=ranking, control={**(control or {}), **interval.token_control},
+            ranking=ranking, control={**(control or {}), "tokens": interval.real_tokens},
             weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
             boxed=self._boxed_axes())
         self._report(CheckpointRequested(checkpoints.directory), step, write)
@@ -2216,7 +2215,7 @@ class Trainer(Generic[Loss, Effects]):
         self._display.status("writing a local checkpoint")
         write = functools.partial(
             checkpoints.save_local, step, state, position, share=DataPartition.of(self.device_mesh),
-            control={**(control or {}), **interval.token_control}, rung=self._checkpoint_rung(),
+            control={**(control or {}), "tokens": interval.real_tokens}, rung=self._checkpoint_rung(),
             artifact=self._artifact(), boxed=self._boxed_axes())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
