@@ -161,10 +161,10 @@ class KernelOp(tokamax.Op):
         return self._fwd(*args, config=config, **kwargs)[0]
 
     def chosen(self, ba: tokamax.BoundArguments) -> Hashable:
-        """The config a launch of `ba` takes where it traces now: a config pinned for its kernel that
-        its key's space holds (`pinned`), else its pick (`_pick`, else `_nearest`), else its own
-        shapes' heuristic."""
-        return self._chosen(ba, self.keyed(ba))
+        """The config a launch of `ba` takes where it traces now: the op's own `config` where it carries
+        one, else a config pinned for its kernel that its key's space holds (`pinned`), else its pick
+        (`_pick`, else `_nearest`), else its own shapes' heuristic."""
+        return self.config if self.config is not None else self._chosen(ba, self.keyed(ba))
 
     def _chosen(self, ba: tokamax.BoundArguments, keyed: tokamax.BoundArguments) -> Hashable:
         pin = dict(cache.KERNEL_PINS.value).get(type(self))
