@@ -132,22 +132,24 @@ def test_a_checkpoint_that_counted_every_steps_tokens_cannot_resume_a_token_budg
     counted commits) holds no committed count: a run whose length is its tokens refuses to resume
     from it, and a run of steps resumes and keeps the count unknown in its own checkpoints, so a
     token budget after it is refused too."""
+    import json
+    import pathlib
+
     first = make_trainer(tmp_path, objective=TokenRegression())
-    trained = first.fit(dataset(), steps=2, log_every=1, checkpoint_every=1)
+    first.fit(dataset(), steps=2, log_every=1, checkpoint_every=1)
     first.checkpoints.wait()
-    directory = first.checkpoints.directory
-    # The trained step's own state and data position, saved again as step 3 with its token clock
-    # written as the old count.
-    old = Checkpoints(directory, keep=3)
-    state, position = old.restore(trained, step=2, share=DataPartition())
-    old.save(3, state, position, share=DataPartition(), control={"tokens": 16})
-    old.wait()
+    # The step's metadata as a run before commits counted wrote it: the old field, every step's count.
+    (written,) = pathlib.Path(first.checkpoints.directory, "2").glob("_CHECKPOINT_METADATA")
+    metadata = json.loads(written.read_text())
+    control = metadata["custom_metadata"]["control"]
+    control["tokens"] = control.pop("committed_tokens")
+    written.write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="committed"):
         make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=30)
     resumed = make_trainer(tmp_path, objective=TokenRegression())
-    assert int(resumed.fit(dataset(), steps=4, log_every=1, checkpoint_every=1).step) == 4
-    assert "tokens" in resumed.checkpoints.control(4)
-    assert "committed_tokens" not in resumed.checkpoints.control(4)
+    assert int(resumed.fit(dataset(), steps=3, log_every=1, checkpoint_every=1).step) == 3
+    assert "tokens" in resumed.checkpoints.control(3)
+    assert "committed_tokens" not in resumed.checkpoints.control(3)
     with pytest.raises(ValueError, match="committed"):
         make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=60)
 
