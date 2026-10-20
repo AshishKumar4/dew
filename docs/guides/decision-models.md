@@ -51,7 +51,8 @@ The response has exactly Jev's fields, with numbers rounded to four places. `det
 Dew ships no HTTP server of its own, but `systemone` is all one needs. `examples/serve_decisions.py` serves it with Starlette in about forty lines, at Jev's `POST /v1/systemone`, with Jev's 422 for a request it refuses and an optional bearer key:
 
 ```bash
-uv pip install "dewml[serve] @ git+https://github.com/AshishKumar4/dew"
+uv pip install "dewml[serve] @ git+https://github.com/AshishKumar4/dew" \
+    --extra-index-url https://pypi.dewml.dev/simple
 python examples/serve_decisions.py --model convaiinnovations/laya --port 8000
 ```
 
