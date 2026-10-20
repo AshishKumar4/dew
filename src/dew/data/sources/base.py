@@ -36,6 +36,10 @@ order with no index."""
 
 READS: tuple[Read, ...] = ("memory", "indexed", "streamed")
 
+TOKENIZER_CONTRACT = ("tokenizer", "vocab_size", "eos_id", "tokenizer_revision")
+"""The facts of a store of token ids that say what its ids mean, which every corpus a run reads
+together, and every store a concatenation joins, must state alike where they state them."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Shard:
