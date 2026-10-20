@@ -111,6 +111,7 @@ The kernel direction was approved on 2026-10-19:
 - Rule on the nine public Dataset members the spec does not name: then, chain, map_with_index, slice, windows, token_split, rebatch, limit and iterate. [811]
 - Chunk a long chat conversation and keep an overlong prompt's tail by default, as the spec says, and carry a row's `ability` into its record's extra_info. [812, 813, 814]
 - Teach only names main has in the post-training and inference docs. [815]
+- Build the data design's remaining contracts: uniform stage errors; a pre-read refusal of a missing artifact; slot maxima shared with `fit`'s separately compiled validation chains; per-member committed-token logging; RL prompt tail cuts counted as truncations; volatility read on every stage kind; and the reader's cache report. [design/data.md]
 
 ## Training and parallelism
 
@@ -133,6 +134,7 @@ The kernel direction was approved on 2026-10-19:
 - Restore a distilled student without its teacher, and count its tokens as the student's. [775, 776]
 - Let rCM accumulate, its phase read from the update clock. [778]
 - Index a sweep's grid lazily. [781]
+- Build the training design's remaining contracts: refusing a split leaf that declares no axes, `Layout.validate(mesh)`'s placement report, a token budget ending at the commit that reaches it, and kernel choices in a run's report. [design/training.md]
 
 ## RL and serving
 
@@ -198,6 +200,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Make float32 numpy references independent of the worker's OpenBLAS kernels, which round differently on x86-64-v3 and v4, without pinning the weaker one. [744]
 - Dew requires its own JAX build, installed from pypi.dewml.dev, with no stock-JAX routes or version gates. The fork AshishKumar4/jax follows upstream releases by CI and carries a patch stack, each patch sent upstream and dropped at the fork's first rebase onto a release that contains it: the compilation cache-key fixes for jax-ml/jax#40940 and #41502 (jax-ml/jax#41776, #41777), and `linear_call`'s batching and forward-mode rules (jax-ml/jax#41782, #41780). Before Dew moves to JAX 0.12, its XLA:CPU narrow float32 dots, which sum K in one sequential chain about twice as far from float64 as 0.11.2's partial sums, need a fix or an upstream report. [713, 714, 731, 732, 743]
 - Judge layout parity through the shared gate, its own order policy and floor deleted. [793]
+- Judge an image model's layout parity under a sequence split, where its gradients' sums over spatial positions reassociate (edm2's sequence-split cell). [827]
 - Use JAX's supported persistent cache in the remote-cache tests, with handling narrowed to transport errors. [794]
 - Use JAX's own transfer guard on GPUs in place of the steady-state reimplementation, and guard CPU arrays' reads to numpy in JAX itself (jax-ml/jax#16602). [795, 801]
 - One collective parser (telemetry.instrumentation) and one cache-worker fixture in the tests. [796, 797]
