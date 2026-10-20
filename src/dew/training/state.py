@@ -28,7 +28,9 @@ class Accumulation:
     The replay buffers, `batches` and `variables`, have a leading dimension
     of window slots, followed by the original batch or mutable-collection
     dimensions. Only the collections that `Aux.variables` rewrites need a
-    snapshot of what each record read.
+    snapshot of what each record read. `tokens` is the real tokens of the
+    window's accepted microbatches, as two uint32 words, which its commit
+    counts toward a run's tokens; None where the objective counts none.
     """
     gradient: Variables | None
     mass: jax.Array | None
@@ -38,6 +40,7 @@ class Accumulation:
     batches: Batch | None
     variables: Variables | None
     attempts: jax.Array | None
+    tokens: jax.Array | None = None
 
     def replays(self, other: Accumulation | None) -> bool:
         """Whether this window's replay slots hold batches of the shapes `other`'s do, so a step

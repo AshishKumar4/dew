@@ -1943,6 +1943,35 @@ def test_native_map_datasets_read_as_streams_and_mix_with_a_stream_only_member()
             resumed.close()
 
 
+@dataclasses.dataclass(frozen=True)
+class Stated(Memory):
+    """Records with the facts their store states, as a producer's metadata states them."""
+
+    facts: tuple[tuple[str, object], ...] = ()
+
+    def metadata(self):
+        return {**super().metadata(), **dict(self.facts)}
+
+
+def test_a_concatenation_states_what_its_stores_state_of_their_records():
+    """Two splits of one token store joined (`dew.data.Concatenate`) state its tokenizer contract and
+    class names, the targets of both and the rows of both, so a token mixture weighs the joined
+    store and a run checks its contract as of either split; a fact one split alone states or the
+    two state apart is none of the join's, and two contracts make no one store."""
+    from dew.data import Concatenate
+
+    contract = (("tokenizer", "gpt2"), ("vocab_size", 50257), ("class_names", {"label": ("a", "b")}))
+    first = Stated([{"id": np.int32(index)} for index in range(3)],
+                   facts=(*contract, ("valid_targets", 30), ("split", "train")))
+    second = Stated([{"id": np.int32(index)} for index in range(2)],
+                    facts=(*contract, ("valid_targets", 20), ("split", "validation"), ("shuffled", True)))
+    assert Concatenate((first, second)).metadata() == {
+        **dict(contract), "rows": 5, "valid_targets": 50}
+    other = Stated([{"id": np.int32(0)}], facts=(("tokenizer", "llama"),))
+    with pytest.raises(ValueError):
+        Concatenate((first, other)).metadata()
+
+
 @pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
 def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(read):
     """Two stores read in turn (`dew.data.Concatenate`) are one store to a recipe and to the verbs:
