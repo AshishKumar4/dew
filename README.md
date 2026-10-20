@@ -837,7 +837,7 @@ set, while the XLA attention path passed the recorded bitwise checks.
 
 ### Standalone evaluation and local reports
 
-`Evaluation.run` scores trained variables without an optimizer and returns metric values and optional previews. `LocalTracker` writes the scalar history, artifacts and plots to disk, with no W&B account or install. Install `dewml[plots]` for Matplotlib output.
+`Evaluation.run` scores trained variables without an optimizer and returns metric values and optional previews. `LocalTracker` writes the scalar history, artifacts and plots to disk, with no W&B account or install. `tracker.plot("train/loss", "val/loss")` draws a run's curves as a `dew.figures` figure.
 
 ```python
 import itertools
