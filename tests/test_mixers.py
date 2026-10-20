@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_leaves_as_exact, float64_terms, widened
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms, widened
 
 from dew.nn import linear
 from dew.nn.attention import alibi_bias
@@ -282,9 +282,10 @@ def test_no_token_reaches_another_document(kind):
     through the kernel choice (`chosen`), which restarts each document's decays. Their port runs a
     row as one sequence, each document's decay prefix shifted by the one before (`linear.FORGET`),
     so the first document's decays round the second's and no bitwise comparison holds: on the port,
-    every leaf of the changed row is held to the float64 second document within the rule of the
-    unchanged row's own distance from it, the same rounding drawn again, which a token crossing the
-    boundary would miss by orders of magnitude.
+    every leaf of the changed row is held to the float64 second document within FACTOR of the port's
+    own distance from it on a row whose first document is silent (zero embeddings, so every value it
+    could carry is zero), the same shifted prefix rounded again with nothing to leak and no floor. A
+    memory that crosses the boundary misses by four orders of magnitude or more.
 
     The loss is differentiated at the embedded tokens, not through the lookup: the table's gradient
     adds each position's by a scatter, which a GPU's deterministic XLA (`--xla_gpu_deterministic_ops`)
@@ -306,12 +307,14 @@ def test_no_token_reaches_another_document(kind):
     weight = weight.at[:, :first].set(0).at[:, first + second:].set(0)
     tokens_at = coordinates(segments=segments, positions=positions, max_segments=3)
 
-    def second_document(row, model=model, variables=variables):
+    def second_document(row, model=model, variables=variables, silent=False):
         def loss(variables, inputs):
             logits = model.apply(variables, row, input_embeddings=inputs, coordinates=tokens_at)
             return jnp.sum(logits * weight), logits[:, first:first + second]
 
         inputs = model.apply(variables, row, method=embedded)
+        if silent:
+            inputs = inputs.at[:, :first].set(0)
         (_, logits), (grads, at_inputs) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True))(
             variables, inputs)
         return logits, grads, at_inputs[:, first:first + second]
@@ -324,10 +327,18 @@ def test_no_token_reaches_another_document(kind):
                                       err_msg=jax.tree_util.keystr(path))
     if kind in DELTA_RULES:
         with chosen(gated_delta_rule="fla"):
-            moved, kept = second_document(changed), second_document(tokens)
+            moved, silent = second_document(changed), second_document(tokens, silent=True)
         with jax.enable_x64(new_val=True):
             truth = second_document(tokens, model.clone(dtype=jnp.float64), widened(variables))
-        assert_leaves_as_exact(moved, kept, jax.tree.map(np.asarray, truth))
+        leaves = zip(jax.tree_util.tree_leaves_with_path(moved), jax.tree.leaves(silent),
+                     jax.tree.leaves(truth), strict=True)
+        for (path, mine), theirs, exact in leaves:
+            mine, theirs, exact = (np.asarray(x, np.float64) for x in (mine, theirs, exact))
+            if np.array_equal(theirs, exact):
+                # The silent row computed it exactly, so the changed one must too.
+                np.testing.assert_array_equal(mine, exact, err_msg=jax.tree_util.keystr(path))
+            else:
+                assert_as_exact_as_the_reference(mine, theirs, exact, jax.tree_util.keystr(path))
 
 
 POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "attention_sinks": True,
