@@ -6,14 +6,15 @@ Each graph's nodes are jitted alone and its witness composes them, so the witnes
 the nodes run; a witness that rounds otherwise fails check 1. The truth graph is the reference's
 graph at float64, and its backward is checked against the float64 chain rule (`jax.vjp`).
 
-Attention's key sums are held against the canonical Sum family (reference_trees.sum_family) as
-members beside the reference: two trees equally exact on average differ element by element, and
-against the reference's one tree a pairwise key sum was flagged at 2 of 768 elements on an AVX2
-worker and none on AVX-512 (ledger 758). With the family, held-out trees as exact as the reference
-(recursive halving, pairwise over the keys reversed, XLA's sum reversed, strided-32) passed at 48,
-128 and 256 keys on both ISAs, a tree less exact on long positive sums (blocked-12) failed there, and
-an eight-ulp fault at one element failed everywhere (24 armada workers a shape); the rule's
-false-failure rate at real element counts is not calibrated by these counts."""
+Every Sum node, the norms' and attention's, is held against the canonical Sum family
+(reference_trees.sum_family) as members beside the reference: two trees equally exact on average
+differ element by element, and against the reference's one tree equally exact code was flagged on
+some CPUs and not others (ledger 758: a pairwise key sum at 2 of 768 elements on an AMD AVX2 worker
+and none on AVX-512; the norm backward's dscale halves at 1 of 256 on an Intel Xeon). With the
+family, held-out trees as exact as the reference (recursive halving, pairwise over the keys
+reversed, XLA's sum reversed, strided-32) passed at 48, 128 and 256 keys on both ISAs, a tree less
+exact on long positive sums (blocked-12) failed there, and an eight-ulp fault at one element failed
+everywhere (24 armada workers a shape); the rule's false-failure rate at real element counts is not calibrated by these counts."""
 
 import jax
 import jax.numpy as jnp
@@ -37,9 +38,23 @@ def composed(inputs, nodes, outputs, held=()):
     return Graph(inputs, tuple(nodes), tuple(outputs), fused)
 
 
-def norm_graph(summed):
-    """An RMS norm over the width: the sum of squares `summed` (a Sum over the width), then the norm."""
-    squares = Node("squares", ("x",), Sum({"x": -1}), jax.jit(lambda x: summed(jnp.square(x))))
+SUM_TREES = sum_family(16)
+"""Every Sum node's members in these graphs: the canonical Sum family at a 16-term tile
+(reference_trees.sum_family)."""
+
+
+def tree_members(arithmetic, trees):
+    """The reference's node `arithmetic(sum)` under each of `trees` (reference_trees.tree_sum) as members."""
+    return {tree: jax.jit(arithmetic(lambda terms, tree=tree: tree_sum(terms, -1, tree))) for tree in trees}
+
+
+def norm_graph(summed, trees=()):
+    """An RMS norm over the width: the sum of squares `summed` (a Sum over the width, with the
+    reference's math under each of `trees` as members), then the norm."""
+    def squared(total):
+        return lambda x: total(jnp.square(x))
+    squares = Node("squares", ("x",), Sum({"x": -1}), jax.jit(squared(summed)),
+                   members=tree_members(squared, trees))
     output = Node("output", ("x", "squares", "scale"), Pointwise(),
                   jax.jit(lambda x, squares, scale:
                           x * jax.lax.rsqrt(squares[..., None] / x.shape[-1] + EPSILON) * scale))
@@ -76,7 +91,8 @@ def test_a_norm_that_sums_in_halves_is_held_where_it_rounds_and_passes():
     """The half-sum norm's sum of squares, held over its own width orders on common parents, and its
     pointwise tail, held once on the reference's sums and on Dew's, are on par: it passes."""
     inputs = norm_inputs()
-    report = assert_graph_as_exact(norm_graph(halves), norm_graph(xla), norm_graph(xla), inputs,
+    reference = norm_graph(xla, SUM_TREES)
+    report = assert_graph_as_exact(norm_graph(halves), reference, reference, inputs,
                                    width_orbit(inputs), "halves")
     assert set(report) == {(name, bundle) for name in ("squares", "output")
                            for bundle in ("reference's parents", "dew's parents")}
@@ -123,20 +139,26 @@ def test_a_nan_at_one_element_fails():
                               norm_graph(xla), norm_graph(xla), inputs, width_orbit(inputs), "nan")
 
 
-def norm_backward(summed):
+def norm_backward(summed, trees=()):
     """The norm's backward from the common forward's saved `squares` and a fixed cotangent `g`: the sum
     over the width of g·x·scale (a Sum), then dx and dscale's per-row terms (Pointwise), and dscale's sum
-    over the rows (a Sum)."""
+    over the rows (a Sum); each Sum with the reference's math under each of `trees` as members."""
     def inverse(x, squares):
         return jax.lax.rsqrt(squares[..., None] / x.shape[-1] + EPSILON)
 
+    def projection(total):
+        return lambda g, x, scale: total(g * scale * x)
+
+    def scale_gradient(total):
+        return lambda g, x, squares: total(jnp.moveaxis(g * x * inverse(x, squares), 0, -1))
+
     projected = Node("projected", ("g", "x", "scale"), Sum({"g": -1, "x": -1, "scale": -1}),
-                     jax.jit(lambda g, x, scale: summed(g * scale * x)))
+                     jax.jit(projection(summed)), members=tree_members(projection, trees))
     dx = Node("dx", ("g", "x", "scale", "squares", "projected"), Pointwise(),
               jax.jit(lambda g, x, scale, squares, projected: inverse(x, squares) * scale * g
                       - x * inverse(x, squares) ** 3 * projected[..., None] / x.shape[-1]))
     dscale = Node("dscale", ("g", "x", "squares"), Sum({"g": 0, "x": 0, "squares": 0}),
-                  jax.jit(lambda g, x, squares: summed(jnp.moveaxis(g * x * inverse(x, squares), 0, -1))))
+                  jax.jit(scale_gradient(summed)), members=tree_members(scale_gradient, trees))
     return composed(("g", "x", "scale", "squares"), (projected, dx, dscale), ("dx", "dscale"))
 
 
@@ -175,8 +197,9 @@ def test_the_float64_backward_graph_is_the_chain_rule():
 
 def test_a_backward_that_sums_in_halves_passes_and_one_that_drops_a_term_fails():
     inputs = backward_inputs()
-    assert_graph_as_exact(norm_backward(halves), norm_backward(xla), norm_backward(xla), inputs,
-                          backward_orbit(inputs), "backward halves")
+    reference = norm_backward(xla, SUM_TREES)
+    assert_graph_as_exact(norm_backward(halves), reference, reference, inputs, backward_orbit(inputs),
+                          "backward halves")
     with pytest.raises(AssertionError):
         assert_graph_as_exact(norm_backward(lambda terms: jnp.sum(terms[..., 1:], axis=-1)),
                               norm_backward(xla), norm_backward(xla), inputs, backward_orbit(inputs),
@@ -189,17 +212,14 @@ def key_sums(keys_sum):
             "accumulated": jax.jit(lambda weights, v: keys_sum(weights[:, None, :] * v.T[None]))}
 
 
-KEY_TREES = sum_family(16)
-"""The key sums' members: the canonical Sum family at a 16-key tile (reference_trees.sum_family)."""
-
-
 def attention_graph(scores_of, keys_sum, trees=()):
     """Dense causal attention for one head: its scores (a Sum over the head width), each row's max and
     its exponentials (Pointwise), the denominator and the accumulator (Sums over keys), and the output.
-    The key sums take the reference's math under each of `trees` as members."""
+    Every Sum takes the reference's math under each of `trees` as members."""
     sums = key_sums(keys_sum)
     members = {tree: key_sums(lambda terms, tree=tree: tree_sum(terms, -1, tree)) for tree in trees}
-    scores = Node("scores", ("q", "k"), Sum({"q": -1, "k": -1}), jax.jit(scores_of))
+    scores = Node("scores", ("q", "k"), Sum({"q": -1, "k": -1}), jax.jit(scores_of),
+                  members=tree_members(masked_scores, trees))
     weights = Node("weights", ("scores",), Pointwise(), jax.jit(
         lambda scores: jnp.exp(scores - jnp.max(scores, axis=-1, keepdims=True))))
     total = Node("total", ("weights",), Sum({"weights": -1}), sums["total"],
@@ -253,7 +273,7 @@ def test_attention_summing_its_keys_by_a_held_out_tree_passes_against_the_family
     and XLA's own sum over the keys reversed."""
     inputs = attention_inputs()
     keys_sum = halving if held_out == "halving" else (lambda terms: jnp.sum(terms[..., ::-1], axis=-1))
-    reference = attention_graph(masked_scores(plain), plain, KEY_TREES)
+    reference = attention_graph(masked_scores(plain), plain, SUM_TREES)
     report = assert_graph_as_exact(attention_graph(masked_scores(plain), keys_sum), reference, reference,
                                    inputs, head_orbit(inputs), held_out)
     assert all(REFERENCE in report[node, "reference's parents"]["['node']"]["admitted"]
@@ -271,7 +291,7 @@ def test_a_key_sum_eight_ulps_off_at_one_element_fails_against_the_family():
         return found
 
     inputs = attention_inputs()
-    reference = attention_graph(masked_scores(plain), plain, KEY_TREES)
+    reference = attention_graph(masked_scores(plain), plain, SUM_TREES)
     with pytest.raises(AssertionError):
         assert_graph_as_exact(attention_graph(masked_scores(plain), off), reference, reference, inputs,
                               head_orbit(inputs), "eight ulps")
