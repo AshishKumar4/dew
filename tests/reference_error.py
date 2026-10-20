@@ -310,9 +310,10 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> No
 
     A leaf passes when its pooled ratio (`_pooled`) is at most FACTOR and its seeds resolve it: the
     ratio's CONFIDENCE bootstrap interval over them no wider than FACTOR. An unresolved leaf is
-    inconclusive, never a pass: its site takes larger inputs or more seeds. A leaf over FACTOR is drawn
-    again over REDRAW times as many further declared seeds, and fails if it is still over: a finding in
-    the code or the reference arm. A leaf the reference holds exactly on every seed, Dew must too.
+    inconclusive, never a pass: its site takes larger inputs or more seeds; one whose whole interval
+    lies over FACTOR is over it, resolved or not. A leaf over FACTOR is drawn again over REDRAW times
+    as many further declared seeds, and fails if it is still over: a finding in the code or the
+    reference arm. A leaf the reference holds exactly on every seed, Dew must too.
 
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
@@ -328,7 +329,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> No
                 over.append(f"{leaf}: the reference equals float64 on every seed and dew does not")
             continue
         low, high = _interval(a, b)
-        if not _resolves(low, high):
+        # A ratio whose whole interval lies over FACTOR is over it however wide the interval.
+        if low <= FACTOR and not _resolves(low, high):
             over.append(f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s {CONFIDENCE:.1%} interval "
                         f"over {seeds} seeds is [{low:.3f}, {high:.3f}], wider than {FACTOR}; give the site "
                         f"larger inputs or more seeds (`seeds_for`)")
