@@ -80,3 +80,25 @@ def test_optunas_first_trials_draw_apart_and_a_resumed_sweep_draws_the_same():
         finished.append(TrialFinished(index=index, name=f"trial-{index}", overrides=point,
                                       value=float(index)))
     assert len({trial.overrides["optim.learning_rate"] for trial in finished}) > 1
+
+
+def test_a_grid_of_a_million_points_names_each_trial_as_its_product_orders_it():
+    """A grid search's next point is the trial's place in the space's cartesian product, its last
+    field varying fastest, as `itertools.product` walks it; a grid of a million points names a late
+    trial without building the points before it, and refuses a trial past its last."""
+    import itertools
+
+    import pytest
+
+    from dew.telemetry.records import TrialFinished
+
+    space = {'a': list(range(100)), 'b': list(range(100)), 'c': list(range(100))}
+    search = GridSearch()
+
+    def done(count):
+        return [TrialFinished(index, str(index), {}, 0.0) for index in range(count)]
+
+    assert search(SPACE, done(3)) == dict(zip(SPACE, list(itertools.product(*SPACE.values()))[3], strict=True))
+    assert search(space, done(123_456)) == {'a': 12, 'b': 34, 'c': 56}
+    with pytest.raises(ValueError):
+        search(SPACE, done(4))
