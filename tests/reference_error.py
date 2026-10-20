@@ -896,8 +896,8 @@ def admitted_members(native, candidates) -> dict[str, list[str]]:
 
 def _admission(draw) -> dict[str, list[str]]:
     """The members `draw`'s ensemble admits at each leaf (`admitted_members`), over a sample of ORDERS
-    orders of its own past the STAGES batches that hold Dew, taken before them: each member's mean squared
-    distance from float64 over each leaf at each order, Dew's draws unread."""
+    orders of its own past the STAGES batches that hold Dew: each member's mean squared distance from
+    float64 over each leaf at each order, Dew's draws unread."""
     native, candidates = {}, {}
     for order in range(STAGES * ORDERS, (STAGES + 1) * ORDERS):
         _, members, truth = draw(order)
@@ -936,15 +936,16 @@ def assert_leaves_as_exact_over_orders(draw, label: str, *, terms=None, rows: bo
     comparison passes `rows=False` and its first step holds the rows.
 
     A member other than the reference (`REFERENCE`) is admitted at a leaf where it is no less exact than
-    the reference there by ADMISSION_MARGIN, judged over a sample of orders of its own before any batch
-    that holds Dew (`_admission`); the element rule holds Dew to the worst admitted member, the leaf and row
-    rules to the reference alone. Returns
-    `assert_elements_as_exact`'s report: by leaf, the members admitted and the bar's inflation over
-    the reference alone."""
-    # Eligibility is frozen on the reference's ensemble alone before any batch holds Dew.
-    admitted = _admission(draw)
+    the reference there by ADMISSION_MARGIN, judged over a sample of orders of its own on the ensemble
+    alone, Dew's draws unread (`_admission`); the element rule holds Dew to the worst admitted member,
+    the leaf and row rules to the reference alone. Returns `assert_elements_as_exact`'s report: by
+    leaf, the members admitted and the bar's inflation over the reference alone."""
     batches = {0: _batch(draw, 0, terms, rows)}
-    _, _, leaves, row_distances, sizes = batches[0]
+    _, members, leaves, row_distances, sizes = batches[0]
+    # Eligibility is decided on the reference's ensemble alone, its own sample of orders, never on
+    # Dew's; an ensemble of the reference alone has nothing to admit and takes no sample.
+    admitted = ({name: [REFERENCE] for name in leaves[0]} if set(members) == {REFERENCE}
+                else _admission(draw))
     for name in leaves[0]:
         mine = np.asarray([order[name][0] for order in leaves])
         theirs = {member: np.asarray([order[name][1][member] for order in leaves])
