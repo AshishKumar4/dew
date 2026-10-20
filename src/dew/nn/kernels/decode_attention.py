@@ -41,6 +41,7 @@ from .selection import Requirement
 
 if TYPE_CHECKING:
     from dew.nn.attention_kernels import AttentionCase
+    from dew.nn.kv_cache import PagedCase
 
 BLOCK = 32
 """Keys a step of the loop reads."""
@@ -51,8 +52,13 @@ DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 """The dtypes it attends in: its products' own precision, accumulated in fp32."""
 
 
+def _widths(head_dim: int) -> bool:
+    """Whether the kernels take heads `head_dim` wide: a power of two from 16 to 256."""
+    return head_dim & (head_dim - 1) == 0 and 16 <= head_dim <= 256
+
+
 def _power_width(case: AttentionCase) -> bool:
-    return case.head_dim & (case.head_dim - 1) == 0 and 16 <= case.head_dim <= 256
+    return _widths(case.head_dim)
 
 
 _Need = Requirement["AttentionCase"]
@@ -157,16 +163,18 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Arra
     return out[:, :positions]
 
 
-def fits_paged(query: jax.Array | jax.ShapeDtypeStruct, key_pages: jax.Array | jax.ShapeDtypeStruct) -> bool:
-    """Whether `attend_paged` takes this `[rows, heads, D]` query over
-    `[kv_heads, pages, page_size, D]` pools: a GPU Dew's Triton kernels run on
-    (`triton_runs`), at most `QUERIES` query heads a key head, a power-of-two
-    width up to 256, and a power-of-two page of at most `BLOCK` keys."""
-    heads, width = query.shape[-2:]
-    kv_heads, page_size = key_pages.shape[0], key_pages.shape[2]
-    return (triton_runs() and heads % kv_heads == 0 and heads // kv_heads <= QUERIES
-            and width & (width - 1) == 0 and 16 <= width <= 256 and page_size & (page_size - 1) == 0
-            and page_size <= BLOCK and query.dtype == key_pages.dtype)
+def _paged_geometry(case: PagedCase) -> bool:
+    return (case.heads % case.kv_heads == 0 and case.heads // case.kv_heads <= QUERIES
+            and _widths(case.head_dim) and case.page_size is not None
+            and case.page_size & (case.page_size - 1) == 0 and case.page_size <= BLOCK)
+
+
+PAGED_GEOMETRY = Requirement["PagedCase"](
+    'geometry', _paged_geometry,
+    "the paged decode kernel reads at most `QUERIES` query heads a key head, a power-of-two width from 16 "
+    "to 256 and a power-of-two page of at most `BLOCK` keys", row='roadmap: decode kernel widths')
+"""What `attend_paged` needs of a paged decode step (`dew.nn.kv_cache.PagedCase`), which the paged
+selector's GPU kernel declares (`dew.nn.kv_cache.TRITON_PAGED_SUPPORTS`)."""
 
 
 def attend_paged(query: jax.Array, key_pages: jax.Array, value_pages: jax.Array, table: jax.Array,

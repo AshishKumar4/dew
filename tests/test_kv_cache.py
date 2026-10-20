@@ -25,6 +25,7 @@ from dew.nn.kv_cache import (
     KVStore,
     _gather_pages,
     _gathered_attention,
+    _gathered_tangent,
     _gpu_paged,
     hadamard,
     overflowed,
@@ -161,9 +162,9 @@ def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(with
     """Over reordered and shared pages and distinct key counts, the Pallas
     kernel's value is as exact as the gathered attention's through the
     dispatch, measured from float64, and its gradients and its jvp are that
-    attention's (`_gathered_attention`): at 256-wide heads too, which cuDNN's
-    backward does not take before Hopper, as the derivative's own kernel
-    needs nothing of cuDNN."""
+    attention's (`_gathered_attention`, in forward mode `_gathered_tangent`):
+    at 256-wide heads too, which cuDNN's backward does not take before
+    Hopper, as the derivative's own kernel needs nothing of cuDNN."""
     q = jax.random.normal(jax.random.key(3), (2, 4, width), jnp.bfloat16)
     k = jax.random.normal(jax.random.key(4), (2, 4, 16, width), jnp.bfloat16)
     v = jax.random.normal(jax.random.key(5), k.shape, jnp.bfloat16)
@@ -188,7 +189,8 @@ def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(with
     direction = jax.random.normal(jax.random.key(6), q.shape, jnp.bfloat16)
     np.testing.assert_array_equal(
         jax.jit(lambda q: jax.jvp(lambda q: native(q, k, v), (q,), (direction,))[1])(q),
-        jax.jit(lambda q: jax.jvp(lambda q: old(q, k, v), (q,), (direction,))[1])(q))
+        jax.jit(lambda q: jax.jvp(lambda q: _gathered_tangent(q, k, v, table, lengths), (q,),
+                                  (direction,))[1])(q))
 
     with jax.enable_x64():
         def reference(q, k, v):
