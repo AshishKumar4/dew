@@ -670,9 +670,14 @@ def mode_fit(args) -> dict:
                         best=Best(counter, mode='max') if args.tokens else None, observe=observe)
     dump_params(args.out.with_suffix(".npz"), state.variables)
     if observe is not None:
+        from dew.coordination import collective_host
+
         np.savez(args.out.with_suffix(".observed.npz"), **{
             f"{step}{name}": leaf for step, variables in observe.values
             for name, leaf in params_dict(variables).items()})
+        # The returned variables whole on each process, where the dump above holds this one's shards.
+        np.savez(args.out.with_suffix(".whole.npz"),
+                 **params_dict(collective_host(state.variables, phase="returned variables")))
     _, final_position = restored_state(trainer)
     return {
         "step": int(as_numpy(state.step)),
