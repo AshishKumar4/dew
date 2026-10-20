@@ -87,11 +87,13 @@ class Admission:
 @struct.dataclass
 class Draws:
     """What one step drew, per slot: the token, whether the row drew at
-    all, whether a criterion stopped it, and both likelihoods."""
+    all, whether a criterion finished it and whether one that ends a row
+    did (`decoding.Finish`), and both likelihoods."""
 
     token: jax.Array
     drawn: jax.Array
     stopped: jax.Array
+    ended: jax.Array
     behavior: jax.Array
     raw: jax.Array
 
@@ -278,12 +280,14 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
     token, behavior, raw = draw(view, decoder.logits,
                                 chain if grammar is None else grammar.guiding(chain, state.automaton))
     committed = view.commit(token, state.active)
-    stopped = state.active & decoding.criterion(stopping)(committed, token)
+    finished = decoding.finish(stopping)(committed, token)
     drawn = state.active
+    stopped = drawn & finished.done
     return (Slots(decoder, committed.tokens, committed.valid, committed.step, state.budget,
                   drawn & ~stopped & (committed.step < state.budget), state.keys,
                   state.automaton if grammar is None else grammar.advanced(state.automaton, token, drawn)),
-            Draws(token, drawn, stopped, jnp.where(drawn, behavior, 0.0), jnp.where(drawn, raw, 0.0)))
+            Draws(token, drawn, stopped, drawn & finished.ended, jnp.where(drawn, behavior, 0.0),
+                  jnp.where(drawn, raw, 0.0)))
 
 
 def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Placement, decoder: DecoderState,
