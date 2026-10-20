@@ -171,10 +171,10 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
     query, key, value, lengths = arrays
     sinks = jnp.asarray(SINKS, jnp.float32) if hooks.get("sinks") else None
     softcap = SOFTCAP if hooks.get("softcap") else None
-    case = attention_case(query, key, key_value_seq_lengths=lengths, sinks=sinks, softcap=softcap)
-    assert decodes(case)
-    if ON_GPU:
-        assert kernel_refusals(DECODE, "decode", case) == []
+    with on_the_gpu():
+        case = attention_case(query, key, key_value_seq_lengths=lengths, sinks=sinks, softcap=softcap)
+        assert decodes(case)
+        assert kernel_refusals(DECODE, "decode", case) == [] or not ON_GPU
     read = spanned(jnp.zeros_like(lengths), lengths, key.shape[1])
     q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
     logits = np.einsum('btnd,bsnd->bnts', q, k) / 16.0
