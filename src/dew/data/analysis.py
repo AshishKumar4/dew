@@ -279,13 +279,16 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
 
 
 def _ruled(source: Source) -> bool:
-    """Whether `source`'s documents were counted by a role or a pad id (`CountRule`), as its first
-    record says: their windows are counted by that rule, which a plan of document lengths, counting
-    every target, does not."""
-    from dew.data.steps.text import CountRule
+    """Whether `source`'s documents may have been counted by a role or a pad id (`CountRule`), whose
+    windows that rule counts and a plan of document lengths, counting every target, does not. A
+    published generation states the rules its rows were counted by (`count_rules`), and one that
+    states none it was published before it could, so its rows are counted as they arrive; any other
+    store holds no count of Dew's, which only a chain's steps write."""
+    from dew.data.generation import _GenerationSource
+    from dew.data.holdout import selecting
 
-    records = source.records("indexed")
-    return len(records) > 0 and CountRule.of(record(records[0], "packed document")) is not None
+    published = [selected for selected in selecting(source) if isinstance(selected, _GenerationSource)]
+    return any(bool(generation.metadata().get("count_rules", True)) for generation in published)
 
 
 def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision: bool) -> Read:
