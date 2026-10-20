@@ -18,7 +18,7 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Reconstruct captured layers with the inverse of pipeline microbatching, including fetched captures. [624]
 - Group an unbound model's banks from its source shapes so unlike rows are never stacked into an invalid bank. [633]
 - Keep decode programs a fixed size in layer and loop depth: retain stacked caches across calls, then scan periodic layer groups and loop passes. [642]
-- Match the reference's highest-precision fp32 products instead of allowing default TF32 to change its arithmetic. [644]
+- Match the reference's highest-precision fp32 products instead of allowing default TF32 to change its arithmetic, a multimodal model's served row included. [644, 828]
 - Finish released-checkpoint nGPT and looped-model qualification against vLLM on real GPUs. Keep the reference engine's approximate-cache behavior distinct from its model code; follow vllm-project/vllm#60149. [596, 638]
 - Route V4 through the shared attention core and preserve the reference's AltUp projection semantics. [NNF-2, NNF-4]
 - Skip quantized payload decoding for shapes-only resumes. Bind diffusion components from lazy tensor sources, including VAE running statistics. [INT-4]
@@ -47,7 +47,7 @@ The kernel direction was approved on 2026-10-19:
 
    The templates' entry measurements, at main 5a761cb7b on A100 and H100: Tokamax attention against XLA, cuDNN, the flash wheel and Triton at 128- and 64-wide heads; packed documents; Mosaic GPU attention against FA3 on H100, where FA3 stays until the gap closes; ragged products; narrow heads on sm86, L4 and G4; and attention sinks.
 3. A composite-operation experiment first needs JAX-side differentiation and sharding rules. Mosaic GPU work follows target-specific measurements; Triton Pallas remains the portable CUDA path.
-4. Record compile time beside execution time, keep programs bounded in depth and remove measured split-KV compiler growth. The persistent compilation cache is on by default, with an opt-out. [635, 641]
+4. Record compile time beside execution time, keep programs bounded in depth and remove measured split-KV compiler growth, and show the serving barrier that bounds nGPT's depth leaves its training step unchanged. The persistent compilation cache is on by default, with an opt-out. [635, 641, 829]
 5. Optimize memory-bound fusions from profiles. The proposed whole-step megakernel speed estimate was withdrawn.
 
 - Integrate a maintained grouped GEMM where it beats the current sm90 kernel; the measured CUTLASS gap is 1.6–3.8×. [153]
