@@ -542,8 +542,8 @@ prompt_batch = {
 }
 
 
-def reward(data_source, completion, ground_truth, extra_info):
-    return float(ground_truth in completion)
+def reward(completion, record):
+    return float(record.ground_truth in completion)
 
 
 rl_data = Loader(
