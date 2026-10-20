@@ -42,14 +42,18 @@ def test_a_benchmark_times_each_call_until_its_output_is_ready_after_untimed_war
 
 
 def test_pair_labels_lay_out_as_rows_by_columns_in_one_unit():
-    measured = benchmark({("euler", "4 steps"): lambda: Slow(0.0), ("euler", "8 steps"): lambda: Slow(0.0),
-                          ("heun", "8 steps"): lambda: Slow(0.011)}, warmup=0, repeats=1)
-    lines = measured.table().splitlines()
-    assert lines[0].split() == ["4", "steps", "8", "steps"]
-    assert lines[1].split()[0] == "euler" and lines[1].count("ms") == 2
-    # Heun ran no 4 steps: its cell there is empty, and its 8 steps are at least 11 ms.
-    assert lines[2].split()[0] == "heun" and lines[2].count("ms") == 1
-    assert float(lines[2].split()[1]) >= 11.0
-    assert "<table>" in measured._repr_html_() and "heun" in measured._repr_html_()
-    single = benchmark({"slow": lambda: Slow(0.0)}, warmup=0, repeats=1)
-    assert single.table().splitlines()[0].split() == ["median"]
+    """Medians laid out by label: pairs as a grid of rows by columns, a pair that never ran left
+    empty, and one unit a table, milliseconds until a median reaches ten seconds."""
+    from dew.telemetry.benchmark import Benchmark
+
+    measured = Benchmark({("euler", "4 steps"): (0.002, 0.001, 0.003), ("euler", "8 steps"): (0.004,),
+                          ("heun", "8 steps"): (1.0115,)}, {})
+    assert measured.table().splitlines() == [
+        "     4 steps     8 steps",
+        "euler  2.0 ms      4.0 ms",
+        "heun          1,011.5 ms"]
+    html = measured._repr_html_()
+    assert "<th>heun</th>" in html and "1,011.5 ms" in html and html.count("<td") == 4
+    slow = Benchmark({"sample": (12.0, 14.0, 13.0), "<script>": (1.0,)}, {})
+    assert slow.table().splitlines() == ["           median", "sample     13.0 s", "<script>    1.0 s"]
+    assert "&lt;script&gt;" in slow._repr_html_()
