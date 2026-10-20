@@ -476,7 +476,9 @@ def mlflow_name(name: str) -> str:
     digest = hashlib.sha256(name.encode()).hexdigest()[:8]
     segments = [segment if segment not in ("", ".", "..") else "_"
                 for segment in re.sub(r"[^/\w.\- ]", "_", name).split("/")]
-    return f"{'/'.join(segments)[:250 - len(digest) - 1]}.{digest}"
+    path = "/".join(segments)
+    # MLflow refuses a name whose normal form starts with `..` (`path_not_unique`), `..loss` too.
+    return f"{'_' * path.startswith('..')}{path}"[:250 - len(digest) - 1] + f".{digest}"
 
 
 class MLflowTracker(_OwnedTracker):
@@ -495,6 +497,8 @@ class MLflowTracker(_OwnedTracker):
         self._run = None
         self._closed = False
         self._status = 'FINISHED'
+        # Each name MLflow holds, by the name logged under it (`mlflow_name`).
+        self._names: dict[str, str] = {}
 
     @property
     def run(self) -> tuple[MlflowClient, str]:
@@ -517,8 +521,18 @@ class MLflowTracker(_OwnedTracker):
 
         client, run = self.run
         moment = int(time.time() * 1000)
-        client.log_batch(run, metrics=[Metric(mlflow_name(name), float(value), moment, step)
+        client.log_batch(run, metrics=[Metric(self._held(name), float(value), moment, step)
                                        for name, value in scalars.items()])
+
+    def _held(self, name: str) -> str:
+        """The name MLflow holds `name`'s metric under, refused where another of the run's names took
+        it, as a name already of MLflow's form and another's repair (`mlflow_name`) can, whose two
+        series MLflow would merge into one."""
+        held = mlflow_name(name)
+        owner = self._names.setdefault(held, name)
+        if owner != name:
+            raise ValueError(f"metrics {owner!r} and {name!r} both reach MLflow as {held!r}; rename one")
+        return held
 
     def artifact(self, value: Reported, step: int) -> None:
         client, run = self.run

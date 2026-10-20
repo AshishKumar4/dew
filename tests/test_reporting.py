@@ -234,7 +234,7 @@ def test_mlflow_takes_a_metric_named_in_free_text_under_a_name_it_accepts(tmp_pa
     from dew.training import MLflowTracker
 
     names = ("rollout/source/openai/gsm8k/reward/mean", "rollout/source/math[hard]/reward/mean",
-             "rollout/source/math(hard)/reward/mean", "rollout/source/a/../b/reward/mean")
+             "rollout/source/math(hard)/reward/mean", "rollout/source/a/../b/reward/mean", "..loss", ".../loss")
     with MLflowTracker('dew-reporting', 'free-text', uri=store) as tracker:
         tracker.log({name: float(index) for index, name in enumerate(names)}, 1)
         client, run = tracker.run
@@ -244,6 +244,11 @@ def test_mlflow_takes_a_metric_named_in_free_text_under_a_name_it_accepts(tmp_pa
     assert len({mlflow_name(name) for name in names}) == len(names)
     assert {mlflow_name(name): index for index, name in enumerate(names)} == logged
     assert mlflow_name(names[0]) == names[0]
+    # A name already of MLflow's form that another's repair reaches is refused, not merged with it.
+    with MLflowTracker('dew-reporting', 'taken', uri=store) as tracker:
+        tracker.log({"": 1.0}, 1)
+        with pytest.raises(ValueError):
+            tracker.log({mlflow_name(""): 2.0}, 2)
 
 
 def test_the_panel_shows_the_metrics_its_last_interval_reported():
