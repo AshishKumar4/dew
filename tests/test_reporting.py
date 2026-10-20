@@ -271,7 +271,8 @@ def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counte
     """A run's data counters (`data/...`) reach the panel as one line, the rows delivered and the
     records rejected over every corpus, not as a row each: a corpus is named only where a mixture
     reads more than one, and a reason only where something was rejected for it."""
-    from dew.training.display import TrainingDisplay, data_line
+    from dew.training import display as shown
+    from dew.training.display import TrainingDisplay
 
     display = TrainingDisplay(total=10)
     display.interval(1, {"train/loss": 2.0, "data/rows/tiny-shakespeare": 4824.0,
@@ -279,6 +280,7 @@ def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counte
                          "data/rejected/tiny-shakespeare/empty": 0.0,
                          "data/truncated/tiny-shakespeare": 0.0})
     assert [row.name for _, row in display.rows()] == ["loss"]
+    data_line = shown.data_line
     line = data_line(display.data)
     assert line is not None and line.plain == "data 4,824 rows  ·  0 rejected"
     mixture = data_line({"data/rows/web": 3000.0, "data/rows/code": 1824.0,
