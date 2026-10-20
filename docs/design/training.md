@@ -100,7 +100,7 @@ state = trainer.fit(
 )
 ```
 
-- One budget: `steps=`, `epochs=` or `tokens=` (committed valid target tokens, the same clock the data `schedule` reads). A run's tokens grow only at a committed update, so a token budget ends at the first commit that reaches it and leaves no partial window.
+- One budget: `steps=`, `epochs=` or `tokens=` (committed valid target tokens, the same clock the data `schedule` reads). A run's tokens grow only at a committed update. `fit` checks the budget between steps, so after a rejected microbatch a split step can reach it at a commit and keep a later partial window; ending at that commit is not built yet.
 - `validation` is one chain or a dict of named chains, each reported separately.
 - `fit` returns the final `TrainState`. `state=` supplies initial state rather than a continuation; checkpoint restore also restores the data position.
 
