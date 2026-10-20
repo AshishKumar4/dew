@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 // Colab's Python has no virtual environment, so uv installs into it with --system. streaming
 // for the Hugging Face datasets the cells read, quantization for Qwix.
-export const INSTALL = '!uv pip install --system -q "dewml[cuda12,streaming,quantization]"';
+export const INSTALL = '!uv pip install --system -q "dewml[cuda12,streaming,quantization]" --extra-index-url https://pypi.dewml.dev/simple';
 const site = fileURLToPath(new URL('..', import.meta.url));
 
 export const colabUrl = (name) =>
