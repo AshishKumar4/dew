@@ -38,8 +38,6 @@ from tools.diffusers_wan_reference import float64
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
 
-pytest.importorskip("torchax")
-
 SEQ = 16
 ROWS = 8
 TINY = {"num_hidden_layers": 2, "hidden_size": 64, "num_attention_heads": 4,
