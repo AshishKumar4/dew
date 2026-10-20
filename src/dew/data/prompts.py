@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
 from dew.nn.inputs import token_ids
+from dew.records import JSON, json_value
 
 from .chat import Conversation, render_prompt
 from .text import ByteTokenizer, HFTokenizer
@@ -48,6 +50,27 @@ TRUTH_KEY = "ground_truth"
 INFO_KEY = "extra_info"
 """Batch key holding the reward's extra context as UTF-8 bytes."""
 
+@dataclass(frozen=True)
+class PromptRecord:
+    """What a reward is told about the prompt it scores, read from the prompt's row.
+
+    `data_source` names the row's dataset or rule, `ground_truth` is its
+    reference answer as the source normalized it, and `extra_info` is any
+    other context the row carries, each the empty string where the row
+    lacks it. A reward reads the fields it needs.
+    """
+
+    data_source: str = ""
+    ground_truth: str = ""
+    extra_info: str = ""
+
+    @classmethod
+    def of(cls, data_source: JSON, ground_truth: JSON, extra_info: JSON) -> PromptRecord:
+        """The record of a row's three values as a prompt batch stores them: a string is itself,
+        a missing one is empty, and any other value travels as its JSON (`_text`)."""
+        return cls(_text(data_source), _text(ground_truth), _text(extra_info))
+
+
 FIELDS = ("prompt", "data_source", "ground_truth", "extra_info", "tools", "reward_model")
 """The fields prompt encoding reads, leaving the others unchanged.
 
@@ -57,33 +80,28 @@ keeps `tools_kwargs` inside `extra_info`."""
 
 
 
-def _text(value: object) -> str:
-    """One reward column as a string.
-
-    Missing is empty and a string is itself. Anything else travels as JSON,
-    and a value that is not JSON is refused.
-    """
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    try:
-        return json.dumps(value, sort_keys=True)
-    except TypeError:
-        raise ValueError(
-            f"a reward column holds text or a JSON value, got {value!r}") from None
+def _text(value: JSON) -> str:
+    """One reward column as a string: missing is empty, a string is itself, and any other value
+    travels as its JSON (a row's value narrowed by `dew.records.json_value` first)."""
+    match value:
+        case None:
+            return ""
+        case str():
+            return value
+        case _:
+            return json.dumps(value, sort_keys=True)
 
 
 def _ground_truth(row: Mapping[str, object], where: str) -> str:
     """The reference answer: top-level, or verl's `reward_model.ground_truth`."""
     nested = row.get("reward_model")
     if nested is None:
-        return _text(row.get("ground_truth"))
+        return _text(json_value(row.get("ground_truth"), f"{where} ground_truth"))
     if not isinstance(nested, Mapping):
         raise ValueError(f"{where}: reward_model is an object holding ground_truth, got {nested!r}")
     if row.get("ground_truth") is not None:
         raise ValueError(f"{where}: ground_truth is both top-level and in reward_model")
-    return _text(nested.get("ground_truth"))
+    return _text(json_value(nested.get("ground_truth"), f"{where} reward_model.ground_truth"))
 
 
 def _prompt_ids(tokenizer: ByteTokenizer | HFTokenizer, prompt: object, tools: object, origin: str,

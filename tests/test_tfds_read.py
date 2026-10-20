@@ -53,22 +53,30 @@ def test_prepared_records_carry_encoded_pixels_labels_and_caption_names():
     ]
 
 
+@pytest.mark.parametrize("split", ["all", "train + test"])
 @pytest.mark.parametrize("location", ["local", "prepared", "mirror"])
-def test_streamed_tfds_pins_one_fingerprint_for_all_virtual_shards(tmp_path, monkeypatch, location):
-    """Virtual shards reuse the prepared split's pinned physical snapshot."""
+def test_streamed_tfds_pins_one_fingerprint_for_all_virtual_shards(tmp_path, monkeypatch, location, split):
+    """Virtual shards reuse the prepared split's pinned physical snapshot: the files TFDS resolves
+    the split's expression to, spaced as TFDS allows, so `train + test` mirrors, reads and
+    fingerprints the files `all` does."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     directory = (tmp_path / "cache" / "dew" / "tfds" / "dew_images" / "1.0.0"
                  if location == "prepared" else tmp_path / "prepared")
     shutil.copytree(FIXTURE, directory)
-    source = TFDS("dew_images", path=None if location == "prepared" else str(directory),
-                  split="all", shard_rows=2,
-                  decoders={"image": tfds.decode.SkipDecoding()})
+    remote = Store(f"memory://tfds-snapshot-{uuid4().hex}/1.0.0")
     if location == "mirror":
-        remote = Store(f"memory://tfds-snapshot-{uuid4().hex}/1.0.0")
         for path in directory.iterdir():
             remote.child(path.name).write(path.read_bytes())
-        source = TFDS("dew_images", path=remote.url, split="all", shard_rows=2,
-                      decoders={"image": tfds.decode.SkipDecoding()}).provision()
+
+    def selected(name: str) -> TFDS:
+        if location == "mirror":
+            return TFDS("dew_images", path=remote.url, split=name, shard_rows=2,
+                        decoders={"image": tfds.decode.SkipDecoding()}).provision()
+        return TFDS("dew_images", path=None if location == "prepared" else str(directory),
+                    split=name, shard_rows=2, decoders={"image": tfds.decode.SkipDecoding()})
+
+    source = selected(split)
+    if location == "mirror":
         directory = Path(source.directory)
     assert source.metadata()["rows"] == 20
     opened = Counter()
@@ -98,6 +106,7 @@ def test_streamed_tfds_pins_one_fingerprint_for_all_virtual_shards(tmp_path, mon
     assert opened["features.json"] == opened["label.labels.txt"] == 1
     assert opened["dew_images-train.array_record-00000-of-00001"] == 1
     assert opened["dew_images-test.array_record-00000-of-00001"] == 1
+    assert source.fingerprint()["files"] == selected("all").fingerprint()["files"]
 
 
 @pytest.mark.parametrize("workers", [0, 2])
