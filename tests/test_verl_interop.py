@@ -153,6 +153,8 @@ def test_the_verl_rl_parquet_reads_its_nested_ground_truth():
         assert read(batch[TRUTH_KEY]) == expected["reward_model"]["ground_truth"]
         info = json.loads(read(batch[INFO_KEY]))
         assert info["tools_kwargs"] == expected["extra_info"]["tools_kwargs"]
+        # The row's task family reaches the reward with the rest of its context (P92).
+        assert info["ability"] == expected["ability"]
 
 
 def test_text_rows_with_the_empty_media_verls_loops_write_are_training_rows():
