@@ -1038,7 +1038,8 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
     boundary. A method or a function named like another, a definition only defined, a parameter
     or a local import called, a helper of an enclosing function, a class body run where it is
     defined, and a nested loop's or a `match`'s exits are each read as what they are; a failure
-    that falls through to the loop's exit retries nothing."""
+    that falls through to the loop's exit retries nothing. A notebook's display reaches its frontend,
+    another process, so its frames redrawn on a clock are at that boundary."""
     found = _linted(tmp_path, {"src/sparx/waits.py": (
         "import concurrent.futures\n"
         "import subprocess\n"
@@ -1131,7 +1132,11 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
         "                case None:\n"
         "                    break\n"
         "        except ValueError:\n"
-        "            continue\n")})
+        "            continue\n"
+        "def frames(done, frame):\n"
+        "    from IPython.display import update_display\n"
+        "    while not done.wait(0.125):\n"
+        "        update_display(frame(), display_id='panel', raw=True)\n")})
     assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (5, 8, 12, 38, 44, 48, 50, 66, 86)]
 
 
