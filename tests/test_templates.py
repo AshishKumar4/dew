@@ -101,6 +101,16 @@ class Hopper(Doubling):
 
 
 @dataclasses.dataclass(frozen=True)
+class Unfitting(Doubling):
+    """An implementation whose every program stages more than any block holds."""
+
+    name: ClassVar[str] = "unfitting"
+
+    def staged_bytes(self, ba, config):
+        return 1 << 30
+
+
+@dataclasses.dataclass(frozen=True)
 class Unpriced(Doubling):
     """An implementation with no cost facts on its target, as XLA on a TPU."""
 
@@ -125,8 +135,10 @@ def test_a_call_runs_the_implementation_estimated_fastest_on_the_device_or_the_o
     assert [(route.kernel, route.preferred) for route in found] == [
         ("doubling", "doubling"), ("slow", "slow")]
     with generation.assumed("sm80"), generation.chosen(decode="doubling"):
-        # A chosen implementation estimates no other, whose cost may need facts the target lacks.
+        # A chosen implementation estimates no other: one whose cost needs facts the target lacks, or
+        # whose programs fit no block of it, leaves the chosen one its call.
         assert type(choose("decode", [Unpriced(), Doubling()], x)) is Doubling
+        assert type(choose("decode", [Unfitting(), Doubling()], x)) is Doubling
     with generation.assumed("sm90"):
         assert type(choose("decode", implementations, x)) is Doubling
         assert type(choose("decode", [Unpriced()], x)) is Unpriced
