@@ -93,7 +93,8 @@ ORDERS = 52
 """The orders a batch holds: tests/reference_error.py's ORDERS, which the release test checks."""
 BATCHES = 4
 """The batches of `ORDERS` orders a run is recorded under, the first holding the identity, the rest
-fresh: the element rule judges each entry on one and re-measures a flagged one on the others."""
+fresh: the release test holds Dew to the first, and the rest are calibration data for the element
+rule's confirmations."""
 DATASET = 'dewml/dory-1.0-4b-vllm-reference'
 """Where the probe and its orders live: source.json pins its revision and each file's sha256."""
 
@@ -342,6 +343,23 @@ def widened_float():
     return widened()
 
 
+def single_rank() -> None:
+    """vLLM's distributed state for this process alone, once: a world of one rank over gloo and
+    tensor and pipeline parallel groups of one, as vLLM's own workers initialize it."""
+    import socket
+
+    from vllm.distributed import parallel_state
+
+    if parallel_state.model_parallel_is_initialized():
+        return
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+    parallel_state.init_distributed_environment(world_size=1, rank=0, local_rank=0, backend='gloo',
+                                                distributed_init_method=f'tcp://127.0.0.1:{port}')
+    parallel_state.initialize_model_parallel(1, 1)
+
+
 def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype, tf32: bool = False,
                device: str = 'cuda'):
     """The pull request's DoryForCausalLM over the release in `dtype` (a torch dtype), built as its
@@ -350,28 +368,28 @@ def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype, tf32: 
     it), and a call that decodes: `rows(prompt, tokens, prompt_rows)` prefills `prompt` and decodes
     each of `tokens` but the last a step at a time, the log-probabilities of the prompt's rows (its
     last alone where `prompt_rows` is False) and a row a token, in at least float32. `tf32` takes
-    the engine's TF32 attention products (`reference_attention`)."""
+    the engine's TF32 attention products (`reference_attention`). The process's one rank is vLLM's
+    whole tensor-parallel group (`single_rank`), so the model holds every head and the vocabulary."""
     from types import SimpleNamespace
 
     import torch
     from vllm.config import CompilationConfig, DeviceConfig, VllmConfig, set_current_vllm_config
-    from vllm.distributed import parallel_state
     from vllm.model_executor.models import dory
     from vllm.transformers_utils.configs.dory import DoryConfig
     from vllm.utils.torch_utils import set_default_torch_dtype
 
     attention = reference_attention(tf32)
-    parallel_state._TP = SimpleNamespace(world_size=1, rank_in_group=0)
     dory.Attention = attention
     vc = VllmConfig(device_config=DeviceConfig(device=device),
                     compilation_config=CompilationConfig(mode=0, custom_ops=['none']))
     hf = DoryConfig(**{**config, 'n_recurrent_loops': loops, 'recurrent_kv_cache_mode': mode})
     vc.model_config = SimpleNamespace(hf_config=hf, head_dtype=None, dtype=dtype)
+    # The groups read the config's model, which a model-code run describes by its own fields alone.
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device=device))):
+        single_rank()
     with set_current_vllm_config(vc), set_default_torch_dtype(dtype), torch.device(device):
         model = dory.DoryForCausalLM(vllm_config=vc).to(dtype)
         model.load_weights((key, value.to(dtype)) for key, value in tensors.items())
-    # One process holds the whole vocabulary, as the test's logits check takes it.
-    model.logits_processor._gather_logits = lambda logits: logits
 
     def start(module, args):
         # The runner's slot mapping for one request's contiguous tokens, as the test's.
@@ -437,8 +455,9 @@ SHARED = tuple(run for run in RUNS if run[1] == 'last_loop')
 def model_orders(directory: Path) -> None:
     """For each `SHARED` run, the model code at the engine's precision (`model_code`: bf16
     throughout, or float32 with TF32 attention products) on the window's rows under every order of
-    every batch (`symmetry`), in the engine's place in the run's files (`orders_run`'s): each order's
-    rows on their columns and their distances, and the batch's sums."""
+    every batch (`symmetry`), as `orders_run` keeps the engine's, in files of its own
+    (`model-{kind}-{run}-{batch}.npy`, each batch's written when it ends), which `sums` takes in the
+    engine's place there."""
     import torch
 
     config, tensors = release()
@@ -452,9 +471,8 @@ def model_orders(directory: Path) -> None:
         columns = columns_of(probe, key)[window]
         unpermuted = None
         for batch in range(BATCHES):
-            kept = np.load(directory / f'columns-{tag(key)}-{batch}.npy', mmap_mode='r+')
-            distances = np.load(directory / f'rows-{tag(key)}-{batch}.npy', mmap_mode='r+')
-            total = np.zeros(truth.shape)
+            kept = np.zeros((ORDERS, *columns.shape), np.float32)
+            distances, total = np.zeros((ORDERS, len(truth))), np.zeros(truth.shape)
             for index in range(ORDERS):
                 drawn = symmetry(config, batch, index)
                 seen = permute(model, config, drawn)
@@ -463,17 +481,12 @@ def model_orders(directory: Path) -> None:
                 assert np.array_equal(seen, unpermuted[drawn['residual']]), (
                     f'{key}: the model holds no order {batch}/{index}')
                 found = rows(probe['window'], probe[f'{key}/window_generated'], prompt_rows=False)
-                kept[index, window] = np.take_along_axis(found, columns, axis=1)
-                distances[index, window] = np.sqrt(np.mean(np.square(found - truth), axis=1))
+                kept[index] = np.take_along_axis(found, columns, axis=1)
+                distances[index] = np.sqrt(np.mean(np.square(found - truth), axis=1))
                 total += np.abs(found - truth)
                 print(f'{key} model code, order {batch}/{index}: '
                       f'{np.sqrt(np.mean(np.square(found - truth))):.4f}', flush=True)
-            kept.flush()
-            distances.flush()
-            path = directory / f'absolutes-{tag(key)}-vllm-{batch}.npy'
-            summed = np.load(path)
-            summed[window] = total
-            np.save(path, summed)
+            kept_order(directory, 'model', key, batch, kept, distances, total)
         del model, rows
         gc.collect()
         torch.cuda.empty_cache()
@@ -629,11 +642,8 @@ def permute(model, config: dict, drawn: dict[str, np.ndarray]) -> np.ndarray:
 
 def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
     """One run under every order of every batch (`symmetry`), the engine's weights set in place to
-    each and the identity run's tokens drawn again (`Forced`): for each batch, each order's rows on
-    their columns (`columns-{run}-{batch}.npy` `[ORDERS, rows, COLUMNS]`), each order's distance of
-    each row over the whole vocabulary from float64, its RMS (`rows-{run}-{batch}.npy` `[ORDERS,
-    rows]`), and every entry's absolute distance summed over the batch's orders
-    (`absolutes-{run}-vllm-{batch}.npy` `[rows, vocab]` float32), each written when its batch ends."""
+    each and the identity run's tokens drawn again (`Forced`), each batch's files written when it
+    ends (`kept_order`)."""
     import functools
 
     probe = np.load(FIXTURE / 'probe.npz')
@@ -673,25 +683,51 @@ def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
             total += np.abs(found - truth)
             print(f'{key} order {batch}/{index}: {np.sqrt(np.mean(np.square(distances[index]))):.4f}',
                   flush=True)
-        np.save(directory / f'columns-{tag(key)}-{batch}.npy', kept)
-        np.save(directory / f'rows-{tag(key)}-{batch}.npy', distances)
-        np.save(directory / f'absolutes-{tag(key)}-vllm-{batch}.npy', total.astype(np.float32))
+        kept_order(directory, 'engine', key, batch, kept, distances, total)
+
+
+KINDS = ('columns', 'rows', 'absolutes')
+"""A batch's files of a stage over orders (`kept_order`)."""
+
+
+def kept_order(directory: Path, stage: str, key: str, batch: int, columns: np.ndarray, rows: np.ndarray,
+               absolutes: np.ndarray) -> None:
+    """Batch `batch` of run `key` under `stage`'s orders ('engine' or 'model'), never rewritten:
+    each order's rows on their columns, `{stage}-columns-{run}-{batch}.npy` `[ORDERS, rows,
+    COLUMNS]` float32; each order's distance of each row over the whole vocabulary from float64, its
+    RMS, `{stage}-rows-...` `[ORDERS, rows]`; every entry's absolute distance summed over the batch's
+    orders, `{stage}-absolutes-...` `[rows, vocab]` float32."""
+    for kind, array in zip(KINDS, (columns, rows, absolutes.astype(np.float32)), strict=True):
+        np.save(directory / f'{stage}-{kind}-{tag(key)}-{batch}.npy', array)
 
 
 def sums(directory: Path) -> None:
-    """Each run's statistics for the release test's leaf and row rules (tests/reference_error.py's
-    over-orders rules), which `publish` puts beside the probe: each row's distance from float64 under
-    each order, `rows-{run}-vllm.npy` `[BATCHES, ORDERS, rows]`; each order's over the run, their RMS,
-    `rms-{run}-vllm.npy` `[BATCHES, ORDERS]`; and each row's float64 size, the truth row's RMS,
-    `sizes-{run}.npy` `[rows]`. The entries' sums (`absolutes-*`) are for the element rule's
-    calibration and the report; nothing is held on them end to end."""
+    """The reference's files, selected and gathered from the stages' (`kept_order`): each run's
+    engine's, and on a `SHARED` run's window rows the model code's (`model_orders`). For each batch
+    its rows on their columns, `columns-{run}-{batch}.npy`, and the entries' sums,
+    `absolutes-{run}-vllm-{batch}.npy`, for the element rule's calibration and the report, nothing
+    being held on them end to end; for the release test's leaf and row rules (tests/reference_error.py's
+    over-orders rules), each row's distance from float64 under each order, `rows-{run}-vllm.npy`
+    `[BATCHES, ORDERS, rows]`, each order's over the run, their RMS, `rms-{run}-vllm.npy` `[BATCHES,
+    ORDERS]`, and each row's float64 size, the truth row's RMS, `sizes-{run}.npy` `[rows]`."""
+    probe = np.load(FIXTURE / 'probe.npz')
     for run in RUNS:
-        key = tag(name(*run))
-        truth = np.load(directory / f'upstream-{key}.npy')
-        np.save(directory / f'sizes-{key}.npy', np.sqrt(np.mean(np.square(truth), axis=1)))
-        rows = np.stack([np.load(directory / f'rows-{key}-{batch}.npy') for batch in range(BATCHES)])
-        np.save(directory / f'rows-{key}-vllm.npy', rows)
-        np.save(directory / f'rms-{key}-vllm.npy', np.sqrt(np.mean(np.square(rows), axis=2)))
+        key = name(*run)
+        truth = np.load(directory / f'upstream-{tag(key)}.npy')
+        np.save(directory / f'sizes-{tag(key)}.npy', np.sqrt(np.mean(np.square(truth), axis=1)))
+        window = slice(-len(probe[f'{key}/window_generated']), None)
+        rows = []
+        for batch in range(BATCHES):
+            found = {kind: np.load(directory / f'engine-{kind}-{tag(key)}-{batch}.npy') for kind in KINDS}
+            if run in SHARED:
+                model = {kind: np.load(directory / f'model-{kind}-{tag(key)}-{batch}.npy') for kind in KINDS}
+                found['columns'][:, window], found['rows'][:, window] = model['columns'], model['rows']
+                found['absolutes'][window] = model['absolutes']
+            np.save(directory / f'columns-{tag(key)}-{batch}.npy', found['columns'])
+            np.save(directory / f'absolutes-{tag(key)}-vllm-{batch}.npy', found['absolutes'])
+            rows.append(found['rows'])
+        np.save(directory / f'rows-{tag(key)}-vllm.npy', np.stack(rows))
+        np.save(directory / f'rms-{tag(key)}-vllm.npy', np.sqrt(np.mean(np.square(np.stack(rows)), axis=2)))
 
 
 LOOPS = sorted({loops for loops, _, _ in RUNS})
