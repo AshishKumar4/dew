@@ -15,6 +15,8 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Annotated, ClassVar
 
 import jax
+import numpy as np
+import tyro
 
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, Prepared, RunConfig
 from dew.config.data import Augment, HoldOut, ImageData, VideoData
@@ -50,6 +52,7 @@ from .objective import LOSS_HEADS, DiffusionObjective
 if TYPE_CHECKING:
 
     from dew.diffusion.presets import Preset
+    from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
 
     # A kind's `union` imports every aliased class, so the run builds it at
     # the end of the module, where the annotations, read when a command line
@@ -172,6 +175,41 @@ class PretrainedAutoencoder:
 
 
 @dataclasses.dataclass(frozen=True)
+class FlowRolloutConfig:
+    """A run's Flow-GRPO rollout: `groups` samples of each prompt over `steps` time points, the first
+    `train_steps` transitions trained (all of them when None), each scored by the image metric
+    `reward` names, an alias or an import path, against its own prompt, higher being better
+    (`clip_score`). `build` makes the `FlowRollout` over an objective."""
+
+    reward: str = "clip_score"
+    groups: int = 4
+    steps: int = 11
+    train_steps: int | None = None
+
+    def __post_init__(self) -> None:
+        if ":" not in self.reward and self.reward not in metrics:
+            raise ValueError(f"reward names {self.reward!r}, which no metric alias names; the aliases are "
+                             f"{sorted(metrics)}, or name a metric by its import path")
+
+    def build(self, objective: FlowGRPOObjective) -> FlowRollout:
+        """The rollout over `objective`, scoring each sample with the metric's per-sample measure."""
+        from dew.artifacts import ImageGrid
+        from dew.eval.common import ImageMetric
+        from dew.objectives.rl.flow import FlowRollout
+
+        metric = metrics[self.reward]()
+        if not isinstance(metric, ImageMetric):
+            raise ValueError(f"reward {self.reward!r} is a {type(metric).__name__}, and Flow-GRPO "
+                             "scores each sample with an image metric's per-sample measure")
+
+        def reward(images, batch):
+            return np.asarray(metric.fn(ImageGrid(images), batch))
+
+        return FlowRollout(objective, reward, groups=self.groups, steps=self.steps,
+                           train_steps=self.train_steps)
+
+
+@dataclasses.dataclass(frozen=True)
 class DiffusionRunConfig(RunConfig):
     """A diffusion run's configuration: the shared run fields plus the diffusion objective's own settings."""
 
@@ -217,6 +255,11 @@ class DiffusionRunConfig(RunConfig):
     """
     pretrained_param_dtype: DtypeName = "float32"
     """The dtype `pretrained`'s parameters are stored and trained in."""
+    rollout: Annotated[FlowRolloutConfig, tyro.conf.subcommand("rollout")] | None = None
+    """The rollout a Flow-GRPO run trains on: its reward metric, group size, time points and trained
+    transitions, `--rollout.reward clip_score --rollout.groups 4`. A Flow-GRPO run without one takes
+    `FlowRolloutConfig()`, which its record then states; another objective trains on its data and
+    takes none."""
     val_metrics: (Annotated[tuple[MetricConfig, ...], record_argument(tuple[MetricConfig, ...])]
                   | None) = None
     """The metrics scored on every validation pass, each with the arguments the run gives it (a
@@ -238,6 +281,14 @@ class DiffusionRunConfig(RunConfig):
                                 f"not {stray!r}")
         if not issubclass(objectives[self.objective.name], DiffusionObjective):
             raise ValueError(f"--objective {self.objective.name} trains no diffusion model")
+        from dew.objectives.rl.flow import FlowGRPOObjective
+
+        flow = issubclass(objectives[self.objective.name], FlowGRPOObjective)
+        if flow and self.rollout is None:
+            object.__setattr__(self, "rollout", FlowRolloutConfig())
+        if not flow and self.rollout is not None:
+            raise ValueError(f"--rollout configures a Flow-GRPO run's rollout, and --objective "
+                             f"{self.objective.name} trains on its data")
         if self.pretrained is None and self.pretrained_param_dtype != "float32":
             raise ValueError("--pretrained-param-dtype stores a --pretrained pipeline's parameters; "
                              "this run loads none")
@@ -392,14 +443,15 @@ class DiffusionRunConfig(RunConfig):
         """The objective `build` makes, with the run's Hub sources pinned
         (`pinned`), on its data, whose captions the objective's conditions
         tokenize. `val_metrics` score each validation, and Flow-GRPO samples
-        the batches it trains on (`FlowGRPOObjective.rollout`)."""
+        the batches it trains on (`rollout`)."""
         from dew.objectives.rl.flow import FlowGRPOObjective
 
         run = self.pinned()
         objective = run.build()
         dataset = run.loader(objective.data())
         metrics = run.build_eval_metrics(dataset.val is not None)
-        rollout = objective.rollout() if isinstance(objective, FlowGRPOObjective) else None
+        flow = isinstance(objective, FlowGRPOObjective) and run.rollout is not None
+        rollout = run.rollout.build(objective) if flow else None
         return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=metrics,
                                                     rollout=rollout))
 
