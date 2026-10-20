@@ -51,9 +51,10 @@ def images(dataset: Dataset, size: int, *, batch: int,
       so a resumed run augments as the uninterrupted one would; an `images.DeviceAugment(size,
       ...)` value sets those three itself. A random step, or a tuple of them, runs on the host
       right after the resize and the caption instead.
-    - `staging_size` resizes to that size instead, for an augmentation that crops to `size`
-      (`augment=True`, a `DeviceAugment`, or a host `images.RandomCrop(size)`); with no
-      augmentation it is not used. `draft` decodes a JPEG at a reduced scale no smaller than that
+    - `staging_size` resizes to that size instead, for an augmentation that crops to `size`:
+      `augment=True` and a `DeviceAugment` do, and host steps return `size` squares, as
+      `images.RandomCrop(size)` and `images.RandomResizedCrop(size)` do. With no augmentation it
+      is not used. `draft` decodes a JPEG at a reduced scale no smaller than that
       size (`images.DecodeImage(at_least=)`).
     - With `rejects=False`, an image that does not decode stops the run instead of being dropped
       and counted.
@@ -80,10 +81,6 @@ def images(dataset: Dataset, size: int, *, batch: int,
     if device is not None and device.size != size:
         raise ValueError(f"the augmentation crops to {device.size} pixels and the images are {size}; give "
                          "DeviceAugment the preset's size")
-    if staging != size and device is None and not any(
-            isinstance(step, image_steps.RandomCrop) and step.size == size for step in on_host):
-        raise ValueError(f"staging_size {staging} needs an augmentation that crops to {size}: augment=True, "
-                         f"images.DeviceAugment({size}, ...) or images.RandomCrop({size}, ...)")
     prepared = _decoded_images(dataset, staging, field=field, at_least=staging if draft else None,
                                rejects=rejects)
     if caption is not None:
