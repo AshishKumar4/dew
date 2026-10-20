@@ -40,8 +40,6 @@ denominator, three roundings where this has one.
 A row reads at least one key: an idle slot reads its first.
 """
 
-from __future__ import annotations
-
 import dataclasses
 import math
 from typing import TYPE_CHECKING, ClassVar
@@ -55,6 +53,7 @@ from .generation import gpu_target, triton_runs
 from .selection import Requirement
 
 if TYPE_CHECKING:
+    # Named in quotes: tokamax reads its ops' `_fwd` annotations as types, which postponed ones are not.
     from dew.nn.attention_kernels import AttentionCase
     from dew.nn.kv_cache import PagedCase
 
@@ -85,7 +84,7 @@ def _widths(head_dim: int) -> bool:
     return head_dim & (head_dim - 1) == 0 and 16 <= head_dim <= 256
 
 
-def _power_width(case: AttentionCase) -> bool:
+def _power_width(case: "AttentionCase") -> bool:
     return _widths(case.head_dim)
 
 
@@ -391,7 +390,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Arra
     return out[:, :positions]
 
 
-def _paged_geometry(case: PagedCase) -> bool:
+def _paged_geometry(case: "PagedCase") -> bool:
     return (case.heads % case.kv_heads == 0 and case.heads // case.kv_heads <= QUERIES
             and _widths(case.head_dim) and case.page_size is not None
             and case.page_size & (case.page_size - 1) == 0 and case.page_size <= BLOCK)

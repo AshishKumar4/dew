@@ -6,7 +6,6 @@ dense kernel's derivatives, which are the folded attention's. What runs on
 CUDA skips elsewhere; the derivatives' lowering for a GPU runs on any host."""
 
 import contextlib
-import re
 
 import jax
 import jax.numpy as jnp
@@ -654,6 +653,7 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
     from tuned import each_config
 
     from dew.nn.kernels import decode_attention, tuning
+    from dew.nn.kv_cache import PAGED, PagedCase
 
     arrays, (key, value, starts, truth) = paged_case(page_size, windowed)
     query, lengths = arrays[0], arrays[4]
