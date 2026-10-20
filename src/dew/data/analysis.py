@@ -526,12 +526,13 @@ def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Mani
     )
 
 
-def _check_batch(stage: Stage, *, batched: bool, budgeted: bool, name: str) -> tuple[bool, bool]:
+def _check_batch(stage: Stage, *, batched: bool, name: str) -> bool:
+    """Whether the pipeline is batched once `stage` is read, refusing a second batch."""
     if isinstance(stage, (BatchStage, TokenBudget)):
         if batched:
             raise ValueError(f"pipeline {name} is already batched")
-        return True, isinstance(stage, TokenBudget)
-    return batched, budgeted
+        return True
+    return batched
 
 
 _EAGER = (Map, MapWithIndex, Filter, FlatMap, Pack, Windows, TokenSplit)
@@ -789,7 +790,6 @@ def _checked(
     and say whether the order must be cut per share."""
     random = next((_identity(stage).name for stage in ancestry if isinstance(stage, RandomMap)), None)
     indexed, batched, workers, host = read != "streamed", False, False, False
-    budgeted = False
     canonical = True
     finite = not any(isinstance(stage, Repeat) for stage in ancestry)
     combined = "mix" if isinstance(pipeline.source, (Mixture, Phases)) else None
@@ -844,7 +844,7 @@ def _checked(
         indexed = indexed and not (streams or (isinstance(stage, Artifact) and read != "memory"))
         shared = _drops(stage) or isinstance(stage, (Interleave, Artifact, TokenBudget))
         per_share = per_share or shared or (isinstance(stage, Workers) and not batched)
-        batched, budgeted = _check_batch(stage, batched=batched, budgeted=budgeted, name=name)
+        batched = _check_batch(stage, batched=batched, name=name)
         if isinstance(stage, Workers):
             if workers:
                 raise ValueError(f"pipeline {name} contains workers more than once")

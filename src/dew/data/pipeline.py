@@ -412,7 +412,7 @@ class Dataset:
 
     def holdout(self, fraction: float | None = None, *, key: str | None = None, records: int | None = None,
                 split: str | tuple[str, ...] | None = None, tokens: float | None = None,
-                **named: float) -> tuple[Dataset, ...]:
+                fields: tuple[str, ...] = ("text",), **named: float) -> tuple[Dataset, ...]:
         """This dataset split into the records a run trains on and the ones it
         scores, with the steps it has replayed on each, so hold out before
         preparing.
@@ -429,13 +429,15 @@ class Dataset:
         records the store reads by default. `tokens=0.01` holds out the first
         hundredth of the tokens of the order the steps so far read, cutting at
         most one document in two, so the parts are disjoint and together the
-        corpus; it reads a finite indexed order, before any repeat.
+        corpus; it reads a finite indexed order, before any repeat, and cuts the
+        per-token `fields` together, counting the first.
         """
         if tokens is not None:
             if fraction is not None or key is not None or records is not None or split is not None or named:
                 raise ValueError("holdout(tokens=) holds out a share of the tokens alone")
             chain = self._chain()
-            return chain._then(TokenSplit(tokens, held=False)), chain._then(TokenSplit(tokens, held=True))
+            return (chain._then(TokenSplit(tokens, held=False, fields=fields)),
+                    chain._then(TokenSplit(tokens, held=True, fields=fields)))
         from dew.data.holdout import holdout
 
         return holdout(self, fraction, key=key, records=records, split=split, **named)

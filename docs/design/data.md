@@ -42,7 +42,7 @@ Three types, six function shapes.
 |---|---|---|---|
 | `RecordFn` | `(r) -> r` or a `grain.MapTransform` | `map` | exactly 1 |
 | `RandomFn` | `(r, rng) -> r` or a `grain.RandomMapTransform` | `random_map` | exactly 1 |
-| `IndexedFn` | `(index, r) -> r`, `index` the record's position in its source | `map_with_index` | exactly 1 |
+| `IndexedFn` | `(index, r) -> r`, `index` the record's position in its source; `-> r \| Rejected` where it declares `rejects = True` | `map_with_index` | exactly 1; 0 or 1 where it declares `rejects` |
 | `Predicate` | `(r) -> bool` | `filter` | 0 or 1 |
 | `TryFn` | `(r) -> r \| Rejected` | `filter_map` | 0 or 1, with a reason |
 | `RandomTryFn` | `(r, rng) -> r \| Rejected` or a `grain.RandomMapTransform` | `random_filter_map` | 0 or 1, with a reason |
@@ -95,7 +95,7 @@ Preparing a Hub dataset happens on first use, with one log line naming what is p
 | Sequence | `pack(seq_len, fields=, bins=, segments=, policy=, along=)`, the options every read lays out alike; `text.Chunks(length, overlap=)` cuts long documents first; `windows(seq_len, stride=)` cuts one stream of tokens across documents at a stride, for perplexity over overlapping windows; `shuffle` after `pack` orders the windows |
 | Order | `shuffle(seed=, window=)`, `repeat(epochs=)` |
 | Combine | `mix(datasets, weights=, by="records" \| "tokens")`, which ends at its first exhausted member, as Grain's does (repeat a member to read on); `concat(datasets)`; `interleave(cycle_length=)` over a store's shards; `schedule([(dataset, tokens), ...])` |
-| Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split="validation" | ("validation", "test"))`, each with `key=`; `holdout(tokens=0.01)`, the first hundredth of a finite order's tokens |
+| Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split="validation" | ("validation", "test"))`, each with `key=`; `holdout(tokens=0.01, fields=("text",))`, the first hundredth of a finite order's tokens, its per-token fields cut together |
 | Batch | `batch(n)`, the global training batch; a `map` after it receives the whole batch |
 | Persist | `cache(url)` (write-through accelerator), `snapshot(url)` (a terminal job that seals an immutable generation, read back with `Files(url)`) |
 | Execution | `workers(n)`, `threads(n)`, `prefetch(n)`, `read(mode)`, `loading(Loading(...))` for every read setting at once |
