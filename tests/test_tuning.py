@@ -4,7 +4,7 @@ heuristic, stored and read back in a fresh process, and measured once on a
 GPU that a process has to itself (dew.nn.kernels.tuning)."""
 
 import ast
-import functools
+import dataclasses
 import json
 import os
 import shutil
@@ -359,8 +359,12 @@ def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_
                  flags=f"{inherited} {READ_ONLY}".strip()) == [path, measured, False, 1]
 
 
+class KernelBug(Exception):
+    """A kernel's own failure, which no GPU limit explains."""
+
+
 @pytest.mark.gpu(reason="the tuner measures on CUDA")
-def test_a_config_failing_for_more_than_its_shared_memory_stops_the_measurement(monkeypatch):
+def test_a_config_failing_for_more_than_its_shared_memory_stops_the_measurement():
     """A launch one of whose configs raises as it lowers, a kernel's bug and not its GPU's shared
     memory: measuring the launch propagates the error, where the tuner had counted it one more
     failed config and kept the others' fastest."""
@@ -368,17 +372,19 @@ def test_a_config_failing_for_more_than_its_shared_memory_stops_the_measurement(
         found = tokamax.autotuning.get_bound_args(step(), *operands(15))
     [norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
     broken_config = sorted(norm.autotuning_configs, key=repr)[0]
-    original = norm_swiglu.RmsForward._fwd
 
-    @functools.wraps(original)
-    def broken(self, *args, config, **kwargs):
-        if config == broken_config:
-            raise ValueError("a kernel's bug")
-        return original(self, *args, config=config, **kwargs)
+    class Broken(norm_swiglu.RmsForward):
+        """The norm's forward, raising for one config of its space."""
 
-    monkeypatch.setattr(norm_swiglu.RmsForward, "_fwd", broken)
-    with pytest.raises(ValueError, match="a kernel's bug"):
-        tuning._measured(norm.op, norm)
+        def _fwd(self, *args, config, **kwargs):
+            if config == broken_config:
+                raise KernelBug
+            return super()._fwd(*args, config=config, **kwargs)
+
+    fields = {field.name: getattr(norm.op, field.name) for field in dataclasses.fields(norm.op) if field.init}
+    broken = tokamax.BoundArguments(Broken(**fields), norm.arguments)
+    with pytest.raises(KernelBug):
+        tuning._measured(broken.op, broken)
 
 
 STORES = """
