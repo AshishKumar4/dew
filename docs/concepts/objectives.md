@@ -217,7 +217,7 @@ Composite accumulation keeps each microbatch's inputs and snapshots of the mutab
 
 `preview(variables, batch, step, *, scored=None)` produces display artifacts once per evaluation event; the base implementation reuses the first scoring artifacts. Every process runs the numerical work and the gathers; decode only on process zero, after every gather has finished.
 
-`fit` evaluates only when `eval_every` is set. Each pass records the validation loss where the objective defines one (`defines_validation_loss`), so the cadence alone scores the run; `metrics`, and `preview=True` with a tracker, add to it. `fit` refuses an `eval_every` only when nothing would read the pass: no validation loss, no metrics, no preview a tracker receives, no checkpointer, and no `best=` or early stop asking for the loss. Evaluation runs outside the compiled training step, so `evaluate` should compile its own expensive device work. [Evaluation and tracking](../guides/evaluation.md) describes scheduling and metrics.
+`fit` evaluates only when `eval_every` is set. Each pass records the validation loss where the objective defines one (`defines_validation_loss`), so the cadence alone scores the run; `metrics`, and `preview=True` with a tracker, add to it. `fit` refuses an `eval_every` only when nothing would read the pass: no validation loss, no metrics, no preview a tracker receives, no checkpointer, and no `restore_best=True` keeping the step of lowest validation loss. Evaluation runs outside the compiled training step, so `evaluate` should compile its own expensive device work. [Evaluation and tracking](../guides/evaluation.md) describes scheduling and metrics.
 
 ## Built-in objectives
 
