@@ -36,7 +36,8 @@ from dew.nn.dense import Dense
 from .activations import GatedActivation, gated_product, relu2
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
-from .kernels.generation import backend, measured_kernel, ran_kernel, triton_runs
+from .kernels.generation import backend, ran_kernel, triton_runs
+from .kernels.selection import forced
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_refusal, xla_ragged_dot
 from .precision import at_least_fp32, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
@@ -59,7 +60,9 @@ from .sharding import (
 # where a sigmoid saturates.
 SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 
-# 'auto' resolves per hardware generation through `gpu_target().kernels['grouped_matmul']`.
+# 'pallas' is the kernels, each launch running the implementation its cost model picks or
+# `generation.chosen(grouped_matmul=...)` names ('triton', 'mosaic_gpu'); 'auto' is the kernels where they
+# run the call, else XLA (`grouped_matmul_kernel`).
 GROUPED_MATMULS = ('auto', 'xla', 'pallas')
 EXPERT_DISPATCHES = ('global', 'exchange')
 
@@ -348,25 +351,33 @@ class Router(nn.Module):
 
 def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[Dtype, ...],
                           precision: PrecisionLike) -> str:
-    """The one choice of grouped matmul: 'xla' or 'pallas'.
+    """The one choice of grouped matmul: 'xla' or 'pallas', the kernels.
 
-    'auto' takes the generation's measured one (`gpu_target().kernels['grouped_matmul']`).
-    'pallas' needs a GPU the kernels compile for and a product they compute
-    exactly (`ragged_dot_refusal`), else 'xla', which `ran_kernel` logs where
-    'pallas' was measured fastest. `operands` are the input and kernel dtypes
-    as stored.
+    `generation.chosen(grouped_matmul=...)` decides first: 'xla' runs XLA, and a kernel's name
+    ('triton', 'mosaic_gpu') runs the kernels, each launch that implementation, or raises where they
+    cannot take the call. Otherwise 'xla' runs XLA, and 'auto' and 'pallas' the kernels where they run
+    on a GPU of sm80 or later (or, for 'pallas', interpreted on a CPU) and compute the product exactly
+    (`ragged_dot_refusal`); elsewhere, a TPU's call above all, both run XLA, which `ran_kernel` reports
+    with the reason. XLA's ragged dot runs a product over every expert, 70 to 200 times the
+    kernels' time on an H100 at Qwen3-30B-A3B's and Kimi Linear's experts (GMM-h100-2), so where the
+    kernels run they are the choice. `operands` are the input and kernel dtypes as stored.
     """
     if implementation not in GROUPED_MATMULS:
         raise ValueError(
             f"implementation must be one of {list(GROUPED_MATMULS)}, got "
             f"{implementation!r}")
-    chosen = measured_kernel('grouped_matmul', 'xla') if implementation == 'auto' else implementation
-    if chosen != 'pallas':
-        return chosen
+    named = forced('grouped_matmul')
+    if named == 'xla' or (named is None and implementation == 'xla'):
+        return 'xla'
     placed = triton_runs() or (implementation == 'pallas' and backend() == 'cpu')
     refusal = ragged_dot_refusal(compute, operands, precision) or (
         None if placed else "the Pallas kernels need a GPU of sm80 or later")
-    return 'pallas' if refusal is None else ran_kernel('grouped_matmul', 'xla', refusal)
+    if refusal is None:
+        return 'pallas'
+    if named is not None:
+        raise ValueError(f"grouped_matmul's implementation {named!r} is chosen and does not run this call: "
+                         f"{refusal}")
+    return ran_kernel('grouped_matmul', 'xla', refusal)
 
 
 def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> jax.Array:

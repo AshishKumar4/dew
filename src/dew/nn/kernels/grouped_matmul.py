@@ -70,14 +70,18 @@ class Tile:
     stages: int
 
 
-TILES = tuple(Tile(*shape) for shape in itertools.product((64, 128, 256), (128, 256), (32, 64, 128), (4, 8),
+TILES = tuple(Tile(*shape) for shape in itertools.product((64, 128, 256), (128, 256), (128, 64, 32), (8, 4),
                                                             (2, 3, 4)))
-"""Every tile the Triton launches may take: the ones the A100 and H100 sweeps found fastest lie inside."""
+"""Every tile the Triton launches may take: the ones the A100 and H100 sweeps found fastest lie inside.
+Where the cost model ties, the first wins: the deeper step, which synchronizes its pipeline fewer times
+a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78, GMM-h100-2), and the
+more warps."""
 
 MOSAIC_TILES = tuple(mosaic_gpu.Tiles(tile_m, tile_n, 64, stages, split, width)
                      for tile_m, tile_n, stages, split, width in itertools.product(
-                         (64, 128), (64, 128), (3, 4, 5), ('m', 'n'), (4, 8)))
-"""Every tile the Mosaic GPU launches may take, a contraction step of 64 (`mosaic_gpu.Tiles`)."""
+                         (128, 64), (128, 64), (4, 3, 5), ('n', 'm'), (8, 4)))
+"""Every tile the Mosaic GPU launches may take, a contraction step of 64 (`mosaic_gpu.Tiles`); where the
+cost model ties, the first wins, the larger tile."""
 
 INTERPRETED = plgpu.InterpretGPUParams(out_of_bounds_reads="uninitialized", uninitialized_memory="zero")
 """How a CPU interprets the Mosaic GPU launches: a read past an operand's rows gives zeros, as the TMA
@@ -159,6 +163,26 @@ class _Triton(_GroupedLaunch):
     def space(self, ba) -> tuple[Tile, ...]:
         return TILES
 
+    def fitting(self, ba, target) -> tuple[Tile, ...]:
+        """The tiles that fit `target` (`Template.fitting`) whose accumulator stays in its threads'
+        registers, and on Hopper those whose dot Triton gives a warpgroup MMA: each warpgroup's share of
+        the output rows a multiple of wgmma's 64. Either other kind ran 1.2 to 8.5 times slower than the
+        fastest tile on an H100 (GMM-h100-2: an accumulator of 256 registers a thread spills; a 32-row
+        share falls back to Ampere's MMA)."""
+        wgmma = _facts(target).wgmma
+
+        def fits(tile: Tile) -> bool:
+            rows, columns = self.output(tile)
+            held = rows * columns // (32 * tile.warps) < cost.THREAD_REGISTERS
+            return held and not (wgmma and rows // max(tile.warps // 4, 1) % 64)
+
+        return tuple(tile for tile in super().fitting(ba, target) if fits(tile))
+
+    @staticmethod
+    @abc.abstractmethod
+    def output(tile: Tile) -> tuple[int, int]:
+        """The rows and columns of a program's output tile, the dot's M and N."""
+
     def staged_bytes(self, ba, config: Tile) -> int:
         # Pallas Triton's pipeline holds `stages - 1` depth steps, and on Hopper `stages` where it
         # pipelines a wgmma, which reads one step while the next loads; an A100 and an H100 refuse
@@ -186,6 +210,10 @@ class Gmm(_Triton):
     @staticmethod
     def loaded(tile: Tile) -> int:
         return (tile.block_m + tile.block_n) * tile.block_k
+
+    @staticmethod
+    def output(tile: Tile) -> tuple[int, int]:
+        return tile.block_m, tile.block_n
 
     def cost(self, ba, config: Tile, target) -> float:
         # A program is one group's chunk of up to `CHUNK_M` rows (ragged_dot.py) by `block_n` columns,
@@ -234,6 +262,10 @@ class Tgmm(_Triton):
     @staticmethod
     def loaded(tile: Tile) -> int:
         return tile.block_m * (tile.block_k + tile.block_n)
+
+    @staticmethod
+    def output(tile: Tile) -> tuple[int, int]:
+        return tile.block_k, tile.block_n
 
     def cost(self, ba, config: Tile, target) -> float:
         # A program is one group's `block_k` x `block_n` output tile, summed over the group's rows
