@@ -2,16 +2,18 @@
 
 Each family's committed tiny config (tests/fixtures/hf/<name>/config.json, the first fixture whose
 model_type is one of the family's) is built in bf16 without weights and traced on a CPU within
-`generation.assumed(target)` for each row of `TARGETS` that names a kernel: a training step's gradient,
-a 64-token prefill, and one decode step on the dense cache and on a paged one. A bidirectional family
+`generation.assumed(target)` for each row of `TARGETS` that names a kernel: a training step's gradient, a
+64-token prefill, and one decode step on the dense cache and on a paged one. A bidirectional family
 (`causal` False) prefills through its causal view, as DiffusionGemma's encoder does, and decodes a canvas
-over that frozen prefix (`CausalSelfAttention._step_positions`). A fixture that is a media bundle its
-family reads whole (`hf_decoders.bundles`) is traced as its decoder. Every dispatch reports its
-decision (`generation.route`), and `generation.routes` collects them, so the report shows per family,
-target and mode which kernel each choice runs and why a generic path ran where it did. A family's widths
-are its fixture's but for its head widths, which are the reference's: transformers' own config defaults for
-the model_type (its flagship sizes), the fixture's hidden width rescaled where the family derives its head
-width from it. A family transformers has no config for keeps its fixture's widths, and its cells say so.
+over that frozen prefix (`CausalSelfAttention._step_positions`); one whose layers keep a window on both
+sides of a query has no causal view, so no prefix to decode over, and trains alone. A fixture that is a
+media bundle its family reads whole (`hf_decoders.bundles`) is traced as its decoder. Every dispatch
+reports its decision (`generation.route`), and `generation.routes` collects them, so the report shows per
+family, target and mode which kernel each choice runs and why a generic path ran where it did. A family's
+widths are its fixture's but for its head widths, which are the reference's: transformers' own config
+defaults for the model_type (its flagship sizes), the fixture's hidden width rescaled where the family
+derives its head width from it. A family transformers has no config for keeps its fixture's widths, and
+its cells say so.
 
 A route is generic where `kernel != preferred`. One whose refusal carries a row (a selector requirement's,
 `Refusal.row`) or whose code its kernel's `SUPPORTS` declares is a tracked gap, named by its roadmap or
@@ -79,13 +81,9 @@ def published(config: dict) -> tuple[dict, bool]:
     for name in WIDTHS:
         if text.get(name) and name in fixture:
             fixture[name] = text[name]
-    if text.get(hidden_key) and text.get(heads_key):
-        # A reference that leaves head_dim unset (None) heads at its width over its heads.
+    if "head_dim" not in fixture and fixture.get(heads_key) and text.get(hidden_key) and text.get(heads_key):
         width = text.get("head_dim") or text[hidden_key] // text[heads_key]
-        if "head_dim" in fixture:
-            fixture["head_dim"] = width
-        elif fixture.get(heads_key):
-            fixture[hidden_key] = fixture[heads_key] * width
+        fixture[hidden_key] = fixture[heads_key] * width
     # Widths a config states twice, derived from the ones above.
     if "qk_head_dim" in fixture:
         fixture["qk_head_dim"] = fixture.get("qk_nope_head_dim", 0) + fixture.get("qk_rope_head_dim", 0)
@@ -225,10 +223,19 @@ def cells(names: Iterable[str], targets: Iterable[str] | None = None) -> Iterato
             continue
         config, widened = published(json.loads((found / "config.json").read_text()))
         held: dict = {}
+        model = model_of(config)
+        # A layer keeping a window on both sides takes no causal view (`CausalTransformer`'s kinds).
+        prefixless = not model.causal and any(model.kind_of(kind).bidirectional_window
+                                              for kind in model.per_layer_types)
         for target in audited() if targets is None else targets:
             for mode in MODES:
                 cell = {"family": name, "fixture": found.name, "target": target, "mode": mode,
                         "widths": "reference" if widened else "fixture"}
+                if prefixless and mode != "train":
+                    cell["absent"] = ("its layers keep windows on both sides of a query, which no causal "
+                                      "view takes, so it has no prefix to prefill or decode over")
+                    yield cell
+                    continue
                 try:
                     seen = traced(config, target, mode, held)
                 except MixerRefused as refusal:
@@ -268,7 +275,7 @@ def report(records: list[dict]) -> str:
                              f"{route['verdict']} | {refusal.get('code', '')}: {refusal.get('detail', '')} |")
     lines += ["", "## Not traced", "", "| Family | Target | Mode | Why |", "|---|---|---|---|"]
     lines += [f"| {c['family']} | {c.get('target', '')} | {c.get('mode', '')} | "
-              f"{c.get('error') or refused(c['refused'])} |"
+              f"{c.get('error') or c.get('absent') or refused(c['refused'])} |"
               for c in records if "routes" not in c]
     lines += ["", "## Every cell", "", "| Family | Widths | Target | Mode | Kernels |",
               "|---|---|---|---|---|"]
@@ -289,14 +296,15 @@ def refused(refusal: dict) -> str:
 
 def unexplained(cell: dict) -> list[str]:
     """What of `cell` no row or reason explains: a route off its kernel with no row or inherent
-    refusal, a mixer's refusal no `LAYOUT_GAPS` row names, a mode refused otherwise, no fixture."""
+    refusal, a mixer's refusal no `LAYOUT_GAPS` row names, a mode refused otherwise, no fixture; a mode
+    the family's layers rule out (`absent`) is explained."""
     if "routes" in cell:
         return [f"{route['choice']} at {route['site']}: {route['kernel']} for {route['preferred']}, "
                 f"{route['verdict']}" for route in cell["routes"]
                 if route["verdict"] in ("undeclared", "unclassified")]
     if "refused" in cell:
         return [] if cell["refused"]["row"] else [refused(cell["refused"])]
-    return [cell["error"]]
+    return [] if "absent" in cell else [cell["error"]]
 
 
 def main(argv: list[str]) -> None:
