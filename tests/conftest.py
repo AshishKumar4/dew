@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 import urllib.parse
+from pathlib import Path
 
 import lane_environment  # configures the backend before JAX reads the environment
 import jax
@@ -97,6 +98,20 @@ def own_hub_answers(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("DEW_HUB_ANSWERS", str(tmp_path_factory.mktemp("hub-answers")))
 
 
+MAPPINGS = Path("/proc/self/maps")
+"""This process's memory mappings, a line each, where Linux lists them."""
+MAPPINGS_BUDGET = (int(Path("/proc/sys/vm/max_map_count").read_text()) // 2
+                   if Path("/proc/sys/vm/max_map_count").exists() else None)
+"""The mappings past which a test's end releases the compiled executables (`released_past_budget`): half
+the kernel's limit, leaving the next test the other half to compile in; None where no limit is listed."""
+
+
+def release() -> None:
+    """Release every compiled executable JAX holds, and the code XLA mapped for it."""
+    jax.clear_caches()
+    gc.collect()
+
+
 @pytest.fixture(autouse=True, scope="module")
 def release_compilations():
     """Each test file's compiled executables are released when it ends.
@@ -109,8 +124,20 @@ def release_compilations():
     it; Debian and most kernels do.
     """
     yield
-    jax.clear_caches()
-    gc.collect()
+    release()
+
+
+@pytest.fixture(autouse=True)
+def released_past_budget():
+    """A test that leaves the process past `MAPPINGS_BUDGET` mappings releases them as it ends, so no file
+    compiles its way to the limit: test_serving.py alone reached 64,581 of armada's 65,530 and failed its
+    next compile ("LLVM compilation error: Cannot allocate memory"); held to the budget it peaked at
+    32,683 and passed. Reading the list takes a few milliseconds at the budget."""
+    yield
+    if MAPPINGS_BUDGET is not None:
+        with MAPPINGS.open("rb") as mapped:
+            if sum(1 for _ in mapped) > MAPPINGS_BUDGET:
+                release()
 
 
 @pytest.fixture

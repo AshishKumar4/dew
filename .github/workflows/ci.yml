@@ -29,7 +29,7 @@ concurrency:
 
 env:
   # The armada runner every armada job uses.
-  ARMADA: github:AshishKumar4/armada#d3ddca1ac25e100e47fe736f56f18c1b307f4d12
+  ARMADA: github:AshishKumar4/armada#461cb61e42956d049ecee6946411a113901809e7
 
 jobs:
   # A commit this workflow passed on another push, as one proved on
@@ -175,6 +175,12 @@ jobs:
     # A straggler at the end runs again (task.speculative). Tasks share XLA's
     # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
     # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets.
+    # Every suite task runs on AMD EPYC 25/17 (task.cpu): armada replaces a
+    # container on another CPU model before it takes a task. Of 1,264 containers
+    # in the 16 runs before 2026-10-20 15:00, 1,025 landed on 25/17.
+    # Per-test median time ratios against 25/17 were 2.0 on 25/1 and 1.35 on
+    # 26/17. In dew-20261020144644-dceff433, the three tasks on 25/1 were
+    # the run's three slowest.
     # This job sends the commit, waits, and prints each red row's output; a
     # failed test, a test skipped on a missing import and a file left
     # unreported each fail it. A commit armada already graded green, as one
