@@ -321,8 +321,14 @@ class _FitPlan:
 
     @property
     def evaluates_midway(self) -> bool:
-        """Whether an evaluation can run between steps: on its cadence, or to rank a checkpoint."""
-        return self.cadenced or bool((self.validation or self.best or self.stop) and self.checkpoint_every)
+        """Whether an evaluation can run before the end's: on a cadence shorter than the run, or to
+        rank a checkpoint written before its end."""
+        def before_end(every: int | datetime.timedelta | None) -> bool:
+            return bool(every) and (self.steps is None or not isinstance(every, int) or every < self.steps)
+
+        cadences = (self.eval_every, *(suite.every for suite in self.suites.values()))
+        return any(map(before_end, cadences)) or bool(
+            (self.validation or self.best or self.stop) and before_end(self.checkpoint_every))
 
     def due(self, step: int) -> tuple[str, ...]:
         """The suites whose own cadence falls on `step`."""
