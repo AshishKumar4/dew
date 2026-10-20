@@ -38,7 +38,7 @@ from dew.objectives.base import Variables, thaw
 from dew.records import JSON
 from dew.sampling.text import Generation, Sampling
 
-from .clients import OpenAICompletion, _choice_tokens, _engine_stops, decode_routed_experts
+from .clients import OpenAICompletion, _engine_stops, decode_routed_experts, listed_ids, reported_log_probs
 from .serving import Server, settled
 
 if TYPE_CHECKING:
@@ -657,35 +657,39 @@ class OpenAIRolloutServer(_RequestServer):
         there, rather than when the budget runs out: SGLang aborts a request
         whose client disconnects.
         """
+        import openai
+
         stops = self._sampling.stops
         tokens: list[int] = []
         probabilities: list[float] = []
         reason: str | None = None
-        terminated = False
-        import openai
-
+        ended: int | None = None
         with self._completion.stream([list(prompt)], budget, key=seed,
                                      sampling=replace(self._sampling, eos_token_ids=None), logprobs=0,
                                      extra_body=self._return_ids) as chunks:
             for chunk in _engine_chunks(chunks, openai.APIError):
+                # A chunk's ids may run ahead of its log-probabilities (SGLang slices the two apart),
+                # so each is read whole and they are matched by position.
                 for choice in chunk.to_dict()["choices"]:
-                    ids, likelihoods = _choice_tokens(choice)
-                    if ids is None or (ids and likelihoods is None):
+                    ids, reported = listed_ids(choice), reported_log_probs(choice)
+                    if ids is None:
                         raise ValueError("SGLang streamed no sampled token ids; is return_token_ids set?")
-                    for token, likelihood in zip(ids, likelihoods or (), strict=True):
-                        tokens.append(token)
-                        probabilities.append(likelihood)
-                        if token in stops:
-                            terminated = True
-                            break
+                    if ended is None:
+                        stopped = next((index for index, token in enumerate(ids) if token in stops), None)
+                        ended = None if stopped is None else len(tokens) + stopped
+                    tokens.extend(ids)
+                    probabilities.extend(() if reported is None else reported[1])
                     reason = choice.get("finish_reason") or reason
-                    if terminated:
-                        break
-                if terminated:
+                if ended is not None and len(probabilities) > ended:
                     break
-        if not terminated and (reason != "length" or len(tokens) != budget):
+        if ended is not None:
+            tokens, probabilities = tokens[:ended + 1], probabilities[:ended + 1]
+        elif reason != "length" or len(tokens) != budget:
             raise ValueError(f"finish reason {reason!r} disagrees with {len(tokens)} streamed ids under a "
                              f"budget of {budget}")
+        if len(probabilities) != len(tokens):
+            raise ValueError(f"SGLang streamed {len(tokens)} ids and {len(probabilities)} log-probabilities")
+        terminated = ended is not None
         return Draw(prompt, tuple(tokens), tuple(probabilities), None, terminated, version).check_stops(stops)
 
 
