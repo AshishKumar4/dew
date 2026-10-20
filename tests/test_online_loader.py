@@ -1,5 +1,6 @@
 """URL fetches use the ordinary pipeline worker and rejection paths."""
 
+import collections
 import contextlib
 import gzip
 import hashlib
@@ -86,25 +87,41 @@ def serving(handle):
         server.server_close()
 
 
+Parents = collections.namedtuple("Parents", ["first", "second"])
+
+
 class TupleWrapped(grain.IterDataset):
-    """A Grain step of the caller's, whose position keeps its parent's in a tuple."""
+    """A Grain step of the caller's, whose position keeps its parent's in a tuple, or in a named
+    tuple (`named`)."""
+
+    named = False
 
     def __iter__(self):
-        return TupleWrappedRead(self._parent.__iter__())
+        return TupleWrappedRead(self._parent.__iter__(), self.named)
+
+
+class NamedTupleWrapped(TupleWrapped):
+    named = True
 
 
 class TupleWrappedRead(grain.DatasetIterator):
+    def __init__(self, parent, named):
+        super().__init__(parent)
+        self.named = named
+
     def __next__(self):
         return next(self._parent)
 
     def get_state(self):
-        return {"parents": (self._parent.get_state(),)}
+        state = self._parent.get_state()
+        return {"parents": Parents(state, None) if self.named else (state,)}
 
     def set_state(self, state):
         self._parent.set_state(state["parents"][0])
 
 
-@pytest.mark.parametrize("repeats", ["endless", "two passes, endlessly", "behind a Grain step"])
+@pytest.mark.parametrize("repeats", ["endless", "two passes, endlessly", "behind a Grain step",
+                                     "behind a Grain step's named tuple"])
 def test_an_endless_read_reads_on_through_passes_whose_fetches_failed_until_one_returns(repeats):
     """A catalog's one url fails for its first three fetches, so each of those passes yields
     nothing; a failed fetch may succeed next time, so the endless read reads on, counting each
@@ -125,8 +142,9 @@ def test_an_endless_read_reads_on_through_passes_whose_fetches_failed_until_one_
 
     with serving(handle) as address:
         fetched = Pipeline(Memory([{"url": f"http://{address}/object"}])).filter_map(Fetch())
-        if repeats == "behind a Grain step":
-            fetched = fetched.grain(TupleWrapped, identity="tuple-wrapped@1")
+        if repeats.startswith("behind"):
+            wrapped = NamedTupleWrapped if repeats.endswith("named tuple") else TupleWrapped
+            fetched = fetched.grain(wrapped, identity=f"{wrapped.__name__}@1")
         repeated = fetched.repeat(2).repeat() if repeats == "two passes, endlessly" else fetched.repeat()
         chain = repeated.batch(1)
         data = compile(chain, read="indexed", loading=READ)
