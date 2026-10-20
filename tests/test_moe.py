@@ -24,7 +24,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from moe_support import by_expert, router_variables
+from reference_error import assert_as_exact_as_the_reference, equations, widened
 
+from dew.nn.kernels import generation
 from dew.nn.mlp import GatedMLP
 from dew.nn.moe import ExpertMLP, Router, SparseMLP, load_balance_update
 
@@ -162,6 +164,105 @@ def test_the_expert_block_reproduces_the_mixtral_block_output():
     # contribution into a zeroed buffer while the ragged path sums a token's
     # k slots, so the two differ in summation order alone.
     assert np.max(np.abs(np.asarray(output) - tensors["block_output"])) < OUTPUT_TOLERANCE
+
+
+def assert_each_leaf_as_exact(dew, reference, truth) -> None:
+    """Each leaf of `dew` as exact as `reference`'s from float64 (`assert_as_exact_as_the_reference`),
+    the three trees alike."""
+    leaves = zip(jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
+                 strict=True)
+    for (path, mine), theirs, true in leaves:
+        assert_as_exact_as_the_reference(mine, theirs, true, jax.tree_util.keystr(path))
+
+
+@pytest.mark.gpu(reason="the SwiGLU kernel compiles for sm80 or later")
+def test_a_step_through_the_experts_runs_the_swiglu_kernel_both_ways():
+    """A step differentiates the Mixtral block's experts in reverse mode, so the SwiGLU kernel
+    the generation measured fastest, which defines a VJP, runs forward and backward: a JVP
+    traced through the experts, which every VJP-only kernel refuses, left every MoE family on
+    the portable product. Its input and parameter gradients are as exact as the portable
+    product's, both from the block's own in float64."""
+    tensors = fixture("mixtral")
+    config = CONFIG["mixtral"]
+    variables = sparse_variables(tensors, config["num_local_experts"])
+    hidden = jnp.asarray(tensors["hidden"])
+    probe = np.random.default_rng(0).standard_normal(hidden.shape)
+
+    def gradients(dtype=None):
+        block = SparseMLP(num_experts=config["num_local_experts"], top_k=config["num_experts_per_tok"],
+                          hidden_features=config["intermediate_size"], out_features=config["hidden_size"],
+                          dtype=dtype)
+        return jax.grad(lambda variables, hidden: jnp.sum(
+            block.apply(variables, hidden) * jnp.asarray(probe, hidden.dtype)), argnums=(0, 1))
+
+    with generation.chosen(swiglu="pallas"):
+        graph = jax.make_jaxpr(gradients())(variables, hidden)
+        kernel = jax.tree.map(np.asarray, gradients()(variables, hidden))
+    launched = {str(equation.params["name"]) for equation in equations(graph)
+                if equation.primitive.name == "pallas_call"}
+    assert {"swiglu_forward", "swiglu_backward"} <= launched, launched
+    with generation.chosen(swiglu="xla"):
+        portable = jax.tree.map(np.asarray, gradients()(variables, hidden))
+    with jax.enable_x64(new_val=True):
+        truth = jax.tree.map(np.asarray, gradients(jnp.float64)(widened(variables), widened(hidden)))
+    assert_each_leaf_as_exact(kernel, portable, truth)
+
+
+def test_the_experts_differentiate_however_their_call_is_staged():
+    """An expert layer's derivative composes with the transformations around it: its tangent
+    under jax.jvp of a jit, through a scan and from jax.linearize, its gradient and the
+    gradient's own tangent (jax.jvp of jax.grad), each as exact as the same derivative taken
+    another way (eager forward mode, the gradient column by column, reverse over forward) from
+    the Mixtral block's own in float64. Chosen from the operands' tracer type at the call, a
+    VJP-only rule was baked into a jit's or a scan's trace, and a later jax.jvp or jax.linearize
+    raised on it. jax.vmap of a gradient stops at the grouped product: jax 0.11.2 batches
+    ragged_dot only along its leading axis."""
+    tensors = fixture("mixtral")
+    config = CONFIG["mixtral"]
+    variables = sparse_variables(tensors, config["num_local_experts"])
+    hidden = jnp.asarray(tensors["hidden"])
+    rng = np.random.default_rng(0)
+    direction, probe = rng.standard_normal((2, *hidden.shape))
+
+    def derivatives(variables, hidden, dtype=None):
+        block = SparseMLP(num_experts=config["num_local_experts"], top_k=config["num_experts_per_tok"],
+                          hidden_features=config["intermediate_size"], out_features=config["hidden_size"],
+                          dtype=dtype)
+
+        def once(hidden):
+            return block.apply(variables, hidden)
+
+        def twice(hidden):
+            return once(once(hidden))
+
+        def scanned(hidden):
+            return jax.lax.scan(lambda carry, _: (once(carry), None), hidden, None, length=2)[0]
+
+        def score(hidden):
+            return jnp.sum(once(hidden) * jnp.asarray(probe, hidden.dtype))
+
+        def sloped(hidden):
+            return jax.jvp(score, (hidden,), (tangent,))[1]
+
+        tangent = jnp.asarray(direction, hidden.dtype)
+        staged = {"jit": jax.jvp(jax.jit(once), (hidden,), (tangent,))[1],
+                  "scan": jax.jvp(scanned, (hidden,), (tangent,))[1],
+                  "linearize": jax.linearize(once, hidden)[1](tangent),
+                  "grad": jax.grad(score)(hidden),
+                  "jvp_grad": jax.jvp(jax.grad(score), (hidden,), (tangent,))[1]}
+        eager = {"jit": jax.jvp(once, (hidden,), (tangent,))[1],
+                 "scan": jax.jvp(twice, (hidden,), (tangent,))[1],
+                 "linearize": jax.jvp(once, (hidden,), (tangent,))[1],
+                 "grad": jax.lax.map(lambda basis: jax.jvp(score, (hidden,), (basis,))[1],
+                                     jnp.eye(hidden.size, dtype=hidden.dtype).reshape(-1, *hidden.shape)
+                                     ).reshape(hidden.shape),
+                 "jvp_grad": jax.grad(sloped)(hidden)}
+        return jax.tree.map(np.asarray, staged), jax.tree.map(np.asarray, eager)
+
+    staged, eager = derivatives(variables, hidden)
+    with jax.enable_x64(new_val=True):
+        _, truth = derivatives(widened(variables), widened(hidden), jnp.float64)
+    assert_each_leaf_as_exact(staged, eager, truth)
 
 
 def deepseek_block(shared: bool = True) -> SparseMLP:
