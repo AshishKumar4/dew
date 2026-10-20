@@ -1048,9 +1048,12 @@ def test_a_token_mixture_weighs_a_published_generations_windows_by_its_documents
     the documents out as their rows arrive, each window counted by that rule, so two such corpora
     deliver equal role-1 targets, to within one window of each."""
     from dew.data.steps.text import CountTargets
+    from dew.data.text import Chunks
 
     def corpus(source, scored):
-        prefix = Pipeline(roled(source, 7, scored), name=str(source)).filter_map(CountTargets(role=1))
+        # A chunk step states each document's length, which a published plan needs; none is cut.
+        prefix = (Pipeline(roled(source, 7, scored), name=str(source)).filter_map(CountTargets(role=1))
+                  .flat_map(Chunks(16, fields=ROLED)))
         cache = Cache(str(tmp_path / f"cache-{source}"), spool_bytes=4 * 1024**2, shard_bytes=256 * 1024)
         generation = publish(prefix.pack(16, fields=ROLED), cache, read="indexed", loading=READ)
         return prefix.cache(generation).pack(16, fields=ROLED).map(Sourced(source))
