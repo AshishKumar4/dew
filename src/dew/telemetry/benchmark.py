@@ -20,7 +20,7 @@ import jax
 
 
 @dataclasses.dataclass(frozen=True)
-class Benchmark:
+class Benchmark[T]:
     """What `benchmark` measured: each call's timed runs in seconds, in order, and its last output.
 
     `table()` and a notebook's display show each call's median. Labels that are all pairs,
@@ -28,7 +28,7 @@ class Benchmark:
     """
 
     seconds: Mapping[Hashable, tuple[float, ...]]
-    outputs: Mapping[Hashable, object]
+    outputs: Mapping[Hashable, T]
 
     def median(self, label: Hashable) -> float:
         return statistics.median(self.seconds[label])
@@ -99,8 +99,8 @@ def samples[T](fn: Callable[..., T], *args, warmup: int = 3, repeats: int = 10,
     return measured
 
 
-def benchmark(calls: Mapping[Hashable, Callable[[], object]], *, warmup: int = 1,
-              repeats: int = 3) -> Benchmark:
+def benchmark[T](calls: Mapping[Hashable, Callable[[], T]], *, warmup: int = 1,
+                 repeats: int = 3) -> Benchmark[T]:
     """Time each of `calls`, in order, `repeats` times after `warmup` untimed runs (`samples`), and
     return the runs' seconds and each call's last output (`Benchmark`); no two of a call's outputs
     are held at once. Raises `ValueError` for no timed run or a negative warm-up."""
@@ -108,7 +108,7 @@ def benchmark(calls: Mapping[Hashable, Callable[[], object]], *, warmup: int = 1
         raise ValueError(f"a benchmark times at least one run after none or more warm-ups, not "
                          f"repeats={repeats} and warmup={warmup}")
     seconds: dict[Hashable, tuple[float, ...]] = {}
-    outputs: dict[Hashable, object] = {}
+    outputs: dict[Hashable, T] = {}
     for label, call in calls.items():
         ran = 0
 
