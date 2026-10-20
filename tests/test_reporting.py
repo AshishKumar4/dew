@@ -267,6 +267,34 @@ def test_the_panel_shows_the_metrics_its_last_interval_reported():
         ("loss", [2.0, 1.5, 1.0]), ("source/a/reward", [1.0, 0.5])]
 
 
+def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counters():
+    """A run's data counters (`data/...`) reach the panel as one line, not as a row each: each
+    label's rows as its reader counted them, named only where there is more than one label, the
+    records rejected over every label, a reason only where something was rejected for it, and the
+    share of the rows truncated, over the rows of the labels that truncate, only where any was."""
+    from dew.training import display as shown
+    from dew.training.display import TrainingDisplay
+
+    display = TrainingDisplay(total=10)
+    display.interval(1, {"train/loss": 2.0, "data/rows/tiny-shakespeare": 4824.0,
+                         "data/rejected/tiny-shakespeare/empty": 0.0, "data/truncated/tiny-shakespeare": 0.0,
+                         "data/chunks_per_record/tiny-shakespeare": 1.0})
+    assert [row.name for _, row in display.rows()] == ["loss"]
+    data_line = shown.data_line
+    line = data_line(display.corpus_counts)
+    assert line is not None and line.plain == "data 4,824 rows  ·  0 rejected"
+    # mix(web, code).filter(f): the corpora count the rows they fed the mix, the mixture the rows
+    # f kept, and f's drops are the mixture's.
+    mixture = data_line({"data/rows/web": 3000.0, "data/rows/code": 1824.0, "data/rows/mixture": 4700.0,
+                         "data/rejected/web/too_long": 2.0, "data/rejected/code/too_long": 1.0,
+                         "data/rejected/code/empty": 0.0, "data/rejected/mixture/filtered": 124.0,
+                         "data/truncated/web": 0.25, "data/truncated/code": 0.0})
+    assert mixture is not None
+    assert mixture.plain == ("data web 3,000  code 1,824  mixture 4,700 rows  ·  127 rejected (too_long 3, "
+                             "filtered 124)  ·  15.5% truncated")
+    assert data_line({"train/loss": 1.0}) is None
+
+
 def test_tensorboard_events_hold_the_fit_read_back_with_the_accumulator(tmp_path):
     pytest.importorskip('tensorboard')
     from tensorboard.backend.event_processing.event_accumulator import (

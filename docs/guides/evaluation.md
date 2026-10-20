@@ -2,7 +2,7 @@
 
 While `Trainer.fit` runs, evaluation scores a separate validation split. The objective's `evaluate` returns artifacts, such as token scores or generated images, and metrics read those artifacts to compute the scores. A tracker receives the training scalars, the validation metrics, previews and run records.
 
-Evaluation runs only when the dataset has a validation split and `fit` has `eval_every` set. Something also has to read the pass, so `fit` refuses `eval_every` unless you also pass `metrics` that read the objective's artifact, or `preview=True` with a tracker. Passing `metrics` alone does not turn evaluation on.
+Evaluation runs only when the dataset has a validation split and `fit` has `eval_every` set. Each pass records the objective's validation loss (`val/loss`) where the objective defines one, so a cadence alone is enough for an LM, a diffusion or a JEPA objective. `metrics` that read the objective's artifacts, and `preview=True` with a tracker, add to it. `fit` refuses a cadence only when nothing would read the pass: an objective with no validation loss (Flow-GRPO's), no metrics, no preview a tracker receives, no checkpointer, and no `restore_best=True` keeping the step of lowest validation loss. Asking for a validation loss an objective does not define is refused on its own. Passing `metrics` alone does not turn evaluation on.
 
 ## Example
 
