@@ -26,7 +26,6 @@ in fp32.
 
 import dataclasses
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
@@ -65,57 +64,62 @@ SUB = 16
 
 def _intra_rows_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, aqk_ref, akk_ref, *,
                        chunk: int, aligned: bool, scale: float):
-    """One token's row of its chunk's scores and keys' products for `BH` value heads, every pair's
-    decay its own: `Aqk_ij = scale sum_k q_ik k_jk exp2(g_ik - g_jk)` for `j <= i` and `Akk_ij = sum_k
-    beta_i k_ik k_jk exp2(g_ik - g_jk)` for `j < i`, in fp32, `Aqk` stored in its dtype and `Akk` fp32.
-    fla's `chunk_kda_fwd_kernel_intra_token_parallel` (chunk_intra_token_parallel.py:33-118) takes the
-    diagonal 16-token blocks so, and factors every block below them through its sub-chunk's first row
-    (`(q exp2(g_i - g_n)) (k exp2(g_n - g_j))`, chunk_intra.py:43-391): two exponentials rounded and one
-    more product a term, against one exponential here (Dew's portable math's, `linear.chunk_decay`'s),
-    which put 0.9% of a packed row's scores and inverse past twice its distance from float64. A program
-    per place of a chunk, where fla's searches the token's sequence; a place past the chunk's end does
-    nothing."""
+    """One token's row of its chunk's scores and keys' products for one value head, every pair's decay
+    its own: `Aqk_ij = scale sum_k q_ik k_jk exp2(g_ik - g_jk)` for `j <= i` and `Akk_ij = sum_k beta_i
+    k_ik k_jk exp2(g_ik - g_jk)` for `j < i`, in fp32, `Aqk` stored in its dtype and `Akk` fp32; each
+    earlier key decayed to the row, then the row's products summed, as Dew's portable math pairs them
+    (`linear.chunk_decay`). A 16-key block of the chunk at a time, the blocks past the token's own
+    written as zeros. fla's `chunk_kda_fwd_kernel_intra_token_parallel`
+    (chunk_intra_token_parallel.py:33-118) takes the diagonal 16-token blocks so, and factors every block
+    below them through its sub-chunk's first row (`(q exp2(g_i - g_n)) (k exp2(g_n - g_j))`,
+    chunk_intra.py:43-391): two exponentials rounded and one more product a term, which put 11 of a
+    packed row's 16384 scores and 5 of its inverse's past twice the portable math's distance from
+    float64 (fla-org/flash-linear-attention#1543). A program per place of a chunk, where fla's
+    searches the token's sequence; a place past the chunk's end does nothing."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
     place = pl.program_id(0) % chunk
 
     @pl.when(place < taken)
     def _():
         token = start + place
-        index = jnp.arange(chunk)
         query = q_ref[token].astype(jnp.float32)
-        weighted = k_ref[token].astype(jnp.float32) * beta_ref[token].astype(jnp.float32)[:, None]
+        weighted = k_ref[token].astype(jnp.float32) * beta_ref[token].astype(jnp.float32)
         gate = _row(g_ref, token)
+        index = jnp.arange(SUB)
 
-        def column(j, sums):
-            earlier = start + j
-            decay = jnp.exp2(gate - _row(g_ref, earlier))
-            gated = k_ref[earlier].astype(jnp.float32) * decay
-            here = (index == j)[None, :]
-            return (jnp.where(here, (jnp.sum(query * gated, axis=1) * scale)[:, None], sums[0]),
-                    jnp.where(here & (j < place), jnp.sum(weighted * gated, axis=1)[:, None], sums[1]))
+        def filled(block):
+            """Block `block`'s 16 columns of the row: the pairs up to the token."""
+            columns = pl.ds(block * SUB, SUB)
+            keys = _read(_rows(k_ref, start + block * SUB, SUB), taken - block * SUB).astype(jnp.float32)
+            earlier = block * SUB + index
+            # Masked before exp2, so no pair past the token overflows.
+            exponent = jnp.where((earlier <= place)[:, None],
+                                 gate[None, :] - _gates(g_ref, start, taken, SUB, block * SUB), 0.0)
+            gated = keys * jnp.exp2(exponent)
+            scores = jnp.sum(gated * query[None, :], axis=1) * scale
+            aqk_ref[token, columns] = jnp.where(earlier <= place, scores, 0.0).astype(aqk_ref.dtype)
+            products = jnp.sum(gated * weighted[None, :], axis=1)
+            akk_ref[token, columns] = jnp.where(earlier < place, products, 0.0)
 
-        empty = jnp.zeros((query.shape[0], chunk), jnp.float32)
-        qk, kk = jax.lax.fori_loop(0, place + 1, column, (empty, empty))
-        aqk_ref[token] = qk.astype(aqk_ref.dtype)
-        akk_ref[token] = kk
+        def emptied(block):
+            """Block `block`'s 16 columns of the row, all past the token: zeros."""
+            columns = pl.ds(block * SUB, SUB)
+            aqk_ref[token, columns] = jnp.zeros((SUB,), aqk_ref.dtype)
+            akk_ref[token, columns] = jnp.zeros((SUB,), akk_ref.dtype)
+
+        for block in range(chunk // SUB):
+            pl.when(block * SUB <= place)(functools.partial(filled, block))
+            pl.when(block * SUB > place)(functools.partial(emptied, block))
 
 
 @dataclasses.dataclass(frozen=True)
 class IntraRows(_Launch):
-    """`intra_rows`'s launch (tuning.KernelOp): its value heads a program, warps and stages."""
+    """`intra_rows`'s launch (tuning.KernelOp): a program a token and value head, its warps."""
 
     NAME = "intra_rows"
     KEYS, VALUES = "k", None
-    # fla autotunes BH over 1, 2, 4, 8 and warps over 1, 2, 4, 8 (chunk_intra_token_parallel.py:13-20).
-    SPACES = _spaces(frozenset(Tiles(0, 0, warps, 1, bh) for bh in (1, 2, 4, 8) for warps in (1, 2, 4, 8)))
-    PICKS = _picks(Tiles(0, 0, 4, 1, 4))
-
-    def _tiles(self, ba, tiles: Tiles) -> Tiles:
-        """A block of value heads that divides them, one where value heads share a key head, as fla's
-        ceil(HV / BH) grid masks its tail."""
-        value_heads, key_heads = ba.arguments["beta"].shape[2], ba.arguments["k"].shape[2]
-        bh = math.gcd(tiles.bh, value_heads) if value_heads == key_heads else 1
-        return dataclasses.replace(tiles, bh=bh)
+    SPACES = _spaces(frozenset(Tiles(0, 0, warps, 1) for warps in (1, 2, 4, 8)))
+    PICKS = _picks(Tiles(0, 0, 4, 1))
 
     def _fwd(self, q: jax.Array, k: jax.Array, g: jax.Array, beta: jax.Array,
              chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, scale: float, interpret: bool,
@@ -125,16 +129,16 @@ class IntraRows(_Launch):
         spans = Sequences(chunk_spans, sequence_spans)
         batch, length, key_heads, width = k.shape
         value_heads = beta.shape[2]
-        group, bh, tokens = value_heads // key_heads, config.bh, batch * length
-        keys = pl.BlockSpec((tokens, bh, width), lambda p, b: (0, b // group, 0))
-        out = pl.BlockSpec((tokens, bh, chunk), lambda p, b: (0, b, 0))
+        group, tokens = value_heads // key_heads, batch * length
+        keys = pl.BlockSpec((tokens, None, width), lambda p, h: (0, h // group, 0))
+        out = pl.BlockSpec((tokens, None, chunk), lambda p, h: (0, h, 0))
         found = pl.pallas_call(
             functools.partial(_intra_rows_kernel, chunk=chunk,
                               aligned=_aligned(spans, batch, length, chunk), scale=scale),
-            grid=(spans.chunks.shape[0] * chunk, value_heads // bh),
-            in_specs=[pl.BlockSpec((None, 2), lambda p, b: (p // chunk, 0)), keys, keys,
-                      pl.BlockSpec((tokens, bh, width), lambda p, b: (0, b, 0)),
-                      pl.BlockSpec((tokens, bh), lambda p, b: (0, b))],
+            grid=(spans.chunks.shape[0] * chunk, value_heads),
+            in_specs=[pl.BlockSpec((None, 2), lambda p, h: (p // chunk, 0)), keys, keys,
+                      pl.BlockSpec((tokens, None, width), lambda p, h: (0, h, 0)),
+                      pl.BlockSpec((tokens, None), lambda p, h: (0, h))],
             out_specs=[out, out],
             out_shape=[jax.ShapeDtypeStruct((tokens, value_heads, chunk), k.dtype),
                        jax.ShapeDtypeStruct((tokens, value_heads, chunk), jnp.float32)],
