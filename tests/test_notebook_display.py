@@ -27,7 +27,9 @@ state = trainer.fit(Loader(lambda partition: batches(), None, None, 8), steps=4,
 
 
 def text(output) -> str:
-    return output.get("text", "") if output.output_type == "stream" else output.get("data", {}).get("text/plain", "")
+    if output.output_type == "stream":
+        return output.get("text", "")
+    return output.get("data", {}).get("text/plain", "")
 
 
 def test_a_notebook_redraws_the_panel_in_one_widget_and_keeps_its_last_frame_and_the_summary(tmp_path):
@@ -37,11 +39,12 @@ def test_a_notebook_redraws_the_panel_in_one_widget_and_keeps_its_last_frame_and
     outputs = nbformat.read(tmp_path / "fit.ipynb", as_version=4).cells[0].outputs
 
     assert not [output for output in outputs if output.output_type == "error"], outputs
-    widgets = [output for output in outputs if "application/vnd.jupyter.widget-view+json" in output.get("data", {})]
+    widgets = [output for output in outputs
+               if "application/vnd.jupyter.widget-view+json" in output.get("data", {})]
     assert len(widgets) == 1, outputs
     assert not [output for output in outputs if "step 1/4" in text(output)], "a line per logging interval"
     frame, summary = [output for output in outputs if output.get("data", {}).get("text/html")][-2:]
-    assert "dew · TimingRegression" in text(frame) and "finished" in text(frame) and "loss" in text(frame)
-    assert "TimingRegression" in text(summary) and "4 steps" in text(summary)
+    assert "dew" in text(frame) and "Affine" in text(frame) and "finished" in text(frame)
+    assert "loss" in text(frame) and "Affine" in text(summary) and "4 steps" in text(summary)
     # Styled, so the site renders each as the panel it is, not as one more line of a log.
     assert all("<span" in "".join(output.data["text/html"]) for output in (frame, summary))
