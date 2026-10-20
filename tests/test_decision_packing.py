@@ -12,7 +12,7 @@ import numpy as np
 import optax
 import pytest
 from recording import RecordingTracker
-from reference_error import assert_leaves_as_exact, float64_terms
+from reference_error import assert_as_exact
 
 from dew.config.data import loader
 from dew.data import Loading
@@ -211,7 +211,7 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     test_fla_kda)."""
     objective = objective_for(arm)
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
-                                          objective.model.head.clone(dtype=jnp.float64)))
+                                          objective.model.head.clone(dtype=jnp.float64)), PACKING_SEEDS[arm])
 
 
 @pytest.mark.gpu(reason="FlashAttention's packed sequences run on CUDA")
@@ -236,7 +236,7 @@ def test_a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_determin
         return "['head']" in path and ("attn" in path or "['attention']" in path)
 
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64), head),
-                              held=attending_in_the_head)
+                              PACKING_SEEDS["flash"], held=attending_in_the_head)
 
 
 def asked(batch, logits) -> np.ndarray:
@@ -246,26 +246,31 @@ def asked(batch, logits) -> np.ndarray:
                            for (window, _), slots in zip(rows_of(batch), order, strict=True)])
 
 
-def rows_alone(objective, variables, batch):
+def rows_alone(decide, batch):
     """The logits and gradients of `batch`'s rows, each alone where its window packed it in a batch of
-    the packed batch's shapes (`in_place`), the logits at their questions' options and the gradients
-    summed over the rows: the packed run's own arithmetic, its products' shapes, the rule's chunks
-    and attention's row length the window's, so the two differ only where another row enters, and in
-    how the rows' gradients add."""
+    the packed batch's shapes (`in_place`), by `decide(batch)`, the logits at their questions' options
+    and the gradients summed over the rows: the packed run's own arithmetic, its products' shapes, the
+    rule's chunks and attention's row length the window's, so the two differ only where another row
+    enters, and in how the rows' gradients add."""
     logits, grads = [], None
     for window, row in rows_of(batch):
         one = in_place(batch, window, row)
-        row_logits, row_grads = decided(objective, variables, one, objective.bounds.segments)
+        row_logits, row_grads = decide(one)
         logits.append(np.asarray(row_logits)[window][one["options"][window]])
         grads = row_grads if grads is None else jax.tree.map(jnp.add, grads, row_grads)
     return np.concatenate(logits), grads
 
 
-def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True) -> None:
+PACKING_SEEDS = {"joint": 8, "marker": 8, "parallel": 16, "flash": 8}
+"""Check 1's declared seeds for each arm's packed window, sized by `seeds_for` (2026-10-21, on armada;
+the flash arm's on an A100)."""
+
+
+def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda path: True) -> None:
     """Two packed windows of the examples decide each row's questions as the row does alone where its
     window packed it (`rows_alone`), logits and the gradients of the leaves `held` names (by
-    `jax.tree_util.keystr`) within the float64 gate, the truth `wide_modules`, the backbone and head
-    in float64, over the rows in windows of their own."""
+    `jax.tree_util.keystr`) on par with it (check 1) over drawn parameters, the truth `wide_modules`,
+    the backbone and head in float64, over the rows in windows of their own."""
     batch = windows(objective, 2)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
@@ -273,34 +278,38 @@ def assert_rows_decided_alone(objective, wide_modules, held=lambda path: True) -
     segments = objective.bounds.segments
     laid = laid_out(batch, segments).coordinates()
     assert int(np.max(laid.segments)) <= laid.max_segments == segments
-    variables = objective.init(jax.random.key(0))
-    packed_logits, packed_grads = decided(objective, variables, batch, segments)
-    packed = asked(batch, packed_logits)
-    logits, grads = rows_alone(objective, variables, batch)
     rows = apart(batch)
-    with jax.enable_x64(new_val=True):
-        wide = copy.copy(objective)
-        wide.substitute(wide_modules)
-        widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
-        # Each gradient leaf's terms in float64: a key bias's and the scorer's shared bias
-        # gradients cancel (q.b shifts every key's logit alike; the residual gate shifts every
-        # option's), and a scalar scale sums every option's terms, so their terms, not their
-        # near-zero sizes, are their rounding's scale (tests/reference_error.py).
-        truth_grads, terms = float64_terms(lambda held: gradient(wide, held, rows), widened)
-        truth = np.asarray(wide.model.logits(widened, laid_out(rows, segments)))[rows["options"]]
+    wide = copy.copy(objective)
+    wide.substitute(wide_modules)
+    decide = jax.jit(lambda variables, batch: decided(objective, variables, batch, segments))
 
     def kept(tree):
         return {name: leaf for name, leaf in ((jax.tree_util.keystr(path), leaf)
                                               for path, leaf in jax.tree_util.tree_leaves_with_path(tree))
                 if held(name)}
 
-    packed_grads, grads, truth_grads, terms = (kept(tree)
-                                               for tree in (packed_grads, grads, truth_grads, terms))
-    assert packed_grads, "no gradient leaf held"
+    def packed(variables):
+        logits, grads = decide(variables, batch)
+        return asked(batch, logits), kept(grads)
+
+    def alone(variables):
+        logits, grads = rows_alone(lambda one: decide(variables, one), batch)
+        return logits, kept(grads)
+
+    @jax.jit
+    def apart_in_float64(variables):
+        return (wide.model.logits(variables, laid_out(rows, segments)),
+                kept(gradient(wide, variables, rows)))
+
+    def truth(variables):
+        logits, grads = apart_in_float64(variables)
+        return np.asarray(logits)[rows["options"]], grads
+
+    assert kept(objective.init(jax.random.key(0))), "no gradient leaf held"
     # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
     # another order than the rows alone.
-    assert_leaves_as_exact(packed, logits, truth, reductions=objective.layout.max_len, terms=truth)
-    assert_leaves_as_exact(packed_grads, grads, truth_grads, reductions=batch["tokens"].size, terms=terms)
+    assert_as_exact(packed, alone, lambda seed: (objective.init(jax.random.key(seed)),), "packed window",
+                    seeds=seeds, truth_fn=truth)
 
 
 def test_a_decision_run_steps_one_program_over_rows_of_every_length():
