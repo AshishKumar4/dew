@@ -20,7 +20,7 @@ from dew import position
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, validation
 from dew.data.dataset import DataPartition, Loading
-from dew.data.mixing import SearchBudget, TokenDeficit, token_weights
+from dew.data.mixing import SearchBudget, TokenDeficit, state_counts, token_weights
 from dew.data.pipeline import Configured, Pipeline, Rejected, mix
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources import Files, Memory
@@ -1157,9 +1157,9 @@ def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation()
                               budget=SearchBudget(consecutive=5)))
     with pytest.raises(ValueError):
         next(reader)
-    counts = reader.get_state()["parents"]["all-zero"]["counts"]
-    assert counts["attempted"] == 5
-    assert counts["rejected"] == {"zero_targets": 5}
+    counts = state_counts(reader.get_state())["all-zero"]
+    assert counts.attempted == 5
+    assert counts.rejected == {"zero_targets": 5}
     reader.close()
 
 

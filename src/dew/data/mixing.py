@@ -392,8 +392,11 @@ class _PrimeReads:
     def read(self, index: int) -> Batch:
         for corpus, parent in enumerate(self.parents):
             if corpus not in self.primed:
-                self.before[corpus] = parent.get_state()
+                # Kept only once the row is read: a corpus refused as it is read ahead keeps the
+                # position, and the counts, its refusal left.
+                before = parent.get_state()
                 self.pending[corpus] = next(parent)
+                self.before[corpus] = before
                 self.primed.add(corpus)
         if index in self.pending:
             self.before.pop(index, None)
