@@ -488,26 +488,36 @@ class _NamedTuple(Protocol):
 
     _fields: tuple[str, ...]
 
-    def _make(self, iterable: Iterable[object]) -> tuple[object, ...]: ...
+    def _make(self, iterable: Sequence[object]) -> Sequence[object]: ...
 
 
-def rewound(start: object, current: object) -> object:
+def rewound(start: Mapping[str, object], current: Mapping[str, object]) -> Mapping[str, object]:
     """`start`, the position a repeat rewinds its pass to, with each counter's counts as `current`
     holds them (`_COUNTER`: its counts, run of rejections and warning): a pass read again goes on
     counting the corpus, where a restored position replaces its counts. Every other part of a
     position is the iterator's own and is left as `start` has it."""
-    if isinstance(start, Mapping) and isinstance(current, Mapping):
-        kept = {key: rewound(value, current[key]) if key in current else value
-                for key, value in start.items()}
-        if _COUNTER in start and _COUNTER in current:
-            kept[_COUNTER] = current[_COUNTER]
-        return kept
-    if isinstance(start, (list, tuple)) and isinstance(current, (list, tuple)) and len(start) == len(current):
-        items = [rewound(value, now) for value, now in zip(start, current, strict=True)]
-        if isinstance(start, list):
-            return items
-        return start._make(items) if isinstance(start, _NamedTuple) else tuple(items)
-    return start
+    parts = _rewound_parts(list(start.values()), [current.get(key, value) for key, value in start.items()])
+    kept = dict(zip(start, parts, strict=True))
+    if _COUNTER in start and _COUNTER in current:
+        kept[_COUNTER] = current[_COUNTER]
+    return kept
+
+
+def _rewound_parts(start: Sequence[object], current: Sequence[object]) -> Sequence[object]:
+    """Each part of a position rewound against its place in `current` (`rewound`): the mappings and
+    the lists and tuples of one length are walked, rebuilt as what they were, and anything else
+    is the iterator's own and kept."""
+    parts: list[object] = []
+    for value, now in zip(start, current, strict=True):
+        if isinstance(value, Mapping) and isinstance(now, Mapping):
+            parts.append(rewound(value, now))
+        elif isinstance(value, (list, tuple)) and isinstance(now, (list, tuple)) and len(value) == len(now):
+            inner = _rewound_parts(value, now)
+            parts.append(list(inner) if isinstance(value, list)
+                         else value._make(inner) if isinstance(value, _NamedTuple) else tuple(inner))
+        else:
+            parts.append(value)
+    return parts
 
 
 def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
