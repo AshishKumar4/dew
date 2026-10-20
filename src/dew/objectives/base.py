@@ -37,6 +37,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import struct
+from flax.core import FrozenDict
 from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
@@ -531,11 +532,12 @@ def _as_computed(value):
     if isinstance(value, Mapping):
         entries = {key: _as_computed(entry) for key, entry in value.items()}
         changed = any(entries[key] is not entry for key, entry in value.items())
-        return type(value)(entries) if changed else value
+        # A model record holds plain mappings (`dict`, or Flax's `FrozenDict` from older code).
+        return (FrozenDict(entries) if isinstance(value, FrozenDict) else entries) if changed else value
     if isinstance(value, (list, tuple)):
-        entries = [_as_computed(entry) for entry in value]
-        changed = any(new is not old for new, old in zip(entries, value, strict=True))
-        return type(value)(entries) if changed else value
+        items = [_as_computed(entry) for entry in value]
+        changed = any(new is not old for new, old in zip(items, value, strict=True))
+        return (tuple(items) if isinstance(value, tuple) else items) if changed else value
     return value
 
 
