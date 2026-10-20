@@ -174,7 +174,7 @@ DPO carries a swapped-halves test guarding the pair order; GRPO carries one fail
 
 ## 12. Staged runs
 
-`Recipe` is an ordered tuple of `Stage` values over one decoder. The data type selects the objective in `Recipe._build`: `TextData` pretraining, `ChatData` SFT, `PreferenceData` DPO, `PromptData` GRPO, and `RecordsData` with `Episodes` PPO. A `Teacher` distills a pretraining or SFT stage.
+`Recipe` is an ordered tuple of `Stage` values over one decoder. It composes the existing objectives, rollouts and data classes and adds no second plan object. The data type selects the objective in `Recipe._build`: `TextData` pretraining, `ChatData` SFT, `PreferenceData` DPO, `PromptData` GRPO, and `RecordsData` with `Episodes` PPO. A `Teacher` distills a pretraining or SFT stage.
 
 Each stage has its own checkpoint directory and a restarted optimizer. `Objective.model_variables` defines the handoff: PPO passes its policy without the critic; distillation passes the student without the teacher. The next stage initializes from those variables and freezes its own reference where required. `Recipe.run` builds all stages' objectives and rollouts before the first stage trains, so invalid data or settings fail before work begins.
 
@@ -182,7 +182,7 @@ A GRPO stage requires a reward and uses its prompts' tokenizer for decoding and 
 
 ## 13. External integrations
 
-External generation engines, agent tools and training frameworks enter through existing rollout and session interfaces. Each integration uses the maintained system's public API.
+External generation engines, agent tools and training frameworks enter through existing rollout and session interfaces. Each integration uses the maintained system's public API. Dew builds no parallel sandbox, server or orchestration platform: integrations come first.
 
 | Boundary | Contract |
 |---|---|
