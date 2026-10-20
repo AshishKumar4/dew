@@ -86,7 +86,8 @@ class Timings(dict):
     @property
     def fastest_config(self) -> Hashable:
         """The config of least median time; a mapping with none that ran raises naming its failures."""
-        ran = [(config, timing) for config, timing in self.items() if isinstance(timing, tokamax.BenchmarkData)]
+        ran = [(config, timing) for config, timing in self.items()
+               if isinstance(timing, tokamax.BenchmarkData)]
         if not ran:
             raise ValueError(f"no config ran: {list(self.values())}")
         return min(ran, key=lambda pair: pair[1].median_evaluation_time_ms)[0]
