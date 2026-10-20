@@ -99,7 +99,7 @@ from dew.telemetry.records import (
     StepCompiled,
 )
 from dew.training._lowering import Lowered
-from dew.training.display import TrainingDisplay
+from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
     DevicePrefetchIterator,
     Layout,
@@ -216,42 +216,6 @@ class ProfileWindow:
     warmup: int = 2
 
 
-# How the display shows the metrics the trainer itself logs; an objective,
-# a rollout and a validation metric declare their own (`Shown`).
-TRAINER_SHOWN = {"loss": Shown(better="lower"),
-                 "learning_rate": Shown(group="optimizer"), "loss_scale": Shown(group="optimizer"),
-                 "accepted": Shown(percent=True, group="optimizer"),
-                 "step_time_ms": Shown(better="lower", group="throughput"),
-                 "samples_per_sec": Shown(better="higher", group="throughput"),
-                 "mfu": Shown(better="higher", percent=True, group="throughput"),
-                 "hfu": Shown(better="higher", percent=True, group="throughput"),
-                 "hlo_flops_util": Shown(better="higher", percent=True, group="throughput"),
-                 **{f"{name}_lower_bound": Shown(better="higher", percent=True, group="throughput")
-                    for name in ("hfu", "hlo_flops_util")}, "unsized_kernels": Shown(group="throughput"),
-                 "tokens": Shown(group="throughput"),
-                 "tokens_per_s": Shown(better="higher", group="throughput"),
-                 "rollout_seconds": Shown(better="lower", group="throughput")}
-
-
-def goodput(wall: float, first_step: float | None, other: float) -> dict[str, float]:
-    """Compute the two goodput numbers from MaxText's report that need no cluster telemetry.
-
-    `first_step` is the time from the start of `fit` to the first step's result:
-    the placement or restore, the first batch, the compile and the step itself.
-    It is None when no step ran. `other` is the time spent outside steps after
-    that: evaluations, checkpoint writes and the wait for them at the end.
-
-    The step fraction is what is left of `wall`. A step's own data stall therefore
-    counts as step time, as it does in MaxText's start-to-start step time.
-    """
-    numbers = {}
-    if first_step is not None:
-        numbers["goodput/time_to_first_step_s"] = first_step
-    steps = wall - (wall if first_step is None else first_step) - other
-    numbers["goodput/step_fraction"] = max(steps, 0.0) / wall if wall > 0 else 0.0
-    return numbers
-
-
 def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
     """The rollout's report of its latest call. A rollout is any callable,
     and a plain function reports nothing, so the trainer reads `metrics` at
@@ -354,6 +318,17 @@ class _FitPlan:
     def cadenced(self) -> bool:
         """Whether any evaluation runs before the end."""
         return bool(self.eval_every or any(suite.every for suite in self.suites.values()))
+
+    @property
+    def evaluates_midway(self) -> bool:
+        """Whether an evaluation can run before the end's: on a cadence shorter than the run, or to
+        rank a checkpoint written before its end."""
+        def before_end(every: int | datetime.timedelta | None) -> bool:
+            return bool(every) and (self.steps is None or not isinstance(every, int) or every < self.steps)
+
+        cadences = (self.eval_every, *(suite.every for suite in self.suites.values()))
+        return any(map(before_end, cadences)) or bool(
+            (self.validation or self.best or self.stop) and before_end(self.checkpoint_every))
 
     def due(self, step: int) -> tuple[str, ...]:
         """The suites whose own cadence falls on `step`."""
@@ -1559,6 +1534,8 @@ class Trainer(Generic[Loss, Effects]):
                     signature = batch_signature(device)
                     run.reads[signature] = step_reads(self.executable, signature)
                 interval.compiles = len(compiled)
+                if len(compiled) > known:
+                    self._warm_evaluations(plan, state, shardings)
                 if not known:
                     # Rebound once the step is compiled, so the first tick
                     # measures steps, not the compile.
@@ -1987,17 +1964,35 @@ class Trainer(Generic[Loss, Effects]):
         held['step'] = run.current
         return held['bad'] >= stop.evals
 
+    def _warm_evaluations(self, plan: _FitPlan, state: TrainState, shardings: Placement[TrainState]) -> None:
+        """Compile the programs the run's evaluations run beside a step's compile, where any runs
+        between steps (`_FitPlan.evaluates_midway`): every suite warms (`Evaluation.run`'s `warm`),
+        its preview included, and nothing is reported.
+
+        An evaluation's programs compile at their first call, which would otherwise be an
+        evaluation's inside the run, its seconds holding the compile (7.5 s at the first of 45
+        records), counted against the run's goodput. A new training shape can change the modules
+        the programs run (the fit ladder's rung), so each step compiled warms them again. The
+        training values a ranking reads ride on the first evaluation that reads them, whose gather
+        of them compiles there."""
+        if plan.evaluates_midway:
+            with region("evaluate"):
+                self._evaluation(plan, state, shardings, {}, warm=True)
+
     def _evaluation(self, plan: _FitPlan, state: TrainState, shardings: Placement[TrainState],
-                    training: Mapping[str, jax.Array], names: Sequence[str] | None = None) -> Evaluation:
+                    training: Mapping[str, jax.Array], names: Sequence[str] | None = None, *,
+                    warm: bool = False) -> Evaluation:
         """Score the suites in `names`, every suite when None, as one evaluation.
 
         With no suite at all, the evaluation carries the training values a
-        ranking or a stopping rule reads."""
+        ranking or a stopping rule reads. `warm` warms every suite instead and
+        reports nothing (`_warm_evaluations`)."""
         ranks = self.checkpoints is not None or plan.best or plan.stop or plan.held_best
-        reports = training if ranks else None
+        reports = training if ranks and not warm else None
         chosen = list(plan.suites if names is None else names)
         if not chosen:
-            return self._evaluate(state, shardings, None, (), plan.preview, split="val", training=reports)
+            return self._evaluate(state, shardings, None, (), plan.preview, split="val", training=reports,
+                                  warm=warm)
         evaluations = []
         for split in chosen:
             suite = plan.suites[split]
@@ -2007,7 +2002,7 @@ class Trainer(Generic[Loss, Effects]):
             loss = ((ranks or self.objective.defines_validation_loss)
                     and not any(metric.name == 'loss' for metric in suite.metrics))
             evaluations.append(self._evaluate(state, shardings, suite.data, suite.metrics, plan.preview,
-                                              loss=loss, split=split, training=reports))
+                                              loss=loss, split=split, training=reports, warm=warm))
         return dataclasses.replace(
             evaluations[0],
             scores={name: value for report in evaluations for name, value in report.scores.items()},
@@ -2370,16 +2365,19 @@ class Trainer(Generic[Loss, Effects]):
         loss: bool = False,
         split: str = "val",
         training: Mapping[str, jax.Array] | None = None,
+        warm: bool = False,
     ) -> Evaluation:
         """Score the validation split with this state's variables and report
         it, returning the seconds it took: the run's, but not its steps',
-        which is what the goodput fraction is measured against.
+        which is what the goodput fraction is measured against. `warm` warms
+        the split (`Evaluation.run`'s `warm`) and reports nothing.
 
         A CPU-owned run evaluates on the accelerator, over the same snapshot
         a step realizes, so validation reads the weights where the loss
         does."""
         paused = time.perf_counter()
-        self._display.status("evaluating")
+        if not warm:
+            self._display.status("evaluating")
         mesh, params = self.device_mesh, state.variables
         averaged = with_ema(state.variables, self._fetched(state, shardings).ema)
         key = state.key
@@ -2399,11 +2397,13 @@ class Trainer(Generic[Loss, Effects]):
             evaluation = Evaluation.run(
                 self.objective, params, reader, metrics=metrics, key=key,
                 step=state.step, schedule_step=state.microstep * self.accumulation // state.window_size,
-                averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training)
-        # The training values ride along for ranking (`_ranking`); the log
-        # interval reports them, so the evaluation's own report leaves them out.
-        self._report_evaluation(dataclasses.replace(evaluation, scores={
-            name: value for name, value in evaluation.scores.items() if name not in (training or {})}))
+                averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training,
+                warm=warm)
+        if not warm:
+            # The training values ride along for ranking (`_ranking`); the log interval reports
+            # them, so the evaluation's own report leaves them out.
+            self._report_evaluation(dataclasses.replace(evaluation, scores={
+                name: value for name, value in evaluation.scores.items() if name not in (training or {})}))
         return dataclasses.replace(evaluation, elapsed_seconds=time.perf_counter() - paused)
 
     def _report_evaluation(self, advanced: Evaluation) -> None:
