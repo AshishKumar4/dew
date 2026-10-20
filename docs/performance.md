@@ -247,6 +247,14 @@ python tools/perf_gate.py run --base main=<tree> --head head=<tree> --rounds 3 \
 python tools/perf_gate.py report gate.json --table gate.md
 ```
 
+A setting is measured the same way: one tree as both base and head, with
+`--head-env NAME=VALUE` set in the head's processes alone, so every row, its
+compile included, is the head's value against the environment the gate was
+started in, which the base keeps. The value replaces the whole variable: to
+measure one XLA flag beside flags the shell already sets, give the head all of
+them, say `--head-env "XLA_FLAGS=$XLA_FLAGS --xla_gpu_enable_command_buffer="`.
+The table names the head's settings.
+
 Every kernel or trainer change that claims speed must also pass the
 same-session Qwen3.5-0.8B backbone reference row on an A100-SXM4-80GB. The
 minimum is parity with the reference, within measured spread; the target is
