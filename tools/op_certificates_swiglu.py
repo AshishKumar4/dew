@@ -142,26 +142,38 @@ def nodes_of(table, values: dict, config) -> dict:
     return values
 
 
+def _subnormal(values) -> np.ndarray:
+    values = np.abs(np.asarray(values, np.float64))
+    return (values > 0) & (values < np.finfo(np.float32).tiny)
+
+
 def check(table, values: dict) -> dict:
     """Each node's contract on its native parents: flags for exact nodes, the ulp distribution for
-    the rest."""
+    the rest, each apart where a parent or the exact result is subnormal, so a flush to zero (FTZ,
+    its own contract where the PTX shows `.ftz`) is reported as such rather than as error."""
     report = {}
     for name, parents, _, (contract, kind) in table:
         native = np.asarray(values[name], np.float32)
-        want = oracle(kind, [np.asarray(values[parent], np.float32) for parent in parents])
+        held = [np.asarray(values[parent], np.float32) for parent in parents]
+        want = oracle(kind, held)
+        tiny = _subnormal(want) | np.any([_subnormal(parent) for parent in held], axis=0)
+        flushed = int((tiny & (native == 0) & (want != 0)).sum())
         if contract == "exact":
             wrong = oc.mismatches(native, want, oc.FLOAT32)
-            first = np.asarray(values[parents[0]])[wrong][:4]
-            report[name] = {"contract": f"exact {kind}", "flags": int(wrong.sum()),
+            first = held[0][wrong & ~tiny][:4]
+            report[name] = {"contract": f"exact {kind}", "flags": int((wrong & ~tiny).sum()),
+                            "flags_subnormal": int((wrong & tiny).sum()), "flushed": flushed,
                             "elements": int(native.size), "first": [float(value) for value in first]}
         else:
             distance = ulps(native, want)
-            finite = np.isfinite(want)
+            finite = np.isfinite(want) & ~tiny
             steps, counts = np.unique(np.minimum(distance[finite], 8), return_counts=True)
             histogram = {str(step): int(count) for step, count in zip(steps, counts, strict=True)}
-            edges = oc.mismatches(native[~finite], want[~finite], oc.FLOAT32)
+            edges = oc.mismatches(native[~np.isfinite(want)], want[~np.isfinite(want)], oc.FLOAT32)
             report[name] = {"contract": f"ulps {kind}", "max": int(distance[finite].max()),
-                            "histogram": histogram, "nonfinite_mismatch": int(edges.sum())}
+                            "at": float(held[0][finite][int(distance[finite].argmax())]),
+                            "histogram": histogram, "nonfinite_mismatch": int(edges.sum()),
+                            "subnormal_elements": int(tiny.sum()), "flushed": flushed}
     return report
 
 
@@ -200,22 +212,27 @@ def bitwise(left, right) -> int:
 
 def sweep(name: str, fn, kind: str, config, chunk: int = 1 << 26, limit: int = 1 << 32) -> dict:
     """`fn` over every fp32 bit pattern (the first `limit`), each against its correctly rounded
-    value: the node's largest distance in ulps on this GPU, and where it sits."""
-    worst, where, mismatched_nonfinite, started = 0, None, 0, time.time()
+    value: the node's largest distance in ulps on this GPU and where it sits, over the elements
+    whose argument and result are normal, and apart, how many subnormal ones it flushed or missed."""
+    worst, where, nonfinite, flushed, subnormal_wrong, started = 0, None, 0, 0, 0, time.time()
     chunk = min(chunk, limit)
     for start in range(0, limit, chunk):
         bits = np.arange(start, start + chunk, dtype=np.uint64).astype(np.uint32)
         x = bits.view(np.float32)
         native = np.asarray(probe(fn, [jnp.asarray(x)], config), np.float32)
         want = oracle(kind, [x])
-        finite = np.isfinite(want) & np.isfinite(x)
+        tiny = _subnormal(x) | _subnormal(want)
+        finite = np.isfinite(want) & np.isfinite(x) & ~tiny
         distance = np.where(finite, ulps(native, want), 0)
         if distance.max() > worst:
             worst, where = int(distance.max()), float(x[int(distance.argmax())])
-        edge = ~finite & ~np.isnan(x)
-        mismatched_nonfinite += int(oc.mismatches(native[edge], want[edge], oc.FLOAT32).sum())
-    return {"node": name, "max_ulps": worst, "at": where, "nonfinite_mismatch": mismatched_nonfinite,
-            "seconds": round(time.time() - started, 1)}
+        edge = ~np.isfinite(want) & ~np.isnan(x)
+        nonfinite += int(oc.mismatches(native[edge], want[edge], oc.FLOAT32).sum())
+        flushed += int((tiny & (native == 0) & (want != 0)).sum())
+        subnormal_wrong += int((tiny & oc.mismatches(native, want, oc.FLOAT32)).sum())
+    return {"node": name, "max_ulps": worst, "at": where, "nonfinite_mismatch": nonfinite,
+            "subnormal_flushed": flushed, "subnormal_mismatch": subnormal_wrong,
+            "patterns": limit, "seconds": round(time.time() - started, 1)}
 
 
 def main() -> int:
