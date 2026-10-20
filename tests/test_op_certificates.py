@@ -125,8 +125,8 @@ def _interval_rounded(function, values, fmt: oc.Format) -> np.ndarray:
     for value in values:
         for precision in (96, 192, 384):
             with oc.interval_precision(precision) as iv:
-                ends = function(iv, iv.mpf(float(value)))._mpi_
-            lower, upper = (oc.fraction_rounded(oc._fraction(end), fmt) for end in ends)
+                ends = oc.interval_ends(function(iv, iv.mpf(float(value))), precision)
+            lower, upper = (oc.fraction_rounded(end, fmt) for end in ends)
             if lower == upper:
                 out.append(lower)
                 break

@@ -202,11 +202,18 @@ def interval_precision(bits: int):
         mpmath.iv.prec = held
 
 
-def _fraction(raw) -> fractions.Fraction:
-    """An mpmath raw mpf (sign, mantissa, exponent, bits) as an exact rational."""
-    sign, mantissa, exponent, _ = raw
-    value = fractions.Fraction(mantissa) * fractions.Fraction(2) ** exponent
-    return -value if sign else value
+def interval_ends(interval, bits: int) -> tuple[fractions.Fraction, fractions.Fraction]:
+    """An mpmath interval's two ends as exact rationals, through mpmath's public interface: each end
+    (`.a`, `.b`) read as an mpf at the `bits` the interval was computed at, so exactly, then its
+    mantissa and exponent (`.man`, `.exp`)."""
+    import mpmath
+
+    def exact(end) -> fractions.Fraction:
+        with mpmath.workprec(bits):
+            value = mpmath.mpf(end)
+        return fractions.Fraction(int(value.man)) * fractions.Fraction(2) ** int(value.exp)
+
+    return exact(interval.a), exact(interval.b)
 
 
 def _fast_two_sum(a, b):
@@ -315,8 +322,8 @@ def exp_rounded(x, fmt: Format) -> np.ndarray:
     for index in np.flatnonzero(~decided):
         for precision in (96, 192, 384, 768):
             with interval_precision(precision) as iv:
-                low_end, high_end = iv.exp(iv.mpf(float(x.flat[index])))._mpi_
-            low_end, high_end = (fraction_rounded(_fraction(end), fmt) for end in (low_end, high_end))
+                ends = interval_ends(iv.exp(iv.mpf(float(x.flat[index]))), precision)
+            low_end, high_end = (fraction_rounded(end, fmt) for end in ends)
             if low_end == high_end:
                 result.flat[index] = low_end
                 break
