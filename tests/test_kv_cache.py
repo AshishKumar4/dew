@@ -177,18 +177,18 @@ def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(with
     s = jnp.asarray([0.5, -1.0, 2.0, -3.0], jnp.float32)
     table = jnp.asarray([[2, 0], [0, 3]], jnp.int32)
     lengths = jnp.asarray([21, 32], jnp.int32)
-    starts = (jnp.asarray([5, 17], jnp.int32),) if windowed else ()
+    starts = jnp.asarray([5, 17], jnp.int32) if windowed else None
     argnums = (0, 1, 2, 3) if sunk else (0, 1, 2)
 
     def old(q, k, v, s):
-        return _gathered_attention(q, k, v, table, lengths, *starts, *[s] * sunk, softcap=softcap, sunk=sunk)
+        return _gathered_attention(q, k, v, table, lengths, starts, s if sunk else None, softcap=softcap)
 
     def loss(function, q, k, v, s):
         out = function(q, k, v, s)
         return jnp.sum(out.astype(jnp.float32) ** 2), out
 
     def native(q, k, v, s):
-        return gpu_paged(softcap, sunk)(q, k, v, table, lengths, *starts, *[s] * sunk)
+        return gpu_paged(softcap)(q, k, v, table, lengths, starts, s if sunk else None)
     (_, out), gradients = jax.jit(jax.value_and_grad(lambda *a: loss(native, *a), argnums=argnums,
                                                      has_aux=True))(q, k, v, s)
     (_, prior), previous = jax.jit(jax.value_and_grad(lambda *a: loss(old, *a), argnums=argnums,
@@ -198,8 +198,8 @@ def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(with
     direction = jax.random.normal(jax.random.key(6), q.shape, jnp.bfloat16)
     np.testing.assert_array_equal(
         jax.jit(lambda q: jax.jvp(lambda q: native(q, k, v, s), (q,), (direction,))[1])(q),
-        jax.jit(lambda q: jax.jvp(lambda q: _gathered_tangent(q, k, v, table, lengths, *starts, *[s] * sunk,
-                                                              softcap=softcap, sunk=sunk),
+        jax.jit(lambda q: jax.jvp(lambda q: _gathered_tangent(q, k, v, table, lengths, starts,
+                                                              s if sunk else None, softcap=softcap),
                                   (q,), (direction,))[1])(q))
 
     with jax.enable_x64():
@@ -207,9 +207,8 @@ def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(with
             return scaled_dot_product_attention(
                 q[:, None], _gather_pages(k, table, 1), _gather_pages(v, table, 1),
                 implementation="reference", key_value_seq_lengths=lengths,
-                key_value_seq_starts=starts[0] if starts else None, softcap=softcap,
-                sinks=s if sunk else None, precision=jax.lax.Precision.HIGHEST,
-                force_fp32_for_softmax=False)[:, 0]
+                key_value_seq_starts=starts, softcap=softcap, sinks=s if sunk else None,
+                precision=jax.lax.Precision.HIGHEST, force_fp32_for_softmax=False)[:, 0]
 
         def reference_loss(q, k, v, s):
             value = reference(q, k, v, s)
