@@ -526,7 +526,8 @@ def test_a_prompt_sessions_source_is_its_data_source_and_the_metrics_report_each
     assert (metrics["source/math/reward/mean"], metrics["source/code/reward/mean"]) == (1.0, 0.0)
     assert metrics["source/math/status/completed"] == metrics["source/code/status/completed"] == 1.0
     assert metrics["reward/mean"] == 0.5
-    assert [trajectory.session for trajectory in from_verl(json.loads(json.dumps(to_verl(sessions))))] == sessions
+    exported = json.loads(json.dumps(to_verl(sessions)))
+    assert [trajectory.session for trajectory in from_verl(exported)] == sessions
 
 
 def test_the_prompt_sources_calls_carry_the_draws_routing_into_the_packed_batch():
