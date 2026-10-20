@@ -13,12 +13,15 @@ RESOLVED=2026-10-12T00:00:00Z
 # Dew's own FlashAttention wheels resolve as they stood when 0.3.4 was published, past the pins the
 # locks hold (-P); nothing else moves.
 FLASH=2026-10-17T18:46:06Z
+# Daytona's SDK resolves as it stood at 0.225.0, the release its adapter was written against.
+DAYTONA=2026-10-17T00:00:00Z
 lock() {
   name=$1
   shift
   uv pip compile -q --no-header pyproject.toml --extra ci --extra tutorials --extra mutation -c constraints.txt \
     --exclude-newer "$RESOLVED" --exclude-newer-package "dew-flash-attn-cu12=$FLASH" \
-    --exclude-newer-package "dew-flash-attn-cu13=$FLASH" -P dew-flash-attn-cu12 -P dew-flash-attn-cu13 \
+    --exclude-newer-package "dew-flash-attn-cu13=$FLASH" --exclude-newer-package "daytona=$DAYTONA" \
+    -P dew-flash-attn-cu12 -P dew-flash-attn-cu13 \
     --python-version "$(tr -d '\n' < .python-version)" "$@" -o "locks/$name.txt"
 }
 lock cpu --universal --torch-backend cpu
