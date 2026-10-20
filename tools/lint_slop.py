@@ -86,7 +86,7 @@ import subprocess
 import sys
 import tokenize
 from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1804,25 +1804,38 @@ RANGES = frozenset({"numpy.arange", "jax.numpy.arange", "torch.arange"})
 float dtype is asked: a range of a length is a range of positions."""
 
 
+def _bound_to(name: str, scope) -> list[ast.AST]:
+    """The values the scope binds `name` to (`_Scope.bindings`)."""
+    return [value for names, value in scope.bindings if name in names]
+
+
+def _negative(value: ast.AST, scope, seen: frozenset = frozenset()) -> bool:
+    """Whether `value` is evidently below zero: a negative literal, a negated positive one, or a name the
+    scope binds to one."""
+    if isinstance(value, ast.Constant):
+        return isinstance(value.value, int | float) and not isinstance(value.value, bool) and value.value < 0
+    if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.USub):
+        return isinstance(value.operand, ast.Constant) and isinstance(value.operand.value, int | float) \
+            and value.operand.value > 0
+    if isinstance(value, ast.Name) and value.id not in seen:
+        return any(_negative(bound, scope, seen | {value.id}) for bound in _bound_to(value.id, scope))
+    return False
+
+
 def _fractional(value: ast.AST, scope, seen: frozenset = frozenset()) -> bool:
-    """Whether `value` is evidently no whole number: a float literal, a quotient, a negative or
-    fractional power, a float() call, arithmetic of one, or a name the scope binds to one."""
+    """Whether `value` is evidently no whole number: a float literal, a quotient, a negative or fractional
+    power, a float() call, arithmetic of one, or a name the scope binds to one (its bindings as
+    `_read_scope` reads them: tuples element by element, `x op= v` as `x op v`)."""
     if isinstance(value, ast.Constant):
         return type(value.value) is float
     if isinstance(value, ast.UnaryOp):
         return _fractional(value.operand, scope, seen)
     if isinstance(value, ast.BinOp):
-        power = value.right
-        negative = isinstance(value.op, ast.Pow) and (
-            (isinstance(power, ast.UnaryOp) and isinstance(power.op, ast.USub))
-            or (isinstance(power, ast.Constant) and isinstance(power.value, int | float) and power.value < 0))
-        return isinstance(value.op, ast.Div) or negative or any(
+        power = isinstance(value.op, ast.Pow) and _negative(value.right, scope, seen)
+        return isinstance(value.op, ast.Div) or power or any(
             _fractional(side, scope, seen) for side in (value.left, value.right))
     if isinstance(value, ast.Name) and value.id not in seen:
-        return any(_fractional(node.value, scope, seen | {value.id}) for node in scope.nodes
-                   if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None
-                   and value.id in [name for target in (node.targets if isinstance(node, ast.Assign)
-                                                        else [node.target]) for name in _bound_names(target)])
+        return any(_fractional(bound, scope, seen | {value.id}) for bound in _bound_to(value.id, scope))
     return isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "float"
 
 
@@ -1852,6 +1865,7 @@ class _Scope:
     errors: set[str]
     integral: set[str]
     timed: set[str]
+    bindings: list[tuple[list[str], ast.AST]] = field(default_factory=list)
 
 
 def _defined(value: ast.Call, scope: _Scope, reading: _Reading, kinds: Set[int]) -> bool:
@@ -1887,8 +1901,9 @@ def _integral_value(value: ast.AST, integral: Set[str], scope: _Scope, reading: 
     if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Pow):
         # A whole number to a whole power is whole only where the power is not negative.
         power = value.right
-        return _integral_value(value.left, integral, scope, reading) and isinstance(power, ast.Constant) \
-            and type(power.value) is int and power.value >= 0
+        return _integral_value(value.left, integral, scope, reading) and _integral_value(
+            power, integral, scope, reading) and not _negative(power, scope) and not (
+            isinstance(power, ast.UnaryOp) and isinstance(power.op, ast.USub))
     if isinstance(value, ast.BinOp) and not isinstance(value.op, ast.Div):
         return all(_integral_value(side, integral, scope, reading) for side in (value.left, value.right))
     if isinstance(value, ast.Call):
@@ -1979,6 +1994,7 @@ def _read_scope(scope_node: ast.AST, reading: _Reading) -> _Scope:
                     assigned.append((_bound_names(target), ast.BinOp(target, node.op, node.value)))
                 else:
                     assigned.append((_bound_names(target), node.value))
+    scope.bindings = assigned
     integral = {name for names, _ in assigned for name in names}
     while True:
         kept = {name for name in integral
