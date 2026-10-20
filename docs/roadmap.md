@@ -30,6 +30,7 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Place a loaded pretrained model's variables on JAX's default device, as jnp arrays are; keeping them on the host is an explicit request. [832]
 - Keep a merged FP8 base finite through training on H100's FP8 tensor cores. [841]
 - Hold a sharded pipeline export to the host tensors it keeps live, not to process RSS, which moves with load. [842]
+- Make the live kernel's preparation smoke deterministic about the contexts a closed page leaves open. [843]
 - Route MPConv through Conv's shared operand path after its normalization. [785]
 - One patch projection for every scan order in DiT, UViT and SimpleUDiT, the tokens permuted after it. [787]
 - Build Llama 4's vision adapter from MergeProjector. [788]
