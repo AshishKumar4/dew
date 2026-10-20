@@ -1073,8 +1073,9 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
         return jnp.take_along_axis(out, back[:, :, None, None], axis=1)
 
     queries, keys = (None, None) if segment_ids is None else document_ids(segment_ids)
-    if queries is not None and (query.shape[:-2] != queries.shape or key.shape[:-2] != keys.shape
-                                or value.shape[:-2] != keys.shape):
+    if queries is not None and keys is not None and (
+            query.shape[:-2] != queries.shape or key.shape[:-2] != keys.shape
+            or value.shape[:-2] != keys.shape):
         # Packed rows run flattened into one run of tokens, where rows of another count or length can
         # flatten to as many tokens and be read as the next row's.
         raise ValueError(
