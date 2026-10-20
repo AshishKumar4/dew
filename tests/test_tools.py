@@ -346,6 +346,30 @@ def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
                           float(reordered.sum()), float(truth.sum()))
 
 
+def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width():
+    """A residual order permutes only the parameters that hold the residual stream: with 2 heads of
+    16 in a 32-wide decoder, Kimi Delta Attention's dt_bias and short-convolution weights are the
+    residual's width too, and permuting them, as a size-matching guess would, changes the function."""
+    from model_support import TINY_DECODER
+    from residual_orders import orders, permuted, residual_width
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.registry import mixers
+
+    mixer = mixers.build("kimi_delta_attention", linear_num_heads=2, linear_head_dim=16)
+    model = CausalTransformer(**{**TINY_DECODER, "max_seq_len": 128}, mixer=mixer)
+    ids = jnp.array([[2, 7, 11, 3, 5, 1, 9, 4]], jnp.int32)
+    variables = model.init(jax.random.key(4), ids)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), variables)
+        model = model.clone(dtype=jnp.float64)
+        truth = np.asarray(model.apply(wide, ids))
+        order = orders(residual_width(variables), 2, seed=6)[1]
+        reordered = np.asarray(model.apply(permuted(wide, order), ids))
+    load('layout_parity').order_invariance({'logits': reordered}, {'logits': truth},
+                                           float(reordered.sum()), float(truth.sum()))
+
+
 @pytest.mark.parametrize("model", ["dit", "dense_mdlm"])
 def test_layout_parity_anchors_an_objective_that_draws_per_row_on_its_own_draws(model):
     """The fp64 anchor is the reference's step with every sum in fp64, the
