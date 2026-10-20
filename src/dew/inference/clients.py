@@ -329,14 +329,38 @@ def _choice_tokens(entry: Mapping[str, object]) -> tuple[tuple[int, ...] | None,
     of the logprob tokens; text tokens are not reverse-mapped through a
     vocabulary.
     """
+    ids = listed_ids(entry)
+    reported = reported_log_probs(entry)
+    if reported is None:
+        return ids, None
+    rendered, probabilities = reported
+    if ids is not None:
+        if len(ids) != len(probabilities):
+            raise ValueError("choice token_ids must be aligned with its token_logprobs")
+        return ids, probabilities
+    rendered_ids: list[int] = []
+    for token in rendered:
+        if not isinstance(token, str) or not token.startswith("token_id:"):
+            return None, probabilities
+        rendered_ids.append(int(token.removeprefix("token_id:")))
+    return tuple(rendered_ids), probabilities
+
+
+def listed_ids(entry: Mapping[str, object]) -> tuple[int, ...] | None:
+    """A choice's `token_ids` list (SGLang's `return_token_ids`), or None where it has none."""
     listed = entry.get("token_ids")
     if listed is not None and (not isinstance(listed, list) or any(
             type(token) is not int or token < 0 for token in listed)):
         raise ValueError("choice token_ids must be a list of nonnegative ids")
-    ids = None if listed is None else tuple(listed)
+    return None if listed is None else tuple(listed)
+
+
+def reported_log_probs(entry: Mapping[str, object]) -> tuple[list[object], tuple[float, ...]] | None:
+    """A choice's logprob tokens as rendered and their log-probabilities, or None where it reports
+    none."""
     logprobs = entry.get("logprobs")
     if logprobs is None:
-        return ids, None
+        return None
     record = _object(logprobs, "choice logprobs")
     rendered, values = record.get("tokens"), record.get("token_logprobs")
     if not isinstance(rendered, list) or not isinstance(values, list) or len(rendered) != len(values):
@@ -346,16 +370,7 @@ def _choice_tokens(entry: Mapping[str, object]) -> tuple[tuple[int, ...] | None,
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("each reported token log-probability must be a number")
         probabilities.append(float(value))
-    if ids is not None:
-        if len(ids) != len(probabilities):
-            raise ValueError("choice token_ids must be aligned with its token_logprobs")
-        return ids, tuple(probabilities)
-    rendered_ids: list[int] = []
-    for token in rendered:
-        if not isinstance(token, str) or not token.startswith("token_id:"):
-            return None, tuple(probabilities)
-        rendered_ids.append(int(token.removeprefix("token_id:")))
-    return tuple(rendered_ids), tuple(probabilities)
+    return rendered, tuple(probabilities)
 
 
 def decode_routed_experts(encoded: object) -> np.ndarray:
