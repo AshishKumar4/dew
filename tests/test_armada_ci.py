@@ -543,7 +543,8 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     assert long / short == pytest.approx(3.0, rel=0.25)
 
 
-def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch):
+def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch,
+                                                                                  cache_worker):
     """A file that ran green is reused by a later task on the same CPU class while its inputs are
     unchanged; a task on another class, after its inputs change, or planned with DEW_TEST_CACHE=off
     (the daily full run) runs it again, and once it has run red on those inputs, so does every task
@@ -561,16 +562,8 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
-    worker: dict[str, bytes] = {}
-
-    def cache_request(url, token, data=None):
-        if data is not None:
-            worker[url] = data
-            return b""
-        return worker.get(url)
-
-    monkeypatch.setattr(ci, "cache_request", cache_request)
-    monkeypatch.setenv("DEW_XLA_CACHE_URL", "https://cache.invalid")
+    url, _, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
     out = tmp_path / "verdict.json"
     command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
@@ -627,7 +620,7 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
 
 
 def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_list_changes(
-        ci, tmp_path, monkeypatch):
+        ci, tmp_path, monkeypatch, cache_worker):
     """A test's inputs outside tests/ and src/ are its file's inputs too (executed.py): a documentation
     page its test reads, and the pages of a directory it lists, so a green row is reused while they
     stay, and its file runs again once the page it trains from changes or a page is added. So are a
@@ -656,17 +649,9 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
-    worker: dict[str, bytes] = {}
-
-    def cache_request(url, token, data=None):
-        if data is not None:
-            worker[url] = data
-            return b""
-        return worker.get(url)
-
-    monkeypatch.setattr(ci, "cache_request", cache_request)
+    url, _, _ = cache_worker
     monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
-    monkeypatch.setenv("DEW_XLA_CACHE_URL", "https://cache.invalid")
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
     # Beside the checkout's entries, not among them: the checkout's own directory is an input.
     (tmp_path / ".verdict").mkdir()
