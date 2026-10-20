@@ -12,19 +12,23 @@ activations and a gated RMS norm of the output are its prologue and epilogue.
 
 This module holds the decode token, the chunk of one (`step`): one program a row and value head
 reads the state once and writes it once, with its hooks inlined, which is the decode step and the
-fused decode step it replaces. Its arithmetic is the XLA reference's (`step_reference`), which is
-also its CPU path and, on float64 operands, the float64 truth.
+fused decode step it replaces. Its arithmetic is a sequence of stages (`stages`), each a value it
+rounds and holds; the launch composes them, and the XLA reference (`step_reference`), which on
+float64 operands is the float64 truth, composes the same stages' reference arithmetic. A stage run
+as its own launch is a node of the launch's graph (`step_graph`, `dew.nn.kernels.graph`), which the
+float64 gate holds where it rounds.
 """
 
 import dataclasses
 import functools
+from collections.abc import Callable
 from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from . import norm_swiglu, short_conv, tuning
+from . import graph, norm_swiglu, short_conv, tuning
 from .generation import triton_runs
 
 L2NORM_EPS = 1e-6
@@ -92,20 +96,6 @@ def round_to_bf16(state, key, value):
     return jax.lax.bitcast_convert_type(rounded, jnp.float32).astype(jnp.bfloat16)
 
 
-def update(state, query, key, value, decay, write, *, delta: bool):
-    """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` per key dimension `[...,
-    Dk]` (`exp(g)`) and `write` the write gate, broadcast against the values `[..., Dv]`: its output
-    `[..., Dv]` and the updated state.
-    Both readouts are products with the old state, `(q decay)^T S + (q . k) d` with `d = write (v -
-    (k decay)^T S)` under the delta rule and `write v` without it, so one pass over the state serves
-    them and the write."""
-    read_query = jnp.sum((query * decay)[..., :, None] * state, axis=-2)
-    corrected = value - jnp.sum((key * decay)[..., :, None] * state, axis=-2) if delta else value
-    written = corrected * write
-    out = read_query + jnp.sum(query * key, axis=-1, keepdims=True) * written
-    return out, state * decay[..., :, None] + key[..., :, None] * written[..., None, :]
-
-
 def _held(updated, key, value, dtype):
     """The updated state as it is held: bf16 rounded stochastically (`round_to_bf16`), else cast."""
     return round_to_bf16(updated, key, value) if dtype == jnp.bfloat16 else updated.astype(dtype)
@@ -114,13 +104,6 @@ def _held(updated, key, value, dtype):
 def _gated_decay(gate, log_a, bias):
     """The gates' log decay `-exp(log_a) softplus(gate + bias)`, in the operands' dtype."""
     return -jnp.exp(log_a) * jax.nn.softplus(gate + bias)
-
-
-def gated_rms(out, z, weight, norm: OutputNorm):
-    """The epilogue over a head's output `[..., Dv]` in fp32 or wider: `rms_norm(o) weight act(z)`,
-    the mean a product by the reciprocal, as XLA's."""
-    inverse = jax.lax.rsqrt(jnp.sum(out * out, axis=-1, keepdims=True) * (1.0 / out.shape[-1]) + norm.epsilon)
-    return out * inverse * weight * norm_swiglu.activation_and_slope(z, norm.activation)[0]
 
 
 @jax.tree_util.register_dataclass
@@ -188,208 +171,394 @@ def _read(hooks: Hooks, operands: Step) -> dict:
     return given
 
 
-def _prologue(hooks: Hooks, given: dict, work):
-    """The reference's queries `[rows, Hv, Dk]`, keys, values `[rows, Hv, Dv]`, each in `work`, and
-    the moved history (None without a conv): the conv's sums in `work` over the history rounded to
-    the token's dtype, the activation, the l2 norm, the key heads repeated over their value heads."""
-    value_heads, key_width, value_width = given['state'].shape[1:]
-    history = None
+STREAMS = ('query', 'key', 'value')
+"""The conv's streams in its channels' order."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Dims:
+    """A decode token's sizes: its rows, value heads, key heads, key and value widths, and the conv's
+    taps (0 without one)."""
+    rows: int
+    value_heads: int
+    key_heads: int
+    key_width: int
+    value_width: int
+    taps: int
+
+    @property
+    def group(self) -> int:
+        """The value heads a key head serves."""
+        return self.value_heads // self.key_heads
+
+
+def _dims(hooks: Hooks, given: dict) -> Dims:
+    """The sizes of the operands `hooks` read (`_read`)."""
+    rows, value_heads, key_width, value_width = given['state'].shape
+    if hooks.conv is None:
+        return Dims(rows, value_heads, given['query'].shape[1], key_width, value_width, 0)
+    key_heads = _pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
+    return Dims(rows, value_heads, key_heads, key_width, value_width, given['taps'].shape[-1])
+
+
+@dataclasses.dataclass(frozen=True)
+class Program:
+    """A launch program's place: its value head `head` (traced), the token's sizes, and whether it
+    interprets."""
+    head: Any
+    dims: Dims
+    interpret: bool
+
+    def piece(self, stream: str) -> tuple[Any, int]:
+        """A stream's first channel and width among the conv's: the program's key head's queries or
+        keys, or its own values."""
+        dims = self.dims
+        key_head = self.head // dims.group
+        if stream == 'query':
+            return key_head * dims.key_width, dims.key_width
+        if stream == 'key':
+            return (dims.key_heads + key_head) * dims.key_width, dims.key_width
+        return 2 * dims.key_heads * dims.key_width + self.head * dims.value_width, dims.value_width
+
+
+@dataclasses.dataclass(frozen=True)
+class Stage:
+    """One value a decode token rounds and holds (`dew.nn.kernels.graph`): its name, its parents' names,
+    its kind, its layout (`_spec`), the dtype it is held in, and its arithmetic on its parents' values,
+    the launch's on a program's blocks (`kernel`, which takes the `Program` first) and the XLA
+    reference's on whole arrays broadcast as a head's (`reference`, `_adapted`)."""
+    name: str
+    parents: tuple[str, ...]
+    kind: graph.Sum | graph.Pointwise
+    layout: str
+    kernel: Callable
+    reference: Callable
+    dtype: Any = jnp.float32
+
+
+def _input_layouts(hooks: Hooks) -> dict[str, str]:
+    """Each operand's layout (`_spec`)."""
+    return {'query': 'key_head', 'key': 'key_head', 'value': 'valued', 'token': 'row', 'held': 'row',
+            'taps': 'taps', 'log_decay': 'keyed' if hooks.decay == 'vector' else 'scalar', 'gate': 'scalar',
+            'beta': 'scalar', 'log_a': 'parameter', 'bias': 'parameter', 'skip': 'parameter', 'z': 'valued',
+            'weight': 'whole', 'state': 'state'}
+
+
+def _window(program: Program, held, token, *, stream: str):
+    """A stream's conv window in the launch, `K` rows `[1, D]` fp32: the held history rounded to the
+    token's dtype, as the layer's conv reads it, then the token."""
+    channels = pl.ds(*program.piece(stream))
+    rows = [held[j, channels][None, :].astype(token.dtype).astype(jnp.float32) for j in range(held.shape[0])]
+    return [*rows, token[channels][None, :].astype(jnp.float32)]
+
+
+def _streamed(x, stream: str, dims: Dims):
+    """A stream's channels of `x` `[..., C]` as `[..., Hv, D]`: its key heads' queries or keys repeated
+    over their value heads, or the values."""
+    if stream == 'value':
+        return x[..., 2 * dims.key_heads * dims.key_width:].reshape(*x.shape[:-1], dims.value_heads,
+                                                                   dims.value_width)
+    first = 0 if stream == 'query' else dims.key_heads * dims.key_width
+    heads = x[..., first:first + dims.key_heads * dims.key_width]
+    return jnp.repeat(heads.reshape(*x.shape[:-1], dims.key_heads, dims.key_width), dims.group, axis=-2)
+
+
+def _window_reference(held, token, *, stream: str, dims: Dims):
+    """A stream's conv window `[rows, Hv, K, D]` in at least fp32, the history rounded to the token's
+    dtype."""
+    window = jnp.concatenate([held.astype(token.dtype), token[:, None]], axis=1)
+    window = window.astype(jnp.promote_types(window.dtype, jnp.float32))
+    return jnp.moveaxis(_streamed(window, stream, dims), 1, 2)
+
+
+def _preactivation(program: Program, window, taps, *, stream: str):
+    """A stream's conv sum in the launch, tap by tap from the oldest token (`short_conv`'s)."""
+    first, width = program.piece(stream)
+    columns = [taps[pl.ds(first, width), j].astype(jnp.float32) for j in range(len(window))]
+    return short_conv._preactivation(window, columns, None)[0]
+
+
+def _preactivation_reference(window, taps, *, stream: str, dims: Dims):
+    """A stream's conv sum `[rows, Hv, D]` over its window's taps."""
+    taps = jnp.moveaxis(_streamed(jnp.swapaxes(taps, 0, 1), stream, dims), 0, 1)
+    return jnp.sum(window * taps[None], axis=-2)
+
+
+def _squares(x):
+    """The sum of `x`'s squares over its last axis, kept."""
+    return jnp.sum(x * x, axis=-1, keepdims=True)
+
+
+def _normed(program: Program, x, squares, *, scale: float | None):
+    """The l2 norm in the launch, its root and quotient each rounded once (`short_conv`'s), then the
+    queries' scale."""
+    root = short_conv._sqrt(squares + L2NORM_EPS, interpret=program.interpret)
+    x = x * short_conv._divide(1.0, root, interpret=program.interpret)
+    return x if scale is None else x * scale
+
+
+def _normed_reference(x, squares, *, scale: float | None):
+    """The l2 norm, then the queries' scale."""
+    x = x * jax.lax.rsqrt(squares + L2NORM_EPS)
+    return x if scale is None else x * scale
+
+
+def _contracted(x, state):
+    """`x` `[..., Dk]` through the state `[..., Dk, Dv]`: `S^T x`."""
+    return jnp.sum(x[..., :, None] * state, axis=-2)
+
+
+def _updated(state, *operands):
+    """The state decayed (where a decay is among `operands`) plus the key's outer product with what
+    the token writes."""
+    *decay, key, written = operands
+    kept = state * decay[0][..., :, None] if decay else state
+    return kept + key[..., :, None] * written[..., None, :]
+
+
+def _gated_rms(out, squares, z, weight, *, norm: OutputNorm):
+    """The epilogue's gated RMS norm from the output's sum of squares: `rms_norm(o) weight act(z)`, the
+    mean a product by the reciprocal, as XLA's."""
+    inverse = jax.lax.rsqrt(squares * (1.0 / out.shape[-1]) + norm.epsilon)
+    return out * inverse * weight * norm_swiglu.activation_and_slope(z, norm.activation)[0]
+
+
+def stages(hooks: Hooks, dims: Dims, *, output, state) -> tuple[Stage, ...]:
+    """The values a decode token rounds and holds, each after its parents: the prologue's conv
+    windows, sums and activations, the l2 norms' sums and quotients, the gates, the decayed queries and
+    keys, the state's readouts, the write, the output and the updated state, the skip and the
+    epilogue's sum and norm, with the output in `output` and the state as `state` holds it. Their names
+    are the graph's (`step_graph`); a cut never falls between a product and the sum it enters."""
+    built = []
+
+    def add(name, parents, kind, layout, reference, kernel=None, dtype=jnp.float32):
+        """A stage, its launch running `kernel` or, where None, `reference`'s arithmetic."""
+        launch = kernel or (lambda program, *values: reference(*values))
+        built.append(Stage(name, tuple(parents), kind, layout, launch, reference, dtype))
+        return name
+
+    pointwise = graph.Pointwise()
+    streams = {stream: stream for stream in STREAMS}
     if hooks.conv is not None:
-        token, held = given['token'], given['held']
-        key_heads = _pieces(hooks, value_heads, key_width, value_width, token.shape[-1])
-        window = jnp.concatenate([held.astype(token.dtype), token[:, None]], axis=1).astype(work)
-        pre = jnp.sum(window * jnp.swapaxes(given['taps'].astype(work), 0, 1)[None], axis=1)
-        convolved = pre if hooks.conv.activation is None else pre * jax.nn.sigmoid(pre)
-        rows = token.shape[0]
-        split = [key_heads * key_width, 2 * key_heads * key_width]
-        query, key, value = jnp.split(convolved, split, axis=-1)
-        query, key = (x.reshape(rows, key_heads, key_width) for x in (query, key))
-        value = value.reshape(rows, value_heads, value_width)
-        history = jnp.concatenate([held[:, 1:], token[:, None].astype(held.dtype)], axis=1)
-    else:
-        query, key, value = (given[name].astype(work) for name in ('query', 'key', 'value'))
+        for stream in STREAMS:
+            layout = 'valued' if stream == 'value' else 'keyed'
+            window = add(f'{stream}_window', ('held', 'token'), pointwise, f'{layout}_window',
+                         functools.partial(_window_reference, stream=stream, dims=dims),
+                         functools.partial(_window, stream=stream))
+            summed = graph.Sum({window: -2, 'taps': -1})
+            streams[stream] = add(f'{stream}_preactivation', (window, 'taps'), summed, layout,
+                                  functools.partial(_preactivation_reference, stream=stream, dims=dims),
+                                  functools.partial(_preactivation, stream=stream))
+            if hooks.conv.activation is not None:
+                streams[stream] = add(
+                    f'{stream}_convolved', (streams[stream],), pointwise, layout,
+                    lambda pre: pre * jax.nn.sigmoid(pre),
+                    lambda program, pre: pre * short_conv._sigmoid(pre, interpret=program.interpret))
     if hooks.l2norm:
-        query, key = (x * jax.lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + L2NORM_EPS)
-                      for x in (query, key))
-        query = query * key_width ** -0.5
-    group = value_heads // query.shape[1]
-    query, key = (jnp.repeat(x, group, axis=1) for x in (query, key))
-    return query, key, value, history
-
-
-def _gates(hooks: Hooks, given: dict, work, key_width: int):
-    """The reference's decay per key dimension `[rows, Hv, Dk]` and write gate `[rows, Hv]`."""
+        for stream in ('query', 'key'):
+            squares = add(f'{stream}_squares', (streams[stream],), graph.Sum({streams[stream]: -1}), 'unit',
+                          _squares)
+            scale = dims.key_width ** -0.5 if stream == 'query' else None
+            streams[stream] = add(f'{stream}_normed', (streams[stream], squares), pointwise, 'keyed',
+                                  functools.partial(_normed_reference, scale=scale),
+                                  functools.partial(_normed, scale=scale))
+    query, key, value = (streams[stream] for stream in STREAMS)
+    decay = None
     if hooks.gates is not None:
-        g = _gated_decay(*(given[name].astype(work) for name in ('gate', 'log_a', 'bias')))
-        beta = jax.nn.sigmoid(given['beta'].astype(work))
+        decay = add('decay', ('gate', 'log_a', 'bias'), pointwise, 'unit',
+                    lambda gate, log_a, bias: jnp.exp(_gated_decay(gate, log_a, bias)))
+        write = add('write', ('beta',), pointwise, 'unit', jax.nn.sigmoid,
+                    lambda program, beta: short_conv._sigmoid(beta, interpret=program.interpret))
     else:
-        g = None if hooks.decay == 'none' else given['log_decay'].astype(work)
-        beta = given['beta'].astype(work) if hooks.delta else None
-    rows, heads = given['state'].shape[:2]
-    if g is None:
-        decay = jnp.ones((rows, heads, key_width), work)
-    else:
-        decay = jnp.exp(g)
-        decay = decay[..., None] if hooks.decay == 'scalar' else decay
-        decay = jnp.broadcast_to(decay, (rows, heads, key_width))
-    write = jnp.ones((rows, heads), work) if beta is None else beta
-    return decay, write
+        if hooks.decay != 'none':
+            decay = add('decay', ('log_decay',), pointwise, 'keyed' if hooks.decay == 'vector' else 'unit',
+                        jnp.exp)
+        write = 'beta'
+    reads = query if decay is None else add('query_decayed', (query, decay), pointwise, 'keyed', jnp.multiply)
+    add('read', (reads, 'state'), graph.Sum({reads: -1, 'state': -2}), 'valued', _contracted)
+    written = value
+    if hooks.delta:
+        predicts = key if decay is None else add('key_decayed', (key, decay), pointwise, 'keyed',
+                                                 jnp.multiply)
+        add('predicted', (predicts, 'state'), graph.Sum({predicts: -1, 'state': -2}), 'valued', _contracted)
+        written = add('written', (value, 'predicted', write), pointwise, 'valued',
+                      lambda value, predicted, write: (value - predicted) * write)
+    add('alignment', (query, key), graph.Sum({query: -1, key: -1}), 'unit',
+        lambda query, key: jnp.sum(query * key, axis=-1, keepdims=True))
+    out = add('out', ('read', 'alignment', written), pointwise, 'valued',
+              lambda read, alignment, written: read + alignment * written)
+    decays = () if decay is None else (decay,)
+    add('updated', ('state', *decays, key, written), pointwise, 'state', _updated)
+    add('next_state', ('updated', key, value), pointwise, 'state',
+        lambda updated, key, value: _held(updated, key, value, state), dtype=state)
+    if hooks.skip:
+        out = add('skipped', (out, 'skip', value), pointwise, 'valued',
+                  lambda out, skip, value: out + skip * value)
+    if hooks.output is not None:
+        add('out_squares', (out,), graph.Sum({out: -1}), 'unit', _squares)
+        out = add('normed', (out, 'out_squares', 'z', 'weight'), pointwise, 'valued',
+                  functools.partial(_gated_rms, norm=hooks.output))
+    add('output', (out,), pointwise, 'valued', lambda out: out.astype(output), dtype=output)
+    return tuple(built)
+
+
+def _layouts(hooks: Hooks, built: tuple[Stage, ...]) -> dict[str, str]:
+    """Every operand's and stage's layout (`_spec`)."""
+    return {**_input_layouts(hooks), **{stage.name: stage.layout for stage in built}}
+
+
+def _adapted(layout: str, x, dims: Dims):
+    """A value as the reference's arithmetic broadcasts a head's: in at least fp32, key heads repeated
+    over their value heads, a head's scalar `[rows, Hv, 1]` and a parameter `[1, Hv, 1]`; the conv's
+    history and token as they are, which its window rounds itself."""
+    x = jnp.asarray(x)
+    if layout == 'row':
+        return x
+    x = x.astype(jnp.promote_types(x.dtype, jnp.float32))
+    if layout == 'key_head':
+        return jnp.repeat(x, dims.group, axis=1)
+    if layout == 'scalar':
+        return x[..., None]
+    if layout == 'parameter':
+        return x[None, :, None]
+    return x
+
+
+def _referenced(built: tuple[Stage, ...], layouts: dict[str, str], dims: Dims, given: dict) -> dict:
+    """Every stage's reference value from the operands `given`, one after another."""
+    values = dict(given)
+    for stage in built:
+        values[stage.name] = stage.reference(*(_adapted(layouts[parent], values[parent], dims)
+                                               for parent in stage.parents))
+    return values
 
 
 def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
-    """`(output [rows, Hv, Dv], history' or None, state')` of a decode token, in XLA: each piece of
-    arithmetic in at least fp32 (float64 operands in float64), the state held as it came (bf16
-    rounded by `round_to_bf16`), the output in `dtype` (the value's or the token's without it)."""
+    """`(output [rows, Hv, Dv], history' or None, state')` of a decode token, in XLA: every stage's
+    reference arithmetic (`stages`) in at least fp32 (float64 operands in float64), the state held as it
+    came (bf16 rounded by `round_to_bf16`), the output in `dtype` (the value's or the token's without
+    it)."""
     given = _read(hooks, operands)
-    state = given['state']
+    dims, state = _dims(hooks, given), given['state']
     operand = given['token' if hooks.conv is not None else 'value'].dtype
-    work = jnp.promote_types(jnp.promote_types(operand, state.dtype), jnp.float32)
-    key_width = state.shape[2]
-    query, key, value, history = _prologue(hooks, given, work)
-    decay, write = _gates(hooks, given, work, key_width)
-    out, updated = update(state.astype(work), query, key, value, decay, write[..., None], delta=hooks.delta)
-    if hooks.skip:
-        out = out + given['skip'].astype(work)[None, :, None] * value
-    if hooks.output is not None:
-        out = gated_rms(out, given['z'].astype(work), given['weight'].astype(work), hooks.output)
-    held = _held(updated, key, value, state.dtype)
+    built = stages(hooks, dims, output=jnp.dtype(operand if dtype is None else dtype), state=state.dtype)
+    values = _referenced(built, _layouts(hooks, built), dims, given)
+    out, held, history = values['output'], values['next_state'], None
+    if hooks.conv is not None:
+        history = jnp.concatenate([given['held'][:, 1:], given['token'][:, None].astype(given['held'].dtype)],
+                                  axis=1)
     if operands.active is not None:
         active = jnp.asarray(operands.active, bool)
         held = jnp.where(active[:, None, None, None], held, state)
-        out = jnp.where(active[:, None, None], out, 0.0)
+        out = jnp.where(active[:, None, None], out, jnp.zeros((), out.dtype))
         if history is not None:
             history = jnp.where(active[:, None, None], history, given['held'])
-    return out.astype(operand if dtype is None else dtype), history, held
+    return out, history, held
 
 
-def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
-    """One row and one value head of a decode token (`step`): the prologue's conv and l2 norm, the
-    gates, the update and the epilogue, each piece of arithmetic `step_reference`'s in fp32, its
-    quotients and roots rounded once (`short_conv`'s). The conv's channels are read where the row holds
-    them, `[K - 1, C]` history and `[C]` token, queries, keys and values in turn; the history the next
-    token reads is written apart, its key head's queries and keys by the head's first value head, so no
-    program reads a history another moved on; an idle row's as it was."""
+def _spec(layout: str, shape: tuple[int, ...], dims: Dims, block: int):
+    """A layout's block over the grid of rows, value heads and `block` value columns: a row's whole
+    block (`row`), a whole array (`taps`, `whole`), the program's key head's `[Dk]` (`key_head`), its
+    value head's `[Dk]` (`keyed`), `[block]` (`valued`) or `[Dk, block]` (`state`), its head's one entry
+    (`scalar` `[rows, Hv]`, `unit` `[rows, Hv, 1]`, `parameter` `[Hv]`), or a window's `[K, Dk]` or `[K,
+    block]` (`keyed_window`, `valued_window`)."""
+    if layout == 'row':
+        return pl.BlockSpec((None, *shape[1:]), lambda r, h, c: (r, *(0,) * (len(shape) - 1)))
+    if layout in ('taps', 'whole'):
+        return pl.BlockSpec(shape, lambda r, h, c: (0,) * len(shape))
+    blocks = {
+        'key_head': ((None, None, dims.key_width), lambda r, h, c: (r, h // dims.group, 0)),
+        'keyed': ((None, None, dims.key_width), lambda r, h, c: (r, h, 0)),
+        'valued': ((None, None, block), lambda r, h, c: (r, h, c)),
+        'state': ((None, None, dims.key_width, block), lambda r, h, c: (r, h, 0, c)),
+        'scalar': ((None, 1), lambda r, h, c: (r, h)),
+        'unit': ((None, None, 1), lambda r, h, c: (r, h, 0)),
+        'parameter': ((1,), lambda r, h, c: (h,)),
+        'keyed_window': ((None, None, dims.taps, dims.key_width), lambda r, h, c: (r, h, 0, 0)),
+        'valued_window': ((None, None, dims.taps, block), lambda r, h, c: (r, h, 0, c)),
+    }
+    return pl.BlockSpec(*blocks[layout])
+
+
+def _shape(layout: str, dims: Dims) -> tuple[int, ...]:
+    """A stage's whole value's shape by its layout."""
+    rows, heads = dims.rows, dims.value_heads
+    return {'keyed': (rows, heads, dims.key_width), 'valued': (rows, heads, dims.value_width),
+            'state': (rows, heads, dims.key_width, dims.value_width), 'unit': (rows, heads, 1),
+            'keyed_window': (rows, heads, dims.taps, dims.key_width),
+            'valued_window': (rows, heads, dims.taps, dims.value_width)}[layout]
+
+
+def _loaded(layout: str, ref):
+    """A program's block as its arithmetic takes it: a ref the conv slices itself (`row`, `taps`), a
+    window's rows `[1, D]`, else the block in fp32."""
+    if layout in ('row', 'taps'):
+        return ref
+    if layout.endswith('_window'):
+        return [ref[pl.ds(j, 1), :].astype(jnp.float32) for j in range(ref.shape[0])]
+    return ref[...].astype(jnp.float32)
+
+
+def _stored(layout: str, ref, value) -> None:
+    """A program's value written to its block, a window a row at a time."""
+    if layout.endswith('_window'):
+        for j, row in enumerate(value):
+            ref[pl.ds(j, 1), :] = row.astype(ref.dtype)
+    else:
+        ref[...] = value.astype(ref.dtype)
+
+
+def _moved(program: Program, moved, windows: dict) -> None:
+    """Each stream's moved history, a row at a time: the values, and the queries and keys where the
+    program is its key head's first, so no program reads a history another moved on."""
+    def store(stream):
+        channels = pl.ds(*program.piece(stream))
+        for j, row in enumerate(windows[stream]):
+            moved[j, channels] = row[0].astype(moved.dtype)
+
+    store('value')
+
+    @pl.when(program.head % program.dims.group == 0)
+    def _():
+        store('query')
+        store('key')
+
+
+def _kernel(*refs, hooks: Hooks, dims: Dims, built: tuple[Stage, ...], layouts: dict[str, str],
+            probes: tuple[str, ...], interpret: bool):
+    """One row and one value head of a decode token (`step`): every stage (`stages`) in turn on the
+    program's blocks, the conv's channels read where the row holds them, `[K - 1, C]` history and `[C]`
+    token, queries, keys and values in turn; the history the next token reads is written apart, its key
+    head's queries and keys by the head's first value head; an idle row's as it was. The stages
+    `probes` names are written out too, each to its own output after the token's."""
     names = _names(hooks)
     inputs = dict(zip(('active', *names), refs[:len(names) + 1], strict=True))
-    outputs = refs[len(names) + 1:]
-    state_out, out_ref = outputs[0], outputs[-1]
-    state_ref = inputs['state']
-    head = pl.program_id(1)
+    state_out, *outputs = refs[len(names) + 1:]
+    moved = outputs.pop(0) if hooks.conv is not None else None
+    out_ref, *written = outputs
+    probed = dict(zip(probes, written, strict=True))
+    program = Program(pl.program_id(1), dims, interpret)
     active = inputs['active'][0] != 0
-    key_width, value_width = state_ref.shape
-
-    def scalar(name):
-        """A head's one entry of a `[1]` block, as a one-entry vector the arithmetic broadcasts."""
-        return inputs[name][...].astype(jnp.float32)
-
-    conv = (_ConvRefs(inputs['token'], inputs['held'], inputs['taps'], outputs[1], key_heads, key_width,
-                      value_width, head, group) if hooks.conv is not None else None)
 
     @pl.when(active)
     def _():
-        windows = conv.windows() if conv is not None else None
-        if hooks.conv is not None and conv is not None and windows is not None:
-            query, key, value = conv.convolved(windows, hooks.conv, interpret)
-        else:
-            query, key, value = (inputs[name][...].astype(jnp.float32) for name in ('query', 'key', 'value'))
-        if hooks.l2norm:
-            query, key = (x[None] for x in (query, key))
-            query = query * short_conv._inverse_norm(query, L2NORM_EPS, interpret=interpret)
-            query = query * key_width ** -0.5
-            key = key * short_conv._inverse_norm(key, L2NORM_EPS, interpret=interpret)
-            query, key = query[0], key[0]
-        if hooks.gates is not None:
-            decay = jnp.exp(_gated_decay(scalar('gate'), scalar('log_a'), scalar('bias')))
-            write_gate = short_conv._sigmoid(scalar('beta'), interpret=interpret)
-        else:
-            decay = (jnp.ones((1,), jnp.float32) if hooks.decay == 'none'
-                     else jnp.exp(inputs['log_decay'][...].astype(jnp.float32)))
-            write_gate = scalar('beta') if hooks.delta else jnp.ones((1,), jnp.float32)
-        decay = jnp.broadcast_to(decay, key.shape)
-        out, updated = update(state_ref[...].astype(jnp.float32), query, key, value, decay, write_gate,
-                              delta=hooks.delta)
-        if hooks.skip:
-            out = out + scalar('skip') * value
-        if hooks.output is not None:
-            gate, weight = (inputs[name][...].astype(jnp.float32) for name in ('z', 'weight'))
-            out = gated_rms(out, gate, weight, hooks.output)
-        state_out[...] = _held(updated, key, value, state_out.dtype)
-        out_ref[...] = out.astype(out_ref.dtype)
-        if conv is not None and windows is not None:
-            conv.write([stream[1:] for stream in windows])
+        values = {name: _loaded(layouts[name], inputs[name]) for name in names}
+        for stage in built:
+            values[stage.name] = stage.kernel(program, *(values[parent] for parent in stage.parents))
+            if stage.name in probed:
+                _stored(stage.layout, probed[stage.name], values[stage.name])
+        state_out[...] = values['next_state']
+        out_ref[...] = values['output']
+        if moved is not None:
+            _moved(program, moved, {stream: values[f'{stream}_window'][1:] for stream in STREAMS})
 
     @pl.when(jnp.logical_not(active))
     def _():
         out_ref[...] = jnp.zeros(out_ref.shape, out_ref.dtype)
-        if conv is not None:
-            conv.write(conv.held())
-
-
-@dataclasses.dataclass(frozen=True)
-class _ConvRefs:
-    """A decode program's view of the prologue's conv: the row's token `[C]` and history `[K - 1, C]`,
-    the taps `[C, K]` and the moved history it writes, its value head's queries, keys and values the
-    channels `pieces` names."""
-    token: Any
-    history: Any
-    taps: Any
-    moved: Any
-    key_heads: int
-    key_width: int
-    value_width: int
-    head: Any
-    group: int
-
-    @property
-    def pieces(self):
-        """Each stream's first channel and width: its key head's queries and keys, its own values."""
-        key_head = self.head // self.group
-        return ((key_head * self.key_width, self.key_width),
-                ((self.key_heads + key_head) * self.key_width, self.key_width),
-                (2 * self.key_heads * self.key_width + self.head * self.value_width, self.value_width))
-
-    def windows(self):
-        """Each stream's conv window, `K` rows `[1, D]` fp32: the held history rounded to the token's
-        dtype, as the layer's conv reads it, then the token."""
-        count = self.taps.shape[-1]
-
-        def window(first, width):
-            channels = pl.ds(first, width)
-            held = [self.history[j, channels][None, :].astype(self.token.dtype).astype(jnp.float32)
-                    for j in range(count - 1)]
-            return [*held, self.token[channels][None, :].astype(jnp.float32)]
-
-        return [window(*piece) for piece in self.pieces]
-
-    def convolved(self, windows, conv: Conv, interpret: bool):
-        """The queries, keys and values `[D]`: each stream's taps over its window, then the activation."""
-        streams = []
-        for stream, (first, width) in zip(windows, self.pieces, strict=True):
-            taps = [self.taps[pl.ds(first, width), j].astype(jnp.float32) for j in range(len(stream))]
-            pre = short_conv._preactivation(stream, taps, None)
-            streams.append(pre if conv.activation is None
-                           else pre * short_conv._sigmoid(pre, interpret=interpret))
-        return tuple(x[0] for x in streams)
-
-    def held(self):
-        """Each stream's history as it was, for an idle row."""
-        count = self.taps.shape[-1]
-        return [[self.history[j, pl.ds(*piece)][None, :] for j in range(count - 1)] for piece in self.pieces]
-
-    def write(self, moved):
-        """Each stream's moved history, a row at a time: the values, and the queries and keys where the
-        program is its key head's first."""
-        def store(piece, rows):
-            for j, row in enumerate(rows):
-                self.moved[j, pl.ds(*piece)] = row[0].astype(self.moved.dtype)
-
-        pieces = self.pieces
-        store(pieces[2], moved[2])
-
-        @pl.when(self.head % self.group == 0)
-        def _():
-            store(pieces[0], moved[0])
-            store(pieces[1], moved[1])
+        if moved is not None:
+            history = inputs['held']
+            _moved(program, moved, {stream: [history[j, pl.ds(*program.piece(stream))][None, :]
+                                             for j in range(dims.taps - 1)] for stream in STREAMS})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -421,69 +590,35 @@ class StepLaunch(tuning.KernelOp):
              log_decay: jax.Array | None, gate: jax.Array | None, beta: jax.Array | None,
              log_a: jax.Array | None, bias: jax.Array | None, skip: jax.Array | None, z: jax.Array | None,
              weight: jax.Array | None, *, hooks: Hooks, dtype: str, interpret: bool, config: Launch,
-             return_residuals: bool = False):
+             probes: tuple[str, ...] = (), return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         arrays = {'state': state, 'query': query, 'key': key, 'value': value, 'token': token, 'held': held,
                   'taps': taps, 'log_decay': log_decay, 'gate': gate, 'beta': beta, 'log_a': log_a,
                   'bias': bias, 'skip': skip, 'z': z, 'weight': weight}
         given = {name: arrays[name] for name in _names(hooks)}
-        rows, value_heads, key_width, value_width = state.shape
-        key_heads = (_pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
-                     if hooks.conv is not None else given['query'].shape[1])
-
+        dims = _dims(hooks, given)
+        built = stages(hooks, dims, output=jnp.dtype(dtype), state=state.dtype)
+        layouts = _layouts(hooks, built)
         # A hook that reads a whole head has only whole-head configs in its space (`_whole`).
-        block = config.block or value_width
-
-        def whole(array):
-            """An array every program reads whole."""
-            return pl.BlockSpec(array.shape, lambda r, h, c: (0,) * array.ndim)
-
-        def per_row(array):
-            """A row's whole block."""
-            return pl.BlockSpec((None, *array.shape[1:]), lambda r, h, c: (r, *(0,) * (array.ndim - 1)))
-
-        def keyed(array):
-            """The program's key head's `[rows, Hk, Dk]` block, `[Dk]`."""
-            group = value_heads // key_heads
-            return pl.BlockSpec((None, None, key_width), lambda r, h, c: (r, h // group, 0))
-
-        def valued(array):
-            """The program's head's and columns' block of a `[rows, Hv, Dv]` array, `[block]`."""
-            return pl.BlockSpec((None, None, block), lambda r, h, c: (r, h, c))
-
-        def one(array, *, rows: bool):
-            """The program's head's one entry, `[1]`."""
-            return (pl.BlockSpec((None, 1), lambda r, h, c: (r, h)) if rows
-                    else pl.BlockSpec((1,), lambda r, h, c: (h,)))
-
-        def keyed_by_value(array):
-            """The program's value head's `[rows, Hv, Dk]` block, `[Dk]`."""
-            return pl.BlockSpec((None, None, key_width), lambda r, h, c: (r, h, 0))
-
-        held_state = pl.BlockSpec((None, None, key_width, block), lambda r, h, c: (r, h, 0, c))
-        specs = {
-            'token': per_row, 'held': per_row, 'taps': whole, 'weight': whole, 'query': keyed, 'key': keyed,
-            'value': valued, 'z': valued, 'state': lambda array: held_state,
-            'gate': functools.partial(one, rows=True), 'beta': functools.partial(one, rows=True),
-            'log_a': functools.partial(one, rows=False), 'bias': functools.partial(one, rows=False),
-            'skip': functools.partial(one, rows=False),
-            'log_decay': keyed_by_value if hooks.decay == 'vector' else functools.partial(one, rows=True),
-        }
+        block = config.block or dims.value_width
         flags = pl.BlockSpec((None, 1), lambda r, h, c: (r, 0))
-        in_specs = [flags, *(specs[name](given[name]) for name in given)]
-        out_specs = [held_state]
+        in_specs = [flags, *(_spec(layouts[name], array.shape, dims, block) for name, array in given.items())]
+        out_specs = [_spec('state', state.shape, dims, block)]
         out_shape = [jax.ShapeDtypeStruct(state.shape, state.dtype)]
         if hooks.conv is not None:
-            out_specs.append(per_row(given['held']))
+            out_specs.append(_spec('row', given['held'].shape, dims, block))
             out_shape.append(jax.ShapeDtypeStruct(given['held'].shape, given['held'].dtype))
-        out_specs.append(valued(None))
-        out_shape.append(jax.ShapeDtypeStruct((rows, value_heads, value_width), jnp.dtype(dtype)))
-        kernel = functools.partial(_kernel, hooks=hooks, group=value_heads // key_heads, key_heads=key_heads,
-                                   interpret=interpret)
+        probed = {stage.name: stage for stage in built if stage.name in probes}
+        for stage in (built[-1], *(probed[name] for name in probes)):
+            shape = _shape(stage.layout, dims)
+            out_specs.append(_spec(stage.layout, shape, dims, block))
+            out_shape.append(jax.ShapeDtypeStruct(shape, stage.dtype))
+        kernel = functools.partial(_kernel, hooks=hooks, dims=dims, built=built, layouts=layouts,
+                                   probes=probes, interpret=interpret)
         return tuple(pl.pallas_call(
-            kernel, grid=(rows, value_heads, value_width // block), in_specs=in_specs, out_specs=out_specs,
-            out_shape=out_shape, input_output_aliases={len(given): 0},
+            kernel, grid=(dims.rows, dims.value_heads, dims.value_width // block), in_specs=in_specs,
+            out_specs=out_specs, out_shape=out_shape, input_output_aliases={len(given): 0},
             compiler_params=plgpu.CompilerParams(num_warps=config.warps),
             interpret=interpret, name="recurrence_step",
         )(active, *given.values())), None
@@ -521,12 +656,10 @@ def fits(hooks: Hooks, state) -> bool:
             and all(width > 0 and width & (width - 1) == 0 for width in (dk, dv)))
 
 
-def step(hooks: Hooks, operands: Step, *, dtype=None):
-    """`(output [rows, Hv, Dv], history' or None, state')` of a decode token in one launch
-    (`StepLaunch`), `step_reference`'s arithmetic: the output in `dtype` (the value's, or the
-    token's with a conv), the history in its dtype, the state as it is held and updated in place
-    where the caller lets it go. A row `active` marks False keeps its history and state, its output
-    zeros."""
+def _launched(hooks: Hooks, operands: Step, dtype, *, config: Launch | None = None,
+              probes: tuple[str, ...] = ()):
+    """`StepLaunch`'s outputs for `operands` (`step`), at `config` where given (else its measured or
+    heuristic one), with the stages `probes` names written out after them."""
     given = _read(hooks, operands)
     rows = given['state'].shape[0]
     flags = (jnp.ones(rows, jnp.int32) if operands.active is None
@@ -538,6 +671,95 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
         given['log_decay'] = given['log_decay'].reshape(rows, -1)
     named = jnp.dtype(operand if dtype is None else dtype).name
     # Positional, None where a hook is off: the tuner keys a launch by its positional arrays.
-    state, *history, out = StepLaunch()(flags, *(given.get(name) for name in OPERANDS), hooks=hooks,
-                                        dtype=named, interpret=not triton_runs())
+    return StepLaunch(config=config)(flags, *(given.get(name) for name in OPERANDS), hooks=hooks, dtype=named,
+                                     interpret=not triton_runs(), probes=probes)
+
+
+def step(hooks: Hooks, operands: Step, *, dtype=None):
+    """`(output [rows, Hv, Dv], history' or None, state')` of a decode token in one launch
+    (`StepLaunch`), its stages' arithmetic (`stages`): the output in `dtype` (the value's, or the
+    token's with a conv), the history in its dtype, the state as it is held and updated in place
+    where the caller lets it go. A row `active` marks False keeps its history and state, its output
+    zeros."""
+    state, *history, out = _launched(hooks, operands, dtype)
     return out, history[0] if history else None, state
+
+
+def step_graph(hooks: Hooks, operands: Step, *, dtype=None, config: Launch | None = None) -> graph.Graph:
+    """The launch as a graph of the values it rounds and holds (`dew.nn.kernels.graph`), over the arrays
+    of `operands` `hooks` read, by name, every row active: each node a stage (`stages`) run as its own
+    launch on the parents it is given, at `config` (the launch's heuristic where None), and the witness
+    the launch itself, every stage's value written out beside its output and state. Its outputs are
+    'output' and 'next_state'."""
+    given = _read(hooks, operands)
+    dims = _dims(hooks, given)
+    operand = given['token' if hooks.conv is not None else 'value'].dtype
+    built = stages(hooks, dims, output=jnp.dtype(operand if dtype is None else dtype),
+                   state=given['state'].dtype)
+    layouts = _layouts(hooks, built)
+    if config is None:
+        config = WARPS if _whole(hooks) else dataclasses.replace(COLUMNS, block=min(COLUMNS.block,
+                                                                                    dims.value_width))
+    interpret = not triton_runs()
+
+    def launched(stage: Stage):
+        """`stage` as its own launch over the token's programs."""
+        from jax.experimental.pallas import triton as plgpu
+
+        block = config.block or dims.value_width
+        shape = _shape(stage.layout, dims)
+
+        def body(*refs):
+            program = Program(pl.program_id(1), dims, interpret)
+            values = [_loaded(layouts[parent], ref)
+                      for parent, ref in zip(stage.parents, refs[:-1], strict=True)]
+            _stored(stage.layout, refs[-1], stage.kernel(program, *values))
+
+        def run(**parents):
+            arrays = [jnp.asarray(parents[parent]) for parent in stage.parents]
+            return pl.pallas_call(
+                body, grid=(dims.rows, dims.value_heads, dims.value_width // block),
+                in_specs=[_spec(layouts[parent], array.shape, dims, block)
+                          for parent, array in zip(stage.parents, arrays, strict=True)],
+                out_specs=_spec(stage.layout, shape, dims, block),
+                out_shape=jax.ShapeDtypeStruct(shape, stage.dtype),
+                compiler_params=plgpu.CompilerParams(num_warps=config.warps), interpret=interpret,
+                name=f"recurrence_{stage.name}")(*arrays)
+        return jax.jit(run)
+
+    probes = tuple(stage.name for stage in built[:-1] if stage.name != 'next_state')
+
+    @jax.jit
+    def fused(**inputs):
+        launched = _launched(hooks, Step(**inputs), dtype, config=config, probes=probes)
+        written = len(launched) - len(probes)
+        probed = dict(zip(probes, launched[written:], strict=True))
+        return {'output': launched[written - 1], 'next_state': launched[0], **probed}
+
+    nodes = tuple(graph.Node(stage.name, stage.parents, stage.kind, launched(stage)) for stage in built)
+    return graph.Graph(tuple(given), nodes, ('output', 'next_state'), fused)
+
+
+def reference_graph(hooks: Hooks, operands: Step, *, dtype=None, float64: bool = False) -> graph.Graph:
+    """`step_graph`'s graph of the XLA reference (`step_reference`): each node a stage's reference
+    arithmetic, run op by op as the witness runs them all, and with `float64` the float64 truth, its
+    output and state held in float64."""
+    given = _read(hooks, operands)
+    dims = _dims(hooks, given)
+    operand = given['token' if hooks.conv is not None else 'value'].dtype
+    held = jnp.float64 if float64 else given['state'].dtype
+    output = jnp.float64 if float64 else operand if dtype is None else dtype
+    built = stages(hooks, dims, output=jnp.dtype(output), state=held)
+    layouts = _layouts(hooks, built)
+
+    def node(stage: Stage):
+        def run(**parents):
+            return stage.reference(*(_adapted(layouts[parent], parents[parent], dims)
+                                     for parent in stage.parents))
+        return graph.Node(stage.name, stage.parents, stage.kind, run)
+
+    def fused(**inputs):
+        values = _referenced(built, layouts, dims, inputs)
+        return {stage.name: values[stage.name] for stage in built}
+
+    return graph.Graph(tuple(given), tuple(node(stage) for stage in built), ('output', 'next_state'), fused)

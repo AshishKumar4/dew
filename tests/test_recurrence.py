@@ -1,14 +1,16 @@
 """The linear recurrence's decode step (`dew.nn.kernels.recurrence.step`): every combination of its
-hooks against its XLA form in float64, at every config of its launch, and the continuation contract a
-decode token keeps (an idle row untouched, a bf16 state rounded as it is held)."""
+hooks against its XLA form in float64, at every config of its launch, held where it rounds (its
+graph, `recurrence.step_graph`), and the continuation contract a decode token keeps (an idle row
+untouched, a bf16 state rounded as it is held)."""
 
+import dataclasses
 import itertools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, widened
+from reference_error import assert_as_exact_as_the_reference, assert_graph_as_exact, widened
 
 from dew.nn.kernels import recurrence, tuning
 
@@ -107,3 +109,57 @@ def test_a_bf16_state_steps_as_its_float64_form(hooks):
     reference = np.asarray(recurrence.step_reference(hooks, given)[2], np.float32)
     assert_as_exact_as_the_reference(np.asarray(state, np.float32), reference, exact, 'the bf16 state')
     np.testing.assert_array_equal(np.asarray(state)[1], np.asarray(given.state)[1])
+
+
+def orbit(hooks: recurrence.Hooks, inputs: dict):
+    """Orders that permute every head's key dimensions alike and its value dimensions alike, exact
+    symmetries of a decode token, each with the map taking its output's value dimensions and its
+    state's both axes back."""
+    def draw(order: int):
+        rng = np.random.default_rng(order)
+        keys = np.arange(KEY_WIDTH) if order == 0 else rng.permutation(KEY_WIDTH)
+        values = np.arange(VALUE_WIDTH) if order == 0 else rng.permutation(VALUE_WIDTH)
+        moved = {name: np.asarray(array) for name, array in inputs.items()}
+
+        def take(name, units, axis):
+            moved[name] = np.take(moved[name], units, axis=axis)
+
+        if hooks.conv is not None:
+            channels = np.concatenate([*(head * KEY_WIDTH + keys for head in range(2 * KEY_HEADS)),
+                                       *(2 * KEY_HEADS * KEY_WIDTH + head * VALUE_WIDTH + values
+                                         for head in range(VALUE_HEADS))])
+            for name, axis in (('token', -1), ('held', -1), ('taps', 0)):
+                take(name, channels, axis)
+        else:
+            for name, units in (('query', keys), ('key', keys), ('value', values)):
+                take(name, units, -1)
+        if hooks.decay == 'vector' and hooks.gates is None:
+            take('log_decay', keys, -1)
+        take('state', keys, 2)
+        take('state', values, 3)
+        if hooks.output is not None:
+            take('z', values, -1)
+            take('weight', values, -1)
+
+        def back(outputs):
+            state = np.take(outputs['next_state'], np.argsort(keys), axis=2)
+            return {'output': np.take(outputs['output'], np.argsort(values), axis=-1),
+                    'next_state': np.take(state, np.argsort(values), axis=3)}
+        return moved, back
+    return draw
+
+
+@pytest.mark.parametrize('hooks', HOOKS, ids=str)
+def test_every_hook_combination_rounds_where_its_reference_does(hooks):
+    """A decode token held where it rounds (bible §7's gate, tests/reference_error.py
+    `assert_graph_as_exact`), at each config of its launch's space: the launch equal to its stages run
+    one by one, bit for bit; each stage on common parents, the XLA reference's and the launch's own,
+    against the reference's stage; and its output and state over orders of the key and value
+    dimensions against the reference's."""
+    given = dataclasses.replace(operands(hooks), active=None)
+    inputs = {name: getattr(given, name) for name in recurrence._names(hooks)}
+    reference = recurrence.reference_graph(hooks, given)
+    truth = recurrence.reference_graph(hooks, given, float64=True)
+    for config in configs(hooks):
+        assert_graph_as_exact(recurrence.step_graph(hooks, given, config=config), reference, truth, inputs,
+                              orbit(hooks, inputs), str(config))
