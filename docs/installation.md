@@ -79,12 +79,14 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 
 ### Process pools across GPUs
 
-JAX 0.11.2 keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links. In a process pool across GPUs that are linked differently, the processes key the same step differently. On the next run some load it from the persistent compilation cache while the others compile it, and that compile then waits forever for every process to join. The fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)) is in no JAX release yet. With the 0.11.2 release, Dew compiles a GPU pool without the persistent cache and prints on every process that it does; the pool trains correctly, but compiles its steps again on every run. To keep the cache, install the patched build of 0.11.2 that `constraints.txt` names:
+JAX 0.11.2 keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links. In a process pool across GPUs that are linked differently, the processes key the same step differently. On the next run some load it from the persistent compilation cache while the others compile it, and that compile then waits forever for every process to join. The fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940), sent as [jax-ml/jax#41776](https://github.com/jax-ml/jax/pull/41776)) is in no JAX release yet. With the 0.11.2 release, Dew compiles a GPU pool without the persistent cache and prints on every process that it does; the pool trains correctly, but compiles its steps again on every run. To keep the cache, install the patched build from Dew's package index, which serves JAX's releases with Dew's fixes on top and nothing else:
 
 ```bash
-uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew" \
-    -c https://raw.githubusercontent.com/AshishKumar4/dew/main/constraints.txt
+uv pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple
+pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple
 ```
+
+Every other package comes from PyPI. `constraints.txt` names the same build for CI and development installs.
 
 A pool of one process, and a TPU or CPU pool, needs nothing more.
 
