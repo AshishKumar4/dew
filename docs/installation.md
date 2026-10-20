@@ -37,6 +37,8 @@ Each command installs that JAX build and the accelerator build of jaxlib 0.11.2 
 | NVIDIA GPU, CUDA 12 | `uv pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` |
 | Google TPU VM | `uv pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` |
 
+Use pip 26.2.2 or newer and uv 0.13.4 or newer: older ones trust the roots of eMudhra's compromised certificate authorities (October 2026). `python -m pip install --upgrade pip` and `uv self update` update them.
+
 Without the index the install stops before it installs anything, at resolving jax, since PyPI has no JAX build Dew accepts. uv says:
 
 ```

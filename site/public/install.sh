@@ -180,9 +180,13 @@ fi
 "$python" -c "import sys; sys.exit(sys.version_info < tuple(map(int, '$python_min'.split('.'))))" || die "$python is Python \
 $("$python" -c 'import sys; print("%d.%d" % sys.version_info[:2])'); Dew needs $python_min or newer, so choose a new .venv or upgrade it"
 
-# pip, for --pip, in an environment uv made without it.
-if [ -n "$use_pip" ] && ! "$python" -m pip --version >/dev/null 2>&1; then
-	"$python" -m ensurepip -q || die "$python has no pip and ensurepip could not add it; rerun without --pip to use uv"
+# pip, for --pip, in an environment uv made without it, and at 26.2.2 or newer: older pips trust the
+# roots of eMudhra's compromised CAs in their own bundle (2026-10-20).
+if [ -n "$use_pip" ]; then
+	if ! "$python" -m pip --version >/dev/null 2>&1; then
+		"$python" -m ensurepip -q || die "$python has no pip and ensurepip could not add it; rerun without --pip to use uv"
+	fi
+	"$python" -m pip install -q --upgrade "pip>=26.2.2" || die "pip could not update itself to 26.2.2; rerun without --pip to use uv"
 fi
 
 # The install, shown and then run.
