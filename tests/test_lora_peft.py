@@ -13,10 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
-from reference_error import (
-    assert_as_exact_as_the_reference,
-    assert_as_exact_over_orders,
-)
+from reference_error import assert_as_exact_as_the_reference, assert_as_exact_over_orders
 from safetensors.numpy import load_file
 
 from dew import lora
@@ -70,8 +67,8 @@ def assert_trains_as_peft(adapter, reference, case: str, tmp_path, masks=None):
     exported = peft_factors(adapter, gradient, tmp_path / "gradient")
     assert sorted(exported) == names and len(names) == 12
     for name in names:
-        assert_as_exact_as_the_reference(exported[name], reference[f"grad/{name}"], reference[f"grad/{name}_f64"],
-                                         f"gradient {name}")
+        assert_as_exact_as_the_reference(exported[name], reference[f"grad/{name}"],
+                                         reference[f"grad/{name}_f64"], f"gradient {name}")
 
     adamw = OPTIMIZER_MAP["adamw"](ADAMW["lr"], *ADAMW["betas"], ADAMW["eps"],
                                    weight_decay=ADAMW["weight_decay"])
@@ -83,7 +80,8 @@ def assert_trains_as_peft(adapter, reference, case: str, tmp_path, masks=None):
     stepped = peft_factors(adapter, moving, tmp_path / "stepped")
     # Each factor's move, from the float32 factors both runs start at: exact in float64.
     for name in names:
-        assert_as_exact_as_the_reference(stepped[name] - start[name], reference[f"stepped/{name}"] - start[name],
+        assert_as_exact_as_the_reference(stepped[name] - start[name],
+                                         reference[f"stepped/{name}"] - start[name],
                                          reference[f"stepped/{name}_f64"] - start[name], f"update {name}")
 
 
