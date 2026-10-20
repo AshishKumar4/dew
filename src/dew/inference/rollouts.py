@@ -685,7 +685,8 @@ class OpenAIRolloutServer(_RequestServer):
             for chunk in _engine_chunks(chunks, openai.APIError):
                 # A chunk's ids may run ahead of its log-probabilities (SGLang slices the two apart),
                 # so each is read whole and they are matched by position.
-                for choice in chunk.to_dict()["choices"]:
+                for entry in chunk.choices:
+                    choice = entry.to_dict()
                     ids, reported = listed_ids(choice), reported_log_probs(choice)
                     if ids is None:
                         raise ValueError("SGLang streamed no sampled token ids; is return_token_ids set?")
@@ -694,7 +695,7 @@ class OpenAIRolloutServer(_RequestServer):
                         ended = None if stopped is None else len(tokens) + stopped
                     tokens.extend(ids)
                     probabilities.extend(() if reported is None else reported[1])
-                    reason = choice.get("finish_reason") or reason
+                    reason = entry.finish_reason or reason
                 if ended is not None and len(probabilities) > ended:
                     break
         if ended is not None:
