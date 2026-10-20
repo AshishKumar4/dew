@@ -17,7 +17,7 @@ import grain.python as pygrain
 
 from dew.data.dataset import Batch
 from dew.data.pipeline import Record, Rejected
-from dew.records import boolean, integer, record
+from dew.records import boolean, integer, record, text
 
 _log = logging.getLogger(__name__)
 
@@ -129,6 +129,11 @@ class _KeepAccepted:
         return False
 
 
+_COUNTER = "dew.corpus_counts"
+"""Where a counting iterator's position keeps its corpus's counts, beside its parent's position:
+a key of Dew's own, which `state_counts` and `rewound` find and no Grain position holds."""
+
+
 class _CountedIterator[Element](pygrain.DatasetIterator[Element]):
     """Checkpoint a corpus counter with its parent, including replay during parent restoration."""
 
@@ -140,12 +145,17 @@ class _CountedIterator[Element](pygrain.DatasetIterator[Element]):
         return next(self._read)
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._read.get_state(), "corpus": self._counts.name, "label": self._counts.label,
-                "counts": self._counts.state()}
+        return {"parent": self._read.get_state(), _COUNTER: self._counted()}
+
+    def _counted(self) -> Mapping[str, object]:
+        return {"corpus": self._counts.name, "label": self._counts.label, "counts": self._counts.state()}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self._read.set_state(record(state["parent"], "counted parent"))
-        self._counts.restore(record(state["counts"], "corpus counts"))
+        self._restore(record(state[_COUNTER], "corpus counter"))
+
+    def _restore(self, counted: Mapping[str, object]) -> None:
+        self._counts.restore(record(counted["counts"], "corpus counts"))
 
     def close(self) -> None:
         self._read.close()
@@ -171,17 +181,14 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         super().__init__(parent, predicate.counts)
         self._predicate = predicate
 
-    def get_state(self) -> Mapping[str, object]:
-        return {
-            **super().get_state(),
-            "consecutive": self._predicate.consecutive,
-            "warned": self._predicate.warned,
-        }
+    def _counted(self) -> Mapping[str, object]:
+        return {**super()._counted(), "consecutive": self._predicate.consecutive,
+                "warned": self._predicate.warned}
 
-    def set_state(self, state: Mapping[str, object]) -> None:
-        super().set_state(state)
-        self._predicate.consecutive = integer(state["consecutive"], "consecutive")
-        self._predicate.warned = boolean(state["warned"], "warned")
+    def _restore(self, counted: Mapping[str, object]) -> None:
+        super()._restore(counted)
+        self._predicate.consecutive = integer(counted["consecutive"], "consecutive")
+        self._predicate.warned = boolean(counted["warned"], "warned")
 
 
 class Accepted(pygrain.IterDataset[Batch]):
@@ -486,14 +493,15 @@ class PrimedMix(pygrain.IterDataset[Batch]):
 
 
 def rewound(start: object, current: object) -> object:
-    """`start`, the position a repeat rewinds its pass to, with the counts `current` holds at each
-    counter's place (its count, run of rejections and warning): a pass read again goes on counting
-    the corpus, where a restored position replaces its counts."""
+    """`start`, the position a repeat rewinds its pass to, with each counter's counts as `current`
+    holds them (`_COUNTER`: its counts, run of rejections and warning): a pass read again goes on
+    counting the corpus, where a restored position replaces its counts. Every other part of a
+    position is the iterator's own and is left as `start` has it."""
     if isinstance(start, Mapping) and isinstance(current, Mapping):
         kept = {key: rewound(value, current[key]) if key in current else value
                 for key, value in start.items()}
-        if "corpus" in start and "counts" in current:
-            kept.update({key: current[key] for key in ("counts", "consecutive", "warned") if key in current})
+        if _COUNTER in start and _COUNTER in current:
+            kept[_COUNTER] = current[_COUNTER]
         return kept
     if isinstance(start, list) and isinstance(current, list) and len(start) == len(current):
         return [rewound(value, now) for value, now in zip(start, current, strict=True)]
@@ -512,10 +520,11 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
     def visit(branch) -> dict[str, CorpusCounts]:
         counted: dict[str, CorpusCounts] = {}
         if isinstance(branch, Mapping):
-            corpus, label, stored = branch.get("corpus"), branch.get("label"), branch.get("counts")
-            if isinstance(corpus, str) and isinstance(label, str) and isinstance(stored, Mapping):
-                counted[corpus] = CorpusCounts(corpus, label)
-                counted[corpus].restore(stored)
+            node = branch.get(_COUNTER)
+            if isinstance(node, Mapping):
+                corpus = text(node["corpus"], "corpus")
+                counted[corpus] = CorpusCounts(corpus, text(node["label"], "label"))
+                counted[corpus].restore(record(node["counts"], "corpus counts"))
             interleaved = branch.get("iterators_in_use_states")
             if isinstance(interleaved, list):
                 # A restored interleave keeps the positions of shards past its cycle as future states.
@@ -526,7 +535,7 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
                         _added(independent, counts)
                 _nested(counted, independent)
             for name, child in branch.items():
-                if name not in ("iterators_in_use_states", "future_states"):
+                if name not in ("iterators_in_use_states", "future_states", _COUNTER):
                     _nested(counted, visit(child))
         elif isinstance(branch, (tuple, list)):
             for child in branch:

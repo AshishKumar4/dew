@@ -557,34 +557,36 @@ def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, re
     would read nothing forever: an indexed pass by its length, a stream's when a pass ends without
     a row and nothing before the repeat drops one (`certain`), so the pass is the source's own
     rows. A pass a step emptied may yield rows next time (a fetch that failed for now), so the
-    repeat reads on, logging its empty passes (`_Passes`)."""
+    repeat reads on, logging its empty passes. Every pass of a stream goes on counting its corpus
+    (`_Passes`)."""
     if isinstance(rows, pygrain.MapDataset):
         if epochs is None and not len(rows):
             raise ValueError(f"a pass of {name} holds no rows, so repeating it reads nothing forever")
         return rows.repeat(epochs, reseed_each_epoch=reseed)
     parent = _as_iter(rows, loading)
-    return gx.RepeatIterDataset(parent if epochs is not None else _Passes(parent, name, certain), epochs)
+    return gx.RepeatIterDataset(_Passes(parent, name, endless=epochs is None, certain=certain), epochs)
 
 
 class _Passes(pygrain.IterDataset):
-    """A stream an endless repeat reads pass after pass: a pass that yields no row is refused where
-    that is certain to repeat (`certain`), and logged at each doubling of a run of them otherwise."""
+    """A stream a repeat reads pass after pass, each going on counting its corpus. Endlessly read
+    (`endless`), a pass that yields no row is refused where that is certain to repeat (`certain`),
+    and logged at each doubling of a run of them otherwise."""
 
-    def __init__(self, parent: pygrain.IterDataset, name: str, certain: bool):
+    def __init__(self, parent: pygrain.IterDataset, name: str, *, endless: bool, certain: bool):
         super().__init__(parent)
-        self._rows, self._name, self._certain = parent, name, certain
+        self._rows, self._name, self._endless, self._certain = parent, name, endless, certain
 
     def __iter__(self) -> pygrain.DatasetIterator:
-        return _PassesIterator(self._rows.__iter__(), self._name, self._certain)
+        return _PassesIterator(self._rows.__iter__(), self._name, self._endless, self._certain)
 
 
 class _PassesIterator(pygrain.DatasetIterator):
     """Its parent's rows and position. The repeat restarts a pass by restoring the parent right
     after one ends, and any other restore lands inside a pass the run already read from."""
 
-    def __init__(self, parent: pygrain.DatasetIterator, name: str, certain: bool):
+    def __init__(self, parent: pygrain.DatasetIterator, name: str, endless: bool, certain: bool):
         super().__init__(parent)
-        self._rows, self._name, self._certain = parent, name, certain
+        self._rows, self._name, self._endless, self._certain = parent, name, endless, certain
         self._yielded = self._ended = False
         self._empty = 0
 
@@ -592,7 +594,7 @@ class _PassesIterator(pygrain.DatasetIterator):
         try:
             value = next(self._rows)
         except StopIteration:
-            if not self._yielded:
+            if not self._yielded and self._endless:
                 if self._certain:
                     raise ValueError(f"a pass of {self._name} yields no rows, so repeating it reads "
                                      "nothing forever") from None
