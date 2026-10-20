@@ -17,6 +17,13 @@ the kernel driver's major gives. docs/installation.md, "Which CUDA build",
 states the rule; site/scripts/gen_install.py generates the standalone install
 script's minima from this table."""
 
+PACKAGE_INDEX = "https://pypi.dewml.dev/simple"
+"""Dew's package index, the one place Dew's JAX build (pyproject.toml's jax
+requirement) is served; every install names it as an extra index beside
+PyPI. `dew tpu setup` and tools/smoke_wheel.py read it here, and
+site/scripts/gen_install.py writes it into constraints.txt, the standalone
+install script and the Colab notebooks' install."""
+
 QUERY = ("nvidia-smi", "--query-gpu=driver_version,compute_cap", "--format=csv,noheader")
 """The question `listed_gpus` reads the answer of."""
 

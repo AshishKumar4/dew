@@ -11,6 +11,7 @@ import pytest
 
 from dew.cli import config as tpu_config, tpu as tpu_cli, tpu_setup
 from dew.cli.launch import remote_script
+from dew.telemetry.builds import PACKAGE_INDEX
 
 #: Stands in for gcloud and rsync. Records every argv, answers from a state file.
 FAKE = '''#!/usr/bin/env python3
@@ -305,9 +306,9 @@ def test_launch_on_several_tpus_joins_them_as_one_multislice_pool(fake):
 def test_a_worker_installs_dew_with_its_tpu_extra_in_one_resolution(tmp_path, source, version):
     """The setup script a worker runs installs Dew once, a release or the synced source, with the tpu
     extra that pins the JAX range and the libtpu release Dew is built against beside the extras asked
-    for: no JAX resolved apart first, which would pick its own TPU runtime and leave it to a second
-    resolve. Run as a worker runs it, with its package manager and privileged commands stand-ins that
-    record being called."""
+    for, and Dew's package index beside PyPI for Dew's JAX build: no JAX resolved apart first, which
+    would pick its own TPU runtime and leave it to a second resolve. Run as a worker runs it, with its
+    package manager and privileged commands stand-ins that record being called."""
     spec, editable = tpu_setup.package_spec(source, "wandb", version)
     script = tpu_setup.render(python_version="3.12", package_spec=spec, editable=editable)
     home, binaries = tmp_path / "home", tmp_path / "bin"
@@ -330,7 +331,7 @@ def test_a_worker_installs_dew_with_its_tpu_extra_in_one_resolution(tmp_path, so
                 if line.startswith("uv pip install")]
     target = f"{home}/dew[tpu,wandb]" if editable else "dewml[tpu,wandb]==1.2.3"
     assert installs == [["pip", "install", "--quiet", "--python", f"{home}/dew-venv/bin/python",
-                         *(["-e"] if editable else []), target]]
+                         "--extra-index-url", PACKAGE_INDEX, *(["-e"] if editable else []), target]]
 
 
 # ----------------------------------------------------------------------- dry run

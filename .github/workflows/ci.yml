@@ -131,8 +131,9 @@ jobs:
     - name: Install the wheel into an empty environment, jax from Dew's package index
       run: |
         python -m venv "$RUNNER_TEMP/clean"
+        index=$(python -c "import runpy; print(runpy.run_path('src/dew/telemetry/builds.py')['PACKAGE_INDEX'])")
         "$RUNNER_TEMP/clean/bin/pip" install --quiet --index-url https://pypi.org/simple \
-          --extra-index-url https://pypi.dewml.dev/simple dist/*.whl
+          --extra-index-url "$index" dist/*.whl
     - name: Run it
       working-directory: ${{ runner.temp }}
       run: |
@@ -157,9 +158,10 @@ jobs:
         EOF
     - name: Resolve the accelerator extras
       run: |
+        index=$(python -c "import runpy; print(runpy.run_path('src/dew/telemetry/builds.py')['PACKAGE_INDEX'])")
         for extras in cuda12,quantization,profile cuda13,quantization,profile tpu,quantization,profile; do
           echo "dewml[$extras] @ file://$(realpath dist/*.whl)" \
-            | uv pip compile - --extra-index-url https://pypi.dewml.dev/simple \
+            | uv pip compile - --extra-index-url "$index" \
               --python-version "$(tr -d '\n' < .python-version)" --python-platform x86_64-manylinux_2_31 --quiet > /dev/null
         done
 
