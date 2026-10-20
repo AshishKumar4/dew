@@ -118,7 +118,7 @@ def test_a_generation_of_documents_counted_by_two_rules_is_packed_as_its_rows_ar
                  .flat_map(Chunks(16, fields=ROLED)))
     cache = Cache(str(tmp_path / "cache"), spool_bytes=4 * 1024**2, shard_bytes=256 * 1024)
     generation = publish(documents, cache, read="indexed", loading=READ)
-    assert generation.source().metadata()["count_rules"] == [(1, None)]
+    assert generation.source().metadata()["count_rules"] == [[1, None]]
     chain = Pipeline(generation.source()).pack(16, fields=ROLED).repeat().batch(2)
     with pytest.raises(ValueError):
         stream = compile(chain, read=read, loading=READ).train(DataPartition())
