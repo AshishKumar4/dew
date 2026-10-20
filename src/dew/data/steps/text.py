@@ -147,12 +147,14 @@ class CountRule:
 
     @classmethod
     def of(cls, element: Batch) -> CountRule | None:
-        """The rule `element`'s targets were counted by, or None where none were."""
-        if "_dew_valid_targets" not in element:
-            return None
+        """The rule `element`'s targets were counted by, or None where it is every target's, as an
+        uncounted row's are (`ValidTargets`): no role and no padding."""
         role, pad_id = (element.get(name) for name in _RULE)
+        if "_dew_valid_targets" not in element or (role is None and pad_id is None):
+            return None
+        # Roles a rule does not read are no part of it.
         return cls(None if role is None else int(role), None if pad_id is None else int(pad_id),
-                   _bound(element)[2])
+                   "" if role is None else _bound(element)[2])
 
     def counted(self, window: Batch, field: str) -> Batch:
         """`window`, made of records counted by this rule from its token `field`, its own targets
@@ -163,7 +165,7 @@ class CountRule:
                 f"drop the roles {self.roles!r}; keep them among the stage's fields")
         rule = {name: value for name, value in zip(_RULE, (self.role, self.pad_id), strict=True)
                 if value is not None}
-        held = {**window, **rule, _BOUND: (field, f"{field}_segment_ids", self.roles)}
+        held = {**window, **rule, _BOUND: (field, f"{field}_segment_ids", self.roles or f"{field}_roles")}
         return {**held, "_dew_valid_targets": _scored(held)}
 
 
