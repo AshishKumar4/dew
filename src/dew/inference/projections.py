@@ -20,6 +20,7 @@ from flax import linen as nn
 from flax.core import unfreeze
 
 from dew.interop.streaming import SourceLeaf
+from dew.nn.kernels.options import QuantizedClass
 from dew.nn.protocols import ProjectionGroup, Serving
 from dew.objectives.base import Variables
 from dew.quantization import QUANTIZATION
@@ -62,22 +63,38 @@ def _concatenates(variables: Variables, group: ProjectionGroup) -> bool:
 def projection_groups(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
     """The groups `model` reads packed (`Serving`) that `variables`
     can serve packed. A model that names none, or is adapted, packs none: an
-    adapter's LoRA branches bind the members' own paths."""
+    adapter's LoRA branches bind the members' own paths. Under a quantization
+    that selects modules by their paths (`Quantization.patterns`), a group packs
+    only where the packed projection is selected as each member is, so a
+    quantized member is not served unquantized, nor the reverse."""
     from dew.lora import AdaptedClass
 
     if isinstance(type(model), AdaptedClass) or not isinstance(model, Serving):
         return ()
+    layer = type(model)
+    spec = layer._dew_quantization if isinstance(layer, QuantizedClass) else None
+
+    def selected_alike(group: ProjectionGroup) -> bool:
+        if spec is None:
+            return True
+        rules = {spec.rule_for((*group.path, name)) for name in (*group.members, group.packed)}
+        return len(rules) == 1
+
     return tuple(group for group in model.inference_projection_groups(variables)
-                 if _concatenates(variables, group))
+                 if _concatenates(variables, group) and selected_alike(group))
 
 
 def pack_projections(variables: Variables, groups: Sequence[ProjectionGroup]) -> Variables:
     """Move the concatenation of constant serving weights out of the decode step.
 
+    A group `variables` already hold packed is left as it is, and `variables`
+    are returned themselves when no group is left to pack.
+
     The members' input quantization becomes the packed product's, which
     quantizes their one input once; members scaled apart are refused, since
     no one scale computes each of them (`projection_groups` leaves such a
     group unpacked, and a reload into a packed layout cannot)."""
+    groups = [group for group in groups if group.packed not in _node(variables, "params", group.path)]
     if not groups:
         return variables
     packed = unfreeze(dict(variables))
@@ -85,8 +102,6 @@ def pack_projections(variables: Variables, groups: Sequence[ProjectionGroup]) ->
         node = packed["params"]
         for part in group.path:
             node = node[part]
-        if group.packed in node:
-            continue
         def joined(field, node=node, projections=group.members):
             leaves = [node[projection][field] for projection in projections]
             if isinstance(leaves[0], SourceLeaf):
