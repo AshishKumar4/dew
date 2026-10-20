@@ -619,4 +619,5 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
     restored = TextToImage.from_run(str(tmp_path / "run"))
     np.testing.assert_array_equal(
         restored(prompts, key=7).host().images,
-        pipeline.bind(restored.variables)(prompts, steps=2, guidance=None, solver=Euler(), key=7).host().images)
+        pipeline.bind(restored.variables)(prompts, steps=2, guidance=None, solver=Euler(),
+                                          key=7).host().images)
