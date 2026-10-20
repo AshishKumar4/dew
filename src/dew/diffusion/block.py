@@ -226,7 +226,7 @@ class BlockProcess:
 
     def generate(self, model: nn.Module, variables: Variables,
                  inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
-                 max_new_tokens: int, *, key: int | jax.Array | None = None,
+                 max_new_tokens: int, *, key: int | jax.Array,
                  n: int = 1, eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration:
         """Runs prefill, refinement and clean-token commits as one device
         computation.
