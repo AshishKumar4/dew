@@ -32,6 +32,7 @@ from dew.nn.protocols import OutputTable
 
 if TYPE_CHECKING:
     from dew.nn.backbones.decoder_block import RematPolicy
+    from dew.nn.kv_cache import KVCache
     from dew.records import JSON
 
 
@@ -211,6 +212,14 @@ class DiffusionGemma(nn.Module):
     @nn.nowrap
     def with_cache_capacity(self, capacity: int) -> Self:
         return self.clone(text=self.text.with_cache_capacity(capacity))
+
+    @property
+    def kv_cache(self) -> KVCache:
+        return self.text.kv_cache
+
+    @nn.nowrap
+    def with_kv_cache(self, layout: KVCache) -> Self:
+        return self.clone(text=self.text.with_kv_cache(layout))
 
     @nn.nowrap
     def projected(self, params, *, updated: bool):
