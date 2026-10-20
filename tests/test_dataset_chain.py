@@ -725,6 +725,20 @@ def test_chunks_cut_long_documents_keeping_every_target():
     assert [piece["text"].tolist() for piece in pieces] == [[0, 1, 2, 3], [3, 4, 5, 6], [6, 7, 8, 9]]
 
 
+def test_a_mix_counts_each_corpus_under_a_name_of_its_own(tmp_path):
+    """Two unnamed stores share a file name and a third is named as one of theirs would be
+    numbered: each corpus keeps its own counts, the two numbered past the name the third holds."""
+    for part in ("first", "second"):
+        (tmp_path / part).mkdir()
+        (tmp_path / part / "train.jsonl").write_text("".join(f'{{"id": {index}}}\n' for index in range(8)))
+    corpora = [Files(str(tmp_path / part / "train.jsonl")) for part in ("first", "second")]
+    named = Memory([{"id": index} for index in range(8)]).named("train-1")
+    counts = mix([*corpora, named]).stats(records=6)
+    assert {name for name in counts if name.startswith("data/rows/")} == {
+        "data/rows/train-1", "data/rows/train-2", "data/rows/train-3"}
+    assert sum(counts[f"data/rows/train-{place}"] for place in (1, 2, 3)) == 6
+
+
 def test_a_character_filter_and_caption_dropout_keep_and_empty_their_records():
     """text.MinChars keeps the texts of at least its count of characters, and text.Dropped empties
     a kept record's caption by the record's own draw: none at p=0, every one at p=1, and at any p

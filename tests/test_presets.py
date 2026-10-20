@@ -116,9 +116,8 @@ def test_lm_packs_documents_into_rows_that_keep_every_target():
 @pytest.mark.parametrize("read", ["memory", "streamed"])
 def test_a_run_logs_its_corpus_counts_under_its_name_and_in_one_unit(tmp_path, read):
     """The landing page's run: passages of tiny Shakespeare, some held out, packed into rows. Its
-    data metrics name the corpus by its file, never by its identity; the records it attempted and
-    accepted are counted in one unit, as integers, and the rows it delivered apart, each passage
-    making several."""
+    data metrics name the corpus by its file, never by its identity, and count in one unit each,
+    as integers: the rows it delivered, and its drops by reason."""
     passages = [{"text": f"{index}: " + "to be, or not to be, that is the question. " * 6}
                 for index in range(48)]
     corpus = tmp_path / "tiny-shakespeare.jsonl"
@@ -131,10 +130,9 @@ def test_a_run_logs_its_corpus_counts_under_its_name_and_in_one_unit(tmp_path, r
     data = {name: value for _, scalars in logged.scalars for name, value in scalars.items()
             if name.startswith("data/")}
     assert {name.split("/")[2] for name in data} == {"tiny-shakespeare"}
-    attempted, accepted, rows = (data[f"data/{kind}/tiny-shakespeare"]
-                                 for kind in ("attempted", "accepted", "rows"))
-    assert all(isinstance(count, int) for count in (attempted, accepted, rows))
-    assert 0 < accepted <= attempted < rows
+    counts = [value for name, value in data.items() if name.startswith(("data/rows/", "data/rejected/"))]
+    assert all(isinstance(count, int) for count in counts)
+    assert data["data/rows/tiny-shakespeare"] >= 3 * 8
 
 
 def test_sft_renders_conversations_and_trains_on_the_assistant_turns():
@@ -197,7 +195,7 @@ def test_sft_token_mixture_weighs_final_assistant_targets_and_resumes(weights, e
         reader.close()
     assert [delivered[marker] / sum(delivered.values()) for marker in (1, 2)] == pytest.approx(weights,
                                                                                           abs=0.01)
-    assert data.counts["sft-1"].rows == 64 - empty_rows
+    assert data.counts["sft-1"].accepted == 64 - empty_rows
     assert data.counts["sft-1"].rejected["zero_targets"] == empty_rows
     resumed = compile(train.batch(8), objective=policy, read="memory",
                       loading=Loading(workers=0)).train(DataPartition())

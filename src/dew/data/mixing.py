@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import logging
 import math
 import threading
@@ -24,31 +25,27 @@ _log = logging.getLogger(__name__)
 @dataclasses.dataclass
 class CorpusCounts:
     """What one corpus's read counted, under its identity (`name`, which plans and saved positions
-    key it by) and the short name its metrics go by (`label`). `attempted` and `accepted` count its
-    records, as the steps before its first expansion or layout read and keep them (`records` says a
-    count of records was taken); `rows` counts the rows it delivered, the pieces or windows a step
-    made of its records included. A rejection counts what the step that drops it reads: a record,
-    or a piece or window after an expansion or layout."""
+    key it by) and the short name its metrics go by (`label`). `accepted` counts the rows it
+    delivered and `truncated` those of them cut short; a rejection counts what the step that drops
+    it reads, a record or a piece or window a step made of one. `attempted` counts what its last
+    filter read, for its own warning; it describes no one unit of the corpus, so no metric shows it."""
 
     name: str
     label: str
     attempted: int = 0
     accepted: int = 0
-    rows: int = 0
-    records: bool = False
     truncated: int = 0
     chunks: int = 0
     chunk_records: int = 0
     rejected: Counter[str] = dataclasses.field(default_factory=Counter)
 
     def metrics(self, label: str) -> dict[str, float]:
-        """The metrics a run logs of this corpus under `label`: integer counts, the truncated share of
-        the rows and the chunks per chunked record."""
-        counts = {"attempted": self.attempted, "accepted": self.accepted} if self.records else {}
+        """The metrics a run logs of this corpus under `label`, each exact in one unit: the rows it
+        delivered and its rejections by reason as integers, the share of those rows cut short and
+        the chunks per chunked record."""
         return {
-            **{f"data/{kind}/{label}": count for kind, count in counts.items()},
-            f"data/rows/{label}": self.rows,
-            f"data/truncated/{label}": self.truncated / max(1, self.rows),
+            f"data/rows/{label}": self.accepted,
+            f"data/truncated/{label}": self.truncated / max(1, self.accepted),
             f"data/chunks_per_record/{label}": self.chunks / max(1, self.chunk_records),
             **{f"data/rejected/{label}/{reason}": count for reason, count in self.rejected.items()},
         }
@@ -57,7 +54,6 @@ class CorpusCounts:
         return {
             "attempted": self.attempted,
             "accepted": self.accepted,
-            "records": self.records,
             "truncated": self.truncated,
             "chunks": self.chunks,
             "chunk_records": self.chunk_records,
@@ -67,7 +63,6 @@ class CorpusCounts:
     def restore(self, state: Mapping[str, object]) -> None:
         self.attempted = integer(state["attempted"], "attempted")
         self.accepted = integer(state["accepted"], "accepted")
-        self.records = boolean(state["records"], "records")
         self.truncated = integer(state["truncated"], "truncated")
         self.chunks = integer(state["chunks"], "chunks")
         self.chunk_records = integer(state["chunk_records"], "chunk_records")
@@ -79,7 +74,6 @@ class CorpusCounts:
         """Each of these counts or `other`'s, whichever is larger: one corpus counted twice."""
         return dataclasses.replace(
             self, attempted=max(self.attempted, other.attempted), accepted=max(self.accepted, other.accepted),
-            rows=max(self.rows, other.rows), records=self.records or other.records,
             truncated=max(self.truncated, other.truncated), chunks=max(self.chunks, other.chunks),
             chunk_records=max(self.chunk_records, other.chunk_records),
             rejected=self.rejected | other.rejected)
@@ -193,26 +187,6 @@ class Chunked(pygrain.IterDataset[Record]):
         return _CountedIterator(iter(gx.FlatMapIterDataset(self._records, self._expand(counts))), counts)
 
 
-class Counted(pygrain.IterDataset[Batch]):
-    """A corpus's records counted as they reach the first step that makes other rows of them (an
-    expansion or a layout), where no filter before it counts them (`CorpusCounts.records`)."""
-
-    def __init__(self, parent: pygrain.IterDataset[Batch], name: str, label: str):
-        super().__init__(parent)
-        self._records, self._name, self._label = parent, name, label
-
-    def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        return _TalliedIterator(iter(self._records), CorpusCounts(self._name, self._label, records=True))
-
-
-class _TalliedIterator(_CountedIterator[Batch]):
-    def __next__(self) -> Batch:
-        value = next(self._read)
-        self._counts.attempted += 1
-        self._counts.accepted += 1
-        return value
-
-
 class _AcceptedIterator(_CountedIterator[Batch]):
     _read: pygrain.DatasetIterator[Batch]
 
@@ -234,8 +208,7 @@ class _AcceptedIterator(_CountedIterator[Batch]):
 
 
 class Accepted(pygrain.IterDataset[Batch]):
-    """Grain's filter, with a named search budget and checkpointed counts, which count the corpus's
-    records where it reads them (`records`: no expansion or layout comes before it)."""
+    """Grain's filter, with a named search budget and checkpointed counts."""
 
     def __init__(
         self,
@@ -243,16 +216,15 @@ class Accepted(pygrain.IterDataset[Batch]):
         name: str,
         label: str,
         *,
-        records: bool,
         budget: SearchBudget = _DEFAULT_BUDGET,
         tokens: Callable[[Batch], int] | None = None,
     ):
         super().__init__(parent)
-        self._records, self._name, self._label, self._on_records = parent, name, label, records
+        self._records, self._name, self._label = parent, name, label
         self._budget, self._tokens = budget, tokens
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        counts = CorpusCounts(self._name, self._label, records=self._on_records)
+        counts = CorpusCounts(self._name, self._label)
         predicate = _KeepAccepted(counts, self._budget, self._tokens)
         return _AcceptedIterator(iter(self._records.filter(predicate)), predicate)
 
@@ -382,7 +354,7 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
         if any(not math.isfinite(weight) or weight <= 0 for weight in weights):
             raise ValueError("token deficit weights must be finite and positive")
         filtered = tuple(
-            Accepted(parent, name, label, records=False, budget=budget, tokens=tokens)
+            Accepted(parent, name, label, budget=budget, tokens=tokens)
             for parent, name, label in zip(parents, names, labels, strict=True)
         )
         super().__init__(filtered)
@@ -542,9 +514,8 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
     """Read per-corpus counters through Grain's nested iterator checkpoints.
 
     Within one iterator a corpus's counters are its stages': the outermost
-    counts the rows it delivered, the deepest stage that reads records the
-    records attempted and the outermost such stage those accepted, and each
-    its own rejections. The iterators Grain interleaves, its worker processes or a
+    counts the rows it delivered and those of them cut short, and each its
+    own rejections. The iterators Grain interleaves, its worker processes or a
     corpus's shards, each read records of their own, so their counts add,
     a shard waiting past the cycle (a future state) included."""
 
@@ -555,8 +526,6 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
             if isinstance(corpus, str) and isinstance(label, str) and isinstance(stored, Mapping):
                 counted[corpus] = CorpusCounts(corpus, label)
                 counted[corpus].restore(stored)
-                # A stage's own count: what it kept is what it delivered.
-                counted[corpus].rows = counted[corpus].accepted
             interleaved = branch.get("iterators_in_use_states")
             if isinstance(interleaved, list):
                 # A restored interleave keeps the positions of shards past its cycle as future states.
@@ -578,31 +547,31 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
 
 
 def data_metrics(counts: Iterable[CorpusCounts]) -> dict[str, float]:
-    """The metrics a run logs of its corpora (`CorpusCounts.metrics`), each under its label, which
-    corpora sharing one tell apart by a number in the order of their identities."""
-    named: dict[str, list[CorpusCounts]] = {}
-    for counted in sorted(counts, key=lambda counted: counted.name):
-        named.setdefault(counted.label, []).append(counted)
-    return {key: value for label, corpora in named.items() for place, counted in enumerate(corpora)
-            for key, value in counted.metrics(label if len(corpora) == 1 else f"{label}-{place + 1}").items()}
+    """The metrics a run logs of its corpora (`CorpusCounts.metrics`), each under its label; corpora
+    that share one are numbered in the order of their identities, past every label a corpus has."""
+    corpora = sorted(counts, key=lambda counted: counted.name)
+    shared = Counter(counted.label for counted in corpora)
+    taken = set(shared)
+    metrics: dict[str, float] = {}
+    for counted in corpora:
+        label = counted.label
+        if shared[label] > 1:
+            label = next(numbered for place in itertools.count(1)
+                         if (numbered := f"{label}-{place}") not in taken)
+            taken.add(label)
+        metrics.update(counted.metrics(label))
+    return metrics
 
 
 def _nested(counted: dict[str, CorpusCounts], inner: Mapping[str, CorpusCounts]) -> None:
     """Fold the counters of a corpus's inner stages into its outer ones', in one iterator: the
-    outermost delivered the rows; of the stages that read records, the deepest attempted them all
-    and the outermost kept the fewest."""
+    outermost delivered the rows and counted those cut short."""
     for corpus, counts in inner.items():
         if corpus not in counted:
             counted[corpus] = counts
             continue
         combined = counted[corpus]
-        if counts.records and combined.records:
-            combined.attempted = max(combined.attempted, counts.attempted)
-            combined.accepted = min(combined.accepted, counts.accepted)
-        elif counts.records:
-            # An outer stage that reads rows a step made counts no records.
-            combined.attempted, combined.accepted, combined.records = counts.attempted, counts.accepted, True
-        combined.truncated = max(combined.truncated, counts.truncated)
+        combined.attempted = max(combined.attempted, counts.attempted)
         combined.chunks = max(combined.chunks, counts.chunks)
         combined.chunk_records = max(combined.chunk_records, counts.chunk_records)
         combined.rejected.update(counts.rejected)
@@ -615,8 +584,6 @@ def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
     combined = counted[counts.name]
     combined.attempted += counts.attempted
     combined.accepted += counts.accepted
-    combined.rows += counts.rows
-    combined.records = combined.records or counts.records
     combined.truncated += counts.truncated
     combined.chunks += counts.chunks
     combined.chunk_records += counts.chunk_records
