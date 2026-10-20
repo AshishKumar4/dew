@@ -274,16 +274,26 @@ def straggling(directory, watched, identity, sample):
     # Held open for reading and writing, so the pipe keeps a release written before the sandbox
     # opens it.
     held = os.open(gate, os.O_RDWR)
+    ended = threading.Event()
 
     def release():
-        watched.wait(lambda: sample in watched.cancelled)
-        os.write(held, b"\n")
+        watched.wait(lambda: sample in watched.cancelled or ended.is_set())
+        if not ended.is_set():
+            os.write(held, b"\n")
 
-    threading.Thread(target=release, daemon=True).start()
+    releaser = threading.Thread(target=release, daemon=True)
     try:
+        releaser.start()
         with sandbox("wait", os.devnull, str(gate), wall_seconds=ESCAPE_SECONDS)(identity) as waiting:
             yield waiting
     finally:
+        # The releaser is done with the pipe before it closes: the sandbox may have ended at its
+        # wall clock, or failed to start, before the scheduler cancelled it.
+        with watched.changed:
+            ended.set()
+            watched.changed.notify_all()
+        if releaser.ident is not None:
+            releaser.join()
         os.close(held)
 
 
