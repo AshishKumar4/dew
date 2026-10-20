@@ -27,6 +27,7 @@ from dew.data.analysis import (
     _at,
     _cache_manifest,
     _capabilities,
+    _configured,
     _cut,
     _identity,
     _leaves,
@@ -38,6 +39,7 @@ from dew.data.analysis import (
     _preferred_read,
     _promoted,
     _Ran,
+    _stated,
     _steps,
     _until,
     _written,
@@ -62,7 +64,6 @@ from dew.data.pipeline import (
     Artifact,
     Batched,
     BatchStage,
-    Bound,
     Configured,
     Dataset,
     DeviceStep,
@@ -88,7 +89,6 @@ from dew.data.pipeline import (
     Shuffle,
     SingleReader,
     Slice,
-    Stage,
     TokenBudget,
     TokenGeometry,
     Volatile,
@@ -200,9 +200,9 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
         if isinstance(source, _Facts):
             return source
         source = _consumed(source, read)
-        # A source may measure a fact as it reads (a prompt's reward bound), so the facts follow the read.
-        held = _PinnedRead(source.records(read)) if read == "memory" else None
-        return _Facts(source, read, source.fingerprint(), source.metadata(), held)
+        records, metadata = _stated(source, read)
+        held = None if records is None else _PinnedRead(records)
+        return _Facts(source, read, source.fingerprint(), metadata, held)
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
         pinned = dict(zip(sources, readers.map(pin, sources.values()), strict=True))
@@ -234,46 +234,6 @@ def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
                         "mixed corpora must share the tokenizer contract"
                     )
                 declared[key] = value
-
-
-def _configured(
-    pipeline: Pipeline,
-    shared: Mapping[str, object],
-    read: Read,
-    scope: Literal["source", "run"] | None = None,
-) -> Pipeline:
-    source = pipeline.source
-    if isinstance(source, (Mixture, Phases)):
-        children = tuple(_configured(child, shared, read, scope) for child in source.pipelines)
-        source = dataclasses.replace(source, pipelines=children)
-        local = shared
-    else:
-        local = source.metadata()
-    stages: list[Stage] = []
-    for stage in pipeline.stages:
-        if not isinstance(stage, Configured) or (scope is not None and stage.scope != scope):
-            stages.append(stage)
-            continue
-        metadata = shared if stage.scope == "run" else local
-        missing = sorted(set(stage.needs) - metadata.keys())
-        if missing:
-            raise ValueError(
-                f"{_name(pipeline)} step {_identity(stage).name} needs metadata {missing}; "
-                "provide producer metadata, recipe fields or read='memory'"
-            )
-        binding = Bound(stage, {key: metadata[key] for key in stage.needs})
-        resolved = stage.factory(metadata)
-        if isinstance(resolved, pygrain.RandomMapTransform) != stage.random:
-            raise ValueError(
-                f"Configured {_identity(stage).name} random={stage.random} disagrees with its step"
-            )
-        if isinstance(resolved, Expansion):
-            stages.append(FlatMap(resolved, configured=binding))
-        elif isinstance(resolved, pygrain.RandomMapTransform):
-            stages.append(RandomMap(resolved, rejects=_declares_rejects(resolved), configured=binding))
-        else:
-            stages.append(Map(resolved, rejects=_declares_rejects(resolved), configured=binding))
-    return dataclasses.replace(pipeline, source=source, stages=tuple(stages))
 
 
 def _row_tokens(pipeline: Pipeline) -> int | None:
@@ -1147,8 +1107,12 @@ def publish(
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
 ):
-    """Fill and seal a deterministic prefix, then publish its certified generation."""
+    """Fill and seal a deterministic prefix, then publish its certified
+    generation, unless one is already published under its key (with the plan
+    of a terminal pack), which it returns."""
     from dew.data.cache import Cache
+    from dew.data.generation import Generation
+    from dew.data.packing import PackingPlan, plan_name
 
     if not isinstance(cache, Cache):
         raise TypeError("publish needs a Cache destination")
@@ -1157,8 +1121,6 @@ def publish(
     planned = _at(pipeline.stages, Pack)
     builder = None
     if planned is not None:
-        from dew.data.packing import PackingPlan
-
         packing = pipeline.stages[planned]
         if not isinstance(packing, Pack) or planned != len(pipeline.stages) - 1:
             raise ValueError("publication accepts one terminal packing stage after the cached prefix")
@@ -1168,12 +1130,23 @@ def publish(
     source = pipeline.source
     if isinstance(source, (Mixture, Phases)):
         raise ValueError("configured publication needs one physical source")
-    cached = pipeline.cache(cache)
     manifest = _cache_manifest(source, pipeline.stages, read)
-    iterator = iter(iterate(cached, read=read, loading=loading))
+
+    def published() -> Generation | None:
+        generation = cache.generation(manifest)
+        held = generation is not None and (
+            builder is None or plan_name(builder.pack, "accepted") in generation.manifest["plan"])
+        return generation if held else None
+
+    found = published()
+    if found is not None:
+        return found
+    iterator = iter(iterate(pipeline.cache(cache), read=read, loading=loading))
     try:
         for _ in iterator:
             pass
     finally:
         iterator.close()
-    return cache.publish(manifest, source, plan=builder)
+    # A fill one reader completed publishes itself (`Cache.mapped`).
+    found = published()
+    return cache.publish(manifest, source, plan=builder) if found is None else found

@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import numpy as np
 import pytest
+import tensorflow_datasets as tfds
 from fsspec.implementations.local import LocalFileSystem
 
 from dew.config.data import HoldOut, ImageData, loader
@@ -21,8 +22,6 @@ from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.image_codec import decode_image
 from dew.data.storage import Store
-
-tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
 

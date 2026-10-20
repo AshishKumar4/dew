@@ -29,6 +29,7 @@ from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training.memory import climb_to
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -738,6 +739,59 @@ def head_scored(vocab: int, **options):
     return model, jax.random.randint(jax.random.key(1), (2, 9), 0, vocab)
 
 
+def test_a_head_that_is_no_matrix_is_never_fused():
+    """A head past a nonlinear transform is no one matrix (`chunked.head_table`), so a training step
+    tiles it unfused, its program says so once traced, and the fit ladder has no rung to unfuse."""
+    vocab = 61
+    model, tokens = head_scored(vocab, head_transform="gelu")
+    objective = LMObjective(model, 8, ema_decay=None, pad_id=0, head_tile=(4, 16))
+    params = objective.init(jax.random.key(0))
+    step = Step(jnp.asarray(0), jax.random.key(1), None, training=True)
+    jax.make_jaxpr(lambda params: objective.scalar_loss(params, {TEXT_KEY: tokens}, step)[0])(params)
+    assert not objective.program_key()[0].head_fused
+    assert objective.unfuse_head() is None
+
+
+def test_a_head_put_back_unfused_stays_so_whatever_decoder_was_traced_before():
+    """A record's unfused rung, put back (`climb_to`) on a decoder the objective has not traced,
+    holds once the decoder's head turns out to be one matrix: a head whose transform was traced, then
+    the decoder replaced by one with a matrix head, as a run's substitution does."""
+    vocab = 61
+    model, tokens = head_scored(vocab, head_transform="gelu")
+    objective = LMObjective(model, 8, ema_decay=None, pad_id=0, head_tile=(4, 16))
+    step = Step(jnp.asarray(0), jax.random.key(1), None, training=True)
+
+    def trace():
+        params = objective.init(jax.random.key(0))
+        jax.make_jaxpr(lambda params: objective.scalar_loss(params, {TEXT_KEY: tokens}, step)[0])(params)
+
+    trace()
+    objective.substitute([model.clone(head_transform=None)])
+    climb_to(objective, {"head_tile": [4, 16], "head_fused": False, "remat": None})
+    trace()
+    assert not objective.program_key()[0].head_fused and objective.unfuse_head() is None
+
+
+def test_a_decoder_put_back_keeps_what_its_trace_found_of_its_head():
+    """Each decoder a loss traced keeps what that trace found of its head, so a decoder put back
+    after another was traced, as a half-rung probe that missed puts its decoder back, is still no
+    fused head where its head is no matrix."""
+    vocab = 61
+    model, tokens = head_scored(vocab, head_transform="gelu")
+    objective = LMObjective(model, 8, ema_decay=None, pad_id=0, head_tile=(4, 16))
+    step = Step(jnp.asarray(0), jax.random.key(1), None, training=True)
+    params = objective.init(jax.random.key(0))
+
+    def trace():
+        jax.make_jaxpr(lambda params: objective.scalar_loss(params, {TEXT_KEY: tokens}, step)[0])(params)
+
+    trace()
+    objective.substitute([model.clone(remat="full")])
+    trace()
+    objective.substitute([model])
+    assert not objective.program_key()[0].head_fused and objective.unfuse_head() is None
+
+
 def test_a_prediction_applies_the_head_once_and_scores_the_logits_it_returns():
     """A teacher's or a student's prediction (`LMObjective.predict`) holds the
     whole logits, and scores its losses from them: its forward contracts the
@@ -775,17 +829,20 @@ def test_a_prediction_applies_the_head_once_and_scores_the_logits_it_returns():
 def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_matches_the_tiled_head(
         tile_tokens):
     """A training step whose head is tiled takes the head's gradient in the
-    forward (`fused_head_loss`), a tile's tokens a chunk: beside blocks
-    recomputed in the backward, the step contracts the whole vocabulary
-    three times, the logits, the states' gradient and the head's, none again,
-    and its loss and gradients are the per-token tiled head's, z-loss and
-    padding included. A tile that holds all 16 tokens would make one chunk
-    holding every logit, so the step keeps the tiled head, contracting the
-    vocabulary as it does without a z-loss, which never fuses."""
+    forward (`fused_head_loss`), a tile's tokens a chunk, all 16 in one where
+    the tile holds them: beside blocks recomputed in the backward, the step
+    contracts the whole vocabulary three times, the logits, the states'
+    gradient and the head's, none again, and its loss and gradients are the
+    per-token tiled head's, z-loss and padding included. Unfused
+    (`unfuse_head`, the fit ladder's rung for a fused chunk that does not
+    fit), the step takes the tiled head's gradient in its backward, a tile
+    of the vocabulary at a time, to the same loss and gradients."""
     vocab = 61
     model, tokens = head_scored(vocab, remat="full")
     tokens = tokens.at[1, 6:].set(0)
     fused = LMObjective(model, 8, ema_decay=None, z_loss=1e-3, pad_id=0, head_tile=(tile_tokens, 16))
+    unfused = LMObjective(model, 8, ema_decay=None, z_loss=1e-3, pad_id=0, head_tile=(tile_tokens, 16))
+    assert unfused.unfuse_head() is not None and unfused.unfuse_head() is None
     params = fused.init(jax.random.key(0))
 
     def loss(objective, *, training):
@@ -800,13 +857,12 @@ def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_ma
         program = jax.make_jaxpr(jax.grad(loss(objective, training=True)))(params)
         return vocabulary_products(program.jaxpr, vocab)
 
-    if tile_tokens == 4:
-        assert step_products(fused) == 3
-    else:
-        tiled = LMObjective(model, 8, ema_decay=None, pad_id=0, head_tile=(tile_tokens, 16))
-        assert step_products(fused) == step_products(tiled) != 3
+    assert step_products(fused) == 3
+    # The tiled head contracts the vocabulary a tile of its columns at a time, so no product spans it.
+    assert step_products(unfused) == 0
     with jax.default_matmul_precision("highest"):
-        mine = jax.value_and_grad(loss(fused, training=True))(params)
         theirs = jax.value_and_grad(loss(fused, training=False))(params)
-    for left, right in zip(jax.tree.leaves(mine), jax.tree.leaves(theirs), strict=True):
-        np.testing.assert_allclose(left, right, rtol=2e-5, atol=2e-6)
+        for objective in (fused, unfused):
+            mine = jax.value_and_grad(loss(objective, training=True))(params)
+            for left, right in zip(jax.tree.leaves(mine), jax.tree.leaves(theirs), strict=True):
+                np.testing.assert_allclose(left, right, rtol=2e-5, atol=2e-6)

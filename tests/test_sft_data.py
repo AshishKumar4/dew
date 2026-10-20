@@ -143,12 +143,19 @@ def test_overlong_conversations_chunk_with_roles_aligned(tmp_path, tokenizer):
     assert data.val is not None
     batches = list(data.val(DataPartition()))
     assert len(batches) == chunks
-    def joined(field):
-        pieces = [batch[field][0] for batch in batches]
-        return np.concatenate([pieces[0], *(piece[1:] for piece in pieces[1:])])[:len(ids)]
-
-    np.testing.assert_array_equal(joined("text"), ids)
-    np.testing.assert_array_equal(joined(ROLES_KEY), roles)
+    # Chunk k holds the render from k * (window - 1), its first id and role the last of chunk k - 1,
+    # then padding: 0 under segment 0.
+    for index, batch in enumerate(batches):
+        start = index * (window - 1)
+        size = min(window, len(ids) - start)
+        for field, rendered in (("text", ids), (ROLES_KEY, roles)):
+            expected = np.zeros(window, batch[field].dtype)
+            expected[:size] = rendered[start:start + size]
+            np.testing.assert_array_equal(batch[field][0], expected)
+        np.testing.assert_array_equal(batch["text_coordinates"].segments[0],
+                                      [1] * size + [0] * (window - size))
+        np.testing.assert_array_equal(batch["text_coordinates"].positions[0],
+                                      list(range(size)) + [0] * (window - size))
 
 
 @pytest.mark.slow
