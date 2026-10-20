@@ -37,7 +37,7 @@ from tuned import each_config
 
 from dew.nn import kernels
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.kernels import fla_gdn, fla_kda, tuning
+from dew.nn.kernels import chunked_launch, fla_kda, tuning
 from dew.nn.linear import fla_rule, l2norm
 from dew.training._lowering import triton_calls
 
@@ -171,7 +171,7 @@ def test_the_port_is_as_exact_as_fla(case, dtype):
         assert_as_exact_as_the_reference(dew, fla, value, f"{case}/{name}", terms=summed)
 
 
-LAUNCHES = sorted({type(op) for op in vars(fla_kda).values() if isinstance(op, fla_gdn._Launch)},
+LAUNCHES = sorted({type(op) for op in vars(fla_kda).values() if isinstance(op, chunked_launch._Launch)},
                   key=lambda kind: kind.__name__)
 """The port's own launches, each a tuner KernelOp."""
 

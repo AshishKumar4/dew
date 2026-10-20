@@ -4,13 +4,14 @@ their training shapes."""
 
 import dataclasses
 import functools
+import importlib
 from collections.abc import Callable, Iterator
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 
-from dew.nn.kernels import fla_gdn, fla_kda, generation, short_conv, tuning
+from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence, short_conv, tuning
 
 COMPILED_SHAPES = {
     "0.8b": {"batch": 8, "length": 3072, "key_heads": 16, "value_heads": 16,
@@ -33,9 +34,10 @@ class KernelCase(NamedTuple):
 
 
 def _pinned(launch, tiles, *args, **kwargs):
-    """`launch`'s kernel on `args`, pinned to `tiles` (`tuning.pinned`)."""
+    """`launch`'s kernel on `args`, pinned to `tiles` (`tuning.pinned`): the function its module
+    names as the launch (`NAME`)."""
     with tuning.pinned({type(launch): tiles}):
-        return getattr(fla_gdn, launch.NAME)(*args, **kwargs)
+        return getattr(importlib.import_module(type(launch).__module__), launch.NAME)(*args, **kwargs)
 
 
 def _case_call(launch, tiles, shape, dtype, *, reverse=False):
@@ -53,7 +55,7 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
     entered = jax.ShapeDtypeStruct((batch * (length // chunk), value_heads, width, columns), narrow)
     state = jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32)
     operands = {
-        "chunk_local_cumsum": (gated,),
+        "cumulated": (gated,),
         "kkt_solve": (keyed, gated, beta),
         "recompute_w_u": (keyed, valued, beta, inverse, gated),
         "chunk_fwd_h": (keyed, weighted, valued, gated, state),
@@ -64,7 +66,7 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
         "prepare_wy_repr_bwd": (keyed, valued, beta, gated, inverse, weighted, valued, keyed),
     }
     kwargs = {"chunk": chunk, "interpret": False}
-    if kernel == "chunk_local_cumsum":
+    if kernel == "cumulated":
         kwargs.update(scale=fla_gdn.RCP_LN2, reverse=reverse)
     elif kernel in ("chunk_fwd_o", "chunk_bwd_dv_local", "chunk_bwd_dhu", "chunk_bwd_dqkwg"):
         kwargs["scale"] = width ** -0.5
@@ -75,16 +77,17 @@ def kernel_cases(target: str) -> Iterator[KernelCase]:
     """Each kernel pinned to the tiles `target` runs it with unmeasured (its launch's `PICKS`) for both
     dtypes at each shape, and the reverse cumsum, for the compile test."""
     with generation.assumed(target):
-        wide = fla_gdn._wide()
+        wide = chunked_launch._wide()
     for dtype in ("bfloat16", "float32"):
-        for launch in (x for x in vars(fla_gdn).values() if isinstance(x, fla_gdn._Launch)):
+        launches = [*vars(fla_gdn).values(), *vars(recurrence).values()]
+        for launch in (x for x in launches if isinstance(x, chunked_launch._Launch)):
             kernel, tiles = launch.NAME, launch.PICKS[dtype, wide]
             config = {field: value for field, value in dataclasses.asdict(tiles).items() if value}
             for shape_name, shape in COMPILED_SHAPES.items():
                 if shape["width"] > fla_gdn.WIDEST and dtype == "float32":
                     continue
                 flags = "-".join(f"{key}{value}" for key, value in sorted(config.items()))
-                for reverse in ((False, True) if kernel == "chunk_local_cumsum" else (False,)):
+                for reverse in ((False, True) if kernel == "cumulated" else (False,)):
                     name = f"{target}/{kernel}/{dtype}/{flags}/{shape_name}" + "/reverse" * reverse
                     yield KernelCase(name, functools.partial(_case_call, launch, tiles, shape, dtype,
                                                              reverse=reverse))
@@ -97,7 +100,7 @@ def pairwise(g):
 
 def _slotted(passing, rows):
     """Memories passing between a row's chunks `[B, C - 1, ...]` and a row's own `[B, ...]` at their
-    slots (`fla_gdn.Sequences`): the passing ones row by row, then the rows'."""
+    slots (`chunked_launch.Sequences`): the passing ones row by row, then the rows'."""
     return jnp.concatenate([passing.reshape(-1, *passing.shape[2:]), rows])
 
 

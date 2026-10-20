@@ -12,11 +12,11 @@ import tokamax
 from fla_gdn_support import CONV_SHAPES, conv_config_cases, conv_training_cases, kda_training_cases
 from kernel_compile import compile_kernels, failures
 
-from dew.nn.kernels import fla_gdn, fla_kda, generation, short_conv, tuning
+from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence, short_conv, tuning
 
-LAUNCHES = {launch for module in (fla_gdn, fla_kda) for launch in vars(module).values()
-            if isinstance(launch, fla_gdn._Launch)}
-"""Every launch of the two ports."""
+LAUNCHES = {launch for module in (fla_gdn, fla_kda, recurrence) for launch in vars(module).values()
+            if isinstance(launch, chunked_launch._Launch)}
+"""Every launch of the two ports and the recurrence template's chunked stages."""
 
 
 def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
@@ -33,7 +33,7 @@ def test_each_gpu_takes_the_picks_its_block_holds_and_measures_a_space_holding_t
     16-bit space holds its unmeasured pick, Kimi delta attention's own kernels' too, and fp32 has a pick
     for every kernel."""
     with generation.assumed(target):
-        assert fla_gdn._wide() is wide
+        assert chunked_launch._wide() is wide
     for launch in LAUNCHES:
         assert launch.PICKS["bfloat16", wide] in launch.SPACES[wide], launch.NAME
         assert {"bfloat16", "float32"} <= {dtype for dtype, _ in launch.PICKS}, launch.NAME
@@ -43,14 +43,15 @@ def test_each_gpu_takes_the_picks_its_block_holds_and_measures_a_space_holding_t
 def test_the_tuner_finds_each_of_the_rules_launches_in_its_lowering(module):
     """The rule's forward and backward, traced as the tuner reads a program (`tuning.launches`): each
     of its kernels is a launch tokamax describes, its arguments serializable into its key; the gated
-    delta rule's nine, and Kimi delta attention's seven with the cumsum and memory kernels it shares."""
+    delta rule's eight and the recurrence template's decay prefix, and Kimi delta attention's seven with
+    the prefix and the memory kernels it shares."""
     per_key = module is fla_kda
     q = jax.ShapeDtypeStruct((1, 64, 1, 64), jnp.bfloat16)
     v = jax.ShapeDtypeStruct((1, 64, 2, 64), jnp.bfloat16)
     g = jax.ShapeDtypeStruct((1, 64, 2, *(64,) * per_key), jnp.float32)
     h0 = jax.ShapeDtypeStruct((1, 2, 64, 64), jnp.float32)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
-    shared = {fla_gdn.ChunkLocalCumsum, fla_gdn.ChunkFwdH, fla_gdn.ChunkBwdDhu} if per_key else set()
+    shared = {recurrence.ChunkLocalCumsum, *((fla_gdn.ChunkFwdH, fla_gdn.ChunkBwdDhu) if per_key else ())}
 
     def rule(*args):
         return port(*args, None, 0.125, 64, interpret=True)
@@ -63,7 +64,7 @@ def test_the_tuner_finds_each_of_the_rules_launches_in_its_lowering(module):
         beta = g.update(shape=g.shape[:3], dtype=jnp.bfloat16)
         found = tokamax.autotuning.get_bound_args(jax.jit(both), q, q, v, g, beta, h0, v)
     assert {type(ba.op) for ba in found} == shared | {type(op) for op in vars(module).values()
-                                                      if isinstance(op, fla_gdn._Launch)}
+                                                      if isinstance(op, chunked_launch._Launch)}
 
 
 def test_a_launch_clips_its_blocks_to_the_operands():
@@ -72,10 +73,10 @@ def test_a_launch_clips_its_blocks_to_the_operands():
     v = jax.ShapeDtypeStruct((1, 64, 1, 32), jnp.bfloat16)
     h = jax.ShapeDtypeStruct((1, 1, 64, 32), jnp.bfloat16)
     g = jax.ShapeDtypeStruct((1, 64, 1), jnp.float32)
-    spans = fla_gdn.sequences(1, 64)
+    spans = chunked_launch.sequences(1, 64)
     ba = fla_gdn._CHUNK_FWD_O.bind(q, q, v, h, g, *spans, scale=1.0, chunk=64, interpret=True)
     with generation.assumed("sm80"):
-        assert fla_gdn._CHUNK_FWD_O._get_heuristics_config(ba) == fla_gdn.Tiles(64, 32, 8, 3)
+        assert fla_gdn._CHUNK_FWD_O._get_heuristics_config(ba) == chunked_launch.Tiles(64, 32, 8, 3)
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm120"])

@@ -760,7 +760,7 @@ def port_refusal(query, key, value) -> Refusal | None:
     reference math itself; and keys wider than the port takes in their
     dtype. Packed documents take the port at any bound: it stores the
     memories by where they pass, as many as the tokens' chunks, a row's and
-    one, whatever the bound (`fla_gdn.Sequences`)."""
+    one, whatever the bound (`chunked_launch.Sequences`)."""
     widest = fla_gdn.WIDEST_KEYS if jnp.result_type(query, key, value).itemsize == 2 else fla_gdn.WIDEST
     return refused(
         (not FORWARD_MODE.get(), 'forward_mode',
@@ -798,7 +798,7 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     memory from zero, as it would alone; the row's first takes `state`, unless
     its first token begins a document of its own. The kernels' grids are
     sized by that bound, a chunk more for each document and the row's
-    padding; the memories they keep are not (`fla_gdn.Sequences`).
+    padding; the memories they keep are not (`chunked_launch.Sequences`).
 
     The operands go to their common dtype, beta with them, as fla's layer
     holds them. On a mesh the rule runs per shard (`manual_map`): rows where

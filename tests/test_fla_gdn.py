@@ -36,7 +36,8 @@ from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
 
 from dew.nn import linear
-from dew.nn.kernels import fla_gdn, fla_kda, generation, tuning
+from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, tuning
+from dew.nn.kernels.recurrence import ChunkLocalCumsum, cumulated
 from dew.nn.linear import GatedDeltaNet, fla_rule, l2norm
 from dew.training._lowering import triton_calls
 
@@ -65,7 +66,7 @@ def tiled(kernel, call, *operands) -> list:
 
 def cumulated_decay(key, batch, length, value_heads, width=None):
     """A base-2 decay cumulated within each 64-token chunk, per head `[B, T, HV]` or per key dimension
-    `[B, T, HV, K]` (fla's gk), as the kernels take it: fp32 (`fla_gdn.chunk_local_cumsum`), from a
+    `[B, T, HV, K]` (fla's gk), as the kernels take it: fp32 (`cumulated`), from a
     float64 sum."""
     shape = (batch, length, value_heads) + (() if width is None else (width,))
     step = np.asarray(-jnp.exp(jax.random.normal(key, shape) - 3.0) * fla_gdn.RCP_LN2, np.float64)
@@ -85,9 +86,9 @@ def output_operands(batch, length, key_heads, value_heads, width, columns, dtype
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape, tiles", [
-    ((2, 128, 2, 2, 64, 64), fla_gdn.Tiles(64, 64, 4, 3)),
-    ((1, 128, 2, 4, 128, 128), fla_gdn.Tiles(128, 128, 8, 3)),
-    ((1, 64, 1, 2, 128, 128), fla_gdn.Tiles(32, 32, 2, 3)),
+    ((2, 128, 2, 2, 64, 64), chunked_launch.Tiles(64, 64, 4, 3)),
+    ((1, 128, 2, 4, 128, 128), chunked_launch.Tiles(128, 128, 8, 3)),
+    ((1, 64, 1, 2, 128, 128), chunked_launch.Tiles(32, 32, 2, 3)),
 ])
 def test_the_output_kernel_computes_flas_expression(dtype, shape, tiles):
     """fla's chunk_fwd_o per chunk and head, grouped value heads included, at each of fla's block
@@ -96,7 +97,7 @@ def test_the_output_kernel_computes_flas_expression(dtype, shape, tiles):
     q, k, v, h, g = output_operands(*shape, dtype)
     scale = shape[4] ** -0.5
     launch = fla_gdn.ChunkFwdO(config=tiles)
-    got = launch(q, k, v, support.entered_states(h), g, *fla_gdn.sequences(*shape[:2]), scale=scale,
+    got = launch(q, k, v, support.entered_states(h), g, *chunked_launch.sequences(*shape[:2]), scale=scale,
                  chunk=64, interpret=INTERPRETED)
     want = support.reference_o(q, k, v, h, g, scale=scale)
     assert got.shape == want.shape and got.dtype == want.dtype
@@ -112,7 +113,7 @@ def test_the_cumsum_kernel_is_flas_chunk_local_cumsum(reverse, columns):
     after the sum, and the gradient's from the end compensated (`compensated_add`), rounded once."""
     g = -jnp.exp(jax.random.normal(jax.random.key(3), (2, 192, 3, *columns)) - 3.0)
     tokens = np.asarray(g, np.float64).reshape(2, 3, 64, 3, *columns)
-    kernel = functools.partial(fla_gdn.chunk_local_cumsum, scale=fla_gdn.RCP_LN2, reverse=reverse,
+    kernel = functools.partial(cumulated, scale=fla_gdn.RCP_LN2, reverse=reverse,
                                interpret=INTERPRETED)
     if reverse:
         want = np.cumsum(tokens[:, :, ::-1] * fla_gdn.RCP_LN2, axis=2)[:, :, ::-1].reshape(g.shape)
@@ -121,7 +122,7 @@ def test_the_cumsum_kernel_is_flas_chunk_local_cumsum(reverse, columns):
         want = (np.cumsum(tokens, axis=2) * fla_gdn.RCP_LN2).reshape(g.shape)
         # fla's prefix rounds once a token: up to 64 roundings of the running sum.
         bound = 64 * np.finfo(np.float32).eps
-    for got in tiled(fla_gdn.ChunkLocalCumsum, kernel, g):
+    for got in tiled(ChunkLocalCumsum, kernel, g):
         assert got.dtype == jnp.float32
         assert relative(got, want) < bound
 
@@ -179,7 +180,7 @@ def test_the_h_kernel_is_flas_recurrence(dtype, shape, per_key):
     g = cumulated_decay(keys[3], batch, length, value_heads, width if per_key else None)
     h0 = 0.1 * jax.random.normal(keys[4], (batch, value_heads, width, columns))
     h, corrected, final = support.reference_h(k, w, u, g, h0)
-    # The port stores each memory at its slot (`fla_gdn.Sequences`).
+    # The port stores each memory at its slot (`chunked_launch.Sequences`).
     want = support.entered_states(h), corrected, final
     kernel = functools.partial(fla_gdn.chunk_fwd_h, interpret=INTERPRETED)
     for got in tiled(fla_gdn.ChunkFwdH, kernel, k, w, u, g, h0):
@@ -206,7 +207,7 @@ def test_the_dhu_kernel_is_flas_reverse_recurrence(dtype, shape, per_key):
     dv = jax.random.normal(keys[6], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
     dh, dh0, dv2 = support.reference_dhu(q, k, w, g, dht, do, dv, scale=scale)
-    # The port stores each memory's gradient at its slot (`fla_gdn.Sequences`).
+    # The port stores each memory's gradient at its slot (`chunked_launch.Sequences`).
     want = support.left_grads(dh), dh0, dv2
     kernel = functools.partial(fla_gdn.chunk_bwd_dhu, scale=scale, interpret=INTERPRETED)
     for got in tiled(fla_gdn.ChunkBwdDhu, kernel, q, k, w, g, dht, do, dv):
@@ -339,7 +340,7 @@ def test_the_wy_backward_gives_the_same_gradients_on_every_call_at_qwen35_08b_sh
     k = l2norm(jax.random.normal(keys[0], (batch, length, heads, width))).astype(jnp.bfloat16)
     v = jax.random.normal(keys[1], (batch, length, heads, width)).astype(jnp.bfloat16)
     beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, heads))).astype(jnp.bfloat16)
-    g = fla_gdn.chunk_local_cumsum(-jnp.exp(jax.random.normal(keys[3], (batch, length, heads)) - 3.0),
+    g = cumulated(-jnp.exp(jax.random.normal(keys[3], (batch, length, heads)) - 3.0),
                                    scale=fla_gdn.RCP_LN2)
     a = fla_gdn.kkt_solve(k, g, beta)
     dw, du, dk = (jax.random.normal(key, k.shape).astype(jnp.bfloat16) for key in keys[4:])
@@ -1028,7 +1029,7 @@ def test_a_timed_launch_draws_the_descriptors_it_reads(read, packed):
     over the drawn chunks bitwise each chunk's run as a row of its own."""
     batch, length = 2, 150
     cuts = jnp.asarray([0, 60, 150, 200, 260, 300], jnp.int32)
-    given = fla_gdn.sequences(batch, length, cuts if packed else None)
+    given = chunked_launch.sequences(batch, length, cuts if packed else None)
     query = jax.ShapeDtypeStruct((batch, length, 2, 64), jnp.bfloat16)
     descriptors = {"chunks": [given.chunks], "spans": [given.spans],
                    "both": [given.chunks, given.spans]}[read]
@@ -1054,9 +1055,9 @@ def test_a_timed_launch_draws_the_descriptors_it_reads(read, packed):
     real = taken > 0
     assert (start[real] + taken[real] <= (first + lengths)[owner[real]]).all(), "a chunk crosses a sequence"
     g = jax.random.normal(jax.random.key(0), (batch, length, 2))
-    described = fla_gdn.Sequences(jnp.asarray(chunked), jnp.asarray(spans))
-    found = np.asarray(fla_gdn.chunk_local_cumsum(g, spans=described, interpret=True)).reshape(-1, 2)
+    described = chunked_launch.Sequences(jnp.asarray(chunked), jnp.asarray(spans))
+    found = np.asarray(cumulated(g, spans=described, interpret=True)).reshape(-1, 2)
     flat = g.reshape(1, batch * length, 2)
     for begin, size in zip(start[real], taken[real], strict=True):
-        alone = fla_gdn.chunk_local_cumsum(flat[:, begin:begin + size], interpret=True)
+        alone = cumulated(flat[:, begin:begin + size], interpret=True)
         np.testing.assert_array_equal(found[begin:begin + size], np.asarray(alone)[0], err_msg=f"at {begin}")
