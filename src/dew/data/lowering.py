@@ -785,6 +785,7 @@ class _Build:
         interleave = None if self.lowering.interleave is None else pipeline.stages[self.lowering.interleave]
         return streamed(
             shards,
+            name=_label(pipeline),
             partition=partition,
             seed=self.seed if self.training else None,
             cycle_length=interleave.cycle_length if isinstance(interleave, Interleave) else 1,

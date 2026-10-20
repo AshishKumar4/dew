@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
 from collections.abc import Callable, Mapping
 
 import grain.experimental as experimental
 import grain.python as grain
+
+from dew.records import boolean, record
 
 from .dataset import DataPartition, Loading
 from .sources.base import Shard, ShardManifest
@@ -80,16 +83,19 @@ class _ShardPass(grain.IterDataset):
 
 
 class _EmptyRun:
-    """How many shards in a row one read found empty, which it logs at each doubling."""
+    """How many shards in a row one read found empty, which it logs at each doubling. Grain reads
+    each shard on a prefetch thread of its own, so the count is kept under a lock."""
 
     def __init__(self, name: str):
         self.name, self.count = name, 0
+        self.lock = threading.Lock()
 
     def ended(self, yielded: bool) -> None:
-        self.count = 0 if yielded else self.count + 1
-        if self.count >= _FIRST_LOGGED_EMPTY and not self.count & (self.count - 1):
-            _log.warning("%s: its last %d shards held no row; the read goes on to the next", self.name,
-                         self.count)
+        with self.lock:
+            self.count = 0 if yielded else self.count + 1
+            count = self.count
+        if count >= _FIRST_LOGGED_EMPTY and not count & (count - 1):
+            _log.warning("%s: its last %d shards held no row; the read goes on to the next", self.name, count)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,10 +136,11 @@ class _WatchedIterator(grain.DatasetIterator):
         return row
 
     def get_state(self) -> Mapping[str, object]:
-        return self.input_parent.get_state()
+        return {"parent": self.input_parent.get_state(), "yielded": self.yielded}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self.input_parent.set_state(state)
+        self.input_parent.set_state(record(state["parent"], "shard position"))
+        self.yielded = boolean(state["yielded"], "shard yielded")
 
     def close(self) -> None:
         self.input_parent.close()
