@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING
 
 import jax
 from jax.experimental import multihost_utils
-from packaging.version import Version
 
 from dew.cache import enable_compilation_cache, persist_compilations
 from dew.coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
@@ -202,15 +201,7 @@ def _join_process_pool(multi_host: bool | None) -> None:
 
 
 def _joined() -> None:
-    """What a process does once it has joined the pool.
-
-    A GPU pool keeps the persistent compilation cache when its jax keys a
-    computation that spans processes alike on every one of them, as the jax
-    constraints.txt names does (`_pool_keys_alike`). With another jax, such
-    as the 0.11.2 release, it compiles without the cache and says so on every
-    process: some ranks would load a step that the others compile, and that
-    compile waits for every rank for ever.
-    """
+    """What a process does once it has joined the pool."""
     # Before the backend opens, which can fail on one process of a
     # pool that has formed, a GPU with no memory left for one. The
     # watch leaves through os._exit, past the atexit handlers, which
@@ -227,12 +218,6 @@ def _joined() -> None:
     _log.info(
         "Joined the JAX process pool: process %s of %s", jax.process_index(), jax.process_count()
     )
-    if jax.process_count() > 1 and jax.default_backend() == "gpu" and not _pool_keys_alike():
-        # Before the first compile, which fixes whether the cache is used.
-        jax.config.update("jax_enable_compilation_cache", val=False)
-        _log.warning("This jax keys a computation that spans processes apart on each of them "
-                     "(jax-ml/jax#40940), so the pool compiles without the persistent compilation "
-                     "cache; docs/installation.md names the jax that keeps it")
     # One collective while the processes are still in lockstep;
     # initialize() returns on every process once the last one has
     # connected. On CPU, collectives rendezvous through the
@@ -242,22 +227,6 @@ def _joined() -> None:
     # wandb init and their model builds, and one that arrives late
     # dies in gloo before the run can report it.
     multihost_utils.sync_global_devices("dew process pool joined")
-
-
-def _pool_keys_alike() -> bool:
-    """Whether this jax keys a computation that spans processes alike on
-    every one of them (jax-ml/jax#40940).
-
-    jax 0.11.2 keys an executable by the compiling process's own topology
-    fingerprint, which on a GPU describes the device down to its NVLink
-    links. In a pool across GPUs linked differently the processes keyed a
-    step apart, and on the next run some loaded it while the others compiled
-    it and waited for ever for their shares of its sharded autotuning. No
-    jax release has the fix. The build constraints.txt names carries it, and
-    its branch versions each build as a post-release of 0.11.2, which jax has
-    never published, so the version says which jax this is.
-    """
-    return Version(jax.__version__).is_postrelease
 
 
 class Preempted(SystemExit):
