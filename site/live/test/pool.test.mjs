@@ -1,16 +1,21 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { build } from 'esbuild';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-async function scenario(name) {
+const config = JSON.parse(readFileSync(fileURLToPath(new URL('../wrangler.jsonc', import.meta.url)), 'utf8'));
+
+/** The pool harness's scenario `name`, under production's vars with `bindings` over them. */
+async function scenario(name, bindings = {}) {
 	const bundle = await build({ entryPoints: [fileURLToPath(new URL('./pool-harness.ts', import.meta.url))],
 		bundle: true, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'], write: false });
 	const worker = new Miniflare(convertV4MiniflareOptions({
 		modules: [{ type: 'ESModule', path: 'pool.mjs', contents: bundle.outputFiles[0].text }], compatibilityDate: '2026-09-29',
 		durableObjects: { POOL: { className: 'Pool', useSQLite: true }, ORPHAN: { className: 'Orphan', useSQLite: true },
 			SHARED: { className: 'Host', useSQLite: true } },
+		bindings: { ...config.vars, ...bindings },
 	}));
 	try { return await (await worker.dispatchFetch(`https://test/${name}`)).json(); }
 	finally { await worker.dispose(); }
@@ -48,6 +53,12 @@ test('an operator retires a host through the pool, which assigns it no session f
 		assert.equal(result.assigned, result.other, 'the retirement was refused because the session took the host first');
 		assert.equal(result.stopped, false);
 	}
+});
+test('a pool of no minimum, as the preview\'s, starts a host only when one is wanted and retires it once unwanted', async () => {
+	const result = await scenario('wanted', { MIN_HOSTS: '0' });
+	assert.deepEqual([result.unasked.status.ready, result.unasked.image, result.unasked.status.minimum], [0, null, 0]);
+	assert.deepEqual([result.asked.status.ready, result.asked.image], [1, 'snapshot']);
+	assert.equal(result.after.ready, 0);
 });
 test('a generation handed over after a newer one does not replace it', async () => {
 	assert.equal((await scenario('older')).desired, 'newer');

@@ -121,7 +121,8 @@
 		"WARM_SECONDS": "600",
 		"IDLE_SECONDS": "300",
 		"IP_WINDOW_SECONDS": "600",
-		"IP_STARTS": "10"
+		"IP_STARTS": "10",
+		"MIN_HOSTS": "2"
 	},
 	"observability": {
 		"enabled": true
@@ -201,7 +202,16 @@
 					"custom_domain": true
 				}
 			],
-			"containers": [],
+			"containers": [
+				{
+					"class_name": "SharedHost",
+					"scheduling_policy": "durable_object"
+				},
+				{
+					"class_name": "SnapshotPreparer",
+					"scheduling_policy": "durable_object"
+				}
+			],
 			"durable_objects": {
 				"bindings": [
 					{
@@ -210,23 +220,19 @@
 					},
 					{
 						"name": "SHARED",
-						"class_name": "SharedHost",
-						"script_name": "dewml-live"
+						"class_name": "SharedHost"
 					},
 					{
 						"name": "POOL",
-						"class_name": "ModelPool",
-						"script_name": "dewml-live"
+						"class_name": "ModelPool"
 					},
 					{
 						"name": "SNAPSHOTS",
-						"class_name": "SnapshotRegistry",
-						"script_name": "dewml-live"
+						"class_name": "SnapshotRegistry"
 					},
 					{
 						"name": "PREPARER",
-						"class_name": "SnapshotPreparer",
-						"script_name": "dewml-live"
+						"class_name": "SnapshotPreparer"
 					}
 				]
 			},
@@ -251,7 +257,8 @@
 				"WARM_SECONDS": "600",
 				"IDLE_SECONDS": "300",
 				"IP_WINDOW_SECONDS": "600",
-				"IP_STARTS": "10"
+				"IP_STARTS": "10",
+				"MIN_HOSTS": "0"
 			}
 		}
 	}
