@@ -44,12 +44,12 @@ feed-forward's hidden units, each attention's heads and value dimensions), on th
 `orders` sets the engine's weights in place to each (`LLM.apply_model`), decoding the identity
 run's tokens again through a logits processor that draws them (tools/dory_vllm_forcing.py) beside
 the same raw log-probabilities. It keeps each
-order's rows on their columns and each entry of every row's whole vocabulary's absolute distance
-from float64 (`errors`); `model_orders` writes the model code's at the engine's precision on a
-last-loop run's rows past the window (`SHARED`) in their place, `invariance` records the float64
-model code's distance under each order from the identity, and `sums` takes each order's RMS over
-the run and over each row, and sums each batch's entries. Order zero reproduces the probe's rows bit
-for bit. `publish` puts the probe and the
+order's rows on their columns, each row's distance over the whole vocabulary from float64, and each
+entry's absolute distance summed over the batch, a batch's files at a time; `model_orders` writes
+the model code's at the engine's precision on a last-loop run's rows past the window (`SHARED`) in
+their place, `invariance` records the float64 model code's distance under each order from the
+identity, and `sums` gathers each run's rows and their RMS. Order zero reproduces the probe's rows
+bit for bit. `publish` puts the probe and the
 batches' sums in `DATASET`, at a revision source.json pins with each file's sha256 (`fetched`).
 """
 
@@ -437,8 +437,8 @@ SHARED = tuple(run for run in RUNS if run[1] == 'last_loop')
 def model_orders(directory: Path) -> None:
     """For each `SHARED` run, the model code at the engine's precision (`model_code`: bf16
     throughout, or float32 with TF32 attention products) on the window's rows under every order of
-    every batch (`symmetry`), in the engine's place in the run's files: each order's rows on their
-    columns and each entry's error (`errors`)."""
+    every batch (`symmetry`), in the engine's place in the run's files (`orders_run`'s): each order's
+    rows on their columns and their distances, and the batch's sums."""
     import torch
 
     config, tensors = release()
@@ -453,7 +453,8 @@ def model_orders(directory: Path) -> None:
         unpermuted = None
         for batch in range(BATCHES):
             kept = np.load(directory / f'columns-{tag(key)}-{batch}.npy', mmap_mode='r+')
-            held = errors(directory, key, batch)
+            distances = np.load(directory / f'rows-{tag(key)}-{batch}.npy', mmap_mode='r+')
+            total = np.zeros(truth.shape)
             for index in range(ORDERS):
                 drawn = symmetry(config, batch, index)
                 seen = permute(model, config, drawn)
@@ -463,11 +464,16 @@ def model_orders(directory: Path) -> None:
                     f'{key}: the model holds no order {batch}/{index}')
                 found = rows(probe['window'], probe[f'{key}/window_generated'], prompt_rows=False)
                 kept[index, window] = np.take_along_axis(found, columns, axis=1)
-                held[index, window] = np.abs(found - truth)
+                distances[index, window] = np.sqrt(np.mean(np.square(found - truth), axis=1))
+                total += np.abs(found - truth)
                 print(f'{key} model code, order {batch}/{index}: '
                       f'{np.sqrt(np.mean(np.square(found - truth))):.4f}', flush=True)
             kept.flush()
-            held.flush()
+            distances.flush()
+            path = directory / f'absolutes-{tag(key)}-vllm-{batch}.npy'
+            summed = np.load(path)
+            summed[window] = total
+            np.save(path, summed)
         del model, rows
         gc.collect()
         torch.cuda.empty_cache()
@@ -534,10 +540,11 @@ TRACED_BATCHES = 8
 
 
 def dew_traces(directory: Path) -> None:
-    """Dew's per-order errors on each `TRACED` run, `TRACED_BATCHES` batches of `symmetry`'s orders,
-    as the release test computes them (tests/test_dory.py), each `[ORDERS, rows, vocab]` float32 in
-    `directory/dew-errors-{run}-{batch}.npy`, kept where they are recorded for the element rule's
-    calibration: a split of Dew's own batches is a null the rule must pass, under Dew's environment."""
+    """Dew on each `TRACED` run, `TRACED_BATCHES` batches of `symmetry`'s orders, as the release test
+    computes it (tests/test_dory.py), kept for the element rule's calibration, a split of Dew's own
+    batches being a null the rule must pass: each order's row distances from float64
+    (`dew-rows-{run}-{batch}.npy` `[ORDERS, rows]`) and every entry's absolute distance summed over the
+    batch's orders (`dew-absolutes-{run}-{batch}.npy` `[rows, vocab]` float32), under Dew's environment."""
     import jax
     import test_dory
 
@@ -553,28 +560,18 @@ def dew_traces(directory: Path) -> None:
         model = test_dory.with_cache(loaded.model.with_passes(loops), mode).with_cache_capacity(CONTEXT)
         programs, placed = test_dory.decoding(model), jax.device_put(loaded.variables)
         for batch in range(TRACED_BATCHES):
-            held = np.lib.format.open_memmap(directory / f'dew-errors-{tag(key)}-{batch}.npy', mode='w+',
-                                             dtype=np.float32, shape=(ORDERS, *truth.shape))
+            distances, total = np.zeros((ORDERS, len(truth))), np.zeros(truth.shape)
             for index in range(ORDERS):
                 ordered = test_dory.symmetric(placed, config, symmetry(config, batch, index))
                 found = np.concatenate([test_dory.forced(programs, ordered, probe[part],
                                                          probe[f'{key}/{part}_generated'],
                                                          prompt_rows=part == 'sentence')
                                         for part in ('sentence', 'window')])
-                held[index] = np.abs(found - truth)
+                distances[index] = np.sqrt(np.mean(np.square(found - truth), axis=1))
+                total += np.abs(found - truth)
                 print(f'Dew {key} order {batch}/{index}', flush=True)
-            held.flush()
-
-
-def errors(directory: Path, key: str, batch: int, shape: tuple[int, ...] | None = None) -> np.ndarray:
-    """Run `key`'s per-order errors in `batch`, `[ORDERS, rows, vocab]` float32 on disk: each entry's
-    absolute distance from float64 (`upstream`'s rows) under each order, kept where they are recorded
-    for the element rule's calibration. With `shape`, created for writing; else opened for reading
-    and writing."""
-    path = directory / f'errors-{tag(key)}-{batch}.npy'
-    if shape is not None:
-        return np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=shape)
-    return np.load(path, mmap_mode='r+')
+            np.save(directory / f'dew-rows-{tag(key)}-{batch}.npy', distances)
+            np.save(directory / f'dew-absolutes-{tag(key)}-{batch}.npy', total.astype(np.float32))
 
 
 def permute(model, config: dict, drawn: dict[str, np.ndarray]) -> np.ndarray:
@@ -632,7 +629,10 @@ def permute(model, config: dict, drawn: dict[str, np.ndarray]) -> np.ndarray:
 def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
     """One run under every order of every batch (`symmetry`), the engine's weights set in place to
     each and the identity run's tokens drawn again (`Forced`): for each batch, each order's rows on
-    their columns (`columns-{run}-{batch}.npy`) and each entry's error (`errors`)."""
+    their columns (`columns-{run}-{batch}.npy` `[ORDERS, rows, COLUMNS]`), each order's distance of
+    each row over the whole vocabulary from float64, its RMS (`rows-{run}-{batch}.npy` `[ORDERS,
+    rows]`), and every entry's absolute distance summed over the batch's orders
+    (`absolutes-{run}-vllm-{batch}.npy` `[rows, vocab]` float32), each written when its batch ends."""
     import functools
 
     probe = np.load(FIXTURE / 'probe.npz')
@@ -653,9 +653,8 @@ def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
 
     unpermuted = None
     for batch in range(BATCHES):
-        kept = np.lib.format.open_memmap(directory / f'columns-{tag(key)}-{batch}.npy', mode='w+',
-                                         dtype=np.float32, shape=(ORDERS, *columns.shape))
-        held = errors(directory, key, batch, (ORDERS, *truth.shape))
+        kept = np.zeros((ORDERS, *columns.shape), np.float32)
+        distances, total = np.zeros((ORDERS, len(truth))), np.zeros(truth.shape)
         for index in range(ORDERS):
             drawn = symmetry(config, batch, index)
             (seen,) = llm.apply_model(functools.partial(permute, config=config, drawn=drawn))
@@ -669,37 +668,29 @@ def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
                 assert np.array_equal(kept[index], probe[f'{key}/vllm']), f'{key}: order 0 is not the probe'
                 assert np.array_equal(found[positions(probe)], probe[f'{key}/vllm_full']), (
                     f'{key}: order 0 is not the probe')
-            held[index] = np.abs(found - truth)
-            apart = np.sqrt(np.mean(np.square(found - truth)))
-            print(f'{key} order {batch}/{index}: {apart:.4f}', flush=True)
-        kept.flush()
-        held.flush()
+            distances[index] = np.sqrt(np.mean(np.square(found - truth), axis=1))
+            total += np.abs(found - truth)
+            print(f'{key} order {batch}/{index}: {np.sqrt(np.mean(np.square(distances[index]))):.4f}',
+                  flush=True)
+        np.save(directory / f'columns-{tag(key)}-{batch}.npy', kept)
+        np.save(directory / f'rows-{tag(key)}-{batch}.npy', distances)
+        np.save(directory / f'absolutes-{tag(key)}-vllm-{batch}.npy', total.astype(np.float32))
 
 
 def sums(directory: Path) -> None:
-    """vLLM's distances from float64 on each run, which `publish` puts beside the probe: each order's
-    RMS over the run's rows, `rms-{run}-vllm.npy` `[BATCHES, ORDERS]`, and each row's,
-    `rows-{run}-vllm.npy` `[BATCHES, ORDERS, rows]`, the release test's leaf and row rules
-    (tests/reference_error.py's over-orders rules); each row's float64 size, the truth row's RMS,
-    `sizes-{run}.npy` `[rows]`; and each entry's distance summed over a batch's orders,
-    `absolutes-{run}-vllm-{batch}.npy` `[rows, vocab]` float32, for the element rule's calibration and
-    the report, on which nothing is held end to end."""
+    """Each run's statistics for the release test's leaf and row rules (tests/reference_error.py's
+    over-orders rules), which `publish` puts beside the probe: each row's distance from float64 under
+    each order, `rows-{run}-vllm.npy` `[BATCHES, ORDERS, rows]`; each order's over the run, their RMS,
+    `rms-{run}-vllm.npy` `[BATCHES, ORDERS]`; and each row's float64 size, the truth row's RMS,
+    `sizes-{run}.npy` `[rows]`. The entries' sums (`absolutes-*`) are for the element rule's
+    calibration and the report; nothing is held on them end to end."""
     for run in RUNS:
         key = tag(name(*run))
         truth = np.load(directory / f'upstream-{key}.npy')
-        np.save(directory / f'sizes-{key}.npy', np.sqrt(np.mean(np.square(truth, dtype=np.float64), axis=1)))
-        spread, rows = np.zeros((BATCHES, ORDERS)), np.zeros((BATCHES, ORDERS, len(truth)))
-        for batch in range(BATCHES):
-            held = errors(directory, name(*run), batch)
-            total = np.zeros(held.shape[1:], np.float64)
-            for index, order in enumerate(held):
-                total += order
-                squares = np.square(order, dtype=np.float64)
-                spread[batch, index] = np.sqrt(np.mean(squares))
-                rows[batch, index] = np.sqrt(np.mean(squares, axis=1))
-            np.save(directory / f'absolutes-{key}-vllm-{batch}.npy', total.astype(np.float32))
-        np.save(directory / f'rms-{key}-vllm.npy', spread)
+        np.save(directory / f'sizes-{key}.npy', np.sqrt(np.mean(np.square(truth), axis=1)))
+        rows = np.stack([np.load(directory / f'rows-{key}-{batch}.npy') for batch in range(BATCHES)])
         np.save(directory / f'rows-{key}-vllm.npy', rows)
+        np.save(directory / f'rms-{key}-vllm.npy', np.sqrt(np.mean(np.square(rows), axis=2)))
 
 
 LOOPS = sorted({loops for loops, _, _ in RUNS})
