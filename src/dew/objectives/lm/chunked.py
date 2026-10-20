@@ -203,7 +203,15 @@ def _row_terms(logits, predict: bool) -> tuple[
     read once, rather than once for the maximum and again for the sum. On an
     RTX 4080 (jax 0.11.2), fp32 logits of 4096 x 151936 take 3.9 ms against
     `jax.nn.logsumexp` and `jnp.argmax`'s 7.6, and 8192 x 50304 2.6 against
-    5.0, with the same columns and logsumexps 1.9e-6 apart."""
+    5.0, with the same columns and logsumexps 1.9e-6 apart.
+
+    The row reduces in two levels, blocks of about its square root's width
+    and then the blocks' terms (`_row_blocks`): XLA's CPU compiler runs a
+    reduction with a combine of its own as one loop over the row, whose sum
+    of 512 exponentials took every softmax share 2.1 times as far from
+    float64 as `jax.nn.logsumexp`'s (tests/test_chunked_cross_entropy.py's
+    vocabulary-split head), and the two levels' loops are each a block
+    long."""
     def combine(first, second):
         larger = jnp.maximum(first[0], second[0])
         total = _rescaled(first[0], first[1], larger) + _rescaled(second[0], second[1], larger)
@@ -219,8 +227,26 @@ def _row_terms(logits, predict: bool) -> tuple[
         # A vocabulary column is int32 whatever the run's default integer width.
         operands.append(jax.lax.broadcasted_iota(jnp.int32, logits.shape, axis))
         initial.append(jnp.array(jnp.iinfo(jnp.int32).max, jnp.int32))
-    terms = jax.lax.reduce(tuple(operands), tuple(initial), combine, (axis,))
+
+    def reduced(operands):
+        return jax.lax.reduce(tuple(operands), tuple(initial), combine, (operands[0].ndim - 1,))
+
+    terms = reduced([jnp.concatenate(level, axis=-1) if len(level) > 1 else level[0]
+                     for level in zip(*(reduced(part) for part in _row_blocks(operands)), strict=True)])
     return terms[0] + jnp.log(terms[1]), ((terms[0], terms[2]) if predict else None), terms[:2]
+
+
+def _row_blocks(operands: list[jax.Array]) -> list[list[jax.Array]]:
+    """`operands`, rows over their last axis, as the parts `_row_terms` reduces first, each part's
+    blocks on a new last axis: blocks of the power of two nearest the row's square root in width,
+    and the columns left past the last whole block as one more."""
+    width = operands[0].shape[-1]
+    block = 1 << round(math.log2(width) / 2) if width > 1 else 1
+    whole = width - width % block
+    parts = [[x[..., :whole].reshape(*x.shape[:-1], whole // block, block) for x in operands]]
+    if whole < width:
+        parts.append([x[..., whole:][..., None, :] for x in operands])
+    return parts
 
 
 class _ChunkTerms(NamedTuple):
