@@ -71,16 +71,20 @@ flowchart LR
 
 `microbatches=` for pipeline stages is a Trainer argument (default: one per stage), the same for both mesh forms.
 
+Where the layout splits a leaf, the shared rule table and that leaf's declared logical axes place it; a leaf that declares none falls back to a shape heuristic, and refusing it instead is not built yet. A rule outside Dew's defaults (`DEFAULT_RULES`) that names an axis the mesh lacks is refused, a role axis among them, since it would split nothing; Dew's own rules take a missing role axis as size 1. A placement rule that deviates for one model family is a separate rule (expert parallelism's, tensor parallelism's), never a branch in the default.
+
+On a native mesh, the layout is to report what it is about to do before the first step, as `Layout.validate(mesh)`, which is not built yet: which leaves split over which axes, the per-device bytes, the batch split, the collectives each logical axis implies, and an unbound logical axis, which would replicate that dimension. A mismatch between the rules and the mesh's axis names is to fail there, not in GSPMD.
+
 ## 3. Memory and speed are chosen for you
 
-The memory planner picks, per model, mesh and GPU, the cheapest combination that fits: micro-batch size, rematerialization policy, LM-head tiling and host offload. The same `batch(1024)` works on one GPU or 256. You override any one of them:
+The memory planner picks, per model, mesh and GPU, the cheapest combination that fits: micro-batch size, rematerialization policy, LM-head tiling and host offload. The planner checks each candidate against its compiled program's memory analysis. Where none fits, `fit` raises naming the split, rematerialization and head options it tried, and the closest candidate's temporary and argument bytes where the analysis gave them. The same `batch(1024)` works on one GPU or 256. You override any one of them:
 
 ```python
 Trainer(objective, opt, key=0, accumulation=4)                    # fix the micro-batch split
 Trainer(objective, opt, key=0, layout=Layout(host=("optimizer",)))  # keep optimizer state in host memory
 ```
 
-Kernels are chosen per GPU generation from one table (`dew.nn.kernels`): FlashAttention 3 on Hopper, FlashAttention 2 on Ampere and Blackwell workstations, fla's gated delta rule, fused norms and SwiGLU. A kernel replaces the XLA path only when it is measured faster and passes the float64 accuracy gate on that GPU. Tile sizes come from one autotuner per GPU and shape, cached with XLA's own autotune results.
+Every eligible model takes the planner's path: no model family needs a planner of its own. Kernels are chosen per GPU generation from one table (`dew.nn.kernels`): FlashAttention 3 on Hopper, FlashAttention 2 on Ampere and Blackwell workstations, fla's gated delta rule, fused norms and SwiGLU. A kernel replaces the XLA path only when it is measured faster and passes the float64 accuracy gate on that GPU. Tile sizes come from one autotuner per GPU and shape, cached with XLA's own autotune results.
 
 ## 4. `fit`
 
@@ -96,7 +100,7 @@ state = trainer.fit(
 )
 ```
 
-- One budget: `steps=`, `epochs=` or `tokens=` (committed valid target tokens, the same clock the data `schedule` reads).
+- One budget: `steps=`, `epochs=` or `tokens=` (committed valid target tokens, the same clock the data `schedule` reads). A run's tokens grow only at a committed update. `fit` checks the budget between steps, so after a rejected microbatch a split step can reach it at a commit and keep a later partial window; ending at that commit is not built yet.
 - `validation` is one chain or a dict of named chains, each reported separately.
 - `fit` returns the final `TrainState`. `state=` supplies initial state rather than a continuation; checkpoint restore also restores the data position.
 
@@ -124,11 +128,11 @@ Trainer(objective, opt, key=0,
 
 ## 6. Compilation
 
-Compiled programs depend only on the model, shapes, dtypes, shardings and configuration, never on where a run happens to be. The persistent compile cache is shared across runs, processes and checkouts. A resumed or repeated run reuses its programs. `lower_for=` lowers a step for a GPU generation on any host. Compiling that lowered step before a GPU is held and carrying its executable into the run is tracked in the [roadmap](../roadmap.md#training-and-parallelism).
+Compiled programs depend only on the model, shapes, dtypes, shardings and configuration, never on where a run happens to be: a compiled program captures no run path, temporary directory or checkout location. The persistent compile cache is shared across runs, processes and checkouts. A resumed or repeated run reuses its programs. `lower_for=` lowers a step for a GPU generation on any host. Compiling that lowered step before a GPU is held and carrying its executable into the run is tracked in the [roadmap](../roadmap.md#training-and-parallelism).
 
 ## 7. Seeing what happens
 
-Every run logs canonical MFU (analytic model FLOPs on real tokens over wall time) and where step time goes. Trackers (W&B, MLflow) take the same metrics; the local metric journal is JSONL. The [roadmap](../roadmap.md#kernels-and-performance) tracks a `dew profile` command that reports the step breakdown, chosen kernels and top three losses from the existing attribution tools.
+Every run logs canonical MFU (analytic model FLOPs on real tokens over wall time) and where step time goes. A model reports its FLOPs through `model_flops`; a model without them reports no MFU rather than an estimate. Each kernel dispatch records which kernel it chose and why (`dew.nn.kernels.generation.routes`); collecting those choices into a run's report is not built yet. Trackers (W&B, MLflow) take the same metrics; the local metric journal is JSONL. The [roadmap](../roadmap.md#kernels-and-performance) tracks a `dew profile` command that reports the step breakdown, chosen kernels and top three losses from the existing attribution tools.
 
 ## 8. After training
 

@@ -119,11 +119,12 @@ def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: 
         records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat
     template, each token's speaker kept beside it for an assistant-only loss,
-    cut to `seq_len + 1` tokens and packed first-fit into rows of that
-    length, in batches of `batch` rows (`records` and `host` as `images` takes them)."""
+    a longer one cut into pieces of `seq_len + 1` tokens that keep every
+    turn, and packed first-fit into rows of that length, in batches of
+    `batch` rows (`records` and `host` as `images` takes them)."""
 
     windows = _conversation_windows(dataset.map(chat.template(tokenizer)), Pack(seq_len + 1, _CHAT_FIELDS),
-                                    long="truncate")
+                                    long="chunk")
     return _finished(windows, batch=batch, records=records, host=host)
 
 

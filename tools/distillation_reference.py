@@ -20,8 +20,8 @@ and normalised with the cross entropy (trainers/pre_train/train.py:227-234,
 The loss is transcribed in float64 torch, so autograd gives its exact
 gradients, and evaluated on the logits and layer outputs of two tiny
 fixed-seed Dew decoders over one batch with padding. What lands under
-tests/fixtures/distillation is the models' variables, the batch, both
-models' outputs and the reference loss with its terms and its gradients
+tests/fixtures/distillation is the models' variables, the batch, the
+student's outputs and the reference loss with its terms and its gradients
 with respect to the student's logits and projected features; the test drives
 Dew's objective on the same variables and chains the gradients through the
 models with `jax.vjp`. The suite needs no maxtext install.
@@ -31,8 +31,8 @@ models with `jax.vjp`. The suite needs no maxtext install.
 What it writes:
 
 - fixture.npz: the variables (`student/`, `teacher/`, `projection_k`
-  prefixed, path-joined), the batch, the logits, the features, and per
-  feature loss the reference values (`cosine/loss`, `l2/...`).
+  prefixed, path-joined), the batch, the student's logits and features, and
+  per feature loss the reference values (`cosine/loss`, `l2/...`).
 - meta.json: the reference release and lines, the configuration.
 """
 
@@ -225,11 +225,11 @@ def main() -> None:
                  for index, state in enumerate(student_states)]
     mask = (targets != PAD).astype(np.float32)
 
+    # The teacher's outputs are not stored: the test runs the teacher's forward as the objective does.
     arrays = {**flat(student_vars, "student/"), **flat(teacher_vars, "teacher/"), **projections,
-              "tokens": tokens, "student_logits": student_logits, "teacher_logits": teacher_logits}
-    for index, (own, other) in enumerate(zip(student_states, teacher_states)):
+              "tokens": tokens, "student_logits": student_logits}
+    for index, own in enumerate(student_states):
         arrays[f"student_feature_{index}"] = own
-        arrays[f"teacher_feature_{index}"] = other
     for kind in ("cosine", "l2"):
         s_logits = torch.tensor(student_logits, dtype=torch.float64, requires_grad=True)
         s_features = torch.tensor(np.stack(projected), dtype=torch.float64, requires_grad=True)
