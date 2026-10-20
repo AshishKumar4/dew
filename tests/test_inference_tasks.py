@@ -227,7 +227,8 @@ def test_seed_is_the_key():
     task = TextGeneration(model, params, sampling=SAMPLING)
     prompt = [[1, 2, 4], [5, 6, 7]]
     assert_same_generation(task(prompt, 3, key=11), task(prompt, 3, key=jax.random.key(11)))
-    with pytest.raises(ValueError):
+    # A call names its key: the task has none of its own to draw with.
+    with pytest.raises(TypeError):
         task(prompt, 3)
 
 
