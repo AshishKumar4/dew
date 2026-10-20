@@ -248,38 +248,28 @@ def token_weights(
 
 
 class _DeficitIterator(pygrain.DatasetIterator[Batch]):
+    """Each row from the corpus furthest below its share of the targets delivered, each corpus
+    read through its first row ahead (`_PrimeReads`)."""
+
     def __init__(
         self,
-        parents: Sequence[pygrain.DatasetIterator[Batch]],
+        reads: Sequence[_PrimedRead],
         weights: tuple[int, ...],
         tokens: Callable[[Batch], int],
         keys: tuple[str, ...],
     ):
-        super().__init__(parents)
-        self._reads, self._weights, self._tokens, self._keys = tuple(parents), weights, tokens, keys
-        self._delivered = [0] * len(parents)
-        self._pending: list[Batch | None] = [None] * len(parents)
-        self._pending_states: list[Mapping[str, object] | None] = [None] * len(parents)
-        # The corpora whose first row was read ahead, so a rejection budget a corpus exhausts is
-        # met before any row: every corpus at the start, and one that joins a resumed mix.
-        self._primed = [False] * len(parents)
+        super().__init__(reads)
+        self._reads, self._weights, self._tokens, self._keys = tuple(reads), weights, tokens, keys
+        self._delivered = [0] * len(reads)
 
     def __next__(self) -> Batch:
-        for index, parent in enumerate(self._reads):
-            if not self._primed[index]:
-                self._pending_states[index] = parent.get_state()
-                self._pending[index] = next(parent)
-                self._primed[index] = True
         total = sum(self._delivered)
         scale = sum(self._weights)
         chosen = max(
             range(len(self._reads)),
             key=lambda index: self._weights[index] * total - self._delivered[index] * scale,
         )
-        value = self._pending[chosen]
-        if value is None:
-            value = next(self._reads[chosen])
-        self._pending[chosen], self._pending_states[chosen] = None, None
+        value = next(self._reads[chosen])
         tokens = self._tokens(value)
         if tokens <= 0:
             raise RuntimeError(
@@ -290,14 +280,8 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
 
     def get_state(self) -> Mapping[str, object]:
         return {
-            "parents": {
-                key: pending if value is not None and pending is not None else parent.get_state()
-                for key, parent, value, pending in zip(
-                    self._keys, self._reads, self._pending, self._pending_states, strict=True
-                )
-            },
+            "parents": {key: read.get_state() for key, read in zip(self._keys, self._reads, strict=True)},
             "delivered": dict(zip(self._keys, self._delivered, strict=True)),
-            "primed": dict(zip(self._keys, self._primed, strict=True)),
         }
 
     def set_state(self, state: Mapping[str, object]) -> None:
@@ -313,23 +297,17 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         if any(count < 0 for count in delivered.values()):
             raise ValueError("token deficit state has negative delivered targets")
         kept = [key in parents for key in self._keys]
-        for key, parent in zip(self._keys, self._reads, strict=True):
+        for key, read in zip(self._keys, self._reads, strict=True):
             if key in parents:
-                parent.set_state(record(parents[key], "corpus iterator"))
+                read.set_state(record(parents[key], "corpus iterator"))
         restored = [delivered[key] for key in self._keys if key in parents]
         total, weight = sum(restored), sum(w for w, held in zip(self._weights, kept, strict=True) if held)
         self._delivered = [delivered[key] if held else (w * total // weight if weight else 0)
                            for key, w, held in zip(self._keys, self._weights, kept, strict=True)]
-        self._pending = [None for _ in self._reads]
-        self._pending_states = [None for _ in self._reads]
-        # A corpus whose first row was read ahead is restored to before it, and reads it when chosen;
-        # one that joined is read ahead as the mix reads on.
-        primed = record(state["primed"], "primed corpora")
-        self._primed = [key in primed and boolean(primed[key], "primed") for key in self._keys]
 
     def close(self) -> None:
-        for parent in self._reads:
-            parent.close()
+        for read in self._reads:
+            read.close()
 
 
 class TokenDeficit(pygrain.IterDataset[Batch]):
@@ -368,8 +346,9 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
         )
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        return _DeficitIterator([iter(parent) for parent in self._corpora], self._weights, self._tokens,
-                                self._keys)
+        group = _PrimeReads([iter(parent) for parent in self._corpora])
+        reads = [_PrimedRead(group, index) for index in range(len(self._corpora))]
+        return _DeficitIterator(reads, self._weights, self._tokens, self._keys)
 
 
 class _PrimeMap:
@@ -421,10 +400,17 @@ def primed_maps(parents: Sequence[pygrain.MapDataset[Batch]]) -> tuple[pygrain.M
 
 
 class _PrimeReads:
+    """Every corpus of a mix, each read through its first row ahead. A mix
+    captures every corpus's position for each record it gives (a packer
+    captures it before each record), and only the corpora the group read
+    moved, so a corpus's position is captured again only after the group
+    reads it or it is restored (`state`)."""
+
     def __init__(self, parents: Sequence[pygrain.DatasetIterator[Batch]]):
         self.parents = tuple(parents)
         self.pending: dict[int, Batch] = {}
-        self.before: dict[int, Mapping[str, object]] = {}
+        # Each corpus's captured position, before the row it holds read ahead while it holds one.
+        self.states: dict[int, Mapping[str, object]] = {}
         # The corpora whose first row was read ahead: every corpus at the start, and one that joins
         # a resumed mix, before the mix gives a row.
         self.primed: set[int] = set()
@@ -432,49 +418,53 @@ class _PrimeReads:
     def read(self, index: int) -> Batch:
         for corpus, parent in enumerate(self.parents):
             if corpus not in self.primed:
-                self.before[corpus] = parent.get_state()
+                # Kept only once the row is read: a corpus refused as it is read ahead keeps the
+                # position, and the counts, its refusal left.
+                self.states.pop(corpus, None)
+                before = parent.get_state()
                 self.pending[corpus] = next(parent)
+                self.states[corpus] = before
                 self.primed.add(corpus)
+        self.states.pop(index, None)
         if index in self.pending:
-            self.before.pop(index, None)
             return self.pending.pop(index)
         return next(self.parents[index])
 
+    def state(self, index: int) -> Mapping[str, object]:
+        """The position of corpus `index`: before its row read ahead while it holds one."""
+        if index not in self.states:
+            self.states[index] = self.parents[index].get_state()
+        return self.states[index]
+
+    def restore(self, index: int, state: Mapping[str, object], primed: bool) -> None:
+        self.parents[index].set_state(state)
+        self.pending.pop(index, None)
+        self.states.pop(index, None)
+        if primed:
+            self.primed.add(index)
+        else:
+            self.primed.discard(index)
+
 
 class _PrimedRead(pygrain.DatasetIterator[Batch]):
-    """One corpus of a mix. The mix captures every corpus's position for each
-    record it gives (a packer captures it before each record), and only the
-    corpus that gave the record moved, so a corpus captures its position again
-    only after it reads or is restored. The position records whether the mix
-    had read the corpus's first row ahead, so a restored mix reads each
+    """One corpus of a mix (`_PrimeReads`). The position records whether the
+    mix had read the corpus's first row ahead, so a restored mix reads each
     corpus on from it and starts none again, but for one that joined, which it
     reads ahead before it gives a row."""
 
     def __init__(self, group: _PrimeReads, index: int):
         super().__init__(group.parents[index])
         self._group, self._index = group, index
-        self._state: Mapping[str, object] | None = None
 
     def __next__(self) -> Batch:
-        self._state = None
         return self._group.read(self._index)
 
     def get_state(self) -> Mapping[str, object]:
-        if self._state is None:
-            before = self._group.before
-            self._state = (before[self._index] if self._index in before
-                           else self._group.parents[self._index].get_state())
-        return {"parent": self._state, "primed": self._index in self._group.primed}
+        return {"parent": self._group.state(self._index), "primed": self._index in self._group.primed}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self._state = None
-        self._group.parents[self._index].set_state(record(state["parent"], "primed corpus"))
-        self._group.pending.pop(self._index, None)
-        self._group.before.pop(self._index, None)
-        if boolean(state["primed"], "primed"):
-            self._group.primed.add(self._index)
-        else:
-            self._group.primed.discard(self._index)
+        self._group.restore(self._index, record(state["parent"], "primed corpus"),
+                            boolean(state["primed"], "primed"))
 
     def close(self) -> None:
         self._group.parents[self._index].close()
