@@ -9,10 +9,9 @@ for value in "$commit" "$source"; do
 done
 apt-get update
 apt-get install -y --no-install-recommends python3 python3-venv ca-certificates curl libcap2-bin libseccomp2 bubblewrap
-# The system trust store leaves out the roots that eMudhra's eight compromised intermediate CAs chain
-# to (Mozilla, 2026-10-20), and pip verifies against it rather than its own bundled roots.
-sed -i -E 's#^mozilla/(emSign_Root_TLS_CA_-_G3|emSign_ECC_Root_CA_-_G3|AAA_Certificate_Services)\.crt$#!&#' /etc/ca-certificates.conf
-update-ca-certificates --fresh >/dev/null
+# trixie-security's ca-certificates (20250419+deb13u1) leaves out the roots that eMudhra's eight
+# compromised intermediate CAs chain to (Mozilla, 2026-10-20); pip verifies against that store
+# rather than its own bundled roots.
 export PIP_CERT=/etc/ssl/certs/ca-certificates.crt
 python3 -m venv /opt/venv
 # One pass under the suite's lock (tools/lock_environment.sh), which pins every package the live,
