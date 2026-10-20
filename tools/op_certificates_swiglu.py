@@ -219,16 +219,19 @@ def _patterns(start: int, count: int) -> np.ndarray:
 
 
 def _swept_oracle(kind: str, start: int, count: int) -> np.ndarray:
-    """A worker's share of a sweep: the correctly rounded value at each pattern, as fp32 (it is one)."""
-    return np.asarray(oracle(kind, [_patterns(start, count)]), np.float32)
+    """A worker's share of a sweep: the correctly rounded value at each pattern, as fp32 (it is one);
+    NaN and infinite patterns compute to themselves, quietly."""
+    with np.errstate(invalid="ignore", over="ignore"):
+        return np.asarray(oracle(kind, [_patterns(start, count)]), np.float32)
 
 
 def sweep(name: str, fn, kind: str, config, chunk: int = 1 << 24, limit: int = 1 << 32) -> dict:
     """`fn` over every fp32 bit pattern (the first `limit`), each against its correctly rounded
-    value: the node's largest distance in ulps on this GPU and where it sits, over the elements
-    whose argument and result are normal, and apart, how many subnormal ones it flushed or missed and
-    the worst of them in steps of the least subnormal. The oracle runs on the host's cores alongside
-    the GPU (each worker spawned, so none inherits the GPU's state), chunk by chunk in order."""
+    value: the node's largest distance in ulps on this GPU and where it sits, over the elements whose
+    result is a finite normal number (whatever the argument), and apart, how many subnormal results it
+    flushed or missed and the worst of them in steps of the least subnormal. The oracle runs on the
+    host's cores alongside the GPU (each worker spawned, so none inherits the GPU's state), chunk by
+    chunk in order."""
     worst, where, nonfinite, flushed, subnormal_wrong, started = 0, None, 0, 0, 0, time.time()
     subnormal_worst, subnormal_at = 0.0, None
     chunk = min(chunk, limit)
@@ -241,7 +244,9 @@ def sweep(name: str, fn, kind: str, config, chunk: int = 1 << 24, limit: int = 1
             x = _patterns(start, chunk)
             native = np.asarray(probe(fn, [jnp.asarray(x)], config), np.float32)
             want = want.astype(np.float64)
-            tiny = _subnormal(x) | _subnormal(want)
+            # A subnormal result's contract is absolute; every other finite result's is in ulps, whatever
+            # its argument (a subnormal argument's reciprocal is a normal result).
+            tiny = _subnormal(want)
             finite = np.isfinite(want) & np.isfinite(x) & ~tiny
             distance = np.where(finite, ulps(native, want), 0)
             if distance.max() > worst:
