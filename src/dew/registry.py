@@ -1085,9 +1085,9 @@ def configured(value: object) -> Configured:
     raise ValueError(f"{value!r} is not a value a member field carries")
 
 
-DtypeName = Literal["float32", "bfloat16", "float16"]
+DtypeName = Literal["float64", "float32", "bfloat16", "float16"]
 _DTYPES: dict[DtypeName, DTypeLike] = {
-    "float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}
+    "float64": jnp.float64, "float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}
 
 
 def resolve_dtype(value: object) -> DTypeLike | None:
@@ -1100,6 +1100,10 @@ def resolve_dtype(value: object) -> DTypeLike | None:
     if value is None:
         return None
     if isinstance(value, str):
+        if value == "float64" and not jax.config.jax_enable_x64:
+            raise ValueError("dtype 'float64' computes in float64 only with JAX_ENABLE_X64=1 "
+                             "(jax.config.update('jax_enable_x64', True)); without it JAX narrows it to "
+                             "float32")
         for name, dtype in _DTYPES.items():
             if value == name:
                 return dtype

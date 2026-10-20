@@ -96,3 +96,24 @@ def test_a_dataclass_members_field_rebuilds_through_a_function_member():
 
 def supervised(loss: dict) -> ObjectiveConfig:
     return ObjectiveConfig("supervised", {"loss": loss, "inputs": InputSpec(Field("x", (3,)))})
+
+
+def test_a_float64_model_records_its_dtype_and_the_name_needs_x64():
+    """A model computing in float64 records its dtype by name and rebuilds from it where JAX
+    computes in float64; without x64 the name is refused, since JAX would narrow it to float32."""
+    import jax
+    import jax.numpy as jnp
+    import pytest
+
+    from dew.config import ModelConfig
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.registry import resolve_dtype
+
+    model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=1, mlp_features=8,
+                              max_seq_len=4, dtype=jnp.float64)
+    with jax.enable_x64(new_val=True):
+        record = ModelConfig.from_model(model)
+        assert record.fields["dtype"] == "float64"
+        assert ModelConfig.from_dict(dataclasses.asdict(record)).build().dtype == jnp.float64
+    with jax.enable_x64(new_val=False), pytest.raises(ValueError):
+        resolve_dtype("float64")
