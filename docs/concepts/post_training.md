@@ -166,7 +166,7 @@ prompt = [
 | `split` | `train` | Split of a Hub dataset. |
 | `validation` | `None` | An explicit held-out Source, Pipeline, HoldOut or named Split. |
 | `seq_len` | `256` | Prediction length `L`. |
-| `long` | `truncate` | Truncate, drop or chunk an over-length conversation. |
+| `long` | `chunk` | Chunk an over-length conversation, every turn kept; `truncate` keeps its first window and `drop` rejects it. |
 
 The chat template is the rule for turning message boundaries, role headers and content into tokens, and each model is trained on its own format. Joining message strings by hand can change both the input and which tokens count toward the loss. `Chat` also preserves tool calls, tool responses and tool schemas.
 

@@ -157,6 +157,21 @@ def test_the_verl_rl_parquet_reads_its_nested_ground_truth():
         assert info["ability"] == expected["ability"]
 
 
+def test_a_prompt_rows_ability_rides_beside_context_that_is_no_mapping():
+    """A row's `ability` joins a mapping `extra_info` as a field of it, and rides beside one that is
+    no mapping (a string) in an envelope that keeps both; a mapping that names another ability is
+    refused, since keeping either would lose the other."""
+    from dew.data.prompts import _extra_info
+
+    assert _extra_info({"extra_info": {"split": "train"}, "ability": "math"}) == {
+        "split": "train", "ability": "math"}
+    assert _extra_info({"extra_info": "suite-A", "ability": "math"}) == {
+        "extra_info": "suite-A", "ability": "math"}
+    assert _extra_info({"ability": "math"}) == {"ability": "math"}
+    with pytest.raises(ValueError):
+        _extra_info({"extra_info": {"ability": "code"}, "ability": "math"})
+
+
 def test_text_rows_with_the_empty_media_verls_loops_write_are_training_rows():
     """ToolAgentLoop and SingleTurnAgentLoop write `multi_modal_data={}` and
     `mm_processor_kwargs={}` on every text-only trajectory (tool_agent_loop.py
