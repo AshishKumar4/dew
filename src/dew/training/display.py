@@ -9,8 +9,11 @@ evaluation of each split with its history; and, in the bottom border, the
 phase the run is in. Notes print above the panel. The run ends with a
 summary panel that keeps the final evaluations and their histories.
 
-Anywhere else (a pipe, a log file, CI, a notebook) the same numbers are
-printed as one line per logging interval. Only process zero shows anything.
+In a notebook the same panel redraws in an output widget (rich's `Live`), and
+the run ends with its last frame and the summary as static outputs, which a
+saved notebook and the site keep where they keep no widget. Anywhere else (a
+pipe, a log file, CI) the same numbers are printed as one line per logging
+interval. Only process zero shows anything.
 
 Nothing here knows a workload. The rows are whatever scalars are logged,
 grouped by the prefix of their names (`train`, `rollout`, ...), and how one
@@ -22,6 +25,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import datetime
+import importlib.util
 import math
 import sys
 import time
@@ -64,10 +68,13 @@ PLAIN = Shown()
 WIDEST = 120
 
 
-def terminal(console: Console) -> bool:
-    """Whether `console` is a terminal the panel can redraw. rich takes
-    FORCE_COLOR, which a CI job may set, for a terminal; that asks for
-    colour, not for redraws in a log, so stdout must be a TTY as well."""
+def redraws(console: Console) -> bool:
+    """Whether the panel can redraw on `console`: a terminal, or a notebook with
+    ipywidgets, whose output widget rich's `Live` redraws there. rich takes
+    FORCE_COLOR, which a CI job may set, for a terminal; that asks for colour,
+    not for redraws in a log, so a terminal's stdout must be a TTY as well."""
+    if console.is_jupyter:
+        return importlib.util.find_spec("ipywidgets") is not None
     return sys.stdout.isatty() and console.is_terminal and not console.is_dumb_terminal
 
 
@@ -317,14 +324,16 @@ class TrainingDisplay:
             self.header.append(("mesh", mesh))
         self.header += [("batch", str(batch)), ("", precision)]
         console = Console()
-        if not terminal(console):
+        if not redraws(console):
             target = (f"to {started.target_steps}" if started.target_steps is not None
                       else f"for {started.tokens} real tokens")
             self.note(f"Training {model} from step {started.start_step} {target}: "
                       + ", ".join(f"{label} {value}".strip() for label, value in self.header))
             return
         self.phase = "compiling"
-        self.live = Live(self, console=console, refresh_per_second=8, vertical_overflow="visible")
+        # A notebook's widget goes when the run ends, for the static frame `close` leaves.
+        self.live = Live(self, console=console, refresh_per_second=8, vertical_overflow="visible",
+                         transient=console.is_jupyter)
         self.live.start()
         self._logs = display_console(console)
         self._logs.__enter__()
@@ -392,11 +401,14 @@ class TrainingDisplay:
             Console().print(Text(text), soft_wrap=True)
 
     def close(self) -> None:
-        """Stop the live panel, leaving its last frame on the screen."""
+        """Stop the live panel, leaving its last frame on the screen: in a
+        notebook, printed as a static output in place of the widget."""
         try:
             if self.live is not None:
                 self.ended = True
                 self.live.stop()
+                if self.live.console.is_jupyter:
+                    self.live.console.print(self)
         finally:
             self.live = None
             if self._logs is not None:
@@ -419,7 +431,7 @@ class TrainingDisplay:
         rate = (steps - 1) / stepping if steps > 1 and stepping > 0 else None
         fraction = f"{goodput['goodput/step_fraction']:.1%} of the wall time in steps"
         console = Console()
-        if not terminal(console):
+        if not redraws(console):
             timing = f"Trained {steps} steps in {duration(seconds)}"
             if first is not None:
                 timing += f": first step after {first:.2f} s"

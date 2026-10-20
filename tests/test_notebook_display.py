@@ -1,0 +1,47 @@
+"""The training display in a notebook, executed in a real Jupyter kernel (nbclient) and saved.
+
+While the run lasts its panel redraws in one output widget, as on a terminal; a saved notebook,
+and the site that renders it (site/scripts/notebook-outputs.mjs), keep no widget's state, so the
+run ends with the panel's last frame and the summary as static outputs. A notebook gets no line
+per logging interval.
+"""
+
+from pathlib import Path
+
+import nbformat
+from nbclient import NotebookClient
+
+TESTS = Path(__file__).resolve().parent
+
+FIT = """\
+import jax
+import optax
+from affine_run import TimingRegression, batches
+
+from dew.data.dataset import Loader
+from dew.training import Trainer
+
+trainer = Trainer(TimingRegression(), optax.sgd(0.01), key=jax.random.key(0))
+state = trainer.fit(Loader(lambda partition: batches(), None, None, 8), steps=4, log_every=1)
+"""
+
+
+def text(output) -> str:
+    return output.get("text", "") if output.output_type == "stream" else output.get("data", {}).get("text/plain", "")
+
+
+def test_a_notebook_redraws_the_panel_in_one_widget_and_keeps_its_last_frame_and_the_summary(tmp_path):
+    notebook = nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell(FIT)])
+    NotebookClient(notebook, kernel_name="python3", resources={"metadata": {"path": str(TESTS)}}).execute()
+    nbformat.write(notebook, tmp_path / "fit.ipynb")
+    outputs = nbformat.read(tmp_path / "fit.ipynb", as_version=4).cells[0].outputs
+
+    assert not [output for output in outputs if output.output_type == "error"], outputs
+    widgets = [output for output in outputs if "application/vnd.jupyter.widget-view+json" in output.get("data", {})]
+    assert len(widgets) == 1, outputs
+    assert not [output for output in outputs if "step 1/4" in text(output)], "a line per logging interval"
+    frame, summary = [output for output in outputs if output.get("data", {}).get("text/html")][-2:]
+    assert "dew · TimingRegression" in text(frame) and "finished" in text(frame) and "loss" in text(frame)
+    assert "TimingRegression" in text(summary) and "4 steps" in text(summary)
+    # Styled, so the site renders each as the panel it is, not as one more line of a log.
+    assert all("<span" in "".join(output.data["text/html"]) for output in (frame, summary))
