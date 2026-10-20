@@ -535,7 +535,8 @@ def test_a_swiglu_takes_the_kernel_its_target_measured_at_its_width(dtype, named
 
 
 @pytest.mark.parametrize("width, dtype, code, row", [
-    (9000, jnp.bfloat16, "width", "roadmap: norm kernel widths"), (64, jnp.float16, "dtype", "inherent")])
+    (9000, jnp.bfloat16, "width", "ledger 820"),
+    (64, jnp.float16, "dtype", norm_swiglu.QUALIFY_FP16)])
 def test_a_norm_the_kernel_refuses_reports_the_requirement_and_its_row(width, dtype, code, row):
     """On an A100, a norm the fused kernel does not take runs XLA's arithmetic and reports the
     requirement it fails (`norm_swiglu.NORM_SUPPORTS`) with the roadmap row that tracks lifting it, or

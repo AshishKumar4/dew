@@ -202,6 +202,16 @@ def _selected[C](op: Op[C], case: C, implementation: str) -> str:
     return select(op, case, None if implementation == 'auto' else implementation, insist=False).kernel
 
 
+QUALIFY_FP16 = 'ledger 823'
+"""The row that tracks qualifying the fused norm and SwiGLU kernels on fp16 operands."""
+
+
+def _within_fp32(dtype) -> bool:
+    """Whether a dtype's accuracy is no finer than fp32's, which the kernels compute in; a dtype that
+    is no float falls to the `dtype` requirement."""
+    return not jnp.issubdtype(dtype, jnp.floating) or jnp.finfo(dtype).bits <= 32
+
+
 def _runs(case) -> bool:
     """Whether the Pallas kernels run for `case` here: a GPU Dew's Triton kernels run on, or on a CPU
     interpreted where the call names them (`case.named`)."""
@@ -282,20 +292,23 @@ NORM_SUPPORTS: tuple[Requirement[NormCase], ...] = (
     Requirement('capability', _runs, "the Pallas kernels need a GPU of sm80 or later", inherent=True),
     Requirement('activation', lambda case: not case.activated,
                 "the norm is followed by an activation, which the kernel does not apply",
-                row='roadmap: norm epilogue activations'),
+                row='ledger 821'),
     Requirement('statistics', lambda case: case.fp32_statistics,
                 "input-dtype statistics round each reduction step; the kernel reduces in fp32",
                 inherent=True),
     Requirement('gate_activation', lambda case: case.activation in (None, 'silu', 'sigmoid'),
                 lambda case: f"the gated kernel gates by silu or sigmoid, not {case.activation!r}",
                 inherent=True),
+    Requirement('precision', lambda case: _within_fp32(case.dtype) and _within_fp32(case.output),
+                lambda case: f"RMSNorm input {case.dtype} and output {case.output}; the kernel computes in "
+                             "fp32, which a wider dtype's accuracy needs more than", inherent=True),
     Requirement('dtype', lambda case: case.dtype in DTYPES and case.output in DTYPES,
-                lambda case: f"RMSNorm input {case.dtype} and output {case.output}; the kernel supports "
-                             "float32 and bfloat16", inherent=True),
+                lambda case: f"RMSNorm input {case.dtype} and output {case.output}; the kernel is qualified "
+                             "on float32 and bfloat16", row=QUALIFY_FP16),
     Requirement('empty', lambda case: not case.empty, "RMSNorm needs nonempty rows with a feature axis",
                 inherent=True),
     Requirement('width', lambda case: 0 < case.width <= 8192,
-                "RMSNorm's register tile holds at most 8192 features", row='roadmap: norm kernel widths'),
+                "RMSNorm's register tile holds at most 8192 features", row='ledger 820'),
     Requirement('scale', lambda case: case.scale_fits,
                 "the kernel takes a float32 or bfloat16 vector scale, not a broadcast affine tensor",
                 inherent=True),
@@ -306,7 +319,7 @@ NORM_SUPPORTS: tuple[Requirement[NormCase], ...] = (
     Requirement('placement', lambda case: case.placed,
                 "a mesh splits RMSNorm's operands by axes the caller does not name or across its features, "
                 "or a shard_map that checks varying axes holds them, and a Pallas call states no varying "
-                "type", row='roadmap: kernels inside checked shard_map'),
+                "type", row='ledger 822'),
 )
 """The fused norms' requirements: a plain, stream and gated RMSNorm over fp32 or bf16 rows of at most
 8192 features, with fp32 statistics, a vector weight, and operands placed as the kernel reads them."""
@@ -350,15 +363,19 @@ class SwigluCase:
 
 SWIGLU_SUPPORTS: tuple[Requirement[SwigluCase], ...] = (
     Requirement('capability', _runs, "the Pallas kernels need a GPU of sm80 or later", inherent=True),
-    Requirement('dtype', lambda case: case.dtype_fits, "SwiGLU needs matching float32 or bfloat16 operands",
-                inherent=True),
+    Requirement('precision', lambda case: _within_fp32(case.dtype),
+                lambda case: f"SwiGLU of {case.dtype} operands; the kernel computes in fp32, which a wider "
+                             "dtype's accuracy needs more than", inherent=True),
+    Requirement('dtype', lambda case: case.dtype_fits,
+                "SwiGLU needs matching operands, float32 or bfloat16, the dtypes the kernel is qualified on",
+                row=QUALIFY_FP16),
     Requirement('shape', lambda case: case.shape_fits,
                 "SwiGLU needs nonempty equal shapes, not broadcasting, or a packed [..., 2, H] gate and up",
                 inherent=True),
     Requirement('placement', lambda case: case.placed,
                 "a mesh splits SwiGLU's operands by axes the caller does not name, or a shard_map that "
                 "checks varying axes holds them, and a Pallas call states no varying type",
-                row='roadmap: kernels inside checked shard_map'),
+                row='ledger 822'),
 )
 """The fused SiLU products' requirements: fp32 or bf16 operands of one shape, apart or packed, placed
 as the kernel reads them."""
