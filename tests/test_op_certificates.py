@@ -166,3 +166,23 @@ def test_rsqrt_rounds_as_interval_arithmetic_does(fmt):
     sample = np.concatenate([values[:2000], hard, [1.0, 4.0, least]])
     expected = _interval_rounded(lambda iv, x: 1 / iv.sqrt(x), sample, fmt)
     assert not oc.mismatches(oc.rsqrt_rounded(sample, fmt), expected, fmt).any()
+
+
+def test_the_exp_enclosure_holds_its_proven_bound():
+    """`_exp_enclosed` against mpmath at 300 bits, on fp32 arguments over its whole range, both ends, the
+    binades its reduction changes k at, and the arguments whose results are fp32 subnormals: every
+    relative error within EXP_BOUND, the oracle's fast path trusting no library exp."""
+    import mpmath
+
+    rng = np.random.default_rng(6)
+    edges = [-110.0, 90.0, 0.0, 1e-30, -1e-30, 88.72, -87.33, -103.9]
+    x = np.concatenate([rng.uniform(-110.0, 90.0, 2000), edges, np.arange(-158, 130) * float(oc._LN2) / 2])
+    x = oc.exact_cast(x, oc.FLOAT32)
+    hi, lo = oc._exp_enclosed(x)
+    def wide(value):
+        return mpmath.mpf(float(value))
+
+    with mpmath.workprec(300):
+        worst = max(abs((wide(high) + wide(low)) / mpmath.exp(wide(v)) - 1)
+                    for v, high, low in zip(x, hi, lo, strict=True))
+    assert worst <= oc.EXP_BOUND, float(worst)

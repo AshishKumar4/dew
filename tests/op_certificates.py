@@ -182,12 +182,6 @@ def mismatches(native, oracle, fmt: Format) -> np.ndarray:
         oracle.astype(np.float64))
 
 
-TRANSCENDENTAL_MARGIN = 2.0 ** -40
-"""The relative distance from float64's `exp` within which the exact value is taken to lie before
-interval arithmetic decides: 2^13 times glibc's documented bound (0.511 float64 ulps), so the only
-assumption is that numpy's float64 exp is not wrong past its 13th bit from the last."""
-
-
 def _decided(low: np.ndarray, high: np.ndarray, fmt: Format) -> tuple[np.ndarray, np.ndarray]:
     """RN in `fmt` of each end of an enclosure of the exact value, and where the ends agree, so the
     rounding of every value between them is that one (round to nearest is monotone)."""
@@ -215,22 +209,102 @@ def _fraction(raw) -> fractions.Fraction:
     return -value if sign else value
 
 
+def _fast_two_sum(a, b):
+    """s + e = a + b exactly, for |a| >= |b| or a = 0 (Dekker)."""
+    total = a + b
+    return total, b - (total - a)
+
+
+def _split(a):
+    """a = hi + lo, each of at most 26 significant bits (Veltkamp, by 2^27 + 1)."""
+    scaled = 134217729.0 * a
+    hi = scaled - (scaled - a)
+    return hi, a - hi
+
+
+def _two_product(a, b):
+    """p + e = a·b exactly (Dekker's product, no fused multiply-add)."""
+    product = a * b
+    a_hi, a_lo = _split(a)
+    b_hi, b_lo = _split(b)
+    return product, ((a_hi * b_hi - product) + a_hi * b_lo + a_lo * b_hi) + a_lo * b_lo
+
+
+def _dd_mul(a_hi, a_lo, b_hi, b_lo):
+    """A double-double product, within 7·2^-106 of the exact one relative to it (Joldes, Muller and
+    Popescu, ACM TOMS 44(2), 2017, DWTimesDW1: 7u^2)."""
+    product, error = _two_product(a_hi, b_hi)
+    return _fast_two_sum(product, error + (a_hi * b_lo + a_lo * b_hi))
+
+
+def _dd_add(a_hi, a_lo, b_hi, b_lo):
+    """A double-double sum, within 3·2^-106 of the exact one relative to it, whatever the operands'
+    signs (Joldes, Muller and Popescu 2017, AccurateDWPlusDW: 3u^2 + 13u^3)."""
+    total, error = two_sum(a_hi, b_hi)
+    low, low_error = two_sum(a_lo, b_lo)
+    total, error = _fast_two_sum(total, error + low)
+    return _fast_two_sum(total, error + low_error)
+
+
+_LN2 = fractions.Fraction(
+    "0.6931471805599453094172321214581765680755001343602552541206800094933936219696947156058633269964186875")
+"""ln 2 to 100 digits (OEIS A002162), 2^-330 from it, far below every bound here."""
+_LN2_HI = float(fractions.Fraction(round(_LN2 * 2 ** 44), 2 ** 44))
+"""ln 2 to 44 fractional bits: k·_LN2_HI is exact in float64 for |k| <= 2^8."""
+_LN2_LO = float(_LN2 - fractions.Fraction(_LN2_HI))
+_TAYLOR = 24
+_COEFFICIENTS = [(float(c), float(c - fractions.Fraction(float(c))))
+                 for c in (fractions.Fraction(1, math.factorial(n)) for n in range(_TAYLOR + 1))]
+"""1/n! for n <= _TAYLOR as double-doubles, each within 2^-106 of it relative to it."""
+EXP_BOUND = 2.0 ** -80
+"""A relative bound on `_exp_enclosed`'s error, from its terms (the arithmetic's 2^-89 and below):
+- the reduced argument r = x - k·ln 2 for fp32 x in [-110, 90]: x - k·_LN2_HI is exact (k·_LN2_HI has 52
+  bits at most, and the difference is exact by Sterbenz for k != 0 and is x for k = 0); k·_LN2_LO is
+  within 2^-53 of itself, |k·_LN2_LO| <= 160·2^-44, and _LN2_LO within 2^-98 of ln 2 - _LN2_HI: r is
+  within 2^-89 of the exact x - k·ln 2, so exp(r) within 2^-88.9 relative;
+- the Taylor remainder at |r| <= 0.347 after 25 terms: 0.347^25/25!·e^0.347 < 2^-118;
+- the double-double Horner evaluation, 25 steps each of one product (7u^2) and one sum (3u^2 relative
+  to it; each step adds 1/n! to a value at most 0.347/(n + 1)·e^0.347 of it, so no step cancels and
+  every partial value stays within a factor 1.6 of its leading term), with 2^-106 coefficient
+  roundings: below 25·(7 + 3 + 1)·1.6·2^-106 < 2^-97;
+- scaling by 2^k is exact (the results stay normal in float64).
+Total below 2^-88; the bound is 2^-80 to keep 2^8 of slack. Measured against mpmath at 300 bits on
+3,000 fp32 arguments over the range: 2^-94.7 at worst (tests/test_op_certificates.py holds it)."""
+
+
+def _exp_enclosed(x):
+    """exp(x) for fp32 or bf16 x in [-110, 90], as a double-double within EXP_BOUND of it relative to it."""
+    k = np.rint(x / float(_LN2))
+    reduced_hi, reduced_lo = _fast_two_sum(x - k * _LN2_HI, -k * _LN2_LO)
+    value_hi, value_lo = np.full_like(x, _COEFFICIENTS[-1][0]), np.full_like(x, _COEFFICIENTS[-1][1])
+    for hi, lo in reversed(_COEFFICIENTS[:-1]):
+        value_hi, value_lo = _dd_mul(value_hi, value_lo, reduced_hi, reduced_lo)
+        value_hi, value_lo = _dd_add(value_hi, value_lo, np.full_like(x, hi), np.full_like(x, lo))
+    return np.ldexp(value_hi, k.astype(np.int64)), np.ldexp(value_lo, k.astype(np.int64))
+
+
 def exp_rounded(x, fmt: Format) -> np.ndarray:
-    """RN(exp(x)) in `fmt` for values of a format no wider than fp32, validated: float64's exp
-    widened by `TRANSCENDENTAL_MARGIN` decides every element whose enclosure rounds one way, and
-    mpmath's interval exp at rising precision decides the rest (exp of a nonzero rational is never
-    a midpoint, so the precision needed is finite)."""
+    """RN(exp(x)) in `fmt` for values of a format no wider than fp32, verified: a double-double exp
+    with a proven relative bound (`_exp_enclosed`, EXP_BOUND) decides every element whose enclosure
+    rounds one way, and mpmath's interval exp at rising precision decides the rest (exp of a nonzero
+    rational is never a midpoint, so the precision needed is finite). No library exp is trusted.
+    Beyond [-110, 90] the result is 0 or inf in every format no wider than fp32 (exp(-110) is below
+    half fp32's least subnormal, exp(90) past its largest finite value); NaN is NaN."""
     x = np.asarray(x, np.float64)
-    estimate = np.exp(x)
-    low, high = estimate * (1 - TRANSCENDENTAL_MARGIN), estimate * (1 + TRANSCENDENTAL_MARGIN)
-    result, decided = _decided(low, np.where(np.isinf(estimate), estimate, high), fmt)
+    inside = (x >= -110) & (x <= 90)
+    hi, lo = _exp_enclosed(np.where(inside, x, 0.0))
+    slack = np.abs(hi) * EXP_BOUND
+    lower, upper = rounded(hi, lo - slack, fmt), rounded(hi, lo + slack, fmt)
+    result = np.where(x > 90, np.inf, np.where(x < -110, 0.0, lower))
+    result = np.where(np.isnan(x), np.nan, result)
+    decided = ~inside | (lower == upper)
     for index in np.flatnonzero(~decided):
         for precision in (96, 192, 384, 768):
             with interval_precision(precision) as iv:
-                lower, upper = iv.exp(iv.mpf(float(x.flat[index])))._mpi_
-            lower, upper = (fraction_rounded(_fraction(end), fmt) for end in (lower, upper))
-            if lower == upper:
-                result.flat[index] = lower
+                low_end, high_end = iv.exp(iv.mpf(float(x.flat[index])))._mpi_
+            low_end, high_end = (fraction_rounded(_fraction(end), fmt) for end in (low_end, high_end))
+            if low_end == high_end:
+                result.flat[index] = low_end
                 break
         else:
             raise ArithmeticError(f"exp({x.flat[index]!r}) undecided at 768 bits")
