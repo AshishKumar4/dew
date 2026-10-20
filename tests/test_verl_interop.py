@@ -18,7 +18,7 @@ import pytest
 from dew.config.data import PromptData
 from dew.data import Loading
 from dew.data.compile import iterate
-from dew.data.prompts import INFO_KEY, SOURCE_KEY, TRUTH_KEY
+from dew.data.prompts import INFO_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
 from dew.objectives.rl.sessions import (
     BEHAVIOR_LOG_PROBS_KEY,
     ROUTED_EXPERTS_KEY,
@@ -29,7 +29,7 @@ from dew.objectives.rl.sessions import (
     Status,
     pack,
 )
-from dew.objectives.rl.verl import from_verl, to_verl
+from dew.objectives.rl.verl import compute_score, from_verl, to_verl, verl_reward
 
 FIXTURES = Path(__file__).parent / "fixtures/rl"
 NATIVE = json.loads((FIXTURES / "verl_native.json").read_text())
@@ -154,3 +154,30 @@ def test_text_rows_with_the_empty_media_verls_loops_write_are_training_rows():
     (trajectory,) = from_verl([row])
     assert trajectory.session.calls
     assert without_dew(json.loads(json.dumps(to_verl([trajectory])))[0]) == row
+
+
+def test_a_reward_crosses_the_verl_boundary_with_the_records_three_fields():
+    """verl's `compute_score(data_source, solution_str, ground_truth, extra_info)` scores in Dew
+    as a `Reward` of the completion and its record, each field passed as verl names it, and a Dew
+    reward handed back to verl reads what verl passed it."""
+    calls = []
+
+    def score(data_source, solution_str, ground_truth, extra_info):
+        calls.append((data_source, solution_str, ground_truth, extra_info))
+        return float(solution_str == ground_truth)
+
+    record = PromptRecord("gsm8k", "72", '{"index": 3}')
+    assert verl_reward(score)("72", record) == 1.0
+    assert calls == [("gsm8k", "72", "72", '{"index": 3}')]
+    seen = []
+
+    def reward(completion, given):
+        seen.append((completion, given))
+        return 0.5
+
+    assert compute_score(reward)("gsm8k", "71", "72", "") == 0.5
+    # verl may pass extra info that is not text; the record holds it as a prompt batch would.
+    assert compute_score(reward)("gsm8k", "71", ["72"], {"split": "test", "index": 3}) == 0.5
+    assert seen == [("71", PromptRecord("gsm8k", "72", "")),
+                    ("71", PromptRecord("gsm8k", '["72"]', '{"index": 3, "split": "test"}'))]
+
