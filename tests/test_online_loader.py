@@ -111,6 +111,24 @@ def test_a_fetch_follows_a_redirect_and_keeps_the_bytes_the_server_sent(header):
     assert row["bytes"] == body and row["content_sha256"] == hashlib.sha256(body).hexdigest()
 
 
+@pytest.mark.parametrize("hops", [0, 10])
+def test_a_redirect_to_a_local_file_is_not_followed(tmp_path, hops):
+    """A server's redirect to a file on this host is never followed, first or past the hops a
+    fetch follows: the fetch is dropped, and the file's bytes never enter a record."""
+    secret = tmp_path / "secret"
+    secret.write_bytes(b"local bytes")
+
+    def handle(request):
+        step = int(request.path.strip("/") or 0)
+        request.send_response(302)
+        request.send_header("Location", secret.as_uri() if step >= hops else f"/{step + 1}")
+        request.end_headers()
+
+    with serving(handle) as address:
+        fetched = Fetch()({"url": f"http://{address}/0"})
+    assert isinstance(fetched, Rejected) and not fetched.permanent
+
+
 def test_a_fetch_reaches_a_host_its_environment_excludes_from_its_proxy(monkeypatch):
     """A host and port the environment excludes from its proxy (NO_PROXY) is fetched directly,
     though a proxy is named for its scheme: the proxy never sees the request."""
