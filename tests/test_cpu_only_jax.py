@@ -244,3 +244,34 @@ def test_a_runs_setup_on_a_gpu_machine_starts_the_cuda_plugin_and_steps_on_the_g
                           timeout=300, cwd=tmp_path)
     assert done.returncode == 0, done.stderr[-2000:]
     assert done.stdout.split() == ["gpu", "14.0"]
+
+
+UNSTARTED = """
+import jax
+
+from dew.telemetry.devices import CPUOnlyJax
+from dew.training import prepare_process
+
+# A device no host has: the registered CUDA plugin's own start fails.
+jax.config.update("jax_cuda_visible_devices", "999")
+try:
+    prepare_process(multi_host=False)
+except CPUOnlyJax:
+    print("refused")
+except RuntimeError as failed:
+    print("plugin", type(failed).__name__)
+"""
+
+
+@pytest.mark.gpu(reason="the machine's own driver and JAX's own CUDA plugin")
+def test_a_cuda_plugin_that_fails_to_start_raises_its_own_error_through_a_runs_setup(tmp_path):
+    """On a GPU machine, a real CUDA plugin that registers and then fails to start raises JAX's own
+    error through a run's setup: the setup does not stand in its refusal for the plugin's reason."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, (os.path.join(root, "src"),
+                                                                     os.environ.get("PYTHONPATH"))))}
+    env.pop("JAX_PLATFORMS", None)
+    done = subprocess.run([sys.executable, "-c", UNSTARTED], capture_output=True, text=True, env=env,
+                          timeout=300, cwd=tmp_path)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert done.stdout.split() == ["plugin", "RuntimeError"]
