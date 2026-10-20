@@ -566,10 +566,12 @@ def test_a_failed_draw_or_a_rewards_os_error_is_an_infra_error():
     drawn = PromptSource(Failing(), lambda *_: 1.0, decode=str, max_new_tokens=4)
     rollout = drawn.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
     assert rollout.status == Status.INFRA_ERROR and "engine restarted" in rollout.detail
+    # A failed draw still came from its prompt's source.
+    assert rollout.source == "math"
     scored = PromptSource(Server(), unreachable, decode=str, max_new_tokens=4)
     rollout = scored.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
     assert rollout.status == Status.INFRA_ERROR and "reward sandbox timed out" in rollout.detail
-    assert len(rollout.calls) == 1
+    assert len(rollout.calls) == 1 and rollout.source == "math"
     drawn.close()
     scored.close()
 

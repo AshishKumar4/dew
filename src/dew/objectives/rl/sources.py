@@ -317,13 +317,14 @@ class PromptSource:
         self._scorers.shutdown(wait=True, cancel_futures=True)
 
     def _rollout(self, task: Task, prompt: _Prompt, version: int, drawn: Future[Draw]) -> Session:
+        source = prompt.record.data_source
         failed = _draw_failure(drawn)
         if failed is not None:
-            return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, failed)
+            return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, failed, source)
         draw = drawn.result()
         if draw.version != version:
             return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {},
-                           f"draw: served by version {draw.version}, submitted under {version}")
+                           f"draw: served by version {draw.version}, submitted under {version}", source)
         call = Call(
             draw.prompt,
             draw.tokens,
@@ -340,9 +341,8 @@ class PromptSource:
         except _INFRASTRUCTURE as error:
             # The reward's boundary failed, a sandbox or a service: infrastructure, retried.
             return Session(task.id, "", 0, 0, (call,), Status.INFRA_ERROR, None, {},
-                           f"reward: {_failure(error)}", prompt.record.data_source)
-        return Session(task.id, "", 0, 0, (call,), status, finite_reward(score),
-                       source=prompt.record.data_source)
+                           f"reward: {_failure(error)}", source)
+        return Session(task.id, "", 0, 0, (call,), status, finite_reward(score), source=source)
 
     def _scored(self, task: Task, prompt: _Prompt, version: int, drawn: Future[Draw]) -> Future[Session]:
         """The draw's future, chained into its reward on a scorer thread."""
