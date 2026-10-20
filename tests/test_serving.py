@@ -160,6 +160,27 @@ def _host_loaded(dtype="float32"):
     return loaded.text_generation(sampling=Sampling(temperature=0, eos_token_ids=None))
 
 
+def test_a_served_length_limit_truncates_a_request_as_a_direct_call_does():
+    """A task whose criteria cut a request short at a length (`MaxNewTokens`) before its budget
+    finishes it unterminated through a server, as the task's own call does, and a task that ends
+    it on a criterion of its own finishes it terminated through both."""
+    from dew.sampling import Sampling, decoding
+
+    def at_two(state, tokens):
+        return state.step >= 2
+
+    prompt = np.asarray([1, 2, 3], np.int32)
+    for stopping, terminated in (((decoding.MaxNewTokens(2),), False), ((at_two,), True)):
+        bound = dataclasses.replace(task(Sampling(temperature=0, eos_token_ids=None)), stopping=stopping)
+        direct = bound(prompt[None], 8, key=0)
+        server = Server.from_task(bound, slots=2, capacity=32)
+        ticket = server.submit(prompt, 8, key=0)
+        server.run()
+        served = ticket.result()
+        assert direct.lengths.tolist() == served.lengths.tolist() == [2]
+        assert direct.terminated.tolist() == served.terminated.tolist() == [terminated]
+
+
 def test_a_server_over_loaded_weights_places_them_once():
     """`Pretrained.load` returns its weights in host memory, which a task keeps as given and places
     on the device once, at its first generation, as decoding reads them (`resident`); a server over
@@ -671,22 +692,24 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
 
 
+@pytest.mark.parametrize("prefix_cache", [False, True], ids=["unshared", "prefix"])
 @pytest.mark.parametrize("fields", [{"position_embedding": "alibi"},
                                     {"layer_types": ("chunked_attention",),
                                      "kinds": {"chunked_attention": {"chunk": 4}}}], ids=["alibi", "chunked"])
-def test_a_paged_server_serves_layers_that_read_their_keys_places(fields):
-    """ALiBi and a chunk read their keys' places, which a dense cache keeps
-    beside its keys; a paged server seats its rows at canonical positions,
-    where a key's slot is its place, so its pool keeps none. Over a pool of
-    pages every row is the lone task call's."""
+def test_a_paged_server_serves_layers_that_read_their_keys_places(fields, prefix_cache):
+    """ALiBi and a chunk read their keys' places, which the cache keeps
+    beside its keys, in a paged pool's pages too, so a shared prefix's pages
+    carry theirs. Over a pool of pages every row is the lone task call's."""
     model = decoder().clone(max_seq_len=128, **fields)
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    _, tickets = served_alongside(bound, kv_cache=KVCache(page_size=16, pages=12))
+    server, tickets = served_alongside(bound, kv_cache=KVCache(page_size=4, pages=40),
+                                       prefix_cache=prefix_cache)
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), lone)
+    assert server.prefix_hits == (4 if prefix_cache else 0)
 
 
 @pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],

@@ -29,18 +29,22 @@ value head.
 import contextlib
 import contextvars
 import functools
+import math
 from collections.abc import Sequence
 from typing import ClassVar, overload
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import linear_call
 from jax.interpreters.ad import JVPTracer
 
+from dew.nn.dense import Dense
 from dew.nn.kernels import delta_rule, fla_gdn, fla_kda, short_conv
+from dew.nn.kernels.delta_rule import L2NORM_EPS
 
 from .attention import FORWARD_MODE, gated_rms_normalized, repeat_kv_heads
 from .blocks import normal_kernel
@@ -70,10 +74,6 @@ CHUNK_SIZE = 64
 (`torch_chunk_gated_delta_rule(..., chunk_size=64)`). The chunked and the
 recurrent form agree at any size; the size only trades memory for
 parallelism, and 64 is what the reference's kernels assume."""
-
-
-L2NORM_EPS = 1e-6
-"""`l2norm`'s epsilon under the root, the FLA library's."""
 
 
 def l2norm(x, eps: float = L2NORM_EPS):
@@ -332,7 +332,7 @@ def _behind(x, *, kernel, held, bias, valid=None, segments=None, parts=None, dty
 
 def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, ...], *, decode: bool,
               coordinates: Coordinates, state: str = 'ssm_state', state_dtype=None, conv_dtype=None,
-              parts=None, dtype=None):
+              parts=None, dtype=None, token=None):
     """The conv and scan of a mixer that holds per-row state: a decode step or
     prefill advancing `module`'s flax cache, `conv_state` `[B, K-1, D]` held
     in `conv_dtype` and `state` `[B, *state_shape]` held in `state_dtype`
@@ -344,7 +344,10 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     `(output, final state)`. None for the allocation-only decode call. The
     tokens' `coordinates` say which are real and which start a packed
     document, where the conv and the state reset; the held state counts as
-    the call's first document, which it continues."""
+    the call's first document, which it continues. `token(mixed, history,
+    held)`, where given, runs a decode token's conv and scan in one, from the
+    history and state as they are stored, returning `(output, history',
+    final state)`; the cache stays this function's either way."""
     batch = mixed.shape[0]
     held = conv_state = None
     if decode:
@@ -354,6 +357,11 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
         held = module.variable('cache', state, jnp.zeros, (batch, *state_shape), state_dtype or mixed.dtype)
         if not allocated:
             return None
+        if token is not None:
+            out, history, final = token(mixed, conv_state.value, held.value)
+            conv_state.value = history.astype(conv_state.value.dtype)
+            held.value = final.astype(held.value.dtype)
+            return checkpoint_name(out, 'context')
     valid = coordinates.valid
     mixed, history = held_conv1d(mixed, taps, valid,
                                  None if conv_state is None else conv_state.value.astype(mixed.dtype),
@@ -1068,7 +1076,7 @@ class GatedDeltaNet(nn.Module):
                 "gate_activation must be 'silu' or 'sigmoid' (the reference's "
                 f"output_gate_type), got {self.gate_activation!r}")
         dense = functools.partial(
-            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
         for name, (_, outputs) in self.projections().items():
             setattr(self, name, dense(outputs, name=name))
         self.conv1d = DepthwiseConv1d(features=self.conv_features,
@@ -1123,6 +1131,97 @@ class GatedDeltaNet(nn.Module):
                                 axis=-1)
         return mixed, z.reshape(B, S, -1), b.reshape(B, S, -1), a.reshape(B, S, -1)
 
+    def _stored(self, operand):
+        """The decode caches' dtypes: the recurrent state's as the docstring says, the conv history's
+        the projections' or wider (`held_scan`)."""
+        wide = at_least_fp32(operand)
+        stored = (jnp.promote_types(self.dtype, jnp.bfloat16)
+                  if self.dtype is not None and asks_default_precision(self.precision, configured=True)
+                  else wide)
+        return stored, jnp.promote_types(operand, stored)
+
+    def _decode_kernel(self, x, operand) -> str:
+        """The kernel a decode token runs on the target, reported as its route ('delta_decode'): the
+        fused step (`delta_rule.fused_step`), the step kernel (`delta_rule.step`) between the layer's
+        own conv and norm, or the portable recurrence ('xla'). Its row's choice, else the step
+        kernel where the rule's own row names the port and the portable recurrence where it names
+        the math, so a caller choosing the rule's math (`generation.chosen`) decodes unfused; a kernel
+        the token's state does not fit hands it to the next. Both kernels update the state in place, which
+        JAX's Pallas gives no tangent, so a token traced for `jax.jvp` (`FORWARD_MODE`) takes the
+        recurrence."""
+        state = jax.ShapeDtypeStruct((x.shape[0], self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                                     self._stored(operand)[0])
+        preferred = measured_kernel(
+            'delta_decode', 'step' if measured_kernel('gated_delta_rule', 'xla') == 'fla' else 'xla')
+        if preferred in ('fused', 'step') and (refusal := refused(
+                (not FORWARD_MODE.get() and not isinstance(x, JVPTracer), 'forward_mode',
+                 "a JVP trace needs forward-mode derivatives; the decode kernels update their state in "
+                 "place, which takes none"))):
+            return route('delta_decode', kernel='xla', preferred=preferred, refusal=refusal).kernel
+        refusal = None
+        if preferred == 'fused':
+            refusal = refused(
+                (triton_runs(), 'capability', "the fused step needs a GPU of sm80 or later"),
+                (delta_rule.fused_fits(state), 'widths',
+                 "the state's widths are not powers of two the fused step's blocks take"),
+            )
+            if refusal is None:
+                return route('delta_decode', kernel='fused', preferred=preferred).kernel
+        if preferred in ('fused', 'step'):
+            stepping = refused(
+                (delta_rule.fits(state), 'step_widths',
+                 "the step kernel takes a state of power-of-two widths in fp32 or bf16 on a GPU of sm80 "
+                 "or later"),
+            )
+            if stepping is None:
+                return route('delta_decode', kernel='step', preferred=preferred, refusal=refusal).kernel
+            refusal = refusal or stepping
+        return route('delta_decode', kernel='xla', preferred=preferred, refusal=refusal).kernel
+
+    def _fused_token(self, z, b, a, valid):
+        """A decode token's conv, gates, update and gated norm in one launch (`delta_rule.fused_step`),
+        `held_scan`'s `token`, each shard's rows and heads on their own (`manual_map`), as
+        `decode_gated_delta_rule` places them. The conv's channels are queries, keys and values in
+        turn, which a mesh splitting the heads holds by shard: there they are reordered so each
+        shard's slice of them is its heads' queries, keys and values in turn, and back after."""
+        B = z.shape[0]
+        widths = (self.head_k_dim, self.head_k_dim, self.head_v_dim)
+        heads = (self.num_k_heads, self.num_k_heads, self.num_v_heads)
+        rows, split = grouped_heads((B, 1, self.num_v_heads, self.head_v_dim), self.num_k_heads)
+        mesh = jax.sharding.get_abstract_mesh()
+        shards = math.prod(mesh.shape[axis] for axis in mesh_axes(split))
+        # Each channel's place in the shards' order: by shard, then piece, then the piece's heads there.
+        first = np.cumsum([0, *(h * w for h, w in zip(heads, widths, strict=True))])
+        order = np.concatenate([first[i] + np.arange(shard * h * w // shards, (shard + 1) * h * w // shards)
+                                for shard in range(shards)
+                                for i, (h, w) in enumerate(zip(heads, widths, strict=True))])
+        inverse = np.argsort(order)
+        P = jax.sharding.PartitionSpec
+        active = jnp.ones((B,), bool) if valid is None else jnp.asarray(valid, bool)[:, 0]
+
+        def token(mixed, history, held):
+            taps = self.conv1d()[0]
+            weight = self.norm.variables['params']['weight']
+            dtype = self.norm.dtype if self.norm.dtype is not None else at_least_fp32(mixed.dtype)
+
+            def local(token, history, taps, gate, beta, log_decay, bias, z, weight, state, active):
+                return delta_rule.fused_step(token, history, taps, gate, beta, log_decay, bias, z, weight,
+                                             state, epsilon=self.norm_eps, activation=self.gate_activation,
+                                             dtype=dtype, active=active)
+
+            def ordered(x, axis):
+                return x if shards == 1 else jnp.take(x, order, axis=axis)
+
+            specs = (P(rows, split), P(rows, None, split), P(split, None), P(rows, split), P(rows, split),
+                     P(split), P(split), P(rows, split, None), P(), P(rows, split, None, None), P(rows))
+            out, history, state = manual_map(local, specs, (specs[7], specs[1], specs[9]))(
+                ordered(mixed[:, 0], 1), ordered(history, 2), ordered(taps, 0), a[:, 0], b[:, 0], self.A_log,
+                self.dt_bias, z[:, 0].reshape(B, self.num_v_heads, -1), weight, held, active)
+            history = history if shards == 1 else jnp.take(history, inverse, axis=2)
+            return out.reshape(B, 1, -1), history, state
+
+        return token
+
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
         decode, attention_metadata = call.decode, call.metadata
@@ -1132,6 +1231,11 @@ class GatedDeltaNet(nn.Module):
         mixed, z, b, a = self._project(x)
         key_dim = self.key_features
         operand = mixed.dtype
+        token, stepped = None, False
+        if decode and S == 1:
+            kernel = self._decode_kernel(x, operand)
+            token = self._fused_token(z, b, a, valid) if kernel == 'fused' else None
+            stepped = kernel == 'step'
 
         # fp32 on purpose, as the reference notes: an fp16 A can make exp
         # underflow to -inf (modeling_qwen3_next.py:652-653); at least fp32,
@@ -1165,7 +1269,7 @@ class GatedDeltaNet(nn.Module):
                                               starts=starts, max_segments=tokens.max_segments)
             # One key head serves `per_v` value heads, the reference's `repeat_interleave`.
             query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
-            if S == 1 and held is not None and delta_rule.fits(held):
+            if stepped and held is not None:
                 return decode_gated_delta_rule(query, key, value, g, beta, held,
                                                None if valid is None else valid[:, 0])
             out, final = recurrent_gated_delta_rule(query, key, value, g, beta, state)
@@ -1179,17 +1283,17 @@ class GatedDeltaNet(nn.Module):
         # open_kv_cache's is: init_cache's dummy token must not consume a
         # position or leave state behind. The conv normalises the queries
         # and keys (`l2norm`).
-        stored = (jnp.promote_types(self.dtype, jnp.bfloat16)
-                  if self.dtype is not None and asks_default_precision(self.precision, configured=True)
-                  else wide)
+        stored, conv = self._stored(operand)
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
         out = held_scan(self, mixed, self.conv1d()[0], None, scan,
                         (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,
-                        coordinates=tokens, state='recurrent_state', state_dtype=stored,
-                        conv_dtype=jnp.promote_types(operand, stored),
-                        parts=heads, dtype=operand if ported else wide)
+                        coordinates=tokens, state='recurrent_state', state_dtype=stored, conv_dtype=conv,
+                        parts=heads, dtype=operand if ported else wide, token=token)
         if out is None:
             return self.out_proj(jnp.zeros((B, S, self.value_features), self.dtype))
+        if token is not None:
+            # The fused step gated and normalized its output (`delta_rule.fused_step`).
+            return self.out_proj(out)
 
         gate = z.reshape(B, S, -1, self.head_v_dim)
         out = self.norm(out, gate)  # the norm scales, then the activation gates
