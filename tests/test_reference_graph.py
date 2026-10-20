@@ -4,14 +4,23 @@ common forward's saved values and a fixed cotangent, held node by node on common
 
 Each graph's nodes are jitted alone and its witness composes them, so the witness is the arithmetic
 the nodes run; a witness that rounds otherwise fails check 1. The truth graph is the reference's
-graph at float64, and its backward is checked against the float64 chain rule (`jax.vjp`)."""
+graph at float64, and its backward is checked against the float64 chain rule (`jax.vjp`).
+
+Attention's key sums are held against the canonical Sum family (reference_trees.sum_family) as
+members beside the reference: two trees equally exact on average differ element by element, and
+against the reference's one tree a pairwise key sum was flagged at 2 of 768 elements on an AVX2
+worker and none on AVX-512 (ledger 758). With the family, held-out trees as exact as the reference
+(recursive halving, pairwise over the keys reversed, XLA's sum reversed, strided-32) passed at 48,
+128 and 256 keys on both ISAs, a tree less exact on long positive sums (blocked-12) failed there, and
+an eight-ulp fault at one element failed everywhere (24 armada workers a shape); the rule's
+false-failure rate at real element counts is not calibrated by these counts."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_graph_as_exact
-from reference_trees import tree_sum
+from reference_error import REFERENCE, assert_graph_as_exact
+from reference_trees import sum_family, tree_sum
 
 from dew.nn.kernels.graph import Graph, Node, Pointwise, Sum
 
@@ -174,15 +183,29 @@ def test_a_backward_that_sums_in_halves_passes_and_one_that_drops_a_term_fails()
                               "backward lost term")
 
 
-def attention_graph(scores_of, keys_sum):
+def key_sums(keys_sum):
+    """The denominator's and the accumulator's arithmetic, each a sum over keys by `keys_sum`."""
+    return {"total": jax.jit(lambda weights: keys_sum(weights)),
+            "accumulated": jax.jit(lambda weights, v: keys_sum(weights[:, None, :] * v.T[None]))}
+
+
+KEY_TREES = sum_family(16)
+"""The key sums' members: the canonical Sum family at a 16-key tile (reference_trees.sum_family)."""
+
+
+def attention_graph(scores_of, keys_sum, trees=()):
     """Dense causal attention for one head: its scores (a Sum over the head width), each row's max and
-    its exponentials (Pointwise), the denominator and the accumulator (Sums over keys), and the output."""
+    its exponentials (Pointwise), the denominator and the accumulator (Sums over keys), and the output.
+    The key sums take the reference's math under each of `trees` as members."""
+    sums = key_sums(keys_sum)
+    members = {tree: key_sums(lambda terms, tree=tree: tree_sum(terms, -1, tree)) for tree in trees}
     scores = Node("scores", ("q", "k"), Sum({"q": -1, "k": -1}), jax.jit(scores_of))
     weights = Node("weights", ("scores",), Pointwise(), jax.jit(
         lambda scores: jnp.exp(scores - jnp.max(scores, axis=-1, keepdims=True))))
-    total = Node("total", ("weights",), Sum({"weights": -1}), jax.jit(lambda weights: keys_sum(weights)))
-    accumulated = Node("accumulated", ("weights", "v"), Sum({"weights": -1, "v": 0}), jax.jit(
-        lambda weights, v: keys_sum(weights[:, None, :] * v.T[None])))
+    total = Node("total", ("weights",), Sum({"weights": -1}), sums["total"],
+                 members={tree: fns["total"] for tree, fns in members.items()})
+    accumulated = Node("accumulated", ("weights", "v"), Sum({"weights": -1, "v": 0}), sums["accumulated"],
+                       members={tree: fns["accumulated"] for tree, fns in members.items()})
     output = Node("output", ("accumulated", "total"), Pointwise(),
                   jax.jit(lambda accumulated, total: accumulated / total[:, None]))
     return composed(("q", "k", "v"), (scores, weights, total, accumulated, output), ("output",),
@@ -216,13 +239,42 @@ def plain(terms):
     return jnp.sum(terms, axis=-1)
 
 
-def test_attention_summing_its_keys_by_another_tree_passes_where_it_rounds():
-    """The shuffled-key null at the source: Dew's denominator and accumulator summed pairwise, the
-    reference's by XLA, each held over its own key orders, both sides' orders redrawn, on common parents."""
+def halving(terms):
+    """Recursive halving at n // 2: a tree of pairwise's accuracy that the key sums' family does not hold."""
+    n = terms.shape[-1]
+    return terms[..., 0] if n == 1 else halving(terms[..., : n // 2]) + halving(terms[..., n // 2:])
+
+
+@pytest.mark.parametrize("held_out", ["halving", "reversed"])
+def test_attention_summing_its_keys_by_a_held_out_tree_passes_against_the_family(held_out):
+    """Two trees equally exact on average differ element by element in expected error, so a key sum is
+    held against the worst admitted member of the canonical Sum family, not the reference's one tree
+    (ledger 758). A held-out tree as exact as the reference passes on every worker: recursive halving,
+    and XLA's own sum over the keys reversed."""
     inputs = attention_inputs()
-    reference = attention_graph(masked_scores(plain), plain)
-    dew = attention_graph(masked_scores(plain), lambda terms: tree_sum(terms, -1, "pairwise"))
-    assert_graph_as_exact(dew, reference, reference, inputs, head_orbit(inputs), "pairwise keys")
+    keys_sum = halving if held_out == "halving" else (lambda terms: jnp.sum(terms[..., ::-1], axis=-1))
+    reference = attention_graph(masked_scores(plain), plain, KEY_TREES)
+    report = assert_graph_as_exact(attention_graph(masked_scores(plain), keys_sum), reference, reference,
+                                   inputs, head_orbit(inputs), held_out)
+    assert all(REFERENCE in report[node, "reference's parents"]["['node']"]["admitted"]
+               for node in ("total", "accumulated"))
+
+
+def test_a_key_sum_eight_ulps_off_at_one_element_fails_against_the_family():
+    """The family widens the bar element by element and no further: a key sum eight ulps past its own
+    rounding at one element of 768 fails."""
+    def off(terms):
+        found = tree_sum(terms, -1, "pairwise")
+        at = (3,) if found.ndim == 1 else (3, 5)
+        for _ in range(8):
+            found = found.at[at].set(jnp.nextafter(found[at], jnp.inf))
+        return found
+
+    inputs = attention_inputs()
+    reference = attention_graph(masked_scores(plain), plain, KEY_TREES)
+    with pytest.raises(AssertionError):
+        assert_graph_as_exact(attention_graph(masked_scores(plain), off), reference, reference, inputs,
+                              head_orbit(inputs), "eight ulps")
 
 
 def test_attention_that_loses_a_key_fails_at_its_denominator():
