@@ -1783,7 +1783,8 @@ MAGNITUDES = frozenset({"abs", "numpy.abs", "numpy.absolute", "numpy.fabs", "jax
 TOLERANCE_KEYWORDS = frozenset({"atol", "rtol"})
 TOLERANCE_NAME = re.compile(r"(?:^|_)(?:tolerance|tol|atol|rtol)s?$", re.IGNORECASE)
 TIMING = re.compile(r"(?:^|_)(?:elapsed|durations?|seconds|timeout|wall|deadline|took|clock|perf_counter|"
-                    r"monotonic)(?:_|$)", re.IGNORECASE)
+                    r"monotonic|ms|us|ns|milliseconds|microseconds|nanoseconds|latency)(?:_|$)",
+                    re.IGNORECASE)
 """Names a comparison of how long something took reads: a timeout is no value comparison."""
 INVENTORY = "tools/tolerance_inventory.json"
 
@@ -1796,8 +1797,23 @@ def _called(node: ast.Call, table: Mapping[str, str]) -> str:
     return called
 
 
-INTEGRAL_CALLS = frozenset({"range", "len", "int", "numpy.arange", "jax.numpy.arange", "torch.arange"})
+INTEGRAL_CALLS = frozenset({"range", "len", "int"})
 """Calls whose values are whole numbers: indices, counts, positions."""
+RANGES = frozenset({"numpy.arange", "jax.numpy.arange", "torch.arange"})
+"""Ranges, whose values are whole unless a bound or step is evidently fractional (`_fractional`) or a
+float dtype is asked: a range of a length is a range of positions."""
+
+
+def _fractional(value: ast.AST) -> bool:
+    """Whether `value` is evidently no whole number: a float literal, a quotient, a float() call, or
+    arithmetic of one."""
+    if isinstance(value, ast.Constant):
+        return type(value.value) is float
+    if isinstance(value, ast.UnaryOp):
+        return _fractional(value.operand)
+    if isinstance(value, ast.BinOp):
+        return isinstance(value.op, ast.Div) or _fractional(value.left) or _fractional(value.right)
+    return isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "float"
 CARRIED = frozenset({"sum", "max", "min", "abs", "tuple", "list", "sorted", "round"})
 """Built-ins whose value is whole, or a time, when what they are given is."""
 CLOCKS = frozenset({"time.perf_counter", "time.monotonic", "time.time", "time.process_time",
@@ -1856,6 +1872,11 @@ def _integral_value(value: ast.AST, integral: Set[str], scope: _Scope, reading: 
     if isinstance(value, ast.List | ast.Tuple | ast.Set):
         return bool(value.elts) and all(_integral_value(element, integral, scope, reading)
                                         for element in value.elts)
+    if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Pow):
+        # A whole number to a whole power is whole only where the power is not negative.
+        power = value.right
+        return _integral_value(value.left, integral, scope, reading) and isinstance(power, ast.Constant) \
+            and type(power.value) is int and power.value >= 0
     if isinstance(value, ast.BinOp) and not isinstance(value.op, ast.Div):
         return all(_integral_value(side, integral, scope, reading) for side in (value.left, value.right))
     if isinstance(value, ast.Call):
@@ -1863,8 +1884,10 @@ def _integral_value(value: ast.AST, integral: Set[str], scope: _Scope, reading: 
         counted = isinstance(value.func, ast.Attribute) and value.func.attr == "integers"
         carried = called in CARRIED and bool(value.args) and all(
             _integral_value(argument, integral, scope, reading) for argument in value.args)
-        return called in INTEGRAL_CALLS or counted or carried or _defined(value, scope, reading,
-                                                                          reading.counting)
+        ranged = called in RANGES and not any(_fractional(argument) for argument in value.args) and not any(
+            keyword.arg == "dtype" and "int" not in ast.unparse(keyword.value) for keyword in value.keywords)
+        return called in INTEGRAL_CALLS or counted or carried or ranged or _defined(value, scope, reading,
+                                                                                    reading.counting)
     return False
 
 
@@ -1938,6 +1961,9 @@ def _read_scope(scope_node: ast.AST, reading: _Reading) -> _Scope:
                         len(target.elts) == len(node.value.elts):
                     pairs = zip(target.elts, node.value.elts, strict=True)
                     assigned += [(_bound_names(name), value) for name, value in pairs]
+                elif isinstance(node, ast.AugAssign):
+                    # `x op= v` binds x to `x op v`, which is what is whole or not.
+                    assigned.append((_bound_names(target), ast.BinOp(target, node.op, node.value)))
                 else:
                     assigned.append((_bound_names(target), node.value))
     integral = {name for names, _ in assigned for name in names}

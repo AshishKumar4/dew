@@ -153,7 +153,7 @@
    "by": "2026-11-20"
   },
   "tests/test_data_mixtures.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -998,7 +998,7 @@
    "by": "2026-11-13"
   },
   "tests/test_tools.py": {
-   "comparisons": 27,
+   "comparisons": 15,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -1179,11 +1179,6 @@
   },
   "tools/reference_runs/qwen35_pair.py": {
    "comparisons": 1,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
-  "tools/reference_runs/torch_qwen35_step.py": {
-   "comparisons": 3,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
