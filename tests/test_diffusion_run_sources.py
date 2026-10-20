@@ -639,6 +639,7 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
     pipeline = source.text_to_image()
     reference = np.asarray(pipeline(prompts, steps=2, guidance=None, solver=Euler(), key=7).images)
     published = np.asarray(inherited.build_task(started(inherited).variables)(prompts, key=7).images)
+    assert np.all(np.isfinite(reference)) and np.all(np.isfinite(published))
     np.testing.assert_array_equal(published, reference)
 
     config = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
@@ -648,13 +649,11 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
                                 objective=ObjectiveConfig("flow_grpo", settings), rollout=rollout)
     saved = config.build()
     initial = started(saved)
-    # The run's step-0 state holds every weight of the pipeline's, where the pipeline holds it.
-    held = dict(jax.tree_util.tree_leaves_with_path(initial.variables))
-    pipeline_weights = dict(jax.tree_util.tree_leaves_with_path(source.variables))
-    missing = pipeline_weights.keys() - held.keys()
-    assert not missing, sorted(map(jax.tree_util.keystr, missing))[:5]
-    for path, weight in pipeline_weights.items():
-        np.testing.assert_array_equal(np.asarray(held[path]), np.asarray(weight),
+    # The run's step-0 state is the pipeline's weights, leaf for leaf.
+    for (path, held), weight in zip(jax.tree_util.tree_leaves_with_path(initial.variables),
+                                    jax.tree.leaves(source.variables), strict=True):
+        assert np.all(np.isfinite(np.asarray(held))), jax.tree_util.keystr(path)
+        np.testing.assert_array_equal(np.asarray(held), np.asarray(weight),
                                       err_msg=jax.tree_util.keystr(path))
     checkpoints = Checkpoints(str(tmp_path / "run"))
     checkpoints.save(0, initial, None, {}, artifact=saved.inference_record())
@@ -666,8 +665,11 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
     published_variables = saved.pipeline(initial).variables
     for got, want in zip(jax.tree.leaves(restored.variables), jax.tree.leaves(published_variables),
                          strict=True):
+        assert np.all(np.isfinite(np.asarray(got)))
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    drawn = np.asarray(restored(prompts, key=7).host().images)
+    assert np.all(np.isfinite(drawn))
     np.testing.assert_array_equal(
-        restored(prompts, key=7).host().images,
+        drawn,
         pipeline.bind(restored.variables)(prompts, steps=2, guidance=None, solver=Euler(),
                                           key=7).host().images)
