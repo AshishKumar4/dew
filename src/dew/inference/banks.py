@@ -40,7 +40,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSh
 from jax.typing import DTypeLike
 
 from dew import records
-from dew.nn.backbones.decoder_stack import DecoderBank
+from dew.nn.backbones.decoder_stack import DecoderBank, stack_layers
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.hyper_connections import Carried
 from dew.objectives.base import Variables, merge
@@ -240,9 +240,7 @@ class CheckpointBanks(LayerBanks):
                              layers[0], namespace=namespace)
         rows = [one_layer(self._restored(at_layer(_row_placement(placement), index, namespace=namespace)),
                           index, namespace=namespace) for index in layers]
-        stacked = jax.jit(lambda *held: jax.tree.map(lambda *leaves: jnp.stack(leaves), *held),
-                          out_shardings=placement)
-        return stacked(*rows)
+        return jax.jit(stack_layers, out_shardings=placement)(*rows)
 
     def _restored(self, placement: Placement) -> Variables:
         """Restore the variables `placement` names onto its shardings."""
@@ -608,10 +606,20 @@ def placed_rows(bank: jax.Array, count: int) -> tuple[jax.Array, ...]:
     sharding places it, in the bank's memory, and the bank deleted after."""
     sharding = bank.sharding
     assert isinstance(sharding, NamedSharding), "a restored bank is placed by a layout's NamedSharding"
-    cut = jax.jit(lambda held: tuple(held[offset] for offset in range(count)),
-                  out_shardings=(row_sharding(sharding),) * count)(bank)
+    cut = jax.jit(_cut, static_argnames="count",
+                  out_shardings=(row_sharding(sharding),) * count)(bank, count=count)
     bank.delete()
     return cut
+
+
+# The programs a load runs are module functions, so `jax.jit` of one with the
+# same shardings again reuses its trace and executable, where a lambda is a
+# new function each call and traces and compiles anew.
+
+
+def _cut(bank: jax.Array, *, count: int) -> tuple[jax.Array, ...]:
+    """A bank's `count` rows (`placed_rows`)."""
+    return tuple(bank[offset] for offset in range(count))
 
 
 def banked_placement(tree: Mapping, rows: Mapping) -> dict:

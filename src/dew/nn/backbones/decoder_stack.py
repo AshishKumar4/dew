@@ -475,7 +475,8 @@ class PipelineStage(nn.Module):
                          per_layer_input=per_layer_input, attention_metadata=attention_metadata)
 
 
-def _stack_leaves(*trees):
+def stack_layers(*trees):
+    """Layers' trees stacked on a new leading layer axis, a bank."""
     return jax.tree.map(lambda *leaves: jnp.stack(leaves), *trees)
 
 
@@ -585,7 +586,7 @@ class StackView:
                         "the others; a run reads every one of its layers or none")
                 _refuse_unlike(collection, [tree[layer] for stage in names for layer in stage],
                                [layer for stage in names for layer in stage])
-                runs = [_stack_leaves(*[tree.pop(layer) for layer in stage]) if count > 1
+                runs = [stack_layers(*[tree.pop(layer) for layer in stage]) if count > 1
                         else tree.pop(stage[0]) for stage in names]
                 if self.stages == 1:
                     # A bank already stored under the run's name holds the
@@ -593,7 +594,7 @@ class StackView:
                     # stack into it.
                     tree[name] = merge(tree[name], runs[0]) if name in tree else runs[0]
                 else:
-                    stages[name] = jax.tree.map(_on_stage_axis, _stack_leaves(*runs))
+                    stages[name] = jax.tree.map(_on_stage_axis, stack_layers(*runs))
             if stages:
                 tree['stages'] = stages
             inside[collection] = tree

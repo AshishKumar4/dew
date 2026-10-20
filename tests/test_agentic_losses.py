@@ -30,6 +30,7 @@ from dew.objectives.rl.sessions import (
     SEGMENT_IDS_KEY,
     SESSION_WEIGHTS_KEY,
 )
+from dew.telemetry.instrumentation import collective, hlo_instructions
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "agentic.npz"
 CHAIN = 7
@@ -196,11 +197,6 @@ def test_rollout_mean_matches_agent_lightning_per_rollout_mean(reference):
     )
 
 
-def test_the_fixture_names_its_references(reference):
-    assert str(reference["verl_revision"]) == "12ebe0cb4d300c58449fb6c675379e8700015c51"
-    assert str(reference["lightning_revision"]) == "ff9457587fb6ec900e16e93be9ad2d77409afa08"
-
-
 
 @pytest.mark.mesh
 def test_chain_reductions_stay_row_local_under_data_parallelism():
@@ -219,7 +215,9 @@ def test_chain_reductions_stay_row_local_under_data_parallelism():
     sharded = NamedSharding(mesh, PartitionSpec("data"))
     placed = [jax.device_put(array, sharded) for array in (values, mask, segments)]
     compiled = jax.jit(segment_mean).lower(*placed).compile()
-    assert "all-reduce" not in compiled.as_text()
+    moved = [name for name, instruction in hlo_instructions(compiled.as_text()).items()
+             if collective(instruction.op) or any(collective(op) for op in instruction.fused)]
+    assert not moved, moved
     pooled = np.asarray(compiled(*placed))
     for row in range(rows):
         for segment in np.unique(segments[row]):

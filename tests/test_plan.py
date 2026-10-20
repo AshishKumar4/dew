@@ -21,9 +21,11 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import LayoutRefused
 from dew.objectives.lm import LMObjective
+from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers
 from dew.training import Trainer
 from dew.training.distributed import Layout, MeshSpec, microbatch
+from dew.training.memory import climb_to, recompute_more, rung_record
 from dew.training.planning import Timer, planned, splits
 
 ROWS, SEQ = 32, 16
@@ -60,6 +62,32 @@ def test_the_plan_takes_the_least_recomputation_then_the_fewest_microbatches(fit
     split = planned([1, 2, 4, 8], first, fits, climb)
     assert (None if split is None else (rung[0], split)) == plan
     assert compiled == asked
+
+
+def test_the_fit_ladder_tiles_the_head_fused_then_unfused_before_it_recomputes_more():
+    """At each remat rung the ladder keeps the whole logits, then tiles the head with its gradient in the
+    forward, the faster tiled head, then in its backward, whose tile holds less than the fused chunk's
+    whole vocabulary, before it recomputes more with the whole logits back; a resumed run climbs to a
+    recorded unfused rung alike."""
+    def objective():
+        model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                                  max_seq_len=SEQ)
+        return LMObjective(model, seq_len=SEQ)
+
+    climbing = objective()
+    rungs = [rung_record(climbing, xla_defaults=False)]
+    while len(rungs) < 5 and recompute_more(climbing):
+        rungs.append(rung_record(climbing, xla_defaults=False))
+    tile = list(chunked_tile())
+    assert [(rung["head_tile"], rung["head_fused"], rung["remat"]) for rung in rungs] == [
+        (None, False, None), (tile, True, None), (tile, False, None), (None, False, "minimal"),
+        (tile, True, "minimal")]
+    resumed = objective()
+    climb_to(resumed, rungs[2])
+    assert rung_record(resumed, xla_defaults=False) == rungs[2]
+    # A head put back whole, as a new shape starts from the run's own rung, tiles fused again.
+    resumed.restore_head(None, fused=False)
+    assert resumed.tile_head() is not None and rung_record(resumed, xla_defaults=False)["head_fused"]
 
 
 def test_a_microbatch_is_every_splitth_row():
@@ -162,6 +190,20 @@ def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(
     for planned_leaf, whole_leaf in zip(jax.tree.leaves(state.variables), jax.tree.leaves(unsplit.variables),
                                         strict=True):
         np.testing.assert_allclose(np.asarray(planned_leaf), np.asarray(whole_leaf), rtol=1e-4, atol=1e-5)
+
+
+def test_each_shape_a_run_meets_starts_at_the_run_s_own_head_fusion():
+    """A run whose own rung tiles its head unfused, as the objective came or a checkpoint recorded,
+    compiles each later shape it meets unfused too: a new shape starts at the run's own rung, its
+    head put back as the first compile found it."""
+    trainer = lm()
+    assert trainer.objective.tile_head() is not None and trainer.objective.unfuse_head() is not None
+    state, _, _ = trainer.place()
+    trainer.compile(state, BATCH)
+    trainer.compile(state, {"text": BATCH["text"][: ROWS // 2]})
+    rung = trainer._checkpoint_rung()
+    assert [shaped["head_fused"] for shaped in rung["shapes"].values()] == [False, False], rung
+    assert rung["head_tile"] is not None and not rung["head_fused"]
 
 
 def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monkeypatch):
