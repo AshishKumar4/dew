@@ -200,6 +200,9 @@ class TrainingDisplay:
     pace: collections.deque = dataclasses.field(default_factory=lambda: collections.deque(maxlen=24))
     # Metrics by group, then by logged name, in the order first logged.
     groups: dict[str, dict[str, Row]] = dataclasses.field(default_factory=dict)
+    # The names the last interval logged, the rows shown: a metric an interval no longer reports (a
+    # rollout source absent from its batch) keeps its trend for when it returns, not its last value.
+    reported: frozenset[str] = frozenset()
     # Each split's last `TREND` evaluations, in the order they completed,
     # scores only: the trackers keep the previews. A new evaluation rebinds
     # its split's list, so the refresh thread never iterates one that grows.
@@ -285,6 +288,7 @@ class TrainingDisplay:
             if name not in rows:
                 rows[name] = Row(rest or prefix, shown, collections.deque(maxlen=TREND))
             rows[name].values.append(value)
+        self.reported = frozenset(scalars)
         if self.live is None:
             target = "" if self.total is None else f"/{self.total}"
             line = f"step {step}{target}  " + "  ".join(
@@ -378,9 +382,11 @@ class TrainingDisplay:
         return f"{split} (ema)" if self.averaged else split
 
     def rows(self) -> list[tuple[str, Row]]:
-        """The metrics to show as (group, row) pairs, grouped in the order
-        each group was first logged."""
-        return [(group, row) for group, named in list(self.groups.items()) for row in list(named.values())]
+        """The metrics the last interval logged, as (group, row) pairs, grouped in the order each
+        group was first logged."""
+        reported = self.reported
+        return [(group, row) for group, named in list(self.groups.items())
+                for name, row in list(named.items()) if name in reported]
 
     def scores(self, evaluation: Evaluation, *, history: bool = False) -> Text:
         """An evaluation's scores and their change since the previous one,
