@@ -68,7 +68,7 @@ differently rounded autodiff.
 import dataclasses
 import functools
 import math
-from typing import ClassVar, NamedTuple
+from typing import ClassVar, NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -212,18 +212,25 @@ def _within_fp32(dtype) -> bool:
     return not jnp.issubdtype(dtype, jnp.floating) or jnp.finfo(dtype).bits <= 32
 
 
-def _dtype_requirements(name: str) -> tuple[Requirement, ...]:
-    """What the norm and SwiGLU kernels need of every dtype a call reads and writes (the case's
+class _Typed(Protocol):
+    """A case that names every dtype its call reads and writes."""
+
+    @property
+    def dtypes(self) -> tuple[np.dtype, ...]: ...
+
+
+def _dtype_requirements[C: _Typed](name: str, case_type: type[C]) -> tuple[Requirement[C], ...]:
+    """What the norm and SwiGLU kernels need of every dtype a call of `case_type` reads and writes (its
     `dtypes`): none wider than fp32, whose accuracy the kernels compute at; none fp16, which they are
     not yet qualified on (ledger 823); and none but fp32, bf16 and fp16, the floats they compute."""
     return (
-        Requirement('precision', lambda case: all(_within_fp32(dtype) for dtype in case.dtypes),
+        Requirement[C]('precision', lambda case: all(_within_fp32(dtype) for dtype in case.dtypes),
                     lambda case: f"{name} reads or writes {', '.join(map(str, case.dtypes))}; the kernel "
                                  "computes in fp32, which a wider dtype's accuracy needs more than",
                     inherent=True),
-        Requirement('fp16', lambda case: jnp.float16 not in case.dtypes,
+        Requirement[C]('fp16', lambda case: jnp.float16 not in case.dtypes,
                     f"{name}'s kernel is not yet qualified on float16 operands", row=QUALIFY_FP16),
-        Requirement('dtype', lambda case: all(dtype in (*DTYPES, jnp.float16) for dtype in case.dtypes),
+        Requirement[C]('dtype', lambda case: all(dtype in (*DTYPES, jnp.float16) for dtype in case.dtypes),
                     lambda case: f"{name} reads or writes {', '.join(map(str, case.dtypes))}; the kernel "
                                  "computes float32, bfloat16 and float16 alone", inherent=True),
     )
@@ -317,7 +324,7 @@ NORM_SUPPORTS: tuple[Requirement[NormCase], ...] = (
     Requirement('gate_activation', lambda case: case.activation in (None, 'silu', 'sigmoid'),
                 lambda case: f"the gated kernel gates by silu or sigmoid, not {case.activation!r}",
                 inherent=True),
-    *_dtype_requirements('RMSNorm'),
+    *_dtype_requirements('RMSNorm', NormCase),
     Requirement('empty', lambda case: not case.empty, "RMSNorm needs nonempty rows with a feature axis",
                 inherent=True),
     Requirement('width', lambda case: 0 < case.width <= 8192,
@@ -364,10 +371,12 @@ def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str
 
 @dataclasses.dataclass(frozen=True)
 class SwigluCase:
-    """A SiLU product as the SwiGLU selector reads it (`SWIGLU`): its operands' `dtypes`, whether they
+    """A SiLU product as the SwiGLU selector reads it (`SWIGLU`): its operands' `dtypes` and the dtype
+    their product `promotes` to (weak types honoured, as the operands' own promotion is), whether they
     share a shape the kernel reads (`shape_fits`), whether their mesh placement fits (`placed`), and the
     implementation the call `named`, None for 'auto'."""
     dtypes: tuple[np.dtype, ...]
+    promotes: np.dtype
     shape_fits: bool
     placed: bool
     named: str | None
@@ -375,7 +384,7 @@ class SwigluCase:
 
 SWIGLU_SUPPORTS: tuple[Requirement[SwigluCase], ...] = (
     Requirement('capability', _runs, "the Pallas kernels need a GPU of sm80 or later", inherent=True),
-    *_dtype_requirements('SwiGLU'),
+    *_dtype_requirements('SwiGLU', SwigluCase),
     Requirement('matching', lambda case: len(set(case.dtypes)) == 1,
                 lambda case: f"SwiGLU of {' and '.join(map(str, case.dtypes))} operands; the kernel reads "
                              "one dtype, and XLA's product promotes mixed ones", inherent=True),
@@ -398,7 +407,7 @@ def _swiglu_preferred(case: SwigluCase) -> str:
     converts and neighbours into one pass the kernel's launch splits (8 layers of Dory's 1 x 2048 nGPT
     block on an A100: 5.4 ms a step through the kernel, 2.6 through XLA). A kernel named per call or
     by `chosen` runs as named."""
-    return 'xla' if jnp.result_type(*case.dtypes) == jnp.float32 else measured_kernel('swiglu', 'xla')
+    return 'xla' if case.promotes == jnp.float32 else measured_kernel('swiglu', 'xla')
 
 
 SWIGLU: Op[SwigluCase] = Op('swiglu', (Kernel('pallas', SWIGLU_SUPPORTS), Kernel('xla', (), generic=True)),
@@ -412,6 +421,7 @@ def swiglu_kernel(implementation: str, gate, up, *, axes=None) -> str:
     arithmetic; broadcasting or mixed operand dtypes also stay there.
     `axes`, the operands' logical axes, places the kernel on a mesh (`_placed`)."""
     case = SwigluCase(dtypes=(jnp.dtype(gate.dtype), jnp.dtype(up.dtype)),
+                      promotes=jnp.dtype(jnp.result_type(gate, up)),
                       shape_fits=gate.shape == up.shape and bool(gate.shape) and gate.size > 0,
                       placed=_placed(axes, (gate, up), whole_last=False),
                       named=None if implementation == 'auto' else implementation)
@@ -422,7 +432,7 @@ def packed_swiglu_kernel(implementation: str, gate_up, *, axes=None) -> str:
     """Resolve the SiLU product of one packed projection's `[..., 2, H]` output (`packed_swiglu`),
     the kernel `KERNELS` names 'swiglu', which reads the halves where the projection wrote them.
     `axes` are the product's logical axes, `[..., H]`'s."""
-    case = SwigluCase(dtypes=(jnp.dtype(gate_up.dtype),),
+    case = SwigluCase(dtypes=(jnp.dtype(gate_up.dtype),), promotes=jnp.dtype(gate_up.dtype),
                       shape_fits=gate_up.ndim >= 2 and gate_up.shape[-2] == 2 and gate_up.size > 0,
                       placed=_placed(None if axes is None else (*axes[:-1], None, axes[-1]), (gate_up,),
                                      whole_last=False),
