@@ -45,7 +45,7 @@ from dew.objectives.base import FROZEN, Step, merge, thaw
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from dew.training.optim import muon_weight_dimension_numbers
+from dew.training.optim import OPTIMIZER_MAP, muon_weight_dimension_numbers
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "lora"
@@ -474,6 +474,31 @@ def test_an_adapters_factors_take_their_kernels_axes_on_each_side_of_the_rank(lo
         for key in path[1:]:
             numbers = numbers[key.key]
         assert (numbers.reduction_axis, numbers.output_axis) == ((0,), (1,)), name
+
+
+def test_muon_steps_an_adapted_head_whose_factors_it_splits_between_its_optimizers(decoder, reference):
+    """An adapter on the vocabulary head as well as q_proj: Muon takes the head's `lora_A`
+    ('embed', rank) as a matrix and AdamW its `lora_B` (rank, 'vocab'), a lookup, and optax hands
+    each optimizer its own masked tree, so a factor's axes are read off it alone. They were read
+    off both factors, so the masked tree raised on Muon's first update."""
+    adapter = LoRA(rank=2, modules=("q_proj", "lm_head")).apply(
+        decoder.model, decoder.variables, key=0, layouts=decoder.layouts)
+    factors = adapter.variables["params"]
+    numbers = muon_weight_dimension_numbers(factors)
+    assert numbers["lm_head"]["lora_A"] is not None and numbers["lm_head"]["lora_B"] is None
+    optimizer = OPTIMIZER_MAP["muon"](1e-3)
+    tokens = jnp.asarray(reference["input_ids"])
+
+    def loss(moving):
+        return jnp.mean(jnp.square(adapter.model.apply({**adapter.variables, "params": moving}, tokens)))
+
+    updates, _ = optimizer.update(jax.grad(loss)(factors), optimizer.init(factors), factors)
+    moved = optax.apply_updates(factors, updates)
+    for path, before in jax.tree_util.tree_leaves_with_path(factors):
+        after = moved
+        for key in path:
+            after = after[key.key]
+        assert not np.array_equal(np.asarray(after), np.asarray(before)), jax.tree_util.keystr(path)
 
 
 def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, reference):
