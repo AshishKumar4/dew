@@ -758,10 +758,11 @@ def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
 
 
 def _running(pid: int) -> bool:
-    """Whether process `pid` runs: it exists and has not ended (a zombie has)."""
+    """Whether process `pid` runs: it exists and has not ended (a zombie has). One that ends between
+    the open of its state and the read fails the read with ESRCH, and has ended too."""
     try:
         status = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
     return status.rsplit(")", 1)[1].split()[0] != "Z"
 
