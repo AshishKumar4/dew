@@ -106,16 +106,19 @@ def test_a_refused_request_raises_at_submit_and_the_native_server_keeps_serving(
     assert native_server.submit([4, 5], 3, key=3).result(timeout=120).prompt == (4, 5)
 
 
-def test_a_draw_that_fails_its_checks_fails_its_future_instead_of_hanging():
-    """A bigram policy so peaked that the model's own likelihood of every id but one underflows
-    to -inf, sampled hot enough to draw those ids. No `Draw` holds a non-finite likelihood, so
-    the draw's future fails with that error, where a check raised in the done-callback reached
-    no one and left the future pending."""
+@pytest.mark.parametrize("decode_steps", [1, BUDGET])
+def test_a_draw_that_fails_its_checks_fails_its_future_instead_of_hanging(decode_steps):
+    """A bigram policy whose prompt's last id leads to a uniform draw and every other id to one so
+    peaked that the model's own likelihood of every id but one underflows to -inf, sampled hot
+    enough to draw those ids. No `Draw` holds a non-finite likelihood, so the draw's future fails
+    with that error, where a check raised in the done-callback reached no one and left the future
+    pending; so it does where the failing draw is a later step of the call that admitted it."""
     vocab = 64
 
     def peaked():
         table = np.full((vocab, vocab), -2e38, np.float32)
         table[:, 0] = 2e38
+        table[3] = 0.0
         return table
 
     model = ToolPolicy(vocab_size=vocab, max_seq_len=64, logits=peaked)
@@ -123,7 +126,8 @@ def test_a_draw_that_fails_its_checks_fails_its_future_instead_of_hanging():
     # At this temperature the scores are 1 and -1, so the ids the model gives -inf are drawn.
     sampling = Sampling(temperature=2e38, eos_token_ids=vocab - 1)
     server = NativeRolloutServer(
-        Server.from_task(TextGeneration(model, params, None, sampling=sampling), slots=2, capacity=64)
+        Server.from_task(TextGeneration(model, params, None, sampling=sampling), slots=2, capacity=64,
+                         decode_steps=decode_steps)
     )
     try:
         with pytest.raises(ValueError):
