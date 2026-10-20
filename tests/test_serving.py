@@ -155,7 +155,7 @@ def _host_loaded(dtype="float32"):
     from dew.interop import Pretrained
 
     loaded = Pretrained.load(Path(__file__).parent / "fixtures/hf/phi-tiny", dtype=dtype,
-                             attention_impl="xla", max_seq_len=64)
+                             attention_impl="xla", max_seq_len=64, on_host=True)
     assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(loaded.variables["params"]))
     return loaded.text_generation(sampling=Sampling(temperature=0, eos_token_ids=None))
 
@@ -182,8 +182,8 @@ def test_a_served_length_limit_truncates_a_request_as_a_direct_call_does():
 
 
 def test_a_server_over_loaded_weights_places_them_once():
-    """`Pretrained.load` returns its weights in host memory, which a task keeps as given and places
-    on the device once, at its first generation, as decoding reads them (`resident`); a server over
+    """`Pretrained.load(on_host=True)` returns its weights in host memory, which a task keeps as given
+    and places on the device once, at its first generation, as decoding reads them (`resident`); a server over
     the task serves that same device copy. Decode steps after a request's admission move nothing
     from the host, and the server draws the task's tokens."""
     bound = _host_loaded()
