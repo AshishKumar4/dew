@@ -62,6 +62,7 @@ import numpy as np
 from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
+from dew.cache import QUANTIZED_TRACE
 from dew.nn.fake_quant import correctly_rounded_divide
 from dew.nn.kernels.generation import backend
 from dew.nn.precision import asks_default_precision
@@ -200,16 +201,6 @@ def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Qua
     layer._dew_wrapped = type(model)
     layer._dew_wrapper = staticmethod(lambda: wrapper)
     return wrapped
-
-
-QUANTIZED_TRACE = jax.make_user_context(default_value=None)
-"""The jit cache key of what a quantized model's methods trace under: its provider's kind and spec.
-
-Qwix intercepts `jax.lax.dot_general` by swapping its code while a wrapped method runs, and
-`jnp.matmul`, `jnp.dot` and the other contractions that reach it are jitted, so a trace of one taken
-under the swap holds its quantized product, and JAX's cache would hand it to a later plain call of
-the same shapes (the reverse too: a quantized call reused a plain trace and quantized nothing). In
-this context their traces are kept apart (`jax.make_user_context`)."""
 
 
 def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantization) -> nn.Module:
