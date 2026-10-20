@@ -36,6 +36,7 @@ from reference_error import (
     widened,
 )
 
+from dew.interop.flaxdiff import SCAN_PROJECTION, scan_projection
 from dew.nn.attention import Stage
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.mmdit import HierarchicalMMDiT, SimpleMMDiT
@@ -60,10 +61,8 @@ UDIT_MOVED = {"time_embed": ("conditioning", "time_embed"),
               "final_norm": ("output", "final_norm"), "final_proj": ("output", "final_proj")}
 DIT_POOLING = {"text_pooling": "all"}
 PROJECTIONS = {"project_in_conv": "project_in", "project_out_conv": "project_out"}
-# FlaxDiff projects a scan order's raw patches with a dense layer, `[p * p * C, D]` in patchify's
-# (row, column, channel) order; Dew embeds every order through the patch convolution, whose
-# `[p, p, C, D]` kernel is that matrix reshaped, and gathers the tokens after.
-SCAN_PROJECTION = ("hilbert_projection", ("patch_embed", "Conv_0"))
+# A scan order's patch projection lands on Dew's patch convolution (`scan_projection`).
+SCAN_PROJECTED = ("patch_embed", "Conv_0")
 MMDITS = ("SimpleMMDiT", "HierarchicalMMDiT")
 # FlaxDiff's MM-DiT block module by module, as Dew's `DoubleStreamBlock`
 # names it: one joint attention holds both streams' projections and norms.
@@ -112,9 +111,9 @@ def mmdit_block(cls: str, name: str) -> bool:
 def dew_path(cls: str, name: str) -> tuple[str, ...]:
     """The Dew parameter a FlaxDiff parameter path lands on."""
     path = tuple(name.split("/"))
-    if SCAN_PROJECTION[0] in path:
-        at = path.index(SCAN_PROJECTION[0])
-        path = (*path[:at], *SCAN_PROJECTION[1], *path[at + 1:])
+    if SCAN_PROJECTION in path:
+        at = path.index(SCAN_PROJECTION)
+        path = (*path[:at], *SCAN_PROJECTED, *path[at + 1:])
     if cls == "SimpleUDiT" and path[0] in UDIT_MOVED:
         return (*UDIT_MOVED[path[0]], *path[1:])
     if mmdit_block(cls, name):
@@ -139,9 +138,9 @@ def to_dew(cls: str, name: str, value: np.ndarray, patch_size: int | None = None
     modulation pieces in SD3's order."""
     if PROJECTIONS.keys() & set(name.split("/")):
         return value[0, 0]
-    if name.endswith(f"{SCAN_PROJECTION[0]}/kernel"):
+    if name.endswith(f"{SCAN_PROJECTION}/kernel"):
         assert patch_size is not None
-        return value.reshape(patch_size, patch_size, -1, value.shape[-1])
+        return scan_projection(value, patch_size)
     if not mmdit_block(cls, name):
         return value
     module, leaf = name.split("/")[1], name.split("/")[-1]

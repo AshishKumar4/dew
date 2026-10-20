@@ -48,10 +48,18 @@ _MOVED = {"time_embed": ("conditioning", "time_embed"),
           "final_norm": ("output", "final_norm"),
           "final_proj": ("output", "final_proj")}
 _MLP_LAYERS = {"layers_0": "up_proj", "layers_2": "down_proj"}
-# FlaxDiff projected a scan order's raw patches with this dense layer, `[p * p * C, D]` in patchify's
-# (row, column, channel) order; Dew embeds every order through the patch convolution, whose
-# `[p, p, C, D]` kernel is that matrix reshaped, and gathers the tokens after.
-_SCAN_PROJECTION = "hilbert_projection"
+SCAN_PROJECTION = "hilbert_projection"
+"""The dense layer FlaxDiff projected a scan order's raw patches with, `[p * p * C, D]` in patchify's
+(row, column, channel) order. Dew embeds every order through the patch convolution and gathers the
+tokens after (`scan_projection`)."""
+
+
+def scan_projection(kernel: np.ndarray, patch_size: int) -> np.ndarray:
+    """FlaxDiff's scan-order projection kernel (`SCAN_PROJECTION`) as Dew's patch convolution's,
+    `[p, p, C, D]`: the same matrix reshaped."""
+    kernel = np.asarray(kernel)
+    return kernel.reshape(patch_size, patch_size, -1, kernel.shape[-1])
+
 _HYBRID_MOVED = {"time_embed": ("conditioning", "time_embed"),
                  "text_context_proj": ("conditioning", "text_context_proj"),
                  "hilbert_projection": ("embed", "patch_embed", "Conv_0"),
@@ -205,9 +213,8 @@ def _variables(weights: Mapping, model: Mapping[str, object],
     params: dict = {}
     patch = records.integer(model["patch_size"], "patch_size")
     for name, value in weights.items():
-        if name == _SCAN_PROJECTION:
-            kernel = np.asarray(value["kernel"])
-            value = {**value, "kernel": kernel.reshape(patch, patch, -1, kernel.shape[-1])}
+        if name == SCAN_PROJECTION:
+            value = {**value, "kernel": scan_projection(value["kernel"], patch)}
         *parents, leaf = moved.get(name, (name,))
         branch = params
         for parent in parents:
