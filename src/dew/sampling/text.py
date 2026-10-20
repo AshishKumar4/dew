@@ -396,7 +396,7 @@ def _empty_cache(model: nn.Module, params: Variables, batch: int, ops: DecodeOps
     mixer is tokenwise (`MLPMixer`) keeps no cache, and its collection is empty."""
     def initialized(method: str) -> dict:
         _, mutated = model.apply(params, batch, method=method, mutable=["cache"])
-        return flatten_dict(dict(mutated.get("cache", {})))
+        return flatten_dict(dict(mutated["cache"])) if "cache" in mutated else {}
 
     cache = initialized("init_cache")
     for method in ("init_mtp_cache",) * bool(ops.depths) + ("init_draft_cache",) * (ops.record is not None):
