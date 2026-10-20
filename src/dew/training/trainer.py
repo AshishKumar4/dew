@@ -1179,7 +1179,7 @@ class Trainer(Generic[Loss, Effects]):
             keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
         self.plan = settled(planned, plans, seconds, probes)
         if planned.split != candidates[0] or seconds:
-            _log.warning("the step fits the devices in the plan %s", self.plan)
+            _log.info("the step fits the devices in the plan %s", self.plan)
         return planned, flops
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,

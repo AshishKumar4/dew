@@ -364,7 +364,7 @@ def plan_step[LossT, EffectsT](
         objective.unfuse_head()
         xla_defaults = False
         lowered.clear()
-        _log.warning("timing the plan against its batch whole at remat %r, %s", recompute_record(objective),
+        _log.info("timing the plan against its batch whole at remat %r, %s", recompute_record(objective),
                      "the head tiled" if head_tile_of(objective) is not None else "the whole logits kept")
         if fits(candidates[0]):
             plans.append(found(candidates[0]))
