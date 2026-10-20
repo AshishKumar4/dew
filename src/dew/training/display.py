@@ -89,7 +89,7 @@ class NotebookPanel:
     widget. An update replaces one output's data and captures nothing."""
 
     def __init__(self, renderable: RenderableType, console: Console):
-        from IPython.display import display
+        from IPython.display import DisplayHandle
 
         self.renderable = renderable
         self.console = console
@@ -97,7 +97,8 @@ class NotebookPanel:
         self._frames = Console(record=True, file=io.StringIO(), width=console.width, height=console.height,
                                color_system="truecolor", force_terminal=True, force_jupyter=False)
         self._shown = self._frame()
-        self._handle = display(self._shown, raw=True, display_id=True)
+        self._handle = DisplayHandle()
+        self._handle.display(self._shown, raw=True)
         self._stopped = threading.Event()
         self._ticker = threading.Thread(target=self._tick, name="dew-notebook-panel", daemon=True)
 
@@ -108,9 +109,11 @@ class NotebookPanel:
                 "text/plain": text}
 
     def _update(self) -> None:
+        from IPython.display import update_display
+
         if (frame := self._frame()) != self._shown:
             self._shown = frame
-            self._handle.update(frame, raw=True)
+            update_display(frame, display_id=self._handle.display_id, raw=True)
 
     def _tick(self) -> None:
         while not self._stopped.wait(1 / 8):
