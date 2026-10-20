@@ -611,7 +611,7 @@ class TextGeneration(_NativeTextTask):
         chain = (self.logits if sampling is None else None) if logits is None else logits
         given = self.stopping if stopping is None else stopping
         # As given: `resolve` tells the criteria that truncate from those that end a row by their kind.
-        criteria = ((given,) if callable(given) else tuple(given)) + stops
+        criteria = (tuple(given) if isinstance(given, Sequence) else (given,)) + stops
         return replace(policy, stop=(), pad_token_id=policy.pad), chain, criteria
 
     def quantized(self, spec: Quantization, example: Rows = ((0,),)) -> TextGeneration:

@@ -700,7 +700,7 @@ def resolve(sampling: Sampling, logits: Transforms | None, stopping: Criteria | 
     termination by accident. No strategy means `Sample`.
     """
     transforms = sampling.transforms() if logits is None else logits
-    given = () if stopping is None else (stopping,) if callable(stopping) else tuple(stopping)
+    given = () if stopping is None else tuple(stopping) if isinstance(stopping, Sequence) else (stopping,)
     return (decoding.components(transforms), decoding.Finishing.of((*given, *sampling.criteria())),
             Sample() if strategy is None else strategies.as_pytree(strategy))
 

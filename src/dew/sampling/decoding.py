@@ -210,11 +210,11 @@ class Stopping(Protocol):
     `MaxNewTokens` and `MaxLength` do, is a `Truncates`: a row it finishes
     is not terminated (`Finish`)."""
 
+    def __call__(self, state: StepState, tokens: jax.Array, /) -> jax.Array: ...
+
 
 class Truncates:
     """Marks a stopping criterion that cuts a row short at a length rather than ending it."""
-
-    def __call__(self, state: StepState, tokens: jax.Array, /) -> jax.Array: ...
 
 
 @struct.dataclass
@@ -960,7 +960,7 @@ def _stop_string_tables(pieces: Sequence[str | bytes], ids: Sequence[int],
                        positions, ends, max(len(value) for value in strings))
 
 
-def as_pytree(value: LogitsTransform) -> LogitsTransform:
+def as_pytree[Component: (LogitsTransform, Stopping)](value: Component) -> Component:
     """`value` in a form `jax.jit` accepts as data.
 
     A built-in whose numbers fix no shape lowers to its `apply` with them
