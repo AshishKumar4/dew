@@ -529,7 +529,13 @@ def underpowered(dew, reference, truth) -> str | None:
     theirs = np.square(np.asarray(reference, np.float64) - truth).ravel()
     if not (mine.sum() > 0 and theirs.sum() > 0):
         return None
-    spread = 0.5 * float(np.sqrt(np.sum(np.square(mine / mine.sum() - theirs / theirs.sum()))))
+    if mine.size < 2:
+        # One element's ratio carries no estimate of its own spread: only draws measure it.
+        return (f"underpowered: one element at one draw measures no spread of its own, so FACTOR {FACTOR} "
+                f"needs the comparison over {ORDERS} orders or input draws")
+    # The plug-in variance of a ratio of sums, times n / (n - 1) for the mean it estimates.
+    share = mine / mine.sum() - theirs / theirs.sum()
+    spread = 0.5 * float(np.sqrt(np.sum(np.square(share)) * mine.size / (mine.size - 1)))
     if Z * spread <= np.log(FACTOR):
         return None
     need = (Z * spread / np.log(FACTOR)) ** 2
