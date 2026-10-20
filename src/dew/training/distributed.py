@@ -7,13 +7,14 @@ import dataclasses
 import fnmatch
 import functools
 import hashlib
+import itertools
 import json
 import logging
 import math
 import statistics
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Concatenate, Protocol, overload
 
@@ -31,6 +32,7 @@ from dew.data.dataset import (
     Closeable,
     DataPartition,
     RampedStream,
+    Stage,
     Stoppable,
     stream_identity,
 )
@@ -470,6 +472,23 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, *, rows: boo
             f"its stages, and {dict(mesh.shape)} with "
             f"{microbatches} microbatch(es) "
             f"holds a batch that is a multiple of {divisor}")
+
+
+def check_ramp_window(stages: Sequence[Stage], window: int) -> None:
+    """Refuse a batch ramp whose stage begins inside an accumulation window of `window` steps that
+    replays its batches (a loss of composite statistics): the window's replay slots hold one
+    stage's batches, reallocated for the next where a window begins (`Trainer`'s accumulation)."""
+    starts = itertools.accumulate((after.records - stage.records) // stage.batch
+                                  for stage, after in itertools.pairwise(stages))
+    inside = [(start, stage.batch) for start, stage in zip(starts, stages[1:], strict=True) if start % window]
+    if inside:
+        start, batch = inside[0]
+        raise ValueError(
+            f"a loss of composite statistics replays its accumulation window's batches, and a batch "
+            f"ramp changes their shape at each stage, so each stage begins where a window of {window} "
+            f"steps does; the stage of {batch} records a step begins at step {start}. Ramp in stages "
+            f"of a multiple of {window} steps (Ramp.samples), or pool a shared mean (Ratio), whose "
+            f"window keeps no batch")
 
 
 def microbatch(batch: Batch, part: jax.Array, split: int) -> Batch:
