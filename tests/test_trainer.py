@@ -26,7 +26,7 @@ import optax
 import orbax.checkpoint as ocp
 import pytest
 from affine_run import BATCH, FEATURES, Counting, Features, Regression, Spread, dataset, raw_leaf, val_batches
-from recording import RecordingTracker
+from recording import Preempting, RecordingTracker
 from steady_state import steady_state
 
 from dew import position
@@ -406,22 +406,6 @@ def drawn(seed=0, opened=None, diverge=None):
 
 def stream(reader):
     return Loader(reader, None, batch=BATCH, records=None)
-
-
-class Preempting(RecordingTracker):
-    """Sends this process the scheduler's SIGTERM, once, when step `at` is
-    logged. The loop reads a step's log once the next step is dispatched, so
-    the notice stops the run after step `at` + 1."""
-
-    def __init__(self, at):
-        super().__init__()
-        self.at = at
-
-    def log(self, scalars, step):
-        super().log(scalars, step)
-        if step == self.at:
-            self.at = None
-            os.kill(os.getpid(), signal.SIGTERM)
 
 
 def preempted(tmp_path, data, at=3, steps=6):
