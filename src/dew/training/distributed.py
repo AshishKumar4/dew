@@ -1133,14 +1133,6 @@ def placed_bytes(tree) -> int:
                for leaf in jax.tree.leaves(tree))
 
 
-def owned[Tree](tree: Tree) -> Tree:
-    """`tree` with each of its arrays already on the devices copied, so a state built from it holds
-    buffers of its own: a step donates its state, and device_put, or a JIT that returns an input as
-    it is, can hand back a buffer the caller still holds, which the donation would free. A host
-    array is left as it is, since placing it copies it."""
-    return jax.tree.map(lambda leaf: leaf.copy() if isinstance(leaf, jax.Array) else leaf, tree)
-
-
 def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Variables],
                       mesh: Mesh) -> tuple[Held, Held]:
     """A copy of `held` on `mesh` as two trees, each None where the other holds
@@ -1168,7 +1160,10 @@ def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Var
                                    (None, None))
         return sharding if shape == np.shape(leaf) else None
 
-    placed = jax.device_put(owned(held), jax.tree_util.tree_map_with_path(
+    # A copy of an array already on the devices: device_put can reuse a
+    # buffer the target shares with the source, which donation would free.
+    owned = jax.tree.map(lambda leaf: leaf.copy() if isinstance(leaf, jax.Array) else leaf, held)
+    placed = jax.device_put(owned, jax.tree_util.tree_map_with_path(
         lambda path, leaf: variable(path, leaf) or replicated, held))
     taken = jax.tree_util.tree_map_with_path(
         lambda path, leaf: None if variable(path, leaf) is None else leaf, placed)
