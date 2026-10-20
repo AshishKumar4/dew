@@ -38,6 +38,7 @@ from dew.data.dataset import DataPartition, Loader, replayed
 from dew.objectives.base import Aux, EMASpec, Objective, merge, under
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
 from dew.training.evaluation import WARM_BATCHES
+from dew.training.model_flops import _TokenCount
 from dew.training.optim import Cosine, Power
 from dew.training.runtime import Preempted
 from dew.training.state import CHECKPOINTED
@@ -104,10 +105,10 @@ def test_a_token_only_run_uses_the_schedules_own_horizon(schedule):
 def test_a_token_budget_resumes_its_count_from_the_checkpoint(tmp_path):
     first = make_trainer(tmp_path, objective=TokenRegression())
     assert int(first.fit(dataset(), steps=2, tokens=30, log_every=1).step) == 2
-    assert first.checkpoints.control(2)["tokens"] == 24
+    assert first.checkpoints.control(2)["committed_tokens"] == 24
     resumed = make_trainer(tmp_path, objective=TokenRegression())
     assert int(resumed.fit(dataset(), tokens=30, log_every=1).step) == 3
-    assert resumed.checkpoints.control(3)["tokens"] == 48
+    assert resumed.checkpoints.control(3)["committed_tokens"] == 48
     complete = make_trainer(tmp_path, objective=TokenRegression())
     assert int(complete.fit(dataset(), tokens=30).step) == 3
 
@@ -117,12 +118,30 @@ def test_a_token_budget_counts_the_tokens_of_committed_updates(tmp_path):
     stopped inside a window counts none of its batch, and its resume counts that batch at the
     window's commit, once (spec training §3)."""
     first = make_trainer(tmp_path, objective=TokenRegression(), accumulation=2)
-    assert int(first.fit(dataset(), steps=3, log_every=1).step) == 3
-    assert first.checkpoints.control(3)["tokens"] == 24
-    assert first.checkpoints.control(3)["pending_tokens"] == 24
+    stopped = first.fit(dataset(), steps=3, log_every=1)
+    assert int(stopped.step) == 3
+    assert first.checkpoints.control(3)["committed_tokens"] == 24
+    assert _TokenCount.host(jax.device_get(stopped.accumulation.tokens)) == 24
     resumed = make_trainer(tmp_path, objective=TokenRegression(), accumulation=2)
     assert int(resumed.fit(dataset(), steps=4, log_every=1).step) == 4
-    assert resumed.checkpoints.control(4)["tokens"] == 80
+    assert resumed.checkpoints.control(4)["committed_tokens"] == 80
+
+
+def test_a_checkpoint_that_counted_every_steps_tokens_cannot_resume_a_token_budget(tmp_path):
+    """A checkpoint whose control counts every step's tokens (`tokens`, as runs counted before they
+    counted commits) holds no committed count, so a run whose length is its tokens refuses to
+    resume from it, and a run of steps resumes."""
+    first = make_trainer(tmp_path, objective=TokenRegression())
+    first.fit(dataset(), steps=2, log_every=1)
+    first.checkpoints.wait()
+    directory = first.checkpoints.directory
+    old = Checkpoints(directory, keep=3)
+    state = make_trainer(objective=TokenRegression()).initial_state()
+    old.save(3, dataclasses.replace(state, step=jnp.asarray(3)), None, control={"tokens": 24})
+    old.wait()
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=30)
+    assert int(make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), steps=4).step) == 4
 
 
 def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
@@ -135,7 +154,7 @@ def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
 def test_a_step_only_prefix_keeps_lifetime_real_tokens(tmp_path):
     first = make_trainer(tmp_path, objective=TokenRegression())
     first.fit(dataset(), steps=2, log_every=1)
-    assert first.checkpoints.control(2)["tokens"] == 24
+    assert first.checkpoints.control(2)["committed_tokens"] == 24
     resumed = make_trainer(tmp_path, objective=TokenRegression())
     assert int(resumed.fit(dataset(), tokens=30, log_every=1).step) == 3
 
@@ -166,7 +185,7 @@ def test_a_token_budget_stays_exact_above_float32_integer_resolution(cadence):
 def test_resumed_tokens_stay_exact_above_float32_integer_resolution(tmp_path, cadence):
     first = make_trainer(tmp_path, objective=LargeTokenRegression())
     first.fit(dataset(LargeTokenRows), steps=65, log_every=cadence)
-    assert first.checkpoints.control(65)["tokens"] == 65 * 262143
+    assert first.checkpoints.control(65)["committed_tokens"] == 65 * 262143
     resumed = make_trainer(tmp_path, objective=LargeTokenRegression())
     state = resumed.fit(dataset(LargeTokenRows), tokens=65 * 262143 + 1, log_every=cadence)
     assert int(state.step) == 66
