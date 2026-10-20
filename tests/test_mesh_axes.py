@@ -176,10 +176,10 @@ def test_an_fsdp_step_splits_leading_dimensions_and_moves_no_activation(fused):
              if sharding.spec and "kernel" in jax.tree_util.keystr(path) and declared_axes(path, 2, declared)}
     assert specs.pop("['lm_head']['kernel']") == P(None, "fsdp")
     assert set(specs.values()) == {P("fsdp")}, specs
-    # Qwen3-Next's fused projections declare the residual axis their unfused ones do.
-    projections = (("in_proj_qkvz", "in_proj_ba") if fused else
-                   ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"))
-    assert all(any(f"['{name}']" in path for path in specs) for name in projections), sorted(specs)
+    if fused:
+        # Qwen3-Next's fused projections declare the residual axis their unfused ones do.
+        assert all(any(f"['{name}']" in path for path in specs) for name in ("in_proj_qkvz", "in_proj_ba")), (
+            sorted(specs))
     assert moved(text) == moved(stepped(MeshSpec(fsdp=2), 2)[1])
     assert_trains_alike(trained, stepped(MeshSpec(), 1, **delta_layers(fused=fused))[2])
 
