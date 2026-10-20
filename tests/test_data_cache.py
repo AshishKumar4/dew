@@ -369,7 +369,7 @@ def test_iterate_and_validation_read_a_published_generation_as_its_accepted_rows
 
     source = Memory([{"id": index} for index in range(8)])
     even = Pipeline(source).filter(lambda row: row["id"] % 2 == 0, identity="even@1")
-    warm = Pipeline(source).cache(publish(even, _cache(), read="memory"))
+    warm = even.cache(publish(even, _cache(), read="memory"))
     assert [int(row["id"]) for row in iterate(warm, read="indexed")] == [0, 2, 4, 6]
     scored = validation(warm.map(lambda row: {"id": row["id"] + 10}), batch=3)(DataPartition())
     try:
@@ -397,6 +397,282 @@ def test_a_hash_holdout_publishes_the_rows_its_stream_reads():
     published = [(int(row["id"]), int(row["tag"]))
                  for row in iterate(Pipeline(generation.source()), read="indexed")]
     assert sorted(published) == [(index, index * 10) for index in part] and 0 < len(part) < 20
+
+
+@pytest.mark.parametrize("changed", ["chunk overlap", "source", "fewer steps"])
+def test_a_generation_reads_in_place_of_the_steps_it_ran_and_of_no_others(changed):
+    """A published generation reads in place of the source and steps it was published from, as
+    the rows those steps make; cached after another source or other steps it would serve rows they
+    never make, so the run is refused before it reads."""
+    from dew.data.compile import iterate, publish
+    from dew.data.pipeline import Pipeline
+    from dew.data.text import Chunks, Tokenize
+
+    texts = [{"text": "x" * size} for size in (3, 7, 18, 2, 12)]
+    source = Memory(texts)
+    chunked = Pipeline(source).map(Tokenize()).flat_map(Chunks(9))
+    generation = publish(chunked, _cache(), read="indexed")
+
+    def pieces(pipeline):
+        return [row["text"].tolist() for row in iterate(pipeline, read="indexed")]
+
+    assert pieces(chunked.cache(generation)) == pieces(chunked)
+    other = {
+        "chunk overlap": Pipeline(source).map(Tokenize()).flat_map(Chunks(9, overlap=1)),
+        "source": Pipeline(Memory(texts[::-1])).map(Tokenize()).flat_map(Chunks(9)),
+        "fewer steps": Pipeline(source).map(Tokenize()),
+    }[changed]
+    with pytest.raises(ValueError):
+        iterate(other.cache(generation), read="indexed")
+
+
+def test_a_generation_of_one_holdout_part_reads_as_that_part():
+    """A generation published from a holdout part holds that part's rows, so it reads in place of
+    that part whole, and the other part, whose rows it does not hold, is refused it; one published
+    from the store the parts select from serves both (`rebased`)."""
+    from dew.data.compile import iterate, publish
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(12)])
+
+    def tagged(pipeline):
+        return pipeline.map(lambda row: {**row, "tag": row["id"] * 10}, identity="tag@1")
+
+    def ids(pipeline):
+        return [(int(row["id"]), int(row["tag"])) for row in iterate(pipeline, read="indexed")]
+
+    train, held = Pipeline(source).holdout(records=5)
+    part = publish(tagged(train), _cache(), read="indexed")
+    assert ids(tagged(train).cache(part)) == ids(tagged(train))
+    assert ids(tagged(train)) == [(index, index * 10) for index in range(5, 12)]
+    with pytest.raises(ValueError):
+        iterate(tagged(held).cache(part), read="indexed")
+    store = publish(tagged(Pipeline(source)), _cache(), read="indexed")
+    served = [ids(tagged(branch).cache(store)) for branch in (train, held)]
+    assert served == [ids(tagged(train)), ids(tagged(held))]
+
+
+@pytest.mark.parametrize("scored", ["source", "chain", "same source"])
+def test_a_loader_reads_a_generation_where_it_holds_the_rows_and_each_other_source_itself(scored):
+    """A recipe given the generation of its training branch trains on the generation and scores
+    its validation source's own rows, through steps no cache could hold too; a recipe none of whose
+    rows the generation holds is refused."""
+    from dew.config.data import RecordsData, loader
+    from dew.data.compile import publish
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    read = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
+    trained = Memory([{"id": index} for index in range(8)])
+    held = Memory([{"id": 100 + index} for index in range(4)])
+    recipe = RecordsData(trained, validation={
+        "source": held, "chain": Pipeline(held).map(lambda row: {**row, "scored": 1}),
+        "same source": Pipeline(trained).map(lambda row: {**row, "scored": 1})}[scored])
+    train, _, _ = recipe.pipelines()
+    generation = publish(train, _cache(), read="indexed", loading=read)
+    data = loader(recipe, batch=2, cache=generation, read="indexed", loading=read)
+    assert data.plan.manifest.source["sources"][0]["store"] == "generation"
+    training, validation = data.train(DataPartition()), data.val(DataPartition())
+    try:
+        assert {int(index) for _ in range(4) for index in next(training)["id"]} == set(range(8))
+        scored_ids = sorted(int(index) for batch in validation for index in batch["id"])
+        assert scored_ids == (list(range(8)) if scored == "same source" else [100, 101, 102, 103])
+    finally:
+        training.close()
+        validation.close()
+    with pytest.raises(ValueError):
+        loader(RecordsData(Memory([{"id": -1}])), batch=2, cache=generation, read="indexed", loading=read)
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_loader_reads_a_generation_of_the_store_in_both_parts_of_a_random_holdout(read):
+    """A generation published from the store a recipe holds out from stands in for its steps in
+    the training part and the held part alike, each picking its rows from the generation's."""
+    from dew.config.data import RecordsData, loader
+    from dew.data.compile import iterate, publish
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.holdout import HoldOut
+    from dew.data.pipeline import Pipeline
+    from dew.data.steps.generic import Formatting
+
+    loading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
+    source = Memory([{"id": index} for index in range(12)])
+    generation = publish(Pipeline(source).map(Formatting()), _cache(), read=read, loading=loading)
+    recipe = RecordsData(source, validation=HoldOut(records=3, by="random", seed=5))
+    data = loader(recipe, batch=1, cache=generation, read=read, loading=loading)
+    assert data.plan.manifest.source["sources"][0]["store"] == "generation"
+    trained, scored, _ = recipe.pipelines()
+    assert scored is not None
+    parts = [sorted(int(row["id"]) for row in iterate(part, read=read, loading=loading))
+             for part in (trained, scored)]
+    training, validation = data.train(DataPartition()), data.val(DataPartition())
+    try:
+        assert sorted(int(next(training)["id"][0]) for _ in range(9)) == parts[0]
+        assert sorted(int(batch["id"][0]) for batch in validation) == parts[1]
+    finally:
+        training.close()
+        validation.close()
+    assert len(parts[1]) == 3 and sorted(parts[0] + parts[1]) == list(range(12))
+
+
+def test_a_generation_of_a_held_out_part_reads_under_the_holdouts_taken_from_that_part():
+    """A generation published from a training part stands in for it under a second holdout taken
+    from that part: the second holdout picks from the generation's rows as from the part's."""
+    from dew.data.compile import iterate, publish
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(12)])
+
+    def tagged(pipeline):
+        return pipeline.map(lambda row: {**row, "tag": row["id"] * 10}, identity="tag@1")
+
+    def ids(pipeline):
+        return [(int(row["id"]), int(row["tag"])) for row in iterate(pipeline, read="indexed")]
+
+    part, _ = Pipeline(source).holdout(records=2)
+    generation = publish(tagged(part), _cache(), read="indexed")
+    for cached, uncached in zip(tagged(part).cache(generation).holdout(records=1),
+                                tagged(part).holdout(records=1), strict=True):
+        assert ids(cached) == ids(uncached)
+
+
+def test_a_prompt_recipe_reads_the_generation_its_memory_read_published():
+    """A prompt recipe states its reward width by reading its rows, so the generation a memory
+    read of it published stands in for the same recipe's steps when it reads its rows again."""
+    from dew.config.data import PromptData, loader
+    from dew.data.compile import publish
+
+    # Two of the prompts are longer than 8 bytes, which the recipe drops.
+    recipe = PromptData(tuple({"prompt": "hi " * (1 + index % 3)} for index in range(6)), "byte",
+                        max_prompt_len=8)
+    train, _, _ = recipe.pipelines()
+    generation = publish(train, _cache(), read="memory")
+    data = loader(recipe, batch=2, cache=generation, read="memory")
+    assert data.plan.manifest.source["sources"][0]["store"] == "generation"
+    assert data.records == loader(recipe, batch=2, read="memory").records == 4
+
+
+@dataclass(frozen=True)
+class Offset:
+    """A deterministic step that notes each row it runs on, so a run shows whether its cache ran it."""
+
+    offset: int
+    calls: list = field(default_factory=list, compare=False, repr=False)
+    identity = "offset@1"
+
+    def __call__(self, row):
+        self.calls.append(int(row["id"]))
+        return {**row, "value": int(row["id"]) + self.offset}
+
+
+@pytest.mark.parametrize(("stored", "read"),
+                         [("memory", "memory"), ("memory", "indexed"), ("jsonl", "memory")])
+def test_a_cache_reads_the_fill_an_earlier_run_completed_and_fills_another_key_afresh(tmp_path, stored, read):
+    """A pass whose cache completes every input publishes it under its key, so a later run of the
+    same source and steps reads it without running them, in a pass and in training; a step
+    configured otherwise is another key, filled afresh."""
+    from dew.data.compile import compile, iterate
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Files
+
+    rows = [{"id": index} for index in range(6)]
+    if stored == "jsonl":
+        (tmp_path / "rows.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+        source = Files(str(tmp_path / "rows.jsonl"))
+    else:
+        source = Memory(rows)
+
+    def cached(step):
+        return Pipeline(source).map(step).cache(str(tmp_path / "cache"))
+
+    def values(step):
+        return [(int(row["id"]), int(row["value"])) for row in iterate(cached(step), read=read)]
+
+    first, again, trained, other = Offset(10), Offset(10), Offset(10), Offset(20)
+    assert values(first) == values(again) == [(index, index + 10) for index in range(6)]
+    assert sorted(first.calls) == list(range(6)) and again.calls == []
+    data = compile(cached(trained).batch(3), read=read, loading=Loading(workers=0, threads=1, read_buffer=1))
+    reader = data.train(DataPartition())
+    try:
+        assert sorted(int(value) for _ in range(2) for value in next(reader)["value"]) == list(range(10, 16))
+    finally:
+        reader.close()
+    assert trained.calls == []
+    assert values(other) == [(index, index + 20) for index in range(6)]
+    assert sorted(other.calls) == list(range(6))
+
+
+def test_a_streamed_cache_reads_the_generation_published_under_its_key(tmp_path):
+    """A streamed fill's shards are filled apart, so `publish` publishes them; a later streamed read
+    of the same source and steps then reads the generation, and `publish` returns it as it is."""
+    from dew.data.compile import iterate, publish
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(6)], shard_rows=2)
+    cache = Cache(str(tmp_path / "cache"))
+    filled, reading, republished = Offset(10), Offset(10), Offset(10)
+    generation = publish(Pipeline(source).map(filled), cache, read="streamed")
+    rows = sorted((int(row["id"]), int(row["value"]))
+                  for row in iterate(Pipeline(source).map(reading).cache(cache), read="streamed"))
+    assert rows == [(index, index + 10) for index in range(6)] and reading.calls == []
+    assert publish(Pipeline(source).map(republished), cache, read="streamed").url == generation.url
+    assert republished.calls == []
+
+
+def test_a_fill_whose_spool_drops_its_last_shard_reads_on_and_publishes_nothing(tmp_path):
+    """A spool too small for the fill's one shard (on_full='stop') stops admitting it: the pass
+    reads every row, and the next run, with nothing published, runs the steps again."""
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(3)])
+    first, again = Offset(1), Offset(1)
+    for step in (first, again):
+        cache = Cache(str(tmp_path / "cache"), spool_bytes=256, shard_bytes=256)
+        chain = Pipeline(source).map(step).cache(cache)
+        assert [int(row["value"]) for row in iterate(chain, read="indexed")] == [1, 2, 3]
+    assert sorted(first.calls) == sorted(again.calls) == [0, 1, 2]
+
+
+def test_a_streamed_generation_serves_its_files_at_another_mount(tmp_path):
+    """A streamed generation names its inputs by the shards of the files where they were filled;
+    the same files mounted elsewhere are the same key, whose shards run their steps and write
+    nothing, so the key holds its inputs under the first mount's names alone and a packing plan
+    publishes onto it there."""
+    import shutil
+
+    from dew.data.compile import iterate, publish
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Files
+    from dew.data.text import Chunks, Tokenize
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    (first / "rows.jsonl").write_text("".join(json.dumps({"text": "x" * size}) + "\n" for size in (2, 5, 7)))
+    shutil.copytree(first, second)
+
+    def chunked(mount):
+        return Pipeline(Files(str(mount / "rows.jsonl"))).map(Tokenize()).flat_map(Chunks(4))
+
+    def pieces(pipeline):
+        return sorted(row["text"].tolist() for row in iterate(pipeline, read="streamed"))
+
+    cache = Cache(str(tmp_path / "cache"))
+    generation = publish(chunked(first), cache, read="streamed")
+    assert pieces(chunked(second).cache(cache)) == pieces(chunked(second))
+    assert publish(chunked(first).pack(4, bins=2), cache, read="streamed").url != generation.url
+
+
+def test_an_empty_stream_publishes_an_empty_generation():
+    """A stream with no records publishes a generation of none, its shards read to their end."""
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import from_iter
+
+    generation = publish(Pipeline(from_iter(lambda: iter(()), name="empty@1", replay=True)).map(Offset(1)),
+                         _cache(), read="streamed")
+    assert len(generation) == 0
 
 
 def test_published_generation_exposes_only_declared_order_metadata_and_plan():

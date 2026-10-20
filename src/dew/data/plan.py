@@ -73,6 +73,8 @@ class StepIdentity:
 
     @classmethod
     def of(cls, step: object, identity: str | None = None, *, cache: bool = False) -> StepIdentity:
+        """`step`'s identity, refused where a cache keys it (`cache`) and
+        cannot (`keyable`)."""
         kind = step if inspect.isfunction(step) else type(step)
         module = kind.__module__
         name = f"{module}.{kind.__qualname__}"
@@ -82,10 +84,6 @@ class StepIdentity:
         unstable = any(marker in name or marker in config for marker in ("<lambda>", "<locals>", " at 0x"))
         exact = bool(declared) or (not unstable and (frozen or inspect.isfunction(step)))
         external = not module.startswith("dew.")
-        if cache and (
-            not exact or (external and declared is None) or (inspect.isfunction(step) and declared is None)
-        ):
-            raise ValueError(f"cache prefix step {name} needs identity='name@version'")
         path = (
             None if inspect.isbuiltin(step) or kind.__module__ == "builtins" else inspect.getsourcefile(kind)
         )
@@ -104,7 +102,16 @@ class StepIdentity:
         )
         if dependencies and dataclasses.is_dataclass(step) and not isinstance(step, type):
             config = json.dumps(_configuration(step), sort_keys=True)
-        return cls(name, config, exact, modules, declared, dependencies)
+        named = cls(name, config, exact, modules, declared, dependencies)
+        if cache and not named.keyable(function=inspect.isfunction(step), external=external):
+            raise ValueError(f"cache prefix step {name} needs identity='name@version'")
+        return named
+
+    def keyable(self, *, function: bool, external: bool) -> bool:
+        """Whether a cache can key what the step computes: a stable identity,
+        declared wherever the step is a function or its code is outside Dew,
+        which Dew's revision does not name."""
+        return self.exact and not ((external or function) and self.declared is None)
 
     def semantic(self) -> dict[str, JSON]:
         """What the step computes, on any host: its identity without its
@@ -161,6 +168,36 @@ _ENVIRONMENT = ("revision", "lock", "python", "platform", "clean")
 def _changed(saved: Mapping[str, object], current: Mapping[str, object]) -> tuple[str, ...]:
     """The fields of a saved record that `current` does not repeat."""
     return tuple(name for name in sorted(set(saved) | set(current)) if saved.get(name) != current.get(name))
+
+
+def _identities(value: object) -> list[dict[str, JSON]]:
+    if not isinstance(value, list):
+        raise ValueError(f"{value!r}: a manifest's steps are a list of step identities")
+    return [{name: json_value(entry, name) for name, entry in record(step, "step").items()} for step in value]
+
+
+def _semantic(recorded: Mapping[str, object]) -> dict[str, JSON]:
+    """What the rows a manifest's record (`Manifest.record`) names are, on
+    any host: the pinned sources, each step's identity and dependencies
+    (`StepIdentity.semantic`), the tokenizers and the fill."""
+    return {
+        name: [{key: entry for key, entry in step.items() if key != "modules"} for step in _identities(value)]
+        if name == "steps" else json_value(value, name)
+        for name, value in recorded.items()
+        if name not in (*_ENVIRONMENT, "ran")
+    }
+
+
+def _environment(recorded: Mapping[str, object]) -> dict[str, JSON]:
+    """The code and machine that ran a manifest's steps, from its record:
+    Dew's revision and lock, the interpreter, the platform and each external
+    module's bytes, for the steps a memory read ran and then the plan's own.
+    A step states a change to what it computes in its configuration or
+    declared identity; its modules' bytes change with any edit to their
+    files, as Dew's revision does with any edit to Dew."""
+    steps = (*_identities(recorded["ran"]), *_identities(recorded["steps"]))
+    return {**{name: json_value(recorded[name], name) for name in _ENVIRONMENT},
+            "modules": [step["modules"] for step in steps]}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -262,25 +299,10 @@ class Manifest:
         return recorded
 
     def semantic(self) -> dict[str, JSON]:
-        """What the rows are, on any host: the pinned sources, each step's
-        identity and dependencies (`StepIdentity.semantic`), the tokenizers
-        and the fill."""
-        recorded = self.record()
-        recorded["steps"] = [step.semantic() for step in self.steps]
-        return {name: value for name, value in recorded.items() if name not in (*_ENVIRONMENT, "ran")}
+        return _semantic(self.record())
 
     def environment(self) -> dict[str, JSON]:
-        """The code and machine that ran the steps: Dew's revision and lock,
-        the interpreter, the platform and each external module's bytes, for
-        the steps a memory read ran and then the plan's own. A step states a
-        change to what it computes in its configuration or declared identity;
-        its modules' bytes change with any edit to their files, as Dew's
-        revision does with any edit to Dew."""
-        recorded = self.record()
-        return {
-            **{name: recorded[name] for name in _ENVIRONMENT},
-            "modules": [list(step.modules) for step in (*self.ran, *self.steps)],
-        }
+        return _environment(self.record())
 
     @property
     def canonical(self) -> bytes:

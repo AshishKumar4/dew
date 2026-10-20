@@ -713,7 +713,7 @@ class _Build:
             rows = stored.map_with_index(placed) if last >= 0 else stored
             return self.shared(rows, pipeline, partition), 0
         filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
-        cached = filled.mapped(stored, manifest, transform=prefix)
+        cached = filled.mapped(stored, manifest, transform=prefix, source=source)
         placed = cached.map_with_index(_Placed(rows=len(cached))) if last > cache else cached
         view = self.shared(placed, pipeline, partition)
         rows = cached.iterated(view, pygrain.ReadOptions(self.loading.threads, self.loading.read_buffer))
