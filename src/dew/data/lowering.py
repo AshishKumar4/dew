@@ -81,7 +81,6 @@ from dew.data.pipeline import (
     Pipeline,
     Prefetch,
     RandomMap,
-    Rebatch,
     Record,
     Rejected,
     Repeat,
@@ -831,7 +830,7 @@ class _Build:
         else:
             rows, consumed = self.indexed(pipeline, source, partition, last)
         for index, stage in enumerate(pipeline.stages[consumed:], start=consumed):
-            if isinstance(stage, (BatchStage, MapBatch, Rebatch)):
+            if isinstance(stage, (BatchStage, MapBatch)):
                 break
             if index == self.lowering.absorbed:
                 continue
@@ -876,10 +875,6 @@ class _Build:
                     num_workers=stage.count, per_worker_buffer_size=stage.buffer
                 ),
                 worker_init_fn=_dies_with_parent,
-            )
-        elif isinstance(stage, Rebatch):
-            rows = gx.RebatchIterDataset(
-                _as_iter(rows, self.loading), partition.rows(stage.size), drop_remainder=self.training
             )
         elif isinstance(stage, Native):
             rows = stage.function(rows.seed(self.stage_seed(pipeline, at, partition)))

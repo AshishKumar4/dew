@@ -83,7 +83,6 @@ from dew.data.pipeline import (
     Pipeline,
     Prefetch,
     RandomMap,
-    Rebatch,
     RecordStep,
     Repeat,
     Shuffle,
@@ -284,7 +283,7 @@ def _windowed(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
     if objective.pack is None:
         return pipeline
     at = _until(pipeline.stages, (BatchStage, TokenBudget))
-    windows = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).then(objective.pack)
+    windows = dataclasses.replace(pipeline, stages=pipeline.stages[:at])._then(objective.pack)
     for step in objective.packed:
         windows = windows.map(step)
     return dataclasses.replace(windows, stages=(*windows.stages, *pipeline.stages[at:]))
@@ -454,7 +453,7 @@ def compile(
     With no `read`, the sources choose it (`_preferred_read`)."""
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(lambda _: branches, provision=provision)
-    loading = loading or train.loading or _DEFAULT_LOADING
+    loading = loading or train._loading or _DEFAULT_LOADING
     if isinstance(train.source, Phases):
         return _compile_phases(
             train,
@@ -536,8 +535,8 @@ def _staged(
 
 def _output_batch(pipeline: Pipeline) -> int:
     """The rows each batch of `pipeline` holds as its reader yields them, which its loader declares
-    and its share pads to: the last rebatch's, else its batch's own, which still groups its reads."""
-    return [stage.size for stage in pipeline.stages if isinstance(stage, (BatchStage, Rebatch))][-1]
+    and its share pads to."""
+    return next(stage.size for stage in pipeline.stages if isinstance(stage, BatchStage))
 
 
 def _compiled(
@@ -729,7 +728,7 @@ def _compile_phases(
     staged: list[tuple[_Staged, int | None]] = []
     previous = 0
     for index, (pipeline, until) in enumerate(zip(source.pipelines, source.until_steps, strict=True)):
-        phase = _staged(_continued(pipeline, consumed).then(*train.stages),
+        phase = _staged(_continued(pipeline, consumed)._then(*train.stages),
                         validation if index == 0 else None, objective=objective, read=read,
                         provision=provision, loading=loading, seed=seed, rejections=rejections, budget=budget)
         end = None if until is None else until * phase.build.batch
@@ -912,7 +911,7 @@ def _objective_records(
         if isinstance(step, Expansion):
             pipeline = pipeline.flat_map(step)
         elif isinstance(step, Configured):
-            pipeline = pipeline.then(step)
+            pipeline = pipeline._then(step)
         elif isinstance(step, pygrain.RandomMapTransform):
             drops = _declares_rejects(step)
             pipeline = pipeline.random_filter_map(step) if drops else pipeline.random_map(step)
@@ -940,7 +939,7 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
     steps = objective.train_batch if train else objective.evaluate_batch
     # A string or object field stays in the batch for the host code and metrics that read it; the
     # prefetcher places the rest (`dew.training.distributed.split_fields`).
-    return branch.then(*(MapBatch(step) for step in steps))
+    return branch._then(*(MapBatch(step) for step in steps))
 
 
 def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]:
@@ -972,9 +971,9 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     eager memory transforms, and leaves its counters in the Grain state.
     """
     read = pipeline.mode or _preferred_read(lambda _: (pipeline,), provision=True)
-    loading = pipeline.loading or _DEFAULT_LOADING
+    loading = pipeline._loading or _DEFAULT_LOADING
     if records is not None:
-        pipeline = pipeline.then(Limit(records))
+        pipeline = pipeline._then(Limit(records))
         loading = dataclasses.replace(loading, workers=0, threads=0, read_buffer=0)
     if not pipeline.batched:
         pipeline = pipeline.batch(1, drop_remainder=False)
@@ -1047,14 +1046,14 @@ def fitted[Entry](
     Loader is already compiled, and an entry that is no Dataset (a reader,
     an evaluation suite) is passed on as it is."""
     if isinstance(dataset, Dataset):
-        train = _endless(dataset.chain())
+        train = _endless(dataset._chain())
         loader = compile(train, objective=objective, provision=True)
     else:
         loader = dataset
     named = {"val": validation} if isinstance(validation, Dataset) else validation
     if named is None:
         return loader, None
-    return loader, {name: _held(entry.chain(), loader.batch, objective) if isinstance(entry, Dataset)
+    return loader, {name: _held(entry._chain(), loader.batch, objective) if isinstance(entry, Dataset)
                     else entry for name, entry in named.items()}
 
 
@@ -1072,7 +1071,7 @@ def _held(chain: Pipeline, batch: int, objective: ObjectiveData) -> Reader:
     """`chain` read once to validate on, batched by `batch` where it states no
     batch, read and loaded as it asks."""
     return validation(chain, batch=batch, objective=objective, read=chain.mode,
-                      loading=chain.loading or _DEFAULT_LOADING, provision=True)
+                      loading=chain._loading or _DEFAULT_LOADING, provision=True)
 
 
 def validation(

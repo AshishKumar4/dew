@@ -408,7 +408,7 @@ def test_a_source_exports_the_records_its_pipeline_exports():
         return [np.asarray(row["id"]).tolist() for shard in files.manifest().shards
                 for row in files.manifest().reader(shard)]
 
-    assert exported(stored) == exported(stored.chain()) == [[2 * index, 2 * index + 1] for index in range(5)]
+    assert exported(stored) == exported(stored._chain()) == [[2 * index, 2 * index + 1] for index in range(5)]
 
 
 def test_spark_directory_requires_success_marker(tmp_path):
@@ -1762,7 +1762,7 @@ def test_a_default_read_is_judged_on_the_order_the_recipe_adds_at_that_read(tmp_
 
     class Split:
         def pipelines(self):
-            return Pipeline(Files(str(tmp_path / "rows.parquet"))).token_split(0.5, held=False), None, ()
+            return Pipeline(Files(str(tmp_path / "rows.parquet"))).holdout(tokens=0.5)[0]._chain(), None, ()
 
     rows = [{"text": [index] * 4} for index in range(8)]
     pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
@@ -1802,7 +1802,7 @@ def test_a_local_store_whose_producer_declared_other_bytes_is_refused(tmp_path):
     path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(8)))
     url = str(path)
     held = {"bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-    assert [row["id"] for row in Files(url, file_info={url: held}).iterate()] == list(range(8))
+    assert [row["id"] for row in Files(url, file_info={url: held})] == list(range(8))
     for stale in ({**held, "bytes": 2 * held["bytes"]}, {**held, "sha256": "0" * 64}):
         with pytest.raises(ValueError):
             Files(url, file_info={url: stale}).fingerprint()
@@ -1960,7 +1960,7 @@ def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(re
     train = Memory([{"id": np.int32(index)} for index in range(6)])
     held = Memory([{"id": np.int32(index)} for index in range(100, 104)])
     joined = Concatenate((train, held))
-    assert joined.map(lambda record: {"id": record["id"] + 1}).chain().source is joined
+    assert joined.map(lambda record: {"id": record["id"] + 1})._chain().source is joined
     loading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
     passed = validation(Pipeline(joined).batch(2), batch=2, read=read, loading=loading)(DataPartition())
     try:
