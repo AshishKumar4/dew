@@ -14,7 +14,8 @@ and none on AVX-512; the norm backward's dscale halves at 1 of 256 on an Intel X
 family, held-out trees as exact as the reference (recursive halving, pairwise over the keys
 reversed, XLA's sum reversed, strided-32) passed at 48, 128 and 256 keys on both ISAs, a tree less
 exact on long positive sums (blocked-12) failed there, and an eight-ulp fault at one element failed
-everywhere (24 armada workers a shape); the rule's false-failure rate at real element counts is not calibrated by these counts."""
+everywhere (24 armada workers a shape); the rule's false-failure rate at real element counts is
+not calibrated by these counts."""
 
 import jax
 import jax.numpy as jnp
