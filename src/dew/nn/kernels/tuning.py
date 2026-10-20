@@ -276,11 +276,15 @@ def _another_subscriber(error: RuntimeError) -> bool:
 
 
 def _resource_exhausted(error: Exception) -> bool:
-    """Whether a config's compile failed for a block past the GPU's shared memory, XLA's
-    "RESOURCE_EXHAUSTED: Shared memory size limit exceeded", the one failure a config of a launch's
-    space may meet on a GPU it was not declared for; any other failure, device memory's included, is
-    the kernel's or the tuner's, and propagates."""
-    return str(error).startswith("RESOURCE_EXHAUSTED: Shared memory size limit exceeded")
+    """Whether a config failed for a block past the GPU's own resources, the failures a config of a
+    launch's space may meet on a GPU it was not declared for: its shared memory as XLA's compile
+    reports it ("RESOURCE_EXHAUSTED: Shared memory size limit exceeded"), or its registers or threads as
+    the driver refuses the launch (CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES, which XLA passes on as an
+    INTERNAL error naming it). Any other failure, device memory's included, is the kernel's or the
+    tuner's, and propagates."""
+    message = str(error)
+    return (message.startswith("RESOURCE_EXHAUSTED: Shared memory size limit exceeded")
+            or "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES" in message)
 
 
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> AutotuningData:
