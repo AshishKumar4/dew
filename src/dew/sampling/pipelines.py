@@ -710,8 +710,7 @@ class TextToImage:
             walk = jax.random.fold_in(request, 1)
             grid = _default_grid(process, count) if times is None else times
             initial = _initial(plan.sharding)(solver, process, grid, prepared.noise, walk)
-            models = (self.model, *guidance_modules(chosen),
-                      *(() if self.autoencoder is None else (self.autoencoder.model,)))
+            models = sampling_modules(self.model, chosen, self.autoencoder)
             walked = _run(plan.sharding, tuple(compiler_options(*models).items()))
             generated = walked(self.model, process, self.autoencoder, self.finish, self.final_denoise, decode,
                                solver, chosen, np.asarray(grid, np.float32), initial, self.variables,
@@ -855,6 +854,14 @@ def _initial(rows: jax.sharding.NamedSharding | None):
 
 
 @functools.cache
+def sampling_modules(model: nn.Module, guidance: Guidance | None,
+                     autoencoder: AutoEncoder | None) -> tuple[nn.Module, ...]:
+    """Every network a walk of `model` under `guidance` that `autoencoder` decodes runs: the
+    denoiser, an autoguide (`guidance_modules`) and the autoencoder's model, which the program
+    that walks it compiles for (`compiler_options`), a task's and an objective's alike."""
+    return (model, *guidance_modules(guidance), *(() if autoencoder is None else (autoencoder.model,)))
+
+
 def _run(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
     """The walk over `rows`, compiled with the XLA `options` of its denoiser, its guidance's guide and
     its autoencoder (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never
