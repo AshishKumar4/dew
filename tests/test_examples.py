@@ -295,7 +295,8 @@ def test_sft_diffusion_gemma_images_smoke_trains_on_two_splits_and_captions_the_
     # A batch marks its repeats where it holds any (`valid_rows`), as the example reads it.
     captioned = [int(image) for batch in data.val(DataPartition())
                  for image, real in zip(np.asarray(batch["image_id"]),
-                                        batch.get(VALID_ROWS, np.ones(len(batch["image_id"]), bool)), strict=True)
+                                        batch.get(VALID_ROWS, np.ones(len(batch["image_id"]), bool)),
+                                        strict=True)
                  if real]
     assert sorted(captioned) == sorted(ids["test"])
     run = tmp_path / "checkpoints" / "flowers-caption"
