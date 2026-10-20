@@ -5,11 +5,12 @@
 Builds the family's committed config (tests/fixtures/hf/<family>/config.json) at every layer it has
 but a narrow width (`--hidden`), since a program's compile scales with its layers and not its width,
 over random weights, and times the Server's warm (first) compile of every step program a run of
-`--slots` slots compiles: the decode step and each power-of-two admission width
-(`Server.admission`). The record holds the wall seconds of the whole warm (`warm_seconds`), which
-its compiles fill (the narrow model runs each step in milliseconds), and of each admission width's
-first round, and the device it compiled for. Nothing is read from or written to a compilation
-cache.
+`--slots` slots compiles: its construction's decode step (`Server.__init__` compiles it to choose
+the resident layouts), then each power-of-two admission width's prefill (`Server.admission`). The
+record holds the wall seconds of construction (`construction_seconds`), of each admission width's
+first round (`by_admission_width`) and of the whole warm (`warm_seconds`), which compiles fill (the
+narrow model runs each step in milliseconds), and the device they compiled for. Nothing is read
+from or written to a compilation cache.
 """
 
 from __future__ import annotations
@@ -61,11 +62,12 @@ def main() -> None:
         lambda leaf: leaf.astype(jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
         variables)
     task = TextGeneration(model, variables, None, sampling=Sampling(temperature=0, eos_token_ids=None))
+    began = time.perf_counter()
     server = Server.from_task(task, slots=args.slots, capacity=args.prompt + args.output)
+    constructed = time.perf_counter() - began
     widths = sorted({min(server.admission, 1 << bit) for bit in range(server.admission.bit_length())})
     rng = np.random.default_rng(0)
     timed = {}
-    began = time.perf_counter()
     for rows in widths:
         start = time.perf_counter()
         tickets = [server.submit(rng.integers(1, 1000, args.prompt).astype(np.int32), args.output,
@@ -76,7 +78,8 @@ def main() -> None:
         timed[f"admission {rows}"] = time.perf_counter() - start
     record = {"family": args.family, "hidden": args.hidden, "layers": config.get("num_hidden_layers"),
               "slots": args.slots, "admission": server.admission, "device": jax.devices()[0].device_kind,
-              "warm_seconds": time.perf_counter() - began, "by_admission_width": timed}
+              "construction_seconds": constructed, "by_admission_width": timed,
+              "warm_seconds": time.perf_counter() - began}
     args.json_out.write_text(json.dumps(record, indent=2))
     print(json.dumps(record))
 
