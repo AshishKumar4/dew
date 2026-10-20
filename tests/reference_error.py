@@ -267,16 +267,17 @@ def _resolves(low: float, high: float) -> bool:
     return high <= FACTOR * max(low, 1e-300)
 
 
-def _drawn(dew_fn, reference_fn, draw, seeds):
+def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None):
     """Each leaf's per-seed mean squared errors from float64, Dew's and the reference's, and each
     seed's (Dew's, the reference's) worst row over its size, with the leaves' names: every function
-    run on `draw(seed)`'s inputs, truth `reference_fn` on them widened to float64."""
+    run on `draw(seed)`'s inputs, truth `truth_fn` on them (by default `reference_fn` on them widened
+    to float64)."""
     mine, theirs, rows, names = [], [], [], None
     for seed in seeds:
         inputs = draw(seed)
         dew, reference = dew_fn(*inputs), reference_fn(*inputs)
         with jax.enable_x64(new_val=True):
-            truth = reference_fn(*widened(inputs))
+            truth = (truth_fn or reference_fn)(*widened(inputs))
         paths = jax.tree_util.tree_leaves_with_path(dew)
         names = names or [jax.tree_util.keystr(path) for path, _ in paths]
         leaves = zip([leaf for _, leaf in paths], jax.tree.leaves(reference), jax.tree.leaves(truth),
@@ -297,14 +298,15 @@ def _drawn(dew_fn, reference_fn, draw, seeds):
     return np.asarray(mine), np.asarray(theirs), np.asarray(rows), names
 
 
-def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> None:
+def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
     """Check 1 of the owner's gate (bible §7, 2026-10-20): on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within FACTOR times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst.
 
     `draw(seed)` returns the inputs of one draw, the same for a seed on every run; `dew_fn(*inputs)`
     and `reference_fn(*inputs)` return the same tree, and truth is `reference_fn` on the inputs
-    widened to float64. A draw may be an orbit's: the same values under an exact symmetry the seed
+    widened to float64, or `truth_fn` on them where the reference fixes a precision of its own (an
+    output dtype it closes over). A draw may be an orbit's: the same values under an exact symmetry the seed
     picks. `seeds` is the site's declared count, sized by `seeds_for` so the reference compared with
     itself resolves FACTOR; jit the two functions so every seed reuses one compiled program.
 
@@ -318,7 +320,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> No
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/op_certificates.py)."""
-    mine, theirs, rows, names = _drawn(dew_fn, reference_fn, draw, range(seeds))
+    mine, theirs, rows, names = _drawn(dew_fn, reference_fn, draw, range(seeds), truth_fn)
     over = []
     for index, name in enumerate(names):
         leaf = label + name
@@ -337,7 +339,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> No
             continue
         if ratio > FACTOR:
             further = range(seeds, (1 + REDRAW) * seeds)
-            more_mine, more_theirs, _, _ = _drawn(dew_fn, reference_fn, draw, further)
+            more_mine, more_theirs, _, _ = _drawn(dew_fn, reference_fn, draw, further, truth_fn)
             again = _pooled(np.concatenate([a, more_mine[:, index]]),
                             np.concatenate([b, more_theirs[:, index]]))
             if again > FACTOR:
@@ -351,15 +353,15 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> No
     assert not over, "\n".join(over)
 
 
-def seeds_for(reference_fn, draw, label: str, *, start: int = 8, most: int = 512) -> int:
+def seeds_for(reference_fn, draw, label: str, *, start: int = 8, most: int = 512, truth_fn=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the reference compared
     with itself (its errors on two disjoint seed sets, `_interval`'s control) resolves FACTOR in every
     leaf: the pooled ratio's CONFIDENCE interval no wider than FACTOR. Fails past `most`, where the
     site needs larger inputs or fewer shared factors, not more seeds."""
     count = start
     while count <= most:
-        _, first, _, names = _drawn(reference_fn, reference_fn, draw, range(count))
-        _, second, _, _ = _drawn(reference_fn, reference_fn, draw, range(count, 2 * count))
+        _, first, _, names = _drawn(reference_fn, reference_fn, draw, range(count), truth_fn)
+        _, second, _, _ = _drawn(reference_fn, reference_fn, draw, range(count, 2 * count), truth_fn)
         wide = [name for index, name in enumerate(names)
                 if np.sum(first[:, index]) > 0 and np.sum(second[:, index]) > 0
                 and not _resolves(*_interval(first[:, index], control=second[:, index]))]
