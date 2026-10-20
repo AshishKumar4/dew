@@ -189,7 +189,9 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
     from dew.sampling import Sampling
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    prompt = tokenizer.apply_chat_template([{"role": "user", "content": "Say hello."}], add_generation_prompt=True)
+    # The chat template's ids as a list: Transformers 5 answers a BatchEncoding unless told not to.
+    prompt = list(tokenizer.apply_chat_template([{"role": "user", "content": "Say hello."}],
+                                                add_generation_prompt=True, tokenize=True, return_dict=False))
     generation = json.loads(Path(hf_hub_download(MODEL, "generation_config.json")).read_text())
     listed = generation["eos_token_id"]
     native = sorted({*(listed if isinstance(listed, list) else [listed]), tokenizer.eos_token_id})
