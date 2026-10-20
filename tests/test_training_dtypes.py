@@ -97,21 +97,11 @@ class DenseObjective(Objective):
         return super().reduce_loss(stats)
 
 
-def compare(actual, expected, *, exact=False, tolerance=2e-6, moment_rounding=False):
+def compare(actual, expected, *, exact=False, tolerance=2e-6):
     for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         got, want = raw_leaf(got), raw_leaf(want)
         assert got.dtype == want.dtype
-        if moment_rounding and not exact and got.dtype == jnp.bfloat16:
-            # A materialized accumulation boundary can round the gradient before
-            # Adam, unlike the fused reference. Allow one adjacent bf16 moment,
-            # not a relative tolerance on parameters, EMA, or resumed state.
-            # These fixtures differ by at most one neighbor on JAX 0.11.1/CUDA
-            # (four accumulation cases); CPU matches the compiled reference.
-            reference = np.asarray(want)
-            lower = np.nextafter(reference, np.full_like(reference, -np.inf))
-            upper = np.nextafter(reference, np.full_like(reference, np.inf))
-            assert np.all(np.asarray(got) >= lower) and np.all(np.asarray(got) <= upper)
-        elif exact or got.dtype == jnp.bfloat16:
+        if exact or got.dtype == jnp.bfloat16:
             np.testing.assert_array_equal(got, want)
         else:
             np.testing.assert_allclose(got, want, rtol=tolerance, atol=tolerance * .1)
@@ -178,7 +168,7 @@ def exercise_updates_and_resume(
                     assert gradient.dtype == jnp.promote_types(parameter.dtype, jnp.float32)
         np.testing.assert_allclose(loss, expected_loss, rtol=tolerance, atol=tolerance * .1)
         compare(state.variables["params"], expected_params, tolerance=tolerance)
-        compare(state.opt_state, expected_opt, tolerance=tolerance, moment_rounding=True)
+        compare(state.opt_state, expected_opt, tolerance=tolerance)
         compare(state.ema, expected_ema, tolerance=tolerance)
     assert int(state.updates) == 2
     checkpoints.wait()

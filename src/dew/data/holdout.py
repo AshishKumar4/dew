@@ -7,7 +7,7 @@ import functools
 import itertools
 import json
 import random
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from types import UnionType
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypeAliasType, runtime_checkable
 
@@ -333,10 +333,21 @@ class _RandomSource:
         raise ValueError(self.refusal)
 
 
-def rebased(source: Source | Mixture | Phases, replacement: Source) -> Source:
-    """The holdout selections of `source` around its replacement."""
-    if isinstance(source, (_HashSource, _SliceRecords, _RandomSource)):
-        return dataclasses.replace(source, source=rebased(source.source, replacement))
+_SELECTIONS = (_HashSource, _SliceRecords, _RandomSource)
+
+
+def selecting(source: Source | Mixture | Phases) -> Iterator[Source | Mixture | Phases]:
+    """`source`, then each source its holdout selections select from, down to their store."""
+    yield source
+    if isinstance(source, _SELECTIONS):
+        yield from selecting(source.source)
+
+
+def rebased(source: Source | Mixture | Phases, replacement: Source,
+            under: Source | Mixture | Phases | None = None) -> Source:
+    """The holdout selections of `source` above `under`, its store by default, around `replacement`."""
+    if source is not under and isinstance(source, _SELECTIONS):
+        return dataclasses.replace(source, source=rebased(source.source, replacement, under))
     return replacement
 
 
