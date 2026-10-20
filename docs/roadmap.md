@@ -66,19 +66,13 @@ The kernel direction was approved on 2026-10-19:
 - Revisit residual certification and Crouzeix bounds only if a profiled solve or accuracy defect needs them; no speedup has been established. [477]
 - Separate normalization and shared attention policy from `attention.py`. [NNK-11]
 - Measure joined QKV in the same A100 session before adopting it. For unbounded packing, evaluate a recurrence implementation that stores continuation state without one full chunk state per position.
-- Accumulate low-precision bias gradients in fp32, keep cancelling key-bias gradients visible and use a single-rounding bias epilogue without a step-time regression. [620, 621, 634]
-- Prefer XLA for fp32 SwiGLU where its fusion wins. [646]
+- Use a single-rounding bias epilogue without a step-time regression. [634]
 - Profile first compilation separately through lowering and XLA passes. [629]
 - Keep document resets out of recurrence decay prefixes, move decode regrouping into the kernel boundary and finish shared tuner/template coverage. [NNK-4, NNK-8, 597]
 - Take paged attention through the typed kernel selector, so its eligibility is each kernel's own as every other operation's is. [742]
-- Keep each slot's logical key place in a paged KV cache, so chunked and ALiBi attention mask a prompt placed past zero by its places, as on a dense cache. [825]
-- Close the route audit's gaps: rms_norm's inverse rounding and its decode operands, swiglu's dtype and its forward mode, each routed to the kernel its row names. [759]
 - Give the chunked gated delta rule one dtype contract on every route. With mixed operands the port returns their common dtype, while the portable math returns the query's and casts its cotangent to it, so output dtype and gradient precision depend on the GPU row. [730]
 - Move rms_norm and swiglu onto the typed selector, so their routes report and their refusals classify. [762]
 - Let tuning take only the declared resource-exhaustion and profiler-subscription errors for an unusable config. [764]
-- Make fused attention the selector's private executor, its second eligibility pass deleted. [765]
-- Capture only the requested step's routes in the route tool. [763]
-- Record in the target table that no Tokamax implementation is any row's kernel, sm86's narrow row on flash. [766]
 - Widen the fused norm and SwiGLU kernels' reach: norms past 8192 features, a norm with an activation epilogue, operands a mesh splits or a varying shard_map holds, and fp16 qualified against the float64 gate. [820, 821, 822, 823]
 
 ## Data
@@ -191,7 +185,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Reconcile requested capabilities with implementation and qualification evidence, and audit upstream reproductions and fixes. [224, 306]
 - The float64 gate is the owner's (2026-10-20): each leaf's RMS error within 1.5× the reference's and its worst row within ROW_FACTOR of the reference's, on the same inputs, with no floor; every element within a certified roundoff bound for its own operation on common native inputs (faithful rounding for pointwise steps, a bound for each sum, native probes at opaque kernels), behind one assertion, `assert_as_exact`. [560, 649, 719, 793, 827]
 - Every accuracy comparison in the tests and tools goes through that assertion; the files that still compare within a tolerance are an inventory that only shrinks, empty by 2026-11-27. [650, 668, 669, 670, 676, 682, 705, 712]
-- Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients, a packed row's state gradient, ragged decision options, distillation's cosine and L2 losses, and Z-Image's padded flow. [833, 834, 835, 836, 837]
+- Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients, ragged decision options, distillation's cosine and L2 losses, and Z-Image's padded flow. [833, 835, 836, 837]
 - Replace test-policy violations with observable lifecycle and reference behavior:
 
   - Training, sampling and objectives: [651, 652, 653, 654, 657, 658, 663, 667, 679, 680, 686, 687, 688, 692, 695, 698, 701, 702, 707, 708].
@@ -209,5 +203,5 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - One collective parser (telemetry.instrumentation) and one cache-worker fixture in the tests. [796, 797]
 - Check every family, target row and mode in the kernel-route test, an unexplained route failing, and drop the KV cache's unconditional GPU xfail. [798, 799]
 - Hold MeanFlow's fused attention away from zero initialization, the delta rule's document isolation without exclusions, and the Mamba-2 TPU mesh by its numbers. [789, 790]
-- Delete the stock-JAX branches (DEW_UPSTREAM_JAX, the runtime's caching branch) and the step benchmark's re-export facade. [779, 792, 800]
+- Delete the step benchmark's re-export facade. [800]
 - Hold the full suite to ten minutes of wall time: shards cut by the last full run's measured per-test times, no single case past a shard's budget, and a new environment warmed before its first full suite. [826]
