@@ -539,7 +539,7 @@ def test_each_network_steps_on_its_own_optimizer_as_repa_e_s_three_do(repae_step
     larger leaves the model's and the autoencoder's updates as they were,
     where one clip over the whole tree would shrink them."""
     task, params, gradients = repae_step.task, repae_step.params, repae_step.gradients
-    tx = task.optimizer(optax.chain(optax.clip_by_global_norm(1.0), optax.sgd(1.0)), accumulation=1)
+    tx = task.optimizer(optax.chain(optax.clip_by_global_norm(1.0), optax.sgd(1.0)))
     louder = {**gradients, DISCRIMINATOR: jax.tree.map(lambda leaf: 1000 * leaf, gradients[DISCRIMINATOR])}
     updates = [tx.update(grads, tx.init(params), params)[0] for grads in (gradients, louder)]
 

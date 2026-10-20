@@ -84,6 +84,25 @@ def trainer(composite=False, k=2, checkpoints=None):
                    accumulation=k, dynamic_scale=True, checkpoints=checkpoints)
 
 
+def test_a_commit_counts_the_tokens_of_its_windows_accepted_microbatches_alone():
+    """A window of two whose second microbatch is rejected (a non-finite loss) commits with its third:
+    its update trained on the first and third microbatches' tokens, which its commit reports
+    (`Committed.tokens`), the rejected one's never, and nothing before the commit."""
+    from dew.training.model_flops import TOKENS, _TokenCount
+
+    train = trainer()
+    rows = 2 * jax.device_count()
+    data = [{**batch, TOKENS: _TokenCount.words(np.full(rows, tokens))}
+            for batch, tokens in zip(batches(), (3, 5, 7, 11), strict=True)]
+    state = train.initial_state()
+    run = train.compile(state, data[0])
+    reported = []
+    for batch in data[:3]:
+        state, _, _, _, accepted, committed = run(state, batch)
+        reported.append((bool(accepted), _TokenCount.host(jax.device_get(committed.tokens))))
+    assert reported == [(True, 0), (False, 0), (True, (3 + 7) * rows)]
+
+
 @pytest.mark.parametrize("composite", [False, True])
 def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composite):
     train = trainer(composite)
@@ -251,6 +270,32 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
     selected, _ = checkpoints.restore(template, 1)
     for want, got in zip(jax.tree.leaves(prefix_params), jax.tree.leaves(selected["variables"]), strict=True):
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
+
+
+def test_every_microbatch_of_an_accumulated_update_reads_the_updates_committed_before_it():
+    """An update of two microbatches (`accumulation=2`) hands each of them the updates the run
+    committed before its own (`Step.updates`), the clock an alternating objective reads its phase
+    from, beside the accepted microbatches its schedules read (`Step.step`)."""
+    from affine_run import Regression, batches
+
+    from dew.data.dataset import Loader
+
+    seen = []
+
+    class Clocked(Regression):
+        def loss(self, variables, batch, step):
+            # Unordered, as a sharded program's callback is, and once a device: the set says each.
+            jax.debug.callback(lambda updates, microbatch: seen.append((int(updates), int(microbatch))),
+                               step.updates, step.step)
+            return super().loss(variables, batch, step)
+
+    state = Trainer(Clocked(), optax.sgd(0.1), key=jax.random.PRNGKey(0), accumulation=2).fit(
+        Loader(lambda partition: batches(), None, None, 8), steps=6, log_every=100)
+    assert int(state.updates) == 3
+    # A debug callback's host work runs apart from the arrays it reads; the barrier waits for it.
+    jax.effects_barrier()
+    assert sorted(set(seen), key=lambda clocks: clocks[1]) == [(0, 0), (0, 1), (1, 2), (1, 3), (2, 4),
+                                                                (2, 5)]
 
 
 @pytest.mark.gpu("XLA:GPU's simplifier speculates the branch; XLA:CPU's pipeline kept it a branch")
