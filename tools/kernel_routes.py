@@ -1,9 +1,11 @@
 """The kernel every op of every registered decoder family runs on each GPU target, from a CPU trace.
 
 Each family's committed tiny config (tests/fixtures/hf/<name>/config.json, the first fixture whose
-model_type is the family's) is built in bf16 without weights and traced on a CPU within
-`generation.assumed(target)` for each GPU row of `TARGETS` this report audits: a training step's gradient,
-a 64-token prefill, and one decode step on the dense cache and on a paged one. Every dispatch reports its
+model_type is one of the family's) is built in bf16 without weights and traced on a CPU within
+`generation.assumed(target)` for each row of `TARGETS` that names a kernel: a training step's gradient,
+a 64-token prefill, and one decode step on the dense cache and on a paged one; a bidirectional family
+(`causal` False) has no causal cache and steps for training alone. A fixture holding a vision tower is
+its wrapper's bundle, whose decoder is traced (`translate_wrapper_config`). Every dispatch reports its
 decision (`generation.route`), and `generation.routes` collects them, so the report shows per family,
 target and mode which kernel each choice runs and why a generic path ran where it did. A family's widths
 are its fixture's but for its head widths, which are the reference's: transformers' own config defaults for
@@ -13,8 +15,9 @@ width from it. A family transformers has no config for keeps its fixture's width
 A route is generic where `kernel != preferred`. One whose refusal carries a row (a selector requirement's,
 `Refusal.row`) or whose code its kernel's `SUPPORTS` declares is a tracked gap, named by its roadmap or
 ledger row, or inherent where no implementation of the kernel lifts it; one whose code is `UNCLASSIFIED`
-comes from a site that gives its refusal as text alone; any other is undeclared. The markdown lists the
-gaps, the unclassified and the undeclared first.
+comes from a site that gives its refusal as text alone; any other is undeclared. A mixer that refuses a
+mode's cache layout (`MixerRefused` for `kv_cache`) is a gap where `LAYOUT_GAPS` names its row. The
+markdown lists the gaps, the unclassified and the undeclared first.
 
     python tools/kernel_routes.py trace --families qwen3,llama OUT.json    # named families
     python tools/kernel_routes.py trace --shard 3/16 OUT.json              # every 16th from the 4th
@@ -36,8 +39,6 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/hf"
-AUDITED = ("sm80", "sm86", "sm89", "sm90", "sm120")
-"""The GPU rows of `generation.TARGETS` the report audits: every one Dew measured a kernel on."""
 MODES = ("train", "prefill", "decode", "decode-paged")
 PROMPT, BATCH = 64, 2
 """The prompt and batch each mode traces; a fixture whose positions are fewer takes all but its last."""
@@ -54,7 +55,8 @@ def fixtures() -> dict[str, Path]:
 
 
 WIDTHS = ("head_dim", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim", "kv_lora_rank",
-          "global_head_dim", "index_head_dim", "partial_rotary_factor")
+          "global_head_dim", "index_head_dim", "partial_rotary_factor", "linear_key_head_dim",
+          "linear_value_head_dim")
 """The head widths a family's reference config states, which kernels' shape rules read, and the rotary
 fraction of a head, which is stated against its width."""
 
@@ -87,11 +89,32 @@ def published(config: dict) -> tuple[dict, bool]:
     return ({**config, "text_config": fixture} if nested else fixture), True
 
 
+def audited() -> tuple[str, ...]:
+    """The rows of `generation.TARGETS` the report audits: every one that names a kernel."""
+    from dew.nn.kernels.generation import TARGETS
+
+    return tuple(row for row, target in TARGETS.items() if target.kernels)
+
+
+LAYOUT_GAPS = {"mla": "ledger 830", "kpool_sparse_attention": "ledger 830",
+               "deepseek_v4": "ledger 831", "llama4": "ledger 784"}
+"""The ledger row of each mixer that takes no cache layout but the default (`MixerRefused` for
+`kv_cache`)."""
+
+
 def families() -> list[str]:
-    """Every registered decoder family's model_type, in the registry's order."""
+    """Every registered decoder family, by its first model_type, in the registry's order."""
     from dew.interop.decoder_families import ENTRIES
 
-    return [name for family in ENTRIES for name in family.model_types]
+    return [family.model_types[0] for family in ENTRIES]
+
+
+def fixture(name: str, present: dict[str, Path]) -> Path | None:
+    """The committed fixture of the family `name` names: the first of its model_types that has one."""
+    from dew.interop.decoder_families import ENTRIES
+
+    [types] = [family.model_types for family in ENTRIES if name in family.model_types] or [(name,)]
+    return next((present[kind] for kind in types if kind in present), None)
 
 
 def _supports(route) -> str | None:
@@ -120,20 +143,32 @@ def verdict(route) -> str:
     return f"gap: {row}" if row else "undeclared"
 
 
+def model_of(config: dict, mode: str = "train"):
+    """The family's `CausalTransformer` in bf16 for `mode`: its decoder, a bundle's
+    (`translate_wrapper_config`) where the fixture holds a vision tower, on a paged cache for
+    'decode-paged'."""
+    import jax.numpy as jnp
+
+    from dew.interop.hf_decoders import translate_config, translate_wrapper_config
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.kv_cache import KVCache
+
+    decoder = (translate_wrapper_config(config)["text"] if config.get("vision_config") is not None
+               else translate_config(config))
+    fields = {**decoder, "dtype": jnp.bfloat16}
+    if mode == "decode-paged":
+        fields["kv_cache"] = KVCache(page_size=16)
+    return CausalTransformer(**fields)
+
+
 def traced(config: dict, target: str, mode: str) -> list:
     """Every route the family's `mode` step reports within `assumed(target)`."""
     import jax
     import jax.numpy as jnp
 
-    from dew.interop.hf_decoders import translate_config
-    from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.kernels import generation
-    from dew.nn.kv_cache import KVCache
 
-    fields = {**translate_config(config), "dtype": jnp.bfloat16}
-    if mode == "decode-paged":
-        fields["kv_cache"] = KVCache(page_size=16)
-    model = CausalTransformer(**fields)
+    model = model_of(config, mode)
     prompt = min(PROMPT, model.max_seq_len - 1)
     tokens = jax.ShapeDtypeStruct((BATCH, prompt), jnp.int32)
     # The parameters and the cache are traced outside the routes kept: their own forward passes are
@@ -159,22 +194,36 @@ def traced(config: dict, target: str, mode: str) -> list:
 
 
 def cells(names: Iterable[str]) -> Iterator[dict]:
-    """One record per family, target and mode: its routes, deduplicated, or why none was traced."""
+    """One record per family, target and mode: its routes, deduplicated; the mixer's refusal of the
+    mode's cache layout, with its row; or why none was traced."""
+    from dew.nn.mixer_base import MixerRefused
+
     present = fixtures()
     for name in names:
-        if name not in present:
+        found = fixture(name, present)
+        if found is None:
             yield {"family": name, "fixture": None, "error": "no committed tiny fixture"}
             continue
-        config, widened = published(json.loads((present[name] / "config.json").read_text()))
-        for target in AUDITED:
+        config, widened = published(json.loads((found / "config.json").read_text()))
+        causal = model_of(config).causal
+        for target in audited():
             for mode in MODES:
-                cell = {"family": name, "fixture": present[name].name, "target": target, "mode": mode,
+                cell = {"family": name, "fixture": found.name, "target": target, "mode": mode,
                         "widths": "reference" if widened else "fixture"}
+                if not causal and mode != "train":
+                    cell["absent"] = "a bidirectional family has no causal cache to prefill or decode"
+                    yield cell
+                    continue
                 try:
                     seen = traced(config, target, mode)
+                except MixerRefused as refusal:
+                    cell["refused"] = {"mixer": refusal.kind, "fields": list(refusal.names),
+                                       "row": LAYOUT_GAPS.get(refusal.kind) if refusal.names == ("kv_cache",)
+                                       else None, "why": refusal.why}
+                    yield cell
+                    continue
                 except ValueError as refusal:
-                    # A mode the family's model refuses (a cache layout it takes no part in) is that cell's
-                    # answer, kept with the refusal as Dew states it; Dew refuses with ValueError.
+                    # Any other refusal of the mode is the cell's answer as Dew states it, unexplained.
                     cell["error"] = f"{type(refusal).__name__}: {refusal}"
                     yield cell
                     continue
@@ -203,8 +252,9 @@ def report(records: list[dict]) -> str:
                              f"`{route['site']}` | {route['kernel']} | {route['preferred']} | "
                              f"{route['verdict']} | {refusal.get('code', '')}: {refusal.get('detail', '')} |")
     lines += ["", "## Not traced", "", "| Family | Target | Mode | Why |", "|---|---|---|---|"]
-    lines += [f"| {c['family']} | {c.get('target', '')} | {c.get('mode', '')} | {c['error']} |"
-              for c in records if "error" in c]
+    lines += [f"| {c['family']} | {c.get('target', '')} | {c.get('mode', '')} | "
+              f"{c.get('error') or c.get('absent') or refused(c['refused'])} |"
+              for c in records if "routes" not in c]
     lines += ["", "## Every cell", "", "| Family | Widths | Target | Mode | Kernels |",
               "|---|---|---|---|---|"]
     for cell in records:
@@ -214,6 +264,24 @@ def report(records: list[dict]) -> str:
             lines.append(f"| {cell['family']} | {cell['widths']} | {cell['target']} | {cell['mode']} | "
                          f"{kernels} |")
     return "\n".join(lines) + "\n"
+
+
+def refused(refusal: dict) -> str:
+    """A mixer's refusal of a cell's cache layout as the report states it."""
+    return (f"the {refusal['mixer']} mixer takes no {', '.join(refusal['fields'])} "
+            f"({refusal['row'] or 'undeclared'}): {refusal['why']}")
+
+
+def unexplained(cell: dict) -> list[str]:
+    """What of `cell` no row or reason explains: a route off its kernel with no row or inherent
+    refusal, a mixer's refusal no `LAYOUT_GAPS` row names, a mode refused otherwise, no fixture."""
+    if "routes" in cell:
+        return [f"{route['choice']} at {route['site']}: {route['kernel']} for {route['preferred']}, "
+                f"{route['verdict']}" for route in cell["routes"]
+                if route["verdict"] in ("undeclared", "unclassified")]
+    if "refused" in cell:
+        return [] if cell["refused"]["row"] else [refused(cell["refused"])]
+    return [] if "absent" in cell else [cell["error"]]
 
 
 def main(argv: list[str]) -> None:
