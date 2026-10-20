@@ -381,10 +381,17 @@ def primed_maps(parents: Sequence[pygrain.MapDataset[Batch]]) -> tuple[pygrain.M
 
 
 class _PrimeReads:
+    """Every corpus of a mix, each read through its first row ahead. A mix
+    captures every corpus's position for each record it gives (a packer
+    captures it before each record), and only the corpora the group read
+    moved, so a corpus's position is captured again only after the group
+    reads it or it is restored (`state`)."""
+
     def __init__(self, parents: Sequence[pygrain.DatasetIterator[Batch]]):
         self.parents = tuple(parents)
         self.pending: dict[int, Batch] = {}
         self.before: dict[int, Mapping[str, object]] = {}
+        self.states: dict[int, Mapping[str, object]] = {}
         # The corpora whose first row was read ahead: every corpus at the start, and one that joins
         # a resumed mix, before the mix gives a row.
         self.primed: set[int] = set()
@@ -394,50 +401,53 @@ class _PrimeReads:
             if corpus not in self.primed:
                 # Kept only once the row is read: a corpus refused as it is read ahead keeps the
                 # position, and the counts, its refusal left.
+                self.states.pop(corpus, None)
                 before = parent.get_state()
                 self.pending[corpus] = next(parent)
                 self.before[corpus] = before
                 self.primed.add(corpus)
+        self.states.pop(index, None)
         if index in self.pending:
             self.before.pop(index, None)
             return self.pending.pop(index)
         return next(self.parents[index])
 
+    def state(self, index: int) -> Mapping[str, object]:
+        """The position of corpus `index`: before its row read ahead while it holds one."""
+        if index not in self.states:
+            before = self.before.get(index)
+            self.states[index] = self.parents[index].get_state() if before is None else before
+        return self.states[index]
+
+    def restore(self, index: int, state: Mapping[str, object], primed: bool) -> None:
+        self.parents[index].set_state(state)
+        for held in (self.pending, self.before, self.states):
+            held.pop(index, None)
+        if primed:
+            self.primed.add(index)
+        else:
+            self.primed.discard(index)
+
 
 class _PrimedRead(pygrain.DatasetIterator[Batch]):
-    """One corpus of a mix. The mix captures every corpus's position for each
-    record it gives (a packer captures it before each record), and only the
-    corpus that gave the record moved, so a corpus captures its position again
-    only after it reads or is restored. The position records whether the mix
-    had read the corpus's first row ahead, so a restored mix reads each
+    """One corpus of a mix (`_PrimeReads`). The position records whether the
+    mix had read the corpus's first row ahead, so a restored mix reads each
     corpus on from it and starts none again, but for one that joined, which it
     reads ahead before it gives a row."""
 
     def __init__(self, group: _PrimeReads, index: int):
         super().__init__(group.parents[index])
         self._group, self._index = group, index
-        self._state: Mapping[str, object] | None = None
 
     def __next__(self) -> Batch:
-        self._state = None
         return self._group.read(self._index)
 
     def get_state(self) -> Mapping[str, object]:
-        if self._state is None:
-            before = self._group.before
-            self._state = (before[self._index] if self._index in before
-                           else self._group.parents[self._index].get_state())
-        return {"parent": self._state, "primed": self._index in self._group.primed}
+        return {"parent": self._group.state(self._index), "primed": self._index in self._group.primed}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self._state = None
-        self._group.parents[self._index].set_state(record(state["parent"], "primed corpus"))
-        self._group.pending.pop(self._index, None)
-        self._group.before.pop(self._index, None)
-        if boolean(state["primed"], "primed"):
-            self._group.primed.add(self._index)
-        else:
-            self._group.primed.discard(self._index)
+        self._group.restore(self._index, record(state["parent"], "primed corpus"),
+                            boolean(state["primed"], "primed"))
 
     def close(self) -> None:
         self._group.parents[self._index].close()
