@@ -265,7 +265,7 @@ class TrainingDisplay:
     reported: frozenset[str] = frozenset()
     # The last interval's data counters (`data/...`, `dew.data.mixing.CorpusCounts.metrics`), shown
     # as one line (`data_line`) rather than as rows; the trackers keep each of them.
-    data: Mapping[str, float] = dataclasses.field(default_factory=dict)
+    corpus_counts: Mapping[str, float] = dataclasses.field(default_factory=dict)
     # Each split's last `TREND` evaluations, in the order they completed,
     # scores only: the trackers keep the previews. A new evaluation rebinds
     # its split's list, so the refresh thread never iterates one that grows.
@@ -344,9 +344,9 @@ class TrainingDisplay:
         """Record one logging interval's scalars, which the host has read."""
         if not self.shown_here:
             return
-        self.data = {name: value for name, value in scalars.items() if name.startswith("data/")}
+        self.corpus_counts = {name: value for name, value in scalars.items() if name.startswith("data/")}
         for name, value in scalars.items():
-            if name in self.data:
+            if name in self.corpus_counts:
                 continue
             prefix, _, rest = name.partition("/")
             shown = self.shown.get(rest or prefix, PLAIN)
@@ -354,12 +354,12 @@ class TrainingDisplay:
             if name not in rows:
                 rows[name] = Row(rest or prefix, shown, collections.deque(maxlen=TREND))
             rows[name].values.append(value)
-        self.reported = frozenset(scalars) - self.data.keys()
+        self.reported = frozenset(scalars) - self.corpus_counts.keys()
         if self.live is None:
             target = "" if self.total is None else f"/{self.total}"
             line = f"step {step}{target}  " + "  ".join(
                 f"{row.name} {number(row.values[-1], row.shown)}" for _, row in self.rows())
-            if (counted := data_line(self.data)) is not None:
+            if (counted := data_line(self.corpus_counts)) is not None:
                 line += f"  {counted.plain}"
             if (rate := self.rate()) and self.total is not None and step < self.total:
                 line += f"  {duration((self.total - step) / rate)} left"
@@ -530,7 +530,7 @@ class TrainingDisplay:
             parts.append(Text.assemble(bar(fraction, room), "  ", stats))
         else:
             parts += [bar(fraction, inner), stats]
-        if (counted := data_line(self.data)) is not None:
+        if (counted := data_line(self.corpus_counts)) is not None:
             parts.append(counted)
 
         if rows := self.rows():
