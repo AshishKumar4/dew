@@ -29,6 +29,7 @@ import pytest
 from episode_support import environment as sandbox
 from tool_support import load
 
+from dew.data.prompts import PromptRecord
 from dew.inference import Draw, VLLMGenerateServer
 from dew.objectives.rl.episodes import EpisodeStatus, Observation
 from dew.objectives.rl.records import episode_from_record
@@ -210,12 +211,12 @@ def test_a_container_runtime_that_starts_no_container_is_an_infra_error_in_both_
     cases, program = '[{"stdin": "", "stdout": "5"}]', "```python\nprint(5)\n```"
     with SandboxFleet(ContainerRunner("python:3.12-slim", runtime="false"), workers=1) as fleet:
         reward = CodeReward(fleet)
-        task = Task("t", {"prompt": (1, 2), "source": "code", "truth": cases, "info": ""})
+        task = Task("t", {"prompt": (1, 2), "record": PromptRecord("code", cases)})
         prompts = PromptSource(Server(), reward, decode=lambda ids: program, max_new_tokens=4)
         rollout = prompts.submit(task, 1, version=0, key=KEY)[0].result(timeout=30)
         prompts.close()
         episodes = source(Server(), factory([], []),
-                          verifier=lambda task, episode: reward("code", program, cases, ""))
+                          verifier=lambda task, episode: reward(program, PromptRecord("code", cases)))
         session = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=30)
         episodes.close()
     for failed in (rollout, session):
@@ -393,9 +394,9 @@ def prompt_batch():
 def test_the_prompt_source_scores_decoded_text_without_eos_and_masks_the_budget_hit():
     seen = []
 
-    def reward(source, completion, truth, info):
-        seen.append((source, completion, truth))
-        return float(completion == truth)
+    def reward(completion, record):
+        seen.append((record.data_source, completion, record.ground_truth))
+        return float(completion == record.ground_truth)
 
     [task] = prompt_tasks(prompt_batch())
     assert task.data["prompt"] == (1, 2)
