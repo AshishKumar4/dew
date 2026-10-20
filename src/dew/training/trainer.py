@@ -1889,7 +1889,7 @@ class Trainer(Generic[Loss, Effects]):
             run.other += run.evaluation.elapsed_seconds
             scores = run.evaluation.scores
         self._saves(plan, run, interval, state, position, scores, evaluation_due=bool(scores), final=True)
-        if plan.observe and run.preempted is None:
+        if plan.observe:
             plan.observe.last(current, state)
         if checkpoints is not None:
             checkpoints.wait()

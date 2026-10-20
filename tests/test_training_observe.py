@@ -6,18 +6,38 @@ EMA tree a call returns is a snapshot. A resumed fit drops what a failed run obs
 restored step, and a fit that finds the run complete observes its final state once.
 """
 
+import os
+import signal
+
 import jax
 import numpy as np
 import optax
 import pytest
 from affine_run import Regression, dataset
+from recording import RecordingTracker
 
 from dew.training import Checkpoints, Layout, Observe, Trainer
+from dew.training.runtime import Preempted
 
 
-def trainer(directory=None) -> Trainer:
+def trainer(directory=None, tracker=None) -> Trainer:
     return Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1),
-                   checkpoints=None if directory is None else Checkpoints(str(directory)))
+                   checkpoints=None if directory is None else Checkpoints(str(directory)), tracker=tracker)
+
+
+class Preempting(RecordingTracker):
+    """Sends this process the scheduler's SIGTERM when step `at` is logged; the loop reads a
+    step's log once the next is dispatched, so the run stops after step `at` + 1."""
+
+    def __init__(self, at):
+        super().__init__()
+        self.at = at
+
+    def log(self, scalars, step):
+        super().log(scalars, step)
+        if step == self.at:
+            self.at = None
+            os.kill(os.getpid(), signal.SIGTERM)
 
 
 def averaged(state):
@@ -48,23 +68,36 @@ def test_an_observer_keeps_each_cadenced_steps_average_and_the_last_as_a_staged_
 
 
 def test_a_resumed_fit_continues_its_observers_ledger_and_a_complete_run_is_observed_once(tmp_path):
-    """A fit resumed at step 4 drops what a failed run observed past it and observes on; a fit
-    that finds the run complete observes its final state once, and not again when asked again."""
+    """A fit resumed at step 4 drops what a failed run observed past it, steps it will not observe
+    again among them, and observes on; a fit that finds the run complete calls the observer once
+    for its final state, and not again when asked again."""
     observe = Observe(2, averaged)
     trainer(tmp_path / "run").fit(dataset(), steps=4, log_every=1, checkpoint_every=2, observe=observe)
     assert [step for step, _ in observe.values] == [2, 4]
     stale = jax.tree.map(np.zeros_like, observe.values[-1][1])
-    observe.values.append((6, stale))
+    observe.values += [(5, stale), (7, stale)]
     resumed = trainer(tmp_path / "run").fit(dataset(), steps=6, log_every=1, checkpoint_every=2,
                                             observe=observe)
     assert [step for step, _ in observe.values] == [2, 4, 6]
     np.testing.assert_array_equal(kernels(observe)[6], kernel(resumed))
 
-    fresh = Observe(2, averaged)
+    calls = []
+    fresh = Observe(2, lambda state: calls.append(int(state.step)) or averaged(state))
     for _ in range(2):
         trainer(tmp_path / "run").fit(dataset(), steps=6, log_every=1, observe=fresh)
-        assert [step for step, _ in fresh.values] == [6]
+    assert calls == [6] and [step for step, _ in fresh.values] == [6]
     np.testing.assert_array_equal(kernels(fresh)[6], kernels(observe)[6])
+
+
+def test_a_preempted_fit_observes_the_step_it_stopped_at(tmp_path):
+    """A preemption stops the run off the cadence, after step 4: that step, the one its
+    checkpoint holds, is the run's last and is observed before fit raises."""
+    observe = Observe(10, averaged)
+    with pytest.raises(Preempted):
+        trainer(tmp_path / "run", tracker=Preempting(3)).fit(dataset(), steps=20, log_every=1,
+                                                             observe=observe)
+    assert [step for step, _ in observe.values] == [4]
+    assert Checkpoints(str(tmp_path / "run")).latest == 4
 
 
 def test_a_failing_observation_fails_the_fit_and_a_cadence_below_one_is_refused():
