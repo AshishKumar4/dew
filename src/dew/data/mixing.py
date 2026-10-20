@@ -10,14 +10,14 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from fractions import Fraction
-from typing import TypeGuard, overload
+from typing import Protocol, TypeGuard, overload, runtime_checkable
 
 import grain.experimental as gx
 import grain.python as pygrain
 
 from dew.data.dataset import Batch
 from dew.data.pipeline import Record, Rejected
-from dew.records import boolean, integer, record
+from dew.records import boolean, integer, record, text
 
 _log = logging.getLogger(__name__)
 
@@ -84,24 +84,19 @@ class CorpusCounts:
         self.chunks += sum(value is not None and not isinstance(value, Rejected) for value in outputs)
 
 
-@dataclasses.dataclass(frozen=True)
-class SearchBudget:
-    consecutive: int = 10_000
-    warn_over: float = 0.01
+_WARN_OVER = 0.01
+"""The share of a corpus's attempted records it may reject before a run warns, once: a filter that
+drops more than one record in a hundred is worth a look."""
 
-    def __post_init__(self) -> None:
-        if self.consecutive < 1:
-            raise ValueError("rejection search budgets must be positive")
-        if not 0 <= self.warn_over <= 1:
-            raise ValueError("warn_over is a share between zero and one")
-
-
-_DEFAULT_BUDGET = SearchBudget()
+_FIRST_LOGGED_RUN = 1024
+"""The run of rejections in a row a read first logs, then again at each doubling: longer than an
+ordinary filter's runs, so a filter that keeps nothing is named from the first line. An endless
+read reads on through any run; none proves the corpus holds nothing to keep."""
 
 
 class _KeepAccepted:
-    def __init__(self, counts: CorpusCounts, budget: SearchBudget, tokens: Callable[[Batch], int] | None):
-        self.counts, self.budget, self.tokens = counts, budget, tokens
+    def __init__(self, counts: CorpusCounts, tokens: Callable[[Batch], int] | None):
+        self.counts, self.tokens = counts, tokens
         self.consecutive = 0
         self.warned = False
 
@@ -118,38 +113,25 @@ class _KeepAccepted:
             self.counts.accepted += 1
             if not isinstance(element, Rejected):
                 self.counts.truncated += int(bool(element.get("_dew_truncated", False)))
-            self._probe()
             self.consecutive = 0
             return True
         self.counts.rejected[reason] += 1
         self.consecutive += 1
-        self._probe()
-        if (
-            not self.warned
-            and sum(self.counts.rejected.values()) / self.counts.attempted > self.budget.warn_over
-        ):
-            _log.warning(
-                "corpus %s rejected more than %.1f%% of attempted records (%s)",
-                self.counts.name,
-                self.budget.warn_over * 100,
-                reason,
-            )
+        if not self.warned and sum(self.counts.rejected.values()) / self.counts.attempted > _WARN_OVER:
+            _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
+                         self.counts.label, _WARN_OVER * 100, reason)
             self.warned = True
-        if self.consecutive >= self.budget.consecutive:
-            raise ValueError(
-                f"corpus {self.counts.name}: rejection search budget exhausted after "
-                f"{self.consecutive} consecutive rejections ({reason}); "
-                "this is not a proof that the corpus is empty"
-            )
+        if self.consecutive >= _FIRST_LOGGED_RUN and not self.consecutive & (self.consecutive - 1):
+            reasons = ", ".join(f"{name} {count}" for name, count in self.counts.rejected.most_common(3))
+            _log.warning("corpus %s rejected its last %d records and has kept %d; the read goes on until "
+                         "one is kept (most rejected: %s)", self.counts.label, self.consecutive,
+                         self.counts.accepted, reasons)
         return False
 
-    def _probe(self) -> None:
-        if self.counts.attempted == 16:
-            _log.info(
-                "corpus %s: estimated rejection share over first 16 attempted records %.4f",
-                self.counts.name,
-                sum(self.counts.rejected.values()) / 16,
-            )
+
+_COUNTER = "dew.corpus_counts"
+"""Where a counting iterator's position keeps its corpus's counts, beside its parent's position:
+a key of Dew's own, which `state_counts` and `rewound` find and no Grain position holds."""
 
 
 class _CountedIterator[Element](pygrain.DatasetIterator[Element]):
@@ -163,12 +145,17 @@ class _CountedIterator[Element](pygrain.DatasetIterator[Element]):
         return next(self._read)
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._read.get_state(), "corpus": self._counts.name, "label": self._counts.label,
-                "counts": self._counts.state()}
+        return {"parent": self._read.get_state(), _COUNTER: self._counted()}
+
+    def _counted(self) -> Mapping[str, object]:
+        return {"corpus": self._counts.name, "label": self._counts.label, "counts": self._counts.state()}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self._read.set_state(record(state["parent"], "counted parent"))
-        self._counts.restore(record(state["counts"], "corpus counts"))
+        self._restore(record(state[_COUNTER], "corpus counter"))
+
+    def _restore(self, counted: Mapping[str, object]) -> None:
+        self._counts.restore(record(counted["counts"], "corpus counts"))
 
     def close(self) -> None:
         self._read.close()
@@ -194,21 +181,18 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         super().__init__(parent, predicate.counts)
         self._predicate = predicate
 
-    def get_state(self) -> Mapping[str, object]:
-        return {
-            **super().get_state(),
-            "consecutive": self._predicate.consecutive,
-            "warned": self._predicate.warned,
-        }
+    def _counted(self) -> Mapping[str, object]:
+        return {**super()._counted(), "consecutive": self._predicate.consecutive,
+                "warned": self._predicate.warned}
 
-    def set_state(self, state: Mapping[str, object]) -> None:
-        super().set_state(state)
-        self._predicate.consecutive = integer(state["consecutive"], "consecutive")
-        self._predicate.warned = bool(state["warned"])
+    def _restore(self, counted: Mapping[str, object]) -> None:
+        super()._restore(counted)
+        self._predicate.consecutive = integer(counted["consecutive"], "consecutive")
+        self._predicate.warned = boolean(counted["warned"], "warned")
 
 
 class Accepted(pygrain.IterDataset[Batch]):
-    """Grain's filter, with a named search budget and checkpointed counts."""
+    """Grain's filter, with checkpointed counts."""
 
     def __init__(
         self,
@@ -216,16 +200,15 @@ class Accepted(pygrain.IterDataset[Batch]):
         name: str,
         label: str,
         *,
-        budget: SearchBudget = _DEFAULT_BUDGET,
         tokens: Callable[[Batch], int] | None = None,
     ):
         super().__init__(parent)
         self._records, self._name, self._label = parent, name, label
-        self._budget, self._tokens = budget, tokens
+        self._tokens = tokens
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         counts = CorpusCounts(self._name, self._label)
-        predicate = _KeepAccepted(counts, self._budget, self._tokens)
+        predicate = _KeepAccepted(counts, self._tokens)
         return _AcceptedIterator(iter(self._records.filter(predicate)), predicate)
 
 
@@ -322,7 +305,6 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
         names: Sequence[str],
         labels: Sequence[str],
         keys: Sequence[str],
-        budget: SearchBudget = _DEFAULT_BUDGET,
     ):
         if not parents or len(parents) != len(weights) or len(names) != len(parents):
             raise ValueError("token deficit mix needs one weight and name per corpus")
@@ -332,7 +314,7 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
         if any(not math.isfinite(weight) or weight <= 0 for weight in weights):
             raise ValueError("token deficit weights must be finite and positive")
         filtered = tuple(
-            Accepted(parent, name, label, budget=budget, tokens=tokens)
+            Accepted(parent, name, label, tokens=tokens)
             for parent, name, label in zip(parents, names, labels, strict=True)
         )
         super().__init__(filtered)
@@ -500,6 +482,45 @@ class PrimedMix(pygrain.IterDataset[Batch]):
         return iter(pygrain.IterDataset.mix(parents, weights))
 
 
+@runtime_checkable
+class _NamedTuple(Protocol):
+    """A named tuple, which its documented `_make` rebuilds from its fields' values."""
+
+    _fields: tuple[str, ...]
+
+    def _make(self, iterable: Sequence[object]) -> Sequence[object]: ...
+
+
+def rewound(start: Mapping[str, object], current: Mapping[str, object]) -> Mapping[str, object]:
+    """`start`, the position a repeat rewinds its pass to, with each counter's counts as `current`
+    holds them (`_COUNTER`: its counts, run of rejections and warning): a pass read again goes on
+    counting the corpus, where a restored position replaces its counts. Every other part of a
+    position is the iterator's own and is left as `start` has it."""
+    shared = [key for key in start if key in current]
+    parts = _rewound_parts([start[key] for key in shared], [current[key] for key in shared])
+    kept = {**start, **dict(zip(shared, parts, strict=True))}
+    if _COUNTER in start and _COUNTER in current:
+        kept[_COUNTER] = current[_COUNTER]
+    return kept
+
+
+def _rewound_parts(start: Sequence[object], current: Sequence[object]) -> Sequence[object]:
+    """Each part of a position rewound against its place in `current` (`rewound`): the mappings and
+    the lists and tuples of one length are walked, rebuilt as what they were, and anything else
+    is the iterator's own and kept."""
+    parts: list[object] = []
+    for value, now in zip(start, current, strict=True):
+        if isinstance(value, Mapping) and isinstance(now, Mapping):
+            parts.append(rewound(value, now))
+        elif isinstance(value, (list, tuple)) and isinstance(now, (list, tuple)) and len(value) == len(now):
+            inner = _rewound_parts(value, now)
+            parts.append(list(inner) if isinstance(value, list)
+                         else value._make(inner) if isinstance(value, _NamedTuple) else tuple(inner))
+        else:
+            parts.append(value)
+    return parts
+
+
 def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
     """Read per-corpus counters through Grain's nested iterator checkpoints.
 
@@ -512,10 +533,11 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
     def visit(branch) -> dict[str, CorpusCounts]:
         counted: dict[str, CorpusCounts] = {}
         if isinstance(branch, Mapping):
-            corpus, label, stored = branch.get("corpus"), branch.get("label"), branch.get("counts")
-            if isinstance(corpus, str) and isinstance(label, str) and isinstance(stored, Mapping):
-                counted[corpus] = CorpusCounts(corpus, label)
-                counted[corpus].restore(stored)
+            node = branch.get(_COUNTER)
+            if isinstance(node, Mapping):
+                corpus = text(node["corpus"], "corpus")
+                counted[corpus] = CorpusCounts(corpus, text(node["label"], "label"))
+                counted[corpus].restore(record(node["counts"], "corpus counts"))
             interleaved = branch.get("iterators_in_use_states")
             if isinstance(interleaved, list):
                 # A restored interleave keeps the positions of shards past its cycle as future states.
@@ -526,7 +548,7 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
                         _added(independent, counts)
                 _nested(counted, independent)
             for name, child in branch.items():
-                if name not in ("iterators_in_use_states", "future_states"):
+                if name not in ("iterators_in_use_states", "future_states", _COUNTER):
                     _nested(counted, visit(child))
         elif isinstance(branch, (tuple, list)):
             for child in branch:
