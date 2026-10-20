@@ -25,7 +25,10 @@ def loss(x, branch, scale, gate, up):
     stream, normed = stream_rms_normalized(x, branch, scale, 1e-6, x.dtype, scale_offset=True,
                                            scale_after_cast=False, fp32_statistics=True,
                                            implementation="pallas")
-    return jnp.sum(stream * normed) + jnp.sum(gated_product("swiglu", implementation="pallas")(gate, up))
+    # The product feeds the rest of the step, as a down projection reads it: a step whose gradient
+    # never reads a fused kernel's output drops its forward launch (`generation.linear_tangent`).
+    product = gated_product("swiglu", implementation="pallas")(gate, up)
+    return jnp.sum(stream * normed) + jnp.sum(product * product)
 
 
 def plain(x, scale):
