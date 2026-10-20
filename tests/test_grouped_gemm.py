@@ -154,9 +154,10 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
 @pytest.mark.parametrize("launch", [grouped_matmul.MosaicGmm(), grouped_matmul.MosaicGmmTransposed(),
                                     grouped_matmul.MosaicTgmm()], ids=lambda launch: type(launch).__name__)
 def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
-    """Each tile the Mosaic GPU launches may pick at an expert layer's shapes lowers for an H100 on the
-    CPU, as a GPU session's compile would, the tiles that fit an H100's block (`Template.fitting`) at
-    least: the interpreter takes kernels Mosaic GPU's layout inference refuses."""
+    """The tiles the Mosaic GPU launches may pick at an expert layer's shapes lower for an H100 on the
+    CPU, as a GPU session's compile would: every block shape and every schedule among those that fit an
+    H100's block (`Template.fitting`). The interpreter takes kernels Mosaic GPU's layout inference
+    refuses; the GPU's tile gate runs each one (test_moe_precision)."""
     rows, depth, width, groups = 2048, 768, 1536, 8
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     sizes, matrices = jax.ShapeDtypeStruct((groups,), jnp.int32), bf16((groups, depth, width))
@@ -170,8 +171,14 @@ def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         fits = launch.fitting(launch.bind(*args, **options), generation.gpu_target())
-        assert len(fits) > 1
-        for config in fits:
+        # Every block shape at its first schedule, and every schedule at the first block shape: what
+        # the lowering depends on (shared memory, the snake's index arithmetic), each value once.
+        first = fits[0]
+        covering = {config for config in fits if (config.stages, config.grid_block_n)
+                    == (first.stages, first.grid_block_n) or (config.block_m, config.block_n)
+                    == (first.block_m, first.block_n)}
+        assert len(covering) > 1
+        for config in sorted(covering, key=repr):
             jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
                 lowering_platforms=("cuda",))
 
