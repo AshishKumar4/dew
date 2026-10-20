@@ -133,13 +133,13 @@ def test_a_checkpoint_that_counted_every_steps_tokens_cannot_resume_a_token_budg
     from it, and a run of steps resumes and keeps the count unknown in its own checkpoints, so a
     token budget after it is refused too."""
     first = make_trainer(tmp_path, objective=TokenRegression())
-    first.fit(dataset(), steps=2, log_every=1, checkpoint_every=1)
+    trained = first.fit(dataset(), steps=2, log_every=1, checkpoint_every=1)
     first.checkpoints.wait()
     directory = first.checkpoints.directory
     # The trained step's own state and data position, saved again as step 3 with its token clock
     # written as the old count.
     old = Checkpoints(directory, keep=3)
-    state, position = old.restore(step=2, share=DataPartition())
+    state, position = old.restore(jax.tree.map(np.asarray, trained), step=2, share=DataPartition())
     old.save(3, state, position, share=DataPartition(), control={"tokens": 16})
     old.wait()
     with pytest.raises(ValueError, match="committed"):
