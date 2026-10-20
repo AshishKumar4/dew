@@ -27,6 +27,7 @@ from dew.objectives.rl.sessions import (
     Call,
     Session,
     Status,
+    Transcript,
     pack,
 )
 from dew.objectives.rl.verl import compute_score, from_verl, to_verl, verl_reward
@@ -106,7 +107,7 @@ def test_packed_native_rows_match_verls_tensor_mapping():
 
 def test_rollouts_round_trip_through_verl_rows_losslessly():
     """Dew's own metadata restores what verl's fields lack: identity,
-    status, finish reasons, versions, step rewards and the sampling support,
+    status, finish reasons, versions, step rewards, transcripts and the sampling support,
     across a rollout whose token history or routing broke the strict chain
     (three rows), and packs to the same batch under either credit."""
     routed = np.arange(4 * 2 * 2).reshape(4, 2, 2) % 5
@@ -115,7 +116,9 @@ def test_rollouts_round_trip_through_verl_rows_losslessly():
             (1, 2), (3, 4), (-0.5, -0.25), "tool_calls", 3, routed_experts=routed[:3], support=((3, 9), (4,))
         ),
         Call((1, 2, 3, 4, 7), (8,), (-1.0,), "length", 4, routed_experts=routed[:, :, :].repeat(2, 0)[:5]),
-        Call((5, 6), (2,), (-0.125,), "stop", 4, reward=0.75),
+        Call((5, 6), (2,), (-0.125,), "stop", 4, reward=0.75, transcript=Transcript(
+            ({"role": "user", "content": "go on"},),
+            {"role": "assistant", "content": "done", "tool_calls": [{"id": "a", "type": "function"}]})),
     )
     rollout = Session("task", "g", 1, 2, calls, Status.COMPLETED, 0.5, {"tests": 0.5}, "log://1")
     failed = Session("task", "g", 2, 0, (Call((1,), (2,), (-3.0,), "abort", 4),), Status.INFRA_ERROR, None)
