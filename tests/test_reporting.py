@@ -371,3 +371,38 @@ def test_a_live_panel_keeps_redrawing_while_evaluations_of_new_splits_arrive():
         sys.setswitchinterval(interval)
     assert failures == []
     assert len(display.evaluation_rows()) == 3000
+
+
+def paths_of(figure) -> list[list[tuple[float, ...]]]:
+    """The points of each line a figure draws, in the order drawn."""
+    return [[tuple(float(value) for value in point.split(","))
+             for point in shape.attributes["d"][1:].split(" L")]
+            for shape in figure.shapes if shape.tag == "path"]
+
+
+def test_a_journals_plot_draws_training_beside_validation_each_at_its_own_steps(tmp_path):
+    """`LocalTracker.plot` draws the metrics it names, by default the training loss beside each
+    split's validation loss, as one `dew.figures` curve whose lines sit at the steps each metric
+    was logged: validation's two evaluations land where training's steps 5 and 10 do. A
+    nonfinite value is left out of its line and counted on the figure; a metric the journal never
+    logged is refused by name; and `plots=True` writes each metric as an SVG on close."""
+    tracker = LocalTracker(tmp_path / "run", plots=True)
+    for step in range(1, 11):
+        tracker.log({"train/loss": 2.0 / step, "train/grad_norm": 1.0}, step)
+        if step % 5 == 0:
+            tracker.log({"val/loss": 2.5 / step}, step)
+    tracker.log({"train/loss": math.inf}, 11)
+    figure = tracker.plot()
+    train, validation = paths_of(figure)
+    assert len(train) == 10 and len(validation) == 2
+    assert validation[0][0] == train[4][0] and validation[1][0] == train[9][0]
+    texts = [shape.text for shape in figure.shapes if shape.tag == "text"]
+    assert "1 nonfinite value left out" in texts and "loss" in texts
+    assert all(math.isfinite(value) for line in (train, validation) for point in line for value in point)
+    # Smoothed, a line is drawn faint with its running mean over it.
+    assert len(paths_of(tracker.plot("train/grad_norm", smooth=4))) == 2
+    with pytest.raises(KeyError):
+        tracker.plot("val/perplexity")
+    tracker.close()
+    assert sorted(path.name for path in (tmp_path / "run").glob("*.svg")) == [
+        "train-grad_norm.svg", "train-loss.svg", "val-loss.svg"]
