@@ -24,7 +24,7 @@ import jax
 import numpy as np
 
 from dew import records
-from dew.cache import hub_answer
+from dew.cache import hub_answer, recorded_hub_answer
 from dew.interop import pickles
 from dew.interop.safetensors_io import (
     LazyTensors,
@@ -269,28 +269,22 @@ class StoredWeights:
         (`HfApi.parse_safetensors_file_metadata`), its weights left on the Hub, and
         recorded so an offline run reads the same answer (`hub_answer`). None where a
         header cannot be read: a directory's file that is not there, or offline a Hub
-        header never read online. Binding variables needs no header, and only the
-        export, which writes by them, goes without."""
-        from huggingface_hub.errors import OfflineModeIsEnabled
+        header never read online. Binding variables needs no header (a run rebuilds its
+        objective over a pipeline's metadata alone), so only the export, which writes by
+        them, refuses (`dew.interop.diffusion.save_source`)."""
+        from huggingface_hub import constants
 
         held: dict[str, tuple[str, jax.ShapeDtypeStruct]] = {}
         for file in self.files(folder):
+            question = ("safetensors header", self.name_or_dir, self.directory.name, file)
             if (self.directory / file).is_file():
                 specs = header_specs(self.directory / file)
-            elif os.path.isdir(self.name_or_dir):
-                _log.warning("%s does not hold %s, so the pipeline binds without the layouts its export "
-                             "writes by", self.name_or_dir, file)
+            elif os.path.isdir(self.name_or_dir) or (constants.HF_HUB_OFFLINE
+                                                     and recorded_hub_answer(question) is None):
                 return None
             else:
-                try:
-                    header = hub_answer(("safetensors header", self.name_or_dir, self.directory.name, file),
-                                        functools.partial(_hub_header, self.name_or_dir, self.directory.name,
-                                                          file)).value
-                except OfflineModeIsEnabled:
-                    _log.warning("%s at %s: offline, and the header of %s was never read online, so the "
-                                 "pipeline binds without the layouts its export writes by; one online "
-                                 "run records them", self.name_or_dir, self.directory.name, file)
-                    return None
+                header = hub_answer(question, functools.partial(_hub_header, self.name_or_dir,
+                                                                self.directory.name, file)).value
                 specs = {name: stored_spec(name, shape, tag, file) for name, (shape, tag) in header.items()}
             held.update({name: (file, spec) for name, spec in specs.items()})
         return held

@@ -74,7 +74,7 @@ pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None,
 
 Decoding reads the weights at the compute dtype. A text task's call and a `Server` cast each floating parameter stored wider, such as a run's float32 masters under bfloat16 compute, to that dtype once: a call before its decode loop, a server when it is built and on each `reload`. The head bias stays float32, as a source loaded at bfloat16 storage keeps it. transformers' `torch_dtype` and vLLM's `dtype` store a model the same way.
 
-A run's `run.json` must name its objective. Saved diffusion, LM, DPO, GRPO, PPO, block-diffusion and masked-diffusion runs have generation tasks. Other kinds, such as JEPA runs, have none, and loading them raises. Loading a task also points XLA at the on-disk compilation cache, so a restarted process reuses what it compiled before.
+A run's `run.json` must name its objective. Saved diffusion, LM, DPO, GRPO, PPO, block-diffusion and masked-diffusion runs have generation tasks. Other kinds, such as JEPA runs, have none, and loading them raises. Loading a task also points XLA at the on-disk compilation cache, so a restarted process reuses what it compiled before, unless `JAX_ENABLE_COMPILATION_CACHE=false` turns it off ([Compilation cache](../installation.md#compilation-cache)).
 
 Checkpoints in a published layout load through `dew.interop.Pretrained.load`, including latent-diffusion pipelines in the diffusers layout, which a `model_index.json` describes. An original-format single-file checkpoint loads with `Pretrained.load(repo_or_dir, single_file="name.safetensors")`. diffusers' key maps convert the file once, into Dew's cache, as the diffusers pipeline it describes. The configs are `repo_or_dir`'s own when it has a `model_index.json`; otherwise they are the configs of the diffusers repo that diffusers infers from the file, pinned to the commit that was fetched. A component the file does not include, such as a Flux file's text encoders and VAE, gets its weights from the same place, and if there are none there, the load names the component and stops. The cache entry is kept only after the pipeline loads, and a newer diffusers converts the file again. FLUX.1's config repos are gated on the Hub, so accept the license and log in, or load from a local directory that holds the configs. The conversion needs `uv pip install 'dewml[diffusers]'`; the loaded pipeline runs in JAX.
 
@@ -119,7 +119,7 @@ For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` ask
 import jax.numpy as jnp
 
 import dew
-from dew.training.quantization import Quantization
+from dew.quantization import Quantization
 
 task = dew.pipeline("Qwen/Qwen3-0.6B", dtype=jnp.bfloat16)
 served = task.quantized(Quantization(dtype="int8", weight_only=True))
@@ -139,7 +139,7 @@ On the RTX 4080, the 176M text-to-image model then holds 183 MiB of denoiser wei
 import jax.numpy as jnp
 
 from dew.sampling import TextToImage
-from dew.training.quantization import Quantization
+from dew.quantization import Quantization
 
 pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
                                    revision="4b322022189373fd9086313241269aa5cea92b86")
@@ -312,6 +312,8 @@ Calling the server with a batch submits every prompt, steps until they all finis
 | `chunk` | Prefill a long prompt in pieces of at most this many tokens, one piece a step. Needs a paged cache. |
 | `prefix_cache` | Share the full prompt pages of an earlier request that began with the same tokens. Needs a paged cache. |
 | `decode_steps` | Decode iterations per device call (default 1). |
+
+A decoder tells the server what its layers allow through `dew.nn.protocols.Serving`: `inference_projection_groups` names the projection groups the variables hold packed, or as members the server packs for decoding (a model that does not decode autoregressively names none), `cache_rebuild_position` is where LongRoPE's cached keys go stale, which refuses paged and mixed serving, `mixed_admission_refusal` says why one mixed prefill-and-decode forward would compute differently, and `split_prefill_refusal` says why a prompt must be prefilled whole, which refuses `chunk` and `prefix_cache`. `CausalTransformer` implements it. A custom decoder that does not implement it packs no projections (`dew.inference.projections.projection_groups`) and runs prefill and decode as separate forwards (`dew.inference.serving_kernel.mixed_refusal`), and the server takes its prefill as safe to split (`dew.inference.serving`), so a decoder whose prefill depends on seeing the prompt whole implements `Serving` and says so in `split_prefill_refusal`.
 
 `KVCache` (`dew.nn.kv_cache`) sets the cache layout. It is passed as `kv_cache=` to `from_task`, or set as a `CausalTransformer`'s `kv_cache` field for `TextGeneration`:
 

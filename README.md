@@ -185,7 +185,7 @@ For int8 quantization-aware training, install the `quantization` extra
 (`uv pip install "dewml[quantization]"`, which installs Qwix) and wrap the model before you construct the objective:
 
 ```python
-from dew.training import Quantization
+from dew.quantization import Quantization
 
 model = Quantization(dtype="int8", patterns=(".*dit_block_.*",)).apply(model)
 ```
@@ -542,8 +542,8 @@ prompt_batch = {
 }
 
 
-def reward(data_source, completion, ground_truth, extra_info):
-    return float(ground_truth in completion)
+def reward(completion, record):
+    return float(record.ground_truth in completion)
 
 
 rl_data = Loader(
