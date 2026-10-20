@@ -70,11 +70,12 @@ def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: i
 def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat
     template, each token's speaker kept beside it for an assistant-only loss,
-    cut to `seq_len + 1` tokens and packed first-fit into rows of that
-    length, in batches of `batch` rows."""
+    a longer one cut into pieces of `seq_len + 1` tokens that keep every
+    turn, and packed first-fit into rows of that length, in batches of
+    `batch` rows."""
 
     return _conversation_windows(dataset.map(chat.template(tokenizer)), Pack(seq_len + 1, _CHAT_FIELDS),
-                                 long="truncate").batch(batch)
+                                 long="chunk").batch(batch)
 
 
 _CHAT_FIELDS = ("text", chat.ROLES_KEY)
@@ -88,8 +89,8 @@ def _next_token_windows(documents: Dataset, pack: Pack) -> Pipeline:
     `lm`, a conversation cut into pieces and the text and chat recipes (`dew.config.data`) prepare
     text through it."""
     if pack.policy == "concat":
-        return documents.then(dataclasses.replace(pack, overlap=1))
-    return documents.flat_map(text_steps.Chunks(pack.seq_len, fields=pack.fields, overlap=1)).then(pack)
+        return documents._then(dataclasses.replace(pack, overlap=1))
+    return documents.flat_map(text_steps.Chunks(pack.seq_len, fields=pack.fields, overlap=1))._then(pack)
 
 
 def _conversation_windows(rendered: Dataset, pack: Pack, *,
@@ -100,7 +101,7 @@ def _conversation_windows(rendered: Dataset, pack: Pack, *,
     if long == "chunk":
         return _next_token_windows(rendered, pack)
     fitted = chat.fit_length(pack.seq_len, long=long)
-    return (rendered.filter_map(fitted) if long == "drop" else rendered.map(fitted)).then(pack)
+    return (rendered.filter_map(fitted) if long == "drop" else rendered.map(fitted))._then(pack)
 
 
 def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: int, batch: int,

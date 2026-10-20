@@ -29,7 +29,7 @@ concurrency:
 
 env:
   # The armada runner every armada job uses.
-  ARMADA: github:AshishKumar4/armada#d3ddca1ac25e100e47fe736f56f18c1b307f4d12
+  ARMADA: github:AshishKumar4/armada#461cb61e42956d049ecee6946411a113901809e7
 
 jobs:
   # A commit this workflow passed on another push, as one proved on
@@ -121,10 +121,19 @@ jobs:
       with:
         name: dist
         path: dist/
-    - name: Install the wheel from PyPI into an empty environment
+    - name: Without Dew's package index, an install stops at resolving jax
+      run: |
+        python -m venv "$RUNNER_TEMP/plain"
+        if "$RUNNER_TEMP/plain/bin/pip" install --index-url https://pypi.org/simple dist/*.whl > plain.txt 2>&1; then
+          cat plain.txt; echo "dewml installed from PyPI alone, on a jax without Dew's fixes"; exit 1
+        fi
+        grep -q "No matching distribution found for jax" plain.txt || { cat plain.txt; exit 1; }
+    - name: Install the wheel into an empty environment, jax from Dew's package index
       run: |
         python -m venv "$RUNNER_TEMP/clean"
-        "$RUNNER_TEMP/clean/bin/pip" install --quiet --index-url https://pypi.org/simple dist/*.whl
+        index=$(python -c "import runpy; print(runpy.run_path('src/dew/telemetry/builds.py')['PACKAGE_INDEX'])")
+        "$RUNNER_TEMP/clean/bin/pip" install --quiet --index-url https://pypi.org/simple \
+          --extra-index-url "$index" dist/*.whl
     - name: Run it
       working-directory: ${{ runner.temp }}
       run: |
@@ -136,13 +145,10 @@ jobs:
 
         import dew
         from dew.nn.backbones import CausalTransformer
-        from dew.training.runtime import _pool_keys_alike
 
         assert "site-packages" in dew.__file__, dew.__file__
         print("dewml", importlib.metadata.version("dewml"), "jax", jax.__version__,
               "flax", importlib.metadata.version("flax"))
-        # PyPI's jax 0.11.2 lacks jax-ml/jax#40940, and Dew sees that it does.
-        assert not _pool_keys_alike()
         import flax.nnx  # noqa: E402,F401  imports on jax 0.11.2 from flax 0.12.10 on
         model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2,
                                   num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=16)
@@ -150,25 +156,14 @@ jobs:
         logits = jax.jit(model.apply)(model.init(jax.random.key(0), tokens), tokens)
         assert logits.shape == (2, 8, 64) and bool(jnp.all(jnp.isfinite(logits)))
         EOF
-    - name: PyPI's jax still keys a pool's processes apart (jax-ml/jax#40940)
-      # The repro is expected to fail here (xfail, strict): once it passes, a
-      # release carries the fix, and the patched jax and its refusal can go.
-      run: |
-        "$RUNNER_TEMP/clean/bin/pip" install --quiet pytest
-        DEW_UPSTREAM_JAX=1 "$RUNNER_TEMP/clean/bin/python" -m pytest -q -rxX \
-          tests/test_distribution.py::test_a_pools_second_run_loads_what_its_first_compiled
     - name: Resolve the accelerator extras
       run: |
+        index=$(python -c "import runpy; print(runpy.run_path('src/dew/telemetry/builds.py')['PACKAGE_INDEX'])")
         for extras in cuda12,quantization,profile cuda13,quantization,profile tpu,quantization,profile; do
           echo "dewml[$extras] @ file://$(realpath dist/*.whl)" \
-            | uv pip compile - --python-version "$(tr -d '\n' < .python-version)" --python-platform x86_64-manylinux_2_31 --quiet > /dev/null
+            | uv pip compile - --extra-index-url "$index" \
+              --python-version "$(tr -d '\n' < .python-version)" --python-platform x86_64-manylinux_2_31 --quiet > /dev/null
         done
-    - name: Install the jax for GPU pools as docs/installation.md says
-      run: |
-        uv pip install --python "$RUNNER_TEMP/clean/bin/python" --quiet jax \
-          -c "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/constraints.txt"
-        cd "$RUNNER_TEMP"
-        "$RUNNER_TEMP/clean/bin/python" -c "from dew.training.runtime import _pool_keys_alike; assert _pool_keys_alike()"
 
   test:
     needs: proven
@@ -180,6 +175,12 @@ jobs:
     # A straggler at the end runs again (task.speculative). Tasks share XLA's
     # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
     # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets.
+    # Every suite task runs on AMD EPYC 25/17 (task.cpu): armada replaces a
+    # container on another CPU model before it takes a task. Of 1,264 containers
+    # in the 16 runs before 2026-10-20 15:00, 1,025 landed on 25/17.
+    # Per-test median time ratios against 25/17 were 2.0 on 25/1 and 1.35 on
+    # 26/17. In dew-20261020144644-dceff433, the three tasks on 25/1 were
+    # the run's three slowest.
     # This job sends the commit, waits, and prints each red row's output; a
     # failed test, a test skipped on a missing import and a file left
     # unreported each fail it. A commit armada already graded green, as one

@@ -214,11 +214,10 @@ def test_chain_statistics_publish_without_reading_the_workers_live_iterator(host
             assert source.entered.wait(5)
             states = tuple(source.states)
             logged = {
-                "data/attempted/grain:observed": float(attempted),
-                "data/accepted/grain:observed": float(batch),
-                "data/rejected/grain:observed/third": float(attempted - batch),
-                "data/truncated/grain:observed": 0.0,
-                "data/chunks_per_record/grain:observed": 0.0,
+                "data/rows/observed": batch,
+                "data/rejected/observed/third": attempted - batch,
+                "data/truncated/observed": 0.0,
+                "data/chunks_per_record/observed": 0.0,
             }
             for _ in range(3):
                 assert data.statistics() == logged
@@ -238,9 +237,8 @@ def test_chain_statistics_publish_without_reading_the_workers_live_iterator(host
     gc.collect()
     assert reference() is None
     final = data.statistics()
-    assert final["data/attempted/grain:observed"] == source.end
-    assert final["data/accepted/grain:observed"] == sum(index % 3 != 0 for index in range(source.end))
-    assert final["data/rejected/grain:observed/third"] == sum(index % 3 == 0 for index in range(source.end))
+    assert final["data/rows/observed"] == sum(index % 3 != 0 for index in range(source.end))
+    assert final["data/rejected/observed/third"] == sum(index % 3 == 0 for index in range(source.end))
 
 
 def test_chain_statistics_count_the_records_every_worker_read():
@@ -261,8 +259,8 @@ def test_chain_statistics_count_the_records_every_worker_read():
         reader.close()
     assert sorted(read) == [index for index in range(24) if index % 3]
     published = data.statistics()
-    assert published["data/accepted/rows"] == len(read)
-    assert published["data/attempted/rows"] == len(read) + published["data/rejected/rows/third"] > 16
+    assert published["data/rows/rows"] == len(read)
+    assert published["data/rows/rows"] + published["data/rejected/rows/third"] > 16
 
 
 def test_corpus_counts_hold_through_grains_restore_into_a_smaller_cycle():
@@ -274,7 +272,7 @@ def test_corpus_counts_hold_through_grains_restore_into_a_smaller_cycle():
 
     def shard(number: int):
         rows = [{"i": np.int32(10 * number + index)} for index in range(6)]
-        return Accepted(grain.MapDataset.source(rows).to_iter_dataset().map(reject_thirds), "rows")
+        return Accepted(grain.MapDataset.source(rows).to_iter_dataset().map(reject_thirds), "rows", "rows")
 
     def interleave(cycle: int):
         return gx.InterleaveIterDataset([shard(number) for number in range(4)], cycle_length=cycle).__iter__()
@@ -282,11 +280,12 @@ def test_corpus_counts_hold_through_grains_restore_into_a_smaller_cycle():
     read = interleave(4)
     for _ in range(10):
         next(read)
-    counts = {name: counted.metrics() for name, counted in state_counts(read.get_state()).items()}
+    counts = {name: counted.metrics(name) for name, counted in state_counts(read.get_state()).items()}
     restored = interleave(2)
     restored.set_shard_states(read.get_shard_states())
-    assert {name: counted.metrics() for name, counted in state_counts(restored.get_state()).items()} == counts
-    assert counts["rows"]["data/accepted/rows"] == 10
+    restored_counts = state_counts(restored.get_state())
+    assert {name: counted.metrics(name) for name, counted in restored_counts.items()} == counts
+    assert counts["rows"]["data/rows/rows"] == 10
 
 
 def test_chain_statistics_follow_each_corpus_through_direct_reads_and_resume():
@@ -301,8 +300,10 @@ def test_chain_statistics_follow_each_corpus_through_direct_reads_and_resume():
         saved = first.get_state()
         expected = next(first)["i"]
         after = data.statistics()
-        assert all(after[f"data/attempted/grain:{name}"] > before[f"data/attempted/grain:{name}"]
-                   for name in ("a", "b"))
+        def read(counts, name):
+            return counts[f"data/rows/{name}"] + counts.get(f"data/rejected/{name}/third", 0)
+
+        assert all(read(after, name) > read(before, name) for name in ("a", "b"))
     finally:
         first.close()
     resumed = compile(chain, read="streamed", loading=READ)
@@ -311,10 +312,6 @@ def test_chain_statistics_follow_each_corpus_through_direct_reads_and_resume():
         reader.set_state(saved)
         np.testing.assert_array_equal(next(reader)["i"], expected)
         assert resumed.statistics() == after
-        for name in ("a", "b"):
-            assert after[f"data/attempted/grain:{name}"] == (
-                after[f"data/accepted/grain:{name}"] + after[f"data/rejected/grain:{name}/third"]
-            )
     finally:
         reader.close()
 
@@ -758,12 +755,36 @@ def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
 
 
 def _running(pid: int) -> bool:
-    """Whether process `pid` runs: it exists and has not ended (a zombie has)."""
+    """Whether process `pid` runs: it exists and has not ended (a zombie has). One that ends between
+    the open of its state and the read fails the read with ESRCH, and has ended too."""
     try:
         status = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
     return status.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+def test_a_process_that_ends_as_its_state_is_read_is_not_running(monkeypatch):
+    """A loading worker that ends after its state file opens and before it is read: the kernel fails
+    the read with ESRCH, which says the process has ended, as a missing file does."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    state = Path(f"/proc/{child.pid}/stat")
+    read = Path.read_text
+
+    def ended_while_read(path, *args, **kwargs):
+        if path != state:
+            return read(path, *args, **kwargs)
+        with path.open() as opened:
+            child.kill()
+            child.wait()
+            return opened.read()
+
+    monkeypatch.setattr(Path, "read_text", ended_while_read)
+    try:
+        assert not _running(child.pid)
+    finally:
+        child.kill()
+        child.wait()
 
 
 def _segments_marked(mark: bytes) -> set[str]:

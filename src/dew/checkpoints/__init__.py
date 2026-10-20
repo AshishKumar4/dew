@@ -1565,14 +1565,17 @@ class Checkpoints:
 
     def variables(self, *, step: int | str | None = None, ema: bool | None = None,
                   mesh=None, layout=None, param_dtype: jax.typing.DTypeLike | None = None,
-                  parameter_roots: tuple[tuple[str, ...], ...] = (("params",), ("frozen",))) -> Variables:
+                  parameter_roots: tuple[tuple[str, ...], ...] = (("params",), ("frozen",)),
+                  unread: tuple[tuple[str, ...], ...] = ()) -> Variables:
         """Read the selected step's live or averaged variables onto the requested layout.
 
         Parameter storage conversion applies only to the owner's parameter
         roots; other collections retain their recorded dtypes and placement.
+        The subtrees at `unread`'s paths are neither placed nor read
+        (`dew.objectives.base.UNREAD`).
         """
         from dew.inference.banks import banked_placement, placed_rows, shape_rows, spread
-        from dew.objectives.base import FROZEN, merge
+        from dew.objectives.base import FROZEN, merge, without
         from dew.registry import resolve_dtype
         from dew.training.distributed import (
             Layout as DefaultLayout,
@@ -1583,12 +1586,12 @@ class Checkpoints:
         target = resolve_dtype(param_dtype)
         step = self.pinned(step)
         stored = self.stored(step)
-        template = {"variables": stored["variables"]}
+        template = {"variables": without(stored["variables"], unread)}
         if ema and stored.get("ema") is None:
             raise ValueError("the run keeps no EMA; request the live policy with ema=False")
         averaged = stored.get("ema") is not None if ema is None else ema
         if averaged:
-            template["ema"] = stored["ema"]
+            template["ema"] = without(stored["ema"], unread)
         device_mesh = resolve_mesh(DefaultMesh() if mesh is None else mesh)
         chosen_layout = DefaultLayout() if layout is None else layout
         # A CPU-owned run stores its frozen collection banked; the layout places
