@@ -102,7 +102,14 @@ class Timings(dict):
         return Timings({config: self[config]})
 
 
-def encoded(value: object) -> object:
+type Json = None | bool | int | float | str | list[Json] | dict[str, Json]
+"""A value JSON writes as it is."""
+
+type Rebuilt = Hashable | list | dict
+"""What `decoded` rebuilds: an op's field, a launch's argument or a config."""
+
+
+def encoded(value: object) -> Json:
     """`value`, an op's field, a launch's argument or a config, as JSON `decoded` rebuilds equal: a
     scalar, None or string as itself; a shape and dtype, a dtype, a tuple, a list, a mapping, an enum
     member and a dataclass by their parts, a class by its module and name. Anything else, a callable
@@ -122,34 +129,63 @@ def encoded(value: object) -> object:
                 "fields": {field.name: encoded(getattr(value, field.name))
                            for field in dataclasses.fields(value) if field.init}}
     if isinstance(value, tuple):
-        return {"tuple": [encoded(item) for item in value]}
+        return {"tuple": [encoded(element) for element in value]}
     if isinstance(value, list):
-        return [encoded(item) for item in value]
+        return [encoded(element) for element in value]
     if isinstance(value, Mapping):
-        return {"mapping": [[encoded(key), encoded(item)] for key, item in value.items()]}
+        return {"mapping": [[encoded(key), encoded(entry)] for key, entry in value.items()]}
     raise TypeError(f"{type(value).__name__} has no JSON form in a kernel's picks: {value!r}")
 
 
-def decoded(value: object) -> object:
-    """What `encoded` wrote, rebuilt: a class it names that this checkout lacks raises ValueError."""
+def decoded(value: Json) -> Rebuilt:
+    """What `encoded` wrote, rebuilt: a class it names that this checkout lacks, or JSON it did not
+    write, raises ValueError."""
     if isinstance(value, list):
-        return [decoded(item) for item in value]
+        return [decoded(element) for element in value]
     if not isinstance(value, dict):
         return value
     if "shape" in value:
-        return jax.ShapeDtypeStruct(tuple(value["shape"]), jnp.dtype(value["dtype"]))
+        return jax.ShapeDtypeStruct(tuple(_ints(value["shape"])), jnp.dtype(_text(value["dtype"])))
     if "dtype" in value:
-        return jnp.dtype(value["dtype"])
+        return jnp.dtype(_text(value["dtype"]))
     if "enum" in value:
-        return getattr(_located(value["enum"]), value["name"])
+        return getattr(_located(_text(value["enum"])), _text(value["name"]))
     if "class" in value:
-        return _located(value["class"])
+        return _located(_text(value["class"]))
     if "dataclass" in value:
-        fields = {name: decoded(field) for name, field in value["fields"].items()}
-        return _located(value["dataclass"])(**fields)
+        fields = value["fields"]
+        if not isinstance(fields, dict):
+            raise ValueError(f"a dataclass's fields are no mapping: {fields!r}")
+        return _located(_text(value["dataclass"]))(**{name: decoded(field) for name, field in fields.items()})
     if "tuple" in value:
-        return tuple(decoded(element) for element in value["tuple"])
-    return {decoded(key): decoded(entry) for key, entry in value["mapping"]}
+        return tuple(decoded(element) for element in _elements(value["tuple"]))
+    return {_key(decoded(pair[0])): decoded(pair[1]) for pair in map(_elements, _elements(value["mapping"]))}
+
+
+def _key(value: Rebuilt) -> Hashable:
+    """`value` as a mapping's key or a config, which hash."""
+    if not isinstance(value, Hashable):
+        raise ValueError(f"expected a hashable value in a kernel's picks: {value!r}")
+    return value
+
+
+def _text(value: Json) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"expected a string in a kernel's picks: {value!r}")
+    return value
+
+
+def _elements(value: Json) -> list[Json]:
+    if not isinstance(value, list):
+        raise ValueError(f"expected a list in a kernel's picks: {value!r}")
+    return value
+
+
+def _ints(value: Json) -> list[int]:
+    elements = _elements(value)
+    if not all(isinstance(element, int) for element in elements):
+        raise ValueError(f"expected integers in a kernel's picks: {value!r}")
+    return [int(element) for element in elements if isinstance(element, int)]
 
 
 def _named(cls: type) -> str:
@@ -204,7 +240,7 @@ def _timings(entries: list) -> Timings:
         metadata = decoded(timing["metadata"])
         if not isinstance(metadata, dict):
             raise ValueError(f"a timing's metadata is no mapping: {metadata!r}")
-        measured[decoded(config)] = tokamax.BenchmarkData(
+        measured[_key(decoded(config))] = tokamax.BenchmarkData(
             compile_time_ms=timing["compile_time_ms"], lower_time_ms=timing["lower_time_ms"],
             evaluation_times_ms=tuple(timing["evaluation_times_ms"]), metadata=metadata)
     return Timings(measured)
