@@ -16,6 +16,7 @@ from reference_error import (
     assert_as_exact_as_the_reference,
     assert_rounds_where_the_reference_does,
     equations,
+    float64_terms,
     within,
 )
 from tuned import each_config, launches, timed
@@ -265,7 +266,10 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, pa
         return run(kernel_conv, x, weights, None, None, parts, dtype, grads, segments=segments)
 
     want, want_grads = run(xla_conv1d, x, weights, None, None, parts, dtype, grads, segments=segments)
-    exact, exact_grads = truth(x, weights, None, None, parts, grads, segments=segments)
+    # Each entry sized by its float64 terms: a tap's gradient sums every token's product, which cancel.
+    with jax.enable_x64(new_val=True):
+        (exact, exact_grads), (terms, grad_terms) = float64_terms(
+            lambda x, weights: truth(x, weights, None, None, parts, grads, segments=segments), x, weights)
     # Every config of each launch's space at the 0.8b's width, the heuristics at the other's.
     pins = [{}] + ([{op: config} for op in (short_conv.ConvForward, short_conv.ConvBackward)
                     for config in each_config(op, kernels, x, weights)] if model == "0.8b" else [])
@@ -274,9 +278,10 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, pa
             got, got_grads = kernels(x, weights)
         labels = ("q", "k", "v", "dx", "dtaps")
         # The gradients of the projection and the taps; there is no bias.
-        for label, mine, theirs, value in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
-                                              (*exact, *exact_grads[:2]), strict=True):
-            assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {pin} {label}")
+        sides = ((*got, *got_grads[:2]), (*want, *want_grads[:2]), (*exact, *exact_grads[:2]),
+                 (*terms, *grad_terms[:2]))
+        for label, mine, theirs, value, summed in zip(labels, *sides, strict=True):
+            assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {pin} {label}", terms=summed)
 
 
 @pytest.mark.mesh(devices=2)

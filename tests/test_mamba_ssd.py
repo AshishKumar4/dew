@@ -127,7 +127,7 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
     for leaves, reductions in ((set(ported) - everywhere, chunk), (everywhere, batch * length)):
         mine, theirs, true, summed = ({name: tree[name] for name in sorted(leaves)}
                                       for tree in (ported, reference, truth, terms))
-        assert_leaves_as_exact(mine, theirs, true, reductions=reductions, terms=summed)
+        assert_leaves_as_exact(mine, theirs, true, terms=summed)
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])

@@ -128,8 +128,7 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
 
     (_, outputs), gradient = jax.value_and_grad(loss, has_aux=True)(altup_variables(tensors)["params"])
     dew = jax.tree.map(np.asarray, {"outputs": list(outputs), "params": gradient})
-    assert_leaves_as_exact(dew, reference(torch.float32), reference(torch.float64),
-                           reductions=stream.shape[1] * stream.shape[2])
+    assert_leaves_as_exact(dew, reference(torch.float32), reference(torch.float64))
 
 
 def clipped_gemma3n():
@@ -344,8 +343,7 @@ def test_the_sparse_mlp_trains_on_padded_rows_as_the_reference_does():
     (_, output), (kernels, inputs) = jax.value_and_grad(loss, (0, 1), has_aux=True)(
         params, jnp.asarray(hidden))
     dew = {"output": output, "input": inputs, **{name: kernels[name]["kernel"] for name in names}}
-    assert_leaves_as_exact(jax.tree.map(np.asarray, dew), reference(torch.float32), reference(torch.float64),
-                           reductions=hidden.shape[0] * hidden.shape[1])
+    assert_leaves_as_exact(jax.tree.map(np.asarray, dew), reference(torch.float32), reference(torch.float64))
 
 
 def sparse_mlps(sparsity: float, width: int, rows: int, dtype, hidden: int = HIDDEN):
@@ -408,10 +406,8 @@ def test_the_sparse_mlp_is_as_exact_as_the_reference_at_each_sparsity(sparsity):
     dew = {"output": output, "input": inputs, **{name: kernel["kernel"] for name, kernel in kernels.items()}}
     ours, theirs, truth = (jax.tree.map(np.asarray, dew), reference(torch.float32, cotangent),
                            reference(torch.float64, cotangent))
-    # The output and the input's gradient sum over the 2048 activations; a kernel's gradient over the rows.
-    for names, reductions in ((("output", "input"), 2048), (("gate_proj", "up_proj", "down_proj"), 256)):
-        assert_leaves_as_exact(*({name: tree[name] for name in names} for tree in (ours, theirs, truth)),
-                               reductions=reductions)
+    names = ("output", "input", "gate_proj", "up_proj", "down_proj")
+    assert_leaves_as_exact(*({name: tree[name] for name in names} for tree in (ours, theirs, truth)))
 
 
 @pytest.mark.parametrize("sparsity", [1e-9, 1 - 1e-9])

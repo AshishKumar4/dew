@@ -126,8 +126,7 @@ def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float
     for label, mine, theirs, true in held:
         if label != 'scale':
             assert_as_exact_as_the_reference(mine, theirs, true, f'{dtype} {softcap} fused {label}')
-    assert_leaves_as_exact(gradients[2], expected_gradients[2], exact_gradients[2], reductions=targets.size,
-                           terms=sizes[2])
+    assert_leaves_as_exact(gradients[2], expected_gradients[2], exact_gradients[2], terms=sizes[2])
 
 
 @pytest.mark.parametrize('kind', ['nvfp4', 'fp8'])
@@ -303,8 +302,7 @@ def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(til
     with jax.enable_x64(new_val=True):
         exact, sizes = float64_terms(jax.value_and_grad(whole, argnums=(0, 1, 2, 3)),
                                      *(jnp.asarray(term, jnp.float64) for term in terms))
-    assert_leaves_as_exact(jax.tree.map(np.asarray, split), reference, exact, reductions=targets.size,
-                           terms=sizes)
+    assert_leaves_as_exact(jax.tree.map(np.asarray, split), reference, exact, terms=sizes)
     moved = [math.prod(shape) for _, shapes in collectives(program) for shape in shapes]
     assert moved and max(moved) < matrix.size // 2, moved
 

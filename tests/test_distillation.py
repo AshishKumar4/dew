@@ -154,7 +154,7 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
 
     dew = {metric: np.float64(reported[metric]) for metric in named}
     assert_leaves_as_exact(dew, terms(rounded_terms), terms(truth_terms),
-                           reductions=int(np.size(arrays["student_logits"])), rows=False)
+                           rows=False)
 
 
 @pytest.mark.parametrize("kind", ["cosine", "l2"])

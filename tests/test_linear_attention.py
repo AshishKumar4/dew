@@ -183,7 +183,7 @@ def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, 
         want = through(functools.partial(recurrence, cuts=(begins,)), *operands[6:])(*operands[:6])
         want = widened(want)
         _, terms = float64_terms(through(packed, *operands[6:]), *operands[:6])
-    assert_leaves_as_exact(got, reference, want, reductions=chunk, terms=terms)
+    assert_leaves_as_exact(got, reference, want, terms=terms)
     for name, mine, theirs in zip(("out", "final", "q", "k", "v", "g", "beta", "h0"), got, want, strict=True):
         assert largest(mine, theirs) < 1e-4 * max(1.0, float(np.max(np.abs(theirs)))), name
 

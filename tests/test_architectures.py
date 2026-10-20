@@ -431,8 +431,8 @@ def shard_terms(case: Case, tmp_path, initial):
     device's partial is its row's: the step from the whole batch with that
     row alone valid (`VALID_ROWS`), the same draws, weighted by its share of
     the batch. The step is linear in its gradient (SGD with momentum and
-    the EMA), so the partials sum to the whole step where its rows add up,
-    and None where they do not."""
+    the EMA), so a leaf's partials sum to its whole step where its rows add
+    up, and it has no such terms (zero) where they do not."""
     trainer, encoder = make_trainer(case, tmp_path / "shards", 1, devices=1)
     batch = model_batch(wide(case, next(batches(case, encoder)())))
     state = widened_state(initial)
@@ -452,15 +452,15 @@ def shard_terms(case: Case, tmp_path, initial):
         whole = written(np.ones(BATCH, bool))
         parts = [jax.tree.map(lambda delta: delta / BATCH, written(np.arange(BATCH) == row))
                  for row in range(BATCH)]
-    summed = jax.tree.map(lambda *deltas: sum(deltas), *parts)
-    terms = jax.tree.map(lambda *deltas: sum(np.abs(delta) for delta in deltas), *parts)
-    # float64 rounds the two sums apart by a few of its units of what they add. A step whose rows do
+    # float64 rounds the two sums apart by a few of its units of what they add. A leaf whose rows do
     # not add up, through a batch-wide statistic (a router's load, a JEPA batch's masks), parts them by
-    # its own size: its devices' sums are no rows' partials, and it has no such terms (None).
-    if not all(np.all(np.abs(got - want) <= 1e-9 * size) for got, want, size in zip(
-            jax.tree.leaves(summed), jax.tree.leaves(whole), jax.tree.leaves(terms), strict=True)):
-        return None
-    return SimpleNamespace(**terms)
+    # its own size: its devices' sums are no rows' partials. Each leaf is judged alone, so an expert's
+    # kernel keeps its partials beside the router a load statistic couples.
+    def added(want, *deltas):
+        size = sum(np.abs(delta) for delta in deltas)
+        return size if np.all(np.abs(sum(deltas) - want) <= 1e-9 * size) else np.zeros_like(size)
+
+    return SimpleNamespace(**jax.tree.map(added, whole, *parts))
 
 
 def decay_terms(objective, variables, batch, index: int) -> dict[tuple[str, ...], np.ndarray]:
@@ -592,8 +592,8 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
             terms = jax.device_get(update_terms(case, tmp_path, copied(), steps))
             # A layout's step adds its devices' partials, whose terms can far exceed the
             # whole batch's where the rows' gradients cancel across devices.
-            across = shard_terms(case, tmp_path, copied()) if rows else None
-            if across is not None:
+            if rows:
+                across = shard_terms(case, tmp_path, copied())
                 terms = replace(terms, **{name: jax.tree.map(np.maximum, getattr(terms, name),
                                                              getattr(across, name))
                                           for name in ("variables", "opt_state", "ema")})
@@ -603,8 +603,7 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         for layout in layouts:
             for name in ("variables", "opt_state", "ema"):
                 assert_leaves_as_exact(*jax.device_get((getattr(layout, name), getattr(alone, name))),
-                                       getattr(exact, name), reductions=reductions,
-                                       terms=getattr(terms, name), rows=rows)
+                                       getattr(exact, name), terms=getattr(terms, name), rows=rows)
         return layouts
 
     as_near(1, rows=True)
