@@ -181,6 +181,17 @@ def cuda_driver_version() -> int | None:
     return None if cuda.cuDriverGetVersion(ctypes.byref(version)) else version.value
 
 
+def remedy(gpus: tuple[str, tuple[int, int]], installed: Sequence[str],
+           cuda: int | None) -> tuple[tuple[str, ...], str | None]:
+    """Of JAX's CUDA builds `installed`, those that run on `gpus` under a user-mode driver of CUDA
+    version `cuda` (`runs_on`), and where none does, the newest build that would
+    (`newest_build`), or None; nothing runs where no driver library loads (`cuda` None)."""
+    if cuda is None:
+        return (), None
+    runs = tuple(build for build in installed if runs_on(build, *gpus, cuda))
+    return runs, None if runs else newest_build(gpus, cuda)
+
+
 def cpu_only_refusal(env: Mapping[str, str], gpus: tuple[str, tuple[int, int]] | None,
                      installed: Sequence[str], cuda: int | None) -> str | None:
     """Why a process would run on the CPU on a machine with an NVIDIA GPU,
@@ -199,11 +210,11 @@ def cpu_only_refusal(env: Mapping[str, str], gpus: tuple[str, tuple[int, int]] |
         return (f"This machine has an NVIDIA GPU (driver {driver}, SM {sm[0]}.{sm[1]}), and JAX would use "
                 "the CPU: no CUDA driver library (libcuda.so.1) loads. Install the NVIDIA driver's user-mode "
                 f"libraries, or put them on the loader's path. {on_cpu}")
-    if any(runs_on(build, driver, sm, cuda) for build in installed):
+    runs, build = remedy(gpus, installed, cuda)
+    if runs:
         return None
     found = (f"This machine has an NVIDIA GPU (driver {driver}, CUDA {cuda // 1000}.{cuda % 1000 // 10}, "
              f"SM {sm[0]}.{sm[1]}), and JAX would use the CPU")
-    build = newest_build(gpus, cuda)
     if build is None:
         needs = ", ".join(f"{name} needs CUDA {version // 1000}.{version % 1000 // 10}+ (driver {major}+, or "
                           f"an older one with NVIDIA's cuda-compat) and SM {least[0]}.{least[1]}+"
@@ -218,7 +229,15 @@ def cpu_only_refusal(env: Mapping[str, str], gpus: tuple[str, tuple[int, int]] |
 
 
 class CPUOnlyJax(RuntimeError):
-    """A machine with an NVIDIA GPU whose JAX opened with none (`refuse_cpu_only_jax`)."""
+    """A machine with an NVIDIA GPU whose JAX opened with none (`refuse_cpu_only_jax`), with what
+    the refusal found: the CUDA version the user-mode driver reports (`cuda`, None where no
+    driver library loads), the installed builds that run on the machine (`runs`) and, where none
+    does, the build to install (`install`, None where none would run either)."""
+
+    def __init__(self, message: str, *, cuda: int | None = None, runs: tuple[str, ...] = (),
+                 install: str | None = None):
+        super().__init__(message)
+        self.cuda, self.runs, self.install = cuda, runs, install
 
 
 def refuse_cpu_only_jax() -> None:
@@ -234,11 +253,14 @@ def refuse_cpu_only_jax() -> None:
     gpus = nvidia_gpus()
     if gpus is None:
         return
-    refusal = cpu_only_refusal(os.environ, gpus, cuda_builds(), cuda_driver_version())
+    installed, cuda = cuda_builds(), cuda_driver_version()
+    runs, build = remedy(gpus, installed, cuda)
+    refusal = cpu_only_refusal(os.environ, gpus, installed, cuda)
     raise CPUOnlyJax(refusal or (
         f"This machine has an NVIDIA GPU (driver {gpus[0]}), and JAX opened with no GPU beside a CUDA "
         f"build that runs on it: {jax.devices()}. Read the CUDA plugin's warning above, or set "
-        "JAX_PLATFORMS=cuda to see why it failed; to run on the CPU instead, set JAX_PLATFORMS=cpu."))
+        "JAX_PLATFORMS=cuda to see why it failed; to run on the CPU instead, set JAX_PLATFORMS=cpu."),
+        cuda=cuda, runs=runs, install=build)
 
 
 def deterministic_ops_requested() -> bool:
