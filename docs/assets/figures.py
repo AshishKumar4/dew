@@ -901,13 +901,72 @@ def cfg_sweep_figure():
     svg.save(HERE / "cfg-sweep.svg")
 
 
+def fsdp_step_figure():
+    """One fully sharded step on four devices: each holds a quarter of a weight, they gather the whole
+    weight before the layer runs, each computes its slice of the batch, and the summed gradient is
+    scattered back so each keeps the quarter it owns."""
+    width, height, devices = 440, 330, 4
+    svg = Figure(width, height, seconds=12, label="One fully sharded step on four devices. Each device holds a "
+                 "quarter of a layer's weight; before the layer runs, the devices gather the whole weight, each "
+                 "computes its own slice of the batch, and the gradient is summed and scattered back so each "
+                 "device keeps the quarter it owns.")
+    svg.rect(0.5, 0.5, width - 1, height - 1, fill="surface", rx=10)
+    left, col, top, tall = 92, 84, 64, 120
+    tints = ("tint0", "tint1", "tint2", "tint3")
+    for d in range(devices):
+        x = left + d * col
+        svg.text(x + 30, 50, f"GPU {d}", size=13, weight=600, anchor="middle")
+        svg.rect(x, top, 60, tall, fill="none", stroke="rule", rx=5)
+    times = [0.4, 2.0, 3.8, 5.6, 7.4]
+    captions = ["each GPU holds a quarter of W", "all-gather: every GPU gets all of W",
+                "forward and backward on its own slice of the batch",
+                "reduce-scatter: sum the gradients, keep your quarter", "update your quarter of W"]
+    shown = []
+    for k, caption in enumerate(captions):
+        shown.append(svg.text(width / 2, height - 22, caption, size=13, color="accent", anchor="middle"))
+    svg.show_in_turn(shown, times)
+    # 1. the shards
+    for d in range(devices):
+        x = left + d * col
+        svg.appear(svg.rect(x + 4, top + 4 + d * (tall - 8) / devices, 52, (tall - 8) / devices - 2,
+                            fill=tints[d], stroke="none", rx=3), times[0])
+    # 2. all-gather: every device fills in the others' quarters
+    for d in range(devices):
+        x = left + d * col
+        with svg.group() as full:
+            for j in range(devices):
+                if j != d:
+                    svg.rect(x + 4, top + 4 + j * (tall - 8) / devices, 52, (tall - 8) / devices - 2,
+                             fill=tints[j], stroke="none", rx=3)
+        svg.appear(full, times[1], 0.4)
+    svg.appear(svg.text(26, top + tall / 2 + 5, "W", size=16, weight=600, mono=True), times[0])
+    # 3. compute on each device's slice of the batch
+    for d in range(devices):
+        x = left + d * col
+        with svg.group() as work:
+            svg.rect(x + 8, top + tall + 14, 44, 22, fill="raised", stroke="accent", rx=4)
+            svg.text(x + 30, top + tall + 30, f"x{d}", size=12, mono=True, anchor="middle")
+        svg.appear(work, times[2])
+    svg.appear(svg.text(26, top + tall + 30, "batch", size=12, color="muted"), times[2])
+    # 4. reduce-scatter: gradient quarters, each device keeps its own
+    for d in range(devices):
+        x = left + d * col
+        with svg.group() as grad:
+            svg.rect(x + 4, top + tall + 46, 52, 18, fill=tints[d], stroke="accent", rx=3)
+            svg.text(x + 30, top + tall + 59, f"∇W{d}", size=11, mono=True, anchor="middle")
+        svg.appear(grad, times[3])
+    svg.appear(svg.text(26, top + tall + 59, "grad", size=12, color="muted"), times[3])
+    svg.save(HERE / "fsdp-step.svg")
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
            "rlvr-advantage": rlvr_advantage_figure, "rlvr-sequence": rlvr_sequence_figure,
            "rlvr-clip": rlvr_clip_figure, "rlvr-kl": rlvr_kl_figure, "edm-step": edm_step_figure,
            "edm-noise": edm_noise_figure, "samplers-paths": samplers_paths_figure,
-           "cfg-step": cfg_step_figure, "cfg-sweep": cfg_sweep_figure}
+           "cfg-step": cfg_step_figure, "cfg-sweep": cfg_sweep_figure,
+           "fsdp-step": fsdp_step_figure}
 
 
 if __name__ == "__main__":
