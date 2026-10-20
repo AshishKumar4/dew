@@ -107,7 +107,8 @@ from dew.training import prepare_process
 try:
     prepare_process(multi_host=False)
 except CPUOnlyJax as refused:
-    print(json.dumps({{"cuda": refused.cuda, "runs": list(refused.runs), "install": refused.install}}))
+    print(json.dumps({{"reason": refused.reason, "cuda": refused.cuda, "runs": list(refused.runs),
+                      "install": refused.install}}))
     sys.exit({REFUSED})
 """
 
@@ -144,30 +145,34 @@ def machine(directory, driver: str, library: int | str, installed: tuple[str, ..
     return env
 
 
-@pytest.mark.parametrize("driver, library, installed, runs, install", [
-    ("580.82.07", 13000, ("cuda13",), ("cuda13",), None),     # a driver that runs CUDA 13.0 itself
-    ("580.82.07", 13000, ("cuda12",), ("cuda12",), None),     # CUDA 13.0 runs the cuda12 build too
-    ("570.124.06", 13000, ("cuda13",), ("cuda13",), None),    # an older one under NVIDIA's cuda-compat
-    ("570.124.06", 13000, (), (), "cuda13"),                  # which installs the newer build
-    ("570.124.06", 12080, ("cuda13",), (), "cuda12"),         # the same driver without it: CUDA 12.8
-    ("570.124.06", 12080, ("cuda12",), ("cuda12",), None),
-    ("580.82.07", 13000, (), (), "cuda13"),                   # no CUDA build of JAX installed
-    ("580.82.07", "error", ("cuda13",), (), None),            # a driver library that reports no CUDA
-    ("580.82.07", "unloadable", ("cuda13",), (), None),       # and one that does not load
+@pytest.mark.parametrize("driver, library, installed, reason, runs, install", [
+    # A driver that runs CUDA 13.0 itself: a build runs here, so its plugin's own start failed.
+    ("580.82.07", 13000, ("cuda13",), "plugin failed", ("cuda13",), None),
+    ("580.82.07", 13000, ("cuda12",), "plugin failed", ("cuda12",), None),  # CUDA 13.0 runs cuda12 too
+    ("570.124.06", 13000, ("cuda13",), "plugin failed", ("cuda13",), None),  # 570 under cuda-compat
+    ("570.124.06", 13000, (), "none installed", (), "cuda13"),  # which installs the newer build
+    ("570.124.06", 12080, ("cuda13",), "another build runs", (), "cuda12"),  # without it: CUDA 12.8
+    ("570.124.06", 12080, ("cuda12",), "plugin failed", ("cuda12",), None),
+    ("580.82.07", 13000, (), "none installed", (), "cuda13"),
+    ("535.104.05", 11080, ("cuda12",), "no build runs", (), None),  # CUDA 11.8 runs no build of JAX
+    ("580.82.07", "error", ("cuda13",), "no driver library", (), None),  # a library that reports none
+    ("580.82.07", "unloadable", ("cuda13",), "no driver library", (), None),  # and one that won't load
 ])
 def test_a_runs_setup_reads_the_machines_driver_and_builds_and_names_the_build_that_runs(
-        tmp_path, driver, library, installed, runs, install):
+        tmp_path, driver, library, installed, reason, runs, install):
     """A run's setup (`prepare_process`) in a fresh process on a machine with an NVIDIA GPU whose JAX
     opens none reads the driver from nvidia-smi, the CUDA version from the user-mode driver library
     and the builds of JAX installed, and stops with what it found: the installed builds that run
     here, as JAX's cuda13 build starts where the user-mode driver reports CUDA 13.0 or newer (a 580
     driver's own, or a 570's under cuda-compat) and a CUDA 12.8 driver runs the cuda12 build alone,
-    and where none does, the build to install, none where no driver library reports a version."""
+    and where none does, the build to install, none where no driver library reports a version, and
+    which of the refusal's cases it chose."""
     done = subprocess.run([sys.executable, "-c", SETUP], capture_output=True, text=True,
                           env=machine(tmp_path, driver, library, installed), timeout=300)
     assert done.returncode == REFUSED, done.stderr[-2000:]
     cuda = library if isinstance(library, int) else None
-    assert json.loads(done.stdout.splitlines()[-1]) == {"cuda": cuda, "runs": list(runs), "install": install}
+    assert json.loads(done.stdout.splitlines()[-1]) == {"reason": reason, "cuda": cuda, "runs": list(runs),
+                                                        "install": install}
 
 
 ROUTED = """
@@ -214,3 +219,28 @@ def test_an_application_that_routes_dews_records_receives_them_through_its_handl
     done = subprocess.run([sys.executable, "-c", ROUTED], capture_output=True, text=True, timeout=300,
                           cwd=tests, env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path})
     assert done.returncode == 0, done.stderr[-2000:]
+
+
+STEPPED = """
+import jax
+import jax.numpy as jnp
+
+from dew.training import prepare_process
+
+prepare_process(multi_host=False)
+print(jax.devices()[0].platform, float(jax.jit(lambda x: (x * x).sum())(jnp.arange(4.0))))
+"""
+
+
+@pytest.mark.gpu(reason="the machine's own driver and JAX's own CUDA plugin")
+def test_a_runs_setup_on_a_gpu_machine_starts_the_cuda_plugin_and_steps_on_the_gpu(tmp_path):
+    """On a machine whose driver and installed build run, a run's setup in a fresh process passes
+    through the real CUDA plugin's start, with no stand-in, and the process computes on the GPU."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, (os.path.join(root, "src"),
+                                                                     os.environ.get("PYTHONPATH"))))}
+    env.pop("JAX_PLATFORMS", None)
+    done = subprocess.run([sys.executable, "-c", STEPPED], capture_output=True, text=True, env=env,
+                          timeout=300, cwd=tmp_path)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert done.stdout.split() == ["gpu", "14.0"]
