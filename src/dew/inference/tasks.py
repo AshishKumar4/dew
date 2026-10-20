@@ -34,7 +34,7 @@ from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_c
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key, token_id
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
-from dew.objectives.base import Variables, thaw
+from dew.objectives.base import UNREAD, Variables, thaw
 from dew.records import integer, record as named_fields, text as named
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping
@@ -290,7 +290,7 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
         raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
     objective = objectives[named(record['objective'], 'objective')]
     declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
-    stray = set(record) - {'objective', 'model', *declared}
+    stray = set(record) - {'objective', 'model', UNREAD, *declared}
     if stray:
         raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                          f"{sorted(stray)}")

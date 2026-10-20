@@ -43,7 +43,7 @@ from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import compensated_sum
 from dew.nn.protocols import HiddenStates, ProjectsParameters
-from dew.records import JSON
+from dew.records import JSON, strings
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -293,6 +293,25 @@ def merge(tree: Variables, overlay: Variables) -> Variables:
 
 TEACHER = "teacher"
 """The collection of a distilling objective's frozen teacher variables."""
+
+UNREAD = "unread"
+"""The field of an inference record naming the parts of the run's tree its model does not read
+(`without`), which a loader leaves unrestored (`Objective._saved_variables`): a distillation's
+teacher and projections beside the student it saves."""
+
+
+def without(tree: Variables, paths: Sequence[Sequence[str]]) -> Variables:
+    """`tree` without the subtree at each of `paths`, a path the tree does not hold left as it is."""
+    kept = dict(tree)
+    for path in paths:
+        name, *rest = path
+        if name in kept:
+            if rest:
+                held = kept[name]
+                kept[name] = without(held, [rest]) if isinstance(held, Mapping) else held
+            else:
+                del kept[name]
+    return kept
 
 FROZEN = "frozen"
 """The name of the collection where a partially trained run keeps its frozen weights.
@@ -593,8 +612,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return self.variables
 
-    counts_tokens: ClassVar[bool] = False
-    """Whether the objective supplies real token lengths for throughput telemetry."""
+    counts_tokens: bool = False
+    """Whether the objective supplies real token lengths (`real_lengths`), for throughput telemetry
+    and a run whose length is its tokens (`Trainer.fit(tokens=)`); an objective over another's
+    batches, a distillation's, counts as that one does."""
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real row (or packed-segment) lengths, read before device placement.
@@ -1103,9 +1124,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         from dew.checkpoints import Checkpoints
 
         with Checkpoints(directory) as checkpoints:
+            step = checkpoints.pinned(step)
+            record = checkpoints.artifact(step)
+            unread = record.get(UNREAD, []) if isinstance(record, Mapping) else []
+            if not isinstance(unread, list):
+                raise ValueError(f"{UNREAD} must be a list of paths")
             variables = checkpoints.variables(
                 step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
-                param_dtype=param_dtype, parameter_roots=parameter_roots)
+                param_dtype=param_dtype, parameter_roots=parameter_roots,
+                unread=tuple(strings(path, UNREAD) for path in unread))
         return cls._model_tree(variables)
 
     @classmethod

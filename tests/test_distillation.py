@@ -406,3 +406,22 @@ def test_a_saved_distillation_loads_as_its_student_and_reads_the_students_data(t
     own = objective.student.build_task(objective.student_variables(state.variables))
     prompt = np.asarray(batch[TEXT_KEY])[:1, :4]
     np.testing.assert_array_equal(task(prompt, 3, key=0).tokens, own(prompt, 3, key=0).tokens)
+    # The load restores the student alone, onto a mesh as on the host: the teacher and the
+    # projections stay unread.
+    from dew.inference import TextGeneration
+
+    for loaded in (task, TextGeneration.from_run(str(tmp_path / "run"), mesh=MeshSpec())):
+        assert jax.tree.structure(loaded.variables) == jax.tree.structure(own.variables)
+
+
+def test_a_distillation_trains_for_a_count_of_its_students_tokens():
+    """A run's length in tokens (`fit(tokens=)`) counts the student's, the batches both models
+    score: the run stops at the first step that reaches the count, as the student's own run does."""
+    arrays = fixture()
+    objective, _ = fixture_objective(arrays)
+    batch = fixture_batch(arrays)
+    tokens = int(np.sum(objective.student.real_lengths(batch)))
+    distilled = Trainer(objective, optax.sgd(0.0), key=0).fit(fixed(batch), tokens=3 * tokens, log_every=1)
+    alone = Trainer(objective.student, optax.sgd(0.0), key=0).fit(fixed(batch), tokens=3 * tokens,
+                                                                  log_every=1)
+    assert int(distilled.step) == int(alone.step) == 3
