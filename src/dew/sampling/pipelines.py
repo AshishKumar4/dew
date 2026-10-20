@@ -853,7 +853,6 @@ def _initial(rows: jax.sharding.NamedSharding | None):
     return jax.jit(initial, static_argnums=(0, 1, 2), in_shardings=(rows, None))
 
 
-@functools.cache
 def sampling_modules(model: nn.Module, guidance: Guidance | None,
                      autoencoder: AutoEncoder | None) -> tuple[nn.Module, ...]:
     """Every network a walk of `model` under `guidance` that `autoencoder` decodes runs: the
@@ -862,6 +861,7 @@ def sampling_modules(model: nn.Module, guidance: Guidance | None,
     return (model, *guidance_modules(guidance), *(() if autoencoder is None else (autoencoder.model,)))
 
 
+@functools.cache
 def _run(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
     """The walk over `rows`, compiled with the XLA `options` of its denoiser, its guidance's guide and
     its autoencoder (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never
