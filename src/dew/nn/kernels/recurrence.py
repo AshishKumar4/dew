@@ -58,14 +58,22 @@ class OutputNorm:
 class Hooks:
     """A step's static form, which enters its launch's key: the prologue's conv, the queries' and
     keys' l2 norm (and the queries' `Dk^-1/2` scale), the decay's kind ('none', 'scalar' a head,
-    'vector' a key dimension), the gates, the delta rule, a skip `D v`, and the epilogue."""
+    'vector' a key dimension), the gates, the delta rule, whether a write gate `beta` scales what the
+    token writes (always under the delta rule or the gates; without them, an input gate, else one),
+    a skip `D v`, and the epilogue."""
     conv: Conv | None = None
     l2norm: bool = False
     decay: str = 'vector'
     gates: Gates | None = None
     delta: bool = True
+    write_gate: bool = False
     skip: bool = False
     output: OutputNorm | None = None
+
+    @property
+    def gated_write(self) -> bool:
+        """Whether the step reads a write gate `beta`."""
+        return self.delta or self.write_gate or self.gates is not None
 
     def __post_init__(self):
         if self.decay not in ('none', 'scalar', 'vector'):
@@ -175,7 +183,7 @@ def _names(hooks: Hooks) -> tuple[str, ...]:
     """The `Step` operands a launch reads, in its order, after `active`; `state` last."""
     streams = ('token', 'held', 'taps') if hooks.conv is not None else ('query', 'key', 'value')
     gates = (('gate', 'beta', 'log_a', 'bias') if hooks.gates is not None
-             else ('log_decay',) * (hooks.decay != 'none') + ('beta',) * hooks.delta)
+             else ('log_decay',) * (hooks.decay != 'none') + ('beta',) * hooks.gated_write)
     return (*streams, *gates, *('skip',) * hooks.skip, *('z', 'weight') * (hooks.output is not None), 'state')
 
 
@@ -205,7 +213,8 @@ def _prologue(hooks: Hooks, given: dict, work):
         query, key, value = jnp.split(convolved, split, axis=-1)
         query, key = (x.reshape(rows, key_heads, key_width) for x in (query, key))
         value = value.reshape(rows, value_heads, value_width)
-        history = jnp.concatenate([held[:, 1:], token[:, None].astype(held.dtype)], axis=1)
+        # The history and the token, then all but the oldest: a one-tap conv holds none.
+        history = jnp.concatenate([held, token[:, None].astype(held.dtype)], axis=1)[:, 1:]
     else:
         query, key, value = (given[name].astype(work) for name in ('query', 'key', 'value'))
     if hooks.l2norm:
@@ -224,7 +233,7 @@ def _gates(hooks: Hooks, given: dict, work, key_width: int):
         beta = jax.nn.sigmoid(given['beta'].astype(work))
     else:
         g = None if hooks.decay == 'none' else given['log_decay'].astype(work)
-        beta = given['beta'].astype(work) if hooks.delta else None
+        beta = given['beta'].astype(work) if hooks.gated_write else None
     rows, heads = given['state'].shape[:2]
     if g is None:
         decay = jnp.ones((rows, heads, key_width), work)
@@ -304,7 +313,7 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
         else:
             decay = (jnp.ones((1,), jnp.float32) if hooks.decay == 'none'
                      else jnp.exp(inputs['log_decay'][...].astype(jnp.float32)))
-            write_gate = scalar('beta') if hooks.delta else jnp.ones((1,), jnp.float32)
+            write_gate = scalar('beta') if hooks.gated_write else jnp.ones((1,), jnp.float32)
         decay = jnp.broadcast_to(decay, key.shape)
         out, updated = update(state_ref[...].astype(jnp.float32), query, key, value, decay, write_gate,
                               delta=hooks.delta)
@@ -521,13 +530,34 @@ def fits(hooks: Hooks, state) -> bool:
             and all(width > 0 and width & (width - 1) == 0 for width in (dk, dv)))
 
 
+def _one_tap(hooks: Hooks, operands: Step, given: dict, dtype):
+    """`step` of a one-tap conv: its token scaled by the taps and activated in at least fp32, as the
+    launch's prologue sums one term, rounded to the token's dtype, then the launch without a conv, the
+    empty history returned as it came."""
+    token = given['token']
+    rows, (value_heads, key_width, value_width) = token.shape[0], given['state'].shape[1:]
+    key_heads = _pieces(hooks, value_heads, key_width, value_width, token.shape[-1])
+    work = jnp.promote_types(token.dtype, jnp.float32)
+    pre = token.astype(work) * given['taps'][:, 0].astype(work)
+    convolved = (pre if hooks.conv.activation is None else pre * jax.nn.sigmoid(pre)).astype(token.dtype)
+    query, key, value = jnp.split(convolved, [key_heads * key_width, 2 * key_heads * key_width], axis=-1)
+    unconvolved = dataclasses.replace(
+        operands, token=None, held=None, taps=None, query=query.reshape(rows, key_heads, key_width),
+        key=key.reshape(rows, key_heads, key_width), value=value.reshape(rows, value_heads, value_width))
+    out, _, state = step(dataclasses.replace(hooks, conv=None), unconvolved, dtype=dtype)
+    return out, given['held'], state
+
+
 def step(hooks: Hooks, operands: Step, *, dtype=None):
     """`(output [rows, Hv, Dv], history' or None, state')` of a decode token in one launch
     (`StepLaunch`), `step_reference`'s arithmetic: the output in `dtype` (the value's, or the
     token's with a conv), the history in its dtype, the state as it is held and updated in place
     where the caller lets it go. A row `active` marks False keeps its history and state, its output
-    zeros."""
+    zeros. A one-tap conv holds no history, so its token is a channel-wise scale: it is taken here
+    and the launch steps the queries, keys and values it makes."""
     given = _read(hooks, operands)
+    if hooks.conv is not None and given['held'].shape[1] == 0:
+        return _one_tap(hooks, operands, given, dtype)
     rows = given['state'].shape[0]
     flags = (jnp.ones(rows, jnp.int32) if operands.active is None
              else jnp.asarray(operands.active).astype(jnp.int32))[:, None]
