@@ -588,7 +588,8 @@ def test_a_prompt_sessions_source_is_its_data_source_and_the_metrics_report_each
     assert (metrics["source/math/reward/mean"], metrics["source/code/reward/mean"]) == (1.0, 0.0)
     assert metrics["source/math/status/completed"] == metrics["source/code/status/completed"] == 1.0
     assert metrics["reward/mean"] == 0.5
-    assert [trajectory.session for trajectory in from_verl(json.loads(json.dumps(to_verl(sessions))))] == sessions
+    exported = json.loads(json.dumps(to_verl(sessions)))
+    assert [trajectory.session for trajectory in from_verl(exported)] == sessions
 
 
 def test_the_prompt_sources_calls_carry_the_draws_routing_into_the_packed_batch():
@@ -627,10 +628,12 @@ def test_a_failed_draw_or_a_rewards_os_error_is_an_infra_error():
     drawn = PromptSource(Failing(), lambda *_: 1.0, decode=str, max_new_tokens=4)
     rollout = drawn.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
     assert rollout.status == Status.INFRA_ERROR and "engine restarted" in rollout.detail
+    # A failed draw still came from its prompt's source.
+    assert rollout.source == "math"
     scored = PromptSource(Server(), unreachable, decode=str, max_new_tokens=4)
     rollout = scored.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
     assert rollout.status == Status.INFRA_ERROR and "reward sandbox timed out" in rollout.detail
-    assert len(rollout.calls) == 1
+    assert len(rollout.calls) == 1 and rollout.source == "math"
     drawn.close()
     scored.close()
 

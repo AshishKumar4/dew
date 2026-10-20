@@ -775,13 +775,18 @@ def sampled_values(batch: Mapping[str, np.ndarray],
 def source_metrics(sessions: Sequence[Session], truncation: str = "mask") -> dict[str, float]:
     """Each source's share of its sessions per status, `source/<source>/status/<name>`, and the mean
     reward its trained sessions train on, `source/<source>/reward/mean`, for every `Session.source`
-    named, where the sessions come from more than one source."""
-    sources = sorted({session.source for session in sessions})
-    if len(sources) < 2:
+    named, where the sessions come from more than one source (sessions naming none count as one).
+    A source is a prompt's `data_source`, so two mixture members sharing one report together,
+    and sessions whose tasks name none (an environment's, a harness's) report under no source."""
+    by_source: dict[str, list[Session]] = {}
+    for session in sessions:
+        by_source.setdefault(session.source, []).append(session)
+    if len(by_source) < 2:
         return {}
     metrics: dict[str, float] = {}
-    for source in filter(None, sources):
-        mine = [session for session in sessions if session.source == source]
+    for source, mine in sorted(by_source.items()):
+        if not source:
+            continue
         for status in Status:
             metrics[f"source/{source}/status/{status.value}"] = (
                 sum(session.status == status for session in mine) / len(mine))
