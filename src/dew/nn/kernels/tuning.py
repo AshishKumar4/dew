@@ -216,12 +216,16 @@ def _located(name: str) -> type:
     module, _, qualified = name.partition(":")
     try:
         found: object = importlib.import_module(module)
-        for part in qualified.split("."):
-            found = getattr(found, part)
-    except (ImportError, AttributeError) as error:
-        raise Unreadable(f"this checkout has no {name}") from error
+    except ModuleNotFoundError as error:
+        # The named module or a parent of it is absent; a module that fails to import otherwise, or
+        # imports something else that is absent, is this checkout's error and propagates.
+        if error.name is None or not (module == error.name or module.startswith(error.name + ".")):
+            raise
+        raise Unreadable(f"this checkout has no module {module}") from error
+    for part in qualified.split("."):
+        found = vars(found).get(part)
     if not isinstance(found, type):
-        raise Unreadable(f"{name} names no class")
+        raise Unreadable(f"this checkout has no class {name}")
     return found
 
 
