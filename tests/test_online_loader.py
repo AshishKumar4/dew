@@ -1,6 +1,12 @@
 """URL fetches use the ordinary pipeline worker and rejection paths."""
 
+import contextlib
+import gzip
+import hashlib
+import http.server
 import itertools
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -60,19 +66,90 @@ def test_fetch_preserves_the_catalog_and_reads_exact_bytes(tmp_path):
     assert row["bytes"] == b"source bytes" and row["caption"] == "the record"
 
 
-def test_a_catalog_fetches_from_any_store_fsspec_reads():
-    """A url of an object store, not only of a web server or a local file, fetches its object's
-    bytes: the fetch reads every url through the store fsspec names for it."""
-    from uuid import uuid4
+@contextlib.contextmanager
+def serving(handle):
+    """A local HTTP server answering each GET with `handle(request)`, and its address."""
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            handle(self)
 
-    import fsspec
+        def log_message(self, *arguments):
+            pass
 
-    url = f"memory://fetch-{uuid4().hex}/payload"
-    with fsspec.open(url, "wb") as file:
-        file.write(b"stored bytes")
-    row = Fetch()({"url": url, "caption": "the record"})
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_fetch_follows_a_redirect_and_keeps_the_bytes_the_server_sent():
+    """A fetch follows its server's redirect and keeps the body as sent, compressed bytes and
+    all: its digest names those bytes, and its size limit counts them, not their inflation."""
+    body = gzip.compress(b"x" * 4096)
+
+    def handle(request):
+        if request.path == "/moved":
+            request.send_response(302)
+            request.send_header("Location", "/object")
+            request.end_headers()
+            return
+        request.send_response(200)
+        request.send_header("Content-Encoding", "gzip")
+        request.send_header("Content-Length", str(len(body)))
+        request.end_headers()
+        request.wfile.write(body)
+
+    with serving(handle) as address:
+        row = Fetch(max_bytes=len(body))({"url": f"http://{address}/moved"})
     assert not isinstance(row, Rejected)
-    assert row["bytes"] == b"stored bytes" and row["caption"] == "the record"
+    assert row["bytes"] == body and row["content_sha256"] == hashlib.sha256(body).hexdigest()
+
+
+def test_a_fetch_reaches_a_host_its_environment_excludes_from_its_proxy(monkeypatch):
+    """A host and port the environment excludes from its proxy (NO_PROXY) is fetched directly,
+    though a proxy is named for its scheme: the proxy never sees the request."""
+    proxied = []
+
+    def proxy(request):
+        proxied.append(request.path)
+        request.send_response(502)
+        request.end_headers()
+
+    def origin(request):
+        request.send_response(200)
+        request.send_header("Content-Length", "6")
+        request.end_headers()
+        request.wfile.write(b"direct")
+
+    with serving(proxy) as relay, serving(origin) as address:
+        monkeypatch.setenv("http_proxy", f"http://{relay}")
+        monkeypatch.setenv("no_proxy", address)
+        row = Fetch()({"url": f"http://{address}/object"})
+    assert not isinstance(row, Rejected) and row["bytes"] == b"direct" and proxied == []
+
+
+def test_a_fetch_ends_at_its_timeout_however_long():
+    """A fetch's timeout ends it when it passes, at five seconds and over as below: a body that
+    would finish half a second later is dropped as transient by then."""
+    def handle(request):
+        request.send_response(200)
+        request.send_header("Content-Length", "11")
+        request.end_headers()
+        for _ in range(11):
+            request.wfile.write(b"x")
+            request.wfile.flush()
+            time.sleep(0.5)
+
+    with serving(handle) as address:
+        began = time.monotonic()
+        fetched = Fetch(timeout=5.0)({"url": f"http://{address}/"})
+        waited = time.monotonic() - began
+    assert isinstance(fetched, Rejected) and not fetched.permanent
+    assert waited < 5.4
 
 
 def test_failed_fetches_are_counted_before_batches(tmp_path):
