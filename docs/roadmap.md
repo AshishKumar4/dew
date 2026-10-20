@@ -105,7 +105,6 @@ The kernel direction was approved on 2026-10-19:
 - Let `from_grain` and `from_iter` work without undocumented names, and `Memory` read a DataFrame directly. [808, 809]
 - Add presets for prompts, preferences and chat canvases, which the run layer's recipes cover today. [810]
 - Rule on the nine public Dataset members the spec does not name: then, chain, map_with_index, slice, windows, token_split, rebatch, limit and iterate. [811]
-- Chunk a long chat conversation and keep an overlong prompt's tail by default, as the spec says, and carry a row's `ability` into its record's extra_info. [812, 813, 814]
 - Teach only names main has in the post-training and inference docs. [815]
 - Build the data design's remaining contracts: uniform stage errors; a pre-read refusal of a missing artifact; slot maxima shared with `fit`'s separately compiled validation chains; per-member committed-token logging; RL prompt tail cuts counted as truncations; volatility read on every stage kind; and the reader's cache report. [design/data.md]
 
@@ -126,10 +125,6 @@ The kernel direction was approved on 2026-10-19:
 - Match PNDM's multistep grouping and startup steps against Diffusers before remeasuring its parity margin. [647]
 - Find the tiled chunked head's residual: at token tile 2, about 40 of 8192 head-gradient elements sit more than twice as far from float64 as the whole-logits reference; at tile 20 there are none. [737]
 - Compile a step lowered by `Trainer(lower_for=)` before allocating training time, carry its executable and tuning picks to the run, and measure the saved startup time. Lowering alone already works. [720]
-- One sampling-module inventory for objective evaluation and TextToImage, so quantized guidance and autoencoders get their compiler options. [774]
-- Restore a distilled student without its teacher, and count its tokens as the student's. [775, 776]
-- Let rCM accumulate, its phase read from the update clock. [778]
-- Index a sweep's grid lazily. [781]
 - Build the training design's remaining contracts: refusing a split leaf that declares no axes, `Layout.validate(mesh)`'s placement report, a token budget ending at the commit that reaches it, and kernel choices in a run's report. [design/training.md]
 
 ## RL and serving
@@ -185,7 +180,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Reconcile requested capabilities with implementation and qualification evidence, and audit upstream reproductions and fixes. [224, 306]
 - The float64 gate is the owner's (2026-10-20): each leaf's RMS error within 1.5× the reference's and its worst row within ROW_FACTOR of the reference's, on the same inputs, with no floor; every element within a certified roundoff bound for its own operation on common native inputs (faithful rounding for pointwise steps, a bound for each sum, native probes at opaque kernels), behind one assertion, `assert_as_exact`. [560, 649, 719, 793, 827]
 - Every accuracy comparison in the tests and tools goes through that assertion; the files that still compare within a tolerance are an inventory that only shrinks, empty by 2026-11-27. [650, 668, 669, 670, 676, 682, 705, 712]
-- Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients, distillation's cosine and L2 losses, and Z-Image's padded flow. [833, 836, 837]
+- Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients and Z-Image's padded flow. [833, 837]
 - Replace test-policy violations with observable lifecycle and reference behavior:
 
   - Training, sampling and objectives: [651, 652, 653, 654, 657, 658, 663, 667, 679, 680, 686, 687, 688, 692, 695, 698, 701, 702, 707, 708].
