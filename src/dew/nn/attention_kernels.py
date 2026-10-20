@@ -399,11 +399,11 @@ kernel (`decode_attention.attend`) and the folded xla attention (`folded_attenti
 def decodes(case: AttentionCase) -> bool:
     """Whether a call is the decode selector's (`DECODE`): a few query positions of the keys' own heads
     over key lengths, one the folded attention reads (`decode_geometry.folds`), with no mask, bias,
-    causality, window, documents, sinks or softcap."""
+    causality, window or documents; sinks and a softcap the decode kernel applies itself."""
     return (case.lengths and case.folds and case.queries <= decode_attention.QUERIES
             and case.heads == case.kv_heads
-            and not (case.mask or case.bias or case.causal or case.sinks) and case.window is None
-            and case.documents is None and case.softcap is None)
+            and not (case.mask or case.bias or case.causal) and case.window is None
+            and case.documents is None)
 
 
 def kernel_refusals(op: Op[AttentionCase], kernel: str, case: AttentionCase) -> list[Refusal]:

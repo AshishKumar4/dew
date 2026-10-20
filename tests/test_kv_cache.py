@@ -26,7 +26,7 @@ from dew.nn.kv_cache import (
     _gather_pages,
     _gathered_attention,
     _gathered_tangent,
-    _gpu_paged,
+    gpu_paged,
     hadamard,
     overflowed,
     quantize,
@@ -157,10 +157,11 @@ def test_a_quantized_read_is_the_rotated_write_within_the_formats_rounding(quant
 
 @pytest.mark.gpu(reason="the paged BF16 decode kernel needs CUDA sm80+")
 @pytest.mark.skipif(not bf16_dot_runs(), reason="the paged BF16 decode kernel needs CUDA sm80+")
+@pytest.mark.parametrize("softcap", [None, 0.5], ids=["plain", "softcap"])
 @pytest.mark.parametrize("width", [64, 256])
 @pytest.mark.parametrize("windowed", [False, True], ids=["prefix", "window"])
 def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(without_deterministic_ops, width,
-                                                                             windowed):
+                                                                             windowed, softcap):
     """Over reordered and shared pages and distinct key counts, from each
     row's first key under a window where `windowed`, the Pallas
     kernel's value is as exact as the gathered attention's through the
@@ -176,14 +177,14 @@ def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(with
     starts = (jnp.asarray([5, 17], jnp.int32),) if windowed else ()
 
     def old(q, k, v):
-        return _gathered_attention(q, k, v, table, lengths, *starts)
+        return _gathered_attention(q, k, v, table, lengths, *starts, softcap=softcap)
 
     def loss(function, q, k, v):
         out = function(q, k, v)
         return jnp.sum(out.astype(jnp.float32) ** 2), out
 
     def native(q, k, v):
-        return _gpu_paged(q, k, v, table, lengths, *starts)
+        return gpu_paged(softcap)(q, k, v, table, lengths, *starts)
     (_, out), gradients = jax.jit(jax.value_and_grad(lambda q, k, v: loss(native, q, k, v),
                                                      argnums=(0, 1, 2), has_aux=True))(q, k, v)
     (_, prior), previous = jax.jit(jax.value_and_grad(lambda q, k, v: loss(old, q, k, v),
@@ -193,15 +194,15 @@ def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(with
     direction = jax.random.normal(jax.random.key(6), q.shape, jnp.bfloat16)
     np.testing.assert_array_equal(
         jax.jit(lambda q: jax.jvp(lambda q: native(q, k, v), (q,), (direction,))[1])(q),
-        jax.jit(lambda q: jax.jvp(lambda q: _gathered_tangent(q, k, v, table, lengths, *starts), (q,),
-                                  (direction,))[1])(q))
+        jax.jit(lambda q: jax.jvp(lambda q: _gathered_tangent(q, k, v, table, lengths, *starts,
+                                                              softcap=softcap), (q,), (direction,))[1])(q))
 
     with jax.enable_x64():
         def reference(q, k, v):
             return scaled_dot_product_attention(
                 q[:, None], _gather_pages(k, table, 1), _gather_pages(v, table, 1),
                 implementation="reference", key_value_seq_lengths=lengths,
-                key_value_seq_starts=starts[0] if starts else None,
+                key_value_seq_starts=starts[0] if starts else None, softcap=softcap,
                 precision=jax.lax.Precision.HIGHEST, force_fp32_for_softmax=False)[:, 0]
 
         def reference_loss(q, k, v):
@@ -330,7 +331,7 @@ def paged_case(**changed):
 
 @pytest.mark.parametrize("changed, kernel, code", [
     ({}, "triton", None),
-    ({"softcap": 30.0}, "gathered", "softcap"),
+    ({"softcap": 30.0}, "triton", None),
     ({"quantized": True}, "gathered", "quantized"),
     ({"groups": 2}, "gathered", "groups"),
     ({"pool": jnp.dtype(jnp.float32), "dtype": jnp.dtype(jnp.float32)}, "gathered", "dtype"),
@@ -347,9 +348,8 @@ def test_the_paged_selector_reads_a_gpu_steps_pool_through_its_kernel_where_its_
         changed, kernel, code):
     """On an A100 (`generation.assumed`), a decode step over a paged pool takes Dew's paged kernel where
     every requirement holds (`kv_cache.PAGED`), else the gathered rows through the layer's attention,
-    reporting the requirement that turned it down; a softcap the GPU kernel does not apply is one, where
-    the step used to reach the kernel and raise. A layer naming xla takes the gathered rows by its
-    choice, no refusal."""
+    reporting the requirement that turned it down; a softcap the kernel applies itself. A layer naming
+    xla takes the gathered rows by its choice, no refusal."""
     from dew.nn.kernels.generation import assumed, routes
     from dew.nn.kernels.selection import select
     from dew.nn.kv_cache import PAGED
@@ -376,9 +376,10 @@ def test_a_windowed_step_reads_its_pool_through_the_gpus_kernel_and_the_tpus_gat
     assert route.refusal.code == "windowed"
 
 
-def test_a_tpu_steps_paged_pool_takes_its_kernel_with_a_softcap_the_gpus_turns_down():
-    """On a TPU (`generation.assumed('v6e')`) the paged attention kernel applies the softcap itself, so a
-    softcapped step reads its pool there; the GPU's selection of the same step takes the gathered rows."""
+def test_a_softcapped_steps_paged_pool_takes_each_devices_kernel():
+    """The TPU's paged attention kernel (`generation.assumed('v6e')`) and the GPU's
+    (`generation.assumed('sm80')`) each apply a softcap themselves, so a softcapped step reads its
+    pool through its device's kernel."""
     from dew.nn.kernels.generation import assumed
     from dew.nn.kernels.selection import select
     from dew.nn.kv_cache import PAGED
@@ -386,7 +387,7 @@ def test_a_tpu_steps_paged_pool_takes_its_kernel_with_a_softcap_the_gpus_turns_d
     with assumed("v6e"):
         assert select(PAGED, paged_case(softcap=30.0)).kernel == "tpu"
     with assumed("sm80"):
-        assert select(PAGED, paged_case(softcap=30.0)).kernel == "gathered"
+        assert select(PAGED, paged_case(softcap=30.0)).kernel == "triton"
 
 
 @pytest.mark.gpu(reason="the paged BF16 decode kernel needs CUDA sm80+")

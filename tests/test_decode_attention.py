@@ -145,6 +145,67 @@ def test_the_decode_kernel_reads_each_row_to_its_length_at_every_config(dtype, w
                                          f"decode kernel, {config}")
 
 
+SINKS = (0.5, -1.0)
+"""Two heads' sink logits, one above the rows' logits' scale and one below."""
+SOFTCAP = 0.5
+"""A softcap near the scaled logits' spread, where `tanh` bends them."""
+
+
+@pytest.mark.parametrize("hooks", [{"sinks": True}, {"softcap": True}, {"sinks": True, "softcap": True}],
+                         ids=["sinks", "softcap", "both"])
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, hooks):
+    """Sinks (one value-free logit a head in each row's softmax) and a logit softcap
+    (`cap · tanh(logit / cap)`) inside the decode kernel: each row read to its length at each config of
+    its space, the sink carried by the first slice alone so the combine counts it once, and within
+    tests/reference_error.py's rule of the reference path's attention over the same keys, which
+    computes both, against float64. The idle row of one key keeps its sink's share. The dispatch
+    takes such a call to the decode kernel where it runs (`decodes`)."""
+    from tuned import each_config
+
+    from dew.nn.attention import reference_attention
+    from dew.nn.attention_kernels import decodes
+    from dew.nn.kernels import decode_attention, tuning
+
+    arrays, _ = dense_case(dtype)
+    query, key, value, lengths = arrays
+    sinks = jnp.asarray(SINKS, jnp.float32) if hooks.get("sinks") else None
+    softcap = SOFTCAP if hooks.get("softcap") else None
+    case = attention_case(query, key, key_value_seq_lengths=lengths, sinks=sinks, softcap=softcap)
+    assert decodes(case)
+    if ON_GPU:
+        assert kernel_refusals(DECODE, "decode", case) == []
+    read = spanned(jnp.zeros_like(lengths), lengths, key.shape[1])
+    q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
+    logits = np.einsum('btnd,bsnd->bnts', q, k) / 16.0
+    logits = np.where(read, logits if softcap is None else softcap * np.tanh(logits / softcap), -np.inf)
+    peak = logits.max(-1, keepdims=True)
+    if sinks is not None:
+        peak = np.maximum(peak, np.asarray(sinks, np.float64)[None, :, None, None])
+    weights = np.exp(logits - peak)
+    total = weights.sum(-1, keepdims=True)
+    if sinks is not None:
+        total = total + np.exp(np.asarray(sinks, np.float64)[None, :, None, None] - peak)
+    truth = np.einsum('bnts,bsnd->btnd', weights / total, v)
+    with jax.default_matmul_precision("float32"):
+        plain = reference_attention(query, key, value, mask=jnp.asarray(read), sinks=sinks, softcap=softcap)
+
+    def attend(query, key, value, lengths):
+        return decode_attention.attend(query, key, value, lengths, softcap=softcap, sinks=sinks,
+                                       interpret=not ON_GPU)
+
+    with on_the_gpu():
+        found = each_config(decode_attention.DecodeAttention, attend, *arrays)
+    assert len(found) > 1
+    for config in found:
+        pin = tuning.pinned({decode_attention.DecodeAttention: config})
+        with on_the_gpu(), pin, jax.default_matmul_precision("default"):
+            out = jax.jit(attend)(*arrays)
+        assert out.shape == plain.shape and out.dtype == plain.dtype
+        assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
+                                         f"decode kernel with {sorted(hooks)}, {config}")
+
+
 def test_the_decode_kernels_launches_are_the_tuners():
     """The dense and paged kernels' launches, traced as the tuner reads a program, are its ops, each
     timed with every row reading its whole capacity (`KernelOp.operands`): the dense spans the

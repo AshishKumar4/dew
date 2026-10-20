@@ -496,7 +496,7 @@ class KVStore:
 
         def local(query, key, value, lengths, table, *starts):
             if backend() == "gpu":
-                return _gpu_paged(query, key, value, table, lengths, *starts)
+                return gpu_paged(softcap)(query, key, value, table, lengths, *starts)
             from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
 
             scaled = query * jnp.asarray(1.0 / math.sqrt(self.head_dim), query.dtype)
@@ -576,12 +576,9 @@ TRITON_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
                 "the paged decode kernel needs a GPU of sm80 or later", inherent=True),
     *_paged_layout('GPU'),
     decode_attention.PAGED_GEOMETRY,
-    Requirement('softcap', lambda case: case.softcap is None,
-                "the GPU paged decode kernel applies no logit softcap",
-                row='roadmap: paged decode softcap on GPU'),
 )
 """Dew's Pallas paged decode kernel (`decode_attention.attend_paged`). Its derivatives at every order
-are the gathered attention's, through the attention dispatch (`_gpu_paged`), so neither a backward's
+are the gathered attention's, through the attention dispatch (`gpu_paged`), so neither a backward's
 kernel nor forward mode limits it."""
 
 TPU_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
@@ -632,43 +629,49 @@ def _gather_pages(pool: jax.Array, table: jax.Array, groups: int) -> jax.Array:
                                      table.shape[1] * pool.shape[2], *pool.shape[3:]), 0, 2)
 
 
-def _gathered_attention(query, key, value, table, lengths, *starts):
+def _gathered_attention(query, key, value, table, lengths, *starts, softcap=None):
     """The paged kernel's arithmetic over the gathered rows, through the attention dispatch: one query a
-    row over the first `lengths` keys of its pages, from its `starts` where a window gives them. An
-    inactive row reads one slot. Its backward is the paged kernel's (`_paged_backward`)."""
+    row over the first `lengths` keys of its pages, from its `starts` where a window gives them, its
+    scaled logits bounded by `softcap` where given. An inactive row reads one slot. Its backward is the
+    paged kernel's (`_paged_backward`)."""
     from dew.nn.attention import scaled_dot_product_attention
 
     keys, values = _gather_pages(key, table, 1), _gather_pages(value, table, 1)
-    return scaled_dot_product_attention(query[:, None], keys, values,
+    return scaled_dot_product_attention(query[:, None], keys, values, softcap=softcap,
                                         key_value_seq_lengths=jnp.maximum(lengths, 1),
                                         key_value_seq_starts=starts[0] if starts else None)[:, 0]
 
 
-def _gathered_tangent(query, key, value, table, lengths, *starts):
+def _gathered_tangent(query, key, value, table, lengths, *starts, softcap=None):
     """`_gathered_attention` traced for forward mode (`forward_mode_attention`): a fused kernel the
     dispatch takes keeps its value and takes its tangent from the reference path's, so `jax.jvp`
     differentiates it at every order, which a reverse-only fused kernel would not."""
     from dew.nn.attention import forward_mode_attention
 
     with forward_mode_attention():
-        return _gathered_attention(query, key, value, table, lengths, *starts)
+        return _gathered_attention(query, key, value, table, lengths, *starts, softcap=softcap)
 
 
-def _paged_forward(query, key, value, table, lengths, *starts):
-    return decode_attention.attend_paged(query, key, value, table, jnp.maximum(lengths, 1), *starts), ()
+def _paged_forward(query, key, value, table, lengths, *starts, softcap=None):
+    return decode_attention.attend_paged(query, key, value, table, jnp.maximum(lengths, 1), *starts,
+                                         softcap=softcap), ()
 
 
-def _paged_backward(saved, operands, cotangent):
-    return jax.vjp(_gathered_attention, *operands)[1](cotangent)
+def _paged_backward(saved, operands, cotangent, *, softcap=None):
+    return jax.vjp(functools.partial(_gathered_attention, softcap=softcap), *operands)[1](cotangent)
 
 
-_gpu_paged = generation.linear_tangent(_paged_forward, _paged_backward, _gathered_tangent)
-"""Dew's Pallas decode kernel over the pages (`decode_attention.attend_paged`), its derivatives at
-every order the gathered attention's (`generation.linear_tangent`): reverse mode runs the backward of
-whichever kernel the dispatch takes for it (`_gathered_attention`), a call cuDNN's width and
-determinism limits turn down included, and forward mode takes the forward-mode path's tangent
-(`_gathered_tangent`), with no context of the caller's. An inactive row reads one slot, so its unused
-output stays finite."""
+@functools.cache
+def gpu_paged(softcap: float | None):
+    """Dew's Pallas decode kernel over the pages (`decode_attention.attend_paged`) under the layer's
+    `softcap`, its derivatives at every order the gathered attention's (`generation.linear_tangent`):
+    reverse mode runs the backward of whichever kernel the dispatch takes for it
+    (`_gathered_attention`), a call cuDNN's width and determinism limits turn down included, and forward
+    mode takes the forward-mode path's tangent (`_gathered_tangent`), with no context of the caller's.
+    An inactive row reads one slot, so its unused output stays finite."""
+    return generation.linear_tangent(functools.partial(_paged_forward, softcap=softcap),
+                                     functools.partial(_paged_backward, softcap=softcap),
+                                     functools.partial(_gathered_tangent, softcap=softcap))
 
 
 def _pages_per_block(pages: int) -> int:

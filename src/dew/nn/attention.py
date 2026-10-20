@@ -1397,16 +1397,21 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
 
         def decoded(query, key, value):
             # A Pallas call has no partitioning rule: each shard decodes its own rows and heads.
-            def attend(query, key, value, lengths, starts=None):
-                return decode_attention.attend(query, key, value, lengths, starts)
+            def attend(query, key, value, lengths, starts=None, sinks=None):
+                return decode_attention.attend(query, key, value, lengths, starts, softcap=softcap,
+                                               sinks=sinks)
 
             rows = ("activation_batch",)
             return _per_shard(attend, query, key, value, lengths=(key_value_seq_lengths, rows),
-                              starts=(starts, rows))
+                              starts=(starts, rows), sinks=(sinks, ("activation_heads",)))
 
         def folded(query, key, value):
-            return folded_attention(query, key, value, with_key_starts(
-                with_key_lengths(None, key_value_seq_lengths, key.shape[-3]), starts, key.shape[-3]))
+            visible = with_key_starts(with_key_lengths(None, key_value_seq_lengths, key.shape[-3]), starts,
+                                      key.shape[-3])
+            if sinks is None and softcap is None:
+                return folded_attention(query, key, value, visible)
+            # The folded form has neither; the reference path computes both over the same keys.
+            return reference_attention(query, key, value, mask=visible, sinks=sinks, softcap=softcap)
 
         # The kernel has no derivative, so both modes differentiate the folded attention it stands in for.
         out = forward_differentiable(decoded, folded, query, key, value)
