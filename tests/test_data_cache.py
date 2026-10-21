@@ -751,14 +751,14 @@ def test_a_prompt_recipe_with_a_cache_reads_by_index_the_prompts_it_reads_uncach
     holds what is left of each input, so its default order is a window over the rows it reads,
     and an epoch reads the prompts the uncached recipe's epoch reads."""
     from dew.config.data import PromptData, loader
-    from dew.data.dataset import DataPartition
+    from dew.data.dataset import DataPartition, Loading
 
     # A third of the prompts are longer than 8 bytes, which the recipe drops: four batches an epoch.
     recipe = PromptData(tuple({"prompt": "hi " * (1 + index % 3)} for index in range(12)), "byte",
                         max_prompt_len=8, long="drop", reward_bytes=8)
-    # The recipe reads in worker processes, which read a cache on disk.
-    cached = loader(recipe, batch=2, cache=str(tmp_path / "cache"), read="indexed")
-    uncached = loader(recipe, batch=2, read="indexed")
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    cached = loader(recipe, batch=2, cache=str(tmp_path / "cache"), read="indexed", loading=loading)
+    uncached = loader(recipe, batch=2, read="indexed", loading=loading)
     assert cached.records == uncached.records
     first, second = cached.train(DataPartition()), uncached.train(DataPartition())
     try:
