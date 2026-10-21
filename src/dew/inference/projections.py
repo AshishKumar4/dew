@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.core import unfreeze
+from jax.sharding import SingleDeviceSharding
 
 from dew.nn.kernels.options import QuantizedClass
 from dew.nn.protocols import ProjectionGroup, Serving
@@ -147,10 +148,54 @@ def pack_projections(variables: Variables, groups: Sequence[ProjectionGroup]) ->
     return _joined(variables, groups)
 
 
-def _joined(variables: Variables, groups: Sequence[ProjectionGroup]) -> Variables:
-    """`variables` with each of `groups`, unpacked, concatenated into its packed projection and its
-    members' input quantization moved to it: array operations alone, so a compiled call can run
-    them (`packed_in_call`) once `pack_projections` or `pending` has checked the groups."""
+type _Array = jax.Array | np.ndarray
+
+
+def _concatenated(leaves: Sequence[_Array]) -> _Array:
+    """`leaves` concatenated on their last axis where they are: a compiled call's arrays in it, host
+    arrays on the host."""
+    if isinstance(leaves[0], np.ndarray):
+        return np.concatenate([np.asarray(leaf) for leaf in leaves], axis=-1)
+    return jnp.concatenate(leaves, axis=-1)
+
+
+def _handed_over(leaves: Sequence[_Array]) -> _Array:
+    """`leaves`, members their caller gives up, concatenated on their last axis through the host:
+    each process reads its devices' shards of every member (one read for each distinct shard),
+    frees the members' device buffers, and places each packed shard on its device, in the members'
+    memory space. The devices never hold a member and the packed leaf at once, and the packed shard
+    takes the space its members freed, where concatenating on the device left the allocator holding
+    0.15 GiB the arrays did not on an A100 for Qwen3-0.6B (IG818-routes-ab-2). The members share one
+    placement that leaves their last axis whole (`_placed_alike`), so each packed shard is its
+    members' shards side by side. Host leaves concatenate on the host."""
+    first = leaves[0]
+    if not isinstance(first, jax.Array):
+        return _concatenated(leaves)
+    sharding = first.sharding
+    shards = [{shard.device: shard for shard in leaf.addressable_shards}
+              for leaf in leaves if isinstance(leaf, jax.Array)]
+    read: dict[tuple[tuple[int | None, ...], ...], np.ndarray] = {}
+    placed = {}
+    for device, shard in shards[0].items():
+        index = tuple((part.start, part.stop, part.step) for part in shard.index)
+        if index not in read:
+            read[index] = np.concatenate([np.asarray(member[device].data) for member in shards], axis=-1)
+        placed[device] = read[index]
+    for leaf in leaves:
+        if isinstance(leaf, jax.Array):
+            leaf.delete()
+    shape = (*first.shape[:-1], sum(np.shape(leaf)[-1] for leaf in leaves))
+    return jax.make_array_from_single_device_arrays(shape, sharding, [
+        jax.device_put(columns, SingleDeviceSharding(device, memory_kind=sharding.memory_kind))
+        for device, columns in placed.items()])
+
+
+def _joined(variables: Variables, groups: Sequence[ProjectionGroup],
+            join: Callable[[Sequence[_Array]], _Array] = _concatenated) -> Variables:
+    """`variables` with each of `groups`, unpacked, joined into its packed projection by `join` and
+    its members' input quantization moved to it: array operations alone by default, so a compiled
+    call can run them (`packed_in_call`) once `pack_projections` or `pending` has checked the
+    groups."""
     if not groups:
         return variables
     packed = unfreeze(dict(variables))
@@ -158,11 +203,8 @@ def _joined(variables: Variables, groups: Sequence[ProjectionGroup]) -> Variable
         node = packed["params"]
         for part in group.path:
             node = node[part]
-        def joined(field, node=node, projections=group.members):
-            leaves = [node[projection][field] for projection in projections]
-            concatenate = np.concatenate if isinstance(leaves[0], np.ndarray) else jnp.concatenate
-            return concatenate(leaves, axis=-1)
-        node[group.packed] = {field: joined(field) for field in node[group.members[0]]}
+        node[group.packed] = {field: join([node[projection][field] for projection in group.members])
+                              for field in node[group.members[0]]}
         for projection in group.members:
             del node[projection]
         quantized = _node(packed, QUANTIZATION, group.path)
@@ -193,24 +235,10 @@ def packed_in_call(variables: Variables, groups: Sequence[ProjectionGroup]) -> V
 
 def packed_owned(model: nn.Module, variables: Variables) -> Variables:
     """`variables`, a tree its caller owns and gives up (a source's or a saved run's placed
-    weights), with its groups packed one at a time: each packed kernel and bias kept where its
-    members were (`_placed_alike`), and the members' buffers deleted once it is written, so the
-    devices hold one copy of the weights and one group's more at most. A host tree packs on the
-    host."""
-    for group in pending(model, variables):
-        held = _node(variables, "params", group.path)
-        members = [held[name] for name in group.members]
-        variables = _joined(variables, [group])
-        node = _node(variables, "params", group.path)
-        node[group.packed] = {field: leaf if isinstance(leaf, np.ndarray)
-                              else jax.device_put(leaf, members[0][field].sharding)
-                              for field, leaf in node[group.packed].items()}
-        jax.block_until_ready([leaf for leaf in node[group.packed].values() if isinstance(leaf, jax.Array)])
-        for member in members:
-            for leaf in member.values():
-                if isinstance(leaf, jax.Array):
-                    leaf.delete()
-    return variables
+    weights), with its groups packed one at a time through the host (`_handed_over`): each packed
+    kernel and bias placed where its members were (`_placed_alike`), the members' buffers freed
+    first, so the devices hold one copy of the weights throughout. A host tree packs on the host."""
+    return _joined(variables, pending(model, variables), _handed_over)
 
 
 def _held_packed(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
