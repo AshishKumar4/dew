@@ -56,7 +56,7 @@ class Cost:
 
 def seconds(cost: Cost, target: generation.GpuTarget) -> float:
     """The seconds `cost`'s launch is estimated to take on `target` (the module's docstring)."""
-    facts = _facts(target)
+    facts = generation.effective(target)
     multiprocessors, clock, bandwidth = facts.multiprocessors, facts.clock_hz, facts.memory_bandwidth
     rate = facts.tensor_rate(cost.mode) if cost.program_flops else 1.0
     if multiprocessors is None or clock is None or bandwidth is None or rate is None:
@@ -69,9 +69,3 @@ def seconds(cost: Cost, target: generation.GpuTarget) -> float:
                   cost.program_staged / (SHARED_BYTES_PER_CLOCK * clock),
                   cost.program_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
     return max(math.ceil(cost.programs / multiprocessors) * program, cost.device_bytes / bandwidth)
-
-
-def _facts(target: generation.GpuTarget) -> generation.GpuTarget:
-    """The target whose facts a launch on `target` is costed by: its own on a GPU, and the A100's on a
-    CPU, which interprets the kernels as an A100's block (`generation.shared_budget`)."""
-    return target if generation.capability(target.generation) is not None else generation.TARGETS['sm80']
