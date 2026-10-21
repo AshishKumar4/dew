@@ -314,7 +314,8 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
         ci, tmp_path, monkeypatch, cache_worker):
     """The GPU lane runs each file once, in a process of its own. A file no
     run has measured runs alone with the lane's whole share, and so does one
-    that started a process it did not follow; files with a measured peak run
+    that started a process it did not follow, its pool growing as it uses it
+    so that child has the rest of the share; files with a measured peak run
     side by side, each with its peak and headroom, and one whose child took
     its share's fraction holds a share more beside them (`gpu_needs`). A red
     row stays red: nothing is run again. The rows join one verdict, each
@@ -336,8 +337,9 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
               "    began = time.monotonic()\n"
               "    time.sleep(1)\n"
               "    share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
+              "    grown = os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE', 'true')\n"
               "    ran = Path(f'ran-{Path(__file__).stem}-{os.getpid()}')\n"
-              "    ran.write_text(f'{share} {began} {time.monotonic()}')\n")
+              "    ran.write_text(f'{share} {began} {time.monotonic()} {grown}')\n")
     names = [f"tests/test_file_{index}.py" for index in range(5)]
     for name in names:
         (tmp_path / name).write_text(source)
@@ -356,7 +358,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
                                                             key=lambda path: path.stat().st_mtime)]
 
     def overlapping(runs: list[list[str]]) -> int:
-        spans = [(float(began), float(ended)) for _, began, ended in runs]
+        spans = [(float(began), float(ended)) for _, began, ended, _ in runs]
         return max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
 
     out = tmp_path / "verdict.json"
@@ -366,6 +368,9 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
         (f"3.12:{name}", int(name == "tests/test_red.py")) for name in every]
     first = [run for name in every for run in ran(Path(name).stem)]
     assert [share for share, *_ in first] == ["0.5"] * len(every), "unmeasured: each alone, the whole share"
+    # Alone with the whole share, a file grows its pool as it uses it: a child it did not follow, another
+    # environment's Python, has what the file leaves of the share.
+    assert [grown for *_, grown in first] == ["false"] * len(every)
     assert overlapping(first) == 1
     assert len(ran("test_red")) == 1, "a red row stays red: its file is not run again"
     # Measured peaks of 4 GiB: each file then holds 6 GiB of the 40, and four run at once. Records without
@@ -381,6 +386,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert [row["exitCode"] for row in rows] == [int(name == "tests/test_red.py") for name in every]
     measured = [ran(Path(name).stem)[-1] for name in names]
     assert [share for share, *_ in measured] == [str(6 * 2 ** 30 / (81920 * 2 ** 20))] * len(names)
+    assert [grown for *_, grown in measured] == ["true"] * len(names), "a measured share is taken whole"
     assert 2 <= overlapping(measured) <= 4
     assert [share for share, *_ in ran("test_spawner")] == ["0.5", measured[0][0]]
     assert overlapping([*measured, ran("test_spawner")[-1]]) >= 2, "a followed spawner packs with the rest"
