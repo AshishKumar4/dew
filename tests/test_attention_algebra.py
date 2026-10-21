@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference
 from test_attention_template import CASES, ROWS, arguments
 from test_attention_triton import (
     BACKWARD_FORMS,
@@ -267,3 +267,47 @@ def test_a_timed_backward_launch_walks_every_key():
     filled = attention_triton.TritonBackward().operands(specs, 0)
     np.testing.assert_array_equal(np.asarray(filled[-2]), 0)
     np.testing.assert_array_equal(np.asarray(filled[-1]), keys)
+
+
+@pytest.mark.parametrize("peak0, scale, key_size",
+                         [(87.0, 1.0, 1.0), (0.0, 2.0 ** -126, 1.0), (0.0, 1.0, 2.0 ** 30)],
+                         ids=["small weight", "small scale", "large key"])
+def test_an_extreme_fp32_backward_is_as_exact_as_the_reference(peak0, scale, key_size):
+    """fp32 at the range's edges, one query over one key resumed from a state holding a denominator of
+    2**25, under an output cotangent of 2**100: a weight exp(-87) / 2**25 below fp32's least subnormal,
+    a scale of 2**-126 over that denominator, or a key of 2**30 beside the cotangent. Both mainloops
+    form each score cotangent as the reference does, its weight over the denominator first, so every
+    intermediate stays within the reference's, and dQ is as exact as fp32's reference against
+    float64's (check 1): a weight the reference loses below fp32 they lose alike, and no product
+    overflows that the reference keeps."""
+    spans = template.spans(1, 1, 1)
+    query = jnp.zeros((1, 1, 1, 1), jnp.float32)
+    key = jnp.full((1, 1, 1, 1), key_size, jnp.float32)
+    value = jnp.ones((1, 1, 1, 1), jnp.float32)
+    dout = jnp.full((1, 1, 1, 1), 2.0 ** 100, jnp.float32)
+    state = template.Initial(jnp.full((1, 1, 1), peak0), jnp.full((1, 1, 1), 2.0 ** 25),
+                             jnp.zeros((1, 1, 1, 1)))
+    hooks = template.Hooks(initial=state)
+    pins = {attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2),
+            attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}
+    with tuning.pinned(pins):
+        triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=scale,
+                                           interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, hooks, dout, block_q=32, block_k=32,
+                                           pad=attention_triton.BLOCK, scale=scale)
+
+    def reference_dq(dtype):
+        def attend(q, k, v):
+            given = template.Hooks(initial=jax.tree.map(lambda x: x.astype(dtype), state))
+            return template.reference(q, k, v, spans, given, scale=scale)
+
+        operands = (query.astype(dtype), key.astype(dtype), value.astype(dtype))
+        return np.asarray(jax.vjp(attend, *operands)[1](dout.astype(dtype))[0])
+
+    theirs = reference_dq(jnp.float32)
+    with jax.enable_x64(new_val=True):
+        want = reference_dq(jnp.float64)
+    for found in (triton, portable):
+        got = np.asarray(found.query)
+        assert np.isfinite(got).all()
+        assert_as_exact_as_the_reference(got, theirs, want, "dq at fp32's edges")
