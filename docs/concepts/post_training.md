@@ -4,9 +4,9 @@ Post-training changes how a trained model behaves. Each method in Dew is an obje
 
 | Method | Supervision | Data | Objective |
 |---|---|---|---|
-| Supervised fine-tuning (SFT) | Example answers | `Chat`, or rows with `text_roles` | `LMObjective(loss_role=Role.ASSISTANT)` |
-| Direct preference optimization (DPO) | A preferred and a rejected answer to one prompt | `Preferences` | `DPOObjective` |
-| Group-relative policy optimization (GRPO) | A reward on answers the model samples | `Prompts` and `SampledRollout`, or a rollout scheduler | `GRPOObjective` |
+| Supervised fine-tuning (SFT) | Example answers | `presets.sft`, or rows with `text_roles` | `LMObjective(loss_role=Role.ASSISTANT)` |
+| Direct preference optimization (DPO) | A preferred and a rejected answer to one prompt | `presets.preferences` | `DPOObjective` |
+| Group-relative policy optimization (GRPO) | A reward on answers the model samples | `presets.prompts` and `SampledRollout`, or a rollout scheduler | `GRPOObjective` |
 | Proximal policy optimization (PPO) | A reward, plus a learned critic | `EpisodeRollout` and `PPORollout` | `PPOObjective` |
 | Flow-GRPO | A reward on samples from a rectified-flow model | `FlowRollout` | `FlowGRPOObjective` |
 
@@ -30,8 +30,7 @@ import numpy as np
 from dew import Trainer
 from dew.config import OptimConfig
 from dew.data.dataset import Loader
-from dew.data import ByteTokenizer, Loading
-from dew.config.data import PreferenceData
+from dew.data import ByteTokenizer, Memory, presets
 from dew.data.chat import Role
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
@@ -78,14 +77,12 @@ Trained 20 steps in 0:00:01: first step after 1.08 s, then 84.1 step/s
 A pair is two sequences with the same prompt, one followed by the chosen response and the other by the rejected one. The masks mark response tokens with 1.
 
 ```python
-from dew.data import Loading
-from dew.config.data import PreferenceData, loader
 rejected = tokenizer.encode(" He kicked kicked.")
 pair = {"chosen": prompt + response, "rejected": prompt + rejected,
         "chosen_mask": [0] * len(prompt) + [1] * len(response),
         "rejected_mask": [0] * len(prompt) + [1] * len(rejected)}
 width = max(len(pair["chosen"]), len(pair["rejected"]))
-pairs = loader(PreferenceData(source=tuple(json.loads(row) for row in (json.dumps(pair),) * 8), seq_len=width), batch=8, read="memory", loading=Loading(workers=0, threads=1, read_buffer=2), validation_records=(4) * (8))
+pairs = Memory([pair] * 8).repeat().pipe(presets.preferences, seq_len=width, batch=8)
 dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, variables=sft_state.variables)
 dpo_state = Trainer(dpo, OptimConfig(optimizer="adam", learning_rate=1e-3), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
@@ -101,11 +98,11 @@ Trained 10 steps in 0:00:03: first step after 2.58 s, then 29.9 step/s
 
 `DPOObjective` and `GRPOObjective` score tokens through `TokenScorer`, the scoring machinery `LMObjective` also builds on. Besides their own loss arguments they take its options: `head_chunks`, `head_tile`, `samples`, `variables`, `qk_stats` and `processor`. The language-model loss's own options (`ema_decay`, `pad_id`, `token_accuracy`, `loss_role`, `mtp_weight`, `z_loss`, the MoE balance and router terms, `indexer`) are `LMObjective`'s alone.
 
-`Preferences.seq_len` is the full row width; shorter rows are padded to it, and the objective scores one position fewer because of the next-token shift.
+The preset's `seq_len` is the full row width; shorter rows are padded to it, and the objective scores one position fewer because of the next-token shift.
 
 ### Reinforcement learning with a reward function
 
-GRPO samples a group of completions per prompt, scores each with a reward function and trains on their rewards relative to the rest of the group. The prompt batch uses the numeric layout `Prompts` produces, with the reward metadata as UTF-8 bytes. The reward here counts the alphabetic characters in the decoded completion and divides the count by 8, the response budget in bytes, so an 8-byte completion of letters scores 1.
+GRPO samples a group of completions per prompt, scores each with a reward function and trains on their rewards relative to the rest of the group. The prompt batch uses the numeric layout `presets.prompts` produces, with the reward metadata as UTF-8 bytes. The reward here counts the alphabetic characters in the decoded completion and divides the count by 8, the response budget in bytes, so an 8-byte completion of letters scores 1.
 
 ```python
 story = tokenizer.encode("Once upon a time")
@@ -149,7 +146,7 @@ Each prompt produces four completions, and `SampledRollout.decode` turns each on
 
 ## Supervised fine-tuning
 
-An SFT conversation is a list of messages, each with a role. `Chat` reads conversations from a Parquet file, a `.jsonl` file or a Hub dataset ID. Each row holds one list of messages in the column named by `column` (default `messages`). If the data has no such column but has a `prompt` column, as verl's layout does, `Chat` reads the messages from `prompt`. Tool schemas, where a row has any, go in a `tools` column. One row in the verl layout:
+An SFT conversation is a list of messages, each with a role. `presets.sft` reads conversations from any dataset: a Parquet or `.jsonl` file (`Files`), a Hub dataset (`Hub`) or records in memory (`Memory`). Each row holds one list of messages in the column named by `messages` (default `messages`). If the data has no such column but has a `prompt` column, as verl's layout does, the preset reads the messages from `prompt`. Tool schemas, where a row has any, go in a `tools` column. One row in the verl layout:
 
 ```text
 prompt = [
@@ -158,21 +155,22 @@ prompt = [
 ]
 ```
 
-| Field | Default | Meaning |
+| Setting | Default | Meaning |
 |---|---|---|
 | `tokenizer` | required | Hub name or local path of a tokenizer with a chat template. |
-| `source` | required | Parquet, JSONL, a Hub Source or record dictionaries. |
-| `column` | `messages` | Column holding each row's messages. |
-| `split` | `train` | Split of a Hub dataset. |
-| `validation` | `None` | An explicit held-out Source, Pipeline, HoldOut or named Split. |
-| `seq_len` | `256` | Prediction length `L`. |
+| `seq_len` | required | Prediction length `L`. |
+| `batch` | required | Rows per batch. |
+| `messages` | `messages` | Column holding each row's messages. |
 | `long` | `chunk` | Chunk an over-length conversation, every turn kept; `truncate` keeps its first window and `drop` rejects it. |
+| `pack` | `first-fit` | How conversations share rows, as `presets.lm` packs documents. |
 
-The chat template is the rule for turning message boundaries, role headers and content into tokens, and each model is trained on its own format. Joining message strings by hand can change both the input and which tokens count toward the loss. `Chat` also preserves tool calls, tool responses and tool schemas.
+Held-out conversations are a part of `holdout`, or a dataset of their own, through the same preset.
+
+The chat template is the rule for turning message boundaries, role headers and content into tokens, and each model is trained on its own format. Joining message strings by hand can change both the input and which tokens count toward the loss. The preset also preserves tool calls, tool responses and tool schemas.
 
 Dew renders the conversation one prefix at a time to give each token a role. For an assistant turn, it leaves the generation header out of the assistant span. It checks that each tokenized prefix matches the start of the longer render, and raises if the template changes earlier tokens. This check does not guarantee correct assistant masks for every chat template or string delimiter, so look at the rendered tokens and roles for some typical conversations before a real run. Conversations must start with a system or user message; one that starts with an assistant message is rejected.
 
-`load(Chat(source=..., tokenizer=...), batch=B, read=...)` packs conversations into these arrays:
+`ds.pipe(presets.sft, tokenizer, seq_len=L, batch=B)` packs conversations into these arrays:
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
@@ -186,9 +184,9 @@ Train with `LMObjective(model, L, loss_role=Role.ASSISTANT)`. The objective shif
 
 DPO compares how much the policy prefers one answer over the other with how much a fixed reference policy does. The policy is the model being updated; the reference is a snapshot of its starting parameters. For each prompt, the chosen and rejected sequences hold the prompt followed by their own completion, and completion masks mark answer tokens with 1 and prompt tokens with 0.
 
-`Preferences(source=...)` accepts a source URL, a typed Source or record dictionaries. Each row has `chosen`, `rejected`, `chosen_mask` and `rejected_mask`; each mask is as long as its ID list. Without a mask, every token counts as a completion token. Give explicit masks for prompt-and-answer data.
+`presets.preferences` reads any dataset of pairs: a file, a Hub dataset or records in memory. Each row has `chosen`, `rejected`, `chosen_mask` and `rejected_mask`; each mask is as long as its ID list. Without a mask, every token counts as a completion token. Give explicit masks for prompt-and-answer data.
 
-A loaded batch holds `input_ids` and `completion_mask`, both `[B, 2, S]`. Index 0 of the middle axis is the chosen sequence and index 1 the rejected one. Shorter rows are right-padded to `S` (`pad_id`, default 0) with mask weight zero; rows that are too long raise. `Preferences.seq_len` is the full row width `S`, so use `DPOObjective(model, seq_len=S - 1)`.
+A loaded batch holds `input_ids` and `completion_mask`, both `[B, 2, S]`. Index 0 of the middle axis is the chosen sequence and index 1 the rejected one. Shorter rows are right-padded to `S` (`pad_id`, default 0) with mask weight zero; rows that are too long raise. The preset's `seq_len` is the full row width `S`, so use `DPOObjective(model, seq_len=S - 1)`.
 
 The objective sums the next-token log-probabilities over each completion and applies the log-sigmoid preference loss. `beta` (default 0.1) must be positive; it scales the comparison between policy and reference. Validation measures the perplexity of the chosen answers under the policy, which alone does not measure how often the preferred answer wins or how good the responses are.
 
@@ -204,8 +202,7 @@ import numpy as np
 
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.data import Loading
-from dew.config.data import PreferenceData, loader
+from dew.data import Memory, presets
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.rl import DPOObjective
 
@@ -216,8 +213,7 @@ rows = [
      "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1, 1]},
 ]
 row_width = 4
-spec = PreferenceData(source=rows * 4, seq_len=row_width, pad_id=0)
-data = loader(spec, batch=8, read="memory", loading=Loading(workers=0))
+data = Memory(rows * 4).repeat().pipe(presets.preferences, seq_len=row_width, batch=8, pad_id=0)
 model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=row_width)
 objective = DPOObjective(model, seq_len=row_width - 1, beta=0.1)
@@ -250,20 +246,17 @@ SFT keeps no moving average unless `ema_decay` is set, as the language-model obj
 
 ## GRPO
 
-GRPO needs a stream of prompts and a reward function before it can build a training batch. `Prompts(tokenizer, path=... or records=...)` accepts a Parquet file in the verl layout or JSON records with `prompt`, `data_source`, `ground_truth` and `extra_info`. A prompt can be token IDs, a string or a list of role and content messages. A string is encoded as it is, without added special tokens. With `tokenizer="byte"` it is encoded with Dew's local UTF-8 vocabulary, and with any other name by that Hugging Face tokenizer.
+GRPO needs a stream of prompts and a reward function before it can build a training batch. `presets.prompts` reads any dataset of prompts, such as a Parquet file in the verl layout or JSON records, with `prompt`, `data_source`, `ground_truth` and `extra_info`. A prompt can be token IDs, a string or a list of role and content messages. A string is encoded as it is, without added special tokens. With `tokenizer="byte"` it is encoded with Dew's local UTF-8 vocabulary, and with any other name by that Hugging Face tokenizer.
 
 Messages go through the Hugging Face tokenizer's chat template, and `thinking` sets a reasoning template's `enable_thinking`. An optional `tools` column holds tool schemas, which are rendered into the prompt tokens. Missing reward fields become empty strings, and reward metadata that is not a string is passed on as JSON text.
 
 ```python
-import json
-from dew.data import Loading
-from dew.config.data import PromptData, loader
+from dew.data import Memory, presets
 
-data = loader(PromptData(source=({"prompt": "dew"},) * 8, tokenizer="byte", max_prompt_len=8),
-            batch=8, read="memory", loading=Loading(workers=0))
+data = Memory([{"prompt": "dew"}] * 8).repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=8)
 ```
 
-The prompt loader produces left-padded `prompt` IDs of shape `[B, P]` and `prompt_length` of shape `[B]`, where `P` is `max_prompt_len` (default 128). A prompt that is too long is cut from the front, so its end is kept. The metadata columns are stored as fixed-width UTF-8 byte arrays, and `SampledRollout` turns them back into each row's `PromptRecord` for the reward:
+The preset produces left-padded `prompt` IDs of shape `[B, P]` and `prompt_length` of shape `[B]`, where `P` is `max_prompt_len`. A prompt that is too long is cut from the front, so its end is kept. The metadata columns are stored as fixed-width UTF-8 byte arrays, and `SampledRollout` turns them back into each row's `PromptRecord` for the reward:
 
 ```text
 reward(completion: str, record: PromptRecord) -> float
