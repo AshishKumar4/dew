@@ -38,10 +38,18 @@ COLLECTIVES = {
     'xla_gpu_reduce_scatter_combine_threshold_bytes': 1 << 27,
     'xla_gpu_enable_all_gather_combine_by_dim': False,
     'xla_gpu_enable_reduce_scatter_combine_by_dim': False,
+    'xla_disable_hlo_passes': 'rematerialization',
 }
 """NVIDIA JAX-Toolbox's collective options for a GPU step over several devices: the scheduler overlaps
 each collective with compute, and the collectives combine into few large ones. Measured in
-docs/performance.md, "Collectives over several GPUs"."""
+docs/performance.md, "Collectives over several GPUs". XLA's rematerialization pass is off, as MaxText
+runs it (JAX-Toolbox's MaxText flags): it fits a step over its memory by recomputing what it picks, a
+sharded weight's all-gather included. Qwen3-8B's step over four H100s (fsdp 2 x tensor 2, a row of
+4096 tokens per data shard, no remat policy), compiled deviceless from XLA's h100_sxm description,
+re-gathered its weights through 86 rematerialized all-gathers, 82 GiB a step, 89 of its 94 all-gathers
+left synchronous; with `minimal` remat its 44 all-gathers, 13 GiB, are all async. With the pass off,
+such a step does not fit (`step_fits`) and the trainer recomputes activations up its ladder
+(`recompute_more`) instead."""
 
 
 def step_compiler_options(objective, tokens: float, frozen: bool,
