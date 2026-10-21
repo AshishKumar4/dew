@@ -6,12 +6,10 @@ import re
 
 import numpy as np
 
-from dew.config.data import loader
 from dew.data import ByteTokenizer, Loading, Memory, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
-from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
-from dew.decision.data import Decisions
+from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout, decisions
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import VALID_ROWS
 
@@ -38,8 +36,11 @@ def _rows(batch):
 def test_decision_branches_keep_labels_aligned_with_option_order_in_packed_windows():
     examples = [Example(f"state {index}", {"class": Choice("Pick", ["yes", "no"])}, {"class": index % 2})
                 for index in range(40)]
-    recipe = Decisions(examples, validation=examples[:5])
-    ours = loader(recipe, batch=4, read="memory", objective=_objective().data(), seed=7, loading=READ)
+    def rows(chosen):
+        return Memory([{"example": example} for example in chosen]).pipe(decisions)
+
+    ours = compile(rows(examples).shuffle(7).repeat().batch(4), validation=rows(examples[:5]).batch(4),
+                   read="memory", objective=_objective().data(), seed=7, loading=READ)
 
     def aligned(text: str, label: int) -> int:
         matched = re.search(r"state (\d+)", text)

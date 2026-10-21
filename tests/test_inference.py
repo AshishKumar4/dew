@@ -24,9 +24,10 @@ import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, TrainerConfig
-from dew.config.data import ImageData as ImageRecipe, VideoData
-from dew.data import ByteTokenizer
+from dew.data import ByteTokenizer, presets
 from dew.data.dataset import Loader
+from dew.data.sources import source
+from dew.data.sources.files import Files
 from dew.diffusion.presets import EDM, Flow
 from dew.inference import RunProcessor, TextGeneration
 from dew.inputs import Field, unit_range
@@ -48,8 +49,8 @@ def run_config(directory, preset=_DEFAULT_RUN_CONFIG_PRESET, encoder=STUB_TEXT, 
     text condition names the registered stub encoder by default."""
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {**MODEL, "dtype": "float32", "attention_impl": "reference"}),
-        data=ImageRecipe(source="tfds://oxford_flowers102", split="all", image_size=RES),
-        trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
+        data=source("tfds://oxford_flowers102").pipe(presets.images, RES, batch=8),
+        trainer=TrainerConfig(checkpoint_dir=str(directory), steps=2, keep=1),
         preset=preset, text=TextCondition(encoder=encoder, checkpoint=checkpoint),
         objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 3}))
 
@@ -242,7 +243,8 @@ def test_build_eval_metrics_follows_the_sample_field(tmp_path):
     that grid there, and an image-only metric raises a ValueError naming it in
     `build_eval_metrics`, before the trainer."""
     video = dataclasses.replace(run_config(tmp_path),
-                                data=VideoData(source="clips", frame_size=8, frames=2),
+                                data=Files("clips", format="files").pipe(presets.video, 2 / 25, frames=2,
+                                                                          fps=25, size=8, batch=2),
                                 val_metrics=(MetricConfig("psnr"),))
     (metric,) = video.build_eval_metrics()
     images = np.zeros((2, 2, 8, 8, 3), np.uint8)

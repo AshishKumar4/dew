@@ -46,22 +46,21 @@ import dew.io
 from dew import registry
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
-from dew.config.data import Augment, HoldOut, ImageData, RunData, loader
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.coordination import agree_process_phase, agreed
-from dew.data import Loading
+from dew.data import records
+from dew.data.compile import fitted
 from dew.data.dataset import Loader, Ramp, Reader, ramped, record_argument
-from dew.data.pipeline import ObjectiveData
-from dew.data.sources.base import Read
+from dew.data.pipeline import Dataset
 from dew.files import write_atomically
+from dew.inputs import Field
 from dew.lora import AdapterRecord, LoRA
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.quantization import InputQuantization, Quantization
-from dew.records import JSON, duration, recorded_duration
+from dew.records import JSON, duration, record, recorded_duration
 from dew.registry import (
     Annotation,
     Configured,
-    datasets,
     declared_type,
     from_record,
     metrics,
@@ -114,10 +113,8 @@ if TYPE_CHECKING:
     # tyro reads the runtime annotation, a Union of the aliased specs, and a
     # type checker cannot read a variable in a type expression. Both get what
     # they need: the base class statically, the union at runtime.
-    type DataSpec = RunData
     type ScheduleSpec = ScheduleBase
 else:
-    DataSpec = datasets.subcommands
     ScheduleSpec = schedules.union
 
 
@@ -653,12 +650,9 @@ class TrainerConfig:
     """The number of latest checkpoints kept, besides the best one."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """The metric name and ranking policy; None selects validation loss or training loss."""
-    batch_size: int | None = 32
-    """The global row batch; None selects token-budget batching."""
-    batch_tokens: int | None = None
-    """The micro-batch's token budget; set batch_size=None to select it."""
     update_tokens: int | None = None
-    """The optimizer update's token budget, a whole number of micro-batches."""
+    """The optimizer update's token budget, a whole number of the data's token batches (its batch stage's
+    `TokenBudget`), which sets the run's accumulation (`RunConfig.train`)."""
     key: int = 0
     """The seed of the run key, which sets parameter init and every per-step draw."""
     steps: int | None = None
@@ -772,28 +766,27 @@ class TrainerConfig:
     nearest measured shape's config or its heuristic, and the run says how many.
     """
 
+    def accumulating(self, dataset: Loader) -> Self:
+        """This config with the accumulation its token budget sets over `dataset`'s token batches:
+        `update_tokens` a whole number of them. Raises ValueError for a budget over data batched in
+        rows, one no whole number of them, or an accumulation set otherwise."""
+        if self.update_tokens is None:
+            return self
+        if dataset.batch_tokens is None or self.update_tokens % dataset.batch_tokens:
+            raise ValueError(f"--trainer.update-tokens {self.update_tokens} is no whole number of the data's "
+                             f"token batches ({dataset.batch_tokens}); batch the data by tokens "
+                             "(Dataset.batch(tokens=)) dividing it")
+        accumulation = self.update_tokens // dataset.batch_tokens
+        if self.accumulation not in (1, accumulation):
+            raise ValueError(f"--trainer.update-tokens sets the accumulation to {accumulation}; omit "
+                             "--trainer.accumulation or match it")
+        return dataclasses.replace(self, accumulation=accumulation)
+
     def __post_init__(self):
-        if (self.batch_tokens is None) != (self.update_tokens is None):
-            raise ValueError("--trainer.batch-tokens and --trainer.update-tokens must be set together")
-        if self.batch_tokens is not None:
-            if self.batch_size is not None:
-                raise ValueError("token budgets require --trainer.batch-size None together with "
-                                 "--trainer.batch-tokens and --trainer.update-tokens")
-            if self.batch_tokens < 1 or self.update_tokens is None or self.update_tokens < 1:
-                raise ValueError("trainer token budgets must be positive")
-            if self.update_tokens % self.batch_tokens:
-                raise ValueError("--trainer.update-tokens must be a multiple of --trainer.batch-tokens")
-            if self.batch_ramp is not None:
-                raise ValueError("--trainer.batch-ramp grows row batches and cannot use token budgets")
-            # The budgets determine the accumulation, held here so every reader of the config,
-            # RunConfig.train's Trainer among them, sees the one value.
-            accumulation = self.update_tokens // self.batch_tokens
-            if self.accumulation not in (1, accumulation):
-                raise ValueError("token budgets determine --trainer.accumulation; omit it or match "
-                                 f"the derived value {accumulation}")
-            object.__setattr__(self, 'accumulation', accumulation)
-        elif self.batch_size is None or self.batch_size < 1:
-            raise ValueError("--trainer.batch-size must be positive without token budgets")
+        if self.update_tokens is not None and self.update_tokens < 1:
+            raise ValueError("--trainer.update-tokens must be positive")
+        if self.update_tokens is not None and self.batch_ramp is not None:
+            raise ValueError("--trainer.batch-ramp grows row batches and cannot use a token budget")
         if self.split is not None and self.split < 1:
             raise ValueError("--trainer.split reads each step's batch in that many microbatches, at least 1")
         if self.publish and (self.wandb is None or not self.checkpoint_final):
@@ -941,6 +934,111 @@ class Prepared:
     train: Callable[[str], TrainState]
 
 
+def media_field(chain: Dataset, run: str) -> Field:
+    """The batch field a run over images or clips reads, at the size its chain makes it
+    (`Dataset.facts`): a clip's video, else an image. Raises ValueError, naming the `run`, for a chain
+    of neither, or one whose size varies."""
+    fields = record(chain.facts()["fields"], "the chain's fields")
+    name = "video" if "video" in fields else "image"
+    shape = fields.get(name)
+    if not isinstance(shape, list | tuple) or not all(isinstance(size, int) for size in shape):
+        raise ValueError(f"a {run} run trains on images or clips of one size (dew.data.presets.images or "
+                         f"clips); this chain's {name} is {shape!r}")
+    return Field(name, tuple(shape))
+
+
+def _set_arguments(given: list[str]) -> tuple[list[str], list[str]]:
+    """`given` without its `--set path=value` pairs, and the pairs' assignments, in order."""
+    rest, settings, index = [], [], 0
+    while index < len(given):
+        if given[index] == "--set" and index + 1 < len(given):
+            settings.append(given[index + 1])
+            index += 2
+        elif given[index].startswith("--set="):
+            settings.append(given[index].removeprefix("--set="))
+            index += 1
+        else:
+            rest.append(given[index])
+            index += 1
+    return rest, settings
+
+
+def _chain_label(chain: Dataset | None) -> str:
+    """A run name's word for its data: the last preset its recorded chain calls (`lm`, `images`), or
+    `data` where it calls none or was not recorded."""
+    encoded = None if chain is None else records.encode(chain)
+    stages = encoded.get("stages", []) if isinstance(encoded, Mapping) else []
+    calls = [stage["pipe"] for stage in stages if isinstance(stage, Mapping) and "pipe" in stage]
+    return str(calls[-1]).rpartition(":")[2].rpartition(".")[2] if calls else "data"
+
+
+_CHAINS = ("data", "validation")
+"""A run's fields that hold chains, which its record writes through the data's codec (`_chain_record`)."""
+
+
+def _chain_record(value: Dataset | Mapping[str, Dataset] | None) -> JSON:
+    """The record of a chain field: a chain's record (`dew.data.records.encode`), `{"unrecorded":
+    reason}` where the codec cannot describe it, one a name for named splits, or None."""
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return {name: _chain_record(split) for name, split in value.items()}
+    encoded = records.encode(value)
+    return {"unrecorded": encoded.reason} if isinstance(encoded, records.Unrecorded) else encoded
+
+
+def _read_chain(name: str, written: object) -> Dataset | dict[str, Dataset] | None:
+    """The chain field `name` its record holds (`_chain_record`). Raises ValueError for a chain that was
+    not recorded, naming why, and for a recipe's record, naming it: a run.json written before runs
+    recorded chains trains again under the Dew release that wrote it."""
+    if written is None:
+        return None
+    if not isinstance(written, Mapping):
+        raise ValueError(f"run.json's {name} is {written!r}, not a chain's record")
+    if "unrecorded" in written:
+        raise ValueError(f"this run's {name} was built in Python and not recorded ({written['unrecorded']}); "
+                         "train it again from the Python that built it")
+    if "class" in written:
+        raise ValueError(f"run.json's {name} is a {written['class']} recipe, which this Dew no longer reads: "
+                         "train it under the Dew release that wrote it, or write its data as a chain "
+                         "(`dew.data.presets`) and train a new run")
+    if "version" in written:
+        return records.decode(written)
+    return {split: chain for split, value in written.items()
+            if (chain := _read_chain(f"{name}.{split}", value)) is not None and isinstance(chain, Dataset)}
+
+
+def _overridden(config: "RunConfig", path: str, value: JSON) -> "RunConfig":
+    """`config` with one setting of a recorded chain set (`dew.data.records.override`): `path` is
+    `data.<call>.<setting>`, or `validation[.<split>].<call>.<setting>`."""
+    name, _, rest = path.partition(".")
+    held = getattr(config, name)
+    if isinstance(held, Mapping):
+        split, _, rest = rest.partition(".")
+        if split not in held:
+            raise KeyError(f"{path} names no split of the run's {name}")
+        return dataclasses.replace(config, **{name: {**held, split: _overridden_chain(path, held[split], rest,
+                                                                                    value)}})
+    if held is None:
+        raise KeyError(f"{path} sets the run's {name}, which it does not hold")
+    return dataclasses.replace(config, **{name: _overridden_chain(path, held, rest, value)})
+
+
+def _overridden_chain(path: str, chain: Dataset, setting: str, value: JSON) -> Dataset:
+    encoded = records.encode(chain)
+    if isinstance(encoded, records.Unrecorded):
+        raise ValueError(f"{path} sets a chain that was not recorded ({encoded.reason}); set it in Python")
+    return records.decode(records.override(encoded, setting, value))
+
+
+def _flag_json_or_text(text: str) -> JSON:
+    """`text` as JSON, or the text itself where it is no JSON, as a chain's setting reads it."""
+    try:
+        return _flag_json(text)
+    except json.JSONDecodeError:
+        return text
+
+
 def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
     """The record `node` holds under `key`. A field declaring a base or a
     union records its value's class beside its fields, and this is the fields."""
@@ -1005,17 +1103,16 @@ class RunConfig:
     subcommand its flags imply."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    data: DataSpec = dataclasses.field(default_factory=lambda: ImageData(
-        source="tfds://oxford_flowers102", split="all", augment=Augment(flip=True, jitter=True),
-        caption_templates=("a photo of a {}",), validation=HoldOut(records=128)))
-    data_read: Read | None = None
-    """How the data is read: 'memory', 'indexed' or 'streamed'. None leaves it
-    to the sources: memory for records held in memory, indexed for a store
-    that reads by index, streamed otherwise."""
-    provision: bool = False
+    data: Annotated[Dataset | None, tyro.conf.Suppress] = None
+    """The data the run trains on: a chain ending in its preset (`dew.data.presets`), whose batch stage
+    is the run's batch, read and loaded as it says. The record writes it as its chain
+    (`dew.data.records`); on the command line, `--set data.<preset>.<setting>=` sets one setting of a
+    recorded chain's call."""
+    validation: Annotated[Dataset | Mapping[str, Dataset] | None, tyro.conf.Suppress] = None
+    """The splits each evaluation scores, one dataset or several by name, each batched by its own batch
+    stage or the training batch."""
     data_seed: int = 0
-    loading: Loading = dataclasses.field(default_factory=Loading)
-    validation_records: int | None = None
+    """The seed of the data's order and of its random steps."""
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
     objective: ObjectiveConfig | None = None
@@ -1035,17 +1132,24 @@ class RunConfig:
         """Return a JSON-safe record of the run.
 
         A value of a subclass of the field's type is written as its class's
-        import path and its fields.
+        import path and its fields. The data and its validation splits are
+        their chains' records (`dew.data.records.encode`), and a chain the
+        codec cannot describe is `{"unrecorded": reason}`.
         """
         with registry.recording():
-            return {field.name: to_record(getattr(self, field.name), declared_type(type(self), field.name))
-                    for field in dataclasses.fields(self)}
+            written = {field.name: to_record(getattr(self, field.name), declared_type(type(self), field.name))
+                       for field in dataclasses.fields(self) if field.name not in _CHAINS}
+        return {**written, **{name: _chain_record(getattr(self, name)) for name in _CHAINS}}
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
         """Read back what `to_dict` wrote, for subclasses too. A field the
-        record lacks takes its default; an unknown field raises."""
-        return from_record(cls, values, dtypes=False)
+        record lacks takes its default; an unknown field raises. A chain
+        recorded as unrecorded, or a recipe's record written before runs
+        recorded chains, is refused by name."""
+        rest = {name: value for name, value in values.items() if name not in _CHAINS}
+        chains = {name: _read_chain(name, values[name]) for name in _CHAINS if name in values}
+        return dataclasses.replace(from_record(cls, rest, dtypes=False), **chains)
 
     def override(self, point: Mapping[str, JSON]) -> Self:
         """This config with each dotted path in `point` replaced, through its record.
@@ -1059,14 +1163,20 @@ class RunConfig:
         row batch) are one point; each path is placed in this config, so a path
         under `model` names an argument of the model this config holds.
         """
-        record = self.to_dict()
+        chained = {path: value for path, value in point.items() if path.partition(".")[0] in _CHAINS}
+        record = {name: value for name, value in self.to_dict().items() if name not in _CHAINS}
         for path, value in point.items():
+            if path in chained:
+                continue
             *groups, field = _placed(self, path)[0]
             node = record
             for group in groups:
                 node = _within(node, group)
             node[field] = value
-        return type(self).from_dict(record)
+        built = dataclasses.replace(type(self).from_dict(record), data=self.data, validation=self.validation)
+        for path, value in chained.items():
+            built = _overridden(built, path, value)
+        return built
 
     def assigned(self, assignments: Sequence[str]) -> Self:
         """This config with each `path=value` in `assignments` set (`override`).
@@ -1081,7 +1191,9 @@ class RunConfig:
             path, equals, text = assignment.partition("=")
             if not equals:
                 raise ValueError(f"{assignment!r} sets no value; write path=value, as trainer.steps=2000")
-            point[path] = _parsed(path, text, _placed(self, path)[1])
+            # A chain's setting is read against its call's signature (`dew.data.records.override`).
+            point[path] = (_flag_json_or_text(text) if path.partition(".")[0] in _CHAINS
+                           else _parsed(path, text, _placed(self, path)[1]))
         return self.override(point)
 
     def save(self, directory: str) -> str:
@@ -1118,9 +1230,11 @@ class RunConfig:
         the default's fields; naming another starts from that class's own and
         the default's compute dtype. `--objective` picks the objective's class
         the same way, each argument it takes a flag, `--objective.<argument>`
-        (`ObjectiveConfig`).
+        (`ObjectiveConfig`). `--set path=value`, once a setting, sets a field at its dotted path
+        after the flags, as `dew train` does (`assigned`): the data's settings are its chain's calls'
+        (`--set data.lm.seq_len=512`), which have no flags of their own.
         """
-        given = list(sys.argv[1:] if args is None else args)
+        given, settings = _set_arguments(list(sys.argv[1:] if args is None else args))
         for field, subcommand in cls._FLAG_SELECTED.items():
             flags = [index for index, arg in enumerate(given) if arg.startswith(f"--{field}.")]
             if flags and not any(arg.startswith(f"{field}:") for arg in given):
@@ -1160,11 +1274,12 @@ class RunConfig:
         parsed = tyro.cli(tyro.conf.CascadeSubcommandArgs[parser], args=given, default=held)
         if parsed is None:
             raise ValueError("the command line built no run config")
-        return cls(**{field.name: getattr(parsed, field.name) for field in dataclasses.fields(cls)
-                      if field.name not in ("model", "objective")},
-                   model=_given(model, parsed.model, model_started),
-                   objective=None if objective is None else _given(objective, parsed.objective,
-                                                                   objective_started))
+        built = cls(**{field.name: getattr(parsed, field.name) for field in dataclasses.fields(cls)
+                       if field.name not in ("model", "objective")},
+                    model=_given(model, parsed.model, model_started),
+                    objective=None if objective is None else _given(objective, parsed.objective,
+                                                                    objective_started))
+        return built.assigned(settings) if settings else built
 
     @classmethod
     def _started(cls, default: Self | None, field: str) -> ModelConfig | ObjectiveConfig | None:
@@ -1210,18 +1325,16 @@ class RunConfig:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
         objective = self.objective.build(model=self.model.build())
-        dataset = self.loader(objective.data())
-        return Prepared(self, lambda name: self.train(objective, dataset, name=name))
+        return Prepared(self, lambda name: self.train(objective, self.chain(), name=name,
+                                                      validation=self.validation))
 
-    def loader(self, objective: ObjectiveData | None, recipe: RunData | None = None) -> Loader:
-        """The run's `data`, or `recipe` in its place, compiled with the
-        `objective`'s steps under the run's data controls: the trainer's batch
-        rows or tokens, `data_read`, `provision`, `data_seed`, `loading` and
-        `validation_records`. Every kind of run's `prepare` loads through it."""
-        return loader(self.data if recipe is None else recipe, batch=self.trainer.batch_size,
-                      tokens=self.trainer.batch_tokens, read=self.data_read, provision=self.provision,
-                      seed=self.data_seed, loading=self.loading, validation_records=self.validation_records,
-                      objective=objective)
+    def chain(self) -> Dataset:
+        """The run's `data`. Raises ValueError for a run that names none: a run trains on the chain
+        it states (`dew.data.presets`), in Python or in its run.json."""
+        if self.data is None:
+            raise ValueError(f"{type(self).__name__} names no data: set data= to a chain ending in its "
+                             "preset (dew.data.presets), in Python or in run.json")
+        return self.data
 
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
@@ -1235,8 +1348,7 @@ class RunConfig:
         prepared = self.prepare()
         stated = prepared.run.objective
         name = trainer.name or (f"{'run' if stated is None else objectives.label(stated.name)}-"
-                                f"{datasets.label(registry.import_path(type(prepared.run.data)))}/"
-                                f"date-{run_timestamp()}")
+                                f"{_chain_label(prepared.run.data)}/date-{run_timestamp()}")
         return prepared.train(name)
 
     def recorded(self, objective: Objective[Loss, Effects]) -> Self:
@@ -1265,12 +1377,13 @@ class RunConfig:
         return dataclasses.replace(self, objective=dataclasses.replace(
             stated, defaults={**stated.defaults, **resolved}))
 
-    def train(self, objective: Objective[Loss, Effects], dataset: Loader, *, name: str,
+    def train(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
               summary: Mapping[str, object] | None = None,
-              validation: Mapping[str, Reader] | None = None,
+              validation: Dataset | Mapping[str, Dataset | Reader] | None = None,
               after: Callable[[TrainState, str], None] | None = None) -> TrainState:
-        """Train `objective` on `data` as this config describes; every recipe calls this after building both.
+        """Train `objective` on `dataset` as this config describes; every kind of run calls this after
+        building both.
 
         The run lives under `name` in `trainer.checkpoint_dir`, and process zero writes
         the record there before training starts. A `trainer.wandb` opens a tracker
@@ -1280,10 +1393,10 @@ class RunConfig:
         replaced because an artifact name allows neither. Local tracking journals
         live in a separate tracking directory.
 
-        `dataset` must be the one the recipe loaded at `trainer.batch_size`; a dataset
-        at any other batch size is refused here. The record, the ramp and the reported
-        throughput all use the configured batch size while each step reads the
-        dataset's, so a mismatch would train at a batch size the run does not report.
+        `dataset` is compiled once with the objective's own stages (`dew.data.compile.fitted`), and its
+        validation splits with it; the run's length, its ramp, its cadences and its recorded plan are
+        read off that one compiled loader, which `fit` trains on. Its batch stage is the run's batch, and
+        a token budget's accumulation is `trainer.update_tokens` over its token batch.
 
         A `trainer.quantization` wraps the module `objective` trains before anything
         initializes it, so the run learns through the quantized forward pass. A
@@ -1298,14 +1411,8 @@ class RunConfig:
         on and the run's directory before the checkpoint is published, as a
         decision run fits its calibration there, so what it writes is published.
         """
-        if self.trainer.batch_size is not None and dataset.batch != self.trainer.batch_size:
-            raise ValueError(
-                f"--trainer.batch-size is {self.trainer.batch_size} and this dataset "
-                f"reads {dataset.batch} records a step; load it with "
-                f"load(batch={self.trainer.batch_size})")
-        if dataset.batch_tokens != self.trainer.batch_tokens:
-            raise ValueError(f"dataset.batch_tokens is {dataset.batch_tokens}, but trainer.batch_tokens is "
-                             f"{self.trainer.batch_tokens}; compile data with the trainer's token budget")
+        dataset, validation = fitted(dataset, validation, objective=objective.data(), seed=self.data_seed)
+        self = dataclasses.replace(self, trainer=self.trainer.accumulating(dataset))
         if self.trainer.quantization is not None:
             quantize_trunk(objective, self.trainer.quantization)
         # The record names the run's directory, so its run.json trains the same run again.

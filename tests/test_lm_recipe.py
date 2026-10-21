@@ -12,9 +12,11 @@ from token_support import write_token_corpus
 from tool_support import load
 
 import dew
-from dew.config.data import loader
-from dew.data import Loading
-from dew.data.dataset import DataPhase, Loader
+from dew.data import Loading, presets
+from dew.data.compile import compile, held
+from dew.data.dataset import Loader
+from dew.data.pipeline import Dataset
+from dew.data.sources.tokens import TokenFiles
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective, LMRunConfig
 from dew.sampling import Sampling
@@ -28,18 +30,18 @@ SEQ = 32
 @pytest.mark.parametrize("steps", [7_250, 725_000])
 def test_rigel_empty_phases_extend_the_preceding_mixture(steps):
     rigel = load("rigel", "recipes/lm")
-    assert rigel.phases({"stem": "data/stem", "other": "data/other"}, steps) == (
-        DataPhase("data/stem", round(515_000 * steps / rigel.STEPS)),
-        DataPhase({"data/stem": 11.5, "data/other": 4.9}),
+    assert rigel.schedule({"stem": "data/stem", "other": "data/other"}, steps) == (
+        ({"data/stem": 1.0}, round(515_000 * steps / rigel.STEPS)),
+        ({"data/stem": 11.5, "data/other": 4.9}, None),
     )
 
 
 def test_rigel_leading_empty_phases_take_the_first_available_mixture():
     rigel = load("rigel", "recipes/lm")
-    assert rigel.phases({"other": "data/other"}, 7_250) == (DataPhase("data/other"),)
-    assert rigel.phases({"stem": "data/stem"}, 7_250) == (DataPhase("data/stem"),)
+    assert rigel.schedule({"other": "data/other"}, 7_250) == (({"data/other": 1.0}, None),)
+    assert rigel.schedule({"stem": "data/stem"}, 7_250) == (({"data/stem": 1.0}, None),)
     with pytest.raises(ValueError):
-        rigel.phases({"unknown": "data/unknown"}, 7_250)
+        rigel.schedule({"unknown": "data/unknown"}, 7_250)
 
 
 # The committed byte-level BPE a run can train with offline.
@@ -66,13 +68,21 @@ def model_flags(record):
     return flags
 
 
-def run_config(tokens, *args, model='{"emb_features": 16, "num_layers": 1, "num_heads": 2}'):
-    # A dataset subcommand has to come before its flags, so `args` leads.
+def windows(tokens, split: str | None = None, **settings):
+    """The store's windows of SEQ tokens in batches of 8 (`presets.lm`), its `split` where named."""
+    store = TokenFiles(str(tokens)) if split is None else TokenFiles(str(tokens)).holdout(split=split)[1]
+    chain = store.pipe(presets.lm, None, seq_len=SEQ, batch=8, pack=None, **settings)
+    return chain.loading(Loading(workers=0))
+
+
+def run_config(tokens, *args, model='{"emb_features": 16, "num_layers": 1, "num_heads": 2}', **settings):
+    """The recipe's run from its command line over the store's windows (`windows`), scored on its
+    validation split."""
+    default = LMRunConfig(data=windows(tokens, **settings), validation=windows(tokens, "val", **settings))
     return LMRunConfig.cli([
-        *args, "--data.source", str(tokens), "--data.seq-len", str(SEQ), "--loading.workers", "0",
-        "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
+        *args, "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--trainer.log-every", "1", "--model.dtype", "float32", *model_flags(model)])
+        "--trainer.log-every", "1", "--model.dtype", "float32", *model_flags(model)], default=default)
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -83,14 +93,13 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     args = ["--trainer.epochs", "1", "--prompt", "the ", "--max-new-tokens", "4",
             "--trainer.name", "run"]
-    if packed:
-        args = ["--data.pack", "first-fit", "--data.packing-bins", "2", "--data-read", "memory", *args]
-    config = run_config(tokens, *args)
-    assert config.data.pack == ('first-fit' if packed else None)
+    settings = {"pack": "first-fit", "bins": 2} if packed else {}
+    config = run_config(tokens, *args, **settings)
+    assert config.tokens().packed is packed
 
     state = config.run()
 
-    data = loader(config.data, batch=8, read="memory", loading=Loading(workers=0))
+    data = compile(config.chain().read("memory"))
     assert data.steps_per_epoch is not None and int(state.step) == data.steps_per_epoch > 0
     run = tmp_path / "runs" / "run"
     assert (run / str(int(state.step))).is_dir()
@@ -116,20 +125,26 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
 
 
 def test_the_recipe_trains_on_weighted_corpora(tmp_path):
-    """`--data.source a 0.7 b 0.3` parses to the weighted mapping and trains:
-    the vocabulary comes from the corpora's shared meta.json, and run.json
-    records the mapping so the run reloads as configured."""
+    """Two token stores, each packed by itself and mixed by their tokens 0.7 to 0.3, train one run:
+    the vocabulary comes from the stores' shared meta.json, and run.json records the mixture's chain
+    so the run reloads as configured."""
+    from dew.data import mix
+
     first = write_token_files(tmp_path / "first", 40 * SEQ, 8 * SEQ, eos_id=0)
     second = write_token_files(tmp_path / "second", 24 * SEQ, 8 * SEQ, eos_id=0)
+
+    def packed(store):
+        return TokenFiles(str(store)).pipe(presets.lm, None, seq_len=SEQ, batch=None, pack="first-fit",
+                                           bins=2)
+
+    mixture = mix([packed(first), packed(second)], [0.7, 0.3], by="tokens").batch(8).read("memory")
     config = LMRunConfig.cli([
-        "--data.pack", "first-fit", "--data.source", json.dumps({str(first): 0.7, str(second): 0.3}),
-        "--data.seq-len", str(SEQ), "--data.packing-bins", "2", "--data-read", "memory",
-        "--loading.workers", "0",
-        "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+        "--trainer.checkpoint-dir", str(tmp_path / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--trainer.steps", "2", "--trainer.name", "mixed", "--max-new-tokens", "0",
         "--model.dtype", "float32",
-        "--model.emb_features", "16", "--model.num_layers", "1", "--model.num_heads", "2"])
+        "--model.emb_features", "16", "--model.num_layers", "1", "--model.num_heads", "2"],
+        default=LMRunConfig(data=mixture.loading(Loading(workers=0))))
     assert config.data.source == {str(first): 0.7, str(second): 0.3}
 
     state = config.run()
@@ -186,9 +201,7 @@ def export_tiny_decoder(directory, *, tokenizer="byte", vocab_size=256):
 
 
 def recipe_args(tokens, *args, model_config="{}"):
-    return [*args, "--data.source", str(tokens), "--data.seq-len", str(SEQ),
-            "--loading.workers", "0", "--trainer.batch-size", "8",
-            "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
+    return [*args, "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
             "--trainer.log-every", "1", "--model.dtype", "float32",
             *model_flags(model_config)]
@@ -196,7 +209,8 @@ def recipe_args(tokens, *args, model_config="{}"):
 
 def pretrained_config(tokens, pretrained, *args, model_config="{}"):
     return LMRunConfig.cli(recipe_args(tokens, "--pretrained", str(pretrained), *args,
-                                              model_config=model_config))
+                                       model_config=model_config),
+                           default=LMRunConfig(data=windows(tokens), validation=windows(tokens, "val")))
 
 
 def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
@@ -302,7 +316,8 @@ def test_a_pretrained_run_stores_its_parameters_in_the_dtype_it_names(tmp_path):
     record = json.loads((tmp_path / "runs" / "bf16" / "run.json").read_text())["fields"]
     assert record["pretrained_param_dtype"] == "bfloat16"
     with pytest.raises(ValueError):
-        LMRunConfig.cli(recipe_args(tokens, "--pretrained-param-dtype", "bfloat16"))
+        LMRunConfig.cli(recipe_args(tokens, "--pretrained-param-dtype", "bfloat16"),
+                        default=LMRunConfig(data=windows(tokens)))
 
 
 def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
@@ -390,7 +405,7 @@ def test_the_recipe_balances_a_sparse_run(tmp_path):
                           recipe_args(tokens, "--trainer.steps", "2",
                                            "--max-new-tokens", "0",
                                            "--trainer.name", name, *extra,
-                                           model_config=sparse))
+                                           model_config=sparse), default=LMRunConfig(data=windows(tokens)))
         state = config.run()
         return np.asarray(state.variables["moe"]["layers_1"]["mlp"]["gate"]
                           ["e_score_correction_bias"])
@@ -416,7 +431,8 @@ def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
                           recipe_args(tokens, "--trainer.steps", "2",
                                            "--max-new-tokens", "0",
                                            "--trainer.name", name, *extra,
-                                           model_config=model_config))
+                                           model_config=model_config),
+            default=LMRunConfig(data=windows(tokens)))
         state = config.run()
         return np.asarray(state.variables["params"]["mtp_0"]["eh_proj"]["kernel"])
 
@@ -446,23 +462,28 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     (directory / "meta.json").write_text(json.dumps(
         {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1,
          "train_tokens": 400, "val_tokens": 96}))
+    def packed(split=None):
+        store = TokenFiles(str(directory))
+        store = store if split is None else store.holdout(split=split)[1]
+        return store.pipe(presets.lm, None, seq_len=11, batch=8, pack="first-fit").read("memory").loading(
+            Loading(workers=0))
+
     config = LMRunConfig.cli([
-        "--data.pack", "first-fit", "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
-        "--tokenizer", str(checkpoint), "--data.source", str(directory),
-        "--data.seq-len", "11", "--data-read", "memory", "--loading.workers", "0",
+        "--pretrained", str(checkpoint), "--objective", "masked_diffusion", "--tokenizer", str(checkpoint),
         "--model.dtype", "float32", "--model.attention-impl", "xla",
-        "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.log-every", "1",
+        "--trainer.steps", "2", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "packed",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--objective.ema-decay", "None", "--max-new-tokens", "0"])
+        "--objective.ema-decay", "None", "--max-new-tokens", "0"],
+        default=LMRunConfig(data=packed(), validation=packed("val")))
 
     state = config.run()
 
     assert int(state.updates) == 2
     original = Pretrained.load(str(checkpoint), dtype="float32", attention_impl="xla")
     objective = config.masked_objective(original.model, original.model_config, None)
-    batch = next(iter(loader(config.data, batch=8, read="memory",
-        loading=Loading(workers=0)).val(DataPartition())))
+    assert isinstance(config.validation, Dataset)
+    batch = next(iter(held(config.validation, objective=objective.data())(DataPartition())))
     padding = np.asarray(batch["text_coordinates"].segments) == 0
     assert padding.any() and not padding.all()
     scored = objective.evaluate(state.variables, batch, Step(jnp.asarray(0), jax.random.key(0), None))
@@ -475,7 +496,7 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
     LLaDA fixture, while the fresh init the same run would otherwise draw is
     1.45 away, so a run that dropped the weights could not pass.
 
-    A window is `--data.seq-len + 1` ids wide and masked diffusion has no
+    A window is `seq_len + 1` ids wide and masked diffusion has no
     shift, so the objective denoises all twelve; the trainer's step would
     raise on an eleven-token objective."""
     from dew.interop import Pretrained
@@ -489,15 +510,16 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
     (directory / "meta.json").write_text(json.dumps(
         {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1,
          "train_tokens": 400, "val_tokens": 96}))
+    data = TokenFiles(str(directory)).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
+        Loading(workers=0))
     config = LMRunConfig.cli([
-        "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
-        "--tokenizer", str(checkpoint), "--data.source", str(directory),
-        "--data.seq-len", "11", "--loading.workers", "0",
+        "--pretrained", str(checkpoint), "--objective", "masked_diffusion", "--tokenizer", str(checkpoint),
         "--model.dtype", "float32", "--model.attention-impl", "xla",
-        "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
+        "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "masked",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--objective.ema-decay", "None", "--max-new-tokens", "0", "--optim.learning-rate", "0.001"])
+        "--objective.ema-decay", "None", "--max-new-tokens", "0", "--optim.learning-rate", "0.001"],
+        default=LMRunConfig(data=data))
 
     state = config.run()
 
@@ -526,15 +548,15 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
         (directory / f"{split}.bin").write_bytes(ids.tobytes())
     (directory / "meta.json").write_text(json.dumps(
         {"tokenizer": str(checkpoint), "vocab_size": 32, "dtype": "uint8", "eos_id": 1}))
+    spans = TokenFiles(str(directory)).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
+        Loading(workers=0))
     config = LMRunConfig.cli([
-        "--pretrained", str(checkpoint), "--objective", "block_diffusion",
-        "--tokenizer", str(checkpoint), "--data.source", str(directory), "--data.seq-len", "11",
-        "--objective.prompt-length", "4", "--loading.workers", "0",
-        "--model.dtype", "float32", "--model.attention-impl", "xla",
-        "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
+        "--pretrained", str(checkpoint), "--objective", "block_diffusion", "--tokenizer", str(checkpoint),
+        "--objective.prompt-length", "4", "--model.dtype", "float32", "--model.attention-impl", "xla",
+        "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "block",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--max-new-tokens", "0", "--optim.learning-rate", "0.001"])
+        "--max-new-tokens", "0", "--optim.learning-rate", "0.001"], default=LMRunConfig(data=spans))
     state = config.run()
     assert int(state.updates) == 1
     original = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=12)
@@ -570,16 +592,18 @@ def test_block_diffusion_trains_quantized_as_any_lm_recipe_does(tmp_path):
     (directory / "meta.json").write_text(json.dumps(
         {"tokenizer": str(checkpoint), "vocab_size": 32, "dtype": "uint8", "eos_id": 1}))
 
+    spans = TokenFiles(str(directory)).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
+        Loading(workers=0))
+
     def run(name, *quantized):
         return LMRunConfig.cli([
-            "--pretrained", str(checkpoint), "--objective", "block_diffusion",
-            "--tokenizer", str(checkpoint), "--data.source", str(directory), "--data.seq-len", "11",
-            "--objective.prompt-length", "4", "--loading.workers", "0",
-            "--model.dtype", "float32", "--model.attention-impl", "xla",
-            "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
+            "--pretrained", str(checkpoint), "--objective", "block_diffusion", "--tokenizer", str(checkpoint),
+            "--objective.prompt-length", "4", "--model.dtype", "float32", "--model.attention-impl", "xla",
+            "--trainer.steps", "1", "--trainer.log-every", "1",
             "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", name,
             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-            "--max-new-tokens", "0", "--optim.learning-rate", "0.001", *quantized])
+            "--max-new-tokens", "0", "--optim.learning-rate", "0.001", *quantized],
+            default=LMRunConfig(data=spans))
 
     quantized = run("quantized")
     quantized = dataclasses.replace(quantized, trainer=dataclasses.replace(

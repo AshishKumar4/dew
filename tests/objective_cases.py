@@ -13,15 +13,14 @@ from pathlib import Path
 
 import jax
 import pytest
+from decision_support import decision_rows
 
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.config.data import HoldOut, ImageData, PreferenceData, TextData, loader
-from dew.data import TFDS, Loading
+from dew.data import TFDS, Loading, Memory, presets
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition
-from dew.data.images import EncodeCaptions
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
-from dew.decision.data import Decisions
 from dew.diffusion.discrete import MDLM
 from dew.diffusion.presets import Flow, MeanFlow, Shortcut
 from dew.inputs import Field, InputSpec
@@ -49,11 +48,11 @@ IMAGES = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
 SEQ_LEN = 15
 
 
-def first(spec, objective=None):
-    """The first training batch `spec` loads, as its recipe loads it."""
-    tokenize = None if objective is None else objective.inputs.tokenize
-    return next(loader(spec, batch=2, read="memory", loading=Loading(workers=0),
-                     host=() if tokenize is None else (EncodeCaptions(tokenize),)).train(DataPartition()))
+def first(chain, objective=None):
+    """The first training batch `chain` makes, compiled with `objective`'s own stages as a run's is."""
+    compiled = compile(chain.read("memory").loading(Loading(workers=0)),
+                       objective=None if objective is None else objective.data())
+    return next(compiled.train(DataPartition()))
 
 
 def decoder(**fields):
@@ -61,10 +60,11 @@ def decoder(**fields):
                              mlp_features=32, max_seq_len=32, **fields)
 
 
-def corpus_windows(corpus: Path) -> TextData:
-    """Text over a byte corpus written to `corpus`, what the LM recipe trains on."""
-    documents = tuple({"text": "the quick brown fox jumps over the lazy dog " * 8} for _ in range(4))
-    return TextData(source=documents, seq_len=SEQ_LEN, token_holdout=HoldOut(fraction=0.25))
+def corpus_windows(corpus: Path):
+    """Windows of SEQ_LEN byte tokens over a short text, in pairs (`presets.lm`), what the LM recipe
+    trains on."""
+    documents = [{"text": "the quick brown fox jumps over the lazy dog " * 8} for _ in range(4)]
+    return Memory(documents).pipe(presets.lm, "byte", seq_len=SEQ_LEN, batch=2)
 
 
 @pytest.fixture(scope="module")
@@ -77,8 +77,7 @@ def diffusion(preset=None, objective="diffusion", **fields) -> DiffusionRunConfi
     with `fields`, sampling in two Euler steps."""
     return DiffusionRunConfig(
         model=ModelConfig.from_model(SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2)),
-        data=ImageData(source=TFDS("dew_images", path=str(IMAGES), split="all"), image_size=4,
-                       augment=None, validation=None),
+        data=TFDS("dew_images", path=str(IMAGES), split="all").pipe(presets.images, 4, batch=2),
         preset=Flow() if preset is None else preset, val_metrics=(),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         objective=ObjectiveConfig(objective, {"solver": Euler(), "steps": 2, **fields}))
@@ -120,14 +119,14 @@ def preference_pairs():
     """The chain recipe's DPO stage: `Preferences` at `seq_len`, DPO one below."""
     pair = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5],
             "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1]}
-    spec = PreferenceData(source=tuple(json.loads(row) for row in (json.dumps(pair),) * 4), seq_len=6)
-    return DPOObjective(decoder(), spec.seq_len - 1), first(spec)
+    pairs = Memory([json.loads(json.dumps(pair))] * 4).pipe(presets.preferences, seq_len=6, batch=2)
+    return DPOObjective(decoder(), 6 - 1), first(pairs)
 
 
 def jepa():
     """The JEPA recipe's sample field over its image dataset, the grid it patches."""
-    config = JepaRunConfig(data=ImageData(source=TFDS("dew_images", path=str(IMAGES), split="all"),
-                                     image_size=16, augment=None, validation=None), probe_classes=2)
+    config = JepaRunConfig(data=TFDS("dew_images", path=str(IMAGES), split="all").pipe(
+        presets.images, 16, batch=2), probe_classes=2)
     sample = config.sample()
     encoder = JepaEncoder(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=2)
     grid = (sample.shape[-2] // encoder.patch_size,) * 2
@@ -147,8 +146,7 @@ def decision():
     objective = DecisionObjective(decoder(), tokenizer=ByteTokenizer(),
                                   specials=Specials(None, 10, 0, "\x00", 255),
                                   layout=StateFirstLayout(max_len=32, head_max_len=24, option_tokens=6))
-    return objective, next(loader(Decisions(source=examples), batch=2, read="memory",
-        objective=objective.data()).train(DataPartition()))
+    return objective, next(decision_rows(examples, 2, objective=objective.data()).train(DataPartition()))
 
 
 def cases(windows):
@@ -160,22 +158,22 @@ def cases(windows):
 
     def masked():
         mask = 259
-        return (MaskedDiffusionObjective(decoder(causal=False), MDLM(mask_id=mask)(), windows.seq_len + 1),
+        return (MaskedDiffusionObjective(decoder(causal=False), MDLM(mask_id=mask)(), SEQ_LEN + 1),
                 first(windows))
 
     def block():
         canvas, prompt = 4, 8
         model = DiffusionGemma(text=decoder(layer_scalar="frozen"), canvas_length=canvas)
-        response = windows.seq_len + 1 - prompt
+        response = SEQ_LEN + 1 - prompt
         return (BlockDiffusionObjective(model, prompt_length=prompt, num_canvases=response // canvas,
                                         canvas_size=canvas), first(windows))
 
     return {
-        "lm": lambda: (LMObjective(decoder(), windows.seq_len), first(windows)),
+        "lm": lambda: (LMObjective(decoder(), SEQ_LEN), first(windows)),
         "masked_diffusion": masked,
         "block_diffusion": block,
-        "distillation": lambda: (DistillationObjective(LMObjective(decoder(), windows.seq_len),
-                                                       LMObjective(decoder(), windows.seq_len)),
+        "distillation": lambda: (DistillationObjective(LMObjective(decoder(), SEQ_LEN),
+                                                       LMObjective(decoder(), SEQ_LEN)),
                                  first(windows)),
         "dpo": preference_pairs,
         "grpo": lambda: packed(lambda seq_len: GRPOObjective(decoder(), seq_len)),
@@ -192,6 +190,6 @@ def cases(windows):
         "jepa": jepa,
         "decision": decision,
         "supervised": lambda: (Supervised(decoder(), CrossEntropy(labels="text"),
-                                          inputs=InputSpec(Field("text", (windows.seq_len + 1,)))),
+                                          inputs=InputSpec(Field("text", (SEQ_LEN + 1,)))),
                                first(windows)),
     }
