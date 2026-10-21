@@ -1,18 +1,13 @@
 """JSON-compatible episode records for interchange and turn-boundary recovery."""
 
+import functools
 import math
-from collections.abc import Callable, Mapping
-from typing import cast
+from collections.abc import Mapping
 
-from dew.records import JSON, integer, integers, listed, record as section, text
+from dew.records import integer, integers, listed, record as section, text
 from dew.sampling.text import Sampling
 
 from .episodes import Action, Episode, EpisodeId, EpisodeStatus, Observation, Transition
-
-
-def sequence[ItemT](value: object, read: Callable[[JSON], ItemT], key: str) -> tuple[ItemT, ...]:
-    """Read every entry of a JSON array, each one through `read`."""
-    return listed(value, key, lambda entry, _: read(cast(JSON, entry)), "a list")
 
 
 def real(value: object, key: str) -> float:
@@ -22,9 +17,8 @@ def real(value: object, key: str) -> float:
     return float(value)
 
 
-def reals(value: object, key: str) -> tuple[float, ...]:
-    """One list of finite numbers: a row's likelihoods."""
-    return listed(value, key, real, "a list of finite numbers")
+reals = functools.partial(listed, read=real, what="a list of finite numbers")
+"""One list of finite numbers: a row's likelihoods (`listed`)."""
 
 
 def observation_record(value: Mapping[str, object]) -> Observation:
@@ -36,9 +30,8 @@ def observation_record(value: Mapping[str, object]) -> Observation:
                        messages(record["messages"], "messages"))
 
 
-def messages(value: object, key: str) -> tuple[Mapping[str, object], ...]:
-    """A list of chat messages, each a JSON object, kept as written."""
-    return listed(value, key, section, "a list of chat messages")
+messages = functools.partial(listed, read=section, what="a list of chat messages")
+"""A list of chat messages, each a JSON object, kept as written (`listed`)."""
 
 
 def action_record(value: Mapping[str, object]) -> Action:
@@ -64,7 +57,7 @@ def episode_from_record(value: Mapping[str, object]) -> Episode:
     transitions = tuple(
         Transition(action_record(section(turn["action"], "action")),
                    observation_record(section(turn["observation"], "observation")))
-        for turn in sequence(record["transitions"], lambda turn: section(turn, "transition"), "transitions"))
+        for turn in listed(record["transitions"], "transitions", read=section, what="a list of transitions"))
     return Episode(EpisodeId(integer(identity["task"], "task"), integer(identity["attempt"], "attempt"),
                              integer(identity["sample"], "sample"), integers(identity["seed"], "seed")),
                    integer(record["policy_step"], "policy_step"),

@@ -36,9 +36,9 @@ from typing import TypedDict
 import numpy as np
 
 from dew.data.prompts import PromptRecord
-from dew.records import JSON, integer, integers, record as section, text
+from dew.records import JSON, integer, integers, listed, record as section, text
 
-from .records import messages, real, reals, sequence
+from .records import messages, real, reals
 from .rollout import Reward
 from .sessions import Call, Session, Status, Transcript, chains
 
@@ -248,8 +248,8 @@ def _calls(row: Mapping[str, object], version: int | None,
                 ),
                 version=integer(stated, "version"),
                 routed_experts=None if record is None else record[:forwarded],
-                support=None if support is None else sequence(
-                    support, lambda kept: integers(kept, "support"), "support"),
+                support=None if support is None else listed(
+                    support, "support", read=integers, what="a list of token-id lists"),
                 reward=None if meta.get("reward") is None else real(meta["reward"], "reward"),
                 transcript=None if meta.get("transcript") is None else _transcript(meta["transcript"]),
             )
@@ -322,8 +322,8 @@ def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
             ):
                 raise ValueError(f"verl rows from {cursor} do not hold the {count} chains of one session")
             calls = tuple(call for member in group
-                          for call in _calls(member, None, sequence(
-                              _dew(member)["calls"], lambda call: section(call, "call"), "calls")))
+                          for call in _calls(member, None, listed(
+                              _dew(member)["calls"], "calls", read=section, what="a list of calls")))
             record = section(dew["session"], "session")
             components = {key: real(value, key)
                           for key, value in section(record["components"], "components").items()}
