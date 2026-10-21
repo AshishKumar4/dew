@@ -23,8 +23,9 @@ over the multiprocessors, a planar snake over the output tiles. A tile is a bloc
 one group, a block two groups share running once for each, and a tile stores only its group's rows, in
 a power-of-two ladder of TMA stores. Changed for Dew, each marked `# Dew:`:
 
-- the rows past the routed ones are one more group, whose tiles store zeros, so they come back zero,
-  and a grid slot past the last tile, which upstream ran on group 0's matrix and stored nothing of,
+- the rows past the routed ones are one more group, whose tiles multiply nothing, so each output there
+  is the epilogue of a zero accumulator (zero without one), and a grid slot past the last tile, which
+  upstream ran on group 0's matrix and stored nothing of,
   multiplies nothing;
 - each writes the output dtype it is asked for (fp32 for a kernel gradient), not the operands';
 - `tgmm` zeroes the neighbouring groups' rows of both operands by selection, where upstream
@@ -143,10 +144,10 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     m = lhs.shape[0]
     lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
-    prologue_operands = tuple(_rows_padded(side) if axes[0] == 'rows' else side
-                              for side, axes in zip(prologue_operands, prologue_axes, strict=True))
-    epilogue_operands = tuple(_rows_padded(side) if axes[0] == 'rows' else side
-                              for side, axes in zip(epilogue_operands, epilogue_axes, strict=True))
+    prologue_operands = tuple(_side_padded(side, axes) for side, axes in zip(prologue_operands, prologue_axes,
+                                                                               strict=True))
+    epilogue_operands = tuple(_side_padded(side, axes) for side, axes in zip(epilogue_operands, epilogue_axes,
+                                                                               strict=True))
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
     sides = len(prologue_operands) + len(epilogue_operands)
 
@@ -200,21 +201,12 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
             outs = (acc,) if epilogue is None else _epilogue(
                 epilogue, acc, epilogue_gmems, epilogue_axes, group_info.block_start, ni * block_n,
                 block_m, block_n)
-            # Dew: the rows past the routed ones store zeros, whatever the epilogue makes of their empty sums.
-            routed = group_info.group_id < g
-
+            # Dew: the rows past the routed ones multiplied nothing: each output there is the epilogue of a
+            # zero accumulator, zero without one.
             for o_gmem, out in zip(o_gmems, outs, strict=True):
                 @functools.partial(pl.run_scoped, o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype))
                 def store_scope(o_smem, o_gmem=o_gmem, out=out):
-                    @pl.when(routed)
-                    def _():
-                        o_smem[...] = out.astype(o_smem.dtype)
-
-                    @pl.when(~routed)
-                    def _():
-                        zeros = jnp.zeros(o_smem.shape, o_smem.dtype)
-                        o_smem[...] = plgpu.layout_cast(zeros, plgpu.Layout.WGMMA)
-
+                    o_smem[...] = out.astype(o_smem.dtype)
                     plgpu.commit_smem()
 
                     smem_start = group_info.start_within_block
@@ -291,8 +283,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     # Dew: the rows padded to a multiple of 8, as `gmm`'s, past every group.
     lhs, rhs = _rows_padded(lhs), _rows_padded(rhs)
     k = lhs.shape[0]
-    prologue_operands = tuple(_rows_padded(side) if axes[0] == 'rows' else side
-                              for side, axes in zip(prologue_operands, prologue_axes, strict=True))
+    prologue_operands = tuple(_side_padded(side, axes) for side, axes in zip(prologue_operands, prologue_axes,
+                                                                               strict=True))
 
     group_sizes = group_sizes.astype(jnp.int32)
     group_starts = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(group_sizes)[:-1]]).astype(jnp.int32)
@@ -327,7 +319,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
                                        delay_release=int(tiles.stages > 1))
 
             side_specs = [side_spec(axes) for axes in prologue_axes]
-            sides = [side.at[gmem_slice] if axes[0] == 'rows' else side
+            sides = [side.at[tuple(gmem_slice if axis == 'rows' else slice(None) for axis in axes)]
                      for side, axes in zip(side_gmems, prologue_axes, strict=True)]
 
             def acc_scope(acc_ref):
@@ -400,10 +392,17 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
                   *prologue_operands)
 
 
-def _rows_padded(array: jax.Array) -> jax.Array:
-    """`array` with zero rows after its own up to a multiple of 8, the rows a TMA descriptor tiles by."""
-    pad = -array.shape[0] % 8
-    return jnp.pad(array, ((0, pad),) + ((0, 0),) * (array.ndim - 1)) if pad else array
+def _rows_padded(array: jax.Array, axis: int = 0) -> jax.Array:
+    """`array` with zeros after its own along `axis` up to a multiple of 8, the rows a TMA descriptor tiles
+    by."""
+    pad = -array.shape[axis] % 8
+    widths = tuple((0, pad if dim == axis else 0) for dim in range(array.ndim))
+    return jnp.pad(array, widths) if pad else array
+
+
+def _side_padded(side: jax.Array, axes: tuple) -> jax.Array:
+    """A side operand padded as the rows are along the dimension that follows them, wherever it is."""
+    return _rows_padded(side, axes.index('rows')) if 'rows' in axes else side
 
 
 def _zero_rows(lhs_smem, rhs_smem, kept, block_k: int, block_m: int, block_n: int) -> None:
