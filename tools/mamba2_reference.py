@@ -181,8 +181,18 @@ def write_seeded() -> None:
 
     PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded
     """
-    from recorded_references import provenance, record_case
+    from recorded_references import provenance, record_case, save
     from ssd_support import mamba2_draw, mamba2_run
+
+    def draw(seed):
+        inputs = mamba2_draw(seed, (B, S, H, P, G, N))
+        redrawn = mamba2_draw(seed)
+        assert inputs.keys() == redrawn.keys(), f"transformers seed {seed}: regenerated inputs differ"
+        for name, value in inputs.items():
+            other = redrawn[name]
+            assert (value.dtype == other.dtype and value.shape == other.shape
+                    and value.tobytes() == other.tobytes()), f"transformers seed {seed}: {name} differs"
+        return inputs
 
     def reference(site, arrays):
         x, dt, A, Bm, Cm, D, bias, initial = (arrays[name] for name in
@@ -209,15 +219,16 @@ def write_seeded() -> None:
                     exact = reference(site, {name: value.double() for name, value in tensors.items()})
             return narrow, exact
 
-        stored.update(record_case(site, lambda seed: mamba2_draw(seed, (B, S, H, P, G, N)), evaluate,
-                                   lambda inputs, site=site: mamba2_run(site, inputs)))
+        stored.update(record_case(site, draw, evaluate,
+                                   lambda inputs, site=site: mamba2_run(site, inputs), store_inputs=False))
     stored["provenance"] = provenance(
         f"transformers {transformers.__version__}", TRANSFORMERS_REVISION, "cpu",
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded",
         truth="transformers reference in torch float64 through tools/torch_precision.py")
     destination = SSD / "ssd_seeded.npz"
-    np.savez_compressed(destination, **stored)
-    print(f"wrote {destination.name}", flush=True)
+    written = save(destination, stored, reference=f"transformers {transformers.__version__}",
+                   license="Apache-2.0")
+    print(f"wrote {destination.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
 
 
 if __name__ == "__main__":

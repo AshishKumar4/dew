@@ -14,9 +14,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, declared_seeds, ieee_fixture, indexed_recording, widened
+from reference_error import PRECISION, assert_as_exact, declared_seeds, indexed_recording, recording, widened
 from sharded import assert_runs_per_shard
-from ssd_support import ssd_value_and_grad
+from ssd_support import mamba_ssd_draw, mamba_ssd_operands, ssd_value_and_grad
+from tool_support import load
 from tuned import each_config
 
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
@@ -27,8 +28,7 @@ pytestmark = pytest.mark.kernel
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
 INTERPRETED = jax.default_backend() != "gpu"
-SEEDS = declared_seeds(FIXTURES / "ssd_mamba_ssm_seeded.npz")
-"""Sized by seeds_for on recorded mamba_ssm outputs; NPZ provenance records the date and GPU device."""
+SEEDED = FIXTURES / "ssd_mamba_ssm_seeded.npz"
 
 
 def row_names_port(*, port: bool = True):
@@ -77,6 +77,23 @@ CASES = [
 ]
 
 
+def test_the_seeded_draw_preserves_the_mamba_ssm_native_inputs():
+    """The torch-free draw keeps every bit of the original recorder's fp32 and bf16 operands."""
+    recorder = load("mamba_ssd_reference")
+    rng = np.random.default_rng(recorder.SEED)
+    with np.load(FIXTURES / "ssd_mamba_ssm.npz") as stored:
+        for case in recorder.CASES:
+            batch, length, heads, width = stored[f"{case}.x"].shape
+            groups, state = stored[f"{case}.B"].shape[2:]
+            dtype = jnp.dtype(str(stored[f"{case}.dtype"]))
+            inputs = mamba_ssd_operands(rng, (batch, length, heads, width, groups, state), dtype,
+                                        f"{case}.seq" in stored)
+            for name, value in inputs.items():
+                other = stored[f"{case}.{name}"]
+                assert (value.dtype == other.dtype and value.shape == other.shape
+                        and value.tobytes() == other.tobytes()), f"{case}: {name} differs"
+
+
 @pytest.mark.parametrize("case, heads", CASES)
 def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
     """Every output and gradient on par with recorded mamba_ssm on fresh input and exact orbit draws.
@@ -84,9 +101,16 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
     The truth is mamba_ssm's minimal torch reference in float64. With `heads`, kernels summing a group's heads
     take that many a program; both configured forms see the same declared draws and every leaf.
     """
-    stored = ieee_fixture(FIXTURES / "ssd_mamba_ssm_seeded.npz")
+    stored = recording(SEEDED)
+    precision = str(stored.pop(PRECISION, "no precision"))
+    if precision != "ieee":
+        raise ValueError(f"{SEEDED} records {precision!r} for its matmuls, not 'ieee'; "
+                         "regenerate it with IEEE matmuls")
+    seeds = declared_seeds(SEEDED)[case]
     chunk, dtype = int(stored[f"{case}.chunk"]), jnp.dtype(str(stored[f"{case}.dtype"]))
-    draw, reference, truth = indexed_recording(stored, case, SEEDS[case])
+    shape, documents = tuple(stored[f"{case}.shape"]), bool(stored[f"{case}.documents"])
+    draw, reference, truth = indexed_recording(
+        stored, case, seeds, inputs_of=lambda seed: mamba_ssd_draw(seed, shape, dtype, documents))
     names = ("x", "dt", "A", "B", "C", "D", "h0")
 
     def run(index, arrays):
@@ -106,7 +130,7 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
         assert all(pin in each_config(kernel, run, *draw(0)) for kernel, pin in pins.items())
     with tuning.pinned(pins):
         assert_as_exact(jax.jit(run), reference, draw, f"mamba_ssm {case}, heads={heads}",
-                        seeds=SEEDS[case], truth_fn=truth)
+                        seeds=seeds, truth_fn=truth)
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])
