@@ -248,18 +248,20 @@ def capability(generation: str) -> tuple[int, int] | None:
 def gpu_target(identifier: str | None = None) -> GpuTarget:
     """The target for a generation, reported device kind or case-insensitive lab alias.
 
-    None is the default device's: its generation is `device_generation`'s, the
-    one seam that `assumed` and tests set, and its device kind only picks the
-    SKU's peaks within that generation; a real GPU the table names no SKU of
+    None is this process's first device's: its generation is
+    `device_generation`'s, the one seam that `assumed` and tests set, and its
+    device kind only picks the SKU's peaks within that generation; a real GPU the table names no SKU of
     keeps its own kind, so its peaks stay unknown, while an assumed or patched
     generation takes the generation's canonical device. SKU queries retain
     that SKU's peaks. Unknown kinds have empty resources.
     """
     if identifier is None:
         import jax
-        device = jax.devices()[0]
+        device = jax.local_devices()[0]
         generation, kind = device_generation(), device.device_kind
         real = device.platform == 'gpu' and ASSUMED.get() is None
+        if real:
+            _one_kind(jax.devices())
         target = gpu_target(kind)
         if target.generation != generation:
             canonical = TARGETS.get(generation, GpuTarget(generation, kind))
@@ -334,6 +336,16 @@ def _clocks(ordinal: int) -> tuple[tuple[str, float], ...]:
     return ('clock_hz', clock * 1e3), ('memory_bandwidth', 2 * memory_clock * 1e3 * bus / 8)
 
 
+def _one_kind(devices) -> None:
+    """Refuse a run over GPUs of more than one kind: every process traces the same program, so the
+    kernel choices each makes from its own GPU's facts must be the same, which GPUs of one kind give."""
+    kinds = sorted({device.device_kind for device in devices})
+    if len(kinds) > 1:
+        raise ValueError(f"the run's GPUs are of {len(kinds)} kinds ({', '.join(kinds)}); Dew's kernel "
+                         "choices read one GPU's facts, the same in every process, so a run takes GPUs "
+                         "of one kind")
+
+
 def runtime_facts(target: GpuTarget, device) -> GpuTarget:
     """`target` with the facts a real CUDA `device` reports of itself in place of the table's: its
     multiprocessors, its block's shared memory, its clock and memory bandwidth (`_clocks`), and
@@ -382,7 +394,7 @@ def device_generation() -> str:
         return generation
     if (platform := placed_platform()) != jax.default_backend():
         return platform
-    device = jax.devices()[0]
+    device = jax.local_devices()[0]
     capability = _compute_capability(device) if device.platform == 'gpu' else None
     if capability:
         return 'sm' + capability.replace('.', '')
