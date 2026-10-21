@@ -29,6 +29,7 @@ from reference_error import (
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
     distance,
+    with_gradients,
 )
 from residual_orders import orders
 
@@ -528,7 +529,7 @@ def test_splash_keeps_the_kernel_contract_on_a_mesh(axis, key_heads, packed):
     (`sharded.assert_runs_per_shard`) under pallas's interpreter: the output and the three input
     gradients on par with one device's over the site's draws, and no operand moved between devices."""
     from jax.sharding import Mesh, PartitionSpec
-    from sharded import assert_runs_per_shard, with_gradients
+    from sharded import assert_runs_per_shard
 
     def draw(seed):
         query, _, _ = qkv((2, 256, 4, 64), jnp.float32, seed=3 * seed)
