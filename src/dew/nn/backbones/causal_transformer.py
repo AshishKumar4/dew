@@ -1243,6 +1243,8 @@ class CausalTransformer(nn.Module):
             routed=spec.routed,
             media_routed=(spec.routed and not spec.hash_routed
                           and self.mixture is not None and self.mixture.media_bias),
+            routing_block=(self.mixture.routing_block if spec.routed and not spec.hash_routed
+                           and self.mixture is not None else None),
             engram=None if spec.engram is None or self.engram is None else functools.partial(
                 EngramLayer, rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
                 hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,

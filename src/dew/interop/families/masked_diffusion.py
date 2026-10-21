@@ -307,6 +307,15 @@ def _llada2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     it through create_bidirectional_mask too. Without an explicit mask Dew
     exposes their full bidirectional view, as the other masked LMs do;
     sampling is Dew's MDLM procedure, not the release's block-wise recipe.
+
+    2.2's block routing departs from the release in one respect: the release
+    cuts its `block_size` blocks from the batch flattened into one stream (and
+    asserts whole blocks), so a row's experts there depend on the rows beside
+    it and a packed document's on its neighbours. Dew routes each request and
+    each packed document by its own blocks of real tokens, padding voting for
+    none (`dew.nn.moe.Router`), which is the release's routing wherever a row
+    is a whole number of blocks of real tokens: one request, or rows that
+    many blocks long (tests/test_hf_decoders.py's recorded probes).
     """
     block = (record_int(hf_config, 'block_size', 32)
              if 'block_size' in hf_config or 'expert_capacity' in hf_config else None)
