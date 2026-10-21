@@ -178,7 +178,7 @@ COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2)
 """A tile two consumer warpgroups compute (a cluster the interpreter does not model)."""
 
 
-@pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "broadcast axes", "scaled"])
+@pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "broadcast axes", "cast prologue"])
 def test_a_cooperative_tile_holds_check_1_with_its_hooks(case):
     """The Hopper launches pinned to a cooperative tile, interpreted: each consumer rewrites half the stage
     both read and computes half the columns' epilogue, as exact as the plain program from float64 truth;
