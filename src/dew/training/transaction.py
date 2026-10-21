@@ -122,6 +122,7 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
     committed."""
     metrics: dict[str, jax.Array | Recorded] = {**aux.metrics, **step_counts(batch)}
     if aux.record is not None:
+        assert "evaluated" in aux.record, "a recording transaction stacks its evaluations (`recorded`)"
         metrics[RECORD] = aux.record
     return (dataclasses.replace(advanced, step=current.step + stepped), loss, metrics, jnp.isfinite(loss),
             advanced.microstep > current.microstep, committed)
@@ -129,10 +130,11 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
 
 def recorded(evaluations: list[tuple[Evaluated, jax.Array]], ran: jax.Array) -> Recorded:
     """A recording step's record (`Recorded`) of its `evaluations`, each with the places its slot and
-    column give its rows (`example_places`), stacked on a first axis: the attempt's own evaluation and
-    then the window's other microbatches as the commit replayed them, each in its slot, `ran` saying
-    which ran. `column_ok` holds where each row's place is its expected one, so rows a layout places
-    apart from their column, or a microbatch read under another's places, fail it."""
+    the column its loss saw give its rows (`Transaction._places`), stacked on a first axis: the
+    attempt's own evaluation and then the window's other microbatches as the commit replayed them, each
+    in its slot, `ran` saying which ran. `column_ok` holds where each row's place is its expected one,
+    so rows a layout places apart from their column, or a microbatch read under another's places, fail
+    it."""
     values = jax.tree.map(lambda *leaves: jnp.stack(leaves),
                           *[evaluated["values"] for evaluated, _ in evaluations])
     index = jnp.stack([evaluated["example_index"] for evaluated, _ in evaluations])
@@ -470,10 +472,11 @@ class Transaction:
     def examples(self, state, slot, batch, part=None, rejected=0) -> dict:
         return example_fields(state, slot, self.split, batch, self.size, part, rejected)
 
-    def _places(self, slot, batch, part) -> jax.Array:
-        """The places the window's slot `slot` and the batch's column give its rows (`example_places`),
-        which a recording evaluation's own are held to (`recorded`)."""
-        return example_places(slot, self.split, rows_of(batch), batch.get(EXAMPLE_ROWS), part)
+    def _places(self, slot, evaluated: Evaluated, part) -> jax.Array:
+        """The places the window's slot `slot` and the column its loss saw give an evaluation's rows
+        (`example_places`), which its own are held to (`recorded`)."""
+        return example_places(slot, self.split, evaluated["example_index"].shape[0], evaluated.get("column"),
+                              part)
 
     def read(self, variables, compute):
         """The variables a step's forward reads: the narrow copies in place of
@@ -689,7 +692,7 @@ class Transaction:
             # The record of each of the window's other microbatches the commit replays, in its slot.
             own = realized.aux.record
             unreplayed = None if own is None else [jax.tree.map(jnp.zeros_like, (own, self._places(
-                state.microstep % self.size, batch, part))) for _ in range(self.size - 1)]
+                state.microstep % self.size, own, part))) for _ in range(self.size - 1)]
 
             def replay(_):
                 cot = pooled(pending.pooled, realized.stats, factor)
@@ -700,7 +703,7 @@ class Transaction:
                     realized = realize(replayed, records, step_info)
                     if kept is not None:
                         attempt = state.accumulation.attempts[index]
-                        evaluated = (realized.aux.record, self._places(index, records,
+                        evaluated = (realized.aux.record, self._places(index, realized.aux.record,
                                                                        attempt % self.split))
                         kept = [jax.tree.map(lambda held, new, slot=slot: jnp.where(slot == index, new, held),
                                              held, evaluated) for slot, held in enumerate(kept)]
@@ -723,7 +726,7 @@ class Transaction:
             else:
                 gradient, replays = pending.gradient, []
             if own is not None:
-                evaluations = [(own, self._places(state.microstep % self.size, batch, part)), *replays]
+                evaluations = [(own, self._places(state.microstep % self.size, own, part)), *replays]
                 ran = jnp.concatenate([jnp.ones((1,), bool), jnp.full((len(replays),), replayed)])
                 realized = dataclasses.replace(realized, aux=dataclasses.replace(
                     realized.aux, record=recorded(evaluations, ran)))
