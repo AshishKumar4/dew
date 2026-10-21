@@ -58,11 +58,11 @@ def fla_math(q, k, v, g, beta, h0):
     return math(q, k, v, plain_prefix(g), beta, h0)
 
 
-SEEDS = {(1, 2, 64, 64, 128): 8, (2, 2, 64, 64, 100): 8, (1, 1, 32, 96, 70): 8,
-         (1, 1, 128, 128, 64): 8}
+SEEDS = {(1, 2, 64, 64, 128): 8, (2, 2, 64, 64, 100): 8, (1, 1, 32, 96, 70): 32,
+         (1, 1, 128, 128, 64): 64}
 """Each geometry's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest
 for which `fla_math` compared with itself resolves the factor in every output and gradient, truth
-the float64 recurrence."""
+the float64 recurrence (2026-10-21, on armada, where this test runs: a GPU skips it)."""
 
 
 @ON_A_GPU
