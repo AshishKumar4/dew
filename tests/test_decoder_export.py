@@ -90,7 +90,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from interop_support import assert_restores, assert_same_stored_tensors
-from model_support import flat_tree
+from model_support import flat_tree, streamed_export
 from reference_error import (
     FACTOR,
     ORDERS,
@@ -516,23 +516,7 @@ def test_a_sharded_export_holds_a_few_shards_on_the_host(tmp_path):
     serialized bytes and one transient tensor, four shards at most
     (measured 0.12-0.13 GB); building the whole export first rises by the
     model (0.32 GB on this checkpoint, 0.57 GB of Qwen3-0.6B's 1.11)."""
-    import os
-    import subprocess
-    import sys
-
-    root = Path(__file__).parents[1]
-    # One device, as a user's process has: the suite's simulated mesh would
-    # place every leaf eight times over.
-    env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
-           "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
-    written = subprocess.run([sys.executable, "-c", SYNTHETIC_CHECKPOINT, str(FIXTURES / "qwen3-tiny"),
-                              str(tmp_path / "source")], capture_output=True, text=True, env=env)
-    assert written.returncode == 0, written.stderr[-2000:]
-    run = subprocess.run([sys.executable, str(root / "tools" / "benchmark_streaming_export.py"),
-                          str(tmp_path / "source"), "50MB", str(tmp_path / "out")],
-                         capture_output=True, text=True, env=env)
-    assert run.returncode == 0, run.stderr[-2000:]
-    measured = json.loads(run.stdout.splitlines()[-1])
+    measured = streamed_export(SYNTHETIC_CHECKPOINT, FIXTURES / "qwen3-tiny", tmp_path, "50MB")
     assert measured["shards"] > 4
     assert measured["rise_gb"] < 4 * 50e6 / 2**30, measured
 

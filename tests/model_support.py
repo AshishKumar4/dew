@@ -1,6 +1,11 @@
 """The tiny decoder and the parameter-tree view several model tests share."""
 
+import json
+import os
+import subprocess
+import sys
 from collections.abc import Callable
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -98,3 +103,22 @@ def greedy_walk(model: nn.Module, params: dict, prompt, steps: int,
             logits = transform(sequence, logits)
         sequence = np.concatenate([sequence, logits.argmax(-1)[:, None].astype(np.int32)], axis=1)
     return sequence
+
+
+def streamed_export(writer: str, argument: Path, directory: Path, shard_size: str) -> dict:
+    """The streaming export's measurements (tools/benchmark_streaming_export.py, its last line) of the
+    checkpoint the script `writer` writes from `argument` into `directory`/source, saved in `shard_size`
+    shards into `directory`/out. The writer and the export each run in a process of their own on one
+    CPU device, as a user's has (the suite's simulated mesh would place every leaf eight times over),
+    so no heap the writer freed is there for the save to reuse."""
+    root = Path(__file__).resolve().parents[1]
+    env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
+           "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
+    written = subprocess.run([sys.executable, "-c", writer, str(argument), str(directory / "source")],
+                             capture_output=True, text=True, env=env)
+    assert written.returncode == 0, written.stderr[-2000:]
+    run = subprocess.run([sys.executable, str(root / "tools" / "benchmark_streaming_export.py"),
+                          str(directory / "source"), shard_size, str(directory / "out")],
+                         capture_output=True, text=True, env=env)
+    assert run.returncode == 0, run.stderr[-2000:]
+    return json.loads(run.stdout.splitlines()[-1])
