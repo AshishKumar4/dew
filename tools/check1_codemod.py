@@ -411,6 +411,53 @@ def revert(manifest: list[dict], refused: set[tuple[str, str]]) -> list[dict]:
     return kept
 
 
+RECIPES = {
+    "seeded": "check 1: the test's own literal seed becomes the draw's seed (`assert_as_exact`)",
+    "recorded": "record the reference over (1 + REDRAW)·K seeds (`record_case`, its evidence where large) "
+                "and judge through `indexed_recording`",
+    "other: parametrized or a fixture": "make the fixture or parametrization draw from a seed, then check 1",
+    "other: a helper given a literal": "the helper's literal is the seed: pass the draw's seed, then check 1",
+    "other: constants": "draw the constants' inputs from a seed, then check 1, or exact where they are exact",
+    "(a) a contract": "the simpler arm run in float64 is the truth; both arms through check 1",
+    "(b) the same computation": "exact equality",
+    "(c) a constant": "exact equality, or a rigorous bound written out",
+    "(d) a golden number": "delete",
+    "(d) a value against itself": "delete",
+    "(e) two things asserted to differ": "`assert_moves`, or exact inequality where the change is "
+                                         "structural; delete a check that only re-asserts a detail",
+}
+
+
+def lists(directory: Path) -> dict:
+    """Each lane's residue, site by site with its family, class and recipe, written to `directory`."""
+    listed = subprocess.run(["git", "ls-files", "tests/*.py", "tools/*.py"], cwd=REPO,
+                            capture_output=True, text=True, check=True).stdout.split()
+    import lint_slop
+
+    by_lane = collections.defaultdict(list)
+    for relative in listed:
+        # The gate's own tests test the families being retired, and go with them.
+        if relative.endswith("check1_codemod.py") or relative in lint_slop.GATE:
+            continue
+        for site in sites(REPO / relative):
+            by_lane[_lane(relative)].append((relative, site["line"], site["family"], site["class"]))
+        for site in tolerance_sites(relative):
+            family = "hand tolerance" + (", on a float64 truth" if site["form"] == "on a float64 truth" else "")
+            by_lane[_lane(relative)].append((relative, site.get("line", 0), family, site["class"]))
+    directory.mkdir(parents=True, exist_ok=True)
+    counts = {}
+    for lane, rows in sorted(by_lane.items()):
+        lines = [f"# {lane}: {len(rows)} sites to judge through check 1 by 2026-11-27", "",
+                 "Classes are the codemod's (tools/check1_codemod.py), an estimate per site: confirm the "
+                 "class when converting. Each row: site, family, class, recipe.", ""]
+        for relative, line, family, kind in sorted(rows):
+            lines.append(f"- `{relative}:{line}`: {family}; {kind}; {RECIPES.get(kind, 'convert by hand')}")
+        (directory / f"{lane.replace(' ', '-').replace('&', 'and').replace(',', '')}.md").write_text(
+            "\n".join(lines) + "\n")
+        counts[lane] = len(rows)
+    return counts
+
+
 def survey(paths: list[str]) -> dict:
     listed = paths or subprocess.run(["git", "ls-files", "tests/*.py", "tools/*.py"], cwd=REPO,
                                      capture_output=True, text=True, check=True).stdout.split()
@@ -427,16 +474,20 @@ def survey(paths: list[str]) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("survey", "exact", "revert"))
+    parser.add_argument("command", choices=("survey", "exact", "revert", "lists"))
     parser.add_argument("paths", nargs="*")
     parser.add_argument("--manifest", type=Path, help="exact: where to write the rewrites made; revert: "
                         "the rewrites to undo from, rewritten to those kept")
     parser.add_argument("--refused", type=Path, help="revert: a file of `file::test` or `file:line` lines")
+    parser.add_argument("--directory", type=Path, help="lists: where to write each lane's residue")
     options = parser.parse_args()
     if options.command == "exact":
         edits = [edit for relative in options.paths for edit in exact_pass(relative, {"(b)", "(c)"})]
         options.manifest.write_text(json.dumps(edits, indent=1))
         print(f"{len(edits)} rewrites in {len({edit['file'] for edit in edits})} files")
+        return 0
+    if options.command == "lists":
+        print(json.dumps(lists(options.directory), indent=1))
         return 0
     if options.command == "revert":
         refused = set()
