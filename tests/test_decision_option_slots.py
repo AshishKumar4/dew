@@ -175,7 +175,8 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     # logit alike; the residual gate shifts every option's), so their rows of float64 zero are held
     # as check 1 holds such rows.
     compacted, grid = stepped(objective, slotted), stepped(objective, batch)
-    assert_as_exact(compacted, grid, lambda seed: (objective.init(jax.random.key(seed)),),
+    initialized = jax.jit(objective.init)
+    assert_as_exact(compacted, grid, lambda seed: (initialized(jax.random.key(seed)),),
                     "compacted options", seeds=SLOT_SEEDS, truth_fn=stepped(wide, widened(batch)))
     variables = objective.init(jax.random.key(0))
     fewer, fewer_gradient = compacted(variables)

@@ -668,8 +668,10 @@ def test_z_loss_gradient_carries_the_reference_factor():
     objective = make_objective(z_loss=coefficient)
     model = objective.model
 
+    initialized = jax.jit(lambda key: objective.init(key)["params"])
+
     def draw(seed):
-        return objective.init(jax.random.key(seed))["params"], np.asarray(token_batch(seed=seed)[TEXT_KEY])
+        return initialized(jax.random.key(seed)), np.asarray(token_batch(seed=seed)[TEXT_KEY])
 
     def programs(forward):
         # The forward and its pullback compiled once each, the oracle's cotangent between them.
