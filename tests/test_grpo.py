@@ -104,12 +104,12 @@ def rollout_batch(seed=0):
 def test_a_prompt_dataset_trains_as_the_prompt_config_does():
     """`Trainer.fit` compiles a Dataset with the objective's own stages.
     GRPO adds none, so one rollout step over `prompts.encode` rows moves the
-    policy exactly as one over the same prompts through `PromptData`."""
+    policy exactly as one over the same prompts through the prompts preset."""
     import optax
     from bank_support import identical
 
-    from dew.config.data import PromptData, loader
-    from dew.data import Loading, Memory, prompts
+    from dew.data import Loading, Memory, presets, prompts
+    from dew.data.compile import compile
     from dew.data.text import tokenizer_for
     from dew.training import Layout, Trainer
 
@@ -126,8 +126,8 @@ def test_a_prompt_dataset_trains_as_the_prompt_config_does():
         return trainer.fit(data, steps=1).variables
 
     identical(trained(Memory(rows).filter_map(prompts.encode(tokenizer, max_prompt_len=8)).batch(8)),
-              trained(loader(PromptData(source=tuple(rows), tokenizer=tokenizer, max_prompt_len=8), batch=8,
-                             read="memory", loading=Loading(workers=0))))
+              trained(compile(Memory(rows).pipe(presets.prompts, tokenizer, max_prompt_len=8, batch=8),
+                              read="memory", loading=Loading(workers=0))))
 
 
 def test_the_loss_reads_the_rolled_out_batch():
