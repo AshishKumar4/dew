@@ -734,6 +734,41 @@ def test_a_cache_of_a_store_that_misses_every_input_publishes_its_empty_fill(tmp
     assert publishing.calls == []
 
 
+def _epoch(reader, batches: int) -> list[tuple[bytes, ...]]:
+    """The rows of a reader's next `batches` batches, each its fields' bytes, sorted: what an epoch
+    reads, in whatever order."""
+    rows = []
+    for _ in range(batches):
+        batch = next(reader)
+        names = sorted(batch)
+        rows += [tuple(np.asarray(batch[name])[row].tobytes() for name in names)
+                 for row in range(len(np.asarray(batch[names[0]])))]
+    return sorted(rows)
+
+
+def test_a_prompt_recipe_with_a_cache_reads_by_index_the_prompts_it_reads_uncached(tmp_path):
+    """A prompt recipe whose rendering drops prompts too long, cached and read by index in the
+    recipe's own loading workers: the cache holds what is left of each input, and an epoch reads
+    the prompts the uncached recipe's epoch reads, however the drops fall among the workers
+    (row 883)."""
+    from dew.config.data import PromptData, loader
+    from dew.data.dataset import DataPartition
+
+    # A third of the prompts are longer than 8 bytes, which the recipe drops: four batches an epoch.
+    recipe = PromptData(tuple({"prompt": "hi " * (1 + index % 3)} for index in range(12)), "byte",
+                        max_prompt_len=8, long="drop", reward_bytes=8)
+    # The recipe reads in worker processes, which read a cache on disk.
+    cached = loader(recipe, batch=2, cache=str(tmp_path / "cache"), read="indexed")
+    uncached = loader(recipe, batch=2, read="indexed")
+    assert cached.records == uncached.records
+    first, second = cached.train(DataPartition()), uncached.train(DataPartition())
+    try:
+        assert _epoch(first, 4) == _epoch(second, 4)
+    finally:
+        first.close()
+        second.close()
+
+
 def test_an_image_recipe_with_a_fixed_caption_and_a_cache_reads_in_its_uncached_order(tmp_path):
     """An image recipe's fixed caption is a configured step, which binds to one that keeps every
     image: cached and read by index, it holds one row for each input, so the recipe takes the
