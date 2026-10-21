@@ -21,3 +21,13 @@ def test_a_family_traced_for_a_gpu_target_reports_each_choice_as_that_target_rou
         judged = kernel_routes.verdict(route)
         assert (judged == "kernel") == (route.kernel == route.preferred)
         assert judged == "kernel" or route.refusal is not None
+
+
+def test_a_decode_steps_routes_are_its_own_not_the_parameters_or_the_caches():
+    """llama's single-token decode step traced for sm80 reports the routes of that step alone: one
+    attention decision per layer, its single query's, where the parameters' and the cache's own
+    forward passes over the prompt used to add theirs to the cell."""
+    config = json.loads((kernel_routes.fixtures()["llama"] / "config.json").read_text())
+    attention = [route for route in kernel_routes.traced(config, "sm80", "decode")
+                 if route.choice in ("attention", "decode")]
+    assert len(attention) == config["num_hidden_layers"]

@@ -15,8 +15,10 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
+import jax
 import numpy as np
 
+from dew.data.sources.codec import content_fingerprint
 from dew.records import JSON, json_value, record
 
 _log = logging.getLogger(__name__)
@@ -100,7 +102,8 @@ class StepIdentity:
             if dataclasses.is_dataclass(step) and not isinstance(step, type)
             else {}
         )
-        if dependencies and dataclasses.is_dataclass(step) and not isinstance(step, type):
+        if dataclasses.is_dataclass(step) and not isinstance(step, type) and (
+                dependencies or _holds_arrays(step)):
             config = json.dumps(_configuration(step), sort_keys=True)
         named = cls(name, config, exact, modules, declared, dependencies)
         if cache and not named.keyable(function=inspect.isfunction(step), external=external):
@@ -155,11 +158,40 @@ def _configuration(step: DataclassInstance) -> dict[str, JSON]:
         value = getattr(step, field.name)
         if isinstance(value, _Dependencies):
             configured[field.name] = json_value(value.dependencies(), field.name)
-        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
-            configured[field.name] = _configuration(value)
         else:
-            configured[field.name] = re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))
+            configured[field.name] = _configured(value)
     return configured
+
+
+def _configured(value) -> JSON:
+    """A step's field, any value, as its configuration records it: a dataclass by its own fields, a
+    value that holds an array entry by entry with the array by its fingerprint, which its repr
+    rounds to eight digits and cuts short past a thousand entries, and anything else by its repr,
+    without addresses."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _configuration(value)
+    if _holds_arrays(value):
+        if isinstance(value, (list, tuple)):
+            return [_configured(entry) for entry in value]
+        if isinstance(value, Mapping):
+            return {repr(name): _configured(entry) for name, entry in value.items()}
+        if isinstance(value, (np.ndarray, jax.Array)):
+            # Its dtype by name and structure, which a dtype's code (`|V1` for both float8s) is not.
+            return {"array": content_fingerprint(np.asarray(value)).hex()}
+    return re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))
+
+
+def _holds_arrays(value) -> bool:
+    """Whether `value`, a step or a field of one, holds an array, whose repr does not spell it out
+    (`_configured`)."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return any(_holds_arrays(getattr(value, field.name))
+                   for field in dataclasses.fields(value) if field.repr)
+    if isinstance(value, (np.ndarray, jax.Array)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return any(map(_holds_arrays, value))
+    return isinstance(value, Mapping) and any(map(_holds_arrays, value.values()))
 
 
 _ENVIRONMENT = ("revision", "lock", "python", "platform", "clean")

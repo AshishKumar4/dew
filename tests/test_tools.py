@@ -346,6 +346,30 @@ def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
                           float(reordered.sum()), float(truth.sum()))
 
 
+def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width():
+    """A residual order permutes only the parameters that hold the residual stream: with 2 heads of
+    16 in a 32-wide decoder, Kimi Delta Attention's dt_bias and short-convolution weights are the
+    residual's width too, and permuting them, as a size-matching guess would, changes the function."""
+    from model_support import TINY_DECODER
+    from residual_orders import orders, permuted, residual_width
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.registry import mixers
+
+    mixer = mixers.build("kimi_delta_attention", linear_num_heads=2, linear_head_dim=16)
+    model = CausalTransformer(**{**TINY_DECODER, "vocab_size": 16, "max_seq_len": 128}, mixer=mixer)
+    ids = jnp.array([[2, 7, 11, 3, 5, 1, 9, 4]], jnp.int32)
+    variables = model.init(jax.random.key(4), ids)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), variables)
+        model = model.clone(dtype=jnp.float64)
+        truth = np.asarray(model.apply(wide, ids))
+        order = orders(residual_width(variables), 2, seed=6)[1]
+        reordered = np.asarray(model.apply(permuted(wide, order), ids))
+    load('layout_parity').order_invariance({'logits': reordered}, {'logits': truth},
+                                           float(reordered.sum()), float(truth.sum()))
+
+
 @pytest.mark.parametrize("model", ["dit", "dense_mdlm"])
 def test_layout_parity_anchors_an_objective_that_draws_per_row_on_its_own_draws(model):
     """The fp64 anchor is the reference's step with every sum in fp64, the
@@ -1014,7 +1038,9 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
     boundary. A method or a function named like another, a definition only defined, a parameter
     or a local import called, a helper of an enclosing function, a class body run where it is
     defined, and a nested loop's or a `match`'s exits are each read as what they are; a failure
-    that falls through to the loop's exit retries nothing."""
+    that falls through to the loop's exit retries nothing. A notebook's display reaches its frontend,
+    another process, so its frames redrawn on a clock are at that boundary, while a representation
+    built round a loop publishes nothing."""
     found = _linted(tmp_path, {"src/sparx/waits.py": (
         "import concurrent.futures\n"
         "import subprocess\n"
@@ -1107,8 +1133,17 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
         "                case None:\n"
         "                    break\n"
         "        except ValueError:\n"
-        "            continue\n")})
-    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (5, 8, 12, 38, 44, 48, 50, 66, 86)]
+        "            continue\n"
+        "def frames(done, frame):\n"
+        "    from IPython.display import update_display\n"
+        "    while not done.wait(0.125):\n"
+        "        update_display(frame(), display_id='panel', raw=True)\n"
+        "def built(done):\n"
+        "    from IPython.display import HTML\n"
+        "    while not done.wait(0.125):\n"
+        "        HTML('<b>waiting</b>')\n")})
+    assert found == [("src/sparx/waits.py", line, "SLOP018")
+                     for line in (5, 8, 12, 38, 44, 48, 50, 66, 86, 99)]
 
 
 def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths(tmp_path):

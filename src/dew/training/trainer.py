@@ -149,11 +149,13 @@ from dew.training.model_flops import (
     TOKENS,
     TRAINING_FLOPS,
     _TokenCount,
+    batch_tokens,
     model_batch,
     prepare_counts,
     uncounted,
 )
 from dew.training.narrow import narrowed, narrowed_paths
+from dew.training.observe import Observe
 from dew.training.optim import learning_rate, with_rate_scales
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
@@ -294,6 +296,7 @@ class _FitPlan:
     suites: Mapping[str, EvalSuite] = dataclasses.field(default_factory=dict)
     held_best: bool = False  # a restore_best without Checkpoints (`HeldBest`)
     """Every validation split by name, its metrics and cadence resolved."""
+    observe: Observe | None = None
 
     @property
     def validation(self) -> bool:
@@ -455,7 +458,7 @@ class Trainer(Generic[Loss, Effects]):
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
         self._config = None if built else optimizer
-        self._optimizer = objective.optimizer(optimizer, accumulation=accumulation) if built else None
+        self._optimizer = objective.optimizer(optimizer) if built else None
         from dew.nn.inputs import request_key
         self.seed = int(key) if isinstance(key, (int, np.integer)) and not isinstance(key, bool) else None
         self.key = request_key(key)
@@ -495,7 +498,6 @@ class Trainer(Generic[Loss, Effects]):
         self._display = TrainingDisplay()
         self._count_work = False
         self._refusal: str | None = None
-        self._unavailable_noted = False
         # The fit ladder's rung beyond the objective's own head and remat: a
         # step that fit only under XLA's default options keeps them for later
         # compiles. A resumed run starts at its checkpoint's rung, and says so
@@ -995,7 +997,8 @@ class Trainer(Generic[Loss, Effects]):
                     compact_qk(jax.tree.map(zeros, aux.qk_stats))),
                 batches=None if shared else buffer(records),
                 variables=None if mutable is None else buffer(mutable),
-                attempts=None if shared else jnp.zeros((slots,), jnp.int32))
+                attempts=None if shared else jnp.zeros((slots,), jnp.int32),
+                tokens=jnp.zeros((2,), jnp.uint32) if TOKENS in batch else None)
 
         pending = jax.eval_shape(allocate)
         if kept_window(state.accumulation, pending, None if shape_only else int(state.microstep) % window):
@@ -1051,7 +1054,7 @@ class Trainer(Generic[Loss, Effects]):
                                split=split).step()
         custom = self.step(self.objective, self.optimizer)
 
-        def run(current, batch, part):
+        def run(current, batch, part, tokens):
             advanced, loss, aux = custom(current, batch)
             return advanced, loss, aux, None
         return run
@@ -1180,7 +1183,7 @@ class Trainer(Generic[Loss, Effects]):
             keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
         self.plan = settled(planned, plans, seconds, probes)
         if planned.split != candidates[0] or seconds:
-            _log.warning("the step fits the devices in the plan %s", self.plan)
+            _log.info("the step fits the devices in the plan %s", self.plan)
         return planned, flops
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
@@ -1240,7 +1243,7 @@ class Trainer(Generic[Loss, Effects]):
             # return the host-resident ones to pinned host memory.
             micro = microbatch(batch, part, split)
             advanced, loss, aux, committed = body(self._fetched(current, shardings), self._model_batch(micro),
-                                                  part)
+                                                  part, batch_tokens(micro))
             return outcome(current, advanced, loss, aux, committed, batch, part == split - 1)
 
         return jax.jit(step, in_shardings=(shardings, placement, replicated),
@@ -1328,7 +1331,7 @@ class Trainer(Generic[Loss, Effects]):
                         self._ramp and not current.accumulation.replays(prepared.accumulation))):
                     current = self._initialize_accumulation(current, batch, shapes, window=self.accumulation)
                 # The device steps run in the accelerator's forward (`HostExecution`).
-                advanced, loss, aux, committed = body(current, model_batch(batch), 0)
+                advanced, loss, aux, committed = body(current, model_batch(batch), 0, batch_tokens(batch))
                 advanced, *stepped = outcome(current, advanced, loss, aux, committed, batch, 1)
                 # A leaf already where its placement says stays the array it
                 # is: the resident frozen collection crosses no boundary.
@@ -1358,6 +1361,7 @@ class Trainer(Generic[Loss, Effects]):
         validation: Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None = None,
         restore_best: bool = False,
         state: TrainState | None = None,
+        observe: Observe | None = None,
     ) -> TrainState:
         """Train until the step or real-token cap is reached, resuming the latest checkpoint.
 
@@ -1402,7 +1406,8 @@ class Trainer(Generic[Loss, Effects]):
         resumes from there.
 
         Previews are generated only when `preview=True` and a tracker receives them;
-        scalar reporting never triggers preview work.
+        scalar reporting never triggers preview work. `observe` takes values of the
+        state at a cadence of its own while the run trains (`Observe`).
 
         The process is readied first (`dew.training.runtime.ready_process`), as
         `prepare_process` readies it: a program that never called that gets Dew's
@@ -1438,7 +1443,7 @@ class Trainer(Generic[Loss, Effects]):
                 checkpoint_every=checkpoint_every, checkpoint_final=checkpoint_final,
                 local_every=None if checkpoints is None else checkpoints.local_every,
                 metrics=metrics, preview=preview, best=selection, stop=stop, suites=suites,
-                held_best=restore_best and checkpoints is None,
+                held_best=restore_best and checkpoints is None, observe=observe,
             )
             trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state)
             # The state a checkpoint would hold: the step rebuilds its narrow copies.
@@ -1461,7 +1466,7 @@ class Trainer(Generic[Loss, Effects]):
         if self._config is None:
             return
         built = self._config.build(updates)
-        self._optimizer = self.objective.optimizer(built, accumulation=self.accumulation)
+        self._optimizer = self.objective.optimizer(built)
 
     def _training_loop(self, plan: _FitPlan, run: _FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,
@@ -1486,9 +1491,8 @@ class Trainer(Generic[Loss, Effects]):
             state = jax.device_put(initial, shardings)
             position = None
         run.last_checkpoint = time.perf_counter()
-        interval = Interval(time.time(), last_saved=(
-            int(state.step) if checkpoints is not None and checkpoints.latest is not None else None),
-            tokens_before_log=int(run.stop_control.pop("tokens", 0)))
+        interval = Interval.resumed(run.stop_control, plan.tokens, last_saved=(
+            int(state.step) if checkpoints is not None and checkpoints.latest is not None else None))
         if self._opened(plan, run, interval, state, position,
                         resumed=initial is None and interval.last_saved is not None):
             return state
@@ -1646,7 +1650,7 @@ class Trainer(Generic[Loss, Effects]):
         # On a device with a known peak, the run counts its batches' work
         # for train/mfu while they can be counted (`_counted_batch`).
         self._count_work = gpu_target(started.device_kind).bf16_peak is not None
-        self._refusal, self._unavailable_noted = None, False
+        self._refusal = None
         self._report(started, current)
         if plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
@@ -1657,8 +1661,11 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 "checkpoint_every asks for checkpoints and this trainer has no "
                 "checkpointer; pass Checkpoints(directory) to write any")
-        if (plan.finished(current, interval.real_tokens)
-                and checkpoints is not None and checkpoints.latest is not None):
+        complete = (plan.finished(current, interval.real_tokens) and checkpoints is not None
+                    and checkpoints.latest is not None)
+        if plan.observe:
+            plan.observe.opened(current, state, complete=complete)
+        if complete:
             return True
         if not plan.finished(current, interval.real_tokens):
             partition = DataPartition.of(mesh)
@@ -1754,6 +1761,8 @@ class Trainer(Generic[Loss, Effects]):
         )
         if not ending:
             self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due)
+        if plan.observe:
+            plan.observe.at(current, state)
         # Asked at every step on every process, as JAX's agreement
         # needs; the last step ends the run on its own.
         if run.stopped:
@@ -1764,14 +1773,8 @@ class Trainer(Generic[Loss, Effects]):
             if checkpoints is not None and interval.last_saved != current:
                 self._read_taken(run)
                 run.other += self._saved_checkpoint(
-                    checkpoints,
-                    current,
-                    state,
-                    position,
-                    interval,
-                    training_best=not plan.validation and not plan.best,
-                    control=run.stop_control,
-                )
+                    checkpoints, current, state, position, interval,
+                    training_best=not plan.validation and not plan.best, control=run.stop_control)
             run.preempted = current
             return True
         return False
@@ -1886,6 +1889,8 @@ class Trainer(Generic[Loss, Effects]):
             run.other += run.evaluation.elapsed_seconds
             scores = run.evaluation.scores
         self._saves(plan, run, interval, state, position, scores, evaluation_due=bool(scores), final=True)
+        if plan.observe:
+            plan.observe.last(current, state)
         if checkpoints is not None:
             checkpoints.wait()
 
@@ -2099,8 +2104,8 @@ class Trainer(Generic[Loss, Effects]):
 
         The count is the capability: from the first batch whose work the
         model or objective cannot declare (`MissingFlopsCount`, as a media
-        row's tower), this process counts no more, keeps the count's reason
-        for the log's note, and trains on. Its batches keep their work
+        row's tower), this process counts no more, says why in the debug
+        log, and trains on. Its batches keep their work
         columns, as unknown work (`uncounted`), so every process runs one
         step program and the step's global sum leaves train/mfu unreported
         pool-wide. One thread prepares batches, the prefetch worker or a
@@ -2112,6 +2117,7 @@ class Trainer(Generic[Loss, Effects]):
                 return prepare_counts(self.objective, batch, count_model=True)
             except MissingFlopsCount as missing:
                 self._refusal = str(missing)
+                _log.debug("train/mfu is not reported for %s: %s", type(self.objective).__name__, missing)
         counted = prepare_counts(self.objective, batch, count_model=False)
         return counted if self._refusal is None else uncounted(counted)
 
@@ -2189,7 +2195,7 @@ class Trainer(Generic[Loss, Effects]):
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         write = functools.partial(
             checkpoints.save, step, state, position, metadata, share=DataPartition.of(self.device_mesh),
-            ranking=ranking, control={**(control or {}), "tokens": interval.real_tokens},
+            ranking=ranking, control={**(control or {}), **interval.token_control},
             weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
             boxed=self._boxed_axes())
         self._report(CheckpointRequested(checkpoints.directory), step, write)
@@ -2215,7 +2221,7 @@ class Trainer(Generic[Loss, Effects]):
         self._display.status("writing a local checkpoint")
         write = functools.partial(
             checkpoints.save_local, step, state, position, share=DataPartition.of(self.device_mesh),
-            control={**(control or {}), "tokens": interval.real_tokens}, rung=self._checkpoint_rung(),
+            control={**(control or {}), **interval.token_control}, rung=self._checkpoint_rung(),
             artifact=self._artifact(), boxed=self._boxed_axes())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
@@ -2251,13 +2257,8 @@ class Trainer(Generic[Loss, Effects]):
         def report() -> None:
             if jax.process_index() != 0:
                 return
+            # A work count a process refused (`_counted_batch`) is NaN here, and train/mfu absent.
             work = None if read.training is None else float(read.training)
-            if work is not None and not math.isfinite(work) and not self._unavailable_noted:
-                # A process refused a count (`_counted_batch`) and the global
-                # sum carried it here: this thread alone says so, once.
-                self._unavailable_noted = True
-                reason = self._refusal or "another process's batch could not be counted"
-                self._display.note(f"train/mfu is unavailable for {type(self.objective).__name__}: {reason}")
             scalars = {"train/loss": float(read.loss),
                        **{f"train/{k}": float(v) for k, v in read.aux.items()},
                        **self._throughput(elapsed, counts.since_log, counts.samples, counts.flops,
@@ -2397,7 +2398,7 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, params, reader, metrics=metrics, key=key,
                 step=state.step, schedule_step=state.microstep * self.accumulation // state.window_size,
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training,
-                warm=warm)
+                warm=warm, updates=state.updates)
         if not warm:
             # The training values ride along for ranking (`_ranking`); the log interval reports
             # them, so the evaluation's own report leaves them out.
