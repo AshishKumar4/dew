@@ -48,6 +48,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
+from ..decode_geometry import grouped_query
 from . import tuning
 from .generation import gpu_target, triton_runs
 from .selection import Requirement
@@ -422,18 +423,16 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Arra
     `sinks` `[N]` put one value-free logit a head in each row's softmax. Its
     Pallas call has no derivative: `dew.nn.attention` differentiates it as the
     attention it stands in for."""
-    batch, positions, heads, width = query.shape
-    kv_heads = key.shape[2]
-    group = heads // kv_heads
-    # A key head's query heads as its query positions, `t * group + g` for head `k * group + g`.
-    grouped = query.reshape(batch, positions, kv_heads, group, width).transpose(0, 1, 3, 2, 4)
-    rows = positions * group
-    padded = jnp.pad(grouped.reshape(batch, rows, kv_heads, width),
-                     ((0, 0), (0, QUERIES - rows), (0, 0), (0, 0)))
-    sunk = None if sinks is None else _row_sinks(sinks, kv_heads, positions)
-    out = _DECODE(padded, key, value, _spans(lengths, starts), sunk, interpret=interpret, softcap=softcap)
-    out = out[:, :rows].reshape(batch, positions, group, kv_heads, width).transpose(0, 1, 3, 2, 4)
-    return out.reshape(batch, positions, heads, width)
+    sunk = None if sinks is None else _row_sinks(sinks, key.shape[2], query.shape[1])
+
+    def launched(grouped, key, value):
+        # A key head's query heads as its query positions, `t * group + g` for head `k * group + g`.
+        rows = grouped.shape[1]
+        padded = jnp.pad(grouped, ((0, 0), (0, QUERIES - rows), (0, 0), (0, 0)))
+        out = _DECODE(padded, key, value, _spans(lengths, starts), sunk, interpret=interpret, softcap=softcap)
+        return out[:, :rows]
+
+    return grouped_query(launched, query, key, value)
 
 
 def _row_sinks(sinks: jax.Array, kv_heads: int, positions: int) -> jax.Array:
