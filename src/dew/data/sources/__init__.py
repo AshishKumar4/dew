@@ -25,8 +25,9 @@ def source(
     URL as its TFDS or Hub dataset, `split` its split ("train" by default); any other URL as its files
     (`Files`, `format` naming their record format where the URL's suffix does not), or as a committed
     token export (`TokenFiles`) where its manifest says it is one; and records in memory (a sequence
-    of rows, a mapping of columns or a data frame) as `Memory`. A split named for anything but a Hub
-    or TFDS URL is refused. With `provision`, the store builds the indexes its reads need first."""
+    of rows, a mapping of columns or a data frame) as `Memory`. Files and records read what they
+    hold, whatever split is named: a split is a Hub or TFDS URL's. With `provision`, the store builds
+    the indexes its reads need first."""
     if isinstance(value, Source):
         resolved = value
     elif isinstance(value, (str, PathLike)):
@@ -49,9 +50,6 @@ def source(
         resolved = Memory(value)
     else:
         raise TypeError(f"a source is a filesystem URL, named store, or records; got {type(value).__name__}")
-    if split is not None and not (isinstance(value, (str, PathLike)) and isinstance(resolved, (TFDS, Hub))):
-        raise ValueError(f"split={split!r} names a split of a Hub or TFDS URL; {resolved.describe()} reads "
-                         "what it holds, so hold out of it with holdout(...) instead")
     if provision and isinstance(resolved, (Files, Hub, TFDS, TokenFiles)):
         resolved.provision()
     return resolved

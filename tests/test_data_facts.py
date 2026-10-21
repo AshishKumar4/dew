@@ -190,3 +190,17 @@ def test_a_store_not_present_states_nothing_and_the_presets_facts_stand(tmp_path
     clips = Files(str(tmp_path / "clips"), format="files").pipe(
         presets.video, 4 / FPS, frames=4, fps=FPS, size=16, batch=2).facts()
     assert clips["fields"]["video"] == [4, 16, 16, 3]
+
+
+def test_host_flips_jitters_crops_and_captions_keep_the_images_shape_their_steps_make():
+    """A host flip, colour jitter and fixed or drawn caption leave each image as its shape was; a
+    centre crop makes it the crop's square. A run over such a chain builds its model from these."""
+    from dew.data import images
+
+    pictures = Memory([{"image": np.zeros((20, 24, 3), np.uint8), "label": 0}])
+    augmented = pictures.pipe(presets.images, 16, batch=4, augment=(images.Flip(), images.ColorJitter()),
+                              caption=images.caption(templates=("a {}",), classes=("rose",)))
+    assert augmented.facts()["fields"]["image"] == [16, 16, 3]
+    cropped = pictures.pipe(presets.images, 16, batch=None, caption=images.caption("a photo")).map(
+        images.CenterCrop(8))
+    assert cropped.facts()["fields"]["image"] == [8, 8, 3]
