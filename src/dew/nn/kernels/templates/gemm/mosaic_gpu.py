@@ -428,8 +428,12 @@ def _gmm_pipeline(tiles: Tiles, transpose_rhs: bool, steps: int, side_axes: tupl
     )
 
 
-_TGMM_IN_FLIGHT = 1
-"""The MMAs the cooperative `tgmm` keeps in flight while it prepares the next stage."""
+_TGMM_IN_FLIGHT = 0
+"""The MMAs the cooperative `tgmm` keeps in flight while it prepares the next stage: none, where the
+cooperative `gmm` keeps one. With a stage's release delayed a step, a pipeline as long as its group's row
+blocks (one to a few) leaves its barriers a phase apart from one tile to the next (the GPU interpreter
+fails it, jax 0.11.2.post6's `emit_pipeline_warp_specialized`); a pipeline of fixed length, `gmm`'s, does
+not."""
 
 
 def _meet(halves) -> None:
