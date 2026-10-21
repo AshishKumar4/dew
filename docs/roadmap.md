@@ -141,7 +141,6 @@ The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case 
 - After the MFU work, implement DiffusionNFT and compare it with FlowGRPO under matched conditions. [533]
 - Qualify two-engine vLLM/NCCL weight publication and policy-version stamps on real GPUs. [579]
 - Replace `ContainerRunner` through Harbor's public environment interface once it preserves exit reasons and resource limits. [605]
-- Add stop strings while preserving terminal versus truncated semantics across rollout servers. [607]
 - Qualify SGLang NCCL publication, delta and sharded transfer, multi-host engine fleets and SGLang training through the shared rollout interface. Add durable scheduler state, nested tool lineage and a real tool-using training run.
 - Qualify live verl transport and a Dew learner within verl. Compare FlowGRPO loss and gradients with verl-omni before designing rollout-record interchange.
 - Extend stage chains with expert-data generation, on-policy distillation, command-line composition and text-scored model-scale qualification.
