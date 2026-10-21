@@ -20,10 +20,10 @@ imports and compiles), which is what armada measured the file at beyond its
 tests' times in tests/test_durations.json, at the cut its rows were last timed
 at and shared among that cut's groups (`measured_cut`), so the file takes the
 fewest groups whose heaviest, setup included, holds to `target` (`split`). A file weighs armada's
-median of its last green runs, else its tests' sum in
-tests/test_durations.json, else the mean. Each entry names its rows, one a
-file (or a file's group), so armada grades a task that leaves one out as not
-green, and armada queues the heaviest entries first.
+median of its last green runs, or its tests' sum in tests/test_durations.json where that is more
+(those runs may predate the file's current tests), else that sum scaled to armada, else the mean.
+Each entry names its rows, one a file (or a file's group), so armada grades a task that leaves
+one out as not green, and armada queues the heaviest entries first.
 
 A task runs its files under its Python's environment (tools/armada/install.sh)
 with CI's selection, and writes a verdict row for each. A row is red on a
@@ -300,16 +300,23 @@ def recorded_tests() -> dict[str, list[float]]:
 
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
     """Each file's seconds on armada under `python`: its median, which armada
-    sums over a split file's groups (`task`); else its tests' sum in
-    tests/test_durations.json, scaled by how much slower armada ran the files
-    measured both ways; else None, for a file nothing has timed."""
+    sums over a split file's groups (`task`), or its tests' sum in
+    tests/test_durations.json where that is more: each test's record is its
+    least time (`durations`), so a sum past the median may mean the measured
+    runs predate the file's current tests, and the sum is a floor on what it
+    takes. base/kernels' route census, 1,576 tests recorded at 2,654 s in a
+    file main ran in 6 s, was packed by that median with six other files into
+    one task, which ran past its deadline (train 18). Else the recorded sum, scaled by
+    how much slower armada ran the files measured both ways; else None, for a
+    file nothing has timed."""
     recorded = {name: sum(tests) for name, tests in recorded_tests().items()}
     measured = {name: timings.get("files", {})[row(python, name, "")] for name in files
                 if row(python, name, "") in timings.get("files", {})}
     ratios = sorted(measured[name] / recorded[name] for name in files
                     if name in measured and recorded.get(name, 0) > 1)
     slower = ratios[len(ratios) // 2] if ratios else 1.0
-    return {name: measured.get(name, recorded[name] * slower if name in recorded else None) for name in files}
+    return {name: max(measured[name], recorded.get(name, 0.0)) if name in measured
+            else recorded[name] * slower if name in recorded else None for name in files}
 
 
 def row(python: str, name: str, split: str) -> str:
@@ -761,7 +768,11 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     and files start heaviest first while what they hold with their children (`gpu_needs`) fits
     the share this process was given (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at
     most `processes` at once. A file that runs out of a measured share is red: it took more than
-    its last run, whose peak its next run is given."""
+    its last run, whose peak its next run is given. A file given the lane's whole share (unmeasured,
+    measured that large, or with a child the lane did not follow, as the fla reference's in another
+    environment's Python) grows its pool as it uses it rather than taking the share at its first GPU
+    op (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a child has what the file has not yet taken; a file
+    that grows to the whole share still leaves its child none."""
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
@@ -786,7 +797,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
             fits = next((name for name in waiting if holds[name] <= free), None)
             if fits is not None and len(running) < processes:
                 waiting.remove(fits)
-                environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total)}
+                environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
+                           **({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"} if shares[fits] >= budget else {})}
                 running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache, 60.0, common,
                                     environ)] = fits
                 continue

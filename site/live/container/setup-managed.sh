@@ -10,6 +10,8 @@ done
 apt-get update
 apt-get install -y --no-install-recommends python3 python3-venv ca-certificates curl libcap2-bin libseccomp2 bubblewrap
 python3 -m venv /opt/venv
+# tools/pip.txt's pip first: older pips trust the roots of eMudhra's compromised CAs (2026-10-20).
+/opt/venv/bin/pip install --no-cache-dir --quiet -r "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/tools/pip.txt"
 # One pass under the suite's lock (tools/lock_environment.sh), which pins every package the live,
 # streaming and profile extras reach, so the container runs the versions CI tests and no package it
 # runs resolves on its own (pip's build tools for Dew's own tarball are outside the lock).
