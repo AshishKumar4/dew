@@ -178,15 +178,22 @@ def activation_name(config: Mapping[str, object], runs: Collection[str], default
 
 
 
-def rope_base(vision: Mapping[str, object], default: float) -> float:
+def rope_base(vision: Mapping[str, object], default: float, *, axial: bool = False) -> float:
     """A trunk's plain rotary base: `rope_parameters`' rope_theta, else the
     flat field, else the family's `default`. A scaled rope refuses, as any
     rope does where only plain rotary has a place (`read_rope_theta`), and so
     does the decoders' 'none' alias: the towers dispatch any type but
     'default' to Transformers' rope initializers, which name no 'none'
-    (modeling_gemma4.py:716-719)."""
+    (modeling_gemma4.py:716-719). An `axial` tower's rotary, its grid's rows
+    and columns each over half the head, is named 'axial' too: Transformers
+    5.17 writes that name where earlier releases wrote 'default', and reads
+    either as the one its vision rotary runs (configuration_gemma4.py's
+    `default_rope_type`, modeling_gemma4.py's Gemma4VisionRotaryEmbedding)."""
     entry = records.record(vision.get("rope_parameters") or {}, "rope_parameters")
-    if entry.get("rope_type", entry.get("type")) == "none":
+    kind = entry.get("rope_type", entry.get("type"))
+    if kind == "none":
         raise ValueError("rope_parameters: a vision tower's rotary type is 'default', not 'none'")
+    if axial and kind == "axial":
+        entry = {**{name: value for name, value in entry.items() if name != "type"}, "rope_type": "default"}
     theta = read_rope_theta(entry, "rope_parameters")
     return records.number(vision.get("rope_theta", default), "rope_theta") if theta is None else theta
