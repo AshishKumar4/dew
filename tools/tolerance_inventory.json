@@ -163,7 +163,7 @@
    "by": "2026-11-20"
   },
   "tests/test_dc_ae.py": {
-   "comparisons": 2,
+   "comparisons": 4,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -228,7 +228,7 @@
    "by": "2026-11-20"
   },
   "tests/test_decoding_strategies.py": {
-   "comparisons": 8,
+   "comparisons": 6,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -253,7 +253,7 @@
    "by": "2026-11-20"
   },
   "tests/test_diffusion_objective.py": {
-   "comparisons": 9,
+   "comparisons": 8,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -353,7 +353,7 @@
    "by": "2026-11-20"
   },
   "tests/test_flux_source.py": {
-   "comparisons": 7,
+   "comparisons": 5,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -408,7 +408,7 @@
    "by": "2026-11-20"
   },
   "tests/test_guided_decoding.py": {
-   "comparisons": 2,
+   "comparisons": 1,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -418,7 +418,7 @@
    "by": "2026-11-13"
   },
   "tests/test_hf_decoder_hybrids.py": {
-   "comparisons": 10,
+   "comparisons": 13,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -528,7 +528,7 @@
    "by": "2026-11-13"
   },
   "tests/test_kernels.py": {
-   "comparisons": 10,
+   "comparisons": 9,
    "lane": "Kernels",
    "by": "2026-11-06"
   },
@@ -549,7 +549,7 @@
   },
   "tests/test_linear_attention.py": {
    "comparisons": 39,
-   "lane": "Recurrence & Dory",
+   "lane": "Kernels",
    "by": "2026-11-06"
   },
   "tests/test_llama4.py": {
@@ -703,7 +703,7 @@
    "by": "2026-11-06"
   },
   "tests/test_mtp.py": {
-   "comparisons": 10,
+   "comparisons": 9,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -743,7 +743,7 @@
    "by": "2026-11-13"
   },
   "tests/test_optim.py": {
-   "comparisons": 19,
+   "comparisons": 18,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -768,7 +768,7 @@
    "by": "2026-11-13"
   },
   "tests/test_packed_rollouts.py": {
-   "comparisons": 10,
+   "comparisons": 9,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -833,17 +833,22 @@
    "by": "2026-11-13"
   },
   "tests/test_qwen_image_source.py": {
-   "comparisons": 2,
+   "comparisons": 11,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_qwen_image_vae.py": {
-   "comparisons": 2,
+   "comparisons": 6,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_qwen_qualification.py": {
    "comparisons": 15,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_rae.py": {
+   "comparisons": 7,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -903,12 +908,17 @@
    "by": "2026-11-13"
   },
   "tests/test_samplers.py": {
-   "comparisons": 10,
+   "comparisons": 9,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_schedulers.py": {
    "comparisons": 18,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_sd3_source.py": {
+   "comparisons": 17,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -998,12 +1008,12 @@
    "by": "2026-11-13"
   },
   "tests/test_torchax_fallback.py": {
-   "comparisons": 6,
+   "comparisons": 5,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_trainer.py": {
-   "comparisons": 15,
+   "comparisons": 14,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -1032,18 +1042,13 @@
    "lane": "Training",
    "by": "2026-11-20"
   },
-  "tests/test_tread.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
   "tests/test_vae.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_vae_16ch.py": {
-   "comparisons": 6,
+   "comparisons": 5,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -1058,7 +1063,7 @@
    "by": "2026-11-13"
   },
   "tests/test_wan_vae.py": {
-   "comparisons": 5,
+   "comparisons": 9,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },

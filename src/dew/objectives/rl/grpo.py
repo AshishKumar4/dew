@@ -163,6 +163,9 @@ class GRPOObjective(TokenScorer):
 
     keeps_whole_logits = False
 
+    scored_fields = (PROMPT_KEY, LENGTH_KEY)
+    """Validation scores the prompts alone, for their perplexity under the policy."""
+
     def __init__(self, model, seq_len: int, beta: float = 0.0,
                  epsilon_low: float = 0.2, epsilon_high: float = 0.2,
                  dual_clip: float = 3.0, *, policy_loss: str = "ppo", aggregation: str = "token-mean",
@@ -355,17 +358,11 @@ class GRPOObjective(TokenScorer):
 
     def _validation_scores(self, params, batch, step):
         """The prompts' NLL with the per-token scores it is the mean of."""
-        scores = self._evaluation_scores(params, batch, step.key)
+        scores = self._evaluation_scores(params, batch, step)
         return Ratio(self.row_mean(scores.losses * scores.weights, batch).total,
                      self.row_mean(scores.weights, batch).total), scores
 
-    def evaluate(self, params, batch, step):
-        """Return the per-token scores of the prompts under the policy, for their perplexity,
-        compiled for the current modules over the prompts alone (`_evaluation_scores`)."""
-        prompts = {PROMPT_KEY: batch[PROMPT_KEY], LENGTH_KEY: batch[LENGTH_KEY]}
-        return self._compiled_scores(self.evaluation_variables(params, step), prompts, step.key)
-
-    def _evaluation_scores(self, params, batch, key) -> TokenScores:
+    def _evaluation_scores(self, params, batch, step) -> TokenScores:
         """The prompts' per-token scores.
 
         Prompts are left-padded, so a row's real tokens are its last
