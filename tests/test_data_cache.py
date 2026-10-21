@@ -14,6 +14,7 @@ import fsspec
 import grain.python as grain
 import numpy as np
 import pytest
+from storage_support import moto_bucket
 
 from dew.data.cache import Abandoned, Cache
 from dew.data.pipeline import Rejected
@@ -253,34 +254,27 @@ def test_cache_identity_and_clean_revision_are_required(refused):
 
 def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
     import fsspec
-    from moto.server import ThreadedMotoServer
 
-    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
-    server.start()
-    _, port = server.get_host_and_port()
-    options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}"}
-    fs = fsspec.filesystem("s3", **options)
-    bucket = "cache-" + uuid4().hex
-    fs.mkdir(bucket)
-    cache, key = Cache(f"s3://{bucket}/cache", storage_options=options), Manifest()
-    source = Memory([{"id": index} for index in range(8)])
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
-    for index in range(len(rows)):
-        rows[index]
-    rows.finish()
-    rows.close()
-    start = threading.Barrier(2)
+    with moto_bucket("cache") as (bucket, options):
+        fs = fsspec.filesystem("s3", **options)
+        cache, key = Cache(f"s3://{bucket}/cache", storage_options=options), Manifest()
+        source = Memory([{"id": index} for index in range(8)])
+        rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
+        for index in range(len(rows)):
+            rows[index]
+        rows.finish()
+        rows.close()
+        start = threading.Barrier(2)
 
-    def publish():
-        from dew.data.storage import PreconditionFailed
+        def publish():
+            from dew.data.storage import PreconditionFailed
 
-        start.wait()
-        try:
-            return cache.publish(key, source)
-        except PreconditionFailed as error:
-            return error
+            start.wait()
+            try:
+                return cache.publish(key, source)
+            except PreconditionFailed as error:
+                return error
 
-    try:
         with ThreadPoolExecutor(2) as pool:
             attempts = list(pool.map(lambda _: publish(), range(2)))
         from dew.data.generation import Generation
@@ -295,8 +289,6 @@ def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
         )
         with pytest.raises(OSError):
             cache.publish(key, source)
-    finally:
-        server.stop()
 
 
 def test_stream_completions_use_physical_shards_and_resume_without_rekeying():

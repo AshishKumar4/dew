@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reader_support import assert_resumes_where_it_stopped
 
 from dew.config.data import Augment, HoldOut, ImageData, RecordsData, VideoData, loader
 from dew.data import Loading, Memory, images
@@ -1309,23 +1310,10 @@ def test_a_torch_dataset_streams_the_records_it_indexes_and_resumes():
         return loader(RecordsData(source=source), batch=4, seed=0, read="streamed", loading=reading).train(
             DataPartition())
 
-    whole = opened()
-    try:
-        expected = [np.asarray(next(whole)["index"]).tolist() for _ in range(6)]
-    finally:
-        whole.close()
-    stopped = opened()
-    try:
-        head = [np.asarray(next(stopped)["index"]).tolist() for _ in range(2)]
-        saved = stopped.get_state()
-    finally:
-        stopped.close()
-    resumed = opened()
-    try:
-        resumed.set_state(saved)
-        assert head + [np.asarray(next(resumed)["index"]).tolist() for _ in range(4)] == expected
-    finally:
-        resumed.close()
+    def indices(reader, count):
+        return [np.asarray(next(reader)["index"]).tolist() for _ in range(count)]
+
+    assert_resumes_where_it_stopped(opened, indices, 2, 4)
 
 
 def test_a_torchvision_style_dataset_reads_its_tuples_as_named_fields():
