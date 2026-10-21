@@ -10,7 +10,6 @@ that write every tensor back, so `Pretrained.save` restores what it read.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 from collections.abc import Callable, Mapping, Sequence
@@ -72,7 +71,7 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Variables
-from dew.registry import dtype_name, from_record, projectors, resolve_dtype, towers
+from dew.registry import constructor_values, dtype_name, from_record, projectors, resolve_dtype, towers
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.text import Sampling
 
@@ -621,8 +620,7 @@ class PretrainedDecoder(Pretrained):
         except ValueError as error:
             raise TypeError(f"{type(model).__name__} has no Hugging Face decoder layout") from error
         config = decoders.export_config(decoder)
-        built = {entry.name: getattr(decoder, entry.name) for entry in dataclasses.fields(decoder)
-                 if entry.init and entry.name not in ("parent", "name")}
+        built = constructor_values(decoder)
         return cls(decoder, variables, None, config, None, built,
                    {**decoders.GENERATION_DEFAULTS, 'use_cache': decoder.causal}
                    if generation_config is None else generation_config,

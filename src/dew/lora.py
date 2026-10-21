@@ -84,7 +84,7 @@ from dew.quantization import (
     frozen_fp8_kernel,
     measured_fp8_sites,
 )
-from dew.registry import wrapper_layers
+from dew.registry import constructor_values, wrapper_layers
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -708,9 +708,7 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
             return output, _fp8_packed(model, dict(freeze(variables, lambda path: path in factors)))
 
     Adapted.__name__ = Adapted.__qualname__ = base.__name__
-    return Adapted(**{field.name: getattr(model, field.name)
-                      for field in dataclasses.fields(model)
-                      if field.init and field.name not in ("parent", "name")})
+    return Adapted(**constructor_values(model))
 
 
 @dataclass(frozen=True)
@@ -1183,8 +1181,7 @@ def unadapted(model: nn.Module) -> nn.Module:
     base, layers = wrapper_layers(type(model))
     if not any("_dew_lora_interceptor" in vars(layer) for layer in layers):
         return model
-    rebuilt = base(**{field.name: getattr(model, field.name) for field in dataclasses.fields(model)
-                      if field.init and field.name not in ("parent", "name")})
+    rebuilt = base(**constructor_values(model))
     for layer in reversed(layers):
         if "_dew_lora_interceptor" not in vars(layer):
             rebuilt = layer._dew_wrapper().apply(rebuilt)

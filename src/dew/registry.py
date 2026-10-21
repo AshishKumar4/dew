@@ -1045,6 +1045,19 @@ class WrapperClass(Protocol):
     def _dew_wrapper() -> Wrapper: ...
 
 
+def constructor_fields(member: type) -> tuple[dataclasses.Field, ...]:
+    """A dataclass's fields its constructor takes, a Flax module's `parent` and `name` aside: what
+    rebuilding an instance under another class (a wrapper's, `wrapper_layers`) passes on."""
+    return tuple(field for field in dataclasses.fields(member)
+                 if field.init and field.name not in ("parent", "name"))
+
+
+def constructor_values(model) -> dict[str, object]:
+    """`model`'s constructor fields (`constructor_fields`) by name, as it holds them: the arguments that
+    build it again, under its own class or one that wraps it."""
+    return {field.name: getattr(model, field.name) for field in constructor_fields(type(model))}
+
+
 def wrapper_layers(model_type: type) -> tuple[type, tuple[WrapperClass, ...]]:
     """The class `model_type`'s wrappers wrap and its wrapper classes, the
     outermost first.

@@ -79,9 +79,6 @@ backend lowers it (measured in docs/performance.md)."""
 Rounding = Literal["uniform", "low_bit_uniform"]
 """How a quantized gradient rounds: Qwix's two stochastic modes."""
 
-CALIBRATIONS = ("absmax", "minmax", "rms", "fixed")
-"""The weight calibration methods Qwix parses, before an optional `,args`
-suffix (`qwix/_src/qconfig.py`, `QuantizationRule`)."""
 
 UNQUANTIZED = {
     "dew.nn.ssm.diagonal_recurrence":
@@ -133,10 +130,9 @@ class Quantization:
     wins. `'.*mlp.*'` quantizes the feed-forward blocks and leaves attention
     in fp32; the default quantizes every matmul of the wrapped methods."""
     calibration: str = "absmax"
-    """The weight calibration method, in the form Qwix parses.
-
-    It is a method name, one of `absmax`, `minmax`, `rms` or `fixed`, with an
-    optional `,args` suffix, for example `absmax,0.8`."""
+    """The weight calibration method, in the form Qwix parses and validates
+    where it quantizes (`absmax,0.8`, for example): Dew keeps no copy of its
+    grammar."""
     tile_size: int | None = None
     """The number of elements per tile for sub-channel scales along the contraction axis.
 
@@ -167,11 +163,6 @@ class Quantization:
                 raise ValueError(
                     f"quantization pattern {pattern!r} does not compile: "
                     f"{error}") from error
-        method = self.calibration.split(",", 1)[0]
-        if method not in CALIBRATIONS:
-            raise ValueError(
-                f"calibration is one of {list(CALIBRATIONS)}, with an optional "
-                f"`,args` suffix, got {self.calibration!r}")
         if self.tile_size is not None and self.tile_size < 1:
             raise ValueError(
                 f"tile_size counts elements per tile, got {self.tile_size}")
@@ -601,15 +592,13 @@ class InputQuantization:
         """`model` computing under this record's frozen FP8 sites, and under
         the input quantization it already computes under, if any: one
         wrapper, so one interceptor, serves both."""
-        from dew.registry import wrapper_layers
+        from dew.registry import constructor_values, wrapper_layers
 
         _, layers = wrapper_layers(type(model))
         held = layers[0]._dew_wrapper() if layers else None
         if not isinstance(held, InputQuantization):
             return self.apply(model)
-        unwrapped = layers[0]._dew_wrapped(**{field.name: getattr(model, field.name)
-                                              for field in dataclasses.fields(model)
-                                              if field.init and field.name not in ("parent", "name")})
+        unwrapped = layers[0]._dew_wrapped(**constructor_values(model))
         joined = dataclasses.replace(held, frozen_fp8=self.frozen_fp8, measured_on=self.measured_on)
         return joined.apply(unwrapped)
 
@@ -630,6 +619,8 @@ class InputQuantization:
         is otherwise unchanged, so its dtype, accumulation precision, output
         sharding and the bias placement stay as the model defines them.
         """
+        from dew.registry import constructor_values
+
         base, record = type(model), self
         if any("_dew_input_quantization" in vars(layer) for layer in base.__mro__):
             raise ValueError(f"{base.__name__} already computes under its checkpoint's input quantization")
@@ -693,9 +684,7 @@ class InputQuantization:
                 return output, ({**variables, QUANTIZATION: record.declared()} if record.sites else variables)
 
         InputQuantized.__name__ = InputQuantized.__qualname__ = base.__name__
-        return InputQuantized(**{field.name: getattr(model, field.name)
-                                 for field in dataclasses.fields(model)
-                                 if field.init and field.name not in ("parent", "name")})
+        return InputQuantized(**constructor_values(model))
 
 
 def _site_kernel(tree: Variables, site: str) -> jax.typing.ArrayLike:
