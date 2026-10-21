@@ -179,11 +179,15 @@ class Recipe:
         (`Stage`'s rules): `ValueError`, or `TypeError` for data no loss
         reads.
         """
+        # A chain whose store states no fields (records in memory, say) is read as its loss reads it,
+        # which refuses a missing field by name; one that states them is checked here.
         facts = stage.data.facts()
-        fields = record(facts.get("fields", {}), "the chain's fields")
-        needed = {"pretrain": ("text",), "sft": ("text",), "dpo": ("chosen", "rejected"), "grpo": ("prompt",),
-                  "ppo": ("task_id",)}[stage.loss]
-        if missing := [name for name in needed if name not in fields]:
+        stated = facts.get("fields")
+        fields = None if stated is None else record(stated, "the chain's fields")
+        # A preference pair's rows, as `preferences.PreferencePair` lays them out.
+        needed = {"pretrain": ("text",), "sft": ("text",), "dpo": ("input_ids", "completion_mask"),
+                  "grpo": ("prompt",), "ppo": ("task_id",)}[stage.loss]
+        if fields is not None and (missing := [name for name in needed if name not in fields]):
             raise ValueError(f"stage {stage.name!r} trains {stage.loss}, whose data carries "
                              f"{', '.join(needed)}; this chain carries no {', '.join(missing)}")
         if (stage.loss == "ppo") != (stage.episodes is not None):
