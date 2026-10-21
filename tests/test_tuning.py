@@ -102,7 +102,8 @@ print(json.dumps([{rows: launches(step(), *operands(rows)) for rows in (13, 15, 
 def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     """The four launches of a norm seam and SwiGLU step are found in its
     lowered program, keyed with their token axis at a power of two. Each
-    takes its heuristic, a pinned config its space holds, and in a fresh
+    takes its heuristic, a pinned config its space holds (one it does not
+    raises, naming the config and why), and in a fresh
     process the picks stored for its device beside its compilation cache,
     for every token count in the bucket, and a token count stored for no
     bucket the nearest bucket's, beside a launch of a kernel only another
@@ -123,7 +124,7 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
 
     usual = launches(step(), *operands(15))
     assert usual["rms_norm_forward"] == ((1,), 4) and usual["swiglu_forward"] == ((2,), 4)
-    # A pinned config its space holds wins; one it does not hold (64 rows of a 64-wide norm) is passed over.
+    # A pinned config its space holds wins; one it does not hold (64 rows of a 64-wide norm) raises.
     with tuning.pinned({norm_swiglu.RmsForward: norm_swiglu.RowsConfig(1, 1),
                         norm_swiglu.RmsBackward: norm_swiglu.ReverseConfig(1, 256, 2),
                         norm_swiglu.SwigluForward: norm_swiglu.BlockConfig(4096, 8)}):
@@ -131,7 +132,8 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     assert pinned["rms_norm_forward"] == ((15,), 1) and pinned["rms_norm_backward"] == ((15,), 2)
     assert pinned["swiglu_forward"] == ((1,), 8) and pinned["swiglu_backward"] == usual["swiglu_backward"]
     with tuning.pinned({norm_swiglu.RmsForward: norm_swiglu.RowsConfig(64, 2)}):
-        assert launches(step(), *operands(15)) == usual
+        with pytest.raises(tuning.Unpinnable, match=r"RmsForward cannot take the pinned config .*rows=64"):
+            launches(step(), *operands(15))
 
     # The picks a GPU measured, stored for this device, as a fresh process finds them.
     picked = {norm_swiglu.RmsForward: norm_swiglu.RowsConfig(4, 2),
