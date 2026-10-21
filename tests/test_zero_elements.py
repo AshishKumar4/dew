@@ -83,6 +83,56 @@ def test_2_a_key_no_query_sees_has_a_value_gradient_of_exactly_zero():
         assert_zero_elements(faulty, attention, inputs, "masked, injected")
 
 
+def _single_key_backward(d_from="own", injected=None):
+    """Attention's query gradient where every query keeps one key: its scores given, so its softmax is
+    exact; D summed from the output as FlashAttention does (dO·O, O = P·V rounded), or from another
+    row's (`d_from="next"`), and `injected` added to dQ. The reference sums D from P·dP, as XLA's
+    softmax VJP does, so its dQ is exactly zero: P·(dP - D) is zero where P is one and D is dP."""
+    keep = np.array([0, 2, 1, 3])
+    visible = jnp.asarray(np.arange(4)[None, :] == keep[:, None])
+
+    def probabilities(scores):
+        scores = jnp.where(visible, scores, -jnp.inf)
+        weights = jnp.exp(scores - jnp.max(scores, axis=-1, keepdims=True))
+        return weights / jnp.sum(weights, axis=-1, keepdims=True)
+
+    def dew(scores, k, v, d_out):
+        p = probabilities(scores)
+        d_p = d_out @ v.T
+        delta = jnp.sum(d_out * (p @ v), axis=-1, keepdims=True)
+        if d_from == "next":
+            delta = jnp.roll(delta, 1, axis=0)
+        d_q = (p * (d_p - delta)) @ k * jnp.float32(0.125)
+        return {"d_q": d_q if injected is None else d_q + injected}
+
+    def reference(scores, k, v, d_out):
+        p = probabilities(scores)
+        d_p = d_out @ v.T
+        delta = jnp.sum(p * d_p, axis=-1, keepdims=True)
+        return {"d_q": (p * (d_p - delta)) @ k * 0.125}
+
+    rng = np.random.default_rng(3)
+    shapes = ((4, 4), (4, 16), (4, 16), (4, 16))
+    return dew, reference, tuple(jnp.asarray(rng.normal(size=shape), jnp.float32) for shape in shapes)
+
+
+def test_3_a_single_key_query_gradient_with_flashattention_s_d_passes_on_its_own_bound():
+    """dQ of a query that keeps one key is zero in float64 and rounding natively, D from the rounded
+    output: held to Dew's own bound it passes; 1e-3 added there fails."""
+    dew, reference, inputs = _single_key_backward()
+    coverage = assert_zero_elements(dew, reference, inputs, "one key")
+    assert coverage.certified == 64 and coverage.uncertified == 0
+    faulty, _, _ = _single_key_backward(injected=jnp.full((4, 16), 1e-3, jnp.float32))
+    with pytest.raises(AssertionError):
+        assert_zero_elements(faulty, reference, inputs, "one key, injected")
+
+
+def test_13_d_from_another_row_fails_past_its_own_bound():
+    dew, reference, inputs = _single_key_backward(d_from="next")
+    with pytest.raises(AssertionError):
+        assert_zero_elements(dew, reference, inputs, "another row's D")
+
+
 def test_4_a_selection_its_predicate_does_not_decide_is_not_certified():
     """where(s > 0, 1, 0) at s = -1 natively, 0 exactly, its bound reaching past zero: undecided, so
     not certified, and nothing fails."""
