@@ -4,10 +4,10 @@ The loss must match verl 0.9's PPO path with the GRPO settings
 (`compute_policy_loss_vanilla` with `clip_ratio` 0.2 both sides,
 `clip_ratio_c` 3.0 and `token-mean`, plus `beta` times the `token-mean` k3
 from `kl_penalty_forward`). The reference is tests/fixtures/rl/grpo.npz,
-written by tools/parity_grpo.py from torch over one fixed rollout: old,
-current and reference log-probabilities, both-signed advantages, and a mask
-with short tails, with entries past every clip point. `GRPOObjective` reads
-the same terms out of the rolled-out batch.
+recorded by tools/parity_grpo.py from torch over the seeds check 1 draws,
+each a rollout: old, current and reference log-probabilities, both-signed
+advantages, and a mask with short tails, with entries past every clip point.
+`GRPOObjective` reads the same terms out of the rolled-out batch.
 """
 
 from pathlib import Path
@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, declared_seeds, indexed_recording
 from rl_support import TinyHead, TinyLogits, clipped_surrogate, token_mean
 from steady_state import steady_state
 
@@ -49,32 +49,27 @@ def reference():
     return dict(np.load(FIXTURE, allow_pickle=True))
 
 
-def terms(fixture):
-    """The fixture rollout as float32 arrays with the KL strength."""
-    def get(key):
-        return np.asarray(fixture[key], np.float32)
-    return (get("old_log_probs"), get("current_log_probs"), get("ref_log_probs"),
-            get("advantages"), get("response_mask"), float(fixture["beta"]))
-
-
 def test_grpo_loss_and_gradient_match_verl(reference):
     """Dew's composition against verl 0.9.0's own `compute_policy_loss_vanilla`
-    and `kl_penalty` (tools/parity_grpo.py) on the fixed rollout, held to the
-    float64 rule over the loss and its gradient in the current
-    log-probabilities: Dew's RMS error from verl's float64 values at most
-    twice verl's own fp32 error."""
-    old, current, ref, advantages, mask, beta = terms(reference)
+    and `kl_penalty` (tools/parity_grpo.py), the loss and its gradient in the
+    current log-probabilities on par with verl's fp32 over the recorded
+    rollouts (check 1), its float64 run the truth."""
+    beta = float(reference["beta"])
+    seeds = declared_seeds(FIXTURE)["grpo"]
+    draw, recorded, truth = indexed_recording(reference, "grpo", seeds)
 
-    def loss(current):
-        ratio = token_log_ratio(current, jnp.asarray(old))
-        pg, _ = clipped_surrogate(ratio, jnp.asarray(advantages), jnp.asarray(mask))
-        kl = token_mean(k3_kl(current, jnp.asarray(ref)), jnp.asarray(mask))
-        return pg + beta * kl
+    @jax.jit
+    def dew(index, rollout):
+        def loss(current):
+            ratio = token_log_ratio(current, rollout["old_log_probs"])
+            pg, _ = clipped_surrogate(ratio, rollout["advantages"], rollout["response_mask"])
+            kl = token_mean(k3_kl(current, rollout["ref_log_probs"]), rollout["response_mask"])
+            return pg + beta * kl
 
-    value, gradient = jax.value_and_grad(loss)(jnp.asarray(current))
-    assert_as_exact_as_the_reference(
-        np.append(value, gradient), np.append(reference["verl_loss"], reference["verl_current_grad"]),
-        np.append(reference["verl_loss_f64"], reference["verl_current_grad_f64"]), "GRPO loss and gradient")
+        value, gradient = jax.value_and_grad(loss)(rollout["current_log_probs"])
+        return {"loss": value, "grad": gradient}
+
+    assert_as_exact(dew, recorded, draw, "GRPO loss and gradient", seeds=seeds, truth_fn=truth)
 
 
 # --- the objective -------------------------------------------------------------
