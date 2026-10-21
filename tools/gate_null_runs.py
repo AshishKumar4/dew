@@ -111,7 +111,6 @@ def main(argv: list[str]) -> int:
     reference, draw, truth = CLASSES[options.name]()
     if options.draws is not None:
         import numpy as np
-
         from reference_error import _drawn
 
         seeds = range(2 * OFFSET * 1024 + options.chunk * options.draws,
