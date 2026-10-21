@@ -85,7 +85,8 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_in
                                [0, *(len(leaf.zero_rows) for leaf in evidence)]),
                            f"{label}.sketch.{name}": np.stack([truth_sketch(record[2][name])
                                                                for record in records[:kept]]),
-                           f"{label}.shape.{name}": np.asarray(np.shape(records[0][2][name]), np.int64)})
+                           f"{label}.shape.{name}": np.asarray(np.shape(records[0][2][name]), np.int64),
+                           f"{label}.dtype.{name}": np.asarray(evidence[0].dtype)})
         result[f"{label}.input_digest"] = np.asarray([input_digest(record[0]) for record in records[:kept]])
         result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
         print(f"{label}: declared {confirmed} seeds; recorded {kept} draws' evidence", flush=True)

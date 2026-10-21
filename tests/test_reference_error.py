@@ -1,6 +1,8 @@
 """The float64 accuracy rule (tests/reference_error.py) on comparisons whose answer is known: what it
 must refuse, and the rounding it must admit."""
 
+import math
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -373,6 +375,29 @@ def test_a_recording_of_the_references_evidence_alone_holds_the_recomputed_truth
     _, _, wrong = indexed_recording(recorded, "site", seeds, inputs_of=draw, truth_fn=off)
     with pytest.raises(AssertionError), jax.enable_x64(new_val=True):
         wrong(*widened(drawn(0)))
+    _, _, overflowing = indexed_recording(recorded, "site", seeds, inputs_of=draw,
+                                          truth_fn=lambda inputs: {"y": wide(inputs)["y"] * 1e300})
+    with pytest.raises(AssertionError), jax.enable_x64(new_val=True):
+        overflowing(*widened(drawn(0)))
     assert recorded["site.sketch.y"].shape == (len(recorded["site.mse.y"]), 16)
     with pytest.raises(AssertionError):
         indexed_recording(recorded, "site", seeds, inputs_of=draw)
+
+
+def test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or_empty_truth_apart():
+    """The sketch of one truth agrees with itself summed in another order within `sketch_rounding`, each
+    block of SKETCH_BLOCK summed from its other end as another host may; a
+    truth recomputed far past float64's range is refused, not passed on an infinite bound; and an empty
+    leaf's evidence is exact, its reference's dtype kept."""
+    from reference_error import SKETCH, _sign_bits, leaf_summary, sketch_rounding, truth_sketch
+
+    rng = np.random.default_rng(7)
+    truth = rng.normal(size=4096)
+    signs = ((_sign_bits(truth.size)[:, None] >> np.arange(SKETCH, dtype=np.uint32)) & 1) * 2.0 - 1
+    # Another host: each block summed one by one from its end, the blocks' sums summed exactly.
+    blocks = np.flip((truth[:, None] * signs).reshape(-1, 64, SKETCH), axis=1).cumsum(axis=1)[:, -1]
+    other_order = np.asarray([math.fsum(blocks[:, index].tolist()) for index in range(SKETCH)])
+    allowed = 2 * sketch_rounding(float(np.sum(np.abs(truth))))
+    assert np.all(np.abs(truth_sketch(truth) - other_order) <= allowed)
+    empty = leaf_summary(jnp.zeros((16, 0), jnp.bfloat16), np.zeros((16, 0)))
+    assert (empty.mse, empty.worst, empty.finite, empty.dtype) == (0.0, 0.0, True, "bfloat16")
