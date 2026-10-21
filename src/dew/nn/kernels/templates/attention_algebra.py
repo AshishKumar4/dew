@@ -49,7 +49,11 @@ class Forward:
 
     @property
     def base2(self) -> bool:
-        """Whether the logits stay in base 2: no hook reads them."""
+        """Whether the logits stay in base 2 (log2(e) folded into the scale, then exp2, jax's mha's and
+        FlashAttention 2's arithmetic): no hook reads them. Its known limits, where the reference stays
+        finite and apart: a scale of 1/log2(e) (0.69) or more takes a product near fp32's largest past
+        it, and the fold's rounding can tie two logits one ulp apart (1610613120 and 1610612992 at scale
+        1, which the reference weighs 1 and 0)."""
         return self.score_mod is None
 
     @property
