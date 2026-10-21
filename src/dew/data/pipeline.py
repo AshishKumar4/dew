@@ -7,7 +7,7 @@ import itertools
 import math
 import sys
 import types
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, runtime_checkable
 
 import grain.python as pygrain
@@ -781,13 +781,6 @@ def concat(datasets: Sequence[Dataset]) -> Pipeline:
     return Pipeline(Concatenate(stores))
 
 
-_VERBS: Mapping[type, str] = {
-    Map: "map", RandomMap: "random_map", MapWithIndex: "map_with_index", Filter: "filter",
-    FlatMap: "flat_map", Configured: "map", Native: "grain", Batched: "map",
-}
-"""The verb that writes each kind of stage that carries a step, which `show` prints beside it."""
-
-
 def _chain_lines(chain: Pipeline, depth: int = 0) -> list[str]:
     """The lines `show` prints of `chain`: its store, or the corpora a mix or phases read, each
     with its own chain indented below, then each stage in order, one a line."""
@@ -807,24 +800,30 @@ def _chain_lines(chain: Pipeline, depth: int = 0) -> list[str]:
     return lines + [f"{indent}.{_stage_line(stage)}" for stage in chain.stages]
 
 
-def _stage_line(stage: Stage) -> str:
-    """One stage as `show` prints it: its verb and the step it runs, or the stage's own settings."""
+def _stage_line(stage: Stage | Batched | Native) -> str:
+    """One stage as `show` prints it: the verb that wrote it and the step it runs, or the
+    stage's own settings."""
     if isinstance(stage, MapBatch):
         where = "device" if isinstance(stage.step, DeviceStep) else "host"
         return f"map({_step_name(stage.step)}) on the {where}, per batch"
-    verb = _VERBS.get(type(stage))
-    if verb is None:
-        return _brief(repr(stage))
-    step = stage.factory if isinstance(stage, Configured) else getattr(stage, "step", None)
-    if step is None:
-        step = getattr(stage, "predicate", None) or getattr(stage, "function", None)
-    return f"{verb}({_step_name(step)})"
+    if isinstance(stage, Configured):
+        return f"map({_step_name(stage.factory)})"
+    if isinstance(stage, Filter):
+        return f"filter({_step_name(stage.predicate)})"
+    if isinstance(stage, Native):
+        return f"grain({_step_name(stage.function)})"
+    if isinstance(stage, (Map, RandomMap, MapWithIndex, FlatMap, Batched)):
+        verb = {Map: "map", RandomMap: "random_map", MapWithIndex: "map_with_index",
+                FlatMap: "flat_map", Batched: "map"}[type(stage)]
+        return f"{verb}({_step_name(stage.step)})"
+    return _brief(repr(stage))
 
 
-def _step_name(step: object) -> str:
+def _step_name(step: Hashable) -> str:
     """A step as `show` prints it: a function by its name, any other step by its settings."""
-    name = getattr(step, "__qualname__", None)
-    return name if isinstance(name, str) and not isinstance(step, type) else _brief(repr(step))
+    if isinstance(step, (types.FunctionType, types.MethodType)):
+        return step.__qualname__
+    return _brief(repr(step))
 
 
 def _brief(text: str, width: int = 120) -> str:

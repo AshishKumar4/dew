@@ -19,16 +19,21 @@ class Grain(Dataset):
     """A Grain `MapDataset`, read by index or as one stream, or an
     `IterDataset`, read as one stream whose position Grain checkpoints. Grain
     states no store of its own, so `name` declares its content version in a
-    run's plan, a cache's key and its logs."""
+    run's plan, a cache's key and its logs; with none, a run reads it and a
+    resume needs `resume="non-exact"`, and no cache keys it (`Manifest.exact`)."""
 
     dataset: grain.MapDataset | grain.IterDataset
-    name: str
+    name: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.name == "":
+            raise ValueError("a Grain dataset's name declares its content version; give one, or none")
 
     def label(self) -> str:
-        return self.name
+        return self.name or "grain"
 
     def describe(self) -> str:
-        return f"grain:{self.name}"
+        return f"grain:{self.name or 'unnamed'}"
 
     def fingerprint(self) -> Mapping[str, object]:
         return {"store": "grain", "identity_required": True, "identity": self.name, **self.metadata()}
@@ -59,6 +64,6 @@ class Grain(Dataset):
         return None
 
 
-def from_grain(dataset: grain.MapDataset | grain.IterDataset, name: str) -> Grain:
-    """`dataset` as a Dew dataset under `name` (`Grain`)."""
+def from_grain(dataset: grain.MapDataset | grain.IterDataset, name: str | None = None) -> Grain:
+    """`dataset` as a Dew dataset, under `name` where given (`Grain`)."""
     return Grain(dataset, name)
