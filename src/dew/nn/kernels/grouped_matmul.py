@@ -45,13 +45,17 @@ def ragged_dot_refusal(compute: Dtype, operands: tuple[Dtype, ...],
                        precision: PrecisionLike) -> str | None:
     """Why the kernels do not compute the product a caller asked for, or None where they do.
 
-    The kernels multiply in `compute`, accumulate in fp32 and ignore
-    `precision`. With 16-bit compute that gives exact products summed in
-    fp32, which any precision asks for. With fp32 compute it gives TF32,
-    which only the default precision asks for (explicitly or through
-    `jax_default_matmul_precision`). An operand or master wider than fp32
-    needs its gradient summed wider than the kernels sum, and x64 widens
-    their int32 group offsets, so both are refused.
+    The kernels multiply in `compute` and accumulate in fp32. With 16-bit
+    compute that gives exact products, summed by the tensor cores, whose fp32
+    accumulation truncates each add: the default precision's sums, and an XLA
+    dot's at it. A precision above the default (explicitly or through
+    `jax_default_matmul_precision`) asks for IEEE fp32 sums, which an fp32
+    output takes by adding each depth step's product apart (`exact_sums`);
+    a 16-bit output's one rounding hides the difference. With fp32 compute
+    the kernels multiply in TF32, which only the default precision asks for.
+    An operand or master wider than fp32 needs its gradient summed wider than
+    the kernels sum, and x64 widens their int32 group offsets, so both are
+    refused.
     """
     if jax.config.jax_enable_x64:
         return "x64 widens the kernels' int32 group offsets"
@@ -154,8 +158,9 @@ def _transcendentals(hook, tile, sides) -> float:
     if hook is None:
         return 0.0
     jaxpr = jax.make_jaxpr(hook)(tile, *sides)
-    counted = sum(math.prod(jax.typeof(var).shape) for equation in _equations(jaxpr.jaxpr)
-                  if equation.primitive.name in TRANSCENDENTALS for var in equation.outvars)
+    counted = sum(math.prod(var.aval.shape) for equation in _equations(jaxpr.jaxpr)
+                  if equation.primitive.name in TRANSCENDENTALS for var in equation.outvars
+                  if isinstance(var.aval, jax.core.ShapedArray))
     return counted / math.prod(tile.shape)
 
 
@@ -282,16 +287,19 @@ class _Triton(_GroupedLaunch[Tile]):
         return TILES
 
     def fitting(self, ba, target) -> tuple[Tile, ...]:
-        """The tiles that fit `target` (`Template.fitting`) whose accumulator stays in its threads'
-        registers, and on Hopper those whose dot Triton gives a warpgroup MMA: each warpgroup's share of
+        """The tiles that fit `target` (`Template.fitting`) whose accumulator (two with `exact_sums`)
+        stays in its threads' registers, and on Hopper those whose dot Triton gives a warpgroup MMA: each
+        warpgroup's share of
         the output rows a multiple of wgmma's 64. Either other kind ran 1.2 to 8.5 times slower than the
         fastest tile on an H100 (GMM-h100-2: an accumulator of 256 registers a thread spills; a 32-row
         share falls back to Ampere's MMA)."""
         wgmma = _facts(target).wgmma
 
+        accumulators = 2 if ba.arguments.get('exact_sums') else 1
+
         def fits(tile: Tile) -> bool:
             rows, columns = self.output(tile)
-            held = rows * columns // (32 * tile.warps) < cost.THREAD_REGISTERS
+            held = accumulators * rows * columns // (32 * tile.warps) < cost.THREAD_REGISTERS
             return held and not (wgmma and rows // max(tile.warps // 4, 1) % 64)
 
         return tuple(tile for tile in super().fitting(ba, target) if fits(tile))
@@ -393,8 +401,8 @@ class Gmm(_Triton):
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
-             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, config: Tile,
-             return_residuals: bool = False):
+             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
+             config: Tile, return_residuals: bool = False):
         # Imported at first use: the kernels need jax's Pallas Triton backend,
         # which jax 0.11.2 deprecates, and importing a model must not load it.
         from . import ragged_dot
@@ -402,7 +410,8 @@ class Gmm(_Triton):
                               block_n=config.block_n, num_warps=config.warps, num_stages=config.stages,
                               trans_rhs=trans_rhs, interpret=interpret, compute_dtype=tokens.dtype,
                               out_dtype=jnp.dtype(out_dtype), prologue_operands=prologue_operands,
-                              epilogue_operands=epilogue_operands, **hooks.kernel_options()), None
+                              epilogue_operands=epilogue_operands, exact_sums=exact_sums,
+                              **hooks.kernel_options()), None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -456,13 +465,14 @@ class Tgmm(_Triton):
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
-             config: Tile, return_residuals: bool = False):
+             exact_sums: bool = False, config: Tile, return_residuals: bool = False):
         from . import ragged_dot
         return ragged_dot.tgmm(tokens, cotangent, sizes, block_m=config.block_m, block_k=config.block_k,
                                block_n=config.block_n, num_warps=config.warps, num_stages=config.stages,
                                interpret=interpret, compute_dtype=tokens.dtype,
                                out_dtype=jnp.dtype(out_dtype), prologue=hooks.prologue,
-                               prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes), None
+                               prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
+                               exact_sums=exact_sums), None
 
 
 class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
@@ -472,6 +482,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     matrix block the row tiles in flight share come from the L2."""
     name: ClassVar[str] = 'mosaic_gpu'
     config_cls: ClassVar[type[mosaic_gpu.Tiles]] = mosaic_gpu.Tiles
+    EXACT_SUMS: ClassVar[bool] = False
+    """Whether the kernel adds each depth step's product apart (`exact_sums`); one that does not is not
+    eligible where the call asks for it."""
 
     def eligible(self, ba, target) -> bool:
         first, second = (value.dtype for name, value in ba.arguments.items()
@@ -480,7 +493,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # process's lowering of the platform choice cannot carry in the CPU branch it does not take.
         interpretable = not ba.arguments['interpret'] or jax.default_backend() == 'cpu'
         return (target.wgmma and first == second and jnp.dtype(first).itemsize == 2 and interpretable
-                and _rated(target, first) and bool(self.space(ba)) and self._hooks_lower(ba, first))
+                and _rated(target, first) and bool(self.space(ba)) and self._hooks_lower(ba, first)
+                and (self.EXACT_SUMS or not ba.arguments.get('exact_sums')))
 
     @staticmethod
     def _hooks_lower(ba, dtype) -> bool:
@@ -586,8 +600,9 @@ class MosaicGmm(_Mosaic):
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
-             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, config: mosaic_gpu.Tiles,
-             return_residuals: bool = False):
+             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
+             config: mosaic_gpu.Tiles, return_residuals: bool = False):
+        del exact_sums  # never set: the launch is not eligible for it
         return mosaic_gpu.gmm(tokens, kernel, sizes, tiles=config, transpose_rhs=trans_rhs,
                               out_dtype=out_dtype, multiprocessors=self._multiprocessors(interpret),
                               interpret=INTERPRETED if interpret else False,
@@ -606,10 +621,19 @@ class MosaicTgmm(_Mosaic):
     `block_k` at a time."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
+    EXACT_SUMS: ClassVar[bool] = True
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
         return tuple(tile for tile in MOSAIC_TILES if depth % tile.block_m == 0 and width % tile.block_n == 0)
+
+    def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
+        """The tiles that fit `target` (`Template.fitting`), with `exact_sums` those whose two fp32
+        accumulators, the running sum and a step's, stay in the warpgroup's registers."""
+        fits = super().fitting(ba, target)
+        if not ba.arguments.get('exact_sums'):
+            return fits
+        return tuple(tile for tile in fits if 2 * tile.block_m * tile.block_n // 128 < cost.THREAD_REGISTERS)
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:
@@ -634,11 +658,12 @@ class MosaicTgmm(_Mosaic):
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
-             config: mosaic_gpu.Tiles, return_residuals: bool = False):
+             exact_sums: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
         return mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=config, out_dtype=out_dtype,
                                multiprocessors=self._multiprocessors(interpret),
                                interpret=INTERPRETED if interpret else False, prologue=hooks.prologue,
-                               prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes), None
+                               prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
+                               exact_sums=exact_sums), None
 
 
 def _facts(target: generation.GpuTarget) -> generation.GpuTarget:
@@ -673,24 +698,32 @@ _TGMMS = (MosaicTgmm(), Tgmm())
 
 
 def launched_gmm(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (), *,
-                 out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool):
+                 out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, exact: bool = False):
     """Each group's rows of `tokens` times its matrix of `kernel`, rounded to `tokens`'s dtype, through
-    the launch that runs it (`_launch`), with the template's hooks (`templates.gemm.template.gemm`)."""
+    the launch that runs it (`_launch`), with the template's hooks (`templates.gemm.template.gemm`).
+    `exact` (a precision above the default) gives an fp32 output IEEE sums (`ragged_dot_refusal`)."""
     arguments = (tokens, kernel.astype(tokens.dtype), sizes, tuple(prologue_operands),
                  tuple(epilogue_operands))
+    exact_sums = _exact_sums(exact=exact, hooks=hooks, out_dtype=out_dtype)
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'trans_rhs': trans_rhs, 'hooks': hooks,
-               'interpret': interpret}
+               'interpret': interpret, 'exact_sums': exact_sums}
     return _launch(_GMMS_TRANSPOSED if trans_rhs else _GMMS, arguments, options)(*arguments, **options)
 
 
 def launched_tgmm(tokens, cotangent, sizes, prologue_operands: tuple = (), *, out_dtype,
-                  hooks: Hooks = NO_HOOKS, interpret: bool):
+                  hooks: Hooks = NO_HOOKS, interpret: bool, exact: bool = False):
     """Each group's rows of `tokens` transposed times its rows of `cotangent`, rounded to `tokens`'s
     dtype, through the launch that runs it, with the template's prologue
     (`templates.gemm.template.gemm_t`)."""
     arguments = (tokens, cotangent.astype(tokens.dtype), sizes, tuple(prologue_operands))
-    options = {'out_dtype': jnp.dtype(out_dtype).name, 'hooks': hooks, 'interpret': interpret}
+    options = {'out_dtype': jnp.dtype(out_dtype).name, 'hooks': hooks, 'interpret': interpret,
+               'exact_sums': _exact_sums(exact=exact, hooks=hooks, out_dtype=out_dtype)}
     return _launch(_TGMMS, arguments, options)(*arguments, **options)
+
+
+def _exact_sums(*, exact: bool, hooks: Hooks, out_dtype) -> bool:
+    """Whether a launch adds each depth step's product apart: asked for IEEE sums, with an fp32 output."""
+    return exact and jnp.dtype(jnp.float32) in {jnp.dtype(d) for d in (hooks.out_dtypes or (out_dtype,))}
 
 
 def _launch(launches, arguments, options):
@@ -761,11 +794,12 @@ def _forward(inputs, matrix, sizes, out_dtype, interpret_on_cpu):
     return jax.lax.platform_dependent(inputs, matrix, sizes, default=default, **branches)
 
 
-def _backward(inputs, matrix, sizes, cotangent, input_dtype, kernel_dtype, interpret_on_cpu):
+def _backward(inputs, matrix, sizes, cotangent, input_dtype, kernel_dtype, interpret_on_cpu, exact):
     def kernel(inputs, matrix, sizes, cotangent, *, interpret):
         return (launched_gmm(cotangent, matrix, sizes, out_dtype=input_dtype, trans_rhs=True,
-                             interpret=interpret),
-                launched_tgmm(inputs, cotangent, sizes, out_dtype=kernel_dtype, interpret=interpret))
+                             interpret=interpret, exact=exact),
+                launched_tgmm(inputs, cotangent, sizes, out_dtype=kernel_dtype, interpret=interpret,
+                              exact=exact))
 
     def fallback(inputs, matrix, sizes, cotangent):
         work = jnp.result_type(_summed(input_dtype), _summed(kernel_dtype))
@@ -785,9 +819,9 @@ def _summed(dtype) -> jnp.dtype:
     return jnp.promote_types(dtype, jnp.float32)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5))
 def grouped_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
-                       compute: Dtype, interpret_on_cpu: bool) -> jax.Array:
+                       compute: Dtype, interpret_on_cpu: bool, exact: bool = False) -> jax.Array:
     """Compute `dew.nn.moe.expert_projection` with the kernels, differentiable in first-order reverse mode.
 
     The operands are cast to `compute`, and the product accumulates in fp32
@@ -797,12 +831,14 @@ def grouped_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     compute means exact products, and the kernels write each in its own
     dtype, one rounding with no pass after. Only a CUDA lowering runs the
     kernels (`interpret_on_cpu` adds the CPU's interpreter). Every other
-    lowering runs `jax.lax.ragged_dot` under the same contract.
+    lowering runs `jax.lax.ragged_dot` under the same contract. `exact` (a
+    precision above the default) gives an fp32 gradient IEEE sums
+    (`ragged_dot_refusal`).
     """
-    return _projection_fwd(x, kernel, group_sizes, compute, interpret_on_cpu)[0]
+    return _projection_fwd(x, kernel, group_sizes, compute, interpret_on_cpu, exact)[0]
 
 
-def _projection_fwd(x, kernel, group_sizes, compute, interpret_on_cpu):
+def _projection_fwd(x, kernel, group_sizes, compute, interpret_on_cpu, exact):
     inputs, matrix = x.astype(compute), kernel.astype(compute)
     sizes = group_sizes.astype(jnp.int32)
     output = _forward(inputs, matrix, sizes, jnp.dtype(compute), interpret_on_cpu)
@@ -812,11 +848,11 @@ def _projection_fwd(x, kernel, group_sizes, compute, interpret_on_cpu):
     return output, residuals
 
 
-def _projection_bwd(compute, interpret_on_cpu, residuals, cotangent):
+def _projection_bwd(compute, interpret_on_cpu, exact, residuals, cotangent):
     del compute
     inputs, matrix, sizes, x_like, kernel_like = residuals
     d_inputs, d_matrix = _backward(inputs, matrix, sizes, cotangent.astype(inputs.dtype), x_like.dtype,
-                                   kernel_like.dtype, interpret_on_cpu)
+                                   kernel_like.dtype, interpret_on_cpu, exact)
     return d_inputs, d_matrix, np.zeros(sizes.shape, jax.dtypes.float0)
 
 
