@@ -311,12 +311,12 @@ def test_a_metric_a_run_names_without_a_validation_split_refuses_before_an_updat
     assert Checkpoints(str(tmp_path / "checkpoints"), keep=1).latest is None
 
 
-def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
+def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=None):
     """Two training steps of a tiny byte-level decoder, its checkpoints, whose
     record names the byte tokenizer it decodes through, and the `run.json` the
     LM recipe writes: the resolved model, tokenizer and budget.
     `max_seq_len` is the model's window, which training at 9 ids does not
-    reach."""
+    reach; `fields` override the decoder's shape."""
     import json
 
     from dew.objectives.lm import LMObjective, Samples
@@ -324,7 +324,7 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     from dew.training import MeshSpec
 
     fields = {"vocab_size": 256, "emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
-                  "mlp_features": 32, "max_seq_len": max_seq_len}
+              "mlp_features": 32, "max_seq_len": max_seq_len, **(fields or {})}
     model_config = ModelConfig("causal_transformer", {**fields,
                                                     "dtype": "float32", "attention_impl": "reference"})
     objective = LMObjective(model_config.build(), 8, ema_decay=ema_decay,
@@ -349,12 +349,13 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     return objective, state
 
 
-def test_every_route_generates_through_its_packed_projections_over_canonical_weights(tmp_path):
-    """A run's task, its source export's task and a live objective's keep the canonical tree, the
-    objective's bound in place, and each generation packs its decoder's query/key/value and gate/up
-    projections inside its own compiled call: each draws, bit for bit, what a task over weights
-    packed beforehand draws, and the routes draw alike. A source's task packed at load and a run's
-    did not, so one model drew two ways and a source's tree could not export."""
+def test_every_route_generates_through_the_same_packed_projections(tmp_path):
+    """A run's task and a source's hold their query/key/value and gate/up packed, packed once at
+    their load from the weights they own; a live objective's task keeps the trainer's own arrays,
+    bound in place, and packs them inside each generation's compiled call. Every route draws, bit
+    for bit, what a task over weights packed beforehand draws, and the run's and the objective's
+    draws agree, where a route reading its members apart draws otherwise. A source's packed tree
+    exports as the source's own members."""
     from dew.inference.projections import inference_projections
     from dew.interop import Pretrained
     from dew.sampling import Sampling
@@ -367,7 +368,9 @@ def test_every_route_generates_through_its_packed_projections_over_canonical_wei
               "objective": objective.pipeline(state)}
     for name, task in routes.items():
         attention = task.variables["params"]["layers_0"]["self_attn"]
-        assert {"q_proj", "k_proj", "v_proj"} <= set(attention) and "qkv_proj" not in attention, name
+        owned = name != "objective"
+        assert ("qkv_proj" in attention) == owned, name
+        assert ({"q_proj", "k_proj", "v_proj"} & set(attention) == set()) == owned, name
     for bound, live in zip(jax.tree.leaves(routes["objective"].variables), jax.tree.leaves(state.variables),
                            strict=True):
         assert bound is live
@@ -381,6 +384,38 @@ def test_every_route_generates_through_its_packed_projections_over_canonical_wei
         np.testing.assert_array_equal(drawn[name].tokens, expected.tokens, err_msg=name)
         np.testing.assert_array_equal(drawn[name].raw_log_probs, expected.raw_log_probs, err_msg=name)
     np.testing.assert_array_equal(drawn["run"].raw_log_probs, drawn["objective"].raw_log_probs)
+    source = Pretrained.load(tmp_path / "source", dtype="float32", param_dtype="float32")
+    exported, canonical = source.export(routes["source"].variables), source.export()
+    assert set(exported) == set(canonical)
+    for name, tensor in canonical.items():
+        np.testing.assert_array_equal(np.asarray(exported[name]), np.asarray(tensor), err_msg=name)
+
+
+@pytest.mark.mesh(devices=3)
+def test_a_run_on_a_mesh_packs_projections_its_tensor_axis_cannot_split(tmp_path):
+    """Three query heads and one key-value head of width four: the tensor axis splits the query's
+    twelve output units three ways but not the packed projection's twenty. A run's task on that
+    mesh packs at its load, each packed leaf placed as the layout places the packed shape, its
+    members' buffers freed, and draws what the run draws on one device."""
+    from dew.sampling import Sampling
+    from dew.training import Layout, MeshSpec
+
+    run = tmp_path / "run"
+    run.mkdir()
+    make_lm_run(run, ema_decay=None, fields={"emb_features": 12, "num_heads": 3, "num_kv_heads": 1,
+                                             "head_dim": 4})
+    layout = Layout(min_shard=1, tolerance=1.0)
+    meshed = dew.pipeline(str(run), mesh=MeshSpec(tensor=3), layout=layout)
+    alone = TextGeneration.from_run(str(run))
+    attention = meshed.variables["params"]["layers_0"]["self_attn"]
+    kernel = attention["qkv_proj"]["kernel"]
+    assert kernel.shape[-1] == 20 and not {"q_proj", "k_proj", "v_proj"} & set(attention)
+    assert kernel.sharding.is_equivalent_to(
+        layout.shardings(kernel.sharding.mesh, meshed.variables)["params"]["layers_0"]["self_attn"][
+            "qkv_proj"]["kernel"], kernel.ndim)
+    greedy = Sampling(temperature=0, eos_token_ids=255)
+    there, here = (task("the ", 4, key=2, sampling=greedy).host() for task in (meshed, alone))
+    np.testing.assert_array_equal(there.tokens, here.tokens)
 
 
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
