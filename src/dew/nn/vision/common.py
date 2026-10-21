@@ -10,6 +10,7 @@ from flax import linen as nn
 
 from dew import records
 from dew.interop.decoder_parts import read_rope_theta
+from dew.registry import Record
 
 PIXEL_VALUES_KEY = "pixel_values"
 """The batch field carrying images as the checkpoint's processor emitted them."""
@@ -142,6 +143,23 @@ def projector_weight_path(kind: str, name: str) -> tuple[str, ...]:
 def _vision_section(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """The vision half of a wrapper config, or a bare vision config."""
     return records.record(hf_config.get("vision_config", hf_config), "vision_config")
+
+
+def merger_projector(hf_config: Mapping[str, object], text_width: int, kind: str) -> Record:
+    """The `kind` projector record of a wrapper whose vision tower ends in its own merger
+    (`out_hidden_size`, `spatial_merge_size`), as Qwen 3.5's and MiMo-V2's do: the merged
+    features enter the text embeddings as they are, so a merger width beside the decoder width
+    refuses."""
+    vision = _vision_section(hf_config)
+    merged = records.integer(vision["out_hidden_size"], "out_hidden_size")
+    if merged != int(text_width):
+        raise ValueError(f"out_hidden_size ({merged}) is not the decoder width ({text_width}), "
+                         "the merger output enters the text embeddings as it is")
+    return {"class": kind, "fields": {
+        "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
+        "merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
+        "out_width": merged,
+    }}
 
 
 def _side(value: object, field: str) -> int:
