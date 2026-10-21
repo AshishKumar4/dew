@@ -634,8 +634,8 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
         moved, kept = _moved(draws)
     _logged(label, 1 if moved and len(draws.mine) == seeds else 2, "pass" if moved else "over")
     if not moved:
-        raise AssertionError(f"{label}: the change moves no leaf beyond rounding over {len(draws.mine)} seeds:\n"
-                             + "\n".join(kept))
+        raise AssertionError(f"{label}: the change moves no leaf beyond rounding over {len(draws.mine)} "
+                             "seeds:\n" + "\n".join(kept))
 
 
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = 512,
