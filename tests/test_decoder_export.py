@@ -90,7 +90,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from interop_support import assert_restores, assert_same_stored_tensors
-from model_support import flat_tree, streamed_export
+from model_support import cached_round_trips, flat_tree, streamed_export
 from reference_error import (
     FACTOR,
     ORDERS,
@@ -147,14 +147,7 @@ def trips(workspace):
     the family-specific claims read the same round trip the parameterized
     ones do.
     """
-    cache = {}
-
-    def trip(name: str):
-        if name not in cache:
-            cache[name] = tool.round_trip(CASES[name], workspace)
-        return cache[name]
-
-    return trip
+    return cached_round_trips(tool.round_trip, CASES, workspace)
 
 
 @pytest.fixture(params=list(CASES), ids=list(CASES))

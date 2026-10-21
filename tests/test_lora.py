@@ -31,6 +31,7 @@ import pytest
 from affine_run import Replaying
 from flax import linen as nn
 from interop_support import extract_fixture, hub_cache
+from model_support import flat_tree
 from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 from test_joined import row_joins
@@ -279,7 +280,7 @@ def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, 
         log_every=2,
     )
 
-    assert set(_flat(state.variables["params"])) == {
+    assert set(flat_tree(state.variables["params"])) == {
         f"{'.'.join(target[1:])}.{factor}" for target in tuned.adapter.targets for factor in lora.FACTORS}
     for before, after in zip(
         jax.tree.leaves(initial.variables[FROZEN]), jax.tree.leaves(state.variables[FROZEN]), strict=True
@@ -288,8 +289,8 @@ def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, 
     trained = thaw(state.variables)
     tuned.adapter.save(state.variables, tmp_path / "adapter")
     read = LoRA.load(source.model, source.variables, tmp_path / "adapter", layouts=source.layouts)
-    for name, leaf in _flat(thaw(read.variables)).items():
-        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(_flat(trained)[name]), err_msg=name)
+    for name, leaf in flat_tree(thaw(read.variables)).items():
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(flat_tree(trained)[name]), err_msg=name)
     # The export is the merged weights in the source's layout, so the reload
     # computes exactly what the source model computes on them; how close the
     # merge is to the adapted forward is the PEFT parity test's to bound.
@@ -741,12 +742,6 @@ REGISTRY_FIELDS = {"vocab_size": 256, "emb_features": 16, "num_layers": 2, "num_
                    "head_dim": 8, "mlp_features": 32, "max_seq_len": 16}
 
 
-def _flat(tree):
-    """Every leaf by its dotted path, for comparing two trees leaf by leaf."""
-    return {".".join(str(entry.key) for entry in path): leaf
-            for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
-
-
 def _registry_decoder():
     """A tiny causal transformer and its variables, built from the registry:
     no published checkpoint, so no weight layouts to resolve names through."""
@@ -840,7 +835,7 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
                        checkpoints=Checkpoints(str(directory)))
 
     def factors(tree):
-        return {name: leaf for name, leaf in _flat(tree["params"]).items() if name.endswith(lora.FACTORS)}
+        return {name: leaf for name, leaf in flat_tree(tree["params"]).items() if name.endswith(lora.FACTORS)}
 
     whole = trainer(Squared(adapter.model, adapter.variables), tmp_path / "whole").fit(data(), steps=4,
                                                                                       log_every=4)
@@ -995,13 +990,13 @@ def test_a_pipeline_lora_run_moves_its_factors_and_nothing_else(family, pipeline
     data = Loader(train=lambda partition: iter([batch] * 3), val=None, records=rows, batch=rows)
     state = trainer.fit(data, steps=3, log_every=3)
 
-    assert set(_flat(state.variables["params"])) == {
+    assert set(flat_tree(state.variables["params"])) == {
         f"{'.'.join(path[1:])}.{factor}" for path in tuned.adapter.targets for factor in lora.FACTORS}
     for collection in (FROZEN, "encoders", "autoencoder"):
         for before, after in zip(jax.tree.leaves(initial.variables[collection]),
                                  jax.tree.leaves(state.variables[collection]), strict=True):
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=collection)
-    assert all(bool(jnp.any(leaf)) for name, leaf in _flat(state.variables["params"]).items()
+    assert all(bool(jnp.any(leaf)) for name, leaf in flat_tree(state.variables["params"]).items()
                if name.endswith("lora_B"))
     assert np.isfinite(_sampled(objective.pipeline(state))).all()
 
@@ -1021,9 +1016,9 @@ def test_a_tuned_pipeline_saves_its_adapter_and_its_merged_weights(family, pipel
     assert json.loads(metadata[lora.DIFFUSERS_METADATA])["transformer.r"] == 2
     loaded = LoRA.load(source.model, source.variables, tmp_path / "adapter", layouts=source.layouts)
     assert (loaded.targets, loaded.layouts) == (tuned.adapter.targets, tuned.adapter.layouts)
-    for name, leaf in _flat(thaw(loaded.variables)).items():
+    for name, leaf in flat_tree(thaw(loaded.variables)).items():
         if "lora_" in name:
-            np.testing.assert_array_equal(np.asarray(leaf), np.asarray(_flat(thaw(variables))[name]),
+            np.testing.assert_array_equal(np.asarray(leaf), np.asarray(flat_tree(thaw(variables))[name]),
                                           err_msg=name)
 
     tuned.save(tmp_path / "merged", variables=variables)
@@ -1178,9 +1173,9 @@ def test_a_pretrained_pipeline_run_from_the_command_line_trains_its_lora(pipelin
 
     source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(16, 16))
     tuned = source.adapt(config.lora, key=config.trainer.key)
-    moved = _flat(state.variables["params"])
+    moved = flat_tree(state.variables["params"])
     assert moved and all(name.endswith(lora.FACTORS) for name in moved)
-    assert all(bool(jnp.any(leaf != _flat(tuned.variables["params"])[name]))
+    assert all(bool(jnp.any(leaf != flat_tree(tuned.variables["params"])[name]))
                for name, leaf in moved.items() if name.endswith("lora_B"))
     for collection in (FROZEN, "encoders", "autoencoder"):
         for before, after in zip(jax.tree.leaves(tuned.variables[collection]),
@@ -1227,11 +1222,11 @@ def test_a_custom_objective_trains_only_an_adapters_factors(decoder, reference):
     initial = trainer.initial_state()
     state = trainer.fit(data, steps=2, log_every=2)
 
-    assert set(_flat(state.variables["params"])) == {
+    assert set(flat_tree(state.variables["params"])) == {
         f"{'.'.join(target[1:])}.{factor}" for target in adapter.targets for factor in lora.FACTORS}
-    before = _flat(initial.variables["params"])
-    assert all(bool(jnp.any(leaf != before[name])) for name, leaf in _flat(state.variables["params"]).items()
-               if name.endswith("lora_B"))
+    before = flat_tree(initial.variables["params"])
+    assert all(bool(jnp.any(leaf != before[name]))
+               for name, leaf in flat_tree(state.variables["params"]).items() if name.endswith("lora_B"))
     for before, after in zip(jax.tree.leaves(initial.variables[FROZEN]),
                              jax.tree.leaves(state.variables[FROZEN]), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
@@ -1254,7 +1249,7 @@ def test_a_scratch_diffusion_run_from_the_command_line_trains_its_lora(tmp_path)
         "--lora.modules", "final_proj")
     assert config.lora == LoRA(rank=2, modules=("final_proj",))
 
-    moved = _flat(state.variables["params"])
+    moved = flat_tree(state.variables["params"])
     assert set(moved) == {f"output.final_proj.{factor}" for factor in lora.FACTORS}
     plain = dataclasses.replace(config, lora=None).build()
     key = jax.random.key(config.trainer.key)
@@ -1263,8 +1258,8 @@ def test_a_scratch_diffusion_run_from_the_command_line_trains_its_lora(tmp_path)
                              strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
     adapter = config.lora.apply(plain.model, drawn, key=jax.random.fold_in(key, 1))
-    assert all(bool(jnp.any(leaf != _flat(adapter.variables["params"])[name])) for name, leaf in moved.items()
-               if name.endswith("lora_B"))
+    assert all(bool(jnp.any(leaf != flat_tree(adapter.variables["params"])[name]))
+               for name, leaf in moved.items() if name.endswith("lora_B"))
     adapter.save(state.variables, tmp_path / "in-process")
     rebuilt = Adapter.from_run(tmp_path / "run")
     rebuilt.save(rebuilt.variables, tmp_path / "from-run")
