@@ -379,7 +379,7 @@ def test_a_recording_of_the_references_evidence_alone_holds_the_recomputed_truth
                                           truth_fn=lambda inputs: {"y": wide(inputs)["y"] * 1e300})
     with pytest.raises(AssertionError), jax.enable_x64(new_val=True):
         overflowing(*widened(drawn(0)))
-    assert recorded["site.sketch.y"].shape == (len(recorded["site.mse.y"]), 16)
+    assert recorded["site.sketch.y"].shape == (len(recorded["site.mse.y"]), 32)
     with pytest.raises(AssertionError):
         indexed_recording(recorded, "site", seeds, inputs_of=draw)
 
@@ -393,7 +393,7 @@ def test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or
 
     rng = np.random.default_rng(7)
     truth = rng.normal(size=4096)
-    signs = ((_sign_bits(truth.size, 3)[:, None] >> np.arange(SKETCH, dtype=np.uint32)) & 1) * 2.0 - 1
+    signs = ((_sign_bits(truth.size, 3)[:, None] >> np.arange(SKETCH, dtype=np.uint64)) & 1) * 2.0 - 1
     # Another host: each block summed one by one from its end, the blocks' sums summed exactly.
     blocks = np.flip((truth[:, None] * signs).reshape(-1, 64, SKETCH), axis=1).cumsum(axis=1)[:, -1]
     other_order = np.asarray([math.fsum(blocks[:, index].tolist()) for index in range(SKETCH)])
@@ -401,3 +401,10 @@ def test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or
     assert np.all(np.abs(truth_sketch(truth, 3) - other_order) <= allowed)
     empty = leaf_summary(jnp.zeros((16, 0), jnp.bfloat16), np.zeros((16, 0)))
     assert (empty.mse, empty.worst, empty.finite, empty.dtype) == (0.0, 0.0, True, "bfloat16")
+    with pytest.raises(AssertionError):
+        leaf_summary(np.zeros(0), np.ones(3))
+    # Two entries swapped are seen at a seed unless their signs agree in all SKETCH places.
+    swapped = truth.copy()
+    swapped[[0, 1]] = swapped[[1, 0]]
+    bits = _sign_bits(truth.size, 3)
+    assert (bits[0] == bits[1]) or np.any(truth_sketch(swapped, 3) != truth_sketch(truth, 3))
