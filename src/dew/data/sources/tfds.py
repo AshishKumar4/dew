@@ -418,7 +418,14 @@ class TFDS(Dataset):
 
     def stated(self) -> Mapping[str, object]:
         """Its builder's info, no data source opened: the dataset's name and version, its class
-        names, and the split's rows the info counts."""
+        names, and the split's rows the info counts. A split not prepared here, or a remote one not
+        mirrored yet, states nothing: a run's record and model are built where its data may not be."""
+        root = epath.Path(os.path.expanduser(self.directory))
+        # A prepared directory holds the split's metadata, or a data directory the dataset's own.
+        prepared = all((root / name).is_file() for name in METADATA)
+        here = root.is_dir() and (prepared or (root / self.name).is_dir())
+        if not here or (self.remote and not Path(self.directory, "READY").is_file()):
+            return {}
         described = self.builder.info
         splits = described.splits
         counted = splits is not None and self.split in splits
