@@ -66,7 +66,7 @@ flowchart TD
   D -- "it makes several" --> FLM["flat_map"]
 ```
 
-Library stages are values of these shapes. `images.Resize(256)` is a `RecordFn`, `images.Flip(p=0.5)` a `RandomFn`, `images.MinSide(256)` a `Predicate`, `images.fetch()` a `TryFn`. Each is a small frozen value with `__call__`: picklable for worker processes, printable in `show()`, and identified for caching by its configuration and the versions it depends on. Your own function works the same way. A `map` stage that returns `Rejected` raises, naming the stage. Every library step passes through the fields it does not read (`text.tokenize` included); `pack` keeps only the fields it packs, as its `fields=` says. A step reads its field by the record's convention (`jpg`/`png`/`image`, `txt`/`text`/`caption`, `url`, `mp4`) and names it where the convention does not fit: `images.DecodeImage(field="jpg", to="image")`, `images.Resize(field=)`, `images.Processor(field=, to=)`, `images.fetch(url=, to=)`. `text.Normalized(form=, field=)` puts text in one Unicode normal form before it tokenizes. Errors that name the failing stage, field and fix are not built yet for every step.
+Library stages are values of these shapes. `images.Resize(256)` is a `RecordFn` (and `images.Fit(256)`, which fits an image whole into its square on white, as a web image is shown), `images.Flip(p=0.5)` a `RandomFn`, `images.MinSide(256)` a `Predicate`, `images.fetch()` a `TryFn`. Each is a small frozen value with `__call__`: picklable for worker processes, printable in `show()`, and identified for caching by its configuration and the versions it depends on. Your own function works the same way. A `map` stage that returns `Rejected` raises, naming the stage. Every library step passes through the fields it does not read (`text.tokenize` included); `pack` keeps only the fields it packs, as its `fields=` says. A step reads its field by the record's convention (`jpg`/`png`/`image`, `txt`/`text`/`caption`, `url`, `mp4`) and names it where the convention does not fit: `images.DecodeImage(field="jpg", to="image")`, `images.Resize(field=)`, `images.Processor(field=, to=)`, `images.fetch(url=, to=)`. `text.Normalized(form=, field=)` puts text in one Unicode normal form before it tokenizes. Errors that name the failing stage, field and fix are not built yet for every step.
 
 ## 2. Sources
 
@@ -77,10 +77,12 @@ Library stages are values of these shapes. `images.Resize(256)` is a `RecordFn`,
 | `TFDS(name, split=)` | TensorFlow Datasets | TFDS ArrayRecord |
 | `Memory(records or columns)` | Arrays, lists of dicts, DataFrames | numpy, pyarrow |
 | `from_hf(dataset, name=)` | An existing `datasets.Dataset`, its `.map()`s already applied. An `IterableDataset` is named, with its version, since it has no content fingerprint; a shuffled one is refused, because HF drops its shuffle buffer on resume. | HF datasets |
-| `from_torch(dataset)` | A map-style `torch.utils.data.Dataset` | PyTorch |
-| `from_grain(dataset)` | A Grain `MapDataset` or `IterDataset` | Grain |
-| `from_iter(factory, state=, load_state=)` | Any resumable iterator: WebDataset, torchdata, Mosaic Streaming, Ray | the library's own state |
+| `from_torch(dataset, identity=None)` | A map-style `torch.utils.data.Dataset` | PyTorch |
+| `from_grain(dataset, name=None)` | A Grain `MapDataset` or `IterDataset` | Grain |
+| `from_iter(factory, name=None, state=, load_state=)` | Any resumable iterator: WebDataset, torchdata, Mosaic Streaming, Ray | the library's own state |
 | `from_iter(factory, replay=True)` | An iterator that reads the same records each time `factory()` opens it | replay to the count read, guarded by the last batch's digest |
+
+A torch, Grain or iterator source holds no content version of its own. Given `name=` (`identity=` for torch), its plan names it, an exact resume finds the same records, and a cache keys it. Given none, it trains as well, but nothing says a later run reads the same records: resuming its position takes `resume="non-exact"`, and a cache of it is refused.
 
 Preparing a Hub dataset happens on first use, with one log line naming what is prepared and its size. `.read("memory" | "indexed" | "streamed")` overrides how it is read.
 
@@ -101,7 +103,7 @@ Preparing a Hub dataset happens on first use, with one log line naming what is p
 | Execution | `workers(n)`, `threads(n)`, `prefetch(n)`, `read(mode)`, `loading(Loading(...))` for every read setting at once |
 | Look | `take(n).show()`, `stats(records=n)`, `for record in ds` (one pass, with training's draws) |
 
-Both diagnostics open a fresh reader, never the training stream. `stats` returns counters from at most `n` accepted records and runs before `batch`; `show` also takes batches. Both handle random and repeated chains. Training logs its own live counters, wait time and throughput.
+Both diagnostics open a fresh reader, never the training stream. `stats` returns counters from at most `n` accepted records and runs before `batch`: the rows delivered and the drops by reason of each corpus, the rows it read a second once its reader was open (loading settings default to none, while workers or prefetching the chain writes run as written), and for token rows the tokens they hold and the share of their places that pad a row. `show` prints the chain, each verb and step a preset or function expanded to, then the first records; it also takes batches. Both handle random and repeated chains. Training logs its own live counters, wait time and throughput.
 
 Batched preprocessing uses Hugging Face's form: `map(fn, batched=True, batch_size=k)` hands `fn` a dict of columns (`{"text": [...k strings]}`). One difference from Hugging Face: there, a batched `map` may return any number of rows; in Dew it must return the same number, and `flat_map(fn, batched=True)` is the one that may change it. The verb keeps saying how many records come out, which is what lets Dew keep exact global resume. A Hugging Face function that changes the row count goes through `flat_map(..., batched=True)` unchanged. The chain stays a stream of records, so `pack`, `mix` and `batch` still follow. After `batch(n)`, a `map` receives the training batch, as in Grain and tf.data.
 
@@ -259,7 +261,7 @@ web = Files("s3://tokens/v3/web/")                 # training reads it back
 clips = (Files("gs://av/catalog.parquet")
            .filter_map(video.fetch())
            .random_filter_map(video.PickClip(seconds=2.0))  # writes one start/stop descriptor
-           .filter_map(video.DecodeVideo(frames=32, fps=16, size=256))            # reads the descriptor
+           .filter_map(video.DecodeVideo(frames=32, fps=16, size=256, min_size=128))  # reads the descriptor; drops clips under 128 px
            .filter_map(audio.DecodeAudio(sample_rate=16_000, missing="silence")))  # reads the same descriptor
 ```
 
@@ -306,6 +308,7 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 - A `lm` or `sft` row holds `seq_len` inputs and their next-token targets.
 - `images` and `clips` pass every other field through, stacked per batch: `label` becomes `[B]`, `caption` a list of `B` strings.
 - `lm` packs first-fit (`bins` rows open at once), best-fit or by concatenation (`pack=`), every cut through a document overlapping by one token so each next-token target stays whole; `pack=None` joins the documents into one stream of tokens and cuts it into windows `stride` apart instead, which carry no document coordinates; a token store's windows read its stream by index. `eos=None` ends a document with the tokenizer's EOS where it has one. A token store whose documents end nowhere (no document index, no EOS) is not packed, alone or among other sources, since its pieces would be no producer's documents; its stream still reads as windows.
+- `text.train_tokenizer(ds, base, path, vocab_size=)` trains a tokenizer on a chain's text by `base`'s algorithm and saves it at `path`, which `lm`, `sft` and `text.tokenize` then read.
 - `sft` cuts a conversation longer than a row into pieces that keep every turn (`long="chunk"`), cuts it at its end (`"truncate"`) or drops and counts it (`"drop"`).
 - `lm` and `sft` pack several documents into one row, so a per-document field has no row to land in. They keep only the fields they write. To pack a per-token field of your own along, write the chain with `pack(fields=)`.
 - `augment=True` crops to `crop_scale` of the area, flips and colour-jitters on the accelerator, as in [Augmenting on the GPU](#augmenting-on-the-gpu); an `images.DeviceAugment(size, crop_scale=, flip=, jitter=)` value sets those itself. `augment=` also takes your own random step or a tuple of them, such as `images.Albumentations(aug)` or `images.RandomCrop(size, scale=)`, which run on the host right after the resize.
@@ -314,7 +317,7 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 - `records=n` keeps `n` prepared records before the batch, as a validation split's `take(n)`; `host=` steps read each batch on the host, before any step on the accelerator. Every preset takes both.
 - `clips` draws a window `margin` seconds clear of the media's ends and its sound `context` seconds wider on each side; `missing="reject"` drops media without sound instead of filling silence, and `rejects=False` stops the run on media that is too short or does not decode.
 - `canvas` never packs: the objective splits each row at `prompt_length`. A tokenizer with no EOS cannot end a response, and is refused.
-- `cache=url` caches the preset's fixed steps (decode and resize, or tokenize). Augmentation, packing and batching run after the cache.
+- `cache=url` (or a `Cache`, or a published `Generation`) caches the preset's fixed steps: decode, resize and a fixed caption, tokenize, or render. Augmentation, a drawn caption, packing and batching run after the cache. The cache holds each input's outputs whatever order reads it, so a `shuffle`, `repeat` or `take` written before the preset reads the cache as it reads the inputs, in indexed and memory reads; a streamed read fills its cache shard by shard and refuses a view before it. A step that drops or expands records before such a view is refused, and is tracked in the roadmap. A memory read runs the steps written before the first view over the whole source first, as it does without a cache, and the cache holds the steps after it.
 
 ### Where the rest of the chain goes
 
