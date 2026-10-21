@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import TINY_DECODER
+from token_support import token_batch_of
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs, coordinates
@@ -106,8 +107,7 @@ def step_at(key=1):
 
 
 def token_batch(batch=4, seed=0):
-    ids = np.random.RandomState(seed).randint(0, VOCAB, (batch, SEQ + 1))
-    return {TEXT_KEY: jnp.asarray(ids, jnp.int32)}
+    return token_batch_of(VOCAB, SEQ, batch, seed)
 
 
 def cross_entropy(logits, targets):
