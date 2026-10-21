@@ -69,6 +69,9 @@ def test_a_launch_without_a_costed_record_has_no_features():
         def cost(self, ba, config, target):
             return 1.0
 
+        def _fwd(self, *args, **kwargs):
+            raise AssertionError("never launched here")
+
     with generation.assumed("sm80"):
         target = generation.gpu_target()
     assert features.features(object(), None, None, target) is None
