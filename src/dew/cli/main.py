@@ -93,18 +93,15 @@ class DataExport:
         pipeline = train if self.branch == "train" else held
         if pipeline is None:
             raise ValueError(f"{self.recipe} has no validation source")
-        metadata = None
         if self.tokenizer is not None:
-            from dew.data.text import Tokenize, tokenizer_for
+            from dew.data.text import export_tokens
 
-            vocabulary = tokenizer_for(self.tokenizer)
-            pipeline = pipeline.map(Tokenize(self.tokenizer, eos=self.eos))
-            metadata = {"token_store": True, "tokenizer": self.tokenizer,
-                        "vocab_size": vocabulary.vocab_size, "dtype": "int32",
-                        "eos_id": vocabulary.eos_id if self.eos else None}
-        manifest = export(iterate(pipeline, read=self.read, provision=self.provision),
-                          self.destination, format=format, rows_per_shard=self.rows_per_shard,
-                          metadata=metadata, length_field="text" if self.tokenizer is not None else None)
+            manifest = export_tokens(pipeline, self.destination, self.tokenizer, eos=self.eos,
+                                     rows_per_shard=self.rows_per_shard, read=self.read,
+                                     provision=self.provision)
+        else:
+            manifest = export(iterate(pipeline, read=self.read, provision=self.provision), self.destination,
+                              format=format, rows_per_shard=self.rows_per_shard)
         emit(json.dumps(manifest, sort_keys=True))
         return 0
 

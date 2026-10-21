@@ -110,6 +110,25 @@ def test_a_token_stores_windows_are_the_text_recipes(tmp_path):
     same_batches(expected, built)
 
 
+def test_the_token_windows_preset_reads_a_stores_windows_as_the_text_recipe(tmp_path):
+    """The token windows preset over a token store shuffled and repeated: the recipe's plan and
+    batches; recorded and read back with its stride overridden, windows that far apart."""
+    from dew.data.records import Unrecorded, decode, encode, override
+
+    store_of_documents(tmp_path)
+    expected = loader(TextData(str(tmp_path), seq_len=8, stride=2), batch=4, read="indexed", loading=LOADING)
+    chain = TokenFiles(str(tmp_path)).shuffle(0).repeat().pipe(presets.token_windows, seq_len=8, batch=4,
+                                                               stride=2)
+    built = compile(chain, read="indexed", loading=LOADING)
+    assert built.plan.identity() == expected.plan.identity()
+    same_batches(expected, built)
+    written = encode(chain)
+    assert not isinstance(written, Unrecorded)
+    wider = decode(override(written, "token_windows.stride", 4))
+    recipe = loader(TextData(str(tmp_path), seq_len=8, stride=4), batch=4, read="indexed", loading=LOADING)
+    assert compile(wider, read="indexed", loading=LOADING).plan.identity() == recipe.plan.identity()
+
+
 def test_a_token_stores_documents_are_packed_whole(tmp_path):
     """A token store's documents, ended by EOS, packed first-fit with no tokenizer: each row holds
     whole documents, so its targets are its documents' own, and together the rows of a pass hold
@@ -143,3 +162,18 @@ def test_the_lm_preset_tokenizes_a_field_of_another_name():
     passages = Memory([{"body": "abc " * 6}])
     rows = list(passages.pipe(presets.lm, "byte", seq_len=8, batch=1, field="body", pack=None))
     assert np.asarray(rows[0]["text"])[0].tolist()[:4] == text.ByteTokenizer().encode("abc ")
+
+
+def test_exported_tokens_read_back_as_a_token_store_and_pack(tmp_path):
+    """Documents exported as tokens by bytes, each ended by EOS: the store states the tokenizer and
+    its vocabulary, and packing it reads every next-token target of every document."""
+    rows = documents(6)
+    manifest = text.export_tokens(rows, str(tmp_path / "tokens"), "byte")
+    assert manifest["metadata"]["tokenizer"] == "byte"
+    store = TokenFiles(str(tmp_path / "tokens"))
+    assert (store.stated()["vocab_size"], store.stated()["eos_id"]) == (256, 255)
+    packed = list(store.pipe(presets.lm, None, seq_len=8, batch=1, bins=8))
+    segments = [np.asarray(row["text_coordinates"].segments)[0] for row in packed]
+    held = sum(int(np.count_nonzero((ids[:-1] == ids[1:]) & (ids[:-1] > 0))) for ids in segments)
+    lengths = [len(str(row["text"]).encode()) + 1 for row in rows]
+    assert held == sum(length - 1 for length in lengths)

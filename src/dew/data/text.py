@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
     from dew.data.dataset import Batch
     from dew.data.pipeline import Dataset
+    from dew.data.sources.base import Read
 
 
 _load_lock = threading.Lock()
@@ -472,6 +473,25 @@ class MinChars:
 
     def __call__(self, element: Batch) -> bool:
         return len(str(element[self.field])) >= self.count
+
+
+def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "text", eos: bool = True,
+                  rows_per_shard: int = 100_000, read: Read = "streamed", provision: bool = False
+                  ) -> Mapping[str, object]:
+    """`dataset`'s documents in `field` tokenized by `tokenizer` and written to `url` as a committed
+    token store (ArrayRecord shards, each record a document's ids under "text", its manifest naming
+    the tokenizer, vocabulary and EOS), which `dew.data.sources.TokenFiles(url)` reads back and
+    `presets.lm(ds, None, ...)` packs. Each document is ended by the tokenizer's EOS with `eos`.
+    Returns the store's manifest."""
+    from dew.data.compile import iterate
+    from dew.data.sinks import export
+
+    vocabulary = tokenizer_for(tokenizer)
+    documents = dataset.map(Tokenize(tokenizer, field, eos))
+    metadata = {"token_store": True, "tokenizer": tokenizer, "vocab_size": vocabulary.vocab_size,
+                "dtype": "int32", "eos_id": vocabulary.eos_id if eos else None}
+    return export(iterate(documents, read=read, provision=provision), url, format="array_record",
+                  rows_per_shard=rows_per_shard, metadata=metadata, length_field="text")
 
 
 def train_tokenizer(dataset: Dataset, base: str, path: str, *, vocab_size: int, field: str = "text",
