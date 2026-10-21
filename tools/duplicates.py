@@ -125,13 +125,16 @@ def stores(statement: ast.stmt) -> bool:
     the parent class's constructor."""
     if isinstance(statement, ast.Assign):
         return all(field(target) for target in statement.targets) and data(statement.value)
+    if isinstance(statement, ast.AnnAssign):
+        return statement.value is not None and field(statement.target) and data(statement.value)
     call = statement.value if isinstance(statement, ast.Expr) else None
     if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
             and call.func.attr == "__init__"):
         return False
     parent = call.func.value
     return (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name) and parent.func.id == "super"
-            and all(data(argument) for argument in call.args)
+            and all(isinstance(argument, (ast.Name, ast.Attribute)) for argument in parent.args)
+            and not parent.keywords and all(data(argument) for argument in call.args)
             and all(data(keyword.value) for keyword in call.keywords))
 
 
@@ -398,7 +401,7 @@ def main(arguments: Sequence[str]) -> int:
             top = Path(git(top, "rev-parse", "--show-toplevel").strip()).resolve()
             merged = merge_base(top, options.base)
         except subprocess.CalledProcessError:
-            print(f"the base {options.base} shares no history with this checkout (git's reason above)")
+            print(f"cannot hold this checkout to the base {options.base} (git's reason on stderr)")
             return 2
     started = time.monotonic()
     # pylint reads a directory as a package; the files, as files.
