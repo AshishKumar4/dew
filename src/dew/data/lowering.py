@@ -134,6 +134,75 @@ class _Materialized(Protocol):
     ran: tuple[Stage, ...]
 
 
+def _dropping(pipeline: Pipeline, lowering: _Lowering) -> bool:
+    """Whether a read can drop records before its batch: a step that drops or expands records, a
+    Grain step of the caller's, or a cache read as each input's outputs, in it or in a corpus it
+    mixes."""
+    if lowering.cache is not None and not lowering.one_to_one:
+        return True
+    if any(_dropping(child, analyzed)
+           for child, analyzed in zip(_corpora(pipeline), lowering.children, strict=True)):
+        return True
+    batched = _until(pipeline.stages, (BatchStage,))
+    return any(_drops(stage) or isinstance(stage, Native) for stage in pipeline.stages[:batched])
+
+
+def _corpora(pipeline: Pipeline) -> tuple[Pipeline, ...]:
+    source = pipeline.source
+    return source.pipelines if isinstance(source, (Mixture, Phases)) else ()
+
+
+def _carried(pipeline: Pipeline, consumed: int, *, marked: bool) -> int:
+    """Where a pooled read's loading workers hand its rows to the reading process (`_Build.pooled`):
+    at its first stage from `consumed` that can't carry a dropped record as a marker. Record steps
+    carry them. A view of the inputs (a shuffle, slice, take or repeat) reads markers as records,
+    and a Grain step of the caller's can't tell one, so either ends the workers' part once a step
+    has dropped (`marked`); before that, the caller's step runs in the workers, as written, and the
+    workers' part ends after it, as what it drops in an iterator of its own leaves no marker. Every
+    other stage lays out, mixes or batches several records into one and ends it."""
+    for at, stage in enumerate(pipeline.stages[consumed:], start=consumed):
+        if isinstance(stage, (Map, RandomMap, MapWithIndex, Filter, FlatMap)):
+            marked = marked or _drops(stage)
+        elif isinstance(stage, Native) and not marked:
+            return at + 1
+        elif not (isinstance(stage, (Shuffle, Slice, Limit, Repeat)) and not marked
+                  and not (isinstance(stage, Shuffle) and stage.window is not None)):
+            return at
+    return len(pipeline.stages)
+
+
+def _shared_pool(pool: int, members: int, index: int) -> int:
+    """The loading workers the `index`th of `members` corpora reads in, of a mixture's `pool`: an
+    equal share, the first ones taking what is left over; one given none reads in the reading
+    process."""
+    return pool // members + int(index < pool % members)
+
+
+class _Marked(pygrain.MapDataset):
+    """A store's records with a marker (`Rejected("missing")`) in place of each it misses, which
+    Grain's own steps would pass over unseen: a loading worker whose inputs are all missing still
+    hands one on for each (`_Build.pooled`)."""
+
+    def __init__(self, records: pygrain.MapDataset):
+        super().__init__(records)
+        self._records = records
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    @overload
+    def __getitem__(self, index: slice) -> pygrain.MapDataset: ...
+
+    @overload
+    def __getitem__(self, index: int) -> Record: ...
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return self.slice(index)
+        value = self._records[index]
+        return Rejected("missing") if value is None else value
+
+
 def _cache_inputs(source: Source, records: Records) -> pygrain.MapDataset:
     """The records a cache over `source` reads by index, the rows a memory read made each at the
     source position it came from (`_Placed`), where a step among the cached ones that reads its
@@ -840,6 +909,12 @@ class _Build:
     training: bool
     corpus: tuple[int, ...] = ()
     """The key of the corpus this builds in each mixture above it (`_member_key`)."""
+    pool: int | None = None
+    """The loading workers of a read whose steps drop records (`pooled`), each a process that reads
+    its corpus's steps up to the first that can't carry a dropped record as a marker (`_carried`),
+    so a worker whose inputs are all dropped still delivers; the reading process drops the markers
+    and runs the rest. A mixture's corpora each read in a share of them. None where the workers
+    read the whole order after its batch, as a read that drops nothing is read."""
 
     @property
     def global_order(self) -> bool:
@@ -849,8 +924,31 @@ class _Build:
         """The build of the `index`th corpus a mixture or phases reads, by its own analysis, keyed
         by the name it goes by there (`_member_key`)."""
         members = strings(self.lowering.order["members"], "mixture members")
-        return dataclasses.replace(self, lowering=self.lowering.children[index],
+        pool = None if self.pool is None else _shared_pool(self.pool, len(members), index)
+        loading = self.loading if pool is None else dataclasses.replace(self.loading, workers=pool)
+        return dataclasses.replace(self, lowering=self.lowering.children[index], loading=loading, pool=pool,
                                    corpus=(*self.corpus, _member_key(members, index)))
+
+    def pooled(self, pipeline: Pipeline) -> _Build:
+        """This build with its loading workers moved before the first step that can't carry what it
+        drops (`pool`), for a training read cut per share whose steps can drop records: a worker
+        whose share of the inputs was all dropped would deliver nothing, and Grain's workers take
+        turns, so the read would wait on it forever. Grain advises a read that filters in its
+        workers to filter after them instead (`MapDataset.mp_prefetch`)."""
+        written = next((stage.count for stage in pipeline.stages if isinstance(stage, Workers)), None)
+        count = self.loading.worker_count if written is None else written
+        if self.global_order or not self.training or not count or not _dropping(pipeline, self.lowering):
+            return self
+        return dataclasses.replace(self, loading=dataclasses.replace(self.loading, workers=count), pool=count)
+
+    def pools(self, pipeline: Pipeline) -> list[int]:
+        """The loading workers each corpus reads in, as `pooled` shares them out, which a position
+        saved under one sharing restores only under the same."""
+        source = pipeline.source
+        if self.pool is None or not isinstance(source, (Mixture, Phases)):
+            return [] if self.pool is None else [self.pool]
+        return [count for index, child in enumerate(source.pipelines)
+                for count in self.child(index).pools(child)]
 
     def stage_seed(self, pipeline: Pipeline, at: int, partition: DataPartition) -> int:
         """The seed of the random stage written at `at` in `pipeline`: the run's seed, the corpus's
@@ -898,7 +996,7 @@ class _Build:
         return PrimedMix(streams, source.weights, keys)
 
     def indexed(
-        self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int
+        self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int, *, marked: bool = False
     ) -> tuple[Rows, int]:
         """The root of an indexed read, cut to its share by index (`shared`),
         and through its cache when it has one, with the stages it consumed.
@@ -917,6 +1015,8 @@ class _Build:
             if present is not None:
                 stored = pygrain.MapDataset.source(present)
                 identifiers = tuple((int(position),) for position in present.positions)
+            elif marked:
+                stored = _Marked(stored)
             placed = _Placed(identifiers=identifiers, rows=len(stored))
             rows = stored.map_with_index(placed) if last >= 0 else stored
             return self.shared(rows, pipeline, partition), 0
@@ -951,10 +1051,10 @@ class _Build:
         read = dataclasses.replace(self.loading, threads=threads,
                                    read_buffer=max(self.loading.read_buffer, threads))
         flat = gx.FlatMapIterDataset(_as_iter(view, read), _CachedOutputs())
-        return Accepted(flat, _name(pipeline), _label(pipeline)), cache + 1
+        return (flat if marked else Accepted(flat, _name(pipeline), _label(pipeline))), cache + 1
 
     def sharded(
-        self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int
+        self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int, *, marked: bool = False
     ) -> tuple[pygrain.IterDataset, int]:
         """The root of a streamed read and the stages it consumed: the cache
         prefix runs inside the cache's shard readers, and the record steps
@@ -975,7 +1075,7 @@ class _Build:
         steps = _ShardSteps(shards.reader, local, cache is not None, _name(pipeline), _label(pipeline))
         shards = dataclasses.replace(shards, reader=steps)
         rows = self.streamed(shards, pipeline, partition)
-        if cache is not None or any(_drops(stage) for stage in local):
+        if not marked and (cache is not None or any(_drops(stage) for stage in local)):
             rows = Accepted(rows, _name(pipeline), _label(pipeline))
         return rows, start if interleave is None else interleave + 1
 
@@ -1015,22 +1115,39 @@ class _Build:
         source = pipeline.source
         placed = [index for index, stage in enumerate(pipeline.stages) if isinstance(stage, MapWithIndex)]
         last = max(placed, default=-1)
+        # This corpus's own workers, where they read its first steps (`pooled`): those steps keep
+        # each record they drop as a marker, which the reading process drops after them.
+        pooled = bool(self.pool) and not isinstance(source, (Mixture, Phases))
         if isinstance(source, (Mixture, Phases)):
             rows, consumed = self.mixed(pipeline, partition), 0
         elif self.read == "streamed":
-            rows, consumed = self.sharded(pipeline, source, partition, last)
+            rows, consumed = self.sharded(pipeline, source, partition, last, marked=pooled)
         else:
-            rows, consumed = self.indexed(pipeline, source, partition, last)
+            rows, consumed = self.indexed(pipeline, source, partition, last, marked=pooled)
+        # A cache read as a stream of each input's outputs marks what it drops from the start, as do
+        # the steps a streamed read runs inside each shard.
+        marked = self.lowering.cache is not None and (self.read == "streamed" or not self.lowering.one_to_one)
+        marked = marked or any(_drops(stage) for stage in pipeline.stages[:consumed])
+        carried = _carried(pipeline, consumed, marked=marked) if pooled else -1
         for index, stage in enumerate(pipeline.stages[consumed:], start=consumed):
+            if index == carried:
+                rows = self.handed(rows, pipeline, partition)
             if isinstance(stage, (BatchStage, MapBatch)):
                 break
             if index == self.lowering.absorbed:
                 continue
             if isinstance(stage, Prefetch) and self.global_order:
                 continue
-            rows = self.stage(rows, stage, pipeline, partition, index)
+            if isinstance(stage, Workers) and self.pool is not None:
+                continue
+            if index < carried and isinstance(stage, (Map, RandomMap, MapWithIndex, Filter, FlatMap)):
+                rows = self.record_stage(rows, stage, pipeline, partition, index, marked=True)
+            else:
+                rows = self.stage(rows, stage, pipeline, partition, index)
             if index == last:
                 rows = rows.map(_unplaced)
+        if carried == len(pipeline.stages):
+            rows = self.handed(rows, pipeline, partition)
         if not self.global_order and _counts_own_rows(pipeline):
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
         return rows
@@ -1138,10 +1255,23 @@ class _Build:
                 rows = viewed
         return rows
 
+    def handed(self, rows: Rows, pipeline: Pipeline, partition: DataPartition) -> pygrain.IterDataset:
+        """`rows`, read by this corpus's loading workers (`pool`), each handing on every row with
+        a marker in place of each record its steps dropped, which the reading process drops here,
+        counting each by its reason."""
+        pool = self.pool or 0
+        # Its rows are records, not batches: as many in flight for each worker as its batches were.
+        workers = Workers(pool, self.loading.worker_buffer * self.batch)
+        handed = self.stage(rows, workers, pipeline, partition, len(pipeline.stages))
+        return Accepted(_as_iter(handed, self.loading), _name(pipeline), _label(pipeline))
+
     def record_stage(
         self, rows: Rows, stage: Map | RandomMap | MapWithIndex | Filter | FlatMap, pipeline: Pipeline,
-        partition: DataPartition, at: int,
+        partition: DataPartition, at: int, *, marked: bool = False,
     ) -> Rows:
+        """`rows` through a record stage. A stage that can drop records drops them after it, counted
+        (`Accepted`), unless its rows are `marked`: then each dropped record goes on as a marker for
+        the reading process to drop (`handed`)."""
         lowered = _Rows(stage)
         threads = _threads((stage,))
         if threads is not None:
@@ -1153,7 +1283,7 @@ class _Build:
             rows = rows.random_map(lowered, seed=self.stage_seed(pipeline, at, partition))
         else:
             rows = rows.map(lowered)
-        if isinstance(stage, (Filter, FlatMap)) or stage.rejects:
+        if not marked and (isinstance(stage, (Filter, FlatMap)) or stage.rejects):
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
         return rows
 
@@ -1262,11 +1392,12 @@ class _Build:
         with the loading's own workers last when the pipeline names none. Host steps run in the
         reader that wraps this stream."""
         stages = [(at, pipeline.stages[at]) for at in after]
-        if self.loading.workers and _at(pipeline.stages, Workers) is None:
+        if self.loading.workers and self.pool is None and _at(pipeline.stages, Workers) is None:
             workers = Workers(self.loading.worker_count, self.loading.worker_buffer)
             stages.append((len(pipeline.stages), workers))
         for at, stage in stages:
-            if not isinstance(stage, MapBatch):
+            # A pooled read's workers read before its batch (`pooled`).
+            if not isinstance(stage, MapBatch) and not (isinstance(stage, Workers) and self.pool is not None):
                 stream = _as_iter(self.stage(stream, stage, pipeline, partition, at), self.loading)
         return stream
 

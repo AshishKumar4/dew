@@ -563,7 +563,7 @@ def _compiled(
             if isinstance(stage, Map)
         ),
     )
-    build = build.tuned(train)
+    build = build.tuned(train).pooled(train)
     train_host, device = _batch_steps(train)
     train_host = packed + train_host + host
     statistics = _Statistics(counts)
@@ -819,6 +819,9 @@ def _training_reader(
                 "cycle_lengths": [
                     stage.cycle_length for stage in _steps(pipeline) if isinstance(stage, Interleave)
                 ],
+                # Where a read that drops records reads in workers of each corpus's own (`pooled`),
+                # each worker's position is that corpus's, saved in that many.
+                **({} if build.pool is None else {"pools": build.pools(pipeline)}),
             },
         )
         opened = _PerShare(

@@ -325,7 +325,7 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 |---|---|
 | `shuffle`, `mix`, `interleave`, `filter`, `take`, your own `map`s | Before the preset. They act on records. |
 | Augmentation | `augment=` on the training split's preset |
-| `workers`, `threads`, `prefetch` | After the preset. They set how the chain up to that point runs, so the preset's decode, resize, pack and batch run in the workers. |
+| `workers`, `threads`, `prefetch` | After the preset. They set how the chain up to that point runs, so the preset's decode, resize, pack and batch run in the workers; where its steps can drop records, the workers run up to its pack or batch (section 6). |
 | A function on whole batches | After the preset. A host `map` after `batch` runs last, in the training process; a device step such as the GPU augmentation runs inside the compiled step. |
 | `snapshot` | A separate job before training, read back with `Files(url)` |
 
@@ -381,7 +381,7 @@ ds = (Files("gs://data/laion/*.array_record").threads(32)   # read parallelism a
 trainer.fit(ds, device_prefetch=2)                            # batches already placed on the GPUs
 ```
 
-`.workers(n)` splits the chain where you put it: heavy decoding and augmentation go before it, cheap work after. Settings are per host. Per-share iterator state records worker and interleave counts; changing them needs an elastic order, as described in section 10. Defaults are fixed numbers or sized from host memory by Grain's `pick_performance_config` with `Loading(workers="auto")`. The [roadmap](../roadmap.md#data) tracks settings measured against step time. A host `map` after `batch` always runs last, in the training process. A device step runs inside the compiled step, so the reader only ever yields numpy.
+`.workers(n)` splits the chain where you put it: heavy decoding and augmentation go before it, cheap work after. A chain whose steps can drop records (a filter, a rejecting step, an expansion, a cache read as each input's outputs, a Grain step of your own) is split earlier: the workers run its steps up to the first that lays out, mixes or batches records, or views them after a drop, and hand on a marker for each record they drop, which the training process drops and counts before running the rest. A worker whose share of the inputs is all dropped then still hands rows on, so it never holds up the others, as Grain advises for a pipeline that filters in its workers. A mixture's corpora each read in an equal share of the workers, and what a Grain step of your own drops in an iterator of its own leaves no marker. Settings are per host. Per-share iterator state records worker and interleave counts; changing them needs an elastic order, as described in section 10. Defaults are fixed numbers or sized from host memory by Grain's `pick_performance_config` with `Loading(workers="auto")`. The [roadmap](../roadmap.md#data) tracks settings measured against step time. A host `map` after `batch` always runs last, in the training process. A device step runs inside the compiled step, so the reader only ever yields numpy.
 
 ## 7. Training on a mesh
 
