@@ -190,5 +190,5 @@ def test_the_raw_likelihood_is_the_models_own_and_the_behaviour_one_the_masked(t
     grammar = guided.regex(tokenizer, "7", EOS, vocab_size=EOS + 1)
     rows = task(tokenizer, grammar, Sampling(temperature=1.0, eos_token_ids=EOS))("q", 4, key=0).host()
     assert continuation(tokenizer, rows) == "7" and bool(rows.terminated[0])
-    np.testing.assert_allclose(rows.behavior_log_probs[0, :2], 0.0, atol=1e-6)
+    np.testing.assert_array_equal(rows.behavior_log_probs[0, :2], 0.0)
     assert np.all(rows.raw_log_probs[0, :2] < 0)

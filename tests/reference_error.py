@@ -115,6 +115,16 @@ def widened(tree):
         leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
 
 
+def with_gradients(fn):
+    """`fn` as `run(*inputs, cotangent)`, which returns `fn(*inputs)` and the gradients of its inputs
+    under the cotangent passed last: a differentiated call's leaves, as the gate compares them."""
+    def run(*arguments):
+        out, pull = jax.vjp(fn, *arguments[:-1])
+        return out, *pull(arguments[-1])
+
+    return run
+
+
 def equations(graph):
     """Every equation of a jaxpr, its sub-jaxprs' (scan, cond, custom rules) in turn."""
     if hasattr(graph, "eqns"):
@@ -222,8 +232,17 @@ BOOTSTRAP = 2000
 """Resamples of a site's seeds for the pooled ratio's interval (`_interval`), drawn by one fixed key so
 an assertion decides alike on every run."""
 CONFIDENCE = 0.999
-"""The bootstrap interval check 1 reads: a site whose pooled ratio's 99.9% interval is wider than
-PARITY cannot tell an equally exact computation from one PARITY off, and is inconclusive."""
+"""Check 1's stated confidence in its ratio's decisions: a pass certifies a leaf's RMS ratio no more
+than PARITY², and an over by its ratio that it is above one, each but for a nominal 5e-4 (LOWER_TAIL,
+UPPER_TAIL). A leaf failed by a row, a row of float64 zero or a value not finite is failed by that
+rule, which certifies no ratio."""
+LOWER_TAIL = 5e-4
+"""The lower tail of a leaf's bootstrap interval, the over side's whole 5e-4, spent at stage 2 alone, where
+an over is decided (`_staged`). Nominal: the rates hold as far as the percentile bootstrap's endpoint
+coverage does, and 2,000 resamples interpolate an endpoint this far out."""
+UPPER_TAIL = 2.5e-4
+"""The upper tail at each of check 1's two stages: the pass side's 5e-4 spent equally over them, a pass
+possible at either (nominal, as LOWER_TAIL)."""
 FEWEST_SEEDS = 8
 """The fewest seeds check 1 judges by, an engineering minimum and no statistical threshold: over very few
 seeds a bootstrap has so few distinct resamples that its interval can sit wholly to one side of PARITY by
@@ -245,11 +264,12 @@ def _pooled(mine: np.ndarray, theirs: np.ndarray) -> float:
         0.0 if np.sum(mine) == 0 else float("inf"))
 
 
-def _interval(mine: np.ndarray, theirs: np.ndarray | None = None, control: np.ndarray | None = None
-              ) -> tuple[float, float]:
-    """The pooled ratio's CONFIDENCE bootstrap interval over seeds: Dew's and the reference's errors
-    resampled by the same seeds, or, for `control`, the reference's errors on two disjoint seed sets
-    resampled apart (the reference compared with itself, an equally exact pair)."""
+def _interval(mine: np.ndarray, theirs: np.ndarray | None = None, control: np.ndarray | None = None,
+              tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)) -> tuple[float, float]:
+    """The pooled ratio's bootstrap interval over seeds, its lower and upper `tails` left out: Dew's and
+    the reference's errors resampled by the same seeds, or, for `control`, the reference's errors on
+    two disjoint seed sets resampled apart (the reference compared with itself, an equally exact
+    pair)."""
     rng = np.random.default_rng(0)
     count = len(mine)
     picks = rng.integers(0, count, (BOOTSTRAP, count))
@@ -258,14 +278,37 @@ def _interval(mine: np.ndarray, theirs: np.ndarray | None = None, control: np.nd
     else:
         other = rng.integers(0, len(control), (BOOTSTRAP, len(control)))
         ratios = np.sqrt(mine[picks].sum(axis=1) / np.maximum(control[other].sum(axis=1), 1e-300))
-    tail = (1 - CONFIDENCE) / 2
-    return float(np.quantile(ratios, tail)), float(np.quantile(ratios, 1 - tail))
+    return float(np.quantile(ratios, tails[0])), float(np.quantile(ratios, 1 - tails[1]))
 
 
 def _resolves(low: float, high: float) -> bool:
     """Whether a pooled ratio's interval is no wider than PARITY, so it tells an equally exact
     computation from one PARITY off."""
     return high <= PARITY * max(low, 1e-300)
+
+
+def _status(ratio: float, low: float, high: float, *, contained: bool = True) -> str:
+    """A leaf's verdict by its pooled ratio and interval: "pass", "over" or "inconclusive". The interval
+    is taken to hold the ratio (low and high widened to it, which no endpoint's coverage loses by), so a
+    pass certifies the ratio's high end at most PARITY², whether the interval lies wholly at or under
+    PARITY or is resolved (no wider than PARITY) with the ratio under it, and an over its low end above
+    one. Straddling PARITY and wider than it, the leaf is inconclusive, as is a ratio or end that is not
+    a number. Not `contained`, the rule before 2026-10-21: the interval as it is, a leaf over PARITY
+    by its ratio wherever the interval does not straddle it unresolved."""
+    if not contained:
+        if low <= PARITY < high and not _resolves(low, high):
+            return "inconclusive"
+        return "over" if ratio > PARITY else "pass"
+    if not all(np.isfinite(value) for value in (ratio, low, high)):
+        return "inconclusive"
+    low, high = min(low, ratio), max(high, ratio)
+    if high <= PARITY:
+        return "pass"
+    if low > PARITY:
+        return "over"
+    if _resolves(low, high):
+        return "pass" if ratio <= PARITY else "over"
+    return "inconclusive"
 
 
 @dataclasses.dataclass
@@ -371,22 +414,33 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
                         finite=bool(np.isfinite(reference).all() and np.isfinite(truth).all()), dtype=dtype)
 
 
-def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
+def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None) -> _Draws:
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
-    `truth_fn` on them (by default `reference_fn` on them widened to float64)."""
+    `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
+    the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
+    row of float64 zero is paired only where the two truths are the same values (an orbit's draws)."""
     mine, theirs, worst, zero_rows, finite, names = [], [], [], [], [], None
-    for seed in seeds:
-        inputs = draw(seed)
-        dew, reference = dew_fn(*inputs), reference_fn(*inputs)
+
+    def truth_of(inputs):
         with jax.enable_x64(new_val=True):
-            truth = (truth_fn or reference_fn)(*widened(inputs))
+            return (truth_fn or reference_fn)(*widened(inputs))
+
+    for at, seed in enumerate(seeds):
+        inputs = draw(seed)
+        dew, truth = dew_fn(*inputs), truth_of(inputs)
+        if reference_seeds is None:
+            reference, their_truth = reference_fn(*inputs), truth
+        else:
+            their_inputs = draw(reference_seeds[at])
+            reference, their_truth = reference_fn(*their_inputs), truth_of(their_inputs)
         paths = jax.tree_util.tree_leaves_with_path(dew)
         names = names or [jax.tree_util.keystr(path) for path, _ in paths]
         row = []
-        for (path, leaf), their_leaf, true in zip(paths, jax.tree.leaves(reference), jax.tree.leaves(truth),
-                                                  strict=True):
+        for (path, leaf), their_leaf, true, their_true in zip(paths, jax.tree.leaves(reference),
+                                                              jax.tree.leaves(truth),
+                                                              jax.tree.leaves(their_truth), strict=True):
             recorded = isinstance(their_leaf, RecordedLeaf)
-            their = their_leaf if recorded else leaf_summary(their_leaf, true)
+            their = their_leaf if recorded else leaf_summary(their_leaf, their_true)
             if np.size(leaf) == 0:
                 # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
                 # reference's shape and dtype (a recorded one's shape its truth's), and the truth empty
@@ -397,7 +451,10 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
                 assert np.shape(true) == np.shape(leaf), (jax.tree_util.keystr(path), np.shape(true))
                 row.append((0.0, 0.0, 0.0, 0.0, 0, True))
                 continue
-            row.append(_paired(jax.tree_util.keystr(path), leaf_summary(leaf, true), their))
+            # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
+            paired = (recorded or their_truth is truth
+                      or np.array_equal(np.asarray(true), np.asarray(their_true)))
+            row.append(_paired(jax.tree_util.keystr(path), leaf_summary(leaf, true), their, paired=paired))
         mine.append([entry[0] for entry in row])
         theirs.append([entry[1] for entry in row])
         worst.append([(entry[2], entry[3]) for entry in row])
@@ -407,12 +464,15 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
                   np.asarray(zero_rows), np.asarray(finite))
 
 
-def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf) -> tuple:
+def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool = True) -> tuple:
     """One seed's evidence of a leaf for check 1 (`_Draws`), Dew's and the reference's alike from
     `leaf_summary`: their mean squared errors, their worst sized rows, how many rows of float64 zero Dew
     is further from than ROW_FACTOR times the reference is on that same row (`rows_over`'s rule for
     them), and whether every value was finite. A row of zero in Dew's truth the reference's lacks (a
-    recorded truth recomputed otherwise) is refused."""
+    recorded truth recomputed otherwise) is refused. Not `paired`, the two held to truths of their own
+    draws (`null_runs`), no row is paired."""
+    if not paired:
+        return mine.mse, theirs.mse, mine.worst, theirs.worst, 0, mine.finite and theirs.finite
     at_zero = dict(zip(theirs.zero_rows.tolist(), theirs.zero_errors.tolist(), strict=True))
     unrecorded = [at for at in mine.zero_rows.tolist() if at not in at_zero]
     if unrecorded:
@@ -423,10 +483,85 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf) -> tuple:
     return mine.mse, theirs.mse, mine.worst, theirs.worst, zero, mine.finite and theirs.finite
 
 
-def _judged(draws: _Draws, index: int) -> tuple[float, float, float]:
-    """A leaf's pooled ratio and its CONFIDENCE interval over the draws."""
+def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)
+            ) -> tuple[float, float, float]:
+    """A leaf's pooled ratio and its interval over the draws, its `tails` left out."""
     a, b = draws.mine[:, index], draws.theirs[:, index]
-    return (_pooled(a, b), *_interval(a, b))
+    return (_pooled(a, b), *_interval(a, b, tails=tails))
+
+
+def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL), *,
+               contained: bool = True) -> tuple[list[str], list[str]]:
+    """Check 1's findings over `draws` (`assert_as_exact`): each leaf over PARITY (`_status`), a row or
+    a value it fails, and each leaf its draws leave inconclusive."""
+    over, unresolved = [], []
+    for index, name in enumerate(draws.names):
+        leaf, count = label + name, len(draws.mine)
+        a, b = draws.mine[:, index], draws.theirs[:, index]
+        if not draws.finite[:, index].all():
+            nonfinite = int(np.sum(~draws.finite[:, index]))
+            over.append(f"{leaf}: a value is not finite on {nonfinite} of {count} seeds")
+            continue
+        if np.sum(b) == 0:
+            if np.sum(a) > 0:
+                over.append(f"{leaf}: the reference equals float64 on every seed and dew does not")
+            continue
+        ratio, low, high = _judged(draws, index, tails)
+        status = _status(ratio, low, high, contained=contained)
+        if status == "inconclusive":
+            unresolved.append(f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s interval over {count} "
+                              f"seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}; give the site larger "
+                              f"inputs or more seeds (`seeds_for`)")
+        elif status == "over":
+            over.append(f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the reference's over "
+                        f"{count} seeds, interval [{low:.3f}, {high:.3f}] (allowed {PARITY})")
+        my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
+        if not within(my_row, ROW_FACTOR * their_row):
+            over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
+                        f"size, the reference's {their_row:.3e}, allowed {ROW_FACTOR * their_row:.3e}")
+        if draws.zero_rows[:, index].any():
+            over.append(f"{leaf}: {int(draws.zero_rows[:, index].sum())} rows of float64 zero over {count} "
+                        f"seeds are further from it than ROW_FACTOR times the reference's own")
+    return over, unresolved
+
+
+PREVIOUS_TAILS = (5e-4, 5e-4)
+"""The interval's tails before check 1's two stages (`_staged`'s `two_stage=False`)."""
+
+
+def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True) -> tuple[list[str], list[str], int]:
+    """Check 1's two pre-declared stages over `drawn(start, stop)`, the draws of seeds start to stop: at
+    `seeds`, a site whose every leaf passes (`_judgement`: its ratio, rows and values) passes; any leaf
+    that does not draws the second stage, REDRAW times as many further seeds, and every leaf is judged
+    again over all of them, that verdict final. Its findings, the leaves left inconclusive and the stage
+    reached. With `two_stage` false, the procedure before it (2026-10-21), for comparison: tails
+    PREVIOUS_TAILS, the interval as it is, only a leaf whose ratio is over PARITY drawing again."""
+    tails = (LOWER_TAIL, UPPER_TAIL) if two_stage else PREVIOUS_TAILS
+    draws = drawn(0, seeds)
+    if two_stage:
+        further = any(_judgement(draws, label, tails))
+    else:
+        further = any(np.sum(draws.theirs[:, index]) > 0 and _judged(draws, index, tails)[0] > PARITY
+                      for index in range(len(draws.names)))
+    if further:
+        draws = draws.joined(drawn(seeds, (1 + REDRAW) * seeds))
+    return (*_judgement(draws, label, tails, contained=two_stage), 2 if further else 1)
+
+
+STAGES_LOG = "DEW_CHECK1_STAGES"
+"""The environment variable naming a file each check-1 judgement appends its stage and verdict to, one
+JSON line (`_logged`): what a train reads every site's stage-two rate from, every attempt counted."""
+
+
+def _logged(label: str, stage: int, verdict: str) -> None:
+    import json
+    import os
+
+    path = os.environ.get(STAGES_LOG)
+    if path:
+        with open(path, "a", encoding="utf-8") as log:
+            log.write(json.dumps({"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0],
+                                  "label": label, "stage": stage, "verdict": verdict}) + "\n")
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
@@ -444,12 +579,16 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     program.
 
     A leaf passes when its pooled ratio (`_pooled`) is at most PARITY and its seeds resolve it: the
-    ratio's CONFIDENCE bootstrap interval over them no wider than PARITY, or lying wholly at or under
-    it. An interval that straddles PARITY and is wider than it is Inconclusive, never a pass: its site
-    takes larger inputs or more seeds. A leaf over PARITY is drawn again, every such leaf over one
-    further REDRAW times as many declared seeds, and is judged again over all of them, its ratio, its
-    interval and its rows: over PARITY there, it fails, a finding in the code or the reference arm. A
-    leaf the reference holds exactly on every seed, Dew must too.
+    ratio's bootstrap interval over them (tails LOWER_TAIL and UPPER_TAIL, widened to hold the ratio)
+    lying wholly at or under PARITY, or no wider than PARITY. Check 1 is two pre-declared stages
+    (`_staged`): where every leaf passes at the declared seeds the site passes; where any leaf does not
+    (over PARITY, inconclusive, failing a row or a value), the site draws REDRAW times as many further
+    seeds and every leaf is judged again over all of them, its ratio, its interval and its rows. Over
+    PARITY there, it fails, a finding in the code or the reference arm; still inconclusive there, it is
+    Inconclusive, never a pass, and its site is sized again (`seeds_for`). A pass certifies the ratio at
+    most PARITY² and an over by its ratio above one, each at a nominal 5e-4 (CONFIDENCE). Every
+    judgement's stage is logged (STAGES_LOG). A leaf the reference holds exactly on every seed, Dew
+    must too.
 
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
@@ -457,52 +596,72 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     if seeds < FEWEST_SEEDS:
         raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                            f"(`seeds_for`)")
-    draws = _drawn(dew_fn, reference_fn, draw, range(seeds), truth_fn)
-    over_first = [index for index in range(len(draws.names))
-                  if np.sum(draws.theirs[:, index]) > 0 and _judged(draws, index)[0] > PARITY]
-    if over_first:
-        draws = draws.joined(_drawn(dew_fn, reference_fn, draw, range(seeds, (1 + REDRAW) * seeds), truth_fn))
-    over, unresolved = [], []
-    for index, name in enumerate(draws.names):
-        leaf, count = label + name, len(draws.mine)
-        a, b = draws.mine[:, index], draws.theirs[:, index]
-        if not draws.finite[:, index].all():
-            nonfinite = int(np.sum(~draws.finite[:, index]))
-            over.append(f"{leaf}: a value is not finite on {nonfinite} of {count} seeds")
-            continue
-        if np.sum(b) == 0:
-            if np.sum(a) > 0:
-                over.append(f"{leaf}: the reference equals float64 on every seed and dew does not")
-            continue
-        ratio, low, high = _judged(draws, index)
-        # Decided where the whole interval lies on one side of PARITY, however wide; straddling it, an
-        # interval wider than PARITY cannot tell an equally exact computation from one PARITY off.
-        if low <= PARITY < high and not _resolves(low, high):
-            unresolved.append(f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s {CONFIDENCE:.1%} "
-                              f"interval over {count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}; "
-                              f"give the site larger inputs or more seeds (`seeds_for`)")
-        elif ratio > PARITY:
-            over.append(f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the reference's over "
-                        f"{count} seeds, {CONFIDENCE:.1%} interval [{low:.3f}, {high:.3f}] "
-                        f"(allowed {PARITY})")
-        my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
-        if not within(my_row, ROW_FACTOR * their_row):
-            over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
-                        f"size, the reference's {their_row:.3e}, allowed {ROW_FACTOR * their_row:.3e}")
-        if draws.zero_rows[:, index].any():
-            over.append(f"{leaf}: {int(draws.zero_rows[:, index].sum())} rows of float64 zero over {count} "
-                        f"seeds are further from it than ROW_FACTOR times the reference's own")
+    over, unresolved, stage = _staged(
+        lambda start, stop: _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn), seeds, label)
+    _logged(label, stage, "over" if over else "inconclusive" if unresolved else "pass")
     if over:
         raise AssertionError("\n".join(over + unresolved))
     if unresolved:
         raise Inconclusive("\n".join(unresolved))
 
 
+def _moved(draws: _Draws, stage: int) -> tuple[list[str], list[str], bool]:
+    """The leaves a change moves beyond rounding (`assert_moves`), why each other one does not, and
+    whether any of those is unresolved (its interval still reaching above PARITY). A stage spends half of
+    LOWER_TAIL, shared among the leaves, so the two looks over every leaf spend no more than check 1's."""
+    moved, kept, unresolved = [], [], False
+    tail = LOWER_TAIL / 2 / max(len(draws.names), 1)
+    for index, name in enumerate(draws.names):
+        mine, theirs = draws.mine[:, index], draws.theirs[:, index]
+        if not draws.finite[:, index].all():
+            kept.append(f"{name}: a value not finite, which moves nothing a ratio can show")
+            unresolved = True
+        elif np.sum(theirs) == 0:
+            # The original holds the float64 truth exactly: any move off it is past its rounding.
+            (moved if np.sum(mine) > 0 else kept).append(
+                f"{name}: {'moved off' if np.sum(mine) > 0 else 'kept'} the original's exact value")
+        else:
+            ratio = _pooled(mine, theirs)
+            low, high = _interval(mine, theirs, tails=(tail, UPPER_TAIL))
+            (moved if low > PARITY else kept).append(
+                f"{name}: at stage {stage}, the changed RMS distance from the original's float64 run is "
+                f"{ratio:.3f} times the original's own, its lower end {low:.3f}")
+            unresolved |= low <= PARITY and max(high, ratio) > PARITY
+    return moved, kept, unresolved
+
+
+def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
+    """A change that must move the result beyond rounding (a sensitivity check): over check 1's draws
+    (`assert_as_exact`), some leaf of `changed_fn` sits further from the original's float64 run than
+    PARITY times `original_fn`'s own rounding, by the lower end of its pooled ratio's interval, so a
+    change rounding could account for passes at a nominal 5e-4 at most over its leaves and both stages
+    (`_moved`). The truth is `original_fn` on the inputs widened to float64, or `truth_fn`, which must be
+    the original's own float64 semantics (an output dtype it closes over), never another computation's.
+    A leaf the original holds exactly moves on any departure from it. Two pre-declared stages, as check
+    1's: at `seeds`, then, where no leaf moved, REDRAW times as many further seeds; still unmoved, it
+    fails, or is Inconclusive where a leaf's interval still reaches above PARITY. Where the change is
+    structural and the alternative is bitwise identity (another seed, another mask), exact inequality
+    says enough and this is not needed."""
+    if seeds < FEWEST_SEEDS:
+        raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
+                           f"(`seeds_for`)")
+    draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn)
+    moved, kept, unresolved = _moved(draws, 1)
+    if not moved:
+        further = range(seeds, (1 + REDRAW) * seeds)
+        draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn))
+        moved, kept, unresolved = _moved(draws, 2)
+    if not moved:
+        found = (f"{label}: the change moves no leaf beyond rounding over {len(draws.mine)} seeds:\n"
+                 + "\n".join(kept))
+        raise Inconclusive(found) if unresolved else AssertionError(found)
+
+
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = 512,
               truth_fn=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the reference compared
     with itself (its errors on two disjoint seed sets, `_interval`'s control) resolves PARITY in every
-    leaf: the pooled ratio's CONFIDENCE interval no wider than PARITY. Fails past `most`, where the
+    leaf: the pooled ratio's interval no wider than PARITY. Fails past `most`, where the
     site needs larger inputs or fewer shared factors, not more seeds."""
     count = max(start, FEWEST_SEEDS)
     while count <= most:
@@ -526,6 +685,41 @@ def recording(path) -> dict[str, np.ndarray]:
 
     with np.load(load("fetched_fixtures").local(path), allow_pickle=False) as stored:
         return dict(stored)
+
+
+def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: int = 0,
+              truth_fn=None, two_stage: bool = True, dew_fn=None) -> list[tuple[str, int]]:
+    """Check 1 run `runs` times on an equally exact pair, the reference against itself on disjoint
+    draws: each run's verdict, "pass", "over" or "inconclusive", and the stage it reached, a run judged
+    as `assert_as_exact` judges a site (`_staged`: its declared `seeds`, its second stage, every leaf's
+    ratio, interval and rows), or as the procedure before it with `two_stage` false. Run r of
+    a call takes draws no other run of any call with the same `first` grid takes: seeds from
+    (first + r)·2·(1 + REDRAW)·seeds on, the first half its "Dew"'s and the second its reference's, so
+    the runs are independent repetitions as far as `draw` makes its draws so. The bible-§10 null
+    control of a site's operation class (orders-through-check1.md): its false-red rate, every
+    nonpassing verdict counted, bounds the gate's own on that class. With `dew_fn` a fault of the
+    reference (a dropped term, a wrong scale), the runs measure the procedure's power on that class,
+    both procedures on the same draws."""
+    verdicts = []
+    span = (1 + REDRAW) * seeds
+    for run in range(first, first + runs):
+        base = run * 2 * span
+
+        def drawn(start, stop, base=base):
+            return _drawn(dew_fn or reference_fn, reference_fn, draw, range(base + start, base + stop),
+                          truth_fn, reference_seeds=range(base + span + start, base + span + stop))
+
+        over, unresolved, stage = _staged(drawn, seeds, label, two_stage=two_stage)
+        verdicts.append(("over" if over else "inconclusive" if unresolved else "pass", stage))
+    return verdicts
+
+
+def null_rate_bound(reds: int, runs: int, confidence: float = CONFIDENCE) -> float:
+    """The one-sided Clopper-Pearson upper bound on a false-red rate at `confidence` after `reds` red
+    runs of `runs`: 1 - (1 - confidence)^(1/runs) at none, so 0 of 1,400 bounds it at 0.49%."""
+    from scipy import stats
+
+    return 1.0 if reds >= runs else float(stats.beta.ppf(confidence, reds + 1, runs - reds))
 
 
 def declared_seeds(path) -> dict[str, int]:

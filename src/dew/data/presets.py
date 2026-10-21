@@ -37,6 +37,8 @@ if TYPE_CHECKING:
 
     from transformers import PreTrainedTokenizerBase
 
+    from dew.data.cache import Cache
+    from dew.data.generation import Generation
     from dew.data.pipeline import Dataset, HostStep, Mixture, Phases, Pipeline, RandomStep
     from dew.data.sources.base import Source
 
@@ -45,7 +47,7 @@ def images(dataset: Dataset, size: int, *, batch: int,
            augment: bool | image_steps.DeviceAugment | RandomStep | tuple[RandomStep, ...] = False,
            crop_scale: tuple[float, float] = (1.0, 1.0), field: str = "image",
            staging_size: int | None = None, draft: bool = False, rejects: bool = True,
-           caption: image_steps.Caption | None = None,
+           caption: image_steps.Caption | None = None, cache: str | Cache | Generation | None = None,
            records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Images in `field` decoded and resized to `size` squares, in batches of `batch`.
 
@@ -64,6 +66,10 @@ def images(dataset: Dataset, size: int, *, batch: int,
     - `caption` (`images.caption(...)`) writes each record's caption after the resize; its class
       names, where it names none, are the source's (`class_names.label` in its metadata), and with
       `templates=` it draws one per record.
+    - `cache` (a URL, `Cache` or published `Generation`) holds the decoded and resized images and a
+      fixed caption, each input's own whatever order reads it: a shuffle or repeat written
+      before the preset reads the cache as it reads the inputs. Drawn captions and augmentation
+      run after it.
     - `records` keeps that many prepared records before the batch; `host` steps then read each
       batch on the host, before any step on the accelerator."""
 
@@ -86,15 +92,26 @@ def images(dataset: Dataset, size: int, *, batch: int,
                          "DeviceAugment the preset's size")
     prepared = _decoded_images(dataset, staging, field=field, at_least=staging if draft else None,
                                rejects=rejects)
-    if caption is not None:
-        prepared = prepared.map(Configured(image_steps.ConfigureCaption(caption), needs=(),
-                                           random=isinstance(caption, image_steps.RandomCaption)))
+    drawn = isinstance(caption, image_steps.RandomCaption)
+    captioned = None if caption is None else Configured(image_steps.ConfigureCaption(caption), needs=(),
+                                                        random=drawn, one_to_one=True)
+    if captioned is not None and not drawn:
+        prepared = prepared.map(captioned)
+    prepared = _cached(prepared, cache)
+    if captioned is not None and drawn:
+        prepared = prepared.map(captioned)
     if device is not None:
         prepared = prepared.random_map(image_steps.AugmentationKey())
     for step in on_host:
         prepared = prepared.random_map(step)
     return _finished(prepared, batch=batch, records=records, host=host,
                      device=() if device is None else (device,))
+
+
+def _cached(prepared: Dataset, cache: str | Cache | Generation | None) -> Dataset:
+    """`prepared` through `cache` where one is given (`Dataset.cache`), which holds what its fixed
+    steps make of each input."""
+    return prepared if cache is None else prepared.cache(cache)
 
 
 def _finished(prepared: Dataset, *, batch: int, records: int | None, host: tuple[HostStep, ...],
@@ -109,7 +126,8 @@ def _finished(prepared: Dataset, *, batch: int, records: int | None, host: tuple
 def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase | None, *, seq_len: int, batch: int,
        field: str = "text", eos: bool | None = None,
        pack: Literal["first-fit", "best-fit", "concat"] | None = "first-fit", bins: int = 32,
-       stride: int | None = None, records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
+       stride: int | None = None, cache: str | Cache | Generation | None = None,
+       records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Documents in `field` tokenized, ended by the tokenizer's EOS where it has one (`eos=True`
     always, `False` never), cut into pieces that keep every next-token target, and packed into
     rows of `seq_len + 1` tokens (the last a target) by `pack`, first-fit with `bins` open rows,
@@ -118,12 +136,13 @@ def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase | None, *, seq
     windows `stride` apart (`windows`), which carry no document coordinates. With
     `tokenizer=None` the documents are token ids already, under "text", such as a token store's,
     whose windows a store reads by index (`TokenFiles(url).pipe(presets.lm, None, seq_len=512,
-    batch=8, pack=None)`); a store packed must state where its documents end."""
+    batch=8, pack=None)`); a store packed must state where its documents end. `cache` holds the
+    tokenized documents, as `images` holds its images."""
 
     if pack is not None and stride is not None:
         raise ValueError("stride places fixed windows, pack=None; a pack lays documents out whole")
-    documents = dataset if tokenizer is None else dataset.map(
-        text_steps.tokenize(tokenizer, field=field, eos=eos))
+    documents = _cached(dataset if tokenizer is None else dataset.map(
+        text_steps.tokenize(tokenizer, field=field, eos=eos)), cache)
     if pack is None:
         windows = documents.windows(seq_len, stride=stride)
     else:
@@ -136,16 +155,18 @@ def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase | None, *, seq
 def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int,
         messages: str = "messages", long: Literal["chunk", "truncate", "drop"] = "chunk",
         pack: Literal["first-fit", "best-fit", "concat"] = "first-fit", bins: int = 32,
-        records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
+        cache: str | Cache | Generation | None = None, records: int | None = None,
+        host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat
     template, each token's speaker kept beside it for an assistant-only loss,
     and packed into rows of `seq_len + 1` tokens by `pack`, as `lm` packs,
     in batches of `batch` rows (`records` and `host` as `images` takes
     them). A conversation longer than a row is cut into pieces that keep
     every turn (`long="chunk"`), cut at its end (`"truncate"`), or dropped
-    and counted (`"drop"`)."""
+    and counted (`"drop"`). `cache` holds the rendered conversations, as `images` holds its
+    images."""
 
-    rendered = dataset.map(chat.template(tokenizer, messages=messages))
+    rendered = _cached(dataset.map(chat.template(tokenizer, messages=messages)), cache)
     packing = Pack(seq_len + 1, _CHAT_FIELDS, bins=bins, policy=pack)
     windows = _conversation_windows(rendered, packing, long=long)
     return _finished(windows, batch=batch, records=records, host=host)
@@ -207,6 +228,36 @@ def _conversation_windows(rendered: Dataset, pack: Pack, *,
     # A concatenating pack cuts conversations where its rows end, so its cuts overlap by one token too.
     pack = dataclasses.replace(pack, overlap=1) if pack.policy == "concat" else pack
     return (rendered.filter_map(fitted) if long == "drop" else rendered.map(fitted))._then(pack)
+
+
+def prompts(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, max_prompt_len: int, batch: int,
+            pad_id: int = 0, long: Literal["drop", "truncate"] = "truncate", thinking: bool | None = None,
+            reward_bytes: int | None = None, records: int | None = None,
+            host: tuple[HostStep, ...] = ()) -> Pipeline:
+    """Prompt rows (verl's columns: "prompt", "data_source", "ground_truth", ...) rendered to
+    `max_prompt_len` left-padded ids, keeping a longer prompt's tail, or dropping it (`long="drop"`),
+    with their reward columns padded to `reward_bytes`, in batches of `batch` (`records` and `host`
+    as `images` takes them). Without `reward_bytes`, a memory read measures it over each store, the
+    widest reward string it holds, so every row fits whole; another read needs it given, or stated
+    by the store's metadata."""
+    rendered = _rendered_prompts(dataset, tokenizer, max_prompt_len, pad_id=pad_id, long=long,
+                                 thinking=thinking, reward_bytes=reward_bytes)
+    return _finished(rendered, batch=batch, records=records, host=host)
+
+
+def _rendered_prompts(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, max_prompt_len: int, *,
+                      pad_id: int, long: Literal["drop", "truncate"], thinking: bool | None,
+                      reward_bytes: int | None) -> Pipeline:
+    """Prompt rows rendered with their reward columns `reward_bytes` wide, or as wide as measured over
+    each store (`prompts`). `prompts` and the prompt recipe (`dew.config.data.PromptData`) share it."""
+    from dew.data.prompts import RewardWidth
+    from dew.data.steps.chat import ConfigurePrompt
+    from dew.data.text import tokenizer_name
+
+    configure = ConfigurePrompt(tokenizer_name(tokenizer), max_prompt_len, pad_id, long, thinking)
+    if reward_bytes is not None:
+        return dataset.filter_map(configure({"reward_bytes": reward_bytes}))
+    return dataset.map(Configured(configure, needs=("reward_bytes",), measures=RewardWidth()))
 
 
 def preferences(dataset: Dataset, *, seq_len: int, batch: int, pad_id: int = 0, records: int | None = None,

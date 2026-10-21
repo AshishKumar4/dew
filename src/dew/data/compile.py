@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import threading
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal, Protocol, runtime_checkable
@@ -23,6 +24,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew.data.analysis import (
+    Measuring,
     _analyzed,
     _at,
     _cache_manifest,
@@ -33,6 +35,7 @@ from dew.data.analysis import (
     _leaves,
     _Lowering,
     _manifest,
+    _measures,
     _member_keys,
     _members,
     _name,
@@ -199,13 +202,27 @@ def _released(pipelines: Sequence[Pipeline]) -> None:
 
 def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, ...]:
     sources = {id(source): source for branch in pipelines for _, source in _leaves(branch)}
+    measured: dict[int, dict[str, Measuring]] = {}
+    for branch in pipelines:
+        for key, measuring in _measured(branch).items():
+            measured.setdefault(key, {}).update({each.measure.fact: each for each in measuring})
+    stores: dict[int, Records] = {}
+    reading = threading.Lock()
+
+    def whole(store: Source) -> Records:
+        # A store several holdout parts measure over is read once for them all.
+        with reading:
+            if id(store) not in stores:
+                stores[id(store)] = store.records(read)
+            return stores[id(store)]
 
     def pin(source: Source) -> _Facts:
         if isinstance(source, _Facts):
             return source
         label = source.label()
+        measuring = tuple(measured.get(id(source), {}).values())
         source = _consumed(source, read)
-        records, metadata = _stated(source, read)
+        records, metadata = _stated(source, read, measuring, whole)
         held = None if records is None else _PinnedRead(records)
         return _Facts(source, read, source.fingerprint(), metadata, held, label)
 
@@ -222,6 +239,22 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
         return dataclasses.replace(branch, source=source)
 
     return tuple(replace(branch) for branch in pipelines)
+
+
+def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int, tuple[Measuring, ...]]:
+    """The facts each store `pipeline` reads has measured for the configured steps over it, its own
+    and its mixtures' (`Configured.measures`), each after the stages its store's records pass
+    through before that step, by the store's identity."""
+    passed = tuple(dataclasses.replace(each, before=(*pipeline.stages, *each.before)) for each in above)
+    measuring = (*_measures(pipeline.stages), *passed)
+    source = pipeline.source
+    if not isinstance(source, (Mixture, Phases)):
+        return {id(source): measuring}
+    found: dict[int, tuple[Measuring, ...]] = {}
+    for child in source.pipelines:
+        for key, child_measuring in _measured(child, measuring).items():
+            found[key] = (*found.get(key, ()), *child_measuring)
+    return found
 
 
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
@@ -563,7 +596,9 @@ def _compiled(
             if isinstance(stage, Map)
         ),
     )
-    build = build.tuned(train)
+    tuned = build.tuned(train)
+    # The training read's workers move before what drops records (`pooled`); validation reads its own.
+    build = tuned.pooled(train)
     train_host, device = _batch_steps(train)
     train_host = packed + train_host + host
     statistics = _Statistics(counts)
@@ -583,7 +618,7 @@ def _compiled(
             _validation_reader,
             pipeline=validation,
             build=dataclasses.replace(
-                build, lowering=_analyzed(validation, read, validation=True), training=False,
+                tuned, lowering=_analyzed(validation, read, validation=True), training=False,
                 batch=_output_batch(validation),
             ).tuned(validation),
             host=_held_coordinated(validation, packed) + _held_steps(validation) + host,
@@ -819,6 +854,9 @@ def _training_reader(
                 "cycle_lengths": [
                     stage.cycle_length for stage in _steps(pipeline) if isinstance(stage, Interleave)
                 ],
+                # Where a read that drops records reads in workers of each corpus's own (`pooled`),
+                # each worker's position is that corpus's, saved in that many.
+                **({} if build.pool is None else {"pools": build.pools(pipeline)}),
             },
         )
         opened = _PerShare(
@@ -929,6 +967,8 @@ def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]
     combined: Batch = {}
     conflicted: set[str] = set()
     slots: dict[str, int] = {}
+    # A fact a configured step measures binds a mixture's step to the largest of its stores'.
+    measured = {each.measure.fact for pipeline in pipelines for each in _measures(tuple(_steps(pipeline)))}
     for pipeline in pipelines:
         for _, source in _leaves(pipeline):
             if isinstance(source, _Memory) and not source.held:
@@ -938,6 +978,8 @@ def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]
                 if key == "slots":
                     for name, size in record(value, "slots").items():
                         slots[name] = max(slots.get(name, 0), integer(size, f"slots.{name}"))
+                elif key in measured:
+                    combined[key] = max(integer(value, key), integer(combined.get(key, 0), key))
                 elif key not in combined:
                     combined[key] = value
                 elif combined[key] != value:
@@ -981,8 +1023,8 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
         lowering = _finite(lowering)
     # A token budget is fixed-length rows by now (`_budgeted`).
     batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
-    build = _Build(read, loading, 0, batch, lowering, training=True)
-    return _Host(build.tuned(pipeline).batches(pipeline, DataPartition()), packed + _batch_steps(pipeline)[0])
+    build = _Build(read, loading, 0, batch, lowering, training=True).tuned(pipeline).pooled(pipeline)
+    return _Host(build.batches(pipeline, DataPartition()), packed + _batch_steps(pipeline)[0])
 
 
 def _finite(lowering: _Lowering) -> _Lowering:

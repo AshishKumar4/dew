@@ -228,21 +228,46 @@ def test_windows_that_drop_the_roles_their_documents_were_counted_in_are_refused
             stream.close()
 
 
+@dataclasses.dataclass(frozen=True)
+class Delivered:
+    """A delivered row as its tokens and the role-1 targets the loss scores of it."""
+
+    def __call__(self, row):
+        return {"text": row["text"], **Scored(1)(row)}
+
+
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
-def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupted_read(read):
+@pytest.mark.parametrize(("layout", "workers"), [("windows", 0), ("first-fit", 2), ("concat", 2)])
+def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupted_read(
+        read, layout, workers):
     """A read of windows counted by their documents' rule saves the rule with its position, so a
-    resume whose next windows come from documents already read counts them by it too."""
+    resume whose next windows come from documents already read counts them by it too: windows
+    cut from a carried document, and a first-fit pack's open bins or a concatenating pack's
+    remainder held in loading workers."""
     from dew.data.steps.text import CountTargets
 
     def corpus(source, scored):
-        # Documents of 40 tokens leave several windows of 8 in the carry, so a resume reads its
-        # next windows from a document it read before stopping.
-        counted = Pipeline(roled(source, 40, scored), name=str(source)).filter_map(CountTargets(role=1))
-        return counted.windows(8, fields=ROLED).map(Sourced(source)).repeat()
+        # Documents longer than a window, of lengths a window doesn't divide, leave windows and
+        # partial bins held when the read stops, so a resume reads next from documents read before;
+        # each of its own tokens, so a lost, repeated or replayed row shows.
+        length = 40 if layout == "windows" else 11
+        documents = Memory([{"text": np.arange(length, dtype=np.int32) + 1000 * index + 100_000 * source,
+                             # The first `scored` targets in role 1, as `roled` scores them: a
+                             # token's role scores the one after it.
+                             "text_roles": (np.arange(length) < scored + 1).astype(np.int32),
+                             "source": np.int32(source)} for index in range(8)], shard_rows=4)
+        # A stream read by two loading workers holds a shard for each of them.
+        counted = Pipeline(documents, name=str(source)).filter_map(CountTargets(role=1))
+        laid_out = (counted.windows(8, fields=ROLED) if layout == "windows"
+                    else counted.pack(16, fields=ROLED, policy=layout, bins=3) if layout == "first-fit"
+                    else counted.pack(16, fields=ROLED, policy=layout))
+        return laid_out.map(Sourced(source)).repeat()
+
+    loading = dataclasses.replace(READ, workers=workers)
 
     def stream():
         mixed = mix([corpus(0, 1), corpus(1, 5)], by="tokens")
-        return compile(mixed.map(Scored(1)).batch(2), read=read, loading=READ).train(DataPartition())
+        return compile(mixed.map(Delivered()).batch(2), read=read, loading=loading).train(DataPartition())
 
     uninterrupted = stream()
     try:
