@@ -282,6 +282,7 @@ def _llada_moe_config(hf_config: Mapping[str, object], used: set[str], *,
     routed = tuple(index for index, enabled in enumerate(pattern[:layers]) if enabled != 0)
     if routed:
         bias = bool(hf_config.get('moe_router_enable_expert_bias'))
+        # The release defaults to -1; only an explicit null disables this branch.
         shared = hf_config.get('shared_expert_intermediate_size', -1)
         config['mixture'] = native_fields(Mixture)(
             experts=record_int(hf_config, 'num_experts'),
