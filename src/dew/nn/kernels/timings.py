@@ -63,10 +63,10 @@ def observation(launch: str, call: str, config: str, *, method: dict, status: st
     }
 
 
-def record(rows: list[dict]) -> None:
+def record(rows: list[dict], *, wait: float = LOCK_SECONDS) -> None:
     """Append `rows` to `timings.jsonl` in `DEW_TIMINGS`'s directory, created where missing, each row
-    one line, all of them under one lock (`LOCK_SECONDS`), so a concurrent writer's lines never
-    interleave with them. A failure to write raises: logging was asked for."""
+    one line, all of them under one lock, waited for `wait` seconds, so a concurrent writer's lines
+    never interleave with them. A failure to write raises: logging was asked for."""
     where = directory()
     if where is None or not rows:
         return
@@ -78,6 +78,6 @@ def record(rows: list[dict]) -> None:
     path = Path(where)
     path.mkdir(parents=True, exist_ok=True)
     lines = ''.join(json.dumps(row, sort_keys=True, allow_nan=False) + '\n' for row in rows)
-    with filelock.FileLock(path / 'timings.jsonl.lock', timeout=LOCK_SECONDS), \
+    with filelock.FileLock(path / 'timings.jsonl.lock', timeout=wait), \
             (path / 'timings.jsonl').open('a', encoding='utf-8') as file:
         file.write(lines)

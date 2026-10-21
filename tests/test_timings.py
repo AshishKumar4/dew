@@ -62,6 +62,5 @@ def test_concurrent_writers_never_interleave_their_lines(tmp_path):
 
 def test_a_held_lock_raises_after_its_stated_wait(monkeypatch, tmp_path):
     monkeypatch.setenv(timings.ENV, str(tmp_path))
-    monkeypatch.setattr(timings, 'LOCK_SECONDS', 0.1)
     with filelock.FileLock(tmp_path / "timings.jsonl.lock"), pytest.raises(filelock.Timeout):
-        timings.record([ROW])
+        timings.record([ROW], wait=0.1)
