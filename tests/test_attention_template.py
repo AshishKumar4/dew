@@ -361,9 +361,10 @@ def halves(spans: template.KeySpans, half: int) -> tuple[template.KeySpans, temp
                               spans.query_ids, None if ids is None else ids[:, half:], spans.keys - half))
 
 
+@pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
 @pytest.mark.parametrize("hooks", [HOOKS["none"], HOOKS["sinks"]], ids=["none", "sinks"])
 @pytest.mark.parametrize("case", [CASES[name] for name in ARITHMETIC], ids=ARITHMETIC)
-def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks):
+def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks, dtype):
     """The softmax over a call's first keys, its output, maxima and denominators resumed as the initial
     state of one over the rest (`template.Initial`, its numerator the output times the denominator, a
     query that saw nothing resuming from no state), gives the output, maxima and denominators of one
@@ -387,13 +388,14 @@ def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks):
     def whole(query, key, value):
         return template.reference(query, key, value, spans, start, residuals=True)
 
-    draw_normal = drawing(queries, keys)
+    draw_normal = drawing(queries, keys, dtype)
 
     def draw(seed):
         query, key, value = draw_normal(seed)
         return jnp.round(2 * query) / 2, jnp.round(2 * key) / 2, value
 
-    assert_as_exact(jax.jit(resumed), jax.jit(whole), draw, f"template resumed {case} {hooks}", seeds=SEEDS)
+    assert_as_exact(jax.jit(resumed), jax.jit(whole), draw,
+                    f"template resumed {case} {hooks} {jnp.dtype(dtype).name}", seeds=SEEDS)
 
 
 def test_hooks_are_a_pytree_whose_values_a_compiled_call_takes():
@@ -469,6 +471,25 @@ def test_chunks_keep_the_keys_dews_chunk_mask_keeps_over_any_document_layout(ids
         if causal:
             expected &= np.tril(np.ones((tokens, tokens), bool))
         np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+
+
+def test_cross_documents_chunk_on_their_given_places():
+    """Another sequence's documents with their own places: a query's chunk holds its document's keys
+    whose places share it, as `cross_document_mask & chunk_mask` keeps them."""
+    cross = CrossDocuments(jnp.asarray([[2, 2, 1, 1, 0]], jnp.int32),
+                           jnp.asarray([[1, 1, 1, 2, 2, 2]], jnp.int32))
+    query_places = jnp.asarray([[1, 2, 0, 2, 0]], jnp.int32)
+    key_places = jnp.asarray([[0, 1, 2, 0, 1, 2]], jnp.int32)
+    spans = template.spans(5, 6, 1, chunk=2, positions=(query_places, key_places), segment_ids=cross)
+    expected = document_mask(cross) & chunk_mask(query_places, key_places, 2)[:, 0]
+    np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+
+
+def test_a_call_of_no_queries_maps_no_tiles():
+    """With no queries, the block map has no query blocks and reads no key block."""
+    blocks = template.block_map(template.spans(0, 40, 1, causal=True), 16, 16)
+    assert blocks.lo.shape == (1, 0)
+    np.testing.assert_array_equal(np.asarray(blocks.q_hi), 0)
 
 
 def test_a_chunk_wider_than_int32_holds_every_place():
