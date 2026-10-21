@@ -216,6 +216,33 @@ def test_two_files_closing_alike_on_exit_fail(tmp_path):
         ("function", ["prefetch.py Prefetch.__exit__", "tracker.py Tracker.__exit__"])]
 
 
+def test_a_copy_written_on_one_line_fails_held_to_a_base_or_not(tmp_path):
+    """A function and its six statements on one line span the same lines: the copy is still named, and
+    still fails."""
+    first = "def first(x): a = x + 1; b = a * 2; c = b - 3; d = c / 4; e = d ** 2; f = e % 5; return f\n"
+    second = ("def second(y): p = y + 11; q = p * 12; r = q - 13; s = r / 14; t = s ** 12; u = t % 15;"
+              " return u\n")
+    copied = tree(tmp_path, "copied", {"first.py": first, "second.py": second})
+    assert gate(copied).returncode == 1
+    assert owners(copies(copied)) == [("function", ["first.py first", "second.py second"])]
+    root = repository(tmp_path, {"first.py": first})
+    (root / "second.py").write_text(second)
+    commit(root, "a head that copies it")
+    assert gate(root, "--base=main").returncode == 1
+    assert owners(added(root)) == [("function", ["first.py first", "second.py second"])]
+
+
+def test_a_constructor_computing_its_parent_is_logic(tmp_path):
+    """A constructor that only hands its arguments to its parent's declares nothing when it computes which
+    parent: written twice, it is a copy."""
+    computed = ("class {0}:\n    def __init__(self, {1}):\n        super(choose({1}, min({1}), max({1}),"
+                " len({1}), sum({1}), tuple({1})), self).__init__()\n")
+    copied = tree(tmp_path, "copied", {"left.py": computed.format("Left", "values"),
+                                       "right.py": computed.format("Right", "items")})
+    assert gate(copied).returncode == 1
+    assert owners(copies(copied)) == [("function", ["left.py Left.__init__", "right.py Right.__init__"])]
+
+
 def test_a_copied_run_of_one_call_fails(tmp_path):
     """Six calls to one function declare data: copied with their data, they are a copy, though no line reads
     alike as text."""
@@ -249,6 +276,9 @@ def test_declarations_alike_are_no_copy(tmp_path):
     reads = "".join(f"{{0}}{index} = {{1}}('{{0}}{index}')\n" for index in range(6))
     fields = ("class {0}:\n    def __init__(self, {1}, {2}):\n        self.{1}, self.{2} = {1}, {2}\n"
               "        self.{3}, self.{4}, self.{5} = [], [], []\n")
+    parameters = ", ".join(f"{{1}}{index}" for index in range(6))
+    annotated = f"class {{0}}:\n    def __init__(self, {parameters}):\n" + "".join(
+        f"        self.{{1}}{index}: object = {{1}}{index}\n" for index in range(6))
     threading = ("def {0}(x):\n    y = normalize(x)\n    scale = y * 2\n"
                  + "    x = layer(x, depth=3)\n" * 8 + "    return x + scale\n")
     alike = tree(tmp_path, "alike", {
@@ -261,6 +291,8 @@ def test_declarations_alike_are_no_copy(tmp_path):
         "right_reads.py": "import re\n" + reads.format("PATTERN", "re.compile"),
         "harness.py": fields.format("Harness", "failure", "paid", "opened", "closed", "calls"),
         "artifact.py": fields.format("Artifact", "name", "kind", "dirs", "files", "references"),
+        "left_fields.py": annotated.format("LeftFields", "a"),
+        "right_fields.py": annotated.format("RightFields", "b"),
         "deep.py": threading.format("deep"),
         "shallow.py": threading.format("shallow").replace("    x = layer(x, depth=3)\n" * 6, "")})
     assert copies(alike) == []
