@@ -44,7 +44,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import tuning
-from dew.nn.kernels.fla_gdn import _dot, _read, _write
+from dew.nn.kernels.chunked_launch import _read, _write
+from dew.nn.kernels.fla_gdn import _dot
 
 
 @dataclasses.dataclass(frozen=True)
