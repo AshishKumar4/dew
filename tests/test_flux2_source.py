@@ -24,7 +24,12 @@ import numpy as np
 import pytest
 import tool_support
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    declared_seeds,
+    indexed_recording,
+)
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux2_fields, flux2_path, read_transformer
@@ -52,20 +57,36 @@ def arrays(source):
     return fixture_arrays(source / "flux2_transformer.npz")
 
 
-def load(source, name):
+def load(source, name, *, dtype="float32"):
     config = json.loads((source / name / "transformer" / "config.json").read_text())
-    model = Flux2Transformer(**flux2_fields(config, dtype="float32", attention_impl="xla"))
+    model = Flux2Transformer(**flux2_fields(config, dtype=dtype, attention_impl="xla"))
     params, layouts = read_transformer(component_tensors(source / name, "transformer"), flux2_path)
     return model, params, layouts
 
 
-def walk(name, arrays, record):
-    rows, columns = record["cases"][name]["grid"]
-    latent = arrays[f"{name}.latent"].reshape(-1, rows, columns, arrays[f"{name}.latent"].shape[-1])
-    guidance = arrays[f"{name}.guidance"]
-    condition = DenoisingCondition(jnp.asarray(arrays[f"{name}.context"]),
-                                   guidance=jnp.asarray(guidance) if guidance.size else None)
-    return jnp.asarray(latent), jnp.asarray(arrays[f"{name}.times"]), condition, (rows, columns)
+def transformer_walk(source, name, grid, *, dtype="float32"):
+    """The compiled native walk on a draw, also used to plan the recording's seeds."""
+    model, params, layouts = load(source, name, dtype=dtype)
+    rows, columns = grid
+
+    @jax.jit
+    def walk(inputs):
+        latent = inputs["latent"].reshape(-1, rows, columns, inputs["latent"].shape[-1])
+        probe = inputs["probe"].reshape(latent.shape[0], rows, columns, -1)
+        guidance = inputs["guidance"] if inputs["guidance"].size else None
+
+        def objective(params, latent, context):
+            output = model.apply({"params": params}, latent, inputs["times"],
+                                 DenoisingCondition(context, guidance=guidance))
+            return jnp.sum(output * probe), output
+
+        (_, output), gradients = jax.value_and_grad(objective, argnums=(0, 1, 2), has_aux=True)(
+            params, latent, inputs["context"])
+        return {"output": output.reshape(inputs["probe"].shape),
+                "grad_latent": gradients[1].reshape(inputs["latent"].shape),
+                "grad_context": gradients[2], "grad_params": gradients[0]}
+
+    return walk, layouts
 
 
 @pytest.mark.parametrize("name", CASES)
@@ -77,29 +98,18 @@ def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
 
 @pytest.mark.parametrize("name", CASES)
 def test_the_forward_and_every_gradient_match_the_source(source, arrays, record, name):
-    model, params, layouts = load(source, name)
-    latent, times, condition, (rows, columns) = walk(name, arrays, record)
-    probe = arrays[f"{name}.probe"].reshape(latent.shape[0], rows, columns, -1)
-
-    def objective(params, latent, context):
-        conditioned = DenoisingCondition(context, guidance=condition.guidance)
-        return jnp.sum(model.apply({"params": params}, latent, times, conditioned) * probe)
-
-    def held(value, key):
-        reference = arrays[f"{name}.{key}"]
-        assert_as_exact_as_the_reference(np.asarray(value).reshape(reference.shape), reference,
-                                         arrays[f"{name}.fp64.{key}"], f"{name} {key}")
-
-    held(model.apply({"params": params}, latent, times, condition), "output")
-    grad_params, grad_latent, grad_context = jax.grad(objective, argnums=(0, 1, 2))(
-        params, latent, condition.context)
-    held(grad_latent, "grad_latent")
-    held(grad_context, "grad_context")
+    walk, layouts = transformer_walk(source, name, record["cases"][name]["grid"])
     tensors = {layout.name.removeprefix("transformer/"): layout for layout in layouts}
-    assert_leaves_as_exact(
-        {tensor: np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()},
-        {tensor: arrays[f"{name}.grad_param.{tensor}"] for tensor in tensors},
-        {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors})
+    seeds = declared_seeds(source / "flux2_transformer.npz")[name]
+    draw, reference, truth = indexed_recording(arrays, name, seeds)
+
+    def native(index, inputs):
+        values = walk(inputs)
+        gradients = values.pop("grad_params")
+        return {**values, **{f"grad_param.{tensor}": layout.export({"params": gradients})
+                            for tensor, layout in tensors.items()}}
+
+    assert_as_exact(native, reference, draw, f"Flux2 {name}", seeds=seeds, truth_fn=truth)
 
 
 def nhwc(array):

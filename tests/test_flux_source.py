@@ -23,7 +23,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import extract_fixture, packed, unpacked
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    declared_seeds,
+    indexed_recording,
+)
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux_fields, flux_path, read_transformer
@@ -38,38 +43,33 @@ def source(tmp_path_factory):
     return extract_fixture(ROOT / "tests/fixtures/flux_source.tar.xz", tmp_path_factory.mktemp("flux-source"))
 
 
+def flux_walk(source, name: str, grid: tuple[int, int], *, dtype="float32"):
+    """A compiled forward and every gradient on a draw, with the fixture's weights.
 
+    The recorder plans its seeds on this same walk with dtype inferred from the inputs, so its
+    float64 proxy widens the computation along with them. Layout export stays outside the jit.
+    """
+    config = json.loads((source / name / "transformer" / "config.json").read_text())
+    model = FluxTransformer(**flux_fields(config, dtype=dtype, attention_impl="xla"))
+    params, layouts = read_transformer(component_tensors(source / name, "transformer"), flux_path)
 
+    @jax.jit
+    def walk(inputs):
+        latent = unpacked(inputs["packed"], *grid)
+        probe = unpacked(inputs["probe"], *grid)
+        guidance = inputs["guidance"] if config["guidance_embeds"] else None
 
-def transformer_case(directory: Path, arrays, name: str, grid: tuple[int, int]):
-    """The native model, its loaded parameters and the case's own inputs."""
-    config = json.loads(str(arrays[f"{name}.config"]))
-    model = FluxTransformer(**flux_fields(config, attention_impl="xla"))
-    params, layouts = read_transformer(component_tensors(directory / name, "transformer"), flux_path)
-    latent = jnp.asarray(unpacked(arrays[f"{name}.packed"], *grid))
-    context = jnp.asarray(arrays[f"{name}.context"])
-    pooled = jnp.asarray(arrays[f"{name}.pooled"])
-    times = jnp.asarray(arrays[f"{name}.times"])
-    recorded = arrays[f"{name}.guidance"]
-    guidance = None if recorded.size == 0 else jnp.asarray(recorded)
+        def objective(params, latent, context, pooled):
+            output = model.apply({"params": params}, latent, inputs["times"],
+                                 DenoisingCondition(context, pooled, guidance=guidance))
+            return jnp.sum(output * probe), output
 
-    def forward(params, latent, context, pooled):
-        return model.apply({"params": params}, latent, times,
-                           DenoisingCondition(context, pooled, guidance=guidance))
+        (_, output), gradients = jax.value_and_grad(objective, argnums=(0, 1, 2, 3), has_aux=True)(
+            params, latent, inputs["context"], inputs["pooled"])
+        return {"output": packed(output), "grad_packed": packed(gradients[1]),
+                "grad_context": gradients[2], "grad_pooled": gradients[3], "grad_params": gradients[0]}
 
-    return forward, params, layouts, latent, context, pooled
-
-
-def flux_walk(source, arrays, name: str, grid: tuple[int, int]):
-    """The native forward and every gradient of one case, once."""
-    forward, params, layouts, latent, context, pooled = transformer_case(
-        source, arrays, name, grid)
-    probe = jnp.asarray(unpacked(arrays[f"{name}.probe"], *grid))
-    output = jax.jit(forward)(params, latent, context, pooled)
-    gradients = jax.jit(jax.grad(
-        lambda p, noisy_latent, c, q: jnp.sum(forward(p, noisy_latent, c, q) * probe), argnums=(0, 1, 2, 3)))(
-            params, latent, context, pooled)
-    return output, gradients, {entry.name: entry for entry in layouts}
+    return walk, {entry.name: entry for entry in layouts}
 
 
 @pytest.mark.parametrize("name", CASES)
@@ -85,21 +85,21 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
     """
     record = json.loads((source / "flux_transformer.json").read_text())
     grid = tuple(record["cases"][name]["grid"])
+    walk, layout = flux_walk(source, name, grid)
+    seeds = declared_seeds(source / "flux_transformer.npz")[name]
     with np.load(source / "flux_transformer.npz") as arrays:
-        output, gradients, layout = flux_walk(source, arrays, name, grid)
-        native = {"output": packed(np.asarray(output)), "grad_packed": packed(np.asarray(gradients[1])),
-                  "grad_context": gradients[2], "grad_pooled": gradients[3]}
-        for key, value in native.items():
-            assert_as_exact_as_the_reference(value, arrays[f"{name}.{key}"], arrays[f"{name}.fp64.{key}"],
-                                             f"{name} {key}")
         prefix = f"{name}.grad_param."
         tensors = [key[len(prefix):] for key in arrays.files if key.startswith(prefix)]
         assert tensors
-        assert_leaves_as_exact(
-            {tensor: np.asarray(layout["transformer/" + tensor].export({"params": gradients[0]}))
-             for tensor in tensors},
-            {tensor: arrays[prefix + tensor] for tensor in tensors},
-            {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors})
+        draw, reference, truth = indexed_recording(arrays, name, seeds)
+
+        def native(index, inputs):
+            values = walk(inputs)
+            gradients = values.pop("grad_params")
+            return {**values, **{f"grad_param.{tensor}": layout["transformer/" + tensor].export(
+                {"params": gradients}) for tensor in tensors}}
+
+        assert_as_exact(native, reference, draw, f"Flux {name}", seeds=seeds, truth_fn=truth)
 
 
 @pytest.fixture(scope="module")

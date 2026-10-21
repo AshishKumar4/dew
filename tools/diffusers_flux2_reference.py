@@ -5,7 +5,7 @@ Tiny `Flux2Transformer2DModel` instances are constructed and saved with
 is run the way `Flux2Pipeline` runs it: the latent flattened one token per
 position, the four-axis ids the pipeline lays out for the text and the grid,
 the timestep it divides by a thousand, and the distilled guidance. Every case
-records the forward, the vector-Jacobian products against a fixed cotangent
+records the forward, the vector-Jacobian products against a drawn cotangent
 for the latent and the text states, and the gradient of every parameter,
 unmodified, in float32, the reference, and in float64, the truth
 (`diffusers_wan_reference.float64`: the source's float32 pins widened). Every
@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,11 +41,13 @@ import numpy as np
 import torch
 from diffusers_reference_helpers import perturb, recording, saved_pipeline, tiny_qwen3_encoder
 from diffusers_wan_reference import float64
+from recorded_references import provenance, record_case
 from reference_releases import RELEASES
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
 BASE = {"patch_size": 1, "in_channels": 8, "num_layers": 2, "num_single_layers": 2, "attention_head_dim": 16,
-        "num_attention_heads": 2, "joint_attention_dim": 12, "timestep_guidance_channels": 32, "mlp_ratio": 3.0,
+        "num_attention_heads": 2, "joint_attention_dim": 12, "timestep_guidance_channels": 32,
+        "mlp_ratio": 3.0,
         "axes_dims_rope": (4, 4, 4, 4), "rope_theta": 2000, "eps": 1e-6, "guidance_embeds": True}
 TOKENS = 5
 SEED = 29
@@ -85,8 +88,13 @@ def twice(walk, model) -> dict[str, np.ndarray]:
 
 
 def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
-    """The case's saved transformer and its walk in float32 and in float64."""
+    """The saved weights walked over seeds, keeping the old draw at seed zero.
+
+    Later draws keep the standard-normal input and cotangent laws, and perturb each row's guidance
+    by a unit-normal draw. Only inputs vary; the weight perturbation is the original one.
+    """
     from diffusers import Flux2Transformer2DModel
+    from test_flux2_source import transformer_walk
 
     config = {**BASE, **case.config}
     torch.manual_seed(SEED)
@@ -96,33 +104,56 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
         for parameter in model.parameters():
             parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
     model.save_pretrained(root / name / "transformer", safe_serialization=True)
+    initial_state = generator.get_state()
     rows, columns = case.grid
     batch = len(case.guidance)
-    latent = torch.randn((batch, rows * columns, config["in_channels"]), generator=generator)
-    context = torch.randn((batch, TOKENS, config["joint_attention_dim"]), generator=generator)
-    times = torch.tensor([731.0, 42.0])
-    guidance = torch.tensor(case.guidance) if config["guidance_embeds"] else None
     text_ids, image_ids = ids(rows, columns)
-    probe = torch.randn((batch, rows * columns, config.get("out_channels") or config["in_channels"]),
-                        generator=generator)
+    shape = (batch, rows * columns, config["in_channels"])
+    output_shape = (*shape[:-1], config.get("out_channels") or config["in_channels"])
 
-    def walk(model, dtype) -> dict[str, np.ndarray]:
-        inputs = [tensor.detach().to(dtype).requires_grad_() for tensor in (latent, context)]
+    def draw(seed):
+        generator = torch.Generator().manual_seed(SEED + 1 + seed)
+        if seed == 0:
+            generator.set_state(initial_state)
+        inputs = {"latent": torch.randn(shape, generator=generator),
+                  "context": torch.randn((batch, TOKENS, config["joint_attention_dim"]), generator=generator),
+                  "times": torch.tensor([731.0, 42.0]),
+                  "probe": torch.randn(output_shape, generator=generator)}
+        guidance = torch.tensor(case.guidance) if config["guidance_embeds"] else torch.zeros(0)
+        if seed and guidance.numel():
+            guidance = guidance + torch.randn(guidance.shape, generator=generator)
+        return {**{key: value.numpy() for key, value in inputs.items()}, "guidance": guidance.numpy()}
+
+    def walk(model, dtype, drawn) -> dict[str, np.ndarray]:
+        inputs = [torch.from_numpy(drawn[key]).to(dtype).requires_grad_() for key in ("latent", "context")]
+        times, guidance, probe = (torch.from_numpy(drawn[key]).to(dtype)
+                                  for key in ("times", "guidance", "probe"))
         named = list(model.named_parameters())
         output = model(hidden_states=inputs[0], encoder_hidden_states=inputs[1],
-                       timestep=times.to(dtype) / 1000, guidance=None if guidance is None else guidance.to(dtype),
+                       timestep=times / 1000, guidance=guidance if guidance.numel() else None,
                        img_ids=image_ids, txt_ids=text_ids, return_dict=False)[0]
-        grads = torch.autograd.grad((output * probe.to(dtype)).sum(), inputs + [value for _, value in named])
+        grads = torch.autograd.grad((output * probe).sum(), inputs + [value for _, value in named])
         return {"output": output.detach().numpy(), "grad_latent": grads[0].numpy(),
                 "grad_context": grads[1].numpy(),
                 **{f"grad_param.{key}": gradient.numpy()
                    for (key, _), gradient in zip(named, grads[2:], strict=True)}}
 
-    arrays = {"latent": latent.numpy(), "context": context.numpy(), "times": times.numpy(),
-              "guidance": np.zeros(0, np.float32) if guidance is None else guidance.numpy(),
-              "probe": probe.numpy(), **twice(walk, model)}
-    print(f"{name}: grid {case.grid} tokens {TOKENS} |output| <= {float(np.abs(arrays['output']).max()):.4g}")
-    return arrays
+    with float64():
+        wide_model = copy.deepcopy(model).double()
+
+    def evaluate(inputs):
+        narrow = walk(model, torch.float32, inputs)
+        with float64():
+            wide = walk(wide_model, torch.float64, inputs)
+        return narrow, wide
+
+    original = draw(0)
+    narrow, wide = evaluate(original)
+    arrays = {**original, **narrow, **{f"fp64.{key}": value for key, value in wide.items()}}
+    print(f"{name}: grid {case.grid} tokens {TOKENS} |output| <= {float(np.abs(narrow['output']).max()):.4g}")
+    proxy, _ = transformer_walk(root, name, case.grid, dtype=None)
+    return {**{f"{name}.{key}": value for key, value in arrays.items()},
+            **record_case(name, draw, evaluate, proxy)}
 
 
 VAE = {"block_out_channels": [8, 16], "down_block_types": ["DownEncoderBlock2D"] * 2,
@@ -191,7 +222,8 @@ def published(destination: str) -> None:
     for `tests/fixtures/flux2_published.npz`."""
     from diffusers import AutoencoderKLFlux2, Flux2Pipeline
 
-    model = AutoencoderKLFlux2.from_pretrained(PUBLISHED_VAE[0], subfolder="vae", revision=PUBLISHED_VAE[1]).eval()
+    model = AutoencoderKLFlux2.from_pretrained(
+        PUBLISHED_VAE[0], subfolder="vae", revision=PUBLISHED_VAE[1]).eval()
 
     def walk(model, dtype) -> dict[str, np.ndarray]:
         with torch.no_grad():
@@ -200,7 +232,8 @@ def published(destination: str) -> None:
             folded = Flux2Pipeline._patchify_latents(
                 model.encode(torch.from_numpy(smooth_image()).to(dtype)).latent_dist.mode())
             pixels = model.decode(Flux2Pipeline._unpatchify_latents(folded)).sample
-            return {"vae.latent": ((folded - mean) / std).numpy(), "vae.pixels": pixels.numpy()[:, :, :CROP, :CROP]}
+            return {"vae.latent": ((folded - mean) / std).numpy(),
+                    "vae.pixels": pixels.numpy()[:, :, :CROP, :CROP]}
 
     arrays = {key.replace("fp64.vae.", "vae.") + (".fp64" if key.startswith("fp64.") else ""): value
               for key, value in twice(walk, model).items()}
@@ -252,7 +285,8 @@ def build_pipeline(root: Path):
         vae.bn.running_var.copy_(torch.rand(vae.bn.running_var.shape, generator=generator) + 0.2)
     scheduler = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
     pipe = Flux2KleinPipeline(scheduler=FlowMatchEulerDiscreteScheduler.from_config(scheduler), vae=vae,
-                              text_encoder=encoder, tokenizer=tok, transformer=transformer, is_distilled=False)
+                              text_encoder=encoder, tokenizer=tok, transformer=transformer,
+                              is_distilled=False)
     return saved_pipeline(pipe, root / "pipeline", HEIGHT, WIDTH)
 
 
@@ -310,8 +344,8 @@ def mistral_tokenizer():
     model = Tokenizer(models.BPE(vocab=vocab, merges=[]))
     model.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
     model.decoder = decoders.ByteLevel()
-    made = PreTrainedTokenizerFast(tokenizer_object=model, bos_token="<s>", eos_token="</s>", pad_token="<pad>",
-                                   unk_token="<unk>", additional_special_tokens=special)
+    made = PreTrainedTokenizerFast(tokenizer_object=model, bos_token="<s>", eos_token="</s>",
+                                   pad_token="<pad>", unk_token="<unk>", additional_special_tokens=special)
     made.chat_template = json.loads((MISTRAL / "chat_template.json").read_text())["chat_template"]
     return made
 
@@ -323,11 +357,11 @@ def build_mistral3(root: Path) -> dict[str, np.ndarray]:
     tok = mistral_tokenizer()
     config = json.loads((MISTRAL / "config.json").read_text())
     config.pop("torch_dtype", None)
-    config["text_config"].update(hidden_size=16, intermediate_size=32, num_hidden_layers=31, num_attention_heads=2,
-                                 num_key_value_heads=1, head_dim=8, vocab_size=len(tok),
-                                 max_position_embeddings=1024)
-    config["vision_config"].update(hidden_size=16, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2,
-                                   head_dim=8, image_size=56)
+    config["text_config"].update(hidden_size=16, intermediate_size=32, num_hidden_layers=31,
+                                 num_attention_heads=2, num_key_value_heads=1, head_dim=8,
+                                 vocab_size=len(tok), max_position_embeddings=1024)
+    config["vision_config"].update(hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+                                   num_attention_heads=2, head_dim=8, image_size=56)
     config["image_token_index"] = tok.convert_tokens_to_ids("[IMG]")
     torch.manual_seed(SEED + 10)
     model = AutoModelForImageTextToText.from_config(Mistral3Config(**config)).eval()
@@ -352,7 +386,7 @@ def main(destination: str) -> None:
     root = recording(destination, "diffusers-0.40")
     arrays: dict[str, np.ndarray] = {}
     for name, case in CASES.items():
-        arrays.update({f"{name}.{key}": value for key, value in build(name, case, root).items()})
+        arrays.update(build(name, case, root))
     for name in VAES:
         arrays.update({f"{name}.{key}": value for key, value in build_vae(name, root).items()})
     arrays.update(pipeline_record(root))
@@ -362,6 +396,11 @@ def main(destination: str) -> None:
                            "width": WIDTH, "steps": STEPS}, "tokens": TOKENS, "seed": SEED,
               "cases": {name: {"config": {**BASE, **case.config}, "grid": list(case.grid),
                                "guidance": list(case.guidance)} for name, case in CASES.items()}}
+    arrays["provenance"] = provenance(
+        "diffusers.Flux2Transformer2DModel", DIFFUSERS, "cpu",
+        "PYTHONPATH=src python tools/diffusers_flux2_reference.py OUTPUT_DIR",
+        generator_revision=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        torch=torch.__version__)
     np.savez_compressed(root / "flux2_transformer.npz", **arrays)
     (root / "flux2_transformer.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
