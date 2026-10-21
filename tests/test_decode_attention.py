@@ -975,11 +975,12 @@ def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask
 
 @pytest.mark.parametrize("width", [128, 96])
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
-def test_a_bf16_decode_step_routes_to_the_kernel_its_generation_measured_fastest(generation, width):
+def test_a_bf16_decode_step_routes_to_the_kernel_its_generation_measured_fastest(generation, width,
+                                                                                without_deterministic_ops):
     """A bf16 decode step of 16 query heads over 8 key heads, traced through the public attention for a
-    GPU on this CPU: an A100 runs the decode kernel its row prefers (`generation.TARGETS`' sm80 'decode',
-    from the DCU receipt), and hands a width it does not take (96) on to cuDNN; an H100 runs cuDNN, its
-    default."""
+    GPU: an A100 runs the decode kernel its row prefers (`generation.TARGETS`' sm80 'decode', from the DCU
+    receipt), and hands a width it does not take (96) on to cuDNN; an H100 runs cuDNN, its default. Out
+    of the cuda lane's deterministic ops, which refuse cuDNN (`without_deterministic_ops`)."""
     from dew.nn.kernels.generation import assumed
 
     query = jnp.zeros((2, 1, 16, width), jnp.bfloat16)
