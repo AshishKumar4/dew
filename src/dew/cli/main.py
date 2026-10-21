@@ -63,13 +63,41 @@ class Export:
         return 0
 
 
+def chain_of(data: str, branch: Literal["train", "validation"], trust: tuple[str, ...] = ()):
+    """The chain `data` names as a `dew.data.compile` pipeline: a Python file's `data`, or with
+    `branch="validation"` its `validation` (each a chain, or a function returning one); a chain's
+    record (a `.json` file `dew.data.records` reads); or a store's URL (`dew.data.sources.source`).
+    Raises ValueError for a file that holds no such chain, or a store asked for its validation."""
+    from dew.data import records
+    from dew.data.pipeline import Dataset
+    from dew.data.sources import source
+
+    path = Path(data)
+    if path.suffix == ".py":
+        sys.path.insert(0, str(path.resolve().parent))
+        module = importlib.import_module(path.stem)
+        held = getattr(module, "data" if branch == "train" else "validation", None)
+        chain = held() if callable(held) and not isinstance(held, Dataset) else held
+    elif path.suffix == ".json":
+        chain = records.decode(json.loads(path.read_text()), trust=trust)
+    elif branch == "validation":
+        raise ValueError(f"{data} is a store, which holds no validation chain; name a Python file's")
+    else:
+        chain = source(data)
+    if not isinstance(chain, Dataset):
+        name = "data" if branch == "train" else "validation"
+        raise ValueError(f"{data} holds no {name} chain, but {chain!r}")
+    return chain._chain()
+
+
 @dataclasses.dataclass(frozen=True)
 class DataExport:
-    """Export a recipe's deterministic records to committed storage."""
+    """Export a chain's deterministic records to committed storage."""
 
-    recipe: Positional[str]
+    data: Positional[str]
+    """A Python file whose `data` (or `validation`, `--branch`) is a chain, a chain's `.json` record, or a
+    store's URL (`chain_of`)."""
     destination: Positional[str]
-    fields: str = "{}"
     format: Literal["parquet", "array_record"] | None = None
     """Parquet for records, ArrayRecord for token stores unless explicitly named."""
     rows_per_shard: int = 100_000
@@ -82,17 +110,11 @@ class DataExport:
     def run_command(self) -> int:
         from dew.data.compile import iterate
         from dew.data.sinks import export
-        from dew.records import record
-        from dew.registry import datasets
 
         format = self.format or ("array_record" if self.tokenizer is not None else "parquet")
         if self.tokenizer is not None and format != "array_record":
             raise ValueError("token exports must use --format array_record")
-        recipe = datasets.build(self.recipe, record(json.loads(self.fields), "recipe fields"))
-        train, held, _ = recipe.pipelines()
-        pipeline = train if self.branch == "train" else held
-        if pipeline is None:
-            raise ValueError(f"{self.recipe} has no validation source")
+        pipeline = chain_of(self.data, self.branch)
         if self.tokenizer is not None:
             from dew.data.text import export_tokens
 
@@ -122,11 +144,11 @@ class DataProvision:
 
 @dataclasses.dataclass(frozen=True)
 class DataPublish:
-    """Fill and publish a deterministic recipe prefix to the artifact cache."""
+    """Fill and publish a chain's deterministic prefix to the artifact cache."""
 
-    recipe: Positional[str]
+    data: Positional[str]
+    """A Python file's chain, a chain's `.json` record, or a store's URL, as `DataExport` reads it."""
     destination: Positional[str]
-    fields: str = "{}"
     branch: Literal["train", "validation"] = "train"
     read: Literal["memory", "indexed", "streamed"] = "streamed"
     provision: bool = False
@@ -134,14 +156,8 @@ class DataPublish:
     def run_command(self) -> int:
         from dew.data.cache import Cache
         from dew.data.compile import publish
-        from dew.records import record
-        from dew.registry import datasets
 
-        recipe = datasets.build(self.recipe, record(json.loads(self.fields), "recipe fields"))
-        train, held, _ = recipe.pipelines()
-        pipeline = train if self.branch == "train" else held
-        if pipeline is None:
-            raise ValueError(f"{self.recipe} has no validation source")
+        pipeline = chain_of(self.data, self.branch)
         generation = publish(pipeline, Cache(self.destination), read=self.read, provision=self.provision)
         emit(f"published {generation.url}")
         return 0
