@@ -132,7 +132,13 @@ def test_a_boundary_rejection_drops_its_window_and_keeps_its_mutable_writes(comp
     for before, after in zip(jax.tree.leaves(prefix_params), jax.tree.leaves(rejected.variables),
                              strict=True):
         np.testing.assert_array_equal(before, after)
-    assert all(not np.any(np.asarray(leaf)) for leaf in rejected.accumulation.statistics)
+    # Every sum of the window is cleared, its QK maxima at their identity; the gradient sum alone stays,
+    # unread until the next window's first microbatch replaces it.
+    window = rejected.accumulation
+    for name in ("statistics", "effects", "mass", "tokens", "batches", "attempts", "variables"):
+        assert all(not np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(getattr(window, name))), name
+    assert all(np.all(np.asarray(leaf) == -np.inf) for leaf in jax.tree.leaves(window.qk_stats)
+               if jnp.issubdtype(leaf.dtype, jnp.inexact))
     pending, _, _, _, accepted, _ = run(rejected, data[2])
     assert bool(accepted) and int(pending.updates) == 0
     final, _, _, _, accepted, _ = run(pending, data[3])

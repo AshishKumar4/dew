@@ -74,7 +74,8 @@ class TrainState:
     together with the root `key`, which never changes, and a microbatch's
     place in its step, it determines each training draw. `microstep` counts
     accepted microbatches, which a step's batch is read in one or more of
-    (`Trainer.compile`), and the objective's schedules read it per step.
+    (`Trainer.compile`), and the objective's schedules read it per step; a
+    dropped window (`dropped_window`) takes back the ones it held.
     `updates` counts committed updates, and the optimizer's and the EMA's
     schedules read it.
 
