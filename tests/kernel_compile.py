@@ -7,7 +7,6 @@ included. A host without the plugin fails here rather than skip. A GPU's tests a
 everything else.
 """
 
-import contextlib
 import functools
 import re
 import tempfile
@@ -79,18 +78,6 @@ def _device(generation: str) -> Mesh:
     return Mesh(np.array(topology.devices[:1]), ("data",))
 
 
-@contextlib.contextmanager
-def _uncached():
-    """No persistent compilation cache: an executable of a compile-only device is never one to load,
-    nor one a GPU's run should find under its key."""
-    enabled = jax.config.jax_enable_compilation_cache
-    jax.config.update("jax_enable_compilation_cache", False)
-    try:
-        yield
-    finally:
-        jax.config.update("jax_enable_compilation_cache", enabled)
-
-
 def failures(found: list[dict]) -> list[str]:
     """Each compiled record's failure, if any: its error, or its shared bytes past its block's limit."""
     return [f"{record['name']}: {record['error']}" if "error" in record else
@@ -122,7 +109,9 @@ def compile_kernels(cases, generation: str) -> list[dict]:
         except Exception as error:  # A case that does not lower is its own failure.
             record["error"] = f"it does not lower: {str(error)[-800:]}"
             continue
-        with tempfile.TemporaryDirectory(prefix="dew-compile-") as dump, _uncached():
+        # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
+        # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
+        with tempfile.TemporaryDirectory(prefix="dew-compile-") as dump:
             try:
                 lowered.compile(compiler_options={"xla_dump_to": dump})
             except jax.errors.JaxRuntimeError as error:
