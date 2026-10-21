@@ -198,7 +198,9 @@ class HarnessSource:
     you are done. A trainer that exits without either, for example on an
     uncaught KeyboardInterrupt, still stops its trials. Trials run on daemon
     threads, and an atexit hook cancels the queued trials and interrupts the
-    running ones, then kills their process groups after `grace` seconds.
+    running ones, then kills their process groups after `grace` seconds. The
+    threads start, and the hook registers, at the first `submit`:
+    constructing the source starts nothing.
     """
 
     def __init__(
@@ -230,15 +232,13 @@ class HarnessSource:
         self._queue: queue.SimpleQueue[Callable[[], None] | None] = queue.SimpleQueue()
         self._workers = [threading.Thread(target=self._work, name=f"dew-harness-trial-{index}", daemon=True)
                          for index in range(workers)]
-        for worker in self._workers:
-            worker.start()
+        self._started = False
         self._lock = threading.Lock()
         # One record per submitted, unresolved future, queued or running; a done-callback drops it.
         self._records: dict[Future[Session], _Running] = {}
         # Trials run in their own process groups, so a Ctrl-C of the trainer does not reach them: at
         # interpreter exit this hook cancels every record and stops every live trial.
         self._exit_hook = functools.partial(_stop_all, self._records, self._lock, grace)
-        atexit.register(self._exit_hook)
 
     def submit(self, task: Task, samples: int, *, version: int, key: jax.Array) -> list[Future[Session]]:
         del key  # the agent's own requests draw through the gateway, which takes no key
@@ -256,6 +256,11 @@ class HarnessSource:
             with self._lock:
                 if self._closed:
                     raise RuntimeError("the harness source is closed")
+                if not self._started:
+                    for worker in self._workers:
+                        worker.start()
+                    atexit.register(self._exit_hook)
+                    self._started = True
                 self._records[future] = _Running()
                 self._queue.put(functools.partial(self._trial, future, task, group, sample, version))
             future.add_done_callback(self._forget_record)
@@ -313,8 +318,11 @@ class HarnessSource:
         with self._lock:
             # A submission checks this under the same lock, so none queues a trial behind the stop marks.
             self._closed = True
+            started = self._started
             pending = list(self._records)
         self.cancel(pending)
+        if not started:
+            return
         for _ in self._workers:
             self._queue.put(None)
         for worker in self._workers:

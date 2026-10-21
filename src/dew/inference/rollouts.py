@@ -22,7 +22,7 @@ import math
 import os
 import shutil
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -38,7 +38,7 @@ from dew.objectives.base import Variables, thaw
 from dew.records import JSON
 from dew.sampling.text import Generation, Sampling
 
-from .clients import OpenAICompletion, decode_routed_experts
+from .clients import OpenAICompletion, _engine_stops, decode_routed_experts, listed_ids, reported_log_probs
 from .serving import Server, settled
 
 if TYPE_CHECKING:
@@ -163,8 +163,9 @@ class NativeRolloutServer:
     step. The server takes it while a step runs and seats it at the next one.
     The server's own sampling policy and transforms decide the draws, and a
     draw keeps both the raw and the behavior likelihoods the server records.
-    If the program ends without `close`, an exit hook stops the stepping after
-    the step in progress.
+    The stepping thread starts at the first submission, so constructing the
+    server starts nothing. If the program ends without `close`, an exit hook
+    stops the stepping after the step in progress.
 
     A draw ends on one of the policy's EOS ids or at its budget, which is
     what `Draw.terminated` tells apart. A server whose task adds stopping
@@ -186,12 +187,8 @@ class NativeRolloutServer:
         self._outstanding: set[Future[Draw]] = set()
         self._closed = False
         self._failure: BaseException | None = None
-        self._thread = threading.Thread(target=self._run, name="dew-rollout-server", daemon=True)
-        self._thread.start()
-        # A step under way at exit runs to its end inside jaxlib, so the bound is a step's, not a poll's.
-        # The stepping thread stops after the step in progress, which may be a long first compile;
-        # it holds no external call, so exit waits for it rather than finalizing under it.
-        self._withdraw = stop_at_exit(self._thread, self._stop, timeout=None)
+        self._thread: threading.Thread | None = None
+        self._withdraw: Callable[[], None] | None = None
 
     @property
     def sampling(self) -> Sampling:
@@ -215,6 +212,13 @@ class NativeRolloutServer:
                 raise RuntimeError("the rollout server stopped") from self._failure
             if self._closed:
                 raise RuntimeError("the rollout server is closed")
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, name="dew-rollout-server", daemon=True)
+                self._thread.start()
+                # A step under way at exit runs to its end inside jaxlib, so the bound is a step's, not a
+                # poll's. The stepping thread stops after the step in progress, which may be a long first
+                # compile; it holds no external call, so exit waits for it rather than finalizing under it.
+                self._withdraw = stop_at_exit(self._thread, self._stop, timeout=None)
             self._outstanding.add(future)
         try:
             with self._loading:
@@ -287,8 +291,11 @@ class NativeRolloutServer:
 
     def close(self) -> None:
         self._stop()
-        self._thread.join()
-        self._withdraw()
+        with self._futures:
+            thread, withdraw = self._thread, self._withdraw
+        if thread is not None and withdraw is not None:
+            thread.join()
+            withdraw()
         cancelled = RuntimeError("the rollout server closed before this draw finished")
         for future in self._detached():
             settled(future, cancelled)
@@ -481,26 +488,36 @@ class Publication:
     runs only after every replica serves the new version, because a gateway
     stamps a call when it arrives, and a stamp ahead of a replica would claim
     weights the call was not sampled from. A failed push or stamp raises and
-    leaves `version` unchanged. The constructor stamps the launch `version`,
-    so a gateway left at a higher version by an earlier run cannot mislabel
-    this run's first calls. Every process calls `load`, and process 0
-    stamps.
+    leaves `version` unchanged. The launch `version` is stamped when the
+    version is first read, which a scheduler does before it submits a draw
+    under it, so a gateway left at a higher version by an earlier run cannot
+    mislabel this run's first calls, and constructing the publication touches
+    no gateway. Every process calls `load`, and process 0 stamps.
     """
 
     def __init__(self, weights: WeightSync, *, version: int = 0, stamp: Callable[[int], None] | None = None):
         self._weights = weights
         self._stamp = stamp
-        self._stamped(version)
         self._version = version
+        # One lock orders the launch stamp against a load, so the gateway always ends at the version
+        # the engines hold.
+        self._published = threading.Lock()
+        self._launch: int | None = version
 
     @property
     def version(self) -> int:
-        return self._version
+        with self._published:
+            if self._launch is not None:
+                self._stamped(self._launch)
+                self._launch = None
+            return self._version
 
     def load(self, variables: Variables, version: int) -> None:
-        self._weights(variables, version)
-        self._stamped(version)
-        self._version = version
+        with self._published:
+            self._weights(variables, version)
+            self._stamped(version)
+            self._launch = None
+            self._version = version
 
     def _stamped(self, version: int) -> None:
         stamp = self._stamp
@@ -566,7 +583,9 @@ class OpenAIRolloutServer(_RequestServer):
     route, so use `VLLMGenerateServer` for a filtering policy. SGLang's
     `/v1/completions` reports the temperature-scaled distribution before its
     filters, so with SGLang any temperature works but no filter does, and
-    `SGLANG_RETURN_ORIGINAL_LOGPROB` must stay unset. The constructor raises
+    `SGLANG_RETURN_ORIGINAL_LOGPROB` must stay unset. An SGLang draw streams,
+    drawn as the policy without its stops and cut at the first of them
+    (`_streamed`). The constructor raises
     ValueError for the combinations these rules exclude, and for a
     temperature of zero. SGLang honors a seed only under
     `--enable-deterministic-inference`.
@@ -612,7 +631,10 @@ class OpenAIRolloutServer(_RequestServer):
     def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
         import openai
 
+        stops = self._sampling.stops
         try:
+            if self._completion.provider == "sglang":
+                return self._streamed(prompt, budget, seed, version)
             completion = self._completion(
                 [list(prompt)],
                 budget,
@@ -627,7 +649,6 @@ class OpenAIRolloutServer(_RequestServer):
         tokens, probabilities = completion.tokens[0], completion.log_probs[0]
         if tokens is None or probabilities is None:
             raise ValueError(f"the engine reported no sampled token ids; is it {self._completion.provider}?")
-        stops = self._sampling.stops
         terminated = bool(tokens) and tokens[-1] in stops
         reason = completion.finish_reasons[0]
         if reason != ("stop" if terminated else "length") or (not terminated and len(tokens) != budget):
@@ -639,6 +660,65 @@ class OpenAIRolloutServer(_RequestServer):
             raise ValueError("vLLM returned no routed_experts; start it with --enable-return-routed-experts")
         return Draw(prompt, tokens, probabilities, None, terminated, version,
                     routed if self._routing else None).check_stops(stops)
+
+    def _streamed(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
+        """One SGLang draw, streamed, and cut at the policy's first stop.
+
+        SGLang ends a request that names stop ids on its model's EOS ids as
+        well, and its one field that turns those off, `ignore_eos`, turns off
+        the named stops too (sglang/srt/managers/schedule_batch.py:1707-1729
+        at v0.5.20). So the policy is drawn as one without stops, which ends
+        on its budget alone, and the draw is cut where the policy stops: the
+        same distribution, since no later id shapes an earlier one. The draw
+        is streamed so that closing the stream at the stop ends the request
+        there, rather than when the budget runs out: SGLang aborts a request
+        whose client disconnects.
+        """
+        import openai
+
+        stops = self._sampling.stops
+        tokens: list[int] = []
+        probabilities: list[float] = []
+        reason: str | None = None
+        ended: int | None = None
+        with self._completion.stream([list(prompt)], budget, key=seed,
+                                     sampling=replace(self._sampling, eos_token_ids=None), logprobs=0,
+                                     extra_body=self._return_ids) as chunks:
+            for chunk in _engine_chunks(chunks, openai.APIError):
+                # A chunk's ids may run ahead of its log-probabilities (SGLang slices the two apart),
+                # so each is read whole and they are matched by position.
+                for entry in chunk.choices:
+                    choice = entry.to_dict()
+                    ids, reported = listed_ids(choice), reported_log_probs(choice)
+                    if ids is None:
+                        raise ValueError("SGLang streamed no sampled token ids; is return_token_ids set?")
+                    if ended is None:
+                        stopped = next((index for index, token in enumerate(ids) if token in stops), None)
+                        ended = None if stopped is None else len(tokens) + stopped
+                    tokens.extend(ids)
+                    probabilities.extend(() if reported is None else reported[1])
+                    reason = entry.finish_reason or reason
+                if ended is not None and len(probabilities) > ended:
+                    break
+        if ended is not None:
+            tokens, probabilities = tokens[:ended + 1], probabilities[:ended + 1]
+        elif reason != "length" or len(tokens) != budget:
+            raise ValueError(f"finish reason {reason!r} disagrees with {len(tokens)} streamed ids under a "
+                             f"budget of {budget}")
+        if len(probabilities) != len(tokens):
+            raise ValueError(f"SGLang streamed {len(tokens)} ids and {len(probabilities)} log-probabilities")
+        terminated = ended is not None
+        return Draw(prompt, tuple(tokens), tuple(probabilities), None, terminated, version).check_stops(stops)
+
+
+def _engine_chunks[Chunk](chunks: Iterable[Chunk], failure: type[Exception]) -> Iterator[Chunk]:
+    """`chunks` as a stream yields them; a `failure` while it streams (its connection dropped, or
+    the engine's error event, which SGLang sends for an abort, a timeout or an out-of-memory) is
+    an infrastructure failure."""
+    try:
+        yield from chunks
+    except failure as error:
+        raise InfrastructureError(f"the stream failed: {type(error).__name__}: {error}") from error
 
 
 class VLLMGenerateServer(_RequestServer):
@@ -682,9 +762,8 @@ class VLLMGenerateServer(_RequestServer):
         sampling = self._sampling
         parameters: dict[str, JSON] = {"temperature": sampling.temperature, "top_p": sampling.top_p,
                                        "top_k": sampling.top_k, "min_p": sampling.min_p,
-                                       "max_tokens": budget, "seed": seed, "logprobs": 0}
-        if sampling.eos_token_ids is not None:
-            parameters["stop_token_ids"] = list(sampling.stops)
+                                       "max_tokens": budget, "seed": seed, "logprobs": 0,
+                                       **_engine_stops(sampling, "vllm")}
         response = _post(self._root, "/inference/v1/generate",
                          {"token_ids": list(prompt), "sampling_params": parameters}, self._timeout)
         (choice,) = response.json()["choices"]

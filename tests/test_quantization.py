@@ -222,18 +222,16 @@ def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision
     pinned = (Conv(features=16, kernel_size=(3, 3), padding="SAME", feature_group_count=groups,
                    use_bias=False, dtype=jnp.bfloat16, precision=jax.lax.Precision.HIGHEST),
               Native(precision=jax.lax.Precision.HIGHEST))
-    for module in pinned:
-        variables = module.init(jax.random.key(1), x)
-        got = Quantization().apply(module).apply(variables, x).astype(jnp.float32)
-        want = module.apply(variables, x).astype(jnp.float32)
-        assert 0.0 < float(jnp.linalg.norm(got - want) / jnp.linalg.norm(want)) < 0.02
     wide = Native(preferred=jnp.float32)
-    variables = wide.init(jax.random.key(1), x)
-    got = Quantization().apply(wide).apply(variables, x)
-    with jax.default_matmul_precision("highest"):
-        want = wide.apply(variables, x)
-    assert got.dtype == want.dtype == jnp.float32
-    assert 0.0 < float(jnp.linalg.norm(got - want) / jnp.linalg.norm(want)) < 0.02
+    for module in (*pinned, wide):
+        variables = module.init(jax.random.key(1), x)
+        got = Quantization().apply(module).apply(variables, x)
+        with jax.default_matmul_precision("highest"):
+            want = module.apply(variables, x)
+        if module is wide:
+            assert got.dtype == want.dtype == jnp.float32
+        got, want = got.astype(jnp.float32), want.astype(jnp.float32)
+        assert 0.0 < float(jnp.linalg.norm(got - want) / jnp.linalg.norm(want)) < 0.02
 
 
 @pytest.mark.skipif(jax.default_backend() == "gpu",

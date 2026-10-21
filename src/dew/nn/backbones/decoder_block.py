@@ -948,7 +948,10 @@ class DecoderBlock(nn.Module):
         """The state after the sublayer at `site` adds `output` to it."""
         if isinstance(state, _Plain) and self.wiring.ngpt is not None:
             alpha = self.attn_alpha if site == "attention" else self.mlp_alpha
-            stepped_x = stepped(state.x, output, alpha, self.wiring.ngpt.step)
+            # The stepped residual is a fusion boundary. Every later sublayer reads it, and without one
+            # XLA's GPU priority fusion clones each earlier sublayer's normalization into every later one:
+            # 556 of a 72-layer Dory prefill's 664 s compile on an A100 (ledger 635).
+            stepped_x = jax.lax.optimization_barrier(stepped(state.x, output, alpha, self.wiring.ngpt.step))
             return state._replace(x=constrain(stepped_x, RESIDUAL))
         if isinstance(state, _Plain):
             return state._replace(x=constrain(state.x + output, RESIDUAL))

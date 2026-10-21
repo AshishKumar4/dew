@@ -33,7 +33,6 @@ from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import OMITTED, Aux, Batch, Omitted, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import DiffusionObjective
-from dew.registry import metrics
 from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
 from dew.sampling.guidance import CFG, Walk
@@ -85,8 +84,8 @@ class FlowGRPOObjective(DiffusionObjective):
     `sde` configures both the rollout and the rescoring. `variables` is the
     whole variables tree the policy starts from, as `DiffusionObjective`
     takes it: the model's collections, `encoders` and any `autoencoder`.
-    `reward`, `groups`, `rollout_steps` and `train_steps` are the rollout
-    `rollout` builds; a rollout over another reward is a `FlowRollout` of its own.
+    The batches it trains on are a `FlowRollout`'s, which a run builds from
+    its `FlowRolloutConfig`.
     """
 
     # The loss is a policy-gradient surrogate, shown without a direction.
@@ -100,12 +99,8 @@ class FlowGRPOObjective(DiffusionObjective):
                  clip_range: float = 1e-4, adv_clip_max: float = 5.0,
                  autoencoder: AutoEncoder | None = None,
                  guidance: CFG | None = _DEFAULT_GUIDANCE, solver: Solver = _DEFAULT_SOLVER,
-                 steps: int = 41, variables: Variables | None = None, reward: str = "clip_score",
-                 groups: int = 4, rollout_steps: int = 11, train_steps: int | None = None,
+                 steps: int = 41, variables: Variables | None = None,
                  grid: SourceGrid | None | Omitted = OMITTED):
-        if ":" not in reward and reward not in metrics:
-            raise ValueError(f"reward names {reward!r}, which no metric alias names; the aliases are "
-                             f"{sorted(metrics)}, or name a metric by its import path")
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("beta must be finite and non-negative")
         if not math.isfinite(clip_range) or not 0 <= clip_range < 1:
@@ -119,34 +114,12 @@ class FlowGRPOObjective(DiffusionObjective):
         super().__init__(model, process, inputs, autoencoder=autoencoder,
                          unconditional_prob=0, ema_decay=1.0, solver=solver,
                          guidance=guidance, steps=steps, variables=variables, grid=grid)
-        sde.validate(self.process, self.process.times(rollout_steps))
         if beta == 0:
             self.ema = None
         self.sde = sde
         self.beta = beta
         self.clip_range = clip_range
         self.adv_clip_max = adv_clip_max
-        self.reward, self.groups = reward, groups
-        self.rollout_steps, self.train_steps = rollout_steps, train_steps
-
-    def rollout(self) -> FlowRollout:
-        """The trainer's rollout over this objective: `groups` samples of each
-        prompt over `rollout_steps` time points, the first `train_steps`
-        transitions trained, each scored by the image metric `reward` names
-        against its own prompt, higher being better (`clip_score`)."""
-        from dew.artifacts import ImageGrid
-        from dew.eval.common import ImageMetric
-
-        metric = metrics[self.reward]()
-        if not isinstance(metric, ImageMetric):
-            raise ValueError(f"reward {self.reward!r} is a {type(metric).__name__}, and Flow-GRPO "
-                             "scores each sample with an image metric's per-sample measure")
-
-        def reward(images, batch):
-            return np.asarray(metric.fn(ImageGrid(images), batch))
-
-        return FlowRollout(self, reward, groups=self.groups, steps=self.rollout_steps,
-                           train_steps=self.train_steps)
 
     @property
     def validation_loss_refusal(self) -> str | None:
@@ -318,6 +291,7 @@ class FlowRollout:
             raise ValueError("train_steps must select between one and steps-1 transitions")
         if self.objective.sde.noise_level == 0:
             raise ValueError("online FlowGRPO needs positive noise for stochastic transitions")
+        self.objective.sde.validate(self.objective.process, self.objective.process.times(self.steps))
         reserved = {"latents", "next_latents", "timesteps", "next_timesteps", "rollout_steps", "spatial",
                     OLD_LOG_PROBS_KEY, ADVANTAGES_KEY, REWARDS_KEY, "transition_mask"}
         if any(condition.field in reserved for condition in self.objective.inputs.conditions.values()):

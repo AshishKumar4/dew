@@ -23,7 +23,7 @@ from dew import records
 from dew.interop.weights import translate_parameters
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
-from dew.nn.precision import float32_conv_general_dilated, float32_dot_general
+from dew.nn.precision import float32_dot_general
 from dew.registry import Record
 
 from .activations import gelu_exact
@@ -130,8 +130,7 @@ class AudioTokenizerEncoder(nn.Module):
     def __call__(self, mels, lengths, batch_lengths=None):
         cfg = self.config
         batch_lengths = jnp.max(lengths) if batch_lengths is None else batch_lengths
-        conv = functools.partial(Conv, cfg.d_model, dtype=self.dtype, precision=self.precision,
-                                 conv_general_dilated=float32_conv_general_dilated)
+        conv = functools.partial(Conv, cfg.d_model, dtype=self.dtype, precision=self.precision)
         place = jnp.arange(mels.shape[1])[None, :]
         x = jnp.where((place < lengths[:, None])[..., None], mels, 0)
         x = gelu_exact(conv((cfg.kernel_size,), padding=((1, 1),), name="conv1")(x))

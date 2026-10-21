@@ -138,15 +138,6 @@ def float32_matmul(lhs, rhs) -> jax.Array:
     return jnp.matmul(lhs, rhs, precision=float32_products(products_dtype(lhs, rhs)))
 
 
-def float32_conv_general_dilated(lhs, rhs, *args, precision: jax.lax.PrecisionLike = None,
-                                 **kwargs) -> jax.Array:
-    """`jax.lax.conv_general_dilated` at the precision its operands' own dtype takes, as
-    `float32_dot_general` is a product's: a flax convolution's
-    (`nn.Conv(conv_general_dilated=...)`)."""
-    return jax.lax.conv_general_dilated(
-        lhs, rhs, *args, precision=float32_products(products_dtype(lhs, rhs), precision), **kwargs)
-
-
 def configurable_precision(precision: jax.lax.PrecisionLike) -> bool:
     """Whether `jax.default_matmul_precision` can name `precision`: one precision or dot algorithm
     preset, unset or default included; not a pair of precisions or a dot algorithm."""
