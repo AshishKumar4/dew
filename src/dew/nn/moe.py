@@ -417,8 +417,8 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
     chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), precision)
     if chosen == 'pallas' and seen_whole(x) and seen_whole(kernel):
-        # The interpreter only where the computation runs on the CPU: a GPU's lowering would otherwise
-        # carry the Mosaic GPU interpreter's ordered effects in a branch it does not take.
+        # The interpreter only where the computation runs on the CPU (`backend`, which follows a placed
+        # call), so a GPU's lowering of the platform choice never traces it.
         interpreted = implementation == 'pallas' and backend() == 'cpu'
         return grouped_projection(x, kernel, group_sizes, compute, interpreted)
     return _projection(x, kernel, group_sizes, dtype, precision)

@@ -123,6 +123,7 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out():
                                       "kernel gradient")
 
 
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="interprets the kernels in a CPU process")
 @pytest.mark.parametrize("generation_name,implementation", [("sm80", "triton"), ("sm90", "mosaic_gpu")])
 def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(generation_name: str,
                                                                                implementation: str):

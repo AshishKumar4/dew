@@ -337,13 +337,17 @@ def _clocks(ordinal: int) -> tuple[tuple[str, float], ...]:
 
 
 def _one_kind(devices) -> None:
-    """Refuse a run over GPUs of more than one kind: every process traces the same program, so the
-    kernel choices each makes from its own GPU's facts must be the same, which GPUs of one kind give."""
-    kinds = sorted({device.device_kind for device in devices})
+    """Refuse a run whose processes read their facts from GPUs of different kinds: every process traces
+    the same program, so the kernel choices each makes from its first GPU's facts (`gpu_target`) must be
+    the same, which first GPUs of one kind give. A process's other GPUs take no part."""
+    first = {}
+    for device in sorted(devices, key=lambda device: device.id):
+        first.setdefault(device.process_index, device.device_kind)
+    kinds = sorted(set(first.values()))
     if len(kinds) > 1:
-        raise ValueError(f"the run's GPUs are of {len(kinds)} kinds ({', '.join(kinds)}); Dew's kernel "
-                         "choices read one GPU's facts, the same in every process, so a run takes GPUs "
-                         "of one kind")
+        raise ValueError(f"the run's processes read their kernel facts from GPUs of {len(kinds)} kinds "
+                         f"({', '.join(kinds)}); each traces the same program, so their first GPUs must "
+                         "be of one kind")
 
 
 def runtime_facts(target: GpuTarget, device) -> GpuTarget:

@@ -320,7 +320,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def eligible(self, ba, target) -> bool:
         first, second = (value.dtype for name, value in ba.arguments.items()
                          if name in ('tokens', 'kernel', 'cotangent'))
-        return (target.wgmma and first == second and jnp.dtype(first).itemsize == 2
+        # Interpreted only in a CPU process: the interpreter's callbacks are ordered effects, which a GPU
+        # process's lowering of the platform choice cannot carry in the CPU branch it does not take.
+        interpretable = not ba.arguments['interpret'] or jax.default_backend() == 'cpu'
+        return (target.wgmma and first == second and jnp.dtype(first).itemsize == 2 and interpretable
                 and _rated(target, first) and bool(self.space(ba)))
 
     def staged_bytes(self, ba, config: mosaic_gpu.Tiles) -> int:

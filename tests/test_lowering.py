@@ -350,11 +350,18 @@ def test_each_process_reads_the_facts_of_the_gpu_it_sees(tmp_path):
     worker = Path(__file__).with_name("device_facts_worker.py")
     coordinator = f"127.0.0.1:{free_port()}"
     outs = [tmp_path / f"process{rank}.json" for rank in range(2)]
+    # The test's own two GPUs, as the run allotted them, one to each process, which allocates on demand
+    # beside this process's preallocation.
+    visible = [str(device.local_hardware_id) for device in jax.local_devices()[:2]]
+    allotted = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if allotted:
+        visible = [allotted.split(",")[int(ordinal)] for ordinal in visible]
     with ProcessGroup() as pool:
         for rank, out in enumerate(outs):
             pool.running.append(start_process(
                 [sys.executable, str(worker), str(rank), coordinator, str(out)], devices=1,
-                environment={"JAX_PLATFORMS": "cuda", "CUDA_VISIBLE_DEVICES": str(rank)}))
+                environment={"JAX_PLATFORMS": "cuda", "CUDA_VISIBLE_DEVICES": visible[rank],
+                             "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}))
         reports = [report_of(process, out, timeout=300, pool=pool.running)
                    for process, out in zip(pool.running, outs, strict=True)]
     placed = [(report["processes"], report["id"], report["ordinal"]) for report in reports]
@@ -367,14 +374,20 @@ def test_each_process_reads_the_facts_of_the_gpu_it_sees(tmp_path):
 
 
 def test_a_run_over_gpus_of_two_kinds_is_refused():
-    """Each process's kernel choices read its own GPU's facts and must agree with every other's, so a
-    run whose devices are of two kinds is refused; devices of one kind pass."""
+    """Each process's kernel choices read its first GPU's facts and must agree with every other's, so a
+    run whose processes' first GPUs are of two kinds is refused; first GPUs of one kind pass, whatever
+    else a process holds."""
     from dew.nn.kernels.generation import _one_kind
 
-    h100 = SimpleNamespace(device_kind="NVIDIA H100 80GB HBM3")
-    _one_kind([h100, h100])
+    def gpu(identifier, process, kind):
+        return SimpleNamespace(id=identifier, process_index=process, device_kind=kind)
+
+    h100, a100 = "NVIDIA H100 80GB HBM3", "NVIDIA A100-SXM4-80GB"
+    _one_kind([gpu(0, 0, h100), gpu(1, 1, h100)])
+    # One process's second GPU of another kind reads no facts.
+    _one_kind([gpu(0, 0, h100), gpu(1, 0, a100), gpu(2, 1, h100), gpu(3, 1, a100)])
     with pytest.raises(ValueError):
-        _one_kind([h100, SimpleNamespace(device_kind="NVIDIA A100-SXM4-80GB")])
+        _one_kind([gpu(0, 0, h100), gpu(1, 1, a100)])
 
 
 def test_chosen_kernels_keep_other_choices_and_restore_the_row_after_an_exception():
