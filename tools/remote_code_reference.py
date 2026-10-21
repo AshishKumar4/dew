@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the llada-tiny, dream-tiny and mimo-v2-tiny logits with the released model code.
+"""Write tiny masked-decoder and MiMo logits with the pinned releases' own model code.
 
 LLaDA and Dream ship no transformers class: their Hub repos carry their own
 configuration and modeling files, loaded with trust_remote_code. This fetches
@@ -32,6 +32,12 @@ draws the fixture's weights (every parameter, the sinks and the balancing
 bias too, from N(0, 0.1^2) at seed 0, as the class leaves the sinks empty)
 and its token ids, written in the class's split layout:
   python tools/remote_code_reference.py mimo-v2-tiny --draw
+
+The LLaDA MoE tinies use --draw too. LLaDA-MoE, v2 and LLaDA2.0 run
+under transformers 4.57.1; LLaDA2.1 and 2.2 under 5.16.1. Forty token
+grids hold the native fp32 forward to its float64 execution. LLaDA2's
+probes carry the release's explicit block-causal attention mask; this
+records forward parity, not parity with its block-wise generation recipe.
 """
 
 import argparse
@@ -153,8 +159,9 @@ def main() -> None:
                 else:
                     f64 = ensemble(model.double(), ids, name)
             if arguments.check:
-                same = np.array_equal(np.load(FIXTURES / name / "logits.npy"), fp32)
-                print(name, "logits.npy bitwise" if same else "logits.npy differs")
+                saved = 'probe_logits.npy' if name in MOE else 'logits.npy'
+                same = np.array_equal(np.load(FIXTURES / name / saved), fp32)
+                print(name, saved, 'bitwise' if same else 'differs')
             else:
                 if name in MOE:
                     np.save(FIXTURES / name / 'probe_logits.npy', fp32)
