@@ -432,7 +432,7 @@ def _llada_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
                          name, config)
 
 
-def _llada_export_path(name: str, config: Mapping[str, object]) -> str | tuple[str, ...] | None:
+def _llada_export_path(name: str, config: Mapping[str, object]) -> str | None:
     names = _LLADA_MOE_NAMES if 'num_experts' in config else _LLADA_NAMES
     return renamed_name(names, name, config)
 
