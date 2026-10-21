@@ -17,6 +17,7 @@ the last `map_with_index`, which is the only step that reads it.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -31,8 +32,10 @@ import numpy as np
 
 from dew.data.analysis import (
     _LOCAL,
+    _VIEWS,
     _at,
     _cache_manifest,
+    _cache_steps,
     _drops,
     _identity,
     _in_memory,
@@ -42,6 +45,8 @@ from dew.data.analysis import (
     _name,
     _until,
 )
+from dew.data.cache import _Mapped
+from dew.data.concurrent import Concurrently
 from dew.data.dataset import (
     SHARED_BYTES,
     Batch,
@@ -96,6 +101,7 @@ from dew.data.pipeline import (
 from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
+from dew.data.sources.urls import Fetch
 from dew.data.steps.generic import Fields
 from dew.data.steps.text import LayoutRule, ValidTargets, recounted
 from dew.data.text import Chunks
@@ -121,9 +127,39 @@ class _Locality(Protocol):
 @runtime_checkable
 class _Materialized(Protocol):
     """Rows a memory read holds, which state the source position each came
-    from (`dew.data.materialize`)."""
+    from (`dew.data.materialize`), the source it read and the steps it ran over them."""
 
     identifiers: tuple[tuple[int, ...], ...]
+    original: Source
+    ran: tuple[Stage, ...]
+
+
+def _cache_inputs(source: Source, records: Records) -> pygrain.MapDataset:
+    """The records a cache over `source` reads by index, the rows a memory read made each at the
+    source position it came from (`_Placed`), where a step among the cached ones that reads its
+    record's index (`map_with_index`) reads it, as it does without the cache."""
+    stored = pygrain.MapDataset.source(records)
+    if isinstance(source, _Materialized) and source.identifiers:
+        return stored.map_with_index(_Placed(identifiers=source.identifiers, rows=len(stored)))
+    return stored
+
+
+def _threads(stages: Sequence[Stage]) -> int | None:
+    """The most records a fetch among `stages` runs at once on a pool of its own (`Fetch.threads`),
+    or None where none has one."""
+    pools = [stage.step.threads for stage in stages
+             if isinstance(stage, Map) and isinstance(stage.step, Fetch) and stage.step.threads is not None]
+    return max(pools, default=None)
+
+
+def _keyed(source: Source) -> Source:
+    """The source a cache over `source` keys its inputs by: under the memory reads that ran no step
+    over its rows (a compile may materialize a source twice, `_prepared` and `_staged`), the source
+    they hold the rows of, as an indexed read and a publication key it; else `source` itself, the
+    rows a memory read made of it before the first view of its inputs (`_analyzed`)."""
+    while isinstance(source, _Materialized) and not source.ran:
+        source = source.original
+    return source
 
 
 def _outputs(
@@ -312,6 +348,11 @@ class _Prefix:
     stages: tuple[Stage, ...]
 
     @property
+    def threads(self) -> int | None:
+        """The records a fetch among these steps runs at once on its own pool (`Fetch.threads`)."""
+        return _threads(self.stages)
+
+    @property
     def volatile(self) -> bool:
         return any(
             isinstance(stage, Map) and isinstance(stage.step, Volatile) and stage.step.volatile
@@ -345,7 +386,9 @@ class _ShardSteps:
         rows = self.reader(shard)
         rows = gx.FlatMapIterDataset(rows, _CachedOutputs()) if self.cached else rows
         for stage in self.stages:
+            threads = _threads((stage,))
             rows = (_expanded(rows, stage, self.name, self.label) if isinstance(stage, FlatMap)
+                    else Concurrently(rows, _Rows(stage), threads) if threads is not None
                     else rows.map(_Rows(stage)))
         return rows
 
@@ -377,7 +420,7 @@ def _fill(pipeline: Pipeline, source: Source, at: int, read: Read) -> tuple[Cach
     artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
     if not isinstance(artifact, Artifact):
         raise ValueError(f"stage {at} of {_name(pipeline)} is not a cache")
-    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(prefix)
+    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(_cache_steps(prefix))
 
 
 def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[int, int, int]]:
@@ -449,11 +492,112 @@ def _dies_with_parent(index: int, count: int) -> None:
 
 
 def _as_iter(rows: Rows, loading: Loading) -> pygrain.IterDataset:
-    return (
-        rows.to_iter_dataset(pygrain.ReadOptions(loading.threads, loading.read_buffer))
-        if isinstance(rows, pygrain.MapDataset)
-        else rows
-    )
+    """`rows` read in order, as every stage that streams them reads them: indexed rows become an
+    iterator here and nowhere else, which owns the cache fills they read (`_Filled`) as Grain
+    carries it into each loading worker."""
+    if not isinstance(rows, pygrain.MapDataset):
+        return rows
+    iterated = rows.to_iter_dataset(pygrain.ReadOptions(loading.threads, loading.read_buffer))
+    fills = _fills(rows)
+    return _Filled(iterated, fills) if fills else iterated
+
+
+def _fills(rows: Rows) -> tuple[_Mapped, ...]:
+    """The cache reads among `rows` and the datasets they read, each once: the fills an iterator
+    of them starts, finishes when it runs out and closes with it. A cache's own parents are the
+    records it reads, which hold none."""
+    found: dict[int, _Mapped] = {}
+    pending: list[pygrain.MapDataset | pygrain.IterDataset] = [rows]
+    seen: set[int] = set()
+    while pending:
+        dataset = pending.pop()
+        if id(dataset) in seen:
+            continue
+        seen.add(id(dataset))
+        if isinstance(dataset, _Mapped):
+            found[id(dataset)] = dataset
+            continue
+        pending.extend(dataset.parents)
+    return tuple(found.values())
+
+
+@contextlib.contextmanager
+def _closing[Read: (pygrain.MapDataset, pygrain.IterDataset, Rows)](rows: Read) -> Iterator[Read]:
+    """`rows` read by a probe of the order, its cache fills finished and closed when it is done."""
+    fills = _fills(rows)
+    try:
+        yield rows
+        for fill in fills:
+            fill.finish()
+    finally:
+        for fill in fills:
+            fill.close()
+
+
+class _Filled(pygrain.IterDataset):
+    """An iterator of indexed rows that owns the cache fills they read: it starts them, finishes
+    them when it runs out, so a fill that read every input publishes, and closes them with it."""
+
+    def __init__(self, parent: pygrain.IterDataset, fills: tuple[_Mapped, ...]):
+        super().__init__(parent)
+        self._rows, self._fills = parent, fills
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        for fill in self._fills:
+            fill.start()
+        return _FilledIterator(self._rows.__iter__(), self._fills)
+
+
+class _FilledIterator(pygrain.DatasetIterator):
+    def __init__(self, parent: pygrain.DatasetIterator, fills: tuple[_Mapped, ...]):
+        super().__init__(parent)
+        self._rows, self._fills = parent, fills
+
+    def __next__(self):
+        try:
+            return next(self._rows)
+        except StopIteration:
+            for fill in self._fills:
+                fill.finish()
+            raise
+
+    def get_state(self) -> Mapping[str, object]:
+        return self._rows.get_state()
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self._rows.set_state(state)
+
+    def close(self) -> None:
+        self._rows.close()
+        for fill in self._fills:
+            fill.close()
+
+
+class _Inputs(pygrain.MapDataset):
+    """A cache read by input, as the source's rows are: by index, at `positions` (the inputs a store
+    holds, those it misses skipped, as an uncached read skips them), each input's outputs, or the
+    one output of each where the cache holds one record for each input (`single`). The cache writes
+    the missing inputs' completions itself as its fill starts (`Cache.mapped(missing=)`)."""
+
+    def __init__(self, cached: _Mapped, positions: np.ndarray | None, *, single: bool):
+        super().__init__(cached)
+        self._cached, self._positions, self._single = cached, positions, single
+
+    def __len__(self) -> int:
+        return len(self._cached) if self._positions is None else len(self._positions)
+
+    @overload
+    def __getitem__(self, index: slice) -> pygrain.MapDataset: ...
+
+    @overload
+    def __getitem__(self, index: int) -> Record | tuple[Record, ...]: ...
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return self.slice(index)
+        position = index if self._positions is None else int(self._positions[index % len(self)])
+        outputs = self._cached[position]
+        return outputs[0] if self._single and isinstance(outputs, tuple) else outputs
 
 
 def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
@@ -776,12 +920,37 @@ class _Build:
             placed = _Placed(identifiers=identifiers, rows=len(stored))
             rows = stored.map_with_index(placed) if last >= 0 else stored
             return self.shared(rows, pipeline, partition), 0
-        filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
-        cached = filled.mapped(stored, manifest, transform=prefix, source=source)
-        placed = cached.map_with_index(_Placed(rows=len(cached))) if last > cache else cached
-        view = self.shared(placed, pipeline, partition)
-        rows = cached.iterated(view, pygrain.ReadOptions(self.loading.threads, self.loading.read_buffer))
-        flat = gx.FlatMapIterDataset(rows, _CachedOutputs())
+        keyed = _keyed(source)
+        if isinstance(source, _Materialized) and keyed is not source:
+            # A memory read that ran no step before the cache holds the rows of the source it keys,
+            # at the places there it states: the cache reads those, its missing inputs skipped.
+            records = keyed.records(self.read)
+            held = np.asarray([identifier[0] for identifier in source.identifiers], np.int64)
+            positions = None if len(held) == len(records) else held
+        else:
+            present = _Present.of(records) if _in_memory(keyed) else None
+            positions = None if present is None else present.positions
+        stored = _cache_inputs(keyed, records)
+        filled, manifest, prefix = _fill(pipeline, keyed, cache, self.read)
+        # Read by input, as the source's own rows are: its missing inputs skipped, as the uncached
+        # root skips them, and written by the fill; one record for each input reads by index and in
+        # the uncached chain's order, the rest as a stream of each input's outputs.
+        missing = () if positions is None else np.setdiff1d(np.arange(len(stored)), positions).tolist()
+        cached = filled.mapped(stored, manifest, transform=prefix, source=keyed, missing=missing)
+        inputs = _Inputs(cached, positions, single=self.lowering.one_to_one)
+        identifiers = source.identifiers if isinstance(source, _Materialized) else ()
+        if positions is not None:
+            identifiers = tuple((int(position),) for position in positions)
+        placed = (inputs.map_with_index(_Placed(identifiers=identifiers, rows=len(inputs)))
+                  if last > cache else inputs)
+        view = self.viewed(self.shared(placed, pipeline, partition), pipeline, partition, cache)
+        if self.lowering.one_to_one:
+            return view, cache + 1
+        # A fetch with a pool of its own among the cached steps reads that many inputs at once.
+        threads = max(self.loading.threads, prefix.threads or 0)
+        read = dataclasses.replace(self.loading, threads=threads,
+                                   read_buffer=max(self.loading.read_buffer, threads))
+        flat = gx.FlatMapIterDataset(_as_iter(view, read), _CachedOutputs())
         return Accepted(flat, _name(pipeline), _label(pipeline)), cache + 1
 
     def sharded(
@@ -798,7 +967,7 @@ class _Build:
         if cache is not None:
             filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
             shards = _positioned(shards) if 0 <= last < cache else shards
-            reader = filled.streamed(shards.reader, manifest, transform=prefix)
+            reader = filled.streamed(shards.reader, manifest, transform=prefix, threads=prefix.threads)
             shards = dataclasses.replace(shards, reader=reader)
         shards = _positioned(shards) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
@@ -900,7 +1069,9 @@ class _Build:
                 worker_init_fn=_dies_with_parent,
             )
         elif isinstance(stage, Native):
-            rows = stage.function(rows.seed(self.stage_seed(pipeline, at, partition)))
+            # A Grain step reads cache fills through an iterator that owns them (`_Filled`).
+            given = _as_iter(rows, self.loading) if _fills(rows) else rows
+            rows = stage.function(given.seed(self.stage_seed(pipeline, at, partition)))
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
             rows = gx.FlatMapIterDataset(groups, _Groups(stage))
@@ -953,12 +1124,30 @@ class _Build:
             )
         return BlockShuffle(rows, sizes, stage.block_shards, stage.seed)
 
+    def viewed(self, rows: Rows, pipeline: Pipeline, partition: DataPartition, cache: int) -> Rows:
+        """`rows`, a cache's inputs, through the views of them written before the cache
+        (`_VIEWS`: shuffles, repeats, slices, takes), where and as the uncached chain applies them:
+        each input's cached outputs follow it, as its record steps would make them after the view."""
+        for at, stage in enumerate(pipeline.stages[:cache]):
+            if isinstance(stage, _VIEWS):
+                viewed = self.stage(rows, stage, pipeline, partition, at)
+                if not isinstance(viewed, pygrain.MapDataset):
+                    raise ValueError(f"{type(stage).__name__} before the cache of {_name(pipeline)} reads "
+                                     "its inputs as a stream, and the cache is read by index: write it "
+                                     "after the cache")
+                rows = viewed
+        return rows
+
     def record_stage(
         self, rows: Rows, stage: Map | RandomMap | MapWithIndex | Filter | FlatMap, pipeline: Pipeline,
         partition: DataPartition, at: int,
     ) -> Rows:
         lowered = _Rows(stage)
-        if isinstance(stage, FlatMap):
+        threads = _threads((stage,))
+        if threads is not None:
+            # A step with a pool of its own: its records in flight at once, delivered in order.
+            rows = Concurrently(_as_iter(rows, self.loading), lowered, threads)
+        elif isinstance(stage, FlatMap):
             rows = _expanded(_as_iter(rows, self.loading), stage, _name(pipeline), _label(pipeline))
         elif isinstance(stage, RandomMap):
             rows = rows.random_map(lowered, seed=self.stage_seed(pipeline, at, partition))
@@ -986,13 +1175,14 @@ class _Build:
         loading = self.loading
         bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0))
         if loading.workers == "auto":
-            loading = loading.resolved(bare.batched(pipeline, DataPartition())[0])
+            with _closing(bare.batched(pipeline, DataPartition())[0]) as sampled:
+                loading = loading.resolved(sampled)
         if loading.worker_count and (not self.training or not self.lowering.endless):
-            rows = bare.records(pipeline, DataPartition())
-            if isinstance(rows, pygrain.MapDataset):
-                size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
-                batches = -(-len(rows) // size)
-                loading = dataclasses.replace(loading, workers=min(loading.worker_count, batches))
+            with _closing(bare.records(pipeline, DataPartition())) as rows:
+                if isinstance(rows, pygrain.MapDataset):
+                    size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
+                    batches = -(-len(rows) // size)
+                    loading = dataclasses.replace(loading, workers=min(loading.worker_count, batches))
         return dataclasses.replace(self, loading=loading)
 
     def batched(
@@ -1102,8 +1292,10 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
             shares = zip(known, weights, strict=True)
             return max(math.ceil(size * sum(weights) / weight) for size, weight in shares)
         at = _until(pipeline.stages, (Repeat,))
-        rows = build.records(dataclasses.replace(pipeline, stages=pipeline.stages[:at]), DataPartition())
-        return len(rows) if isinstance(rows, pygrain.MapDataset) else None
+        # A token split reads its rows as it is built, filling a cache before it; the probe seals it.
+        with _closing(build.records(dataclasses.replace(pipeline, stages=pipeline.stages[:at]),
+                                    DataPartition())) as rows:
+            return len(rows) if isinstance(rows, pygrain.MapDataset) else None
 
     return counted(train, build)
 
@@ -1123,7 +1315,9 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
             rows = build.records(before, DataPartition())
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
-            yield _TokenSplit(rows, split).spans
+            with _closing(rows) as read:
+                spans = _TokenSplit(read, split).spans
+            yield spans
 
 
 def _weights(mixture: Mixture) -> Sequence[float]:
