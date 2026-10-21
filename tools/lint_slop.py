@@ -1761,9 +1761,28 @@ INVENTORY = "tools/tolerance_inventory.json"
 
 def _tolerance_comparisons(module: Module) -> Iterator[tuple[ast.AST, str]]:
     """SLOP020's comparisons in a module (`tolerance_rules.comparisons`), its imports read from its own
-    package and its calls resolved as SLOP018 resolves them."""
-    tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
-    return tolerance_rules.comparisons(module.tree, tables, _Calls(module.tree))
+    package and its calls resolved as SLOP018 resolves them. A function imported by a bare module name
+    from a file beside it, as tests import their support (`from test_pipeline_core import delivered`),
+    returns only whole numbers where that file's own reading proves it does (`_whole_functions`)."""
+    parent = tuple(_parent(module))
+    tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, list(parent))}
+
+    def whole_import(called: str) -> bool:
+        source, _, name = called.rpartition(".")
+        path = module.path.parent / f"{source}.py"
+        return bool(source) and "." not in source and path.is_file() and name in _whole_functions(
+            path, parent, path.stat().st_mtime_ns)
+
+    return tolerance_rules.comparisons(module.tree, tables, _Calls(module.tree), whole_import)
+
+
+@functools.cache
+def _whole_functions(path: Path, parent: tuple[str, ...], modified: int) -> frozenset[str]:
+    """The module-level functions of the file at `path` every return of which is whole, read as of its
+    modification time `modified`."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tables = {id(node): table for node, table in scopes.scoped(tree.body, {}, list(parent))}
+    return frozenset(tolerance_rules.whole_functions(tree, tables, _Calls(tree)))
 
 
 def _inventory(checkout: Path) -> dict:
