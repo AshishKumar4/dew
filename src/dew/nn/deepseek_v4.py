@@ -60,7 +60,7 @@ from dew.nn.attention_sinks import sink_softmax
 from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
 from dew.nn.fake_quant import FakeQuantizing
-from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, valid_order
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
@@ -128,7 +128,7 @@ def real_first(x, valid):
     (`Coordinates.places`), never a padding token. Unpadded rows come back as they are."""
     if valid is None:
         return x
-    order = jnp.argsort(~valid, axis=1, stable=True)
+    order, _ = valid_order(valid)
     return jnp.take_along_axis(x, order.reshape(*order.shape, *(1,) * (x.ndim - 2)), axis=1)
 
 
