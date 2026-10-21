@@ -280,6 +280,32 @@ def test_a_block_model_unmasks_its_response_one_block_at_a_time():
         MaskedDiffusionObjective(model, task.process, seq_len=8, variables=source.variables)
 
 
+def test_a_block_canvas_over_a_cached_prefix_reads_the_prefix_and_its_earlier_blocks():
+    """A block model's canvas, decoded over the prompt its causal view cached, reads every prefix
+    key and, of its own, the keys of its block and the blocks before it: a token of a later block
+    moves no logit of an earlier one and moves its own block's, and a prompt token moves them all."""
+    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="xla")
+    model = source.model.clone(diffusion_block=4)
+    writer = model.clone(causal=True, diffusion_block=None)
+    mask = model.mask_token_id
+
+    def canvas_logits(prompt, canvas):
+        cache = writer.apply(source.variables, 1, method="init_cache", mutable=["cache"])[1]["cache"]
+        cache = writer.apply({**source.variables, "cache": cache}, jnp.asarray([prompt]), decode=True,
+                             mutable=["cache"])[1]["cache"]
+        return np.asarray(model.apply({**source.variables, "cache": cache}, jnp.asarray([canvas]),
+                                      decode=True, mutable=["cache"])[0])[0]
+
+    # Six prompt places put the canvas's places 6..13 in blocks 1 (6, 7), 2 (8-11) and 3 (12, 13).
+    prompt, canvas = [3, 9, 5, 6, 7, 8], [mask, 11, 12, mask, mask, 13, mask, mask]
+    logits = canvas_logits(prompt, canvas)
+    later = canvas_logits(prompt, [*canvas[:6], 14, 15])
+    np.testing.assert_array_equal(later[:6], logits[:6])
+    assert (later[6:] != logits[6:]).any(axis=-1).all()
+    earlier = canvas_logits([4, *prompt[1:]], canvas)
+    assert (earlier != logits).any(axis=-1).all()
+
+
 def test_masked_continuations_seed_eos_and_zero_budget(masked_source):
     source, inputs = masked_source
     task = source.text_generation()
