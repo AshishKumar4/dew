@@ -176,11 +176,10 @@ class Interpreter:
         if name in {"scan", "while", "cond"}:
             return getattr(self, f"_{name}_loop" if name != "cond" else "_branch")(eqn, operands)
         if name == "linear_call":
-            # The callee on its own constants and the call's arguments; the transpose is not run forward.
-            callee, own = eqn.params["callee"], eqn.params["num_callee_consts"]
-            skipped = own + eqn.params["num_transpose_consts"]
-            return self._program(callee.jaxpr, [_input(c) for c in callee.consts],
-                                 operands[:own] + operands[skipped:])
+            # The callee on the call's whole arguments (its constants, residuals and linear arguments, in
+            # that order); the transpose is not run forward.
+            callee = eqn.params["callee"]
+            return self._program(callee.jaxpr, [_input(c) for c in callee.consts], operands)
         if name in CALLS:
             inner = eqn.params[CALLS[name]]
             closed = inner if hasattr(inner, "consts") else None
@@ -569,12 +568,15 @@ class Interpreter:
             ordinary = inside | below
         else:
             for index in np.flatnonzero(ordinary):
-                with interval_precision(128) as iv:
-                    low, high = interval_ends(iv.exp(iv.mpf(float(x.flat[index]))), 128)
-                native_value = fractions.Fraction(float(value.flat[index]))
-                upper.flat[index] = math.nextafter(float(high), math.inf)
-                apart = max(abs(native_value - low), abs(high - native_value))
-                local.flat[index] = math.nextafter(float(apart), math.inf)
+                try:
+                    with interval_precision(128) as iv:
+                        low, high = interval_ends(iv.exp(iv.mpf(float(x.flat[index]))), 128)
+                    native_value = fractions.Fraction(float(value.flat[index]))
+                    apart = max(abs(native_value - low), abs(high - native_value))
+                    upper.flat[index] = math.nextafter(float(high), math.inf)
+                    local.flat[index] = math.nextafter(float(apart), math.inf)
+                except (ValueError, OverflowError):
+                    ordinary.flat[index] = False
         transfer = _up(_times(upper, _up(e * (1 + e))))
         point = operand.exact & operand.certified & (
             ((x == -np.inf) & (value == 0.0)) | ((x == 0.0) & (value == 1.0)))
@@ -609,7 +611,11 @@ class Interpreter:
                 continue
             native_value = fractions.Fraction(float(value.flat[index]))
             apart = max(abs(native_value - low), abs(high - native_value))
-            error.flat[index] = math.nextafter(float(apart), math.inf) if apart else 0.0
+            try:
+                error.flat[index] = math.nextafter(float(apart), math.inf) if apart else 0.0
+            except OverflowError:
+                certified.flat[index] = False
+                continue
             exact.flat[index] = low == high == native_value and bool(operand.exact.flat[index])
         certified &= np.isfinite(error)
         return [Bounded(native, np.where(certified, error, 0.0), exact & certified, certified)]
