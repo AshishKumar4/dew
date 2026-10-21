@@ -1013,6 +1013,20 @@ def test_a_ramp_stage_begins_where_an_update_does_and_an_update_pools_one_stage(
         np.testing.assert_allclose(pooled[name], value, rtol=1e-5, atol=1e-6, err_msg=name)
 
 
+def test_a_configured_run_counts_its_ramped_epochs_in_stages_aligned_to_its_updates():
+    """A config's run length and its epoch intervals count a ramp's steps as the trainer's stream cuts
+    them, each stage beginning where an update of its accumulation does: an epoch of 64 records ramped
+    from 8 to 16 is five steps read one at a time and six read two to an update."""
+    from dew.config import TrainerConfig
+
+    data = ramped(indexed_data(64, 16), Ramp(start=8, increment=8, samples=24))
+    assert TrainerConfig(epochs=1).total_steps(data) == 5
+    config = TrainerConfig(epochs=1, accumulation=2)
+    assert config.total_steps(data) == config.eval_interval(data) == config.checkpoint_interval(data) == 6
+    with pytest.raises(ValueError):
+        Ramp(start=8, increment=8, samples=24).stages(16, window=0)
+
+
 def test_each_aligned_stage_begins_from_its_own_schedule_and_one_left_no_step_is_dropped():
     """Every stage's start moves to the update boundary at or after its own, not after the moved
     start before it, so no stage drifts past its end; a stage whose start and the next's meet
