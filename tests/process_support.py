@@ -8,16 +8,18 @@ import signal
 import socket
 import subprocess
 import sys
-import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
 
 import pytest
+from tool_support import load
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("multiprocess_worker.py")
 DEVICES = 8
+groups = load("child_groups", "tools/armada")
+"""The children's group ownership Dew's CI uses too."""
 
 
 READ_ONLY = "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ"
@@ -95,9 +97,8 @@ def worker_env(devices: int) -> dict[str, str]:
 
 def start_process(command: Sequence[str], devices: int, *,
                   environment: Mapping[str, str] | None = None) -> subprocess.Popen[str]:
-    return subprocess.Popen(
-        command, cwd=REPO_ROOT, env={**worker_env(devices), **(environment or {})},
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    return groups.start(command, cwd=REPO_ROOT, env={**worker_env(devices), **(environment or {})},
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 
 def spawn(mode: str, out: Path, processes: int = 1, process_id: int = 0,
@@ -118,28 +119,9 @@ def spawn(mode: str, out: Path, processes: int = 1, process_id: int = 0,
 
 def terminate(process: subprocess.Popen[str]) -> None:
     """Kill the session even if its leader already exited and left descendants,
-    and return once none of them still runs: SIGKILL lands asynchronously, so a
-    descendant can still be running when the leader has been reaped."""
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-    process.wait(timeout=60)
-    deadline = time.monotonic() + 60
-    while running := session_members(process.pid):
-        assert time.monotonic() < deadline, f"session {process.pid} still runs {running} after SIGKILL"
-        time.sleep(0.01)
-
-
-def session_members(group: int) -> list[int]:
-    """The live (not zombie) processes of process group `group`."""
-    members = []
-    for stat in Path("/proc").glob("[0-9]*/stat"):
-        try:
-            fields = stat.read_text().rsplit(")", 1)[1].split()
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        if fields[0] != "Z" and int(fields[2]) == group:
-            members.append(int(stat.parent.name))
-    return members
+    and return once none of them still runs (tools/armada/child_groups.py's `stop`)."""
+    running = groups.stop(process, settle=120.0)
+    assert not running, f"session {process.pid} still runs {running} after SIGKILL"
 
 
 class ProcessGroup:

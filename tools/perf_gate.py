@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from benchmark_cases import LM_DENSE, LM_MOE
+from benchmark_cases import DIT_B, FORWARD, LM_DENSE, LM_MOE
 from environments import CACHE, Unlocked, environment, machine_lock
 
 FLOOR = 0.02
@@ -54,7 +54,6 @@ spread still widens the band as for any row) but the materiality the project's r
 grows it materially needs a reason" (BIBLE, compile time is performance), set at a quarter with the owner
 on 2026-10-19."""
 
-DIT = {"patch_size": 4, "emb_features": 768, "num_layers": 12, "num_heads": 12, "mlp_ratio": 4}
 # FLUX.2 and Wan 2.1 1.3B at their head width over a few of their blocks: the
 # rotary, the joint attention and the modulated feed-forwards of the hot path.
 FLUX2 = {"num_layers": 2, "num_single_layers": 4, "heads": 12, "head_dim": 128,
@@ -66,18 +65,15 @@ STEP_CASES = {
                              "batch_size": 4, "seq_len": 1024},
     "step lm-moe 4x1024": {"architecture": "causal_transformer", "config": LM_MOE, "dtype": "bfloat16",
                            "batch_size": 4, "seq_len": 1024},
-    "step simple-dit-b 32x64px": {"architecture": "simple_dit", "config": DIT, "dtype": "bfloat16",
+    "step simple-dit-b 32x64px": {"architecture": "simple_dit", "config": DIT_B, "dtype": "bfloat16",
                                   "batch_size": 32, "image_size": 64},
-    "step simple-mmdit-b 32x64px": {"architecture": "simple_mmdit", "config": DIT, "dtype": "bfloat16",
+    "step simple-mmdit-b 32x64px": {"architecture": "simple_mmdit", "config": DIT_B, "dtype": "bfloat16",
                                     "batch_size": 32, "image_size": 64},
     "step flux2 4x32px": {"architecture": "flux2_transformer", "config": FLUX2, "dtype": "bfloat16",
                           "batch_size": 4, "image_size": 32, "channels": 128},
     "step wan 2x5x32px": {"architecture": "wan_transformer", "config": WAN, "dtype": "bfloat16",
                           "batch_size": 2, "image_size": 32, "channels": 16, "frames": 5},
 }
-# Forward passes of inference modules at their published sizes, random weights.
-FORWARD_CASES = ("vision siglip-400m 384px b8", "vision qwen3.5 448px b8", "vision gemma4 672px b4",
-                 "vae decode sd 512px b4")
 SLOTS = (32, 128)
 """The serving rows' slot counts."""
 ATTENTION = ("cudnn", "xla")
@@ -196,7 +192,7 @@ PROBES = [
     *[Probe((Row(name, "ms", "benchmark_forward.py"),),
             lambda _, out, name=name: ["--cases", name, "--json-out", str(out)],
             lambda _, out, name=name: (json.loads(out.read_text())[name],))
-      for name in FORWARD_CASES],
+      for name in FORWARD],
     Probe((*[Row(f"serve qwen3-0.6b {slots} slots", "items/s", "benchmark_lm_serving.py") for slots in SLOTS],
            # The median of the same repeats: the stalls best-of-five hides (a recompile, a pause), shown.
            *[Row(f"serve qwen3-0.6b {slots} slots, median repeat", "items/s", "benchmark_lm_serving.py",

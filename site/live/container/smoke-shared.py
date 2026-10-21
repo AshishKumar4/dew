@@ -7,7 +7,7 @@ import time
 import uuid
 from pathlib import Path
 
-from shared_bridge import DEADLINE_HEADER, GUEST_UIDS, available, load, processes, resident
+from shared_bridge import DEADLINE_HEADER, GUEST_UIDS, OOM_PROBE, available, load, processes, resident
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
@@ -16,20 +16,9 @@ TEXT = ("from dew.interop import PretrainedDecoder\nfrom dew.sampling import Sam
         "max_seq_len=256)\n"
         "task = model.text_generation(sampling=Sampling(temperature=0))\n"
         "print(task('The capital of France is', 24, key=0).text[0])")
-# A guest cannot lower its OOM score below the 1000 it starts at; its /proc is read-only besides.
-LOWER = """for score in ("-1000", "-999", "0"):
-    try:
-        with open("/proc/self/oom_score_adj", "w") as file:
-            file.write(score)
-    except OSError:
-        pass
-    else:
-        raise AssertionError(f"a guest lowered its OOM score to {score}")
-assert open("/proc/self/oom_score_adj").read().strip() == "1000"
-"""
 # Fill memory 128 MiB at a time until the context's own limit refuses more, having first
 # tried to make itself the last choice of the OOM killer.
-FILL = LOWER + """import numpy as np
+FILL = OOM_PROBE + """import numpy as np
 blocks = []
 try:
     while True:

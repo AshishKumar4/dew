@@ -120,7 +120,7 @@ from .decoder_stack import (
     run_pipeline,
     run_stack,
 )
-from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
+from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, layer_index, scan_groups
 
 _INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
@@ -1686,8 +1686,8 @@ class CausalTransformer(nn.Module):
             return final
         kept = collections.get(_INTERMEDIATES, {}).get(f"layers_{layer}")
         if kept is None:
-            held = sorted(int(name[len("layers_"):]) for name in collections.get(_INTERMEDIATES, {})
-                          if name.startswith("layers_") and name[len("layers_"):].isdigit())
+            held = sorted(index for name in collections.get(_INTERMEDIATES, {})
+                          if (index := layer_index(name)) is not None)
             raise ValueError(f"the model kept no layer {layer}; it kept layers {held}")
         return kept["__call__"][-1]
 
