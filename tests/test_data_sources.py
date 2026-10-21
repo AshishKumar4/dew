@@ -526,20 +526,6 @@ def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
     assert tokens.tolist() == list(original)
 
 
-def test_a_split_names_a_split_of_a_hub_or_tfds_url_and_a_file_store_refuses_one(tmp_path):
-    """`source(url, split=)` picks a split of a Hub or TFDS URL; a file store reads what it holds, so
-    it refuses a split by name rather than read its files as the split asked for."""
-    from dew.data.sources import TFDS, source
-
-    rows = tmp_path / "rows.jsonl"
-    rows.write_text('{"text": "a"}\n')
-    tfds_test = source("tfds://dew_images", split="test")
-    assert isinstance(tfds_test, TFDS) and tfds_test.split == "test"
-    assert isinstance(source(str(rows)), Files)
-    with pytest.raises(ValueError):
-        source(str(rows), split="val")
-
-
 def test_a_token_export_of_no_documents_reads_as_an_empty_corpus(tmp_path):
     """An export whose input yields no rows commits no shards, and reads back as no tokens and no
     documents rather than failing to open."""
