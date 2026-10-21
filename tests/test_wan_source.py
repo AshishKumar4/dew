@@ -370,8 +370,14 @@ def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, 
     batch = clip_batch(objective, prompts)
     trainer = Trainer(objective, optax.sgd(1e-1), key=jax.random.key(3))
     initial = trainer.initial_state()
+    # The step donates the state it is given, so what it is compared with is read first; the
+    # source it started from still reads as loaded after it.
+    held, loaded = jax.device_get(initial), jax.device_get(tuned.variables)
     state, _, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
+    for leaf, before in zip(jax.tree.leaves(tuned.variables), jax.tree.leaves(loaded), strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), before)
+    initial = held
     factors = jax.tree_util.tree_leaves_with_path(state.variables["params"])
     assert factors and all(path[-1].key in ("lora_A", "lora_B") for path, _ in factors)
     assert all(bool(jnp.any(leaf)) for path, leaf in factors if path[-1].key == "lora_B")
