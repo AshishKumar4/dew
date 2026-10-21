@@ -9,7 +9,7 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Pass dense MLA visibility descriptors to the shared attention core. [41]
 - Bind native Flax forward methods explicitly, including the objective's choice of forward method. [171]
 - Inventory FlaxDiff capabilities with a receipt or an explicit gap for each, and publish workflow-level qualification against MaxText rather than inferring it from individual components. [230, 267]
-- Load the requested families Dew does not load yet: Qwen4-Exp, MiniMax Text-01, M1 and M3, the LLaDA MoE variants and LLaDA 2.x, DiffuCoder, Kimi K2.5's and K3's vision, and MiniMax M2.5, M2.7 and H3. [849, 850, 851, 852, 853, 854, 855, 856]
+- Load the requested families Dew does not load yet: Qwen4-Exp, MiniMax Text-01, M1 and M3, the LLaDA MoE variants and LLaDA 2.x, DiffuCoder, Kimi K2.5's and K3's vision, and MiniMax M2.5, M2.7 and H3. [266, 849, 850, 851, 852, 853, 854, 855, 856]
 - Complete Nemotron 3 Ultra, MiMo-V2.6-Pro and Muse Glimmer on the shared family components. Current support covers only parts of their text and multimodal configurations. [357]
 - Add K2 Horizon's MoVA routed value-expert attention on the shared attention and routing primitives; dense K2 Horizon already has source qualification. [479]
 - Qualify MiniCPM5-2B through the existing llama reader and record its supported source fields. [480]
