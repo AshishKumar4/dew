@@ -89,8 +89,8 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         if ids is not None:
             narrowing["query_ids"] = ids[0][row, rows]
 
-        def step(j, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array]):
-            state, arg, own = carry
+        def step(j, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array, jax.Array]):
+            state, arg, own, others_total = carry
             columns = j * block_k + jnp.arange(block_k)
             coords = algebra.Coords(q_pos, columns[None, :], **narrowing,
                                     key_ids=None if ids is None else ids[1][row, columns])
@@ -106,9 +106,10 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             anchor = algebra.argmax(arg, logits, coords.k_pos)
             others, own_tile = algebra.anchor_split(algebra.narrow(weights, v_tile.dtype),
                                                     coords.k_pos == anchor.key[:, None])
-            acc, own = algebra.split_accumulate(state.acc, own, alpha, anchor.peak > arg.peak,
-                                                value[row, arg.key, kv_head], _dot(others, v_tile), own_tile)
-            return algebra.Partial(acc, m, denominator), anchor, own
+            acc, own, others_total = algebra.split_accumulate(
+                state.acc, own, others_total, alpha, anchor.peak > arg.peak, value[row, arg.key, kv_head],
+                _dot(others, v_tile), others, own_tile)
+            return algebra.Partial(acc, m, denominator), anchor, own, others_total
 
         if initial is None:
             state = algebra.empty(block_q, value_width)
@@ -123,14 +124,16 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             lo, hi = 0, tiles
         out_params = tuple(_output_param(param, kind, row, head, rows)
                            for param, kind in zip(output_params, output_kinds, strict=True))
-        split, arg, own = jax.lax.fori_loop(lo, hi, step, (state, algebra.no_argmax(block_q),
-                                                           jnp.zeros((block_q,), jnp.float32)))
+        nothing = jnp.zeros((block_q,), jnp.float32)
+        carry = state, algebra.no_argmax(block_q), nothing, nothing
+        split, arg, own, others_total = jax.lax.fori_loop(lo, hi, step, carry)
         state = split._replace(acc=algebra.split_output(split.acc, own, value[row, arg.key, kv_head]))
         out, m, denominator = algebra.finish(spec, state, initial=initial is not None, output_mod=output_mod,
                                              output_params=out_params)
-        return out.astype(query.dtype), m, denominator, arg.key, split.acc, own
+        return out.astype(query.dtype), m, denominator, arg.key, split.acc, own, others_total
 
-    out, m, denominator, anchors, others, own = jax.lax.map(program, jnp.arange(blocks * batch * heads))
+    out, m, denominator, anchors, others, own, others_total = jax.lax.map(program,
+                                                                          jnp.arange(blocks * batch * heads))
     # [blocks * batch * heads, bq, ...] back to [B, Qp, H, ...] and [B, H, Qp].
     out = out.reshape(blocks, batch, heads, block_q, value_width).transpose(1, 0, 3, 2, 4)
     out = out.reshape(batch, queries, heads, value_width)
@@ -140,7 +143,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
 
     others = others.reshape(blocks, batch, heads, block_q, value_width).transpose(1, 2, 0, 3, 4)
     return (out, rowwise(m), rowwise(denominator), rowwise(anchors),
-            Split(others.reshape(batch, heads, queries, value_width), rowwise(own)))
+            Split(others.reshape(batch, heads, queries, value_width), rowwise(own), rowwise(others_total)))
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
@@ -166,7 +169,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
         output_mod=hooks.output_mod)
     if not residuals:
         return out[:, :queries, :, :value_width]
-    sums = Split(split.others[:, :, :queries, :value_width], split.own[:, :, :queries])
+    sums = Split(split.others[:, :, :queries, :value_width], split.own[:, :, :queries],
+                 split.others_total[:, :, :queries])
     return (out[:, :queries, :, :value_width], m[:, :, :queries], denominator[:, :, :queries],
             anchors[:, :, :queries], sums)
 
@@ -241,8 +245,9 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                                                              state_share, chosen)
         else:
             # The forward took the first pass (`algebra.split_delta`).
-            anchor, delta, chosen = algebra.split_delta(sums[0][row, head, rows], sums[1][row, head, rows],
-                                                        sums[2][row, head, rows], anchor_rows, do, chosen)
+            others, own, others_total, forward_total = (part[row, head, rows] for part in sums)
+            anchor, delta, chosen = algebra.split_delta(others, own, others_total, forward_total, state_total,
+                                                        anchor_rows, do, chosen)
         m = maxima
 
         def step(j, carry):
@@ -381,7 +386,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 
 
 def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, others, own,
-            forward_total, start, end, query_ids, key_ids, score_params, *, score_mod,
+            others_total, forward_total, start, end, query_ids, key_ids, score_params, *, score_mod,
             score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float, block_q: int,
             block_k: int, split: bool):
     """The Triton backward's outputs (`TritonBackward`), from this mainloop's two launches."""
@@ -389,7 +394,7 @@ def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_ind
     spans = start, end, query_ids, key_ids
     shared = {"score_mod": score_mod, "score_kinds": score_kinds, "scale": scale, "block_q": block_q,
               "block_k": block_k}
-    sums = (others, own, forward_total) if split else None
+    sums = (others, own, others_total, forward_total) if split else None
     dq, softmax, chosen, dq_grads = _dq_launch(query, key, value, dout, peak, total, initial_term, maximum,
                                                key_index, anchor_value, sums, spans, score_params, **shared)
     delta, anchor, m, denominator, _ = softmax

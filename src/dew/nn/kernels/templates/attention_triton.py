@@ -198,30 +198,33 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         acc = algebra.rescale(state.acc, alpha) + _dot(algebra.narrow(weights, value.dtype), value, interpret)
         return algebra.Partial(acc, m, denominator)
 
-    def tracked(index, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array]):
+    def tracked(index, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array, jax.Array]):
         # A training forward's step: the anchor key and the split sums the backward reads
         # (`algebra.split_accumulate`); its state's values are `B`, every key's but the anchor's.
-        state, arg, own = carry
+        state, arg, own, others_total = carry
         tile, coords, logits, m, alpha, weights, denominator = softmax(index, state)
         anchor = algebra.argmax(arg, logits, coords.k_pos)
         moved = anchor.peak > arg.peak
         value = value_ref[tile, :]
         others, own_tile = algebra.anchor_split(algebra.narrow(weights, value.dtype),
                                                 coords.k_pos == anchor.key[:, None])
-        acc, own = algebra.split_accumulate(state.acc, own, alpha, moved, value_ref[arg.key, :],
-                                            _dot(others, value, interpret), own_tile)
-        return algebra.Partial(acc, m, denominator), anchor, own
+        product = _dot(others, value, interpret)
+        acc, own, others_total = algebra.split_accumulate(state.acc, own, others_total, alpha, moved,
+                                                          value_ref[arg.key, :], product, others, own_tile)
+        return algebra.Partial(acc, m, denominator), anchor, own, others_total
 
     start = (algebra.resumed(spec, *(ref[...] for ref in initial_refs)) if initial
              else algebra.empty(block_q, value_ref.shape[-1]))
     output_params = tuple(_tile_param(ref, kind, head, q_pos, None)
                           for ref, kind in zip(output_refs, output_kinds, strict=True))
     if residuals:
-        split, arg, own = jax.lax.fori_loop(lo, hi, tracked, (start, algebra.no_argmax(block_q),
-                                                              jnp.zeros((block_q,), jnp.float32)))
+        nothing = jnp.zeros((block_q,), jnp.float32)
+        carry = start, algebra.no_argmax(block_q), nothing, nothing
+        split, arg, own, others_total = jax.lax.fori_loop(lo, hi, tracked, carry)
         residual_refs[2][...] = arg.key
         residual_refs[3][...] = split.acc
         residual_refs[4][...] = own
+        residual_refs[5][...] = others_total
         state = split._replace(acc=algebra.split_output(split.acc, own, value_ref[arg.key, :]))
     else:
         state = jax.lax.fori_loop(lo, hi, step, start)
@@ -299,9 +302,9 @@ class TritonForward(Template[Tiles]):
             out_shape += [*[jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 2,
                           jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32),
                           jax.ShapeDtypeStruct((batch, heads, queries, value_width), jnp.float32),
-                          jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)]
+                          *[jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 2]
             per_value = pl.BlockSpec((None, None, block_q, value_width), lambda i, b, h: (b, h, i, 0))
-            out_specs += [per_row, per_row, per_row, per_value, per_row]
+            out_specs += [per_row, per_row, per_row, per_value, per_row, per_row]
         spec = algebra.Forward(self.form, self.keys or keys, ids, self.scale, self.score_mod)
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
@@ -418,9 +421,10 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
              interpret=interpret)
     if not residuals:
         return out[:, :queries, :, :value_width]
-    out, peak, total, anchors, others, own = out
+    out, peak, total, anchors, others, own, others_total = out
     return (out[:, :queries, :, :value_width], peak[:, :, :queries], total[:, :, :queries],
-            anchors[:, :, :queries], Split(others[:, :, :queries, :value_width], own[:, :, :queries]))
+            anchors[:, :, :queries],
+            Split(others[:, :, :queries, :value_width], own[:, :, :queries], others_total[:, :, :queries]))
 
 
 def _key_param(ref, kind: Kind, head, rows):
@@ -473,7 +477,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     (query_ref, key_ref, value_ref, dout_ref, peak_ref, total_ref, initial_ref, maximum_ref, index_ref,
      anchor_value_ref) = (refs.pop(0) for _ in range(10))
     # The forward's split sums and denominator, where it gives them (`algebra.split_delta`).
-    split_refs = [refs.pop(0) for _ in range(3 if split else 0)]
+    split_refs = [refs.pop(0) for _ in range(4 if split else 0)]
     score_refs = [refs.pop(0) for _ in score_kinds]
     dq_ref, delta_ref, anchor_ref, peak_out_ref, total_out_ref, mass_ref, index_out_ref, *outputs = refs
     grad_refs = {place: outputs.pop(0) for place, kind in enumerate(score_kinds) if kind in DQ_GRADS}
@@ -516,9 +520,10 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
                                                                 value_ref.shape[-1])
     if split:
         # The forward took the first pass (`algebra.split_accumulate`).
-        others_ref, own_ref, forward_total_ref = split_refs
-        anchor, delta, key_index = algebra.split_delta(others_ref[...], own_ref[...], forward_total_ref[...],
-                                                       anchor_value_ref[...], dout, key_index)
+        others_ref, own_ref, others_total_ref, forward_total_ref = split_refs
+        anchor, delta, key_index = algebra.split_delta(
+            others_ref[...], own_ref[...], others_total_ref[...], forward_total_ref[...], state_total,
+            anchor_value_ref[...], dout, key_index)
     else:
         state = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_terms, before)
         anchor, delta, key_index = algebra.off_anchor_delta(state, anchor_value_ref[...], dout, state_total,
@@ -675,12 +680,12 @@ class TritonBackward(Template[BackwardTiles]):
     split: bool = True
 
     def _fwd(self, query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value,
-             others, own, forward_total, start, end, query_ids, key_ids, score_params, *, interpret: bool,
-             config: BackwardTiles, return_residuals: bool = False):
+             others, own, others_total, forward_total, start, end, query_ids, key_ids, score_params, *,
+             interpret: bool, config: BackwardTiles, return_residuals: bool = False):
         shared = {"score_mod": self.score_mod, "score_kinds": self.score_kinds, "scale": self.scale,
                   "block_q": config.block_q, "block_k": config.block_k, "interpret": interpret}
         spans = start, end, query_ids, key_ids, score_params
-        sums = (others, own, forward_total) if self.split else None
+        sums = (others, own, others_total, forward_total) if self.split else None
         dq_out = _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index,
                             anchor_value, sums, *spans, warps=config.dq_warps, stages=config.dq_stages,
                             **shared)
@@ -814,9 +819,9 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
     arrays = [bounds, start, end, *([query_ids, key_ids] if ids else []), query, key, value, dout, peak,
               total, initial_term, maximum, key_index, anchor_value]
     if sums is not None:
-        # The forward's split sums `[B, H, Qp, Dvp]` and `[B, H, Qp]`, and its denominator.
+        # The forward's split sums `[B, H, Qp, Dvp]` and `[B, H, Qp]` twice, and its denominator.
         in_specs += [pl.BlockSpec((None, None, block_q, value_width), lambda i, b, h: (b, h, i, 0)),
-                     per_head, per_head]
+                     per_head, per_head, per_head]
         arrays += list(sums)
     for param, kind in zip(score_params, score_kinds, strict=True):
         in_specs.append(_param_spec(kind, param, block_q, keys))

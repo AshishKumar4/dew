@@ -193,16 +193,19 @@ def anchor_split(narrowed: jax.Array, at_anchor: jax.Array) -> tuple[jax.Array, 
             jnp.where(at_anchor, narrowed, zero).astype(jnp.float32).sum(axis=-1))
 
 
-def split_accumulate(others: jax.Array, own: jax.Array, alpha: jax.Array, moved: jax.Array,
-                     old_value: jax.Array, product: jax.Array,
-                     own_tile: jax.Array) -> tuple[jax.Array, jax.Array]:
+def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array, alpha: jax.Array,
+                     moved: jax.Array, old_value: jax.Array, product: jax.Array, rest: jax.Array,
+                     own_tile: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     """A training forward's weighted values kept apart from the anchor key's (`others`, `B`, with the
-    initial state's), and the anchor's own weight, after a tile: where the anchor moved to this tile
-    (`moved`), the old anchor's term (its weight times its value row, `old_value`, which the mainloop
-    gathers) joins `B` before the rescale, and the new anchor's weight is the tile's (`own_tile`); the
-    tile's other keys add their `product`. So `B` is summed with no key's weight cancelled out of it."""
+    initial state's), the anchor's own weight, and the other keys' weights' sum (`others_total`, keys
+    alone), after a tile: where the anchor moved to this tile (`moved`), the old anchor's term (its
+    weight times its value row, `old_value`, which the mainloop gathers, and its weight) joins `B` and
+    the sum before the rescale, and the new anchor's weight is the tile's (`own_tile`); the tile's other
+    keys add their `product` and their narrowed weights `rest`. So neither is summed with a key's weight
+    cancelled out of it."""
     joined = jnp.where(moved[:, None], own[:, None] * old_value.astype(jnp.float32), 0.0)
-    return rescale(others + joined, alpha) + product, jnp.where(moved, own_tile, alpha * own)
+    total = alpha * (others_total + jnp.where(moved, own, 0.0)) + rest.astype(jnp.float32).sum(axis=-1)
+    return rescale(others + joined, alpha) + product, jnp.where(moved, own_tile, alpha * own), total
 
 
 def split_output(others: jax.Array, own: jax.Array, anchor_value: jax.Array) -> jax.Array:
@@ -372,17 +375,21 @@ def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array,
             jnp.where(anchored, key_index, -1))
 
 
-def split_delta(others: jax.Array, own: jax.Array, total: jax.Array, anchor_value: jax.Array,
-                dout: jax.Array, key_index: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """`off_anchor_delta` from a training forward's split sums (`split_accumulate`): `B`, the initial
-    state's share inside it, its total and the anchor's own weight, the backward's first pass taken
-    by the forward. D's numerator about 0 is `(B + own v_c) · dO`, about `c = v_c · dO` it is
-    `(B - (total - own) v_c) · dO`; each query takes the one nearer its D."""
+def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, total: jax.Array,
+                state_total: jax.Array, anchor_value: jax.Array, dout: jax.Array,
+                key_index: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`off_anchor_delta` from a training forward's split sums (`split_accumulate`), the backward's first
+    pass taken by the forward: `B` with the initial state's share inside it, the other keys' weights'
+    sum, the anchor's own weight, the denominator `total` and the initial state's own `state_total`, all
+    at the forward's maximum. D's numerator about 0 is `(B + own v_c) · dO`, about `c = v_c · dO` it is
+    `(B - others_total v_c) · dO - state_total c`, its terms kept apart so a state or keys that weigh
+    little beside the anchor are not lost from a total; each query takes the one nearer its D."""
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
     anchor = jnp.sum(anchor_value * cotangent, axis=-1)
     about_zero = jnp.sum(split_output(others, own, anchor_value) * cotangent, axis=-1)
-    about_anchor = jnp.sum((others - (total - own)[:, None] * anchor_value) * cotangent, axis=-1)
+    about_anchor = (jnp.sum((others - others_total[:, None] * anchor_value) * cotangent, axis=-1)
+                    - state_total * anchor)
     anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
     numerator = jnp.where(anchored, about_anchor, about_zero)
     return jnp.where(anchored, anchor, 0.0), numerator * inverse(total), jnp.where(anchored, key_index, -1)
