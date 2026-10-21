@@ -33,6 +33,7 @@ from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import OMITTED, Aux, Batch, Omitted, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import DiffusionObjective
+from dew.rl.advantage import group_normalised
 from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
 from dew.sampling.guidance import CFG, Walk
@@ -369,12 +370,10 @@ class FlowRollout:
         `train_steps` transitions train, and a row whose group gave it no
         advantage is masked out of the loss.
         """
-        grouped = rewards.reshape(-1, self.groups)
-        centered = grouped - grouped.mean(axis=1, keepdims=True)
-        # The author code uses float64 population statistics. The shared
-        # JAX group estimator fixes float32 and ddof=1, which changes this loss.
-        deviation = grouped.std(axis=1, keepdims=True)
-        advantages = (centered / (deviation + 1e-4)).astype(np.float32).reshape(-1)
+        # The author code uses float64 population statistics on the host, and 1e-4; text GRPO's
+        # estimator (`group_advantage`) float32 and ddof=1, which would change this loss.
+        advantages = group_normalised(rewards.reshape(-1, self.groups), ddof=0, eps=1e-4, xp=np)
+        advantages = advantages.astype(np.float32).reshape(-1)
         if not np.isfinite(advantages).all():
             raise ValueError("flow group advantages must remain finite")
         selected = self.steps - 1 if self.train_steps is None else self.train_steps
