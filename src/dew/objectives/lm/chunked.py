@@ -579,22 +579,30 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, resi
         logits, 0, excluded, peaks, masses, targets.reshape(-1), loss_cotangent.reshape(-1),
         partition_cotangent.reshape(-1), picked))
     d_raw = _logits_cotangent(d_raw, precision)
-    d_states = _state_product(d_raw, table.astype(operands), precision, work, WHOLE_STATE_BLOCK)
+    d_states = _state_product(d_raw, table.astype(operands), precision, work,
+                              None if precision is BF16 else FP32_STATE_BLOCK)
     d_table = jnp.einsum('tv,td->vd', d_raw, hidden.reshape(-1, features).astype(operands),
                          precision=precision, preferred_element_type=work)
     return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
             None, None, d_cap, d_columns)
 
 
-WHOLE_STATE_BLOCK: int | None = None
-"""The columns the whole head's state gradient sums each block of before a compensated sum over the
-blocks (`_state_product`), or None for one product over every column."""
+FP32_STATE_BLOCK = 1024
+"""The columns an fp32 whole head's state gradient sums each block of before a compensated sum over
+the blocks (`_state_product`). One product over a whole vocabulary rounds its long sum alone: 131
+tokens over 2053 columns sat 1.60 times as far from float64 as the tiled head on XLA:CPU, 1.11 times
+over 1024-column blocks and 0.90 over 512 (24 seeds), check 1 passing at both. On one A100-40GB,
+Qwen3-0.6B's head (151936 columns, 1024 wide, 4096 tokens) in fp32 took 53.7 ms forward and backward
+at 1024, 64.2 at 512, against 57.1 tiled and 40.0 for one product (node receipts
+TR-head-blocks-float32, 2026-10-21); in bf16, where one product passes check 1, it took 23.9 ms
+against 29.9 tiled and 36.7 at 1024, so a bf16 head keeps one product."""
 
 
 def _state_product(d_raw, table, precision, work, block: int | None) -> jax.Array:
     """The state gradient `d_raw @ table` over the vocabulary: one product, or with `block` the
-    vocabulary cut into blocks of that many columns, every block's product taken at once
-    (`[blocks, tokens, features]`) and the blocks summed as a double-float pair (`compensated_add`)."""
+    vocabulary cut into blocks of that many columns (`FP32_STATE_BLOCK`), every block's product taken
+    at once (`[blocks, tokens, features]`) and the blocks summed as a double-float pair
+    (`compensated_add`)."""
     if block is None or table.shape[0] <= block:
         return jnp.einsum('tv,vd->td', d_raw, table, precision=precision, preferred_element_type=work)
     count = -(-table.shape[0] // block)
