@@ -29,6 +29,13 @@ from .common import (
 from .vit import MergeProjector, VisionTransformer, ViTLayout
 
 
+def default_layer_types(layers: int) -> tuple[str, ...]:
+    """Muse Glimmer's attention cadence over `layers` layers: full attention every fourth layer and
+    at the last, window attention elsewhere (MuseGlimmerVisionConfig's default `layer_types`)."""
+    return tuple("full_attention" if (i + 1) % 4 == 0 or i == layers - 1 else "window_attention"
+                 for i in range(layers))
+
+
 @dataclasses.dataclass(frozen=True)
 class MuseGlimmerVision(TowerBase):
     """Muse Glimmer's trunk geometry under its vision_config's names.
@@ -54,8 +61,7 @@ class MuseGlimmerVision(TowerBase):
     pos_emb_width: int = 32
     layer_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
-    layer_types: tuple[str, ...] = tuple(
-        "full_attention" if (i + 1) % 4 == 0 or i == 49 else "window_attention" for i in range(50))
+    layer_types: tuple[str, ...] = default_layer_types(50)
 
     def __post_init__(self):
         if len(self.layer_types) != self.num_hidden_layers:
@@ -157,9 +163,7 @@ def translate_muse_glimmer_vision_config(hf_config: Mapping[str, object]) -> Rec
     if vision.get("model_type", "muse_glimmer_vision") != "muse_glimmer_vision":
         raise ValueError(f"vision model_type {vision.get('model_type')!r} is not Muse Glimmer's trunk")
     layers = records.integer(vision["num_hidden_layers"], "num_hidden_layers")
-    default = ["full_attention" if (i + 1) % 4 == 0 or i == layers - 1 else "window_attention"
-               for i in range(layers)]
-    kinds = records.strings(vision.get("layer_types") or default, "layer_types")
+    kinds = records.strings(vision.get("layer_types") or default_layer_types(layers), "layer_types")
     unknown = sorted(set(kinds) - {"full_attention", "window_attention"})
     if unknown:
         raise ValueError(f"layer_types {unknown} are neither window_attention nor full_attention")
