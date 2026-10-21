@@ -403,3 +403,57 @@ def test_a_function_is_held_to_its_interval_enclosure_over_its_operands_bound():
         assert fractions.Fraction(float(out.error)) >= apart, function
     negative, _ = _interpreted(jnp.log, jnp.asarray([-1.0], jnp.float32))
     assert not negative.certified.any()
+
+
+def test_a_scan_carries_its_bound_through_every_step_in_its_order():
+    """A running fp32 sum by `scan`, forward and reversed: certified, its final carry's bound at least
+    its distance from the exact sum, and each stacked step's its own."""
+    x = jnp.asarray([1.0, 2.0 ** -24, 2.0 ** -24, -1.0], jnp.float32)
+    exact = sum(fractions.Fraction(float(v)) for v in x)
+    for reverse in (False, True):
+        def running(v, reverse=reverse):
+            return jax.lax.scan(lambda c, t: (c + t, c), jnp.float32(0.0), v, reverse=reverse)
+
+        interpreter = Interpreter()
+        total, steps = interpreter.run(jax.make_jaxpr(running)(x), x)
+        assert total.certified.all() and steps.certified.all()
+        assert steps.value.shape == (4,)
+        assert fractions.Fraction(float(total.error)) >= abs(exact - fractions.Fraction(float(total.value)))
+
+
+def test_a_loop_whose_count_rounding_decides_is_not_certified_and_a_counted_one_is():
+    """s, a cancellation that is -1 natively and 0 exactly: `while s < 0: s += 1` runs once natively and
+    not at all exactly, its first predicate undecided, so nothing is certified; a `fori_loop` counted by
+    an exact integer is."""
+    summed, inputs = _sequential([TWO_24, 1.0, -TWO_24, -1.0])
+
+    def counted_by_rounding(x):
+        return jax.lax.while_loop(lambda s: s < 0, lambda s: s + 1, summed(x))
+
+    out, blocked = _interpreted(counted_by_rounding, *inputs)
+    assert not out.certified.any() and any(name.startswith("while") for name in blocked)
+
+    def counted(x):
+        return jax.lax.fori_loop(0, 3, lambda i, s: s + x[i], jnp.float32(0.0))
+
+    out, _ = _interpreted(counted, *inputs)
+    assert out.certified.all()
+
+
+def test_a_branch_rounding_decides_is_not_certified_and_a_decided_one_is():
+    """`cond(s > -0.5, ...)` with s the cancellation above takes the other branch natively than exactly:
+    undecided, so not certified; on an exact predicate it is."""
+    summed, inputs = _sequential([TWO_24, 1.0, -TWO_24, -1.0])
+
+    def flipped(x):
+        s = summed(x)
+        return jax.lax.cond(s > -0.5, lambda: s * 2, lambda: s * 3)
+
+    out, blocked = _interpreted(flipped, *inputs)
+    assert not out.certified.any() and any(name.startswith("cond") for name in blocked)
+
+    def decided(x):
+        return jax.lax.cond(x[0] > 0, lambda: x[1] * 2, lambda: x[1] * 3)
+
+    out, _ = _interpreted(decided, *inputs)
+    assert out.certified.all() and out.exact.all()
