@@ -846,7 +846,8 @@ def llada_moe_source(request):
     fields = {}
     if name in ('llada2-tiny', 'llada21-tiny', 'llada22-tiny'):
         blocks = np.arange(ids.shape[-1]) // 4
-        fields['attention_pairwise_mask'] = jnp.asarray((blocks[None, :] <= blocks[:, None])[None, None])
+        fields['attention_pairwise_mask'] = jnp.asarray(np.broadcast_to(
+            blocks[None, :] <= blocks[:, None], ids.shape[1:2] + (ids.shape[-1], ids.shape[-1])))
     return name, source, ids, fields
 
 
