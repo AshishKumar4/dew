@@ -1031,11 +1031,13 @@ def test_llada22_block_routing_is_each_requests_own():
     wherever a row is whole blocks (the recorded draws). Two requests 6 and 9 tokens long, neither a
     whole number of 4-token blocks, batched with left padding, route every real token to the experts
     it routes to alone: their blocks do not meet, and the padding votes for none. (The recorded draws
-    are two 16-token rows, whole blocks, where Dew's routing is the release's.)"""
+    are two 16-token rows, whole blocks, where Dew's routing is the release's.) Eight requests of
+    5 to 15 tokens make the stream's blocks straddle rows and padding throughout."""
     source = Pretrained.load(FIXTURES / 'llada22-tiny', dtype='float32', attention_impl='reference')
     assert source.model.mixture.routing_block == 4
     vocabulary = source.model.vocab_size
-    requests = [llada_draw(1, vocabulary)['ids'][0, :6], llada_draw(2, vocabulary)['ids'][1, :9]]
+    requests = [llada_draw(seed, vocabulary)['ids'][seed % 2, :length]
+                for seed, length in enumerate((6, 9, 5, 11, 7, 13, 10, 15), start=1)]
     width = max(len(request) for request in requests)
     padded = np.stack([np.pad(request, (width - len(request), 0)) for request in requests])
     valid = np.stack([np.arange(width) >= width - len(request) for request in requests])
