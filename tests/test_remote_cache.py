@@ -438,3 +438,21 @@ def test_a_program_whose_key_fills_a_file_name_round_trips(cache_worker, tmp_pat
     cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
     cache.opened("tests/long.py")
     assert programs(tmp_path) == {key: b"executable"} and cache.programs_fetched == 1
+
+
+def test_a_bundle_whose_program_could_not_be_read_goes_up_once_it_can(cache_worker, tmp_path):
+    """A close that cannot read a program the file's tests compiled sends nothing and counts against
+    the remote; the next close, once the program reads, sends the bundle."""
+    url, stored, _ = cache_worker
+    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
+    cache.opened("tests/read.py")
+    unreadable = tmp_path / f"jit_read-1{remote_cache.SUFFIX}"
+    unreadable.mkdir()
+    cache.closed("tests/read.py")
+    assert cache.failures == 1 and cache.uploads.unfinished_tasks == 0
+    unreadable.rmdir()
+    compiled(tmp_path, "jit_read-1")
+    cache.closed("tests/read.py")
+    cache.drain()
+    bundle = stored["/jax/cpu/bundles/tests/read.py"]
+    assert [key for key, _ in remote_cache.unpacked(bundle)] == ["jit_read-1"]
