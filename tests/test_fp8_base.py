@@ -26,10 +26,10 @@ from flax.traverse_util import flatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
 from process_support import READ_ONLY, fresh, keeping_picks
-from reference_error import assert_leaves_as_exact, float64_terms
+from reference_error import assert_as_exact
 
 from dew.data.dataset import Loader
-from dew.interop.codecs import dequantize_fp8_blocks, quantize_fp8_blocks
+from dew.interop.codecs import fp8_block_cast, quantize_fp8_blocks
 from dew.lora import LoRA, unadapted
 from dew.nn.kernels.generation import assumed, device_generation, fp8_tensor_cores
 from dew.objectives.base import FROZEN
@@ -107,48 +107,73 @@ def calls(model, variables, inputs):
     return seen
 
 
-def operands(x, rows, scales):
-    """`x`'s rows through the host FP8 block cast, and the packed rows, in float64."""
-    codes, row_scales = quantize_fp8_blocks(np.asarray(x, np.float32), (1, x.shape[1]))
-    packed = dequantize_fp8_blocks(np.asarray(rows), np.asarray(scales), (1, rows.shape[1]))
-    cast = dequantize_fp8_blocks(codes, row_scales, (1, x.shape[1]))
-    return cast.astype(np.float64), packed.astype(np.float64)
+PRODUCT_SEEDS = 16
+"""The frozen product's declared draws (check 1, `assert_as_exact`), sized by `seeds_for`: the fewest for
+which the float32 reference compared with itself resolves the factor."""
 
 
-def product_case():
-    """An input whose rows span twelve binades, a kernel packed, and an output cotangent."""
-    rng = np.random.default_rng(1)
+def product_case(seed=1):
+    """An input whose rows span twelve binades, a kernel packed, and an output cotangent:
+    `(x, forward, forward_scale, dgrad, dgrad_scale, cotangent)`."""
+    rng = np.random.default_rng(seed)
     x = jnp.asarray(rng.standard_normal((48, 96)) * np.exp2(rng.integers(-6, 6, (48, 1))), jnp.bfloat16)
     kernel = rng.standard_normal((96, 80)).astype(np.float32) * 0.05
     leaves = [jnp.asarray(value) for value in frozen_fp8_leaves(kernel).values()]
-    return x, leaves, jnp.asarray(rng.standard_normal((48, 80)), jnp.float32)
+    return x, *leaves, jnp.asarray(rng.standard_normal((48, 80)), jnp.float32)
 
 
-def assert_products_exact(x, leaves, cotangent, output, gradient):
-    """The forward and the input gradient are the float64 products of the FP8
-    block cast's rows to float32's order of summation; the input gradient
-    rounds once more, to the input's dtype."""
-    forward, forward_scale, dgrad, dgrad_scale = leaves
-    rows, packed = operands(x, forward, forward_scale)
-    cotangent_rows, packed_dgrad = operands(cotangent, dgrad, dgrad_scale)
-    with jax.enable_x64(new_val=True):
-        (truth, gradient_truth), (terms, gradient_terms) = float64_terms(
-            lambda a, b, c, d: (a @ b.T, c @ d.T), rows, packed, cotangent_rows, packed_dgrad)
-    truth, gradient_truth = np.asarray(truth), np.asarray(gradient_truth)
-    assert_leaves_as_exact(np.asarray(output), truth, truth, reductions=x.shape[1], terms=terms)
-    rounded = np.asarray(jnp.asarray(gradient_truth, gradient.dtype), np.float64)
-    assert_leaves_as_exact(np.asarray(gradient, np.float32), rounded, gradient_truth,
-                           reductions=forward.shape[0], terms=gradient_terms)
+def fp8_products(x, forward, forward_scale, dgrad, dgrad_scale, cotangent):
+    """Dew's frozen product and the input gradient it takes under `cotangent`."""
+    output, pullback = jax.vjp(frozen_fp8_product, x, forward, forward_scale, dgrad, dgrad_scale)
+    return output, pullback(cotangent)[0]
+
+
+def dequantized_products(x, forward, forward_scale, dgrad, dgrad_scale, cotangent):
+    """The reference arm: the FP8 block cast's rows of `x` and of the cotangent and the packed rows,
+    each dequantized, multiplied in float32 by XLA, the input gradient rounded to `x`'s dtype; the
+    same products Dew computes from the codes, with the scales applied before the dot rather than
+    after it."""
+    def product(values, rows, row_scales):
+        codes, scales = fp8_block_cast(values, (1, values.shape[1]))
+        cast = codes.astype(jnp.float32) * scales
+        return jnp.dot(cast, (rows.astype(jnp.float32) * row_scales).T, precision=jax.lax.Precision.HIGHEST,
+                       preferred_element_type=jnp.float32)
+
+    return product(x, forward, forward_scale), product(cotangent, dgrad, dgrad_scale).astype(x.dtype)
+
+
+def exactly(codes, scales) -> np.ndarray:
+    """What FP8 rows `codes` scaled a row by `scales` `[rows, 1]` stand for, in float64: each code times
+    its row's scale, unrounded."""
+    return np.asarray(codes).astype(np.float64) * np.asarray(scales).astype(np.float64)
+
+
+def exact_products(x, forward, forward_scale, dgrad, dgrad_scale, cotangent):
+    """The float64 products of the FP8 block cast's rows and the packed rows, each code times its scale
+    in float64, as the codes stand for them."""
+    def product(values, rows, row_scales):
+        codes, scales = quantize_fp8_blocks(np.asarray(values, np.float32), (1, values.shape[1]))
+        return exactly(codes, scales) @ exactly(rows, row_scales).T
+
+    return product(x, forward, forward_scale), product(cotangent, dgrad, dgrad_scale)
+
+
+def assert_products_exact(products, label):
+    """The forward and the input gradient `products` computes (`fp8_products`, placed as a run places
+    them) are on par with the dequantized float32 products over the site's draws (check 1), measured from
+    the float64 products of the FP8 block cast's rows."""
+    assert_as_exact(products, jax.jit(dequantized_products), product_case, label,
+                    seeds=PRODUCT_SEEDS, truth_fn=exact_products)
 
 
 def test_the_frozen_product_multiplies_the_cast_rows_exactly_and_trains_no_kernel():
     """Neither the packed kernel nor its scales take a gradient."""
-    x, leaves, cotangent = product_case()
-    output, pullback = jax.vjp(frozen_fp8_product, x, *leaves)
+    x, *leaves, cotangent = product_case()
+    _, pullback = jax.vjp(frozen_fp8_product, x, *leaves)
     gradients = pullback(cotangent)
-    assert_products_exact(x, leaves, cotangent, output, gradients[0])
     assert gradients[0].dtype == x.dtype and all(gradient is None or not np.any(gradient)
                                                  for gradient in gradients[1:])
+    assert_products_exact(jax.jit(fp8_products), "the frozen FP8 product")
 
 
 @pytest.mark.mesh(devices=2)
@@ -156,12 +181,17 @@ def test_split_over_fsdp_the_frozen_product_is_one_devices():
     """The input's rows and the packed kernel's split over fsdp, as a run
     places them, the product and the input gradient are the same exact
     products: a row's cast reads the row alone, wherever it lies."""
-    x, leaves, cotangent = product_case()
     mesh = jax.make_mesh((2,), ("fsdp",), (jax.sharding.AxisType.Auto,), devices=jax.devices()[:2])
     split = NamedSharding(mesh, PartitionSpec("fsdp", None))
-    x, cotangent, *leaves = jax.device_put((x, cotangent, *leaves), split)
-    output, pullback = jax.jit(lambda *args: jax.vjp(frozen_fp8_product, *args))(x, *leaves)
-    assert_products_exact(x, leaves, cotangent, output, pullback(cotangent)[0])
+    products = jax.jit(fp8_products)
+
+    def placed(*arrays):
+        # Placed before the jit, as a run's arrays arrive: a device_put inside one constrains nothing.
+        arrays = jax.device_put(arrays, split)
+        assert all(array.sharding == split for array in arrays)
+        return products(*arrays)
+
+    assert_products_exact(placed, "the frozen FP8 product split over fsdp")
 
 
 @pytest.mark.parametrize("measured_on", [None, ELSEWHERE], ids=["here", "elsewhere"])
