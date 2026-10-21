@@ -206,8 +206,9 @@ def check_backward(case: dict, names: tuple, dtype, forward_config, backward_con
 
     def ours(query, key, value, dout):
         with pins:
-            _, peak, total = attention_triton.forward(query, key, value, spans, hooks, residuals=True,
-                                                      interpret=not ON_GPU)
+            out, peak, total = attention_triton.forward(query, key, value, spans, hooks, residuals=True,
+                                                        interpret=not ON_GPU)
+            del out
             grads = attention_triton.backward(query, key, value, spans, hooks, peak, total, dout,
                                               interpret=not ON_GPU)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
