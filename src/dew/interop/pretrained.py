@@ -167,6 +167,31 @@ def _share_quantized_aliases(tensors: dict[str, np.ndarray], aliases: tuple[tupl
                 tensors[name] = value
 
 
+def on_default_device(variables: Variables) -> Variables:
+    """`variables` with each host leaf on JAX's default device as a `jnp` array is, uncommitted, so a
+    jitted call reads it where it is and a placement moves it, one leaf at a time: a leaf's transfer
+    completes before the next starts, and its host copy is released (a memory-mapped one's pages
+    evicted, `dew.training.host.evict`) once its device copy is written back in its place."""
+    from dew.training.host import evict
+
+    def placed(node):
+        if not isinstance(node, Mapping):
+            if not isinstance(node, (np.ndarray, np.generic)):
+                return node
+            landed = jax.block_until_ready(jax.device_put(node))
+            if isinstance(node, np.ndarray):
+                evict(node)
+            return landed
+        # A freshly loaded tree's nodes are its own plain dicts, written in place so that no host leaf
+        # outlives its device copy; any other mapping is rebuilt.
+        held = node if type(node) is dict else dict(node)
+        for name in list(held):
+            held[name] = placed(held[name])
+        return held
+
+    return placed(variables)
+
+
 @dataclass(frozen=True)
 class Pretrained:
     """A native model with explicit variables and its checkpoint's host processor.
@@ -333,7 +358,7 @@ class Pretrained:
              revision: str | None = None, gguf_file: str | None = None,
              single_file: str | None = None, dduf_file: str | None = None,
              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-             fallback: str | None = None, weights: bool = True) -> Self:
+             fallback: str | None = None, weights: bool = True, on_host: bool = False) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
         `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
@@ -350,12 +375,17 @@ class Pretrained:
         too, while router, clipping, positional and safety state keep their own FP32
         or integer dtypes.
 
-        Without `mesh` or `layout`, the variables are host arrays. With either, they
-        are placed on that mesh (the default `MeshSpec()` when only `layout` is given)
-        under that layout, one leaf at a time. A decoder's or a diffusion pipeline's
-        leaves are read from the memory-mapped checkpoint one device shard at a time,
-        and cast and transposed there (`dew.interop.streaming`), so the host never
-        holds the whole translated model. Towers, projectors, a quantized source's
+        A loaded source is ready to run: without `mesh` or `layout` its variables are
+        built on the host and then placed on JAX's default device (`jax.default_device`)
+        one leaf at a time, uncommitted, as a `jnp` array is, so a call or a placement
+        over other devices still takes them. With either, they are placed on that mesh
+        (the default `MeshSpec()` when only `layout` is given) under that layout.
+        `on_host=True` keeps them as host arrays instead, for a caller that places them
+        itself, as a training start or an export does; a host tree passed to a jitted
+        call is copied to the device at each call. With a mesh or layout, a decoder's or
+        a diffusion pipeline's leaves are read from the memory-mapped checkpoint one
+        device shard at a time, and cast and transposed there (`dew.interop.streaming`),
+        so the host never holds the whole translated model. Towers, projectors, a quantized source's
         dequantized tensors and a pipeline's convolution kernels are still built
         whole on the host first.
 
@@ -395,7 +425,7 @@ class Pretrained:
         return cls._load(name_or_dir, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
                          max_seq_len=max_seq_len, revision=revision, gguf_file=gguf_file,
                          single_file=single_file, dduf_file=dduf_file, mesh=mesh, layout=layout,
-                         fallback=fallback, weights=weights)
+                         fallback=fallback, weights=weights, on_host=on_host)
 
     @classmethod
     def _load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
@@ -405,7 +435,7 @@ class Pretrained:
               dduf_file: str | None = None,
               mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None, fallback: str | None = None,
               prepare: Callable[[nn.Module, Variables], Variables] | None = None,
-              weights: bool = True) -> Self:
+              weights: bool = True, on_host: bool = False) -> Self:
         """Share the source reader with inference's pre-placement projection packing."""
         if fallback not in (None, "torchax"):
             raise ValueError(f"fallback={fallback!r} names no loader; the one fallback is 'torchax', "
@@ -418,6 +448,9 @@ class Pretrained:
             raise ValueError(f"fallback='torchax' builds the transformers model the repo's config.json "
                              f"and weights describe, and {' and '.join(selected)} selects another payload; "
                              "load it without fallback")
+        if on_host and (mesh is not None or layout is not None):
+            raise ValueError("on_host keeps the variables as host arrays, and mesh and layout place them; "
+                             "pass one")
         streaming = mesh is not None or layout is not None
         if streaming and not weights:
             raise ValueError("a source loaded without its weights has nothing to place; the restore that "
@@ -458,6 +491,8 @@ class Pretrained:
         if not weights:
             loaded = replace(loaded, variables=jax.tree.map(
                 lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), loaded.variables))
+        elif not streaming and not on_host:
+            loaded = replace(loaded, variables=on_default_device(loaded.variables))
         return loaded
 
     @property
