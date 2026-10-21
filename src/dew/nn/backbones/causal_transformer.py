@@ -1686,8 +1686,8 @@ class CausalTransformer(nn.Module):
             return final
         kept = collections.get(_INTERMEDIATES, {}).get(f"layers_{layer}")
         if kept is None:
-            held = sorted(index for name in collections.get(_INTERMEDIATES, {})
-                          if (index := layer_index(name)) is not None)
+            held = sorted(number for number in map(layer_index, collections.get(_INTERMEDIATES, {}))
+                          if number is not None)
             raise ValueError(f"the model kept no layer {layer}; it kept layers {held}")
         return kept["__call__"][-1]
 
