@@ -165,7 +165,8 @@ def test_rejected_attempts_do_not_contribute_to_grad_norm():
     trainer.fit(targets([1., float('nan'), 3., 2.]), steps=4, log_every=1)
     rows = {step: values['train/grad_norm'] for step, values in sink.scalars
             if 'train/grad_norm' in values}
-    assert rows == pytest.approx({3: 4.})
+    # The rejection drops its window, the first target's with it: the one update is the last two's.
+    assert rows == pytest.approx({4: 5.})
 
 
 class Repeated:
