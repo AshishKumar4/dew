@@ -1323,3 +1323,26 @@ def test_a_finite_mixture_resumed_after_a_member_ends_reads_what_the_uninterrupt
             assert ids(resumed) == expected[step:]
         finally:
             resumed.close()
+
+
+def test_phases_read_each_chain_until_its_step_as_the_phased_text_recipe(tmp_path):
+    """Two token stores read one until step two, then a mix of both, each phase packed by the lm
+    preset: the phased text recipe's plan and batches."""
+    from dew.config.data import DataPhase, TextData, loader
+    from dew.data import TokenFiles, phases, presets
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    write_token_corpus(first, np.arange(1, 200, dtype=np.uint16) % 250 + 1)
+    write_token_corpus(second, np.arange(1, 300, dtype=np.uint16) % 250 + 2)
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    recipe = TextData(source="", seq_len=8, pack="first-fit",
+                      phases=(DataPhase(str(first), 2), DataPhase({str(first): 1.0, str(second): 1.0}, None)))
+    expected = loader(recipe, batch=2, read="indexed", loading=loading)
+
+    def packed(dataset):
+        return dataset.shuffle(0).repeat().pipe(presets.lm, None, seq_len=8, batch=2, pack="first-fit")
+
+    chain = phases((packed(TokenFiles(str(first))), 2),
+                   (packed(mix([TokenFiles(str(first)), TokenFiles(str(second))])), None))
+    built = compile(chain, read="indexed", loading=loading)
+    assert built.plan.identity() == expected.plan.identity()
