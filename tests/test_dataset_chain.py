@@ -768,6 +768,23 @@ class Tagged:
         return {**row, "tagged": True}
 
 
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_stats_reports_the_records_a_second_tokens_and_padding_of_packed_rows(read):
+    """Token documents of differing lengths packed into rows of 16: stats reports the tokens
+    the rows hold, all the documents' (one of them id 0, a token like any other), the share of
+    the rows' places that pad them, and the records it read a second; rows with no token ids
+    report none of those two."""
+    lengths = [5, 7, 3, 9, 11, 2, 6, 8]
+    documents = Memory([{"text": np.arange(length, dtype=np.int32)} for length in lengths]).named("docs")
+    counts = documents.pack(16).read(read).loading(READ).stats(records=100)
+    packed = counts["data/rows/docs"]
+    assert counts["data/tokens"] == sum(lengths)
+    assert counts["data/padding"] == (16 * packed - sum(lengths)) / (16 * packed)
+    assert 0 < counts["data/records_per_second"] < float("inf")
+    plain = Memory(rows("a", 4)).named("plain").read(read).loading(READ).stats(records=4)
+    assert "data/tokens" not in plain and "data/padding" not in plain
+
+
 def test_show_prints_what_a_preset_expanded_to_then_the_records(capsys):
     """`show` prints a chain's store and every verb and step a preset expanded to, in order, then
     its first records; a mixture's corpora each with their weight and their own steps."""
