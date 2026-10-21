@@ -157,4 +157,4 @@ def test_a_native_dataset_names_its_classes_in_a_configured_caption(streamed):
     native = native.to_iterable_dataset() if streamed else native
     caption = Configured(ConfigureCaption(Caption("a photo of a {label}")), needs=())
     captioned = from_hf(native, "labels@1" if streamed else None).map(caption)
-    assert [row["caption"] for row in captioned.iterate()] == ["a photo of a dog", "a photo of a cat"]
+    assert [row["caption"] for row in captioned] == ["a photo of a dog", "a photo of a cat"]

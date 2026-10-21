@@ -134,7 +134,8 @@ def test_batch_refuses_ragged_numeric_arrays_beside_object_columns(read):
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_prompt_encoding_passes_unread_catalog_fields_through(read):
-    """Prompt padding and reward encoding leave catalog and routing fields intact."""
+    """Prompt padding and reward encoding leave catalog and routing fields intact, and a row's
+    `ability` also reaches the reward inside its `extra_info` (P92)."""
     originals = [{"id": index, "prompt": [index + 1, index + 2], "data_source": "rule",
                   "reward_model": {"ground_truth": str(index)}, "extra_info": {"split": "train"},
                   "ability": "math", "agent_name": "solver", "catalog": {"tags": [str(index)]}}
@@ -149,7 +150,7 @@ def test_prompt_encoding_passes_unread_catalog_fields_through(read):
         np.testing.assert_array_equal(row["prompt"], [0, 0, *original["prompt"]])
         assert int(row["prompt_length"]) == 2
         for name, expected in (("data_source", "rule"), ("ground_truth", str(original["id"])),
-                               ("extra_info", '{"split": "train"}')):
+                               ("extra_info", '{"ability": "math", "split": "train"}')):
             assert bytes(row[name][row[name] != 0].astype(np.uint8)).decode() == expected
 
 

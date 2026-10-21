@@ -21,6 +21,7 @@ from dew.data.dataset import Batch
 from dew.data.sources.base import Source
 from dew.data.sources.codec import encode
 from dew.data.sources.files import _arrow_filesystem
+from dew.data.steps.text import count_rules, stated_rules
 from dew.data.storage import ObjectRef, Store
 
 if TYPE_CHECKING:
@@ -173,28 +174,29 @@ def export(
             metadata=metadata,
             length_field=length_field,
         )
-    if isinstance(values, Source):
-        from dew.data.pipeline import Pipeline
+    from dew.data.pipeline import Dataset, Pipeline
 
-        # A source exports as a pipeline of it does, by a read it supports, physical shards or none.
-        values = Pipeline(values)
-    if isinstance(values, Iterable):
-        rows = iter(values)
-    else:
+    if isinstance(values, (Source, Dataset)):
         from dew.data.analysis import _preferred_read
         from dew.data.compile import iterate
         from dew.data.dataset import Loading
 
-        read = values.mode or _preferred_read(lambda _: (values,), provision=True)
-        rows = iter(iterate(values, read=read, provision=True, loading=values.loading or Loading()))
+        # A store exports as a chain of it does, by a read it supports, physical shards or none.
+        chain = values._chain() if isinstance(values, Dataset) else Pipeline(values)
+        read = chain.mode or _preferred_read(lambda _: (chain,), provision=True)
+        rows = iter(iterate(chain, read=read, provision=True, loading=chain._loading or Loading()))
+    else:
+        rows = iter(values)
     root = Store(url, storage_options)
     writer = uuid.uuid4().hex
     target = root.child(f"shards/{writer}")
     files = []
     count = 0
+    rules: set[tuple[int | None, int | None]] = set()
     try:
         for number, batch in enumerate(_chunks(rows, rows_per_shard)):
             count += len(batch)
+            rules.update(stated_rules(count_rules(batch)))
             index = _length_index(root, writer, number, batch, length_field)
             if format == "array_record":
                 files.append(_array_shard(root, writer, number, batch, index))
@@ -215,6 +217,9 @@ def export(
             "format": format,
             "codec": 1 if format == "array_record" else None,
             "rows": count,
+            # The rules other than every target's its rows were counted by, which a pack of them
+            # by a plan of their lengths could not count (`dew.data.analysis._ruled`).
+            "count_rules": [list(rule) for rule in sorted(rules, key=repr)],
             "partitioning": partitioning,
             "files": files,
             "metadata": metadata or {},

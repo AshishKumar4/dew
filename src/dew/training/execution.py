@@ -459,9 +459,10 @@ class HostExecution:
         layout = (treedef, held)
         with jax.set_mesh(self.accelerator):
             batch = transfer(batch, batch_shardings(self.accelerator, batch))
-            clock, key = self.on_accelerator((step.step, step.key))
+            clock, key, updates = self.on_accelerator((step.step, step.key, step.updates))
             rest = {name: tree for name, tree in store.items() if name != "params"}
-            stats, back, aux = self.forward(primal, frozen, rest, batch, Step(clock, key, ema), layout=layout)
+            here = Step(clock, key, ema, committed=updates)
+            stats, back, aux = self.forward(primal, frozen, rest, batch, here, layout=layout)
         stats, aux = self.on_cpu((stats, aux))
         if aux.variables is not None:
             with jax.set_mesh(self.cpu):
