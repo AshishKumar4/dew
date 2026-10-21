@@ -1326,27 +1326,25 @@ def test_a_finite_mixture_resumed_after_a_member_ends_reads_what_the_uninterrupt
 
 
 def test_phases_read_each_chain_until_its_step_as_the_phased_text_recipe(tmp_path):
-    """Two token stores read one until step two, then a mix of both, each phase packed by the lm
-    preset: the phased text recipe's plan and batches."""
+    """Two token stores read one until step two, then a mix of both, each store packed alone by the
+    lm preset and the phases batched after: the phased text recipe's plan."""
     from dew.config.data import DataPhase, TextData, loader
     from dew.data import phases, presets
     from dew.data.sources import TokenFiles
 
     first, second = tmp_path / "first", tmp_path / "second"
     # Documents of nine tokens, each ended by EOS (0).
-    write_token_corpus(first, np.where(np.arange(200) % 10 == 9, 0, np.arange(200) % 250 + 1).astype(np.uint16),
-                       eos_id=0)
-    write_token_corpus(second, np.where(np.arange(300) % 10 == 9, 0, np.arange(300) % 250 + 2).astype(np.uint16),
-                       eos_id=0)
+    for path, size in ((first, 200), (second, 300)):
+        ids = np.where(np.arange(size) % 10 == 9, 0, np.arange(size) % 250 + 1).astype(np.uint16)
+        write_token_corpus(path, ids, eos_id=0)
     loading = Loading(workers=0, threads=1, read_buffer=1)
     recipe = TextData(source="", seq_len=8, pack="first-fit",
                       phases=(DataPhase(str(first), 2), DataPhase({str(first): 1.0, str(second): 1.0}, None)))
     expected = loader(recipe, batch=2, read="indexed", loading=loading)
 
-    def packed(dataset):
-        return dataset.shuffle(0).repeat().pipe(presets.lm, None, seq_len=8, batch=2, pack="first-fit")
+    def packed(path):
+        return TokenFiles(str(path)).pipe(presets.lm, None, seq_len=8, batch=None, pack="first-fit")
 
-    chain = phases((packed(TokenFiles(str(first))), 2),
-                   (packed(mix([TokenFiles(str(first)), TokenFiles(str(second))])), None))
+    chain = phases((packed(first), 2), (mix([packed(first), packed(second)], by="tokens"), None)).batch(2)
     built = compile(chain, read="indexed", loading=loading)
     assert built.plan.identity() == expected.plan.identity()
