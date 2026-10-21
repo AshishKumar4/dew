@@ -85,23 +85,26 @@ A confidence is a statistic of the answer's distribution, and the task decides w
 ```python
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.decision import ECE, Accuracy, Brier, Choice, DecisionObjective, Decisions, LogLoss
+from dew.data import Hub
+from dew.data.compile import held
+from dew.decision import ECE, Accuracy, Brier, DecisionObjective, LogLoss, decisions
 from dew.interop import Pretrained
 from dew.lora import LoRA
-from dew.data import Hub
-from dew.config.data import HoldOut, loader
 
 qwen = Pretrained.load("Qwen/Qwen3-0.6B").adapt(LoRA(rank=16, modules=("q_proj", "v_proj")), key=0)
-banking77 = Decisions(source=Hub("mteb/banking77"), label="label_text", question="intent",
-                      instructions="Which banking request is this?",
-                      validation=HoldOut(fraction=0.1, by="random", most=400))
+# A tenth of the rows, by the hash of each one's content, the same in every run.
+train, val = Hub("mteb/banking77").holdout(0.1)
+
+def asked(rows):
+    return rows.pipe(decisions, label="label_text", question="intent",
+                     instructions="Which banking request is this?").read("memory")
 
 objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier())
-data = loader(banking77, batch=32, read="memory", provision=True, objective=objective.data())
 state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(
-    data, steps=2_000, eval_every=500, metrics=[Accuracy(), ECE()])
+    asked(train).shuffle(0).repeat().batch(32), steps=2_000, eval_every=500,
+    validation={"val": asked(val).batch(32)}, metrics=[Accuracy(), ECE()])
 
-decide = objective.pipeline(state).calibrated(data.val)
+decide = objective.pipeline(state).calibrated(held(asked(val).batch(32), objective=objective.data()))
 ```
 
 Examples need not come from a table: `objective.dataset` takes any labelled examples, `Example`s or mappings with a `state`, `questions` (as `Question`s or in Jev's wire form) and `answers`, an answer naming its option by key or index.
