@@ -388,12 +388,12 @@ def _tile_products(score_mod, query, key, value, dout, peak, total, seen, q_pos,
 
 def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta, seen, q_pos, k_pos, params,
                  *, scale: float, interpret: bool):
-    """A tile's backward through its scores: its weights, and the pullbacks of the masked score
-    cotangents `p * ((dP - c) - (D - c))` through `score_mod`, `c` each query's `anchor` and `delta` its
-    `D - c`, over the scaled logits and each parameter."""
+    """A tile's backward through its scores: its weights, the masked score cotangents
+    `p * ((dP - c) - (D - c))`, `c` each query's `anchor` and `delta` its `D - c`, and the pullback
+    through `score_mod`, over the scaled logits and each parameter."""
     weights, products, pull = _tile_products(score_mod, query, key, value, dout, peak, total, seen, q_pos,
                                              k_pos, params, scale=scale, interpret=interpret)
-    return weights, pull(jnp.where(seen, weights * ((products - anchor[:, None]) - delta[:, None]), 0.0))
+    return weights, jnp.where(seen, weights * ((products - anchor[:, None]) - delta[:, None]), 0.0), pull
 
 
 def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tuple[Kind, ...], score_mod,
@@ -422,8 +422,10 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         seen = (k_pos >= start[:, None]) & (k_pos < end[:, None])
         if ids:
             seen &= query_ids[:, None] == key_ids_ref[keys][None, :]
-        params = [_tile_param(ref, kind, head, q_pos, keys) for ref, kind in zip(score_refs, score_kinds,
-                                                                                 strict=True)]
+        # A head's scalar over the tile's queries, so its pullbacks sum each query's own (`step`).
+        params = [jnp.broadcast_to(_tile_param(ref, kind, head, q_pos, keys), (block_q, 1))
+                  if kind == Kind.HEAD else _tile_param(ref, kind, head, q_pos, keys)
+                  for ref, kind in zip(score_refs, score_kinds, strict=True)]
         return keys, k_pos, seen, params
 
     def row_terms(index, carry):
@@ -452,41 +454,63 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
 
     if exact:
         # From the softmax's initial state (`backward`), anchored at 0.
+        start, shares = peak, (total, initial_ref[...])
         peak, anchor, total, numerator = jax.lax.fori_loop(
-            bounds_ref[0], bounds_ref[1], row_terms, (peak, jnp.zeros_like(total), total, initial_ref[...]))
+            bounds_ref[0], bounds_ref[1], row_terms, (peak, jnp.zeros_like(total), *shares))
         peak = jnp.where(peak == -jnp.inf, 0.0, peak)
         delta = jnp.where(total > 0, numerator / jnp.where(total > 0, total, 1.0), 0.0)
     else:
-        # The forward's maxima and denominators, and each query's whole row term (`backward`'s `output`).
+        # The forward's maxima and denominators, and each query's whole row term (`backward`'s `residuals`).
         anchor, delta = jnp.zeros_like(total), initial_ref[...]
+    summed = tuple(kind in (Kind.HEAD, Kind.QUERY) for kind in score_kinds)
+
+    def step(index, carry):
+        dq, residual, mass, grads, weighed = carry
+        keys, k_pos, seen, params = tile(index)
+        key, value = key_ref[keys, :], value_ref[keys, :]
+        weights, cotangents, pull = _tile_scores(score_mod, query, key, value, dout, peak, total, anchor,
+                                                 delta, seen, q_pos, k_pos, params, scale=scale,
+                                                 interpret=interpret)
+        pulled = pull(cotangents)
+        dq = dq + _dot(pulled[0].astype(key.dtype), key, interpret) * scale
+        for kind, ref, piece in zip(score_kinds, grad_refs, pulled[1:], strict=True):
+            if kind == Kind.TILE:
+                ref[:, keys] = piece
+        grads = tuple(grad + jnp.sum(piece, axis=-1) if row else grad
+                      for grad, row, piece in zip(grads, summed, pulled[1:], strict=True))
+        if exact and any(summed):
+            weighed = tuple(sums + jnp.sum(piece, axis=-1) if row else sums
+                            for sums, row, piece in zip(weighed, summed, pull(weights)[1:], strict=True))
+        return (dq, residual + cotangents.sum(axis=-1), mass + weights.sum(axis=-1), grads, weighed)
+
+    nothing = jnp.zeros((block_q,), jnp.float32)
+    rows = tuple(nothing for _ in score_kinds)
+    dq, residual, mass, grads, weighed = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], step,
+                                                           (jnp.zeros(query.shape, jnp.float32), nothing,
+                                                            nothing, rows, rows))
+    dq_ref[...] = dq
+    if exact:
+        # D refined once from the main pass's own sums: the score cotangents of a query and of its initial
+        # state sum to 0 by the softmax's shift, and what they sum to here is D's rounding. Moving D by it
+        # over the weights' total lets the dK/dV launch, the initial state's gradients and the head and
+        # query parameters' (by the pullbacks of the weights, `weighed`) take the D whose cotangents do.
+        inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
+        carried = jnp.where(start == -jnp.inf, 0.0, jnp.exp(start - peak)) * inverse
+        residual = residual + (shares[1] - shares[0] * (anchor + delta)) * carried
+        mass = mass + shares[0] * carried
+        refined = jnp.where(mass > 0, residual / jnp.where(mass > 0, mass, 1.0), 0.0)
+        delta = delta + refined
+        grads = tuple(grad - refined * sums if row else grad
+                      for grad, row, sums in zip(grads, summed, weighed, strict=True))
     delta_ref[...] = delta
     anchor_ref[...] = anchor
     peak_out_ref[...] = peak
     total_out_ref[...] = total
-
-    def step(index, carry):
-        dq, *grads = carry
-        keys, k_pos, seen, params = tile(index)
-        key, value = key_ref[keys, :], value_ref[keys, :]
-        _, pulled = _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta, seen, q_pos,
-                                 k_pos, params, scale=scale, interpret=interpret)
-        dq = dq + _dot(pulled[0].astype(key.dtype), key, interpret) * scale
-        updated = []
-        for grad, kind, ref, piece in zip(grads, score_kinds, grad_refs, pulled[1:], strict=True):
-            if kind == Kind.TILE:
-                ref[:, keys] = piece
-            updated.append(grad + jnp.sum(piece, axis=-1) if kind == Kind.QUERY
-                           else grad + jnp.sum(piece) if kind == Kind.HEAD else grad)
-        return dq, *updated
-
-    sums = [jnp.zeros((block_q,), jnp.float32) if kind == Kind.QUERY else jnp.zeros((), jnp.float32)
-            for kind in score_kinds]
-    dq, *grads = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], step,
-                                   (jnp.zeros(query.shape, jnp.float32), *sums))
-    dq_ref[...] = dq
     for grad, kind, ref in zip(grads, score_kinds, grad_refs, strict=True):
-        if kind in (Kind.HEAD, Kind.QUERY):
-            ref[...] = jnp.broadcast_to(grad, ref.shape)
+        if kind == Kind.HEAD:
+            ref[...] = jnp.broadcast_to(jnp.sum(grad), ref.shape)
+        elif kind == Kind.QUERY:
+            ref[...] = grad
 
 
 def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tuple[Kind, ...], score_mod,
@@ -514,9 +538,10 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
             seen &= query_ids_ref[rows][:, None] == key_ids[None, :]
         params = [_key_param(ref, kind, head, rows)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
-        weights, pulled = _tile_scores(score_mod, query, key, value, dout, peak_ref[rows], total_ref[rows],
-                                       anchor_ref[rows], delta_ref[rows], seen, q_pos, k_pos, params,
-                                       scale=scale, interpret=interpret)
+        weights, cotangents, pull = _tile_scores(score_mod, query, key, value, dout, peak_ref[rows],
+                                                 total_ref[rows], anchor_ref[rows], delta_ref[rows], seen,
+                                                 q_pos, k_pos, params, scale=scale, interpret=interpret)
+        pulled = pull(cotangents)
         dv = dv + _dot(weights.astype(dout.dtype).T, dout, interpret)
         dk = dk + _dot(pulled[0].astype(query.dtype).T, query, interpret) * scale
         updated = [grad + jnp.sum(piece, axis=0) if kind == Kind.KEY else grad
@@ -753,10 +778,12 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     query's softmax again, online over the tiles and products its main pass takes, to its maximum,
     denominator and `D = sum_j p dP`, as the softmax's derivative takes it: the weights it differentiates
     sum to one over its own logits, and each `dP - D` is taken about the product of the key that holds
-    the query's maximum, so no rounding of that key's product enters it. Given the forward's `residuals`
-    instead, its maxima, denominators and fp32 output before its hook (`forward`'s `wide`), `D` is
-    `rowsum(dout * output)` and that pass is skipped. The output hook is no part of it: a differentiated call applies `output_mod` past the
-    kernel, where its own derivative runs, and passes `dout` before it. Deterministic: every gradient
+    the query's maximum, so no rounding of that key's product enters it; the main pass then refines `D`
+    once from its own sums for the dK/dV launch and the head, query and initial state's gradients
+    (`_dq_kernel`). Given the forward's `residuals` instead, its maxima, denominators and fp32 output
+    before its hook (`forward`'s `wide`), `D` is `rowsum(dout * output)` and that pass is skipped. The
+    output hook is no part of it: a differentiated call applies `output_mod` past the kernel, where its
+    own derivative runs, and passes `dout` before it. Deterministic: every gradient
     element is written by one program, a head parameter's partial sums added in a fixed order and a key
     head's query heads summed in XLA."""
     hooks = Hooks() if hooks is None else hooks
