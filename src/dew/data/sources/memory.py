@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import sys
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Protocol, runtime_checkable
@@ -42,11 +43,30 @@ def _record(value: object) -> Batch | bytes | None:
     raise TypeError(f"source feature record must have named fields or bytes, got {type(value).__name__}")
 
 
-def _table_records(table: DataFrame) -> list[Batch]:
-    """A table's rows as records of its columns, through Arrow's interchange reader."""
-    from pyarrow.interchange import from_dataframe
+@runtime_checkable
+class _ArrowStream(Protocol):
+    """A table that hands itself to Arrow as a stream of record batches: an Arrow or polars table."""
 
-    rows = from_dataframe(table, allow_copy=True).to_pylist()
+    def __arrow_c_stream__(self, requested_schema: None = None, /) -> Hashable: ...
+
+
+def _table_records(table: DataFrame) -> list[Batch]:
+    """A table's rows as records of its columns, through Arrow, which keeps lists, bytes, nested
+    records and nulls as `Memory(records)` holds them: a pandas DataFrame by its own converter, its
+    index none of them; a table that streams itself to Arrow as it does; any other through the
+    interchange protocol."""
+    import pyarrow as pa
+
+    pandas = sys.modules.get("pandas")
+    if pandas is not None and isinstance(table, pandas.DataFrame):
+        arrow = pa.Table.from_pandas(table, preserve_index=False)
+    elif isinstance(table, _ArrowStream):
+        arrow = pa.table(table)
+    else:
+        from pyarrow.interchange import from_dataframe
+
+        arrow = from_dataframe(table, allow_copy=True)
+    rows = arrow.to_pylist()
     for row in rows[:1]:
         _record(row)
     return rows

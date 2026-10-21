@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import grain.python as grain
 import numpy as np
@@ -12,7 +12,7 @@ import numpy as np
 from dew.data.dataset import Batch, Closeable, Records, Replayed, Stoppable
 from dew.data.pipeline import Dataset
 
-from .base import Read, Shard, ShardManifest
+from .base import Read, Shard, ShardManifest, unnamed
 from .codec import Value, decode, encode
 from .memory import _record
 
@@ -34,6 +34,7 @@ class Iterated(Dataset):
     state: Callable[[Iterator[Batch]], Value] | None = None
     load_state: Callable[[Iterator[Batch], Value], None] | None = None
     replay: bool = False
+    place: int = field(default_factory=unnamed, repr=False)
 
     def __post_init__(self) -> None:
         if self.name == "":
@@ -47,7 +48,7 @@ class Iterated(Dataset):
         return self.name or "iterator"
 
     def describe(self) -> str:
-        return f"iter:{self.name or 'unnamed'}"
+        return f"iter:{self.name}" if self.name is not None else f"iter:unnamed-{self.place}"
 
     def fingerprint(self) -> Mapping[str, object]:
         return {"store": "iterator", "identity_required": True, "identity": self.name}
