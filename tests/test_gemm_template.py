@@ -317,21 +317,22 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
     def dew(x, w, ms, nw, b):
         return template.gemm(x, w, None, prologue=normed,
                              prologue_operands=((ms, ("rows",)), (nw, ("depth",))), epilogue=biased,
-                             epilogue_operands=((b, ("columns",)),), out_dtype=jnp.float32,
+                             epilogue_operands=((b, ("columns",)),), out_dtype=jnp.bfloat16,
                              transpose_rhs=transpose_rhs, interpret_on_cpu=True)
 
-    def plain(x, w, ms, nw, b, wide=jnp.float32):
+    def plain(x, w, ms, nw, b, wide=jnp.float32, out=jnp.bfloat16):
+        # A 16-bit output: an fp32 one's cotangent makes the kernel gradient an fp32 product, XLA's.
         w = w.T if transpose_rhs else w
-        return jnp.dot(normed(x, ms, nw).astype(wide), w.astype(wide)) + b[None, :].astype(wide)
+        return (jnp.dot(normed(x, ms, nw).astype(wide), w.astype(wide)) + b[None, :].astype(wide)).astype(out)
 
     def loss(run):
         return jax.grad(lambda *a: jnp.sum(run(*a) * jnp.linspace(-1, 1, 100)), argnums=(0, 1, 2, 3, 4))
 
     with generation.assumed("sm80"), tuning.seen() as launches:
-        assert_as_exact(jax.jit(dew), jax.jit(plain), draw, "dense 65x40x100", seeds=SEEDS,
-                        truth_fn=functools.partial(plain, wide=jnp.float64))
+        truth = functools.partial(plain, wide=jnp.float64, out=jnp.float64)
+        assert_as_exact(jax.jit(dew), jax.jit(plain), draw, "dense 65x40x100", seeds=SEEDS, truth_fn=truth)
         assert_as_exact(jax.jit(loss(dew)), jax.jit(loss(plain)), draw, "dense 65x40x100 gradients",
-                        seeds=SEEDS, truth_fn=loss(functools.partial(plain, wide=jnp.float64)))
+                        seeds=SEEDS, truth_fn=loss(truth))
     ran = {(type(launch).__name__, ba.arguments.get('dense')) for launch, ba in launches}
     assert {('GmmTransposed' if transpose_rhs else 'Gmm', True), ('Tgmm', True)} <= ran
 
@@ -349,15 +350,15 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
         return jax.grad(lambda x, w: jnp.sum(run(x, w) * jnp.linspace(-1, 1, 128)), argnums=(0, 1))
 
     def dew(x, w):
-        return template.gemm(x, w, None, out_dtype=jnp.float32, interpret_on_cpu=True)
+        return template.gemm(x, w, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
 
-    def plain(x, w, wide=jnp.float32):
-        return jnp.dot(x.astype(wide), w.astype(wide))
+    def plain(x, w, wide=jnp.float32, out=jnp.bfloat16):
+        # A 16-bit output: an fp32 one's cotangent makes the kernel gradient an fp32 product, XLA's.
+        return jnp.dot(x.astype(wide), w.astype(wide)).astype(out)
 
     with generation.assumed("sm90"), tuning.seen() as launches:
         assert_as_exact(jax.jit(loss(dew)), jax.jit(loss(plain)), draw, "dense depth 96", seeds=SEEDS,
-                        truth_fn=loss(functools.partial(plain, wide=jnp.float64)))
-    # The kernel gradient ran the plain kernel (an fp32 output's cotangent takes XLA's input gradient).
+                        truth_fn=loss(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
     assert ('Tgmm', True) in {(type(launch).__name__, ba.arguments.get('dense')) for launch, ba in launches}
 
 
