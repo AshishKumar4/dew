@@ -204,7 +204,6 @@ def published_methods(dtype) -> tuple[dict, float]:
     attention_mla.py, with the module scope they read, at `dtype`."""
     import jax
     from jax.ad_checkpoint import checkpoint_name
-
     from reference_source import defined_in, definitions, fetched
 
     scope = {"jax": jax, "jnp": Numpy(dtype), "checkpoint_name": checkpoint_name, "np": np,
