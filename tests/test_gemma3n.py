@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from reference_error import assert_as_exact
+from residual_orders import permuted, residual_width
 
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock
 from dew.nn.mlp import GatedMLP, gaussian_topk
@@ -202,25 +203,40 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
     initial, _, _ = trainer.place()
     step = trainer.compile(initial, {"text": fixed})
     names = list(loaded.export(loaded.variables))
+    width = residual_width(loaded.variables)
 
     def draw(seed):
-        """The fixture's rows at seed 0, else rows of ids drawn uniformly from the vocabulary."""
+        """The fixture's rows and weights at seed 0. Every other seed draws rows of ids uniformly
+        from the vocabulary and, independently, an order of the residual stream's units
+        (`tests/residual_orders`), which both sides start from: every contraction then sums in
+        another order, where fresh rows alone left the embedding's and AltUp projections' sparse
+        gradients unresolved within 512 seeds at four times the rows."""
         if seed == 0:
-            return (fixed,)
-        vocab = int(model.vocab_size)
-        return (np.random.default_rng(seed).integers(0, vocab, fixed.shape).astype(np.int32),)
+            return fixed, np.arange(width)
+        draws = np.random.default_rng(seed)
+        rows = draws.integers(0, int(model.vocab_size), fixed.shape).astype(np.int32)
+        return rows, np.random.default_rng(seed).permutation(width)
 
-    def stepped(rows):
+    def start(order):
+        return permuted(loaded.variables, order)
+
+    def stepped(rows, order):
         # The step donates the state it is given: each draw steps from its own copy.
-        state, *_ = step(jax.tree.map(jnp.copy, initial), {"text": rows})
+        begun = initial.replace(variables=jax.device_put(start(order), trainer.shardings(initial).variables))
+        state, *_ = step(begun, {"text": rows})
         trained = loaded.export({**loaded.variables, "params": state.variables["params"]})
         return {name: np.asarray(trained[name], np.float32) for name in names}
 
-    def reference(dtype, rows):
+    def reference(dtype, rows, order):
         hf_config = AutoConfig.from_pretrained(directory)
         hf_config.altup_coef_clip = clip
         reference = AutoModelForCausalLM.from_pretrained(directory, config=hf_config,
                                                          attn_implementation="eager").float()
+        # Every parameter starts from the draw's order (a tied one through the parameter it shares).
+        exported = loaded.export(start(order))
+        assert {name for name, _ in reference.named_parameters()} <= set(exported)
+        reference.load_state_dict({name: torch.from_numpy(np.asarray(tensor, np.float32))
+                                   for name, tensor in exported.items()}, strict=False)
         if dtype == torch.float64:
             with float64():
                 wide = AutoModelForCausalLM.from_config(hf_config, dtype=torch.float64,
@@ -236,9 +252,9 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
         state_dict = reference.state_dict()
         return {name: state_dict[name].detach().numpy() for name in names}
 
-    assert_as_exact(stepped, lambda rows: reference(torch.float32, rows), draw,
+    assert_as_exact(stepped, lambda rows, order: reference(torch.float32, rows, order), draw,
                     f"a clamped AltUp training step, decay {decay}", seeds=STEP_SEEDS,
-                    truth_fn=lambda rows: reference(torch.float64, rows))
+                    truth_fn=lambda rows, order: reference(torch.float64, rows, order))
 
 
 @pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
