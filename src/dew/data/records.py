@@ -91,10 +91,10 @@ def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str,
     """`written` with one setting of one call of `pipe` set to `value`, parsed JSON and read against
     the setting's annotation. `path` is "<preset>.<setting>", the preset by its name where the
     chain's own stages call it once, by its entry's place among the record's stages ("2.seq_len"),
-    or "source" for the call that made its store. Where no call made the store, "source.<field>"
-    sets that field of the store, or of the first store below its selections (a holdout's) that
-    has it (`_store_with`). A call inside a mix or phases is not addressed here. Reading the record
-    back makes the call again, so the stages it makes follow it."""
+    or "source" for the call that made its store. A setting that call doesn't take, or any where no
+    call made the store, sets that field of the store the chain reads (`_source_with`). A call
+    inside a mix or phases is not addressed here. Reading the record back makes the call again, so
+    the stages it makes follow it."""
     version = written.get("version")
     if version != VERSION:
         raise ValueError(f"a chain's record of version {version!r}; this Dew overrides version {VERSION}")
@@ -103,8 +103,8 @@ def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str,
         raise ValueError(f"an override names a call and its setting, `<preset>.<setting>`, not {path!r}")
     changed = record(json.loads(json.dumps(written)), "chain")
     source = record(changed["source"], "chain source")
-    if target == "source" and "pipe" not in source:
-        moved = json_value({**changed, "source": _store_with(source, setting, value)}, "chain")
+    if target == "source" and not ("pipe" in source and _takes(source, setting)):
+        moved = json_value(_source_with(changed, setting, value), "chain")
         if not isinstance(moved, dict):
             raise ValueError("a chain's record is a mapping")
         return moved
@@ -141,6 +141,25 @@ def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str,
     if not isinstance(written_back, dict):
         raise ValueError("a chain's record is a mapping")
     return written_back
+
+
+def _takes(call: Mapping[str, object], setting: str) -> bool:
+    """Whether the function a call of `pipe` names takes `setting`, by name or as a keyword."""
+    parameters = inspect.signature(_function(call["pipe"])).parameters
+    return setting in parameters or any(parameter.kind is inspect.Parameter.VAR_KEYWORD
+                                        for parameter in parameters.values())
+
+
+def _source_with(chain: Mapping[str, object], setting: str, value: JSON) -> Mapping[str, object]:
+    """`chain`'s record with `setting` set on the store it reads: its store's (`_store_with`), or,
+    where a call made the store from a chain it read, that chain's."""
+    source = record(chain["source"], "chain source")
+    if "pipe" not in source:
+        return {**chain, "source": _store_with(source, setting, value)}
+    if "input" not in source:
+        raise ValueError(f"{source['pipe']} made the chain's store, and takes no setting {setting!r}")
+    read = _source_with(record(source["input"], "a call's input"), setting, value)
+    return {**chain, "source": {**source, "input": read}}
 
 
 def _store_with(store: Mapping[str, object], setting: str, value: JSON) -> Mapping[str, object]:
