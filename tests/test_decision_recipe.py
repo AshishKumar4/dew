@@ -32,7 +32,7 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
     train, held = Files(str(table), format="csv").holdout(0.5)
 
     def asked(rows):
-        return rows.pipe(decisions, question="team").batch(8).loading(Loading(workers=0))
+        return rows.pipe(decisions, question="team").read("memory").batch(8).loading(Loading(workers=0))
 
     config = DecisionRunConfig.cli([
         "--pretrained", str(TINY), "--objective.loss", json.dumps(

@@ -72,7 +72,7 @@ def windows(corpus, held: bool = False, **settings):
     """The corpus's training store's windows of SEQ tokens in batches of 8 (`presets.lm`), or its
     validation store's where `held`."""
     store = TokenFiles(corpus.val if held else corpus.train)
-    chain = store.pipe(presets.lm, None, seq_len=SEQ, batch=8, pack=None, **settings)
+    chain = store.pipe(presets.lm, None, **{"seq_len": SEQ, "batch": 8, "pack": None, **settings})
     return chain.loading(Loading(workers=0))
 
 
