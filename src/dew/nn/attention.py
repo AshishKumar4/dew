@@ -48,7 +48,7 @@ from .documents import (
     query_order,
     with_documents,
 )
-from .flops import attention_flops, cross_attention_flops, projection_flops
+from .flops import cross_attention_flops, projection_flops, self_attention_flops
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, gpu_placed
@@ -2032,8 +2032,7 @@ class NormalAttention(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Self-attention maps and its full QK/AV products on real rows."""
-        return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
-                + attention_flops(lengths, self.heads, self.dim_head, self.dim_head, causal=False))
+        return self_attention_flops(lengths, self.projections(), self.heads, self.dim_head)
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths, context_features: int) -> float:

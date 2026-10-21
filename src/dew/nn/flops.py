@@ -7,7 +7,7 @@ MFU. Rematerialization belongs only to the separate HLO hardware count.
 """
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 from flax import linen as nn
@@ -115,6 +115,14 @@ def attention_flops(lengths: np.ndarray, heads: int, key: int, value: int, *, ca
     else:
         work = pairs(length)
     return _attention_products(work, heads, key, value)
+
+
+def self_attention_flops(lengths: np.ndarray, projections: Mapping[str, tuple[int, int]], heads: int,
+                         head_dim: int) -> float:
+    """A bidirectional self-attention block over real rows: its `projections` (name to input and
+    output width) and the full QK and AV products of `heads` heads `head_dim` wide."""
+    return (sum(projection_flops(lengths, *shape) for shape in projections.values())
+            + attention_flops(lengths, heads, head_dim, head_dim, causal=False))
 
 
 def cross_attention_flops(lengths: np.ndarray, context_lengths: np.ndarray,
