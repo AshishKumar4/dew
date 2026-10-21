@@ -134,6 +134,7 @@ def _forward_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kind
     carry = jax.lax.fori_loop(full_lo, full_hi, functools.partial(step, masked=False), carry)
     acc, peak, total = jax.lax.fori_loop(full_hi, hi, functools.partial(step, masked=True), carry)
     out = jnp.where(total[:, None] > 0, acc / jnp.where(total > 0, total, 1.0)[:, None], 0.0)
+    unhooked = out
     if output_mod is not None:
         params = [_tile_param(ref, kind, head, q_pos, None) for ref, kind in zip(output_refs, output_kinds,
                                                                                strict=True)]
@@ -143,6 +144,8 @@ def _forward_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kind
         # A query that saw nothing from no state holds 0 for both, as the reference's residuals do.
         residual_refs[0][...] = jnp.where(peak == -jnp.inf, 0.0, peak)
         residual_refs[1][...] = total
+        if len(residual_refs) == 3:
+            residual_refs[2][...] = unhooked
 
 
 @dataclasses.dataclass(frozen=True)
@@ -152,7 +155,8 @@ class TritonForward(Template[Tiles]):
     `start` to `end` `[B, Qp]` and, with documents, its id `[B, Qp]` against the keys' `[B, Kp]`; the
     score and output hooks' parameters (`score_params`, `output_params`, laid out by `score_kinds` and
     `output_kinds`) and the softmax's initial state. Returns the output `[B, Qp, H, Dvp]` and, with
-    `residuals`, each query's running maximum and denominator `[B, H, Qp]`, fp32."""
+    `residuals`, each query's running maximum and denominator `[B, H, Qp]`, fp32, and with `wide` the
+    output before the output hook in fp32 too."""
 
     name = "triton"
     config_cls = Tiles
@@ -161,6 +165,7 @@ class TritonForward(Template[Tiles]):
     score_kinds: tuple[Kind, ...] = ()
     output_kinds: tuple[Kind, ...] = ()
     scale: float = 1.0
+    wide: bool = False
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, m0, total0,
              acc0, *, residuals: bool, interpret: bool, config: Tiles, return_residuals: bool = False):
@@ -199,6 +204,10 @@ class TritonForward(Template[Tiles]):
         if residuals:
             out_shape += [jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 2
             out_specs += [pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))] * 2
+            if self.wide:
+                out_shape.append(jax.ShapeDtypeStruct((batch, queries, heads, value_width), jnp.float32))
+                out_specs.append(pl.BlockSpec((None, block_q, None, value_width),
+                                              lambda i, b, h: (b, i, h, 0)))
         kernel = functools.partial(
             _forward_kernel, ids=ids, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, score_mod=self.score_mod, output_mod=self.output_mod,
@@ -279,12 +288,14 @@ def _padded(param: Param, queries: int, keys: int, value_width: int) -> jax.Arra
 
 
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-            *, scale: float | None = None, residuals: bool = False, interpret: bool = False):
+            *, scale: float | None = None, residuals: bool = False, wide: bool = False,
+            interpret: bool = False):
     """The template's forward (`TritonForward`) on `query` `[B, Q, H, D]` over `key` and `value`
     `[B, K, Hk, D]` and `[B, K, Hk, Dv]` and the keys `spans` leaves each query: as
     `dew.nn.kernels.templates.attention.reference` computes it, with `residuals` its running maxima and
-    denominators `[B, H, Q]` too. The operands pad to whole blocks of the largest tile and to power-of-two
-    head widths; the padding is unread and sliced off. `interpret` runs it on the CPU."""
+    denominators `[B, H, Q]` too, and with `wide` the output before the output hook in fp32, from which
+    `backward` may take each query's `D`. The operands pad to whole blocks of the largest tile and to
+    power-of-two head widths; the padding is unread and sliced off. `interpret` runs it on the CPU."""
     hooks = Hooks() if hooks is None else hooks
     queries, width = query.shape[1], query.shape[3]
     keys, value_width = key.shape[1], value.shape[-1]
@@ -308,7 +319,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     op = TritonForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
                        score_kinds=tuple(param.kind for param in hooks.score_params),
                        output_kinds=tuple(param.kind for param in hooks.output_params),
-                       scale=width ** -0.5 if scale is None else scale)
+                       scale=width ** -0.5 if scale is None else scale, wide=wide and residuals)
     out = op(pad(query, padded_q, padded_d), pad(key, padded_k, padded_d), pad(value, padded_k, padded_dv),
              pad_rows(spans.start, padded_q), pad_rows(spans.end, padded_q),
              pad_rows(spans.query_ids, padded_q), pad_rows(spans.key_ids, padded_k),
@@ -317,8 +328,9 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
              m0, total0, acc0, residuals=residuals, interpret=interpret)
     if not residuals:
         return out[:, :queries, :, :value_width]
-    out, peak, total = out
-    return out[:, :queries, :, :value_width], peak[:, :, :queries], total[:, :, :queries]
+    out, peak, total, *unhooked = out
+    kept = (out[:, :queries, :, :value_width], peak[:, :, :queries], total[:, :, :queries])
+    return (*kept, unhooked[0][:, :queries, :, :value_width]) if wide else kept
 
 
 
@@ -377,7 +389,7 @@ def _tile_scores(score_mod, query, key, value, dout, peak, total, delta, seen, q
 
 
 def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tuple[Kind, ...], score_mod,
-               scale: float, block_k: int, interpret: bool):
+               scale: float, block_k: int, exact: bool, interpret: bool):
     refs = list(refs)
     query_ids_ref, key_ids_ref = (refs.pop(0), refs.pop(0)) if ids else (None, None)
     query_ref, key_ref, value_ref, dout_ref, peak_ref, total_ref, initial_ref = (refs.pop(0)
@@ -415,7 +427,9 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
                                               interpret=interpret)
         return delta + jnp.sum(weights * products, axis=-1)
 
-    delta = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_term, initial_ref[...])
+    # Without the first pass, the row term enters whole (`backward`'s `output`).
+    delta = (jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_term, initial_ref[...]) if exact
+             else initial_ref[...])
     delta_ref[...] = delta
 
     def step(index, carry):
@@ -544,10 +558,12 @@ class TritonDq(_Backward):
     from the forward's residuals: first for its queries' `D = sum_j p dP` (plus the softmax's initial
     state's share, `initial_term`), then for dQ. Returns dQ `[B, Qp, H, Dp]` fp32, `D` `[B, H, Qp]`, which
     the dK/dV launch reads, and the gradients of the score hook's head (`[nQb, B, H, 1]` partials), query
-    (`[B, H, Qp]`) and tile (`[B, H, Qp, Kp]`) parameters."""
+    (`[B, H, Qp]`) and tile (`[B, H, Qp, Kp]`) parameters. Not `exact`, `initial_term` is each query's
+    whole `D` and the first pass is skipped."""
 
     name = "triton"
     config_cls = Tiles
+    exact: bool = True
 
     def _programs(self, batch, heads, queries, keys, config):
         return batch * heads * (queries // config.block_q), keys // config.block_k
@@ -598,7 +614,7 @@ class TritonDq(_Backward):
                     out_specs.append(pl.BlockSpec((None, None, block_q, keys), lambda i, b, h: (b, h, i, 0)))
         kernel = functools.partial(_dq_kernel, ids=ids, score_kinds=self.score_kinds,
                                    score_mod=self.score_mod, scale=self.scale, block_k=block_k,
-                                   interpret=interpret)
+                                   exact=self.exact, interpret=interpret)
         out = pl.pallas_call(
             kernel, grid=(queries // block_q, batch, heads), in_specs=in_specs, out_specs=out_specs,
             out_shape=out_shape, input_output_aliases=aliases, interpret=interpret, name="attention_dq",
@@ -694,12 +710,13 @@ class Gradients:
 
 
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
-             peak: jax.Array, total: jax.Array, dout: jax.Array, *, scale: float | None = None,
-             interpret: bool = False) -> Gradients:
+             peak: jax.Array, total: jax.Array, dout: jax.Array, *, output: jax.Array | None = None,
+             scale: float | None = None, interpret: bool = False) -> Gradients:
     """The template's backward (`TritonDq`, `TritonDkv`) of `forward` from its residuals `peak` and
     `total` `[B, H, Q]` under the output's cotangent `dout` `[B, Q, H, Dv]`: each gradient fp32, then
     rounded to its input's dtype. Each query's `D = sum_j p dP` is summed from the tiles' own products
-    (`TritonDq`), as the softmax's derivative takes it, rather than from the rounded output. The output
+    (`TritonDq`), as the softmax's derivative takes it, or given the forward's fp32 `output` before its
+    hook (`forward`'s `wide`), as `rowsum(dout * output)`, which saves that pass. The output
     hook is no part of it: a differentiated call applies `output_mod` past the kernel, where its own
     derivative runs, and passes `dout` before it. Deterministic: every gradient element is written by one
     program, a head parameter's partial sums added in a fixed order and a key head's query heads summed in
@@ -723,6 +740,9 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         weight = jnp.where((total > 0) & jnp.isfinite(state.m),
                            jnp.exp(state.m - peak) / jnp.where(total > 0, total, 1.0), 0.0)
         initial_term = weight * jnp.sum(state.acc * cotangent, axis=-1)
+    if output is not None:
+        # The whole row term from the fp32 output, the initial state's share in it.
+        initial_term = jnp.einsum("bqhd,bqhd->bhq", output.astype(jnp.float32), dout.astype(jnp.float32))
 
     def pad(array, rows, columns):
         return jnp.pad(array, ((0, 0), (0, rows - array.shape[1]), (0, 0), (0, columns - array.shape[3])))
@@ -739,7 +759,8 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
             pad_rows(spans.query_ids, padded_q), pad_rows(spans.key_ids, padded_k),
             tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score_params))
     kinds = tuple(param.kind for param in hooks.score_params)
-    dq, padded_delta, *dq_grads = TritonDq(score_mod=hooks.score_mod, score_kinds=kinds, scale=scale)(
+    dq, padded_delta, *dq_grads = TritonDq(score_mod=hooks.score_mod, score_kinds=kinds, scale=scale,
+                                           exact=output is None)(
         *operands, pad_heads(initial_term), *rows, interpret=interpret)
     dk, dv, *key_grads = TritonDkv(score_mod=hooks.score_mod, score_kinds=kinds, scale=scale)(
         *operands, padded_delta, *rows, interpret=interpret)
