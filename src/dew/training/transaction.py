@@ -70,6 +70,27 @@ def _chosen(take, taken, kept):
     return jax.tree.map(lambda new, old: jnp.where(take, new, old), taken, kept)
 
 
+def cleared(acc: Accumulation) -> Accumulation:
+    """`acc` emptied for its next window: its sums zero, its QK maxima at their identity."""
+    return dataclasses.replace(jax.tree.map(jnp.zeros_like, acc), qk_stats=jax.tree.map(
+        lambda x: jnp.full_like(x, -jnp.inf) if jnp.issubdtype(x.dtype, jnp.inexact) else jnp.zeros_like(x),
+        acc.qk_stats))
+
+
+def dropped_window(state, size: int):
+    """`state` with its window of `size` microbatches dropped: its accepted microbatches forgotten and
+    the next taking its first slot, as a rejected attempt (`Transaction.finish_attempt`) or a batch
+    ramp's new stage (`Trainer`'s runner) leaves it, so a committed update pools one window of one
+    stage's batches, all drawn under one key (`example_fields`). The window's gradient sum stays in
+    place, unread, as a commit leaves it (`prepare_attempt`); the mutable collections its microbatches
+    wrote keep what they wrote, as torch's AMP keeps a skipped update's running statistics."""
+    if state.accumulation is None:
+        return state
+    window = dataclasses.replace(cleared(dataclasses.replace(state.accumulation, gradient=None)),
+                                 gradient=state.accumulation.gradient)
+    return dataclasses.replace(state, microstep=state.microstep - state.microstep % size, accumulation=window)
+
+
 def _only_when(due, taken, kept, operand):
     """`taken(operand)` where `due` holds, else `kept(operand)`, running `taken` then alone.
 
@@ -240,9 +261,11 @@ def example_places(slot, split: int, rows: int, column: jax.Array | None = None,
     else its row in the step's batch, every `split`th from row `part` (`microbatch`; by default
     `slot % split`).
 
-    A window pools its steps' microbatches in the order it accepts them, so a dynamic loss scale's
-    rejected microbatch leaves its slot to the next, which takes its places under a key that folds in
-    the rejection (`example_fields`): no two accepted microbatches of an update draw alike."""
+    A window pools its steps' microbatches in the order it accepts them. A dynamic loss scale's
+    rejection drops its window (`dropped_window`), and the next takes its first slot under a key that
+    folds in the rejection (`example_fields`), whatever part of its step it reads: a window's slots
+    are consecutive parts, so each step's places stay distinct, and no two examples of an update
+    draw alike."""
     step = slot // split
     if column is None:
         part = slot % split if part is None else part
@@ -254,7 +277,7 @@ def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, re
     """The `Step` fields of the microbatch in window slot `slot` of the update `state` commits next, of
     `slots` microbatches, its steps read in `split` microbatches each, this the `part`th, after the run
     rejected `rejected` attempts: the update's key (`Step.example_key`), which folds in the rejections,
-    so the input a rejected one leaves its slot to draws afresh, each row's place among the update's
+    so a window that follows a dropped one draws afresh, each row's place among the update's
     examples (`example_places`), placed as the batch's rows are, so each device draws its own rows'
     examples alone, and how many examples the update pools. A batch with no rows has no examples."""
     rows = rows_of(batch)
@@ -563,19 +586,17 @@ class Transaction:
                             lambda held, x: held.at[pending.fill].set(x), acc.variables, reads))
                 return acc
 
-            def clear(acc):
-                return dataclasses.replace(jax.tree.map(jnp.zeros_like, acc), qk_stats=jax.tree.map(
-                    lambda x: jnp.full_like(x, -jnp.inf) if jnp.issubdtype(x.dtype, jnp.inexact)
-                    else jnp.zeros_like(x), acc.qk_stats))
             # A pooled window's gradient sum (a replayed window keeps none)
             # goes round the reset too, its next first microbatch restarting
             # it (`prepare_attempt`): passed through on every microbatch the
             # window does not commit, it was copied each time (Qwen3.5-0.8B's 1 GB
             # embedding sum, twice a step on an A100).
-            window = jax.lax.cond(pending.due, clear, retain, dataclasses.replace(candidate, gradient=None))
+            window = jax.lax.cond(pending.due, cleared, retain, dataclasses.replace(candidate, gradient=None))
             numerical = dataclasses.replace(
                 numerical, accumulation=dataclasses.replace(window, gradient=candidate.gradient))
-        advanced = _chosen(accepted, numerical, state)
+        # A rejected attempt drops its window (`dropped_window`): the update it would have closed is
+        # skipped whole, its accepted microbatches with it.
+        advanced = _chosen(accepted, numerical, dropped_window(state, self.size))
         if self.size == 1 and advanced.compute is not None:
             # The copies are the cast of whichever parameters were chosen, so
             # they are cast after the choice. Choosing between the new and the
