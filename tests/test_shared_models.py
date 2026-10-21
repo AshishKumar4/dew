@@ -4,14 +4,15 @@ import sys
 from pathlib import Path
 
 import pytest
-from tool_support import load
+from tool_support import load, run_from
 
 SITE = Path(__file__).resolve().parents[1] / "site"
 
 
 @pytest.fixture(scope="module")
 def service():
-    return load("model_service", "site/live/container")
+    with run_from("model_service", "site/live/container") as module:
+        yield module
 
 
 def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_path):

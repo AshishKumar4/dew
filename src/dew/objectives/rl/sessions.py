@@ -42,7 +42,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Protocol
+from typing import Protocol, SupportsFloat
 
 import jax
 import jax.numpy as jnp
@@ -104,6 +104,12 @@ CREDITS = ("session", "turn")
 return, every call alike; `turn`, one per call from the return still ahead of
 it, compared with the group's members' at the same turn."""
 
+
+
+def finite_reward(value: SupportsFloat) -> float:
+    """A verifier's or reward's score as a float: anything `float` takes (a bool's 1.0 and 0.0, a
+    NumPy or JAX scalar), refused unless finite (`records.finite`)."""
+    return finite(float(value), "a reward")
 
 
 def local_task_ids(batch: Mapping[str, ArrayLike]) -> np.ndarray:

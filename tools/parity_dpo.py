@@ -21,7 +21,6 @@ environment):
 
 from __future__ import annotations
 
-import argparse
 import dataclasses
 from collections import defaultdict
 from pathlib import Path
@@ -38,11 +37,11 @@ VOCAB = 8
 BETA = 0.1
 
 
-def batch() -> dict[str, np.ndarray]:
-    """Fixed logits, ids and TRL-layout masks for [chosen; rejected] rows: a
-    prompt prefix, a completion span and two short rows standing in for
-    padding."""
-    rng = np.random.default_rng(7)
+def batch(seed: int = 0) -> dict[str, np.ndarray]:
+    """Seed `seed`'s logits, ids and TRL-layout masks for [chosen; rejected]
+    rows: a prompt prefix, a completion span and two short rows standing in
+    for padding."""
+    rng = np.random.default_rng(7 + seed)
     rows = 2 * PAIRS
     mask = np.ones((rows, SEQUENCE), np.float32)
     mask[:, :2] = 0
@@ -97,27 +96,43 @@ def trl_loss(arrays: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
             "rewards": np.asarray([metrics["rewards/chosen"][0], metrics["rewards/rejected"][0]])}
 
 
-def main(argv: list[str] | None = None) -> None:
+def evaluated(arrays: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """TRL's loss, gradient and rewards on a batch in fp32, and in float64."""
     import torch
-    import trl
 
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", type=Path, default=FIXTURES / "rl" / "dpo.npz")
-    out = parser.parse_args(argv).out
-    from reference_releases import require
+    fp32, exact = trl_loss(arrays, torch.float32), trl_loss(arrays, torch.float64)
+    return ({name: np.asarray(value, np.float32) for name, value in fp32.items()},
+            {name: np.asarray(value, np.float64) for name, value in exact.items()})
 
-    require("trl")
-    torch.set_num_threads(1)
-    arrays = batch()
-    fp32 = trl_loss(arrays, torch.float32)
-    exact = trl_loss(arrays, torch.float64)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out, **arrays, beta=np.asarray(BETA),
-             **{f"trl_{name}": np.asarray(value, np.float32) for name, value in fp32.items()},
-             **{f"trl_{name}_f64": value for name, value in exact.items()},
-             trl_version=np.array(trl.__version__), torch_version=np.array(torch.__version__))
-    print(f"{out}: loss {fp32['loss']:.6f}, trl {trl.__version__}, torch {torch.__version__}")
+
+def proxy(arrays):
+    """Dew's own composition (`dew.rl.preference_logsigmoid_terms`) on a batch, which plans the seeds
+    the recorder confirms on TRL."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.rl import preference_logsigmoid_terms
+
+    ids = jnp.asarray(arrays["input_ids"], jnp.int32)[:, 1:, None]
+    mask = arrays["completion_mask"][:, 1:]
+
+    def token_log_probs(logits):
+        return jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids, axis=-1)[..., 0]
+
+    def loss(policy_logits):
+        policy, ref = token_log_probs(policy_logits), token_log_probs(arrays["ref_logits"])
+        half = policy.shape[0] // 2
+        terms, (chosen, rejected) = preference_logsigmoid_terms(
+            policy[:half], policy[half:], ref[:half], ref[half:], mask[:half], mask[half:], BETA)
+        return jnp.mean(terms), jnp.stack([jnp.mean(chosen), jnp.mean(rejected)])
+
+    (value, rewards), gradient = jax.value_and_grad(loss, has_aux=True)(arrays["policy_logits"])
+    return {"loss": value, "policy_logits_grad": gradient, "rewards": rewards}
 
 
 if __name__ == "__main__":
-    main()
+    from recorded_references import record_reference
+
+    record_reference("dpo", batch, evaluated, proxy, package="trl", repo="huggingface/trl",
+                     tool="tools/parity_dpo.py", out=FIXTURES / "rl" / "dpo.npz", description=__doc__,
+                     beta=BETA)

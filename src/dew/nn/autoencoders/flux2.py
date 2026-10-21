@@ -45,9 +45,11 @@ class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
         super().__init__(model, params)
         self.statistics = {'mean': np.asarray(mean, np.float32), 'variance': np.asarray(variance, np.float32),
                            'epsilon': epsilon}
-        # `Flux2Pipeline._patchify_latents` and `_unpatchify_latents`, channels last.
-        self.encode_single_frame = jax.jit(lambda params, image, key=None: pixel_unshuffle(jnp.asarray(
-            model.apply({"params": params}, image, key, method=model.encode))))
+        # `Flux2Pipeline._patchify_latents` and `_unpatchify_latents`, channels last. A posterior's
+        # `noise` comes in the folded latent's layout and is unfolded to the one it is drawn in.
+        self.encode_single_frame = jax.jit(lambda params, image, key=None, noise=None: pixel_unshuffle(
+            jnp.asarray(model.apply({"params": params}, image, key,
+                                    None if noise is None else pixel_shuffle(noise), method=model.encode))))
         self.decode_single_frame = jax.jit(lambda params, latent: model.apply(
             {"params": params}, pixel_shuffle(latent), method=model.decode))
         self.latent_shift = np.asarray(mean, np.float32)

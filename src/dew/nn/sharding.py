@@ -596,6 +596,14 @@ def explicit_spec(x: jax.Array, trailing: int = 0) -> jax.sharding.NamedSharding
     return jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec(*padded))
 
 
+def rows_taken(table: jax.Array, index: jax.Array) -> jax.Array:
+    """`table`'s rows at `index` (`jnp.take` on its first axis), placed as `index` is where an Explicit
+    axis splits it: a replicated table read by each device's own indices, as a schedule's is by each
+    example's time (`dew.objectives.base.Step.sample`)."""
+    placed = explicit_spec(jnp.asarray(index), table.ndim - 1)
+    return jnp.take(table, index, axis=0) if placed is None else table.at[index].get(out_sharding=placed)
+
+
 def rows_spec(like: jax.Array, ndim: int) -> jax.sharding.NamedSharding | None:
     """A placement for an array of `ndim` dimensions whose rows are `like`'s:
     the Explicit axis that splits `like`'s first dimension on its first, the
