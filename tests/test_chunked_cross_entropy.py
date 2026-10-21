@@ -46,8 +46,8 @@ def true_logits(table, states, dtype):
     """`table`'s logits of `states` (`OutputTable.logits`) for a float64 truth: the states through its
     input quantizer, taken as exact, and the rest in float64; under bf16 compute, which multiplies bf16
     operands and rounds the logits to bf16 (`head_product`), the exact product of the bf16 operands
-    rounded to bf16 once, as either head's product is, its own order aside. Called where x64 is
-    enabled."""
+    rounded to bf16 once, as each head's one product (`bf16_product`) is, its own order aside. Called
+    where x64 is enabled."""
     with jax.enable_x64(new_val=False):
         read = np.asarray(table.states(jnp.asarray(states, dtype)))
     operands = [np.asarray(value, np.float64) for value in (read, table.matrix)]
@@ -129,9 +129,8 @@ def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float
     """The gradient-in-forward head's weighted sum of losses and z-loss, and
     its gradients for the states, the head, the per-token scale and the bias,
     and its per-token losses and log Z, on par with the whole-logits head's over
-    drawn heads and columns (check 1), over chunks whose last is short (four
-    token tiles and four column tiles), padded weights and a cap; its top-1
-    columns are the whole head's."""
+    drawn heads and columns (check 1), over chunks whose last is short, padded
+    weights and a cap; its top-1 columns are the whole head's."""
     z_loss = 1e-2
 
     def draw(seed):
@@ -151,7 +150,7 @@ def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float
     def fused(states, matrix, scale, bias, targets, weights):
         return fused_head_loss(states, OutputTable(matrix, vocab_major=False, bias=bias, softcap=softcap,
                                                    scale=scale),
-                               targets, weights, z_loss=z_loss, tile=(40, 11))
+                               targets, weights, z_loss=z_loss, tile=(3, 11))
 
     def held(loss):
         def run(*terms):
@@ -246,11 +245,13 @@ def columns(vocab: int, seed: int = 0):
             jax.random.normal(bias, (vocab,), jnp.float32) / 17)
 
 
-SEEDS = {'bias': 8, 'fused': 16, 'quantized': 8, 'scale and bias': 64, 'vocabulary split': 256,
-         'column orders': 8, 'split bias': 8, 'quantized split': 8, 'backbone states': 8, 'backbone': 8,
-         'small vocabulary': 8, 'small vocabulary training': 8, 'bounded': 8, 'saturated': 8, 'excluded': 8,
-         'token tiles': 8, 'both outputs': 8, 'gemma': 8, 'bf16 cotangent': 8, 'whole logits': 8}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
+SEEDS = {'bias': 128, 'fused': 512, 'quantized': 64, 'scale and bias': 128, 'vocabulary split': 512,
+         'column orders': 8, 'split bias': 32, 'quantized split': 32, 'backbone states': 16, 'backbone': 128,
+         'small vocabulary': 128, 'small vocabulary training': 128, 'bounded': 32, 'saturated': 256,
+         'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 16, 'bf16 cotangent': 8,
+         'whole logits': 512}
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, 2026-10-21):
+the most any of a site's cases took."""
 
 
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
