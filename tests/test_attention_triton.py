@@ -143,3 +143,112 @@ def test_a_query_that_sees_no_key_reads_zero_and_a_sink_keeps_its_share():
     assert np.all(np.asarray(out)[padding] == 0)
     assert np.all(np.asarray(total).transpose(0, 2, 1)[padding] == 0)
     assert np.all(np.asarray(sunk).transpose(0, 2, 1)[padding] == 1)
+
+
+SCORE_HOOKS = {"none": (), "softcap": ("softcap",), "sinks": ("sinks",), "alibi": ("alibi",),
+               "key-bias": ("key",), "tile-bias": ("tile",),
+               "softcap-sinks-alibi": ("softcap", "sinks", "alibi")}
+"""The score hooks the backward differentiates, each kind of parameter among them: ALiBi's slopes a
+head's, a per-key bias, a dense bias."""
+
+
+def score_hooks(names: tuple, queries: int, keys: int) -> template.Hooks:
+    """The score hooks `names` asks for, their parameters fixed: a softcap, ALiBi, a per-key bias, a dense
+    bias as one score_mod, sinks as the softmax's initial state."""
+    slopes = alibi_bias(jnp.ones((1, 1)), 4, dtype=jnp.float32).reshape(4)
+    streams = jax.random.split(jax.random.key(77), 2)
+    params = []
+    if "alibi" in names:
+        params.append(template.Param(slopes, template.Kind.HEAD))
+    if "key" in names:
+        params.append(template.Param(jax.random.normal(streams[0], (ROWS, 4, keys)), template.Kind.KEY))
+    if "tile" in names:
+        dense = jax.random.normal(streams[1], (ROWS, 4, queries, keys))
+        params.append(template.Param(dense, template.Kind.TILE))
+
+    def score_mod(s, q_pos, k_pos, *values):
+        values = list(values)
+        if "softcap" in names:
+            s = SOFTCAP * jnp.tanh(s / SOFTCAP)
+        if "alibi" in names:
+            s = s + values.pop(0).astype(s.dtype) * k_pos.astype(s.dtype)
+        for _ in range(("key" in names) + ("tile" in names)):
+            s = s + values.pop(0).astype(s.dtype)
+        return s
+
+    scoring = bool({"softcap", "alibi", "key", "tile"} & set(names))
+    return template.Hooks(score_mod if scoring else None, tuple(params),
+                          template.sinks(SINKS, ROWS, queries, 32) if "sinks" in names else None)
+
+
+def check_backward(case: dict, names: tuple, dtype, forward_config, backward_config):
+    """`attention_triton.backward` after `forward`, its every gradient (queries, keys, values, each score
+    parameter, the initial state's) on par with `jax.vjp` of the template's XLA arithmetic, from float64."""
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    hooks = score_hooks(names, queries, keys)
+    draw_qkv = drawing(queries, keys, dtype)
+
+    def draw(seed):
+        query, key, value = draw_qkv(seed)
+        dout = jax.random.normal(jax.random.key(seed + 1000), (ROWS, queries, 4, 32), jnp.float32)
+        return query, key, value, dout.astype(dtype)
+
+    def with_hooks(params, initial):
+        return template.Hooks(hooks.score_mod, tuple(template.Param(value, param.kind)
+                                                     for value, param in zip(params, hooks.score_params,
+                                                                             strict=True)),
+                              initial)
+
+    pins = tuning.pinned({attention_triton.TritonForward: forward_config,
+                          attention_triton.TritonDq: backward_config,
+                          attention_triton.TritonDkv: backward_config})
+
+    def ours(query, key, value, dout):
+        with pins:
+            out, peak, total = attention_triton.forward(query, key, value, spans, hooks, residuals=True,
+                                                        interpret=not ON_GPU)
+            grads = attention_triton.backward(query, key, value, spans, hooks, out, peak, total, dout,
+                                              interpret=not ON_GPU)
+        return grads.query, grads.key, grads.value, grads.score_params, grads.initial
+
+    def xla(query, key, value, dout):
+        params = tuple(param.value for param in hooks.score_params)
+
+        def attend(query, key, value, params, initial):
+            return template.reference(query, key, value, spans, with_hooks(params, initial))
+
+        _, pull = jax.vjp(attend, query, key, value, params, hooks.initial)
+        dq, dk, dv, dparams, dinitial = pull(dout.astype(query.dtype))
+        return dq, dk, dv, dparams, dinitial
+
+    assert_as_exact(jax.jit(ours), jax.jit(xla), draw,
+                    f"triton backward {case} {names} {jnp.dtype(dtype).name} {backward_config}",
+                    seeds=ALL_HOOKS_SEEDS if len(names) > 1 else SEEDS)
+
+
+BACKWARD_FORMS = ("full", "causal-window", "documents", "cross-causal-lengths-starts", "two-sided-window")
+
+
+@pytest.mark.parametrize("config", PINNED[:3], ids=str)
+@pytest.mark.parametrize("form", BACKWARD_FORMS)
+def test_the_backward_is_on_par_over_every_call_form(form, config):
+    """Each call form's keys, fp32, no hooks, at pinned dQ and dK/dV configs."""
+    check_backward(CASES[form], (), jnp.float32, PINNED[1], config)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=lambda d: jnp.dtype(d).name)
+@pytest.mark.parametrize("hooks", SCORE_HOOKS.values(), ids=SCORE_HOOKS)
+def test_the_backward_is_on_par_under_every_score_hook(hooks, dtype):
+    """Each score hook over causal packed documents under a window: the gradients of its parameters and
+    of the sinks' initial state too."""
+    check_backward(CASES["causal-documents-window"], hooks, dtype, PINNED[1], PINNED[0])
+
+
+@pytest.mark.gpu(reason="every config compiles for the GPU")
+@pytest.mark.parametrize("config", attention_triton.SPACE, ids=str)
+def test_every_backward_config_on_a_gpu(config):
+    """Every config of the backward's space, bf16, causal documents under a window, a softcap, sinks and
+    ALiBi."""
+    check_backward(CASES["causal-documents-window"], SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16,
+                   PINNED[1], config)
