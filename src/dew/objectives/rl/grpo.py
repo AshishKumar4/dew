@@ -362,7 +362,6 @@ class GRPOObjective(TokenScorer):
         return Ratio(self.row_mean(scores.losses * scores.weights, batch).total,
                      self.row_mean(scores.weights, batch).total), scores
 
-
     def _evaluation_scores(self, params, batch, step) -> TokenScores:
         """The prompts' per-token scores.
 
