@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
+import functools
 import inspect
 import logging
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -91,7 +92,12 @@ class GpuTarget:
     (`dew.nn.kernels.grouped_matmul`). `multiprocessors` is the canonical
     device's streaming multiprocessors, a real device's own where it reports
     them (`gpu_target`), which a launch sizes its programs by
-    (`dew.nn.kernels.decode_attention`). This table is the one place a choice is
+    (`dew.nn.kernels.decode_attention`). `clock_hz` and `memory_bandwidth` are the
+    canonical device's boost clock and device-memory bytes per second, and
+    `tensor_rates` the generation's dense tensor-core FLOPs per clock per
+    multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in
+    fp32; 'tf32'), which a kernel's cost model reads
+    (`dew.nn.kernels.templates.cost`). This table is the one place a choice is
     keyed on the hardware generation; any other code reads its facts, a library's
     support rule the compute capability (`capability`), and a launch config the
     autotuner (`dew.nn.kernels.tuning`), as tools/lint_slop.py's SLOP016 holds.
@@ -106,6 +112,9 @@ class GpuTarget:
     head_tile: tuple[int, int] | None = None
     wgmma: bool = False
     multiprocessors: int | None = None
+    clock_hz: float | None = None
+    memory_bandwidth: float | None = None
+    tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
@@ -128,6 +137,18 @@ class GpuTarget:
     def fp8_peak(self) -> float | None:
         return self.peaks.get('fp8')
 
+    def tensor_rate(self, mode: str) -> float | None:
+        """Dense tensor-core FLOPs per clock per multiprocessor in arithmetic `mode`, or None where
+        the generation states none: the generation's, lowered where the SKU's catalogued dense bf16 peak
+        is below what its multiprocessors and clock give at that rate, as a GeForce part's half-rate
+        fp32 accumulation reads. A part reporting fewer multiprocessors than its catalogue counts (a
+        MIG slice) keeps the generation's rate: the catalogue never raises it."""
+        rate = self.tensor_rates.get(mode)
+        peak = self.bf16_peak
+        if rate is None or not (peak and self.multiprocessors and self.clock_hz):
+            return rate
+        return rate * min(1.0, peak / (self.tensor_rates['16bit'] * self.multiprocessors * self.clock_hz))
+
 
 # CUDA datasheets give sparse tensor peaks; the dense figures below are half.
 # A100 bf16 624; H100 SXM bf16/FP8 1979/3958, PCIe 1513/3026, NVL 1671/3341;
@@ -144,6 +165,13 @@ class GpuTarget:
 # v5e 197, v5p459, v6e918 from Google's architecture and generation pages.
 # Streaming multiprocessors of each canonical device: T4 40, A100 108, A10 72, L4 58, H100 SXM 132,
 # RTX PRO 6000 Blackwell Server 188, from NVIDIA's architecture whitepapers and datasheets.
+# Boost clock (MHz) and memory bandwidth (GB/s) of each canonical device, from the same datasheets:
+# A100 SXM4 80GB 1410/2039, A10 1695/600, L4 2040/300, H100 SXM 1830/3350, RTX PRO 6000 Blackwell
+# Server 2617/1792. Tensor FLOPs per clock per multiprocessor are a datasheet's dense peak over SMs x
+# boost clock: A100 312 TF bf16 -> 2048, TF32 156 -> 1024; A10 125/62.5 -> 1024/512; L4 121/60 ->
+# 1024/512; H100 SXM 989/495 -> 4096/2048; RTX PRO 6000 Blackwell Server 500/250 -> 1024/512.
+# GeForce parts of sm86 and sm89 sum 16-bit products in fp32 at half that rate (the GA102 and Ada
+# whitepapers); their generation's row states the data-center rate.
 # Opted-in shared memory per block, in KiB: Turing64, A100163, Ampere/Ada/RTX
 # Blackwell99, Hopper227. The SM reservation is already excluded:
 # https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
@@ -167,43 +195,44 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash',
-               'attention_packed': 'flash', 'grouped_matmul': 'pallas', 'xla_triton_gemm': 'off',
+               'attention_packed': 'flash', 'xla_triton_gemm': 'off',
                'rms_norm': 'pallas', 'swiglu': 'pallas', 'gate_up': 'joined', 'delta_gates': 'joined',
                'gated_delta_rule': 'fla', 'ssd': 'pallas'},
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), head_tile=(4096, 8192),
-              multiprocessors=108),
-    GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'attention_narrow': 'flash', 'grouped_matmul': 'pallas'},
-              {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72),
+              multiprocessors=108, clock_hz=1410e6, memory_bandwidth=2039e9,
+              tensor_rates={'16bit': 2048, 'tf32': 1024}),
+    GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'attention_narrow': 'flash'},
+              {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
+              clock_hz=1695e6, memory_bandwidth=600e9, tensor_rates={'16bit': 1024, 'tf32': 512}),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'attention': 'flash', 'attention_window': 'flash', 'attention_sinks': 'flash',
-               'grouped_matmul': 'pallas', 'xla_triton_gemm': 'off', 'gated_delta_rule': 'fla'},
+               'xla_triton_gemm': 'off', 'gated_delta_rule': 'fla'},
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
                'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), head_tile=(4096, 8192),
-              multiprocessors=58),
+              multiprocessors=58, clock_hz=2040e6, memory_bandwidth=300e9,
+              tensor_rates={'16bit': 1024, 'tf32': 512}),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
-               'attention_sinks': 'flash', 'attention_packed': 'flash', 'grouped_matmul': 'pallas',
-               'xla_triton_gemm': 'off', 'rms_norm': 'pallas', 'swiglu': 'pallas', 'delta_gates': 'joined',
-               'gated_delta_rule': 'fla', 'ssd': 'pallas'}, {
+               'attention_sinks': 'flash', 'attention_packed': 'flash', 'xla_triton_gemm': 'off',
+               'rms_norm': 'pallas', 'swiglu': 'pallas', 'delta_gates': 'joined', 'gated_delta_rule': 'fla',
+               'ssd': 'pallas'}, {
         'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
         'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
-        'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12}}, wgmma=True, multiprocessors=132),
+        'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12}}, wgmma=True, multiprocessors=132,
+              clock_hz=1830e6, memory_bandwidth=3350e9, tensor_rates={'16bit': 4096, 'tf32': 2048}),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               {'attention': 'flash', 'gated_delta_rule': 'fla'},
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
-              aliases=('gpu:g4', 'g4'), multiprocessors=188),
+              aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1792e9,
+              tensor_rates={'16bit': 1024, 'tf32': 512}),
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
-    GpuTarget('v5e', 'TPU v5 lite',
-              kernels={'grouped_matmul': 'xla'},
-              dense_peaks={'TPU v5 lite': {'bf16': 197e12}}),
+    GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
-    GpuTarget('v6e', 'TPU v6 lite',
-              kernels={'grouped_matmul': 'xla'},
-              dense_peaks={'TPU v6 lite': {'bf16': 918e12}}),
+    GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}),
 )}
 
 
@@ -219,18 +248,20 @@ def capability(generation: str) -> tuple[int, int] | None:
 def gpu_target(identifier: str | None = None) -> GpuTarget:
     """The target for a generation, reported device kind or case-insensitive lab alias.
 
-    None is the default device's: its generation is `device_generation`'s, the
-    one seam that `assumed` and tests set, and its device kind only picks the
-    SKU's peaks within that generation; a real GPU the table names no SKU of
+    None is this process's first device's: its generation is
+    `device_generation`'s, the one seam that `assumed` and tests set, and its
+    device kind only picks the SKU's peaks within that generation; a real GPU the table names no SKU of
     keeps its own kind, so its peaks stay unknown, while an assumed or patched
     generation takes the generation's canonical device. SKU queries retain
     that SKU's peaks. Unknown kinds have empty resources.
     """
     if identifier is None:
         import jax
-        device = jax.devices()[0]
+        device = jax.local_devices()[0]
         generation, kind = device_generation(), device.device_kind
         real = device.platform == 'gpu' and ASSUMED.get() is None
+        if real:
+            _one_kind(jax.devices())
         target = gpu_target(kind)
         if target.generation != generation:
             canonical = TARGETS.get(generation, GpuTarget(generation, kind))
@@ -290,12 +321,39 @@ def _shared_memory(device) -> int | None:
     return getattr(device, 'shared_memory_per_block_optin', None)
 
 
+@functools.cache
+def _clocks(ordinal: int) -> tuple[tuple[str, float], ...]:
+    """The visible GPU `ordinal`'s multiprocessor clock and device-memory bandwidth (twice the memory
+    clock times the bus's bytes, as CUDA's deviceQuery derives it), which jax's Device does not carry,
+    from the CUDA driver (`dew.telemetry.devices.gpu_attribute`), read once a process; none where no
+    driver loads."""
+    from dew.telemetry.devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, MEMORY_CLOCK_RATE, gpu_attribute
+
+    clock, memory_clock, bus = (gpu_attribute(ordinal, attribute)
+                                for attribute in (CLOCK_RATE, MEMORY_CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH))
+    if clock is None or memory_clock is None or bus is None:
+        return ()
+    return ('clock_hz', clock * 1e3), ('memory_bandwidth', 2 * memory_clock * 1e3 * bus / 8)
+
+
+def _one_kind(devices) -> None:
+    """Refuse a run over GPUs of more than one kind: every process traces the same program, so the
+    kernel choices each makes from its own GPU's facts must be the same, which GPUs of one kind give."""
+    kinds = sorted({device.device_kind for device in devices})
+    if len(kinds) > 1:
+        raise ValueError(f"the run's GPUs are of {len(kinds)} kinds ({', '.join(kinds)}); Dew's kernel "
+                         "choices read one GPU's facts, the same in every process, so a run takes GPUs "
+                         "of one kind")
+
+
 def runtime_facts(target: GpuTarget, device) -> GpuTarget:
     """`target` with the facts a real CUDA `device` reports of itself in place of the table's: its
-    multiprocessors, its block's shared memory, and Hopper's warpgroup MMA, which capability 9.0 alone
-    has. A GPU the table does not name so keeps every resource a kernel's requirements read."""
+    multiprocessors, its block's shared memory, its clock and memory bandwidth (`_clocks`), and
+    Hopper's warpgroup MMA, which capability 9.0 alone has. A GPU the table does not name so keeps
+    every resource a kernel's requirements and cost read."""
     capability = _compute_capability(device)
-    facts = {'multiprocessors': _multiprocessors(device), 'shared_limit': _shared_memory(device)}
+    facts = {'multiprocessors': _multiprocessors(device), 'shared_limit': _shared_memory(device),
+             **dict(_clocks(device.local_hardware_id))}
     return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None},
                                wgmma=capability == '9.0' if capability else target.wgmma)
 
@@ -336,7 +394,7 @@ def device_generation() -> str:
         return generation
     if (platform := placed_platform()) != jax.default_backend():
         return platform
-    device = jax.devices()[0]
+    device = jax.local_devices()[0]
     capability = _compute_capability(device) if device.platform == 'gpu' else None
     if capability:
         return 'sm' + capability.replace('.', '')
