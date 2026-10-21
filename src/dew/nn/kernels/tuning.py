@@ -60,6 +60,7 @@ from typing import ClassVar
 
 import filelock
 import jax
+import jax.core
 import jax.numpy as jnp
 import numpy as np
 import tokamax

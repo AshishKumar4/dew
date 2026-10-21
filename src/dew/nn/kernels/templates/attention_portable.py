@@ -27,9 +27,10 @@ def _dot(a: jax.Array, b: jax.Array) -> jax.Array:
     return jnp.dot(a, b, preferred_element_type=jnp.float32)
 
 
-def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: jax.Array | None):
-    """A hook parameter's values for a tile of query rows `rows` and keys `keys` (index arrays) of batch
-    row `row` and query head `head`, as `kind` lays them out: `_tile_param` in the Triton mainloop."""
+def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: jax.Array):
+    """A score hook parameter's values for a tile of query rows `rows` and keys `keys` (index arrays) of
+    batch row `row` and query head `head`, as `kind` lays them out: `_tile_param` in the Triton
+    mainloop."""
     match kind:
         case Kind.HEAD:
             return value[head]
@@ -40,7 +41,20 @@ def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: 
         case Kind.TILE:
             return value[row, head][rows[:, None], keys[None, :]]
         case Kind.OUTPUT:
+            raise ValueError("an output hook's parameter has no score tile")
+
+
+def _output_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array):
+    """An output hook parameter's values for query rows `rows` of batch row `row` and query head `head`."""
+    match kind:
+        case Kind.HEAD:
+            return value[head]
+        case Kind.QUERY:
+            return value[row, head, rows][:, None]
+        case Kind.OUTPUT:
             return value[row, rows, head]
+        case Kind.KEY | Kind.TILE:
+            raise ValueError("an output hook's parameter has no key axis")
 
 
 def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.Array, start: jax.Array,
@@ -101,7 +115,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             lo, hi = 0, jnp.minimum(-(-(first_query + block_q) // block_k), tiles)
         else:
             lo, hi = 0, tiles
-        out_params = tuple(_tile_param(param, kind, row, head, rows, None)
+        out_params = tuple(_output_param(param, kind, row, head, rows)
                            for param, kind in zip(output_params, output_kinds, strict=True))
         state, arg = jax.lax.fori_loop(lo, hi, step, (state, algebra.no_argmax(block_q)))
         out, m, denominator = algebra.finish(spec, state, initial=initial is not None, output_mod=output_mod,
