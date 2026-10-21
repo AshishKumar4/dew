@@ -573,7 +573,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         step = (config.block_m + config.block_n) * config.block_k * size + _side_tile_bytes(
             ba.arguments['prologue_operands'], hooks.prologue_axes, extents)
         epilogue = _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents)
-        return config.stages * step + epilogue + max(outs) * config.block_m * config.block_n
+        # One warpgroup stages each output in turn; two hold every output's staging buffer at once.
+        staged_outs = sum(outs) if config.warpgroups == 2 else max(outs)
+        return config.stages * step + epilogue + staged_outs * config.block_m * config.block_n
 
     @staticmethod
     @abc.abstractmethod
@@ -626,7 +628,8 @@ class MosaicGmm(_Mosaic):
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         kernel = ba.arguments['kernel']
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
-        return tuple(tile for tile in MOSAIC_TILES if depth % tile.block_k == 0 and width % tile.block_n == 0)
+        return tuple(tile for tile in _modelled(ba)
+                     if depth % tile.block_k == 0 and width % tile.block_n == 0)
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:
@@ -640,11 +643,11 @@ class MosaicGmm(_Mosaic):
         # A pair of multiprocessors runs two row tiles of one group, its second empty past the group.
         pair = config.cluster
         tiles, columns = pair * _block_tiles(rows, groups, pair * config.block_m), width // config.block_n
-        # The rows are read once a band; a group's matrix once for the row tiles of it in flight, once a
-        # pair's.
+        # The rows are read once a band; a group's matrix once for the row tiles of it in flight (a pair's
+        # multicast saves the L2's reads, not the device's).
         bands = math.ceil(columns / config.grid_block_n)
         in_flight = self._in_flight(config, target)
-        per_group = tiles / pair / max(min(groups, rows), 1)
+        per_group = tiles / max(min(groups, rows), 1)
         matrices = _routed(rows, groups) * kernel.size * size * math.ceil(per_group / in_flight)
         hooks = ba.arguments['hooks']
         rereads = {'rows': tiles, 'columns': bands}
@@ -681,7 +684,7 @@ class MosaicTgmm(_Mosaic):
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
         # A pair takes two depth tiles of one group.
-        return tuple(tile for tile in MOSAIC_TILES
+        return tuple(tile for tile in _modelled(ba)
                      if depth % (tile.block_m * tile.cluster) == 0 and width % tile.block_n == 0)
 
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
@@ -704,9 +707,9 @@ class MosaicTgmm(_Mosaic):
         size, out = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(ba.arguments['out_dtype']).itemsize
         blocks = depth // config.block_m, width // config.block_n
         # A group's rows are read once a band of column tiles, its cotangent once for the row tiles in
-        # flight, a pair's once between them.
+        # flight (a pair's multicast saves the L2's reads, not the device's).
         bands = math.ceil(blocks[1] / config.grid_block_n)
-        in_flight = self._in_flight(config, target) * config.cluster
+        in_flight = self._in_flight(config, target)
         hooks = ba.arguments['hooks']
         rereads = {'rows': groups, 'depth': blocks[0], 'columns': bands}
         moved = ((bands * rows * depth + math.ceil(blocks[0] / in_flight) * rows * width) * size
@@ -723,6 +726,12 @@ class MosaicTgmm(_Mosaic):
                                interpret=INTERPRETED if interpret else False, prologue=hooks.before(),
                                prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
                                exact_sums=exact_sums), None
+
+
+def _modelled(ba) -> tuple[mosaic_gpu.Tiles, ...]:
+    """The Mosaic GPU tiles a launch may take: interpreted, none of a pair of multiprocessors, which the
+    interpreter's one block does not model."""
+    return tuple(tile for tile in MOSAIC_TILES if not (ba.arguments['interpret'] and tile.cluster == 2))
 
 
 def _facts(target: generation.GpuTarget) -> generation.GpuTarget:

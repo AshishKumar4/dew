@@ -231,17 +231,10 @@ def _gmm_alone(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: 
                     o_smem[...] = out.astype(o_smem.dtype)
                     plgpu.commit_smem()
 
-                    smem_start = group_info.start_within_block
-                    remaining_rows = min(block_m, m)
-                    # TMA descriptors need to be generated with static tile sizes along each axis, but we
-                    # do not know at compile time how many rows we will need to store, only that it is at
-                    # most min(block_m, m): a logarithmic ladder of descriptors, each storing 2**i rows,
-                    # stores any count between 1 and min(block_m, m).
-                    while remaining_rows > 0:
-                        const_rows_len = 1 << int(math.log2(remaining_rows))
-                        remaining_rows //= 2
-                        _store_rows(o_smem, o_gmem, group_info, smem_start, const_rows_len, ni * block_n)
-                        smem_start += group_info.actual_size & const_rows_len
+                    # TMA descriptors need static extents, but how many rows to store is known only at run
+                    # time: a ladder of power-of-two stores (`_store_ladder`).
+                    _store_ladder(o_smem, o_gmem, group_info.block_start, group_info.start_within_block,
+                                  group_info.actual_size, ni * block_n, min(block_m, m))
                     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     kernel = plgpu.kernel(
@@ -301,9 +294,11 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
             **_staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), prologue_gmems[i])
                                  for i in fixed]),
             halves=plgpu.Barrier(num_arrivals=2, num_barriers=2),
+            drained=plgpu.Barrier(num_arrivals=2),
             collective_axes="wg",
         )
-        def scope(allocations, o_smems, side_smems, side_barriers, fixed_smems, fixed_barriers, halves):
+        def scope(allocations, o_smems, side_smems, side_barriers, fixed_smems, fixed_barriers, halves,
+                  drained):
             wg = lax.axis_index("wg")
             cta = lax.axis_index("cluster") if pair == 2 else 0
             mine_rows = pl.ds(wg * rows_half, rows_half)
@@ -335,6 +330,7 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
                     def _(acc_ref):
                         run(acc_ref)
                         plgpu.wgmma_wait(0)
+                        plgpu.barrier_arrive(drained)
                         finish(acc_ref[...])
 
                 def mma(_, lhs_smem, rhs_smem, *rest):
@@ -350,8 +346,8 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
                     matrix = (rhs_smem.at[columns].transpose((1, 0)) if transpose_rhs
                               else rhs_smem.at[:, columns])
                     plgpu.wgmma(acc_ref, lhs_smem, matrix)
-                    # One MMA in flight: the next stage is prepared while this one runs.
-                    plgpu.wgmma_wait(1)
+                    # An MMA in flight: the next stage is prepared while this one runs.
+                    plgpu.wgmma_wait(_IN_FLIGHT)
                     return acc_ref
 
                 # Both multiprocessors of a pair run its pipeline, or neither: they share its loads.
@@ -364,6 +360,7 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
                         rhs_columns(rhs_gmem.at[jnp.minimum(group_info.group_id, g - 1)], ni),
                         *stepped_views(pl.ds(row_start, block_m)),
                         allocations=allocations)
+                    _drain(drained, wg)
 
                 # The unrouted rows, and a slot past the last tile, multiply nothing.
                 @pl.when(~active & (wg < 2))
@@ -386,7 +383,7 @@ def _gmm_pipeline(tiles: Tiles, transpose_rhs: bool, steps: int, side_axes: tupl
     def side_spec(axes):
         return plgpu.BlockSpec(tuple(extent[axis] for axis in axes),
                                lambda step: tuple(step if axis == 'depth' else 0 for axis in axes),
-                               memory_space=plgpu.SMEM, delay_release=1)
+                               memory_space=plgpu.SMEM, delay_release=_IN_FLIGHT)
 
     rhs_block = (tiles.block_n, tiles.block_k) if transpose_rhs else (tiles.block_k, tiles.block_n)
     return plgpu.emit_pipeline_warp_specialized(
@@ -394,9 +391,9 @@ def _gmm_pipeline(tiles: Tiles, transpose_rhs: bool, steps: int, side_axes: tupl
         grid=(steps,),
         memory_registers=40,
         in_specs=[plgpu.BlockSpec((tiles.block_m, tiles.block_k), lambda step: (0, step),
-                                  memory_space=plgpu.SMEM, delay_release=1),
+                                  memory_space=plgpu.SMEM, delay_release=_IN_FLIGHT),
                   plgpu.BlockSpec(rhs_block, _rhs_index(transpose_rhs), memory_space=plgpu.SMEM,
-                                  delay_release=1, collective_axes=_shared(tiles)),
+                                  delay_release=_IN_FLIGHT, collective_axes=_shared(tiles)),
                   *(side_spec(axes) for axes in side_axes)],
         wg_axis="wg",
         num_compute_wgs=2,
@@ -466,12 +463,16 @@ def _finish_half(acc, epilogue, sides: tuple, outs: tuple, place: tuple, wg) -> 
         _store_ladder(o_smem.at[wg], o_gmem, row_start, first, stored, column, most)
 
 
-_TGMM_IN_FLIGHT = 0
-"""The MMAs the cooperative `tgmm` keeps in flight while it prepares the next stage: none, where the
-cooperative `gmm` keeps one. With a stage's release delayed a step, a pipeline as long as its group's row
-blocks (one to a few) leaves its barriers a phase apart from one tile to the next (the GPU interpreter
-fails it, jax 0.11.2.post6's `emit_pipeline_warp_specialized`); a pipeline of fixed length, `gmm`'s, does
-not."""
+_IN_FLIGHT = 1
+"""The MMAs the cooperative kernels keep in flight while they prepare the next stage. A pipeline's last
+stage is released one step late, past its end, so a persistent kernel's producer would load the next
+tile's first stages over one an MMA still reads: the consumers report each tile drained (`_drain`)."""
+
+
+def _drain(drained, wg) -> None:
+    """Dew: the producer warpgroup waits until both consumers have finished the tile's MMAs (each arrives
+    at `drained` after its last wait) before its next tile's loads reuse the pipeline's stages."""
+    pl.when(wg == 2)(lambda: plgpu.barrier_wait(drained))
 
 
 def _meet(halves) -> None:
@@ -533,16 +534,6 @@ def _epilogue(epilogue, acc, gmems, axes_of, row_start, column_start, block_m: i
         return outs if isinstance(outs, tuple) else (outs,)
 
     return scope
-
-
-def _store_rows(o_smem, o_gmem, group_info: GroupInfo, smem_start, rows: int, column) -> None:
-    """One rung of the ladder: where the tile's group has `rows` rows left, store them from `smem_start`."""
-    @pl.when(group_info.actual_size & rows != 0)
-    def _():
-        o_smem_slice = o_smem.at[pl.ds(smem_start, rows)]
-        o_gref_slice = o_gmem.at[pl.ds(group_info.block_start + smem_start, rows),
-                                 pl.ds(column, o_smem.shape[1])]
-        plgpu.copy_smem_to_gmem(o_smem_slice, o_gref_slice)
 
 
 def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, out_dtype,
@@ -671,9 +662,10 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
             **_staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), side_gmems[i])
                                  for i in fixed]),
             halves=plgpu.Barrier(num_arrivals=2, num_barriers=2),
+            drained=plgpu.Barrier(num_arrivals=2),
             collective_axes="wg",
         )
-        def scope(allocations, o_smem, fixed_smems, fixed_barriers, halves):
+        def scope(allocations, o_smem, fixed_smems, fixed_barriers, halves, drained):
             wg = lax.axis_index("wg")
             cta = lax.axis_index("cluster") if pair == 2 else 0
             mine_depth, mine_columns = pl.ds(wg * depth_half, depth_half), pl.ds(wg * half, half)
@@ -721,13 +713,16 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                                 fixed_refs, fixed_barriers, wg)
                     if exact_sums:
                         zeros = jnp.zeros((block_m, half), jnp.float32)
-                        store(run(plgpu.layout_cast(zeros, plgpu.Layout.WGMMA)))
+                        summed = run(plgpu.layout_cast(zeros, plgpu.Layout.WGMMA))
+                        plgpu.barrier_arrive(drained)
+                        store(summed)
                         return
 
                     @functools.partial(pl.run_scoped, acc_ref=plgpu.WGMMAAccumulatorRef((block_m, half)))
                     def _(acc_ref):
                         run(acc_ref)
                         plgpu.wgmma_wait(0)
+                        plgpu.barrier_arrive(drained)
                         store(acc_ref[...])
 
                 nonempty = sizes_gmem[g_i] > 0  # an empty group's tile is zero
@@ -736,6 +731,7 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                 def _():
                     pipeline(mma, context, steps)(*views(rows, depth, pl.ds(n_i * block_n, block_n)),
                                                   allocations=allocations)
+                    _drain(drained, wg)
 
                 @pl.when(~nonempty & (wg < 2))
                 def _():
@@ -757,16 +753,16 @@ def _tgmm_pipeline(tiles: Tiles, side_axes: tuple, body, context, steps):
     def side_spec(axes):
         return plgpu.BlockSpec(tuple(extent[axis] for axis in axes),
                                lambda step: tuple(step if axis == 'rows' else 0 for axis in axes),
-                               memory_space=plgpu.SMEM, delay_release=_TGMM_IN_FLIGHT)
+                               memory_space=plgpu.SMEM, delay_release=_IN_FLIGHT)
 
     return plgpu.emit_pipeline_warp_specialized(
         body,
         grid=(steps,),
         memory_registers=40,
         in_specs=[plgpu.BlockSpec((tiles.block_k, tiles.block_m), lambda step: (step, 0),
-                                  memory_space=plgpu.SMEM, delay_release=_TGMM_IN_FLIGHT),
+                                  memory_space=plgpu.SMEM, delay_release=_IN_FLIGHT),
                   plgpu.BlockSpec((tiles.block_k, tiles.block_n), lambda step: (step, 0),
-                                  memory_space=plgpu.SMEM, delay_release=_TGMM_IN_FLIGHT,
+                                  memory_space=plgpu.SMEM, delay_release=_IN_FLIGHT,
                                   collective_axes=_shared(tiles)),
                   *(side_spec(axes) for axes in side_axes)],
         wg_axis="wg",
@@ -782,7 +778,7 @@ def _gradient_step(rows_smem, cotangent_smem, carry, exact_sums: bool):
     summed apart, joins by an IEEE add (a tensor core's accumulation truncates each add)."""
     if not exact_sums:
         plgpu.wgmma(carry, rows_smem.transpose((1, 0)), cotangent_smem)
-        plgpu.wgmma_wait(_TGMM_IN_FLIGHT)
+        plgpu.wgmma_wait(_IN_FLIGHT)
         return carry
 
     def step_scope(step_ref):
