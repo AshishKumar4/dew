@@ -176,7 +176,8 @@ class DecisionRunConfig(RunConfig):
                                   if number(value, f"mixture_weights.{name}") > 0}
             summary["made"] = record(facts.get("mixture_made", {}), "mixture_made")
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
-        dataset, held = fitted(self.chain(), self.validation, objective=objective.data())
+        dataset, held = fitted(self.chain(), self.validation, objective=objective.data(),
+                                seed=self.data_seed)
         summary["records"] = dataset.records
         unfit = {name: counter.rejected.get("unfit", 0) for name, counter in dataset.counts.items()}
         unfit["held out"] = sum(counter.rejected.get("unfit",

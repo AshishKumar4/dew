@@ -1392,7 +1392,7 @@ class RunConfig:
         on and the run's directory before the checkpoint is published, as a
         decision run fits its calibration there, so what it writes is published.
         """
-        dataset, validation = fitted(dataset, validation, objective=objective.data())
+        dataset, validation = fitted(dataset, validation, objective=objective.data(), seed=self.data_seed)
         self = dataclasses.replace(self, trainer=self.trainer.accumulating(dataset))
         if self.trainer.quantization is not None:
             quantize_trunk(objective, self.trainer.quantization)

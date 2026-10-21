@@ -56,7 +56,8 @@ class JepaRunConfig(RunConfig):
         computes as the encoder does, its compute dtype and attention kernel."""
         # Compiled once, before the objective, whose EMA ramps over the run's length: JEPA reads its
         # batches as the chain makes them, with no stages of its own.
-        dataset, held = fitted(self.chain(), self.validation, objective=ObjectiveData())
+        dataset, held = fitted(self.chain(), self.validation, objective=ObjectiveData(),
+                                seed=self.data_seed)
         sample = self.sample()
         video = sample.key == "video"
         if video != (models[self.model.name] is models["jepa_video_encoder"]):
