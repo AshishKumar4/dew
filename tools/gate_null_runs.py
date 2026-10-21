@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(REPO / "tests"), str(REPO / "src")]
+sys.path[:0] = [str(REPO / "tests"), str(REPO / "src"), str(REPO)]
 
 OFFSET = 1 << 16
 """The first run a chunk's grid takes, past the seeds of any sizing."""
