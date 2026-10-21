@@ -42,15 +42,18 @@ def members(group: int) -> list[int]:
 
 def stop(process: subprocess.Popen, *, interrupt: float | None = None, settle: float = 60.0) -> list[int]:
     """`process`'s group stopped: where `interrupt` is given and the leader still runs, SIGINT and up to
-    `interrupt` seconds for it to end; then SIGKILL to the group, the leader reaped, and up to `settle`
-    seconds for every other member to end. The members still running then (none, normally)."""
+    `interrupt` seconds for it to end; then SIGKILL to the group and up to `settle` seconds, one budget,
+    for the leader to be reaped and every other member to end. The members still running then (none,
+    normally; a leader the kill has not reached, in uninterruptible sleep, among them), never raised, so
+    a caller can still report what ran."""
     if interrupt is not None and process.poll() is None:
         signal_group(process.pid, signal.SIGINT)
         with contextlib.suppress(subprocess.TimeoutExpired):
             process.wait(interrupt)
     signal_group(process.pid, signal.SIGKILL)
-    process.wait(settle)
     deadline = time.monotonic() + settle
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(settle)
     while (running := members(process.pid)) and time.monotonic() < deadline:
         time.sleep(0.01)
     return running

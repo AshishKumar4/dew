@@ -92,8 +92,21 @@ import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import owned  # tools/armada/owned.py, beside this file
+
+def _beside(name: str):
+    """tools/armada/`name`.py, the module beside this file, loaded by its path: this file runs as a
+    script and is loaded by the tests, and puts nothing on sys.path."""
+    spec = importlib.util.spec_from_file_location(f"armada_{name}", Path(__file__).with_name(f"{name}.py"))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+owned = _beside("owned")
+SETTLE = 30.0
+"""Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
+with the default deadline and grace (1680 + 60 + 30 + the reader's 10 < .armada.json's 1800)."""
 
 REPO = Path(__file__).resolve().parents[2]
 _CLASSIFIERS = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["classifiers"]
@@ -535,8 +548,8 @@ def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dic
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool = True,
          grace: float = 60.0, coverage: Path | None = None) -> int:
-    """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds and
-    killing them `grace` seconds after that.
+    """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
+    their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
 
     A row's seconds are its share of the task's wall time, in proportion to its tests' own times:
     the plan weighs a file by what it costs a container (its import, its collection, the
@@ -596,9 +609,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     except subprocess.TimeoutExpired:
         expired = True
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
-    # killed, what pytest's tests left running with it, and given `grace` to be gone.
-    if left := owned.stop(done, interrupt=grace if expired else None, settle=grace):
-        print(f"processes {left} of the task's group still ran {grace:.0f} s after SIGKILL", flush=True)
+    # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
+    if left := owned.stop(done, interrupt=grace if expired else None, settle=SETTLE):
+        print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
     reader.join(10)
     output = "".join(lines)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []

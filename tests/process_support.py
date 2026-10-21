@@ -120,7 +120,7 @@ def spawn(mode: str, out: Path, processes: int = 1, process_id: int = 0,
 def terminate(process: subprocess.Popen[str]) -> None:
     """Kill the session even if its leader already exited and left descendants,
     and return once none of them still runs (tools/armada/owned.py's `stop`)."""
-    running = owned.stop(process)
+    running = owned.stop(process, settle=120.0)
     assert not running, f"session {process.pid} still runs {running} after SIGKILL"
 
 
