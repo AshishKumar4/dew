@@ -371,10 +371,10 @@ def test_the_context_smoke_loads_beside_the_bridge_it_reports_with(bridge):
 
 
 def test_a_training_context_caps_the_batch_of_every_way_a_cell_loads_data_and_its_steps():
-    """In a training context (live_training.install), a cell's dataset batched itself, a preset called and
-    a preset through `pipe` each read batches of BATCH rows, and its fit, called by another name with its
-    steps unpacked, trains STEPS steps, each saying so first: IPython runs the cell with its calls capped,
-    and Dew's own functions are untouched."""
+    """In a training context (live_training.install), a cell's dataset batched itself, by any name and
+    with its size passed either way, a preset called and a preset through `pipe` each read batches of
+    BATCH rows, and its fit, called by another name with its steps unpacked, trains STEPS steps, each
+    saying so first: IPython runs the cell with its calls capped, and Dew's own functions are untouched."""
     cell = """
 import numpy as np
 from dew import Trainer
@@ -386,7 +386,9 @@ from dew.objectives.lm import LMObjective
 records = Memory([{"id": index} for index in range(320)])
 tokens = Memory([{"text": np.arange(400, dtype=np.int32)}])
 windows = dict(seq_len=4, pack=None, stride=1)
-batches = [compile_data(records.batch(64)).batch,
+rows = records.batch
+batches = [compile_data(records.batch(64)).batch, compile_data(rows(64)).batch,
+           compile_data(rows(size=64)).batch,
            compile_data(presets.lm(tokens, None, batch=64, **windows)).batch,
            compile_data(tokens.pipe(presets.lm, None, batch=64, **windows)).batch]
 model = CausalTransformer(vocab_size=400, emb_features=8, num_layers=1, num_heads=1, mlp_features=16,
@@ -409,9 +411,9 @@ shell.run_cell({cell!r}).raise_error()
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert done.returncode == 0, done.stderr[-4000:]
     lines = done.stdout.strip().splitlines()
-    assert json.loads(lines[-1].removeprefix("ran ")) == [[8, 8, 8], 20, True]
+    assert json.loads(lines[-1].removeprefix("ran ")) == [[8, 8, 8, 8, 8], 20, True]
     assert [line for line in lines if line.startswith("Live run:")] == [
-        "Live run: batch 64 -> 8, so it fits a shared 4-vCPU host."] * 4 + [
+        "Live run: batch 64 -> 8, so it fits a shared 4-vCPU host."] * 6 + [
         "Live run: steps 1000 -> 20, log_every 100 -> 5, so it finishes in about two minutes."]
 
 
