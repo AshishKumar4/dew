@@ -924,6 +924,15 @@ def prompt_major(tree):
         lambda leaf: jnp.swapaxes(leaf, 0, 1).reshape((-1, *leaf.shape[2:])), tree)
 
 
+def default_placement() -> jax.sharding.SingleDeviceSharding:
+    """Where a `jnp` array is created: `jax.default_device`'s device, or this process's first of the
+    default backend's (`jax_default_device` may name a backend)."""
+    default = jax.config.jax_default_device
+    if default is None or isinstance(default, str):
+        return jax.sharding.SingleDeviceSharding(jax.local_devices(backend=default)[0])
+    return jax.sharding.SingleDeviceSharding(default)
+
+
 def mesh_of(tree) -> jax.sharding.Mesh | None:
     """The mesh the tree's leaves sit on, or None for single-device arrays."""
     for leaf in jax.tree.leaves(tree):

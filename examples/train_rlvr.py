@@ -541,7 +541,8 @@ def main(config: Config) -> dict:
     # refuses a context past the export's; the next shape bucket covers both.
     context = next(bucket for bucket in SHAPE_BUCKETS if bucket >= engine_context(config))
     source = PretrainedDecoder.load(config.model, dtype=jnp.float32 if config.smoke else jnp.bfloat16,
-                             param_dtype=jnp.float32, max_seq_len=context)
+                             param_dtype=jnp.float32, max_seq_len=context,
+                             on_host=True)  # the trainer places the weights over its mesh
     stock = source.text_generation().sampling
     words = HFTokenizer(tokenizer)
     # An attempt ends on EOS; the committed tiny Qwen2 names none, its tokenizer does.
