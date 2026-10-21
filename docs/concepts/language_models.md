@@ -4,15 +4,13 @@
 
 ## Example
 
-The example writes a small corpus of token files, trains a two-layer decoder on it and generates a continuation. It uses `ByteTokenizer`, which maps each UTF-8 byte to one of 256 IDs, so it downloads nothing.
+The example writes a small corpus of token records, trains a two-layer decoder on it and generates a continuation. It uses `ByteTokenizer`, which maps each UTF-8 byte to one of 256 IDs, so it downloads nothing.
 
 ```python
-import json
-from pathlib import Path
-
 import numpy as np
 
 from dew.data import ByteTokenizer
+from dew.data.sinks import export
 
 tokenizer = ByteTokenizer()
 stories = [
@@ -21,15 +19,14 @@ stories = [
     "Lily threw the ball and the dog ran after it. They played all day.",
     "At night, Lily went home. She was happy and tired.",
 ]
-ids = np.array(tokenizer.encode(" ".join(stories * 200)), dtype=np.uint8)
+ids = np.array(tokenizer.encode(" ".join(stories * 200)), dtype=np.int32)
 held_out = len(ids) // 20
-corpus = Path("data/stories-byte")
-corpus.mkdir(parents=True, exist_ok=True)
-ids[:held_out].tofile(corpus / "val.bin")
-ids[held_out:].tofile(corpus / "train.bin")
-(corpus / "meta.json").write_text(json.dumps({
-    "tokenizer": "byte", "vocab_size": tokenizer.vocab_size, "dtype": "uint8",
-    "train_tokens": len(ids) - held_out, "val_tokens": held_out, "eos_id": None}))
+metadata = {"token_store": True, "tokenizer": "byte", "vocab_size": tokenizer.vocab_size,
+            "dtype": "int32", "eos_id": None}
+export([{"text": ids[held_out:]}], "data/stories-byte/train", format="array_record",
+       metadata=metadata, length_field="text")
+export([{"text": ids[:held_out]}], "data/stories-byte/val", format="array_record",
+       metadata=metadata, length_field="text")
 print(len(ids) - held_out, "training tokens,", held_out, "validation tokens")
 ```
 
@@ -37,27 +34,26 @@ print(len(ids) - held_out, "training tokens,", held_out, "validation tokens")
 48830 training tokens, 2569 validation tokens
 ```
 
-This small self-contained fixture uses native binary token stores: `train.bin` and `val.bin` hold the token IDs back to back, and `meta.json` records the tokenizer, vocabulary size, dtype and counts. The validation split is the head of the stream.
+`export` writes each split as committed ArrayRecord shards with a manifest recording the tokenizer, vocabulary size and dtype. Each holds the token IDs as one stream, and the validation split is the head of it.
 
 ```python
-from dew.config.data import loader
 import jax
 
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.data import Loading
-from dew.config.data import TextData
+from dew.data import Files, presets
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
 
-data = loader(TextData(source="data/stories-byte", seq_len=64), batch=16, read="memory", loading=Loading(workers=0), validation_records=(4) * (16))
+data = Files("data/stories-byte/train").repeat().pipe(presets.lm, None, seq_len=64, batch=16, pack=None)
+held = Files("data/stories-byte/val").pipe(presets.lm, None, seq_len=64, batch=16, pack=None, records=64)
 model = CausalTransformer(vocab_size=tokenizer.vocab_size,
                           emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
                           max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
 lm_state = Trainer(objective, OptimConfig(learning_rate=3e-3), key=jax.random.key(0)).fit(
-    data, steps=300, log_every=100, eval_every=300, metrics=(Perplexity(),))
+    data, validation=held, steps=300, log_every=100, eval_every=300, metrics=(Perplexity(),))
 continuation = generate(model, lm_state.variables, [tokenizer.encode("One day, Lily")],
                         max_new_tokens=40, key=jax.random.key(1),
                         sampling=Sampling(temperature=0.0))
@@ -75,7 +71,7 @@ Trained 300 steps in 0:00:14: first step after 2.76 s, then 30.0 step/s
 One day, Lily saw a big dog in the park. The dog want
 ```
 
-`TextData(seq_len=64)` yields rows of 65 IDs under the key `text`. `LMObjective(model, seq_len=64)` feeds the first 64 to the model and scores the predictions against the next 64. Token IDs must be integers inside the model's vocabulary. `temperature=0.0` picks the most likely token at every step, and the returned row holds the prompt followed by the continuation.
+The records are already token IDs, so the `lm` preset takes no tokenizer, and `pack=None` cuts the stream into windows: `seq_len=64` yields rows of 65 IDs under the key `text`. `LMObjective(model, seq_len=64)` feeds the first 64 to the model and scores the predictions against the next 64. Token IDs must be integers inside the model's vocabulary. `temperature=0.0` picks the most likely token at every step, and the returned row holds the prompt followed by the continuation.
 
 The training loss is near zero because the same four sentences repeat, and validation on the held-out start of the stream scores just as low. Validation and the generation above both use the trained `lm_state.variables`, since the objective keeps no moving average unless `ema_decay` is set.
 
@@ -109,7 +105,7 @@ The measured run changes these settings from the example:
 | Setting | Value |
 |---|---|
 | Tokenizer | `HFTokenizer("gpt2")` |
-| Data | `loader(TextData(source="data/tinystories/train", validation="data/tinystories/val", seq_len=256), batch=32, read="memory")` |
+| Data | `Files("data/tinystories/train").repeat().pipe(presets.lm, None, seq_len=256, batch=32, pack=None)`, validation from `data/tinystories/val` |
 | Model | `emb_features=256, num_layers=4, num_heads=4, max_seq_len=256, dtype=jnp.bfloat16` |
 | Optimizer | `OptimConfig(learning_rate=1e-3)` |
 | Objective | `LMObjective(model, seq_len=256, ema_decay=0.999)` |
@@ -130,7 +126,7 @@ Use one tokenizer everywhere: data preparation, model construction, decoding and
 
 `RunProcessor(tokenizer)` in `dew.inference` wraps an `encode`/`decode` tokenizer in the same kind of callable, which is what a task takes as `processor=`. A text-to-image run's captions are tokenized by its condition encoder, for example `CLIPText.tokenize` in `dew.inputs`.
 
-`export` writes token records as committed ArrayRecord shards with a producer manifest and length index. Use the same tokenizer for data, model construction, decoding and checkpoint export. `dew data export` accepts a recipe alias and JSON fields; optional `--tokenizer` and `--eos` add tokenization to the deterministic prefix.
+`export` writes token records as committed ArrayRecord shards with a producer manifest and length index. Use the same tokenizer for data, model construction, decoding and checkpoint export. `dew data export` writes one from the command line; optional `--tokenizer` and `--eos` add tokenization to the deterministic prefix.
 
 ```bash
 dew data export records data/corpus-byte \
@@ -138,7 +134,7 @@ dew data export records data/corpus-byte \
     --format array_record --tokenizer byte --eos --read memory
 ```
 
-That command publishes the complete input. Prepare held-out records separately and pass their URL as `TextData(validation=...)`. To preserve a token-axis head split, encode the stream once and export two slices:
+That command publishes the complete input. Prepare held-out records separately and read them as a second `Files` source. To preserve a token-axis head split, encode the stream once and export two slices:
 
 ```python
 from pathlib import Path
@@ -157,10 +153,10 @@ export([{"text": ids[:held]}], "data/corpus-byte/val", format="array_record",
        metadata=metadata, length_field="text")
 ```
 
-`loader(TextData(source="data/corpus-byte/train", validation="data/corpus-byte/val", seq_len=64), batch=8, read="memory")` reads those stores. Indexed mode reads producer lengths without scanning token payloads. Binary token stores remain native inputs through TokenFiles; new producers use committed shards.
+`Files("data/corpus-byte/train").pipe(presets.lm, None, seq_len=64, batch=8, pack=None)` reads the training store, and the same chain over `data/corpus-byte/val` the validation one. Indexed mode reads producer lengths without scanning token payloads.
 
-- Fixed windows contain `seq_len + 1` IDs, `{"text": int32 [B, seq_len + 1]}`. Each starts `seq_len` IDs after the last.
-- `pack="first-fit"` keeps documents in padded windows and adds aligned segment IDs and positions. `pack="concat"` concatenates and splits aligned fields.
+- `pack=None` cuts fixed windows of `seq_len + 1` IDs, `{"text": int32 [B, seq_len + 1]}`. Each starts `seq_len` IDs after the last.
+- `pack="first-fit"`, the default, keeps documents in padded windows and adds aligned segment IDs and positions. `pack="concat"` concatenates and splits aligned fields.
 
 ## LMObjective
 
@@ -225,11 +221,10 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 <!-- not run: fine-tunes Qwen3-0.6B on a produced token store, which CI does not prepare -->
 ```python
-from dew.data import Loading
-from dew.config.data import TextData, loader
+from dew.data import Files, presets
 from dew.interop import PretrainedDecoder
 
-data = loader(TextData(source="data/qwen3-tokens", seq_len=512), batch=4, read="memory", loading=Loading(workers=0), validation_records=(4) * (4))
+data = Files("data/qwen3-tokens").repeat().pipe(presets.lm, None, seq_len=512, batch=4)
 bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", max_seq_len=512)
 objective = LMObjective(bundle, seq_len=512)
 state = Trainer(objective, OptimConfig(learning_rate=1e-5), key=jax.random.key(0)).fit(data, steps=100)
@@ -393,15 +388,13 @@ An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_featur
 
 ## Masked diffusion language models
 
-`MaskedDiffusionObjective` trains a bidirectional decoder to recover masked tokens under MDLM's negative ELBO. As in MDLM's SUBS parameterization, the mask token gets no probability mass, so its column is left out of the cross entropy's partition. LLaDA's published training script takes the cross entropy over the whole vocabulary, so its loss values differ from Dew's by that term. Each row holds exactly `seq_len` tokens, because there is no next-token shift; `TextData(seq_len=63)`, whose rows hold 64 IDs, feeds a 64-token objective. The mask token needs an ID of its own, here the one after the last byte:
+`MaskedDiffusionObjective` trains a bidirectional decoder to recover masked tokens under MDLM's negative ELBO. As in MDLM's SUBS parameterization, the mask token gets no probability mass, so its column is left out of the cross entropy's partition. LLaDA's published training script takes the cross entropy over the whole vocabulary, so its loss values differ from Dew's by that term. Each row holds exactly `seq_len` tokens, because there is no next-token shift; the `lm` preset at `seq_len=63`, whose rows hold 64 IDs, feeds a 64-token objective. The mask token needs an ID of its own, here the one after the last byte:
 
 ```python
-from dew.data import Loading
-from dew.config.data import TextData, loader
 from dew.diffusion.discrete import MDLM
 from dew.objectives.diffusion import MaskedDiffusionObjective
 
-masked_data = loader(TextData(source="data/stories-byte", seq_len=63), batch=16, read="memory", loading=Loading(workers=0), validation_records=(4) * (16))
+masked_data = Files("data/stories-byte/train").repeat().pipe(presets.lm, None, seq_len=63, batch=16, pack=None)
 mask_id = tokenizer.vocab_size
 process = MDLM(mask_id=mask_id)()
 masked_model = CausalTransformer(vocab_size=mask_id + 1,
