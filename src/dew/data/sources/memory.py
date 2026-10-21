@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import sys
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from functools import cached_property
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 
@@ -15,12 +17,22 @@ from .base import Read, ShardManifest, _indexed_manifest
 from .codec import fingerprint
 
 
-class ArrowTable(Protocol):
-    def to_pylist(self) -> list[Batch]: ...
+class _Interchanged(Protocol):
+    """A table as the dataframe interchange protocol hands it over."""
+
+    def num_columns(self) -> int: ...
+
+
+@runtime_checkable
+class DataFrame(Protocol):
+    """A table that hands itself over through the dataframe interchange protocol: a pandas or
+    polars DataFrame, or an Arrow table."""
+
+    def __dataframe__(self) -> _Interchanged: ...
 
 
 class SparkFrame(Protocol):
-    def toArrow(self) -> ArrowTable: ...
+    def toArrow(self) -> DataFrame: ...
 
 
 def _record(value: object) -> Batch | bytes | None:
@@ -29,6 +41,35 @@ def _record(value: object) -> Batch | bytes | None:
     if isinstance(value, Mapping) and all(isinstance(key, str) for key in value):
         return value
     raise TypeError(f"source feature record must have named fields or bytes, got {type(value).__name__}")
+
+
+@runtime_checkable
+class _ArrowStream(Protocol):
+    """A table that hands itself to Arrow as a stream of record batches: an Arrow or polars table."""
+
+    def __arrow_c_stream__(self, requested_schema: None = None, /) -> Hashable: ...
+
+
+def _table_records(table: DataFrame) -> list[Batch]:
+    """A table's rows as records of its columns, through Arrow, which keeps lists, bytes, nested
+    records and nulls as `Memory(records)` holds them: a pandas DataFrame by its own converter, its
+    index none of them; a table that streams itself to Arrow as it does; any other through the
+    interchange protocol."""
+    import pyarrow as pa
+
+    pandas = sys.modules.get("pandas")
+    if pandas is not None and isinstance(table, pandas.DataFrame):
+        arrow = pa.Table.from_pandas(table, preserve_index=False)
+    elif isinstance(table, _ArrowStream):
+        arrow = pa.table(table)
+    else:
+        from pyarrow.interchange import from_dataframe
+
+        arrow = from_dataframe(table, allow_copy=True)
+    rows = arrow.to_pylist()
+    for row in rows[:1]:
+        _record(row)
+    return rows
 
 
 @dataclass(frozen=True)
@@ -49,9 +90,10 @@ class _Columns:
 
 @dataclass(frozen=True)
 class Memory(Dataset):
-    """Records, column arrays or an Arrow table, with immutable positional IDs."""
+    """Records, column arrays, or a DataFrame or Arrow table (`DataFrame`), with immutable
+    positional IDs. A table's rows become records of its columns, its index none of them."""
 
-    values: Records | Sequence[Batch] | Mapping[str, Sequence]
+    values: Records | Sequence[Batch] | Mapping[str, Sequence] | DataFrame
     identity: str | None = None
     shard_rows: int = 1024
 
@@ -60,13 +102,9 @@ class Memory(Dataset):
             raise ValueError("memory shard_rows must be positive")
 
     @classmethod
-    def from_arrow(cls, table: ArrowTable) -> Memory:
-        return cls(table.to_pylist())
-
-    @classmethod
     def from_spark(cls, frame: SparkFrame) -> Memory:
         """Gather a small pyspark 4.0+ frame through its Arrow handoff."""
-        return cls.from_arrow(frame.toArrow())
+        return cls(frame.toArrow())
 
     def label(self) -> str:
         return self.identity or "memory"
@@ -88,6 +126,13 @@ class Memory(Dataset):
         return True
 
     def records(self, read: Read) -> Records:
+        return self._held
+
+    @cached_property
+    def _held(self) -> Records:
+        """Its records: the rows given, the rows of columns or a table's rows, read once."""
+        if isinstance(self.values, DataFrame):
+            return _table_records(self.values)
         if isinstance(self.values, Mapping):
             return _Columns(self.values)
         return self.values
@@ -96,7 +141,15 @@ class Memory(Dataset):
         return _indexed_manifest(self, "memory", "memory", self.shard_rows)
 
     def metadata(self) -> Mapping[str, object]:
-        return {"rows": len(self.records("indexed"))}
+        return {"rows": len(self.records("indexed")), "count_rules": self._count_rules}
+
+    @cached_property
+    def _count_rules(self) -> list[list[int | None]]:
+        """The rules its rows' targets were counted by, read off the rows it holds."""
+        from dew.data.steps.text import count_rules
+
+        records = self.records("indexed")
+        return count_rules(records[index] for index in range(len(records)))
 
     def lengths(self) -> np.ndarray | None:
         if isinstance(self.values, Mapping) and "length" in self.values:

@@ -5,9 +5,6 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from os import PathLike, fspath
-from typing import Protocol, runtime_checkable
-
-from dew.data.dataset import Batch
 
 from .base import Read, Shard, ShardManifest, Source
 from .concatenate import Concatenate
@@ -16,15 +13,10 @@ from .grain import Grain, from_grain
 from .hf import HF, from_hf
 from .hub import Hub
 from .iterator import Iterated, from_iter
-from .memory import Memory
+from .memory import DataFrame, Memory
 from .pytorch import Torch, from_torch
 from .tfds import TFDS
 from .tokens import TokenFiles
-
-
-@runtime_checkable
-class _ArrowRows(Protocol):
-    def to_pylist(self) -> list[Batch]: ...
 
 
 def source(
@@ -61,9 +53,7 @@ def source(
                 if format is None and (native_tokens or fs.exists(token_file))
                 else files
             )
-    elif isinstance(value, _ArrowRows):
-        resolved = Memory(value.to_pylist())
-    elif isinstance(value, (Mapping, Sequence)):
+    elif isinstance(value, (DataFrame, Mapping, Sequence)):
         resolved = Memory(value)
     else:
         raise TypeError(f"a source is a filesystem URL, named store, or records; got {type(value).__name__}")

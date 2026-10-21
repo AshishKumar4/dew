@@ -11,9 +11,18 @@
 # (jax-ml/jax#41502, sent as jax-ml/jax#41777), which two checkouts need to
 # share one compiled kernel; and linear_call's batching rule, an all-unmapped
 # call left unmapped, and the JVP of its residuals and constants, which the
-# experts' fused SwiGLU route needs. Every CI and development install takes
+# experts' fused SwiGLU route needs; and the device-to-host transfer guard held
+# on a CPU array's implicit host read (float, item, np.asarray, its buffer) as
+# on an accelerator's copy, which a steady state's guard needs on the CPU suite
+# (tests/steady_state.py); and Pallas Triton's 16-bit float division and
+# erf_inv, through float32 and correctly rounded, which a GEMM template prologue
+# dividing in bfloat16 needs on CUDA. Every CI and development install takes
 # this one build. Return to a release once one ships the fixes.
 # BEGIN package index (site/scripts/gen_install.py)
 --extra-index-url https://pypi.dewml.dev/simple
 # END package index
-jax==0.11.2.post6
+jax==0.11.2.post11
+
+# The CA bundle requests, httpx and the Hub verify TLS with: 2026.10.19 dropped emSign ECC Root CA - G3,
+# whose intermediates' private keys were compromised in October 2026 (tests/test_trust_store.py).
+certifi>=2026.10.19

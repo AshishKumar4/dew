@@ -1,0 +1,590 @@
+"""dew.nn.kernels.templates.attention: the attention template's shared core. Its visibility (`KeySpans`)
+keeps the keys Dew's masks keep for every call form; its block map visits every visible entry and calls
+a tile whole only where every entry is visible; and its XLA arithmetic (`reference`), hooks and all, is
+on par with Dew's reference attention from float64 (check 1)."""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from attention_oracle import exact_attention
+from reference_error import assert_as_exact
+
+from dew.nn.attention import (
+    alibi_bias,
+    chunk_mask,
+    combined_attention_mask,
+    scaled_dot_product_attention,
+    with_key_lengths,
+    with_key_starts,
+)
+from dew.nn.documents import CrossDocuments, cross_document_mask, document_ids, document_mask, with_documents
+from dew.nn.inputs import coordinates
+from dew.nn.kernels.templates import attention as template
+
+QUERIES, KEYS = 100, 96
+"""A call's query and key counts, neither a multiple of a tile, so the block map's edges pad; a call of
+its own documents attends over its own tokens, `QUERIES` of each (`geometry`)."""
+
+ROWS = 2
+
+
+def own_documents():
+    """A call's own packed documents `[2, 100]`: three and two documents, then padding (0)."""
+    return jnp.asarray([[1] * 30 + [2] * 40 + [3] * 20 + [0] * 10, [4] * 55 + [5] * 45], jnp.int32)
+
+
+def cross_documents():
+    """Another sequence's documents: queries `[2, 100]` in any order, keys `[2, 96]` ascending, padding
+    after them, the second row's second document holding no query."""
+    queries = jnp.asarray([[2] * 20 + [1] * 50 + [0] * 30, [7] * 100], jnp.int32)
+    keys = jnp.asarray([[1] * 60 + [2] * 30 + [0] * 6, [7] * 70 + [8] * 26], jnp.int32)
+    return CrossDocuments(queries, keys)
+
+
+LENGTHS = jnp.asarray([96, 61], jnp.int32)
+STARTS = jnp.asarray([0, 17], jnp.int32)
+
+
+CASES = {
+    "full": {},
+    "causal": {"causal": True},
+    "causal-window": {"causal": True, "sliding_window": 24},
+    "two-sided-window": {"sliding_window": 24},
+    "chunk": {"chunk": 32},
+    "causal-chunk": {"causal": True, "chunk": 32},
+    "documents": {"segment_ids": "own"},
+    "causal-documents-window": {"causal": True, "sliding_window": 24, "segment_ids": "own"},
+    "cross-documents": {"segment_ids": "cross"},
+    "cross-causal": {"causal": True, "segment_ids": "cross"},
+    "cross-window": {"sliding_window": 24, "segment_ids": "cross"},
+    "cross-causal-window": {"causal": True, "sliding_window": 24, "segment_ids": "cross"},
+    "lengths": {"lengths": True},
+    "lengths-starts": {"lengths": True, "starts": True},
+    "documents-lengths": {"segment_ids": "own", "lengths": True},
+    "cross-causal-lengths-starts": {"causal": True, "segment_ids": "cross", "lengths": True, "starts": True},
+    "documents-causal-chunk-places": {"causal": True, "chunk": 16, "segment_ids": "own", "positions": True},
+    "cross-causal-chunk": {"causal": True, "chunk": 32, "segment_ids": "cross"},
+    "widest-window": {"sliding_window": 2 ** 31 - 1},
+    "causal-widest-window": {"causal": True, "sliding_window": 2 ** 31 - 1},
+}
+
+
+def geometry(case: dict) -> tuple[int, int]:
+    """`case`'s query and key counts: a call's own documents are its keys, so it has as many of each."""
+    return (QUERIES, QUERIES) if case.get("segment_ids") == "own" else (QUERIES, KEYS)
+
+
+def arguments(case: dict) -> dict:
+    """`case`'s `template.spans` keywords, its documents and key bounds materialized."""
+    ids = {"own": own_documents, "cross": cross_documents}
+    keywords = {name: value for name, value in case.items() if name in ("causal", "sliding_window", "chunk")}
+    if "segment_ids" in case:
+        keywords["segment_ids"] = ids[case["segment_ids"]]()
+    if case.get("lengths"):
+        keywords["lengths"] = LENGTHS
+    if case.get("starts"):
+        keywords["starts"] = STARTS
+    if case.get("positions"):
+        # Each token's place in its own document, as a packed row's coordinates count it.
+        places = coordinates(segments=keywords["segment_ids"]).positions
+        keywords["positions"] = (places, places)
+    return keywords
+
+
+def dews_mask(case: dict) -> np.ndarray:
+    """The keys Dew's reference path keeps for `case`, `[B, Q, K]`, composed as
+    `scaled_dot_product_attention` composes them: another sequence's documents under causality or a
+    window aligned to their last keys (`cross_document_mask`), else causality and a window on the
+    indices (`combined_attention_mask`) narrowed to the documents (`with_documents`); a chunk as
+    `chunk_mask` keeps it over the call's places (the attention layer's `_chunked`), its indices where it
+    names none; then key lengths and starts."""
+    keywords = arguments(case)
+    queries, keys = geometry(case)
+    ids = keywords.get("segment_ids")
+    causal, window = keywords.get("causal", False), keywords.get("sliding_window")
+    if isinstance(ids, CrossDocuments) and (causal or window is not None):
+        mask = cross_document_mask(ids, causal=causal, sliding_window=window)
+    else:
+        mask = combined_attention_mask(queries, keys, causal, window, None)
+        if ids is not None:
+            mask = with_documents(mask, ids)
+    if "chunk" in keywords:
+        places = keywords.get("positions", (jnp.arange(queries), jnp.arange(keys)))
+        chunked = chunk_mask(*places, keywords["chunk"])
+        mask = chunked if mask is None else jnp.logical_and(mask, chunked)
+    if "lengths" in keywords:
+        mask = with_key_lengths(mask, keywords["lengths"], keys)
+    mask = with_key_starts(mask, keywords.get("starts"), keys)
+    full = np.ones((ROWS, queries, keys), bool)
+    return full if mask is None else np.broadcast_to(np.asarray(mask)[:, 0], full.shape)
+
+
+@pytest.mark.parametrize("case", CASES.values(), ids=CASES)
+def test_key_spans_keep_the_keys_dews_masks_keep(case):
+    """Each call form's spans (`template.spans`, `template.dense`) keep exactly the keys Dew's reference
+    path keeps, under `jax.jit` too, the bounds traced."""
+    expected = dews_mask(case)
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    np.testing.assert_array_equal(np.asarray(template.dense(spans)), expected)
+    static = {name: case[name] for name in ("causal", "sliding_window", "chunk") if name in case}
+    if case is CASES["documents-causal-chunk-places"]:
+        # The second document opens at token 30, so its chunk 0 holds tokens 30 to 45: chunks counted
+        # from the row's start would part tokens 31 and 32.
+        assert expected[0, 32, 31]
+    traced = jax.jit(lambda keywords: template.dense(
+        template.spans(queries, keys, ROWS, **keywords, **static)))
+    dynamic = {name: value for name, value in arguments(case).items()
+               if name not in ("causal", "sliding_window", "chunk")}
+    np.testing.assert_array_equal(np.asarray(traced(dynamic)), expected)
+
+
+BLOCKS = [(16, 16), (32, 16), (16, 64), (64, 32)]
+
+
+def uniform_documents(ids, block: int) -> np.ndarray:
+    """Each block's document id `[B, N // block]` where every one of its tokens carries that one id,
+    else 0, the padding id, from the call's ids themselves; a block running past them is 0 unless its
+    tokens are all padding too."""
+    ids = np.asarray(ids)
+    padded = np.zeros((ids.shape[0], -(-ids.shape[1] // block) * block), ids.dtype)
+    padded[:, :ids.shape[1]] = ids
+    blocks = padded.reshape(ids.shape[0], -1, block)
+    return np.where((blocks == blocks[..., :1]).all(axis=-1), blocks[..., 0], 0)
+
+
+@pytest.mark.parametrize("block_q, block_k", BLOCKS)
+@pytest.mark.parametrize("case", CASES.values(), ids=CASES)
+def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_where_it_is(case, block_q,
+                                                                                         block_k):
+    """At each tile shape, every visible entry lies in a tile its query block visits (`lo` to `hi`), and
+    its key block's query range (`q_lo` to `q_hi`) holds that query block; each block's one document
+    (`query_doc`, `key_doc`) is the one its tokens carry (`uniform_documents`); every tile in a query
+    block's whole range (`full_lo` to `full_hi`) whose blocks carry one document, or which has no
+    documents, has every entry visible, the padding past the call's queries and keys excluded from no
+    tile; with no narrowing, every tile inside the call is whole, and a call of its own documents has
+    whole tiles inside them."""
+    queries_, keys_ = geometry(case)
+    spans = template.spans(queries_, keys_, ROWS, **arguments(case))
+    blocks = template.block_map(spans, block_q, block_k)
+    seen = np.asarray(template.dense(spans))
+    lo, hi, full_lo, full_hi, q_lo, q_hi = (np.asarray(x) for x in (
+        blocks.lo, blocks.hi, blocks.full_lo, blocks.full_hi, blocks.q_lo, blocks.q_hi))
+    rows, queries, keys = np.nonzero(seen)
+    i, j = queries // block_q, keys // block_k
+    assert np.all((lo[rows, i] <= j) & (j < hi[rows, i]))
+    assert np.all((q_lo[rows, j] <= i) & (i < q_hi[rows, j]))
+    query_doc = key_doc = None
+    if "segment_ids" in case:
+        query_ids, key_ids = document_ids(arguments(case)["segment_ids"])
+        query_doc, key_doc = uniform_documents(query_ids, block_q), uniform_documents(key_ids, block_k)
+        np.testing.assert_array_equal(np.asarray(blocks.query_doc), query_doc)
+        np.testing.assert_array_equal(np.asarray(blocks.key_doc), key_doc)
+    padded = np.zeros((ROWS, -(-queries_ // block_q) * block_q, -(-keys_ // block_k) * block_k), bool)
+    padded[:, :queries_, :keys_] = seen
+    whole = 0
+    for row in range(ROWS):
+        for block in range(lo.shape[1]):
+            assert lo[row, block] <= full_lo[row, block] <= full_hi[row, block] <= hi[row, block]
+            for tile in range(full_lo[row, block], full_hi[row, block]):
+                if query_doc is not None and not (query_doc[row, block] == key_doc[row, tile] != 0):
+                    continue
+                entries = padded[row, block * block_q:(block + 1) * block_q,
+                                 tile * block_k:(tile + 1) * block_k]
+                assert entries.all(), (row, block, tile)
+                whole += 1
+    # Every tile whose entries are all visible, of one document where there are any, is in a whole range.
+    tiles = padded.reshape(ROWS, padded.shape[1] // block_q, block_q, -1, block_k).all(axis=(2, 4))
+    if query_doc is not None:
+        tiles &= (query_doc[:, :, None] == key_doc[:, None, :]) & (query_doc[:, :, None] != 0)
+    assert whole == tiles.sum()
+    if case is CASES["documents"] and (block_q, block_k) == (16, 16):
+        assert whole > 0
+
+
+SEEDS = 8
+"""The reference arithmetic's declared draws (check 1), sized by `seeds_for`."""
+
+
+def drawing(queries: int, keys: int, dtype=jnp.float32):
+    """A draw of queries `[2, queries, 4, 32]` over keys and values `[2, keys, 2, 32]` in `dtype`, two
+    query heads a key head."""
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        return tuple(jax.random.normal(stream, (ROWS, count, heads, 32), jnp.float32).astype(dtype)
+                     for stream, count, heads in zip(streams, (queries, keys, keys), (4, 2, 2), strict=True))
+
+    return draw
+
+
+SINKS = jnp.asarray([0.5, -1.0, 2.0, -3.0], jnp.float32)
+SOFTCAP = 0.5
+
+
+HOOKS = {
+    "none": {},
+    "softcap": {"softcap": True},
+    "sinks": {"sinks": True},
+    "alibi": {"alibi": True},
+    "softcap-sinks-alibi": {"softcap": True, "sinks": True, "alibi": True},
+}
+
+
+def hooks_of(hooks: dict, queries: int) -> template.Hooks:
+    """The template's hooks for `hooks`: a softcap and ALiBi as one score_mod, sinks as the softmax's
+    initial state."""
+    slopes = alibi_bias(jnp.ones((1, 1)), 4, dtype=jnp.float32).reshape(4)
+    cap = SOFTCAP if hooks.get("softcap") else None
+
+    def score_mod(s, q_pos, k_pos, *params):
+        if cap is not None:
+            s = cap * jnp.tanh(s / cap)
+        if hooks.get("alibi"):
+            s = s + params[0].astype(s.dtype) * k_pos.astype(s.dtype)
+        return s
+
+    params = (template.Param(slopes, template.Kind.HEAD),) if hooks.get("alibi") else ()
+    initial = template.sinks(SINKS, ROWS, queries, 32) if hooks.get("sinks") else None
+    used = cap is not None or hooks.get("alibi")
+    return template.Hooks(score_mod if used else None, params, initial)
+
+
+ARITHMETIC = ("full", "causal-window", "causal-documents-window", "cross-causal-lengths-starts")
+
+
+@pytest.mark.parametrize("case", [CASES[name] for name in ARITHMETIC], ids=ARITHMETIC)
+def test_the_scores_hide_exactly_the_keys_their_spans_hide(case):
+    """`template.scores`, which `reference`'s softmax takes, under every score hook: -inf where the
+    call's spans hide the key, finite where they keep it."""
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    query, key, _ = drawing(queries, keys)(0)
+    logits = template.scores(query, key, spans, hooks_of(HOOKS["softcap-sinks-alibi"], queries))
+    seen = np.broadcast_to(np.asarray(template.dense(spans))[:, None], logits.shape)
+    np.testing.assert_array_equal(np.isfinite(np.asarray(logits)), seen)
+
+
+DTYPES = [jnp.float32, jnp.bfloat16]
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
+@pytest.mark.parametrize("hooks", HOOKS.values(), ids=HOOKS)
+@pytest.mark.parametrize("case", [CASES[name] for name in ARITHMETIC], ids=ARITHMETIC)
+def test_the_templates_arithmetic_is_on_par_with_dews_reference_attention(case, hooks, dtype):
+    """`template.reference` over each call form's spans and each hook, on par with Dew's reference path
+    (`scaled_dot_product_attention`, 'reference', the same keys as a mask) over the site's draws, both
+    measured from float64 (`exact_attention` under that mask); a query that keeps no key reads zero on
+    both."""
+    mask = jnp.asarray(dews_mask(case))[:, None]
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    sinks = SINKS if hooks.get("sinks") else None
+    softcap = SOFTCAP if hooks.get("softcap") else None
+    alibi = alibi_bias(jnp.arange(keys)[None], 4, dtype=jnp.float32) if hooks.get("alibi") else None
+
+    def ours(query, key, value):
+        return template.reference(query, key, value, spans, hooks_of(hooks, queries))
+
+    def dews(query, key, value):
+        bias = None if alibi is None else alibi.astype(query.dtype)
+        return scaled_dot_product_attention(query, key, value, mask=mask, bias=bias, sinks=sinks,
+                                            softcap=softcap, implementation="reference")
+
+    def exact(query, key, value):
+        return exact_attention(query, key, value, None if sinks is None else sinks.astype(query.dtype),
+                               softcap=softcap, mask=np.asarray(mask))
+
+    # `exact_attention` takes no bias: under ALiBi the truth is Dew's reference path in float64.
+    assert_as_exact(jax.jit(ours), jax.jit(dews), drawing(queries, keys, dtype),
+                    f"template arithmetic {case} {hooks} {jnp.dtype(dtype).name}",
+                    seeds=SEEDS, truth_fn=None if alibi is not None else exact)
+
+
+LAYOUTS = ("causal-documents-window", "cross-causal-lengths-starts")
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
+@pytest.mark.parametrize("case", [CASES[name] for name in LAYOUTS], ids=LAYOUTS)
+def test_every_parameter_layout_and_the_output_hook_are_on_par(case, dtype):
+    """A score hook reading a parameter of each score layout, a query's temperature, a key's bias and a
+    dense bias, `s * t_q + b_k + B_qk`, and an output gate `o * sigmoid(g)`, on par with Dew's reference
+    path taking them as it can: the temperature in the queries, the biases as one dense bias, the gate
+    on its output; both measured from float64."""
+    mask = jnp.asarray(dews_mask(case))[:, None]
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    streams = jax.random.split(jax.random.key(5), 4)
+    temperature = jax.random.uniform(streams[0], (ROWS, 4, queries), jnp.float32, 0.5, 1.5)
+    key_bias = jax.random.normal(streams[1], (ROWS, 4, keys), jnp.float32)
+    dense_bias = 0.5 * jax.random.normal(streams[2], (ROWS, 4, queries, keys), jnp.float32)
+    gate = jax.random.normal(streams[3], (ROWS, queries, 4, 32), jnp.float32)
+
+    def score_mod(s, q_pos, k_pos, t, b, bias):
+        return s * t.astype(s.dtype) + b.astype(s.dtype) + bias.astype(s.dtype)
+
+    def output_mod(o, g):
+        return o * jax.nn.sigmoid(g.astype(o.dtype))
+
+    hooks = template.Hooks(score_mod, (template.Param(temperature, template.Kind.QUERY),
+                                       template.Param(key_bias, template.Kind.KEY),
+                                       template.Param(dense_bias, template.Kind.TILE)),
+                           None, output_mod, (template.Param(gate, template.Kind.OUTPUT),))
+
+    def ours(query, key, value):
+        return template.reference(query, key, value, spans, hooks)
+
+    def dews(query, key, value):
+        wide = jnp.promote_types(query.dtype, jnp.float32)
+        scaled = (query.astype(wide) * jnp.swapaxes(temperature, 1, 2)[..., None]).astype(query.dtype)
+        bias = (key_bias[:, :, None, :] + dense_bias).astype(query.dtype)
+        out = scaled_dot_product_attention(scaled, key, value, mask=mask, bias=bias,
+                                           implementation="reference")
+        return (out.astype(wide) * jax.nn.sigmoid(gate.astype(wide))).astype(query.dtype)
+
+    assert_as_exact(jax.jit(ours), jax.jit(dews), drawing(queries, keys, dtype),
+                    f"template layouts {case} {jnp.dtype(dtype).name}", seeds=SEEDS)
+
+
+def halves(spans: template.KeySpans, half: int) -> tuple[template.KeySpans, template.KeySpans]:
+    """`spans` over the keys before `half` and over those from it, each in its own keys' indices."""
+    ids = spans.key_ids
+    return (template.KeySpans(jnp.minimum(spans.start, half), jnp.minimum(spans.end, half), spans.query_ids,
+                              None if ids is None else ids[:, :half], half),
+            template.KeySpans(jnp.maximum(spans.start - half, 0), jnp.maximum(spans.end - half, 0),
+                              spans.query_ids, None if ids is None else ids[:, half:], spans.keys - half))
+
+
+@pytest.mark.parametrize("split", ["sliced-at-a-tile-edge", "spanned-at-the-half"])
+@pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
+@pytest.mark.parametrize("hooks", [HOOKS["none"], HOOKS["sinks"]], ids=["none", "sinks"])
+@pytest.mark.parametrize("case", [CASES[name] for name in ARITHMETIC], ids=ARITHMETIC)
+def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks, dtype, split):
+    """The softmax over a call's first keys, its output, maxima and denominators resumed as the initial
+    state of one over the rest (`template.Initial`, its numerator the output times the denominator, a
+    query that saw nothing resuming from no state), gives the output, maxima and denominators of one
+    pass over every key, on par from float64 over the site's draws: the keys parted at a tile's edge
+    into two arrays, as a split-KV launch parts them, or parted at their half by the spans over the
+    whole arrays. The resume's contract is at the cuts launches make, tile edges. (Sliced into arrays of
+    50 or 64 of these 100 keys, XLA:CPU's fp32 product of the queries with the keys rounds the logits
+    1.555 times as far from float64 as the whole 100-key product does on the same entries, over 20
+    draws; sliced at 48 or 100, alike: the reference's own dot rounding by its shape, which the
+    spanned half keeps the whole call's. Recorded 2026-10-21.)"""
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    start = hooks_of(hooks, queries)
+    if split == "sliced-at-a-tile-edge":
+        edge = keys // 2 // 32 * 32
+        first, rest = halves(spans, edge)
+
+        def parted(array):
+            return array[:, :edge], array[:, edge:]
+    else:
+        edge = keys // 2
+        first = template.KeySpans(jnp.minimum(spans.start, edge), jnp.minimum(spans.end, edge),
+                                  spans.query_ids, spans.key_ids, keys)
+        rest = template.KeySpans(jnp.maximum(spans.start, edge), spans.end, spans.query_ids, spans.key_ids,
+                                 keys)
+
+        def parted(array):
+            return array, array
+
+    def resumed(query, key, value):
+        (key_first, key_rest), (value_first, value_rest) = parted(key), parted(value)
+        out, m, total = template.reference(query, key_first, value_first, first, start, residuals=True)
+        acc = jnp.swapaxes(out.astype(jnp.float32), 1, 2) * total[..., None]
+        state = template.Initial(jnp.where(total > 0, m, -jnp.inf), total, acc)
+        return template.reference(query, key_rest, value_rest, rest, template.Hooks(initial=state),
+                                  residuals=True)
+
+    def whole(query, key, value):
+        return template.reference(query, key, value, spans, start, residuals=True)
+
+    assert_as_exact(jax.jit(resumed), jax.jit(whole), drawing(queries, keys, dtype),
+                    f"template resumed {case} {hooks} {jnp.dtype(dtype).name} {split}", seeds=SEEDS)
+
+
+def test_hooks_are_a_pytree_whose_values_a_compiled_call_takes():
+    """A compiled call takes the hooks as its argument: new parameter and state values run the one
+    program it traced, and their gradients flow back into a `Hooks` of the same structure."""
+    queries, keys = geometry(CASES["causal-window"])
+    spans = template.spans(queries, keys, ROWS, **arguments(CASES["causal-window"]))
+    query, key, value = drawing(queries, keys)(0)
+    traces = []
+
+    def attend(hooks):
+        traces.append(hooks)
+        return template.reference(query, key, value, spans, hooks)
+
+    compiled = jax.jit(attend)
+    alibi = hooks_of(HOOKS["softcap-sinks-alibi"], queries)
+    steeper = template.Hooks(alibi.score_mod, (template.Param(2 * alibi.score_params[0].value,
+                                                              template.Kind.HEAD),),
+                             template.Initial(alibi.initial.m + 1, alibi.initial.total, alibi.initial.acc))
+    outputs = compiled(alibi), compiled(steeper)
+    assert len(traces) == 1
+    assert not np.array_equal(np.asarray(outputs[0]), np.asarray(outputs[1]))
+    grads = jax.grad(lambda hooks: jnp.sum(attend(hooks)))(alibi)
+    assert jax.tree.structure(grads) == jax.tree.structure(alibi)
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(grads))
+    assert np.abs(np.asarray(grads.score_params[0].value)).sum() > 0
+
+
+def test_a_call_of_no_keys_reads_its_initial_state_or_zero():
+    """With no keys, every call form leaves each query none; the output is zero from no state or sinks,
+    and a resumed partial's own `acc / total`."""
+    cross = CrossDocuments(jnp.asarray([[1, 1, 0]], jnp.int32), jnp.zeros((1, 0), jnp.int32))
+    for segment_ids in (None, cross):
+        spans = template.spans(3, 0, 1, causal=True, sliding_window=4, chunk=2, segment_ids=segment_ids,
+                               lengths=jnp.zeros((1,), jnp.int32))
+        assert template.dense(spans).shape == (1, 3, 0)
+        blocks = template.block_map(spans, 16, 16)
+        assert not np.asarray(blocks.hi - blocks.lo).any()
+        query = jnp.ones((1, 3, 2, 4), jnp.float32)
+        empty = jnp.zeros((1, 0, 1, 4), jnp.float32)
+        np.testing.assert_array_equal(np.asarray(template.reference(query, empty, empty, spans)), 0)
+        sinks = template.Hooks(initial=template.sinks(jnp.asarray([0.5, -1.0]), 1, 3, 4))
+        np.testing.assert_array_equal(np.asarray(template.reference(query, empty, empty, spans, sinks)), 0)
+        state = template.Initial(jnp.zeros((1, 2, 3)), jnp.full((1, 2, 3), 2.0), jnp.full((1, 2, 3, 4), 3.0))
+        resumed = template.reference(query, empty, empty, spans, template.Hooks(initial=state))
+        np.testing.assert_array_equal(np.asarray(resumed), 1.5)
+
+
+def test_document_ids_wider_than_int32_keep_their_documents_apart():
+    """Ids past int32, under x64, keep their documents apart: `2 ** 32 + 1` is not document 1, and
+    `2 ** 32` is no padding."""
+    with jax.enable_x64(new_val=True):
+        ids = jnp.asarray([[1, 1, 2 ** 32 + 1, 2 ** 32 + 1, 2 ** 32]], jnp.int64)
+        spans = template.spans(5, 5, 1, segment_ids=ids)
+        np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(document_mask(ids)))
+
+
+@pytest.mark.parametrize("ids, places, chunk", [
+    ([[1, 1, 0, 1, 1]], [[0, 1, 0, 2, 3]], 2),
+    ([[1, 2, 1, 2, 1, 2]], [[0, 0, 1, 1, 2, 2]], 2),
+    ([[1, 2, 2]], [[0, 0, 1]], 2 ** 31 - 1),
+], ids=["padding-inside", "interleaved", "widest"])
+def test_chunks_keep_the_keys_dews_chunk_mask_keeps_over_any_document_layout(ids, places, chunk):
+    """A call's own documents, padding inside one, two interleaved, or a chunk as wide as int32 allows:
+    the spans keep exactly the keys `document_mask & chunk_mask` keeps over the call's places, causal or
+    not."""
+    ids, places = jnp.asarray(ids, jnp.int32), jnp.asarray(places, jnp.int32)
+    tokens = ids.shape[1]
+    for causal in (False, True):
+        spans = template.spans(tokens, tokens, 1, causal=causal, chunk=chunk, positions=(places, places),
+                               segment_ids=ids)
+        expected = document_mask(ids) & chunk_mask(places, places, chunk)[:, 0]
+        if causal:
+            expected &= np.tril(np.ones((tokens, tokens), bool))
+        np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+
+
+def test_cross_documents_chunk_on_their_given_places():
+    """Another sequence's documents with their own places: a query's chunk holds its document's keys
+    whose places share it, as `cross_document_mask & chunk_mask` keeps them."""
+    cross = CrossDocuments(jnp.asarray([[2, 2, 1, 1, 0]], jnp.int32),
+                           jnp.asarray([[1, 1, 1, 2, 2, 2]], jnp.int32))
+    query_places = jnp.asarray([[1, 2, 0, 2, 0]], jnp.int32)
+    key_places = jnp.asarray([[0, 1, 2, 0, 1, 2]], jnp.int32)
+    spans = template.spans(5, 6, 1, chunk=2, positions=(query_places, key_places), segment_ids=cross)
+    expected = document_mask(cross) & chunk_mask(query_places, key_places, 2)[:, 0]
+    np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+
+
+def test_a_call_of_no_queries_maps_no_tiles():
+    """With no queries, the block map has no query blocks and reads no key block."""
+    blocks = template.block_map(template.spans(0, 40, 1, causal=True), 16, 16)
+    assert blocks.lo.shape == (1, 0)
+    np.testing.assert_array_equal(np.asarray(blocks.q_hi), 0)
+
+
+def test_chunks_over_the_widest_places_neither_wrap_nor_alias():
+    """Places at int32's least, and int64 places past int32, chunk as `chunk_mask` chunks them."""
+    ids = jnp.asarray([[1, 2]], jnp.int32)
+    places = jnp.asarray([[-2 ** 31, -2 ** 31 + 1]], jnp.int32)
+    spans = template.spans(2, 2, 1, chunk=3, positions=(places, places), segment_ids=ids)
+    expected = document_mask(ids) & chunk_mask(places, places, 3)[:, 0]
+    np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+    with jax.enable_x64(new_val=True):
+        ids = jnp.asarray([[1, 1, 1]], jnp.int32)
+        places = jnp.asarray([[2 ** 32, 2 ** 32 + 1, 2 ** 32 + 2]], jnp.int64)
+        spans = template.spans(3, 3, 1, chunk=2, positions=(places, places), segment_ids=ids)
+        expected = document_mask(ids) & chunk_mask(places, places, 2)[:, 0]
+        np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+
+
+def test_cross_documents_of_two_id_widths_align_as_one():
+    """Another sequence's documents whose queries' and keys' ids differ in width: each query aligns
+    within its own document, by an independent causal document mask: the int8 queries' 127 is not the
+    int16 keys' 383, which narrowed to int8 would be."""
+    for query_ids, key_ids in (([[127]], [[127]]), ([[127, 3]], [[3, 127, 383, 383]])):
+        cross = CrossDocuments(jnp.asarray(query_ids, jnp.int8), jnp.asarray(key_ids, jnp.int16))
+        spans = template.spans(len(query_ids[0]), len(key_ids[0]), 1, causal=True, segment_ids=cross)
+        queries, keys = np.asarray(query_ids[0]), np.asarray(key_ids[0])
+        places = [np.flatnonzero(keys == document)[-1] - (np.sum(queries[index + 1:] == document))
+                  for index, document in enumerate(queries)]
+        expected = (queries[:, None] == keys[None, :]) & (np.arange(len(keys))[None, :]
+                                                            <= np.asarray(places)[:, None])
+        np.testing.assert_array_equal(np.asarray(template.dense(spans))[0], expected)
+
+
+def test_cross_documents_of_ids_wider_than_int32_align_apart():
+    """Another sequence's documents with ids past int32, causal: each query aligns within its own
+    document, as `cross_document_mask` aligns it."""
+    with jax.enable_x64(new_val=True):
+        ids = jnp.asarray([[1, 1, 2 ** 32 + 1, 2 ** 32 + 1]], jnp.int64)
+        cross = CrossDocuments(ids, ids)
+        spans = template.spans(4, 4, 1, causal=True, segment_ids=cross)
+        expected = cross_document_mask(cross, causal=True, sliding_window=None)[:, 0]
+        np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+        np.testing.assert_array_equal(np.asarray(expected)[0],
+                                      np.tril(np.ones((4, 4), bool)) & np.asarray(document_mask(ids)[0]))
+
+
+def test_a_chunk_wider_than_its_places_dtype_holds_every_place_of_one_sign():
+    """A chunk wider than int32 counts, over int32 places, holds the largest places together and the
+    negative ones apart, as `chunk_mask` does (over int64 places, an ordinary chunk)."""
+    ids = jnp.asarray([[1, 1, 1]], jnp.int32)
+    places = jnp.asarray([[-1, 2 ** 31 - 2, 2 ** 31 - 1]], jnp.int32)
+    spans = template.spans(3, 3, 1, chunk=2 ** 31, positions=(places, places), segment_ids=ids)
+    with jax.enable_x64(new_val=True):
+        wide = places.astype(jnp.int64)
+        expected = document_mask(ids) & chunk_mask(wide, wide, 2 ** 31)[:, 0]
+    np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+
+
+def test_a_block_of_unsigned_ids_is_whole_only_within_one_document():
+    """Unsigned document ids: a block whose tokens carry two documents is tagged as none, so a block map
+    over interleaved documents calls no tile whole."""
+    ids = jnp.asarray([[1, 2, 1, 2, 1, 2, 1, 2]], jnp.uint32)
+    blocks = template.block_map(template.spans(8, 8, 1, segment_ids=ids), 2, 2)
+    np.testing.assert_array_equal(np.asarray(blocks.query_doc), uniform_documents(ids, 2))
+    np.testing.assert_array_equal(np.asarray(blocks.key_doc), uniform_documents(ids, 2))
+    seen = np.asarray(template.dense(template.spans(8, 8, 1, segment_ids=ids)))
+    for block in range(4):
+        for tile in range(int(blocks.full_lo[0, block]), int(blocks.full_hi[0, block])):
+            if blocks.query_doc[0, block] == blocks.key_doc[0, tile] != 0:
+                assert seen[0, 2 * block:2 * block + 2, 2 * tile:2 * tile + 2].all()
+
+
+def test_a_wider_initial_state_is_read_in_its_own_dtype():
+    """Under x64, a state whose denominator and numerator are float64 and maximum float32 starts a
+    float32 query's softmax in float64: a call of no keys reads `acc / total` unrounded."""
+    with jax.enable_x64(new_val=True):
+        state = template.Initial(jnp.zeros((1, 1, 1), jnp.float32), jnp.full((1, 1, 1), 1 + 2 ** -24),
+                                 jnp.ones((1, 1, 1, 1), jnp.float64))
+        query = jnp.ones((1, 1, 1, 1), jnp.float32)
+        empty = jnp.zeros((1, 0, 1, 1), jnp.float32)
+        spans = template.spans(1, 0, 1)
+        out, _, total = template.reference(query, empty, empty, spans, template.Hooks(initial=state),
+                                           residuals=True)
+        assert float(total[0, 0, 0]) == 1 + 2 ** -24
+        assert float(out[0, 0, 0, 0]) == np.float32(1 / (1 + 2 ** -24))
+
+
+def test_sinks_keep_their_own_wider_dtype():
+    """Float64 sinks start the softmax in float64, unrounded."""
+    with jax.enable_x64(new_val=True):
+        state = template.sinks(jnp.asarray([1 + 2 ** -30], jnp.float64), 1, 1, 1)
+        assert state.m.dtype == state.total.dtype == state.acc.dtype == jnp.float64
+        assert float(state.m[0, 0, 0]) == 1 + 2 ** -30

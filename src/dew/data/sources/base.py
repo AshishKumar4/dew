@@ -19,6 +19,7 @@ in a run's metrics, never its identity.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import logging
 from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -145,6 +146,18 @@ class Source(Protocol):
         """Each record's length when the store states it (a producer's index),
         which length grouping ranks by; None when it does not."""
         ...
+
+
+_UNNAMED = itertools.count()
+"""The places the stores a program makes without a name take in the order it makes them, which tell
+apart two such stores read in one run (`unnamed`)."""
+
+
+def unnamed() -> int:
+    """The next place among the stores a program makes without a name: in its run, the key its
+    counters and phases keep apart, the same in every run of the program, and no content
+    version, which a store without a name has none of (`dew.data.plan.identified`)."""
+    return next(_UNNAMED)
 
 
 def url_label(url: str) -> str:

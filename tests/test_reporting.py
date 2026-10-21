@@ -267,6 +267,40 @@ def test_the_panel_shows_the_metrics_its_last_interval_reported():
         ("loss", [2.0, 1.5, 1.0]), ("source/a/reward", [1.0, 0.5])]
 
 
+def test_the_panel_names_a_lower_bound_utilization_and_its_uncounted_kernels_within_its_name_column():
+    """A step some of whose launches' work XLA's cost analysis cannot count reports its utilizations
+    as lower bounds beside how many launches went uncounted: the panel shows them as `hfu ≥` and
+    `hlo_flops_util ≥` and the count as `uncounted kernels`, each whole within the name column, where
+    the metrics' own names would be cut."""
+    from dew.training.display import TRAINER_SHOWN, TrainingDisplay
+
+    display = TrainingDisplay(total=10, shown=TRAINER_SHOWN)
+    display.interval(1, {"train/loss": 2.0, "train/hfu_lower_bound": 0.41,
+                         "train/hlo_flops_util_lower_bound": 0.38, "train/unsized_kernels": 50.0})
+    names = {row.name: group for group, row in display.rows()}
+    assert names == {"loss": "train", "hfu ≥": "throughput", "hlo_flops_util ≥": "throughput",
+                     "uncounted kernels": "throughput"}
+    assert all(len(name) + 2 <= 24 for name in names)
+
+
+def test_a_metrics_label_names_it_in_evaluations_and_the_summary_too():
+    """A label (`Shown.label`) is the name everywhere the display shows the metric: an evaluation's
+    scores, its rows and the run's summary, whose trackers keep the metric's own name."""
+    from dew.objectives.base import Shown
+    from dew.training.display import TrainingDisplay
+    from dew.training.evaluation import Evaluation
+
+    display = TrainingDisplay(total=2, first=0, shown={"loss": Shown(better="lower", label="nll"),
+                                                       "accuracy": Shown(percent=True, label="top-1")})
+    evaluation = Evaluation(step=2, split="val", scores={"val/accuracy": 0.5}, coordinated_batches=1,
+                            records=4, event_key=(0,), elapsed_seconds=0.1, previews=())
+    display.evaluation(evaluation)
+    assert display.scores(evaluation).plain.startswith("top-1 ")
+    assert [row.name for _, row in display.evaluation_rows()] == ["top-1"]
+    # The summary's final loss is named as the display names it.
+    assert display.named("loss") == "nll" and display.named("tokens") == "tokens"
+
+
 def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counters():
     """A run's data counters (`data/...`) reach the panel as one line, not as a row each: each
     label's rows as its reader counted them, named only where there is more than one label, the
@@ -410,6 +444,23 @@ def paths_of(figure) -> list[list[tuple[float, ...]]]:
 
 def texts_of(figure) -> list[str]:
     return [shape.text for shape in figure.shapes if shape.tag == "text"]
+
+
+def test_a_figures_label_and_text_read_back_as_written():
+    """Markup characters in a figure's label and text are escaped: an SVG reader reads back what was
+    written, quotes of either kind included."""
+    from xml.etree import ElementTree
+
+    from dew import figures
+
+    written = "a < b & \"c\" 'd' > e"
+    figure = figures.Figure(120, 40, label=written)
+    figure.text(10, 20, written)
+    read = ElementTree.fromstring(figure.svg())
+    svg = "{http://www.w3.org/2000/svg}"
+    assert read.get("aria-label") == written
+    assert read.find(f"{svg}title").text == written
+    assert read.find(f"{svg}text").text == written
 
 
 def test_a_curve_draws_each_series_at_its_own_steps_from_its_finite_values():

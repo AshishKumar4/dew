@@ -16,27 +16,27 @@ import tokamax
 from dew.nn.kernels import generation, selection, tuning
 
 
-class Template(tuning.KernelOp):
-    """A template's launch: `space`, `staged_bytes` and `cost` give its configs, the ones that fit a
-    block of the device (`fitting`), and its heuristic, the fitting config `cost` estimates fastest,
-    ties going to the first in `space`'s order. An implementation that does not run a call on a
-    target says so in `eligible`; its operands' token counts are `ROWS`, as for any `KernelOp`, and
-    every other argument is keyed as it is. A hook is a plain JAX callable the kernel's body traces,
-    and the ops beside the launch fuse into it through `jax.experimental.pallas.fuser`: neither is
-    the base's."""
+class Template[Config: Hashable](tuning.KernelOp):
+    """A template's launch, its configs all of one `Config` type: `space`, `staged_bytes` and `cost`
+    give its configs, the ones that fit a block of the device (`fitting`), and its heuristic, the
+    fitting config `cost` estimates fastest, ties going to the first in `space`'s order. An
+    implementation that does not run a call on a target says so in `eligible`; its operands' token
+    counts are `ROWS`, as for any `KernelOp`, and every other argument is keyed as it is. A hook is a
+    plain JAX callable the kernel's body traces, and the ops beside the launch fuse into it through
+    `jax.experimental.pallas.fuser`: neither is the base's."""
 
     name: ClassVar[str] = "template"
     """The implementation's name, as a route reports it and `generation.chosen` may name it."""
 
-    def space(self, ba: tokamax.BoundArguments) -> Sequence[Hashable]:
+    def space(self, ba: tokamax.BoundArguments) -> Sequence[Config]:
         """Every config the launch is proven over for `ba`, in a fixed order."""
         raise NotImplementedError(f"{type(self).__name__} declares no space")
 
-    def staged_bytes(self, ba: tokamax.BoundArguments, config: Hashable) -> int:
+    def staged_bytes(self, ba: tokamax.BoundArguments, config: Config) -> int:
         """The shared memory, in bytes, a program of the launch of `ba` stages at `config`."""
         raise NotImplementedError(f"{type(self).__name__} declares no staged bytes")
 
-    def cost(self, ba: tokamax.BoundArguments, config: Hashable, target: generation.GpuTarget) -> float:
+    def cost(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> float:
         """The seconds the launch of `ba` is estimated to take at `config` on `target`."""
         raise NotImplementedError(f"{type(self).__name__} declares no cost")
 
@@ -45,7 +45,7 @@ class Template(tuning.KernelOp):
         target's facts): every one does unless it says otherwise."""
         return True
 
-    def fitting(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Hashable, ...]:
+    def fitting(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
         """The configs of `space` whose programs fit a block of `target` (`generation.shared_budget`),
         in `space`'s order. A call none fits raises, naming the least any config stages and the
         budget: the template's own requirements refuse the call before it reaches a launch."""
@@ -57,7 +57,7 @@ class Template(tuning.KernelOp):
                                                      default=None), budget, target.generation)
         return fits
 
-    def estimate(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[float, Hashable]:
+    def estimate(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[float, Config]:
         """The seconds `cost` estimates at the launch's fastest fitting config on `target`, and that
         config, the first of `space`'s order where several tie."""
         fits = self.fitting(ba, target)
@@ -65,10 +65,10 @@ class Template(tuning.KernelOp):
         fastest = min(range(len(fits)), key=lambda index: (costs[index], index))
         return costs[fastest], fits[fastest]
 
-    def _get_autotuning_configs(self, ba: tokamax.BoundArguments) -> set[Hashable]:
+    def _get_autotuning_configs(self, ba: tokamax.BoundArguments) -> set[Config]:
         return set(self.fitting(ba, generation.gpu_target()))
 
-    def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Hashable:
+    def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         return self.estimate(ba, generation.gpu_target())[1]
 
 
@@ -101,20 +101,22 @@ def choose(choice: str, implementations: Sequence[Template], *args, **kwargs) ->
     if not eligible:
         raise ValueError(f"no implementation of {choice} runs this call on {target.generation}: "
                          f"{', '.join(bound)}")
+    named = selection.forced(choice)
+    if named is not None:
+        # A chosen implementation is the call's without estimating the others, whose costs may need
+        # facts the target does not state.
+        if named not in bound or not bound[named][0].eligible(bound[named][1], target):
+            raise ValueError(f"{choice}'s implementation {named!r} is chosen and does not run this call on "
+                             f"{target.generation}; the ones that do are "
+                             f"{', '.join(implementation.name for implementation, _ in eligible)}")
+        picked, ba = bound[named]
+        picked.fitting(ba, target)
+        generation.route(choice, kernel=picked.name)
+        return picked
     # One eligible implementation is the call's without an estimate, so a target with no cost facts
     # (a TPU, where XLA's alone runs) needs none.
     costs = [0.0] if len(eligible) == 1 else [implementation.estimate(ba, target)[0]
                                               for implementation, ba in eligible]
-    estimated = eligible[min(range(len(eligible)), key=lambda index: (costs[index], index))][0]
-    named = selection.forced(choice)
-    if named is None:
-        picked = estimated
-    elif named not in bound or not bound[named][0].eligible(bound[named][1], target):
-        raise ValueError(f"{choice}'s implementation {named!r} is chosen and does not run this call on "
-                         f"{target.generation}; the ones that do are "
-                         f"{', '.join(implementation.name for implementation, _ in eligible)}")
-    else:
-        picked, ba = bound[named]
-        picked.fitting(ba, target)
-    generation.route(choice, kernel=picked.name, preferred=estimated.name)
+    picked = eligible[min(range(len(eligible)), key=lambda index: (costs[index], index))][0]
+    generation.route(choice, kernel=picked.name, preferred=picked.name)
     return picked

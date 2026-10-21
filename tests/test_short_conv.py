@@ -26,6 +26,9 @@ from dew.nn.linear import causal_conv1d, conv_refusal, xla_conv1d
 pytestmark = pytest.mark.kernel
 
 DELTA = ((32, 16), (32, 16), (32, None))
+SHARDED_SEEDS = 8
+"""The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
+`seeds_for`: the fewest for which one device compared with itself resolves the factor."""
 """A delta rule's queries, keys and values on two 16-wide heads: the keys and queries normalised."""
 
 
@@ -198,9 +201,8 @@ def test_a_conv_step_launches_the_configs_its_store_holds_as_exact_as_xla(tmp_pa
 
     path, stamp, settled, taken = fresh(TUNED, "measure", str(tmp_path / "measured.npz"),
                                         cache_dir=cache_dir, flags=inherited)
-    with open(path) as file:
-        stored = {(type(ba.op), ba.autotuning_cache_key): timings
-                  for ba, timings in tokamax.AutotuningResult.loads(file.read()).data}
+    stored = {(type(ba.op), ba.autotuning_cache_key): timings
+              for ba, timings in tuning._read(path)[0].values()}
     assert settled is True and stored.keys() == distinct.keys()
     for key, timings in stored.items():
         assert len(timings) > 1, key[0]
@@ -220,8 +222,8 @@ def test_a_conv_step_launches_the_configs_its_store_holds_as_exact_as_xla(tmp_pa
     timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                    metadata={})
     with open(path, "w") as file:
-        file.write(tokamax.AutotuningResult(jax.devices()[0].device_kind, tuple(
-            (ba, tuning.AutotuningData({chosen[key]: timing})) for key, ba in distinct.items())).dumps())
+        file.write(tuning.dumps_picks(jax.devices()[0].device_kind, tuple(
+            (ba, tuning.Timings({chosen[key]: timing})) for key, ba in distinct.items())))
     _, _, settled, taken = fresh(TUNED, "read", str(tmp_path / "chosen.npz"), cache_dir=cache_dir,
                                  flags=reading)
     assert settled is True and taken == taking(chosen)
@@ -366,21 +368,26 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, pa
 def test_the_conv_keeps_the_kernel_contract_on_a_mesh_that_splits_rows(axis):
     """`causal_conv1d` over rows split two ways, as data or fsdp parallelism splits them, runs per shard
     (`sharded.assert_runs_per_shard`): its pieces, the l2-normalised queries and keys of a delta rule
-    over padded rows of packed documents, and the gradients of the input, the taps and the bias within
-    the float64 gate of one device's, and no operand moved between devices. On a GPU each shard is the
-    fused kernel."""
+    over padded rows of packed documents, and the gradients of the input, the taps and the bias on par
+    with one device's over the site's draws, and no operand moved between devices. On a GPU each shard
+    is the fused kernel."""
     from jax.sharding import Mesh, PartitionSpec
     from sharded import assert_runs_per_shard
 
-    x, weights, shift, valid = operands(4, 48, DELTA, dtype=jnp.float32, bias=True, valid=True)
-    segments = documents(4, 48)
-    grads = cotangents(x, DELTA, jnp.float32)
+    def draw(seed):
+        # Each role's stream its own: a draw's cotangents never replay another draw's input.
+        x, weights, shift, valid = operands(4, 48, DELTA, dtype=jnp.float32, bias=True, valid=True,
+                                            seed=3 * seed)
+        return (x, weights, shift, valid, documents(4, 48, seed=3 * seed + 2),
+                *cotangents(x, DELTA, jnp.float32, seed=3 * seed + 1))
 
     def gradients(x, weights, shift, valid, segments, *grads):
         return run(causal_conv1d, x, weights, shift, valid, DELTA, jnp.float32, grads, segments=segments)
 
-    expected = jax.tree.map(np.asarray, truth(x, weights, shift, valid, DELTA, grads, segments=segments))
+    def exact(x, weights, shift, valid, segments, *grads):
+        return truth(x, weights, shift, valid, DELTA, grads, segments=segments)
+
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     rows, whole = PartitionSpec(axis), PartitionSpec()
-    assert_runs_per_shard(gradients, (x, weights, shift, valid, segments, *grads),
-                          [rows, whole, whole, rows, rows, rows, rows, rows], mesh, expected)
+    assert_runs_per_shard(gradients, draw, [rows, whole, whole, rows, rows, rows, rows, rows], mesh,
+                          f"conv split over {axis}", seeds=SHARDED_SEEDS, truth_fn=exact)

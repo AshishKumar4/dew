@@ -413,28 +413,37 @@ def test_layout_parity_reaches_every_leaf_of_a_model_that_initializes_its_output
 # tools/benchmark_step.py
 # ---------------------------------------------------------------------------
 
-def composite_case(tool, architecture: str, **changes):
+def owners(monkeypatch):
+    """tools/benchmark_cases.py and tools/benchmark_models.py, the cases and the trainer, batches and
+    compiled step the step benchmark measures (benchmark_models imports benchmark_cases by name)."""
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
+    import benchmark_cases
+    import benchmark_models
+    return benchmark_cases, benchmark_models
+
+
+def composite_case(cases, architecture: str, **changes):
     """The cpu-smoke preset's case for one composite, in fp32 as the preset
     runs it, resized by `changes`."""
-    (case,) = [c for c in tool.cpu_smoke_cases() if c.architecture == architecture]
+    (case,) = [c for c in cases.cpu_smoke_cases() if c.architecture == architecture]
     return dataclasses.replace(case, **{"dtype": "float32", **changes})
 
 
-def parameter_movement(tool, case, steps: int = 2):
+def parameter_movement(models, case, steps: int = 2):
     """How far every parameter moved over `steps` of the case's real compiled
     step, by tree path, with the loss and the step's measured FLOPs.
 
-    The trainer, the batches and the compiled step are the tool's own: a
+    The trainer, the batches and the compiled step are the benchmark's own: a
     parameter that does not move here is one the measured step never trains.
     """
     def named(tree):
         return {jax.tree_util.keystr(path): leaf
                 for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
 
-    trainer = tool.build_trainer(case, "reference")
-    with tool.compiled_step(case, trainer) as compiled:
+    trainer = models.build_trainer(case, "reference")
+    with models.compiled_step(case, trainer) as compiled:
         before = jax.tree.map(np.asarray, named(compiled.state.variables))  # the step consumes the state
-        state, loss, finite, _ = tool.timed_steps(compiled.step, compiled.state, steps)
+        state, loss, finite, _ = models.timed_steps(compiled.step, compiled.state, steps)
     after = named(state.variables)
     assert bool(finite) and np.isfinite(float(loss))
     moved = {name: float(jnp.max(jnp.abs(value - before[name])))
@@ -443,18 +452,18 @@ def parameter_movement(tool, case, steps: int = 2):
 
 
 @pytest.mark.parametrize("architecture", ["sd3_transformer", "flux_transformer"])
-def test_step_benchmark_native_diffusion_trains_text_and_pooled_conditioning(architecture):
-    tool = load("benchmark_step")
-    case = composite_case(tool, architecture)
-    trainer = tool.build_trainer(case, "reference")
+def test_step_benchmark_native_diffusion_trains_text_and_pooled_conditioning(architecture, monkeypatch):
+    cases, models = owners(monkeypatch)
+    case = composite_case(cases, architecture)
+    trainer = models.build_trainer(case, "reference")
     encoder = trainer.objective.inputs.conditions["conditioning"].encoder
-    encoded = encoder.encode(encoder.params, tool.global_batch(case)["text"])
-    assert encoded.context.shape == (case.batch_size, tool.TEXT_TOKENS,
+    encoded = encoder.encode(encoder.params, models.global_batch(case)["text"])
+    assert encoded.context.shape == (case.batch_size, cases.TEXT_TOKENS,
                                      trainer.objective.model.joint_attention_dim)
     assert encoded.pooled.shape == (case.batch_size, trainer.objective.model.pooled_projection_dim)
     if architecture == "flux_transformer":
         np.testing.assert_array_equal(encoded.guidance, np.full(case.batch_size, 3.5))
-    moved, flops = parameter_movement(tool, case)
+    moved, flops = parameter_movement(models, case)
     assert flops > 0
     for projection in ("context_embedder", "text_embedder_linear_1"):
         changes = [value for path, value in moved.items() if projection in path]
@@ -464,64 +473,64 @@ def test_step_benchmark_native_diffusion_trains_text_and_pooled_conditioning(arc
         assert changes and min(changes) > 0
 
 
-def test_step_benchmark_media_step_trains_the_image_tower():
+def test_step_benchmark_media_step_trains_the_image_tower(monkeypatch):
     """The measured step is the whole conditioned model's: the tower and the
     projector move under it, and a second image a row raises the FLOPs the
     row reports. A step that fed no pixels would leave both untouched."""
-    tool = load("benchmark_step")
-    case = composite_case(tool, "multimodal_transformer")
+    cases, models = owners(monkeypatch)
+    case = composite_case(cases, "multimodal_transformer")
 
-    moved, flops = parameter_movement(tool, case)
+    moved, flops = parameter_movement(models, case)
 
     media = {name: value for name, value in moved.items()
              if "tower" in name or "projector" in name}
     assert media and min(media.values()) > 0
     assert min(value for name, value in moved.items() if "language_model" in name) > 0
     _, wider = parameter_movement(
-        tool, dataclasses.replace(case, media={**case.media, "images": 2}), steps=1)
+        models, dataclasses.replace(case, media={**case.media, "images": 2}), steps=1)
     assert wider > flops
 
 
-def test_step_benchmark_canvas_step_trains_the_self_conditioning_decoder():
+def test_step_benchmark_canvas_step_trains_the_self_conditioning_decoder(monkeypatch):
     """The measured step is the official fine-tuning step: the
     self-conditioning MLP the second decoder pass feeds moves under it, and a
     wider response raises the FLOPs the row reports. A plain next-token step
     on the same trunk has no such parameter to move."""
-    tool = load("benchmark_step")
-    narrow = composite_case(tool, "diffusion_gemma",
+    cases, models = owners(monkeypatch)
+    narrow = composite_case(cases, "diffusion_gemma",
                             canvas={"prompt_length": 12, "canvas_size": 4})
 
-    moved, one_canvas = parameter_movement(tool, narrow)
+    moved, one_canvas = parameter_movement(models, narrow)
 
     conditioning = {name: value for name, value in moved.items()
                     if "self_conditioning" in name}
     assert conditioning and min(conditioning.values()) > 0
     assert min(value for name, value in moved.items() if "text" in name) > 0
     _, two_canvases = parameter_movement(
-        tool, composite_case(tool, "diffusion_gemma"), steps=1)
+        models, composite_case(cases, "diffusion_gemma"), steps=1)
     assert two_canvases > one_canvas
 
 
 
-def test_a_canvas_case_trains_with_the_head_chunks_and_objective_keywords_it_names():
+def test_a_canvas_case_trains_with_the_head_chunks_and_objective_keywords_it_names(monkeypatch):
     """A canvas case's head chunking and objective keywords reach the block objective its measured
     step trains, as a decoder case's reach its objective: with the canvas loss weighed at nothing,
     the self-conditioning MLP only the canvas pass feeds stays where it was while the trunk the
     encoder loss trains moves, over the head in the one chunk the case names (chunking changes no
     number, so that the step trains with it is what is asked). A case that names another decoder
     objective is refused: the canvas case would benchmark the block objective under its name."""
-    tool = load("benchmark_step")
+    cases, models = owners(monkeypatch)
     case = dataclasses.replace(
-        composite_case(tool, "diffusion_gemma", canvas={"prompt_length": 12, "canvas_size": 4}),
+        composite_case(cases, "diffusion_gemma", canvas={"prompt_length": 12, "canvas_size": 4}),
         head_chunks=1, objective={"decoder_loss_weight": 0.0})
 
-    moved, _ = parameter_movement(tool, case, steps=1)
+    moved, _ = parameter_movement(models, case, steps=1)
 
     conditioning = [value for name, value in moved.items() if "self_conditioning" in name]
     assert conditioning and max(conditioning) == 0
     assert max(value for name, value in moved.items() if "text" in name) > 0
     with pytest.raises(ValueError):
-        tool.build_objective(dataclasses.replace(case, decoder_objective="dpo"))
+        models.build_objective(dataclasses.replace(case, decoder_objective="dpo"))
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +703,11 @@ def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
     modules = list(lint.collect(["src/sparx", "tests", "tools"], tmp_path, "sparx"))
     return sorted((finding.path, finding.line, finding.code)
                   for module in modules for finding in lint.check(module))
+
+
+def assert_reported(tmp_path, path: str, source: str, code: str, lines: tuple[int, ...]) -> None:
+    """`source`, written at `path` in a sparx checkout, is reported as `code` at `lines` and nowhere else."""
+    assert _linted(tmp_path, {path: source}) == [(path, line, code) for line in lines]
 
 
 def test_the_gate_reads_the_site_the_docs_generators_and_the_kernel_packages_but_not_installed_npm(tmp_path):
@@ -950,8 +964,7 @@ def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_repor
     added to), proves wording. A name bound again to a parse of the output, the same name in a test
     that captured nothing or only in a function it defines, and a mapping an item of the output is
     put in, hold data, and are not reported."""
-    found = _linted(tmp_path, {"tests/test_report.py": (
-        "import json\n"
+    assert_reported(tmp_path, "tests/test_report.py", ("import json\n"
         "def test_direct(capsys):\n"
         "    assert 'saved' in capsys.readouterr().out\n"
         "def test_held(capsys):\n"
@@ -979,8 +992,7 @@ def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_repor
         "def test_item(capsys):\n"
         "    report = {'tokens': 8}\n"
         "    report['err'] = capsys.readouterr().err\n"
-        "    assert 'tokens' in report\n")})
-    assert found == [("tests/test_report.py", line, "SLOP011") for line in (3, 6, 9, 13)]
+        "    assert 'tokens' in report\n"), "SLOP011", (3, 6, 9, 13))
 
 
 def test_an_errors_or_a_processs_wording_is_reported_and_its_parsed_output_is_not(tmp_path):
@@ -990,8 +1002,7 @@ def test_an_errors_or_a_processs_wording_is_reported_and_its_parsed_output_is_no
     wording. A refusal's type, a process's exit code, a value the process prints and the test
     parses, and an error's own attribute hold behaviour, as does a process's whole output compared
     with the value it computes, and are not reported."""
-    found = _linted(tmp_path, {"tests/test_refusal.py": (
-        "import json\n"
+    assert_reported(tmp_path, "tests/test_refusal.py", ("import json\n"
         "import subprocess\n"
         "import pytest\n"
         "def test_caught():\n"
@@ -1025,8 +1036,7 @@ def test_an_errors_or_a_processs_wording_is_reported_and_its_parsed_output_is_no
         "    try:\n"
         "        int('x')\n"
         "    except ValueError as error:\n"
-        "        assert error.args\n")})
-    assert found == [("tests/test_refusal.py", line, "SLOP011") for line in (8, 12, 13, 18, 21, 22)]
+        "        assert error.args\n"), "SLOP011", (8, 12, 13, 18, 21, 22))
 
 
 def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(tmp_path):
@@ -1041,8 +1051,7 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
     that falls through to the loop's exit retries nothing. A notebook's display reaches its frontend,
     another process, so its frames redrawn on a clock are at that boundary, while a representation
     built round a loop publishes nothing."""
-    found = _linted(tmp_path, {"src/sparx/waits.py": (
-        "import concurrent.futures\n"
+    assert_reported(tmp_path, "src/sparx/waits.py", ("import concurrent.futures\n"
         "import subprocess\n"
         "import time\n"
         "def poll(done):\n"
@@ -1141,9 +1150,7 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
         "def built(done):\n"
         "    from IPython.display import HTML\n"
         "    while not done.wait(0.125):\n"
-        "        HTML('<b>waiting</b>')\n")})
-    assert found == [("src/sparx/waits.py", line, "SLOP018")
-                     for line in (5, 8, 12, 38, 44, 48, 50, 66, 86, 99)]
+        "        HTML('<b>waiting</b>')\n"), "SLOP018", (5, 8, 12, 38, 44, 48, 50, 66, 86, 99))
 
 
 def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths(tmp_path):
@@ -1155,8 +1162,7 @@ def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths
     attempt does not. A failure that runs on into the loop's tail retries where some path of the
     tail goes round, and a `try` inside the loop's own `with`, branch or `match` case is read as
     one in its body."""
-    found = _linted(tmp_path, {"src/sparx/retries.py": (
-        "def retry(work):\n"
+    assert_reported(tmp_path, "src/sparx/retries.py", ("def retry(work):\n"
         "    for _ in range(3):\n"
         "        try:\n"
         "            return work()\n"
@@ -1251,8 +1257,7 @@ def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths
         "            parsed, _ = work()\n"
         "            return parsed\n"
         "        except ValueError:\n"
-        "            continue\n")})
-    assert found == [("src/sparx/retries.py", line, "SLOP018") for line in (2, 8, 33, 60, 67, 74, 91)]
+        "            continue\n"), "SLOP018", (2, 8, 33, 60, 67, 74, 91))
 
 
 def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_path):
@@ -1263,8 +1268,7 @@ def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_pa
     comprehension rebinds is another object's. A generator's element runs only as it is consumed,
     at once where a loop iterates it, and a list's again and again, as a loop's body does. A sleep
     beside a call that reaches a subprocess, a list built of them included, is at its boundary."""
-    found = _linted(tmp_path, {"src/sparx/waits.py": (
-        "import subprocess\n"
+    assert_reported(tmp_path, "src/sparx/waits.py", ("import subprocess\n"
         "import time\n"
         "def run(command):\n"
         "    return subprocess.run(command, check=True)\n"
@@ -1332,8 +1336,7 @@ def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_pa
         "    return [done.wait(0.1) for _ in range(3)]\n"
         "def consumed(commands):\n"
         "    for finished in (subprocess.run(command) for command in commands):\n"
-        "        time.sleep(1)\n")})
-    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (25, 30, 39, 44, 47, 50, 57, 64, 66)]
+        "        time.sleep(1)\n"), "SLOP018", (25, 30, 39, 44, 47, 50, 57, 64, 66))
 
 
 def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
@@ -1344,8 +1347,7 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
     defines is no raise of its own, and one that raises on some paths carries on along the rest. A
     `finally` that completes resumes the raise it interrupted, and a `match` whose last case
     catches all, through `as` or `|`, leaves by its cases alone, unless a guard lets it through."""
-    found = _linted(tmp_path, {"src/sparx/features.py": (
-        "from builtins import ImportError as Missing\n"
+    assert_reported(tmp_path, "src/sparx/features.py", ("from builtins import ImportError as Missing\n"
         "def optional():\n"
         "    try:\n"
         "        import yaml\n"
@@ -1430,8 +1432,7 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
         "            case _ if name:\n"
         "                raise RuntimeError('install sparx[yaml]') from error\n"
         "        yaml = None\n"
-        "    return yaml\n")})
-    assert found == [("src/sparx/features.py", line, "SLOP019") for line in (5, 17, 22, 37, 54, 81)]
+        "    return yaml\n"), "SLOP019", (5, 17, 22, 37, 54, 81))
 
 
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):

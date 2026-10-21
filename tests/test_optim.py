@@ -17,6 +17,7 @@ import optax
 import pytest
 from jax.extend.core import ClosedJaxpr, Jaxpr, Literal
 from jax.sharding import NamedSharding, PartitionSpec as P
+from model_support import largest_difference
 from reference_error import assert_as_exact_as_the_reference, equations
 
 from dew.config import OptimConfig
@@ -380,11 +381,6 @@ def qk_stats(layers=1, heads=4, rows=3, values=None, nope=None, kv_heads=None, h
     return stats
 
 
-def largest_update_difference(left, right) -> float:
-    return max(float(jnp.max(jnp.abs(a - b)))
-               for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
-
-
 def test_muonclip_without_stats_steps_like_muon():
     """No maxima, no clip: the transform steps aside bitwise, leaving every
     run whose loss never opened the collection on Muon's update."""
@@ -393,7 +389,7 @@ def test_muonclip_without_stats_steps_like_muon():
     clipped = muonclip_solver()
     expected, _ = muon.update(grads, muon.init(params), params)
     updates, _ = clipped.update(grads, clipped.init(params), params)
-    assert largest_update_difference(updates, expected) == 0.0
+    assert largest_difference(updates, expected) == 0.0
 
 
 def test_a_quiet_clip_steps_like_muon():
@@ -405,7 +401,7 @@ def test_a_quiet_clip_steps_like_muon():
     updates, _ = clipped.update(
         grads, clipped.init(params), params,
         qk_stats=qk_stats(values=[[10.0] * 4] * 3))
-    assert largest_update_difference(updates, expected) == 0.0
+    assert largest_difference(updates, expected) == 0.0
 
 
 def test_the_clip_matches_the_paper_equations():
@@ -526,7 +522,7 @@ def test_the_threshold_rides_optimizer_opts():
     plain, _ = muon.update(grads, muon.init(params), params)
     updates, _ = default.update(grads, default.init(params), params,
                                 qk_stats=stats)
-    assert largest_update_difference(updates, plain) == 0.0
+    assert largest_difference(updates, plain) == 0.0
     low = OptimConfig(
         optimizer='muonclip', learning_rate=LR,
         optimizer_opts={'qk_clip_threshold': 5.0}).build(10)
@@ -643,7 +639,7 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
     observed = aux.qk_stats["policy"] if kind == "ppo" and aux.qk_stats is not None else aux.qk_stats
     assert observed is not None
     for got, want in zip(jax.tree.leaves(compact_qk(observed)), jax.tree.leaves(expected), strict=True):
-        np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-6)
+        np.testing.assert_array_equal(got, want)
     start = jax.tree.map(np.asarray, policy["params"])
     compiled = trainer.compile(initial, batch)
     final, *_ = compiled(initial, batch)

@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -23,6 +23,7 @@ import grain.python as grain
 import numpy as np
 from array_record.python.array_record_module import ArrayRecordWriter
 
+from dew.data.concurrent import Concurrently
 from dew.data.dataset import _QUIET_STOP_SECONDS
 from dew.data.generation import (
     DependencyManifest,
@@ -37,6 +38,7 @@ from dew.data.generation import (
     _json,
     _publish,
     _row_key,
+    _rule,
 )
 from dew.data.pipeline import Record, Rejected, Volatile
 from dew.data.retention import LocalRetention
@@ -160,17 +162,20 @@ class Cache:
         *,
         transform: Transform | None = None,
         source: Source | None = None,
+        missing: Sequence[int] = (),
     ) -> _Mapped:
         """The cached rows of `parent`, a source's records by index: a published
         generation's, or filled as they are read. A fill that completes every
-        input publishes the generation of `source`, the source they are."""
+        input publishes the generation of `source`, the source they are. The
+        inputs `missing` that a read skips (a store's absent records) are written
+        as a fill starts, so it can complete without reading them."""
         self._root(key)
         if transform is not None and _volatile(transform):
             return _Mapped(parent.map_with_index(_Passthrough(transform)))
         published = self.generation(key)
         if published is not None:
             return _Mapped(grain.MapDataset.range(len(parent)).map(_Published(published, transform)))
-        return _CachedMap(parent, self, key, transform, source)
+        return _CachedMap(parent, self, key, transform, source, tuple(missing))
 
     def streamed(
         self,
@@ -178,10 +183,11 @@ class Cache:
         key: DependencyManifest,
         *,
         transform: Transform | None = None,
+        threads: int | None = None,
     ) -> Callable[[Shard], grain.IterDataset]:
         self._root(key)
         if transform is not None and _volatile(transform):
-            return _PassthroughReader(reader, _Passthrough(transform))
+            return _PassthroughReader(reader, _Passthrough(transform), threads)
         published = self.generation(key)
         return _CachedReader(reader, self, key, transform,
                              None if published is None else _Published(published, transform))
@@ -406,6 +412,7 @@ class _Writer:
                     "payload_sha256": fingerprint(outputs),
                     "lengths": [_fact(value, "_dew_length") for value in accepted],
                     "valid_targets": [_fact(value, "_dew_valid_targets") for value in accepted],
+                    "rules": [_rule(value) for value in accepted],
                     "rejections": [value.reason for value in outputs if isinstance(value, Rejected)],
                 }
             )
@@ -638,6 +645,9 @@ class _Mapped(grain.MapDataset[CachedValue]):
     def record(self, index: int) -> CachedValue:
         return self.input_parent[index]
 
+    def start(self) -> None:
+        pass
+
     def close(self) -> None:
         pass
 
@@ -646,12 +656,6 @@ class _Mapped(grain.MapDataset[CachedValue]):
 
     def metrics(self) -> CacheStats:
         return _READING
-
-    def iterated(
-        self, view: grain.MapDataset[CachedValue], read_options: grain.ReadOptions | None = None
-    ) -> grain.IterDataset[CachedValue]:
-        """An indexed view read without a cache writer."""
-        return view.to_iter_dataset(read_options)
 
 
 class _CachedMap(_Mapped):
@@ -662,10 +666,12 @@ class _CachedMap(_Mapped):
         key: DependencyManifest,
         transform: Transform | None,
         source: Source | None,
+        missing: tuple[int, ...] = (),
     ):
         super().__init__(parent)
         # Not `source`, which names MapDataset's own constructor.
         self.cache, self.key, self.transform, self.filled = cache, key, transform, source
+        self.missing = missing
         self.writer_lock = threading.RLock()
 
     @property
@@ -683,6 +689,10 @@ class _CachedMap(_Mapped):
             index % len(self), index % len(self), self.input_parent[index], self.transform
         )
 
+    def start(self) -> None:
+        for position in self.missing:
+            self.record(position)
+
     def close(self) -> None:
         if "_writer" in self.__dict__:
             self.writer.close()
@@ -694,18 +704,6 @@ class _CachedMap(_Mapped):
     def metrics(self) -> CacheStats:
         return self.writer.metrics()
 
-    def to_iter_dataset(
-        self, read_options: grain.ReadOptions | None = None, *, allow_nones: bool = False
-    ) -> grain.IterDataset[CachedValue]:
-        return _ClosingCache(super().to_iter_dataset(read_options, allow_nones=allow_nones), self)
-
-    def iterated(
-        self, view: grain.MapDataset[CachedValue], read_options: grain.ReadOptions | None = None
-    ) -> grain.IterDataset[CachedValue]:
-        """A view of this map, such as one share of it, read as an iterator that
-        finishes the fill when it runs out and closes the cache with it."""
-        return _ClosingCache(view.to_iter_dataset(read_options), self)
-
     def __getstate__(self) -> dict:
         return {key: value for key, value in self.__dict__.items() if key not in ("_writer", "writer_lock")}
 
@@ -714,45 +712,36 @@ class _CachedMap(_Mapped):
         self.writer_lock = threading.RLock()
 
 
-class _ClosingCache(grain.IterDataset[CachedValue]):
-    def __init__(self, parent: grain.IterDataset[CachedValue], owner: _CachedMap):
-        super().__init__(parent)
-        self.input_parent, self.owner = parent, owner
+@dataclass(frozen=True)
+class _Indexed:
+    """A record beside its place in its shard, as a passthrough transform reads it."""
 
-    def __iter__(self) -> grain.DatasetIterator[CachedValue]:
-        return _ClosingCacheIterator(self.input_parent.__iter__(), self.owner)
+    def __call__(self, index: int, value: Record) -> tuple[int, Record]:
+        return index, value
 
 
-class _ClosingCacheIterator(grain.DatasetIterator[CachedValue]):
-    def __init__(self, parent: grain.DatasetIterator[CachedValue], owner: _CachedMap):
-        super().__init__(parent)
-        self.input_parent, self.owner = parent, owner
+@dataclass(frozen=True)
+class _Applied:
+    """A transform over a record beside its place (`_Indexed`)."""
 
-    def __next__(self) -> CachedValue:
-        try:
-            return next(self.input_parent)
-        except StopIteration:
-            self.owner.finish()
-            raise
+    transform: _Passthrough
 
-    def get_state(self) -> Mapping[str, object]:
-        return self.input_parent.get_state()
-
-    def set_state(self, state: Mapping[str, object]) -> None:
-        self.input_parent.set_state(state)
-
-    def close(self) -> None:
-        self.input_parent.close()
-        self.owner.close()
+    def __call__(self, placed: tuple[int, Record]) -> Outputs:
+        return self.transform(*placed)
 
 
 @dataclass(frozen=True)
 class _PassthroughReader:
     reader: Callable[[Shard], grain.IterDataset]
     transform: _Passthrough
+    threads: int | None = None
 
     def __call__(self, shard: Shard) -> grain.IterDataset:
-        return self.reader(shard).map_with_index(self.transform)
+        if self.threads is None:
+            return self.reader(shard).map_with_index(self.transform)
+        # A fetch with a pool of its own runs its records at once, in their order.
+        indexed = self.reader(shard).map_with_index(_Indexed())
+        return Concurrently(indexed, _Applied(self.transform), self.threads)
 
 
 @dataclass(frozen=True)

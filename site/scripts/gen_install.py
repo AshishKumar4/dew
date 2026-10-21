@@ -1,8 +1,9 @@
 """Generate the install facts other files repeat from their owners: the CUDA builds' minima
-(dew.telemetry.builds.CUDA_BUILDS), Dew's package index (dew.telemetry.builds.PACKAGE_INDEX) and
-Dew's least Python (pyproject.toml's requires-python), into the standalone installer, constraints.txt,
-the Colab notebooks' install, the site's scripts that install Dew (site/package.json), docs/installation.md's
-table and the least Python the README and docs/installation.md state."""
+(dew.telemetry.builds.CUDA_BUILDS), Dew's package index (dew.telemetry.builds.PACKAGE_INDEX),
+Dew's least Python (pyproject.toml's requires-python) and the pip every pip install takes first
+(tools/pip.txt), into the standalone installer, constraints.txt, the Colab notebooks' install, the site's
+scripts that install Dew (site/package.json), docs/installation.md's table, and the least Python and
+the pip the README and docs/installation.md state."""
 
 import argparse
 import ast
@@ -17,6 +18,7 @@ TABLE = ("<!-- BEGIN CUDA builds (site/scripts/gen_install.py) -->", "<!-- END C
 LEAST = ("<!-- BEGIN least Python (site/scripts/gen_install.py) -->", "<!-- END least Python -->")
 CONSTRAINT = ("# BEGIN package index (site/scripts/gen_install.py)", "# END package index")
 COLAB = ("// BEGIN package index (site/scripts/gen_install.py)", "// END package index")
+PIP = ("<!-- BEGIN pip (site/scripts/gen_install.py) -->", "<!-- END pip -->")
 
 
 def facts() -> tuple[list[tuple[str, int, tuple[int, int]]], str, str]:
@@ -69,21 +71,28 @@ def main() -> None:
     parser.add_argument("--check", action="store_true", help="Check the generated blocks without writing them.")
     args = parser.parse_args()
     builds, index, python = facts()
-    shell = [f"python_min={python}", f"package_index={index}"]
+    pip = next(line for line in (REPO / "tools/pip.txt").read_text().splitlines()
+               if line and not line.startswith("#"))
+    shell = [f"python_min={python}", f"package_index={index}", f"pip_least='{pip}'"]
     table = ["| Build | CUDA | NVIDIA driver | GPU (SM) |", "|---|---|---|---|"]
     for build, driver, (major, minor), cuda in builds:
         shell.extend((f"{build}_driver={driver}", f"{build}_sm={major}.{minor}"))
         table.append(f"| `{build}` | {cuda // 1000}.{cuda % 1000 // 10} or later | {driver} or later, or an older "
                      f"one under NVIDIA's cuda-compat | {major}.{minor} or later |")
     least = [f"Dew needs Python {python} or newer."]
+    advice = ["Use pip 26.2.2 or newer and uv 0.13.4 or newer: older ones trust the roots of eMudhra's "
+              "compromised certificate authorities (October 2026). Update pip from its wheel by hash, so "
+              "the update holds whatever the older pip trusts, and uv through the system's certificates "
+              "once they are updated:", "",
+              "```bash", f'python -m pip install "{pip}"', "UV_SYSTEM_CERTS=true uv self update", "```"]
     stale = []
     for path, blocks in ((REPO / "site/public/install.sh", ((SHELL, shell),)),
                          (REPO / "constraints.txt", ((CONSTRAINT, [f"--extra-index-url {index}"]),)),
                          (REPO / "site/scripts/colab-notebooks.mjs",
                           ((COLAB, [f"const PACKAGE_INDEX = '{index}';"]),)),
                          (REPO / "site/package.json", ()),
-                         (REPO / "docs/installation.md", ((TABLE, table), (LEAST, least))),
-                         (REPO / "README.md", ((LEAST, least),))):
+                         (REPO / "docs/installation.md", ((TABLE, table), (LEAST, least), (PIP, advice))),
+                         (REPO / "README.md", ((LEAST, least), (PIP, advice)))):
         original = generated = path.read_text()
         for markers, lines in blocks:
             generated = between(generated, markers, lines)

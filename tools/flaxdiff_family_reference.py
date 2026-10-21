@@ -49,7 +49,6 @@ gradient returned to the original order. The float64 reference checks that
 each order computes the same function.
 """
 
-import json
 import os
 import sys
 import types
@@ -60,7 +59,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_source import CACHE as UPSTREAM, verified
+from reference_source import CACHE as UPSTREAM, saved_fixture, verified
 
 REPO, COMMIT = "AshishKumar4/FlaxDiff", "15c55b001304604147a2a8002a76cf5d4c32092f"
 # In import order: each module's own imports come before it.
@@ -299,8 +298,7 @@ def main():
             "cases": {case: {"module": module, "class": cls, "config": config}
                       for case, (module, cls, config, _, _) in CASES.items()},
             "times": TIMES, "jax": jax.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(sys.argv[1], **arrays)
+    saved_fixture(Path(sys.argv[1]), arrays, meta)
     print(f"{sys.argv[1]}: {Path(sys.argv[1]).stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays")
 
 

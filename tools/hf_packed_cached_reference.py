@@ -77,6 +77,7 @@ def cached(net, ids: np.ndarray) -> torch.Tensor:
 
 def main():
     from diffusers_wan_reference import float64
+    from reference_source import saved_fixture
 
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
@@ -106,8 +107,7 @@ def main():
             print(f"{family} {precision}: packed vs alone {gap:.2g}, cached vs full {drift:.2g}")
     meta = {"transformers": transformers.__version__, "torch": torch.__version__, "families": FAMILIES,
             "packing": PACKING, "prompt": PROMPT, "steps": STEPS}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(sys.argv[1], **arrays)
+    saved_fixture(Path(sys.argv[1]), arrays, meta)
     print(f"{sys.argv[1]}: {Path(sys.argv[1]).stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays")
 
 
