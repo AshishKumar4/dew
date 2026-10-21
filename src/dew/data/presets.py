@@ -157,10 +157,12 @@ def lm(dataset: Dataset, tokenizer: str | SavedTokenizer | None, *, seq_len: int
     `tokenizer=None` the documents are token ids already, under "text", such as a token store's,
     whose windows a store reads by index (`TokenFiles(url).pipe(presets.lm, None, seq_len=512,
     batch=8, pack=None)`); a store packed must state where its documents end. `cache` holds the
-    tokenized documents, packed cut into the pieces a row holds, as `images` holds its images; a
-    generation published from the preset's own rows (`publish`) reads its packing plan in place of
-    the pack. `batch=None` leaves the rows unbatched, for corpora each laid out alone and then
-    mixed or phased (`phases`), batched after."""
+    tokenized documents, as `images` holds its images: packed first-fit or best-fit, cut into the
+    pieces a row holds, so the cache is `seq_len`'s alone; concatenated or cut into windows, whole.
+    A generation published from the preset's own unbatched first-fit rows (`publish`) reads its
+    packing plan in place of the pack, the rows ordered after the preset. `batch=None` leaves the
+    rows unbatched, for corpora each laid out alone and then mixed or phased (`phases`), batched
+    after."""
 
     if pack is not None and stride is not None:
         raise ValueError("stride places fixed windows, pack=None; a pack lays documents out whole")
@@ -212,8 +214,8 @@ def sft(dataset: Dataset, tokenizer: str | SavedTokenizer, *, seq_len: int, batc
     in batches of `batch` rows (`batch=None`, `records` and `host` as
     `images` takes them). A conversation longer than a row is cut into pieces that keep
     every turn (`long="chunk"`), cut at its end (`"truncate"`), or dropped
-    and counted (`"drop"`). `cache` holds the rendered conversations so cut, as `lm` holds its
-    documents."""
+    and counted (`"drop"`). `cache` holds the rendered conversations so cut or fitted, as `lm` holds
+    its documents, so the cache is that `seq_len`'s and `long`'s alone."""
 
     rendered = dataset.map(chat.template(tokenizer, messages=messages))
     packing = Pack(seq_len + 1, _CHAT_FIELDS, bins=bins, policy=pack)

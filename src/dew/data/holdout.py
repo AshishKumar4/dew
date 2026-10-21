@@ -6,7 +6,7 @@ import dataclasses
 import functools
 import itertools
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
+from typing import ClassVar, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -14,9 +14,6 @@ from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset, Mixture, Phases, Pipeline
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed, _uncounted, stated
 from dew.data.sources.codec import content_fingerprint
-
-if TYPE_CHECKING:
-    pass
 
 _INDEXED_READS: tuple[Read, ...] = ("memory", "indexed")
 _BY_INDEX = ("reads by index, under read='memory' or 'indexed'; a stream holds out a hash fraction "

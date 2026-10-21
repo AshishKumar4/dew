@@ -18,8 +18,9 @@ from .files import Files
 from .index import ArrayIndex
 
 _SPLIT = "train"
-"""The split a token export's description, fingerprint and shards have always named: an export holds
-one, so a run saved before reads the same plan."""
+"""The split a token export's description, fingerprint, shards and document index have always named
+at the default: an export holds one, so a run saved before reads the same plan and a store provisioned
+before keeps its index. A store once read under another split's name is named "train" now."""
 
 
 @dataclass(frozen=True)
@@ -60,7 +61,8 @@ class TokenRecords:
 
     @cached_property
     def shards(self) -> tuple[_TokenShard, ...]:
-        starts = np.cumsum([0, *(len(index.values) for index in self.indexes[:-1])])
+        # Each shard's first document's place; an export of no shards has none.
+        starts = np.cumsum([0, *(len(index.values) for index in self.indexes)])[:-1]
         return tuple(_TokenShard(index.values, int(start))
                      for index, start in zip(self.indexes, starts, strict=True))
 
@@ -110,14 +112,15 @@ class TokenRecords:
 
 
 def _document_ends(tokens: TokenRecords) -> np.ndarray:
-    """Each document ends just past its EOS, or at the stream's end for an unterminated tail."""
+    """Each document ends just past its EOS, or at the stream's end for an unterminated tail; an
+    empty stream holds no document."""
     block = 1 << 24
     found = [
         np.flatnonzero(tokens[start : start + block] == tokens.eos_id) + start + 1
         for start in range(0, len(tokens), block)
     ]
     ends = np.concatenate([np.zeros(0, np.int64), *found]).astype(np.int64)
-    return ends if len(ends) and ends[-1] == len(tokens) else np.append(ends, len(tokens))
+    return ends if (ends[-1] if len(ends) else 0) == len(tokens) else np.append(ends, len(tokens))
 
 
 @dataclass(frozen=True)
@@ -147,7 +150,7 @@ class TokenFiles(Dataset):
 
     @property
     def document_index(self) -> Store:
-        return Store(self.url, self.storage_options).child("documents.npy")
+        return Store(self.url, self.storage_options).child(f"{_SPLIT}.documents.npy")
 
     @cached_property
     def mapped_documents(self) -> ArrayIndex:
@@ -241,9 +244,11 @@ class TokenFiles(Dataset):
         return self
 
     def records(self, read: Read) -> Records:
-        """Each document by index (`document_ends`), in every read; without EOS, one document."""
+        """Each document by index (`document_ends`), in every read; without EOS, one document, and an
+        export of no tokens none."""
         ends = self.document_ends()
-        return _TokenDocuments(self.tokens, np.asarray([len(self.tokens)]) if ends is None else ends)
+        whole = np.asarray([len(self.tokens)] if len(self.tokens) else [], np.int64)
+        return _TokenDocuments(self.tokens, whole if ends is None else ends)
 
     def document_ends(self) -> np.ndarray | None:
         """Document ends from the persisted index or one EOS scan; None without an EOS id."""
