@@ -228,10 +228,7 @@ class DiscreteDenoiser:
 
     def __call__(self, x_t, t):
         fields = {} if self.inputs is None else self.inputs.kwargs()
-        logits = self.model.apply(self.params, x_t, **fields, rngs=None, mutable=False,
-                                  capture_intermediates=False,
-                                  method="logits" if isinstance(self.model, Logits) else None)
-        assert not isinstance(logits, tuple)  # no mutable collections were asked for
+        logits = _rows_folded(self._logits)(self.params, x_t, fields)
         # Normalized in fp32, as `token_log_probs` does: the reveal draws its
         # categorical from these, and a bf16 log partition would quantize it.
         logits = logits.astype(jnp.float32).at[..., self.process.mask_id].set(-jnp.inf)
@@ -239,6 +236,44 @@ class DiscreteDenoiser:
         masked = self.masked(x_t)
         filled = jnp.where(masked, jnp.argmax(log_probs, axis=-1), x_t)
         return filled, log_probs
+
+    def _logits(self, params, tokens, fields):
+        logits = self.model.apply(params, tokens, **fields, rngs=None, mutable=False,
+                                  capture_intermediates=False,
+                                  method="logits" if isinstance(self.model, Logits) else None)
+        assert not isinstance(logits, tuple)  # no mutable collections were asked for
+        return logits
+
+
+def _rows_folded(forward):
+    """`forward(params, tokens, fields)`, which vmaps over rows as one call over all of them.
+
+    A model's rows are independent (a routed expert's capacity is counted per
+    sequence, `capacity_positions`), so the vmapped axis folds into the batch
+    one: one batched forward, where vmap would batch every op of it, and one
+    that runs kernels without a batching rule of their own (ragged_dot's
+    refuses an expert kernel shared across the vmapped axis). Weights that are
+    themselves vmapped are vmapped as given. It takes no gradient
+    (`jax.custom_batching.custom_vmap` has no transpose), which sampling never
+    asks of it.
+    """
+    @jax.custom_batching.custom_vmap
+    def folded(params, tokens, fields):
+        return forward(params, tokens, fields)
+
+    @folded.def_vmap
+    def rule(size, batched, params, tokens, fields):
+        if any(jax.tree.leaves(batched[0])):
+            axes = tuple(jax.tree.map(lambda each: 0 if each else None, batched))
+            return jax.vmap(forward, in_axes=axes)(params, tokens, fields), True
+        def merged(leaf, each):
+            leaf = leaf if each else jnp.broadcast_to(leaf, (size, *leaf.shape))
+            return leaf.reshape(-1, *leaf.shape[2:])
+
+        logits = folded(params, *jax.tree.map(merged, (tokens, fields), tuple(batched[1:])))
+        return logits.reshape(size, -1, *logits.shape[1:]), True
+
+    return folded
 
 
 @dataclass(frozen=True)

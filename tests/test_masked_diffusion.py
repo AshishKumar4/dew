@@ -204,27 +204,36 @@ def test_the_trainer_builds_its_state_from_the_held_checkpoint():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]))
 
 
-@pytest.fixture(scope="module", params=["llada-tiny", "dream-tiny"])
-def masked_source(request):
-    source = Pretrained.load(FIXTURES / request.param, dtype="float32", attention_impl="xla")
-    tokens = jnp.asarray([[0, 120, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
+def _masked_request(name):
+    """A masked source and a prompt per row, one holding the literal mask id."""
+    source = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="xla")
+    tokens = jnp.asarray([[0, source.model.mask_token_id, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
     fields = {"attention_mask": jnp.asarray([[0, 1, 1, 1], [1, 1, 1, 1], [0, 0, 1, 1]], bool),
               "positions": jnp.asarray([[0, 3, 4, 5], [0, 1, 2, 3], [0, 0, 4, 5]])}
     return source, ModelInputs(tokens, fields)
 
 
-def test_native_masked_task_matches_direct_mdlm_trajectory(masked_source):
-    source, inputs = masked_source
-    task = source.text_generation()
+@pytest.fixture(scope="module", params=["llada-tiny", "dream-tiny"])
+def masked_source(request):
+    return _masked_request(request.param)
+
+
+@pytest.mark.parametrize("name", ["llada-tiny", "dream-tiny", "llada-moe-tiny"])
+def test_native_masked_task_matches_direct_mdlm_trajectory(name):
+    """The task's rows, sampled together, walk the trajectories each row walks alone, routed experts
+    and all, every response whole (no EOS trims it)."""
+    source, inputs = _masked_request(name)
+    mask = source.model.mask_token_id
+    task = replace(source.text_generation(), eos_token_ids=())
     key = jax.random.key(7)
     result = task(inputs, 8, key=key, steps=5).host()
     np.testing.assert_array_equal(result.tokens[:, :4], inputs.tokens)
-    assert np.all(result.tokens[:, 4:] != 120)
+    assert np.all(result.tokens[:, 4:] != mask)
     np.testing.assert_array_equal(result.lengths, 8)
     np.testing.assert_array_equal(result.decoder_steps, 5)
     np.testing.assert_array_equal(result.terminated, desired=False)
     for row in range(3):
-        tokens = jnp.concatenate([inputs.tokens[row:row + 1], jnp.full((1, 8), 120)], axis=1)
+        tokens = jnp.concatenate([inputs.tokens[row:row + 1], jnp.full((1, 8), mask)], axis=1)
         valid = jnp.concatenate(
             [inputs.token_fields["attention_mask"][row : row + 1], jnp.ones((1, 8), bool)], axis=1
         )
@@ -245,7 +254,7 @@ def test_a_block_model_unmasks_its_response_one_block_at_a_time():
     row does not hold, so the objective refuses it."""
     source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="xla")
     model = source.model.clone(diffusion_block=4)
-    task = replace(source.text_generation(), model=model)
+    task = replace(source.text_generation(), model=model, eos_token_ids=())
     tokens = jnp.asarray([[0, 9, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
     valid = jnp.asarray([[0, 1, 1, 1], [1, 1, 1, 1], [0, 0, 1, 1]], bool)
     places = jnp.asarray([[0, 3, 4, 5], [0, 1, 2, 3], [0, 0, 4, 5]])
