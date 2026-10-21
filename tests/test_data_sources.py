@@ -40,6 +40,48 @@ def test_memory_columns_snapshot_changes_with_content():
     assert Memory([{"x": 1}], shard_rows=1).fingerprint() != Memory([{"x": 1}], shard_rows=2).fingerprint()
 
 
+@dataclasses.dataclass(frozen=True)
+class Numbered:
+    """Adds one to each record's id."""
+
+    def __call__(self, row):
+        return {**row, "id": int(row["id"]) + 1}
+
+
+@pytest.mark.parametrize("table", ["pandas", "arrow"])
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_memory_reads_a_dataframe_or_arrow_table_as_its_rows(read, table):
+    """A DataFrame with an index of its own, or an Arrow table, read by `Memory`: each row a record
+    of its columns and nothing of the index, as the same rows given as records read; a changed
+    cell changes the store."""
+    import pandas as pd
+    import pyarrow as pa
+
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    columns = {"id": list(range(6)), "text": [f"row {index}" for index in range(6)]}
+    frame = pd.DataFrame(columns, index=[10 * index for index in range(6)])
+    given = frame if table == "pandas" else pa.table(columns)
+    records = [{"id": index, "text": f"row {index}"} for index in range(6)]
+
+    def read_back(memory):
+        chain = Pipeline(memory).map(Numbered(), identity="numbered@1").batch(2)
+        reader = compile(chain, read=read, loading=Loading(workers=0, threads=1, read_buffer=1)).train(
+            DataPartition())
+        try:
+            return [(np.asarray(batch["id"]).tolist(), list(batch["text"]))
+                    for batch in (next(reader) for _ in range(3))]
+        finally:
+            reader.close()
+
+    assert read_back(Memory(given)) == read_back(Memory(records))
+    assert Memory(given).fingerprint()["sha256"] == Memory(records).fingerprint()["sha256"]
+    changed = frame.assign(text=[*columns["text"][:5], "changed"])
+    assert Memory(changed).fingerprint()["sha256"] != Memory(frame).fingerprint()["sha256"]
+
+
 def test_memory_columns_of_different_row_counts_are_refused():
     assert len(Memory({"x": [1, 2], "y": [1, 2]}).records("indexed")) == 2
     with pytest.raises(ValueError):
@@ -1258,21 +1300,51 @@ def test_torch_source_reads_every_way_and_refuses_a_cache_without_content_identi
         )
 
 
-@pytest.mark.parametrize("read", ["memory", "indexed"])
-@pytest.mark.parametrize("resume", ["exact", "non-exact"])
-def test_torch_compilation_requires_identity_even_for_equal_shapes(read, resume):
-    """Same-class, same-length datasets cannot name an exact position by their shape."""
+@pytest.mark.parametrize("kind,read", [("torch", "memory"), ("torch", "indexed"),
+                                       ("grain", "indexed"), ("grain", "streamed"), ("iterator", "streamed")])
+def test_an_unnamed_foreign_source_trains_and_resumes_only_where_told_its_content_is_unknown(
+        tmp_path, kind, read):
+    """A torch, Grain or iterator source given no name reads and trains; nothing says a later run
+    reads the same records, so an exact resume of its position is refused, one with
+    `resume="non-exact"` reads on from it, and no cache keys it."""
+    import grain.python as grain
     import torch
     from torch.utils.data import TensorDataset
 
-    from dew.data import from_torch
+    from dew.data import from_grain, from_iter, from_torch
     from dew.data.compile import compile
 
-    for offset in (0, 100):
-        source = from_torch(TensorDataset(torch.arange(32) + offset), fields=("id",))
+    rows = [{"id": index} for index in range(32)]
+
+    def source():
+        if kind == "torch":
+            return from_torch(TensorDataset(torch.arange(32)), fields=("id",))
+        if kind == "grain":
+            return from_grain(grain.MapDataset.source(rows))
+        return from_iter(lambda: iter(rows), replay=True)
+
+    def reader(resume):
+        return compile(source().repeat().batch(4), read=read, resume=resume,
+                       loading=Loading(workers=0)).train(DataPartition())
+
+    original = reader("exact")
+    try:
+        assert [next(original)["id"].tolist() for _ in range(2)] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+        saved = original.get_state()
+        remaining = [next(original)["id"].tolist() for _ in range(2)]
+    finally:
+        original.close()
+    exact, loose = reader("exact"), reader("non-exact")
+    try:
         with pytest.raises(ValueError):
-            compile(source.shuffle(4).repeat().batch(4), read=read, resume=resume,
-                    loading=Loading(workers=0))
+            exact.set_state(saved)
+        loose.set_state(saved)
+        assert [next(loose)["id"].tolist() for _ in range(2)] == remaining
+    finally:
+        exact.close()
+        loose.close()
+    with pytest.raises(ValueError):
+        compile(source().cache(str(tmp_path / "cache")).batch(4), read=read, loading=Loading(workers=0))
 
 
 @pytest.mark.parametrize("kind,read", [("torch", "memory"), ("torch", "indexed"),
@@ -1440,21 +1512,64 @@ def test_from_iter_forwards_a_native_stop_request():
         reader.close()
 
 
+def test_two_unnamed_grain_stores_keep_their_own_rows_and_counts_in_phases_and_a_mix():
+    """Two Grain stores given no name, read one in each phase, each from its own first row; mixed,
+    each counted apart. A store read again in a later phase goes on where it stopped."""
+    import grain.python as grain
+
+    from dew.data import from_grain
+    from dew.data.compile import compile
+    from dew.data.pipeline import Phases, Pipeline, mix
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    first = from_grain(grain.MapDataset.source([{"id": index} for index in range(100)]))
+    second = from_grain(grain.MapDataset.source([{"id": 1000 + index} for index in range(100)]))
+    phased = Pipeline(Phases((Pipeline(first).repeat(), Pipeline(second).repeat()), (4, None))).batch(1)
+    stream = compile(phased, read="indexed", loading=loading).train(DataPartition())
+    try:
+        assert [int(next(stream)["id"][0]) for _ in range(6)] == [0, 1, 2, 3, 1000, 1001]
+    finally:
+        stream.close()
+    again = Pipeline(Phases((Pipeline(first).repeat(), Pipeline(first).repeat()), (4, None))).batch(1)
+    stream = compile(again, read="indexed", loading=loading).train(DataPartition())
+    try:
+        assert [int(next(stream)["id"][0]) for _ in range(6)] == [0, 1, 2, 3, 4, 5]
+    finally:
+        stream.close()
+    counts = mix([Pipeline(first), Pipeline(second)]).stats(records=10)
+    assert sorted(value for name, value in counts.items() if name.startswith("data/rows/")) == [5, 5]
+
+
+@pytest.mark.parametrize("table", ["pandas", "arrow"])
+def test_memory_reads_a_table_of_lists_bytes_and_nulls_as_records_hold_them(table):
+    """A table whose columns hold token lists, encoded bytes and a missing value reads as the same
+    records given as records do."""
+    import pandas as pd
+    import pyarrow as pa
+
+    columns = {"tokens": [[1, 2], [3, 4, 5]], "image": [b"ab", b"cde"], "caption": ["a cat", None]}
+    given = pd.DataFrame(columns) if table == "pandas" else pa.table(columns)
+    records = [{"tokens": [1, 2], "image": b"ab", "caption": "a cat"},
+               {"tokens": [3, 4, 5], "image": b"cde", "caption": None}]
+    held = Memory(given).records("indexed")
+    assert [held[index] for index in range(len(held))] == records
+    assert Memory(given).fingerprint()["sha256"] == Memory(records).fingerprint()["sha256"]
+
+
 @pytest.mark.parametrize("kind", ["grain", "iterator"])
-@pytest.mark.parametrize("resume", ["exact", "non-exact"])
-def test_foreign_sources_cannot_use_an_empty_content_identity(kind, resume):
-    """Grain and iterator adapters require a real source name, just as Torch requires identity."""
+def test_foreign_sources_cannot_use_an_empty_content_identity(kind):
+    """A Grain or iterator source given an empty name declares no content version, which is no
+    name at all said otherwise: it is refused as it is made."""
     import grain.python as grain
 
     from dew.data import from_grain, from_iter
-    from dew.data.compile import compile
 
     rows = [{"id": index} for index in range(8)]
-    source = (from_grain(grain.MapDataset.source(rows), "") if kind == "grain"
-              else from_iter(lambda: iter(rows), name=""))
     with pytest.raises(ValueError):
-        compile(source.repeat().batch(2), read="indexed" if kind == "grain" else "streamed",
-                resume=resume, loading=Loading(workers=0))
+        if kind == "grain":
+            from_grain(grain.MapDataset.source(rows), "")
+        else:
+            from_iter(lambda: iter(rows), name="")
 
 
 def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):
