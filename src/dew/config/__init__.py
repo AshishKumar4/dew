@@ -53,10 +53,11 @@ from dew.data.compile import fitted
 from dew.data.dataset import Loader, Ramp, Reader, ramped, record_argument
 from dew.data.pipeline import Dataset
 from dew.files import write_atomically
+from dew.inputs import Field
 from dew.lora import AdapterRecord, LoRA
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.quantization import InputQuantization, Quantization
-from dew.records import JSON, duration, recorded_duration
+from dew.records import JSON, duration, record, recorded_duration
 from dew.registry import (
     Annotation,
     Configured,
@@ -931,6 +932,19 @@ class Prepared:
 
     run: "RunConfig"
     train: Callable[[str], TrainState]
+
+
+def media_field(chain: Dataset, run: str) -> Field:
+    """The batch field a run over images or clips reads, at the size its chain makes it
+    (`Dataset.facts`): a clip's video, else an image. Raises ValueError, naming the `run`, for a chain
+    of neither, or one whose size varies."""
+    fields = record(chain.facts()["fields"], "the chain's fields")
+    name = "video" if "video" in fields else "image"
+    shape = fields.get(name)
+    if not isinstance(shape, list | tuple) or not all(isinstance(size, int) for size in shape):
+        raise ValueError(f"a {run} run trains on images or clips of one size (dew.data.presets.images or "
+                         f"clips); this chain's {name} is {shape!r}")
+    return Field(name, tuple(shape))
 
 
 def _chain_label(chain: Dataset | None) -> str:
