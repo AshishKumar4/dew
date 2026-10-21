@@ -19,6 +19,7 @@ import pytest
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
 from rl_support import TinyHead
 from steady_state import steady_state
+from tool_support import load
 
 from dew.config.data import PreferenceData, loader
 from dew.data import Loading
@@ -27,7 +28,6 @@ from dew.data.dataset import DataPartition
 from dew.data.preferences import IDS_KEY, MASK_KEY
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
-from dew.rl import preference_logsigmoid_terms
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "dpo.npz"
 VOCAB = 8
@@ -40,26 +40,6 @@ def reference():
     return recording(FIXTURE)
 
 
-def trl_layout_loss(policy_logits, fixture):
-    """Dew's DPO loss and mean chosen and rejected rewards over the fixture's
-    TRL-layout batch: token log-probabilities read off the shifted logits,
-    the shifted completion mask, and `preference_logsigmoid_terms` over the
-    [chosen; rejected] halves, averaged over pairs as `DPOObjective` does."""
-    ids = jnp.asarray(fixture["input_ids"], jnp.int32)[:, 1:, None]
-    mask = jnp.asarray(fixture["completion_mask"], jnp.float32)[:, 1:]
-
-    def token_log_probs(logits):
-        return jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids, axis=-1)[..., 0]
-
-    policy = token_log_probs(policy_logits)
-    ref = token_log_probs(jnp.asarray(fixture["ref_logits"]))
-    half = policy.shape[0] // 2
-    terms, (chosen, rejected) = preference_logsigmoid_terms(
-        policy[:half], policy[half:], ref[:half], ref[half:], mask[:half], mask[half:],
-        float(fixture["beta"]))
-    return jnp.mean(terms), (jnp.mean(chosen), jnp.mean(rejected))
-
-
 def test_dpo_loss_rewards_and_gradient_match_trl(reference):
     """Dew against TRL 1.12.0's own `DPOTrainer._compute_loss` with its
     default settings (tools/parity_dpo.py), on par with TRL's fp32 over the
@@ -68,12 +48,13 @@ def test_dpo_loss_rewards_and_gradient_match_trl(reference):
     the truth."""
     seeds = declared_seeds(FIXTURE)["dpo"]
     draw, recorded, truth = indexed_recording(reference, "dpo", seeds)
+    # Dew's composition over the TRL-layout batch, the one the recorder planned its seeds by: token
+    # log-probabilities off the shifted logits and `preference_logsigmoid_terms` over the halves.
+    composed = load("parity_dpo").proxy
 
     @jax.jit
     def dew(index, arrays):
-        (loss, rewards), gradient = jax.value_and_grad(trl_layout_loss, has_aux=True)(
-            arrays["policy_logits"], {**arrays, "beta": reference["beta"]})
-        return {"loss": loss, "policy_logits_grad": gradient, "rewards": jnp.stack(rewards)}
+        return composed(arrays)
 
     assert_as_exact(dew, recorded, draw, "DPO loss, gradient and rewards", seeds=seeds, truth_fn=truth)
 

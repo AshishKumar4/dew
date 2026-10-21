@@ -24,7 +24,6 @@ on a JAX transcription):
 
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
 import numpy as np
@@ -109,26 +108,9 @@ def proxy(arrays):
     return {"loss": value, "grad": gradient}
 
 
-def main(argv: list[str] | None = None) -> None:
-    import torch
-    import verl
-    from recorded_references import provenance, record_case, save
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", type=Path, default=FIXTURES / "rl" / "grpo.npz")
-    out = parser.parse_args(argv).out
-    from reference_releases import require
-
-    require("verl")
-    torch.set_num_threads(1)
-    # The proxy's truth is itself on the rollout widened, as check 1 takes a reference's.
-    recorded = record_case("grpo", rollout, evaluated, proxy)
-    written = save(out, {**recorded, "beta": np.asarray(BETA), "provenance": provenance(
-        "verl", verl.__version__, "cpu", "python tools/parity_grpo.py", torch=torch.__version__)},
-        reference=f"volcengine/verl {verl.__version__}", license="Apache-2.0")
-    print(f"{written}: {int(recorded['grpo.seeds'])} seeds, verl {verl.__version__}, "
-          f"torch {torch.__version__}")
-
-
 if __name__ == "__main__":
-    main()
+    from recorded_references import record_reference
+
+    record_reference("grpo", rollout, evaluated, proxy, package="verl", repo="volcengine/verl",
+                     tool="tools/parity_grpo.py", out=FIXTURES / "rl" / "grpo.npz", description=__doc__,
+                     beta=BETA)

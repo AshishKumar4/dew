@@ -21,7 +21,6 @@ environment):
 
 from __future__ import annotations
 
-import argparse
 import dataclasses
 from collections import defaultdict
 from pathlib import Path
@@ -131,24 +130,9 @@ def proxy(arrays):
     return {"loss": value, "policy_logits_grad": gradient, "rewards": rewards}
 
 
-def main(argv: list[str] | None = None) -> None:
-    import torch
-    import trl
-    from recorded_references import provenance, record_case, save
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", type=Path, default=FIXTURES / "rl" / "dpo.npz")
-    out = parser.parse_args(argv).out
-    from reference_releases import require
-
-    require("trl")
-    torch.set_num_threads(1)
-    recorded = record_case("dpo", batch, evaluated, proxy)
-    written = save(out, {**recorded, "beta": np.asarray(BETA), "provenance": provenance(
-        "trl", trl.__version__, "cpu", "python tools/parity_dpo.py", torch=torch.__version__)},
-        reference=f"huggingface/trl {trl.__version__}", license="Apache-2.0")
-    print(f"{written}: {int(recorded['dpo.seeds'])} seeds, trl {trl.__version__}, torch {torch.__version__}")
-
-
 if __name__ == "__main__":
-    main()
+    from recorded_references import record_reference
+
+    record_reference("dpo", batch, evaluated, proxy, package="trl", repo="huggingface/trl",
+                     tool="tools/parity_dpo.py", out=FIXTURES / "rl" / "dpo.npz", description=__doc__,
+                     beta=BETA)

@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fetched_fixtures import save
 from reference_error import REDRAW, input_digest, leaf_summary, seeds_for, truth_sketch
 
-__all__ = ["provenance", "record_case", "save"]
+__all__ = ["provenance", "record_case", "record_reference", "save"]
 
 
 def provenance(reference: str, revision: str, device: str, command: str, **details) -> np.ndarray:
@@ -32,6 +32,34 @@ def provenance(reference: str, revision: str, device: str, command: str, **detai
     reproduces it, as a JSON string array to save beside the recorded arrays."""
     return np.asarray(json.dumps({"reference": reference, "revision": revision, "device": device,
                                   "date": datetime.date.today().isoformat(), "command": command, **details}))
+
+
+def record_reference(label: str, draw, evaluate, proxy, *, package: str, repo: str, tool: str, out: Path,
+                     description: str | None = None, argv: list[str] | None = None, **constants) -> Path:
+    """A parity tool's whole command line: `label`'s recording over its seeds (`record_case`), the release
+    of `package` (`repo`'s) pinned (`reference_releases.require`) and run on one CPU thread, saved to
+    `out` or the `--out` given, with `constants` beside it and the provenance `tool` reproduces it by
+    (`save`). Returns the file written."""
+    import argparse
+    import importlib
+
+    import torch
+    from reference_releases import require
+
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--out", type=Path, default=out)
+    out = parser.parse_args(argv).out
+    require(package)
+    torch.set_num_threads(1)
+    version = importlib.import_module(package).__version__
+    recorded = record_case(label, draw, evaluate, proxy)
+    written = save(out, {**recorded, **{name: np.asarray(value) for name, value in constants.items()},
+                         "provenance": provenance(package, version, "cpu", f"python {tool}",
+                                                  torch=torch.__version__)},
+                   reference=f"{repo} {version}", license="Apache-2.0")
+    print(f"{written}: {int(recorded[f'{label}.seeds'])} seeds, {package} {version}, "
+          f"torch {torch.__version__}")
+    return written
 
 
 def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_inputs: bool = True,
