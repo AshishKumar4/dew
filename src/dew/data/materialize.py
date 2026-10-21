@@ -15,6 +15,7 @@ records the derived order facts a resume checks.
 
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import logging
 from collections.abc import Mapping, Sequence
@@ -24,7 +25,7 @@ import numpy as np
 
 from dew.data.analysis import _VIEWS, _analyzed, _identity, _label, _name
 from dew.data.dataset import Batch, Records
-from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _TokenSplit
+from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _threads, _TokenSplit
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
     FlatMap,
@@ -173,6 +174,16 @@ def _memory_inputs(
     return rows, consumed
 
 
+@dataclasses.dataclass(frozen=True)
+class _Fetched:
+    """What a stage makes of one identified row, run on a fetch's own pool."""
+
+    stage: Stage
+
+    def __call__(self, row: tuple[tuple[int, ...], Record]) -> tuple[Record, ...]:
+        return _outputs(self.stage, row[0][0], row[1])
+
+
 def _memory_stages(
     pipeline: Pipeline,
     source: Source,
@@ -253,8 +264,15 @@ def _memory_stages(
             expanded: list[tuple[tuple[int, ...], Record]] = []
             expanded_counts: dict[tuple[int, ...], int] = {}
             counts_targets = isinstance(stage, Map) and isinstance(stage.step, CountTargets)
-            for identifier, value in rows:
-                outputs = _outputs(stage, identifier[0], value, counts=counter)
+            threads = _threads((stage,))
+            if threads is None:
+                made = (_outputs(stage, identifier[0], value, counts=counter) for identifier, value in rows)
+            else:
+                # A fetch with a pool of its own runs that many records at once, in their order.
+                pool = concurrent.futures.ThreadPoolExecutor(threads, thread_name_prefix="dew-step")
+                with pool:
+                    made = iter(list(pool.map(_Fetched(stage), rows)))
+            for (identifier, value), outputs in zip(rows, made, strict=True):
                 for child, output in enumerate(outputs):
                     if isinstance(output, Rejected):
                         counter.rejected[output.reason] += 1

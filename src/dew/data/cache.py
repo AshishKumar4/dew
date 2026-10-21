@@ -23,6 +23,7 @@ import grain.python as grain
 import numpy as np
 from array_record.python.array_record_module import ArrayRecordWriter
 
+from dew.data.concurrent import Concurrently
 from dew.data.dataset import _QUIET_STOP_SECONDS
 from dew.data.generation import (
     DependencyManifest,
@@ -179,10 +180,11 @@ class Cache:
         key: DependencyManifest,
         *,
         transform: Transform | None = None,
+        threads: int | None = None,
     ) -> Callable[[Shard], grain.IterDataset]:
         self._root(key)
         if transform is not None and _volatile(transform):
-            return _PassthroughReader(reader, _Passthrough(transform))
+            return _PassthroughReader(reader, _Passthrough(transform), threads)
         published = self.generation(key)
         return _CachedReader(reader, self, key, transform,
                              None if published is None else _Published(published, transform))
@@ -702,12 +704,36 @@ class _CachedMap(_Mapped):
 
 
 @dataclass(frozen=True)
+@dataclass(frozen=True)
+class _Indexed:
+    """A record beside its place in its shard, as a passthrough transform reads it."""
+
+    def __call__(self, index: int, value: Record) -> tuple[int, Record]:
+        return index, value
+
+
+@dataclass(frozen=True)
+class _Applied:
+    """A transform over a record beside its place (`_Indexed`)."""
+
+    transform: _Passthrough
+
+    def __call__(self, placed: tuple[int, Record]) -> Outputs:
+        return self.transform(*placed)
+
+
+@dataclass(frozen=True)
 class _PassthroughReader:
     reader: Callable[[Shard], grain.IterDataset]
     transform: _Passthrough
+    threads: int | None = None
 
     def __call__(self, shard: Shard) -> grain.IterDataset:
-        return self.reader(shard).map_with_index(self.transform)
+        if self.threads is None:
+            return self.reader(shard).map_with_index(self.transform)
+        # A fetch with a pool of its own runs its records at once, in their order.
+        indexed = self.reader(shard).map_with_index(_Indexed())
+        return Concurrently(indexed, _Applied(self.transform), self.threads)
 
 
 @dataclass(frozen=True)
