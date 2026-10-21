@@ -424,9 +424,11 @@ def assert_transformers_reads_the_run(export, task, ids, *, ordered_export=None)
 def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     """The whole way out of a run directory: run.json and the checkpoint in,
     a Hugging Face directory out, and `Pretrained.load` reads it back at the
-    logits the run's own task computes, as transformers does."""
+    logits the run's weights compute, as transformers does; read with its
+    projections packed, as the run's own task holds them, at the task's."""
     from test_inference import make_lm_run
 
+    from dew.inference.projections import inference_projections
     from dew.interop import Pretrained
 
     run = tmp_path / "run"
@@ -435,7 +437,8 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     task = dew.pipeline(str(run))
     destination = tmp_path / "export"
 
-    Pretrained.from_run(str(run)).save(destination)
+    exported = Pretrained.from_run(str(run))
+    exported.save(destination)
 
     assert {entry.name for entry in destination.iterdir()} == {
         "config.json", "generation_config.json", "model.safetensors"}
@@ -443,7 +446,10 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     reloaded = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
-                                  np.asarray(task.model.apply(task.variables, ids)))
+                                  np.asarray(exported.model.apply(exported.variables, ids)))
+    np.testing.assert_array_equal(
+        np.asarray(reloaded.model.apply(inference_projections(reloaded.model, reloaded.variables), ids)),
+        np.asarray(task.model.apply(task.variables, ids)))
     assert_transformers_reads_the_run(destination, task, np.asarray([[3, 4, 5, 6, 7, 8, 9, 10]]),
                                       ordered_export=tmp_path / "orders")
 

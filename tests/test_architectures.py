@@ -388,9 +388,17 @@ def widened_state(state):
                         else jnp.copy(leaf), state)
 
 
-LAYOUT_SEEDS: dict[str, int] = {}
-"""Each cell's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`; a cell not
-named takes DEFAULT_LAYOUT_SEEDS."""
+LAYOUT_SEEDS: dict[str, int] = {
+    "unet": 128, "uvit": 128, "simple_udit": 64, "simple_dit": 64, "simple_mmdit": 64,
+    "hierarchical_mmdit": 128, "hybrid_dit": 64, "video_dit": 64, "unet_3d": 128, "jepa_encoder": 128,
+    "jepa_video_encoder": 256, "causal_transformer": 64, "causal_transformer+moe": 128,
+    "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 128,
+    "causal_transformer+glm4_moe": 256, "causal_transformer+llama4": 256,
+    "causal_transformer+gemma4_moe": 128,
+}
+"""Each cell's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` (2026-10-21, on
+armada: the most any of its four layouts and step counts took); a cell not named takes
+DEFAULT_LAYOUT_SEEDS."""
 DEFAULT_LAYOUT_SEEDS = 16
 
 
