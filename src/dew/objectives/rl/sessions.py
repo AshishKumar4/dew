@@ -49,8 +49,10 @@ from typing import Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.typing import ArrayLike
 
 from dew.data.tokens import first_fit
+from dew.nn.inputs import local_rows
 from dew.records import json_value, record as section
 from dew.rl import group_advantage, rloo_advantage
 
@@ -104,6 +106,15 @@ CREDITS = ("session", "turn")
 return, every call alike; `turn`, one per call from the return still ahead of
 it, compared with the group's members' at the same turn."""
 
+
+
+def local_task_ids(batch: Mapping[str, ArrayLike]) -> np.ndarray:
+    """This process's `task_id` rows of `batch`, refused unless a nonempty vector of integers: the
+    rollout's task boundary, which the scheduler and native episode collection both read."""
+    ids = local_rows(batch["task_id"])
+    if ids.ndim != 1 or not ids.size or not np.issubdtype(ids.dtype, np.integer):
+        raise ValueError("task_id must be a nonempty vector of integer task identities")
+    return ids
 
 class Status(Enum):
     """How a session ended, which decides whether it trains.

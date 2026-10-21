@@ -26,7 +26,7 @@ from jax.experimental import multihost_utils
 from dew.coordination import PeerFailure, agree_process_phase, agreed, broadcast_from_process_zero
 from dew.data.dataset import DataPartition
 from dew.inference.rollouts import check_ending
-from dew.nn.inputs import ModelInputs, local_rows, mesh_of
+from dew.nn.inputs import ModelInputs, mesh_of
 from dew.objectives.base import Batch, Variables
 from dew.sampling.text import Generation, Sampling
 from dew.training.state import TrainState
@@ -39,6 +39,7 @@ from .sessions import (
     Transcript,
     check_credit,
     json_objects,
+    local_task_ids,
     pack,
     sampled_values,
 )
@@ -675,9 +676,7 @@ class EpisodeRollout:
             mesh = mesh_of(state.variables)
             if mesh is not None and DataPartition.of(mesh).readers > 1:
                 raise ValueError("native episodes do not support replicated data-share readers")
-            tasks = local_rows(batch["task_id"])
-            if tasks.ndim != 1 or not tasks.size or not np.issubdtype(tasks.dtype, np.integer):
-                raise ValueError("task_id must be a nonempty vector of integer task identities")
+            tasks = local_task_ids(batch)
             policy = self.policy.bind(state.variables)
             signature = (tasks.size, self.groups, self.max_turns, self.max_prompt_tokens,
                          self.max_new_tokens, self.sampling, int(state.step), int(state.updates),
