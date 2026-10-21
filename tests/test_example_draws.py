@@ -383,7 +383,7 @@ def test_a_recording_step_returns_what_each_evaluation_drew_its_replays_each_the
     boundaries by name, its rows' places and its column check: an accepted microbatch's own, then at
     the commit the window's other microbatches as replayed, each equal to what it drew when it ran
     and to the example's own draw, resident and host-master alike."""
-    from dew.objectives.base import RECORD
+    from dew.objectives.base import taken_record
     from dew.training import Layout, MeshSpec, Trainer
 
     layout = Layout(host=("variables",) if host else (), min_shard=1, tolerance=1.)
@@ -398,7 +398,7 @@ def test_a_recording_step_returns_what_each_evaluation_drew_its_replays_each_the
     state, _, opened, *_ = run(state, first)
     state, _, closed, *_ = run(state, second)
     assert int(state.updates) == 1
-    opened, closed = jax.device_get(opened[RECORD]), jax.device_get(closed[RECORD])
+    opened, closed = (jax.device_get(taken_record(metrics)[0]) for metrics in (opened, closed))
     # The first attempt: its own evaluation, and no replay (the window has not committed).
     np.testing.assert_array_equal(opened["evaluated"], [True, False])
     np.testing.assert_array_equal(opened["example_index"][0], np.arange(4))
@@ -450,7 +450,7 @@ class WitnessedMean(Witnessed):
 def test_a_split_recording_step_returns_every_microbatchs_evaluation():
     """A step read in two microbatches returns both evaluations in the order they ran, each at the rows
     its part reads, every row once, at the example's own draw."""
-    from dew.objectives.base import RECORD
+    from dew.objectives.base import taken_record
     from dew.training import MeshSpec, Trainer
 
     trainer = Trainer(WitnessedMean(), optax.sgd(.1), key=jax.random.key(4), split=2, checkpoints=None,
@@ -460,7 +460,7 @@ def test_a_split_recording_step_returns_every_microbatchs_evaluation():
     batch = {"y": jnp.arange(4, dtype=jnp.float32), EXAMPLE_ROWS: jnp.arange(4, dtype=jnp.int32)}
     key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM), 0), 0)
     _, _, metrics, *_ = trainer.compile(state, batch)(state, batch)
-    record = jax.device_get(metrics[RECORD])
+    record = jax.device_get(taken_record(metrics)[0])
     np.testing.assert_array_equal(record["example_index"], [[0, 2], [1, 3]])
     np.testing.assert_array_equal(record["evaluated"], [True, True])
     assert bool(np.all(record["column_ok"]))

@@ -157,9 +157,10 @@ class Recorder:
         return {name: placed(name, records) for name, records in self.values.items()}
 
 
-RECORD = "record"
-"""The metrics key under which a recording step (`Trainer(record=True)`) returns what its evaluations'
-`Step.sample` and `Step.boundary` calls produced (`Recorded`)."""
+RECORD = "record/"
+"""The prefix of the metrics under which a recording step (`Trainer(record=True)`) returns what its
+evaluations' `Step.sample` and `Step.boundary` calls produced, one array each (`recorded_metrics`),
+which `taken_record` reads back as a `Recorded`."""
 
 
 class Evaluated(TypedDict):
@@ -179,6 +180,24 @@ class Recorded(TypedDict):
     example_index: jax.Array
     column_ok: jax.Array
     evaluated: jax.Array
+
+
+def recorded_metrics(record: Recorded) -> dict[str, jax.Array]:
+    """`record` as a step's metrics, one array each under `RECORD`, as a compiled step returns them."""
+    fields = {f"{RECORD}{name}": record[name] for name in ("example_index", "column_ok", "evaluated")}
+    return {**fields, **{f"{RECORD}values/{name}": value for name, value in record["values"].items()}}
+
+
+def taken_record(metrics: Mapping[str, jax.Array]) -> tuple[Recorded | None, dict[str, jax.Array]]:
+    """A step's record read back from its `metrics` (`recorded_metrics`), None for a step that
+    records nothing, and the metrics without it."""
+    rest = {name: value for name, value in metrics.items() if not name.startswith(RECORD)}
+    if f"{RECORD}evaluated" not in metrics:
+        return None, rest
+    values = {name.removeprefix(f"{RECORD}values/"): value for name, value in metrics.items()
+              if name.startswith(f"{RECORD}values/")}
+    return Recorded(values=values, example_index=metrics[f"{RECORD}example_index"],
+                    column_ok=metrics[f"{RECORD}column_ok"], evaluated=metrics[f"{RECORD}evaluated"]), rest
 
 
 @dataclass(eq=False)
@@ -1143,9 +1162,12 @@ class Objective(ABC, Generic[Loss, Effects]):
             # The trainer's column of the examples' places is the step's (`Step.example_index`).
             batch = {name: value for name, value in batch.items() if name != EXAMPLE_ROWS}
         witness = Witness() if step.record and not validation else None
-        step = step if witness is None else step.replace(witness=witness)
+        step = step if witness is None else replace(step, witness=witness)
         loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
-        stats, aux = loss if _has_aux(loss) else (loss, Aux(metrics={}))
+        if _has_aux(loss):
+            stats, aux = loss
+        else:
+            stats, aux = loss, Aux[Effects](metrics={})
         if witness is not None:
             # A batch with no rows has no examples (`example_fields`), and records none.
             places = jnp.zeros((0,), jnp.int32) if step.example_index is None else step.example_index

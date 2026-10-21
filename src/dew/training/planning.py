@@ -92,11 +92,9 @@ def whole_step(outputs):
     microbatch's; finite and accepted where every microbatch was; and the
     commits summed."""
     losses, metrics, finite, accepted, committed = zip(*outputs, strict=True)
-    report = dict(metrics[-1])
-    if RECORD in report:
-        # A recording step's evaluations are every microbatch's, in the order they ran (`Recorded`).
-        report[RECORD] = jax.tree.map(lambda *parts: jnp.concatenate(parts),
-                                      *(part[RECORD] for part in metrics))
+    # A recording step's evaluations are every microbatch's, in the order they ran (`RECORD`).
+    report = {name: jnp.concatenate([part[name] for part in metrics]) if name.startswith(RECORD) else value
+              for name, value in metrics[-1].items()}
     return (losses[-1], report, jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)),
             jax.tree.map(lambda *values: sum(values), *committed))
 
