@@ -8,7 +8,12 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 
 - Pass dense MLA visibility descriptors to the shared attention core. [41]
 - Bind native Flax forward methods explicitly, including the objective's choice of forward method. [171]
-- Inventory FlaxDiff capabilities and requested model families, with a receipt or an explicit gap for each. Publish workflow-level qualification against MaxText rather than inferring it from individual components. [230, 266, 267]
+- Carry FlaxDiff's remaining capabilities, or record dropping them: the continuous and tangent cosine schedules and the exponential schedule's test, SimpleAutoEncoder, the learned-variance head and the old UViT and wrapper, the W&B sweep promotion and run loading, the older checkpoints, and the named datasets. [230, 864, 865, 866, 867, 868]
+- Carry MaxText's workflows Dew lacks: the pretrain-to-RL chain, named LoRA directories, MaxText checkpoints, replica and live-slice recovery, a host prefix tier and disaggregated serving, DiLoCo, sparse indexed attention, GPT-3 and Engram, audio language models, each text backend and tokenizer training, and remote-topology compilation. [267, 869, 870, 871, 872, 873, 874, 875, 876, 877, 878, 879, 880, 881]
+- Load the requested families Dew does not load yet: Qwen4-Exp, MiniMax Text-01, M1 and M3, the LLaDA MoE variants and LLaDA 2.x, DiffuCoder, Kimi K2.5's and K3's vision, and MiniMax M2.5, M2.7 and H3. [266, 849, 850, 851, 852, 853, 854, 855, 856]
+- Carry the historical repair plan's RL tickets as rows: each likelihood and the weight version kept, methods composed from explicit choices, lossless episode records, and on-policy distillation. [857, 858, 859, 860]
+- Hold stage-local state in a pipeline and qualify its schedule. [861]
+- Test Dew at its declared dependency bounds in a clean environment. [862]
 - Complete Nemotron 3 Ultra, MiMo-V2.6-Pro and Muse Glimmer on the shared family components. Current support covers only parts of their text and multimodal configurations. [357]
 - Add K2 Horizon's MoVA routed value-expert attention on the shared attention and routing primitives; dense K2 Horizon already has source qualification. [479]
 - Qualify MiniCPM5-2B through the existing llama reader and record its supported source fields. [480]
@@ -27,8 +32,11 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Take the grouped convolution's backward off Qwix's private modules: its public provider API, or an upstream Qwix fix carried meanwhile. [783]
 - Let Llama 4's mixer take any KV cache, its context derived from the caller's, not rebuilt. [784]
 - Let latent attention (MLA and its sparse pooling), DeepSeek V4's compressed cache and a bidirectional canvas's encoder prefix take paged and quantized KV cache layouts. [830, 831, 838]
-- Place a loaded pretrained model's variables on JAX's default device, as jnp arrays are; keeping them on the host is an explicit request. [832]
+- Stream a pretrained start onto the trainer's mesh, one device shard at a time, with no whole copy on the host. [848]
 - Keep a merged FP8 base finite through training on H100's FP8 tensor cores. [841]
+- Settle whether a remat rung's step is bitwise its plain step on an sm86 GPU, or held by the float64 gate. [847]
+- Hold the Triton grouped GEMM's gradient to XLA's error under the fp32-master tile gate. [863]
+- Hold the full suite to ten minutes of wall time when it runs as more tasks than containers. [826]
 - Prove a counted first-fit or concatenating pack resumes with loader workers as it does without. [845]
 - Make the live kernel's preparation smoke deterministic about the contexts a closed page leaves open. [843]
 - Update a live notebook's displays across its cells, as Jupyter does, once a notebook runs live. [846]
@@ -48,8 +56,6 @@ The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case 
    - GEMM with prologue and epilogue hooks, including grouped MoE products, bias and SwiGLU.
 
    Build on upstream Tokamax's public API, with no fork. A template replaces a kernel only when it matches or beats it on each target's numerical gate, step time and compile time. Until then the cut-down selector serves as the interim, and it is removed as the templates take over. Forward-mode AD is part of every template's acceptance, qualified through MeanFlow and consistency objectives. Follow the upstream issues while qualifying on public APIs: openxla/tokamax#1666 (serializing bound arguments, the autotuning data type and device-kind inference), #1667 (forward-mode differentiation through Ops), #1668 (registering third-party implementations, recording fallbacks and eligibility by device kind) and #1669 (exporting the Op classes, attention's Mask and residuals). [715, 716, 717]
-
-   Tuning's two private Tokamax imports, `dump_bound_args_to_json` and `AutotuningData`, move to `tokamax.autotuning` once a release carries openxla/tokamax#1676. [738]
 
    The templates' entry measurements, at main 5a761cb7b on A100 and H100: Tokamax attention against XLA, cuDNN, the flash wheel and Triton at 128- and 64-wide heads; packed documents; Mosaic GPU attention against FA3 on H100, where FA3 stays until the gap closes; ragged products; narrow heads on sm86, L4 and G4; and attention sinks.
 
@@ -94,6 +100,8 @@ The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case 
 - Add language and scored quality filters with recorded models and thresholds. Existing length, image-size and aspect filters remain the simple predicates. [202]
 - Add a public `schedule([(dataset, tokens), ...])` on the committed-token clock. Step-based phases exist; named mixture draws are already stable. Keep schedule member state keyed by member identity. [216]
 - Translate per-share streamed, filtered and packed positions across host counts without changing their order. Global record-count positions already support host-count changes. [722]
+- Spread a filtered read across worker processes so none starves, and have a read that can never yield a row raise rather than spin. [883]
+- Select holdouts over a generation by input position, or refuse them above the published store. [884]
 - Fuse adjacent per-record stages without reordering them. [723]
 - Measure loader defaults against step time; memory-sized worker selection alone does not tune the training pipeline. [724]
 - Qualify NUMA-local data workers and memory on multi-socket GPU hosts; retain affinity only where measured. Add host-sized offline IO-thread and CPU-process stages with bounded backpressure through the existing publication path. Current publication drains the chain's own workers and read threads, writes shards serially and uploads cache shards on its writer pool.
@@ -104,11 +112,7 @@ The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case 
 - Compare augmentation policies on fixed data and measure worker scaling when a corpus has one physical shard. [234, 573]
 - Remove duplicated worker-shutdown policy by using Grain's lifecycle interface. [DAT-10]
 - Qualify URL-caption fetching through `images.fetch` and `video.fetch` against the previous online flow on CC3M and WebVid. [155]
-- Fingerprint a transform's arrays by their content, not their truncated repr. [768]
 - Cache automatically: the deterministic stages before the first random or cross-record step are fingerprinted by content and their output reused on a re-run, with no `cache=`, in a local cache directory with a size cap and eviction; `cache=url` stays for shared or remote caches, and there is an opt-out. [824]
-- Carry the caption tokenizer's content in the text conditioners' dependencies, so an exact resume refuses changed token ids. [769]
-- Let Windows and Pack resume with their row ids. [770]
-- Keep a concatenation's metadata, class names and the tokenizer contract included. [771]
 - Run DeviceAugment in the image pipeline benchmark's device-augment arms. [772]
 - The chain is the one data API; recipes, spec.load and the public loader are removed; run.json records the chain (213). [780]
 - Let the image, language-model and SFT presets take the documented `cache=`. [803]
@@ -144,7 +148,6 @@ The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case 
 - After the MFU work, implement DiffusionNFT and compare it with FlowGRPO under matched conditions. [533]
 - Qualify two-engine vLLM/NCCL weight publication and policy-version stamps on real GPUs. [579]
 - Replace `ContainerRunner` through Harbor's public environment interface once it preserves exit reasons and resource limits. [605]
-- Add stop strings while preserving terminal versus truncated semantics across rollout servers. [607]
 - Qualify SGLang NCCL publication, delta and sharded transfer, multi-host engine fleets and SGLang training through the shared rollout interface. Add durable scheduler state, nested tool lineage and a real tool-using training run.
 - Qualify live verl transport and a Dew learner within verl. Compare FlowGRPO loss and gradients with verl-omni before designing rollout-record interchange.
 - Extend stage chains with expert-data generation, on-policy distillation, command-line composition and text-scored model-scale qualification.
@@ -162,7 +165,6 @@ The following direction was approved on 2026-10-19:
 
 Keep the existing gateway interface. Miles would currently duplicate it: its trainer requires torch.distributed and its TITO service speaks SGLang's extended chat API. Revisit a Miles dependency if it offers a small standalone session package. Cancellation must stop both the trial's sandbox and a long in-flight engine decode before either is claimed. The gateway leaves the engine decoding when a session is cancelled; rllm-org/rllm#938 cancels the upstream call on client disconnect, and Dew claims engine abort after a GPU receipt once it merges. [729]
 - Let disk banks load packed families whose packing is a view. [786]
-- Keep the TPU command's dry run free of local writes. [777]
 - Start a rollout server's thread and a harness's workers on their first submit, and stamp a publication before its first draw, not in their constructors. [816]
 - Let FlowRollout alone own collection, the Flow objective's reward, group and rollout fields gone. [817]
 - One route to a task: bundles and objectives delegate to dew.pipeline's task factories. [818]
@@ -185,16 +187,15 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Run one bounded image lifecycle qualification at a meaningful resolution. [295]
 - Extend low-coverage sampling, source and publication modules through scenario settings; run device-only code under device coverage. [580]
 - Keep numerical results keyed by CPU model and qualify CPU-dependent rounding against the reference on that same class. [478]
-- Reuse test results at executed-function and fixture-dependency granularity. [515]
 - Establish and triage a daily GPU baseline before it replaces batch qualification. Reproduce reference autotune picks in their recorders and qualify FP8 on suitable hardware. [558, 568, TTC-1]
 - Qualify H100, newer-GPU, TPU and paged-decode shard routes at runtime; compile and interpret checks leave those obligations open.
-- Reconcile requested capabilities with implementation and qualification evidence, and audit upstream reproductions and fixes. [224, 306]
+- Audit upstream reproductions and fixes. [306]
 - The float64 gate is the owner's (2026-10-20): each leaf's RMS error within 1.5× the reference's and its worst row within ROW_FACTOR of the reference's, on the same inputs, with no floor; every element within a certified roundoff bound for its own operation on common native inputs (faithful rounding for pointwise steps, a bound for each sum, native probes at opaque kernels), behind one assertion, `assert_as_exact`. [560, 649, 719, 793, 827]
 - Every accuracy comparison in the tests and tools goes through that assertion; the files that still compare within a tolerance are an inventory that only shrinks, empty by 2026-11-27. [650, 668, 669, 670, 676, 682, 705, 712, 844]
 - Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients and Z-Image's padded flow. [833, 837]
 - Replace test-policy violations with observable lifecycle and reference behavior:
 
-  - Training, sampling and objectives: [651, 652, 653, 654, 657, 658, 663, 667, 679, 680, 686, 687, 688, 692, 695, 698, 701, 702, 707, 708].
+  - Training, sampling and objectives: [651, 652, 653, 654, 657, 658, 667, 679, 680, 686, 687, 688, 692, 695, 698, 701, 702, 707, 708].
   - Model loading, adapters and exports: [675, 677, 681, 691, 699, 700, 703, 704].
   - Attention, convolution and tuning: [655, 656, 674, 689, 690, 696].
   - Recurrences and looped models: [659, 660, 661, 662, 664, 665, 678, 706, 711].
@@ -206,7 +207,6 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Judge an image model's layout parity under a sequence split, where its gradients' sums over spatial positions reassociate (edm2's sequence-split cell). [827]
 - Use JAX's supported persistent cache in the remote-cache tests, with handling narrowed to transport errors. [794]
 - Use JAX's own transfer guard on GPUs in place of the steady-state reimplementation, and guard CPU arrays' reads to numpy in JAX itself (jax-ml/jax#16602). [795, 801]
-- Check every family, target row and mode in the kernel-route test, an unexplained route failing, and drop the KV cache's unconditional GPU xfail. [798, 799]
+- Drop the KV cache test's unconditional GPU xfail. [799]
 - Hold MeanFlow's fused attention away from zero initialization, the delta rule's document isolation without exclusions, and the Mamba-2 TPU mesh by its numbers. [789, 790]
-- Delete the step benchmark's re-export facade. [800]
-- Hold the full suite to ten minutes of wall time: shards cut by the last full run's measured per-test times, no single case past a shard's budget, and a new environment warmed before its first full suite. [826]
+
