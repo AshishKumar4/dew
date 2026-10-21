@@ -138,20 +138,15 @@ To produce token records, export a deterministic prefix. This example downloads 
 ```python
 import tempfile
 
-from dew.data import ByteTokenizer, Files, Memory, presets, text
+from dew.data import Memory, presets, text
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
-from dew.data.sinks import export
+from dew.data.sources import TokenFiles
 
-tokenizer = ByteTokenizer()
 documents = Memory([{"text": "one document " * 40}, {"text": "another document " * 40}])
 token_store = tempfile.mkdtemp(prefix="dew-tokens-")
-export(documents.map(text.tokenize("byte", eos=True)), token_store, format="array_record",
-       length_field="text",
-       metadata={"token_store": True, "tokenizer": "byte",
-                 "vocab_size": tokenizer.vocab_size, "dtype": "int32",
-                 "eos_id": tokenizer.eos_id})
-data = compile(Files(token_store).pipe(presets.lm, None, seq_len=32, batch=4))
+text.export_tokens(documents, token_store, "byte")
+data = compile(TokenFiles(token_store).pipe(presets.lm, None, seq_len=32, batch=4))
 stream = data.train(DataPartition())
 try:
     packed = next(stream)
@@ -161,7 +156,7 @@ finally:
     stream.close()
 ```
 
-Use a fresh output directory: exports commit immutable shards and a manifest, and refuse an existing publication. Export validation to a second URL and read it as a second `Files` source. A store's tokenizer, dtype and document boundaries come from its producer metadata.
+Use a fresh output directory: exports commit immutable shards and a manifest, and refuse an existing publication. Export validation to a second URL and read it as a second `TokenFiles` source. A store's tokenizer, dtype and document boundaries come from its producer metadata.
 
 `presets.lm` ends each document with the tokenizer's EOS where it has one (`eos=True` always, `eos=False` never). Nothing is held out unless the chain says so: `holdout(tokens=0.01, fields=("text",))` holds out the first hundredth of a finite order's tokens, and a token store keeps its producer's own validation split, read as a second source. Streamed runs need producer-published token splits. Records held out by slice, `holdout(records=256)`, are read by index; a streamed read holds out by identity, `holdout(f)`, whose validation pass streams the whole source: over the 7,169 records of Oxford Flowers' Hub train split, a 1% pass took 11.2 s against 0.3 s for the 256-record slice read by index.
 

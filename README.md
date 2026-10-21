@@ -423,14 +423,16 @@ import jax.numpy as jnp
 import optax
 
 from dew import Trainer
-from dew.data import Files, HFTokenizer, presets
+from dew.data import HFTokenizer, presets
+from dew.data.sources import TokenFiles
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
 
 tokenizer = HFTokenizer("gpt2")
-data = Files("data/tinystories/train").repeat().pipe(presets.lm, None, seq_len=256, batch=32, pack=None)
-held = Files("data/tinystories/val").pipe(presets.lm, None, seq_len=256, batch=32, pack=None, records=128)
+train, val = TokenFiles("data/tinystories").holdout(split="val")
+data = train.shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=256, batch=32)
+held = val.pipe(presets.token_windows, seq_len=256, batch=32, records=128)
 model = CausalTransformer(vocab_size=tokenizer.vocab_size, emb_features=256, num_layers=4,
                           num_heads=4, max_seq_len=256, dtype=jnp.bfloat16)
 objective = LMObjective(model, seq_len=256, ema_decay=0.999)
@@ -448,7 +450,7 @@ On one Colab L4 GPU the run takes about three minutes. The training loss falls f
 
 `temperature=0` selects the highest-probability token. GPU reductions are not bitwise repeatable by default, so a second run can continue differently after the first sentence. Validation uses EMA weights, which lag the live parameters during a short run: at step 1,000 their perplexity is 29.3.
 
-The token records are already ids, so the `lm` preset takes no tokenizer, and the store is one stream with no document ends, so `pack=None` cuts it into windows. Given documents, `presets.lm` tokenizes them and packs whole documents into each row by default (`pack="first-fit"`), recording each row's documents in `text_coordinates`. `presets.sft` reads conversations, from a Parquet or JSONL file or a Hub dataset, renders them with the tokenizer's chat template, and records each token's role. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md) for checkpoint loading and text tokenization.
+`TokenFiles` reads the token store, its `train` and `val` splits, and the `token_windows` preset cuts each into windows by index: the store is one stream with no document ends. Given documents, `presets.lm` tokenizes them and packs whole documents into each row by default (`pack="first-fit"`), recording each row's documents in `text_coordinates`. `presets.sft` reads conversations, from a Parquet or JSONL file or a Hub dataset, renders them with the tokenizer's chat template, and records each token's role. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md) for checkpoint loading and text tokenization.
 
 ### Supervised fine-tuning
 
@@ -580,8 +582,8 @@ Masked diffusion trains a bidirectional decoder to recover masked tokens. There 
 from dew.diffusion.discrete import MDLM
 from dew.objectives.diffusion import MaskedDiffusionObjective
 
-masked_data = Files("data/tinystories/train").repeat().pipe(presets.lm, None, seq_len=127, batch=64, pack=None)
-masked_held = Files("data/tinystories/val").pipe(presets.lm, None, seq_len=127, batch=64, pack=None, records=256)
+masked_data = train.shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=127, batch=64)
+masked_held = val.pipe(presets.token_windows, seq_len=127, batch=64, records=256)
 mask_id = tokenizer.vocab_size
 process = MDLM(mask_id=mask_id)()
 masked_model = CausalTransformer(
@@ -1136,7 +1138,8 @@ import numpy as np
 import optax
 
 from dew import Trainer
-from dew.data import Files, HFTokenizer, presets
+from dew.data import HFTokenizer, presets
+from dew.data.sources import TokenFiles
 from dew.interop import PretrainedDecoder
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
@@ -1146,7 +1149,7 @@ tokens = Path("runs/tokens")
 export = Path("runs/dew-decoder")
 tokenizer = HFTokenizer("tests/fixtures/tokenizers/tiny-tools")
 
-data = Files(str(tokens / "train")).repeat().pipe(presets.lm, None, seq_len=128, batch=16, pack=None)
+data = TokenFiles(str(tokens)).shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=128, batch=16)
 model = CausalTransformer(vocab_size=tokenizer.vocab_size,
                           emb_features=128, num_layers=4, num_heads=4, num_kv_heads=2,
                           mlp_features=256, max_seq_len=128, dtype=jnp.float32,
@@ -1285,11 +1288,13 @@ def main():
         import jax.numpy as jnp
 
         from dew import Checkpoints, MeshSpec, Trainer
-        from dew.data import Files, presets
+        from dew.data import presets
+        from dew.data.sources import TokenFiles
         from dew.nn.backbones import CausalTransformer
         from dew.objectives.lm import LMObjective
 
-        data = Files(os.environ["DEW_TOKEN_DIR"]).repeat().pipe(presets.lm, None, seq_len=128, batch=16, pack=None)
+        tokens = TokenFiles(os.environ["DEW_TOKEN_DIR"])
+        data = tokens.shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=128, batch=16)
         model = CausalTransformer(
             vocab_size=256,
             emb_features=128,
