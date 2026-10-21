@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 from reference_error import PRECISION, assert_as_exact, declared_seeds, indexed_recording, recording, widened
 from sharded import assert_runs_per_shard
-from ssd_support import mamba_ssd_draw, mamba_ssd_operands, ssd_value_and_grad
+from ssd_support import mamba_ssd_draw, mamba_ssd_operands, mamba_ssd_xla, ssd_value_and_grad
 from tool_support import load
 from tuned import each_config
 
@@ -109,8 +109,10 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
     seeds = declared_seeds(SEEDED)[case]
     chunk, dtype = int(stored[f"{case}.chunk"]), jnp.dtype(str(stored[f"{case}.dtype"]))
     shape, documents = tuple(stored[f"{case}.shape"]), bool(stored[f"{case}.documents"])
+    # The truth is Dew's float64 path, which the recorder held to mamba_ssm's float64 oracle at every seed.
     draw, reference, truth = indexed_recording(
-        stored, case, seeds, inputs_of=lambda seed: mamba_ssd_draw(seed, shape, dtype, documents))
+        stored, case, seeds, inputs_of=lambda seed: mamba_ssd_draw(seed, shape, dtype, documents),
+        truth_fn=jax.jit(lambda inputs: mamba_ssd_xla(inputs, chunk)))
     names = ("x", "dt", "A", "B", "C", "D", "h0")
 
     def run(index, arrays):

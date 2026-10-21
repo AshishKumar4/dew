@@ -168,7 +168,7 @@ def write_seeded(scan, minimal, version, revision):
         stored.update(record_case(
             case, draw, evaluate,
             lambda arrays, chunk=chunk, dtype=narrow_dtype: mamba_ssd_xla(arrays, chunk, dtype),
-            truth_proxy=exact_run, store_inputs=False))
+            truth_proxy=exact_run, store_inputs=False, summary=True))
         stored[f"{case}.chunk"] = np.int32(chunk)
         stored[f"{case}.dtype"] = np.asarray(str(narrow_dtype))
         stored[f"{case}.shape"] = np.asarray(shape, np.int32)

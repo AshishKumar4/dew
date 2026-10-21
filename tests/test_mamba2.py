@@ -100,7 +100,9 @@ def operands(reference):
 def assert_recorded_as_exact(reference, site):
     """The recorded reference and its torch-float64 truth on each fresh native-input/orbit draw."""
     seeds = declared_seeds(SEEDED)[site]
-    draw, recorded, truth = indexed_recording(reference, site, seeds, inputs_of=mamba2_draw)
+    # The truth is Dew's float64 path, which the recorder held to transformers' float64 at every seed.
+    draw, recorded, truth = indexed_recording(reference, site, seeds, inputs_of=mamba2_draw,
+                                              truth_fn=jax.jit(lambda inputs: mamba2_run(site, inputs)))
     run = jax.jit(lambda index, inputs: mamba2_run(site, inputs))
     assert_as_exact(run, recorded, draw, f"transformers {site}", seeds=seeds, truth_fn=truth)
 
