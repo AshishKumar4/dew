@@ -456,10 +456,9 @@ class Trainer(Generic[Loss, Effects]):
         the first step for it in place of compiling it (`dew.training._lowering.Lowered`).
         `tune_kernels` measures each Pallas launch of a step that has no config measured on this GPU,
         where the process has the GPU to itself (`dew.nn.kernels.tuning.tune`); without it such a
-        launch runs the nearest measured shape's config or its heuristic. `record` makes each compiled step
-        return, under its metrics' `RECORD`, what every evaluation's `Step.sample` and `Step.boundary`
-        calls produced, the commit's replays each its own (`transaction.recorded`), which `fit` keeps
-        in `records`, a step's a entry.
+        launch runs the nearest measured shape's config or its heuristic. `record` makes each step return
+        under its metrics' `RECORD` what each evaluation, the commit's replays too, sampled and passed as
+        a boundary (`Recorded`), which `fit` appends to `records`.
         """
         whole = _read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -2354,8 +2353,7 @@ class Trainer(Generic[Loss, Effects]):
 
         agreed(type(value).__name__, send)
 
-    # ------------------------------------------------------------------
-    # Validation
+    # ------------------------------------------------------------------ Validation
     # ------------------------------------------------------------------
 
     def _evaluate(
@@ -2425,8 +2423,7 @@ class Trainer(Generic[Loss, Effects]):
         agreed("evaluation reporting", report)
 
 
-    # ------------------------------------------------------------------
-    # Telemetry
+    # ------------------------------------------------------------------ Telemetry
     # ------------------------------------------------------------------
 
     def _stop_trace(self, run: _FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
