@@ -196,12 +196,17 @@ def test_check_one_decides_at_its_second_stage_what_its_first_leaves_inconclusiv
 
 def test_a_leafs_interval_is_widened_to_hold_its_ratio():
     """A percentile interval that leaves out its own ratio is widened to hold it before any verdict: a
-    ratio over PARITY under an interval wholly at or under it is no pass."""
+    ratio over PARITY under an interval wholly at or under it is no pass, and a ratio that is not a
+    number is inconclusive."""
     from reference_error import _status
 
     assert _status(1.6, 1.0, 1.4) != "pass"
     assert _status(0.9, 1.1, 1.4) == "pass"
     assert _status(1.7, 1.6, 1.8) == "over"
+    assert _status(float("nan"), 1.0, 1.2) == "inconclusive"
+    # The rule before the two stages read the interval as it was.
+    assert _status(1.6, 1.0, 1.4, contained=False) == "over"
+    assert _status(1.2, 0.5, 1.6, contained=False) == "inconclusive"
 
 
 def test_check_one_holds_dew_exact_where_the_reference_is_exact_on_every_seed():

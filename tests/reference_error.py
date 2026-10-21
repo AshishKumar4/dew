@@ -222,8 +222,10 @@ BOOTSTRAP = 2000
 """Resamples of a site's seeds for the pooled ratio's interval (`_interval`), drawn by one fixed key so
 an assertion decides alike on every run."""
 CONFIDENCE = 0.999
-"""Check 1's stated confidence: a pass certifies a leaf's RMS ratio no more than PARITY², and an over
-that it is above one, each but for a nominal 5e-4 (LOWER_TAIL, UPPER_TAIL)."""
+"""Check 1's stated confidence in its ratio's decisions: a pass certifies a leaf's RMS ratio no more
+than PARITY², and an over by its ratio that it is above one, each but for a nominal 5e-4 (LOWER_TAIL,
+UPPER_TAIL). A leaf failed by a row, a row of float64 zero or a value not finite is failed by that
+rule, which certifies no ratio."""
 LOWER_TAIL = 5e-4
 """The lower tail of a leaf's bootstrap interval, the over side's whole 5e-4, spent at stage 2 alone, where
 an over is decided (`_staged`). Nominal: the rates hold as far as the percentile bootstrap's endpoint
@@ -275,12 +277,20 @@ def _resolves(low: float, high: float) -> bool:
     return high <= PARITY * max(low, 1e-300)
 
 
-def _status(ratio: float, low: float, high: float) -> str:
+def _status(ratio: float, low: float, high: float, *, contained: bool = True) -> str:
     """A leaf's verdict by its pooled ratio and interval: "pass", "over" or "inconclusive". The interval
     is taken to hold the ratio (low and high widened to it, which no endpoint's coverage loses by), so a
     pass certifies the ratio's high end at most PARITY², whether the interval lies wholly at or under
     PARITY or is resolved (no wider than PARITY) with the ratio under it, and an over its low end above
-    one. Straddling PARITY and wider than it, the leaf is inconclusive."""
+    one. Straddling PARITY and wider than it, the leaf is inconclusive, as is a ratio or end that is not
+    a number. Not `contained`, the rule before 2026-10-21: the interval as it is, a leaf over PARITY
+    by its ratio wherever the interval does not straddle it unresolved."""
+    if not all(np.isfinite(value) for value in (ratio, low, high)):
+        return "inconclusive"
+    if not contained:
+        if low <= PARITY < high and not _resolves(low, high):
+            return "inconclusive"
+        return "over" if ratio > PARITY else "pass"
     low, high = min(low, ratio), max(high, ratio)
     if high <= PARITY:
         return "pass"
@@ -468,8 +478,8 @@ def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL,
     return (_pooled(a, b), *_interval(a, b, tails=tails))
 
 
-def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)
-               ) -> tuple[list[str], list[str]]:
+def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL), *,
+               contained: bool = True) -> tuple[list[str], list[str]]:
     """Check 1's findings over `draws` (`assert_as_exact`): each leaf over PARITY (`_status`), a row or
     a value it fails, and each leaf its draws leave inconclusive."""
     over, unresolved = [], []
@@ -485,7 +495,7 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                 over.append(f"{leaf}: the reference equals float64 on every seed and dew does not")
             continue
         ratio, low, high = _judged(draws, index, tails)
-        status = _status(ratio, low, high)
+        status = _status(ratio, low, high, contained=contained)
         if status == "inconclusive":
             unresolved.append(f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s interval over {count} "
                               f"seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}; give the site larger "
@@ -503,22 +513,27 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
     return over, unresolved
 
 
-def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True,
-            tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)) -> tuple[list[str], list[str], int]:
+PREVIOUS_TAILS = (5e-4, 5e-4)
+"""The interval's tails before check 1's two stages (`_staged`'s `two_stage=False`)."""
+
+
+def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True) -> tuple[list[str], list[str], int]:
     """Check 1's two pre-declared stages over `drawn(start, stop)`, the draws of seeds start to stop: at
-    `seeds`, every leaf passing (`_status`) passes the site; any leaf over or inconclusive draws the
-    second stage, REDRAW times as many further seeds, and every leaf is judged again over all of them.
-    Its findings, the leaves left inconclusive and the stage reached. With `two_stage` false, the
-    procedure before it (2026-10-21): only a leaf whose ratio is over PARITY draws again, an
-    inconclusive is final, at `tails`."""
+    `seeds`, a site whose every leaf passes (`_judgement`: its ratio, rows and values) passes; any leaf
+    that does not draws the second stage, REDRAW times as many further seeds, and every leaf is judged
+    again over all of them, that verdict final. Its findings, the leaves left inconclusive and the stage
+    reached. With `two_stage` false, the procedure before it (2026-10-21), for comparison: tails
+    PREVIOUS_TAILS, the interval as it is, only a leaf whose ratio is over PARITY drawing again."""
+    tails = (LOWER_TAIL, UPPER_TAIL) if two_stage else PREVIOUS_TAILS
     draws = drawn(0, seeds)
-    judged = [(index, _judged(draws, index, tails)) for index in range(len(draws.names))
-              if np.sum(draws.theirs[:, index]) > 0 and draws.finite[:, index].all()]
-    further = (any(_status(*values) != "pass" for _, values in judged) if two_stage
-               else any(values[0] > PARITY for _, values in judged))
+    if two_stage:
+        further = any(_judgement(draws, label, tails))
+    else:
+        further = any(np.sum(draws.theirs[:, index]) > 0 and draws.finite[:, index].all()
+                      and _judged(draws, index, tails)[0] > PARITY for index in range(len(draws.names)))
     if further:
         draws = draws.joined(drawn(seeds, (1 + REDRAW) * seeds))
-    return (*_judgement(draws, label, tails), 2 if further else 1)
+    return (*_judgement(draws, label, tails, contained=two_stage), 2 if further else 1)
 
 
 STAGES_LOG = "DEW_CHECK1_STAGES"
@@ -533,7 +548,7 @@ def _logged(label: str, stage: int, verdict: str) -> None:
     path = os.environ.get(STAGES_LOG)
     if path:
         with open(path, "a", encoding="utf-8") as log:
-            log.write(json.dumps({"site": os.environ.get("PYTEST_CURRENT_TEST", "").split(" ")[0],
+            log.write(json.dumps({"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0],
                                   "label": label, "stage": stage, "verdict": verdict}) + "\n")
 
 
@@ -554,13 +569,14 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     A leaf passes when its pooled ratio (`_pooled`) is at most PARITY and its seeds resolve it: the
     ratio's bootstrap interval over them (tails LOWER_TAIL and UPPER_TAIL, widened to hold the ratio)
     lying wholly at or under PARITY, or no wider than PARITY. Check 1 is two pre-declared stages
-    (`_staged`): where every leaf passes at the declared seeds the site passes; where any leaf is over
-    PARITY or inconclusive (straddling it, wider than it), the site draws REDRAW times as many further
+    (`_staged`): where every leaf passes at the declared seeds the site passes; where any leaf does not
+    (over PARITY, inconclusive, failing a row or a value), the site draws REDRAW times as many further
     seeds and every leaf is judged again over all of them, its ratio, its interval and its rows. Over
     PARITY there, it fails, a finding in the code or the reference arm; still inconclusive there, it is
     Inconclusive, never a pass, and its site is sized again (`seeds_for`). A pass certifies the ratio at
-    most PARITY² and an over above one, each at a nominal 5e-4 (CONFIDENCE). Every judgement's stage is
-    logged (STAGES_LOG). A leaf the reference holds exactly on every seed, Dew must too.
+    most PARITY² and an over by its ratio above one, each at a nominal 5e-4 (CONFIDENCE). Every
+    judgement's stage is logged (STAGES_LOG). A leaf the reference holds exactly on every seed, Dew
+    must too.
 
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
@@ -608,8 +624,7 @@ def recording(path) -> dict[str, np.ndarray]:
 
 
 def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: int = 0,
-              truth_fn=None, two_stage: bool = True, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)
-              ) -> list[tuple[str, int]]:
+              truth_fn=None, two_stage: bool = True, dew_fn=None) -> list[tuple[str, int]]:
     """Check 1 run `runs` times on an equally exact pair, the reference against itself on disjoint
     draws: each run's verdict, "pass", "over" or "inconclusive", and the stage it reached, a run judged
     as `assert_as_exact` judges a site (`_staged`: its declared `seeds`, its second stage, every leaf's
@@ -618,17 +633,19 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     (first + r)·2·(1 + REDRAW)·seeds on, the first half its "Dew"'s and the second its reference's, so
     the runs are independent repetitions as far as `draw` makes its draws so. The bible-§10 null
     control of a site's operation class (orders-through-check1.md): its false-red rate, every
-    nonpassing verdict counted, bounds the gate's own on that class."""
+    nonpassing verdict counted, bounds the gate's own on that class. With `dew_fn` a fault of the
+    reference (a dropped term, a wrong scale), the runs measure the procedure's power on that class,
+    both procedures on the same draws."""
     verdicts = []
     span = (1 + REDRAW) * seeds
     for run in range(first, first + runs):
         base = run * 2 * span
 
         def drawn(start, stop, base=base):
-            return _drawn(reference_fn, reference_fn, draw, range(base + start, base + stop), truth_fn,
-                          reference_seeds=range(base + span + start, base + span + stop))
+            return _drawn(dew_fn or reference_fn, reference_fn, draw, range(base + start, base + stop),
+                          truth_fn, reference_seeds=range(base + span + start, base + span + stop))
 
-        over, unresolved, stage = _staged(drawn, seeds, label, two_stage=two_stage, tails=tails)
+        over, unresolved, stage = _staged(drawn, seeds, label, two_stage=two_stage)
         verdicts.append(("over" if over else "inconclusive" if unresolved else "pass", stage))
     return verdicts
 
