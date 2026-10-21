@@ -33,7 +33,7 @@ from jax.sharding import PartitionSpec as P
 from dew.nn.attention import FORWARD_MODE, repeat_kv_heads
 from dew.nn.inputs import cu_seqlens
 from dew.nn.precision import at_least_fp32, compensated_add, compensated_difference
-from dew.nn.sharding import grouped_heads, manual_map
+from dew.nn.sharding import grouped_heads, manual_map, rows_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence
 from .generation import Refusal, first_refusal, measured_kernel, ran_kernel, refused, route, triton_runs
@@ -324,8 +324,10 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
         out_vals, k_cumdecay = vb_c, jnp.zeros_like(kb_c)
 
     # A zero state like the values: inside a shard_map that checks varying axes the chunk loop's
-    # carry varies as the operands it takes in do.
-    state = jnp.zeros_like(value, work, shape=(B, H, Dk, Dv)) if state is None else state.astype(work)
+    # carry varies as the operands it takes in do, and under an Explicit axis its rows are placed as
+    # theirs are.
+    state = (rows_like(jnp.zeros_like(value, work, shape=(B, H, Dk, Dv)), value) if state is None
+             else state.astype(work))
     # XLA:CPU workaround: under a jitted scan over the layers the chunk
     # loop's zero initial state came back with other values in most
     # processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical modules).
@@ -667,7 +669,7 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     batch, _, heads, head_dim = x.shape
     state_size = B.shape[-1]
     # The SSD's memory is `[P, N]`, values by keys: the template's `[N, P]` transposed.
-    carried = (jnp.zeros_like(x, work, shape=(batch, heads, head_dim, state_size)) if state is None
+    carried = (rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x) if state is None
                else jnp.swapaxes(state, -1, -2).astype(work))
     refusal = ssd_port_refusal(x, B, chunk_size) if kernels else "the caller's route is the portable math"
     if refusal is None:
