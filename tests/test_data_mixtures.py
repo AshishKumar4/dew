@@ -1329,7 +1329,8 @@ def test_phases_read_each_chain_until_its_step_as_the_phased_text_recipe(tmp_pat
     """Two token stores read one until step two, then a mix of both, each phase packed by the lm
     preset: the phased text recipe's plan and batches."""
     from dew.config.data import DataPhase, TextData, loader
-    from dew.data import TokenFiles, phases, presets
+    from dew.data import phases, presets
+    from dew.data.sources import TokenFiles
 
     first, second = tmp_path / "first", tmp_path / "second"
     write_token_corpus(first, np.arange(1, 200, dtype=np.uint16) % 250 + 1)
