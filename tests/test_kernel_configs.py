@@ -39,18 +39,15 @@ def test_each_gpu_takes_the_picks_its_block_holds_and_measures_a_space_holding_t
         assert {"bfloat16", "float32"} <= {dtype for dtype, _ in launch.PICKS}, launch.NAME
 
 
-@pytest.mark.parametrize("module", [fla_gdn, fla_kda])
-def test_the_tuner_finds_each_of_the_rules_launches_in_its_lowering(module):
-    """The rule's forward and backward, traced as the tuner reads a program (`tuning.launches`): each
-    of its kernels is a launch tokamax describes, its arguments serializable into its key; the gated
-    delta rule's nine, and Kimi delta attention's seven with the cumsum and memory kernels it shares."""
+def rule_launches(module) -> tuple:
+    """The launches the rule of `module` (`fla_gdn`, `fla_kda`) makes forward and backward, as the
+    tuner reads them from its lowering (`tuning.launches`)."""
     per_key = module is fla_kda
     q = jax.ShapeDtypeStruct((1, 64, 1, 64), jnp.bfloat16)
     v = jax.ShapeDtypeStruct((1, 64, 2, 64), jnp.bfloat16)
     g = jax.ShapeDtypeStruct((1, 64, 2, *(64,) * per_key), jnp.float32)
     h0 = jax.ShapeDtypeStruct((1, 2, 64, 64), jnp.float32)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
-    shared = {fla_gdn.ChunkLocalCumsum, fla_gdn.ChunkFwdH, fla_gdn.ChunkBwdDhu} if per_key else set()
 
     def rule(*args):
         return port(*args, None, 0.125, 64, interpret=True)
@@ -61,13 +58,24 @@ def test_the_tuner_finds_each_of_the_rules_launches_in_its_lowering(module):
 
     with tuning.launches():
         beta = g.update(shape=g.shape[:3], dtype=jnp.bfloat16)
-        found = tokamax.autotuning.get_bound_args(jax.jit(both), q, q, v, g, beta, h0, v)
-    assert {type(ba.op) for ba in found} == shared | {type(op) for op in vars(module).values()
-                                                      if isinstance(op, fla_gdn._Launch)}
+        return tokamax.autotuning.get_bound_args(jax.jit(both), q, q, v, g, beta, h0, v)
+
+
+@pytest.mark.parametrize("module", [fla_gdn, fla_kda])
+def test_the_tuner_finds_each_of_the_rules_launches_in_its_lowering(module):
+    """The rule's forward and backward, traced as the tuner reads a program (`tuning.launches`): each
+    of its kernels is a launch tokamax describes, its arguments serializable into its key; the gated
+    delta rule's nine, and Kimi delta attention's seven with the cumsum and memory kernels it shares."""
+    shared = ({fla_gdn.ChunkLocalCumsum, fla_gdn.ChunkFwdH, fla_gdn.ChunkBwdDhu} if module is fla_kda
+              else set())
+    assert {type(ba.op) for ba in rule_launches(module)} == shared | {
+        type(op) for op in vars(module).values() if isinstance(op, fla_gdn._Launch)}
 
 
 def test_a_launch_clips_its_blocks_to_the_operands():
-    """Blocks wider than a call's keys or values shrink to them."""
+    """Blocks wider than a call's keys or values shrink to them: on an A100, whose picks block 64 values
+    or more, the heuristic and every config the tuner measures fit a call's 64-wide keys and 32-wide
+    values, the heuristic among them."""
     q = jax.ShapeDtypeStruct((1, 64, 1, 64), jnp.bfloat16)
     v = jax.ShapeDtypeStruct((1, 64, 1, 32), jnp.bfloat16)
     h = jax.ShapeDtypeStruct((1, 1, 64, 32), jnp.bfloat16)
@@ -75,20 +83,39 @@ def test_a_launch_clips_its_blocks_to_the_operands():
     spans = fla_gdn.sequences(1, 64)
     ba = fla_gdn._CHUNK_FWD_O.bind(q, q, v, h, g, *spans, scale=1.0, chunk=64, interpret=True)
     with generation.assumed("sm80"):
-        assert fla_gdn._CHUNK_FWD_O._get_heuristics_config(ba) == fla_gdn.Tiles(64, 32, 8, 3)
+        heuristic = fla_gdn._CHUNK_FWD_O._get_heuristics_config(ba)
+        space = fla_gdn._CHUNK_FWD_O._get_autotuning_configs(ba)
+    assert heuristic in space
+    for tiles in space:
+        assert tiles.bk <= q.shape[-1] and tiles.bv <= v.shape[-1], tiles
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm120"])
 def test_the_kernel_cases_lower_each_kernel_on_abstract_operands(target):
+    """The compile gate's cases (`kernel_cases`) hold each kernel the gated delta rule launches forward
+    and backward, at both dtypes at every compiled shape the dtype takes (fp32 keys at most
+    `fla_gdn.WIDEST` wide), the cumsum reversed too, each once, on abstract operands of that shape
+    lowered as on the GPU."""
     cases = list(support.kernel_cases(target))
-    # Nine kernels at two dtypes and two shapes and at bf16's widest keys, plus the five reverse cumsums.
-    assert len(cases) == 50 and len({case.name for case in cases}) == 50
-    for case in cases:
+    names = [case.name.split("/") for case in cases]
+    assert len({tuple(name) for name in names}) == len(names)
+    assert all(name[0] == target for name in names)
+    covered = {(kernel, dtype, shape, *reverse) for _, kernel, dtype, _, shape, *reverse in names}
+    launched = {ba.op.NAME for ba in rule_launches(fla_gdn)}
+    reversals = {kernel: [(), ("reverse",)] if kernel == "chunk_local_cumsum" else [()]
+                 for kernel in launched}
+    assert covered == {(kernel, dtype, shape, *reverse)
+                       for kernel in launched for dtype in ("bfloat16", "float32")
+                       for shape, geometry in support.COMPILED_SHAPES.items()
+                       if dtype == "bfloat16" or geometry["width"] <= fla_gdn.WIDEST
+                       for reverse in reversals[kernel]}
+    by_name = dict(zip((case.name for case in cases), cases, strict=True))
+    for name, case in by_name.items():
         fn, args = case.call()
+        geometry = support.COMPILED_SHAPES[name.split("/")[4]]
         assert fn.keywords["interpret"] is False
         assert args and all(isinstance(arg, jax.ShapeDtypeStruct) for arg in args)
-        assert (args[0].shape[0], args[0].shape[1]) in ((8, 3072), (4, 3072), (1, 512))
-        assert case.name.startswith(target + "/")
+        assert args[0].shape[:2] == (geometry["batch"], geometry["length"])
 
 
 @pytest.mark.parametrize("exact", [False, True])
