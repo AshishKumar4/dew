@@ -12,8 +12,8 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import OptimConfig
-from dew.config.data import Augment, HoldOut, ImageData, loader
-from dew.data import TFDS
+from dew.data import TFDS, Dataset, presets
+from dew.data.compile import compile
 from dew.inputs import Field
 from dew.interop import save_params
 from dew.objectives.jepa import (
@@ -43,14 +43,21 @@ class Config:
     out: Path = Path("runs/ijepa-flowers")
 
 
+def flowers(config: Config) -> tuple[Dataset, Dataset]:
+    """Every Flowers image, less four batches held out for the probes."""
+    source = TFDS("oxford_flowers102", split="all",
+                  path=None if config.data_path is None else str(config.data_path.expanduser()))
+    train, validation = source.holdout(records=4 * config.batch_size)
+    return (train.shuffle(seed=0).repeat().pipe(presets.images, config.image_size, batch=config.batch_size,
+                                                augment=True),
+            validation.pipe(presets.images, config.image_size, batch=config.batch_size))
+
+
 def main(config: Config, data=None):
-    data = data or loader(ImageData(
-        source=TFDS("oxford_flowers102", split="all",
-                    path=None if config.data_path is None else str(config.data_path.expanduser())),
-        image_size=config.image_size,
-        caption_templates=("a photo of a {}",),
-        augment=Augment(flip=True, jitter=True), validation=HoldOut(records=4 * config.batch_size),
-    ), batch=config.batch_size, provision=config.data_path is None, read="memory")
+    if data is None:
+        # Compiled here, so the run's length in epochs is known before the objective that ramps over it.
+        train, validation = flowers(config)
+        data = compile(train, validation=validation, read="memory", provision=config.data_path is None)
     steps = config.steps or data.epoch_steps(config.epochs)
     side = config.image_size // config.patch_size
     grid = (side, side)
