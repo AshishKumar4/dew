@@ -19,12 +19,12 @@ An arm that runs out of memory records the error in its row.
 The JAX arms run in Dew's environment (`jax` mode) and the torch arms in their own (`torch` mode, which
 imports neither JAX nor Dew), one process each, one after another on the same GPU; `row` mode reads
 their JSON lines and prints the markdown rows. Each time is the median of `--repeats` synchronized
-calls after `--warmup`, in milliseconds; forward plus backward is one call of the gradient of
-`sum(out * do) + sum(final * dfinal)`.
+calls after `--warmup`, in milliseconds; forward plus backward is one call returning the outputs and
+their VJP under the cotangents `do` and `dfinal`, as torch's backward runs after its forward.
 
-MFU is the shape's algorithmic FLOPs (`flops`, the chunked form's matrix products, the same count for
-every arm) over the time and the GPU's dense bf16 peak (`dew.nn.kernels.generation`'s table, which
-needs no JAX); the backward is counted as twice the forward.
+MFU is the shape's model FLOPs (`flops`: `dew.nn.flops`' recurrent function, the same count for every
+arm, chunk work excluded) over the time and the GPU's dense bf16 peak (`dew.nn.kernels.generation`'s
+table); forward plus backward is counted as three times the forward.
 
     PYTHONPATH=src python tools/benchmark_recurrence.py jax --shape all --out runs.jsonl
     $FLA_ENV/bin/python tools/benchmark_recurrence.py torch --shape all --arm fla --out runs.jsonl
@@ -81,20 +81,17 @@ ARMS = {'gdn': ('template', 'hand', 'xla', 'fla'), 'kda': ('template', 'hand', '
 
 
 def flops(shape: Shape) -> float:
-    """The chunked forward's matrix products a row of `length` tokens computes, per value head: with
-    the delta rule, the keys' Gram matrix, `w` and `u`, the memory's update and its correction, the
-    readout, the queries' scores and their values (`2 T (3 C K + 2 C V + 3 K V)`); without it (the
-    SSD) the scores, their values, the chunk's states and their readout (`2 T (C N + C P + 2 N P)`);
-    the conv's `2 T C K` over its channels."""
-    tokens, chunk, keys, values = shape.batch * shape.length, shape.chunk, shape.key_width, shape.value_width
+    """The forward's model FLOPs, the recurrent function's (`dew.nn.flops`): the delta rule's
+    `6 H K V` a token, the SSD's `4 H N P`, the depthwise conv's `2 C K_taps` over its channels."""
+    from dew.nn import flops as model
+
+    lengths = np.full(shape.batch, shape.length)
     if shape.kind == 'conv':
-        channels = 2 * shape.key_heads * keys + shape.value_heads * values
-        return 2.0 * tokens * channels * shape.taps
+        channels = 2 * shape.key_heads * shape.key_width + shape.value_heads * shape.value_width
+        return model.conv_flops(lengths, channels, channels, shape.taps, groups=channels)
     if shape.kind == 'ssd':
-        per_head = 2.0 * tokens * (chunk * keys + chunk * values + 2 * keys * values)
-    else:
-        per_head = 2.0 * tokens * (3 * chunk * keys + 2 * chunk * values + 3 * keys * values)
-    return per_head * shape.value_heads
+        return model.ssd_flops(lengths, shape.value_heads, shape.key_width, shape.value_width)
+    return model.delta_flops(lengths, shape.value_heads, shape.key_width, shape.value_width)
 
 
 def operands(shape: Shape, seed: int = 0) -> dict[str, np.ndarray]:
@@ -137,7 +134,7 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
     import jax.numpy as jnp
 
     from dew.nn import linear
-    from dew.nn.kernels import mamba_ssd, recurrence
+    from dew.nn.kernels import generation, mamba_ssd, recurrence
     from dew.nn.kernels.recurrence_chunk import Chunk, chunk, fla_rule, ssd_port_refusal
     from dew.nn.mixers.mamba2 import SSD
     from dew.telemetry.benchmark import samples
@@ -149,13 +146,7 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
         x, taps = given['x'].astype(bf16), given['taps'].astype(bf16)
         arms = {'hand': lambda x, taps: linear.causal_conv1d(x, taps),
                 'xla': lambda x, taps: linear.xla_conv1d(x, taps, activation=True)}
-        inputs, cotangent = (x, taps), given['dy'].astype(bf16)
-
-        def forward_of(fn):
-            return fn
-
-        def loss_of(fn):
-            return lambda *args: jnp.sum(fn(*args).astype(jnp.float32) * cotangent.astype(jnp.float32))
+        inputs, cotangents = (x, taps), given['dy'].astype(bf16)
     else:
         if shape.kind == 'ssd':
             x, B, C = (given[key].astype(bf16) for key in ('x', 'B', 'C'))
@@ -171,7 +162,9 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
                 interpret = False
                 return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, None, shape.chunk, interpret)
 
-            refusals['hand'] = ssd_port_refusal(x, B, shape.chunk)
+            # What the kernels take, whatever this GPU's row prefers.
+            with generation.chosen(ssd='pallas'):
+                refusals['hand'] = ssd_port_refusal(x, B, shape.chunk)
             cotangents = (given['dy'], given['dfinal'])
         else:
             hooks = recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
@@ -193,15 +186,11 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
 
         arms = {'template': template, 'hand': hand, 'xla': xla}
 
-        def forward_of(fn):
-            return fn
-
-        def loss_of(fn):
-            def loss(*args):
-                out, final = fn(*args)
-                return sum(jnp.sum(a.astype(jnp.float32) * b) for a, b in zip((out, final), cotangents,
-                                                                              strict=True))
-            return loss
+    def forward_backward(fn):
+        def run(*args):
+            outputs, pull = jax.vjp(fn, *args)
+            return outputs, pull(jax.tree.map(lambda c, o: c.astype(o.dtype), cotangents, outputs))
+        return run
 
     rows = []
     for arm, fn in arms.items():
@@ -210,9 +199,7 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
         if refusals.get(arm):
             row.update(fwd_ms=None, fwd_bwd_ms=None, error=f"refuses: {refusals[arm]}")
             continue
-        forward = jax.jit(forward_of(fn))
-        backward = jax.jit(jax.grad(loss_of(fn), argnums=tuple(range(len(inputs)))))
-        for part, compiled in (('fwd_ms', forward), ('fwd_bwd_ms', backward)):
+        for part, compiled in (('fwd_ms', jax.jit(fn)), ('fwd_bwd_ms', jax.jit(forward_backward(fn)))):
             try:
                 measured = samples(compiled, *inputs, warmup=warmup, repeats=repeats)
                 row[part] = 1e3 * statistics.median(measured)
@@ -256,10 +243,12 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
         else:
             from fla.ops.gated_delta_rule import chunk_gated_delta_rule as rule
         group = shape.value_heads // shape.key_heads
-        q, k = (given[key].repeat_interleave(group, dim=2).to(bf16) for key in ('q', 'k'))
-        leaves = [q, k, given['v'].to(bf16), given['g'], given['beta'].to(bf16)]
+        leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'],
+                  given['beta'].to(bf16)]
 
         def run(q, k, v, g, beta):
+            # The layers' repeat, inside the timed call so its transpose sums each key head's gradients.
+            q, k = (x.repeat_interleave(group, dim=2) for x in (q, k))
             return rule(q, k, v, g, beta, scale=shape.key_width ** -0.5, output_final_state=True)
 
         cotangents = (given['do'].to(bf16), given['dfinal'])
@@ -302,14 +291,14 @@ def markdown(rows: list[dict], sha: str) -> list[str]:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
     from dew.nn.kernels.generation import gpu_target
 
-    device = next((row['device'] for row in rows if row.get('device')), 'unknown GPU')
-    peak = gpu_target(device).bf16_peak
     lines = []
-    for name, shape in SHAPES.items():
-        found = {row['arm']: row for row in rows if row['shape'] == name}
-        if not found:
-            continue
-        shape = dataclasses.replace(shape, length=next(iter(found.values())).get('length', shape.length))
+    runs = sorted({(row['shape'], row['length'], row['device']) for row in rows if row['shape'] in SHAPES})
+    for name, length, device in runs:
+        # The last measurement of each arm at this shape, length and device.
+        found = {row['arm']: row for row in rows
+                 if (row['shape'], row['length'], row['device']) == (name, length, device)}
+        shape = dataclasses.replace(SHAPES[name], length=length)
+        peak = gpu_target(device).bf16_peak
         work = flops(shape)
         cells = []
         for arm in ARMS[shape.kind]:
