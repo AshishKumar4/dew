@@ -36,6 +36,7 @@ from flax.typing import Dtype
 
 from dew import records
 from dew.interop.components import bind_component, component_source
+from dew.interop.weights import indexed_path
 from dew.objectives.base import Variables
 
 from ..attention import l2_normalized, scaled_dot_product_attention
@@ -408,12 +409,7 @@ def wan_vae_path(name: str, ndim: int) -> tuple[str, ...]:
         raise ValueError(f"{name!r} is not an AutoencoderKLWan tensor")
     if ndim not in _LEAF_RANK[leaf]:
         raise ValueError(f"{name!r} has {ndim} axes, not {' or '.join(map(str, _LEAF_RANK[leaf]))}")
-    path: list[str] = []
-    for part in parts:
-        if part.isdigit() and path:
-            path[-1] = f"{path[-1]}_{part}"
-        else:
-            path.append("attention_out" if part == "proj" else part)
+    path = indexed_path("attention_out" if part == "proj" else part for part in parts)
     return (*path, "kernel" if leaf == "weight" else leaf)
 
 

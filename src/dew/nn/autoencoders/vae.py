@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.interop.weights import ParamTree, translate_parameters
+from dew.interop.weights import ParamTree, indexed_path, translate_parameters
 from dew.nn.attention import GroupNorm, projected_heads, projected_output, scaled_dot_product_attention
 from dew.nn.conv import Conv
 
@@ -223,28 +223,9 @@ def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
     """
     parts = torch_name.split(".")
     leaf = "bias" if parts[-1] == "bias" else ("scale" if rank == 1 else "kernel")
-    parts = parts[:-1]
-    path = []
-    index = 0
-    while index < len(parts):
-        name = parts[index]
-        following = parts[index + 1] if index + 1 < len(parts) else None
-        if name == "to_out":
-            # to_out.0 is the projection; there is no second entry.
-            path.append("proj_attn")
-            index += 2
-            continue
-        if name in _VAE_ATTENTION:
-            path.append(_VAE_ATTENTION[name])
-            index += 1
-            continue
-        if following is not None and following.isdigit():
-            path.append(f"{name}_{following}")
-            index += 2
-            continue
-        path.append(name)
-        index += 1
-    return (*path, leaf)
+    # to_out.0 is the projection; there is no second entry.
+    names = ".".join(parts[:-1]).replace("to_out.0", "proj_attn").split(".")
+    return (*indexed_path(_VAE_ATTENTION.get(name, name) for name in names), leaf)
 
 
 def translate_vae_weights(torch_tensors: ParamTree) -> ParamTree:

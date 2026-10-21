@@ -26,6 +26,7 @@ from flax.typing import Dtype
 
 from dew import records
 from dew.interop.components import bind_component, component_source
+from dew.interop.weights import indexed_path
 from dew.nn.dense import Dense
 from dew.objectives.base import Variables
 
@@ -484,12 +485,7 @@ def dc_ae_path(name: str, ndim: int) -> tuple[str, ...] | None:
     ranks = (2, 4) if leaf == "weight" and not norm else (1,)
     if ndim not in ranks:
         raise ValueError(f"{name!r} has {ndim} axes, not {' or '.join(map(str, ranks))}")
-    path: list[str] = []
-    for part in parts:
-        if part.isdigit():
-            path[-1] = f"{path[-1]}_{part}"
-        else:
-            path.append("per_head" if part == "proj_out" else part)
+    path = indexed_path("per_head" if part == "proj_out" else part for part in parts)
     if leaf == "weight":
         leaf = "scale" if norm else "kernel"
     return (*path, leaf)
