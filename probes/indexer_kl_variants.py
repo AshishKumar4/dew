@@ -16,7 +16,8 @@ def variant(scores, query, key, *, additive=False, scan=True, log_ratio=False):
     q = query.astype(f) * scale
     k = key.astype(f)
     def mask(x):
-        return x + jnp.where(keep, 0.0, mask_value).astype(f) if additive else jnp.where(keep, x, masked)
+        held = keep if x.ndim == 3 else keep[:, None]
+        return x + jnp.where(held, 0.0, mask_value).astype(f) if additive else jnp.where(held, x, masked)
     if scan:
         def head(summed, projections):
             qh, kh = projections
@@ -24,7 +25,7 @@ def variant(scores, query, key, *, additive=False, scan=True, log_ratio=False):
         summed, _ = jax.lax.scan(head, jnp.zeros(scores.shape, f), (jnp.moveaxis(q, 2, 0), jnp.moveaxis(k, 2, 0)))
     else:
         logits = jnp.einsum("bthd,bshd->bhts", q, k)
-        summed = jnp.sum(jax.nn.softmax(mask(logits) if not additive else logits + jnp.where(keep, 0.0, mask_value)[:, None].astype(f), axis=-1), axis=1)
+        summed = jnp.sum(jax.nn.softmax(mask(logits), axis=-1), axis=1)
     target = summed / (jnp.sum(summed, axis=-1, keepdims=True) + EPS)
     indexer = jax.nn.softmax(mask(scores.astype(f)), axis=-1)
     if log_ratio:
