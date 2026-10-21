@@ -294,10 +294,12 @@ mean square by about its own norm (a single element's by exactly its size); a mo
 signs, in the span their complement leaves, is not seen, which no fixed sketch can exclude."""
 SKETCH_DEVIATIONS = 2.5
 """How many times the oracle rule's bound on a difference's norm the root mean square of its SKETCH sign
-projections may reach: a difference independent of the signs passes it with probability under 2e-12
-(a Rademacher sum's square is no heavier-tailed than a normal's, and Chernoff's bound on a chi-square of
-SKETCH degrees past 2.5² times its mean), and a difference over 2.5 times the bound in norm, a single
-element's alike, moves it past."""
+projections may reach. A truth recomputed within the oracle rule, its difference independent of the
+signs, is refused with probability under 2e-12 (a Rademacher sum's square is no heavier-tailed than a
+normal's: Chernoff's bound on a chi-square of SKETCH degrees past 2.5² times its mean). A single
+element's move past 2.5 times the bound is refused always; a wider move past it in norm is refused but
+for its chance of lying near the signs' complement, which is no guarantee: two entries swapped whose
+sign words agree (one pair in 2^16) move no projection, at every seed alike."""
 SKETCH_BLOCK = 64
 """The entries `truth_sketch` sums in float64 in one block, each block's sum then summed exactly: its
 rounding at most gamma(SKETCH_BLOCK) of the magnitudes', in whatever order a host takes a block."""
