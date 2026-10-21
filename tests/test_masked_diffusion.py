@@ -51,11 +51,12 @@ def test_biased_masked_objective_scores_the_same_affine_logits_as_its_forward():
     process = MDLM(mask_id=31)()
     objective = MaskedDiffusionObjective(model, process, seq_len=4, head_chunks=4,
                                          variables=variables, ema_decay=None)
-    key = jax.random.key(1)
-    _, losses, _, _, predicted, _ = objective._token_losses(variables, {'text': tokens},
-                                                            Step(jnp.asarray(0), key, None), train=False)
-    time_key, mask_key, _ = jax.random.split(key, 3)
-    corrupted, _ = process.corrupt(mask_key, tokens, process.sample_t(time_key, tokens.shape[0]))
+    time_key, mask_key, _ = jax.random.split(jax.random.key(1), 3)
+    times = process.sample_t(time_key, tokens.shape[0])
+    corrupted, is_masked = process.corrupt(mask_key, tokens, times)
+    # The objective reads this corruption (`Step.tape`).
+    step = Step(jnp.asarray(0), jax.random.key(1), None, tape={"times": times, "mask": is_masked})
+    _, losses, _, _, predicted, _ = objective._token_losses(variables, {'text': tokens}, step, train=False)
     logits = model.apply(variables, corrupted).at[..., 31].set(-jnp.inf)
     expected = optax.softmax_cross_entropy_with_integer_labels(logits, tokens)
     # The same 1e-5 relative loss contract as the bias-free chunked head.

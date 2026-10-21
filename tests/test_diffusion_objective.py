@@ -393,16 +393,21 @@ def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
                                   np.asarray(jax.random.normal(third, (RES, RES, 3), jnp.float32)))
 
 
+POOLED_SEEDS = 16
+"""Check 1's declared seeds for the pooled update, sized by `seeds_for` (2026-10-21, on armada)."""
+
+
 def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_one_device():
     """Two microbatches pooled by the trainer step as their batch whole does: each example draws its
     time, noise and dropped condition by its place among the update's examples, which the halves
-    give as the whole gives them, so the pooled update is the whole batch's to its sums' rounding,
-    held by the float64 rule against the whole batch's float32 step, its float64 twin the truth.
-    Drawn by the attempt, the halves read other noise than the whole, and the step another update."""
+    give as the whole gives them, so the pooled update is on par with the whole batch's float32 step
+    over drawn weights (check 1), its float64 twin the truth. The weights are the init's, each leaf
+    moved by a draw, so the DiT's zero-initialized layers take a gradient too. Drawn by the attempt,
+    the halves read other noise than the whole, and the step another update."""
     import copy
 
     import optax
-    from reference_error import assert_as_exact_as_the_reference, widened
+    from reference_error import assert_as_exact, widened
 
     from dew.training import Trainer
     from dew.training.transaction import example_fields
@@ -415,17 +420,30 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
     trainer = Trainer(objective, optax.sgd(1.0), key=jax.random.PRNGKey(3), accumulation=2)
     initial = trainer.initial_state()
     run = trainer.compile(initial, halves[0])
-    start = jax.tree.map(np.asarray, initial.variables)
     fields = example_fields(initial, 0, 1, whole)
     info = Step(jnp.asarray(0), jax.random.fold_in(initial.key, 0), None, **fields)
-    partial, *_ = run(initial, halves[0])
-    pooled, *_ = run(partial, halves[1])
-    assert int(pooled.updates) == 1
-    # sgd(1): the update applied is the pooled gradient.
+    twin = copy.copy(objective)
+    twin.substitute([objective.model.clone(dtype=jnp.float64)])
+
+    def draw(seed):
+        variables = jax.tree.map(np.asarray, initial.variables)
+        keys = iter(jax.random.split(jax.random.key(seed), len(jax.tree.leaves(variables["params"]))))
+        def moved_leaf(leaf):
+            return (leaf + 0.02 * np.asarray(jax.random.normal(next(keys), leaf.shape))).astype(leaf.dtype)
+
+        params = jax.tree.map(moved_leaf, variables["params"])
+        return ({**variables, "params": params},)
+
     def moved(before, after):
+        # sgd(1): the update applied, in float64, is the gradient with the update's float32 rounding.
         return np.asarray(before, np.float64) - np.asarray(after, np.float64)
 
-    applied = jax.tree.map(moved, start["params"], jax.tree.map(np.asarray, pooled.variables["params"]))
+    def pooled(variables):
+        state = initial.replace(variables=jax.tree.map(jnp.asarray, variables))
+        partial, *_ = run(state, halves[0])
+        stepped, *_ = run(partial, halves[1])
+        assert int(stepped.updates) == 1
+        return jax.tree.map(moved, variables["params"], jax.tree.map(np.asarray, stepped.variables["params"]))
 
     def gradient(objective, variables, batch):
         def loss(params):
@@ -433,15 +451,16 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
 
         return jax.grad(loss)(variables["params"])
 
-    # The whole batch's step, its update applied in float32 as the trainer applies it.
-    reference = jax.jit(lambda variables: gradient(objective, variables, whole))(start)
-    reference = jax.tree.map(lambda before, grad: moved(before, np.asarray(before - grad, np.float32)),
-                             start["params"], jax.tree.map(np.asarray, reference))
-    twin = copy.copy(objective)
-    twin.substitute([objective.model.clone(dtype=jnp.float64)])
-    with jax.enable_x64(new_val=True):
-        truth = jax.tree.map(np.asarray, gradient(twin, widened(start), widened(whole)))
-    leaves = zip(jax.tree_util.tree_leaves_with_path(applied), jax.tree.leaves(reference),
-                 jax.tree.leaves(truth), strict=True)
-    for (path, got), want, exact in leaves:
-        assert_as_exact_as_the_reference(got, want, exact, f"pooled {jax.tree_util.keystr(path)}")
+    whole_gradient = jax.jit(lambda variables: gradient(objective, variables, whole))
+
+    def alone(variables):
+        # The whole batch's step, its update applied in float32 as the trainer applies it.
+        grads = jax.tree.map(np.asarray, whole_gradient(variables))
+        return jax.tree.map(lambda before, grad: moved(before, (before - grad).astype(np.float32)),
+                            variables["params"], grads)
+
+    def truth(variables):
+        with jax.enable_x64(new_val=True):
+            return jax.tree.map(np.asarray, gradient(twin, widened(variables), widened(whole)))
+
+    assert_as_exact(pooled, alone, draw, "pooled update", seeds=POOLED_SEEDS, truth_fn=truth)
