@@ -83,17 +83,20 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
     reference = xla_products(x, w, dy, sizes, dtype, jnp.float32)
     arrays = [jnp.asarray(value, dtype) for value in (x, w, dy)]
     group_sizes = jnp.asarray(sizes, jnp.int32)
-    for block_m, transpose in itertools.product((64, 128), (False, True)):
-        tiles = mosaic_gpu.Tiles(block_m, 64, 64, 2, 1)
+    # One warpgroup a tile at two row blocks, and two (CUTLASS's cooperative schedule; a pair of
+    # multiprocessors the interpreter does not model, the GPU's tile gate runs).
+    tiled = [mosaic_gpu.Tiles(64, 64, 64, 2, 1), mosaic_gpu.Tiles(128, 64, 64, 2, 1),
+             mosaic_gpu.Tiles(64, 128, 64, 2, 1, warpgroups=2)]
+    for tiles, transpose in itertools.product(tiled, (False, True)):
         matrix = jnp.swapaxes(arrays[1], 1, 2) if transpose else arrays[1]
         got = mosaic_gpu.gmm(arrays[0], matrix, group_sizes, tiles=tiles, transpose_rhs=transpose,
                              out_dtype=dtype, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
-        check(got, reference[0], truth[0], group, f"forward block_m={block_m} transpose={transpose}")
-    for block_k in (64, 128):
-        tiles = mosaic_gpu.Tiles(64, 64, block_k, 2, 1)
+        check(got, reference[0], truth[0], group, f"forward {tiles} transpose={transpose}")
+    for tiles in (mosaic_gpu.Tiles(64, 64, 64, 2, 1), mosaic_gpu.Tiles(64, 64, 128, 2, 1),
+                  mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2)):
         got = mosaic_gpu.tgmm(arrays[0], arrays[2], group_sizes, tiles=tiles, out_dtype=jnp.float32,
                               multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
-        check(got, reference[2], truth[2], None, f"kernel gradient block_k={block_k}")
+        check(got, reference[2], truth[2], None, f"kernel gradient {tiles}")
 
 
 def check(got, reference, truth, group, label):
@@ -189,8 +192,10 @@ def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
         # (shared memory, the snake's index arithmetic), each value once.
         covering = set({(c.block_m, c.block_n): c for c in reversed(fits)}.values())
         covering |= set({(c.stages, c.grid_block_n): c for c in reversed(fits)}.values())
+        covering |= set({(c.warpgroups, c.cluster, c.block_n): c for c in reversed(fits)}.values())
         assert {(c.block_m, c.block_n) for c in covering} == {(c.block_m, c.block_n) for c in fits}
         assert {(c.stages, c.grid_block_n) for c in covering} == {(c.stages, c.grid_block_n) for c in fits}
+        assert {(c.warpgroups, c.cluster) for c in covering} == {(c.warpgroups, c.cluster) for c in fits}
         for config in sorted(covering, key=repr):
             jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
                 lowering_platforms=("cuda",))
@@ -298,3 +303,35 @@ def test_the_cost_model_names_a_fact_its_target_lacks():
                                    jax.ShapeDtypeStruct((2,), jnp.int32), out_dtype="bfloat16",
                                    trans_rhs=False, interpret=False)
     assert not grouped_matmul.Gmm().eligible(ba, target)
+
+
+def halved(acc, bias):
+    return (acc + bias[None, :]).astype(jnp.bfloat16)
+
+
+def doubled_halves(acc, bias):
+    return (acc * 2).astype(jnp.bfloat16), (acc + bias[None, :]).astype(jnp.bfloat16)
+
+
+def twice(acc, bias):
+    del bias
+    return (acc * 2).astype(jnp.bfloat16)
+
+
+def test_a_cooperative_tile_stores_each_of_several_outputs():
+    """A cooperative tile's consumers stage every output at once: a two-output epilogue's outputs, each its
+    own staging buffer, are bit for bit those of the same tile asked for each output alone."""
+    x, w, _, _ = operands(SIZES["ragged"], jnp.bfloat16)
+    x, w = jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.bfloat16)
+    bias = jnp.asarray(np.linspace(-1, 1, WIDTH), jnp.float32)
+    sizes = jnp.asarray(SIZES["ragged"], jnp.int32)
+    tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2)
+
+    def run(epilogue, out_dtypes=None):
+        return mosaic_gpu.gmm(x, w, sizes, tiles=tiles, transpose_rhs=False, out_dtype=jnp.bfloat16,
+                              multiprocessors=1, interpret=grouped_matmul.INTERPRETED, epilogue=epilogue,
+                              epilogue_operands=(bias,), epilogue_axes=(("columns",),), out_dtypes=out_dtypes)
+
+    first, second = run(doubled_halves, (jnp.bfloat16, jnp.bfloat16))
+    np.testing.assert_array_equal(np.asarray(first, np.float32), np.asarray(run(twice), np.float32))
+    np.testing.assert_array_equal(np.asarray(second, np.float32), np.asarray(run(halved), np.float32))
