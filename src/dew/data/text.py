@@ -468,9 +468,9 @@ def train_tokenizer(dataset: Dataset, base: str, path: str, *, vocab_size: int, 
     """A tokenizer of `vocab_size` tokens trained on the text in `field` of `dataset`'s records, the
     first `records` where given, by the algorithm, normalization and special tokens of `base` (a Hub
     repo or directory: a BPE tokenizer's learns merges, a unigram's pieces), saved at `path`, which it
-    returns for `tokenize(path)` and the `lm` and `sft` presets to read."""
-    from transformers import AutoTokenizer
-
+    returns for `tokenize(path)` and the `lm` and `sft` presets to read. A `vocab_size` smaller than
+    the base's alphabet and special tokens, which its algorithm always keeps, is refused, and so is a
+    base without a fast tokenizer, which has no algorithm to train."""
     if vocab_size < 1:
         raise ValueError("a trained tokenizer needs a positive vocab_size")
     rows = iter(dataset if records is None else dataset.take(records))
@@ -483,7 +483,16 @@ def train_tokenizer(dataset: Dataset, base: str, path: str, *, vocab_size: int, 
                                  f"{type(text).__name__}")
             yield text
 
-    trained = AutoTokenizer.from_pretrained(base).train_new_from_iterator(texts(), vocab_size)
+    from transformers import PreTrainedTokenizerFast
+
+    learning = load_tokenizer(base)
+    if not isinstance(learning, PreTrainedTokenizerFast):
+        raise ValueError(f"{base} loads as {type(learning).__name__}; training learns a fast (tokenizers) "
+                         "tokenizer's algorithm, so give a base that has one")
+    trained = learning.train_new_from_iterator(texts(), vocab_size)
+    if len(trained) > vocab_size:
+        raise ValueError(f"{base}'s algorithm keeps {len(trained)} tokens of its alphabet and special tokens "
+                         f"and those it learned, more than vocab_size={vocab_size}: give at least that many")
     trained.save_pretrained(path)
     return path
 

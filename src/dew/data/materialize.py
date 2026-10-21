@@ -25,7 +25,16 @@ import numpy as np
 
 from dew.data.analysis import _analyzed, _identity, _label, _name
 from dew.data.dataset import Batch, Records
-from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _threads, _TokenSplit
+from dew.data.lowering import (
+    _cache_inputs,
+    _CachedOutputs,
+    _fill,
+    _Locality,
+    _outputs,
+    _packed,
+    _threads,
+    _TokenSplit,
+)
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
     FlatMap,
@@ -147,7 +156,7 @@ def _memory_inputs(
     consumed = 0
     if artifact_at is not None:
         filled, manifest, prefix = _fill(pipeline, source, artifact_at, "memory")
-        cached = filled.mapped(pygrain.MapDataset.source(stored), manifest, transform=prefix, source=source)
+        cached = filled.mapped(_cache_inputs(source, stored), manifest, transform=prefix, source=source)
         try:
             if prefix.threads is None:
                 filling = [cached.record(index) for index in range(len(cached))]
