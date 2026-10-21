@@ -626,10 +626,7 @@ class MosaicGmm(_Mosaic):
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         kernel = ba.arguments['kernel']
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
-        # A prologue rewrites a stage one warpgroup owns: a tile two compute cannot take one.
-        alone = ba.arguments['hooks'].prologue is not None
-        return tuple(tile for tile in MOSAIC_TILES if depth % tile.block_k == 0 and width % tile.block_n == 0
-                     and not (alone and tile.warpgroups == 2))
+        return tuple(tile for tile in MOSAIC_TILES if depth % tile.block_k == 0 and width % tile.block_n == 0)
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:
