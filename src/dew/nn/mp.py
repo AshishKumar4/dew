@@ -37,26 +37,29 @@ MP_KERNEL = "mp_kernel"
 normalization keeps these weights at unit magnitude."""
 
 
-def normalize(x: jax.Array, axes: Sequence[int] | None = None, eps: float = 1e-4) -> jax.Array:
+def normalize(x: jax.Array, axes: Sequence[int] | None = None, eps: float = 1e-4, *,
+              compensated: bool = False) -> jax.Array:
     """Return `x` scaled to unit root-mean-square magnitude over `axes`.
 
     `axes` defaults to all but the last, which normalizes each output channel
-    of a kernel, or each feature vector.
+    of a kernel, or each feature vector. `compensated` sums the squares with
+    `compensated_sum`, as a kernel's initialization does (`drawn_kernel`).
     """
     axes = tuple(range(x.ndim - 1)) if axes is None else tuple(axes)
     count = math.prod(x.shape[axis] for axis in axes)
-    norm = jnp.sqrt(jnp.sum(jnp.square(x.astype(at_least_fp32(x.dtype))), axis=axes, keepdims=True))
-    return x / (eps + norm / math.sqrt(count)).astype(x.dtype)
+    squares = jnp.square(x.astype(at_least_fp32(x.dtype)))
+    total = (jnp.expand_dims(compensated_sum(squares, axes), axes) if compensated
+             else jnp.sum(squares, axis=axes, keepdims=True))
+    return x / (eps + jnp.sqrt(total) / math.sqrt(count)).astype(x.dtype)
 
 
 def drawn_kernel(key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
-    """A standard normal kernel of `shape` scaled to unit magnitude per output channel, as
-    `normalize` scales it, the same on every layout: its sum of squares is compensated
-    (`compensated_sum`), not whichever reduction XLA picks for the shard a device draws, so a
-    kernel split over its fan-in starts as it does whole."""
-    x = jax.random.normal(key, shape)
-    norm = jnp.sqrt(compensated_sum(jnp.square(x), tuple(range(len(shape) - 1))))
-    return x / (1e-4 + norm / math.sqrt(math.prod(shape[:-1])))
+    """A standard normal kernel of `shape` scaled to unit magnitude per output channel by
+    `normalize`, its sum of squares compensated: a kernel split over its fan-in sums each shard
+    apart, and the compensated sum rounds once at the end, so a split draw has matched one
+    device's bit for bit where a plain sum's last bits followed the split (tools/layout_parity.py
+    holds each split draw to one device's)."""
+    return normalize(jax.random.normal(key, shape), compensated=True)
 
 
 def mp_silu(x: jax.Array) -> jax.Array:
