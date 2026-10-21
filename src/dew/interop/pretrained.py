@@ -57,12 +57,7 @@ from dew.interop.pipeline_assembly import (
     pipeline_denoiser,
     text_components,
 )
-from dew.interop.processors import (
-    HostProcessor as HostProcessor,
-    Processor as Processor,
-    ProcessorCall as ProcessorCall,
-    hosts,
-)
+from dew.interop.processors import Processor, hosts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, declared_dtype
