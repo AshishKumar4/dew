@@ -87,7 +87,9 @@ def smoke_config(config: Config) -> Config:
 
 def adapted_objective(config: Config) -> tuple[PretrainedBlockDecoder, BlockDiffusionObjective]:
     """The base with its adapter, and the SFT objective over it."""
-    source = PretrainedBlockDecoder.load(config.model, dtype=jnp.bfloat16, param_dtype=jnp.float32).adapt(
+    # On the host: the trainer streams the stack from there (Layout(host=...)).
+    source = PretrainedBlockDecoder.load(config.model, dtype=jnp.bfloat16, param_dtype=jnp.float32,
+                                         on_host=True).adapt(
         LoRA(rank=config.rank, modules=tuple(config.modules), alpha=config.alpha), key=0)
     # A host layout streams the stack one layer per scan iteration, so the
     # decoder runs as a scan; a plain loop's fetches would all be hoisted and
