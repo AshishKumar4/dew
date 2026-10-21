@@ -579,12 +579,36 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, resi
         logits, 0, excluded, peaks, masses, targets.reshape(-1), loss_cotangent.reshape(-1),
         partition_cotangent.reshape(-1), picked))
     d_raw = _logits_cotangent(d_raw, precision)
-    d_states = jnp.einsum('tv,vd->td', d_raw, table.astype(operands), precision=precision,
-                          preferred_element_type=work)
+    d_states = _state_product(d_raw, table.astype(operands), precision, work, WHOLE_STATE_BLOCK)
     d_table = jnp.einsum('tv,td->vd', d_raw, hidden.reshape(-1, features).astype(operands),
                          precision=precision, preferred_element_type=work)
     return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
             None, None, d_cap, d_columns)
+
+
+WHOLE_STATE_BLOCK: int | None = None
+"""The columns the whole head's state gradient sums each block of before a compensated sum over the
+blocks (`_state_product`), or None for one product over every column."""
+
+
+def _state_product(d_raw, table, precision, work, block: int | None) -> jax.Array:
+    """The state gradient `d_raw @ table` over the vocabulary: one product, or with `block` the
+    vocabulary cut into blocks of that many columns, every block's product taken at once
+    (`[blocks, tokens, features]`) and the blocks summed as a double-float pair (`compensated_add`)."""
+    if block is None or table.shape[0] <= block:
+        return jnp.einsum('tv,vd->td', d_raw, table, precision=precision, preferred_element_type=work)
+    count = -(-table.shape[0] // block)
+    pad = count * block - table.shape[0]
+    blocks = jnp.pad(d_raw, ((0, 0), (0, pad))).reshape(d_raw.shape[0], count, block)
+    rows = jnp.pad(table, ((0, pad), (0, 0))).reshape(count, block, table.shape[1])
+    parts = jnp.einsum('tnb,nbd->ntd', blocks, rows, precision=precision, preferred_element_type=work)
+    zero = jnp.zeros(parts.shape[1:], work)
+
+    def add(pair, part):
+        return compensated_add(pair, (part, zero)), None
+
+    (high, low), _ = jax.lax.scan(add, (zero, zero), parts)
+    return high + low
 
 
 _whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(5, 6, 7, 8, 10, 11))
