@@ -173,7 +173,10 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
     from jax.sharding import Mesh, PartitionSpec
 
     operands, starts = scan_operands(2, 80, 4, 16, 2, 16, documents=True)
-    keys = jax.random.split(jax.random.key(2))
+    # The cotangents' key is one no draw's seed reaches: `scan_operands` draws a seed's x from its own
+    # key, so a cotangent keyed by a small seed equals that seed's x, and its dD = sum dy * x is that
+    # draw's alone, an outlier the comparison cannot resolve.
+    keys = jax.random.split(jax.random.fold_in(jax.random.key(0), 1 << 20))
     dy = jax.random.normal(keys[0], operands[0].shape)
     dfinal = jax.random.normal(keys[1], operands[6].shape)
     run = through(32, starts, dy, dfinal)
