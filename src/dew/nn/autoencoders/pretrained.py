@@ -15,7 +15,7 @@ from jax.typing import DTypeLike
 from dew.interop.components import bind_component, component_source
 from dew.objectives.base import Variables
 
-from .api import AutoEncoder
+from .api import AutoEncoder, LatentNormalization
 from .dc_ae import load_dc_ae
 from .flux2 import load_flux2_vae
 from .kl import AutoencoderKL
@@ -134,8 +134,10 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
     if given - autoencoder.record_arguments().keys():
         raise ValueError(f"{class_name} normalizes by its published statistics, which its record keeps: "
                          f"{sorted(given)} would not survive the run's rebuild from that record")
-    if latent_shift is not None:
-        autoencoder.latent_shift = latent_shift
-    if latent_scale is not None:
-        autoencoder.latent_scale = latent_scale
-    return autoencoder
+    if not given:
+        return autoencoder
+    record = dict(autoencoder.normalization.record)
+    overrides = (("latent_shift", latent_shift), ("latent_scale", latent_scale))
+    record.update({name: value for name, value in overrides if value is not None})
+    return autoencoder.with_normalization(
+        LatentNormalization(record, record["latent_shift"], record["latent_scale"]))

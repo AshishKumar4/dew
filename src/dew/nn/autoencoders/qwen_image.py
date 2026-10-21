@@ -29,7 +29,7 @@ from dew.interop.components import bind_component, component_source
 from dew.interop.weights import indexed_path
 from dew.objectives.base import Variables
 
-from .api import ModuleAutoEncoder
+from .api import LatentNormalization, ModuleAutoEncoder
 from .kl import posterior_latent
 from .vae import FlaxDownsample2D, FlaxUpsample2D
 from .wan import WanMidBlock, WanResidualBlock, WanRMSNorm, causal_conv
@@ -337,28 +337,19 @@ class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
     def __init__(self, *, model: QwenImageVAE, params: Variables,
                  latents_mean: Sequence[float], latents_std: Sequence[float]):
         super().__init__(model, params)
-        self.latents_mean = np.asarray(latents_mean, np.float32)
-        self.latents_std = np.asarray(latents_std, np.float32)
+        latents_mean, latents_std = np.asarray(latents_mean, np.float32), np.asarray(latents_std, np.float32)
         expected = (model.latent_channels,)
-        if self.latents_mean.shape != expected or self.latents_std.shape != expected:
+        if latents_mean.shape != expected or latents_std.shape != expected:
             raise ValueError(
-                f"latents_mean {self.latents_mean.shape} and latents_std {self.latents_std.shape} "
+                f"latents_mean {latents_mean.shape} and latents_std {latents_std.shape} "
                 f"must both hold one value per latent channel {expected}"
             )
+        # The pipeline divides by the standard deviation and multiplies back.
+        self.normalization = LatentNormalization({'latents_mean': latents_mean, 'latents_std': latents_std},
+                                                 latents_mean, latents_std, divides=True)
 
     def record_arguments(self) -> dict:
-        return {'latents_mean': self.latents_mean, 'latents_std': self.latents_std}
-
-    # The base class's shift and scale stay 0 and 1, so its encode and decode
-    # only flatten video around the batch calls here.
-    def encode(self, params, x, key=None, noise=None):
-        latent = super().encode(params, x, key=key, noise=noise)
-        return (latent - self.latents_mean.astype(latent.dtype)) / self.latents_std.astype(latent.dtype)
-
-    def decode(self, params, z):
-        return super().decode(
-            params, z * self.latents_std.astype(z.dtype) + self.latents_mean.astype(z.dtype)
-        )
+        return dict(self.normalization.record)
 
 
 def load_qwen_image_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,

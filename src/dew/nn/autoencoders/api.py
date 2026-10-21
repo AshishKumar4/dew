@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import copy
+import dataclasses
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import jax
@@ -11,6 +14,35 @@ from flax import linen as nn
 from dew.objectives.base import Variables
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class LatentNormalization:
+    """A latent normalization, one description: the source values an autoencoder's record keeps
+    (`record`, as given) and the shift and factor derived from them once. Latents are normalized as
+    `(z - shift) * factor` and restored as `z / factor + shift`; one that `divides` normalizes as
+    `(z - shift) / factor` and restores as `z * factor + shift`, as its source rounds."""
+    record: Mapping[str, Any]
+    shift: Any
+    factor: Any
+    divides: bool = False
+
+    @property
+    def scale(self):
+        """The factor a normalized latent is the shifted one times."""
+        return np.float32(1.0) / self.factor if self.divides else self.factor
+
+    def normalized(self, latent: jnp.ndarray) -> jnp.ndarray:
+        shift, factor = (jnp.asarray(value, latent.dtype) for value in (self.shift, self.factor))
+        return (latent - shift) / factor if self.divides else (latent - shift) * factor
+
+    def restored(self, z: jnp.ndarray) -> jnp.ndarray:
+        shift, factor = (jnp.asarray(value, z.dtype) for value in (self.shift, self.factor))
+        return z * factor + shift if self.divides else z / factor + shift
+
+
+IDENTITY = LatentNormalization({}, 0.0, 1.0)
+"""The normalization that leaves latents as they are."""
+
+
 class AutoEncoder(ABC):
     """Encodes images or video to the latents a latent diffusion model trains on, and decodes them back.
 
@@ -18,20 +50,21 @@ class AutoEncoder(ABC):
     `[B, h, w, c]` and back. `encode` and `decode` here take video
     `[B, T, H, W, C]` frame by frame, unless the subclass encodes time itself
     (`encode_video`, `decode_video`, `latent_shape`), and they apply the
-    latent normalization. On the way out, latents are normalized as
-    (z - latent_shift) * latent_scale, and on the way in the normalization is
-    inverted, the SD3 convention. `latent_shift` and `latent_scale` are each
-    one number or one per latent channel. The defaults are the identity; set
-    them to the dataset's own latent mean and 1/std so the diffusion model
-    sees roughly unit-variance, zero-mean inputs.
+    latent normalization (`normalization`, `LatentNormalization`). On the way
+    out, latents are normalized as (z - latent_shift) * latent_scale, and on
+    the way in the normalization is inverted, the SD3 convention.
+    `latent_shift` and `latent_scale` are each one number or one per latent
+    channel, read from `normalization`. The default is the identity; an
+    autoencoder normalized by the dataset's own latent mean and 1/std, so the
+    diffusion model sees roughly unit-variance, zero-mean inputs, is
+    `with_normalization`'s.
 
     The weights are an argument, as a `ConditionEncoder`'s are. `params` holds
     what a run loaded, and every call takes the tree to use, so the layout
     places the weights and the checkpoint stores them.
     """
 
-    latent_shift: float | np.ndarray | jax.Array = 0.0
-    latent_scale: float | np.ndarray | jax.Array = 1.0
+    normalization: LatentNormalization = IDENTITY
     params: Variables
     model: nn.Module
 
@@ -47,6 +80,21 @@ class AutoEncoder(ABC):
         `params`, as it was given them: its compute dtype and latent
         normalization."""
         raise TypeError(f"{type(self).__name__} needs an explicit autoencoder record declaration")
+
+    @property
+    def latent_shift(self):
+        return self.normalization.shift
+
+    @property
+    def latent_scale(self):
+        return self.normalization.scale
+
+    def with_normalization(self, normalization: LatentNormalization) -> AutoEncoder:
+        """This autoencoder normalizing its latents by `normalization` instead: a copy, this one
+        unchanged."""
+        replaced = copy.copy(self)
+        replaced.normalization = normalization
+        return replaced
 
     def to_json(self) -> dict:
         """Return the record of this built-in autoencoder's constructor, without its parameters:
@@ -162,13 +210,11 @@ class AutoEncoder(ABC):
         encoder's sample drawn from `key` or read off `noise` (`encode_batch`)."""
         latent = (self.encode_video(params, x, key, noise) if x.ndim == 5
                   else self.encode_batch(params, x, key=key, noise=noise))
-        shift, scale = (jnp.asarray(value, latent.dtype) for value in (self.latent_shift, self.latent_scale))
-        return (latent - shift) * scale
+        return self.normalization.normalized(latent)
 
     def decode(self, params, z: jnp.ndarray) -> jnp.ndarray:
         """Decode normalized latents `[B, h, w, c]` or `[B, t, h, w, c]` back to images or video."""
-        shift, scale = (jnp.asarray(value, z.dtype) for value in (self.latent_shift, self.latent_scale))
-        z = z / scale + shift
+        z = self.normalization.restored(z)
         return self.decode_video(params, z) if z.ndim == 5 else self.decode_batch(params, z)
 
     def __call__(self, params, x: jnp.ndarray,

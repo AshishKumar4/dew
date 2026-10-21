@@ -1,7 +1,7 @@
 """Pretrained variational image autoencoders behind the AutoEncoder seam."""
 import jax.numpy as jnp
 
-from .api import ModuleAutoEncoder
+from .api import LatentNormalization, ModuleAutoEncoder
 from .kl import AutoencoderKL
 from .vae import load_pretrained_vae
 
@@ -46,13 +46,13 @@ class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
         if params is None:
             raise ValueError("A native autoencoder requires explicit parameters")
         super().__init__(model, params)
-        self.latent_shift = 0.0 if latent_shift is None else latent_shift
-        self.latent_scale = 0.18215 if latent_scale is None else latent_scale
+        shift = 0.0 if latent_shift is None else latent_shift
+        scale = 0.18215 if latent_scale is None else latent_scale
+        self.normalization = LatentNormalization({'latent_shift': shift, 'latent_scale': scale}, shift, scale)
 
     def record_arguments(self) -> dict:
         from dew.registry import dtype_name
-        return {'dtype': dtype_name(self.dtype), 'latent_shift': self.latent_shift,
-                'latent_scale': self.latent_scale}
+        return {'dtype': dtype_name(self.dtype), **self.normalization.record}
 
     def moments(self, params, images):
         """Return `AutoencoderKL.moments` of the frames, which `encode_batch` draws its latent from."""

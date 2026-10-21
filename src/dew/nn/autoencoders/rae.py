@@ -41,7 +41,7 @@ from dew.nn.precision import float32_dot_general
 from dew.objectives.base import Variables
 
 from ..conv import Conv
-from .api import ModuleAutoEncoder
+from .api import LatentNormalization, ModuleAutoEncoder
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -434,18 +434,17 @@ class RAEAutoencoder(ModuleAutoEncoder[RAE]):
     def __init__(self, *, model: RAE, params: Variables, latents_mean=None, latents_std=None,
                  scaling_factor: float = 1.0):
         super().__init__(model, params)
-        # The checkpoint's statistics as given, in the source's layout, for the record.
-        self.statistics: dict[str, object] = {
+        # The record keeps the checkpoint's statistics as given, in the source's layout.
+        record: dict[str, object] = {
             name: None if value is None else np.asarray(value, np.float32)
             for name, value in (('latents_mean', latents_mean), ('latents_std', latents_std))}
-        self.statistics['scaling_factor'] = scaling_factor
-        self.latent_shift = _statistic(latents_mean, model.grid, model.encoder_width, 0.0)
-        self.latent_scale = scaling_factor / (
-            _statistic(latents_std, model.grid, model.encoder_width, 1.0) + 1e-5
-        )
+        record['scaling_factor'] = scaling_factor
+        self.normalization = LatentNormalization(
+            record, _statistic(latents_mean, model.grid, model.encoder_width, 0.0),
+            scaling_factor / (_statistic(latents_std, model.grid, model.encoder_width, 1.0) + 1e-5))
 
     def record_arguments(self) -> dict:
-        return self.statistics
+        return dict(self.normalization.record)
 
     @property
     def downscale_factor(self) -> int:
