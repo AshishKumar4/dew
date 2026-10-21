@@ -250,8 +250,10 @@ TRAINER_SHOWN = {"loss": Shown(better="lower"),
                  "mfu": Shown(better="higher", percent=True, group="throughput"),
                  "hfu": Shown(better="higher", percent=True, group="throughput"),
                  "hlo_flops_util": Shown(better="higher", percent=True, group="throughput"),
-                 **{f"{name}_lower_bound": Shown(better="higher", percent=True, group="throughput")
-                    for name in ("hfu", "hlo_flops_util")}, "unsized_kernels": Shown(group="throughput"),
+                 # A utilization some launches' work went uncounted in is at least the value shown.
+                 **{f"{name}_lower_bound": Shown(better="higher", percent=True, group="throughput",
+                                                 label=f"{name} ≥") for name in ("hfu", "hlo_flops_util")},
+                 "unsized_kernels": Shown(group="throughput", label="uncounted kernels"),
                  "tokens": Shown(group="throughput"),
                  "tokens_per_s": Shown(better="higher", group="throughput"),
                  "rollout_seconds": Shown(better="lower", group="throughput")}
@@ -427,7 +429,7 @@ class TrainingDisplay:
             shown = self.shown.get(rest or prefix, PLAIN)
             rows = self.groups.setdefault(shown.group or prefix, {})
             if name not in rows:
-                rows[name] = Row(rest or prefix, shown, collections.deque(maxlen=TREND))
+                rows[name] = Row(shown.label or rest or prefix, shown, collections.deque(maxlen=TREND))
             rows[name].values.append(value)
         self.reported = frozenset(scalars) - self.corpus_counts.keys()
         if self.live is None:
