@@ -11,6 +11,7 @@ nothing of it is importable:
 - every module the wheel installed compiles (`compileall`), so a syntax
   error anywhere in the package fails, imported or not;
 - the console entry point the wheel declares, `dew --help`, runs;
+- the installed dewml, jax and flax report their versions, and flax.nnx imports;
 - a tiny language model trains two steps through `Trainer.fit` on token
   files written here, and its parameters stay finite.
 
@@ -46,6 +47,10 @@ from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 
 assert "site-packages" in dew.__file__, dew.__file__
+import importlib.metadata
+import flax.nnx  # imports on jax 0.11.2 from flax 0.12.10 on
+print("dewml", importlib.metadata.version("dewml"), "jax", jax.__version__, "flax",
+      importlib.metadata.version("flax"))
 tokens = Path(sys.argv[1])
 tokens.mkdir()
 for split, repeats in (("train", 64), ("val", 16)):
