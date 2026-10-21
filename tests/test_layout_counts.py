@@ -229,6 +229,14 @@ def test_windows_that_drop_the_roles_their_documents_were_counted_in_are_refused
 
 
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
+@dataclasses.dataclass(frozen=True)
+class Delivered:
+    """A delivered row as its tokens and the role-1 targets the loss scores of it."""
+
+    def __call__(self, row):
+        return {"text": row["text"], **Scored(1)(row)}
+
+
 @pytest.mark.parametrize(("layout", "workers"), [("windows", 0), ("first-fit", 2), ("concat", 2)])
 def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupted_read(
         read, layout, workers):
@@ -240,11 +248,14 @@ def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupte
 
     def corpus(source, scored):
         # Documents longer than a window, of lengths a window doesn't divide, leave windows and
-        # partial bins held when the read stops, so a resume reads next from documents read before.
-        documents = roled(source, 40 if layout == "windows" else 11, scored, count=8)
+        # partial bins held when the read stops, so a resume reads next from documents read before;
+        # each of its own tokens, so a lost, repeated or replayed row shows.
+        length = 40 if layout == "windows" else 11
+        documents = Memory([{"text": np.arange(length, dtype=np.int32) + 1000 * index + 100_000 * source,
+                             "text_roles": (np.arange(length) < scored).astype(np.int32),
+                             "source": np.int32(source)} for index in range(8)], shard_rows=4)
         # A stream read by two loading workers holds a shard for each of them.
-        stored = dataclasses.replace(documents, shard_rows=4)
-        counted = Pipeline(stored, name=str(source)).filter_map(CountTargets(role=1))
+        counted = Pipeline(documents, name=str(source)).filter_map(CountTargets(role=1))
         laid_out = (counted.windows(8, fields=ROLED) if layout == "windows"
                     else counted.pack(16, fields=ROLED, policy=layout, bins=3) if layout == "first-fit"
                     else counted.pack(16, fields=ROLED, policy=layout))
@@ -254,7 +265,7 @@ def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupte
 
     def stream():
         mixed = mix([corpus(0, 1), corpus(1, 5)], by="tokens")
-        return compile(mixed.map(Scored(1)).batch(2), read=read, loading=loading).train(DataPartition())
+        return compile(mixed.map(Delivered()).batch(2), read=read, loading=loading).train(DataPartition())
 
     uninterrupted = stream()
     try:

@@ -783,6 +783,15 @@ def test_stats_reports_the_records_a_second_tokens_and_padding_of_packed_rows(re
     assert 0 < counts["data/records_per_second"] < float("inf")
     plain = Memory(rows("a", 4)).named("plain").read(read).loading(READ).stats(records=4)
     assert "data/tokens" not in plain and "data/padding" not in plain
+    # Rows stored packed, their documents and validity beside them: a place of segment 0 or
+    # marked invalid pads its row.
+    stored = Memory({"text": [np.arange(9, dtype=np.int32)] * 2,
+                     "text_segment_ids": [np.asarray([1, 1, 1, 2, 2, 2, 2, 2, 0], np.int32)] * 2,
+                     "text_attention_mask": [np.asarray([1] * 8 + [0], bool),
+                                             np.asarray([1] * 7 + [0, 0], bool)]}).named("stored")
+    held = stored.read(read).loading(READ).stats(records=2)
+    assert held["data/tokens"] == 8 + 7
+    assert held["data/padding"] == (1 + 2) / 18
 
 
 @dataclasses.dataclass(frozen=True)
