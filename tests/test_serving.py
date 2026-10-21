@@ -41,7 +41,8 @@ EOS = 12
 PROMPTS = ["12", "5", "1234567", "98", "321"]
 BUDGETS = [5, 9, 3, 12, 7]
 MESH_SEEDS = 16
-"""The mesh server's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`."""
+"""The mesh server's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` (2026-10-21,
+on armada: 16 for each of the three meshes)."""
 
 
 

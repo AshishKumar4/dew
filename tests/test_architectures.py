@@ -24,6 +24,7 @@ import pytest
 from diffusion_stubs import StubText
 from recording import RecordingTracker
 from reference_error import assert_as_exact
+from residual_orders import permuted, residual_width
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig
@@ -393,21 +394,35 @@ named takes DEFAULT_LAYOUT_SEEDS."""
 DEFAULT_LAYOUT_SEEDS = 16
 
 
+def reordered(state, order):
+    """`state` with its residual stream's units in `order` (`tests/residual_orders.permuted`), its
+    variables and EMA alike: the same function in other coordinates, every contraction inside the
+    model summed in another order. Its momentum starts at zero, which no order moves. An empty
+    `order` is a model with no residual stream to permute, and leaves `state` as it is."""
+    if not len(order):
+        return state
+    assert all(not np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(state.opt_state)
+               if jnp.issubdtype(leaf.dtype, jnp.floating))
+    ema = None if state.ema is None else permuted(state.ema, order)
+    return state.replace(variables=permuted(state.variables, order), ema=ema)
+
+
 def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exact: bool = False):
-    """`steps` steps of a layout from `initial` over the batch a draw gives, every step on the same
-    rows, as `run_case`'s `fit` takes them, the step compiled once for every draw: a function of the
-    raw batch returning the stepped state's variables, optimizer state and EMA. `exact` runs one
-    device in float64 from `initial` widened, the batch's samples widened (`wide`), built at its first
-    call, so under the caller's float64."""
+    """`steps` steps of a layout over the batch a draw gives, from `initial` in the residual order
+    it gives (`reordered`), every step on the same rows, as `run_case`'s `fit` takes them, the step
+    compiled once for every draw: a function of the raw batch and the order returning the stepped
+    state's variables, optimizer state and EMA. `exact` runs one device in float64 from the state
+    widened, the batch's samples widened (`wide`), built at its first call, so under the caller's
+    float64."""
     built = []
 
-    def stepped(raw):
+    def stepped(raw, order):
         if not built:
             trainer, _ = make_trainer(case, tmp_path / f"drawn-{devices}-{fsdp}-{steps}-{exact}", fsdp,
                                       RecordingTracker(), devices)
             built.append(trainer)
         trainer = built[0]
-        start = widened_state(initial) if exact else jax.tree.map(jnp.copy, initial)
+        start = reordered(widened_state(initial) if exact else jax.tree.map(jnp.copy, initial), order)
         # A copy each draw, as each step donates the state it is handed.
         state = jax.device_put(start, trainer.shardings(start))
         batch = shard_batch(trainer.device_mesh, prepare_counts(
@@ -441,19 +456,16 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         # Each fit donates the state it was handed.
         return jax.tree.map(jnp.copy, initial)
 
-    own = next(batches(case, encoder)())
+    width = residual_width(initial.variables) if case.is_lm else 0
 
     def draw(seed):
-        """The cell's own batch at seed 0. A language model's other draws are that batch with its rows
-        in another order, an exact symmetry of a step that averages its rows, which splits them over
-        the devices otherwise: a fresh batch decides a router's or a sparse gate's near-ties, which
-        are discrete, on one side in some seeds and not in others, and glm4_moe's, gemma3n's and
-        qwen35's one-device steps compared with themselves did not resolve within 512 fresh batches.
-        Any other cell's are batches drawn alike from the seed, as its step's noise follows the rows."""
-        if not case.is_lm:
-            return (next(batches(case, encoder, seed)()),)
-        order = np.arange(BATCH) if seed == 0 else np.random.default_rng(seed).permutation(BATCH)
-        return ({name: value[order] for name, value in own.items()},)
+        """A batch drawn from the seed and, independently, an order of the residual stream's units
+        (`reordered`), the cell's own batch and the identity at seed 0: the fresh batch varies the
+        values, the order every contraction's summation, and the reference and each layout start
+        from the same reordered state, so all are judged in its coordinates. A model with no
+        token embedding has no residual stream to permute, and draws batches alone."""
+        order = (np.arange(width) if seed == 0 else np.random.default_rng(seed).permutation(width))
+        return next(batches(case, encoder, seed)()), order
 
     seeds = LAYOUT_SEEDS.get(case.name, DEFAULT_LAYOUT_SEEDS)
     for steps in (1, 2):
