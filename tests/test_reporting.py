@@ -267,6 +267,34 @@ def test_the_panel_shows_the_metrics_its_last_interval_reported():
         ("loss", [2.0, 1.5, 1.0]), ("source/a/reward", [1.0, 0.5])]
 
 
+def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counters():
+    """A run's data counters (`data/...`) reach the panel as one line, not as a row each: each
+    label's rows as its reader counted them, named only where there is more than one label, the
+    records rejected over every label, a reason only where something was rejected for it, and the
+    share of the rows truncated, over the rows of the labels that truncate, only where any was."""
+    from dew.training import display as shown
+    from dew.training.display import TrainingDisplay
+
+    display = TrainingDisplay(total=10)
+    display.interval(1, {"train/loss": 2.0, "data/rows/tiny-shakespeare": 4824.0,
+                         "data/rejected/tiny-shakespeare/empty": 0.0, "data/truncated/tiny-shakespeare": 0.0,
+                         "data/chunks_per_record/tiny-shakespeare": 1.0})
+    assert [row.name for _, row in display.rows()] == ["loss"]
+    data_line = shown.data_line
+    line = data_line(display.corpus_counts)
+    assert line is not None and line.plain == "data 4,824 rows  ·  0 rejected"
+    # mix(web, code).filter(f): the corpora count the rows they fed the mix, the mixture the rows
+    # f kept, and f's drops are the mixture's.
+    mixture = data_line({"data/rows/web": 3000.0, "data/rows/code": 1824.0, "data/rows/mixture": 4700.0,
+                         "data/rejected/web/too_long": 2.0, "data/rejected/code/too_long": 1.0,
+                         "data/rejected/code/empty": 0.0, "data/rejected/mixture/filtered": 124.0,
+                         "data/truncated/web": 0.25, "data/truncated/code": 0.0})
+    assert mixture is not None
+    assert mixture.plain == ("data web 3,000  code 1,824  mixture 4,700 rows  ·  127 rejected (too_long 3, "
+                             "filtered 124)  ·  15.5% truncated")
+    assert data_line({"train/loss": 1.0}) is None
+
+
 def test_tensorboard_events_hold_the_fit_read_back_with_the_accumulator(tmp_path):
     pytest.importorskip('tensorboard')
     from tensorboard.backend.event_processing.event_accumulator import (
@@ -371,3 +399,73 @@ def test_a_live_panel_keeps_redrawing_while_evaluations_of_new_splits_arrive():
         sys.setswitchinterval(interval)
     assert failures == []
     assert len(display.evaluation_rows()) == 3000
+
+
+def paths_of(figure) -> list[list[tuple[float, ...]]]:
+    """The points of each line a figure draws, in the order drawn."""
+    return [[tuple(float(value) for value in point.split(","))
+             for point in shape.attributes["d"][1:].split(" L")]
+            for shape in figure.shapes if shape.tag == "path"]
+
+
+def texts_of(figure) -> list[str]:
+    return [shape.text for shape in figure.shapes if shape.tag == "text"]
+
+
+def test_a_curve_draws_each_series_at_its_own_steps_from_its_finite_values():
+    """`figures.curve` with steps per series: the axes span the finite values only, a nonfinite
+    value is left out of its line (its neighbours joined) and counted on the figure, the running
+    mean is taken over the finite values, the last value is the last window's mean, and a series
+    with no finite value draws no line. Shared steps still give each series as many as it has
+    values, as the tutorials' calls pass them."""
+    from dew import figures
+
+    drawn = figures.curve({"loss": [4.0, math.nan, 2.0, 1.0, math.inf], "other": [math.nan]},
+                          x={"loss": [1, 2, 3, 4, 5], "other": [3]}, x_label="step", y_label="loss",
+                          smooth=2)
+    raw, mean = paths_of(drawn)
+    # Finite values 4, 2, 1 at steps 1, 3, 4, and their running mean of two, 3 and 1.5, at steps 3
+    # and 4. The plot area runs from x 50 to 440 over steps 1 to 4, the last finite step, and from
+    # y 242 to 62 over values 1 to 4, the finite ones, under the legend's row.
+    assert raw == pytest.approx([(50, 62), (310, 182), (440, 242)], abs=0.01)
+    assert mean == pytest.approx([(310, 122), (440, 212)], abs=0.01)
+    assert "3 nonfinite values left out" in texts_of(drawn)
+    assert "loss 1.50" in texts_of(drawn) and "other none finite" in texts_of(drawn)
+
+    # One series names its last value at its line's end: 3 at step 10, the plot area's top right.
+    alone = figures.curve({"loss": [1.0, 3.0]}, x=[0, 10], x_label="step", y_label="loss")
+    (end,) = [shape for shape in alone.shapes if shape.tag == "text" and shape.text == "3.00"]
+    assert (float(end.attributes["x"]), float(end.attributes["y"])) == pytest.approx((436, 30), abs=0.01)
+
+    shared = figures.curve({"long": [1.0, 2.0, 3.0], "short": [1.0, 3.0]}, x=[10, 20, 30],
+                           x_label="step", y_label="value")
+    long, short = paths_of(shared)
+    assert [x for x, _ in short] == [x for x, _ in long][:2]
+
+
+def test_a_journals_plot_draws_training_beside_validation_each_at_its_own_steps(tmp_path):
+    """`LocalTracker.plot` draws the metrics it names, by default the training loss beside each
+    split's validation loss, as one `dew.figures` curve whose lines sit at the steps each metric
+    was logged: validation's two evaluations land where training's steps 5 and 10 do. The axis
+    is named for the metrics' common last part unless the caller names it, even as nothing. A
+    metric the journal never logged is refused by name; and `plots=True` writes each metric to a
+    file of its own on close, two names that would read alike included."""
+    tracker = LocalTracker(tmp_path / "run", plots=True)
+    for step in range(1, 11):
+        tracker.log({"train/loss": 2.0 / step, "train/grad_norm": 1.0 + step, "train-loss": 0.5}, step)
+        if step % 5 == 0:
+            tracker.log({"val/loss": 2.5 / step}, step)
+    tracker.log({"train/loss": math.inf}, 11)
+    figure = tracker.plot()
+    train, validation = paths_of(figure)
+    assert len(train) == 10 and len(validation) == 2
+    assert validation[0][0] == train[4][0] and validation[1][0] == train[9][0]
+    assert "1 nonfinite value left out" in texts_of(figure) and "loss" in texts_of(figure)
+    assert all(math.isfinite(value) for line in (train, validation) for point in line for value in point)
+    assert "value" in texts_of(tracker.plot("train/loss", "train/grad_norm"))
+    assert "loss" not in texts_of(tracker.plot("train/loss", y_label=""))
+    with pytest.raises(KeyError):
+        tracker.plot("val/perplexity")
+    tracker.close()
+    written = sorted(path.name for path in (tmp_path / "run").glob("*.svg"))
+    assert len(written) == 4 and len({name.rpartition("-")[0] for name in written}) == 3

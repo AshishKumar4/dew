@@ -475,6 +475,25 @@ def pool_checkpoint(tmp_path_factory):
 
 
 @pytest.mark.distributed
+def test_a_pools_observer_holds_every_processs_parameters_whole_at_each_observed_step(tmp_path):
+    """An observer on two processes of one device each, whose parameters fsdp splits between them:
+    every process runs the call and holds each observed step's variables whole, copied home before
+    the next step donates them, the same on both, and the last observation is the variables the
+    fit returns."""
+    reports = run_pool("fit", tmp_path / "out", 2, devices=1, name="observed", run_dir=tmp_path / "run",
+                       fsdp_size=2, steps=4, records=RECORDS, observe_every=2)
+    assert all(report["split_between_processes"] for report in reports)
+    observed = [dict(np.load(tmp_path / "out" / f"process{index}.observed.npz")) for index in range(2)]
+    assert sorted({name.partition("[")[0] for name in observed[0]}) == ["2", "4"]
+    assert_identical_parameters(*observed)
+    # The fit's own dump gathers each global leaf whole (`params_dict`).
+    final = dumped_params(tmp_path / "out" / "process0.json")
+    assert_identical_parameters({name.removeprefix("4"): leaf for name, leaf in observed[0].items()
+                                 if name.startswith("4")}, final)
+    assert any(not np.array_equal(observed[0][f"2{name}"], leaf) for name, leaf in final.items())
+
+
+@pytest.mark.distributed
 def test_a_pool_resumes_every_process_at_its_own_position(tmp_path, pool_checkpoint):
     """A checkpoint hands each process back the position that process wrote.
 
