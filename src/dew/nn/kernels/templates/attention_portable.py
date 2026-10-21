@@ -43,21 +43,20 @@ def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: 
             return value[row, rows, head]
 
 
-def forward(spec: algebra.Forward, query, key, value, start, end, query_ids, key_ids, score_params,
+def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.Array, start: jax.Array,
+            end: jax.Array, query_ids: jax.Array | None, key_ids: jax.Array | None, score_params,
             score_kinds: tuple[Kind, ...], output_params, output_kinds: tuple[Kind, ...], initial, *,
-            block_q: int, block_k: int, output_mod=None, residuals: bool = False):
-    """`TritonForward._fwd`'s outputs from its operands (`query` `[B, Qp, H, Dp]`, `key` and `value`
-    `[B, Kp, Hk, ...]`, the spans' rows and ids, the hooks' padded parameters, the initial state
-    `(m0, total0, acc0)` or None), one query block and head at a time in sequence, its key tiles walked as
-    the Triton mainloop walks them."""
+            block_q: int, block_k: int, output_mod=None) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """`TritonForward._fwd`'s outputs with its residuals from its operands (`query` `[B, Qp, H, Dp]`,
+    `key` and `value` `[B, Kp, Hk, ...]`, the spans' rows and ids, the hooks' padded parameters, the
+    initial state `(m0, total0, acc0)` or None), one query block and head at a time in sequence, its key
+    tiles walked as the Triton mainloop walks them."""
     batch, queries, heads, _ = query.shape
     keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
     group = heads // kv_heads
     blocks = queries // block_q
-    bounds = None
-    if spec.form == "spans":
-        blocks_map = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
-        bounds = jnp.stack([blocks_map.lo, blocks_map.hi], axis=-1).astype(jnp.int32)
+    blocks_map = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
+    ids = None if query_ids is None or key_ids is None else (query_ids, key_ids)
     tiles = -(-spec.keys // block_k)
 
     def program(index):
@@ -71,27 +70,25 @@ def forward(spec: algebra.Forward, query, key, value, start, end, query_ids, key
         narrowing = {}
         if spec.form == "spans":
             narrowing = {"start": start[row, rows], "end": end[row, rows]}
-        if spec.ids:
-            narrowing["query_ids"] = query_ids[row, rows]
+        if ids is not None:
+            narrowing["query_ids"] = ids[0][row, rows]
 
-        def step(j, carry):
-            state, arg = carry if residuals else (carry, None)
+        def step(j, carry: tuple[algebra.Partial, algebra.Argmax]):
+            state, arg = carry
             columns = j * block_k + jnp.arange(block_k)
             coords = algebra.Coords(q_pos, columns[None, :], **narrowing,
-                                    key_ids=key_ids[row, columns] if spec.ids else None)
+                                    key_ids=None if ids is None else ids[1][row, columns])
             params = tuple(_tile_param(param, kind, row, head, rows, columns)
                            for param, kind in zip(score_params, score_kinds, strict=True))
             k_tile = jax.lax.dynamic_slice_in_dim(key[row, :, kv_head], j * block_k, block_k)
             logits = algebra.modify(spec, _dot(q, k_tile.T), coords, params)
-            if residuals:
-                arg = algebra.argmax(arg, logits, coords.k_pos)
             m, alpha = algebra.peak(spec, state.m, logits)
             weights = algebra.weights(spec, logits, m)
             denominator = algebra.total(state.total, alpha, weights)
             v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
             acc = algebra.rescale(state.acc, alpha) + _dot(algebra.narrow(weights, v_tile.dtype), v_tile)
-            state = algebra.Partial(acc, m, denominator)
-            return (state, arg) if residuals else state
+            # The anchor key is tracked always: it changes no other output's bits.
+            return algebra.Partial(acc, m, denominator), algebra.argmax(arg, logits, coords.k_pos)
 
         if initial is None:
             state = algebra.empty(block_q, value_width)
@@ -99,25 +96,22 @@ def forward(spec: algebra.Forward, query, key, value, start, end, query_ids, key
             m0, total0, acc0 = initial
             state = algebra.resumed(spec, m0[row, head, rows], total0[row, head, rows], acc0[row, head, rows])
         if spec.form == "spans":
-            lo, hi = bounds[row, i, 0], bounds[row, i, 1]
+            lo, hi = blocks_map.lo[row, i], blocks_map.hi[row, i]
         elif spec.form == "causal":
             lo, hi = 0, jnp.minimum(-(-(first_query + block_q) // block_k), tiles)
         else:
             lo, hi = 0, tiles
         out_params = tuple(_tile_param(param, kind, row, head, rows, None)
                            for param, kind in zip(output_params, output_kinds, strict=True))
-        carry = jax.lax.fori_loop(lo, hi, step, (state, algebra.no_argmax(block_q)) if residuals else state)
-        state, arg = carry if residuals else (carry, algebra.no_argmax(block_q))
+        state, arg = jax.lax.fori_loop(lo, hi, step, (state, algebra.no_argmax(block_q)))
         out, m, denominator = algebra.finish(spec, state, initial=initial is not None, output_mod=output_mod,
                                              output_params=out_params)
-        return out.astype(query.dtype), m, denominator, arg.index
+        return out.astype(query.dtype), m, denominator, arg.key
 
     out, m, denominator, anchors = jax.lax.map(program, jnp.arange(blocks * batch * heads))
     # [blocks * batch * heads, bq, ...] back to [B, Qp, H, ...] and [B, H, Qp].
     out = out.reshape(blocks, batch, heads, block_q, value_width).transpose(1, 0, 3, 2, 4)
     out = out.reshape(batch, queries, heads, value_width)
-    if not residuals:
-        return out
 
     def rowwise(x):
         return x.reshape(blocks, batch, heads, block_q).transpose(1, 2, 0, 3).reshape(batch, heads, queries)
@@ -130,7 +124,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     """The template's forward on this mainloop: `query` `[B, Q, H, D]` over `key` and `value`
     `[B, K, Hk, D]` and `[B, K, Hk, Dv]` and the keys `spans` leaves each query, padded as a backend
     whose largest tile is `pad` pads it (`padded_call`) and walked in `block_q` by `block_k` tiles; with
-    `residuals`, the running maxima and denominators `[B, H, Q]` too."""
+    `residuals`, the running maxima and denominators `[B, H, Q]` and the anchor keys too."""
     hooks = Hooks() if hooks is None else hooks
     call = padded_call(query, key, value, spans, hooks, pad)
     queries, value_width = call.queries, value.shape[-1]
@@ -141,22 +135,23 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
                    jnp.pad(call.rows(state.acc), ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)))
     spec = algebra.Forward(spans.form, spans.keys or call.key.shape[1], call.query_ids is not None,
                            query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod)
-    out = forward(spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
-                  call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
-                  tuple(param.kind for param in hooks.output_params), initial, block_q=block_q,
-                  block_k=block_k, output_mod=hooks.output_mod, residuals=residuals)
+    out, m, denominator, anchors = forward(
+        spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
+        call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
+        tuple(param.kind for param in hooks.output_params), initial, block_q=block_q, block_k=block_k,
+        output_mod=hooks.output_mod)
     if not residuals:
         return out[:, :queries, :, :value_width]
-    out, m, denominator, anchors = out
     return (out[:, :queries, :, :value_width], m[:, :, :queries], denominator[:, :, :queries],
             anchors[:, :, :queries])
 
 
-def _seen(spans: tuple, row, rows: jax.Array, columns: jax.Array) -> jax.Array:
+def _seen(spans: tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None], row, rows: jax.Array,
+          columns: jax.Array) -> jax.Array:
     """The entries `[len(rows), len(columns)]` of batch row `row` its spans let each query see."""
     start, end, query_ids, key_ids = spans
     seen = (columns[None, :] >= start[row, rows][:, None]) & (columns[None, :] < end[row, rows][:, None])
-    if query_ids is not None:
+    if query_ids is not None and key_ids is not None:
         seen &= query_ids[row, rows][:, None] == key_ids[row, columns][None, :]
     return seen
 

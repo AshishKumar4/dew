@@ -111,16 +111,32 @@ def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array,
         return logits
     seen = None
     if spec.form == "spans":
-        seen = (coords.k_pos >= coords.start[:, None]) & (coords.k_pos < coords.end[:, None])
+        start, end = _interval(coords)
+        seen = (coords.k_pos >= start[:, None]) & (coords.k_pos < end[:, None])
     elif spec.form == "causal":
         seen = coords.k_pos <= coords.q_pos
     if spec.form != "spans" and spec.keys % s.shape[1]:
         # A tile past the call's last key reads padding.
         seen = coords.k_pos < spec.keys if seen is None else seen & (coords.k_pos < spec.keys)
     if spec.ids:
-        same = coords.query_ids[:, None] == coords.key_ids[None, :]
+        query_ids, key_ids = _ids(coords)
+        same = query_ids[:, None] == key_ids[None, :]
         seen = same if seen is None else seen & same
     return logits if seen is None else jnp.where(seen, logits, -jnp.inf)
+
+
+def _interval(coords: Coords) -> tuple[jax.Array, jax.Array]:
+    """A spans call's intervals, which its mainloop gives every tile's coordinates."""
+    if coords.start is None or coords.end is None:
+        raise ValueError("a spans call's mainloop gives each tile its queries' intervals (`Coords`)")
+    return coords.start, coords.end
+
+
+def _ids(coords: Coords) -> tuple[jax.Array, jax.Array]:
+    """A call of documents' query and key ids, which its mainloop gives every tile's coordinates."""
+    if coords.query_ids is None or coords.key_ids is None:
+        raise ValueError("a mainloop gives a call of documents' tiles their queries' and keys' ids")
+    return coords.query_ids, coords.key_ids
 
 
 def _safe(spec: Forward, m: jax.Array) -> jax.Array:
@@ -156,11 +172,11 @@ def rescale(acc: jax.Array, alpha: jax.Array) -> jax.Array:
 
 
 class Argmax(NamedTuple):
-    """The keys' running maximum logit `peak` `[bq]` (the initial state's apart) and `index`, the first
+    """The keys' running maximum logit `peak` `[bq]` (the initial state's apart) and `key`, the first
     key that holds it `[bq]` int32: the backward's anchor key (`off_anchor`), a residual of the forward."""
 
     peak: jax.Array
-    index: jax.Array
+    key: jax.Array
 
 
 def no_argmax(rows: int) -> Argmax:
@@ -173,7 +189,7 @@ def argmax(state: Argmax, logits: jax.Array, k_pos: jax.Array) -> Argmax:
     tile_peak = logits.max(axis=-1)
     first = jnp.min(jnp.where(logits == tile_peak[:, None], k_pos, jnp.iinfo(jnp.int32).max), axis=-1)
     return Argmax(jnp.maximum(state.peak, tile_peak),
-                  jnp.where(tile_peak > state.peak, first.astype(jnp.int32), state.index))
+                  jnp.where(tile_peak > state.peak, first.astype(jnp.int32), state.key))
 
 
 def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
@@ -213,6 +229,23 @@ def inverse(total: jax.Array) -> jax.Array:
     return jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
 
 
+def floating_params(params) -> list[int]:
+    """The places of a hook's floating parameters, the ones it differentiates along."""
+    return [index for index, param in enumerate(params) if jnp.issubdtype(param.dtype, jnp.floating)]
+
+
+def differentiable(score_mod: Callable, q_pos, k_pos, params, floating: list[int]) -> Callable:
+    """`score_mod` at the tile's coordinates as a function of its logits and its floating parameters
+    (`floating`) alone, the others held: what `jax.vjp` takes."""
+    def hooked(s, *wide):
+        values = list(params)
+        for index, value in zip(floating, wide, strict=True):
+            values[index] = value
+        return score_mod(s, q_pos, k_pos, *values)
+
+    return hooked
+
+
 def scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
     """`score_mod` on the scaled logits, in fp32, and with `slopes` each entry's derivative of it along
     the logits and along each parameter, a tile apiece: `score_mod` being pointwise in the entries, they
@@ -225,16 +258,9 @@ def scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
         return logits, None
     if not slopes:
         return score_mod(logits, q_pos, k_pos, *params).astype(jnp.float32), None
-    floating = [index for index, param in enumerate(params) if jnp.issubdtype(param.dtype, jnp.floating)]
-
-    def hooked(s, *wide):
-        values = list(params)
-        for index, value in zip(floating, wide, strict=True):
-            values[index] = value
-        return score_mod(s, q_pos, k_pos, *values)
-
+    floating = floating_params(params)
     inputs = (logits, *(params[index] for index in floating))
-    out, pull = jax.vjp(hooked, *inputs)
+    out, pull = jax.vjp(differentiable(score_mod, q_pos, k_pos, params, floating), *inputs)
     along = jax.linear_transpose(pull, out)
 
     def slope(index):
@@ -267,7 +293,7 @@ def pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...]):
 class OffAnchor(NamedTuple):
     """The backward's first pass weighed against the forward's maximum m, so no running maximum rescales
     a sum: the denominator `total` `[bq]`, and of every key but the forward's maximum key c
-    (`Argmax.index`) the weighted values `others` `B = sum_{j != c} e_j v_j` `[bq, Dv]` (the mainloop's
+    (`Argmax.key`) the weighted values `others` `B = sum_{j != c} e_j v_j` `[bq, Dv]` (the mainloop's
     product of `off_anchor_weights`' narrowed weights with the values), their weights' sum
     `others_total`, and c's own weight `own`, each `e_j = exp(s_j - m)` rounded as the forward rounds it,
     fp32."""
