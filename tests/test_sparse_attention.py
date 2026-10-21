@@ -189,9 +189,7 @@ def test_memory_follows_the_selection_not_the_sequence():
 def test_a_querys_empty_selection_slots_leave_the_next_querys_keys_alone():
     """A selection's -1 slots (`top_k_selection` leaves them where fewer keys are allowed than the top
     k) mark no key in `selection_mask`, so packed documents keep their own keys: the second query, the
-    first of its document, sees its own key alone and never the first query's key 0. On the cuda lane's
-    deterministic scatter this is the form openxla/xla#49380 reaches, where a slot at the key axis's
-    size would land on the next query's key 0 (`dew.nn.scatter`)."""
+    first of its document, sees its own key alone and never the first query's key 0."""
     segments = jnp.asarray([[1, 2, 2, 2]])
     indices = causal_selection(jnp.zeros((1, 4, 4)), 2, segments)
     np.testing.assert_array_equal(np.asarray(indices)[0, :2], [[0, -1], [1, -1]])
