@@ -110,11 +110,40 @@ def _scaled(factor):
     return change
 
 
+def _changed(before, after):
+    """`after`, refused where it equals `before`: a fault that changes nothing is no fault."""
+    import numpy as np
+
+    assert not np.array_equal(np.asarray(before), np.asarray(after)), "the fault changes nothing"
+    return after
+
+
 def _bfloat16(arguments):
     import jax.numpy as jnp
 
-    states, *rest = arguments
-    return (jnp.asarray(states, jnp.bfloat16).astype(states.dtype), *rest)
+    states, matrix, scale, bias, *rest = arguments
+    rounded = _changed(scale, jnp.asarray(scale, jnp.bfloat16).astype(jnp.asarray(scale).dtype))
+    return (states, matrix, rounded, bias, *rest)
+
+
+def _parameters(change):
+    """A decoder's parameters changed by `change`, leaf by leaf, its tokens as they are."""
+    def changed(arguments):
+        import jax
+
+        variables, ids = arguments
+        return (jax.tree.map(change, variables), ids)
+    return changed
+
+
+def _parameters_scaled(factor):
+    return _parameters(lambda leaf: leaf * factor)
+
+
+def _parameters_bfloat16(leaf):
+    import jax.numpy as jnp
+
+    return jnp.asarray(leaf, jnp.bfloat16).astype(jnp.asarray(leaf).dtype)
 
 
 def _dropped(arguments):
@@ -127,15 +156,22 @@ def _dropped(arguments):
 
 
 FAULTS = {
-    "scale-2^-10": _faulted(_scaled(1 + 2.0 ** -10)),
-    "scale-2^-20": _faulted(_scaled(1 + 2.0 ** -20)),
-    "scale-2^-22": _faulted(_scaled(1 + 2.0 ** -22)),
-    "bf16-states": _faulted(_bfloat16),
-    "dropped-column": _faulted(_dropped),
+    "cross-entropy-columns": {
+        "scale-2^-10": _faulted(_scaled(1 + 2.0 ** -10)),
+        "scale-2^-20": _faulted(_scaled(1 + 2.0 ** -20)),
+        "scale-2^-22": _faulted(_scaled(1 + 2.0 ** -22)),
+        "bf16-scale": _faulted(_bfloat16),
+        "dropped-column": _faulted(_dropped),
+    },
+    "decoder-residual-orders": {
+        "scale-2^-20": _faulted(_parameters_scaled(1 + 2.0 ** -20)),
+        "bf16-parameters": _faulted(_parameters(_parameters_bfloat16)),
+    },
 }
-"""Real faults of the cross-entropy class, its own computation changed before it runs: its states
-scaled by a wrong factor at three sizes, rounded to bfloat16 where float32 is claimed, and a column of
-its vocabulary dropped, for the procedures' power on the class (`null_runs`'s `dew_fn`)."""
+"""Real faults of each class, its own computation changed before it runs, for the procedures' power on
+it (`null_runs`'s `dew_fn`): the cross-entropy head's states scaled by a wrong factor at three sizes,
+its column scale rounded to bfloat16 where float32 is claimed, a column of its vocabulary dropped; the
+decoder's parameters scaled, or rounded to bfloat16."""
 
 
 def _law(name: str, rng, size: int):
@@ -195,7 +231,7 @@ def main(argv: list[str]) -> int:
                         "law: a class's or exact-f, flip, gamma-1")
     parser.add_argument("--ratio", type=float, help="run known-ratio controls of this population ratio")
     parser.add_argument("--today", action="store_true", help="the procedure before the two stages")
-    parser.add_argument("--fault", choices=sorted(FAULTS), help="run the class's reference with this fault "
+    parser.add_argument("--fault", help="run the class's reference with this fault of its own (FAULTS) "
                         "as Dew, for power")
     parser.add_argument("--seeds", type=int, help="the class's declared count; without it, size it "
                         "(`seeds_for`, on the seeds below OFFSET) and print it")
@@ -231,7 +267,7 @@ def main(argv: list[str]) -> int:
     verdicts = null_runs(reference, draw, options.name, seeds=options.seeds, runs=options.runs,
                          first=OFFSET + options.chunk * options.runs, truth_fn=truth,
                          two_stage=not options.today,
-                         dew_fn=FAULTS[options.fault](reference) if options.fault else None)
+                         dew_fn=FAULTS[options.name][options.fault](reference) if options.fault else None)
     print(json.dumps({"class": options.name, "chunk": options.chunk, "seeds": options.seeds,
                       "today": options.today, "fault": options.fault, "verdicts": verdicts}), flush=True)
     return 0
