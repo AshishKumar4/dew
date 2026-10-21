@@ -222,6 +222,11 @@ an assertion decides alike on every run."""
 CONFIDENCE = 0.999
 """The bootstrap interval check 1 reads: a site whose pooled ratio's 99.9% interval is wider than
 PARITY cannot tell an equally exact computation from one PARITY off, and is inconclusive."""
+FEWEST_SEEDS = 8
+"""The fewest seeds check 1 judges by, an engineering minimum and no statistical threshold: over very few
+seeds a bootstrap has so few distinct resamples that its interval can sit wholly to one side of PARITY by
+the draws' luck, so fewer is Inconclusive whatever their ratio reads; above it the measured interval
+decides. `seeds_for` never declares fewer."""
 REDRAW = 4
 """A failing site's pooled ratio is drawn again over REDRAW times its seeds before it fails."""
 
@@ -352,6 +357,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/op_certificates.py)."""
+    if seeds < FEWEST_SEEDS:
+        raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
+                           f"(`seeds_for`)")
     draws = _drawn(dew_fn, reference_fn, draw, range(seeds), truth_fn)
     over_first = [index for index in range(len(draws.names))
                   if np.sum(draws.theirs[:, index]) > 0 and _judged(draws, index)[0] > PARITY]
@@ -378,7 +386,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                               f"give the site larger inputs or more seeds (`seeds_for`)")
         elif ratio > PARITY:
             over.append(f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the reference's over "
-                        f"{count} seeds (allowed {PARITY})")
+                        f"{count} seeds, {CONFIDENCE:.1%} interval [{low:.3f}, {high:.3f}] "
+                        f"(allowed {PARITY})")
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
         if not within(my_row, ROW_FACTOR * their_row):
             over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
@@ -392,12 +401,13 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive("\n".join(unresolved))
 
 
-def seeds_for(reference_fn, draw, label: str, *, start: int = 8, most: int = 512, truth_fn=None) -> int:
+def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = 512,
+              truth_fn=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the reference compared
     with itself (its errors on two disjoint seed sets, `_interval`'s control) resolves PARITY in every
     leaf: the pooled ratio's CONFIDENCE interval no wider than PARITY. Fails past `most`, where the
     site needs larger inputs or fewer shared factors, not more seeds."""
-    count = start
+    count = max(start, FEWEST_SEEDS)
     while count <= most:
         first = _drawn(reference_fn, reference_fn, draw, range(count), truth_fn)
         second = _drawn(reference_fn, reference_fn, draw, range(count, 2 * count), truth_fn)
