@@ -34,7 +34,7 @@ from ..hyper_connections import (
     mix_streams,
 )
 from ..inputs import LayerInputs, MixerCall, PredictionPhase
-from ..linear import recomputing
+from ..kernels.recurrence_chunk import recomputing
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
 from ..precision import scaled
