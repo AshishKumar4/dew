@@ -125,23 +125,45 @@ def augmentation_accuracy():
             "bound": float(255 * 8 * np.finfo(np.float32).eps)}
 
 
+def device_steps(steps):
+    """The steps a loader leaves to the accelerator (`Loader.device`), applied to a batch's arrays
+    in one compiled function, as `Trainer.fit` applies them before its update; text fields stay
+    on the host."""
+
+    @jax.jit
+    def apply(arrays):
+        for step in steps:
+            arrays = step(arrays)
+        return arrays
+
+    def augmented(batch):
+        return apply({name: value for name, value in batch.items() if np.asarray(value).dtype.kind in "biuf"})
+
+    return augmented
+
+
 def pipeline_timing(config, backend, crop_scale):
     spec = ImageData(source=TFDS("oxford_flowers102", path=config.flowers, split="all"),
                   image_size=config.image_size, caption_templates=("a photo of a {}",),
                   augment=Augment(flip=True, jitter=True, backend=backend, crop_scale=crop_scale))
-    stream = loader(spec, batch=config.batch, read="memory",
-                  loading=Loading(workers=0, threads=config.threads,
-                      read_buffer=2 * config.batch)).train(DataPartition())
-    consume = jax.jit(lambda pixels: jnp.mean(pixels.astype(jnp.float32)))
+    data = loader(spec, batch=config.batch, read="memory",
+                  loading=Loading(workers=0, threads=config.threads, read_buffer=2 * config.batch))
+    stream = data.train(DataPartition())
+    augmented = device_steps(data.device)
+    reduce = jax.jit(lambda pixels: jnp.mean(pixels.astype(jnp.float32)))
+
+    def consume(batch):
+        return reduce(augmented(batch)["image"])
+
     durations, cpu_times = [], []
     try:
         for _ in range(config.warmup):
-            jax.block_until_ready(consume(next(stream)["image"]))
+            jax.block_until_ready(consume(next(stream)))
         for _ in range(config.repeats):
             cpu_started = time.process_time()
             started = time.perf_counter()
             for _ in range(config.steps):
-                jax.block_until_ready(consume(next(stream)["image"]))
+                jax.block_until_ready(consume(next(stream)))
             durations.append(time.perf_counter() - started)
             cpu_times.append(time.process_time() - cpu_started)
     finally:
@@ -172,19 +194,22 @@ def training_timing(config, backend):
                                   ema_decay=None)
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0))
     state, _, _ = trainer.place()
-    source = loader(spec, batch=config.batch, read="memory",
-                  loading=Loading(workers=0, threads=config.threads, read_buffer=2 * config.batch)).train(
-                      DataPartition.of(trainer.device_mesh))
+    data = loader(spec, batch=config.batch, read="memory",
+                  loading=Loading(workers=0, threads=config.threads, read_buffer=2 * config.batch))
+    source = data.train(DataPartition.of(trainer.device_mesh))
+    # The loader's device steps, augmentation among them, run in their own compiled dispatch
+    # before each update; `Trainer.fit` runs them inside it.
+    augmented = device_steps(data.device)
     durations = []
     with DevicePrefetchIterator(source, trainer.device_mesh) as batches:
-        step = trainer.compile(state, next(batches))
+        step = trainer.compile(state, augmented(next(batches)))
         for _ in range(config.warmup):
-            state, loss, _, _, _, _ = step(state, next(batches))
+            state, loss, _, _, _, _ = step(state, augmented(next(batches)))
         jax.block_until_ready(state)
         for _ in range(config.repeats):
             started = time.perf_counter()
             for _ in range(config.steps):
-                state, loss, _, _, _, _ = step(state, next(batches))
+                state, loss, _, _, _, _ = step(state, augmented(next(batches)))
             jax.block_until_ready(state)
             durations.append(time.perf_counter() - started)
     if not np.isfinite(float(loss)):
