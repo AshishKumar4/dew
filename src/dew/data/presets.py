@@ -336,6 +336,19 @@ def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: in
     return _finished(windows, batch=batch, records=records, host=host)
 
 
+def video(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: int, batch: int,
+          caption: str = "", extensions: tuple[str, ...] = (".mp4", ".avi", ".mov", ".webm"),
+          sample_rate: int | None = None, margin: float = 0.0, context: float = 0.0,
+          missing: Literal["silence", "reject"] = "silence", rejects: bool = True, records: int | None = None,
+          host: tuple[HostStep, ...] = ()) -> Pipeline:
+    """A listing of media files (`Files(url, format="files")`, or rows with a `path` or
+    `video_path`), those whose name ends in one of `extensions`, each read as `clips` reads its
+    media, with its caption, `caption` where it states none. The other settings are `clips`'."""
+    listed = dataset.filter(video_steps.Extensions(extensions)).map(video_steps.Row(caption))
+    return clips(listed, seconds, frames=frames, fps=fps, size=size, batch=batch, sample_rate=sample_rate,
+                 margin=margin, context=context, missing=missing, rejects=rejects, records=records, host=host)
+
+
 def _decoded_images(rows: Dataset, size: int, *, field: str = "image", at_least: int | None = None,
                     rejects: bool = True) -> Pipeline:
     """The images in `field` decoded, reduced no further than `at_least` pixels where given, and
