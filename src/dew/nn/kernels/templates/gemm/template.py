@@ -26,6 +26,7 @@ their VJPs in XLA, recomputing the accumulator only where the epilogue's VJP rea
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.extend import core as jax_core
 
 from dew.nn.kernels import generation, grouped_matmul
 
@@ -159,10 +160,10 @@ def _reads_accumulator(epilogue, acc_shape: tuple, sides: tuple) -> bool:
     acc = jax.ShapeDtypeStruct(acc_shape, jnp.float32)
     outs = jax.eval_shape(lambda acc, *sides: _as_tuple(epilogue(acc, *sides)), acc, *sides)
     closed = jax.make_jaxpr(pulled)(acc, sides, outs)
-    needed = {var for var in closed.jaxpr.outvars if isinstance(var, jax.core.Var)}
+    needed = {var for var in closed.jaxpr.outvars if isinstance(var, jax_core.Var)}
     for equation in reversed(closed.jaxpr.eqns):
         if needed.intersection(equation.outvars):
-            needed.update(var for var in equation.invars if isinstance(var, jax.core.Var))
+            needed.update(var for var in equation.invars if isinstance(var, jax_core.Var))
     return closed.jaxpr.invars[0] in needed
 
 
