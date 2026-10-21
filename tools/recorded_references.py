@@ -83,8 +83,8 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_in
                                [np.zeros(0), *(leaf.zero_errors for leaf in evidence)]),
                            f"{label}.zero_offsets.{name}": np.cumsum(
                                [0, *(len(leaf.zero_rows) for leaf in evidence)]),
-                           f"{label}.sketch.{name}": np.stack([truth_sketch(record[2][name])
-                                                               for record in records[:kept]]),
+                           f"{label}.sketch.{name}": np.stack([truth_sketch(record[2][name], seed)
+                                                               for seed, record in enumerate(records[:kept])]),
                            f"{label}.shape.{name}": np.asarray(np.shape(records[0][2][name]), np.int64),
                            f"{label}.dtype.{name}": np.asarray(evidence[0].dtype)})
         result[f"{label}.input_digest"] = np.asarray([input_digest(record[0]) for record in records[:kept]])
