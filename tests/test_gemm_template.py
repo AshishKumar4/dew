@@ -1025,10 +1025,13 @@ def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton(
     and gradient (GMMGATE-h100-8)."""
     drawn = [jax.ShapeDtypeStruct(array.shape, array.dtype) for array in _draw(0)]
     dew = _drop(_dew(CASES["broadcast axes"]))
+
+    def loss(*drawn):
+        return sum(jnp.sum(out.astype(jnp.float32)) for out in dew(*drawn))
+
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh), generation.routes() as taken:
         jax.jit(dew).trace(*drawn).lower(lowering_platforms=("cuda",))
-        loss = lambda *drawn: sum(jnp.sum(out.astype(jnp.float32)) for out in dew(*drawn))  # noqa: E731
         jax.jit(jax.grad(loss)).trace(*drawn).lower(lowering_platforms=("cuda",))
     assert _kernels(taken) == {'triton'}
 
