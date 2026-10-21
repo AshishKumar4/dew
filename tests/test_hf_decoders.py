@@ -867,6 +867,27 @@ def test_llada_moe_logits_match_the_released_model_code(llada_moe_source):
                     truth_fn=lambda seed: truth[int(seed)], seeds=8)
 
 
+@pytest.mark.mesh(devices=4)
+def test_llada_moe_expert_and_sequence_shards_match_released_logits(llada_moe_source):
+    from dew.nn.sharding import mesh_axes
+    from dew.training import Layout, MeshSpec
+
+    name, _, ids, fields = llada_moe_source
+    mesh = MeshSpec(expert=2, sequence=2).build(jax.devices()[:4])
+    source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference',
+                              mesh=mesh, layout=Layout(min_shard=1, tolerance=1.0))
+    kernels = [value for path, value in flat_tree(source.variables['params']).items()
+               if '.experts.' in path]
+    assert all(any('expert' in mesh_axes(axis) for axis in value.sharding.spec) for value in kernels)
+    reference = np.load(FIXTURES / name / 'probe_logits.npy')
+    truth = np.load(FIXTURES / name / 'probe_logits_f64.npy')
+    with jax.set_mesh(mesh):
+        forward = jax.jit(lambda tokens: source.model.apply(source.variables, tokens, **fields))
+        assert_as_exact(lambda seed: forward(ids[int(seed)]), lambda seed: reference[int(seed)],
+                        lambda seed: (np.asarray(seed, np.int32),), name + ' sharded released logits',
+                        truth_fn=lambda seed: truth[int(seed)], seeds=8)
+
+
 def test_llada_moe_routing_limits_change_the_forward(llada_moe_source):
     """The expert bias, group limit and 2.2 block shortlist each bind on real hidden states."""
     from dataclasses import replace
