@@ -303,16 +303,53 @@ def _tiny_row(dew_ulps):
     return jax.jit(run(dew_ulps)), jax.jit(run(0))
 
 
-def test_a_small_row_the_reference_resolves_is_judged_at_its_own_size():
+def test_a_small_row_the_reference_measures_is_judged_at_its_own_size():
     """A row 1e-18 of its leaf, which float64 holds to its own precision, lies below RESOLUTION of the
     leaf; the reference carries it exactly, so it is no row of float64 zero: Dew four float32 units off
     there is ordinary rounding judged at the row's own size, as at every row, and passes; four thousand
-    units off fails the worst-row rule."""
+    units off fails the worst-row rule. The row is held against the reference's worst row over the leaf,
+    not its own error on the row, which is exact: the zero rows' rule failed Dew at four units, the
+    worst-row rule admits Dew's row up to ROW_FACTOR times the leaf's worst."""
     dew, reference = _tiny_row(4)
     assert_as_exact(dew, reference, _draw, "tiny row", seeds=8)
     further, reference = _tiny_row(4000)
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(further, reference, _draw, "tiny row", seeds=8)
+    assert raised.type is AssertionError
+
+
+def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
+    """A recording that keeps its reference's evidence and its truth's sketch alone (`record_case`'s
+    summary) keeps no row's own size, and its sketch holds the truth at its leaf's scale, not a tiny
+    row's: its rows below RESOLUTION keep the zero rows' rule, so Dew four float32 units off on the row
+    the reference holds exactly fails there, where the live reference judges the row at its own size."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+    dew, live = _tiny_row(4)
+
+    def draw(seed):
+        x, w = _draw(seed)
+        return {"x": x, "w": w}
+
+    def as_inputs(fn):
+        return lambda inputs: fn(inputs["x"], inputs["w"])
+
+    def evaluate(inputs):
+        with jax.enable_x64(new_val=False):
+            reference = jax.tree.map(np.asarray, live(inputs["x"], inputs["w"]))
+        truth = jax.tree.map(np.asarray, live(*(np.asarray(inputs[n], np.float64) for n in ("x", "w"))))
+        return reference, truth
+
+    with jax.enable_x64(new_val=True):
+        recorded = recorder.record_case("site", draw, evaluate, as_inputs(live), summary=True)
+    seeds = int(recorded["site.seeds"])
+    assert_as_exact(dew, live, _draw, "live", seeds=seeds)
+    drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
+                                                truth_fn=as_inputs(live))
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(lambda index, inputs: as_inputs(dew)(inputs), reference, drawn, "summarized",
+                        seeds=seeds, truth_fn=truth)
     assert raised.type is AssertionError
 
 

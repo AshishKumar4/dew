@@ -389,7 +389,7 @@ class RecordedLeaf:
     mean squared error from its own float64 truth, its worst sized row over its size, its RMS error on
     each row the truth sizes zero (below RESOLUTION of its leaf) by the row's index, and whether it and
     its truth were finite; read from a leaf here (`leaf_summary`), also the truth's own RMS on each of
-    those rows, which decides whether a row the reference resolves is zero (`_paired`)."""
+    those rows, which decides whether a row a live reference measures is zero (`_paired`)."""
     mse: float
     worst: float
     zero_rows: np.ndarray
@@ -474,13 +474,17 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     `leaf_summary`: their mean squared errors, their worst sized rows, how many rows of float64 zero Dew
     is further from than ROW_FACTOR times the reference is on that same row (`rows_over`'s rule for
     them), and whether every value was finite. A row the truth sizes zero (below RESOLUTION of its leaf)
-    is one of float64 zero only where the reference does not resolve it, its error there at least the
-    row's own float64 RMS: a sum that cancels to float64's residue. A row the reference resolves, a
-    small value float64 holds to its own precision (a product far below its leaf), is judged at its own
-    size as any row is, its error over its size entering both worst rows. The truth is the one both
-    share, so the sizes are Dew's side's (a recorded reference keeps none). A row of zero in Dew's truth
-    the reference's lacks (a recorded truth recomputed otherwise) is refused. Not `paired`, the two held
-    to truths of their own draws (`null_runs`), no row is paired."""
+    is one of float64 zero unless a live reference measures it: its error there below the row's own
+    float64 RMS, so it carries the row better than zero would. That is an engineering definition of a
+    measured row, not a proof of float64's accuracy on it; a sum that cancels to float64's residue is
+    never measured so, and a product far below its leaf, which float64 holds to its own precision, is.
+    A measured row is judged at its own size as any row is, its error over its size entering both worst
+    rows: against the reference's worst row over the leaf, which holds it with less power than the zero
+    rows' rule held it against the reference's own error on it. Both arms are classified alike, from the
+    one truth they share. A recorded reference keeps no row's own size, and the recording's sketch holds
+    the truth at the leaf's scale, not a tiny row's, so its rows keep the zero rows' rule. A row of zero
+    in Dew's truth the reference's lacks (a recorded truth recomputed otherwise) is refused. Not
+    `paired`, the two held to truths of their own draws (`null_runs`), no row is paired."""
     if not paired:
         return mine.mse, theirs.mse, mine.worst, theirs.worst, 0, mine.finite and theirs.finite
     at_zero = dict(zip(theirs.zero_rows.tolist(), theirs.zero_errors.tolist(), strict=True))
@@ -488,9 +492,11 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     if unrecorded:
         raise AssertionError(f"{name}: the truth holds rows of float64 zero the reference's did not, "
                              f"{unrecorded[:4]}")
-    rows = zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), mine.zero_sizes.tolist(), strict=True)
+    sizes = (dict(zip(theirs.zero_rows.tolist(), theirs.zero_sizes.tolist(), strict=True))
+             if theirs.zero_sizes is not None else {})
     worst, their_worst, zero = mine.worst, theirs.worst, 0
-    for at, error, size in rows:
+    for at, error in zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), strict=True):
+        size = sizes.get(at, 0.0)
         if at_zero[at] < size:
             worst, their_worst = max(worst, error / size), max(their_worst, at_zero[at] / size)
         elif not error <= ROW_FACTOR * at_zero[at]:
@@ -583,8 +589,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     """Check 1 of the owner's gate (bible §7, 2026-10-20): on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst; each row of float64 zero (below RESOLUTION
-    of its leaf where the reference does not resolve it, `_paired`) no further from it than ROW_FACTOR
-    times the reference on that row; every value finite.
+    of its leaf where a live reference does not measure it, `_paired`) no further from it than
+    ROW_FACTOR times the reference on that row; every value finite.
 
     `draw(seed)` returns the inputs of one draw, the same for a seed on every run; `dew_fn(*inputs)`
     and `reference_fn(*inputs)` return the same tree, and truth is `reference_fn` on the inputs
