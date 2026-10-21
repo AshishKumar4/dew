@@ -230,8 +230,13 @@ def unpacked(model: nn.Module, variables: Variables) -> Variables:
     """`variables` as training and an export read them, the model's own tree: each group they hold
     packed (a loaded task's serving layout) split back into its members (`_split`), on the host one
     group at a time, so the devices hold no second copy. A packed leaf no one process holds whole
-    splits where it lives. A tree that holds no group packed is returned as it is."""
-    groups = _held_packed(model, variables)
+    splits where it lives. A group stored quantized for serving (`TextGeneration.quantized`, Qwix's
+    arrays in place of its kernel) stays packed: such a tree computes only as the served model it
+    was quantized for, which reads it packed. A tree that holds no group to split is returned as it
+    is."""
+    groups = tuple(group for group in _held_packed(model, variables) if all(
+        isinstance(leaf, (jax.Array, np.ndarray)) for leaf in _node(variables, "params", group.path)[
+            group.packed].values()))
     if not groups:
         return variables
 

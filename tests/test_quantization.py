@@ -678,6 +678,28 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
     np.testing.assert_allclose(drawn.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
 
 
+def test_an_objective_over_a_quantized_packed_task_holds_its_served_tree():
+    """A task's tree quantized for serving computes only as its served model, which reads its
+    projections packed: an objective built over it, a distillation teacher's, holds that tree as it
+    is, and computes the served task's logits."""
+    from pathlib import Path
+
+    import dew
+    from dew.objectives.lm import LMObjective
+
+    pytest.importorskip("qwix")
+    directory = Path(__file__).parent / "fixtures/hf/llama-tiny"
+    served = dew.pipeline(str(directory), dtype="float32").quantized(
+        Quantization(weight_only=True, patterns=(".*_proj",)))
+    assert "qkv_proj" in served.variables["params"]["layers_0"]["self_attn"]
+    held = LMObjective(served.model, 3, variables=served.variables).variables
+    for ours, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(served.variables), strict=True):
+        assert ours is theirs
+    tokens = jnp.asarray([[1, 2, 3]], jnp.int32)
+    np.testing.assert_array_equal(served.model.apply(held, tokens),
+                                  served.model.apply(served.variables, tokens))
+
+
 def test_a_quantized_multimodal_task_keeps_its_processor_and_media():
     from pathlib import Path
 
