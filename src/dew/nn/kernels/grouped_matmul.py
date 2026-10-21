@@ -458,15 +458,25 @@ _TGMMS = (MosaicTgmm(), Tgmm())
 def _gmm(tokens, kernel, sizes, out_dtype, *, trans_rhs: bool, interpret: bool):
     arguments = (tokens, kernel.astype(tokens.dtype), sizes)
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'trans_rhs': trans_rhs, 'interpret': interpret}
-    launch = base.choose('grouped_matmul', _GMMS_TRANSPOSED if trans_rhs else _GMMS, *arguments, **options)
+    launch = _launch(_GMMS_TRANSPOSED if trans_rhs else _GMMS, arguments, options)
     return launch(*arguments, **options)
 
 
 def _tgmm(tokens, cotangent, sizes, out_dtype, *, interpret: bool):
     arguments = (tokens, cotangent.astype(tokens.dtype), sizes)
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'interpret': interpret}
-    launch = base.choose('grouped_matmul', _TGMMS, *arguments, **options)
-    return launch(*arguments, **options)
+    return _launch(_TGMMS, arguments, options)(*arguments, **options)
+
+
+def _launch(launches, arguments, options):
+    """The launch of `launches` that runs the call: the cost model's (`base.choose`), except in a GPU
+    process's CPU branch, which interprets Triton's, the one launch that interprets there
+    (`_Mosaic.eligible`): a chosen implementation names the GPU's launch, the branch the call takes."""
+    if options['interpret'] and jax.default_backend() != 'cpu':
+        *_, triton = launches
+        generation.route('grouped_matmul', kernel=triton.name)
+        return triton
+    return base.choose('grouped_matmul', launches, *arguments, **options)
 
 
 def _on_platform(kernel, fallback, interpret_on_cpu: bool):
