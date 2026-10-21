@@ -689,7 +689,7 @@ class Transaction:
             # The record of each of the window's other microbatches the commit replays, in its slot.
             own = realized.aux.record
             unreplayed = None if own is None else [jax.tree.map(jnp.zeros_like, (own, self._places(
-                state, state.microstep % self.size, batch, part))) for _ in range(self.size - 1)]
+                state.microstep % self.size, batch, part))) for _ in range(self.size - 1)]
 
             def replay(_):
                 cot = pooled(pending.pooled, realized.stats, factor)
@@ -700,7 +700,8 @@ class Transaction:
                     realized = realize(replayed, records, step_info)
                     if kept is not None:
                         attempt = state.accumulation.attempts[index]
-                        evaluated = (realized.aux.record, self._places(index, records, attempt % self.split))
+                        evaluated = (realized.aux.record, self._places(index, records,
+                                                                       attempt % self.split))
                         kept = [jax.tree.map(lambda held, new, slot=slot: jnp.where(slot == index, new, held),
                                              held, evaluated) for slot, held in enumerate(kept)]
                     return add(accumulated, realized.pullback(cot), factor), kept
