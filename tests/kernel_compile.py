@@ -1,65 +1,79 @@
-"""Compile Pallas kernels for a GPU on this CPU with Triton's own compiler: the CPU suite's first filter
-for declared kernel configs (tests/test_kernel_configs.py). A GPU's tests are the verdict."""
+"""Compile Pallas kernels for a GPU on this CPU with the compiler the GPU itself runs: the CPU suite's
+first filter for declared kernel configs (tests/test_kernel_configs.py). XLA's CUDA backend (the
+jax-cuda12-plugin of this jaxlib, the `test` extra) compiles a program for a compile-only device of the
+generation, no GPU attached, through the Triton jaxlib bundles: so a kernel's shared bytes here are the
+bytes the GPU asks for, the GPU's own refusal included. A GPU's tests are the verdict on everything else.
+"""
 
-import concurrent.futures
-import hashlib
-import json
-import os
-import signal
-import subprocess
-import sys
+import functools
+import re
 import tempfile
 from pathlib import Path
 
 import jax
+import jax.experimental.topologies as topologies
 import numpy as np
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
-from dew.training._lowering import TritonCall, triton_calls
+from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
 
-HUNG = 600.0
-"""Wall seconds after which a compile's child session is stopped as hung: the process boundary's
-guard, not a bound on the kernel. How long a compile takes on a shared CPU says nothing about it."""
+THREADS_PER_MULTIPROCESSOR = {(8, 0): 2048, (9, 0): 2048, (10, 0): 2048}
+"""Resident threads a multiprocessor holds by compute capability, 1536 on the others the targets name
+(CUDA C++ Programming Guide, "Technical Specifications per Compute Capability")."""
 
-_COMPILE = """import json, sys
-import triton
-from triton.backends.compiler import GPUTarget
+REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
+"""XLA's refusal of a Triton kernel whose shared memory a block of the GPU does not hold."""
 
-entry = json.loads(sys.argv[1])
-kernel = triton.compile(entry["path"], target=GPUTarget("cuda", entry["capability"], 32),
-                        options={"num_warps": entry["warps"], "num_stages": entry["stages"]})
-print(json.dumps({"shared": kernel.metadata.shared}))
+KERNEL = re.compile(r"kCustomKernel .*? shared_memory: (\d+) bytes")
+"""A custom (Triton) kernel's line in XLA's thunk sequence, with the shared bytes it launches with."""
+
+
+def target_config(generation: str) -> str:
+    """The `gpu_device_info` XLA compiles for, from the CUDA `generation`'s target
+    (`generation.TARGETS`): its compute capability, the shared memory a block may opt into, its
+    multiprocessors, clock and bandwidth; CUDA's per-capability limits for the rest. The fields past
+    the capability and shared memory only steer XLA's own fusions, never a Triton kernel's code."""
+    target, version = gpu_target(generation), capability(generation)
+    facts = (target.shared_limit, target.multiprocessors, target.clock_hz, target.memory_bandwidth)
+    if version is None or any(fact is None for fact in facts):
+        raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
+    major, minor = version
+    shared, multiprocessors, clock, bandwidth = facts
+    return f"""gpu_device_info {{
+  threads_per_block_limit: 1024
+  threads_per_warp: 32
+  shared_memory_per_block: 49152
+  shared_memory_per_core: {shared + 1024}
+  threads_per_core_limit: {THREADS_PER_MULTIPROCESSOR.get((major, minor), 1536)}
+  core_count: {multiprocessors}
+  fpus_per_core: {64 if (major, minor) == (8, 0) else 128}
+  block_dim_limit_x: 2147483647
+  block_dim_limit_y: 65535
+  block_dim_limit_z: 65535
+  memory_bandwidth: {int(bandwidth)}
+  clock_rate_ghz: {clock / 1e9}
+  shared_memory_per_block_optin: {shared}
+  cuda_compute_capability {{
+    major: {major}
+    minor: {minor}
+  }}
+  registers_per_core_limit: 65536
+  registers_per_block_limit: 65536
+}}
+platform_name: "CUDA"
+dnn_version_info {{
+  major: 9
+}}
+device_description_str: "{target.device_kind}"
 """
 
 
-def _triton_text(calls: list[TritonCall]) -> list[str]:
-    """Each call's Triton IR as text, without debug locations."""
-    # Triton IR parses only in a context with Triton's dialect, which JAX's own MLIR bindings register.
-    from jax.interpreters import mlir
-    from jaxlib.mlir import ir
-    from jaxlib.triton import dialect
-
-    context = mlir.make_ir_context()
-    dialect.register_dialect(context)
-    with context:
-        return [ir.Module.parse(call.ir).operation.get_asm(enable_debug_info=False) for call in calls]
-
-
-def _compiled(entry: dict) -> dict:
-    """One Triton call compiled by pip's Triton in a child of its own session: its shared bytes, or why
-    it has none. A session still running at HUNG seconds is stopped."""
-    child = subprocess.Popen([sys.executable, "-c", _COMPILE, json.dumps(entry)], stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, text=True, start_new_session=True)
-    try:
-        output, _ = child.communicate(timeout=HUNG)
-    except subprocess.TimeoutExpired:
-        os.killpg(child.pid, signal.SIGKILL)
-        child.communicate()
-        return {"error": f"its compile hung past {HUNG:.0f} s"}
-    if child.returncode:
-        return {"error": f"Triton's compile failed ({child.returncode}): {output.strip()[-800:]}"}
-    return json.loads(output.strip().splitlines()[-1])
+@functools.cache
+def _device(generation: str) -> Mesh:
+    """A one-device mesh of a compile-only device of `generation`."""
+    topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=target_config(generation),
+                                            topology="1x1x1")
+    return Mesh(np.array(topology.devices[:1]), ("data",))
 
 
 def failures(found: list[dict]) -> list[str]:
@@ -71,45 +85,38 @@ def failures(found: list[dict]) -> list[str]:
 
 def compile_kernels(cases, generation: str) -> list[dict]:
     """Each case (`name`, `call()` giving the kernel and abstract operands) on the CUDA `generation`,
-    lowered as on that GPU on this host (`assumed`, `gpu_mesh`) and compiled by pip's Triton for its
-    capability, never run: its name, the generation's block limit, and the shared bytes Triton allocates (the
-    most of any call it makes), or the error.
+    lowered as on that GPU on this host (`assumed`, `gpu_mesh`) and compiled by XLA for a compile-only
+    device of it, never run: its name, the generation's block limit, and the shared bytes its Triton
+    kernels launch with (the most of any; those XLA refused, where it refused one), or the error.
 
-    A cheap first filter, not a GPU's verdict: a kernel that does not compile or takes more shared
-    memory than its GPU's block holds fails here, before a GPU is paid for. Identical IR compiles once;
-    compiles run one to each CPU this process may use."""
+    A cheap first filter: a kernel that does not compile or takes more shared memory than its GPU's
+    block holds fails here as it would there, before a GPU is paid for."""
+    mesh = _device(generation)
+    replicated = NamedSharding(mesh, PartitionSpec())
     found: list[dict] = []
-    calls: dict[str, tuple[dict, list[dict]]] = {}
-    with tempfile.TemporaryDirectory(prefix="dew-compile-") as scratch:
-        mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation)
-        for case in cases:
-            record: dict = {"name": case.name, "generation": generation,
-                            "limit": gpu_target(generation).shared_limit, "shared": 0}
-            found.append(record)
-            fn, args = case.call()
+    for case in cases:
+        record: dict = {"name": case.name, "generation": generation,
+                        "limit": gpu_target(generation).shared_limit, "shared": 0}
+        found.append(record)
+        fn, args = case.call()
+        placed = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=replicated)
+                              if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, args)
+        try:
+            with assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)):
+                lowered = jax.jit(fn).trace(*placed).lower()
+        except Exception as error:  # A case that does not lower is its own failure.
+            record["error"] = f"it does not lower: {str(error)[-800:]}"
+            continue
+        with tempfile.TemporaryDirectory(prefix="dew-compile-") as dump:
             try:
-                with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
-                    lowered = jax.jit(fn).trace(*args).lower(lowering_platforms=("cuda",))
-            except Exception as error:  # A case that does not lower is its own failure.
-                record["error"] = f"it does not lower: {str(error)[-800:]}"
+                lowered.compile(compiler_options={"xla_dump_to": dump})
+            except jax.errors.JaxRuntimeError as error:
+                refused = REFUSED.search(str(error))
+                if refused is None:
+                    record["error"] = f"XLA does not compile it: {str(error)[-800:]}"
+                else:
+                    record["shared"] = int(refused.group(1))
                 continue
-            triton = triton_calls(lowered)
-            for call, text in zip(triton, _triton_text(triton), strict=True):
-                named = f"{generation}|{call.warps}|{call.stages}|{text}"
-                key = hashlib.sha256(named.encode()).hexdigest()
-                if key not in calls:
-                    path = Path(scratch) / f"{len(calls)}.ttir"
-                    path.write_text(text)
-                    calls[key] = ({"path": str(path), "capability": int(generation.removeprefix("sm")),
-                                   "warps": call.warps, "stages": call.stages}, [])
-                calls[key][1].append(record)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(os.sched_getaffinity(0))) as pool:
-            entries = [entry for entry, _ in calls.values()]
-            outcomes = list(pool.map(_compiled, entries))
-    for (_, records), outcome in zip(calls.values(), outcomes, strict=True):
-        for record in records:
-            if "error" in outcome:
-                record.setdefault("error", outcome["error"])
-            else:
-                record["shared"] = max(record["shared"], outcome["shared"])
+            sequences = [path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")]
+        record["shared"] = max((int(size) for text in sequences for size in KERNEL.findall(text)), default=0)
     return found

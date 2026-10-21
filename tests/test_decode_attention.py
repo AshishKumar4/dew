@@ -819,7 +819,7 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
     every GPU here, lowered for each GPU on this CPU and compiled by Triton
     within its block's shared memory. A first filter: the A100 runs them; the H100 and the RTX PRO
     6000 have this check alone."""
-    pytest.importorskip("triton")
+    pytest.importorskip("jax_cuda12_plugin")
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_kernels, failures
 
