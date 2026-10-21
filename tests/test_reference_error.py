@@ -373,5 +373,6 @@ def test_a_recording_of_the_references_evidence_alone_holds_the_recomputed_truth
     _, _, wrong = indexed_recording(recorded, "site", seeds, inputs_of=draw, truth_fn=off)
     with pytest.raises(AssertionError), jax.enable_x64(new_val=True):
         wrong(*widened(drawn(0)))
+    assert recorded["site.sketch.y"].shape == (len(recorded["site.mse.y"]), 16)
     with pytest.raises(AssertionError):
         indexed_recording(recorded, "site", seeds, inputs_of=draw)
