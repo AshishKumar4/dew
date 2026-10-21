@@ -1042,10 +1042,6 @@ EMA copy merged over the live parameters, so you don't repeat the model
 configuration at generation time.
 
 ```python
-from dew.data.images import EncodeCaptions
-from dew.config.data import loader
-from dew.data import TFDS
-from dew.config.data import Augment
 from pathlib import Path
 
 import jax
@@ -1054,21 +1050,22 @@ import optax
 
 from dew import Checkpoints, Trainer
 from dew.config import ModelConfig, TrainerConfig
-from dew.data import Loading
-from dew.config.data import ImageData
-from dew.diffusion import presets
+from dew.data import TFDS, presets
+from dew.diffusion.presets import EDM
 from dew.inference import TextToImage
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.sampling import Heun
 
 run = Path("runs/flowers-run")
+data_path = Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"
+flowers = TFDS("oxford_flowers102", split="all", path=str(data_path))
 config = DiffusionRunConfig(
     model=ModelConfig.from_model(SimpleDiT(patch_size=4, emb_features=128, num_layers=4,
                                            num_heads=4, dtype=jnp.bfloat16)),
-    data=ImageData(source=TFDS(name="oxford_flowers102", split="all", path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1")), image_size=64, caption_templates=("a photo of a {}",), augment=Augment(flip=True, jitter=True, backend="device")),
-    trainer=TrainerConfig(checkpoint_dir=str(run), batch_size=16, steps=20, keep=1),
-    preset=presets.EDM(regime="pixel"),
+    data=flowers.shuffle(seed=0).repeat().pipe(presets.images, 64, batch=16, augment=True),
+    trainer=TrainerConfig(checkpoint_dir=str(run), steps=20, keep=1),
+    preset=EDM(regime="pixel"),
     text=None,
 )
 
@@ -1077,10 +1074,7 @@ def main():
     objective = config.build()
     checkpoints = Checkpoints(str(run), keep=1)
     state = Trainer(objective, optax.adamw(2e-4), key=jax.random.key(0),
-                    checkpoints=checkpoints).fit(
-        loader(config.data, batch=16, read="memory", loading=Loading(workers=0),
-             host=(EncodeCaptions(objective.inputs.tokenize),)),
-        steps=20, log_every=20, checkpoint_every=20)
+                    checkpoints=checkpoints).fit(config.data, steps=20, log_every=20, checkpoint_every=20)
     checkpoints.wait()
     config.save(str(run))
     print(sorted(path.name for path in run.iterdir()))
@@ -1098,10 +1092,8 @@ if __name__ == "__main__":
 The run directory then holds `['20', 'run.json']` and the task draws
 `(2, 64, 64, 3)` images clipped to `[-1, 1]`. `text=None` trains an
 unconditional model, so the prompt list only sets how many images to draw; a
-run with a `TextCondition` encodes the prompts with the encoder it names.
-`load` applies `EncodeCaptions(objective.inputs.tokenize)` as a common host
-stage because the objective's conditions read captions. It runs in the
-training process after batching and closes with the iterator.
+run with a `TextCondition` encodes the prompts with the encoder it names, and
+its objective encodes each batch's captions as the trainer reads them.
 
 ### Exporting a decoder and serving it
 
