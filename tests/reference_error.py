@@ -289,6 +289,9 @@ class _Draws:
 SKETCH = 16
 """The random projections a recording keeps of each leaf of its reference's float64 truth (`truth_sketch`):
 a truth moved beyond float64's rounding anywhere in the leaf, a wrong row or index, moves each of them."""
+SKETCH_DEVIATIONS = 6.0
+"""How many of its own norms a difference independent of the projections may move one projection by:
+a standard normal's, past which one in 5e8 lands (`indexed_recording`'s sketch bound)."""
 
 
 @functools.cache
@@ -345,10 +348,12 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
                                                   strict=True):
             if np.size(leaf) == 0:
                 # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
-                # reference's shape and dtype, it adds no error and resolves nothing.
+                # reference's shape and dtype (a recorded one's to its truth's shape), it adds no error
+                # and resolves nothing.
                 kept = (np.shape(leaf), jnp.dtype(leaf.dtype))
-                assert kept == (np.shape(their_leaf), jnp.dtype(their_leaf.dtype)), (
-                    jax.tree_util.keystr(path), kept, np.shape(their_leaf))
+                if not isinstance(their_leaf, RecordedLeaf):
+                    assert kept == (np.shape(their_leaf), jnp.dtype(their_leaf.dtype)), (
+                        jax.tree_util.keystr(path), kept, np.shape(their_leaf))
                 # The truth empty alike (in float64, its dtype is its own).
                 assert np.shape(true) == np.shape(leaf), (jax.tree_util.keystr(path), np.shape(true))
                 row.append((0.0, 0.0, 0.0, 0.0, 0, True))
@@ -642,9 +647,10 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         for name, value in computed.items():
             value = np.asarray(value, np.float64)
             recorded = sketch[name][index]
-            norms = np.linalg.norm(_projections(value.size), axis=0) if value.size else np.zeros(SKETCH)
             scale = float(np.sqrt(np.mean(np.square(value)))) if value.size else 0.0
-            bound = 2 * roundings["count"] * eps * scale * np.sqrt(value.size) * norms
+            # The oracle rule bounds the difference's norm; its projection on a standard normal vector
+            # drawn apart from it is that norm times a standard normal.
+            bound = 2 * roundings["count"] * eps * scale * np.sqrt(value.size) * SKETCH_DEVIATIONS
             apart = np.abs(truth_sketch(value) - recorded)
             if apart.shape != recorded.shape or not (apart <= bound).all():
                 away = float(np.max(apart)) if apart.size else 0.0

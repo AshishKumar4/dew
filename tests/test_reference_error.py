@@ -337,8 +337,8 @@ def test_a_recording_of_outputs_alone_draws_its_inputs_again(tmp_path):
 def test_a_recording_of_the_references_evidence_alone_holds_the_recomputed_truth_to_its_sketch():
     """A recording that keeps the reference's evidence (`leaf_summary`) and its truth's sketch, no
     outputs: check 1 judges Dew against it with the test's own float64 path as truth, held at every seed
-    to the recorded sketch, so a float64 path that computes one row a millionth off is refused, and a
-    recording without that path is refused outright."""
+    to the recorded sketch, so a float64 path that computes one element a millionth off is refused, and
+    a recording without that path is refused outright."""
     from tool_support import load
 
     recorder = load("recorded_references")
@@ -368,7 +368,7 @@ def test_a_recording_of_the_references_evidence_alone_holds_the_recomputed_truth
 
     def off(inputs):
         y = wide(inputs)["y"]
-        return {"y": y.at[3].multiply(1 + 1e-6)}
+        return {"y": y.at[3, 5].multiply(1 + 1e-6)}
 
     _, _, wrong = indexed_recording(recorded, "site", seeds, inputs_of=draw, truth_fn=off)
     with pytest.raises(AssertionError), jax.enable_x64(new_val=True):
