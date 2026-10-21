@@ -45,6 +45,7 @@ from dew.data.dataset import (
     RampedStream,
     Reader,
     Stage,
+    rows_of,
     stream_endless,
     stream_identity,
 )
@@ -163,7 +164,7 @@ from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, HeldBest, rankings
 from dew.training.state import MODEL_STATE, Accumulation, TrainState, kept_window
 from dew.training.tracker import Tracker
-from dew.training.transaction import Committed, Transaction, compact_qk, outcome, with_ema
+from dew.training.transaction import Committed, Transaction, compact_qk, dropped_window, outcome, with_ema
 
 _log = logging.getLogger(__name__)
 
@@ -490,9 +491,8 @@ class Trainer(Generic[Loss, Effects]):
         # whether a step compiled since has yet to run once.
         self.memory: JSON = None
         self._unproven = False
-        # The links the last compiled step decided its projections by, which
-        # say whether one spread over each axis (`dew.nn.sharding.Link`), and
-        # each mesh axis's measured bandwidth.
+        # The links the last compiled step decided its projections by, which say whether one spread over
+        # each axis (`dew.nn.sharding.Link`), and each mesh axis's measured bandwidth.
         self.links: dict[str, Link] = {}
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
@@ -525,6 +525,7 @@ class Trainer(Generic[Loss, Effects]):
         self._rows: tuple[int, ...] | None = None
         # The stages of the batch ramp `fit` reads, which change the batch's shape; none without one.
         self._ramp: tuple[Stage, ...] = ()
+        self._window_rows: int | None = None
         # The training batch's device steps, which the compiled step runs (`Loader.device`).
         self._device: tuple[DeviceStep, ...] = ()
 
@@ -560,9 +561,8 @@ class Trainer(Generic[Loss, Effects]):
         # Static metadata, the same on every trace of the state: the
         # placement reads it from here rather than tracing init again.
         self._boxed = boxed_axes(initialized)
-        # The state holds its trees as dicts, whichever Flax container (a
-        # FrozenDict) the objective's tree came in, so its placement, its
-        # updates and its restores share one structure.
+        # The state holds its trees as dicts, whichever Flax container (a FrozenDict) the objective's
+        # tree came in, so its placement, its updates and its restores share one structure.
         params = unfreeze(nn.unbox(initialized))
         if "params" not in params:
             raise ValueError(
@@ -578,9 +578,8 @@ class Trainer(Generic[Loss, Effects]):
             window_size=jnp.asarray(self.accumulation, jnp.int32),
             variables=params,
             opt_state=self._boxed_init(initialized, params["params"]),
-            # The average starts equal to the parameters but as its own
-            # buffers: the step donates the state, and a buffer can be
-            # donated once.
+            # The average starts equal to the parameters but as its own buffers: the step donates
+            # the state, and a buffer can be donated once.
             ema=None if ema is None else jax.tree.map(jnp.copy, select(params, ema.select)),
             key=run_key,
         )
@@ -697,9 +696,8 @@ class Trainer(Generic[Loss, Effects]):
         It returns the state with its shardings and the data position a resume
         continues from.
         """
-        # Resolved once, so that the shapes and the values are the same
-        # inputs through the same overridable method, and the objective is
-        # asked for what it holds exactly once.
+        # Resolved once, so that the shapes and the values are the same inputs through the same
+        # overridable method, and the objective is asked for what it holds exactly once.
         initializer, key = self.objective.initializer, self.key
         if self.host_master:
             from dew.training.host import transfer
@@ -709,9 +707,8 @@ class Trainer(Generic[Loss, Effects]):
         shardings = self.shardings(abstract)
         self.check(abstract.variables, shardings.variables)
         checkpoints = self.checkpoints
-        # Each process lists the checkpoints itself, and on a shared
-        # filesystem one listing can lag another's: every process resumes
-        # from one step or none does.
+        # Each process lists the checkpoints itself, and on a shared filesystem one listing can lag
+        # another's: every process resumes from one step or none does.
         resume = None if checkpoints is None else agreed_same("newest checkpoint", lambda: checkpoints.latest)
         if checkpoints is None or resume is None:
             if self.host_master:
@@ -1110,24 +1107,30 @@ class Trainer(Generic[Loss, Effects]):
 
     def _runner(self, planned: Planned, mesh: Mesh) -> CompiledStep:
         """The step `planned` compiled, which reads a batch in its microbatches."""
-        # The program compiled above, not the jit: a call through the jit
-        # traces and compiles its own, without the step's compiler options,
-        # which was 25 s of an A100's cold start.
+        # The program compiled above, not the jit: a call through the jit traces and compiles its own,
+        # without the step's compiler options, which was 25 s of an A100's cold start.
         split, candidate, executable = planned.split, planned.candidate, planned.executable
         parts = [jax.device_put(np.int32(part), NamedSharding(mesh, P())) for part in range(split)]
+        window = split * self.accumulation
 
         def run(current, batch):
             with self._traced_on(mesh):
+                # A ramp's new stage begins a window: one a rejection left part filled is dropped.
+                previous, self._window_rows = self._window_rows, rows_of(batch)
+                staged = self._ramp and previous not in (None, self._window_rows)
+                if staged and window > 1 and current.accumulation is not None:
+                    current = jax.jit(functools.partial(dropped_window, size=window), donate_argnums=0,
+                                      out_shardings=jax.tree.map(lambda x: x.sharding, current))(current)
                 if candidate.copies and current.compute is None:
                     current = dataclasses.replace(current, compute=jax.jit(
                         lambda variables: narrowed(variables, candidate.copies),
                         out_shardings=candidate.shardings.compute)(current.variables))
-                if (split * self.accumulation > 1 and self.step is None and (current.accumulation is None or (
+                if (window > 1 and self.step is None and (current.accumulation is None or (
                         self._ramp and not current.accumulation.replays(candidate.prepared.accumulation)))):
                     # The window, and with it the split, is the state's from here on.
                     current = dataclasses.replace(self._initialize_accumulation(
-                        current, candidate.micro, candidate.shapes, window=split * self.accumulation),
-                        window_size=jnp.asarray(split * self.accumulation, jnp.int32))
+                        current, candidate.micro, candidate.shapes, window=window),
+                        window_size=jnp.asarray(window, jnp.int32))
                     current = jax.device_put(current, candidate.shardings)
                 outputs = []
                 for part in parts:
@@ -1498,9 +1501,8 @@ class Trainer(Generic[Loss, Effects]):
         seen = 0
         run.notice = PreemptionNotice()
         while not plan.finished(run.current, interval.real_tokens if plan.tokens is not None else 0):
-            # The window's capture opens before this iteration's first
-            # read, so the step row records the read it waits on rather
-            # than a compile that ran before capture began.
+            # The window's capture opens before this iteration's first read, so the step row records
+            # the read it waits on rather than a compile that ran before capture began.
             if (profiler is not None and profile is not None
                     and not run.tracing and run.traced == 0
                     and seen >= profile.warmup):
@@ -1620,8 +1622,8 @@ class Trainer(Generic[Loss, Effects]):
                     error = failure
                 else:
                     error.add_note(f"{label} cleanup failed: {failure!r}")
-        # The traceback of a failed run holds fit's frame and this one, and
-        # with them whatever these names still point at.
+        # The traceback of a failed run holds fit's frame and this one, and with them whatever these
+        # names still point at.
         run.source, run.train, run.taken = None, None, None
         close = stop_trace = cleanup = unread = None
         run.other += time.perf_counter() - paused

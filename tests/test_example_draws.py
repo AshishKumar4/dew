@@ -220,10 +220,11 @@ class Drawing(Objective):
         return loss, Aux({}, variables={"stats": kept})
 
 
-def test_an_input_that_takes_a_rejected_microbatchs_slot_draws_afresh():
-    """A step read in two microbatches whose second a dynamic loss scale rejects leaves that slot to
-    the next input's first, which carries the same rows' columns: it draws under a key that folds in
-    the rejection, so no two accepted microbatches of the update draw alike."""
+def test_a_rejected_microbatch_drops_its_window_and_the_next_draws_afresh():
+    """A step read in two microbatches whose second a dynamic loss scale rejects drops its window,
+    its accepted first part with it: the next input's two parts make the update alone, at distinct
+    places, under a key that folds in the rejection, so they draw apart from each other and from the
+    dropped part."""
     from dew.training import MeshSpec, Trainer
 
     trainer = Trainer(Drawing(), optax.sgd(.1), key=jax.random.key(4), split=2, dynamic_scale=True,
@@ -234,12 +235,12 @@ def test_an_input_that_takes_a_rejected_microbatchs_slot_draws_afresh():
     clean = {"y": jnp.ones((4,)), "bad": jnp.zeros((4,), bool)}
     run = trainer.compile(state, rejected)
     state, *_ = run(state, rejected)
-    assert (int(state.microstep), int(state.updates)) == (1, 0)
+    assert (int(state.microstep), int(state.updates)) == (0, 0)
     state, *_ = run(state, clean)
-    assert int(state.updates) == 1
-    drawn = np.asarray(state.variables["stats"]["drawn"])
-    # The update's first microbatch and the one that took the rejected one's slot.
-    assert np.all(drawn[0] != drawn[1])
+    assert (int(state.microstep), int(state.updates)) == (2, 1)
+    # The dropped part, then the update's two, in the order the collection saw them.
+    dropped, first, second = np.asarray(state.variables["stats"]["drawn"])[:3]
+    assert np.all(first != second) and np.all(first != dropped) and np.all(second != dropped)
 
 
 class ReplayedDrawing(Drawing):

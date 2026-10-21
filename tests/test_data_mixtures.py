@@ -1027,6 +1027,37 @@ def test_a_configured_run_counts_its_ramped_epochs_in_stages_aligned_to_its_upda
         Ramp(start=8, increment=8, samples=24).stages(16, window=0)
 
 
+class Rejecting(Pooled):
+    """`Pooled` whose loss is not finite on a batch holding the record `rejected`, as a dynamic loss
+    scale rejects an overflowing step."""
+
+    def __init__(self, rejected: int):
+        super().__init__()
+        self.rejected = rejected
+
+    def loss(self, variables, batch, step):
+        import jax.numpy as jnp
+
+        stats, aux = super().loss(variables, batch, step)
+        poisoned = jnp.any(batch["id"] == self.rejected)
+        return Ratio(jnp.where(poisoned, jnp.inf, stats.total), stats.mass), aux
+
+
+def test_a_window_a_rejection_shifted_is_dropped_where_a_ramp_stage_begins():
+    """A rejected step drops its window, so the next begins a step later than the ramp's stages,
+    which begin where unrejected windows do: the stage's first batch then drops the window its last
+    one left part filled, and no update pools two stages' batches. Rejecting step 0 of a ramp of two
+    eight-record steps, then sixteen, two to an update: step 1 alone in its window is dropped at step
+    2, which with step 3 makes the run's one update."""
+    records, seed = 4096, 7
+    ramp = Ramp(start=8, increment=8, samples=16)
+    first = next(iter(ramped(indexed_data(records, 16, seed), ramp).train(DataPartition(window=2))))
+    trainer = Trainer(Rejecting(int(first["id"][0])), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+                      dynamic_scale=True, layout=Layout(min_shard=1, tolerance=1.0), checkpoints=None)
+    state = trainer.fit(ramped(indexed_data(records, 16, seed), ramp), steps=4, log_every=100)
+    assert (int(state.step), int(state.microstep), int(state.updates)) == (4, 2, 1)
+
+
 def test_each_aligned_stage_begins_from_its_own_schedule_and_one_left_no_step_is_dropped():
     """Every stage's start moves to the update boundary at or after its own, not after the moved
     start before it, so no stage drifts past its end; a stage whose start and the next's meet
