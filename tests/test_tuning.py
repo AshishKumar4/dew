@@ -131,9 +131,9 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
         pinned = launches(step(), *operands(15))
     assert pinned["rms_norm_forward"] == ((15,), 1) and pinned["rms_norm_backward"] == ((15,), 2)
     assert pinned["swiglu_forward"] == ((1,), 8) and pinned["swiglu_backward"] == usual["swiglu_backward"]
-    with tuning.pinned({norm_swiglu.RmsForward: norm_swiglu.RowsConfig(64, 2)}):
-        with pytest.raises(tuning.Unpinnable, match=r"RmsForward cannot take the pinned config .*rows=64"):
-            launches(step(), *operands(15))
+    with (tuning.pinned({norm_swiglu.RmsForward: norm_swiglu.RowsConfig(64, 2)}),
+          pytest.raises(tuning.Unpinnable, match=r"RmsForward cannot take the pinned config .*rows=64")):
+        launches(step(), *operands(15))
 
     # The picks a GPU measured, stored for this device, as a fresh process finds them.
     picked = {norm_swiglu.RmsForward: norm_swiglu.RowsConfig(4, 2),
