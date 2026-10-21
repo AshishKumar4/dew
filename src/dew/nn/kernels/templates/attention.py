@@ -256,6 +256,30 @@ def _per_head(param: Param, row: jax.Array, head: jax.Array) -> jax.Array:
             return value[row, :, head]
 
 
+def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
+           scale: float | None = None) -> jax.Array:
+    """The scores `[B, H, Q, K]` the template's softmax takes, as `reference` computes them: the products
+    of `query` `[B, Q, H, D]` and `key` `[B, K, Hk, D]` accumulated in fp32 (fp64 for fp64 inputs), the
+    scale, then `hooks.score_mod`; -inf where `spans` hides the key."""
+    hooks = Hooks() if hooks is None else hooks
+    batch, queries, heads, width = query.shape
+    kv_heads = key.shape[2]
+    wide = jnp.promote_types(query.dtype, jnp.float32)
+    scale = width ** -0.5 if scale is None else scale
+    seen = dense(spans)
+
+    def one(row, head):
+        q, k = query[row, :, head], key[row, :, head // (heads // kv_heads)]
+        s = jnp.einsum("qd,kd->qk", q, k, preferred_element_type=wide) * jnp.asarray(scale, wide)
+        if hooks.score_mod is not None:
+            q_pos = jnp.arange(queries)[:, None]
+            k_pos = jnp.arange(spans.keys)[None, :]
+            s = hooks.score_mod(s, q_pos, k_pos, *(_per_head(p, row, head) for p in hooks.score_params))
+        return jnp.where(seen[row], s, -jnp.inf)
+
+    return jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch), jnp.arange(heads))
+
+
 def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
               *, scale: float | None = None, residuals: bool = False):
     """The template's arithmetic in XLA ops: `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]`
@@ -268,21 +292,13 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     `[B, H, Q]` (natural log, unnormalized), fp32, a query that sees no key and starts from no state
     holding 0 for both, so every residual is finite. No hooks where `hooks` is None."""
     hooks = Hooks() if hooks is None else hooks
-    batch, queries, heads, width = query.shape
+    batch, queries, heads, _ = query.shape
     kv_heads = key.shape[2]
     wide = jnp.promote_types(query.dtype, jnp.float32)
-    scale = width ** -0.5 if scale is None else scale
-    seen = dense(spans)
+    logits = scores(query, key, spans, hooks, scale=scale)
 
     def one(row, head):
-        shared = head // (heads // kv_heads)
-        q, k, v = query[row, :, head], key[row, :, shared], value[row, :, shared]
-        s = jnp.einsum("qd,kd->qk", q, k, preferred_element_type=wide) * jnp.asarray(scale, wide)
-        if hooks.score_mod is not None:
-            q_pos = jnp.arange(queries)[:, None]
-            k_pos = jnp.arange(spans.keys)[None, :]
-            s = hooks.score_mod(s, q_pos, k_pos, *(_per_head(p, row, head) for p in hooks.score_params))
-        s = jnp.where(seen[row], s, -jnp.inf)
+        s, v = logits[row, head], value[row, :, head // (heads // kv_heads)]
         if hooks.initial is None:
             m0 = jnp.full((queries,), -jnp.inf, wide)
             total0 = jnp.zeros((queries,), wide)
