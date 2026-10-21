@@ -213,7 +213,6 @@ class RemoteCache:
                 written = list(self.written.get(file, []))
                 if not set(written) - self.held.get(file, set()) - self.queued.get(file, set()):
                     return
-                self.queued[file] = set(written)
                 fetched = list(self.fetched.get(file, []))
             entries, size = [], 0
             for key in dict.fromkeys([*written, *fetched]):
@@ -230,6 +229,7 @@ class RemoteCache:
             return
         with self.state:
             self.held[file] = {key for key, _ in entries}
+            self.queued[file] = set(written)
         self.uploads.put((file, packed(entries)))
 
     def _uploading(self) -> None:
