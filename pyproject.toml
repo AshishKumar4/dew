@@ -129,8 +129,9 @@ test = [
     "scipy",
     # tests/test_reporting.py exercises the WandbTracker adapter.
     "dewml[wandb]",
-    # The committed VAE fixture was generated with this reference release.
-    "diffusers==0.34.0",
+    # The Diffusers references the tests run live (Flux 2's and Z-Image's transformers among them,
+    # which 0.40.0 first ships), and the release the committed VAE fixture records.
+    "diffusers==0.40.0",
     # tests/test_wan_source.py cleans prompts as Wan's pipelines do (the wan extra).
     "dewml[wan]",
     # tests/test_tools.py imports FlaxDiff's reference, whose hilbert module imports matplotlib.
@@ -140,12 +141,10 @@ test = [
     "dewml[live]",
     # tests/test_notebook_display.py executes a notebook in a Jupyter kernel and reads it back saved.
     "dewml[notebooks]",
-    # Every decoder and MoE parity number is calibrated against this exact
-    # release: the fixtures record it (tests/fixtures/hf/*/meta.json), the
-    # tests cite its line numbers, and a resolve that moved it would compare
-    # dew against a different reference while the tolerances stayed. The
-    # library accepts this release and later; the reference suite pins it.
-    "transformers==5.16.1",
+    # The reference suite runs this exact release: the fixtures that record their release
+    # (tests/fixtures/hf/*/meta.json) were recorded under it, and a resolve that moved it would
+    # compare Dew against a different reference unseen. The library accepts 5.16.1 and later.
+    "transformers==5.17.0",
     # tests/test_reference_helpers.py holds tools/kimi_k3_reference.py's MXFP4
     # encoding, this release's compressor, the one that tool's environment names.
     "compressed-tensors==0.17.1",
