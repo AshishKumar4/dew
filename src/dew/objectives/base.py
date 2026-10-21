@@ -133,11 +133,11 @@ class Recorder:
         if self.kinds.setdefault(name, kind) != kind:
             raise ValueError(f"{name!r} is recorded as a {self.kinds[name]} and as a {kind}: a tape "
                              "replays a name as one value")
-        examples = np.asarray(examples)
+        places = np.asarray(examples)
         held = [np.asarray(index) for index, _ in self.values.get(name, ())]
-        if held and np.intersect1d(np.concatenate(held), examples).size:
+        if held and np.intersect1d(np.concatenate(held), places).size:
             raise ValueError(f"{name!r} is recorded twice for an example: a tape holds one value each")
-        self.values.setdefault(name, []).append((examples, np.asarray(value)))
+        self.values.setdefault(name, []).append((places, np.asarray(value)))
 
     def tape(self, examples: int) -> dict[str, np.ndarray]:
         """Every recorded name's values placed at their examples, of `examples` in all: a `Step.tape`.
@@ -235,9 +235,9 @@ class Step:
                              f"asked for {rows} rows")
         return self.example_index
 
-    def _taped(self, name: str, examples: jax.Array, row: tuple[int, ...]) -> jax.Array:
-        """The tape's rows of `name` at `examples`, checked against the update's examples and `row`."""
-        tape = self.tape[name]
+    def _taped(self, tape: jax.Array, name: str, examples: jax.Array, row: tuple[int, ...]) -> jax.Array:
+        """`tape`, the step's tape of `name`, at `examples`, checked against the update's examples and
+        `row`."""
         needed = examples.shape[0] if self.example_count is None else self.example_count
         if tape.shape[0] < needed or tuple(tape.shape[1:]) != row:
             raise ValueError(f"the tape's {name!r} holds {tuple(tape.shape)}, and the step reads "
@@ -276,7 +276,7 @@ class Step:
 
         if self.tape is not None and name in self.tape:
             like = jax.eval_shape(drawn, jax.random.key(0))
-            return self._taped(name, examples, like.shape).astype(like.dtype)
+            return self._taped(self.tape[name], name, examples, like.shape).astype(like.dtype)
         key = jax.random.fold_in(example_stream(self.key if self.example_key is None else self.example_key),
                                  stream(name))
         return jax.vmap(lambda example: drawn(jax.random.fold_in(key, example)))(examples)
@@ -287,7 +287,7 @@ class Step:
         rows for these examples, at `value`'s dtype, and a `recorder` keeps it."""
         examples = self.examples(value.shape[0])
         if self.tape is not None and name in self.tape:
-            value = self._taped(name, examples, value.shape[1:]).astype(value.dtype)
+            value = self._taped(self.tape[name], name, examples, value.shape[1:]).astype(value.dtype)
         if self.recorder is not None:
             self.recorder.record("boundary", name, examples, value)
         return value
@@ -1235,7 +1235,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         if self._evaluation_scores is None:
             return None
-        return self._compiled_scores(self.evaluation_variables(params, step), batch, step.replace(ema=None))
+        return self._compiled_scores(self.evaluation_variables(params, step), batch, replace(step, ema=None))
 
     _evaluation_scores: Callable[..., TokenScores] | None = None
     """The per-token scores of one evaluation batch, a pure function of the

@@ -276,7 +276,8 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         assert self.process.prediction is not None
         conditions = self._dropped(*self._conditions(variables, batch, drop_key, step), batch, step)
         steps = len(self.student_times)
-        indices = step.sample("student times", lambda key: jax.random.randint(key, (), 0, steps), rows=count)
+        indices = step.sample("student times", lambda key: jax.random.randint(key, (), 0, steps, jnp.int32),
+                              rows=count)
         t = rows_taken(jnp.asarray(self.student_times), indices)
         # Float32 draws, as the step's others are, at any precision.
         noise = step.sample("noise", jax.random.normal, samples.shape[1:], dtype=jnp.float32, rows=count)

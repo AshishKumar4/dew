@@ -27,16 +27,15 @@ def posterior_latent(moments: jnp.ndarray, key: jax.Array | None,
     the mean's shape, drawn from `key` where `noise` is None. Raises
     `ValueError` for a noise of another shape than the mean's."""
     mean, log_variance = posterior_moments(moments)
-    if key is None and noise is None:
-        return mean
-    deviation = jnp.exp(0.5 * log_variance)
     if noise is None:
+        if key is None:
+            return mean
         # Drawn in float32, as the rest of a step's draws are, whatever the
         # moments' precision, so a float64 run draws the same numbers.
         noise = jax.random.normal(key, mean.shape, dtype=jnp.float32)
     elif noise.shape != mean.shape:
         raise ValueError(f"the posterior's noise is {noise.shape}, and its mean {mean.shape}")
-    return mean + deviation * noise.astype(mean.dtype)
+    return mean + jnp.exp(0.5 * log_variance) * noise.astype(mean.dtype)
 
 
 class AutoencoderKL(nn.Module):
