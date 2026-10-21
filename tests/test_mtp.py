@@ -214,7 +214,7 @@ def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same(depths):
     for ours, reference in zip((supplied.losses, supplied.weights, *supplied.depths),
                               (explicit.losses, explicit.weights, *explicit.depths), strict=True):
         for left, right in zip(jax.tree.leaves(ours), jax.tree.leaves(reference), strict=True):
-            np.testing.assert_allclose(left, right, rtol=1e-6, atol=1e-6)
+            np.testing.assert_array_equal(left, right)
 
 
 def test_a_routed_depth_balances_only_when_the_depths_run():

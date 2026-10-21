@@ -2,6 +2,8 @@
 
 import importlib.util
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 
@@ -19,3 +21,15 @@ def load(name: str, directory: str = "tools") -> ModuleType:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@contextmanager
+def run_from(name: str, directory: str) -> Iterator[ModuleType]:
+    """`directory/name.py` loaded as `load` loads it, with its directory first on sys.path while held: a
+    script run from its directory, which imports its siblings."""
+    path = str(REPO_ROOT / directory)
+    sys.path.insert(0, path)
+    try:
+        yield load(name, directory)
+    finally:
+        sys.path.remove(path)

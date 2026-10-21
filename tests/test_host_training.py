@@ -147,14 +147,15 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
         prefix, *_ = step(state, data[0])
         # the step consumes the state
         prefix_params = jax.tree.map(np.asarray, prefix.variables)
-        prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
         rejected, _, _, _, accepted, _ = step(prefix, data[1])
         assert not bool(accepted)
+        # The rejection drops its window (`dropped_window`); the next two microbatches make the update.
         equal(prefix_params, rejected.variables)
-        equal(prefix_accumulation, rejected.accumulation)
+        assert int(rejected.microstep) == 0
         state, *_ = step(rejected, data[2])
+        state, *_ = step(state, data[3])
         assert int(state.updates) == 1
-        assert float(state.variables["stats"]["seen"]) == 2
+        assert float(state.variables["stats"]["seen"]) == 3
         states.append(state)
     platforms_agree(*states, steps=1)
 
@@ -173,6 +174,7 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
     resumed_step = trainer.compile(restored, data[1])
     resumed, *_ = resumed_step(restored, data[1])
     resumed, *_ = resumed_step(resumed, data[2])
+    resumed, *_ = resumed_step(resumed, data[3])
     equal(resumed, states[1])
 
 
