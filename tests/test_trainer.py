@@ -1315,7 +1315,7 @@ def test_the_ema_stores_only_the_selected_subtree_and_merges_over_the_rest():
     average = {"params": {"tracked": {"w": jnp.ones((2,))}}}
     updated = ema_update(average, params, 0.5)
     assert set(updated["params"]) == {"tracked"}
-    np.testing.assert_allclose(updated["params"]["tracked"]["w"], 2.0)
+    np.testing.assert_array_equal(updated["params"]["tracked"]["w"], 2.0)
 
 
 # --------------------------------------------------------------------------
