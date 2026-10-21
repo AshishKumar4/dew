@@ -346,7 +346,8 @@ class TokenFiles(Dataset):
             facts.update(tokens=len(tokens), **{f"{self.split}_tokens": len(tokens)})
         elif f"{self.split}_tokens" in facts:
             facts["tokens"] = facts[f"{self.split}_tokens"]
-        return {**facts, "token_store": True}
+        # Its records are token spans, which carry no count of Dew's.
+        return {**facts, "token_store": True, "count_rules": []}
 
     def fingerprint(self) -> Mapping[str, object]:
         return self._fingerprint

@@ -15,6 +15,7 @@ from tool_support import load
 
 CONTAINER = Path(__file__).resolve().parents[1] / "site/live/container"
 SECRET = "bridge-secret"
+FRAME = 4000
 
 
 @pytest.fixture(scope="module")
@@ -27,7 +28,11 @@ def bridge():
 class Kernels:
     """The Kernel Gateway's REST and channel protocol over a set of kernels. A phase in `held`
     ("create", or "preload", a context loading its client) sets its `entered` event and waits for
-    its `release`; a cell whose code is `sleep N` runs N seconds, or until the kernel is interrupted.
+    its `release`; a cell whose code is `sleep N` runs N seconds, or until the kernel is interrupted;
+    one whose code is `panel N` shows a display under an id, as IPython's display handle does, and
+    updates it N times with frames of FRAME characters, as the notebook panel does; `display N` shows
+    N displays of FRAME characters under one id, and `redraw N` clears with wait=True and shows a
+    frame N times, as a cell redrawing a plot does.
     The next `failing` deletes fail. `live` holds the kernels created and not deleted, and `created`
     counts every one."""
 
@@ -76,6 +81,20 @@ class Kernels:
             status = "ok"
             if code.startswith(("import model_client", "import live_training")):
                 await self.phase("preload")
+            elif code.startswith("panel "):
+                transient = {"display_id": "panel"}
+                await reply("display_data", {"data": {"text/plain": "frame 0"}, "transient": transient})
+                for frame in range(1, int(code.split()[1]) + 1):
+                    text = f"frame {frame} ".ljust(FRAME, ".")
+                    await reply("update_display_data", {"data": {"text/plain": text}, "transient": transient})
+            elif code.startswith("display "):
+                for _ in range(int(code.split()[1])):
+                    await reply("display_data", {"data": {"text/plain": "x" * FRAME},
+                                                 "transient": {"display_id": "same"}})
+            elif code.startswith("redraw "):
+                for _ in range(int(code.split()[1])):
+                    await reply("clear_output", {"wait": True})
+                    await reply("display_data", {"data": {"text/plain": "x" * FRAME}})
             elif code.startswith("sleep "):
                 # Its seconds, unless an interrupt ends it first, as an error.
                 self.interrupts[kernel].clear()
@@ -175,6 +194,49 @@ def test_a_page_runs_or_queues_at_most_its_cells_of_either_kind(bridge, monkeypa
             await second.close()
             await settled(kernels)
             assert kernels.live == set()
+        finally:
+            server.close()
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_a_display_updated_in_place_is_one_output_its_frames_replace(bridge, monkeypatch):
+    """A training cell's panel is one display that IPython's handle updates eight times a second: the
+    bridge sends each frame under the display's id, an update marked as one, and counts against the
+    cell's output allowance what the page shows, so a long run's frames, past the allowance together,
+    end the cell as it ends (7fb1f1bd3's preview: the finetune cell stopped at 101 s), as do a redraw's
+    cleared frames; displays that share an id each count."""
+    monkeypatch.setattr(bridge, "available", lambda: 1 << 40)
+    frames = bridge.MAX_OUTPUT // FRAME * 2
+
+    async def scenario():
+        kernels = Kernels()
+        _, server, runner, port = await serving(bridge, kernels)
+        try:
+            socket = await page(port, str(uuid.uuid4()))
+            await socket.send(json.dumps({"op": "execute", "id": "train", "cell": "finetune",
+                                          "kernel": "train", "code": f"panel {frames}"}))
+            heard = await answer(socket, "train")
+            assert heard[-1]["status"] == "ok", heard[-1]
+            shown = [message for message in heard if message["type"] == "display"]
+            assert len(shown) == frames + 1
+            assert {message["display"] for message in shown} == {"panel"}
+            assert [message.get("update", False) for message in shown] == [False] + [True] * frames
+            assert shown[-1]["text"].startswith(f"frame {frames} ")
+            # A cell that redraws, clearing as it shows each frame, shows one frame at a time.
+            await socket.send(json.dumps({"op": "execute", "id": "redraw", "cell": "finetune",
+                                          "kernel": "train", "code": f"redraw {frames}"}))
+            heard = await answer(socket, "redraw")
+            assert heard[-1]["status"] == "ok", heard[-1]
+            assert heard[0] == {"id": "redraw", "type": "clear", "wait": True}
+            # Every display the page appends counts, whatever id it shares with the others.
+            await socket.send(json.dumps({"op": "execute", "id": "same", "cell": "finetune",
+                                          "kernel": "train", "code": f"display {frames}"}))
+            heard = await answer(socket, "same")
+            assert heard[-2]["type"] == "error" and "output allowance" in heard[-2]["evalue"], heard[-2:]
+            await socket.close()
+            await settled(kernels)
         finally:
             server.close()
             await runner.cleanup()
