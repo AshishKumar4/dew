@@ -103,6 +103,7 @@ def main(config: Config) -> dict:
         dtype=jnp.float32 if config.smoke else jnp.bfloat16,
         param_dtype=jnp.float32,
         max_seq_len=config.width,
+        on_host=True,  # the trainer places the weights over its mesh
     )
     objective = GRPOObjective(source.model, config.width - 1, variables=source.variables,
                               behavior_importance=2.0, epsilon_high=0.28)

@@ -10,6 +10,7 @@ exists to avoid.
 """
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -170,3 +171,66 @@ def test_a_host_source_is_placed_holding_one_device_shard_at_a_time():
     placed = place_leaf(source, NamedSharding(mesh, PartitionSpec("fsdp")))
     np.testing.assert_array_equal(np.asarray(placed), source.value)
     assert source.most == 1
+
+
+def test_a_loaded_source_is_ready_to_run_on_the_default_device():
+    """A source loaded without a mesh or layout holds its variables on JAX's default device,
+    uncommitted, as a `jnp` array is held, so a jitted call reads them where they are rather than
+    copying the whole tree from the host at each call, and a call or placement over every device
+    still takes them; `on_host=True` keeps host arrays, which a mesh or layout
+    beside it contradicts. A load returned host arrays, and a 4.57B model's step moved 9.1 GB
+    each call."""
+    from pathlib import Path
+
+    from dew.interop import Pretrained
+
+    fixture = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
+    loaded = Pretrained.load(fixture, dtype="float32", attention_impl="reference")
+    leaves = jax.tree.leaves(loaded.variables)
+    # Where a jnp array goes: the default device, uncommitted.
+    native = jnp.zeros(())
+    assert leaves and all(isinstance(leaf, jax.Array) and leaf.devices() == native.devices()
+                          and leaf.committed == native.committed for leaf in leaves)
+    # Uncommitted, as a jnp array is: a call placed on every device takes it where it is.
+    mesh = jax.sharding.Mesh(np.array(jax.devices()), ("data",))
+    spread = jax.jit(lambda leaf: leaf * 2, out_shardings=jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec()))(leaves[0])
+    np.testing.assert_array_equal(np.asarray(spread), 2 * np.asarray(leaves[0]))
+    host = Pretrained.load(fixture, dtype="float32", attention_impl="reference", on_host=True)
+    assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(host.variables))
+    for placed, held in zip(leaves, jax.tree.leaves(host.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(placed), held)
+    with pytest.raises(ValueError):
+        Pretrained.load(fixture, on_host=True, mesh=jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)))
+
+
+@pytest.mark.parametrize("where", ["device", "host"])
+def test_a_source_trained_from_keeps_its_arrays_after_the_step_donates_the_state(where):
+    """A step donates the state it is given, and a run's state holds buffers of its own: a source
+    loaded on the device and trained from, its state resident or held on the host, has every array
+    readable and unchanged after the step, placed as `fit` places it or built eagerly
+    (tests/test_flux_source.py holds a pipeline's objective, whose eager state was its source's
+    own arrays, to the same)."""
+    from pathlib import Path
+
+    import jax.numpy as jnp
+    import optax
+
+    from dew.interop import Pretrained
+    from dew.objectives.lm import LMObjective
+    from dew.training import Layout, Trainer
+
+    fixture = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
+    loaded = Pretrained.load(fixture, dtype="float32", attention_impl="reference")
+    before = jax.device_get(loaded.variables)
+    # The default layout replicates a small source's leaves, so its placed state can share their buffers.
+    layout = Layout(host=("variables",)) if where == "host" else Layout()
+    trainer = Trainer(LMObjective(loaded, 8, ema_decay=None), optax.sgd(0.1), key=jax.random.key(5),
+                      layout=layout)
+    batch = {"text": jnp.tile(jnp.arange(1, 10, dtype=jnp.int32)[None], (jax.device_count(), 1))}
+    states = [trainer.place()[0]] + ([trainer.initial_state()] if where == "device" else [])
+    for state in states:
+        stepped, *_ = trainer.compile(state, batch)(state, batch)
+        jax.block_until_ready(stepped)
+        for leaf, held in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(before), strict=True):
+            np.testing.assert_array_equal(np.asarray(leaf), held)

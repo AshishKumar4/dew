@@ -182,17 +182,29 @@ def test_members_scaled_apart_stay_unpacked(case):
 
 
 def test_the_served_pipeline_quantizes_as_the_loaded_model(case):
-    """`dew.pipeline` packs the projections while it places them; its task
-    computes the loaded model's quantized logits."""
-    directory, _, reference = case
+    """`dew.pipeline`'s task keeps the loaded model's own tree and packs the
+    projections, under their one input scale, at the weights its generations
+    read (`placed`): those compute the loaded model's quantized logits, and a
+    generation runs over them, the scales compared outside its compiled call."""
+    directory, loaded, reference = case
     task = dew.pipeline(str(directory), dtype=jnp.float32)
-    logits = task.model.apply(task.variables, reference["ids"].astype(np.int32))
-    assert_quantized(logits, reference, "pipeline")
+    groups = projection_groups(loaded.model, loaded.variables)
+    for group in groups:
+        canonical, placed = (tree[QUANTIZATION] for tree in (task.variables, task.placed))
+        for part in group.path:
+            canonical, placed = canonical[part], placed[part]
+        assert set(group.members) <= set(canonical) and group.packed not in canonical
+        assert group.packed in placed and not set(group.members) & set(placed)
+    ids = reference["ids"].astype(np.int32)
+    assert_quantized(task.model.apply(task.placed, ids), reference, "pipeline")
+    generated = task(ids[:1, :4], 3, key=0).host()
+    assert generated.lengths[0] == 3 and np.isfinite(generated.raw_log_probs).all()
 
 
 def test_a_server_of_the_packed_task_reloads_the_loaded_models_own_tree(case):
-    """`dew.pipeline` serves the query, key and value packed under their one
-    input scale. A reload takes the loaded model's own tree, each member's
+    """A server over `dew.pipeline`'s task serves the query, key and value packed
+    under their one input scale, the task holding the loaded model's own tree.
+    A reload takes the loaded model's own tree, each member's
     scale at its own scope, and packs it as placement did, so the server
     holds the weights it held before. Members scaled apart cannot share the
     packed product's one scale, and their reload is refused."""
