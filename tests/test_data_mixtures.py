@@ -26,7 +26,7 @@ import jax
 import numpy as np
 import optax
 import pytest
-from flax import linen as nn
+from affine_run import FEATURES, Affine
 from token_support import write_token_corpus
 
 from dew.config.data import TextData, loader
@@ -850,15 +850,6 @@ def test_only_a_stream_whose_position_is_a_global_count_can_ramp(stream):
 # --------------------------------------------------------------------------
 # The batch ramp through the trainer
 # --------------------------------------------------------------------------
-
-FEATURES = 3
-
-
-class Affine(nn.Module):
-    @nn.compact
-    def __call__(self, x):
-        return nn.Dense(2)(x)
-
 
 class Regression(Objective):
     """Squared error of an affine map on records that differ per index, so

@@ -15,7 +15,9 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from data_support import WideDraw
 from reader_support import assert_resumes_where_it_stopped
+from token_support import write_token_corpus
 
 from dew import position
 from dew.data.cache import Cache
@@ -28,12 +30,6 @@ from dew.data.sources import Files, Memory
 from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
-
-
-@dataclasses.dataclass(frozen=True)
-class Draw(grain.RandomMapTransform):
-    def random_map(self, element, rng):
-        return {**element, "draw": np.int64(rng.integers(0, 2**32))}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -176,7 +172,8 @@ def test_memory_rejections_are_dense_before_global_order():
 
 
 def test_global_position_resumes_across_share_counts_with_rng():
-    data = compile(Pipeline(source()).shuffle(7).repeat().random_map(Draw()).batch(4), loading=READ, seed=7)
+    chain = Pipeline(source()).shuffle(7).repeat().random_map(WideDraw()).batch(4)
+    data = compile(chain, loading=READ, seed=7)
     reader = data.train(DataPartition())
     take(reader, 3)
     saved = reader.get_state()
@@ -239,8 +236,8 @@ def test_a_random_step_draws_alike_in_every_read_of_one_order():
     the map before it over the whole source, an indexed read and a streamed read of one share draw
     the same values, in a mixture as alone, and a second random step draws apart from the first."""
     rows = Pipeline(source(8)).map(Tagged())
-    alone = rows.random_map(Draw()).repeat(1).batch(4)
-    mixed = mix([rows.random_map(Draw()).repeat(1)]).batch(4)
+    alone = rows.random_map(WideDraw()).repeat(1).batch(4)
+    mixed = mix([rows.random_map(WideDraw()).repeat(1)]).batch(4)
 
     def draws(chain, read):
         data = compile(chain, read=read, loading=READ, seed=5)
@@ -253,7 +250,7 @@ def test_a_random_step_draws_alike_in_every_read_of_one_order():
 
     for chain in (alone, mixed):
         assert draws(chain, "memory") == draws(chain, "indexed") == draws(chain, "streamed")
-    again = draws(rows.random_map(Draw()).random_map(Draw()).repeat(1).batch(4), "indexed")
+    again = draws(rows.random_map(WideDraw()).random_map(WideDraw()).repeat(1).batch(4), "indexed")
     assert [draw for _, draw in again] != [draw for _, draw in draws(alone, "indexed")]
 
 
@@ -272,7 +269,7 @@ def test_a_mixture_members_draws_stay_as_they_were_when_another_member_joins():
     the members: a member joining before it leaves its draws as they were, and two members of one
     name draw apart."""
     def member(name, index):
-        return Pipeline(source(8), name=name).map(Member(index)).random_map(Draw()).repeat(1)
+        return Pipeline(source(8), name=name).map(Member(index)).random_map(WideDraw()).repeat(1)
 
     def draws(members):
         data = compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
@@ -297,8 +294,8 @@ def test_an_unnamed_member_draws_alike_wherever_a_host_mounts_it_and_when_a_name
     def mounted(directory, joining=False):
         directory.mkdir(exist_ok=True)
         (directory / "rows.jsonl").write_text("".join(json.dumps({"id": i}) + "\n" for i in range(8)))
-        chain = Pipeline(Files(str(directory / "rows.jsonl"))).map(Member(0)).random_map(Draw())
-        named = Pipeline(source(8), name="joining").map(Member(1)).random_map(Draw()).repeat(1)
+        chain = Pipeline(Files(str(directory / "rows.jsonl"))).map(Member(0)).random_map(WideDraw())
+        named = Pipeline(source(8), name="joining").map(Member(1)).random_map(WideDraw()).repeat(1)
         joined = [named] if joining else []
         return compile(mix([*joined, chain.repeat(1)]).batch(4), read="memory", loading=READ, seed=5)
 
@@ -323,7 +320,7 @@ def test_a_member_named_as_a_place_keeps_its_draws_when_an_unnamed_one_joins():
     member named like a place keeps its draws when an unnamed member joins ahead of it, and an
     unnamed member keeps its own when that named member joins ahead of it."""
     def member(name, index):
-        return Pipeline(source(8), name=name).map(Member(index)).random_map(Draw()).repeat(1)
+        return Pipeline(source(8), name=name).map(Member(index)).random_map(WideDraw()).repeat(1)
 
     def draws(members, of):
         data = compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
@@ -545,8 +542,8 @@ def test_a_position_is_refused_where_a_mixture_member_was_renamed():
     """A mixture's plan names its members, whose draws their names key: a position saved under one
     name is refused by the mixture that renamed it, which would draw other rows."""
     def mixed(name):
-        members = [Pipeline(source(8), name=name).random_map(Draw()).repeat(),
-                   Pipeline(source(4)).random_map(Draw()).repeat()]
+        members = [Pipeline(source(8), name=name).random_map(WideDraw()).repeat(),
+                   Pipeline(source(4)).random_map(WideDraw()).repeat()]
         return compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
 
     stream = mixed("first").train(DataPartition())
@@ -566,7 +563,7 @@ def test_a_position_is_refused_where_a_mixture_member_was_renamed():
 def drawn_natively(rows):
     """A Grain step Dew does not name, whose random step draws by the default seed of the rows it
     is handed."""
-    return rows.random_map(Draw())
+    return rows.random_map(WideDraw())
 
 
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
@@ -591,7 +588,7 @@ def test_a_position_saved_under_another_plan_version_is_refused(order):
     an earlier version saved, whose random steps drew by another key, is refused rather than
     resumed into other draws, in a global order and in one read per share; one this version saved
     resumes."""
-    rows = Pipeline(source(8)).random_map(Draw())
+    rows = Pipeline(source(8)).random_map(WideDraw())
     chain = rows if order == "global" else rows.grain(drawn_natively)
     data = compile(chain.repeat().batch(2), read="indexed", loading=READ, seed=7)
     assert data.plan is not None and data.plan.lowering == order
@@ -669,7 +666,7 @@ def test_random_validation_is_refused():
     compile(Pipeline(source()).batch(4), validation=Pipeline(source()).shuffle(0).batch(4), loading=READ)
     with pytest.raises(ValueError):
         compile(Pipeline(source()).batch(4),
-                validation=Pipeline(source()).shuffle(0).random_map(Draw()).batch(4), loading=READ)
+                validation=Pipeline(source()).shuffle(0).random_map(WideDraw()).batch(4), loading=READ)
 
 
 @pytest.mark.parametrize("workers", [0, 2])
@@ -1443,7 +1440,7 @@ def test_cold_warm_and_resumed_cache_keep_per_epoch_randomness(tmp_path):
     prefix = Pipeline(stored).cache(cache)
 
     def build(prefix):
-        return compile(prefix.shuffle(5).repeat().random_map(Draw()).batch(4),
+        return compile(prefix.shuffle(5).repeat().random_map(WideDraw()).batch(4),
                        read="memory", seed=5, loading=READ)
 
     cold = build(prefix)
@@ -2075,7 +2072,7 @@ def test_a_nested_mixture_counts_its_epoch_from_each_part():
 def test_a_streamed_training_read_with_a_random_step_and_no_repeat_never_runs_out():
     """A training order that writes no repeat repeats for ever, as its plan
     says, whether or not a random step reads its rows."""
-    reader = compile(Pipeline(source(8)).random_map(Draw()).batch(4), read="streamed",
+    reader = compile(Pipeline(source(8)).random_map(WideDraw()).batch(4), read="streamed",
                      loading=READ).train(DataPartition())
     try:
         assert reader.endless and len(take(reader, 6)) == 6
@@ -2102,10 +2099,7 @@ def test_an_indexed_pack_over_a_token_store_reads_its_planned_global_windows(tmp
 
     documents = [np.append(np.full(size, index + 1), 0).astype(np.int32)
                  for index, size in enumerate((5, 3, 9, 2, 7, 4, 6, 1))]
-    (tmp_path / "train.bin").write_bytes(np.concatenate(documents).astype(np.uint16).tobytes())
-    (tmp_path / "meta.json").write_text(json.dumps({
-        "tokenizer": "byte", "dtype": "uint16", "vocab_size": 256, "eos_id": 0,
-        "train_tokens": sum(len(document) for document in documents)}))
+    write_token_corpus(tmp_path, np.concatenate(documents).astype(np.uint16), eos_id=0)
     store = TokenFiles(str(tmp_path)).provision()
 
     def windows(pipeline, read):
@@ -2314,7 +2308,7 @@ def test_a_random_step_after_an_endless_repeat_draws_as_after_a_finite_one():
     rows = Pipeline(source(2)).take(2)
 
     def draws(chain) -> list[int]:
-        data = compile(chain.random_map(Draw()).batch(2), read="streamed", loading=READ)
+        data = compile(chain.random_map(WideDraw()).batch(2), read="streamed", loading=READ)
         stream = data.train(DataPartition())
         try:
             return [int(value) for batch in itertools.islice(stream, 2) for value in batch["draw"]]
@@ -2328,7 +2322,7 @@ def test_a_random_step_after_an_endless_repeat_draws_as_after_a_finite_one():
 def test_a_repeat_after_the_batch_replays_its_first_pass_draws_included(read):
     """A repeat after the batch repeats the batches the first pass made, a random step's draws
     and all, in every read, and a resume reads on as the uninterrupted run does."""
-    data = compile(Pipeline(source(2)).random_map(Draw()).batch(2).repeat(), read=read, loading=READ)
+    data = compile(Pipeline(source(2)).random_map(WideDraw()).batch(2).repeat(), read=read, loading=READ)
 
     def batches(stream, count: int) -> list[tuple[list[int], list[int]]]:
         return [(np.asarray(batch["id"]).tolist(), np.asarray(batch["draw"]).tolist())

@@ -18,9 +18,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from absl import flags
+from data_support import parse_grain_flags
 from reader_support import assert_a_rewrite_moves_the_identity
-from token_support import export_byte_tokens, write_token_corpus
+from token_support import export_byte_tokens, write_token_corpus, write_token_meta
 
 from dew.config.data import TextData, loader
 from dew.data import ByteTokenizer, Loading
@@ -31,13 +31,10 @@ from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import LMObjective
 from dew.training import Step
 
+parse_grain_flags()
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# grain's worker processes read absl flags; a test that never ran absl.app
-# would trip UnparsedFlagAccessError at any worker_count > 0.
-
-if not flags.FLAGS.is_parsed():
-    flags.FLAGS.mark_as_parsed()
 
 
 def _token_dir(tmp_path, train_tokens, val_tokens=None, dtype=np.uint16,
@@ -947,14 +944,12 @@ def stores(tmp_path):
     boundary has to be joined out of two of them; identical windows then say
     the stream view is the stream, not the chunking.
     """
-    meta = {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint16", "train_tokens": len(CORPUS),
-            "val_tokens": len(CORPUS), "eos_id": PACK_EOS}
     held = {}
     stores = (("bin", None, None), ("records", [4, 3], None), ("packed_records", [2, 9], "ids"))
     for name, sizes, field in stores:
         directory = tmp_path / name
         directory.mkdir()
-        (directory / "meta.json").write_text(json.dumps(meta))
+        write_token_meta(directory, len(CORPUS), len(CORPUS), eos_id=PACK_EOS)
         for split in ("train", "val"):
             if sizes is None:
                 (directory / f"{split}.bin").write_bytes(CORPUS.astype(np.uint16).tobytes())

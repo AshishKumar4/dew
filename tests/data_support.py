@@ -1,0 +1,38 @@
+"""What the data suites share: Grain's flags parsed for its worker processes, a caption reader that
+hands the words back, the caption templates and host augmentation the image suites draw from, and a
+random step that draws a wide integer."""
+
+import dataclasses
+
+import grain.python as grain
+import numpy as np
+from absl import flags
+
+from dew.config.data import Augment
+
+
+def parse_grain_flags() -> None:
+    """Mark absl's flags parsed, as Grain's worker processes read them: a suite that never ran
+    absl.app would trip UnparsedFlagAccessError at any worker_count > 0. A suite whose loading
+    workers import it calls this as it is imported, in its own process and in each worker."""
+    if not flags.FLAGS.is_parsed():
+        flags.FLAGS.mark_as_parsed()
+
+CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
+"""More than one, so a test can see which the record's rng drew."""
+
+FLIP_JITTER = Augment(flip=True, jitter=True, backend="host")
+
+
+def keep_captions(captions):
+    """A caption reader that hands the words back, so a test reads what the dataset wrote before a
+    run's encoder tokenizes it."""
+    return {"caption": np.asarray(captions)}
+
+
+@dataclasses.dataclass(frozen=True)
+class WideDraw(grain.RandomMapTransform):
+    """A record's draw of an integer below 2**32, which its generator makes."""
+
+    def random_map(self, element, rng):
+        return {**element, "draw": np.int64(rng.integers(0, 2**32))}
