@@ -362,6 +362,7 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
     assert ('Tgmm', True) in {(type(launch).__name__, ba.arguments.get('dense')) for launch, ba in launches}
 
 
+@pytest.mark.gpu(reason="checks Triton's MMA accumulation on a GPU")
 @pytest.mark.skipif(not generation.triton_runs(), reason="needs a GPU the Pallas kernels compile for")
 def test_a_dense_products_exact_sums_survive_one_row_tile():
     """At the highest precision, a dense fp32 product of one row tile and many depth steps (its first grid
