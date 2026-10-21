@@ -1889,19 +1889,13 @@ def _lineage(checkout: Path, walk: list[tuple[str, list[str]]]) -> dict[str, dic
 
 def _merge_loosens(name: str, per_parent: list[dict]) -> str | None:
     """How a commit loosens `name` (a file, or "empty_by") against all its parents at once (`_loosened`
-    against each, `per_parent`), or None. Where a parent holds the entry, some parent holding it must
-    keep it whole, its count and its date both; where none does, one must allow its addition."""
-    keys = [key for key in ((name, "count"), (name, "date")) if any(key in found for found in per_parent)]
-    if name == "empty_by":
-        return per_parent[0][keys[0]] if keys and all(keys[0] in found for found in per_parent) else None
-    holding = [found for found in per_parent if (name, "held") in found]
-    if holding:
-        if any(not any(key in found for key in keys) for found in holding):
-            return None
-        return next(found[key] for found in holding for key in keys if key in found)
-    if all((name, "count") in found for found in per_parent):
+    against each, `per_parent`), or None: its count past every parent's (each parent's own raise judged
+    at its own commit, so one parent's allows it), or its date past any parent's holding the entry
+    (dates only come earlier, so a merge keeps the earliest)."""
+    if (name, "count") in per_parent[0] and all((name, "count") in found for found in per_parent):
         return per_parent[0][(name, "count")]
-    return None
+    dated = [found for found in per_parent if (name, "held") in found or name == "empty_by"]
+    return next((found[(name, "date")] for found in dated if (name, "date") in found), None)
 
 
 def _duplicated(lineage: dict[str, frozenset[str]]) -> Iterator[str]:
@@ -1922,10 +1916,10 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
     CI), and every commit in HEAD's history whose inventory differs from a parent's, merges included
     (`--full-history`, no simplification), to that parent's (`_loosened`), from the commit that first
     made it on, which has no parent's to keep, and no commit removes it once made. A merge is held to
-    its loosest parent, file by file (`_merge_loosens`): a parent holding the entry keeps it whole, its
-    count and date, or one allows its addition, each parent's own change judged at its own commit, so a
-    merge that brings a count another branch raised is no loosening of its own; and it keeps one entry
-    only once, however its parents renamed it (`_lineage`). Only a
+    its loosest parent's count, file by file, each parent's own raise judged at its own commit, so a
+    merge that brings a count another branch raised is no loosening of its own; to every parent's date
+    that holds the entry, dates only coming earlier; and to keeping one entry only once, however its
+    parents renamed it (`_merge_loosens`, `_lineage`). Only a
     reading of the rule HEAD's own history changed since `base` authorizes a count against it.
     `--ratchet` runs it (CI's lint job, on its whole history); a shallow
     checkout, or one without git, cannot hold the inventory, and it says so rather than passing."""
