@@ -696,12 +696,22 @@ class DiffusionObjective(Objective[Ratio]):
                   for keyword, condition in self.inputs.conditions.items()}
         return self.encode(params["encoders"], tokens)
 
-    def clean_samples(self, variables, batch, key) -> jax.Array:
-        """Return the batch's samples in [-1, 1], or under an autoencoder their latents drawn with `key`."""
+    def clean_samples(self, variables, batch, key, step: Step | None = None) -> jax.Array:
+        """Return the batch's samples in [-1, 1], or under an autoencoder their latents drawn with `key`:
+        in a step, each example's posterior draw its own (`Step.sample`)."""
         samples = unit_range(batch[self.inputs.sample.key])
         if self.autoencoder is None:
             return samples
-        return self.autoencoder.encode(variables["autoencoder"], samples, key)
+        return self.autoencoder.encode(variables["autoencoder"], samples, key,
+                                       noise=self._posterior_noise(step, "posterior", samples))
+
+    def _posterior_noise(self, step: Step | None, name: str, pixels) -> jax.Array | None:
+        """Each example's standard normal draw for its latent's posterior (`posterior_latent`), None
+        outside a step."""
+        if step is None or self.autoencoder is None:
+            return None
+        shape = self.autoencoder.latent_shape(tuple(pixels.shape[1:]))
+        return step.sample(name, jax.random.normal, shape, dtype=jnp.float32, rows=pixels.shape[0])
 
     def denoiser(self, params, given, unconditional, process: Process | None = None):
         """Build `process`'s denoiser, the training process's by default, over the model's own
@@ -713,25 +723,27 @@ class DiffusionObjective(Objective[Ratio]):
         return (self.process if process is None else process).denoiser(
             self.model, self.model_variables(params), given, None if self.guidance is None else unconditional)
 
-    def _conditions(self, params, batch, key):
+    def _conditions(self, params, batch, key, step: Step | None = None):
         """The batch's conditions and the blank ones, the blank aligned to and
         broadcast over the batch's rows."""
         given = self.encoded_conditions(params, batch)
         unconditional = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
                                      given, aligned_conditions(given, self.blank_conditions(params, given)))
-        spatial = self._spatial(params, batch, key)
+        spatial = self._spatial(params, batch, key, step)
         return {**given, **spatial}, {**unconditional, **spatial}
 
-    def _spatial(self, params, batch, key) -> dict[str, jax.Array]:
+    def _spatial(self, params, batch, key, step: Step | None = None) -> dict[str, jax.Array]:
         """The masked-image inputs an inpainting model reads in both guidance branches
-        (`latent_image_conditions`), none where the inputs name no mask."""
+        (`latent_image_conditions`), none where the inputs name no mask: in a step, each example's
+        posterior draw of its masked image its own (`Step.sample`)."""
         if self.inputs.mask is None:
             return {}
         from dew.inputs.diffusion import latent_image_conditions
 
-        return latent_image_conditions(self.autoencoder, params["autoencoder"],
-                                       unit_range(batch[self.inputs.sample.key]), batch[self.inputs.mask.key],
-                                       jax.random.fold_in(key, 1))
+        pixels = unit_range(batch[self.inputs.sample.key])
+        return latent_image_conditions(self.autoencoder, params["autoencoder"], pixels,
+                                       batch[self.inputs.mask.key], jax.random.fold_in(key, 1),
+                                       noise=self._posterior_noise(step, "masked image posterior", pixels))
 
     def _dropped(self, given, blank, batch, step: Step):
         """`given` with a drawn share of the batch's rows `blank`, classifier-free guidance's training
@@ -751,10 +763,10 @@ class DiffusionObjective(Objective[Ratio]):
 
     def loss(self, variables, batch, step: Step):
         images = unit_range(batch[self.inputs.sample.key])
-        # The times, the noise and the dropped conditions are each example's own (`Step.sample`); the
-        # model's dropout, and the autoencoder's posterior draw, are the attempt's (`Step.key`).
+        # The times, the noise, the posterior's draws and the dropped conditions are each example's own
+        # (`Step.sample`); the model's dropout is the attempt's (`Step.key`).
         encode_key, drop_key, _, _, dropout_key = jax.random.split(step.key, 5)
-        given, blank = self._conditions(variables, batch, drop_key)
+        given, blank = self._conditions(variables, batch, drop_key, step)
         conditions = self._dropped(given, blank, batch, step)
         schedule = self.process.schedule
         count = images.shape[0]
@@ -764,7 +776,7 @@ class DiffusionObjective(Objective[Ratio]):
             end_to_end = self._end_to_end_latents(variables, images, encode_key, step, batch)
             samples = end_to_end.samples
         else:
-            samples = self.clean_samples(variables, batch, encode_key)
+            samples = self.clean_samples(variables, batch, encode_key, step)
         noise = step.sample("noise", jax.random.normal, samples.shape[1:], dtype=jnp.float32, rows=count)
         # The times are drawn in float32 and read at the samples' precision,
         # so a float64 run interpolates in float64.
@@ -836,7 +848,9 @@ class DiffusionObjective(Objective[Ratio]):
         assert self.end_to_end is not None and self.autoencoder is not None
         weights = params["params"][AUTOENCODER]
         moments = self.autoencoder.moments(weights, images)
-        raw = posterior_latent(moments, key)
+        mean_shape = (*moments.shape[1:-1], moments.shape[-1] // 2)
+        raw = posterior_latent(moments, key, step.sample("posterior", jax.random.normal, mean_shape,
+                                                         dtype=jnp.float32, rows=moments.shape[0]))
         reconstruction = self.autoencoder.decode_raw(weights, raw)
         discriminator = params["params"].get(DISCRIMINATOR)
         regularizer, hinge, terms = self.end_to_end.regularizer(

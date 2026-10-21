@@ -34,6 +34,7 @@ from dew.inputs import InputSpec
 from dew.nn.attention import l2_normalized
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.dit import TextContext, masked_mean
+from dew.nn.sharding import rows_taken
 from dew.objectives.base import TEACHER, Aux, Batch, Objective, Step, Variables
 
 from .objective import DISCRIMINATOR, SPECTRAL, FlowDistillationObjective
@@ -267,16 +268,16 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         return grids
 
     def loss(self, variables, batch, step: Step):
-        # Each example's times and noises are its own (`Step.sample`); the posterior draw is the attempt's.
+        # Each example's times, noises and posterior draw are its own (`Step.sample`).
         encode_key, drop_key, _, _, _ = jax.random.split(step.key, 5)
-        samples = self.clean_samples(variables, batch, encode_key)
+        samples = self.clean_samples(variables, batch, encode_key, step)
         count = samples.shape[0]
         schedule = self.process.schedule
         assert self.process.prediction is not None
-        conditions = self._dropped(*self._conditions(variables, batch, drop_key), batch, step)
+        conditions = self._dropped(*self._conditions(variables, batch, drop_key, step), batch, step)
         steps = len(self.student_times)
         indices = step.sample("student times", lambda key: jax.random.randint(key, (), 0, steps), rows=count)
-        t = jnp.asarray(self.student_times)[indices]
+        t = rows_taken(jnp.asarray(self.student_times), indices)
         # Float32 draws, as the step's others are, at any precision.
         noise = step.sample("noise", jax.random.normal, samples.shape[1:], dtype=jnp.float32, rows=count)
         noisy, _, _ = self.process.prediction.forward_diffusion(samples, noise,

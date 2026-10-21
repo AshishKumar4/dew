@@ -283,13 +283,13 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return stats, Aux(metrics={"canvas_ce": stats.canvas.mean()[0],
                                   "encoder_ce": stats.encoder.mean()[0]})
 
-    def _evaluation_scores(self, params: Variables, batch: Batch, key: jax.Array) -> TokenScores:
+    def _evaluation_scores(self, params: Variables, batch: Batch, step: Step) -> TokenScores:
         """Return the denoiser's cross entropy on every canvas target of the batch.
 
-        One noise level and one canvas per row are drawn from the pass's key,
-        as in training, with dropout off. So `perplexity` over a validation
+        One noise level and one canvas per row are drawn by each example, as
+        in training (`Step.sample`), with dropout off. So `perplexity` over a validation
         pass is the exponential of the denoising loss per target."""
-        _, scores = self._scored(params, batch, Step(jnp.asarray(0), key, None), train=False)
+        _, scores = self._scored(params, batch, step, train=False)
         assert scores is not None
         return scores
 

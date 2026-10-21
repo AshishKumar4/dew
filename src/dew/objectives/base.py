@@ -44,6 +44,7 @@ from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import compensated_sum
 from dew.nn.protocols import HiddenStates, ProjectsParameters
+from dew.nn.sharding import rows_taken
 from dew.records import JSON, strings
 
 if TYPE_CHECKING:
@@ -120,38 +121,60 @@ Effects = TypeVar("Effects", default=None)
 @dataclass(eq=False)
 class Recorder:
     """What a loss's `Step.sample` and `Step.boundary` calls produced, by name, each with the examples
-    (`Step.example_index`) its rows are: what one run records for others to replay (`Step.tape`). A
-    harness hands a step one and returns `values` from the same trace."""
-    values: dict[str, list[tuple[jax.Array, jax.Array]]] = field(default_factory=dict)
+    (`Step.example_index`) its rows are: what one run records for others to replay (`Step.tape`). It
+    records concrete values, a loss run outside `jax.jit`; a jitted step records through the trainer's
+    `record`."""
+    values: dict[str, list[tuple[np.ndarray, np.ndarray]]] = field(default_factory=dict)
     kinds: dict[str, str] = field(default_factory=dict)
 
     def record(self, kind: str, name: str, examples: jax.Array, value: jax.Array) -> None:
-        """Keep `value`, a `kind` ("sample" or "boundary") named `name`; a name is one kind, as a tape
-        replays it by name alone."""
+        """Keep `value`, a `kind` ("sample" or "boundary") named `name`. A name is one kind and holds
+        each example once, as a tape replays it by name and example alone."""
         if self.kinds.setdefault(name, kind) != kind:
             raise ValueError(f"{name!r} is recorded as a {self.kinds[name]} and as a {kind}: a tape "
                              "replays a name as one value")
-        self.values.setdefault(name, []).append((examples, value))
+        examples = np.asarray(examples)
+        held = [np.asarray(index) for index, _ in self.values.get(name, ())]
+        if held and np.intersect1d(np.concatenate(held), examples).size:
+            raise ValueError(f"{name!r} is recorded twice for an example: a tape holds one value each")
+        self.values.setdefault(name, []).append((examples, np.asarray(value)))
 
-    def tape(self, examples: int) -> dict[str, jax.Array]:
-        """Every recorded name's values placed at their examples, of `examples` in all: a `Step.tape`."""
-        def placed(records):
+    def tape(self, examples: int) -> dict[str, np.ndarray]:
+        """Every recorded name's values placed at their examples, of `examples` in all: a `Step.tape`.
+        Raises `ValueError` for a name not recorded for every example."""
+        def placed(name, records):
             first = records[0][1]
-            tape = jnp.zeros((examples, *first.shape[1:]), first.dtype)
+            tape = np.zeros((examples, *first.shape[1:]), first.dtype)
+            seen = np.zeros(examples, bool)
             for index, value in records:
-                tape = tape.at[index].set(value)
+                tape[index], seen[index] = value, True
+            if not seen.all():
+                raise ValueError(f"{name!r} is recorded for {int(seen.sum())} of the {examples} examples")
             return tape
 
-        return {name: placed(records) for name, records in self.values.items()}
+        return {name: placed(name, records) for name, records in self.values.items()}
 
 
 EXAMPLE_STREAM = 0x6578616D
 """What a run folds its key with for its examples' draws (`Step.example_key`), apart from its attempts'."""
 
+_STREAMS: dict[int, str] = {}
+
 
 def stream(name: str) -> int:
-    """The fold of a named draw (`Step.sample`): the same on every process and every run."""
-    return zlib.crc32(name.encode()) & 0x7FFFFFFF
+    """The fold of a named draw (`Step.sample`): the same on every process and every run. Raises
+    `ValueError` for a name whose fold another name has, which would draw what it draws."""
+    fold = zlib.crc32(name.encode()) & 0x7FFFFFFF
+    if _STREAMS.setdefault(fold, name) != name:
+        raise ValueError(f"the draws {name!r} and {_STREAMS[fold]!r} fold alike; rename one")
+    return fold
+
+
+def example_stream(key: jax.Array) -> jax.Array:
+    """A counter-based key (threefry2x32) of `key`'s bits, whatever `key`'s implementation: a mapped
+    draw under it is each mapped key's own, where an RBG key maps every draw from its first key
+    (https://docs.jax.dev/en/latest/jax.random.html#advanced-rng-configuration)."""
+    return jax.random.wrap_key_data(jax.random.bits(key, (2,), jnp.uint32), impl="threefry2x32")
 
 
 @struct.dataclass
@@ -199,8 +222,8 @@ class Step:
 
     def places(self, rows: int) -> tuple[jax.Array, int]:
         """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
-        examples the update pools: what a draw stratified over the update's examples reads, the same
-        on every layout."""
+        examples the update pools: what a draw stratified over the update's examples reads, or a role
+        the update gives a share of its examples, the same on every layout."""
         return self.examples(rows), rows if self.example_count is None else self.example_count
 
     def examples(self, rows: int) -> jax.Array:
@@ -212,28 +235,51 @@ class Step:
                              f"asked for {rows} rows")
         return self.example_index
 
+    def _taped(self, name: str, examples: jax.Array, row: tuple[int, ...]) -> jax.Array:
+        """The tape's rows of `name` at `examples`, checked against the update's examples and `row`."""
+        tape = self.tape[name]
+        needed = examples.shape[0] if self.example_count is None else self.example_count
+        if tape.shape[0] < needed or tuple(tape.shape[1:]) != row:
+            raise ValueError(f"the tape's {name!r} holds {tuple(tape.shape)}, and the step reads "
+                             f"{needed} examples of {row}")
+        return rows_taken(jnp.asarray(tape), examples)
+
     def sample(self, name: str, draw: Callable[..., jax.Array], shape: tuple[int, ...] | None = None, *,
                dtype=None, rows: int) -> jax.Array:
         """`draw(key, shape, dtype=dtype)` for each of `rows` examples, under the example's own key
         folded with `name` (`stream`): `[rows, *shape]`, the same values an example draws on any layout,
         as `jax.random`'s draws take them. `dtype` is the draw's own, never a model's, so a float64 twin
         draws what the run drew; None leaves it out, and `shape` None calls `draw(key)`, a draw that fixes
-        both. With a `tape` holding `name`, its rows for these examples instead."""
+        both. The key is the example's place folded into `example_stream` of the update's key, or of the
+        attempt's outside a run. With a `tape` holding `name`, its rows for these examples instead,
+        at the draw's dtype."""
         examples = self.examples(rows)
-        if self.tape is not None and name in self.tape:
-            value = jnp.take(self.tape[name], examples, axis=0)
-        else:
-            key = jax.random.fold_in(self.key if self.example_key is None else self.example_key, stream(name))
-            given = () if shape is None else (shape,)
-            options = {} if dtype is None else {"dtype": dtype}
-
-            def drawn(example):
-                return draw(jax.random.fold_in(key, example), *given, **options)
-
-            value = jax.vmap(drawn)(examples)
+        value = self._drawn(name, draw, shape, dtype, examples)
         if self.recorder is not None:
             self.recorder.record("sample", name, examples, value)
         return value
+
+    def sample_update(self, name: str, draw: Callable[..., jax.Array], shape: tuple[int, ...] | None = None,
+                      *, dtype=None, rows: int) -> jax.Array:
+        """`sample`'s draws of `name` for every example of the update, in place order, where a batch of
+        `rows` rows is a part of it (`places`): what a role the update gives a count of its examples
+        by reads, the same on every layout. Not recorded: `sample` records the batch's own rows."""
+        _, count = self.places(rows)
+        return self._drawn(name, draw, shape, dtype, jnp.arange(count, dtype=jnp.int32))
+
+    def _drawn(self, name, draw, shape, dtype, examples) -> jax.Array:
+        given = () if shape is None else (shape,)
+        options = {} if dtype is None else {"dtype": dtype}
+
+        def drawn(key):
+            return draw(key, *given, **options)
+
+        if self.tape is not None and name in self.tape:
+            like = jax.eval_shape(drawn, jax.random.key(0))
+            return self._taped(name, examples, like.shape).astype(like.dtype)
+        key = jax.random.fold_in(example_stream(self.key if self.example_key is None else self.example_key),
+                                 stream(name))
+        return jax.vmap(lambda example: drawn(jax.random.fold_in(key, example)))(examples)
 
     def boundary(self, name: str, value: jax.Array) -> jax.Array:
         """`value`, one row an example, where the model's computation starts from it (a noised input,
@@ -241,7 +287,7 @@ class Step:
         rows for these examples, at `value`'s dtype, and a `recorder` keeps it."""
         examples = self.examples(value.shape[0])
         if self.tape is not None and name in self.tape:
-            value = jnp.take(self.tape[name], examples, axis=0).astype(value.dtype)
+            value = self._taped(name, examples, value.shape[1:]).astype(value.dtype)
         if self.recorder is not None:
             self.recorder.record("boundary", name, examples, value)
         return value
@@ -445,6 +491,12 @@ two before the model reads them."""
 
 
 VALID_ROWS = "valid_rows"
+
+EXAMPLE_ROWS = "example_rows"
+"""A training batch's column of each row's place among its step's records, int32: the order the
+records' stream holds them in, whatever process read a row (`dew.training.distributed.marked`). The
+trainer's transaction reads it for the examples' draws (`Step.example_index`) and takes it out of the
+batch the objective sees."""
 """The field every evaluation batch holds: one bool per row, True for a real record and False for a repeat.
 
 A split's last batch is padded to full size with repeats of its own rows, and
@@ -1021,6 +1073,9 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def _loss(self, variables: Variables, batch: Batch, step: Step, *,
               validation: bool = False) -> tuple[Loss, Aux[Effects]]:
+        if EXAMPLE_ROWS in batch:
+            # The trainer's column of the examples' places is the step's (`Step.example_index`).
+            batch = {name: value for name, value in batch.items() if name != EXAMPLE_ROWS}
         loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
         if _has_aux(loss):
             return loss
@@ -1180,12 +1235,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         if self._evaluation_scores is None:
             return None
-        return self._compiled_scores(self.evaluation_variables(params, step), batch, step.key)
+        return self._compiled_scores(self.evaluation_variables(params, step), batch, step.replace(ema=None))
 
     _evaluation_scores: Callable[..., TokenScores] | None = None
     """The per-token scores of one evaluation batch, a pure function of the
-    weights, the batch and the pass's key, or None when the objective scores
-    no tokens."""
+    weights, the batch and the pass's step, whose draws are its examples'
+    (`Step.sample`), or None when the objective scores no tokens."""
 
     _validation_scores: Callable[..., tuple[Loss, Artifacts]] | None = None
     """One validation batch's loss statistics and the artifacts `evaluate`

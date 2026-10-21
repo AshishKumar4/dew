@@ -118,6 +118,7 @@ from dew.training.distributed import (
     link_bandwidth,
     link_figures,
     link_topology,
+    marked,
     microbatch,
     microbatch_shapes,
     placed_bytes,
@@ -1609,9 +1610,7 @@ class Trainer(Generic[Loss, Effects]):
         unread = (None if run.taken is None or not run.taken.ready()
                   else functools.partial(self._read_taken, run, agree=False))
         for label, cleanup in (
-            ("Training log", unread),
-            ("Training iterator", close),
-            ("Profiler", stop_trace),
+            ("Training log", unread), ("Training iterator", close), ("Profiler", stop_trace),
             ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
             ("Display", self._display.close),
         ):
@@ -1683,9 +1682,9 @@ class Trainer(Generic[Loss, Effects]):
                 agreed_same("training data", lambda: (
                     f"{plan.dataset.batch} records a step of {stream_identity(run.source)}"))
             run.endless = stream_endless(run.source)
-            run.train = DevicePrefetchIterator(run.source, mesh, source_state=position,
-                                                prepare=self._counted_batch if self.rollout is None else None,
-                                                reads=run.reads)
+            self._marked = marked(mesh, self._counted_batch)
+            run.train = DevicePrefetchIterator(run.source, mesh, source_state=position, reads=run.reads,
+                                                prepare=self._marked if self.rollout is None else None)
             run.source = None  # Lifetime transferred to the prefetch worker.
 
         trained = [entry.module for entry in self.objective.program_key() if entry.trained]
@@ -2132,7 +2131,7 @@ class Trainer(Generic[Loss, Effects]):
         began = time.perf_counter()
         assert self.rollout is not None
         key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
-        batch = shard_batch(self.device_mesh, self._counted_batch(self.rollout(state, batch, key)))
+        batch = shard_batch(self.device_mesh, self._marked(self.rollout(state, batch, key)))
         return batch, time.perf_counter() - began
 
     def _compiled_for(self, compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]],

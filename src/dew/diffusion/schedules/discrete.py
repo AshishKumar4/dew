@@ -6,6 +6,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.sharding import rows_taken
+
 from .common import NoiseScheduler
 
 
@@ -51,14 +53,15 @@ class DiscreteNoiseScheduler(NoiseScheduler):
 
     def rates(self, t):
         index = self.index(t)
-        return self.sqrt_alpha_cumprod[index], self.sqrt_one_minus_alpha_cumprod[index]
+        return (rows_taken(self.sqrt_alpha_cumprod, index),
+                rows_taken(self.sqrt_one_minus_alpha_cumprod, index))
 
     def variances(self, t):
         index = self.index(t)
-        return self.alpha_cumprod[index], self.one_minus_alpha_cumprod[index]
+        return rows_taken(self.alpha_cumprod, index), rows_taken(self.one_minus_alpha_cumprod, index)
 
     def sample_t(self, key, n):
         return jax.random.randint(key, (n,), 0, self.T)
 
     def weight(self, t):
-        return self.p2_loss_weights[self.index(t)]
+        return rows_taken(self.p2_loss_weights, self.index(t))

@@ -110,9 +110,9 @@ class DPOObjective(TokenScorer):
         """Return per-token scores of the chosen responses under the policy, for their perplexity,
         compiled for the current modules over the pairs alone (`_evaluation_scores`)."""
         pairs = {IDS_KEY: batch[IDS_KEY], MASK_KEY: batch[MASK_KEY]}
-        return self._compiled_scores(self.evaluation_variables(params, step), pairs, step.key)
+        return self._compiled_scores(self.evaluation_variables(params, step), pairs, step.replace(ema=None))
 
-    def _evaluation_scores(self, params, batch, key) -> TokenScores:
+    def _evaluation_scores(self, params, batch, step) -> TokenScores:
         """The chosen responses' per-token cross entropies, with the shifted
         completion mask as weights."""
         chosen_ids, _, _, _ = self._halves(batch)

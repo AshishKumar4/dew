@@ -355,7 +355,7 @@ class GRPOObjective(TokenScorer):
 
     def _validation_scores(self, params, batch, step):
         """The prompts' NLL with the per-token scores it is the mean of."""
-        scores = self._evaluation_scores(params, batch, step.key)
+        scores = self._evaluation_scores(params, batch, step)
         return Ratio(self.row_mean(scores.losses * scores.weights, batch).total,
                      self.row_mean(scores.weights, batch).total), scores
 
@@ -363,9 +363,9 @@ class GRPOObjective(TokenScorer):
         """Return the per-token scores of the prompts under the policy, for their perplexity,
         compiled for the current modules over the prompts alone (`_evaluation_scores`)."""
         prompts = {PROMPT_KEY: batch[PROMPT_KEY], LENGTH_KEY: batch[LENGTH_KEY]}
-        return self._compiled_scores(self.evaluation_variables(params, step), prompts, step.key)
+        return self._compiled_scores(self.evaluation_variables(params, step), prompts, step.replace(ema=None))
 
-    def _evaluation_scores(self, params, batch, key) -> TokenScores:
+    def _evaluation_scores(self, params, batch, step) -> TokenScores:
         """The prompts' per-token scores.
 
         Prompts are left-padded, so a row's real tokens are its last

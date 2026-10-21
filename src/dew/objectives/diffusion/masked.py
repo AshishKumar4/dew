@@ -151,16 +151,16 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         nelbo, aux, _ = self._scored(variables, batch, step, train=step.training)
         return nelbo, aux
 
-    def _evaluation_scores(self, params, batch, key) -> TokenScores:
+    def _evaluation_scores(self, params, batch, step) -> TokenScores:
         """Return the negative ELBO of every token in the batch.
 
-        One noise level and one masking are drawn from the pass's key, as in
-        training, with dropout off. Every real token counts: a masked token
+        One noise level and one masking are drawn by each example, as in
+        training (`Step.sample`), with dropout off. Every real token counts: a masked token
         scores its weighted cross entropy, a visible one scores zero, and a
         packed window's padding has no weight. So `perplexity` over a
         validation pass is the exponential of the ELBO bound per token, the
         number MDLM reports."""
-        return self._scored(params, batch, Step(jnp.asarray(0), key, None), train=False)[2]
+        return self._scored(params, batch, step, train=False)[2]
 
     def _validation_scores(self, params, batch, step: Step) -> tuple[Ratio, TokenScores]:
         nelbo, _, scores = self._scored(params, batch, step, train=False)
