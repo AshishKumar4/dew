@@ -16,7 +16,7 @@ from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates import product
-from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, template
+from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, template, triton_dense
 
 pytestmark = pytest.mark.kernel
 
@@ -945,4 +945,55 @@ def test_a_product_under_x64_is_refused():
     with jax.enable_x64(new_val=True):
         assert "x64" in product.declared(jnp.bfloat16, DEFAULT).refusal
         assert grouped_matmul.ragged_dot_refusal(jnp.bfloat16, (jnp.float64,), DEFAULT) is not None
+
+
+def swiglu(gate, up):
+    """A SwiGLU epilogue on a paired product's two fp32 accumulators, each rounded to bf16 first and the
+    activated gate again, as `activations.gated_product` rounds them."""
+    gate, up = gate.astype(jnp.bfloat16), up.astype(jnp.bfloat16)
+    return (jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16) * up).astype(jnp.float32)
+
+
+PAIRED_TILE = grouped_matmul.Tile(64, 128, 64, 4, 2)
+
+
+def test_a_paired_product_is_its_two_products_combined_bitwise():
+    """The two-source dense kernel (one `lhs` tile, two matrices, two accumulators) at a tile is the same
+    kernel's two plain products at that tile, their fp32 accumulators combined by the same epilogue in
+    XLA, bit for bit, with rows, depth and width no tile divides."""
+    rows, depth, width = 200, 300, 140
+    keys = jax.random.split(jax.random.key(7), 3)
+    shapes = ((rows, depth), (depth, width), (depth, width))
+    lhs, gate, up = (jax.random.normal(key, shape).astype(jnp.bfloat16)
+                     for key, shape in zip(keys, shapes, strict=True))
+    options = {"tile": PAIRED_TILE, "transpose_rhs": False, "interpret": True}
+    [paired] = triton_dense.gmm(lhs, gate, paired=up, epilogue=swiglu, out_dtypes=("bfloat16",), **options)
+    [gate_acc] = triton_dense.gmm(lhs, gate, out_dtypes=("float32",), **options)
+    [up_acc] = triton_dense.gmm(lhs, up, out_dtypes=("float32",), **options)
+    expected = swiglu(gate_acc, up_acc).astype(jnp.bfloat16)
+    assert paired.shape == (rows, width) and paired.dtype == jnp.bfloat16
+    np.testing.assert_array_equal(np.asarray(paired, np.float32), np.asarray(expected, np.float32))
+
+
+@pytest.mark.parametrize("generation_name", ["sm80", "sm86", "sm90"])
+def test_a_paired_dense_product_lowers_for_cuda(generation_name):
+    """The two-source dense kernel lowers for CUDA on the CPU, its pallas_call named."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    args = (bf16((1021, 200)), bf16((200, 300)), bf16((200, 300)))
+
+    def paired(lhs, gate, up):
+        return triton_dense.gmm(lhs, gate, paired=up, epilogue=swiglu, out_dtypes=("bfloat16",),
+                                tile=PAIRED_TILE, transpose_rhs=False, interpret=False)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
+    with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(paired).trace(*args).lower(lowering_platforms=("cuda",))
+    assert "pallas_triton_dense_dot" in lowered.as_text()
+
+
+def test_a_paired_product_without_an_epilogue_is_refused():
+    lhs = jnp.zeros((64, 64), jnp.bfloat16)
+    with pytest.raises(ValueError, match="epilogue"):
+        triton_dense.gmm(lhs, lhs, paired=lhs, out_dtypes=("bfloat16",), tile=PAIRED_TILE,
+                         transpose_rhs=False, interpret=True)
 
