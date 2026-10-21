@@ -178,8 +178,8 @@ def compile_reference(name, path):
     return module
 
 
-def load_verl():
-    """verl's core_algos and the masked reductions it calls."""
+def load_verl(verl=VERL):
+    """verl's core_algos and the masked reductions it calls, from the clone at `verl`."""
     stub("ray")
     stub("tensordict", TensorDict=dict)
     stub("omegaconf", DictConfig=dict, MISSING=None)
@@ -195,9 +195,9 @@ def load_verl():
     stub("verl.workers.config", ActorConfig=ActorConfig)
 
     compile_reference("verl.utils.torch_functional",
-                      VERL / "verl" / "utils" / "torch_functional.py")
+                      verl / "verl" / "utils" / "torch_functional.py")
     return compile_reference("verl.trainer.ppo.core_algos",
-                             VERL / "verl" / "trainer" / "ppo" / "core_algos.py")
+                             verl / "verl" / "trainer" / "ppo" / "core_algos.py")
 
 
 def load_tunix():

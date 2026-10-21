@@ -291,6 +291,7 @@ def consume() -> None:
     import transformers
 
     from tools.diffusers_reference_helpers import restore_transformers_names
+    from tools.reference_source import saved_fixture
 
     # Before Diffusers' pipelines: the transformers names they import.
     restore_transformers_names()
@@ -311,8 +312,7 @@ def consume() -> None:
         meta = {"peft": peft.__version__,
                 "transformers": transformers.__version__, "diffusers": diffusers.__version__,
                 "torch": torch.__version__}
-        arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-        np.savez_compressed(FIXTURES / f"{name}.npz", **arrays)
+        saved_fixture(FIXTURES / f"{name}.npz", arrays, meta)
         gap = float(np.abs(arrays["fp32.adapted"] - arrays["fp64.adapted"]).max())
         moved_by = float(np.abs(arrays["fp32.adapted"] - arrays["fp32.base"]).max())
         print(f"{name}: fp32 off float64 by {gap:.3g}, the adapter moves the output by {moved_by:.3g}")

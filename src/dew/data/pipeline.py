@@ -5,14 +5,16 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import math
+import sys
+import time
 import types
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, runtime_checkable
 
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.dataset import Batch
+from dew.data.dataset import Batch, Records
 
 if TYPE_CHECKING:
     import jax
@@ -93,14 +95,32 @@ class Expansion(Protocol):
 type ExpandStep = Expansion | Callable[[Batch], Iterable[Batch | Rejected]]
 
 
+@runtime_checkable
+class Measure(Protocol):
+    """A fact a configured step needs that a memory read measures over a store's records where the
+    store states none (`Configured.measures`): `fact` names it, and calling it on the records gives
+    its value."""
+
+    fact: str
+
+    def __call__(self, records: Records, /) -> int: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class Configured:
-    """Resolve one record step from source facts before any record reader opens."""
+    """Resolve one record step from source facts before any record reader opens. `one_to_one`
+    states that the step keeps one record for each input whatever the facts, which a cache after it
+    and a recipe's order read before it binds; binding it to a step that drops or expands records is
+    refused. `measures` measures a fact it needs over each store it reads, in a memory read: the
+    whole store, below any holdout, so the parts a run trains and scores on agree; a store's own
+    statement of it gives way to the measure, and a mixture's step binds the largest of its stores'."""
 
     factory: Callable[[Mapping[str, object]], RecordStep | pygrain.RandomMapTransform | Expansion]
     needs: tuple[str, ...]
     scope: Literal["source", "run"] = "source"
     random: bool = False
+    one_to_one: bool = False
+    measures: Measure | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -674,9 +694,12 @@ class Dataset:
         return self._then(Native(function, identity))
 
     def stats(self, records: int = 1000) -> dict[str, float]:
-        """The counts a run logs from a fresh, lazy pass over at most
-        `records` accepted records: the rows delivered and the drops by
-        reason (`dew.data.mixing.CorpusCounts`)."""
+        """The counts a run logs from a fresh, lazy pass over at most `records` accepted records:
+        the rows delivered and the drops by reason (`dew.data.mixing.CorpusCounts`), the rows the
+        pass read a second once its reader was open (`data/records_per_second`: the loading
+        settings default to none, while workers or prefetching the chain writes run as written),
+        and for token rows, under "text", the tokens they hold (`data/tokens`) and the share of
+        their places that pad a row (`data/padding`)."""
         from dew.data.compile import _diagnostic
         from dew.data.mixing import data_metrics, state_counts
         from dew.records import record
@@ -689,12 +712,22 @@ class Dataset:
         if records == 0:
             return {}
         reader = _diagnostic(chain, records=records)
+        rows = places = padding = 0
+        started = time.perf_counter()
         try:
-            for _ in reader:
-                pass
-            return data_metrics(state_counts(record(reader.get_state(), "diagnostic state")).values())
+            for batch in reader:
+                rows += 1
+                held, padded = _token_places(batch)
+                places, padding = places + held, padding + padded
+            seconds = time.perf_counter() - started
+            metrics = data_metrics(state_counts(record(reader.get_state(), "diagnostic state")).values())
         finally:
             reader.close()
+        metrics["data/records_per_second"] = rows / seconds if seconds > 0 else math.inf
+        if places:
+            metrics["data/tokens"] = places - padding
+            metrics["data/padding"] = padding / places
+        return metrics
 
     def read(self, mode: Read) -> Pipeline:
         """Read the stores this way, rather than as they prefer: "memory" holds
@@ -742,9 +775,11 @@ class Dataset:
             reader.close()
 
     def show(self, count: int = 8) -> None:
-        """Print the first `count` records."""
+        """Print the chain, each verb and step a preset or function expanded to in order, then
+        its first `count` records."""
         from rich.pretty import pprint
 
+        sys.stdout.write("\n".join(_chain_lines(self._chain())) + "\n")
         for record in itertools.islice(self, count):
             pprint({name: _shown(value) for name, value in record.items()} if isinstance(record, Mapping)
                    else record)
@@ -778,9 +813,97 @@ def concat(datasets: Sequence[Dataset]) -> Pipeline:
     return Pipeline(Concatenate(stores))
 
 
-def _shown[Field](value: np.ndarray | bytes | Field) -> np.ndarray | bytes | Field | str:
-    """A field as `show` prints it: an array as its shape and dtype, bytes as their length."""
-    if isinstance(value, np.ndarray) and value.size > 16:
+def _chain_lines(chain: Pipeline, depth: int = 0) -> list[str]:
+    """The lines `show` prints of `chain`: its store, or the corpora a mix or phases read, each
+    with its own chain indented below, then each stage in order, one a line."""
+    indent = "  " * depth
+    source = chain.source
+    if isinstance(source, Mixture):
+        lines = [f"{indent}mix" if source.tokens is None else f"{indent}mix(by='tokens')"]
+        for weight, child in zip(source.weights, source.pipelines, strict=True):
+            lines += [f"{indent}  weight {weight:g}:", *_chain_lines(child._chain(), depth + 2)]
+    elif isinstance(source, Phases):
+        lines = [f"{indent}phases"]
+        for until, child in zip(source.until_steps, source.pipelines, strict=True):
+            lines += [f"{indent}  until step {until}:" if until is not None else f"{indent}  last:",
+                      *_chain_lines(child._chain(), depth + 2)]
+    else:
+        lines = [f"{indent}{type(source).__name__} {source.label()!r}"]
+    return lines + [f"{indent}.{_stage_line(stage)}" for stage in chain.stages]
+
+
+def _stage_line(stage: Stage | Batched | Native) -> str:
+    """One stage as `show` prints it: the verb that wrote it and the step it runs, or the
+    stage's own settings."""
+    if isinstance(stage, MapBatch):
+        where = "device" if isinstance(stage.step, DeviceStep) else "host"
+        return f"map({_step_name(stage.step)}) on the {where}, per batch"
+    if isinstance(stage, Configured):
+        return f"map({_step_name(stage.factory)})"
+    if isinstance(stage, Filter):
+        return f"filter({_step_name(stage.predicate)})"
+    if isinstance(stage, Native):
+        return f"grain({_step_name(stage.function)})"
+    if isinstance(stage, Batched):
+        verb = "map" if stage.same_rows else "flat_map"
+        return f"{verb}({_step_name(stage.step)}, batched=True, batch_size={stage.size})"
+    if isinstance(stage, (Map, RandomMap)):
+        drawn = "random_" if isinstance(stage, RandomMap) else ""
+        verb = drawn + ("filter_map" if stage.rejects else "map")
+        return f"{verb}({_step_name(stage.step)})"
+    if isinstance(stage, (MapWithIndex, FlatMap)):
+        verb = "map_with_index" if isinstance(stage, MapWithIndex) else "flat_map"
+        return f"{verb}({_step_name(stage.step)})"
+    if isinstance(stage, BatchStage):
+        return f"batch({stage.size})"
+    return _brief(repr(stage))
+
+
+def _step_name(step: Hashable) -> str:
+    """A step as `show` prints it: a function by its name, any other step by its settings."""
+    if isinstance(step, (types.FunctionType, types.MethodType)):
+        return step.__qualname__
+    return _brief(repr(step))
+
+
+def _brief(text: str, width: int = 120) -> str:
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def _token_places(batch: Batch) -> tuple[int, int]:
+    """The places a batch's token rows under "text" hold, and those of them that pad a row, as a
+    model reads them (`dew.nn.inputs.real_slots`): segment 0 of a packed row and the places its
+    validity marks invalid, in its `text_coordinates` or in stored `text_segment_ids` and
+    `text_attention_mask`; none where it holds no token ids."""
+    tokens = batch.get("text")
+    if not isinstance(tokens, np.ndarray) or tokens.dtype.kind not in "iu":
+        return 0, 0
+    from dew.nn.inputs import COORDINATES_FIELD, VALIDITY_FIELD, real_slots
+
+    fields = {name: batch[f"text_{name}"] for name in (COORDINATES_FIELD, VALIDITY_FIELD, "segment_ids")
+              if f"text_{name}" in batch}
+    real = real_slots(fields, tokens.shape, xp=np)
+    return int(tokens.size), int(tokens.size - np.count_nonzero(real))
+
+
+@runtime_checkable
+class _Shaped(Protocol):
+    """An array a step leaves on a device (a JAX array), as `show` reads it."""
+
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+
+    @property
+    def dtype(self) -> np.dtype: ...
+
+    @property
+    def size(self) -> int: ...
+
+
+def _shown[Field](value: np.ndarray | _Shaped | bytes | Field) -> np.ndarray | _Shaped | bytes | Field | str:
+    """A field as `show` prints it: an array, on the host or on a device after the chain's device
+    steps, as its shape and dtype; bytes as their length."""
+    if isinstance(value, (np.ndarray, _Shaped)) and value.size > 16:
         return f"{value.dtype}{list(value.shape)}"
     if isinstance(value, bytes) and len(value) > 64:
         return f"<{len(value)} bytes>"

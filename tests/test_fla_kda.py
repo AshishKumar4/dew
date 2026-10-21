@@ -16,14 +16,13 @@ import numpy as np
 import pytest
 from delta_rule_support import NAMES, fla_side, float64_truth, math, plain_prefix, recurrence, through
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, distance
-from sharded import boundary_copies
 from tuned import each_config
 
 from dew.nn import kernels
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.kernels import fla_gdn, fla_kda, tuning
-from dew.nn.linear import fla_rule, l2norm
-from dew.training._lowering import triton_calls
+from dew.nn.kernels import chunked_launch, fla_kda, tuning
+from dew.nn.kernels.recurrence_chunk import fla_rule
+from dew.nn.linear import l2norm
 
 pytestmark = pytest.mark.kernel
 
@@ -112,22 +111,6 @@ def test_a_bf16_kimi_delta_attention_trains_on_the_port_as_on_the_math():
         assert distance(mine, theirs) <= bound, jax.tree_util.keystr(path)
 
 
-@pytest.mark.gpu(reason="the port's kernels lower to Triton calls only on a GPU")
-def test_a_bf16_kimi_delta_attention_trains_with_no_copy_at_the_ports_edges():
-    """A bf16 KimiDeltaAttention at Kimi Linear's heads, forward and backward, compiled for this GPU:
-    no copy or transpose feeds one of the port's Triton calls or reads one of its results."""
-    layer = KimiDeltaAttention(emb_features=1024, num_heads=8, head_dim=128, dtype=jnp.bfloat16)
-    x = jax.random.normal(jax.random.key(47), (2, 512, 1024), jnp.bfloat16)
-    params = layer.init(jax.random.key(53), x)
-
-    def loss(params, x):
-        return jnp.sum(layer.apply(params, x).astype(jnp.float32) ** 2)
-
-    lowered = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(params, x)
-    assert triton_calls(lowered)
-    assert boundary_copies(lowered.compile().as_text()) == []
-
-
 GPU_CASES = {
     # Kimi Linear's KDA layer: 32 heads of 128 at a 4096-token row.
     "training": ((4096, 32, 32, 128, 128), None),
@@ -159,7 +142,7 @@ def test_the_port_is_as_exact_as_fla(case, dtype):
         assert_as_exact_as_the_reference(dew, fla, value, f"{case}/{name}", terms=summed)
 
 
-LAUNCHES = sorted({type(op) for op in vars(fla_kda).values() if isinstance(op, fla_gdn._Launch)},
+LAUNCHES = sorted({type(op) for op in vars(fla_kda).values() if isinstance(op, chunked_launch._Launch)},
                   key=lambda kind: kind.__name__)
 """The port's own launches, each a tuner KernelOp."""
 

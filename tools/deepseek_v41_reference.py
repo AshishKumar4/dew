@@ -80,6 +80,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import saved_fixture
 
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash"
 DEEPSEEK_V41_REVISION = "dba1be0a40aa45a94ad051997016db3960a90277"
@@ -279,11 +280,14 @@ def reset(net):
 
 
 def forward(net, ids, start_pos=0):
-    """Transformer.forward (model.py:1241-1272) under autograd, full logits."""
+    """The release's Transformer.forward (V4.1's model.py:1241-1272, V4 DSpark's 912-926) under
+    autograd, every position's logits."""
     return type(net).forward.__wrapped__(net, ids, start_pos)
 
 
 def draft(net, ids, main_hidden, start_pos):
+    """The release's Transformer.forward_spec (V4.1's model.py:1274-1282, V4 DSpark's 928-936),
+    DSpark's draft."""
     return type(net).forward_spec.__wrapped__(net, ids, main_hidden, start_pos)
 
 
@@ -498,14 +502,15 @@ def stepped(net, gradients, ids) -> np.ndarray:
     return logits.numpy()
 
 
-def cached(net, ids) -> dict[str, np.ndarray]:
-    """The prefill of the first PROMPT tokens, the teacher-forced steps after
-    it and DSpark's draft after each."""
+def cached(net, ids, *, reset=reset, prompt=PROMPT, length=LENGTH) -> dict[str, np.ndarray]:
+    """The prefill of the first `prompt` tokens after the caller's `reset`, the
+    teacher-forced steps after it to `length` and DSpark's draft after each: the
+    driver every DSpark release's reference runs (deepseek_v4_dspark_reference.py)."""
     decode_logits, draft_ids, draft_logits, draft_confidence = [], [], [], []
     reset(net)
-    next_ids, prompt_logits, main_hidden = forward(net, ids[:, :PROMPT])
+    next_ids, prompt_logits, main_hidden = forward(net, ids[:, :prompt])
     draft(net, next_ids[:, -1], main_hidden, 0)
-    for position in range(PROMPT, LENGTH):
+    for position in range(prompt, length):
         next_ids, step_logits, main_hidden = forward(net, ids[:, position:position + 1], position)
         decode_logits.append(step_logits[:, 0])
         drafted = draft(net, next_ids[:, -1], main_hidden, position)
@@ -792,8 +797,7 @@ def write_kernels():
     meta = {"repo": REPO, "revision": DEEPSEEK_V41_REVISION, "code": "inference/kernel.py",
             "device": torch.cuda.get_device_name(), "torch": torch.__version__,
             "tilelang": tilelang.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(FIXTURE / "kernels.npz", **arrays)
+    saved_fixture(FIXTURE / "kernels.npz", arrays, meta)
     print(f"{FIXTURE / 'kernels.npz'}: {len(arrays)} arrays, {meta['device']}")
 
 

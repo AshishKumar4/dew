@@ -12,23 +12,23 @@ from uuid import uuid4
 
 import fsspec
 import grain.python as grain
+import numpy as np
 import pytest
+from storage_support import moto_bucket
 
 from dew.data.cache import Abandoned, Cache
 from dew.data.pipeline import Rejected
+from dew.data.plan import Manifest, StepIdentity
 from dew.data.sources import Memory
 from dew.data.storage import Store
 
 
-@dataclass(frozen=True)
-class Manifest:
-    canonical: bytes = b'{"revision":"test","source":"memory"}'
-    clean: bool = True
-    exact: bool = True
-
-    @property
-    def key(self):
-        return hashlib.sha256(self.canonical).hexdigest()
+def _key(source: object = "memory", *, revision: str = "test", clean: bool = True,
+         exact: bool = True) -> Manifest:
+    """A dependency manifest of fixed fields, keying a cache of `source`'s rows at `revision`: a
+    dirty checkout's (`clean=False`), or one whose step has no stable identity (`exact=False`)."""
+    steps = () if exact else (StepIdentity("tests.unstable", "<lambda>", exact=False),)
+    return Manifest({"store": source}, steps, revision=revision, clean=clean)
 
 
 def _cache(**kwargs):
@@ -102,7 +102,7 @@ def test_expansion_publication_certifies_empty_and_nonempty_inputs():
     from dew.data.sources.codec import encode
 
     source = Memory([{"id": index} for index in range(5)])
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
 
     def expand(index, value):
         return tuple({"id": value["id"], "part": part} for part in range(index))
@@ -137,7 +137,7 @@ def test_missing_input_completion_refuses_publication():
     """A writer that never read row 1 leaves it uncovered and publication is
     refused; a second writer that reads it completes the generation."""
     source = Memory([{"id": index} for index in range(3)])
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     assert rows[0] == {"id": 0}
     assert rows[2] == {"id": 2}
@@ -155,7 +155,7 @@ def test_missing_input_completion_refuses_publication():
 
 def test_unsealed_writer_cannot_certify_coverage():
     source = Memory([{"id": 0}, {"id": 1}])
-    cache, key = _cache(shard_bytes=1), Manifest()
+    cache, key = _cache(shard_bytes=1), _key()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     rows[0]
     with pytest.raises(ValueError):
@@ -171,7 +171,7 @@ def test_conflicting_duplicate_writers_refuse_publication(second_row):
     """Two writers of one row publish it where they wrote the same row, and
     are refused where they wrote different ones."""
     source = Memory([{"id": 0}])
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     first = cache.mapped(grain.MapDataset.source([{"id": 0}]), key)
     second = cache.mapped(grain.MapDataset.source([second_row]), key)
     first[0], second[0]
@@ -188,7 +188,7 @@ def test_conflicting_duplicate_writers_refuse_publication(second_row):
 
 def test_corrupt_shard_never_reaches_current():
     source = Memory([{"id": 0}])
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     rows[0]
     rows.finish()
@@ -206,7 +206,7 @@ def test_corrupt_shard_never_reaches_current():
 
 def test_corrupt_committed_index_is_an_error_without_fallback():
     source = Memory([{"id": 0}])
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     rows[0]
     rows.finish()
@@ -227,7 +227,7 @@ def test_full_spool_stops_admitting_and_training_continues(spool_bytes):
     """A row larger than the spool is served but not admitted, so its cache
     cannot be published; a spool that holds it publishes."""
     source = Memory([{"bytes": b"x" * 2048}])
-    cache, key = _cache(spool_bytes=spool_bytes, shard_bytes=128), Manifest()
+    cache, key = _cache(spool_bytes=spool_bytes, shard_bytes=128), _key()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     assert rows[0] == source.records("indexed")[0]
     assert rows.writer.admitting is (spool_bytes > 2048)
@@ -244,42 +244,35 @@ def test_full_spool_stops_admitting_and_training_continues(spool_bytes):
 def test_cache_identity_and_clean_revision_are_required(refused):
     source = Memory([{"id": 0}])
     rows = grain.MapDataset.source(source.records("indexed"))
-    _cache().mapped(rows, Manifest()).close()
+    _cache().mapped(rows, _key()).close()
     with pytest.raises(ValueError):
-        _cache().mapped(rows, Manifest(**refused))
-    assert Manifest().key != Manifest(b'{"revision":"changed"}').key
+        _cache().mapped(rows, _key(**refused))
+    assert _key().key != _key(revision="changed").key
 
 
 def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
     import fsspec
-    from moto.server import ThreadedMotoServer
 
-    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
-    server.start()
-    _, port = server.get_host_and_port()
-    options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}"}
-    fs = fsspec.filesystem("s3", **options)
-    bucket = "cache-" + uuid4().hex
-    fs.mkdir(bucket)
-    cache, key = Cache(f"s3://{bucket}/cache", storage_options=options), Manifest()
-    source = Memory([{"id": index} for index in range(8)])
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
-    for index in range(len(rows)):
-        rows[index]
-    rows.finish()
-    rows.close()
-    start = threading.Barrier(2)
+    with moto_bucket("cache") as (bucket, options):
+        fs = fsspec.filesystem("s3", **options)
+        cache, key = Cache(f"s3://{bucket}/cache", storage_options=options), _key()
+        source = Memory([{"id": index} for index in range(8)])
+        rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
+        for index in range(len(rows)):
+            rows[index]
+        rows.finish()
+        rows.close()
+        start = threading.Barrier(2)
 
-    def publish():
-        from dew.data.storage import PreconditionFailed
+        def publish():
+            from dew.data.storage import PreconditionFailed
 
-        start.wait()
-        try:
-            return cache.publish(key, source)
-        except PreconditionFailed as error:
-            return error
+            start.wait()
+            try:
+                return cache.publish(key, source)
+            except PreconditionFailed as error:
+                return error
 
-    try:
         with ThreadPoolExecutor(2) as pool:
             attempts = list(pool.map(lambda _: publish(), range(2)))
         from dew.data.generation import Generation
@@ -294,13 +287,11 @@ def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
         )
         with pytest.raises(OSError):
             cache.publish(key, source)
-    finally:
-        server.stop()
 
 
 def test_stream_completions_use_physical_shards_and_resume_without_rekeying():
     source = Memory([{"id": index} for index in range(8)], shard_rows=2)
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     manifest = source.manifest()
     reader = cache.streamed(manifest.reader, key)
     for shard in reversed(manifest.shards):
@@ -324,7 +315,7 @@ class Draw(grain.RandomMapTransform):
 
 def test_cold_warm_and_resumed_caches_keep_per_epoch_randomness():
     source = Memory([{"id": index} for index in range(8)])
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     parent = grain.MapDataset.source(source.records("indexed"))
     cold = cache.mapped(parent, key)
 
@@ -553,6 +544,18 @@ def test_a_prompt_recipe_reads_the_generation_its_memory_read_published():
 
 
 @dataclass(frozen=True)
+class Same:
+    """A deterministic step that keeps its row and notes each row it runs on."""
+
+    calls: list = field(default_factory=list, compare=False, repr=False)
+    identity = "same@1"
+
+    def __call__(self, row):
+        self.calls.append(1)
+        return row
+
+
+@dataclass(frozen=True)
 class Offset:
     """A deterministic step that notes each row it runs on, so a run shows whether its cache ran it."""
 
@@ -601,6 +604,577 @@ def test_a_cache_reads_the_fill_an_earlier_run_completed_and_fills_another_key_a
     assert trained.calls == []
     assert values(other) == [(index, index + 20) for index in range(6)]
     assert sorted(other.calls) == list(range(6))
+
+
+def _ids(batches):
+    return [[(int(row), int(value)) for row, value in zip(batch["id"], batch["value"], strict=True)]
+            for batch in batches]
+
+
+def test_a_cache_of_one_record_an_input_reads_each_share_as_the_uncached_order_does(tmp_path):
+    """A cache whose steps keep one record for each input, then a shuffle: two shares of an
+    indexed read each read what the uncached chain's share reads, the shuffle one order over every
+    input. A position saved at two shares restores at one, reading on as the uncached chain does."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    source = Memory([{"id": index} for index in range(12)])
+
+    def built(cache):
+        stepped = Pipeline(source).map(Offset(10))
+        return compile((stepped if cache is None else stepped.cache(cache)).shuffle(0).repeat().batch(2),
+                       read="indexed", loading=loading)
+
+    def share(data, index, count, steps, state=None):
+        reader = data.train(DataPartition(index=index, count=count))
+        try:
+            if state is not None:
+                reader.set_state(state)
+            return _ids(next(reader) for _ in range(steps)), reader.get_state()
+        finally:
+            reader.close()
+
+    uncached, cached = built(None), built(str(tmp_path / "cache"))
+    for index in range(2):
+        assert share(cached, index, 2, 4)[0] == share(uncached, index, 2, 4)[0]
+    _, saved = share(cached, 0, 2, 3)
+    _, uncached_saved = share(uncached, 0, 2, 3)
+    assert share(cached, 0, 1, 3, saved)[0] == share(uncached, 0, 1, 3, uncached_saved)[0]
+
+
+def test_a_cache_skips_the_inputs_a_store_misses_as_the_uncached_read_does_and_publishes_them(tmp_path):
+    """A store in memory missing two of its inputs: a cache of one record for each input reads the
+    rest as the uncached chain does, and completes its fill with the missing ones, so a later run
+    reads the cache without running its step."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    records = [None if index in (3, 7) else {"id": index} for index in range(10)]
+
+    def batches(step, cache):
+        stepped = Pipeline(Memory(records)).map(step)
+        chain = (stepped if cache is None else stepped.cache(cache)).repeat(1).batch(2)
+        reader = compile(chain, read="indexed", loading=loading).train(DataPartition())
+        try:
+            return _ids(reader)
+        finally:
+            reader.close()
+
+    expected = batches(Offset(10), None)
+    filling, reading = Offset(10), Offset(10)
+    assert batches(filling, str(tmp_path / "cache")) == expected
+    assert batches(reading, str(tmp_path / "cache")) == expected
+    assert sorted(filling.calls) == [index for index in range(10) if index not in (3, 7)]
+    assert reading.calls == []
+
+
+def test_a_cache_read_by_two_loading_workers_seals_what_each_filled(tmp_path):
+    """A cache read in one pass by two loading workers: each worker's fill is sealed as its pass
+    ends, the inputs the store misses among them, so together the sealed fills hold every input,
+    which a publication of the cache unions."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    # Two inputs the store misses: each worker writes their completions as its pass starts.
+    source = Memory([None if index in (5, 11) else {"id": index} for index in range(16)], shard_rows=4)
+    cache = str(tmp_path / "cache")
+    filling = Offset(10)
+    chain = Pipeline(source).map(filling).cache(cache).repeat(1).workers(2).batch(2)
+    reader = compile(chain, read="indexed", loading=Loading(workers=0, threads=1, read_buffer=1)).train(
+        DataPartition())
+    try:
+        assert sorted(row for batch in _ids(reader) for row, _ in batch) == [
+            index for index in range(16) if index not in (5, 11)]
+    finally:
+        reader.close()
+    fs, path = Store(cache).resolve()
+    seals = [location for location in fs.find(path) if location.endswith("/seal.json")]
+    # Each seal lists the segments its worker wrote, under the fill's root.
+    held = {completion["id"] for seal in seals
+            for segment in json.loads(fs.cat_file(seal))["segments"]
+            for completion in json.loads(fs.cat_file(
+                f"{seal.rsplit('/segments/', 1)[0]}/{segment['path']}"))["completions"]}
+    assert len(seals) == 2
+    assert held == {str(index) for index in range(16)}
+
+
+def test_a_cache_of_a_store_that_misses_every_input_publishes_its_empty_fill(tmp_path):
+    """A store whose every input is missing: a pass reads no row, and its fill holds every input's
+    completion, so a publication runs no step and holds no row."""
+    from dew.data.compile import iterate, publish
+    from dew.data.dataset import Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    source = Memory([None] * 6)
+    cache = str(tmp_path / "cache")
+    # A pass that reads every input: no training run, which refuses a corpus with no row.
+    rows = iter(iterate(Pipeline(source).map(Offset(10)).cache(cache), read="indexed", loading=loading))
+    try:
+        assert list(rows) == []
+    finally:
+        rows.close()
+    publishing = Offset(10)
+    assert len(publish(Pipeline(source).map(publishing), Cache(cache), read="indexed", loading=loading)) == 0
+    assert publishing.calls == []
+
+
+def _rows(reader, batches: int) -> set[tuple[bytes, ...]]:
+    """The distinct rows of a reader's next `batches` batches, each its fields' bytes."""
+    rows = set()
+    for _ in range(batches):
+        batch = next(reader)
+        names = sorted(batch)
+        rows |= {tuple(np.asarray(batch[name])[row].tobytes() for name in names)
+                 for row in range(len(np.asarray(batch[names[0]])))}
+    return rows
+
+
+def test_a_prompt_recipe_with_a_cache_reads_by_index_the_prompts_it_reads_uncached(tmp_path):
+    """A prompt recipe whose rendering drops prompts too long, cached and read by index in the
+    recipe's own loading workers: the cache holds what is left of each input, and the read goes on
+    through every prompt kept, as the uncached recipe's does, however the drops fall among the
+    workers (row 883)."""
+    from dew.config.data import PromptData, loader
+    from dew.data.dataset import DataPartition
+
+    # A third of the twelve prompts are longer than 6 bytes, which the recipe drops: eight are kept.
+    recipe = PromptData(tuple({"prompt": chr(97 + index) + "hi" * (1 + index % 3)} for index in range(12)),
+                        "byte", max_prompt_len=6, long="drop", reward_bytes=8)
+    # The recipe reads in worker processes, which read a cache on disk.
+    cached = loader(recipe, batch=2, cache=str(tmp_path / "cache"), read="indexed")
+    uncached = loader(recipe, batch=2, read="indexed")
+    assert cached.records == uncached.records
+    first, second = cached.train(DataPartition()), uncached.train(DataPartition())
+    try:
+        kept = _rows(second, 16)
+        assert len(kept) == 8
+        assert _rows(first, 16) == kept
+    finally:
+        first.close()
+        second.close()
+
+
+def test_an_image_recipe_with_a_fixed_caption_and_a_cache_reads_in_its_uncached_order(tmp_path):
+    """An image recipe's fixed caption is a configured step, which binds to one that keeps every
+    image: cached and read by index, it holds one row for each input, so the recipe takes the
+    global order it takes uncached and reads the same batches."""
+    from dew.config.data import ImageData, loader
+    from dew.data.dataset import DataPartition
+
+    images = [{"image": np.random.default_rng(index).integers(0, 256, (6, 5, 3), np.uint8), "label": index}
+              for index in range(80)]
+    recipe = ImageData(Memory(images), image_size=4, caption="a photo", augment=None, validation=None)
+    cached = loader(recipe, batch=4, cache=str(tmp_path / "cache"), read="indexed")
+    uncached = loader(recipe, batch=4, read="indexed")
+    first, second = cached.train(DataPartition()), uncached.train(DataPartition())
+    try:
+        for _ in range(20):
+            left, right = next(first), next(second)
+            assert sorted(left) == sorted(right)
+            for name in right:
+                np.testing.assert_array_equal(np.asarray(left[name]), np.asarray(right[name]))
+    finally:
+        first.close()
+        second.close()
+
+
+def test_a_cache_followed_by_a_token_split_seals_the_fill_the_split_reads():
+    """A cache, then a token holdout, which reads every document as the run is planned: the fill
+    the planning read is sealed, so a publication afterwards runs no step again."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    documents = Memory([{"text": np.arange(3 + index % 4, dtype=np.int32)} for index in range(8)])
+    cache = _cache()
+    train, _ = Pipeline(documents).map(Same()).cache(cache).holdout(tokens=0.25)
+    reader = compile(train.repeat().batch(1), read="indexed", loading=loading).train(DataPartition())
+    reader.close()
+    publishing = Same()
+    publish(Pipeline(documents).map(publishing), cache, read="indexed", loading=loading)
+    assert publishing.calls == []
+
+
+@dataclass(frozen=True)
+class Keeps:
+    """Rejects a record whose id is a multiple of `every`, permanently: a record steps cannot make."""
+
+    every: int
+    identity = "keeps@1"
+    rejects = True
+
+    def __call__(self, row):
+        return Rejected("unkept") if int(row["id"]) % self.every == 0 else row
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_shuffled_cache_fills_what_a_publication_of_its_steps_reads(tmp_path, read):
+    """A store missing two of its inputs, shuffled and then cached: the cache fills each input's
+    rows by its place in the store, missing ones too, as a publication of the steps keys them, so
+    publishing afterwards runs no step again and holds every kept row."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    source = Memory([None if index in (3, 7) else {"id": index} for index in range(12)])
+    cache = str(tmp_path / "cache")
+    filling = Offset(10)
+    chain = Pipeline(source).shuffle(3).map(filling).cache(cache).repeat(1).batch(2)
+    reader = compile(chain, read=read, loading=loading).train(DataPartition())
+    try:
+        assert sorted(row for batch in _ids(reader) for row, _ in batch) == [
+            index for index in range(12) if index not in (3, 7)]
+    finally:
+        reader.close()
+    publishing = Offset(10)
+    generation = publish(Pipeline(source).map(publishing), Cache(cache), read=read, loading=loading)
+    assert len(generation) == 10
+    assert publishing.calls == []
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_published_generation_after_a_shuffle_reads_as_the_steps_it_stands_for(tmp_path, read):
+    """A generation published from a step that keeps one row for each input stands in for that
+    step after a shuffle, read as the shuffled step's rows; one published from a step that drops
+    rows holds no row for each input, so a shuffle before it is refused, naming the cache that
+    reads it by input."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    source = Memory([{"id": index} for index in range(12)])
+
+    def batches(chain):
+        reader = compile(chain.repeat().batch(3), read=read, loading=loading).train(DataPartition())
+        try:
+            return _ids(next(reader) for _ in range(4))
+        finally:
+            reader.close()
+
+    generation = publish(Pipeline(source).map(Offset(10)), Cache(str(tmp_path / "one")), read="indexed",
+                         loading=loading)
+    expected = batches(Pipeline(source).shuffle(3).map(Offset(10)))
+    assert batches(Pipeline(source).shuffle(3).map(Offset(10)).cache(generation)) == expected
+    kept = Pipeline(source).map(Offset(10)).filter_map(Keeps(5), identity="keeps@1")
+    dropped = publish(kept, Cache(str(tmp_path / "kept")), read="indexed", loading=loading)
+    with pytest.raises(ValueError):
+        batches(Pipeline(source).shuffle(3).map(Offset(10)).filter_map(Keeps(5), identity="keeps@1")
+                .cache(dropped))
+
+
+@pytest.mark.parametrize("views", ["shuffled", "shuffled in windows", "repeated then shuffled", "taken"])
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_cache_after_views_of_the_inputs_reads_as_the_uncached_chain(tmp_path, read, views):
+    """Views of the inputs written before a cache (a shuffle, a window shuffle, a repeat, a take)
+    read it as they read the inputs: the batches are the uncached chain's, rejected records
+    dropped where they are. A view that reads every input completes the cache, so a later run
+    reads its published fill without running its steps; a take reads part of them, and the
+    cache, holding every input's, is filled again."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+
+    def chain(step, cache):
+        viewed = {"shuffled": lambda source: source.shuffle(3),
+                  "shuffled in windows": lambda source: source.shuffle(3, window=4),
+                  "repeated then shuffled": lambda source: source.repeat(2).shuffle(3),
+                  "taken": lambda source: source.shuffle(3).take(7)}[views](Pipeline(Memory(
+                      [{"id": index} for index in range(12)])))
+        stepped = viewed.map(step).filter_map(Keeps(5), identity="keeps@1")
+        return (stepped if cache is None else stepped.cache(cache)).repeat().batch(3)
+
+    def batches(step, cache):
+        reader = compile(chain(step, cache), read=read, loading=loading).train(DataPartition())
+        try:
+            return [[(int(row), int(value)) for row, value in zip(batch["id"], batch["value"], strict=True)]
+                    for batch in (next(reader) for _ in range(5))]
+        finally:
+            reader.close()
+
+    expected = batches(Offset(10), None)
+    cache = str(tmp_path / "cache")
+    filling, reading = Offset(10), Offset(10)
+    assert batches(filling, cache) == expected
+    assert batches(reading, cache) == expected
+    assert filling.calls
+    assert (reading.calls == []) == (views != "taken")
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_cache_of_one_record_an_input_after_views_reads_each_share_as_the_uncached_chain(tmp_path, read):
+    """A shuffle and a take of the inputs, then a step that keeps one record for each and a cache:
+    each of two shares reads what the uncached chain's share reads, the take one over every input,
+    and a position saved at two shares restores at one as the uncached chain's does."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    source = Memory([{"id": index} for index in range(12)])
+
+    def built(cache):
+        stepped = Pipeline(source).shuffle(0).take(10).map(Offset(10))
+        return compile((stepped if cache is None else stepped.cache(cache)).repeat().batch(2), read=read,
+                       loading=loading)
+
+    def share(data, index, count, steps, state=None):
+        reader = data.train(DataPartition(index=index, count=count))
+        try:
+            if state is not None:
+                reader.set_state(state)
+            return _ids(next(reader) for _ in range(steps)), reader.get_state()
+        finally:
+            reader.close()
+
+    uncached, cached = built(None), built(str(tmp_path / "cache"))
+    for index in range(2):
+        assert share(cached, index, 2, 4)[0] == share(uncached, index, 2, 4)[0]
+    _, saved = share(cached, 0, 2, 3)
+    _, uncached_saved = share(uncached, 0, 2, 3)
+    assert share(cached, 0, 1, 3, saved)[0] == share(uncached, 0, 1, 3, uncached_saved)[0]
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_views_before_a_cache_of_a_store_missing_inputs_read_its_present_ones(tmp_path, read):
+    """A store missing some inputs, shuffled and taken, then steps that drop records, then a cache:
+    the views read the inputs the store holds, as the uncached chain's do, in its order."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    records = [None if index in (0, 3, 4) else {"id": index} for index in range(12)]
+
+    def batches(cache):
+        stepped = (Pipeline(Memory(records)).shuffle(1).take(6).map(Offset(10))
+                   .filter_map(Keeps(5), identity="keeps@1"))
+        chain = (stepped if cache is None else stepped.cache(cache)).repeat(1).batch(1)
+        reader = compile(chain, read=read, loading=loading).train(DataPartition())
+        try:
+            return _ids(reader)
+        finally:
+            reader.close()
+
+    assert batches(str(tmp_path / "cache")) == batches(None)
+
+
+def test_views_before_a_cache_of_a_grain_store_missing_inputs_read_its_present_ones_in_memory(tmp_path):
+    """A Grain dataset missing an input, read in memory, shuffled, then a step and a cache: the
+    cache reads the inputs the store holds, as the uncached chain does, in its order."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources.grain import from_grain
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    records = [None if index == 2 else {"id": index} for index in range(6)]
+    source = from_grain(grain.MapDataset.source(records), name="missing-two")
+
+    def batches(cache):
+        stepped = Pipeline(source).shuffle(1).map(Offset(10))
+        chain = (stepped if cache is None else stepped.cache(cache)).repeat(1).batch(1)
+        reader = compile(chain, read="memory", loading=loading).train(DataPartition())
+        try:
+            return _ids(reader)
+        finally:
+            reader.close()
+
+    expected = batches(None)
+    assert sorted(row for batch in expected for row, _ in batch) == [0, 1, 3, 4, 5]
+    assert batches(str(tmp_path / "cache")) == expected
+
+
+@dataclass(frozen=True)
+class KeepsBy:
+    """A configured step that binds to `step`, which drops records."""
+
+    step: Keeps
+    identity = "keeps-by@1"
+
+    def __call__(self, metadata):
+        return self.step
+
+
+@dataclass(frozen=True)
+class OffsetBy:
+    """A configured step that binds to `step`, keeping every record."""
+
+    step: Offset
+    identity = "offset-by@1"
+
+    def __call__(self, metadata):
+        return self.step
+
+
+def test_a_configured_memory_read_fills_the_cache_its_publication_reads(tmp_path):
+    """A memory read of a configured step after a shuffle, then a cache: its fill is the one a
+    publication of that step over the store reads, so publishing afterwards runs no step."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Configured, Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    source = Memory([None if index == 4 else {"id": index} for index in range(9)])
+    cache = str(tmp_path / "cache")
+    filling = Offset(10)
+    chain = Pipeline(source).shuffle(2).map(Configured(OffsetBy(filling), needs=())).cache(cache)
+    reader = compile(chain.repeat(1).batch(2), read="memory", loading=loading).train(DataPartition())
+    try:
+        assert sorted(row for batch in _ids(reader) for row, _ in batch) == [
+            index for index in range(9) if index != 4]
+    finally:
+        reader.close()
+    assert sorted(filling.calls) == [index for index in range(9) if index != 4]
+    publishing = Offset(10)
+    publish(Pipeline(source).map(Configured(OffsetBy(publishing), needs=())), Cache(cache), read="memory",
+            loading=loading)
+    assert publishing.calls == []
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_generation_of_a_configured_step_after_a_shuffle_reads_as_the_steps_it_stands_for(tmp_path, read):
+    """A generation published from a configured step that states it keeps every record stands in for
+    it after a shuffle, read as the uncached chain's rows; one that binds to a step dropping records
+    against its statement is refused."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Configured, Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    source = Memory([{"id": index} for index in range(12)])
+
+    def stepped(chain):
+        return chain.map(Configured(OffsetBy(Offset(10)), needs=(), one_to_one=True))
+
+    def batches(chain):
+        reader = compile(chain.repeat().batch(3), read=read, loading=loading).train(DataPartition())
+        try:
+            return _ids(next(reader) for _ in range(4))
+        finally:
+            reader.close()
+
+    generation = publish(stepped(Pipeline(source)), Cache(str(tmp_path / "one")), read=read, loading=loading)
+    assert batches(stepped(Pipeline(source).shuffle(3)).cache(generation)) == batches(
+        stepped(Pipeline(source).shuffle(3)))
+    with pytest.raises(ValueError):
+        batches(Pipeline(source).map(Configured(KeepsBy(Keeps(5)), needs=(), one_to_one=True)))
+
+
+@dataclass(frozen=True)
+class Bounded:
+    """A step that keeps its record and states a bound of it (`_dew_bounds`), which a memory read
+    measures over its rows."""
+
+    identity = "bounded@1"
+
+    def __call__(self, row):
+        return {**row, "_dew_bounds": {"width": int(row["id"]) + 1}}
+
+
+@dataclass(frozen=True)
+class Widened:
+    """A run's configured step: each record carries the widest bound the run measured."""
+
+    identity = "widened@1"
+
+    def __call__(self, metadata):
+        return Width(int(metadata["width"]))
+
+
+@dataclass(frozen=True)
+class Width:
+    width: int
+    identity = "width@1"
+
+    def __call__(self, row):
+        return {**row, "width": self.width}
+
+
+def test_a_memory_read_measures_the_steps_before_a_view_and_its_cache_as_uncached(tmp_path):
+    """A memory read runs the steps written before the first view of the inputs over the whole
+    source, cache or none, so a run's configured step after the cache binds to the bound they
+    state, and the run reads what the uncached chain reads."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Configured, Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    source = Memory([{"id": index} for index in range(12)])
+
+    def batches(cache):
+        stepped = Pipeline(source).map(Bounded()).shuffle(3).map(Offset(10))
+        cached = stepped if cache is None else stepped.cache(cache)
+        chain = cached.map(Configured(Widened(), needs=("width",), scope="run")).repeat().batch(3)
+        reader = compile(chain, read="memory", loading=loading).train(DataPartition())
+        try:
+            return [[(int(row), int(value), int(width))
+                     for row, value, width in zip(batch["id"], batch["value"], batch["width"], strict=True)]
+                    for batch in (next(reader) for _ in range(4))]
+        finally:
+            reader.close()
+
+    expected = batches(None)
+    assert {width for batch in expected for _, _, width in batch} == {12}
+    assert batches(str(tmp_path / "cache")) == expected
+
+
+@dataclass(frozen=True)
+class Stamped:
+    """Notes the source position a read gives its record."""
+
+    identity = "stamped@1"
+
+    def __call__(self, index, row):
+        return {**row, "at": index}
+
+
+def test_a_step_reading_its_index_in_a_cache_after_a_memory_read_step_reads_the_source_position(tmp_path):
+    """A store missing some inputs, a step a memory read runs over it, a shuffle, then a step that
+    reads its record's index and a cache: the cached step reads each record's place in the store,
+    as the uncached one does, in each of two passes."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    source = Memory([None if index in (0, 4) else {"id": index} for index in range(8)])
+
+    def batches(cache):
+        stepped = Pipeline(source).map(Same()).shuffle(0).map_with_index(Stamped(), identity="stamped@1")
+        chain = (stepped if cache is None else stepped.cache(cache)).repeat(2).batch(1)
+        reader = compile(chain, read="memory", loading=loading).train(DataPartition())
+        try:
+            return [(int(batch["id"][0]), int(batch["at"][0])) for batch in reader]
+        finally:
+            reader.close()
+
+    # Two passes, each of every record the store holds.
+    expected = batches(None)
+    assert sorted(expected) == sorted(2 * [(index, index) for index in range(8) if index not in (0, 4)])
+    assert batches(str(tmp_path / "cache")) == expected
+
+
+def test_a_streamed_view_before_a_cache_is_refused_with_its_reason(tmp_path):
+    """A streamed read fills its cache shard by shard, so a shuffle written before the cache is
+    refused there, naming the reads that support it."""
+    from dew.data.compile import compile
+    from dew.data.dataset import Loading
+    from dew.data.pipeline import Pipeline
+
+    chain = Pipeline(Memory([{"id": index} for index in range(8)])).shuffle(3, window=4).map(Offset(1))
+    with pytest.raises(ValueError):
+        compile(chain.cache(str(tmp_path / "cache")).batch(2), read="streamed", loading=Loading(workers=0))
 
 
 def test_a_streamed_cache_reads_the_generation_published_under_its_key(tmp_path):
@@ -681,7 +1255,7 @@ def test_published_generation_exposes_only_declared_order_metadata_and_plan():
     source = Memory(
         [{"id": index, "_dew_length": index + 2, "_dew_valid_targets": index + 1} for index in range(4)]
     )
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     for index in range(len(rows)):
         rows[index]
@@ -700,7 +1274,7 @@ def test_transient_failures_never_certify_cache_coverage_but_permanent_rejection
     from dew.data.pipeline import Rejected
 
     source = Memory([{"id": 0}, {"id": 1}])
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     transient = cache.mapped(
         grain.MapDataset.source(source.records("indexed")),
         key,
@@ -728,7 +1302,7 @@ def test_transient_failures_never_certify_cache_coverage_but_permanent_rejection
 def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_path):
     source = Memory([{"id": 0}])
     cache = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1)
-    first_key, second_key = Manifest(b'{"source":"one"}'), Manifest(b'{"source":"two"}')
+    first_key, second_key = _key("one"), _key("two")
     first = cache.mapped(grain.MapDataset.source(source.records("indexed")), first_key)
     first[0]
     first.finish()
@@ -763,10 +1337,10 @@ def test_local_retention_reclaims_the_bytes_of_fills_closed_before_they_sealed(t
     for index in range(3):
         source = rows(index)
         stopped = cache.mapped(grain.MapDataset.source(source.records("indexed")),
-                               Manifest(json.dumps({"source": index}).encode()))
+                               _key(index))
         stopped[0]
         stopped.close()
-    source, key = Memory([{"id": 99}]), Manifest(b'{"source":"kept"}')
+    source, key = Memory([{"id": 99}]), _key("kept")
     filled = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     filled[0]
     filled.finish()
@@ -792,7 +1366,7 @@ def test_a_local_cache_fails_a_shard_its_disk_refuses_at_once(tmp_path, monkeypa
     monkeypatch.setattr(filelock.FileLock, "acquire", counted)
     source = Memory([{"id": 0, "blob": np.random.default_rng(0).bytes(200_000)}])
     cache = Cache(str(tmp_path), keep_local_bytes=64 * 1024, on_full="block", shard_bytes=1, retry=3)
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest())
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), _key())
     try:
         assert rows[0]["id"] == 0
         with pytest.raises(OSError):
@@ -837,7 +1411,7 @@ def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
     source = Memory([{"id": index, "blob": blobs.bytes(300_000)} for index in range(2)])
     cache = Cache(f"refusing://cache-{uuid4().hex}", spool_bytes=500_000, shard_bytes=1, on_full="block",
                   retry=1)
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest())
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), _key())
     rows.writer.lock = Observed(threading.RLock())
     raised: list[BaseException] = []
 
@@ -888,7 +1462,7 @@ def test_training_close_abandons_a_stalled_upload_without_publishing_a_segment()
     fsspec.register_implementation("stalled", Stalled, clobber=True)
     source = Memory([{"id": 0}])
     cache = Cache(f"stalled://cache-{uuid4().hex}", shard_bytes=1, retry=0)
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest())
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), _key())
     try:
         assert rows[0] == {"id": 0}
         assert entered.wait(5)
@@ -908,7 +1482,7 @@ def test_training_close_abandons_a_stalled_upload_without_publishing_a_segment()
 def test_real_r2_generation_publication_mirror_and_cleanup(tmp_path):
     root = os.environ["DEW_DATA_TEST_URL"]  # a writable remote smoke prefix
     source = Memory([{"id": index, "text": "remote"} for index in range(4)])
-    key = Manifest(b'{"r2-smoke":"artifact-v1"}')
+    key = _key("r2-smoke artifact-v1")
     cache = Cache(
         root.rstrip("/") + "/generation",
         storage_options={"dewcache": {"cache_storage": str(tmp_path), "max_bytes": 2**20}},

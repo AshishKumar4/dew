@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from data_support import keep_captions
 
 from dew.config.data import Augment, HoldOut, ImageData, loader
 from dew.data import Files, Loading, Memory, images
@@ -101,10 +102,6 @@ def test_a_bucket_is_the_size_nearest_an_image_s_aspect_covered_and_cut_at_the_c
     assert abs(float(bucketed[0]["image"][:, 9:11].mean()) - 118) < 8
     with pytest.raises(ValueError):
         images.bucket(((16, 0),))
-
-
-def keep_captions(captions):
-    return {"caption": np.asarray(captions)}
 
 
 @pytest.mark.parametrize("captions", ["record", "template", "templates", "empty"])
