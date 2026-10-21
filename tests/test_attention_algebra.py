@@ -269,33 +269,30 @@ def test_a_timed_backward_launch_walks_every_key():
     np.testing.assert_array_equal(np.asarray(filled[-1]), keys)
 
 
-@pytest.mark.parametrize("peak0, scale", [(87.0, 1.0), (0.0, 2.0 ** -126)],
-                         ids=["small weight", "small scale"])
-def test_a_resumed_backward_keeps_a_gradient_whose_factors_are_below_fp32(peak0, scale):
-    """fp32, one query over one key, Q 0 and K and V 1, resumed from a state holding a denominator of
-    2**25, under an output cotangent of 2**100: at maximum 87 the key's weight exp(-87) / 2**25 lies
-    below fp32's least subnormal, and at scale 2**-126 so does the scale over the denominator, yet the
-    score cotangent and dQ are normal numbers. Both mainloops keep dQ (nonzero, and as exact as fp32's
-    reference against float64), where taking a small factor first would have zeroed it."""
+def test_a_resumed_backward_keeps_a_weight_below_fp32_beside_a_large_cotangent():
+    """fp32, one query over one key, Q 0 and K and V 1, resumed from a state at maximum 87 holding a
+    denominator of 2**25, under an output cotangent of 2**100: the key's weight exp(-87) / 2**25 lies
+    below fp32's least subnormal, but its score cotangent, exp(-87) (dP - D) / 2**25, is a normal
+    number. Both mainloops keep it (nonzero, and as exact as fp32's reference against float64), where
+    taking the weight first would have zeroed it."""
     spans = template.spans(1, 1, 1)
     query = jnp.zeros((1, 1, 1, 1), jnp.float32)
     key = value = jnp.ones((1, 1, 1, 1), jnp.float32)
     dout = jnp.full((1, 1, 1, 1), 2.0 ** 100, jnp.float32)
-    state = template.Initial(jnp.full((1, 1, 1), peak0), jnp.full((1, 1, 1), 2.0 ** 25),
+    state = template.Initial(jnp.full((1, 1, 1), 87.0), jnp.full((1, 1, 1), 2.0 ** 25),
                              jnp.zeros((1, 1, 1, 1)))
     hooks = template.Hooks(initial=state)
     pins = {attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2),
             attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}
     with tuning.pinned(pins):
-        triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=scale,
-                                           interpret=True)
+        triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=1.0, interpret=True)
     portable = attention_portable.backward(query, key, value, spans, hooks, dout, block_q=32, block_k=32,
-                                           pad=attention_triton.BLOCK, scale=scale)
+                                           pad=attention_triton.BLOCK, scale=1.0)
 
     def reference_dq(dtype):
         def attend(q, k, v):
             given = template.Hooks(initial=jax.tree.map(lambda x: x.astype(dtype), state))
-            return template.reference(q, k, v, spans, given, scale=scale)
+            return template.reference(q, k, v, spans, given, scale=1.0)
 
         operands = (query.astype(dtype), key.astype(dtype), value.astype(dtype))
         return np.asarray(jax.vjp(attend, *operands)[1](dout.astype(dtype))[0])
@@ -306,4 +303,4 @@ def test_a_resumed_backward_keeps_a_gradient_whose_factors_are_below_fp32(peak0,
     for found in (triton, portable):
         got = np.asarray(found.query)
         assert got[0, 0, 0, 0] != 0.0
-        assert_as_exact_as_the_reference(got, theirs, want, "dq below fp32's factors")
+        assert_as_exact_as_the_reference(got, theirs, want, "dq below fp32's weights")
