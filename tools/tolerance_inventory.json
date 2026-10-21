@@ -572,11 +572,6 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
-  "tests/test_loop.py": {
-   "comparisons": 12,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
   "tests/test_lora.py": {
    "comparisons": 26,
    "lane": "Models, Serving & RL",
