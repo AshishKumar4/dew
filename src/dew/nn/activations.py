@@ -223,8 +223,8 @@ def _portable(activate, halves):
     rounded_product = _recomputed(lambda *operands: rounded(*halves(*operands)))
 
     def portable(*operands: jax.Array) -> jax.Array:
-        gate, up = halves(*operands)
-        if jnp.finfo(jnp.result_type(gate, up)).bits >= 32:
+        if jnp.finfo(jnp.result_type(*operands)).bits >= 32:
+            gate, up = halves(*operands)
             return activate(gate) * up
         return rounded_product(*operands)
 
