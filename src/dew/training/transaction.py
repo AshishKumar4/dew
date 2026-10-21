@@ -250,11 +250,16 @@ def example_fields(state, slot, split: int, batch, slots: int = 1) -> dict:
     if not rows:
         return {}
     key = jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM), state.updates)
-    index = example_places(slot, split, rows)
+    return {"example_key": key, "example_index": placed_as_rows(example_places(slot, split, rows), batch),
+            "example_count": slots * rows}
+
+
+def placed_as_rows(index: jax.Array, batch) -> jax.Array:
+    """`index`, an entry for each of `batch`'s rows, placed as the batch's rows are, so each device
+    reads its own rows' entries alone."""
     like = next(leaf for leaf in jax.tree.leaves(batch) if np.ndim(leaf))
-    if (placed := rows_spec(like, 1)) is not None:
-        index = jax.sharding.reshard(index, placed)
-    return {"example_key": key, "example_index": index, "example_count": slots * rows}
+    placed = rows_spec(like, 1)
+    return index if placed is None else jax.sharding.reshard(index, placed)
 
 
 class Transaction:
