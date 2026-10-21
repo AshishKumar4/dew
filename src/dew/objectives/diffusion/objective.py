@@ -795,7 +795,8 @@ class DiffusionObjective(Objective[Ratio]):
         # latent, read through the frozen model and projector in evaluation
         # mode (the batch norm on its running statistics, no condition
         # dropped), as REPA-E's `align_only` pass reads them, on the same
-        # times and noise.
+        # times and noise. That pass draws nothing, and its noised input and
+        # target are its own, so its step marks no boundary a tape replaces.
         latents = self.end_to_end.normalized(end_to_end.raw, variables[LATENT_STATS])
         frozen = jax.lax.stop_gradient(variables)
         _, through = self._denoised(frozen, self.model_variables(frozen), latents, t, noise,
