@@ -16,12 +16,18 @@ from .base import Read, ShardManifest, _indexed_manifest
 from .codec import fingerprint
 
 
+class _Interchanged(Protocol):
+    """A table as the dataframe interchange protocol hands it over."""
+
+    def num_columns(self) -> int: ...
+
+
 @runtime_checkable
 class DataFrame(Protocol):
     """A table that hands itself over through the dataframe interchange protocol: a pandas or
     polars DataFrame, or an Arrow table."""
 
-    def __dataframe__(self, nan_as_null: bool = False, allow_copy: bool = True) -> object: ...
+    def __dataframe__(self) -> _Interchanged: ...
 
 
 class SparkFrame(Protocol):

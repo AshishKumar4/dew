@@ -64,7 +64,7 @@ from dew.data.pipeline import (
     Workers,
     _declares_rejects,
 )
-from dew.data.plan import Manifest, StepIdentity, _changed, _semantic
+from dew.data.plan import Manifest, StepIdentity, _changed, _semantic, identified
 from dew.data.sources.base import READS, Read, Source, _consumed
 from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
@@ -547,8 +547,15 @@ def _manifest(
 
 
 def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest:
+    """The key of a cache of `prefix` over `source`, which keys the source's content: a store
+    given no name states none (`Manifest.exact`), and its cache would serve any other's rows."""
+    stated = source.fingerprint()
+    if not identified(json_value(stated, "source")):
+        raise ValueError(f"a cache keys its store's content, which {source.describe()} doesn't "
+                         "state: name it (from_grain(..., name=), from_iter(..., name=), "
+                         "from_torch(..., identity=))")
     return _manifest(
-        source.fingerprint(),
+        stated,
         (source,),
         tuple(_identity(stage, cache=True) for stage in prefix),
         fill={"read": read, "row_ids": "sharded" if read == "streamed" else "indexed"},
