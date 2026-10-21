@@ -31,8 +31,9 @@ from dew.nn.backbones.flux import FluxTransformer
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("schnell", "dev", "rect", "deep", "mixed")
-CASE_SEEDS = dict.fromkeys(CASES, 8)
-"""Each transformer's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`."""
+CASE_SEEDS = {"schnell": 256, "dev": 256, "rect": 256, "deep": 128, "mixed": 256}
+"""Each transformer's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` (2026-10-21,
+on armada)."""
 
 
 @pytest.fixture(scope="module")

@@ -188,7 +188,8 @@ def whitened(rewards, values, gamma, lam, dtype):
 
 
 PPO_SHIFT_SEEDS = 16
-"""The shifted-reward site's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`."""
+"""The shifted-reward site's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`
+(2026-10-21, on armada)."""
 
 
 def test_whitened_advantages_of_rewards_far_above_the_values_are_as_exact_as_the_equations():
