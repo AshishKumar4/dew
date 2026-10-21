@@ -375,3 +375,26 @@ def test_a_single_key_query_gradient_with_computed_scores_is_certified():
     inputs = tuple(jnp.asarray(rng.normal(size=(4, 16)), jnp.float32) for _ in range(4))
     coverage = assert_zero_elements(dew, reference, inputs, "computed scores")
     assert coverage.certified == 64, coverage
+
+
+def test_a_function_is_held_to_its_interval_enclosure_over_its_operands_bound():
+    """log, log1p, sqrt, rsqrt, sin, cos, tanh and the logistic at bounded arguments: certified, each
+    element's bound at least its distance from the exact value at the native argument (mpmath at 200
+    bits); log of a negative, not certified."""
+    import mpmath
+
+    cases = {jnp.log: mpmath.log, jnp.log1p: mpmath.log1p, jnp.sqrt: mpmath.sqrt,
+             jax.lax.rsqrt: lambda t: 1 / mpmath.sqrt(t), jnp.sin: mpmath.sin, jnp.cos: mpmath.cos,
+             jnp.tanh: mpmath.tanh, jax.nn.sigmoid: lambda t: 1 / (1 + mpmath.exp(-t))}
+    terms = [np.float32(0.3), np.float32(2.0 ** -25), np.float32(0.4)]
+    summed, inputs = _sequential(terms)
+    for function, exact_function in cases.items():
+        out, _ = _interpreted(lambda x, f=function: f(summed(x)), *inputs)
+        assert out.certified.all(), function
+        with mpmath.workprec(200):
+            argument = sum((mpmath.mpf(float(term)) for term in terms), mpmath.mpf(0))
+            mantissa, exponent = exact_function(argument).man_exp
+        exact = fractions.Fraction(mantissa) * fractions.Fraction(2) ** exponent
+        assert fractions.Fraction(float(out.error)) >= abs(exact - fractions.Fraction(float(out.value))), function
+    negative, _ = _interpreted(jnp.log, jnp.asarray([-1.0], jnp.float32))
+    assert not negative.certified.any()
