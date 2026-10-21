@@ -151,6 +151,12 @@ SCORE_HOOKS = {"none": (), "softcap": ("softcap",), "sinks": ("sinks",), "alibi"
 """The score hooks the backward differentiates, each kind of parameter among them: ALiBi's slopes a
 head's, a per-key bias, a dense bias."""
 
+BACKWARD_SEEDS = {(("alibi",), "float32"): 64, (("alibi",), "bfloat16"): 128,
+                  (("sinks",), "bfloat16"): 16, (("softcap", "sinks", "alibi"), "float32"): 64,
+                  (("softcap", "sinks", "alibi"), "bfloat16"): 256}
+"""The backward sites' declared draws where `seeds_for` sizes them above `SEEDS`: a head's ALiBi slope
+is a gradient of four values a draw, and the sinks' bf16 state's of a few."""
+
 
 def score_hooks(names: tuple, queries: int, keys: int) -> template.Hooks:
     """The score hooks `names` asks for, their parameters fixed: a softcap, ALiBi, a per-key bias, a dense
@@ -181,9 +187,10 @@ def score_hooks(names: tuple, queries: int, keys: int) -> template.Hooks:
                           template.sinks(SINKS, ROWS, queries, 32) if "sinks" in names else None)
 
 
-ROW_TERMS = ("exact", "output")
-"""The backward's two forms of each query's `D = sum_j p dP`: summed from its tiles in a first pass
-(`backward`'s default), and `rowsum(dO * O)` from the forward's fp32 output (`residuals=`)."""
+ROW_TERMS = ("exact", "online", "output", "compensated")
+"""The backward's forms of each query's `D = sum_j p dP`: summed from its tiles in a first pass
+(`backward`'s default), in the dQ launch's one pass beside dQ (`online=`), and `rowsum(dO * O)` from the
+forward's fp32 output (`residuals=`), plainly or compensated (`compensated=`)."""
 
 
 def check_backward(case: dict, names: tuple, dtype, forward_config, backward_config, row_term: str = "exact"):
@@ -213,11 +220,12 @@ def check_backward(case: dict, names: tuple, dtype, forward_config, backward_con
     def ours(query, key, value, dout):
         with pins:
             residuals = None
-            if row_term == "output":
+            if row_term in ("output", "compensated"):
                 _, *residuals = attention_triton.forward(query, key, value, spans, hooks, residuals=True,
                                                          wide=True, interpret=not ON_GPU)
             grads = attention_triton.backward(query, key, value, spans, hooks, dout, residuals=residuals,
-                                              interpret=not ON_GPU)
+                                              online=row_term == "online",
+                                              compensated=row_term == "compensated", interpret=not ON_GPU)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
     def xla(query, key, value, dout):
@@ -232,7 +240,7 @@ def check_backward(case: dict, names: tuple, dtype, forward_config, backward_con
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), draw,
                     f"triton backward {case} {names} {jnp.dtype(dtype).name} {backward_config} {row_term}",
-                    seeds=ALL_HOOKS_SEEDS if len(names) > 1 else SEEDS)
+                    seeds=BACKWARD_SEEDS.get((names, jnp.dtype(dtype).name), SEEDS))
 
 
 BACKWARD_FORMS = ("full", "causal-window", "documents", "cross-causal-lengths-starts", "two-sided-window")
