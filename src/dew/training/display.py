@@ -489,6 +489,7 @@ class TrainingDisplay:
         rate = (steps - 1) / stepping if steps > 1 and stepping > 0 else None
         fraction = f"{goodput['goodput/step_fraction']:.1%} of the wall time in steps"
         console = Console()
+        named = self.shown.get("loss", PLAIN).label or "loss"
         if not redraws(console):
             timing = f"Trained {steps} steps in {duration(seconds)}"
             if first is not None:
@@ -496,7 +497,7 @@ class TrainingDisplay:
             if rate is not None:
                 timing += f", then {rate:.1f} step/s"
             self.note(timing)
-            self.note(fraction + ("" if loss is None else f", final loss {number(loss)}"))
+            self.note(fraction + ("" if loss is None else f", final {named} {number(loss)}"))
             return
         rows: list[tuple[str, RenderableType]] = [("trained", f"{steps} steps in {duration(seconds)}")]
         if first is not None:
@@ -505,7 +506,7 @@ class TrainingDisplay:
             rows.append(("then", f"{rate:.1f} step/s"))
         rows.append(("goodput", fraction))
         if loss is not None:
-            rows.append(("final loss", Text(number(loss), "bold")))
+            rows.append((f"final {named}", Text(number(loss), "bold")))
         for split, history in self.evaluations.items():
             evaluation = history[-1]
             rows.append((f"{self.label(split)} at {evaluation.step}", self.scores(evaluation, history=True)))
@@ -542,7 +543,8 @@ class TrainingDisplay:
         for index, (name, value) in enumerate(evaluation.scores.items()):
             bare = name.removeprefix(evaluation.split + "/")
             shown = self.shown.get(bare, PLAIN)
-            text.append("   " if index else "").append(f"{bare} ", LABEL).append(number(value, shown), "bold")
+            text.append("   " if index else "").append(f"{shown.label or bare} ", LABEL)
+            text.append(number(value, shown), "bold")
             if previous is not None and name in previous.scores:
                 text.append(" ").append_text(change(previous.scores[name], value, shown))
             if history:
@@ -559,8 +561,9 @@ class TrainingDisplay:
             for name in latest.scores:
                 bare = name.removeprefix(split + "/")
                 values = collections.deque(record.scores[name] for record in history if name in record.scores)
-                rows.append((f"{self.label(split)} · step {latest.step}",
-                             Row(bare, self.shown.get(bare, PLAIN), values)))
+                shown = self.shown.get(bare, PLAIN)
+                heading = f"{self.label(split)} · step {latest.step}"
+                rows.append((heading, Row(shown.label or bare, shown, values)))
         return rows
 
     def rate(self) -> float | None:
