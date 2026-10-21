@@ -183,7 +183,8 @@ class Call:
     """One model call as the engine served it.
 
     `prompt_ids` are the ids the engine read and `sampled_ids` the ids it
-    sampled, including EOS when `finish_reason` is a natural stop.
+    sampled, including the id that ended it (an EOS id, or one completing a
+    stop string) when `finish_reason` is a natural stop.
     `behavior_log_probs` holds the engine-reported log-probability of each
     sampled id. `finish_reason` is `stop`, `tool_calls`, `length` or `abort`.
     `version` is the policy version being served when the request was

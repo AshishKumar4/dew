@@ -250,8 +250,10 @@ TRAINER_SHOWN = {"loss": Shown(better="lower"),
                  "mfu": Shown(better="higher", percent=True, group="throughput"),
                  "hfu": Shown(better="higher", percent=True, group="throughput"),
                  "hlo_flops_util": Shown(better="higher", percent=True, group="throughput"),
-                 **{f"{name}_lower_bound": Shown(better="higher", percent=True, group="throughput")
-                    for name in ("hfu", "hlo_flops_util")}, "unsized_kernels": Shown(group="throughput"),
+                 # A utilization some launches' work went uncounted in is at least the value shown.
+                 **{f"{name}_lower_bound": Shown(better="higher", percent=True, group="throughput",
+                                                 label=f"{name} ≥") for name in ("hfu", "hlo_flops_util")},
+                 "unsized_kernels": Shown(group="throughput", label="uncounted kernels"),
                  "tokens": Shown(group="throughput"),
                  "tokens_per_s": Shown(better="higher", group="throughput"),
                  "rollout_seconds": Shown(better="lower", group="throughput")}
@@ -427,7 +429,7 @@ class TrainingDisplay:
             shown = self.shown.get(rest or prefix, PLAIN)
             rows = self.groups.setdefault(shown.group or prefix, {})
             if name not in rows:
-                rows[name] = Row(rest or prefix, shown, collections.deque(maxlen=TREND))
+                rows[name] = Row(self.named(rest or prefix), shown, collections.deque(maxlen=TREND))
             rows[name].values.append(value)
         self.reported = frozenset(scalars) - self.corpus_counts.keys()
         if self.live is None:
@@ -487,6 +489,7 @@ class TrainingDisplay:
         rate = (steps - 1) / stepping if steps > 1 and stepping > 0 else None
         fraction = f"{goodput['goodput/step_fraction']:.1%} of the wall time in steps"
         console = Console()
+        named = self.named("loss")
         if not redraws(console):
             timing = f"Trained {steps} steps in {duration(seconds)}"
             if first is not None:
@@ -494,7 +497,7 @@ class TrainingDisplay:
             if rate is not None:
                 timing += f", then {rate:.1f} step/s"
             self.note(timing)
-            self.note(fraction + ("" if loss is None else f", final loss {number(loss)}"))
+            self.note(fraction + ("" if loss is None else f", final {named} {number(loss)}"))
             return
         rows: list[tuple[str, RenderableType]] = [("trained", f"{steps} steps in {duration(seconds)}")]
         if first is not None:
@@ -503,7 +506,7 @@ class TrainingDisplay:
             rows.append(("then", f"{rate:.1f} step/s"))
         rows.append(("goodput", fraction))
         if loss is not None:
-            rows.append(("final loss", Text(number(loss), "bold")))
+            rows.append((f"final {named}", Text(number(loss), "bold")))
         for split, history in self.evaluations.items():
             evaluation = history[-1]
             rows.append((f"{self.label(split)} at {evaluation.step}", self.scores(evaluation, history=True)))
@@ -524,6 +527,10 @@ class TrainingDisplay:
         """The split's name, marked when its scores are of the averaged weights."""
         return f"{split} (ema)" if self.averaged else split
 
+    def named(self, metric: str) -> str:
+        """The name the display shows `metric` under: its `Shown.label`, else its own."""
+        return self.shown.get(metric, PLAIN).label or metric
+
     def rows(self) -> list[tuple[str, Row]]:
         """The metrics the last interval logged, as (group, row) pairs, grouped in the order each
         group was first logged."""
@@ -540,7 +547,8 @@ class TrainingDisplay:
         for index, (name, value) in enumerate(evaluation.scores.items()):
             bare = name.removeprefix(evaluation.split + "/")
             shown = self.shown.get(bare, PLAIN)
-            text.append("   " if index else "").append(f"{bare} ", LABEL).append(number(value, shown), "bold")
+            text.append("   " if index else "").append(f"{self.named(bare)} ", LABEL)
+            text.append(number(value, shown), "bold")
             if previous is not None and name in previous.scores:
                 text.append(" ").append_text(change(previous.scores[name], value, shown))
             if history:
@@ -557,8 +565,9 @@ class TrainingDisplay:
             for name in latest.scores:
                 bare = name.removeprefix(split + "/")
                 values = collections.deque(record.scores[name] for record in history if name in record.scores)
-                rows.append((f"{self.label(split)} · step {latest.step}",
-                             Row(bare, self.shown.get(bare, PLAIN), values)))
+                shown = self.shown.get(bare, PLAIN)
+                heading = f"{self.label(split)} · step {latest.step}"
+                rows.append((heading, Row(self.named(bare), shown, values)))
         return rows
 
     def rate(self) -> float | None:
