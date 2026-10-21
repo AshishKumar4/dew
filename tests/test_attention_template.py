@@ -361,7 +361,7 @@ def halves(spans: template.KeySpans, half: int) -> tuple[template.KeySpans, temp
                               spans.query_ids, None if ids is None else ids[:, half:], spans.keys - half))
 
 
-@pytest.mark.parametrize("split", ["tile-edge", "half-exact-products"])
+@pytest.mark.parametrize("split", ["sliced-at-a-tile-edge", "spanned-at-the-half"])
 @pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
 @pytest.mark.parametrize("hooks", [HOOKS["none"], HOOKS["sinks"]], ids=["none", "sinks"])
 @pytest.mark.parametrize("case", [CASES[name] for name in ARITHMETIC], ids=ARITHMETIC)
@@ -369,38 +369,42 @@ def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks, dt
     """The softmax over a call's first keys, its output, maxima and denominators resumed as the initial
     state of one over the rest (`template.Initial`, its numerator the output times the denominator, a
     query that saw nothing resuming from no state), gives the output, maxima and denominators of one
-    pass over every key, on par from float64: over the site's draws parted at a tile's edge, as a
-    split-KV launch parts them, and parted at the keys' half over draws in halves, whose every product of
-    a query with a key is exact in fp32 however a product of the call's shape sums it, so the two arms
-    differ only by the resume's own arithmetic. (A Gaussian draw parted at 50 of 100 keys sees XLA:CPU's
-    50-key product round its logits 1.5 times as far from float64 as its 100-key product does, which no
-    arithmetic of the resume's touches.)"""
+    pass over every key, on par from float64 over the site's draws: the keys parted at a tile's edge
+    into two arrays, as a split-KV launch parts them, or parted at their half by the spans over the
+    whole arrays. (Sliced into arrays of 50 or 64 of these 100 keys, XLA:CPU's product rounds the
+    logits 1.55 times as far from float64 as the whole call's product does on the same entries, and of
+    48 alike: a rounding of the product's shape, which the spanned half keeps the whole call's.)"""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
-    edge = keys // 2 // 32 * 32 if split == "tile-edge" else keys // 2
-    first, rest = halves(spans, edge)
     start = hooks_of(hooks, queries)
+    if split == "sliced-at-a-tile-edge":
+        edge = keys // 2 // 32 * 32
+        first, rest = halves(spans, edge)
+
+        def parted(array):
+            return array[:, :edge], array[:, edge:]
+    else:
+        edge = keys // 2
+        first = template.KeySpans(jnp.minimum(spans.start, edge), jnp.minimum(spans.end, edge),
+                                  spans.query_ids, spans.key_ids, keys)
+        rest = template.KeySpans(jnp.maximum(spans.start, edge), spans.end, spans.query_ids, spans.key_ids,
+                                 keys)
+
+        def parted(array):
+            return array, array
 
     def resumed(query, key, value):
-        out, m, total = template.reference(query, key[:, :edge], value[:, :edge], first, start,
-                                           residuals=True)
+        (key_first, key_rest), (value_first, value_rest) = parted(key), parted(value)
+        out, m, total = template.reference(query, key_first, value_first, first, start, residuals=True)
         acc = jnp.swapaxes(out.astype(jnp.float32), 1, 2) * total[..., None]
         state = template.Initial(jnp.where(total > 0, m, -jnp.inf), total, acc)
-        return template.reference(query, key[:, edge:], value[:, edge:], rest, template.Hooks(initial=state),
+        return template.reference(query, key_rest, value_rest, rest, template.Hooks(initial=state),
                                   residuals=True)
 
     def whole(query, key, value):
         return template.reference(query, key, value, spans, start, residuals=True)
 
-    draw = drawing(queries, keys, dtype)
-    if split == "half-exact-products":
-        normal = draw
-
-        def draw(seed):
-            query, key, value = normal(seed)
-            return jnp.round(2 * query) / 2, jnp.round(2 * key) / 2, value
-
-    assert_as_exact(jax.jit(resumed), jax.jit(whole), draw,
+    assert_as_exact(jax.jit(resumed), jax.jit(whole), drawing(queries, keys, dtype),
                     f"template resumed {case} {hooks} {jnp.dtype(dtype).name} {split}", seeds=SEEDS)
 
 
@@ -511,6 +515,21 @@ def test_chunks_over_the_widest_places_neither_wrap_nor_alias():
         spans = template.spans(3, 3, 1, chunk=2, positions=(places, places), segment_ids=ids)
         expected = document_mask(ids) & chunk_mask(places, places, 2)[:, 0]
         np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+
+
+def test_cross_documents_of_two_id_widths_align_as_one():
+    """Another sequence's documents whose queries' and keys' ids differ in width, negative ids among
+    them: each query aligns within its own document, by an independent causal document mask."""
+    # Keys in the documents' order, padding's 0 last: a negative id as an unsigned word follows 3.
+    for query_ids, key_ids in (([[-1]], [[-1]]), ([[-1, 3, -1]], [[3, 3, -1, -1]])):
+        cross = CrossDocuments(jnp.asarray(query_ids, jnp.int8), jnp.asarray(key_ids, jnp.int16))
+        spans = template.spans(len(query_ids[0]), len(key_ids[0]), 1, causal=True, segment_ids=cross)
+        queries, keys = np.asarray(query_ids[0]), np.asarray(key_ids[0])
+        places = [np.flatnonzero(keys == document)[-1] - (np.sum(queries[index + 1:] == document))
+                  for index, document in enumerate(queries)]
+        expected = (queries[:, None] == keys[None, :]) & (np.arange(len(keys))[None, :]
+                                                            <= np.asarray(places)[:, None])
+        np.testing.assert_array_equal(np.asarray(template.dense(spans))[0], expected)
 
 
 def test_cross_documents_of_ids_wider_than_int32_align_apart():
