@@ -206,7 +206,7 @@ def reset(net):
 def cached(net, ids) -> dict[str, np.ndarray]:
     """The prefill of the first PROMPT tokens, which seeds DSpark's windows, then a
     teacher-forced step and DSpark's draft after each (V4.1's driver, `v41.cached`,
-    under this release's reset and prompt)."""
+    under this release's reset, prompt and length)."""
     outputs = v41.cached(net, ids, reset=reset, prompt=PROMPT, length=LENGTH)
     return {name: outputs[name] for name in ("draft_ids", "draft_logits", "draft_confidence")}
 

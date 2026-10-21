@@ -15,7 +15,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from reference_torch import host_arrays
 import transformers
 from safetensors.numpy import save_file
 from transformers import (Gemma3nAudioConfig, Gemma3nAudioFeatureExtractor, Gemma3nTextConfig,
@@ -92,6 +91,7 @@ def reference(kind):
 
 def write_reference(root):
     from reference_releases import require
+    from reference_torch import host_arrays
 
     require("transformers")
     torch.set_num_threads(2)
