@@ -52,6 +52,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
+import reference_mxfp4
 import torch
 from safetensors.torch import save_file
 
@@ -161,21 +162,9 @@ def greedy(model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: torc
 
 
 def mxfp4(weight: torch.Tensor):
-    """compressed-tensors' MXFP4 encoding of a Linear weight and its decoding."""
-    from compressed_tensors.compressors.mxfp4.base import MXFP4PackedCompressor
-    from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
-    from compressed_tensors.quantization.utils.helpers import calculate_qparams
-
-    args = QuantizationArgs(num_bits=4, type="float", strategy="group", group_size=32,
-                            symmetric=True, scale_dtype=torch.uint8)
-    scheme = QuantizationScheme(targets=["Linear"], weights=args)
-    weight = weight.detach().float().cpu()
-    groups = weight.unflatten(-1, (-1, args.group_size))
-    scale, zero = calculate_qparams(groups.amin(-1), groups.amax(-1), args)
-    packed = MXFP4PackedCompressor.compress(
-        {"weight": weight, "weight_scale": scale, "weight_zero_point": zero}, scheme)
-    decoded = MXFP4PackedCompressor.decompress(dict(packed), scheme)["weight"].float()
-    return packed["weight_packed"].contiguous(), packed["weight_scale"].contiguous(), decoded
+    """compressed-tensors' MXFP4 encoding of a Linear weight and its decoding (`reference_mxfp4`)."""
+    packed, scale = reference_mxfp4.encoded(weight.detach().float().cpu())
+    return packed, scale, reference_mxfp4.decoded(packed, scale)
 
 
 def released_modules():
@@ -210,7 +199,8 @@ def load_weights(model: torch.nn.Module, tensors: dict[str, torch.Tensor]) -> No
         for name, parameter in model.named_parameters():
             if ".block_sparse_moe.experts." in name:
                 stem = name.removesuffix(".weight")
-                source = mxfp4_decode(tensors[stem + ".weight_packed"], tensors[stem + ".weight_scale"])
+                packed, scale = tensors[stem + ".weight_packed"], tensors[stem + ".weight_scale"]
+                source = reference_mxfp4.decoded(packed, scale)
             elif name.endswith("A_log"):
                 source = tensors[name].reshape(-1)[:parameter.numel()].reshape(parameter.shape)
             else:
@@ -264,7 +254,7 @@ def main() -> None:
         for name, parameter in model.named_parameters():
             if ".block_sparse_moe.experts." in name:
                 stem = name.removesuffix(".weight")
-                parameter.copy_(mxfp4_decode(
+                parameter.copy_(reference_mxfp4.decoded(
                     tensors[stem + ".weight_packed"], tensors[stem + ".weight_scale"]).to(parameter))
         again = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
         assert torch.equal(again, logits), "restoring the written weights must restore the logits"
@@ -331,16 +321,7 @@ def record_orders(model: torch.nn.Module, drawn: Path, destination: Path,
     print("orders", len(distances), "distances", np.round(np.asarray(distances) / distances[0], 2))
 
 
-def mxfp4_decode(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """compressed-tensors' decompression of one packed pair."""
-    from compressed_tensors.compressors.mxfp4.base import MXFP4PackedCompressor
-    from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 
-    args = QuantizationArgs(num_bits=4, type="float", strategy="group", group_size=32,
-                            symmetric=True, scale_dtype=torch.uint8)
-    scheme = QuantizationScheme(targets=["Linear"], weights=args)
-    return MXFP4PackedCompressor.decompress(
-        {"weight_packed": packed, "weight_scale": scale}, scheme)["weight"].float()
 
 
 if __name__ == "__main__":
