@@ -17,6 +17,7 @@ the last `map_with_index`, which is the only step that reads it.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -42,6 +43,7 @@ from dew.data.analysis import (
     _name,
     _until,
 )
+from dew.data.cache import _Mapped
 from dew.data.dataset import (
     SHARED_BYTES,
     Batch,
@@ -449,11 +451,121 @@ def _dies_with_parent(index: int, count: int) -> None:
 
 
 def _as_iter(rows: Rows, loading: Loading) -> pygrain.IterDataset:
-    return (
-        rows.to_iter_dataset(pygrain.ReadOptions(loading.threads, loading.read_buffer))
-        if isinstance(rows, pygrain.MapDataset)
-        else rows
-    )
+    """`rows` read in order, as every stage that streams them reads them: indexed rows become an
+    iterator here and nowhere else, which owns the cache fills they read (`_Filled`) as Grain
+    carries it into each loading worker."""
+    if not isinstance(rows, pygrain.MapDataset):
+        return rows
+    iterated = rows.to_iter_dataset(pygrain.ReadOptions(loading.threads, loading.read_buffer))
+    fills = _fills(rows)
+    return _Filled(iterated, fills) if fills else iterated
+
+
+def _fills(rows: Rows) -> tuple[_Mapped | _Single, ...]:
+    """The cache reads among `rows` and the datasets they read, each once: the fills an iterator
+    of them starts, finishes when it runs out and closes with it."""
+    found: dict[int, _Mapped | _Single] = {}
+    pending: list[pygrain.MapDataset | pygrain.IterDataset] = [rows]
+    seen: set[int] = set()
+    while pending:
+        dataset = pending.pop()
+        if id(dataset) in seen:
+            continue
+        seen.add(id(dataset))
+        if isinstance(dataset, (_Mapped, _Single)):
+            found[id(dataset)] = dataset
+        pending.extend(dataset.parents)
+    return tuple(found.values())
+
+
+@contextlib.contextmanager
+def _closing[Read: (pygrain.MapDataset, pygrain.IterDataset)](rows: Read) -> Iterator[Read]:
+    """`rows` read by a probe of the order, its cache fills finished and closed when it is done."""
+    fills = _fills(rows)
+    try:
+        yield rows
+        for fill in fills:
+            fill.finish()
+    finally:
+        for fill in fills:
+            fill.close()
+
+
+class _Filled(pygrain.IterDataset):
+    """An iterator of indexed rows that owns the cache fills they read: it starts them, finishes
+    them when it runs out, so a fill that read every input publishes, and closes them with it."""
+
+    def __init__(self, parent: pygrain.IterDataset, fills: tuple[_Mapped | _Single, ...]):
+        super().__init__(parent)
+        self._rows, self._fills = parent, fills
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        for fill in self._fills:
+            fill.start()
+        return _FilledIterator(self._rows.__iter__(), self._fills)
+
+
+class _FilledIterator(pygrain.DatasetIterator):
+    def __init__(self, parent: pygrain.DatasetIterator, fills: tuple[_Mapped | _Single, ...]):
+        super().__init__(parent)
+        self._rows, self._fills = parent, fills
+
+    def __next__(self):
+        try:
+            return next(self._rows)
+        except StopIteration:
+            for fill in self._fills:
+                fill.finish()
+            raise
+
+    def get_state(self) -> Mapping[str, object]:
+        return self._rows.get_state()
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self._rows.set_state(state)
+
+    def close(self) -> None:
+        self._rows.close()
+        for fill in self._fills:
+            fill.close()
+
+
+class _Single(pygrain.MapDataset):
+    """A cache that holds one record for each input, read as the source's rows are: by index, at
+    `positions` (the inputs a store holds, those it misses skipped, as an uncached read skips
+    them), each the one output its completion holds. An iterator of it first writes each missing
+    input's completion (`Rejected("missing")`), so the fill it reads covers every input."""
+
+    def __init__(self, cached: _Mapped, positions: np.ndarray | None):
+        super().__init__(cached)
+        self._cached, self._positions = cached, positions
+
+    def __len__(self) -> int:
+        return len(self._cached) if self._positions is None else len(self._positions)
+
+    @overload
+    def __getitem__(self, index: slice) -> pygrain.MapDataset: ...
+
+    @overload
+    def __getitem__(self, index: int) -> Record: ...
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return self.slice(index)
+        position = index if self._positions is None else int(self._positions[index % len(self)])
+        outputs = self._cached[position]
+        return outputs[0] if isinstance(outputs, tuple) else outputs
+
+    def start(self) -> None:
+        if self._positions is not None:
+            for position in sorted(set(range(len(self._cached))) - {int(p) for p in self._positions}):
+                self._cached[position]
+
+    def finish(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
 
 
 def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
@@ -778,10 +890,18 @@ class _Build:
             return self.shared(rows, pipeline, partition), 0
         filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
         cached = filled.mapped(stored, manifest, transform=prefix, source=source)
+        if self.lowering.one_to_one:
+            # One record for each input: read as the source's own rows, by index and in the
+            # uncached chain's order, its missing inputs skipped as there.
+            present = _Present.of(records) if _in_memory(source) else None
+            single = _Single(cached, None if present is None else present.positions)
+            identifiers = () if present is None else tuple((int(position),) for position in present.positions)
+            placed = (single.map_with_index(_Placed(identifiers=identifiers, rows=len(single)))
+                      if last > cache else single)
+            return self.shared(placed, pipeline, partition), cache + 1
         placed = cached.map_with_index(_Placed(rows=len(cached))) if last > cache else cached
         view = self.shared(placed, pipeline, partition)
-        rows = cached.iterated(view, pygrain.ReadOptions(self.loading.threads, self.loading.read_buffer))
-        flat = gx.FlatMapIterDataset(rows, _CachedOutputs())
+        flat = gx.FlatMapIterDataset(_as_iter(view, self.loading), _CachedOutputs())
         return Accepted(flat, _name(pipeline), _label(pipeline)), cache + 1
 
     def sharded(
@@ -900,7 +1020,9 @@ class _Build:
                 worker_init_fn=_dies_with_parent,
             )
         elif isinstance(stage, Native):
-            rows = stage.function(rows.seed(self.stage_seed(pipeline, at, partition)))
+            # A Grain step reads cache fills through an iterator that owns them (`_Filled`).
+            given = _as_iter(rows, self.loading) if _fills(rows) else rows
+            rows = stage.function(given.seed(self.stage_seed(pipeline, at, partition)))
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
             rows = gx.FlatMapIterDataset(groups, _Groups(stage))
@@ -986,7 +1108,8 @@ class _Build:
         loading = self.loading
         bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0))
         if loading.workers == "auto":
-            loading = loading.resolved(bare.batched(pipeline, DataPartition())[0])
+            with _closing(bare.batched(pipeline, DataPartition())[0]) as sampled:
+                loading = loading.resolved(sampled)
         if loading.worker_count and (not self.training or not self.lowering.endless):
             rows = bare.records(pipeline, DataPartition())
             if isinstance(rows, pygrain.MapDataset):
@@ -1123,7 +1246,9 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
             rows = build.records(before, DataPartition())
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
-            yield _TokenSplit(rows, split).spans
+            with _closing(rows) as read:
+                spans = _TokenSplit(read, split).spans
+            yield spans
 
 
 def _weights(mixture: Mixture) -> Sequence[float]:
