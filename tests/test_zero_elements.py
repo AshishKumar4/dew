@@ -306,13 +306,13 @@ def test_a_subnormal_constant_is_held_to_its_size_where_a_backend_may_read_it_as
 
 def test_values_without_a_contract_are_not_certified():
     """A complex modulus, a value that is not a number, a sum whose bound overflows, and a dot by an
-    algorithm that may convert its operands."""
+    algorithm, which may convert its operands (not run: the CPU has none to run)."""
+    from zero_elements import _probed_dot
+
     modulus, _ = _interpreted(jnp.abs, jnp.asarray([1 + 1j], jnp.complex64))
     passed, _ = _interpreted(lambda x: x, jnp.asarray([np.nan], jnp.float32))
     overflowing, _ = _float64(jnp.sum, [2.0 ** 1023, -(2.0 ** 1023)])
-    half = jax.lax.DotAlgorithmPreset.F16_F16_F16
-    a = jnp.asarray([1 + 2.0 ** -12], jnp.float32)
-    converted, blocked = _interpreted(lambda x, y: jax.lax.dot(x, y, precision=half), a, a)
-    for out in (modulus, passed, overflowing, converted):
+    for out in (modulus, passed, overflowing):
         assert not out.certified.any()
-    assert any(name.startswith("dot_general") for name in blocked)
+    assert not _probed_dot(jax.lax.DotAlgorithmPreset.F16_F16_F16, None, np.float32)
+    assert _probed_dot(None, None, np.float32)
