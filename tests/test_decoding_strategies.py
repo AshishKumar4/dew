@@ -306,7 +306,7 @@ def test_an_undefined_distribution_raises_instead_of_returning_a_token(model):
                                                jnp.int32))
     drawn = generate(module, params, prompt, 2, key=jax.random.key(0), logits=(kept,))
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[0, 3:], [5, 5])
-    np.testing.assert_allclose(np.asarray(drawn.behavior_log_probs), 0.0, atol=1e-6)
+    np.testing.assert_array_equal(np.asarray(drawn.behavior_log_probs), 0.0)
 
 
 def test_min_new_tokens_holds_the_eos_back_and_the_row_still_terminates(model):
@@ -356,7 +356,7 @@ def test_stop_strings_end_a_row_on_text_it_never_decodes_on_the_host(tmp_path, m
                      stopping=(criterion,))
     assert drawn.lengths.tolist() == [2] and drawn.terminated.tolist() == [True]
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[0, 3:5], order[:2])
-    np.testing.assert_allclose(np.asarray(drawn.behavior_log_probs)[0, :2], 0.0, atol=1e-6)
+    np.testing.assert_array_equal(np.asarray(drawn.behavior_log_probs)[0, :2], 0.0)
     np.testing.assert_array_equal(np.asarray(drawn.behavior_log_probs)[0, 2:], 0.0)
 
 

@@ -441,7 +441,7 @@ def test_a_key_reproduces_a_trajectory():
     process, model = karras_process()
     first = generate(process, model, MultiStepDPM())
     second = generate(process, model, MultiStepDPM())
-    assert jnp.allclose(first, second, atol=1e-5)
+    assert np.array_equal(np.asarray(first), np.asarray(second))
 
 
 ############################################################################################################

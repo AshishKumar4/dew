@@ -73,12 +73,22 @@ def _called(node: ast.Call, table: Mapping[str, str]) -> str:
     return called
 
 
+@dataclass(frozen=True)
+class Imported:
+    """What its own file's reading proves of a function another file imports (`support_functions`):
+    whether every return is whole, whether one may be an error, and, where every return is a tuple,
+    the places of it that may hold an error (else None), as `_Reading` knows a function of the file."""
+    whole: bool
+    erring: bool
+    places: frozenset[int] | None
+
+
 @dataclass
 class _Reading:
     """What SLOP020 knows of one file: each node's import table, its calls' definitions, and the ids of
     its functions that may return an error or a difference, and of those that return only a margin or
     only whole numbers; for each function every return of which is a tuple, the places of it that may
-    hold an error; and whether an imported function returns only whole numbers (`comparisons`)."""
+    hold an error; and what is known of a function it imports, by its dotted name (`comparisons`)."""
     tables: Mapping[int, Mapping[str, str]]
     calls: Calls
     erring: set[int]
@@ -86,7 +96,7 @@ class _Reading:
     margining: set[int]
     counting: set[int] = field(default_factory=set)
     erring_at: dict[int, set[int]] = field(default_factory=dict)
-    whole_import: Callable[[str], bool] = field(default=lambda called: False)
+    imported: Callable[[str], Imported | None] = field(default=lambda called: None)
 
 
 @dataclass
@@ -136,6 +146,11 @@ def _returned(value: ast.Call, scope: _Scope, reading: _Reading, kinds: Set[int]
     return any(id(definition) in kinds for definition in reading.calls.reached(scope.node, value))
 
 
+def _imported(value: ast.Call, reading: _Reading) -> Imported | None:
+    """What is known of the imported function a call calls (`Imported`), or None."""
+    return reading.imported(_called(value, reading.tables.get(id(value), {})))
+
+
 STRUCTURAL = frozenset({"len", "isinstance", "type", "id", "hash", "str", "repr"})
 """Calls that read a value's structure, not its numbers: what they return carries none of its traits."""
 SHAPES = frozenset({"shape", "size", "ndim", "dtype"})
@@ -170,7 +185,10 @@ def _placed(value: ast.AST, scope: _Scope, reading: _Reading | None) -> set[int]
                                and isinstance(value.slice, ast.Constant)):
         return None
     reached = list(reading.calls.reached(scope.node, value.value))
-    if not reached or not all(id(definition) in reading.erring_at for definition in reached):
+    if not reached:
+        found = _imported(value.value, reading)
+        return None if found is None or found.places is None else set(found.places)
+    if not all(id(definition) in reading.erring_at for definition in reached):
         return None
     return set().union(*(reading.erring_at[id(definition)] for definition in reached))
 
@@ -239,7 +257,7 @@ def _counted(value: ast.AST, scope: _Scope | None = None, reading: _Reading | No
     int literal, a truth value, an `int`, `len`, one-argument `round` or `.count` call, `range`, a
     `sum`, `max` or `min` of whole numbers, a container, comprehension or element of them, arithmetic
     that keeps them whole, a name every binding of which is one, or a call of a function of the file, or
-    one it imports (`whole_import`), every return of which is one (`delivered` returning its token
+    one it imports (`Imported.whole`), every return of which is one (`delivered` returning its token
     counts). Nothing is whole by its name or its use."""
     def counted(part):
         return _counted(part, scope, reading, seen)
@@ -280,8 +298,8 @@ def _counted(value: ast.AST, scope: _Scope | None = None, reading: _Reading | No
         return all(counted(argument) for argument in value.args)
     if scope is None or reading is None:
         return False
-    return _returned(value, scope, reading, reading.counting) or reading.whole_import(
-        _called(value, reading.tables.get(id(value), {})))
+    found = _imported(value, reading)
+    return _returned(value, scope, reading, reading.counting) or (found is not None and found.whole)
 
 
 def _measured(inner: ast.AST, scope: _Scope, reading: _Reading) -> tuple[bool, bool]:
@@ -312,7 +330,8 @@ def _measured(inner: ast.AST, scope: _Scope, reading: _Reading) -> tuple[bool, b
 def _erring(value: ast.AST, scope: _Scope, reading: _Reading) -> bool:
     """Whether `value` holds an error: a magnitude, square or norm of a difference, or a distance
     (`_measured`), a name the scope binds to one, what a function of the file may return of one (the
-    call resolved to its definitions, `_Calls.reached`), or a place of a tuple it returns."""
+    call resolved to its definitions, `_Calls.reached`) or a function it imports (`Imported.erring`),
+    or a place of a tuple one returns."""
     for inner in _parts(value, scope, reading):
         if isinstance(inner, ast.Name) and inner.id in scope.errors:
             return True
@@ -322,7 +341,8 @@ def _erring(value: ast.AST, scope: _Scope, reading: _Reading) -> bool:
             continue
         if _measured(inner, scope, reading)[1]:
             return True
-        if isinstance(inner, ast.Call) and _returned(inner, scope, reading, reading.erring):
+        if isinstance(inner, ast.Call) and (_returned(inner, scope, reading, reading.erring) or (
+                (found := _imported(inner, reading)) is not None and found.erring)):
             return True
     return False
 
@@ -615,9 +635,9 @@ def _conjoined_bands(node: ast.AST, scope: _Scope, reading: _Reading) -> int:
 
 
 def _read(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls,
-          whole_import: Callable[[str], bool]) -> tuple[_Reading, list[ast.AST]]:
+          imported: Callable[[str], Imported | None]) -> tuple[_Reading, list[ast.AST]]:
     """What SLOP020 knows of a file's functions (`_Reading`), and the file's scopes."""
-    reading = _Reading(tables, calls, set(), set(), set(), whole_import=whole_import)
+    reading = _Reading(tables, calls, set(), set(), set(), imported=imported)
     nodes = [tree, *(node for node in ast.walk(tree) if isinstance(node, scopes.SCOPES))]
     functions = [node for node in nodes if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)]
     # Which functions return only tuples is read first, from their returns' shapes alone, so a call of one
@@ -652,27 +672,31 @@ def _read(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Call
     return reading, nodes
 
 
-def whole_functions(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls) -> set[str]:
-    """The names of a file's module-level functions every return of which is whole (`_counted`), read
-    for a file that imports one; what they call through an import of their own is not followed."""
-    reading, _ = _read(tree, tables, calls, lambda called: False)
-    return {node.name for node in tree.body
-            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and id(node) in reading.counting}
+def support_functions(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls
+                      ) -> dict[str, Imported]:
+    """What a file's own reading proves of each of its module-level functions, by name, read for a file
+    that imports one (`Imported`); what they call through an import of their own is not followed."""
+    reading, _ = _read(tree, tables, calls, lambda called: None)
+    places = {key: frozenset(value) for key, value in reading.erring_at.items()}
+    return {node.name: Imported(whole=id(node) in reading.counting, erring=id(node) in reading.erring,
+                                places=places.get(id(node)))
+            for node in tree.body if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
 
 
 def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls,
-                whole_import: Callable[[str], bool] = lambda called: False) -> Iterator[tuple[ast.AST, str]]:
+                imported: Callable[[str], Imported | None] = lambda called: None
+                ) -> Iterator[tuple[ast.AST, str]]:
     """Each place a file compares floats within a tolerance, and what it is (its nodes' import tables
-    `tables`, its calls' definitions `calls`, and whether a function it imports returns only whole
-    numbers, `whole_import` of its dotted name): a call of the gate's one-draw rules (ONE_DRAW), a
-    tolerance API not told to
+    `tables`, its calls' definitions `calls`, and what its own file proves of a function it imports,
+    `imported` of its dotted name): a call of the gate's one-draw rules (ONE_DRAW), a tolerance API not
+    told to
     compare exactly (`_exact`), `atol` or `rtol` handed to any call, an ordering relation that compares
     within a tolerance (`_relation`), and a name bound to a tolerance. What is known of a value only
     adds findings: nothing is exempted as whole or as a time, so a bound on a count, a time or a mask
     of positions is written as a plain ordering (lo <= x <= hi, or x - y < w for a window). SLOP020
     reads conventional code: it does not prove what an obfuscated one computes (a shadowed built-in, a
     mutated alias), which review does."""
-    reading, nodes = _read(tree, tables, calls, whole_import)
+    reading, nodes = _read(tree, tables, calls, imported)
     # A band is a test's claim: what an assertion holds, not a schedule's window in a test's helper.
     asserted = {id(part) for statement in ast.walk(tree) if isinstance(statement, ast.Assert)
                 for part in ast.walk(statement.test)}

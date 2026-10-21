@@ -27,6 +27,7 @@ from typing_extensions import TypeVar
 from dew.nn.blocks import table_rows
 from dew.nn.dit import TextContext
 from dew.nn.flops import counted_flops
+from dew.nn.protocols import Counted
 from dew.nn.text_encoders import (
     DEFAULT_MODEL,
     DEFAULT_T5_MODEL,
@@ -74,6 +75,15 @@ class ConditionWork:
     features: int
     pooled_features: int | None = None
     time_ids: int | None = None
+
+    @classmethod
+    def of_tokens(cls, tower: Counted, tokens: Mapping[str, np.ndarray], features: int) -> Self:
+        """The work of a `tower` that reads each row's unmasked `tokens` and hands its denoiser the
+        whole fixed-length sequence, `features` wide: its FLOPs over the real tokens, their lengths,
+        and spans of the token budget."""
+        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
+        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
+        return cls(counted_flops(tower, lengths), lengths, spans, features)
 
 
 class ConditionEncoder(ABC, Generic[Raw, Encoded]):
@@ -225,10 +235,7 @@ class _TextTower(ConditionEncoder[str, TextContext]):
                 "attention_mask": np.asarray(tokens["attention_mask"], np.int32)}
 
     def conditioning_flops(self, tokens) -> ConditionWork:
-        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
-        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
-        return ConditionWork(counted_flops(self.transformer, lengths), lengths, spans,
-                             self.transformer.emb_features)
+        return ConditionWork.of_tokens(self.transformer, tokens, self.transformer.emb_features)
 
     def encode(self, params, tokens) -> TextContext:
         mask = jnp.asarray(tokens["attention_mask"])
@@ -313,6 +320,22 @@ class T5Text(_TextTower):
 
 
 
+def char_codes(texts: Sequence[str], tokens: int, vocab: int) -> dict[str, np.ndarray]:
+    """Each text as `tokens` ids of a `vocab`-row table, behind a start token, with its mask
+    (`CharTable.tokenize`)."""
+    # id 0 is padding and 1 is the start token, so a character takes the
+    # rest of the table: its code point wrapped into the vocabulary above
+    # those two. Two characters that wrap together share a vector, which
+    # a table this small is for.
+    ids = np.zeros((len(texts), tokens), np.int32)
+    mask = np.zeros((len(texts), tokens), np.int32)
+    for row, text in enumerate(texts):
+        codes = [1] + [2 + (ord(char) % (vocab - 2)) for char in text[:tokens - 1]]
+        ids[row, :len(codes)] = codes
+        mask[row, :len(codes)] = 1
+    return {"input_ids": ids, "attention_mask": mask}
+
+
 @dataclass(frozen=True, eq=False)
 class CharTable(ConditionEncoder[str, TextContext]):
     """Encodes text as a table lookup: one id per character, one fixed random
@@ -353,17 +376,7 @@ class CharTable(ConditionEncoder[str, TextContext]):
                    dtype=compute, param_dtype=param_dtype)
 
     def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
-        # id 0 is padding and 1 is the start token, so a character takes the
-        # rest of the table: its code point wrapped into the vocabulary above
-        # those two. Two characters that wrap together share a vector, which
-        # a table this small is for.
-        ids = np.zeros((len(texts), self.tokens), np.int32)
-        mask = np.zeros((len(texts), self.tokens), np.int32)
-        for row, text in enumerate(texts):
-            codes = [1] + [2 + (ord(char) % (self.vocab - 2)) for char in text[:self.tokens - 1]]
-            ids[row, :len(codes)] = codes
-            mask[row, :len(codes)] = 1
-        return {"input_ids": ids, "attention_mask": mask}
+        return char_codes(texts, self.tokens, self.vocab)
 
     def conditioning_flops(self, tokens) -> ConditionWork:
         lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)

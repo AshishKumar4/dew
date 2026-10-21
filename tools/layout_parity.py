@@ -592,7 +592,7 @@ def anchor_program(case, batch, state):
     import jax.numpy as jnp
 
     from dew.objectives.base import Step
-    from dew.training.transaction import with_ema
+    from dew.training.transaction import example_fields, with_ema
 
     def widened(tree):
         return jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
@@ -600,11 +600,12 @@ def anchor_program(case, batch, state):
 
     wide = widened(state.variables)
     objective = bench.build_objective(case, widened=True)
-    # The trainer's first step: its key folded with the step, which draws a
-    # diffusion objective's noise and a masked one's masks, and the frozen
-    # EMA DPO and GRPO score against.
+    # The trainer's first step: its key folded with the step, its examples' (`example_fields`), which
+    # draw a diffusion objective's noise and a masked one's masks, and the frozen EMA DPO and GRPO
+    # score against.
     step = Step(state.microstep, jax.random.fold_in(state.key, state.step),
-                with_ema(wide, None if state.ema is None else widened(state.ema)))
+                with_ema(wide, None if state.ema is None else widened(state.ema)),
+                **example_fields(state, 0, 1, batch))
 
     def loss(variables, batch):
         return objective.scalar_loss({**wide, "params": variables}, batch, step)[0]

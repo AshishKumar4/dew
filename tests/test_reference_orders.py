@@ -150,3 +150,19 @@ def test_two_ports_equally_exact_pass_element_by_element_on_tails_heavier_than_a
             "student-t5": lambda size: rng.standard_t(5, size=size)}[tails]
     sums = [[np.sum(np.abs(draw((ORDERS, 200_000))), axis=0) for _ in range(STAGES)] for _ in range(2)]
     assert_elements_as_exact(lambda stage: (sums[0][stage], {REFERENCE: sums[1][stage]}), tails)
+
+
+def test_each_seed_draws_its_own_order_and_a_group_moves_whole():
+    """Check 1's orbit draws: each seed its own order of the units, the same on every call, and with a
+    group of 4 every block of 4 moves whole and is permuted within."""
+    from residual_orders import order
+
+    drawn = [order(64, seed) for seed in range(8)]
+    assert all(sorted(each.tolist()) == list(range(64)) for each in drawn)
+    assert len({each.tobytes() for each in drawn}) == 8
+    assert np.array_equal(order(64, 3), drawn[3])
+    with pytest.raises(ValueError):
+        order(10, 0, group=4)
+    grouped = order(64, 5, group=4)
+    assert sorted(grouped.tolist()) == list(range(64))
+    assert all(sorted((grouped[at:at + 4] // 4).tolist()) == [grouped[at] // 4] * 4 for at in range(0, 64, 4))
