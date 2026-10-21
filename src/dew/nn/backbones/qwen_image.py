@@ -40,7 +40,7 @@ from dew.nn.flops import (
     patch_lengths,
     projection_flops,
 )
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables
 from dew.nn.sharding import logical_axes
 
@@ -79,7 +79,8 @@ def _rotary_positions(lengths: jax.Array, text: int, rows: int, columns: int) ->
 
 
 def _dense(features: int, name: str, dtype, precision) -> Dense:
-    return Dense(features, use_bias=False, dtype=dtype, precision=precision, name=name)
+    return Dense(features, use_bias=False, dtype=dtype, precision=precision, name=name,
+                 dot_general=float32_dot_general)
 
 
 def _per_rows(x, values, image: int, apply):

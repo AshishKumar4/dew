@@ -52,6 +52,7 @@ from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
+from dew.nn.precision import float32_dot_general
 from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
 
@@ -308,7 +309,7 @@ class CLIP(nn.Module):
 
     def setup(self):
         dense = functools.partial(Dense, self.projection_dim, use_bias=False,
-                                  dtype=self.dtype, precision=self.precision)
+                                  dtype=self.dtype, precision=self.precision, dot_general=float32_dot_general)
         self.text_projection = dense(name="text_projection")
         self.visual_projection = dense(name="visual_projection")
 

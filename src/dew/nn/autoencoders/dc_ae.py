@@ -32,7 +32,7 @@ from dew.objectives.base import Variables
 from ..activations import gated_product
 from ..attention import rms_normalized
 from ..conv import Conv
-from ..precision import at_least_fp32
+from ..precision import at_least_fp32, float32_dot_general, float32_products
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
 from .api import ModuleAutoEncoder
 
@@ -133,7 +133,8 @@ class _LinearAttention(nn.Module):
         batch, height, width, _ = x.shape
         heads = self.features // self.head_dim
         inner = heads * self.head_dim
-        qkv = jnp.concatenate([Dense(inner, use_bias=False, dtype=self.dtype, name=name)(x)
+        qkv = jnp.concatenate([Dense(inner, use_bias=False, dtype=self.dtype, name=name,
+                                     dot_general=float32_dot_general)(x)
                                for name in ("to_q", "to_k", "to_v")], axis=-1)
         qkv = jnp.concatenate(
             [
@@ -154,16 +155,19 @@ class _LinearAttention(nn.Module):
         qkv = qkv.reshape(batch, positions, -1, 3, self.head_dim)
         query, key, value = nn.relu(qkv[..., 0, :]), nn.relu(qkv[..., 1, :]), qkv[..., 2, :]
         if quadratic:
-            scores = jnp.einsum("bmgd,bngd->bgmn", key, query).astype(jnp.float32)
+            products = float32_products(query.dtype)
+            scores = jnp.einsum("bmgd,bngd->bgmn", key, query, precision=products).astype(jnp.float32)
             scores = scores / (jnp.sum(scores, axis=2, keepdims=True) + _ATTENTION_EPS)
-            attended = jnp.einsum("bmgd,bgmn->bngd", value, scores.astype(value.dtype))
+            attended = jnp.einsum("bmgd,bgmn->bngd", value, scores.astype(value.dtype), precision=products)
         else:
             value = jnp.concatenate([value, jnp.ones_like(value[..., :1])], axis=-1)
-            scores = jnp.einsum("bngd,bnge->bgde", value, key)
-            attended = jnp.einsum("bgde,bnge->bngd", scores, query)
+            products = float32_products(query.dtype)
+            scores = jnp.einsum("bngd,bnge->bgde", value, key, precision=products)
+            attended = jnp.einsum("bgde,bnge->bngd", scores, query, precision=products)
             attended = (attended[..., :-1] / (attended[..., -1:] + _ATTENTION_EPS)).astype(x.dtype)
         attended = attended.reshape(batch, height, width, -1)
-        out = Dense(self.features, use_bias=False, dtype=self.dtype, name="to_out")(attended)
+        out = Dense(self.features, use_bias=False, dtype=self.dtype, name="to_out",
+                    dot_general=float32_dot_general)(attended)
         return _norm(self.norm, self.features, self.dtype, "norm_out")(out) + x
 
 

@@ -17,7 +17,7 @@ from dew.nn.dense import Dense
 
 from .conv import Conv
 from .flops import conv_flops, projection_flops
-from .precision import at_least_fp32
+from .precision import at_least_fp32, float32_dot_general, float32_products
 
 
 def hippo_a_imag_init(key, shape, dtype=jnp.float32):
@@ -219,14 +219,15 @@ def _chunked_directions(u: jax.Array, operators, reversed_: tuple[bool, ...], dt
     u = u.astype(compute_dtype(dtype))
     width = 2 * operators[0][0].shape[0]
     stacked = jnp.concatenate([jnp.concatenate([b.real, b.imag]) for _, b, _, _ in operators])
-    projected = jnp.einsum('bsf,nf->bsn', u, stacked)
+    projected = jnp.einsum('bsf,nf->bsn', u, stacked, precision=float32_products(u.dtype))
     out = []
     for index, ((pole, _, c, d), backwards) in enumerate(zip(operators, reversed_, strict=True)):
         v = projected[..., index * width:(index + 1) * width]
         x = (jnp.flip(diagonal_recurrence(pole, jnp.flip(v, axis=1)), axis=1) if backwards
              else diagonal_recurrence(pole, v))
         # The k-th output is Re(C x_k), the real form's [C_re, -C_im] product.
-        y = jnp.einsum('bsn,fn->bsf', x, jnp.concatenate([c.real, -c.imag], -1)) + d * u
+        y = jnp.einsum('bsn,fn->bsf', x, jnp.concatenate([c.real, -c.imag], -1),
+                       precision=float32_products(x.dtype)) + d * u
         out.append(y.astype(dtype))
     return out
 
@@ -273,7 +274,8 @@ class BidirectionalS5Layer(nn.Module):
                           for name in ("s5_forward", "s5_backward"))
         y_fwd, y_bwd = _directions(u, operators, (False, True), dtype)
         y_cat = jnp.concatenate([y_fwd, y_bwd], axis=-1)  # [B, S, 2F]
-        return Dense(features=self.features, dtype=self.dtype, name="out_proj")(y_cat)
+        return Dense(features=self.features, dtype=self.dtype, name="out_proj",
+                     dot_general=float32_dot_general)(y_cat)
 
 
 class SpatialFusionConv(nn.Module):

@@ -34,7 +34,7 @@ from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import attention_flops, matching_lengths, patch_lengths, projection_flops
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables, rotate
 from dew.nn.sharding import logical_axes
 
@@ -103,7 +103,8 @@ class Flux2SingleBlock(nn.Module):
         normalized = modulate(layer_norm(self.dtype, self.epsilon)(x), shift, scale)
         maps = self.projections()
         projected = Dense(maps['to_qkv_mlp_proj'][1], use_bias=False, dtype=self.dtype,
-                          precision=self.precision, name="to_qkv_mlp_proj")(normalized)
+                          precision=self.precision, name="to_qkv_mlp_proj",
+                          dot_general=float32_dot_general)(normalized)
         heads = (x.shape[0], x.shape[1], self.heads, self.head_dim)
         query, key, value = (
             part.reshape(heads) for part in jnp.split(projected[..., : 3 * inner], 3, axis=-1)
@@ -120,7 +121,8 @@ class Flux2SingleBlock(nn.Module):
         # The source's `attn.to_out`, named as Flux's single block names its
         # fused output map.
         return x + gate[:, None] * Dense(maps['proj_fused'][1], use_bias=False, dtype=self.dtype,
-                                         precision=self.precision, name="proj_fused")(joined)
+                                         precision=self.precision, name="proj_fused",
+                                         dot_general=float32_dot_general)(joined)
 
 
 @logical_axes({("context_embedder",): (None, "embed"), ("x_embedder",): (None, "embed"),
@@ -195,8 +197,10 @@ class Flux2Transformer(TextStream, nn.Module):
             raise ValueError(f"FLUX.2 takes NHWC latents, got shape {x.shape}")
         batch, rows, columns, _ = x.shape
         dense = {"use_bias": False, "dtype": self.dtype, "precision": self.precision}
-        image = Dense(self.features, name="x_embedder", **dense)(x.reshape(batch, rows * columns, -1))
-        context = Dense(self.features, name="context_embedder", **dense)(conditioning.context)
+        image = Dense(self.features, name="x_embedder", **dense,
+                      dot_general=float32_dot_general)(x.reshape(batch, rows * columns, -1))
+        context = Dense(self.features, name="context_embedder", **dense,
+                        dot_general=float32_dot_general)(conditioning.context)
 
         # `Flux2TimestepGuidanceEmbeddings`: the time's sinusoids through two
         # bias-free maps, plus the guidance's where the checkpoint embeds it.
@@ -234,7 +238,7 @@ class Flux2Transformer(TextStream, nn.Module):
         image = joined[:, context.shape[1]:]
         scale, shift = modulation("norm_out")
         image = modulate(layer_norm(self.dtype, self.eps)(image), shift, scale)
-        out = Dense(self.out_channels, name="proj_out", **dense)(image)
+        out = Dense(self.out_channels, name="proj_out", **dense, dot_general=float32_dot_general)(image)
         return out.reshape(batch, rows, columns, self.out_channels)
 
 

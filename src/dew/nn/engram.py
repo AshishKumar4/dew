@@ -38,7 +38,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.dense import Dense
 
-from .precision import at_least_fp32
+from .precision import at_least_fp32, float32_dot_general
 from .sharding import logical_axes
 
 _DEAD = -1
@@ -279,7 +279,7 @@ class EngramLayer(nn.Module):
         dtype = streams.dtype if self.dtype is None else self.dtype
         looked = table(hash_ids).astype(dtype).reshape(*hash_ids.shape[:2], -1)
         kv = Dense(self.emb_features * (self.hc_mult + 1), use_bias=False, dtype=self.dtype,
-                   precision=self.precision, name='wkv')(looked)
+                   precision=self.precision, name='wkv', dot_general=float32_dot_general)(looked)
         q_weight = self.param(
             "q_weight", nn.initializers.ones, (self.hc_mult, self.emb_features), jnp.float32
         )

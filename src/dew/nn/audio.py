@@ -23,6 +23,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.interop.weights import ParamTree, placed
 from dew.nn.dense import Dense
+from dew.nn.precision import float32_dot_general, float32_products, products_dtype
 from dew.registry import from_record
 
 from .activations import activation
@@ -128,7 +129,8 @@ def _clip(x, bound: float):
 def _dense(config: Gemma3nAudio | Gemma4Audio, dtype: Dtype | None, precision: PrecisionLike):
     """The encoders' bias-free linear map, its kernel drawn at `initializer_range`."""
     return functools.partial(Dense, use_bias=False, dtype=dtype, precision=precision,
-                             kernel_init=nn.initializers.normal(config.initializer_range))
+                             kernel_init=nn.initializers.normal(config.initializer_range),
+                             dot_general=float32_dot_general)
 
 
 @logical_axes({("linear",): ("embed", "mlp")})
@@ -270,9 +272,10 @@ def _relative_logits(query, key, positional, precision: PrecisionLike = None):
     batch, blocks, chunk, heads, dim = query.shape
     context = key.shape[2]
     q = query.transpose(0, 3, 1, 2, 4)
-    content = jnp.matmul(q, key.transpose(0, 3, 1, 4, 2), precision=precision)
+    products = float32_products(products_dtype(q, key, positional), precision)
+    content = jnp.matmul(q, key.transpose(0, 3, 1, 4, 2), precision=products)
     positions = positional.reshape(-1, heads, dim).transpose(1, 2, 0)
-    relative = jnp.matmul(q.reshape(batch, heads, blocks * chunk, dim), positions, precision=precision)
+    relative = jnp.matmul(q.reshape(batch, heads, blocks * chunk, dim), positions, precision=products)
     relative = relative.reshape(batch, heads, blocks, chunk, -1)
     relative = jnp.pad(relative, ((0, 0),) * 4 + ((0, context + 1 - relative.shape[-1]),))
     relative = relative.reshape(batch, heads, blocks, chunk * (context + 1))
@@ -303,7 +306,8 @@ def _chunked_attention(query, key, value, positional, valid, chunk: int, left: i
     allowed = _block_context(valid, chunk, left, right)[:, None, :, None, :] & window(distance)
     logits = jnp.where(allowed, logits, fill)
     probabilities = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(value.dtype)
-    out = jnp.matmul(probabilities, value.transpose(0, 3, 1, 2, 4), precision=precision)
+    out = jnp.matmul(probabilities, value.transpose(0, 3, 1, 2, 4),
+                     precision=float32_products(value.dtype, precision))
     return out.transpose(0, 2, 3, 1, 4).reshape(batch, -1, heads * dim)[:, :length]
 
 
@@ -543,7 +547,8 @@ class Gemma4AudioEncoder(nn.Module):
                 x, mask
             )
         x = Dense(cfg.output_proj_dims, use_bias=True, dtype=self.dtype, precision=self.precision,
-                  kernel_init=nn.initializers.normal(cfg.initializer_range), name="output_proj")(x)
+                  kernel_init=nn.initializers.normal(cfg.initializer_range), name="output_proj",
+                  dot_general=float32_dot_general)(x)
         return AudioEncoding(x, mask)
 
 
