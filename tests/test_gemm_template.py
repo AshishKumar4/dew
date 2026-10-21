@@ -1025,8 +1025,9 @@ def test_a_paired_product_without_an_epilogue_is_refused():
 
 def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton():
     """Mosaic's layout inference finds no layout for a side operand given back with its dimension of
-    one, so the Mosaic launches refuse such a hook: a Hopper call's hooked launch lowers through
-    Triton's, and its gradient lowers too (GMMGATE-h100-8)."""
+    one, so the Mosaic launches refuse such a hook: a Hopper call's every launch with one, the forward's
+    and the kernel gradient's with its prologue, lowers through Triton's, beside the gradients' plain
+    launches, which may be Mosaic's (GMMGATE-h100-8)."""
     drawn = [jax.ShapeDtypeStruct(array.shape, array.dtype) for array in _draw(0)]
     dew = _drop(_dew(CASES["broadcast axes"]))
 
@@ -1034,9 +1035,10 @@ def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton(
         return sum(jnp.sum(out.astype(jnp.float32)) for out in dew(*drawn))
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        with generation.routes() as taken:
-            jax.jit(dew).trace(*drawn).lower(lowering_platforms=("cuda",))
-        jax.jit(jax.grad(loss)).trace(*drawn).lower(lowering_platforms=("cuda",))
-    assert _kernels(taken) == {'triton'}
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh), tuning.seen() as launches:
+        jax.jit(jax.grad(loss, argnums=range(len(drawn)))).trace(*drawn).lower(lowering_platforms=("cuda",))
+    broadcast = [(launch, ba) for launch, ba in launches
+                 if ba.arguments['hooks'].prologue_broadcast or ba.arguments['hooks'].epilogue_broadcast]
+    assert {type(launch) for launch, _ in broadcast} >= {grouped_matmul.Gmm, grouped_matmul.Tgmm}
+    assert not any(isinstance(launch, grouped_matmul._Mosaic) for launch, _ in broadcast)
 

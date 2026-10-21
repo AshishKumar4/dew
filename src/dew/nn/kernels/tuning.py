@@ -603,6 +603,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     # holds it, from the first run or any later one, the launch keeps its
     # heuristic until a later compile.
     cupti = profiler.Cupti(finalize=False)
+    flushes: set[str] = set()
     try:
         flushes = {name for name, _ in _kernel_times(cupti, evicting, flush)}
         for config, future in futures.items():
@@ -621,12 +622,19 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
         return Timings(dict.fromkeys(ba.autotuning_configs, error))
     finally:
         _detach(profiler, evicting, flush)
+        # Every config measured before an exit, a failed one's or another subscriber's too, is logged.
+        observed(op, ba, {**timings, **_benchmarks(read, flushes)}, get_default_device())
+    return Timings({**timings, **_benchmarks(read, flushes)})
+
+
+def _benchmarks(read: Mapping, flushes: set[str]) -> dict[Hashable, tokamax.BenchmarkData]:
+    """The configs `_measured` timed, each run's time the sum of its own kernels', the flush's left out."""
+    benchmarks = {}
     for config, (runs, lowering, compiling) in read.items():
         times = tuple(sum(milliseconds for name, milliseconds in run if name not in flushes) for run in runs)
-        timings[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
-                                                metadata={}, evaluation_times_ms=times)
-    observed(op, ba, timings, get_default_device())
-    return Timings(timings)
+        benchmarks[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
+                                                   metadata={}, evaluation_times_ms=times)
+    return benchmarks
 
 
 def observed(op: KernelOp, ba: tokamax.BoundArguments, measured: Mapping[Hashable, object],

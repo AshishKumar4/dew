@@ -145,4 +145,5 @@ def test_the_tuner_logs_each_measured_config_with_its_features(monkeypatch, tmp_
     assert exhausted['status'] == 'resource_exhausted' and exhausted['error'] == 'MemoryError'
     assert exhausted['samples_ms'] == [] and exhausted['compile_ms'] is None
     assert norm['features'] is None and norm['estimate_s'] is None and norm['launch'] == 'RmsForward'
+    assert norm['features_status'] == 'unsupported' and timed['features_status'] == 'stated'
 
