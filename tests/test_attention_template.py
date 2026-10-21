@@ -199,9 +199,12 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
                                  tile * block_k:(tile + 1) * block_k]
                 assert entries.all(), (row, block, tile)
                 whole += 1
-    if case is CASES["full"]:
-        assert whole == ROWS * (queries_ // block_q) * (keys_ // block_k)
-    if case is CASES["documents"]:
+    # Every tile whose entries are all visible, of one document where there are any, is in a whole range.
+    tiles = padded.reshape(ROWS, padded.shape[1] // block_q, block_q, -1, block_k).all(axis=(2, 4))
+    if query_doc is not None:
+        tiles &= (query_doc[:, :, None] == key_doc[:, None, :]) & (query_doc[:, :, None] > 0)
+    assert whole == tiles.sum()
+    if case is CASES["documents"] and (block_q, block_k) == (16, 16):
         assert whole > 0
 
 
@@ -363,19 +366,21 @@ def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks):
     """The softmax over a call's first keys, its output, maxima and denominators resumed as the initial
     state of one over the rest (`template.Initial`, its numerator the output times the denominator, a
     query that saw nothing resuming from no state), gives the output, maxima and denominators of one
-    pass over every key, on par from float64."""
+    pass over every key, on par from float64. The keys part at a tile's edge, as a split-KV launch
+    parts them."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
-    first, rest = halves(spans, keys // 2)
+    edge = keys // 2 // 32 * 32
+    first, rest = halves(spans, edge)
     start = hooks_of(hooks, queries)
 
     def resumed(query, key, value):
-        out, m, total = template.reference(query, key[:, :keys // 2], value[:, :keys // 2], first, start,
+        out, m, total = template.reference(query, key[:, :edge], value[:, :edge], first, start,
                                            residuals=True)
         acc = jnp.swapaxes(out.astype(jnp.float32), 1, 2) * total[..., None]
         state = template.Initial(jnp.where(total > 0, m, -jnp.inf), total, acc)
-        return template.reference(query, key[:, keys // 2:], value[:, keys // 2:], rest,
-                                  template.Hooks(initial=state), residuals=True)
+        return template.reference(query, key[:, edge:], value[:, edge:], rest, template.Hooks(initial=state),
+                                  residuals=True)
 
     def whole(query, key, value):
         return template.reference(query, key, value, spans, start, residuals=True)
