@@ -111,8 +111,8 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     keys, as Dew's coordinates count them, by default their indices; `segment_ids`, one `[B, S]` array or a
     `CrossDocuments` (its keys in ascending id order, as it takes them), keeps each query to its
     document's keys, under causality or a window a cross call's queries aligned to their document's last
-    keys (`aligned_places`); `lengths` `[B]` end each row's keys and `starts` `[B]` begin them. The ids
-    keep their own dtype, so no two documents share one."""
+    keys (`aligned_places`); `lengths` `[B]` end each row's keys and `starts` `[B]` begin them. Places,
+    lengths and starts are int32 token coordinates; the ids keep their own dtype."""
     from dew.nn.attention import window_sides
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
 
@@ -231,8 +231,8 @@ def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     j = jnp.arange(key_blocks)[None, None, :]
     reads = (lo[:, :, None] <= j) & (j < hi[:, :, None])
     i = jnp.arange(lo.shape[1])[None, :, None]
-    q_lo = jnp.min(jnp.where(reads, i, big), axis=1)
-    q_hi = jnp.max(jnp.where(reads, i + 1, 0), axis=1)
+    q_lo = jnp.min(jnp.where(reads, i, big), axis=1, initial=big)
+    q_hi = jnp.max(jnp.where(reads, i + 1, 0), axis=1, initial=0)
     q_lo = jnp.where(q_hi > 0, q_lo, 0)
     return BlockMap(lo, hi, full_lo, full_hi, q_lo, q_hi, _uniform_doc(spans.query_ids, block_q),
                     _uniform_doc(spans.key_ids, block_k), block_q, block_k)
@@ -344,9 +344,10 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     """The template's arithmetic in XLA ops: `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]`
     and `[B, K, Hk, Dv]`, a query head reading the key head it shares with `H // Hk` others, the keys
     `spans` leaves it. As the kernels compute it: products of the inputs accumulated in fp32 (fp64 for
-    fp64 inputs), the scale and `score_mod` on the fp32 logits, the softmax from `hooks.initial` in fp32,
-    the probabilities rounded to the values' dtype for their product, the output normalized in fp32 and
-    `output_mod` applied before it rounds to the query's dtype. A query that sees no key and starts from
+    fp64 inputs), the scale and `score_mod` on the fp32 logits, the softmax from `hooks.initial` in fp32
+    (or the wider of the inputs' and the state's dtypes), the probabilities rounded to the values' dtype
+    for their product, the output normalized in fp32 and `output_mod` applied before it rounds to the
+    query's dtype. A query that sees no key and starts from
     no state gives zeros. With `residuals`, also each query's running maximum `m` and denominator `total`
     `[B, H, Q]` (natural log, unnormalized), fp32, a query that sees no key and starts from no state
     holding 0 for both, so every residual is finite; a softmax resumed from them (`Initial`) starts such
@@ -355,7 +356,9 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     batch, queries, heads, _ = query.shape
     kv_heads = key.shape[2]
     wide = jnp.promote_types(query.dtype, jnp.float32)
-    logits = scores(query, key, spans, hooks, scale=scale)
+    if hooks.initial is not None:
+        wide = jnp.promote_types(wide, hooks.initial.m.dtype)
+    logits = scores(query, key, spans, hooks, scale=scale).astype(wide)
 
     def one(row, head):
         s, v = logits[row, head], value[row, :, head // (heads // kv_heads)]
