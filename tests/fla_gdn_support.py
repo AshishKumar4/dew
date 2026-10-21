@@ -18,11 +18,14 @@ COMPILED_SHAPES = {
              "width": 128, "columns": 128, "chunk": 64},
     "9b": {"batch": 4, "length": 3072, "key_heads": 16, "value_heads": 32,
            "width": 128, "columns": 128, "chunk": 64},
+    "27b": {"batch": 1, "length": 4096, "key_heads": 16, "value_heads": 48,
+            "width": 128, "columns": 128, "chunk": 64},
     "wide keys": {"batch": 1, "length": 512, "key_heads": 2, "value_heads": 4,
                   "width": 256, "columns": 128, "chunk": 64},
 }
 """The shapes every declared config compiles at: the training shapes, whose heads are `fla_gdn.WIDEST`
-wide, and the widest keys the port takes in 16 bits (`fla_gdn.WIDEST_KEYS`)."""
+wide, three value heads a key head among them (no power of two), and the widest keys the port takes
+in 16 bits (`fla_gdn.WIDEST_KEYS`)."""
 
 
 class KernelCase(NamedTuple):
