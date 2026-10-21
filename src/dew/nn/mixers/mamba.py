@@ -42,7 +42,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
-from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_products
@@ -73,8 +73,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     pad = (chunk_size - length % chunk_size) % chunk_size
 
     def chunks(t):  # [B, S, ...] -> [NC, B, C, ...], chunks leading for the scan
-        t = jnp.pad(t, ((0, 0), (0, pad), *[(0, 0)] * (t.ndim - 2)))
-        return jnp.moveaxis(t.reshape(batch, (length + pad) // chunk_size, chunk_size, *t.shape[2:]), 1, 0)
+        return sequence_blocks(t, chunk_size, leading=True)
 
     # A padded step is dt 0, which neither decays nor writes, and no reset.
     resets = jnp.zeros((batch, length), jnp.bool_) if starts is None else jnp.asarray(starts, jnp.bool_)
