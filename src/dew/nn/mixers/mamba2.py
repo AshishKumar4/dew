@@ -66,7 +66,7 @@ from dew.nn.attention import FORWARD_MODE, repeat_kv_heads, unweighted_rmsnorm
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
-from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.kernels import mamba_ssd
 from dew.nn.kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
@@ -146,9 +146,8 @@ def xla_chunk_scan(x, B, C, a, carried, chunk_size: int):
     chunks lead its own einsums."""
     batch, total, heads, head_dim = x.shape
 
-    def chunks(t):  # [B, T, ...] -> [NC, B, C, ...]
-        blocked = t.reshape(batch, total // chunk_size, chunk_size, *t.shape[2:])
-        return jnp.moveaxis(blocked, 1, 0)
+    def chunks(t):  # [B, T, ...] -> [NC, B, C, ...]; T is whole chunks already
+        return sequence_blocks(t, chunk_size, leading=True)
 
     x_c, B_c, C_c = chunks(x), chunks(B), chunks(C)         # [NC, B, C, H, ...]
     a_c = jnp.moveaxis(chunks(a), 3, 2)                     # [NC, B, H, C]

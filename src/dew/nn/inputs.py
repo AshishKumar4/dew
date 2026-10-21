@@ -66,6 +66,17 @@ def token_ids(values: object, *, where: str) -> list[int]:
     return [token_id(token, where=where) for token in values]
 
 
+def sequence_blocks(x: jax.Array, block: int, blocks: int | None = None, *,
+                    leading: bool = False) -> jax.Array:
+    """`x` `[B, S, ...]` padded with zeros at the end to `blocks` blocks of `block` positions (as
+    many as `S` needs when None) and cut into them, `[B, blocks, block, ...]`, or with the blocks
+    leading, `[blocks, B, block, ...]`, for a scan or map over them (`leading`)."""
+    blocks = -(-x.shape[1] // block) if blocks is None else blocks
+    x = jnp.pad(x, [(0, 0), (0, blocks * block - x.shape[1])] + [(0, 0)] * (x.ndim - 2))
+    x = x.reshape(x.shape[0], blocks, block, *x.shape[2:])
+    return jnp.moveaxis(x, 1, 0) if leading else x
+
+
 def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 0,
                    padding_side: Literal["left", "right"] = "left",
                    fields: Mapping[str, Sequence[Sequence[int]] | np.ndarray] | None = None,
