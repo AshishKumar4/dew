@@ -559,7 +559,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
         # Scaled and normalized in fp32 before it narrows to the operands' dtype, so fp16 holds what fp32
         # does.
-        dq = dq + _dot((logits * scale * over_prior[:, None]).astype(key.dtype), key, interpret)
+        dq = dq + _dot((logits * (scale * over_prior)[:, None]).astype(key.dtype), key, interpret)
         grads = tuple(grad + piece if row else grad for grad, row, piece in zip(grads, summed, pieces,
                                                                                strict=True))
         if any(summed):
