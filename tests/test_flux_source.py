@@ -65,7 +65,8 @@ def flux_walk(source, name: str, grid: tuple[int, int], *, dtype="float32"):
             return jnp.sum(output * probe), output
 
         (_, output), gradients = jax.value_and_grad(objective, argnums=(0, 1, 2, 3), has_aux=True)(
-            params, latent, inputs["context"], inputs["pooled"])
+            jax.tree.map(lambda value: jnp.asarray(value, latent.dtype), params),
+            latent, inputs["context"], inputs["pooled"])
         return {"output": packed(output), "grad_packed": packed(gradients[1]),
                 "grad_context": gradients[2], "grad_pooled": gradients[3], "grad_params": gradients[0]}
 

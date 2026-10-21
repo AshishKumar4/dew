@@ -86,7 +86,7 @@ def transformer_walk(source, name, lengths, *, dtype="float32"):
             return jnp.sum(output * probe), output
 
         (_, output), gradients = jax.value_and_grad(objective, argnums=(0, 1, 2), has_aux=True)(
-            params, latents, context)
+            jax.tree.map(lambda value: jnp.asarray(value, latents.dtype), params), latents, context)
         return {"output": -output.transpose(0, 3, 1, 2)[:, :, None],
                 "grad_latents": -gradients[1].transpose(0, 3, 1, 2)[:, :, None],
                 **{f"grad_caption.{row}": -gradients[2][row, :length]
