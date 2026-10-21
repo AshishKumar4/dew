@@ -1546,7 +1546,8 @@ def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> N
     (tools/recorded_references.py): each seed's token grid (tests/interop_support.py `drawn_ids`), the
     reference's fp32 eager logits on the CPU and their float64 truth (the model in float64, its float32
     pins widened), its count planned on Dew's own load of the fixture and confirmed on the reference.
-    The ids are drawn again by the test, so only the outputs and the ids' digests are kept, in
+    The ids are drawn again by the test, and the reference's evidence alone is kept with its truth's
+    sketch (`record_case`'s summary), which the test's float64 run of Dew's model is held to, in
     recorded_logits.npz beside the fixture."""
     import sys
     from copy import deepcopy
@@ -1587,7 +1588,7 @@ def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> N
 
     with jax.enable_x64(True):
         recording = record_case("logits", lambda seed: drawn_ids(vocab, seed), evaluate, proxy,
-                                truth_proxy=truth_proxy, store_inputs=False)
+                                truth_proxy=truth_proxy, store_inputs=False, summary=True)
     import transformers
 
     record = provenance(f"transformers {type(model).__name__}", transformers.__version__, "cpu", command,
