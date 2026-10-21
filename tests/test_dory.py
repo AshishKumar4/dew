@@ -740,13 +740,17 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
         del variables
     for dtype in ('bfloat16', 'float32'):
         loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype=dtype)
+        # The weights live on the host, each order's copy alone on the device (below).
+        host = jax.device_get(loaded.variables)
+        for leaf in jax.tree.leaves(loaded.variables):
+            if isinstance(leaf, jax.Array):
+                leaf.delete()
         for loops, mode, run in recorder.RUNS:
             if run != dtype:
                 continue
             key = recorder.name(loops, mode, run)
             model = with_cache(loaded.model.with_passes(loops), mode).with_cache_capacity(recorder.CONTEXT)
             programs, columns, truth = decoding(model), recorder.columns_of(probe, key), truths[key]
-            placed = jax.device_put(loaded.variables)
             theirs = np.load(recorder.fetched(f'columns-{recorder.tag(key)}-0.npy'))
             sampled = np.take_along_axis(truth, columns, axis=1)
             # Each order's distance of each row from float64: over the whole vocabulary, then on the
@@ -754,8 +758,11 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
             distances = {'whole': np.zeros((ORDERS, len(truth))), 'columns': np.zeros((ORDERS, len(truth))),
                          'theirs': np.sqrt(np.mean(np.square(theirs - sampled), axis=2))}
             for order in range(ORDERS):
-                # Each order's weights are reordered where they sit, on the device.
-                found = rows(programs, symmetric(placed, config, recorder.symmetry(config, 0, order)), key)
+                # Each order's weights are reordered on the host and placed alone: the 4B's weights twice
+                # over, with its compiled step and cache, do not fit a 40 GB GPU.
+                ordered = jax.device_put(symmetric(host, config, recorder.symmetry(config, 0, order)))
+                found = rows(programs, ordered, key)
+                del ordered
                 distances['whole'][order] = np.sqrt(np.mean(np.square(found - truth), axis=1))
                 distances['columns'][order] = np.sqrt(np.mean(np.square(
                     np.take_along_axis(found, columns, axis=1) - sampled), axis=1))
