@@ -211,10 +211,17 @@ def compensated_add(left, right):
     value rounded once, where a pair left unrenormalised keeps the plain
     running sum in `hi`, every addition's rounding in it.
     XLA reassociates no float arithmetic unless fast math is on; with it,
-    `lo` cancels to zero and the sum is the plain one."""
+    `lo` cancels to zero and the sum is the plain one.
+
+    A sum that reaches an infinity or a NaN is the plain IEEE one, with no
+    residual: `+-inf` stays infinite, opposite infinities and NaNs give NaN,
+    where every residual past an infinity is inf - inf. A finite sum the
+    renormalisation rounds to an infinity keeps that infinity."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
     total, dropped = _two_sum(left_hi, right_hi)
-    return _two_sum(total, dropped + left_lo + right_lo)
+    hi, lo = _two_sum(total, dropped + left_lo + right_lo)
+    finite = jnp.isfinite(total)
+    return jnp.where(finite, hi, total), jnp.where(finite & jnp.isfinite(hi), lo, jnp.zeros_like(lo))
 
 
 def compensated_difference(later, earlier):

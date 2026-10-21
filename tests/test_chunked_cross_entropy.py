@@ -1192,3 +1192,22 @@ def test_an_fp32_whole_heads_overflowed_state_gradient_stays_infinite():
         value, gradient = jax.value_and_grad(loss)(hidden)
     assert np.isfinite(float(value))
     assert np.all(np.isinf(np.asarray(gradient))) and not np.any(np.isnan(np.asarray(gradient)))
+
+
+def test_a_fused_heads_overflowed_column_gradient_stays_infinite():
+    """The fused head sums each column term's gradient over its token tiles as a double-float pair: a
+    term that overflows leaves the sum infinite, as a plain sum's is, never inf - inf's NaN. One state
+    of 1, columns at -3e38, 3e38 and 3e38 scaled by 1e-37: logits -30, 30 and 30, a finite loss, and the
+    target column's scale gradient 2 * 3e38, past float32."""
+    matrix = jnp.asarray([[-3e38, 3e38, 3e38]], jnp.float32)
+    hidden, targets, weights = jnp.ones((1, 1), jnp.float32), jnp.zeros((1,), jnp.int32), jnp.full((1,), 2.0)
+
+    def total(scale):
+        head = OutputTable(matrix, vocab_major=False, scale=scale)
+        return fused_head_loss(hidden, head, targets, weights)[0]
+
+    with jax.default_matmul_precision("highest"):
+        value, gradient = jax.value_and_grad(total)(jnp.full((3,), 1e-37, jnp.float32))
+    gradient = np.asarray(gradient)
+    assert np.isfinite(float(value))
+    assert np.isposinf(gradient[0]) and np.all(np.isfinite(gradient[1:]))
