@@ -45,7 +45,13 @@ from dew.nn.kv_cache import KVCache, write_cache
 # contracts from base avoids importing the kind hub back during this module's
 # initialization, so either kind can be the first imported.
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
-from dew.nn.precision import at_least_fp32, compensated_add, compensated_sum, float32_dot_general, float32_products
+from dew.nn.precision import (
+    at_least_fp32,
+    compensated_add,
+    compensated_sum,
+    float32_dot_general,
+    float32_products,
+)
 from dew.nn.rope import YarnScaling, deinterleaved, rotate, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
