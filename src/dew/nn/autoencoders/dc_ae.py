@@ -35,7 +35,7 @@ from ..attention import rms_normalized
 from ..conv import Conv
 from ..precision import at_least_fp32, float32_dot_general, float32_products
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
-from .api import ModuleAutoEncoder
+from .api import LatentNormalization, ModuleAutoEncoder
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -500,15 +500,15 @@ class DCAutoencoder(ModuleAutoEncoder[DCAE]):
 
     def __init__(self, *, model: DCAE, params: Variables, latent_scale: float, latent_shift: float = 0.0):
         super().__init__(model, params)
-        self.latent_scale = latent_scale
-        self.latent_shift = latent_shift
+        self.normalization = LatentNormalization({'latent_scale': latent_scale, 'latent_shift': latent_shift},
+                                                 latent_shift, latent_scale)
 
     @property
     def stochastic(self) -> bool:
         return False
 
     def record_arguments(self) -> dict:
-        return {'latent_scale': self.latent_scale, 'latent_shift': self.latent_shift}
+        return dict(self.normalization.record)
 
 
 def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
