@@ -104,7 +104,7 @@ class EnvironmentSource:
     read the task's own payload, and `identity.task` is the submission's
     serial number. `workers` is the most sessions that run at once, and the
     server batches their calls. The server's sampling policy must set an EOS
-    id. `cancel` stops a session at its next turn or during a draw, but
+    id or a stop string. `cancel` stops a session at its next turn or during a draw, but
     never inside `environment.step`. So an environment must bound its own
     step time, as `SubprocessEnvironment` does with its wall clock, or a hung
     step holds its worker until it returns. An action carries the draw's raw
@@ -119,8 +119,9 @@ class EnvironmentSource:
                             ("max_turns", max_turns), ("workers", workers)):
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        if server.sampling.eos_token_ids is None:
-            raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
+        if server.sampling.eos_token_ids is None and not server.sampling.stop:
+            raise ValueError("tool episodes need an EOS id or a stop string to tell a turn that ended "
+                             "from one cut at its token limit")
         self.server, self.environment, self.verifier = server, environment, verifier
         self.max_prompt_tokens, self.max_new_tokens, self.max_turns = (
             max_prompt_tokens,
@@ -277,7 +278,8 @@ class PromptSource:
     """Draws one completion per sample of a `prompt_tasks` task and scores its decoded text.
 
     `decode` turns the sampled ids into text, and `reward` scores that text,
-    without the EOS, on `scorers` threads as soon as each draw finishes. A
+    without the EOS id a draw ended on but with a stop string it ended on
+    (`Draw.response`), on `scorers` threads as soon as each draw finishes. A
     draw that ends on its token budget is TRUNCATED and still scored. A
     draw the server cancelled, and an `InfrastructureError` or `OSError`
     the draw or the reward fails with, such as an unreachable engine or a
@@ -334,7 +336,7 @@ class PromptSource:
             support=draw.support,
         )
         status = Status.COMPLETED if draw.terminated else Status.TRUNCATED
-        text = self.decode(draw.tokens[:len(draw.tokens) - int(draw.terminated)])
+        text = self.decode(draw.response(self.server.sampling))
         try:
             score = self.reward(text, prompt.record)
         except _INFRASTRUCTURE as error:
