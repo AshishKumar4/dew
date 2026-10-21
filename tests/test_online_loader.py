@@ -155,7 +155,8 @@ def test_a_cached_fetch_with_threads_of_its_own_fetches_that_many_at_once(tmp_pa
             try:
                 # Each body is its url's path, the same from either server.
                 read_ids = [[(int(row), bytes(later))
-                             for row, later in zip(batch["id"], batch["later"], strict=True)] for batch in reader]
+                             for row, later in zip(batch["id"], batch["later"], strict=True)]
+                            for batch in reader]
             finally:
                 reader.close()
         assert handle.most == {"before": 4, "after": 2}
