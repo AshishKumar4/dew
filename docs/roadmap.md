@@ -124,6 +124,7 @@ The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case 
 
 ## Training and parallelism
 
+- Stop a block-diffusion run's generation at its checkpoint's end-of-sequence ids, as a loaded model's does. [895]
 - Shard persistent optimizer state on sequence-only meshes. [156]
 - Qualify loss, resume, failure handling and throughput on two physical hosts. [158]
 - Expand training and inference across supported parallelism combinations; replace restrictions with composed support where the mathematics permits it. [226, 245]
