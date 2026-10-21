@@ -21,9 +21,21 @@ CHUNK = 16
 
 HOOKS = [recurrence.Hooks(decay=decay, delta=delta, write_gate=not delta, skip=skip,
                           scale=KEY_WIDTH ** -0.5 if delta else None)
-         for decay, delta, skip in itertools.product(('none', 'scalar', 'vector'), (True, False), (False, True))]
+         for decay, delta, skip in itertools.product(('none', 'scalar', 'vector'), (True, False),
+                                                     (False, True))]
 """The decay kinds, the delta rule or a write gate alone (R = 0, Mamba2's SSD and the gated linear
 attentions), with and without the skip."""
+
+FORMED = [
+    recurrence.Hooks(decay='scalar', gates=recurrence.Gates(), l2norm=True),
+    recurrence.Hooks(decay='scalar', gates=recurrence.Gates(write='step', limit=(0.0, 0.5)), delta=False,
+                     skip=True),
+    recurrence.Hooks(decay='vector', l2norm=True, output=recurrence.OutputNorm(1e-6)),
+    recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5,
+                     output=recurrence.OutputNorm(1e-5, 'sigmoid')),
+]
+"""The prologue's and epilogue's hooks: the gated delta rule's gates and l2 norm, Mamba2's step gates
+clipped with the skip, and the gated RMS norm after the l2 norm and after a plain scale."""
 
 PACKED = (False, True)
 """A row of one sequence, and of packed documents."""
@@ -52,6 +64,20 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int) -> tuple[Chunk]:
     log_decay = -jax.nn.softplus(jax.random.normal(keys[3], shape) - 1.0)
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], (ROWS, LENGTH, VALUE_HEADS)))
     skip = jax.random.normal(keys[5], (VALUE_HEADS,))
+    gates = {}
+    if hooks.gates is not None:
+        # Pre-activations: the gate and beta raw, `log_a` and `bias` a head's.
+        heads = jax.random.split(keys[6], 3)
+        gates = {'gate': jax.random.normal(heads[0], (ROWS, LENGTH, VALUE_HEADS)),
+                 'log_a': 0.5 * jax.random.normal(heads[1], (VALUE_HEADS,)),
+                 'bias': jax.random.normal(heads[2], (VALUE_HEADS,))}
+        beta = jax.random.normal(keys[4], (ROWS, LENGTH, VALUE_HEADS))
+    epilogue = {}
+    if hooks.output is not None:
+        norms = jax.random.split(keys[7], 2)
+        epilogue = {'z': jnp.take(jax.random.normal(norms[0], (ROWS, LENGTH, VALUE_HEADS, VALUE_WIDTH)),
+                                  value_order, axis=-1),
+                    'weight': jnp.take(1.0 + 0.1 * jax.random.normal(norms[1], (VALUE_WIDTH,)), value_order)}
     query, key = (jnp.take(x, key_order, axis=-1) for x in (query, key))
     value = jnp.take(value, value_order, axis=-1)
     if hooks.decay == 'vector':
@@ -59,9 +85,10 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int) -> tuple[Chunk]:
     starts = None
     if packed:
         starts = jnp.zeros((ROWS, LENGTH), bool).at[0, jnp.array([0, 23, 40])].set(True).at[1, 9].set(True)
-    return (Chunk(query, key, value, log_decay=None if hooks.decay == 'none' else log_decay,
-                  beta=beta if hooks.gated_write else None, skip=skip if hooks.skip else None,
-                  starts=starts),)
+    reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
+    return (Chunk(query, key, value, log_decay=None if hooks.decay == 'none' or hooks.gates else log_decay,
+                  beta=beta if reads_beta else None, skip=skip if hooks.skip else None, starts=starts,
+                  **gates, **epilogue),)
 
 
 def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
@@ -75,10 +102,14 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
 
     def one_token(state, t):
         state = jnp.where(starts[:, t, None, None, None], 0.0, state)
+        def at(x):
+            return None if x is None else x[:, t]
+
         token = recurrence.Step(
             state, query=query[:, t], key=key[:, t], value=operands.value[:, t],
-            log_decay=None if operands.log_decay is None else operands.log_decay[:, t],
-            beta=None if operands.beta is None else operands.beta[:, t], skip=operands.skip)
+            log_decay=at(operands.log_decay), gate=at(operands.gate), log_a=operands.log_a,
+            bias=operands.bias, beta=at(operands.beta), skip=operands.skip, z=at(operands.z),
+            weight=operands.weight)
         out, _, state = recurrence.step_reference(hooks, token)
         return state, out
 
@@ -87,7 +118,7 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
 
 
 @pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
-@pytest.mark.parametrize('hooks', HOOKS, ids=str)
+@pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)
 def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, packed):
     """`chunk`'s portable math in `CHUNK`-token chunks against the same recurrence a token at a time,
     output and final memory, over draws of fresh operands under orders of the keys' and values'
