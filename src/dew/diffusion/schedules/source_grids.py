@@ -28,6 +28,7 @@ from dew.diffusion.schedules.common import GeneralizedNoiseScheduler, NoiseSched
 from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
 from dew.diffusion.schedules.flow import RectifiedFlow
 from dew.diffusion.transforms import PredictionTransform
+from dew.nn.sharding import rows_taken
 from dew.records import JSON
 
 if TYPE_CHECKING:
@@ -52,16 +53,19 @@ class TabulatedVP(DiscreteNoiseScheduler):
         self.stride = stride
 
     def rates(self, t):
-        t = jnp.asarray(t, jnp.float32)
-        index = jnp.clip(t.astype(jnp.int32), 0, self.T - 1)
-        return (jnp.where(t < 0, self.final_rates[0], self.sqrt_alpha_cumprod[index]),
-                jnp.where(t < 0, self.final_rates[1], self.sqrt_one_minus_alpha_cumprod[index]))
+        return self._tabulated(t, self.final_rates, self.sqrt_alpha_cumprod,
+                               self.sqrt_one_minus_alpha_cumprod)
 
     def variances(self, t):
+        return self._tabulated(t, self.final_variances, self.alpha_cumprod, self.one_minus_alpha_cumprod)
+
+    def _tabulated(self, t, final, signal, noise):
+        """The tables' rows at each time's step, read where the time is (`rows_taken`), and `final`'s
+        pair past the grid's last step (a negative time)."""
         t = jnp.asarray(t, jnp.float32)
         index = jnp.clip(t.astype(jnp.int32), 0, self.T - 1)
-        return (jnp.where(t < 0, self.final_variances[0], self.alpha_cumprod[index]),
-                jnp.where(t < 0, self.final_variances[1], self.one_minus_alpha_cumprod[index]))
+        return (jnp.where(t < 0, final[0], rows_taken(signal, index)),
+                jnp.where(t < 0, final[1], rows_taken(noise, index)))
 
     def model_time(self, t):
         return jnp.maximum(jnp.asarray(t, jnp.float32), 0.0)
@@ -94,10 +98,12 @@ def _interpolate(x, xp, fp):
     """
     x = jnp.asarray(x, jnp.float32)
     i = jnp.clip(jnp.searchsorted(xp, x, side="right", method="compare_all"), 1, len(xp) - 1)
-    df = fp[i] - fp[i - 1]
-    dx = xp[i] - xp[i - 1]
+    # Each example's time reads the replicated grid at its own shard (`rows_taken`).
+    left, right = rows_taken(fp, i - 1), rows_taken(fp, i)
+    low, high = rows_taken(xp, i - 1), rows_taken(xp, i)
+    dx = high - low
     flat = jnp.abs(dx) <= np.spacing(np.finfo(np.float32).eps)
-    f = jnp.where(flat, fp[i - 1], fp[i - 1] + (x - xp[i - 1]) / jnp.where(flat, 1, dx) * df)
+    f = jnp.where(flat, left, left + (x - low) / jnp.where(flat, 1, dx) * (right - left))
     return jnp.where(x > xp[-1], fp[-1], jnp.where(x < xp[0], fp[0], f))
 
 
@@ -175,7 +181,7 @@ class _UniformGrid(_PairedGrid, NoiseScheduler):
     """
 
     def sample_t(self, key, n: int):
-        return jax.random.uniform(key, (n,), minval=0, maxval=self.T)
+        return jax.random.uniform(key, (n,), jnp.float32, 0, self.T)
 
     def weight(self, t):
         return jnp.ones_like(jnp.asarray(t, jnp.float32))

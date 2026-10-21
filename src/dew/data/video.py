@@ -32,12 +32,13 @@ def fit_frames(frames: np.ndarray, size: int) -> np.ndarray:
                      for frame in frames])
 
 
-def fetch(url: str = "url", to: str = "mp4", *, timeout: float = 30.0, max_bytes: int = 256 * 2**20) -> Fetch:
+def fetch(url: str = "url", to: str = "mp4", *, timeout: float = 30.0, max_bytes: int = 256 * 2**20,
+          threads: int | None = None) -> Fetch:
     """A record step that fetches the clip at the record's `url` field into
-    `to` as bytes, as `images.fetch` does an image."""
+    `to` as bytes, `threads` at once where given, as `images.fetch` does an image."""
     from dew.data.sources.urls import Fetch
 
-    return Fetch(url, to, timeout, max_bytes)
+    return Fetch(url, to, timeout, max_bytes, threads)
 
 
 @contextlib.contextmanager
@@ -108,12 +109,14 @@ class DecodeVideo(grain.MapTransform):
     """`frames` frames at `fps` from the start of the window under `clip`, read from the video in
     `field`, each fitted into a `size` square, under `to`. The frames must fit the window: one shorter
     than `frames / fps` raises, as no record could pass. A clip that does not decode is counted and
-    dropped."""
+    dropped, and so is one whose frames are under `min_size` on their shorter side as stored, before
+    they are fitted (`"too_small"`)."""
 
     frames: int = 16
     _: dataclasses.KW_ONLY
     fps: float = 25.0
     size: int = 256
+    min_size: int = 0
     field: str = "mp4"
     clip: str = "clip"
     to: str = "video"
@@ -134,4 +137,9 @@ class DecodeVideo(grain.MapTransform):
             if not self.rejects:
                 raise
             return Rejected("undecodable")
+        if min(frames.shape[1:3]) < self.min_size:
+            if not self.rejects:
+                raise ValueError(f"a {frames.shape[2]}x{frames.shape[1]} clip is under {self.min_size} "
+                                 "pixels on its shorter side")
+            return Rejected("too_small")
         return {**element, self.to: fit_frames(frames, self.size)}

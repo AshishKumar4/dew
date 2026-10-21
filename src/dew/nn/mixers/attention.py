@@ -1032,7 +1032,7 @@ class CausalSelfAttention(nn.Module):
         """
         reads = jnp.maximum(positions + 1, 1)
         # The core reads each key head's query heads as its query positions
-        # (`decode_geometry.grouped_query`).
+        # (`decode_attention.grouped_query`).
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,

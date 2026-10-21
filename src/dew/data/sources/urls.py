@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import dataclasses
 import hashlib
 import logging
+import threading
 import time
 import urllib.request
 from collections.abc import Mapping
@@ -76,18 +79,38 @@ class Fetch:
     last byte, however slowly a server sends; any other url (a file's) by
     urllib. Resolving a host is the system resolver's, which takes no timeout.
     A cache never freezes a fetch's outcome; only `snapshot(url)` seals
-    outcomes."""
+    outcomes. `threads` fetches that many records' urls at once on a pool of
+    the stage's own, whatever the read's threads, and delivers them in the
+    order they were read; however the step is read (the shards an interleave
+    opens, a cache's reads of its inputs), each loading process runs at most
+    that many of its fetches at once. It changes no record, so no plan or key
+    records it."""
 
     field: str = "url"
     output: str = "bytes"
     timeout: float = 10.0
     max_bytes: int = 64 * 2**20
+    threads: int | None = dataclasses.field(default=None, compare=False, repr=False)
+    _running: threading.BoundedSemaphore | None = dataclasses.field(
+        default=None, init=False, compare=False, repr=False)
     volatile: ClassVar[bool] = True
     rejects: ClassVar[bool] = True
 
     def __post_init__(self) -> None:
         if self.timeout <= 0 or self.max_bytes < 1:
             raise ValueError("Fetch needs a positive timeout and max_bytes")
+        if self.threads is not None and self.threads < 1:
+            raise ValueError("Fetch threads must be positive")
+        running = None if self.threads is None else threading.BoundedSemaphore(self.threads)
+        object.__setattr__(self, "_running", running)
+
+    def __getstate__(self) -> Mapping[str, object]:
+        # The fetches running at once are counted in each process: one that reads the step counts its own.
+        return {name: value for name, value in vars(self).items() if name != "_running"}
+
+    def __setstate__(self, state: Mapping[str, object]) -> None:
+        vars(self).update(state)
+        self.__post_init__()
 
     def __call__(self, record: Mapping[str, object]):
         from dew.data.pipeline import Rejected
@@ -98,7 +121,8 @@ class Fetch:
         if not isinstance(url, str):
             return Rejected("invalid_url")
         try:
-            status, payload = self._read(url)
+            with contextlib.nullcontext() if self._running is None else self._running:
+                status, payload = self._read(url)
         except ValueError:
             return Rejected("invalid_url")
         except (OSError, aiohttp.ClientError) as error:

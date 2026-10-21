@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 
@@ -383,9 +384,9 @@ print(*(remote_cache.install(url, "token") is None for url in ("http://[::1", "h
     assert run_child(script, str(tmp_path / "cache")) == ["True", "True", "True"]
 
 
-def test_a_bundle_fetched_while_another_file_runs_is_not_that_files(tmp_path):
-    """A file's bundle that arrives while another file's tests run is the first file's: the second's
-    bundle holds only what its own tests compiled."""
+def bundles_while_one_is_on_its_way(tmp_path: Path, meanwhile: Callable[[], None]) -> dict[str, bytes]:
+    """The bundles a Worker keeps from a cache whose fetch of tests/slow.py's bundle is held on its way
+    while tests/other.py opens, `meanwhile` runs, and tests/other.py closes."""
     server, url = counted()
     stored = {}
 
@@ -402,12 +403,19 @@ def test_a_bundle_fetched_while_another_file_runs_is_not_that_files(tmp_path):
     while not Counted.requests:
         time.sleep(0.01)
     cache.opened("tests/other.py")
-    compiled(tmp_path, "jit_other-1")
+    meanwhile()
     Counted.released.set()
     slow.join()
     cache.closed("tests/other.py")
     cache.drain()
     server.shutdown()
+    return stored
+
+
+def test_a_bundle_fetched_while_another_file_runs_is_not_that_files(tmp_path):
+    """A file's bundle that arrives while another file's tests run is the first file's: the second's
+    bundle holds only what its own tests compiled."""
+    stored = bundles_while_one_is_on_its_way(tmp_path, lambda: compiled(tmp_path, "jit_other-1"))
     assert programs(tmp_path)["jit_slow-1"] == b"slow"
     bundle = stored["/jax/cpu/bundles/tests/other.py"]
     assert [key for key, _ in remote_cache.unpacked(bundle)] == ["jit_other-1"]
@@ -461,28 +469,7 @@ def test_a_bundle_whose_program_could_not_be_read_goes_up_once_it_can(cache_work
 def test_a_program_another_file_compiled_while_a_bundle_was_on_its_way_stays_that_files(tmp_path):
     """A file's bundle that brings a program another file's tests compiled while it was on its way
     leaves the program the other file's: its bundle carries it."""
-    server, url = counted()
-    stored = {}
-
-    class Keeping(Counted):
-        def do_PUT(self):
-            stored[self.path] = self.rfile.read(int(self.headers.get("Content-Length") or 0))
-            self.send_response(204)
-            self.end_headers()
-
-    server.RequestHandlerClass = Keeping
-    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
-    slow = threading.Thread(target=cache.opened, args=("tests/slow.py",))
-    slow.start()
-    while not Counted.requests:
-        time.sleep(0.01)
-    cache.opened("tests/other.py")
-    compiled(tmp_path, "jit_slow-1", b"mine")
-    Counted.released.set()
-    slow.join()
-    cache.closed("tests/other.py")
-    cache.drain()
-    server.shutdown()
+    stored = bundles_while_one_is_on_its_way(tmp_path, lambda: compiled(tmp_path, "jit_slow-1", b"mine"))
     bundle = stored["/jax/cpu/bundles/tests/other.py"]
     assert dict(remote_cache.unpacked(bundle)) == {"jit_slow-1": b"mine"}
 

@@ -10,16 +10,17 @@ import sys
 import time
 import urllib.request
 
+from guests import GUEST_UIDS
 from jupyter_client import BlockingKernelClient
 from jupyter_core.utils import ensure_event_loop
-from shared_bridge import load, processes
+from shared_bridge import OOM_PROBE, load, processes
 
 
 def dump_processes():
     for _, fields, command in processes():
         text = "\n".join(f"{name}:{value}" for name, value in fields.items()) + "\ncmd=" + (
             command.replace(b"\0", b" ").decode(errors="replace"))
-        if '6100' in text or '6101' in text:
+        if any(str(uid) in text for uid in GUEST_UIDS[:2]):
             print('PROCESS_STATUS', text[:1600], flush=True)
 
 def request(path, data=None, method=None):
@@ -74,17 +75,7 @@ def collect(client, message, timeout=30):
 
 # A cell's caps hold from the cell after the one that installs them (live_training.install).
 CAPS = "import live_training\nlive_training.install()"
-TRAINING_PROBE = """
-for score in ("-1000", "-999", "0"):
-    try:
-        with open("/proc/self/oom_score_adj", "w") as file:
-            file.write(score)
-    except OSError:
-        pass
-    else:
-        raise AssertionError(f"a guest lowered its OOM score to {score}")
-assert open("/proc/self/oom_score_adj").read().strip() == "1000"
-import urllib.request
+TRAINING_PROBE = OOM_PROBE + """import urllib.request
 from pathlib import Path
 try:
     urllib.request.urlopen("https://huggingface.co", timeout=5)
@@ -325,7 +316,7 @@ def measured(kernels, count):
                 "print(json.dumps({'uid': os.getuid(), 'fds': len(os.listdir('/proc/self/fd')), "
                 "'pss_bytes': int(pss.split()[1]) * 1024}))")
             usage = json.loads(stdout)
-            assert usage['uid'] >= 6100
+            assert usage['uid'] in GUEST_UIDS
             rows.append({"request": index, "execute_seconds": time.perf_counter() - started,
                          "arrival_to_result_seconds": time.perf_counter() - submitted,
                          "uid": usage["uid"], "fds": usage["fds"],

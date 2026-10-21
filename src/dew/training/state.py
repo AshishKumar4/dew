@@ -9,9 +9,9 @@ import optax
 from flax import struct
 from flax.training.dynamic_scale import DynamicScale
 
-from dew.objectives.base import Aux, Batch, Step, Variables, merge
+from dew.objectives.base import Batch, Variables, merge
 
-__all__ = ["CHECKPOINTED", "MODEL_STATE", "Accumulation", "Aux", "Step", "TrainState", "Variables"]
+__all__ = ["CHECKPOINTED", "MODEL_STATE", "Accumulation", "TrainState", "Variables"]
 
 
 @struct.dataclass
@@ -74,7 +74,8 @@ class TrainState:
     together with the root `key`, which never changes, and a microbatch's
     place in its step, it determines each training draw. `microstep` counts
     accepted microbatches, which a step's batch is read in one or more of
-    (`Trainer.compile`), and the objective's schedules read it per step.
+    (`Trainer.compile`), and the objective's schedules read it per step; a
+    dropped window (`dropped_window`) takes back the ones it held.
     `updates` counts committed updates, and the optimizer's and the EMA's
     schedules read it.
 

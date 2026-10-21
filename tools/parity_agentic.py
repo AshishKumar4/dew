@@ -34,7 +34,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from parity_rl import ActorConfig, AlgoConfig, compile_reference, stub
+from parity_rl import ActorConfig, compile_reference, load_verl, stub
 
 SOURCES = Path.home() / ".cache/dew/research/src"
 VERL = SOURCES / "verl"
@@ -98,37 +98,25 @@ def load():
     for path, wanted in ((VERL, VERL_REVISION), (LIGHTNING, LIGHTNING_REVISION)):
         if revision(path) != wanted:
             raise RuntimeError(f"{path} is not at {wanted}")
-    stub("ray")
-    stub("tensordict", TensorDict=dict)
-    stub("omegaconf", DictConfig=dict, MISSING=None)
-    stub("verl")
-    stub("verl.utils", as_torch_index=None, group_mean_std=None)
-    stub("verl.utils.device", get_device_name=lambda: "cpu", get_torch_device=lambda: None)
-    stub("verl.utils.import_utils", deprecated=lambda *_: (lambda f: f))
+    core = load_verl(VERL)
+    # What rollout_corr_helper imports beyond core_algos.
     stub("verl.protocol", DataProto=object)
-    stub("verl.trainer")
-    stub("verl.trainer.config", AlgoConfig=AlgoConfig)
     stub("verl.trainer.config.algorithm", RolloutCorrectionConfig=object)
-    stub("verl.trainer.ppo")
-    stub("verl.workers")
-    stub("verl.workers.config", ActorConfig=ActorConfig)
     stub("verl.workers.config.actor", PolicyLossConfig=object)
-    functional = compile_reference("verl.utils.torch_functional", VERL / "verl/utils/torch_functional.py")
-    core = compile_reference("verl.trainer.ppo.core_algos", VERL / "verl/trainer/ppo/core_algos.py")
     helper = compile_reference("verl.trainer.ppo.rollout_corr_helper",
                                VERL / "verl/trainer/ppo/rollout_corr_helper.py")
     stub("agentlightning")
     stub("agentlightning.verl")
     lightning = compile_reference("agentlightning.verl.per_rollout_loss",
                                   LIGHTNING / "agentlightning/verl/per_rollout_loss.py")
-    return functional, core, helper, lightning
+    return core, helper, lightning
 
 
 def main() -> None:
     import torch
 
     torch.set_num_threads(1)
-    _, core, helper, lightning = load()
+    core, helper, lightning = load()
     old, behavior, mask = (torch.tensor(value) for value in (OLD, BEHAVIOR, MASK))
     advantages = torch.tensor(ADVANTAGES)[:, None].expand_as(old).contiguous()
     config = ActorConfig(clip_ratio=EPSILON_LOW, clip_ratio_low=EPSILON_LOW,

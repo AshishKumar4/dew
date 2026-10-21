@@ -27,6 +27,50 @@ def ci(tmp_path, monkeypatch):
     return module
 
 
+def interpreter(root: Path, version: str) -> None:
+    """The checkout's `.venv-<version>` python, as the CI image has it: here, this interpreter."""
+    venv = root / f".venv-{version}/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+
+
+def written(root: Path, files: dict[str, str]) -> None:
+    for name, source in files.items():
+        (root / "tests" / name).write_text(source)
+
+
+def cached(monkeypatch, url: str) -> None:
+    """The shared test cache at `url`, as CI's environment names it."""
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+
+
+def gpu_driver(root: Path, monkeypatch) -> None:
+    """nvidia-smi as the driver answers it for an 80 GiB GPU, first on PATH."""
+    tools = root / "bin"
+    tools.mkdir()
+    (tools / "nvidia-smi").write_text("#!/bin/sh\necho 81920\n")
+    (tools / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
+
+
+def armada_task(ci, monkeypatch, out: Path, policy: str = "on") -> dict:
+    """The 3.12 task the plan makes under DEW_TEST_CACHE=`policy`, run as armada starts it: .armada.json's
+    command filled from its plan entry, in .armada.json's environment, which the plan's DEW_TEST_CACHE is
+    not part of. Its one row."""
+    command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
+    monkeypatch.setenv("DEW_TEST_CACHE", policy)
+    [entry] = [entry for entry in ci.plan(300.0, {}) if entry["python"] == "3.12"]
+    values = {**entry, "out": out}
+    filled = [re.sub(r"\{(\w+)\}", lambda field: str(values[field[1]]), word) for word in command]
+    monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
+    monkeypatch.delenv("DEW_TEST_CACHE")
+    assert ci.main() == 0
+    [only] = json.loads(out.read_text())["rows"]
+    return only
+
+
 def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(ci, tmp_path, monkeypatch):
     """On 3.12 files are packed near the target by armada's medians, else
     the recorded durations; a file nothing has timed runs alone; a file
@@ -78,12 +122,8 @@ def test_a_collect_task_rows_each_file_red_where_it_would_not_import(ci, tmp_pat
         "test_missing.py": "import pytest\nmissing = pytest.importorskip('no_such_module_anywhere')\n"
                            "def test_never(): pass\n",
     }
-    for name, source in files.items():
-        (tmp_path / "tests" / name).write_text(source)
-    venv = tmp_path / ".venv-3.14/bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "python").chmod(0o755)
+    written(tmp_path, files)
+    interpreter(tmp_path, "3.14")
     out = tmp_path / "verdict.json"
     ci.collect("3.14", [f"tests/{name}" for name in files], out, 120.0)
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
@@ -104,12 +144,8 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
                            "def test_never(): pass\n",
         "test_broken.py": "import no_such_module_anywhere\n",
     }
-    for name, source in files.items():
-        (tmp_path / "tests" / name).write_text(source)
-    venv = tmp_path / ".venv-3.12/bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "python").chmod(0o755)
+    written(tmp_path, files)
+    interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     ci.task("3.12", [f"tests/{name}" for name in files], "", out, 600.0)
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
@@ -154,8 +190,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     spreads the tier over its shards, each file once, and per batch names
     the files the checkout marks for a GPU."""
     url, stored, _ = cache_worker
-    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
-    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    cached(monkeypatch, url)
     device = "class Device:\n    platform = 'gpu'\n"
     files = {
         "devices.py": device + "def placed(device): return device.platform\n",
@@ -203,13 +238,9 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
            for method in ("spawn", "forkserver", "fork")},
         "test_new.py": "def test_unrun(): pass\n",
     }
-    for name, source in files.items():
-        (tmp_path / "tests" / name).write_text(source)
+    written(tmp_path, files)
     install_compiler(tmp_path / "tests/compiler")
-    venv = tmp_path / ".venv-3.12/bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "python").chmod(0o755)
+    interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     # The session fixture's files in a task of their own, where it reads for every file.
     fixtures = ["tests/test_one.py", "tests/test_two.py"]
@@ -263,8 +294,7 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     until one changes. A child given an environment of its own, or killed
     before it wrote its record, leaves its file without a key."""
     url, _, _ = cache_worker
-    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
-    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    cached(monkeypatch, url)
     started = "import os, subprocess, sys\ndef test_child():\n    "
     files = {
         "devices.py": "class Device:\n    platform = 'gpu'\ndef placed(device): return device.platform\n",
@@ -283,14 +313,10 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
         "test_own_environment.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True,\n"
                                              "                   env={'PATH': os.environ['PATH']})\n",
     }
-    for name, source in files.items():
-        (tmp_path / "tests" / name).write_text(source)
+    written(tmp_path, files)
     (tmp_path / "notes").mkdir()
     (tmp_path / "notes/page.md").write_text("page\n")
-    venv = tmp_path / ".venv-3.12/bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "python").chmod(0o755)
+    interpreter(tmp_path, "3.12")
     tests = [f"tests/{name}" for name in files if name.startswith("test_")]
     ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
 
@@ -327,18 +353,10 @@ def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_
     """The tests read pinned fixtures offline (CLOSED_HUB), so the lane fetches them first, while the Hub is
     reachable; a pin whose upload is due stops the lane before any file runs."""
     url, _, _ = cache_worker
-    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
-    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    cached(monkeypatch, url)
     monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
-    tools = tmp_path / "bin"
-    tools.mkdir()
-    (tools / "nvidia-smi").write_text("#!/bin/sh\necho 81920\n")
-    (tools / "nvidia-smi").chmod(0o755)
-    monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
-    venv = tmp_path / ".venv-3.12/bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "python").chmod(0o755)
+    gpu_driver(tmp_path, monkeypatch)
+    interpreter(tmp_path, "3.12")
     (tmp_path / "tests/test_reads.py").write_text(
         "import time\nfrom pathlib import Path\n"
         "def test_reads(): Path('read').write_text(str(time.monotonic()))\n")
@@ -365,16 +383,10 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     row stays red: nothing is run again. The rows join one verdict, each
     recorded as a task's are, and a later lane reuses the green ones."""
     url, stored, _ = cache_worker
-    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
-    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    cached(monkeypatch, url)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
-    # nvidia-smi as the driver answers it for an 80 GiB GPU.
-    tools = tmp_path / "bin"
-    tools.mkdir()
-    (tools / "nvidia-smi").write_text("#!/bin/sh\necho 81920\n")
-    (tools / "nvidia-smi").chmod(0o755)
-    monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
+    gpu_driver(tmp_path, monkeypatch)
     source = ("import os, subprocess, sys, time\n"
               "from pathlib import Path\n"
               "def test_runs():\n"
@@ -392,10 +404,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     (tmp_path / "tests/test_spawner.py").write_text(
         source + "    subprocess.run([sys.executable, '-c', 'pass'], check=True)\n")
     every = [*names, "tests/test_red.py", "tests/test_spawner.py"]
-    venv = tmp_path / ".venv-3.12/bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "python").chmod(0o755)
+    interpreter(tmp_path, "3.12")
     fetcher(tmp_path)
 
     def ran(stem: str) -> list[list[str]]:
@@ -503,10 +512,7 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
                          and f"--coverage={ci.ARTIFACTS}" in item for item in items)
     assert sorted(name for item in items for name in re.search(r"--tests='([^']*)'", item)[1].split()) == [
         "tests/test_negative.py", "tests/test_positive.py"]
-    venv = tmp_path / ".venv-3.12/bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "python").chmod(0o755)
+    interpreter(tmp_path, "3.12")
     # armada keeps each task's artifacts under its index; a directory of another name is no task.
     for index, name in enumerate(("negative", "positive")):
         (tmp_path / "runs" / str(index)).mkdir(parents=True)
@@ -592,10 +598,7 @@ def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
         "def test_unrecorded(): pass\n")
     Path("tests/test_durations.json").write_text(json.dumps(
         {f"tests/test_split.py::test_n[{n}]": seconds for n, seconds in enumerate([5, 1, 1, 1, 5, 1])}))
-    venv = tmp_path / ".venv-3.12/bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "python").chmod(0o755)
+    interpreter(tmp_path, "3.12")
     ran = []
     for group in ("1/3", "2/3", "3/3"):
         out = tmp_path / f"verdict-{group.replace('/', '-')}.json"
@@ -657,10 +660,7 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     (tmp_path / "tests").mkdir(exist_ok=True)
     (tmp_path / "tests/test_short.py").write_text("import time\ndef test_a(): time.sleep(0.3)\n")
     (tmp_path / "tests/test_long.py").write_text("import time\ndef test_b(): time.sleep(0.9)\n")
-    venv = tmp_path / ".venv-3.12/bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "python").chmod(0o755)
+    interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     began = time.monotonic()
     ci.task("3.12", ["tests/test_short.py", "tests/test_long.py"], "", out, 60.0)
@@ -686,27 +686,14 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
         "    with Path('runs').open('a') as runs: runs.write('x')\n"
         "    assert not os.environ.get('FAIL')\n"
         "    if os.environ.get('EXIT'): os._exit(3)\n")
-    venv = tmp_path / ".venv-3.12/bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "python").chmod(0o755)
+    interpreter(tmp_path, "3.12")
     url, _, _ = cache_worker
-    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
-    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    cached(monkeypatch, url)
     out = tmp_path / "verdict.json"
-    command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
 
     def run(cpu, policy="on"):
         monkeypatch.setattr(ci, "cpu_class", lambda: cpu)
-        monkeypatch.setenv("DEW_TEST_CACHE", policy)
-        [entry] = [entry for entry in ci.plan(300.0, {}) if entry["python"] == "3.12"]
-        values = {**entry, "out": out}
-        filled = [re.sub(r"\{(\w+)\}", lambda field: str(values[field[1]]), word) for word in command]
-        monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
-        # A task's environment is .armada.json's, which the plan's DEW_TEST_CACHE is not part of.
-        monkeypatch.delenv("DEW_TEST_CACHE")
-        assert ci.main() == 0
-        [only] = json.loads(out.read_text())["rows"]
+        only = armada_task(ci, monkeypatch, out, policy)
         assert (only["exitCode"] == 0) == (not os.environ.get("FAIL") and not os.environ.get("EXIT"))
         return len((tmp_path / "runs").read_text())
 
@@ -773,50 +760,30 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
         "        os.close(os.open('plan.md', os.O_RDONLY, dir_fd=folder))\n"
         "    finally:\n"
         "        os.close(folder)\n")
-    venv = tmp_path / ".venv-3.12/bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "python").chmod(0o755)
+    interpreter(tmp_path, "3.12")
     url, _, _ = cache_worker
     monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
-    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
-    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    cached(monkeypatch, url)
     # Beside the checkout's entries, not among them: the checkout's own directory is an input.
     (tmp_path / ".verdict").mkdir()
     out = tmp_path / ".verdict/verdict.json"
-    command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
 
     def run():
-        monkeypatch.setenv("DEW_TEST_CACHE", "on")
-        [entry] = [entry for entry in ci.plan(300.0, {}) if entry["python"] == "3.12"]
-        values = {**entry, "out": out}
-        filled = [re.sub(r"\{(\w+)\}", lambda field: str(values[field[1]]), word) for word in command]
-        monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
-        monkeypatch.delenv("DEW_TEST_CACHE")
-        assert ci.main() == 0
-        [only] = json.loads(out.read_text())["rows"]
-        assert only["exitCode"] == 0
+        assert armada_task(ci, monkeypatch, out)["exitCode"] == 0
         return len((tmp_path / "runs").read_text())
 
-    assert run() == 1
-    assert run() == 1
-    (tmp_path / "docs/model.md").write_text("width 8\n")
-    assert run() == 2
-    assert run() == 2
-    (tmp_path / "docs/serving.md").write_text("serve\n")
-    assert run() == 3
-    assert run() == 3
-    # Python bytecode a run leaves beside a page is no change to the directory's pages.
-    (tmp_path / "docs/__pycache__").mkdir()
-    assert run() == 3
-    (tmp_path / "docs/guides/serving.md").write_text("serve\n")
-    assert run() == 4
-    (tmp_path / "LICENSE").write_text("license\n")
-    assert run() == 5
-    assert run() == 5
-    (tmp_path / "notes/plan.md").write_text("plan again\n")
-    assert run() == 6
-    assert run() == 6
+    # Each page changed, added or listed anew runs the file again, and the run after reuses that row.
+    # Python bytecode a run leaves beside a page (a directory, `None` here) is no change to the pages.
+    changes = [(None, "", 1), ("docs/model.md", "width 8\n", 2), ("docs/serving.md", "serve\n", 3),
+               ("docs/__pycache__", None, 3), ("docs/guides/serving.md", "serve\n", 4),
+               ("LICENSE", "license\n", 5), ("notes/plan.md", "plan again\n", 6)]
+    for page, text, runs in changes:
+        if page and text is None:
+            (tmp_path / page).mkdir()
+        elif page:
+            (tmp_path / page).write_text(text)
+        assert run() == runs
+        assert run() == runs
 
 def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
     """A hang is graded: the task interrupts pytest at its deadline, short of
@@ -832,17 +799,38 @@ def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(c
         "    subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
         "    signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
         "    time.sleep(600)\n")
-    venv = tmp_path / ".venv-3.12/bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "python").chmod(0o755)
+    interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     began = time.monotonic()
     ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py"], "", out, 3.0, grace=2.0)
-    assert time.monotonic() - began < 60
+    # The deadline, the interrupt's grace, one settle budget and the reader's join, with room to spare.
+    assert time.monotonic() - began < 3.0 + 2.0 + ci.SETTLE + 10 + 15
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     assert {name: row["exitCode"] for name, row in rows.items()} == {
         "3.12:tests/test_quick.py": 1, "3.12:tests/test_hangs.py": 1}
+
+
+def test_stopping_a_group_spends_one_settle_budget_and_reports_a_leader_that_will_not_reap(monkeypatch):
+    """A group is stopped within one settle budget after SIGKILL, the leader's reaping and the other
+    members' ending together, and a leader still unreapable then is reported among the members that
+    outlived it, never raised: CI writes its verdict either way."""
+    groups = load("child_groups", "tools/armada")
+
+    class Stuck:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            time.sleep(timeout)
+            raise subprocess.TimeoutExpired("stuck", timeout)
+
+    monkeypatch.setattr(groups, "signal_group", lambda leader, number: None)
+    monkeypatch.setattr(groups, "members", lambda group: [group])
+    began = time.monotonic()
+    assert groups.stop(Stuck(), settle=0.5) == [4242]
+    assert time.monotonic() - began < 0.9, "the leader's wait and the members' share one budget"
 
 
 def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):
