@@ -8,6 +8,7 @@ import jax
 import numpy as np
 import optax
 import pytest
+from data_support import keep_captions
 from recording import RecordingTracker
 
 from dew import Field, InputSpec, Trainer
@@ -110,11 +111,6 @@ def jpegs(count: int) -> list[dict]:
     return encoded
 
 
-def kept_captions(captions):
-    """The captions a batch holds, kept as an array to compare."""
-    return {"caption": np.asarray(captions)}
-
-
 IMAGE_RECIPES = {
     # Each case: the recipe's settings, and the preset settings that prepare its records alike.
     "device augmentation from a staged size": (
@@ -155,7 +151,7 @@ def test_the_images_preset_prepares_what_the_image_recipe_does(read, case):
     recipe = ImageData(source, image_size=16, augment=augment, classes=("cat", "dog", "owl"),
                        validation=holdout, **recipe_settings)
     recipe_settings["augment"] = backend
-    host = (images.EncodeCaptions(kept_captions),)
+    host = (images.EncodeCaptions(keep_captions),)
     expected = loader(recipe, batch=4, read=read, loading=loading, validation_records=3, host=host)
 
     order = {"memory": None, "indexed": None, "streamed": 64}[read]

@@ -13,6 +13,7 @@ from uuid import uuid4
 import fsspec
 import pytest
 from fsspec.implementations.local import LocalFileSystem
+from storage_support import moto_bucket
 
 from dew.data.sources import Files
 from dew.data.storage import BoundedFileCache, PreconditionFailed, Store, Versioned, _profile
@@ -21,20 +22,12 @@ from dew.data.storage import BoundedFileCache, PreconditionFailed, Store, Versio
 @pytest.fixture(params=["memory", "file", "s3"])
 def store(request, tmp_path):
     if request.param == "memory":
-        return Store(f"memory://storage-{uuid4().hex}/value")
-    if request.param == "file":
-        return Store(str(tmp_path / "value"))
-    from moto.server import ThreadedMotoServer
-
-    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
-    server.start()
-    _, port = server.get_host_and_port()
-    options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}"}
-    fs = fsspec.filesystem("s3", **options)
-    bucket = "storage-test-" + uuid4().hex
-    fs.mkdir(bucket)
-    request.addfinalizer(server.stop)
-    return Store(f"s3://{bucket}/value", options)
+        yield Store(f"memory://storage-{uuid4().hex}/value")
+    elif request.param == "file":
+        yield Store(str(tmp_path / "value"))
+    else:
+        with moto_bucket("storage-test") as (bucket, options):
+            yield Store(f"s3://{bucket}/value", options)
 
 
 def test_a_versioned_s3_read_is_the_filesystems_own_request():
@@ -45,20 +38,11 @@ def test_a_versioned_s3_read_is_the_filesystems_own_request():
     import hashlib
     import os
 
-    from moto.server import ThreadedMotoServer
-
-    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
-    server.start()
-    try:
-        _, port = server.get_host_and_port()
-        secret = os.urandom(32)
-        sealed = {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": base64.b64encode(secret).decode(),
-                  "SSECustomerKeyMD5": base64.b64encode(hashlib.md5(secret).digest()).decode()}
-        options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}",
-                   "s3_additional_kwargs": sealed}
-        bucket = "sealed-" + uuid4().hex
+    secret = os.urandom(32)
+    sealed = {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": base64.b64encode(secret).decode(),
+              "SSECustomerKeyMD5": base64.b64encode(hashlib.md5(secret).digest()).decode()}
+    with moto_bucket("sealed", s3_additional_kwargs=sealed) as (bucket, options):
         fs = fsspec.filesystem("s3", **options)
-        fs.mkdir(bucket)
         fs.pipe(f"{bucket}/value", b"payload")
         # The read's own parameters, as botocore builds the request from them.
         sent = []
@@ -68,8 +52,6 @@ def test_a_versioned_s3_read_is_the_filesystems_own_request():
         assert sent and all(sent[-1].get(name) == value for name, value in sealed.items())
         with pytest.raises(FileNotFoundError):
             Store(f"s3://{bucket}/absent", options).get_versioned()
-    finally:
-        server.stop()
 
 
 @pytest.mark.parametrize("publish", ["write", "put_if_absent"])

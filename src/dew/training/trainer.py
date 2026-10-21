@@ -105,6 +105,7 @@ from dew.telemetry.records import (
 from dew.training._lowering import Lowered
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
+    PREFETCH_DEPTH,
     DevicePrefetchIterator,
     Layout,
     MeshSpec,
@@ -532,6 +533,7 @@ class Trainer(Generic[Loss, Effects]):
         self._stage_starts: frozenset[int] = frozenset()
         # The training batch's device steps, which the compiled step runs (`Loader.device`).
         self._device: tuple[DeviceStep, ...] = ()
+        self._prefetch = PREFETCH_DEPTH
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -1210,7 +1212,7 @@ class Trainer(Generic[Loss, Effects]):
         last = state.accumulation
         rebuilt = last is not None and not last.replays(prepared.accumulation)
         built = [(prepared.compute, state.compute), (prepared.accumulation, None if rebuilt else last)]
-        held = prefetched_bytes(batch, placement) + placed_bytes(
+        held = prefetched_bytes(batch, placement, self._prefetch) + placed_bytes(
             [field for field, kept in built if kept is None and field is not None])
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
@@ -1368,6 +1370,7 @@ class Trainer(Generic[Loss, Effects]):
         restore_best: bool = False,
         state: TrainState | None = None,
         observe: Observe | None = None,
+        device_prefetch: int = PREFETCH_DEPTH,
     ) -> TrainState:
         """Train until the step or real-token cap is reached, resuming the latest checkpoint.
 
@@ -1413,7 +1416,8 @@ class Trainer(Generic[Loss, Effects]):
 
         Previews are generated only when `preview=True` and a tracker receives them;
         scalar reporting never triggers preview work. `observe` takes values of the
-        state at a cadence of its own while the run trains (`Observe`).
+        state at a cadence of its own while the run trains (`Observe`). `device_prefetch` training
+        batches are placed on the devices ahead of the step, which the step's memory plan holds room for.
 
         The process is readied first (`dew.training.runtime.ready_process`), as
         `prepare_process` readies it: a program that never called that gets Dew's
@@ -1425,7 +1429,7 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("tokens= needs an objective that counts real tokens")
         ready_process()
         loader, validation = fitted(dataset, validation, objective=self.objective.data())
-        self._device = loader.device
+        self._device, self._prefetch = loader.device, device_prefetch
         if epochs is not None:
             steps = loader.epoch_steps(epochs, self.accumulation)
         count_compilation_cache()
@@ -1497,7 +1501,7 @@ class Trainer(Generic[Loss, Effects]):
             state = jax.device_put(initial, shardings)
             position = None
         run.last_checkpoint = time.perf_counter()
-        interval = Interval.resumed(run.stop_control, plan.tokens, last_saved=(
+        interval = Interval.resumed(run.stop_control, last_saved=(
             int(state.step) if checkpoints is not None and checkpoints.latest is not None else None))
         if self._opened(plan, run, interval, state, position,
                         resumed=initial is None and interval.last_saved is not None):
@@ -1688,8 +1692,9 @@ class Trainer(Generic[Loss, Effects]):
                     f"{plan.dataset.batch} records a step of {stream_identity(run.source)}"))
             run.endless = stream_endless(run.source)
             self._marked = marked(partition, self._counted_batch)
-            run.train = DevicePrefetchIterator(run.source, mesh, source_state=position, reads=run.reads,
-                                                prepare=self._marked if self.rollout is None else None)
+            prepare = self._marked if self.rollout is None else None
+            run.train = DevicePrefetchIterator(run.source, mesh, self._prefetch, source_state=position,
+                                               reads=run.reads, prepare=prepare)
             run.source = None  # Lifetime transferred to the prefetch worker.
 
         trained = [entry.module for entry in self.objective.program_key() if entry.trained]

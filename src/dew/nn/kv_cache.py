@@ -44,7 +44,7 @@ from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.kernels import decode_attention, generation
-from dew.nn.kernels.generation import backend
+from dew.nn.kernels.generation import INHERENT, backend
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Requirement
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import logical_spec, manual_map, mesh_axes
@@ -555,7 +555,7 @@ def _paged_layout(device: str) -> tuple[Requirement[PagedCase], ...]:
     and arithmetic other than the reference path's."""
     return (
         Requirement('pages', lambda case: case.page_size is not None, "the cache keeps no pages",
-                    inherent=True),
+                    row=INHERENT),
         Requirement('quantized', lambda case: not case.quantized,
                     f"the {device} kernel reads bf16 pages; a quantized pool is read through the gather, "
                     "which dequantizes it", row='roadmap: paged decode over quantized pools'),
@@ -564,22 +564,22 @@ def _paged_layout(device: str) -> tuple[Requirement[PagedCase], ...]:
                     row='roadmap: paged decode over grouped pools'),
         Requirement('dtype', lambda case: case.pool == jnp.bfloat16 and case.dtype == case.pool,
                     lambda case: f"the {device} kernel reads a bf16 query over bf16 pages, not "
-                                 f"{case.dtype} over {case.pool}", inherent=True),
+                                 f"{case.dtype} over {case.pool}", row=INHERENT),
         Requirement('widths', lambda case: case.value_dim == case.head_dim,
                     "the paged kernels read keys and values of one width; narrower values take the "
-                    "gathered rows, which the attention core widens", inherent=True),
+                    "gathered rows, which the attention core widens", row=INHERENT),
         Requirement('head_shards', lambda case: case.kv_heads % case.head_shards == 0,
                     "a mesh splits the query heads past the pool's key heads, whose pages the kernel reads "
-                    "per shard", inherent=True),
+                    "per shard", row=INHERENT),
         Requirement('arithmetic', lambda case: not case.arithmetic,
                     "the step asks for arithmetic only the reference path computes (`reference_only`)",
-                    inherent=True),
+                    row=INHERENT),
     )
 
 
 TRITON_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
     Requirement('capability', lambda case: generation.triton_runs(),
-                "the paged decode kernel needs a GPU of sm80 or later", inherent=True),
+                "the paged decode kernel needs a GPU of sm80 or later", row=INHERENT),
     *_paged_layout('GPU'),
     decode_attention.PAGED_GEOMETRY,
 )
@@ -589,14 +589,14 @@ kernel nor forward mode limits it."""
 
 TPU_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
     Requirement('capability', lambda case: generation.backend() == 'tpu',
-                "the paged attention kernel runs on a TPU", inherent=True),
+                "the paged attention kernel runs on a TPU", row=INHERENT),
     *_paged_layout('TPU'),
     Requirement('windowed', lambda case: not case.windowed,
                 "the TPU paged kernel reads every slot to a row's length, not a window's span",
                 row='roadmap: TPU paged decode over windows'),
     Requirement('sinks', lambda case: not case.sinks,
                 "jax's TPU paged attention has no sinks; the gathered rows' attention applies them",
-                inherent=True),
+                row=INHERENT),
 )
 """jax's Pallas TPU paged attention, which applies a logit softcap itself."""
 
