@@ -42,8 +42,8 @@ import tyro
 import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.data import ByteTokenizer, Files, Loading, Memory, presets
-from dew.data.sinks import export
+from dew.data import ByteTokenizer, Loading, Memory, presets, text
+from dew.data.sources import TokenFiles
 from dew.eval import FID, CLIPScore
 from dew.inference import RunProcessor, TextGeneration, TextToImage
 from dew.nn.backbones import CausalTransformer
@@ -102,13 +102,10 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
     causal decoder and its checkpoint, whose record names the model, the
     byte tokenizer the objective decodes through and the preview budget.
     """
-    text = "to be or not to be, that is the question. " * 200
+    play = "to be or not to be, that is the question. " * 200
     # The held-out tokens as the store `--tokens` names, as `dew data export --tokenizer byte` writes one.
     held = out / "held-out"
-    export([{"text": np.asarray(ByteTokenizer().encode(text[6000:]), np.int32)}], str(held),
-           format="array_record", length_field="text",
-           metadata={"token_store": True, "tokenizer": "byte", "vocab_size": 256, "dtype": "int32",
-                     "eos_id": None})
+    text.export_tokens(Memory([{"text": play[6000:]}]), str(held), "byte", eos=False)
     loading = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
     model = CausalTransformer(emb_features=16, num_layers=1, num_heads=2, head_dim=8, mlp_features=32,
@@ -116,9 +113,9 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
                               attention_impl="reference")
     run = LMRunConfig(
         model=ModelConfig.from_model(model),
-        data=Memory([{"text": text[:6000]}]).repeat().pipe(
+        data=Memory([{"text": play[:6000]}]).repeat().pipe(
             presets.lm, "byte", seq_len=32, batch=4, pack=None, eos=False).loading(loading),
-        validation=Files(str(held)).pipe(presets.lm, None, seq_len=32, batch=4, pack=None).loading(loading),
+        validation=TokenFiles(str(held)).pipe(presets.token_windows, seq_len=32, batch=4).loading(loading),
         max_new_tokens=8,
         optim=OptimConfig(learning_rate=1e-3),
         trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), steps=2,
@@ -139,8 +136,8 @@ def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:
     if config.tokens is None:
         return {}
     # Every window of the held-out store is scored.
-    held = Files(str(config.tokens)).pipe(presets.lm, None, seq_len=config.sequence_length,
-                                          batch=config.batch_size, pack=None)
+    held = TokenFiles(str(config.tokens)).pipe(presets.token_windows, seq_len=config.sequence_length,
+                                               batch=config.batch_size)
     scored = Evaluation.run(LMObjective(task.model, config.sequence_length),
                             task.variables, held, key=jax.random.key(0), metrics=[Perplexity()])
     return dict(scored.scores)
