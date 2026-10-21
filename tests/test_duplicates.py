@@ -67,8 +67,7 @@ def copies(root: Path) -> list:
 
 def added(root: Path) -> list:
     """The copies `root`'s checkout adds to main's, which the gate held to main refuses."""
-    merged = duplicates.merge_base(root, "main")
-    return duplicates.named(duplicates.new(duplicates.found(sources(root)), merged, root))
+    return duplicates.judged(duplicates.found(sources(root)), duplicates.merge_base(root, "main"), root)[0]
 
 
 def owners(hits: list) -> list[tuple[str, list[str]]]:
