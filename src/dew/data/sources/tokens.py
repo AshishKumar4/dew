@@ -289,7 +289,8 @@ class TokenFiles(Dataset):
             for entry in entries:
                 if entry["lengths"] is None:
                     raise FileNotFoundError(
-                        "token export needs the producer's lengths; export with length_field='text'"
+                        f"token export needs the producer's lengths; export with length_field="
+                        f"{self.field or 'text'!r}"
                     )
                 index = ArrayIndex(root.child(entry["lengths"]["path"]).url, self.storage_options)
                 index.verify(entry["lengths"])
@@ -301,7 +302,8 @@ class TokenFiles(Dataset):
                 tuple(paths),
                 tuple(indexes),
                 str(self.meta.get("dtype", "int32")),
-                "text",
+                # The field of each record that holds its tokens, "text" where the export names none.
+                self.field or "text",
                 eos,
                 self.storage_options,
                 record_codec=True,
