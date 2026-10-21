@@ -8,7 +8,7 @@ appendix maps every variant each template covers, and every current dispatch it 
 
 There are three templates: attention, linear recurrence and GEMM. Each one meets five requirements:
 
-1. **It is the fastest:** at every shape it serves, on A100 and H100 (later B200 and TPU), it meets or beats the best existing kernel at that shape, measured in one session on one GPU.
+1. **It is the fastest:** at every shape it serves, on every generation it claims (§6: sm80, sm86, sm89, sm90, sm100, sm120 and TPU), it meets or beats the best existing kernel at that shape, measured in one session on one GPU of that generation.
    - The row is measured **at the chooser's default pick, with no autotuning,** end to end: preprocessing, merges and hook gradients included. A tuned row is shown beside it.
    - Every row names its comparator's mode (deterministic or atomic, D form, precision) and the template's.
 2. **It is the most general:** it covers every row of its coverage table (§12). Any row marked a non-goal needs the owner's sign-off.
@@ -168,7 +168,7 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 
 **Toolkit, per generation, shared by every template.** It reuses JAX's machinery directly, with no wrapper that renames a native API:
 - **Pipelines:**
-  - sm80/86: the Pallas Triton loop, `num_stages` and `num_warps`;
+  - sm80, sm86, sm89 and sm120: the Pallas Triton loop, `num_stages` and `num_warps`;
   - sm90/100: Mosaic GPU's `emit_pipeline_warp_specialized`, its rings, barriers, register reallocation, TMA and clusters;
   - TPU: Mosaic TPU's pipeline and DMA.
 - **One tile scheduler:** persistent grid, LPT, rasterization and swizzle, and split-K, stream-K and split-KV work lists.
@@ -184,13 +184,27 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 - the epilogue overlap;
 - for recurrence, its launch DAG: a fused or split solve (FlashQLA's fused prologue and fused scan against fla's four launches), and sequential or parallel state passing, chosen by B·H. Its sm90 shape includes a compute-producer warpgroup role, like FA4's correction warpgroup.
 
+**Every accelerator.** The templates target every accelerator Dew runs on, on par with the best framework on each. Each mainloop claims the generations below. A claim holds only with a measured scoreboard row on one GPU of that generation (booked through the GPU lane), in one session against the best kernel there. A generation without a measured row routes to XLA or the best external kernel (§9), never to an unmeasured mainloop.
+
+| Mainloop | Backend | Claims | Instructions it relies on | One GPU per claim |
+|---|---|---|---|---|
+| Triton | Pallas Triton | sm80, sm86, sm89, sm120 | mma.sync, cp.async, ldmatrix | A100; A10 or RTX 3090; L4 or RTX 4090; RTX 5090 or RTX PRO 6000 |
+| Hopper | Mosaic GPU | sm90 | wgmma, TMA, warp specialization, clusters | H100 |
+| Blackwell | Mosaic GPU | sm100 | tcgen05, TMEM, 2-CTA | B200 |
+| TPU | Mosaic TPU | v5e, v6e and later | MXU, DMA pipeline | one chip per generation |
+
+- **sm120 (consumer Blackwell: RTX 50, RTX PRO 6000) has no tcgen05 and no TMEM.** Its tensor cores take sm80's mma.sync forms (with FP8/FP4 additions), so it runs the Triton mainloop, not the Blackwell one.
+- **sm86/sm89/sm120 differ from sm80 in shared memory per SM** (99–100 KB a block against the A100's 163 KB) and in SM count. So their tile spaces and picks are their own TARGETS rows (`generation.shared_budget`), and their scoreboard rows are measured, not inferred from the A100.
+- **sm75 (T4) and older** have no bf16 tensor cores, and Pallas Triton doesn't compile there (§ the T4 row in TARGETS). They run XLA.
+
 Each mainloop's shape comes from the fastest known kernel on its hardware, built rung by rung against it:
 
 | Generation | Attention | GEMM | Recurrence |
 |---|---|---|---|
-| sm80 | jax mha and FA2 | Triton dense and grouped | fla and FlashQLA |
+| sm80, sm86, sm89, sm120 | jax mha and FA2 | Triton dense and grouped | fla and FlashQLA |
 | sm90 | Tokamax Mosaic first, then FA3's ping-pong and intra-warpgroup overlap | CUTLASS's cooperative and ping-pong with clusters | FlashQLA |
-| sm100 | FA4 (the TMEM correction warpgroup, 2-CTA backward) | — | — |
+| sm100 | FA4 (the TMEM correction warpgroup, 2-CTA backward) | CUTLASS's sm100 (tcgen05, 2-CTA) | — |
+| TPU | Splash, ragged paged attention | Megablox | the TPU chunked kernels |
 
 On TPU, mainloops follow Splash, Megablox and ragged paged attention: no warp roles, MXU tile shapes, and shared structure and hooks.
 
