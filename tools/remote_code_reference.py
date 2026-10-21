@@ -154,11 +154,11 @@ def _scattered(model: torch.nn.Module) -> None:
                 tensor.copy_(torch.randn_like(tensor) * 0.1 + (1.0 if key.endswith("norm.weight") else 0.0))
 
 
-def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Module:
+def released_model(name: str, workspace: Path, draw: bool = False) -> torch.nn.Module:
     """The release's own model class over the fixture's config and weights,
     or, with `draw`, weights it draws and writes as the fixture's."""
     repo, revision, files, auto, _ = RELEASES[name]
-    directory = scratch / name
+    directory = workspace / name
     directory.mkdir(parents=True)
     for file in files:
         shutil.copy(hf_hub_download(repo, file, revision=revision), directory / file)
@@ -198,10 +198,10 @@ def released_logits(name: str, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]
 
     from diffusers_wan_reference import float64
 
-    with tempfile.TemporaryDirectory() as scratch, torch.no_grad():
-        fp32 = run(released_model(name, Path(scratch) / "fp32").float(), torch.float32)
+    with tempfile.TemporaryDirectory() as workspace, torch.no_grad():
+        fp32 = run(released_model(name, Path(workspace) / "fp32").float(), torch.float32)
         with float64():
-            f64 = run(released_model(name, Path(scratch) / "f64").double(), torch.float64)
+            f64 = run(released_model(name, Path(workspace) / "f64").double(), torch.float64)
     return fp32, f64
 
 
@@ -228,10 +228,10 @@ def record(name: str, python: str) -> Path:
         if key not in outputs:
             first = len(outputs)
             batch = [draw(seed)["input_ids"] for seed in range(first, first + 40)]
-            with tempfile.TemporaryDirectory() as scratch:
-                np.save(Path(scratch) / "ids.npy", np.stack(batch))
-                subprocess.run([python, __file__, name, "--evaluate", scratch], check=True)
-                with np.load(Path(scratch) / "logits.npz") as written:
+            with tempfile.TemporaryDirectory() as workspace:
+                np.save(Path(workspace) / "ids.npy", np.stack(batch))
+                subprocess.run([python, __file__, name, "--evaluate", workspace], check=True)
+                with np.load(Path(workspace) / "logits.npz") as written:
                     for index, ids in enumerate(batch):
                         outputs[ids.tobytes()] = (written["fp32"][index], written["f64"][index])
         fp32, f64 = outputs[key]
@@ -269,12 +269,12 @@ def main() -> None:
         for name in arguments.names:
             print(name, record(name, arguments.python))
         return
-    with tempfile.TemporaryDirectory() as scratch:
+    with tempfile.TemporaryDirectory() as workspace:
         for name in arguments.names:
             if name in RECORDED:
-                released_model(name, Path(scratch) / name, arguments.draw)
+                released_model(name, Path(workspace) / name, arguments.draw)
                 continue
-            model = released_model(name, Path(scratch) / "fp32", arguments.draw)
+            model = released_model(name, Path(workspace) / "fp32", arguments.draw)
             ids = torch.from_numpy(np.load(FIXTURES / name / "input_ids.npy").astype(np.int64))
             with torch.no_grad():
                 fp32 = model.float()(input_ids=ids).logits.numpy()
@@ -282,7 +282,7 @@ def main() -> None:
                     from diffusers_wan_reference import float64
 
                     with float64():
-                        wide = released_model(name, Path(scratch) / "f64").double()
+                        wide = released_model(name, Path(workspace) / "f64").double()
                         f64 = wide(input_ids=ids).logits.numpy()
                 else:
                     f64 = model.double()(input_ids=ids).logits.numpy()
