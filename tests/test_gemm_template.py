@@ -569,17 +569,28 @@ def transposed_twice_nested(x, side):
 
 def test_an_fp32_product_above_the_default_precision_runs_xla():
     """fp32 products are TF32 in the kernels, which only the default precision asks for: an explicit
-    'highest' runs XLA's portable program whatever the configured precision, the default the kernels."""
-    x, w = jnp.ones((64, DEPTH), jnp.float32), jnp.ones((1, DEPTH, WIDTH), jnp.float32)
+    'highest' under a configured default runs XLA's portable program, reported as the route with the
+    reason, with the products' low mantissa bits TF32 would drop; a kernel chosen for it raises."""
+    rng = np.random.default_rng(8)
+    x = jnp.asarray(1 + rng.integers(1, 2 ** 10, size=(64, DEPTH)) * 2.0 ** -20, jnp.float32)
+    w = jnp.asarray(1 + rng.integers(1, 2 ** 10, size=(1, DEPTH, WIDTH)) * 2.0 ** -20, jnp.float32)
 
-    def launches(precision):
-        program = jax.make_jaxpr(lambda x, w: template.gemm(x, w, jnp.asarray([64]), out_dtype=jnp.float32,
-                                                            precision=precision, interpret_on_cpu=True))(x, w)
-        return "pallas_call" in str(program)
+    def product(precision):
+        return jax.jit(lambda x, w: template.gemm(x, w, jnp.asarray([64]), out_dtype=jnp.float32,
+                                                  precision=precision, interpret_on_cpu=True))
 
     with generation.assumed("sm80"), jax.default_matmul_precision("default"):
-        assert not launches("highest")
-        assert launches("default")
+        with generation.routes() as highest:
+            got = product("highest")(x, w)
+        with generation.routes() as default:
+            product("default")(x, w)
+        with generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError):
+            product("highest").lower(x, w)
+    taken = [(route.kernel, route.refusal is not None) for route in highest if route.choice == "grouped_matmul"]
+    assert taken == [("xla", True)]
+    assert {route.kernel for route in default if route.choice == "grouped_matmul"} == {"triton"}
+    exact = np.asarray(x, np.float64) @ np.asarray(w[0], np.float64)
+    assert float(np.max(np.abs(np.asarray(got, np.float64) - exact) / exact)) < 2.0 ** -20
 
 
 def test_an_integer_side_operand_takes_no_gradient():
@@ -600,7 +611,7 @@ def test_an_integer_side_operand_takes_no_gradient():
     np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(portable, np.float32))
 
 
-@pytest.mark.parametrize("consumer", [lambda p, s: p * s, lambda p, s: (p.T * s).astype(jnp.bfloat16)],
+@pytest.mark.parametrize("consumer", [lambda p, s: p * s, lambda p, s: p.T.astype(jnp.bfloat16)],
                          ids=["scalar", "transpose"])
 def test_a_consumer_the_kernels_cannot_tile_runs_after_the_product(consumer):
     """A consumer of a captured scalar (no launch axis) or of the product transposed (its block not the

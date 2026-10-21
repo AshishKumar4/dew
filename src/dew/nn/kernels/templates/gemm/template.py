@@ -35,6 +35,7 @@ from flax.typing import PrecisionLike
 from jax.extend import core as jax_core
 
 from dew.nn.kernels import generation, grouped_matmul
+from dew.nn.kernels.selection import forced
 from dew.nn.precision import asks_default_precision
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
@@ -263,8 +264,17 @@ def _exact(precision: PrecisionLike) -> bool:
 def _kernels_take(compute, precision: PrecisionLike) -> bool:
     """Whether the kernels compute the products `precision` asks for in `compute`: 16-bit products are
     exact at any precision; fp32's are TF32 in the kernels, which only the default precision asks for, so
-    a higher one runs XLA's portable program (`grouped_matmul.ragged_dot_refusal`)."""
-    return jnp.dtype(compute).itemsize == 2 or not _exact(precision)
+    a higher one runs XLA's portable program, reported as the dispatch's route with the reason
+    (`grouped_matmul.ragged_dot_refusal`), and a kernel `generation.chosen` names for it raises."""
+    if jnp.dtype(compute).itemsize == 2 or not _exact(precision):
+        return True
+    refusal = "fp32 products above the default precision, and the kernels multiply in TF32"
+    named = forced('grouped_matmul')
+    if named not in (None, 'xla'):
+        raise ValueError(f"grouped_matmul's implementation {named!r} is chosen and does not run this call: "
+                         f"{refusal}")
+    generation.ran_kernel('grouped_matmul', 'xla', refusal)
+    return False
 
 
 def _as_tuple(outs) -> tuple:
