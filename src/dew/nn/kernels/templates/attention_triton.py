@@ -454,7 +454,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
 
     if exact:
         # From the softmax's initial state (`backward`), anchored at 0.
-        start, shares = peak, (total, initial_ref[...])
+        peak0, shares = peak, (total, initial_ref[...])
         peak, anchor, total, numerator = jax.lax.fori_loop(
             bounds_ref[0], bounds_ref[1], row_terms, (peak, jnp.zeros_like(total), *shares))
         peak = jnp.where(peak == -jnp.inf, 0.0, peak)
@@ -495,7 +495,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         # over the weights' total lets the dK/dV launch, the initial state's gradients and the head and
         # query parameters' (by the pullbacks of the weights, `weighed`) take the D whose cotangents do.
         inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
-        carried = jnp.where(start == -jnp.inf, 0.0, jnp.exp(start - peak)) * inverse
+        carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(peak0 - peak)) * inverse
         residual = residual + (shares[1] - shares[0] * (anchor + delta)) * carried
         mass = mass + shares[0] * carried
         refined = jnp.where(mass > 0, residual / jnp.where(mass > 0, mass, 1.0), 0.0)
@@ -783,9 +783,9 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     (`_dq_kernel`). Given the forward's `residuals` instead, its maxima, denominators and fp32 output
     before its hook (`forward`'s `wide`), `D` is `rowsum(dout * output)` and that pass is skipped. The
     output hook is no part of it: a differentiated call applies `output_mod` past the kernel, where its
-    own derivative runs, and passes `dout` before it. Deterministic: every gradient
-    element is written by one program, a head parameter's partial sums added in a fixed order and a key
-    head's query heads summed in XLA."""
+    own derivative runs, and passes `dout` before it. Deterministic: every gradient element is written by
+    one program, a head parameter's partial sums added in a fixed order and a key head's query heads
+    summed in XLA."""
     hooks = Hooks() if hooks is None else hooks
     if hooks.output_mod is not None:
         raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
