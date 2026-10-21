@@ -111,7 +111,6 @@ from dew.training.distributed import (
     batch_shardings,
     batch_signature,
     check_batch,
-    check_ramp_window,
     check_stream,
     device_mesh,
     explicit_axes,
@@ -961,13 +960,11 @@ class Trainer(Generic[Loss, Effects]):
                                  shape_only=False):
         """The state with the accumulation a `window` of microbatches of `batch`'s shapes pools in,
         empty; unchanged under a window of one, a custom step or a held one that replays such batches
-        (`Accumulation.replays`): a ramp's stage begins with a window (`check_ramp_window`)."""
+        (`Accumulation.replays`): a ramp's stage begins with a window (`Ramp.stages`)."""
         if window == 1 or self.step is not None:
             return state
         stats, aux = shapes
         shared = isinstance(stats, (Ratio, jax.ShapeDtypeStruct))
-        if self._ramp and not shared:
-            check_ramp_window(self._ramp, window)
         mean_dtype = jnp.result_type(jnp.float32, *(x.dtype for x in jax.tree.leaves(stats)))
         slots = window - 1
         def shape(leaf: jax.Array) -> jax.ShapeDtypeStruct:
@@ -1422,7 +1419,7 @@ class Trainer(Generic[Loss, Effects]):
         loader, validation = fitted(dataset, validation, objective=self.objective.data())
         self._device = loader.device
         if epochs is not None:
-            steps = loader.epoch_steps(epochs)
+            steps = loader.epoch_steps(epochs, self.accumulation)
         count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
         suites = _suites(loader, validation, metrics, eval_every)
@@ -1667,7 +1664,8 @@ class Trainer(Generic[Loss, Effects]):
         if complete:
             return True
         if not plan.finished(current, interval.real_tokens):
-            partition = DataPartition.of(mesh)
+            # A ramp's stages begin where updates do (`Ramp.stages`).
+            partition = DataPartition.of(mesh, window=self.accumulation)
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
