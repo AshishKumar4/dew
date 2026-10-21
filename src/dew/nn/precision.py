@@ -211,17 +211,10 @@ def compensated_add(left, right):
     value rounded once, where a pair left unrenormalised keeps the plain
     running sum in `hi`, every addition's rounding in it.
     XLA reassociates no float arithmetic unless fast math is on; with it,
-    `lo` cancels to zero and the sum is the plain one.
-
-    A sum that reaches an infinity or a NaN is the plain IEEE one, with no
-    residual: `+-inf` stays infinite, opposite infinities and NaNs give NaN,
-    where every residual past an infinity is inf - inf. A finite sum the
-    renormalisation rounds to an infinity keeps that infinity."""
+    `lo` cancels to zero and the sum is the plain one."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
     total, dropped = _two_sum(left_hi, right_hi)
-    hi, lo = _two_sum(total, dropped + left_lo + right_lo)
-    finite = jnp.isfinite(total)
-    return jnp.where(finite, hi, total), jnp.where(finite & jnp.isfinite(hi), lo, jnp.zeros_like(lo))
+    return _two_sum(total, dropped + left_lo + right_lo)
 
 
 def compensated_difference(later, earlier):
@@ -253,10 +246,16 @@ def _compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     wide = values.astype(jnp.promote_types(values.dtype, jnp.float32))
     zero = jnp.zeros((), wide.dtype)
     hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), compensated_add, axes)
-    # A sum that reaches an infinity is the plain one, +-inf or NaN as `jnp.sum`'s is, where every
-    # residual past the infinity is inf - inf.
-    plain = jnp.sum(wide, axes)
-    return jnp.where(jnp.isfinite(plain), hi + lo, plain).astype(values.dtype)
+    return compensated_total((hi, lo), jnp.sum(wide, axes)).astype(values.dtype)
+
+
+def compensated_total(pair: tuple[jax.Array, jax.Array], plain: jax.Array) -> jax.Array:
+    """A compensated sum's value, its `(hi, lo)` pair rounded once, or the `plain` sum of the same
+    values where that reaches an infinity: +-inf or NaN as `jnp.sum`'s is, where every residual past
+    the infinity is inf - inf. `compensated_add` itself stays arithmetic alone, so a tangent's scan
+    through it stays linear; a running sum that can overflow keeps its plain sum beside the pair
+    and reads its value here."""
+    return jnp.where(jnp.isfinite(plain), pair[0] + pair[1], plain)
 
 
 @_compensated_sum.defjvp

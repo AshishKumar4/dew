@@ -48,6 +48,7 @@ from dew.nn.precision import (
     capped_logits,
     compensated_add,
     compensated_sum,
+    compensated_total,
     head_product,
     rounded_operand,
     rounds_to_bf16,
@@ -795,9 +796,11 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
             d_raw, terms = pullback(cotangent)
             # Each column term's running sum over the token tiles as a double-float pair, rounded once at
             # the end: summed tile after tile in fp32, 43 tiles of a 128-token f32 head left the scale
-            # and bias gradients 1.5 times as far from float64 as the whole head's.
-            d_columns = jax.tree.map(lambda pair, term: jnp.stack(compensated_add(
-                (pair[0], pair[1]), (term.astype(work), jnp.zeros(term.shape, work)))), d_columns, terms)
+            # and bias gradients 1.5 times as far from float64 as the whole head's. The plain sum beside
+            # it keeps an overflowed term's infinity (`compensated_total`).
+            d_columns = jax.tree.map(lambda held, term: jnp.stack((*compensated_add(
+                (held[0], held[1]), (term.astype(work), jnp.zeros(term.shape, work))),
+                held[2] + term.astype(work))), d_columns, terms)
             d_raw = _logits_cotangent(d_raw, precision)
             values.append(jnp.einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
                                      preferred_element_type=work))
@@ -814,9 +817,10 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
     if gradients:
         outputs += (jnp.zeros((count, features), work),)
     d_table = jnp.zeros(table.shape, work) if gradients else None
-    d_columns = jax.tree.map(lambda terms: jnp.zeros((2, *terms.shape), work), columns) if gradients else None
+    d_columns = jax.tree.map(lambda terms: jnp.zeros((3, *terms.shape), work), columns) if gradients else None
     outputs, d_table, d_columns = _over_tiles((outputs, d_table, d_columns), count, chunk, tokens)
-    summed = None if d_columns is None else jax.tree.map(lambda pair: pair[0] + pair[1], d_columns)
+    summed = None if d_columns is None else jax.tree.map(
+        lambda held: compensated_total((held[0], held[1]), held[2]), d_columns)
     return outputs, d_table, summed
 
 
