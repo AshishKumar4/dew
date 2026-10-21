@@ -697,7 +697,7 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
 
     Each distinct `[in, out]` kernel shape among `sites` (scopes in the
     stored tree, `/`-joined) is timed both ways, forward and input
-    gradient, by `dew.nn.kernels.tuning.samples` on a GPU the process holds
+    gradient, by `dew.telemetry.benchmark.samples` on a GPU the process holds
     alone: bf16 operands as a bf16 Dense multiplies them, and the FP8
     products `frozen_fp8_dense` runs. On an H100 FP8 won from about 2048
     inputs and outputs and lost below: 0.70x at 1024 by 1024, 1.10x at 4096
@@ -748,7 +748,7 @@ def _fp8_faster(shape: tuple[int, ...], tokens: int) -> bool:
     `tokens` rows run faster as FP8 products than as bf16 ones on this GPU."""
     import statistics
 
-    from dew.nn.kernels.tuning import samples
+    from dew.telemetry.benchmark import samples
 
     inputs, outputs = shape
     keys = jax.random.split(jax.random.key(0), 3)
