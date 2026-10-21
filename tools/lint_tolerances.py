@@ -501,25 +501,43 @@ def _written(bound: ast.AST, scope: _Scope) -> ast.AST | None:
     return None
 
 
+def _number(bound: ast.AST | None) -> float | None:
+    """A written-out bound's value (`1 / 8`, `-1.0`), or None where it is not arithmetic of numbers."""
+    if isinstance(bound, ast.Constant) and type(bound.value) in (int, float):
+        return float(bound.value)
+    if isinstance(bound, ast.UnaryOp) and isinstance(bound.op, ast.USub | ast.UAdd):
+        operand = _number(bound.operand)
+        return None if operand is None else -operand if isinstance(bound.op, ast.USub) else operand
+    if isinstance(bound, ast.BinOp):
+        left, right = _number(bound.left), _number(bound.right)
+        operations = {ast.Add: float.__add__, ast.Sub: float.__sub__, ast.Mult: float.__mul__,
+                      ast.Div: float.__truediv__}
+        operation = operations.get(type(bound.op))
+        if left is not None and right is not None and operation is not None and (
+                right != 0 or not isinstance(bound.op, ast.Div)):
+            return operation(left, right)
+    return None
+
+
 def _band(lower: ast.AST, value: ast.AST, upper: ast.AST, scope: _Scope, reading: _Reading) -> bool:
     """Whether `lower <= value <= upper` holds a float in a band around a target: a value neither whole
     nor a duration, between bounds one of which holds a fraction (`_fractional`), both written out, as
     they are or through names (`2.25 <= ratio <= 3.75`, `-1e-6 <= residual <= 1e-6`), a target less
     and plus one width (`c - w <= value <= c + w`), or a target scaled by two written-out factors
-    (`0.75 * c <= value <= 1.25 * c`). A bound at zero asks a sign, [-1, 1] is a cosine's domain, a
-    duration's floor and timeout time it, and a bound that is a reading (a task's wall time) is no
-    target."""
+    (`0.75 * c <= value <= 1.25 * c`). A bound at a domain's edge leaves one side alone, which is no
+    band: zero either way asks a sign, and 1 above or -1 below is a share's or a cosine's edge (the
+    busiest of eight shares in [1 / 8, 1], a cosine in [-1, 1]). A duration's floor and timeout time
+    it, and a bound that is a reading (a task's wall time) is no target."""
     low, high = _written(lower, scope), _written(upper, scope)
     bounds = [bound for bound in (lower, upper, low, high) if bound is not None]
-    if _counted(value, scope, reading) or _clocked(value, scope, reading) or any(map(_zero, bounds)):
+    if _counted(value, scope, reading) or _clocked(value, scope, reading):
+        return False
+    if _number(low) in (0.0, -1.0) or _number(high) in (0.0, 1.0):
         return False
     if not any(_fractional(bound, scope, reading) for bound in bounds):
         return False
     if low is not None and high is not None:
-        try:
-            return (ast.literal_eval(low), ast.literal_eval(high)) != (-1, 1)
-        except ValueError:
-            return True
+        return True
     if not (isinstance(lower, ast.BinOp) and isinstance(upper, ast.BinOp)):
         return False
     if isinstance(lower.op, ast.Sub) and isinstance(upper.op, ast.Add):
@@ -551,9 +569,9 @@ def _conjunction(node: ast.AST) -> bool:
         isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitAnd))
 
 
-def _bounds(node: ast.AST) -> Iterator[tuple[ast.AST, str, ast.AST]]:
+def _bounds(node: ast.AST) -> Iterator[tuple[ast.AST, str, ast.AST, ast.Compare]]:
     """Each one-relation ordering a conjunction holds (`and`, or `&` of masks), as (value, "lower" or
-    "upper", bound) for both its sides."""
+    "upper", bound, the ordering) for both its sides."""
     assert isinstance(node, ast.BoolOp | ast.BinOp)
     parts = node.values if isinstance(node, ast.BoolOp) else [node.left, node.right]
     for part in parts:
@@ -567,21 +585,27 @@ def _bounds(node: ast.AST) -> Iterator[tuple[ast.AST, str, ast.AST]]:
             left, right = right, left
         elif not isinstance(op, ast.Lt | ast.LtE):
             continue
-        yield right, "lower", left
-        yield left, "upper", right
+        yield right, "lower", left, part
+        yield left, "upper", right, part
 
 
-def _conjoined_band(node: ast.AST, scope: _Scope, reading: _Reading) -> bool:
-    """Whether a conjunction bounds one value on both sides in a band (`_band`): `lo <= x and x <= hi`,
-    or `(x > lo) & (x < hi)`."""
-    found: dict[str, dict[str, list[ast.AST]]] = {}
+def _conjoined_bands(node: ast.AST, scope: _Scope, reading: _Reading) -> int:
+    """How many values a conjunction bounds on both sides in a band (`_band`): `lo <= x and x <= hi`,
+    or `(x > lo) & (x < hi)`, each counted once. A band one of whose orderings is found a tolerance on
+    its own (`_relation`) is found there, not again."""
+    found: dict[str, dict[str, list[tuple[ast.AST, ast.Compare]]]] = {}
     values: dict[str, ast.AST] = {}
-    for value, side, bound in _bounds(node):
+    for value, side, bound, part in _bounds(node):
         key = ast.dump(value)
         values.setdefault(key, value)
-        found.setdefault(key, {"lower": [], "upper": []})[side].append(bound)
-    return any(_band(lower, values[key], upper, scope, reading)
-               for key, sides in found.items() for lower in sides["lower"] for upper in sides["upper"])
+        found.setdefault(key, {"lower": [], "upper": []})[side].append((bound, part))
+
+    def alone(part: ast.Compare) -> bool:
+        return not _relation(part.left, part.comparators[0], scope, reading)
+
+    return sum(any(_band(lower, values[key], upper, scope, reading) and alone(low) and alone(high)
+                   for lower, low in sides["lower"] for upper, high in sides["upper"])
+               for key, sides in found.items())
 
 
 def _read(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls,
@@ -672,12 +696,10 @@ def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls
                     yield node, "a float held in a band around a target"
             elif _conjunction(node) and id(node) in asserted and id(node) not in conjoined:
                 inner = [part for part in ast.walk(node) if isinstance(part, ast.BoolOp | ast.BinOp)]
-                # A relation found a tolerance on its own is found there, not again as a band.
-                found = any(_relation(part.left, right, scope, reading) or _chained_band(part, scope, reading)
-                            for part in ast.walk(node) if isinstance(part, ast.Compare)
-                            for right in part.comparators[:1])
-                if not found and _conjoined_band(node, scope, reading):
+                bands = _conjoined_bands(node, scope, reading)
+                if bands:
                     conjoined.update(id(part) for part in inner)
+                for _ in range(bands):
                     yield node, "a float held in a band around a target"
             elif isinstance(node, ast.Assign | ast.AnnAssign):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]

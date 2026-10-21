@@ -77,10 +77,15 @@ COMPARISONS = {
     "a band as a conjunction": ("assert x >= 2.25 and x <= 3.75", 1),
     "a band of masks": ("import numpy as np\nassert np.all((x > 2.25) & (x < 3.75))", 1),
     "a statistic's band": ("assert 0.3 < revealed.mean() < 0.7", 1),
-    "a fraction's band": ("assert all(1 / 8 <= load <= 1.0 for load in loads)", 1),
+    "a ratio's band above one": ("assert 1.0 <= ratio <= 1.05", 1),
+    "a band beside an error in one assertion": (
+        "assert abs(a - b) <= 1e-6 and 2.25 <= ratio and ratio <= 3.75", 2),
+    "two bands in one assertion": ("assert 2.25 <= r and r <= 3.75 and 0.3 < s and s < 0.7", 2),
+    "a share's domain": ("assert all(1 / 8 <= load <= 1.0 for load in loads)", 0),
     "an error bounded the other way round": ("import numpy as np\nassert 1e-6 >= np.max(np.abs(a - b))", 1),
     "a sign and a bound": ("assert 0 <= share <= 0.5", 0),
     "a cosine's domain": ("assert -1.0 <= float(alignment) <= 1.0", 0),
+    "a cosine near one": ("assert 0.99 <= cosine <= 1.0", 0),
     "the sleeps' floor and the task's wall time": ("assert 1.2 < short + long <= wall", 0),
     "a duration's floor and timeout": ("import time\nbegan = time.monotonic()\n"
                                        "assert 4.0 <= time.monotonic() - began < 30", 0),
@@ -191,7 +196,8 @@ def test_a_float_compared_within_a_tolerance_outside_the_gate_is_reported(lint, 
 
 def test_counts_a_helper_beside_the_file_returns_are_whole_where_its_own_file_proves_it(lint, tmp_path):
     """A test importing its support's helper by a bare module name: the helper's token counts are whole
-    as its own file makes them, and a helper there that may return a float is not."""
+    as its own file makes them, and a helper there that may return a float is not, nor one its file
+    binds twice."""
     _module(lint, tmp_path, "tests/counting_support.py", """\
         def delivered(batches):
             targets = [0, 0]
@@ -203,9 +209,17 @@ def test_counts_a_helper_beside_the_file_returns_are_whole_where_its_own_file_pr
         def shares(batches):
             left, right = delivered(batches)
             return left / 2, right / 2
+
+
+        def rebound(batches):
+            return delivered(batches)
+
+
+        def rebound(batches):
+            return [0.25, 0.75]
         """)
     body = """\
-        from counting_support import delivered, shares
+        from counting_support import delivered, rebound, shares
 
 
         def test():
@@ -213,9 +227,11 @@ def test_counts_a_helper_beside_the_file_returns_are_whole_where_its_own_file_pr
             assert abs(left - right) <= 12 + 12
             half, other = shares(batches)
             assert abs(half - other) <= 12
+            one, two = rebound(batches)
+            assert abs(one - two) <= 12
         """
-    [found] = list(lint.tolerances(_module(lint, tmp_path, "tests/test_case.py", body)))
-    assert found.line == 8
+    found = list(lint.tolerances(_module(lint, tmp_path, "tests/test_case.py", body)))
+    assert [finding.line for finding in found] == [8, 10]
 
 
 def test_the_gate_compares_floats_and_scripts_outside_tests_and_tools_are_not_read(lint, tmp_path):
@@ -308,6 +324,10 @@ def test_a_change_of_the_rules_reading_grows_the_inventory_only_for_files_it_lea
     subprocess.run(["git", "checkout", "-q", "-b", "head"], cwd=repo, check=True)
     _commit(repo, _inventory({"tests/test_a.py": 2, "tests/test_b.py": 1}), "the rule reads more",
             {lint.RULE: "reading = 2\n"})
+    assert list(lint.ratchet(repo, "main")) == []
+    # A later edit of a file whose count the rule raised keeps that count against the base.
+    _commit(repo, _inventory({"tests/test_a.py": 2, "tests/test_b.py": 1}), "a docstring",
+            {"tests/test_a.py": "a = 1  # one\n"})
     assert list(lint.ratchet(repo, "main")) == []
     _commit(repo, _inventory({"tests/test_a.py": 3, "tests/test_b.py": 1, "tests/test_c.py": 1}),
             "the rule and the files change", {lint.RULE: "reading = 3\n", "tests/test_a.py": "a = 2\n",
