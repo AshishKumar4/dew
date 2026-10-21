@@ -14,6 +14,7 @@ packs what those hold packed (`packed_layout`).
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable, Sequence
 
 import jax
@@ -92,6 +93,7 @@ def projection_groups(model: nn.Module, variables: Variables) -> tuple[Projectio
 
     if isinstance(type(model), AdaptedClass) or not isinstance(model, Serving):
         return ()
+    variables = unfreeze(dict(variables))
     layer = type(model)
     spec = layer._dew_quantization if isinstance(layer, QuantizedClass) else None
 
@@ -101,8 +103,29 @@ def projection_groups(model: nn.Module, variables: Variables) -> tuple[Projectio
         rules = {spec.rule_for((*group.path, name)) for name in (*group.members, group.packed)}
         return len(rules) == 1
 
-    return tuple(group for group in model.inference_projection_groups(variables)
+    return tuple(group for group in _declared(model, variables)
                  if _concatenates(variables, group) and selected_alike(group))
+
+
+def _declared(model: Serving, variables: Variables) -> tuple[ProjectionGroup, ...]:
+    """`model.inference_projection_groups` over `variables`, once per model and tree shape: the
+    groups read which parameters the layers hold, never their values (`Serving`), and binding a
+    model to find them took 50 ms of each generate call on a 28-layer decoder."""
+    leaves, structure = jax.tree.flatten(variables)
+    return _declared_over(model, (structure, tuple(
+        (np.shape(leaf), leaf.dtype if isinstance(leaf, (jax.Array, np.ndarray)) else jnp.result_type(leaf))
+        for leaf in leaves)))
+
+
+_Signature = tuple[jax.tree_util.PyTreeDef, tuple[tuple[tuple[int, ...], np.dtype], ...]]
+"""A tree's structure and each leaf's shape and dtype."""
+
+
+@functools.lru_cache(maxsize=32)
+def _declared_over(model: Serving, signature: _Signature) -> tuple[ProjectionGroup, ...]:
+    structure, shapes = signature
+    return tuple(model.inference_projection_groups(jax.tree.unflatten(
+        structure, [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in shapes])))
 
 
 def pack_projections(variables: Variables, groups: Sequence[ProjectionGroup]) -> Variables:
@@ -154,6 +177,7 @@ def pending(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ..
     """The groups `model` reads packed that `variables` hold unpacked and can pack
     (`projection_groups`), compared on these concrete values: what a generation over a borrowed
     tree, a live objective's, packs inside its compiled call (`packed_in_call`)."""
+    variables = unfreeze(dict(variables))
     return tuple(group for group in projection_groups(model, variables)
                  if group.packed not in _node(variables, "params", group.path))
 
@@ -194,7 +218,8 @@ def _held_packed(model: nn.Module, variables: Variables) -> tuple[ProjectionGrou
     whatever an adapter or a quantization would now let `projection_groups` pack anew."""
     if not isinstance(model, Serving):
         return ()
-    return tuple(group for group in model.inference_projection_groups(variables)
+    variables = unfreeze(dict(variables))
+    return tuple(group for group in _declared(model, variables)
                  if group.packed in _node(variables, "params", group.path))
 
 
