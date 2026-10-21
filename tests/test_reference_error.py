@@ -501,3 +501,21 @@ def test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or
     swapped[[0, 1]] = swapped[[1, 0]]
     bits = _sign_bits(truth.size, 3)
     assert (bits[0] == bits[1]) or np.any(truth_sketch(swapped, 3) != truth_sketch(truth, 3))
+
+
+def test_the_procedure_before_the_two_stages_draws_again_as_it_did():
+    """Compared against, the procedure before check 1's two stages (`_staged(two_stage=False)`) draws
+    the second set wherever a leaf's ratio is over PARITY, a value not finite included, and only there:
+    an inconclusive leaf is final at its declared seeds."""
+    from reference_error import _Draws, _staged
+
+    def law(dew):
+        def drawn(start, stop):
+            count = stop - start
+            return _Draws(["leaf"], np.full((count, 1), dew), np.ones((count, 1)), np.zeros((count, 1, 2)),
+                          np.zeros((count, 1), int), np.full((count, 1), np.isfinite(dew)))
+        return drawn
+
+    assert _staged(law(np.inf), 8, "infinite", two_stage=False)[2] == 2
+    assert _staged(law(1.0), 8, "equal", two_stage=False)[2] == 1
+    assert _staged(law(np.inf), 8, "infinite")[2] == 2
