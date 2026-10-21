@@ -1993,6 +1993,29 @@ def _checkout(module: Module) -> Path:
     return Path(module.path.as_posix().removesuffix(module.relative))
 
 
+RETIRING = "assert_leaves_as_exact"
+RETIRING_SITES = frozenset({"tests/test_architectures.py", "tests/test_flux2_source.py",
+                            "tests/test_z_image_source.py", "tests/test_linear_attention.py",
+                            "tests/test_mixers.py"})
+"""The gate's retiring one-draw helper and the sites that keep it until they convert (Main,
+2026-10-21; `tests/reference_error.py`'s own RETIRING_SITES, which a test holds equal)."""
+
+
+def _retiring(module: Module) -> Iterator[Finding]:
+    """SLOP020: the retiring one-draw helper imported or called outside its sites, by its name or any
+    attribute of that name."""
+    if module.relative in RETIRING_SITES:
+        return
+    for node in ast.walk(module.tree):
+        imported = isinstance(node, ast.ImportFrom) and any(alias.name == RETIRING for alias in node.names)
+        named = imported or (isinstance(node, ast.Attribute) and node.attr == RETIRING) or (
+            isinstance(node, ast.Name) and node.id == RETIRING)
+        if named:
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP020",
+                          f"`{RETIRING}` is the retiring one-draw rule, kept only at its named sites "
+                          "(RETIRING_SITES); judge through check 1 (`assert_as_exact`)")
+
+
 def tolerances(module: Module) -> Iterator[Finding]:
     """SLOP020: a float compared within a tolerance outside the gate (`GATE`, `_tolerance_comparisons`).
     A file the inventory holds may keep its count until its date and the inventory's own (`empty_by`);
@@ -2001,6 +2024,7 @@ def tolerances(module: Module) -> Iterator[Finding]:
     inventory to its parents')."""
     if not module.relative.startswith(("tests/", "tools/")) or module.relative in GATE:
         return
+    yield from _retiring(module)
     found = sorted(_tolerance_comparisons(module),
                    key=lambda pair: (pair[0].lineno, pair[0].col_offset))
     inventory = _inventory(_checkout(module))

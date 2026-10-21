@@ -18,7 +18,9 @@ the reference's, a mask one step off) moves it further than PARITY and
 fails.
 
 Comparisons not yet converted to check 1 hold the one-draw rule at PARITY
-(`assert_as_exact_as_the_reference`), and the K-order and element rules
+(`assert_as_exact_as_the_reference`), but for five named sites that keep the
+retiring one-draw helper as it was until they convert (`assert_leaves_as_exact`,
+RETIRING_SITES, no new caller), and the K-order and element rules
 (`assert_as_exact_over_orders`, `assert_elements_as_exact`) hold
 ORDER_FACTOR, the factor their order count is derived for, until they judge
 through check 1 over orders (target 2026-10-28). SLOP020 (tools/lint_slop.py)
@@ -162,10 +164,11 @@ def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
     return sizes, rms(np.asarray(value, np.float64) - truth)
 
 
-def rows_over(dew, reference, truth, terms=None) -> list[str]:
+def rows_over(dew, reference, truth, terms=None, *, floor: float = 0.0) -> list[str]:
     """Where Dew's rows are further from float64 than ROW_FACTOR times the
     reference's (`row_errors`): its worst row over its own size against the
-    reference's worst, and each row of size zero, a sum that cancels exactly before anything its
+    reference's worst (at least `floor`, the retiring helper's order floor, `assert_leaves_as_exact`; zero
+    for every other rule), and each row of size zero, a sum that cancels exactly before anything its
     terms see (a query that keeps one key), against the reference's distance
     on that same row, which is all the evidence such a row has: where the
     reference is exactly the float64 zero, Dew must be too."""
@@ -176,9 +179,9 @@ def rows_over(dew, reference, truth, terms=None) -> list[str]:
     if sized.any():
         row = float(np.max(mine[sized] / sizes[sized]))
         their_row = float(np.max(theirs[sized] / sizes[sized]))
-        if not within(row, ROW_FACTOR * their_row):
+        if not within(row, ROW_FACTOR * max(their_row, floor)):
             over.append(f"the worst row is {row:.3e} from float64 over its size, the reference's "
-                        f"{their_row:.3e}, allowed {ROW_FACTOR * their_row:.3e}")
+                        f"{their_row:.3e}, allowed {ROW_FACTOR * max(their_row, floor):.3e}")
     zero = ~sized & ~(mine <= ROW_FACTOR * theirs)
     if zero.any():
         at = int(np.flatnonzero(zero)[0])
@@ -824,6 +827,58 @@ def assert_no_less_exact(dew, reference, truth, label: str) -> None:
     mine, theirs = distance(dew, truth), distance(reference, truth)
     assert within(mine, theirs), (
         f"{label}: {mine:.3e} from float64 (rms), the unchanged source {theirs:.3e}")
+
+
+RETIRING_FACTOR = 2.0
+"""The retiring one-draw helper's factor (`assert_leaves_as_exact`), today's check at its remaining
+sites until they convert: no other rule reads it."""
+
+RETIRING_SITES = frozenset({"tests/test_architectures.py", "tests/test_flux2_source.py",
+                            "tests/test_z_image_source.py", "tests/test_linear_attention.py",
+                            "tests/test_mixers.py"})
+"""The sites that keep the retiring one-draw helper until they convert (Main, 2026-10-21): every other
+caller is refused (tools/lint_slop.py, SLOP020)."""
+
+
+def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None,
+                           rows: bool = True) -> None:
+    """The one-draw rule before check 1, kept as it was for the sites that have not converted yet
+    (RETIRING_SITES, Main 2026-10-21) and for no other: tools/lint_slop.py refuses a new caller, and
+    it is deleted when the last of them converts. Each leaf of the tree `dew` within RETIRING_FACTOR
+    times the matching leaf of `reference`'s RMS distance from float64 (`truth`), the three trees alike.
+
+    A port that sums `reductions` terms the reference sums in another order
+    rounds by up to sqrt(reductions) float32 units of what it sums in RMS,
+    so the reference's distance counts as at least that: one draw of
+    rounding below it is luck, not a bar, and a leaf that lost a term still
+    fails by orders of magnitude. What a leaf sums is its own float64 size,
+    or, where `terms` gives the tree of each leaf's terms (`float64_terms`),
+    the larger of that and their root sum of squares, the size of the
+    partial sums a reordered sum rounds. A leaf whose sum cancels, as a key
+    bias's gradient does under the softmax's shift invariance, is held to
+    its terms' rounding, not to its own near-zero size; one whose terms'
+    signs are independent keeps about its own. Each leaf's rows are held to
+    the reference's too (`rows_over`), unless `rows` is false: after a
+    second training step a row inherits the first step's rounding through
+    the parameters it reads, which its own terms do not see, so such a
+    comparison holds each tensor alone and its first step holds the rows."""
+    unit = float(np.finfo(np.float32).eps)
+    spread = np.sqrt(reductions)
+    sizes = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
+    over = []
+    leaves = zip(jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
+                 sizes, strict=True)
+    for (path, mine), theirs, true, summed in leaves:
+        scale = max(distance(true, 0), distance(summed, 0))
+        bar = RETIRING_FACTOR * max(distance(theirs, true), spread * unit * scale)
+        if not within(distance(mine, true), bar):
+            over.append(f"{jax.tree_util.keystr(path)}: {distance(mine, true):.3e} from float64 (rms), "
+                        f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
+        # Each row over its own terms where they are given, the order floor in those units.
+        over += [f"{jax.tree_util.keystr(path)}: {row}"
+                 for row in (rows_over(mine, theirs, true, None if terms is None else summed,
+                                       floor=spread * unit) if rows else ())]
+    assert not over, "\n".join(over)
 
 
 SUMS = frozenset({"dot_general", "ragged_dot_general", "reduce_sum", "conv_general_dilated", "cumsum",

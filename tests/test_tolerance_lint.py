@@ -494,3 +494,19 @@ def test_the_ratchet_holds_a_branch_to_its_base_and_refuses_a_shallow_history(li
     subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{repo}", str(shallow)], check=True)
     [refused] = list(lint.ratchet(shallow))
     assert "shallow" in refused.message
+
+
+def test_the_retiring_helper_is_refused_outside_its_named_sites(lint, tmp_path):
+    """The retiring one-draw helper imported or called anywhere but its named sites is a finding; at a
+    named site it is not; and the lint's sites are the gate's own."""
+    import reference_error
+
+    body = "from reference_error import assert_leaves_as_exact\nassert_leaves_as_exact(a, b, c)\n"
+    outside = [finding for finding in lint.tolerances(_module(lint, tmp_path, "tests/test_case.py", body))
+               if lint.RETIRING in finding.message]
+    assert len(outside) == 2
+    named = sorted(lint.RETIRING_SITES)[0]
+    inside = [finding for finding in lint.tolerances(_module(lint, tmp_path, named, body))
+              if lint.RETIRING in finding.message]
+    assert inside == []
+    assert lint.RETIRING_SITES == reference_error.RETIRING_SITES
