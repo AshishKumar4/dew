@@ -24,6 +24,7 @@ import pytest
 from interop_support import (
     assert_autoencoder_vjp,
     assert_layout_tensors,
+    channels_last,
     extract_fixture,
     fixture_arrays,
     scaled_gap,
@@ -47,10 +48,6 @@ def source(tmp_path_factory):
 def variant(request, source):
     directory = source / request.param
     return directory, load_dc_ae(directory), fixture_arrays(directory / "reference.npz")
-
-
-def channels_last(array):
-    return np.asarray(array).transpose(0, 2, 3, 1)
 
 
 def parameters(layouts):
