@@ -284,8 +284,10 @@ def _inventory(counts: dict, by="2026-11-20", empty_by="2026-11-27"):
 
 
 def test_no_commit_loosens_the_inventory_its_parents_kept(lint, tmp_path):
-    """A commit may lower a count and carry an entry across a rename; one that raises a count, adds a
-    file, or merges back a looser inventory than its branch kept is reported, merges included."""
+    """A commit may lower a count and carry an entry across a rename; one that raises a count or adds a
+    file is reported, and a merge that keeps a count past every parent's. A merge keeping one parent's
+    count is held at that parent's own commit; a file left above its count is the inventory's to bring
+    down (`tolerances`)."""
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
@@ -299,10 +301,18 @@ def test_no_commit_loosens_the_inventory_its_parents_kept(lint, tmp_path):
     subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
     _commit(repo, _inventory({"tests/test_b.py": 8}), "main touches", {"tests/other.py": "x = 1\n"})
     subprocess.run(["git", "checkout", "-q", "branch"], cwd=repo, check=True)
-    # The merge takes main's inventory whole, the branch's lower count undone: TREESAME to main.
+    # A merge keeping main's 8 keeps one parent's count, judged where main kept it.
     subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-commit", "main"],
                    cwd=repo, check=True)
     _commit(repo, _inventory({"tests/test_b.py": 8}), "merge keeps main's 8")
+    assert list(lint.ratchet(repo)) == []
+    # One past both parents' is the merge's own.
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_b.py": 8}), "main again", {"tests/other.py": "x = 2\n"})
+    subprocess.run(["git", "checkout", "-q", "branch"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-commit", "main"],
+                   cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_b.py": 9}), "merge raises past both")
     assert any("raises tests/test_b.py" in finding.message for finding in lint.ratchet(repo))
     # Removing the inventory, then making it again looser, is reported at the removal.
     subprocess.run(["git", "rm", "-q", "tools/tolerance_inventory.json"], cwd=repo, check=True)
@@ -339,6 +349,27 @@ def test_a_change_of_the_rules_reading_grows_the_inventory_only_for_files_it_lea
     _commit(repo, _inventory({"tests/test_a.py": 3, "tests/test_b.py": 1, "tests/test_c.py": 1},
                              by="2026-11-21"), "a later date", {lint.RULE: "reading = 4\n"})
     assert any("moves its date" in finding.message for finding in lint.ratchet(repo, "main"))
+
+
+def test_a_merge_bringing_a_count_its_other_parent_raised_by_rereading_is_no_loosening(lint, tmp_path):
+    """Main raises a file's count by changing the rule's reading while a lane edits that file; the lane
+    merging main keeps main's count, past the lane's but no parent's, and is no loosening, against its
+    parents or against main."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_a.py": 7}), "made",
+            {"tests/test_a.py": "a = 1\n", lint.RULE: "r = 1\n"})
+    subprocess.run(["git", "checkout", "-q", "-b", "lane"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_a.py": 7}), "the lane edits the file",
+            {"tests/test_a.py": "a = 2\n"})
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_a.py": 8}), "the rule reads more", {lint.RULE: "r = 2\n"})
+    subprocess.run(["git", "checkout", "-q", "lane"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-commit", "main"],
+                   cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_a.py": 8}), "the lane merges main")
+    assert list(lint.ratchet(repo, "main")) == []
 
 
 def test_the_ratchet_holds_a_branch_to_its_base_and_refuses_a_shallow_history(lint, tmp_path):
