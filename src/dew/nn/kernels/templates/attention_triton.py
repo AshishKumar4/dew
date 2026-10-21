@@ -27,6 +27,7 @@ from dew.nn.kernels.templates.attention import (
     Hooks,
     KeySpans,
     Kind,
+    Split,
     block_map,
     gradients,
     kept_dtype,
@@ -178,7 +179,7 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     query = query_ref[...]
     q_pos = first_query + jnp.arange(block_q)[:, None]
 
-    def advance(index, state: algebra.Partial):
+    def softmax(index, state: algebra.Partial):
         tile = pl.ds(index * block_k, block_k)
         coords = algebra.Coords(q_pos, index * block_k + jnp.arange(block_k)[None, :], **narrowing,
                                 key_ids=key_ids["ref"][tile] if spec.ids else None)
@@ -187,27 +188,40 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         logits = algebra.modify(spec, _dot(query, key_ref[tile, :].T, interpret), coords, params)
         m, alpha = algebra.peak(spec, state.m, logits)
         weights = algebra.weights(spec, logits, m)
-        denominator = algebra.total(state.total, alpha, weights)
+        return tile, coords, logits, m, alpha, weights, algebra.total(state.total, alpha, weights)
+
+    def step(index, state: algebra.Partial) -> algebra.Partial:
+        tile, _, _, m, alpha, weights, denominator = softmax(index, state)
         # The values load after the softmax, where jax's mha loads them.
         value = value_ref[tile, :]
         acc = algebra.rescale(state.acc, alpha) + _dot(algebra.narrow(weights, value.dtype), value, interpret)
-        return algebra.Partial(acc, m, denominator), logits, coords
+        return algebra.Partial(acc, m, denominator)
 
-    def step(index, state: algebra.Partial) -> algebra.Partial:
-        return advance(index, state)[0]
-
-    def tracked(index, carry: tuple[algebra.Partial, algebra.Argmax]):
-        # A training forward's step: the anchor key too, for the backward.
-        state, logits, coords = advance(index, carry[0])
-        return state, algebra.argmax(carry[1], logits, coords.k_pos)
+    def tracked(index, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array]):
+        # A training forward's step: the anchor key and the split sums the backward reads
+        # (`algebra.split_accumulate`); its state's values are `B`, every key's but the anchor's.
+        state, arg, own = carry
+        tile, coords, logits, m, alpha, weights, denominator = softmax(index, state)
+        anchor = algebra.argmax(arg, logits, coords.k_pos)
+        moved = anchor.peak > arg.peak
+        value = value_ref[tile, :]
+        others, own_tile = algebra.anchor_split(algebra.narrow(weights, value.dtype),
+                                                coords.k_pos == anchor.key[:, None])
+        acc, own = algebra.split_accumulate(state.acc, own, alpha, moved, value_ref[arg.key, :],
+                                            _dot(others, value, interpret), own_tile)
+        return algebra.Partial(acc, m, denominator), anchor, own
 
     start = (algebra.resumed(spec, *(ref[...] for ref in initial_refs)) if initial
              else algebra.empty(block_q, value_ref.shape[-1]))
     output_params = tuple(_tile_param(ref, kind, head, q_pos, None)
                           for ref, kind in zip(output_refs, output_kinds, strict=True))
     if residuals:
-        state, arg = jax.lax.fori_loop(lo, hi, tracked, (start, algebra.no_argmax(block_q)))
+        split, arg, own = jax.lax.fori_loop(lo, hi, tracked, (start, algebra.no_argmax(block_q),
+                                                              jnp.zeros((block_q,), jnp.float32)))
         residual_refs[2][...] = arg.key
+        residual_refs[3][...] = split.acc
+        residual_refs[4][...] = own
+        state = split._replace(acc=algebra.split_output(split.acc, own, value_ref[arg.key, :]))
     else:
         state = jax.lax.fori_loop(lo, hi, step, start)
     out, m, denominator = algebra.finish(spec, state, initial=initial, output_mod=output_mod,
@@ -280,9 +294,13 @@ class TritonForward(Template[Tiles]):
         out_shape = [jax.ShapeDtypeStruct((batch, queries, heads, value_width), query.dtype)]
         out_specs = [pl.BlockSpec((None, block_q, None, value_width), lambda i, b, h: (b, i, h, 0))]
         if residuals:
+            per_row = pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))
             out_shape += [*[jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 2,
-                          jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32)]
-            out_specs += [pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))] * 3
+                          jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32),
+                          jax.ShapeDtypeStruct((batch, heads, queries, value_width), jnp.float32),
+                          jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)]
+            per_value = pl.BlockSpec((None, None, block_q, value_width), lambda i, b, h: (b, h, i, 0))
+            out_specs += [per_row, per_row, per_row, per_value, per_row]
         spec = algebra.Forward(self.form, self.keys or keys, ids, self.scale, self.score_mod)
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
@@ -399,9 +417,9 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
              interpret=interpret)
     if not residuals:
         return out[:, :queries, :, :value_width]
-    out, peak, total, anchors = out
+    out, peak, total, anchors, others, own = out
     return (out[:, :queries, :, :value_width], peak[:, :, :queries], total[:, :, :queries],
-            anchors[:, :, :queries])
+            anchors[:, :, :queries], Split(others[:, :, :queries, :value_width], own[:, :, :queries]))
 
 
 def _key_param(ref, kind: Kind, head, rows):
@@ -444,11 +462,13 @@ def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta,
 
 
 def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tuple[Kind, ...], score_mod,
-               scale: float, block_k: int, interpret: bool):
+               scale: float, block_k: int, split: bool, interpret: bool):
     refs = list(refs)
     id_refs = [refs.pop(0), refs.pop(0)] if ids else []
     (query_ref, key_ref, value_ref, dout_ref, peak_ref, total_ref, initial_ref, maximum_ref, index_ref,
      anchor_value_ref) = (refs.pop(0) for _ in range(10))
+    # The forward's split sums and denominator, where it gives them (`algebra.split_delta`).
+    split_refs = [refs.pop(0) for _ in range(3 if split else 0)]
     score_refs = [refs.pop(0) for _ in score_kinds]
     # A tile parameter's gradient enters as its zeros, aliased to its output (`_dq_launch`).
     for _ in (kind for kind in score_kinds if kind == Kind.TILE):
@@ -490,12 +510,19 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     # From the softmax's initial state (`gradients`): its maximum, denominator and share of D's numerator.
     key_index = index_ref[...]
     peak0, shares = peak, (total, initial_ref[...])
-    before, state_total, state_share = algebra.off_anchor_start(peak, total, shares[1], maximum,
-                                                                value_ref.shape[-1])
-    state = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_terms, before)
-    peak, total = maximum, state.total
-    anchor, delta, key_index = algebra.off_anchor_delta(state, anchor_value_ref[...], dout, state_total,
-                                                        state_share, key_index)
+    if split:
+        # The forward took the first pass (`algebra.split_accumulate`).
+        others_ref, own_ref, forward_total_ref = split_refs
+        peak, total = maximum, forward_total_ref[...]
+        anchor, delta, key_index = algebra.split_delta(others_ref[...], own_ref[...], total,
+                                                       anchor_value_ref[...], dout, key_index)
+    else:
+        before, state_total, state_share = algebra.off_anchor_start(peak, total, shares[1], maximum,
+                                                                    value_ref.shape[-1])
+        state = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_terms, before)
+        peak, total = maximum, state.total
+        anchor, delta, key_index = algebra.off_anchor_delta(state, anchor_value_ref[...], dout, state_total,
+                                                            state_share, key_index)
     index_out_ref[...] = key_index
     summed = tuple(kind in (Kind.HEAD, Kind.QUERY) for kind in score_kinds)
 
@@ -632,15 +659,18 @@ class TritonBackward(Template[BackwardTiles]):
     score_kinds: tuple[Kind, ...] = ()
     score_dtypes: tuple[str, ...] = ()
     scale: float = 1.0
+    split: bool = True
 
     def _fwd(self, query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value,
-             start, end, query_ids, key_ids, score_params, *, interpret: bool, config: BackwardTiles,
-             return_residuals: bool = False):
+             others, own, forward_total, start, end, query_ids, key_ids, score_params, *, interpret: bool,
+             config: BackwardTiles, return_residuals: bool = False):
         shared = {"score_mod": self.score_mod, "score_kinds": self.score_kinds, "scale": self.scale,
                   "block_q": config.block_q, "block_k": config.block_k, "interpret": interpret}
         spans = start, end, query_ids, key_ids, score_params
+        sums = (others, own, forward_total) if self.split else None
         dq_out = _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index,
-                            anchor_value, *spans, warps=config.dq_warps, stages=config.dq_stages, **shared)
+                            anchor_value, sums, *spans, warps=config.dq_warps, stages=config.dq_stages,
+                            **shared)
         delta, anchor, peak, total = dq_out[1:5]
         # Each query's anchor key as the dQ launch chose it, -1 where it took D about 0.
         dkv_out = _dkv_launch(query, key, value, dout, peak, total, anchor, delta, dq_out[6], *spans,
@@ -738,8 +768,8 @@ def _geometry(query, key, value, start, end, query_ids, key_ids, block_q: int, b
     return batch, queries, heads, width, keys, value_width, heads // kv_heads, blocks
 
 
-def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, start,
-               end, query_ids, key_ids, score_params, *, score_mod, score_kinds: tuple[Kind, ...],
+def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, sums,
+               start, end, query_ids, key_ids, score_params, *, score_mod, score_kinds: tuple[Kind, ...],
                scale: float, block_q: int, block_k: int, warps: int, stages: int,
                interpret: bool) -> tuple[jax.Array, ...]:
     """The backward's dQ launch over padded operands (`backward` pads them): a program per query block
@@ -769,6 +799,11 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 pl.BlockSpec((None, block_q, None, value_width), lambda i, b, h: (b, i, h, 0))]
     arrays = [bounds, start, end, *([query_ids, key_ids] if ids else []), query, key, value, dout, peak,
               total, initial_term, maximum, key_index, anchor_value]
+    if sums is not None:
+        # The forward's split sums `[B, H, Qp, Dvp]` and `[B, H, Qp]`, and its denominator.
+        in_specs += [pl.BlockSpec((None, None, block_q, value_width), lambda i, b, h: (b, h, i, 0)),
+                     per_head, per_head]
+        arrays += list(sums)
     for param, kind in zip(score_params, score_kinds, strict=True):
         in_specs.append(_param_spec(kind, param, block_q, keys))
         arrays.append(param)
@@ -794,7 +829,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 out_shape.append(jax.ShapeDtypeStruct(param.shape, jnp.float32))
                 out_specs.append(pl.BlockSpec((None, None, block_q, keys), lambda i, b, h: (b, h, i, 0)))
     kernel = functools.partial(_dq_kernel, ids=ids, score_kinds=score_kinds,
-                               score_mod=score_mod, scale=scale, block_k=block_k,
+                               score_mod=score_mod, scale=scale, block_k=block_k, split=sums is not None,
                                interpret=interpret)
     out = pl.pallas_call(
         kernel, grid=(queries // block_q, batch, heads), in_specs=in_specs, out_specs=out_specs,
@@ -869,22 +904,24 @@ def _key_param_spec(kind: Kind, param: jax.Array, queries: int, block_k: int) ->
 
 
 def _launch(*arrays, score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
-            interpret: bool):
+            split: bool, interpret: bool):
     """The Triton mainloop's two launches under one tuning decision (`TritonBackward`)."""
-    op = TritonBackward(score_mod=score_mod, score_kinds=score_kinds, scale=scale, score_dtypes=score_dtypes)
+    op = TritonBackward(score_mod=score_mod, score_kinds=score_kinds, scale=scale, score_dtypes=score_dtypes,
+                        split=split)
     return op(*arrays, interpret=interpret)
 
 
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
-             dout: jax.Array, *, residuals: tuple[jax.Array, jax.Array] | None = None,
-             scale: float | None = None, interpret: bool = False) -> Gradients:
+             dout: jax.Array, *, residuals: tuple[jax.Array, jax.Array, jax.Array, Split] | None = None,
+             split: bool = True, scale: float | None = None, interpret: bool = False) -> Gradients:
     """The template's backward on the Triton mainloop (`gradients`, `TritonBackward`), from the forward's
-    `residuals`, its maxima and anchor keys (`forward`'s, which it takes again where None). `interpret`
-    runs it on the CPU."""
+    `residuals`: its maxima, denominators, anchor keys and split sums (`forward`'s, which it takes again
+    where None). With `split`, D comes from the split sums; without, the dQ launch takes its own first pass
+    over the keys (`algebra.off_anchor`). `interpret` runs it on the CPU."""
     if residuals is None:
         plain = Hooks() if hooks is None else Hooks(hooks.score_mod, hooks.score_params, hooks.initial)
-        _, maxima, _, anchors = forward(query, key, value, spans, plain, scale=scale, residuals=True,
-                                        interpret=interpret)
-        residuals = maxima, anchors
-    return gradients(functools.partial(_launch, interpret=interpret), query, key, value, spans, hooks, dout,
-                     residuals, block=BLOCK, scale=scale)
+        _, maxima, totals, anchors, sums = forward(query, key, value, spans, plain, scale=scale,
+                                                   residuals=True, interpret=interpret)
+        residuals = maxima, totals, anchors, sums
+    return gradients(functools.partial(_launch, split=split, interpret=interpret), query, key, value, spans,
+                     hooks, dout, residuals, block=BLOCK, scale=scale)
