@@ -6,7 +6,8 @@
   order it is first used, every constant is read as its type, and docstrings and annotations are dropped
   (at least `FUNCTION_NODES` syntax nodes), fail. So do six consecutive statements of two statement lists in
   different files, equal the same way (at least `WINDOW_NODES` nodes). A class's annotated fields and a run
-  of calls to one function (a parser's arguments, a registry's entries) are declarations, not windows.
+  of calls to one function (a parser's arguments, a registry's entries) are declarations: no window, and
+  in a function one statement, as the data they declare is not logic.
 
     python tools/duplicates.py [--base=REF] PATH...
 
@@ -123,11 +124,24 @@ def digest(parts: Sequence[list[str]]) -> str:
     return hashlib.sha256("\x1f".join(text).encode()).hexdigest()
 
 
+def callee(statement: ast.stmt) -> str | None:
+    """The function a statement that is only a call calls, as written."""
+    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+        return ast.dump(statement.value.func)
+    return None
+
+
 def declarative(window: Sequence[ast.stmt]) -> bool:
-    """A run of calls to one function: data, not logic."""
-    calls = [statement.value for statement in window
-             if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)]
-    return len(calls) == len(window) and len({ast.dump(call.func) for call in calls}) == 1
+    """A run of calls to one function (a parser's arguments, a registry's entries): data, not logic."""
+    called = {callee(statement) for statement in window}
+    return len(called) == 1 and None not in called
+
+
+def logic(body: list[ast.stmt]) -> list[ast.stmt]:
+    """`body` with each run of calls to one function kept as its first: what the run declares is data, so
+    two functions that differ only in it are not one logic."""
+    return [statement for index, statement in enumerate(body)
+            if index == 0 or callee(statement) is None or callee(statement) != callee(body[index - 1])]
 
 
 def units(file: str, tree: ast.Module) -> Iterator[tuple[str, str, Place, int]]:
@@ -149,10 +163,11 @@ def units(file: str, tree: ast.Module) -> Iterator[tuple[str, str, Place, int]]:
                 continue
             body = stripped(node, field, statements)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and field == "body" and body:
-                nodes = sum(shape(statement)[1] for statement in body)
+                kept = logic(body)
+                nodes = sum(shape(statement)[1] for statement in kept)
                 if nodes >= FUNCTION_NODES:
                     place = Place(file, owner, node.lineno)
-                    yield "function", digest([shape(s)[0] for s in body]), place, nodes
+                    yield "function", digest([shape(s)[0] for s in kept]), place, nodes
             for start in range(len(body) - WINDOW + 1):
                 window = body[start:start + WINDOW]
                 nodes = sum(shape(statement)[1] for statement in window)
@@ -218,8 +233,9 @@ def main(arguments: Sequence[str]) -> int:
     parser.add_argument("--base", help="a commit: a structural hit fails if new to its merge-base with HEAD")
     parser.add_argument("paths", nargs="+")
     options = parser.parse_args(arguments)
-    text = Run([*ARGUMENTS, *options.paths], exit=False).linter.msg_status
     files = python_files(options.paths)
+    # pylint reads a directory as a package; the files, as files.
+    text = Run([*ARGUMENTS, *map(str, files)], exit=False).linter.msg_status
     hits = structural({str(file): file.read_text() for file in files})
     failing = new(hits, options.base) if options.base else hits
     for hit in hits:
