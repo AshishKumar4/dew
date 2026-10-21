@@ -424,8 +424,6 @@ class RAEAutoencoder(ModuleAutoEncoder[RAE]):
     out and its inverse on the way in, per latent position where the
     checkpoint gives per-position statistics."""
 
-    record_name = 'rae'
-    record_module = RAE
 
     @property
     def stochastic(self) -> bool:

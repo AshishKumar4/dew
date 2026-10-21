@@ -1,6 +1,7 @@
 """A published autoencoder, built as its own config names it."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -17,14 +18,14 @@ from dew.interop.components import bind_component, component_source
 from dew.objectives.base import Variables
 
 from .api import AutoEncoder, LatentNormalization
-from .dc_ae import load_dc_ae
-from .flux2 import load_flux2_vae
+from .dc_ae import DCAE, DCAutoencoder, load_dc_ae
+from .flux2 import Flux2Autoencoder, load_flux2_vae
 from .kl import AutoencoderKL
-from .qwen_image import load_qwen_image_vae
-from .rae import load_rae
+from .qwen_image import QwenImageAutoencoder, QwenImageVAE, load_qwen_image_vae
+from .rae import RAE, RAEAutoencoder, load_rae
 from .sd_vae import StableDiffusionVAE, published_normalization
 from .vae import FLAX_REVISIONS, _vae_path, kl_config
-from .wan import load_wan_vae
+from .wan import WanAutoencoder, WanVAE, load_wan_vae
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -49,19 +50,6 @@ class Loader(Protocol):
                  ) -> tuple[AutoEncoder, Variables, tuple[WeightLayout, ...], dict]: ...
 
 
-LOADERS: Mapping[str, Loader] = MappingProxyType({
-    "AutoencoderDC": load_dc_ae,
-    "AutoencoderKLWan": load_wan_vae,
-    "AutoencoderRAE": load_rae,
-    "AutoencoderKLQwenImage21": load_qwen_image_vae,
-    "AutoencoderKLFlux2": load_flux2_vae,
-})
-"""Every published autoencoder but an AutoencoderKL, by the `_class_name`
-its config states. A standalone load (`load_autoencoder`) and a pipeline's
-(`dew.interop.pipeline_assembly`) both build from this one table; each
-reads an AutoencoderKL its own way."""
-
-
 def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                 subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
                 lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
@@ -81,6 +69,41 @@ def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
                                          latent_shift=shift, latent_scale=scale),
         prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(image,),
         shapes=shapes)
+
+
+@dataclasses.dataclass(frozen=True)
+class Registration:
+    """One built-in autoencoder: its wrapper, the name its record goes by and the native module its
+    record's 'model' rebuilds (`AutoEncoder.to_json`, `from_json`), the `_class_name` a published
+    config states, and the loader that builds it from a pipeline's directory or a repo."""
+    wrapper: type[AutoEncoder]
+    record: str
+    module: type
+    published: str
+    load: Loader
+
+
+REGISTRATIONS: tuple[Registration, ...] = (
+    Registration(StableDiffusionVAE, 'sd_vae', AutoencoderKL, 'AutoencoderKL', load_kl_vae),
+    Registration(DCAutoencoder, 'dc_ae', DCAE, 'AutoencoderDC', load_dc_ae),
+    Registration(WanAutoencoder, 'wan', WanVAE, 'AutoencoderKLWan', load_wan_vae),
+    Registration(RAEAutoencoder, 'rae', RAE, 'AutoencoderRAE', load_rae),
+    Registration(Flux2Autoencoder, 'flux2', AutoencoderKL, 'AutoencoderKLFlux2', load_flux2_vae),
+    Registration(QwenImageAutoencoder, 'qwen_image', QwenImageVAE, 'AutoencoderKLQwenImage21',
+                 load_qwen_image_vae),
+)
+"""Every built-in autoencoder, which saved runs rebuild and sources load alike: one registration each."""
+
+LOADERS: Mapping[str, Loader] = MappingProxyType({
+    registration.published: registration.load for registration in REGISTRATIONS})
+"""Every published autoencoder's loader, by the `_class_name` its config states. A pipeline's load
+(`dew.interop.pipeline_assembly`) builds from this table; a standalone one (`load_autoencoder`) too,
+but for an AutoencoderKL's, which also reads the SD1-era flax layouts (`StableDiffusionVAE`)."""
+
+
+def registration(of: type[AutoEncoder] | str) -> Registration | None:
+    """The registration of a wrapper class or of a record's name, None for one no built-in declares."""
+    return next((entry for entry in REGISTRATIONS if of in (entry.wrapper, entry.record)), None)
 
 
 def _published(modelname: str, revision: str) -> tuple[str | None, str | None]:
@@ -128,7 +151,7 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
     (`AutoEncoder.from_json`) would lose the override, and refuses it.
     """
     class_name, subfolder = _published(modelname, revision)
-    if class_name is None or class_name not in LOADERS:
+    if class_name is None or class_name not in LOADERS or class_name == "AutoencoderKL":
         return StableDiffusionVAE(modelname, revision=revision, dtype=dtype, latent_shift=latent_shift,
                                   latent_scale=latent_scale, params=params)
     autoencoder, *_ = LOADERS[class_name](modelname, dtype, revision=revision, subfolder=subfolder or "",

@@ -38,8 +38,6 @@ class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
     """Native FLUX.2 VAE weights, the 2x2 fold and the batch-norm statistics
     as the latent normalization, per folded channel."""
 
-    record_name = 'flux2'
-    record_module = AutoencoderKL
 
     def __init__(self, *, model: AutoencoderKL, params: Variables, mean, variance, epsilon: float):
         super().__init__(model, params)
