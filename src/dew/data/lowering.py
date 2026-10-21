@@ -209,6 +209,24 @@ class _Marked(pygrain.MapDataset):
         return Rejected(self._reason) if value is None else value
 
 
+def prepared_rows(rows: Records, stages: Sequence[Stage]) -> list[Batch | bytes]:
+    """`rows`, a store's records by index, through the record steps among `stages` as a read makes
+    them, for a fact measured over what reaches a configured step (`Configured.measures`). A step
+    drawing from a record's generator, a configured or Grain step, or one that lays records out
+    makes rows no measure before the run can read, and is refused; a view of the inputs changes no
+    record and is passed over, so the measure reads them all."""
+    current = [(index, rows[index]) for index in range(len(rows))]
+    for stage in stages:
+        if isinstance(stage, (Shuffle, Repeat, Slice, Limit, Prefetch, Workers)):
+            continue
+        if not isinstance(stage, (Map, MapWithIndex, Filter, FlatMap)):
+            raise ValueError(f"a fact measured after {_identity(stage).name} reads rows that step makes "
+                             "only as the run reads them; give the fact itself")
+        current = [(position, output) for position, row in current if row is not None
+                   for output in _outputs(stage, position, row) if not isinstance(output, Rejected)]
+    return [row for _, row in current if isinstance(row, (Mapping, bytes))]
+
+
 def _cache_inputs(source: Source, records: Records) -> pygrain.MapDataset:
     """The records a cache over `source` reads by index, the rows a memory read made each at the
     source position it came from (`_Placed`), where a step among the cached ones that reads its

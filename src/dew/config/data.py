@@ -39,10 +39,16 @@ from dew.data import images
 from dew.data.chat import RenderChat
 from dew.data.images import ConfigureCaption, EncodeCaptions
 from dew.data.preferences import PreferencePair
-from dew.data.presets import _CHAT_FIELDS, _clips, _conversation_windows, _decoded_images, _next_token_windows
-from dew.data.prompts import RewardWidth
+from dew.data.presets import (
+    _CHAT_FIELDS,
+    _clips,
+    _conversation_windows,
+    _decoded_images,
+    _next_token_windows,
+    _rendered_prompts,
+)
 from dew.data.sources.base import Read
-from dew.data.steps.chat import ConfigurePrompt, ResponseCanvases
+from dew.data.steps.chat import ResponseCanvases
 from dew.data.steps.generic import Formatting
 from dew.data.text import Tokenize
 
@@ -285,12 +291,9 @@ class PromptData(_Loadable):
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         source = _source(self.source, split=self.split)
-        configure = ConfigurePrompt(self.tokenizer, self.max_prompt_len, self.pad_id, self.long,
-                                    self.thinking)
-        # The reward width given, or measured over each store (`Configured.measures`).
-        measured = Configured(configure, needs=("reward_bytes",), measures=RewardWidth())
-        rendered = (Pipeline(source).filter_map(configure({"reward_bytes": self.reward_bytes}))
-                    if self.reward_bytes is not None else Pipeline(source).map(measured))
+        rendered = _rendered_prompts(Pipeline(source), self.tokenizer, self.max_prompt_len,
+                                     pad_id=self.pad_id, long=self.long, thinking=self.thinking,
+                                     reward_bytes=self.reward_bytes)
         train, held = _branches(source, self.validation, split=self.split, prefix=rendered.stages)
         return train, held, ()
 

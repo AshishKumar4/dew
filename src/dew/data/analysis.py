@@ -25,13 +25,13 @@ import dataclasses
 import inspect
 import itertools
 import json
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Literal, Protocol, get_args, runtime_checkable
 
 import grain.python as pygrain
 
-from dew.data.dataset import Records
+from dew.data.dataset import Records, SourceSlice
 from dew.data.pipeline import (
     Artifact,
     Batched,
@@ -143,24 +143,42 @@ def _in_memory(source: Source) -> bool:
     return isinstance(_store(source), Memory)
 
 
-def _stated(source: Source, read: Read,
-            measures: Sequence[Measure] = ()) -> tuple[Records | None, Mapping[str, object]]:
-    """The records a memory read of `source` holds, then its metadata, with each fact `measures`
-    measure over its store's records in a memory read in place of any the store states: the whole
-    store, below any holdout, so each part of it binds alike (`Configured.measures`)."""
+@dataclasses.dataclass(frozen=True)
+class Measuring:
+    """A fact a configured step measures (`Configured.measures`) and the stages before it, which
+    make the records it reads from the store's."""
+
+    measure: Measure
+    before: tuple[Stage, ...]
+
+
+def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
+            whole: Callable[[Source], Records] | None = None) -> tuple[Records | None, Mapping[str, object]]:
+    """The records a memory read of `source` holds, then its metadata, with each fact `measuring`
+    measures in place of any the store states, in a memory read: over the whole store's records,
+    below any holdout, so each part of it binds alike, as the stages before the measuring step make
+    them (`dew.data.lowering.prepared_rows`). `whole` reads the store once for every part of it."""
+    from dew.data.lowering import prepared_rows
+
     held = source.records(read) if read == "memory" else None
     metadata = source.metadata()
-    if held is None or not measures:
+    if held is None or not measuring:
         return held, metadata
     store = _store(source)
-    rows = held if store is source else store.records(read)
-    return held, {**metadata, **{measure.fact: measure(rows) for measure in measures}}
+    # A records holdout reads its part of the whole store's records, which it keeps.
+    rows = (held if store is source else held.source if isinstance(held, SourceSlice)
+            else whole(store) if whole is not None else store.records(read))
+    return held, {**metadata, **{each.measure.fact: each.measure(prepared_rows(rows, each.before))
+                                 for each in measuring}}
 
 
-def _measures(stages: Iterable[Stage]) -> tuple[Measure, ...]:
-    """The facts the configured steps among `stages` measure (`Configured.measures`), each once."""
-    found = {stage.measures.fact: stage.measures for stage in stages
-             if isinstance(stage, Configured) and stage.measures is not None}
+def _measures(stages: Sequence[Stage]) -> tuple[Measuring, ...]:
+    """The facts the configured steps among `stages` measure (`Configured.measures`), each once,
+    with the stages before each."""
+    found: dict[str, Measuring] = {}
+    for index, stage in enumerate(stages):
+        if isinstance(stage, Configured) and stage.measures is not None:
+            found.setdefault(stage.measures.fact, Measuring(stage.measures, tuple(stages[:index])))
     return tuple(found.values())
 
 

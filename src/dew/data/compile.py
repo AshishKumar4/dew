@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import threading
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal, Protocol, runtime_checkable
@@ -23,6 +24,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew.data.analysis import (
+    Measuring,
     _analyzed,
     _at,
     _cache_manifest,
@@ -76,7 +78,6 @@ from dew.data.pipeline import (
     Limit,
     Map,
     MapBatch,
-    Measure,
     Mixture,
     Native,
     ObjectiveData,
@@ -201,18 +202,27 @@ def _released(pipelines: Sequence[Pipeline]) -> None:
 
 def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, ...]:
     sources = {id(source): source for branch in pipelines for _, source in _leaves(branch)}
-    measured: dict[int, dict[str, Measure]] = {}
+    measured: dict[int, dict[str, Measuring]] = {}
     for branch in pipelines:
-        for key, measures in _measured(branch).items():
-            measured.setdefault(key, {}).update({measure.fact: measure for measure in measures})
+        for key, measuring in _measured(branch).items():
+            measured.setdefault(key, {}).update({each.measure.fact: each for each in measuring})
+    stores: dict[int, Records] = {}
+    reading = threading.Lock()
+
+    def whole(store: Source) -> Records:
+        # A store several holdout parts measure over is read once for them all.
+        with reading:
+            if id(store) not in stores:
+                stores[id(store)] = store.records(read)
+            return stores[id(store)]
 
     def pin(source: Source) -> _Facts:
         if isinstance(source, _Facts):
             return source
         label = source.label()
-        measures = tuple(measured.get(id(source), {}).values())
+        measuring = tuple(measured.get(id(source), {}).values())
         source = _consumed(source, read)
-        records, metadata = _stated(source, read, measures)
+        records, metadata = _stated(source, read, measuring, whole)
         held = None if records is None else _PinnedRead(records)
         return _Facts(source, read, source.fingerprint(), metadata, held, label)
 
@@ -231,17 +241,19 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
     return tuple(replace(branch) for branch in pipelines)
 
 
-def _measured(pipeline: Pipeline, above: tuple[Measure, ...] = ()) -> dict[int, tuple[Measure, ...]]:
+def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int, tuple[Measuring, ...]]:
     """The facts each store `pipeline` reads has measured for the configured steps over it, its own
-    and its mixtures' (`Configured.measures`), by the store's identity."""
-    measures = (*above, *_measures(pipeline.stages))
+    and its mixtures' (`Configured.measures`), each after the stages its store's records pass
+    through before that step, by the store's identity."""
+    passed = tuple(dataclasses.replace(each, before=(*pipeline.stages, *each.before)) for each in above)
+    measuring = (*_measures(pipeline.stages), *passed)
     source = pipeline.source
     if not isinstance(source, (Mixture, Phases)):
-        return {id(source): measures}
-    found: dict[int, tuple[Measure, ...]] = {}
+        return {id(source): measuring}
+    found: dict[int, tuple[Measuring, ...]] = {}
     for child in source.pipelines:
-        for key, child_measures in _measured(child, measures).items():
-            found[key] = (*found.get(key, ()), *child_measures)
+        for key, child_measuring in _measured(child, measuring).items():
+            found[key] = (*found.get(key, ()), *child_measuring)
     return found
 
 
@@ -956,7 +968,7 @@ def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]
     conflicted: set[str] = set()
     slots: dict[str, int] = {}
     # A fact a configured step measures binds a mixture's step to the largest of its stores'.
-    measured = {measure.fact for pipeline in pipelines for measure in _measures(_steps(pipeline))}
+    measured = {each.measure.fact for pipeline in pipelines for each in _measures(tuple(_steps(pipeline)))}
     for pipeline in pipelines:
         for _, source in _leaves(pipeline):
             if isinstance(source, _Memory) and not source.held:

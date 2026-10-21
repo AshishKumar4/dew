@@ -240,14 +240,24 @@ def prompts(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, max_p
     as `images` takes them). Without `reward_bytes`, a memory read measures it over each store, the
     widest reward string it holds, so every row fits whole; another read needs it given, or stated
     by the store's metadata."""
+    rendered = _rendered_prompts(dataset, tokenizer, max_prompt_len, pad_id=pad_id, long=long,
+                                 thinking=thinking, reward_bytes=reward_bytes)
+    return _finished(rendered, batch=batch, records=records, host=host)
+
+
+def _rendered_prompts(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, max_prompt_len: int, *,
+                      pad_id: int, long: Literal["drop", "truncate"], thinking: bool | None,
+                      reward_bytes: int | None) -> Pipeline:
+    """Prompt rows rendered with their reward columns `reward_bytes` wide, or as wide as measured over
+    each store (`prompts`). `prompts` and the prompt recipe (`dew.config.data.PromptData`) share it."""
     from dew.data.prompts import RewardWidth
     from dew.data.steps.chat import ConfigurePrompt
     from dew.data.text import tokenizer_name
 
     configure = ConfigurePrompt(tokenizer_name(tokenizer), max_prompt_len, pad_id, long, thinking)
-    rendered = (dataset.filter_map(configure({"reward_bytes": reward_bytes})) if reward_bytes is not None
-                else dataset.map(Configured(configure, needs=("reward_bytes",), measures=RewardWidth())))
-    return _finished(rendered, batch=batch, records=records, host=host)
+    if reward_bytes is not None:
+        return dataset.filter_map(configure({"reward_bytes": reward_bytes}))
+    return dataset.map(Configured(configure, needs=("reward_bytes",), measures=RewardWidth()))
 
 
 def preferences(dataset: Dataset, *, seq_len: int, batch: int, pad_id: int = 0, records: int | None = None,

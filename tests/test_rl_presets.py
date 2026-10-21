@@ -205,3 +205,36 @@ def test_a_prompt_width_neither_given_nor_stated_is_refused_where_the_read_canno
                 loading=LOADING)
     given = rows.repeat().pipe(presets.prompts, "byte", max_prompt_len=16, batch=2, reward_bytes=4)
     assert _widths(compile(given, read="indexed", loading=LOADING), 2) == {4}
+
+
+def test_a_measured_reward_width_reads_the_rows_the_steps_before_the_preset_make():
+    """Rows whose prompt and answer fields are renamed before the preset: the measured width is the
+    widest answer the renamed rows hold, which every row then fits."""
+    rows = Memory([{"q": "hi", "a": "an answer " * (1 + index % 2)} for index in range(4)])
+    renamed = rows.rename_columns({"q": "prompt", "a": "ground_truth"})
+    chain = renamed.repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2)
+    assert _widths(compile(chain, read="memory", loading=LOADING), 2) == {len("an answer " * 2)}
+
+
+@dataclasses.dataclass(frozen=True)
+class Shouted:
+    """A random step of the caller's: its rows are known only as the run reads them."""
+
+    def random_map(self, row, rng):
+        return {**row, "ground_truth": str(row["ground_truth"]).upper()}
+
+
+def test_a_reward_width_after_a_random_step_is_refused_until_given():
+    """A random step before the preset makes rows no measure before the run can read: the width is
+    refused unmeasured, and reads given."""
+    import grain.python as grain
+
+    class Upper(Shouted, grain.RandomMapTransform):
+        pass
+
+    shouted = _prompts(4).random_map(Upper())
+    with pytest.raises(ValueError):
+        compile(shouted.repeat().pipe(presets.prompts, "byte", max_prompt_len=16, batch=2), read="memory",
+                loading=LOADING)
+    given = shouted.repeat().pipe(presets.prompts, "byte", max_prompt_len=16, batch=2, reward_bytes=8)
+    assert _widths(compile(given, read="memory", loading=LOADING), 2) == {8}
