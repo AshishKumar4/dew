@@ -605,6 +605,58 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive("\n".join(unresolved))
 
 
+def _moved(draws: _Draws, stage: int) -> tuple[list[str], list[str], bool]:
+    """The leaves a change moves beyond rounding (`assert_moves`), why each other one does not, and
+    whether any of those is unresolved (its interval still reaching above PARITY). A stage spends half of
+    LOWER_TAIL, shared among the leaves, so the two looks over every leaf spend no more than check 1's."""
+    moved, kept, unresolved = [], [], False
+    tail = LOWER_TAIL / 2 / max(len(draws.names), 1)
+    for index, name in enumerate(draws.names):
+        mine, theirs = draws.mine[:, index], draws.theirs[:, index]
+        if not draws.finite[:, index].all():
+            kept.append(f"{name}: a value not finite, which moves nothing a ratio can show")
+            unresolved = True
+        elif np.sum(theirs) == 0:
+            # The original holds the float64 truth exactly: any move off it is past its rounding.
+            (moved if np.sum(mine) > 0 else kept).append(
+                f"{name}: {'moved off' if np.sum(mine) > 0 else 'kept'} the original's exact value")
+        else:
+            ratio = _pooled(mine, theirs)
+            low, high = _interval(mine, theirs, tails=(tail, UPPER_TAIL))
+            (moved if low > PARITY else kept).append(
+                f"{name}: at stage {stage}, the changed RMS distance from the original's float64 run is "
+                f"{ratio:.3f} times the original's own, its lower end {low:.3f}")
+            unresolved |= low <= PARITY and max(high, ratio) > PARITY
+    return moved, kept, unresolved
+
+
+def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
+    """A change that must move the result beyond rounding (a sensitivity check): over check 1's draws
+    (`assert_as_exact`), some leaf of `changed_fn` sits further from the original's float64 run than
+    PARITY times `original_fn`'s own rounding, by the lower end of its pooled ratio's interval, so a
+    change rounding could account for passes at a nominal 5e-4 at most over its leaves and both stages
+    (`_moved`). The truth is `original_fn` on the inputs widened to float64, or `truth_fn`, which must be
+    the original's own float64 semantics (an output dtype it closes over), never another computation's.
+    A leaf the original holds exactly moves on any departure from it. Two pre-declared stages, as check
+    1's: at `seeds`, then, where no leaf moved, REDRAW times as many further seeds; still unmoved, it
+    fails, or is Inconclusive where a leaf's interval still reaches above PARITY. Where the change is
+    structural and the alternative is bitwise identity (another seed, another mask), exact inequality
+    says enough and this is not needed."""
+    if seeds < FEWEST_SEEDS:
+        raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
+                           f"(`seeds_for`)")
+    draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn)
+    moved, kept, unresolved = _moved(draws, 1)
+    if not moved:
+        further = range(seeds, (1 + REDRAW) * seeds)
+        draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn))
+        moved, kept, unresolved = _moved(draws, 2)
+    if not moved:
+        found = (f"{label}: the change moves no leaf beyond rounding over {len(draws.mine)} seeds:\n"
+                 + "\n".join(kept))
+        raise Inconclusive(found) if unresolved else AssertionError(found)
+
+
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = 512,
               truth_fn=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the reference compared
