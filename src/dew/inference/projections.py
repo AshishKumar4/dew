@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Sequence
+from typing import TypeGuard
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.core import unfreeze
+from flax.core import FrozenDict, freeze, unfreeze
 from jax.sharding import SingleDeviceSharding
 
 from dew.nn.kernels.options import QuantizedClass
@@ -93,11 +94,19 @@ def projection_groups(model: nn.Module, variables: Variables) -> tuple[Projectio
     return _projection_groups(model, unfreeze(dict(variables)))
 
 
-def _projection_groups(model: nn.Module, variables: dict) -> tuple[ProjectionGroup, ...]:
-    """`projection_groups` over a tree of plain dicts, which reading costs no copy."""
+def _declares(model: nn.Module) -> TypeGuard[Serving]:
+    """Whether `model` names groups for a tree of its own: it serves them (`Serving`) and no adapter
+    wraps it. An adapter's LoRA branches bind the members' own paths, so an adapted model's tree
+    holds them unpacked, and its interceptor places the base weights only as it applies, so the model
+    binds over its tree for no declaration."""
     from dew.lora import AdaptedClass
 
-    if isinstance(type(model), AdaptedClass) or not isinstance(model, Serving):
+    return isinstance(model, Serving) and not isinstance(type(model), AdaptedClass)
+
+
+def _projection_groups(model: nn.Module, variables: dict) -> tuple[ProjectionGroup, ...]:
+    """`projection_groups` over a tree of plain dicts, which reading costs no copy."""
+    if not _declares(model):
         return ()
     layer = type(model)
     spec = layer._dew_quantization if isinstance(layer, QuantizedClass) else None
@@ -247,8 +256,9 @@ def packed_owned(model: nn.Module, variables: Variables) -> Variables:
 
 def _held_packed(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
     """The groups `model` declares (`Serving`) that `variables` hold packed: what the tree stores,
-    whatever an adapter or a quantization would now let `projection_groups` pack anew."""
-    if not isinstance(model, Serving):
+    whatever a quantization would now let `projection_groups` pack anew. An adapted model's tree
+    holds none (`_declares`)."""
+    if not _declares(model):
         return ()
     variables = unfreeze(dict(variables))
     return tuple(group for group in _declared(model, variables)
@@ -310,7 +320,8 @@ def unpacked(model: nn.Module, variables: Variables) -> Variables:
             return jnp.split(leaf, edges, axis=-1)
         return np.split(np.asarray(leaf), edges, axis=-1)
 
-    return _split(variables, groups, parts)
+    split = _split(variables, groups, parts)
+    return freeze(split) if isinstance(variables, FrozenDict) else split
 
 
 def inference_projections(model: nn.Module, variables: Variables) -> Variables:
