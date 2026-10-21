@@ -22,24 +22,28 @@ BLOCK = """\
 
 SPREAD = '''\
 def spread(values, limit):
-    """How far apart the values past a limit lie, over how many there are."""
+    """How far apart the values past a limit lie, over how many there are, and where their middle falls."""
     kept = [value for value in values if value > limit]
     if not kept:
         raise ValueError(f"no value past {limit}")
     low, high = min(kept), max(kept)
-    return (high - low) / len(kept)
+    middle = (low + high) / 2
+    above = sum(1 for value in kept if value > middle)
+    return {"spread": (high - low) / len(kept), "above": above / len(kept)}
 '''
 
 RANGE_OVER_COUNT = '''\
 def range_over_count(items, floor):
-    """The range of the items above a floor, per item."""
+    """The range of the items above a floor, per item, and the share above the range's midpoint."""
     chosen = [item for item in items if item > floor]
     if not chosen:
-        raise ValueError(f"nothing above {floor}: no range")
+        raise ValueError(f"nothing above {floor}")
     lo, hi = min(chosen), max(chosen)
-    return (hi - lo) / len(chosen)
+    centre = (lo + hi) / 2
+    over = sum(1 for item in chosen if item > centre)
+    return {"range": (hi - lo) / len(chosen), "over": over / len(chosen)}
 '''
-"""`SPREAD` renamed, its message and docstring reworded: no line of it is SPREAD's; it is the same logic."""
+"""`SPREAD` renamed, its message, keys and docstring reworded: no line is SPREAD's; it is the same logic."""
 
 
 def gate(root: Path, *arguments: str) -> subprocess.CompletedProcess:
