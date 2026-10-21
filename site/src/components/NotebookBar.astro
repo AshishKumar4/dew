@@ -104,7 +104,8 @@ const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs 
 			output.replaceChildren(head, body);
 			block.classList.add('nb-ran-live');
 			if (button) button.disabled = true;
-			const done = await session.run(cell.code, (out) => renderOutput(body, out));
+			// The notebook's cells share one kernel, so a display one cell shows another may update.
+			const done = await session.run(cell.code, (out) => renderOutput(body, out, document));
 			head.textContent =
 				done.status === 'ok' ? `Live [${done.count ?? ' '}]` : done.status === 'error' ? `Live [${done.count ?? ' '}], raised an error` : 'Stopped';
 			if (button) button.disabled = false;
