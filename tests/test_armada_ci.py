@@ -500,7 +500,8 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
         "                   check=True, env={**os.environ, 'PYTHONPATH': 'src'})\n")
     items = ci.coverage_items(300.0, {})
     assert items and all("--python=3.12 " in item and "--cache=off" in item
-                         and f"--coverage={ci.ARTIFACTS}" in item for item in items)
+                         and f"--coverage={ci.ARTIFACTS}" in item
+                         and f"--deadline={ci.COVERAGE_DEADLINE:.0f}" in item for item in items)
     assert sorted(name for item in items for name in re.search(r"--tests='([^']*)'", item)[1].split()) == [
         "tests/test_negative.py", "tests/test_positive.py"]
     venv = tmp_path / ".venv-3.12/bin"
@@ -517,6 +518,12 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     assert files["sign.py"]["summary"]["percent_covered"] == 100.0
     least = (tmp_path / "runs/coverage.md").read_text().splitlines()[2].split(" | ")
     assert Path(least[0].removeprefix("| ")).name == "unused.py" and least[-1] == "0.0% |"
+    # A task interrupted at its deadline leaves its later tests' coverage out: the pass is refused.
+    (tmp_path / "tests/test_slow.py").write_text("import time\ndef test_slow(): time.sleep(30)\n")
+    (tmp_path / "runs/slow").mkdir()
+    ci.task("3.12", ["tests/test_slow.py"], "", tmp_path / "runs/slow/rows.json", 1.0, cache=False, grace=5.0,
+            coverage=tmp_path / "runs/slow")
+    assert ci.coverage_report(tmp_path / "runs") == 1
 
 
 def test_a_file_whose_recorded_tests_outweigh_its_median_runs_split_by_them(ci, tmp_path):
