@@ -37,10 +37,6 @@ if TYPE_CHECKING:
     from dew.training.distributed import Layout, MeshSpec
 
 
-type Task = TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask
-"""A task `pipeline` returns: one of Dew's, or a plugin objective's saved task."""
-
-
 def pipeline(
     source: str,
     *,
@@ -52,7 +48,7 @@ def pipeline(
     step: int | str | None = None,
     revision: str | None = None,
     trust: Sequence[str] = (),
-) -> Task:
+) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask:
     """Load the inference task for `source`, with its weights placed once.
 
     `source` is a run directory, a source checkpoint directory or a Hub
@@ -101,44 +97,13 @@ def pipeline(
     if root.is_dir() and (root / RUN_FILE).is_file():
         if revision is not None:
             raise ValueError("revision pins a Hub source; a run directory has checkpoints, selected by step")
-        return _prepared(_from_run(root, mesh=mesh, layout=layout, dtype=dtype,
-                                   param_dtype=None if param_dtype == "auto" else param_dtype, ema=ema,
-                                   step=step, trust=trust), layout)
+        return _from_run(root, mesh=mesh, layout=layout, dtype=dtype,
+                         param_dtype=None if param_dtype == "auto" else param_dtype, ema=ema, step=step,
+                         trust=trust)
     if step is not None:
         raise ValueError("step selects a run's checkpoint; a source checkpoint has one set of weights")
-    return _prepared(_from_source(source, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype,
-                                  revision=revision), layout)
-
-
-NATIVE_TASKS = (TextGeneration, BlockGeneration, MaskedGeneration, TextToImage)
-"""Dew's own tasks, which `_prepared` prepares; a plugin's saved task prepares itself."""
-
-
-def _prepared(task: Task, layout: Layout | None) -> Task:
-    """`task` as every task `pipeline` returns is prepared, however it was read: the projection
-    groups its model reads packed are packed (`inference_projections`), whether its weights sit on
-    the host or on a mesh. A packed weight on a mesh is placed as `layout` places it (the trainer's
-    default when None), and every weight packing left alone keeps its array and its placement;
-    weights on the host stay there, for the task to place at its first call
-    (`dew.inference.tasks.resident`), so they can still be quantized on the host. A source's loader
-    packs before it places (`Pretrained._load`), so its task is already prepared; a run's reader
-    does not. A plugin's saved task prepares itself."""
-    from dew.inference.projections import inference_projections
-    from dew.nn.inputs import mesh_of
-    from dew.training.distributed import Layout as DefaultLayout
-
-    if not isinstance(task, NATIVE_TASKS):
-        return task
-    packed = inference_projections(task.model, task.variables)
-    if packed is task.variables:
-        return task
-    mesh = mesh_of(packed)
-    if mesh is not None:
-        kept = {id(leaf) for leaf in jax.tree.leaves(task.variables)}
-        shardings = (DefaultLayout() if layout is None else layout).shardings(mesh, packed)
-        packed = jax.tree.map(lambda leaf, sharding: leaf if id(leaf) in kept
-                              else jax.device_put(leaf, sharding), packed, shardings)
-    return task.bind(packed)
+    return _from_source(source, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype,
+                        revision=revision)
 
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,

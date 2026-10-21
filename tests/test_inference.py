@@ -18,7 +18,6 @@ import optax
 import pytest
 from affine_run import Replaying
 from diffusion_stubs import STUB_TEXT
-from reference_error import assert_as_exact_as_the_reference, widened
 from steady_state import steady_state
 
 import dew
@@ -31,7 +30,6 @@ from dew.data.dataset import Loader
 from dew.diffusion.presets import EDM, Flow
 from dew.inference import RunProcessor, TextGeneration
 from dew.inputs import Field, unit_range
-from dew.nn.inputs import mesh_of
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG, DPMSolverSDE, Euler, Heun, TextToImage
@@ -349,63 +347,6 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
         "max_new_tokens": 4, "sampling": dataclasses.asdict(objective.samples.sampling),
         "ema_decay": ema_decay, "data": {"seq_len": 8}}))
     return objective, state
-
-
-def decoded(model, variables, tokens) -> np.ndarray:
-    """`model`'s logits over `tokens` read through its decode cache: a prefill of all but the last
-    token, then a cached step of the last."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-
-    cache = model.apply(variables, tokens.shape[0], method=CausalTransformer.init_cache,
-                        mutable=["cache"])[1]["cache"]
-    prefill, written = model.apply({**variables, "cache": cache}, tokens[:, :-1], decode=True,
-                                   mutable=["cache"])
-    step, _ = model.apply({**variables, "cache": written["cache"]}, tokens[:, -1:], decode=True,
-                          mutable=["cache"])
-    return np.concatenate([np.asarray(prefill, np.float64), np.asarray(step, np.float64)], axis=1)
-
-
-@pytest.mark.parametrize("devices", [1, pytest.param(2, marks=pytest.mark.mesh(devices=2))])
-def test_a_run_loads_with_its_projections_packed_as_a_source_does(tmp_path, devices):
-    """A run's task reads its decoder's query, key and value projections, and its MLP's gate and up
-    projections, each packed into one kernel, as a source's does: its prefill and cached decode
-    logits are as exact as the run's unpacked weights', both from the unpacked weights' float64
-    logits, and it draws what they draw. Each packed kernel is placed as the layout places it, and
-    every weight packing left alone keeps the sharding the run restored it with. A run's reader
-    packed none, so each decode step multiplied three times where a source's multiplied once."""
-    from dew.sampling import Sampling
-    from dew.training import Layout, MeshSpec
-
-    make_lm_run(tmp_path)
-    mesh = MeshSpec(fsdp=devices).build(jax.devices()[:devices])
-    task = dew.pipeline(str(tmp_path), mesh=mesh, layout=Layout(min_shard=1))
-    unpacked = TextGeneration.from_run(str(tmp_path), mesh=mesh, layout=Layout(min_shard=1))
-    layer = task.variables["params"]["layers_0"]
-    assert "qkv_proj" in layer["self_attn"] and not {"q_proj", "k_proj", "v_proj"} & set(layer["self_attn"])
-    assert "gate_up_proj" in layer["mlp"] and not {"gate_proj", "up_proj"} & set(layer["mlp"])
-    packed_paths = {("layers_0", "self_attn", "qkv_proj"), ("layers_0", "mlp", "gate_up_proj")}
-    placed = Layout(min_shard=1).shardings(mesh_of(task.variables), task.variables)
-    for path, leaf in jax.tree_util.tree_leaves_with_path(task.variables["params"]):
-        names = tuple(key.key for key in path)
-        if names[:3] in packed_paths:
-            expected = placed["params"]
-            for name in names:
-                expected = expected[name]
-        else:
-            expected = unpacked.variables["params"]
-            for name in names:
-                expected = expected[name]
-            expected = expected.sharding
-        assert leaf.sharding.is_equivalent_to(expected, leaf.ndim), names
-    tokens = jnp.asarray(np.random.default_rng(0).integers(1, 250, (2, 8)), jnp.int32)
-    packed_logits = decoded(task.model, task.variables, tokens)
-    unpacked_logits = decoded(unpacked.model, unpacked.variables, tokens)
-    with jax.enable_x64(new_val=True):
-        truth = decoded(unpacked.model.clone(dtype=jnp.float64), widened(unpacked.variables), tokens)
-    assert_as_exact_as_the_reference(packed_logits, unpacked_logits, truth, "the packed logits")
-    greedy = Sampling(temperature=0, eos_token_ids=255)
-    np.testing.assert_array_equal(task("the ", key=2, sampling=greedy).host().tokens,
-                                  unpacked("the ", key=2, sampling=greedy).host().tokens)
 
 
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
