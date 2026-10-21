@@ -463,13 +463,22 @@ def _scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
     are the whole of its pullback (`_pulled`). They are its reverse-mode pullback's transpose applied to
     each input's ones, on the hook's own tile and layouts, so a hook through a `jax.custom_vjp`
     differentiates as the reference's does and a hook reads its arguments at the ranks it is called
-    with. Without a hook, the logits and no slopes."""
+    with. An integer parameter has no derivative: its slopes are zeros. Without a hook, the logits and
+    no slopes."""
     if score_mod is None:
         return logits, None
-    inputs = (logits, *params)
-    out, pull = jax.vjp(lambda s, *values: score_mod(s, q_pos, k_pos, *values), *inputs)
     if not slopes:
-        return out.astype(jnp.float32), None
+        return score_mod(logits, q_pos, k_pos, *params).astype(jnp.float32), None
+    floating = [index for index, param in enumerate(params) if jnp.issubdtype(param.dtype, jnp.floating)]
+
+    def scored(s, *wide):
+        values = list(params)
+        for index, value in zip(floating, wide, strict=True):
+            values[index] = value
+        return score_mod(s, q_pos, k_pos, *values)
+
+    inputs = (logits, *(params[index] for index in floating))
+    out, pull = jax.vjp(scored, *inputs)
     along = jax.linear_transpose(pull, out)
 
     def slope(index):
@@ -477,7 +486,9 @@ def _scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
                                 for place, x in enumerate(inputs)))
         return entries.astype(jnp.float32)
 
-    return out.astype(jnp.float32), tuple(slope(index) for index in range(len(inputs)))
+    differentiated = {index: slope(place + 1) for place, index in enumerate(floating)}
+    return out.astype(jnp.float32), (slope(0), *(differentiated.get(index, jnp.zeros_like(logits))
+                                                  for index in range(len(params))))
 
 
 def _pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...]):
