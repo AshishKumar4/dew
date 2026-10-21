@@ -721,11 +721,16 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
                                       prompt_rows=part == 'sentence') for part in ('sentence', 'window')])
 
     loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype='float32')
-    # The float64 arm on the host, its kernels chosen as a CPU's: the 4B in float64 outgrows a 40 GB GPU,
-    # and float64 is float64 on either.
-    host = jax.devices('cpu')[0]
-    with jax.enable_x64(new_val=True), jax.default_device(host), generation.assumed('cpu'):
-        variables = jax.device_put(widened(loaded.variables), host)
+    # The float64 arm on the default device, a GPU's float64 units where one runs the test (IEEE
+    # double, as the host's), its kernels chosen as a CPU's, the portable math: the fp32 weights leave
+    # the device first, so its 32 GB of float64 weights are the only copy on it.
+    weights = jax.device_get(loaded.variables)
+    for leaf in jax.tree.leaves(loaded.variables):
+        if isinstance(leaf, jax.Array):
+            leaf.delete()
+    with jax.enable_x64(new_val=True), generation.assumed('cpu'):
+        variables = jax.device_put(widened(weights))
+        del weights
         for loops, mode, run in recorder.RUNS:
             key = recorder.name(loops, mode, run)
             wide = with_cache(loaded.model.with_passes(loops), mode).clone(dtype=jnp.float64)
