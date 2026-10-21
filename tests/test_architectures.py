@@ -119,6 +119,12 @@ PREDICTOR = {"grid": GRID, "emb_features": 32, "predictor_features": 16,
 
 VOCAB = 64
 SEQ_LEN = 16
+LONG_SEQ_LEN = 128
+"""The rows of a cell whose float32 error is heavy-tailed over draws, four draws in 64 holding most
+of it (Gemma 3n's, where float32 now and then takes the other branch of the AltUp clamp or the
+sparsity cutoff than float64 does, and Qwen 3.5's): longer rows put more such events in each draw,
+so check 1's pooled ratio resolves over a sized count of draws, where SEQ_LEN's rows left the
+reference compared with itself unresolved within 512."""
 LM = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 2,
       "num_kv_heads": 1, "mlp_features": 64, "max_seq_len": SEQ_LEN}
 
@@ -227,8 +233,8 @@ CASES = [
         "layer_types": ("sliding_attention", "sliding_attention"),
         "kinds": {"sliding_attention": {"window": 4, "rope_theta": 1e4}},
         "altup": {"num_inputs": 3}, "laurel_rank": 8,
-        "per_layer_input_dim": 8, "kv_shared_layers": (1,),
-    }, seq_len=SEQ_LEN, label="gemma3n"),
+        "per_layer_input_dim": 8, "kv_shared_layers": (1,), "max_seq_len": LONG_SEQ_LEN,
+    }, seq_len=LONG_SEQ_LEN, label="gemma3n"),
     # Qwen3.5's stack: gated delta net layers on the linear_attention kind,
     # one gated full-attention layer with the sliced partial rotary. The
     # delta net's projections are wide enough to cross the shard threshold,
@@ -241,8 +247,8 @@ CASES = [
         "kinds": {"linear_attention": {"mixer": {
             "class": "gated_delta_net", "fields": {"linear_num_key_heads": 2,
             "linear_num_value_heads": 4, "linear_key_head_dim": 8,
-            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}}},
-        seq_len=SEQ_LEN, label="qwen35"),
+            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}},
+        "max_seq_len": LONG_SEQ_LEN}, seq_len=LONG_SEQ_LEN, label="qwen35"),
 ]
 
 IDS = [case.name for case in CASES]
