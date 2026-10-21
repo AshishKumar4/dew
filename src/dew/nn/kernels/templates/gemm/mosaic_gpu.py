@@ -261,12 +261,10 @@ def _gmm_alone(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: 
 
 def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
                      multiprocessors: int, interpret, hooks: tuple, sides: tuple) -> tuple:
-    """Dew: `gmm`'s product at a tile two consumer warpgroups compute, a half of its columns each, beside a
-    producer warpgroup issuing the loads (as JAX's `hopper_matmul_mgpu`), with `tiles.cluster` 2 a pair of
-    multiprocessors on two row tiles of one group, which load each step's matrix block once, multicast. A
-    prologue rewrites the stage of `lhs` both read: each rewrites half its rows and waits for the other's
-    before its MMA, keeping one MMA in flight. `lhs` is padded and `lengths` holds the unrouted rows'
-    group last (`gmm`); the outputs keep the padded rows."""
+    """Dew: `gmm` at a tile two consumer warpgroups compute (half its columns each) beside a producer
+    issuing the loads (as `hopper_matmul_mgpu`); `tiles.cluster` 2 pairs two row tiles of one group, which
+    load each matrix block once, multicast. A prologue's consumers each rewrite half the rows' shared stage,
+    then meet. `lhs` is padded, `lengths` ends with the unrouted rows' group (`gmm`)."""
     prologue, prologue_axes, epilogue, epilogue_axes = hooks
     prologue_operands, epilogue_operands = sides
     m, n, k, g = shape
@@ -282,13 +280,9 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
                                  tuple(prologue_axes[i] for i in stepped))
 
     def body(lengths_gmem, lhs_gmem, rhs_gmem, *refs):
-        prologue_gmems = refs[:len(prologue_operands)]
-        side_gmems = refs[len(prologue_operands):len(prologue_operands) + len(epilogue_operands)]
-        o_gmems = refs[len(prologue_operands) + len(epilogue_operands):]
-        grid_m = pl.cdiv(m, block_m * pair) + g  # pairs of row tiles: g groups and the unrouted rows
-        grid_n = n // block_n
-        rhs_columns = (lambda gmem, ni: gmem.at[pl.ds(ni * block_n, block_n)]) if transpose_rhs else (
-            lambda gmem, ni: gmem.at[:, pl.ds(ni * block_n, block_n)])
+        prologue_gmems, side_gmems, o_gmems = _split(refs, len(prologue_operands), len(epilogue_operands))
+        grid_m, grid_n = pl.cdiv(m, block_m * pair) + g, n // block_n  # pairs: g groups, the unrouted rows
+        rhs_columns = functools.partial(_matrix_columns, block_n=block_n, transpose_rhs=transpose_rhs)
 
         def stepped_views(rows):
             return [prologue_gmems[i].at[tuple(rows if axis == 'rows' else slice(None)
@@ -500,6 +494,17 @@ def _meet(halves) -> None:
 def _shared(tiles: Tiles) -> tuple[str, ...]:
     """The axes a block a pair shares is loaded over, multicast: the cluster's, for a pair."""
     return ("cluster",) if tiles.cluster == 2 else ()
+
+
+def _split(refs: tuple, prologue: int, epilogue: int) -> tuple:
+    """Dew: a kernel's refs after its operands: the prologue's side operands, the epilogue's, the outputs."""
+    return refs[:prologue], refs[prologue:prologue + epilogue], refs[prologue + epilogue:]
+
+
+def _matrix_columns(gmem, column_tile, *, block_n: int, transpose_rhs: bool):
+    """Dew: a group's matrix at a column tile: its rows (`transpose_rhs`'s `[width, depth]`) or columns."""
+    columns = pl.ds(column_tile * block_n, block_n)
+    return gmem.at[columns] if transpose_rhs else gmem.at[:, columns]
 
 
 def _rhs_index(transpose_rhs: bool):
