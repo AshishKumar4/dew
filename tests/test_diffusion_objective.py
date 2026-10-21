@@ -464,3 +464,28 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
             return jax.tree.map(np.asarray, gradient(twin, widened(variables), widened(whole)))
 
     assert_as_exact(pooled, alone, draw, "pooled update", seeds=POOLED_SEEDS, truth_fn=truth)
+
+
+def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does():
+    """A step whose variables live on the host runs its loss on the accelerator with the examples'
+    draws the step carries, so it takes the update a resident step takes: a host-master run's draws
+    by the attempt would read other times, noise and dropped conditions, and step elsewhere."""
+    import optax
+
+    from dew.training import Layout, Trainer
+
+    objective = make_objective(unconditional_prob=0.5)
+    batch = make_batch_of(4 * jax.device_count())
+
+    def stepped(layout):
+        trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(3), layout=layout)
+        state, _, _ = trainer.place()
+        run = trainer.compile(state, batch)
+        state, *_ = run(state, batch)
+        return jax.tree.map(np.asarray, state.variables["params"])
+
+    resident = stepped(Layout(min_shard=1, tolerance=1.))
+    host = stepped(Layout(host=("variables",), min_shard=1, tolerance=1.))
+    for (path, got), want in zip(jax.tree_util.tree_leaves_with_path(host), jax.tree.leaves(resident),
+                                 strict=True):
+        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6, err_msg=jax.tree_util.keystr(path))
