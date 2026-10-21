@@ -23,6 +23,8 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 
+from dew.nn.precision import at_least_fp32
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -57,8 +59,12 @@ def dense(spans: KeySpans) -> jax.Array:
 
 
 def _document_extent(query_ids: jax.Array, key_ids: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """The first key index and one past the last carrying each query's id, `[B, Q]` each, the keys' ids
-    in any order; an id no key carries gives an empty extent at 0."""
+    """The first key index and one past the last carrying each query's id, `[B, Q]` int32 each, the keys'
+    ids in any order; an id no key carries, or a call of no keys, gives an empty extent at 0."""
+    if key_ids.shape[-1] == 0:
+        empty = jnp.zeros(query_ids.shape, jnp.int32)
+        return empty, empty
+
     def row(queries, keys):
         order = jnp.argsort(keys, stable=True)
         ordered = keys[order]
@@ -69,47 +75,61 @@ def _document_extent(query_ids: jax.Array, key_ids: jax.Array) -> tuple[jax.Arra
         # the sorted keys are its smallest and largest key index; an index past the end clamps.
         lowest = order[jnp.minimum(first, keys.shape[0] - 1)]
         highest = order[jnp.maximum(last - 1, 0)] + 1
-        return jnp.where(present, lowest, 0), jnp.where(present, highest, 0)
+        return (jnp.where(present, lowest, 0).astype(jnp.int32),
+                jnp.where(present, highest, 0).astype(jnp.int32))
 
     return jax.vmap(row)(query_ids, key_ids)
 
 
 def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_window: int | None = None,
-          chunk: int | None = None, segment_ids=None, lengths: jax.Array | None = None,
-          starts: jax.Array | None = None) -> KeySpans:
+          chunk: int | None = None, positions: tuple[jax.Array, jax.Array] | None = None, segment_ids=None,
+          lengths: jax.Array | None = None, starts: jax.Array | None = None) -> KeySpans:
     """The `KeySpans` of a call of `queries` queries over `keys` keys in `batch` rows, in the terms
     `dew.nn.attention.scaled_dot_product_attention` takes them: `causal` keeps query i to keys 0..i (top
-    left aligned, as jax's `is_causal`); `sliding_window=w` keeps the w - 1 keys before a query and it, or
-    without causality those within w - 1 of it (`window_sides`); `chunk=c` keeps a query to the keys of
-    its own chunk of c (`chunk_mask`, Llama 4's, under causality those before it); `segment_ids`, one `[B,
-    S]` array or a `CrossDocuments`, keeps each query to its document's keys, under causality or a window
-    a cross call's queries aligned to their document's last keys (`aligned_places`); `lengths` `[B]` end
-    each row's keys and `starts` `[B]` begin them."""
+    left aligned, as jax's `is_causal`); `sliding_window=w` keeps the keys `window_sides` gives, the w - 1
+    before a query and it, or without causality those within w - 1 of it; `chunk=c` keeps a query to the
+    keys of its own chunk of c places (`chunk_mask`, Llama 4's, under causality those before it), the
+    queries' `[B, Q]` and keys' `[B, K]` places `positions`, which count up by one within each document as
+    Dew's coordinates do, by default their indices; `segment_ids`, one `[B, S]` array or a
+    `CrossDocuments` (its keys in ascending id order, as it takes them), keeps each query to its
+    document's keys, under causality or a window a cross call's queries aligned to their document's last
+    keys (`aligned_places`); `lengths` `[B]` end each row's keys and `starts` `[B]` begin them. The ids
+    keep their own dtype, so no two documents share one."""
+    from dew.nn.attention import window_sides
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
 
-    place = jnp.broadcast_to(jnp.arange(queries, dtype=jnp.int32)[None, :], (batch, queries))
+    index = jnp.broadcast_to(jnp.arange(queries, dtype=jnp.int32)[None, :], (batch, queries))
+    place, first = index, jnp.zeros((batch, queries), jnp.int32)
     start = jnp.zeros((batch, queries), jnp.int32)
     end = jnp.full((batch, queries), keys, jnp.int32)
     query_ids = key_ids = None
     if segment_ids is not None:
-        query_ids, key_ids = (ids.astype(jnp.int32) for ids in document_ids(segment_ids))
+        query_ids, key_ids = document_ids(segment_ids)
         first, last = _document_extent(query_ids, key_ids)
         padding = query_ids == 0
         start = jnp.where(padding, 0, jnp.maximum(start, first))
         end = jnp.where(padding, 0, jnp.minimum(end, last))
-        if isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None):
+        if isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None) and keys > 0:
             # A cross call's query sits at its rank among its document's keys, counted from the
             # document's first key (`cross_document_mask`).
             place = first + aligned_places(segment_ids).astype(jnp.int32)
     if causal:
         end = jnp.minimum(end, place + 1)
     if sliding_window is not None:
-        start = jnp.maximum(start, place - sliding_window + 1)
-        if not causal:
-            end = jnp.minimum(end, place + sliding_window)
-    if chunk is not None:
-        start = jnp.maximum(start, (place // chunk) * chunk)
-        end = jnp.minimum(end, (place // chunk + 1) * chunk)
+        # No two places of the call lie further apart than its queries and keys, so a wider window
+        # keeps what that one does, and its bounds stay within int32.
+        before, after = window_sides(causal, min(sliding_window, queries + keys + 1))
+        start = jnp.maximum(start, place - before)
+        end = jnp.minimum(end, place + after + 1)
+    if chunk is not None and keys > 0:
+        query_places, key_places = (
+            (index, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
+            if positions is None else (positions[0].astype(jnp.int32), positions[1].astype(jnp.int32)))
+        # The key index of the query's document's place 0: its first key's index less that key's place.
+        origin = first - jnp.take_along_axis(key_places, first, axis=1)
+        cut = origin + (query_places // chunk) * chunk
+        start = jnp.maximum(start, cut)
+        end = jnp.minimum(end, cut + chunk)
     if lengths is not None:
         end = jnp.minimum(end, lengths.astype(jnp.int32)[:, None])
     if starts is not None:
@@ -212,8 +232,9 @@ class Param:
 @dataclasses.dataclass(frozen=True)
 class Initial:
     """Where each query's online softmax starts: its running maximum `m` `[B, H, Q]` (natural log), its
-    unnormalized denominator `total` `[B, H, Q]` and numerator `acc` `[B, H, Q, Dv]`, fp32. Sinks are `m`
-    the head's sink, `total` one and `acc` zero (`sinks`); a resumed partial is its own state."""
+    unnormalized denominator `total` `[B, H, Q]` and numerator `acc` `[B, H, Q, Dv]`, fp32 or wider.
+    Sinks are `m` the head's sink, `total` one and `acc` zero (`sinks`); a resumed partial is its own
+    state."""
 
     m: jax.Array
     total: jax.Array
@@ -221,22 +242,26 @@ class Initial:
 
 
 def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
-    """The `Initial` of one value-free logit a query head, `values` `[H]`."""
-    m = jnp.broadcast_to(values.astype(jnp.float32)[None, :, None], (batch, values.shape[0], queries))
-    return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), jnp.float32))
+    """The `Initial` of one value-free logit a query head, `values` `[H]`, in fp32 or their own wider
+    dtype (`at_least_fp32`)."""
+    wide = at_least_fp32(values.dtype)
+    m = jnp.broadcast_to(values.astype(wide)[None, :, None], (batch, values.shape[0], queries))
+    return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide))
 
 
+@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Hooks:
     """The template's hooks, each absent where None: `score_mod(s, q_pos, k_pos, *params)` on the scaled
     logits `s` `[..., q, k]` with `q_pos` `[q, 1]` and `k_pos` `[1, k]` the entries' query and key
     indices, pointwise in the entries; `initial` the softmax's start; `output_mod(o, *params)` on the
-    normalized output `[..., q, Dv]`."""
+    normalized output `[..., q, Dv]`. A pytree whose callables are static and whose parameters and state
+    are its leaves, so a compiled call takes new values of them."""
 
-    score_mod: Callable | None = None
+    score_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
     score_params: tuple[Param, ...] = ()
     initial: Initial | None = None
-    output_mod: Callable | None = None
+    output_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
     output_params: tuple[Param, ...] = ()
 
 
@@ -290,7 +315,8 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     `output_mod` applied before it rounds to the query's dtype. A query that sees no key and starts from
     no state gives zeros. With `residuals`, also each query's running maximum `m` and denominator `total`
     `[B, H, Q]` (natural log, unnormalized), fp32, a query that sees no key and starts from no state
-    holding 0 for both, so every residual is finite. No hooks where `hooks` is None."""
+    holding 0 for both, so every residual is finite; a softmax resumed from them (`Initial`) starts such
+    a query from `m = -inf`. No hooks where `hooks` is None."""
     hooks = Hooks() if hooks is None else hooks
     batch, queries, heads, _ = query.shape
     kv_heads = key.shape[2]
@@ -307,7 +333,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
             m0 = hooks.initial.m[row, head].astype(wide)
             total0 = hooks.initial.total[row, head].astype(wide)
             acc0 = hooks.initial.acc[row, head].astype(wide)
-        m = jnp.maximum(m0, jnp.max(s, axis=-1))
+        m = jnp.maximum(m0, jnp.max(s, axis=-1, initial=-jnp.inf))
         safe = jnp.where(jnp.isfinite(m), m, 0)
         p = jnp.exp(s - safe[:, None])
         carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - safe), 0)
