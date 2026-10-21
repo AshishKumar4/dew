@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from reference_error import (
     FACTOR,
+    REDRAW,
     Inconclusive,
     assert_as_exact,
     assert_as_exact_as_the_reference,
@@ -14,6 +15,7 @@ from reference_error import (
     declared_seeds,
     distance,
     indexed_recording,
+    input_digest,
     seeds_for,
 )
 
@@ -200,7 +202,8 @@ def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_pa
     truth = x.astype(np.float64) ** 2 - 1
     path = tmp_path / "recorded.npz"
     np.savez(path, **{"site.input.x": x, "site.reference.y": x * x - np.float32(1),
-                      "site.truth.y": truth, "site.seeds": np.int64(seeds)})
+                      "site.truth.y": truth, "site.seeds": np.int64(seeds),
+                      "site.redraw": np.int64(REDRAW)})
     assert declared_seeds(path) == {"site": seeds}
     with np.load(path) as stored:
         draw, reference, truth_fn = indexed_recording(dict(stored), "site", seeds)
@@ -287,9 +290,19 @@ def test_a_recording_keeps_the_confirmed_count_where_the_proxy_planned_more():
     assert planned > seeds and len(recorded["site.input.x"]) == 5 * seeds
 
 
+def test_an_input_digest_tells_apart_a_scalar_from_its_vector_and_two_formats_of_one_width():
+    """Inputs drawn again in another shape or format with the same bytes are not the recorded ones."""
+    assert input_digest({"x": np.float32(1)}) != input_digest({"x": np.ones(1, np.float32)})
+    one = np.array([1.0, 2.0], jnp.float8_e4m3fn)
+    assert input_digest({"x": one}) != input_digest({"x": one.view(jnp.float8_e4m3fnuz)})
+    strided = np.arange(12, dtype=np.float32).reshape(3, 4)[:, ::2]
+    assert input_digest({"x": strided}) == input_digest({"x": np.ascontiguousarray(strided)})
+
+
 def test_a_recording_of_outputs_alone_draws_its_inputs_again(tmp_path):
     """A generator's seeded draw, called again by the test (`inputs_of`), stands in for recorded inputs:
-    the recording holds the outputs alone and is judged as one that holds both."""
+    the recording holds the outputs alone and is judged as one that holds both. A draw that changed since
+    the recording is refused by its digest, as is `inputs_of` on a recording with no digest."""
     from tool_support import load
 
     recorder = load("recorded_references")
@@ -312,3 +325,9 @@ def test_a_recording_of_outputs_alone_draws_its_inputs_again(tmp_path):
     drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw)
     assert_as_exact(jax.jit(lambda index, inputs: squared(inputs)), reference, drawn, "drawn again",
                     seeds=seeds, truth_fn=truth)
+    changed, _, _ = indexed_recording(recorded, "site", seeds, inputs_of=lambda seed: draw(seed + 1))
+    with pytest.raises(AssertionError):
+        changed(0)
+    undigested = {name: value for name, value in recorded.items() if name != "site.input_digest"}
+    with pytest.raises(AssertionError):
+        indexed_recording(undigested, "site", seeds, inputs_of=draw)
