@@ -31,6 +31,13 @@ configuration, which cuDNN refuses on an H100, so that test compiles in its
 own process without it (tests/test_quantization.py)."""
 
 
+def without_deterministic_ops(flags: str) -> str:
+    """XLA `flags` without the cuda lane's deterministic-ops flag, under which a process keeps no picks
+    (`dew.cache.keeps_picks`) and XLA refuses cudnn attention (openxla/xla#46500)."""
+    name = REPEATABLE_GPU_FLAGS[0].split("=")[0]
+    return " ".join(flag for flag in flags.split() if not flag.startswith(name))
+
+
 def configure_lane(environ: MutableMapping[str, str]) -> None:
     """Set the environment a lane runs the suite under, before jax opens a backend.
 

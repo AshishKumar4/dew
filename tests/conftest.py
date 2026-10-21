@@ -151,9 +151,8 @@ def without_deterministic_ops(monkeypatch):
     variable at the compile above, so taking the flag back out of the
     environment leaves this executable's reductions as they are and lets a
     test reach the cudnn path it is about."""
-    kept = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-            if not flag.startswith("--xla_gpu_deterministic_ops")]
-    monkeypatch.setenv("XLA_FLAGS", " ".join(kept))
+    flags = os.environ.get("XLA_FLAGS", "")
+    monkeypatch.setenv("XLA_FLAGS", lane_environment.without_deterministic_ops(flags))
 
 
 @pytest.fixture
