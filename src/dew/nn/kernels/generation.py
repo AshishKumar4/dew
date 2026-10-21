@@ -116,6 +116,10 @@ class GpuTarget:
     clock_hz: float | None = None
     memory_bandwidth: float | None = None
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    load_latency: float | None = None
+    """The generation's global-memory load latency in multiprocessor clocks, as a pointer chase measures
+    it (the kernel cost model's waiting term, `dew.nn.kernels.templates.cost`); None where no
+    measurement states it."""
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
@@ -177,6 +181,9 @@ class GpuTarget:
 # lane a clock: 64 lanes an SM on GA100 -> 128 (A100 19.5 TF over 108 SMs x 1410 MHz), 128 on GA10x,
 # AD10x, GH100 and GB20x -> 256 (A10 31.2 TF over 72 x 1695 MHz, L4 30.3 TF over 58 x 2040 MHz; the
 # GH100 and Blackwell whitepapers' 128 fp32 lanes an SM).
+# Global-memory load latency in clocks, a pointer chase's (Luo et al., "Benchmarking and Dissecting the
+# Nvidia Hopper GPU Architecture", IPDPS 2024, arXiv 2402.13499, Table IV): A100 466.3, H800 478.8,
+# RTX 4090 541.5; sm86 and the Blackwell generations are unmeasured there.
 # Opted-in shared memory per block, in KiB: Turing64, A100163, Ampere/Ada/RTX
 # Blackwell99, Hopper227. The SM reservation is already excluded:
 # https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
@@ -193,7 +200,13 @@ class GpuTarget:
 # products, 8192 tokens x 2048 -> 768 over 64 experts: Dew's Pallas grouped matmul 0.60/2.41 on an
 # A100 and 0.27/0.86 on an H100, XLA's ragged dot 7.54/33.99 and 2.62/14.51; tokamax's ragged_dot
 # has no Triton kernel in 0.0.15 and its Mosaic one's backward takes no mixed dtypes. No tokamax
-# implementation is a row's kernel; Dew calls its own through tokamax's Op and tuning.
+# implementation is a row's kernel; Dew calls its own through tokamax's Op and tuning. Decode
+# (bf16, one query, A100-SXM4-40GB, 2026-10-21, ced5d3ad9, synchronized ms by tuning.samples): Qwen3-0.6B's
+# 16/8 heads of 128 at 1 to 128 rows over 2048 to 131072 keys, the decode kernel 1.57x faster than
+# cuDNN in geometric mean over the 28 shapes, faster in 21, at most 1.19x the fastest arm (cuDNN
+# 2.78 ms and the decode kernel 0.42 at one row of 131072 keys; cuDNN's 7 wins at 4, 16 and 128 rows
+# by 0.7 to 18%, 0.56 ms against 0.47 at 16 rows of 8192); Qwen3.5-0.8B's 8/2 heads of 256,
+# which cuDNN does not take on sm80, the decode kernel at 1.04x the fastest in geometric mean.
 TARGETS = {target.generation: target for target in (
     # T4: 40 SMs at a 1590 MHz boost, 320 GB/s; 65 TF fp16 summed in fp32 and 8.1 TF fp32 (the T4
     # datasheet) -> 1024 and 128 an SM a clock.
@@ -203,12 +216,12 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash',
-               'attention_packed': 'flash', 'xla_triton_gemm': 'off',
+               'attention_packed': 'flash', 'xla_triton_gemm': 'off', 'decode': 'decode',
                'rms_norm': 'pallas', 'swiglu': 'pallas', 'gate_up': 'joined', 'delta_gates': 'joined',
                'gated_delta_rule': 'fla', 'ssd': 'pallas'},
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), head_tile=(4096, 8192),
               multiprocessors=108, clock_hz=1410e6, memory_bandwidth=2039e9,
-              tensor_rates={'16bit': 2048, 'tf32': 1024, 'fp32': 128}),
+              tensor_rates={'16bit': 2048, 'tf32': 1024, 'fp32': 128}, load_latency=466.3),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'attention_narrow': 'flash'},
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
               clock_hz=1695e6, memory_bandwidth=600e9,
@@ -219,7 +232,7 @@ TARGETS = {target.generation: target for target in (
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
                'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), head_tile=(4096, 8192),
               multiprocessors=58, clock_hz=2040e6, memory_bandwidth=300e9,
-              tensor_rates={'16bit': 1024, 'tf32': 512, 'fp32': 256}),
+              tensor_rates={'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash', 'attention_packed': 'flash', 'xla_triton_gemm': 'off',
@@ -231,7 +244,7 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12}}, wgmma=True, multiprocessors=132,
               clock_hz=1830e6, memory_bandwidth=3350e9,
-              tensor_rates={'16bit': 4096, 'tf32': 2048, 'fp32': 256}),
+              tensor_rates={'16bit': 4096, 'tf32': 2048, 'fp32': 256}, load_latency=478.8),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               {'attention': 'flash', 'gated_delta_rule': 'fla'},
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
@@ -270,7 +283,7 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
         device = jax.local_devices()[0]
         generation, kind = device_generation(), device.device_kind
         real = device.platform == 'gpu' and ASSUMED.get() is None
-        if real:
+        if real and gpu_placed():
             _one_kind(jax.devices())
         target = gpu_target(kind)
         if target.generation != generation:
@@ -347,13 +360,17 @@ def _clocks(ordinal: int) -> tuple[tuple[str, float], ...]:
 
 
 def _one_kind(devices) -> None:
-    """Refuse a run over GPUs of more than one kind: every process traces the same program, so the
-    kernel choices each makes from its own GPU's facts must be the same, which GPUs of one kind give."""
-    kinds = sorted({device.device_kind for device in devices})
+    """Refuse a run whose processes read their facts from GPUs of different kinds: every process traces
+    the same program, so the kernel choices each makes from its first GPU's facts (`gpu_target`) must be
+    the same, which first GPUs of one kind give. A process's other GPUs take no part."""
+    first = {}
+    for device in sorted(devices, key=lambda device: device.id):
+        first.setdefault(device.process_index, device.device_kind)
+    kinds = sorted(set(first.values()))
     if len(kinds) > 1:
-        raise ValueError(f"the run's GPUs are of {len(kinds)} kinds ({', '.join(kinds)}); Dew's kernel "
-                         "choices read one GPU's facts, the same in every process, so a run takes GPUs "
-                         "of one kind")
+        raise ValueError(f"the run's processes read their kernel facts from GPUs of {len(kinds)} kinds "
+                         f"({', '.join(kinds)}); each traces the same program, so their first GPUs must "
+                         "be of one kind")
 
 
 def runtime_facts(target: GpuTarget, device) -> GpuTarget:

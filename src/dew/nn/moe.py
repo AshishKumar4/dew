@@ -39,7 +39,7 @@ from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels.generation import backend, ran_kernel, route, triton_runs
 from .kernels.grouped_matmul import grouped_projection, kernel_refusal, ragged_dot_refusal, xla_ragged_dot
 from .kernels.selection import forced
-from .precision import at_least_fp32, rounded_operand
+from .precision import asks_default_precision, at_least_fp32, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
 from .sharding import (
     EXPERT_AXIS,
@@ -417,10 +417,8 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
     chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), precision)
     if chosen == 'pallas' and seen_whole(x) and seen_whole(kernel):
-        # The interpreter only where the computation runs on the CPU: a GPU's lowering would otherwise
-        # carry the Mosaic GPU interpreter's ordered effects in a branch it does not take.
-        interpreted = implementation == 'pallas' and backend() == 'cpu'
-        return grouped_projection(x, kernel, group_sizes, compute, interpreted)
+        return grouped_projection(x, kernel, group_sizes, compute, implementation == 'pallas',
+                                  not asks_default_precision(precision, configured=True))
     return _projection(x, kernel, group_sizes, dtype, precision)
 
 

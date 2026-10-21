@@ -35,6 +35,7 @@ from s3fs import S3FileSystem
 
 from dew.cache import dew_cache_dir
 from dew.data.retention import LocalRetention
+from dew.files import write_atomically
 from dew.records import JSON, json_value
 
 
@@ -478,11 +479,7 @@ class Store:
         if not local(fs):
             fs.pipe_file(path, payload)
             return
-        with tempfile.NamedTemporaryFile(dir=str(Path(path).parent), delete=False) as pending:
-            pending.write(payload)
-            pending.flush()
-            os.fsync(pending.fileno())
-        os.replace(pending.name, path)
+        write_atomically(path, payload)
 
     def verified(self, payload: bytes) -> ObjectInfo:
         self.put_if_absent(payload)
@@ -620,11 +617,7 @@ class Store:
                 if previous != version:
                     raise PreconditionFailed(self.url)
                 if scheme == "file":
-                    with tempfile.NamedTemporaryFile(dir=str(Path(path).parent), delete=False) as pending:
-                        pending.write(payload)
-                        pending.flush()
-                        os.fsync(pending.fileno())
-                    os.replace(pending.name, path)
+                    write_atomically(path, payload)
                 else:
                     fs.pipe_file(path, payload)
                 return hashlib.sha256(payload).hexdigest()

@@ -537,10 +537,10 @@ def test_chunks_over_the_widest_places_neither_wrap_nor_alias():
 
 
 def test_cross_documents_of_two_id_widths_align_as_one():
-    """Another sequence's documents whose queries' and keys' ids differ in width, negative ids among
-    them: each query aligns within its own document, by an independent causal document mask."""
-    # Keys in the documents' order, padding's 0 last: a negative id as an unsigned word follows 3.
-    for query_ids, key_ids in (([[-1]], [[-1]]), ([[-1, 3, -1]], [[3, 3, -1, -1]])):
+    """Another sequence's documents whose queries' and keys' ids differ in width: each query aligns
+    within its own document, by an independent causal document mask: the int8 queries' 127 is not the
+    int16 keys' 383, which narrowed to int8 would be."""
+    for query_ids, key_ids in (([[127]], [[127]]), ([[127, 3]], [[3, 127, 383, 383]])):
         cross = CrossDocuments(jnp.asarray(query_ids, jnp.int8), jnp.asarray(key_ids, jnp.int16))
         spans = template.spans(len(query_ids[0]), len(key_ids[0]), 1, causal=True, segment_ids=cross)
         queries, keys = np.asarray(query_ids[0]), np.asarray(key_ids[0])

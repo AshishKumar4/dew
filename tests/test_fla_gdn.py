@@ -33,6 +33,11 @@ pytestmark = pytest.mark.kernel
 
 INTERPRETED = jax.default_backend() != "gpu"
 
+SHARDED_SEEDS = {False: 64, True: 8}
+"""The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`) with a decay per
+head and per key dimension, sized by `seeds_for`: the fewest for which one device compared with itself
+resolves the factor."""
+
 
 def relative(got, want) -> float:
     want = np.asarray(want, np.float64)
@@ -832,28 +837,32 @@ def test_the_rule_on_the_port_takes_any_chunk_size_and_mixed_dtypes_in_their_com
 def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split, per_key):
     """`fla_rule` over rows split two ways, or heads split two ways (each shard's key head with the
     value heads it serves), with a decay per head or per key dimension (Kimi's delta attention), runs
-    per shard (`assert_runs_per_shard`): its output, final memory and gradients within the float64
-    gate of one device's, and no operand moved between devices."""
+    per shard (`assert_runs_per_shard`): its output, final memory and gradients on par with one
+    device's over the site's draws, and no operand moved between devices."""
     from jax.sharding import Mesh, PartitionSpec
 
-    keys = jax.random.split(jax.random.key(43), 6)
-    q = l2norm(jax.random.normal(keys[0], (2, 80, 2, 64)))
-    k = l2norm(jax.random.normal(keys[1], q.shape))
-    v = jax.random.normal(keys[2], (2, 80, 4, 64))
-    g = -jnp.exp(jax.random.normal(keys[3], (*v.shape[:3], *(64,) * per_key)) - 3.0)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], v.shape[:3]))
-    do = jax.random.normal(keys[5], v.shape)
-    every = jnp.ones((v.shape[0], 4, 64, 64))
+    do = jax.random.normal(jax.random.split(jax.random.key(43), 6)[5], (2, 80, 4, 64))
+    every = jnp.ones((do.shape[0], 4, 64, 64))
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(43 + seed), 6)
+        q = l2norm(jax.random.normal(keys[0], (2, 80, 2, 64)))
+        k = l2norm(jax.random.normal(keys[1], q.shape))
+        v = jax.random.normal(keys[2], (2, 80, 4, 64))
+        g = -jnp.exp(jax.random.normal(keys[3], (*v.shape[:3], *(64,) * per_key)) - 3.0)
+        return q, k, v, g, jax.nn.sigmoid(jax.random.normal(keys[4], v.shape[:3]))
 
     def repeated(*args):
         return recurrence(*args, jnp.zeros_like(every, args[0].dtype))
 
-    with jax.enable_x64(new_val=True):
-        operands = widened((q, k, v, g, beta, do, every))
-        truth = jax.tree.map(np.asarray, through(repeated, *operands[-2:])(*operands[:-2]))
+    def exact(*operands):
+        return through(repeated, *widened((do, every)))(*operands)
+
     spec = PartitionSpec(*(axis if dim in split else None for dim in range(3)))
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
-    assert_runs_per_shard(through(fla_rule, do, every), (q, k, v, g, beta), [spec] * 5, mesh, truth)
+    assert_runs_per_shard(through(fla_rule, do, every), draw, [spec] * 5, mesh,
+                          f"fla rule split over {axis}, {'per key' if per_key else 'per head'}",
+                          seeds=SHARDED_SEEDS[per_key], truth_fn=exact)
 
 
 @pytest.mark.gpu(reason="the port's kernels lower to Triton calls only on a GPU")
