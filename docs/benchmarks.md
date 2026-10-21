@@ -107,7 +107,7 @@ python tools/benchmark_data.py data:oxford-flowers --batch 8 \
     --data.source <prepared version directory>
 ```
 
-The dataset was Oxford Flowers 102 from local TFDS ArrayRecord files: 8189 records, resized to 64px, with flip and jitter augmentation and CLIP tokenization per record. The measurement predates the recipe API. The current equivalent is Images over a prepared TFDS Source, with explicit augmentation and caption encoding; preparation remains separate.
+The dataset was Oxford Flowers 102 from local TFDS ArrayRecord files: 8189 records, resized to 64px, with flip and jitter augmentation and CLIP tokenization per record. The measurement predates the chain API, and the command above is the one it ran. Today the tool times a run's chain, `python tools/benchmark_data.py --steps 100 --data run.py`, here the `images` preset over a prepared `TFDS` source with `augment=True` and its captions; preparation remains separate.
 
 | grain workers | samples/s | p50 step | p95 step |
 |---------------|-----------|----------|----------|
