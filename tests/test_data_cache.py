@@ -1062,6 +1062,41 @@ def test_a_memory_read_measures_the_steps_before_a_view_and_its_cache_as_uncache
     assert batches(str(tmp_path / "cache")) == expected
 
 
+@dataclass(frozen=True)
+class Stamped:
+    """Notes the source position a read gives its record."""
+
+    identity = "stamped@1"
+
+    def __call__(self, index, row):
+        return {**row, "at": index}
+
+
+def test_a_step_reading_its_index_in_a_cache_after_a_memory_read_step_reads_the_source_position(tmp_path):
+    """A store missing some inputs, a step a memory read runs over it, a shuffle, then a step that
+    reads its record's index and a cache: the cached step reads each record's place in the store,
+    as the uncached one does."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    source = Memory([None if index in (0, 4) else {"id": index} for index in range(8)])
+
+    def batches(cache):
+        stepped = Pipeline(source).map(Same()).shuffle(0).map_with_index(Stamped(), identity="stamped@1")
+        chain = (stepped if cache is None else stepped.cache(cache)).repeat(1).batch(1)
+        reader = compile(chain, read="memory", loading=loading).train(DataPartition())
+        try:
+            return [(int(batch["id"][0]), int(batch["at"][0])) for batch in reader]
+        finally:
+            reader.close()
+
+    expected = batches(None)
+    assert sorted(expected) == [(index, index) for index in range(8) if index not in (0, 4)]
+    assert batches(str(tmp_path / "cache")) == expected
+
+
 def test_a_streamed_view_before_a_cache_is_refused_with_its_reason(tmp_path):
     """A streamed read fills its cache shard by shard, so a shuffle written before the cache is
     refused there, naming the reads that support it."""
