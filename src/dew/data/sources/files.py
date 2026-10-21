@@ -643,6 +643,15 @@ class Files(Dataset):
     def metadata(self) -> Mapping[str, object]:
         return self._metadata
 
+    def stated(self) -> Mapping[str, object]:
+        """What its committed manifest says, or a parquet or Arrow store's schema names (class
+        names), no record read."""
+        if self.committed is not None:
+            return self._metadata
+        if self.kind in ("parquet", "arrow"):
+            return {"class_names": self._metadata.get("class_names", {})}
+        return {}
+
     @cached_property
     def _metadata(self) -> Mapping[str, object]:
         if self.committed is not None:

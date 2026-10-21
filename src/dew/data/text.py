@@ -317,7 +317,15 @@ class HFTokenizer:
         return f"{self.__class__.__name__}(name={self.name!r})"
 
 
-def tokenizer_name(tokenizer: str | PreTrainedTokenizerBase) -> str:
+@runtime_checkable
+class SavedTokenizer(Protocol):
+    """A tokenizer object Dew names by the files it saves (`tokenizer_name`), such as a transformers
+    tokenizer: a preset or a step given one reads it by that name."""
+
+    def save_pretrained(self, save_directory: str, /) -> tuple[str, ...]: ...
+
+
+def tokenizer_name(tokenizer: str | SavedTokenizer) -> str:
     """A tokenizer as the name Dew's steps carry: a name as it is, and a
     transformers tokenizer object saved once to a directory named for its
     files' hash, which every worker reads and every run hashes alike."""
@@ -347,7 +355,7 @@ def tokenizer_name(tokenizer: str | PreTrainedTokenizerBase) -> str:
     return str(directory)
 
 
-def tokenize(tokenizer: str | PreTrainedTokenizerBase = "byte", *, field: str = "text",
+def tokenize(tokenizer: str | SavedTokenizer = "byte", *, field: str = "text",
              eos: bool | None = None) -> Tokenize:
     """A record step that encodes the text in `field` to token ids under
     "text", each document ended by the tokenizer's EOS with `eos`, or where
@@ -370,8 +378,9 @@ class Tokenize(grain.MapTransform):
         """Token ids of each document's length under "text", by `tokenizer`, `vocab_size` of them."""
         from dew.data.facts import unshaped
 
+        ended = self.eos if self.eos is not None else self.vocabulary.eos_id is not None
         return {**unshaped(facts, self.field, "text"), "tokenizer": self.tokenizer,
-                "vocab_size": self.vocabulary.vocab_size}
+                "vocab_size": self.vocabulary.vocab_size, "eos_id": self.vocabulary.eos_id if ended else None}
 
     @functools.cached_property
     def vocabulary(self) -> ByteTokenizer | HFTokenizer:
@@ -411,8 +420,10 @@ class Chunks:
     overlap: int = 0
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
-        """Pieces of the documents, each field of no fixed length still."""
-        return facts
+        """Pieces of the documents, each of `fields` up to `length` long."""
+        from dew.data.facts import unshaped
+
+        return unshaped(facts, *self.fields)
 
     def __post_init__(self) -> None:
         if not 0 <= self.overlap < self.length:

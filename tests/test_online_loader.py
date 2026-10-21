@@ -139,27 +139,30 @@ def test_a_fetch_with_threads_of_its_own_fetches_that_many_at_once_in_order_and_
 def test_a_cached_fetch_with_threads_of_its_own_fetches_that_many_at_once(tmp_path, read, threads):
     """A fetch given four threads of its own before a cache, and another given two after it, each
     fetches as many urls at once as it was given whatever the read's threads, and the run reads
-    what the uncached chain reads."""
-    handle = Slow(sides=True)
-    with serving(handle) as address:
-        catalog = Memory([{"url": f"http://{address}/before/{index}", "id": index} for index in range(12)])
+    what the uncached chain reads. Each run reads from a server of its own, so what it counts is
+    its own fetches alone."""
 
-        def ids(cache):
+    def ids(cache):
+        handle = Slow(sides=True)
+        with serving(handle) as address:
+            urls = [{"url": f"http://{address}/before/{index}", "id": index} for index in range(12)]
+            catalog = Memory(urls)
             fetched = Pipeline(catalog).filter_map(images.fetch(to="bytes", threads=4))
             cached = fetched if cache is None else fetched.cache(cache)
             again = cached.map(Again(address)).filter_map(images.fetch("again", to="later", threads=2))
             loading = Loading(workers=0, threads=threads, read_buffer=threads)
             reader = compile(again.repeat(1).batch(3), read=read, loading=loading).train(DataPartition())
             try:
-                return [[(int(row), bytes(later))
-                         for row, later in zip(batch["id"], batch["later"], strict=True)] for batch in reader]
+                # Each body is its url's path, the same from either server.
+                read_ids = [[(int(row), bytes(later))
+                             for row, later in zip(batch["id"], batch["later"], strict=True)]
+                            for batch in reader]
             finally:
                 reader.close()
+        assert handle.most == {"before": 4, "after": 2}
+        return read_ids
 
-        uncached = ids(None)
-        handle.most.clear()
-        assert ids(str(tmp_path / "cache")) == uncached
-    assert handle.most == {"before": 4, "after": 2}
+    assert ids(str(tmp_path / "cache")) == ids(None)
 
 
 @dataclass(frozen=True)

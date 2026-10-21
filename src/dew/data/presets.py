@@ -30,24 +30,37 @@ from dew.data import (
     text as text_steps,
     video as video_steps,
 )
-from dew.data.pipeline import Configured, DeviceStep, Limit, Pack, Repeat, Shuffle, Slice, Windows
+from dew.data.pipeline import (
+    Cached,
+    Configured,
+    Dataset,
+    DeviceStep,
+    HostStep,
+    Limit,
+    Mixture,
+    Pack,
+    Phases,
+    Pipeline,
+    Prefetch,
+    RandomStep,
+    Repeat,
+    Shuffle,
+    Slice,
+    Windows,
+    Workers,
+)
+from dew.data.sources.base import Source
+from dew.data.text import SavedTokenizer
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-
-    from transformers import PreTrainedTokenizerBase
-
-    from dew.data.cache import Cache
-    from dew.data.generation import Generation
-    from dew.data.pipeline import Dataset, HostStep, Mixture, Phases, Pipeline, RandomStep
-    from dew.data.sources.base import Source
 
 
 def images(dataset: Dataset, size: int, *, batch: int,
            augment: bool | image_steps.DeviceAugment | RandomStep | tuple[RandomStep, ...] = False,
            crop_scale: tuple[float, float] = (1.0, 1.0), field: str = "image",
            staging_size: int | None = None, draft: bool = False, rejects: bool = True,
-           caption: image_steps.Caption | None = None, cache: str | Cache | Generation | None = None,
+           caption: image_steps.Caption | None = None, cache: str | Cached | None = None,
            records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Images in `field` decoded and resized to `size` squares, in batches of `batch`.
 
@@ -108,7 +121,7 @@ def images(dataset: Dataset, size: int, *, batch: int,
                      device=() if device is None else (device,))
 
 
-def _cached(prepared: Dataset, cache: str | Cache | Generation | None) -> Dataset:
+def _cached(prepared: Dataset, cache: str | Cached | None) -> Dataset:
     """`prepared` through `cache` where one is given (`Dataset.cache`), which holds what its fixed
     steps make of each input."""
     return prepared if cache is None else prepared.cache(cache)
@@ -128,10 +141,10 @@ def _finished(prepared: Dataset, *, batch: int | None, records: int | None, host
     return kept.batch(batch).map(*host, *device) if host or device else kept.batch(batch)
 
 
-def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase | None, *, seq_len: int, batch: int | None,
+def lm(dataset: Dataset, tokenizer: str | SavedTokenizer | None, *, seq_len: int, batch: int | None,
        field: str = "text", eos: bool | None = None,
        pack: Literal["first-fit", "best-fit", "concat"] | None = "first-fit", bins: int = 32,
-       stride: int | None = None, cache: str | Cache | Generation | None = None,
+       stride: int | None = None, cache: str | Cached | None = None,
        records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Documents in `field` tokenized, ended by the tokenizer's EOS where it has one (`eos=True`
     always, `False` never), cut into pieces that keep every next-token target, and packed into
@@ -172,7 +185,8 @@ def token_windows(dataset: Dataset, *, seq_len: int, batch: int | None, stride: 
     if not isinstance(store, TokenFiles):
         raise ValueError(f"token_windows reads a token store's stream (TokenFiles), not "
                          f"{type(store).__name__}")
-    views = (Shuffle, Repeat, Slice, Limit)
+    # Views order and select the windows; prefetch and workers say how they're read.
+    views = (Shuffle, Repeat, Slice, Limit, Prefetch, Workers)
     stages = [type(stage).__name__ for stage in chain.stages if not isinstance(stage, views)]
     if stages:
         raise ValueError(f"token_windows orders the windows of {store.describe()}, which {stages} would "
@@ -182,10 +196,10 @@ def token_windows(dataset: Dataset, *, seq_len: int, batch: int | None, stride: 
     return _finished(windows, batch=batch, records=records, host=host)
 
 
-def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int,
+def sft(dataset: Dataset, tokenizer: str | SavedTokenizer, *, seq_len: int, batch: int,
         messages: str = "messages", long: Literal["chunk", "truncate", "drop"] = "chunk",
         pack: Literal["first-fit", "best-fit", "concat"] = "first-fit", bins: int = 32,
-        cache: str | Cache | Generation | None = None, records: int | None = None,
+        cache: str | Cached | None = None, records: int | None = None,
         host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat
     template, each token's speaker kept beside it for an assistant-only loss,
@@ -260,7 +274,7 @@ def _conversation_windows(rendered: Dataset, pack: Pack, *,
     return (rendered.filter_map(fitted) if long == "drop" else rendered.map(fitted))._then(pack)
 
 
-def prompts(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, max_prompt_len: int, batch: int,
+def prompts(dataset: Dataset, tokenizer: str | SavedTokenizer, *, max_prompt_len: int, batch: int,
             pad_id: int = 0, long: Literal["drop", "truncate"] = "truncate", thinking: bool | None = None,
             reward_bytes: int | None = None, records: int | None = None,
             host: tuple[HostStep, ...] = ()) -> Pipeline:
@@ -275,7 +289,7 @@ def prompts(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, max_p
     return _finished(rendered, batch=batch, records=records, host=host)
 
 
-def _rendered_prompts(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, max_prompt_len: int, *,
+def _rendered_prompts(dataset: Dataset, tokenizer: str | SavedTokenizer, max_prompt_len: int, *,
                       pad_id: int, long: Literal["drop", "truncate"], thinking: bool | None,
                       reward_bytes: int | None) -> Pipeline:
     """Prompt rows rendered with their reward columns `reward_bytes` wide, or as wide as measured over
@@ -302,7 +316,7 @@ def preferences(dataset: Dataset, *, seq_len: int, batch: int, pad_id: int = 0, 
                      host=host)
 
 
-def canvas(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, prompt_length: int,
+def canvas(dataset: Dataset, tokenizer: str | SavedTokenizer, *, prompt_length: int,
            canvas_size: int, batch: int, canvases: int = 1, pad_id: int = 0, messages: str = "messages",
            records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat template, then each
@@ -347,10 +361,15 @@ def video(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: in
           sample_rate: int | None = None, margin: float = 0.0, context: float = 0.0,
           missing: Literal["silence", "reject"] = "silence", rejects: bool = True, records: int | None = None,
           host: tuple[HostStep, ...] = ()) -> Pipeline:
-    """A listing of media files (`Files(url, format="files")`, or rows with a `path` or
-    `video_path`), those whose name ends in one of `extensions`, each read as `clips` reads its
-    media, with its caption, `caption` where it states none. The other settings are `clips`'."""
-    listed = dataset.filter(video_steps.Extensions(extensions)).map(video_steps.Row(caption))
+    """A listing of media files (`Files(url, format="files")`, cut to those whose name ends in one
+    of `extensions`), or rows with a `path` or `video_path`, each read as `clips` reads its media,
+    with its caption, `caption` where it states none. The other settings are `clips`'."""
+    from dew.data.sources.files import Files
+
+    chain = dataset._chain()
+    if isinstance(chain.source, Files) and chain.source.kind == "files":
+        chain = dataclasses.replace(chain, source=video_steps.media(chain.source, extensions))
+    listed = chain.map(video_steps.Row(caption))
     return clips(listed, seconds, frames=frames, fps=fps, size=size, batch=batch, sample_rate=sample_rate,
                  margin=margin, context=context, missing=missing, rejects=rejects, records=records, host=host)
 

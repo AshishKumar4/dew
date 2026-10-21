@@ -2,6 +2,7 @@
 from its record compiles to the same plan; one no record carries whole is `Unrecorded`, with the
 reason."""
 
+import dataclasses
 import json
 from dataclasses import dataclass
 
@@ -9,7 +10,7 @@ import grain.python as grain
 import numpy as np
 import pytest
 
-from dew.data import Loading, Memory, from_iter, mix, presets, text
+from dew.data import Loading, Memory, from_iter, mix, phases, presets, text
 from dew.data.compile import compile, held
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Dataset
@@ -102,6 +103,7 @@ class Rows:
     pytest.param(lambda: Memory([{"image": np.zeros((2, 2), np.uint8)}]).batch(1), id="arrays in the store"),
     pytest.param(lambda: Memory([{"pair": (1, 2)}]).batch(1), id="a tuple read back a list"),
     pytest.param(lambda: from_iter(Rows().opened, name="rows").batch(1), id="a bound method"),
+    pytest.param(lambda: Memory([{"x": np.float64(1.5)}]).batch(1), id="a scalar JSON makes a float"),
 ])
 def test_a_chain_no_record_carries_whole_is_unrecorded_with_its_reason(unrecordable):
     """A lambda step, a store of arrays, a store whose tuples a record would read back as lists, an
@@ -137,8 +139,8 @@ def test_a_presets_call_is_recorded_as_the_call_and_its_settings():
     chain = _documents().shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=8, batch=2)
     written = encode(chain)
     assert not isinstance(written, Unrecorded)
-    assert written["stages"][-1] == {"pipe": "dew.data.presets:lm", "args": ["byte"],
-                                     "settings": {"seq_len": 8, "batch": 2}}
+    assert written["stages"][-1] == {"pipe": "dew.data.presets:lm",
+                                     "settings": {"tokenizer": "byte", "seq_len": 8, "batch": 2}}
     assert _batches(decode(written)) == _batches(chain)
 
 
@@ -213,3 +215,144 @@ def test_fitted_reads_training_and_validation_with_the_runs_data_seed():
     assert draws(1) == draws(1)
     first, second = draws(1), draws(2)
     assert first[0] != second[0] and first[1] != second[1]
+
+
+def _plain(value):
+    """A batch's value as plain lists, a dataclass of arrays (a row's coordinates) field by field."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {field.name: _plain(getattr(value, field.name)) for field in dataclasses.fields(value)}
+    return np.asarray(value).tolist()
+
+
+def _records_of(dataset, steps: int = 3, read: str = "indexed"):
+    """The first `steps` batches of `dataset` compiled for `read`, as plain lists."""
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    reader = compile(dataset, read=read, loading=loading).train(DataPartition())
+    try:
+        batches = (next(reader) for _ in range(steps))
+        return [{name: _plain(value) for name, value in batch.items()} for batch in batches]
+    finally:
+        reader.close()
+
+
+def _prompts():
+    rows = Memory([{"prompt": "hi", "ground_truth": "x" * index} for index in range(1, 5)])
+    return rows.repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2)
+
+
+def _cached(tmp_path):
+    return _documents().map(Tagged(1)).cache(str(tmp_path / "cache")).shuffle(0).repeat().batch(2)
+
+
+def _phased():
+    phased = phases((_documents(0).map(Tagged(1)), 2), (_documents(8).map(Tagged(2)), None))
+    return phased.shuffle(0).repeat().batch(2)
+
+
+ROUND_TRIPS = {
+    "phases": lambda tmp_path: _phased(),
+    "a holdout": lambda tmp_path: _lm(_documents().holdout(records=2)[0].shuffle(0).repeat()),
+    "a cache": _cached,
+    "a prompt width measured": lambda tmp_path: _prompts(),
+    "host steps": lambda tmp_path: _lm(_documents().shuffle(0).repeat(), host=(Batched(),)),
+    "its loading and read": lambda tmp_path: _lm(_documents().shuffle(0).repeat()).read("indexed").workers(0),
+}
+
+
+@dataclass(frozen=True)
+class Batched(grain.MapTransform):
+    """A host step of the caller's: each batch as it is, its rows counted."""
+
+    def map(self, batch):
+        return {**batch, "rows": np.int32(len(batch["text"]))}
+
+
+@pytest.mark.parametrize("name", list(ROUND_TRIPS))
+def test_each_part_of_a_chain_reads_back_from_its_record(tmp_path, name):
+    """Phases, a holdout's part, a cache, a measured prompt width, host steps, a loading and a read:
+    each chain recorded and read back reads the same batches."""
+    chain = ROUND_TRIPS[name](tmp_path)
+    written = encode(chain)
+    assert not isinstance(written, Unrecorded), written
+    # A measured width is measured by a memory read.
+    read = "memory" if name == "a prompt width measured" else "indexed"
+    assert _records_of(decode(json.loads(json.dumps(written))), read=read) == _records_of(chain, read=read)
+
+
+def test_a_published_generation_reads_back_from_its_record(tmp_path):
+    """A generation published from documents stands in for its steps: recorded and read back, it
+    reads the same batches."""
+    from dew.data.cache import Cache
+    from dew.data.compile import publish
+
+    generation = publish(_documents().map(Tagged(1)), Cache(str(tmp_path / "cache")), read="indexed")
+    chain = _documents().map(Tagged(1)).cache(generation).shuffle(0).repeat().batch(2)
+    written = encode(chain)
+    assert not isinstance(written, Unrecorded), written
+    assert _records_of(decode(json.loads(json.dumps(written)))) == _records_of(chain)
+
+
+def test_a_record_naming_a_class_no_store_is_refused_before_it_is_built(tmp_path):
+    """A store's record naming `subprocess.Popen` with a command: refused as no store of Dew's or a
+    trusted package's, before anything is built, so the command never runs."""
+    marker = tmp_path / "ran"
+    written = encode(_documents().batch(1))
+    assert not isinstance(written, Unrecorded)
+    forged = {**written, "source": {"class": "subprocess:Popen", "fields": {"args": ["touch", str(marker)]}}}
+    with pytest.raises(ValueError):
+        decode(forged)
+    assert not marker.exists()
+
+
+def test_an_override_of_a_positional_setting_replaces_it(tmp_path):
+    """The images preset's size given in its call's place, overridden: the chain read back makes
+    images of the new size; a setting of the wrong type, or the dataset the call reads, is refused."""
+    import cv2
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from dew.data import Files
+
+    images = [{"image": cv2.imencode(".png", np.full((6, 6, 3), index, np.uint8))[1].tobytes(),
+               "label": index} for index in range(4)]
+    pq.write_table(pa.Table.from_pylist(images), tmp_path / "images.parquet")
+    written = encode(Files(str(tmp_path / "images.parquet")).repeat().pipe(presets.images, 4, batch=2))
+    assert not isinstance(written, Unrecorded)
+    larger = decode(override(written, "images.size", 5))
+    assert np.asarray(next(iter(larger))["image"]).shape[1:] == (5, 5, 3)
+    with pytest.raises(ValueError):
+        override(written, "images.size", "large")
+    with pytest.raises(ValueError):
+        override(written, "images.dataset", 3)
+
+
+def _with_width(dataset, *, options):
+    """A preset of the caller's whose step takes its width from `options` as a keyword default."""
+    def widen(row, *, width=options["width"]):
+        return {**row, "text": row["text"] + "!" * width}
+
+    return dataset.map(widen)
+
+
+def test_a_call_whose_keyword_default_changed_since_is_recorded_as_its_stages():
+    """A caller's preset whose step keeps a setting as a keyword default, the setting changed after
+    the call: made again it would make another step, so the record writes the stages it made."""
+    options = {"width": 1}
+    chain = _documents().pipe(_with_width, options=options)
+    options["width"] = 3
+    assert isinstance(encode(chain), Unrecorded)
+
+
+def _outer(dataset, *, times: int):
+    """A preset of the caller's that pipes another."""
+    return dataset.pipe(_shouted, times=times)
+
+
+def test_a_preset_calling_another_is_recorded_as_the_outer_call():
+    """A preset of the caller's that pipes another over the same stages is recorded as the outer
+    call, which an override then addresses."""
+    written = encode(_documents().pipe(_outer, times=2).batch(1))
+    assert not isinstance(written, Unrecorded)
+    assert written["stages"][0]["pipe"] == "test_data_records:_outer"
+    changed = decode(override(written, "_outer.times", 3))
+    assert next(iter(changed))["text"][0].endswith(" tag tag tag")

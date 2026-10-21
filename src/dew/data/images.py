@@ -272,6 +272,9 @@ class RandomCrop(grain.RandomMapTransform):
     flip: bool = False
     jitter: bool = False
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        return resized(facts, "image", self.size, self.size)
+
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         from dew.data.image_augmentation import apply_host, draw_host
 
@@ -331,6 +334,9 @@ class RandomResizedCrop(grain.RandomMapTransform):
     ratio: tuple[float, float] = (3 / 4, 4 / 3)
     method: Interpolation = "bilinear"
     field: str = "image"
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        return resized(facts, self.field, self.size, self.size)
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         image = np.asarray(element[self.field])
