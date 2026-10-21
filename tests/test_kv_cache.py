@@ -101,16 +101,26 @@ def test_a_cache_leaf_with_no_elements_moves_as_words_and_back_whole(dtype):
 def test_a_dropped_cache_write_leaves_the_next_rows_slot_to_its_own_write():
     """A mixed call's token write (`write_tokens`, one scatter over rows and slots) whose dropped token
     (position -1) sits beside the next row's write to its slot 0 leaves that slot holding the next row's
-    token. XLA's deterministic GPU scatter, which the cuda lane's flags select, linearizes a row and
-    slot index and would write a slot at the axis size onto the next row's first slot
-    (openxla/xla#49380); the write drops at `dew.nn.scatter.DROPPED` instead, so on every backend each
-    row holds exactly its own tokens."""
+    token, on every backend: each row holds exactly its own tokens."""
     buffer = jnp.zeros((2, 4, 1, 1), jnp.int32)
     values = jnp.asarray([1, 2, 3, 4], jnp.int32)[:, None, None]
     rows = jnp.asarray([0, 0, 1, 1], jnp.int32)
     positions = jnp.asarray([0, -1, 0, -1], jnp.int32)
     written = np.asarray(jax.jit(write_tokens)(buffer, values, rows, positions))[..., 0, 0]
     np.testing.assert_array_equal(written, [[1, 0, 0, 0], [3, 0, 0, 0]])
+
+
+def test_an_element_scatter_drops_its_dropped_index_on_every_backend():
+    """A scatter of single elements over rows and columns with `mode='drop'`, the form Dew's dropped
+    writes take, drops a column at `dew.nn.scatter.DROPPED`: row 0's dropped write leaves row 1's 3 in
+    its slot 0. XLA's deterministic GPU scatter (`--xla_gpu_deterministic_ops`, the cuda lane's) drops
+    only a position past the whole linearized index space, so a column at its axis size would land on
+    the next row's slot 0 (openxla/xla#49380, present on jaxlib 0.11.2's A100 lane, 2026-10-21)."""
+    scatter = jax.jit(lambda buffer, rows, columns, values: buffer.at[rows, columns].set(values, mode="drop"))
+    columns = jnp.asarray([[0, DROPPED], [0, DROPPED]])
+    written = scatter(jnp.zeros((2, 4), jnp.int32), jnp.arange(2)[:, None], columns,
+                      jnp.asarray([[1, 2], [3, 4]], jnp.int32))
+    np.testing.assert_array_equal(np.asarray(written), [[1, 0, 0, 0], [3, 0, 0, 0]])
 
 
 def test_an_int8_cache_keeps_the_logits_outlier_key_channels_would_flatten():
