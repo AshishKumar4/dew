@@ -339,6 +339,11 @@ class TokenFiles(Dataset):
             self.storage_options,
         )
 
+    def stated(self) -> Mapping[str, object]:
+        """What the store's manifest says of its tokens, none of them read (`Dataset.facts`): their
+        tokenizer, vocabulary and EOS, as token ids under "text"."""
+        return {**self.meta, "token_store": True}
+
     def metadata(self) -> Mapping[str, object]:
         facts = dict(self.meta)
         tokens = self.tokens

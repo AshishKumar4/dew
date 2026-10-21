@@ -16,8 +16,10 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from dew.data.dataset import Batch
+from dew.data.facts import resized, shaped, unshaped
 from dew.data.image_codec import as_rgb, decode_image
 from dew.data.pipeline import DeviceStep, Rejected
+from dew.records import record
 
 if TYPE_CHECKING:
     import jax
@@ -92,6 +94,10 @@ class DecodeImage(grain.MapTransform):
     _: dataclasses.KW_ONLY
     at_least: int | None = None
     rejects: bool = True
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """RGB pixels under `to`, each image its own height and width, in place of the bytes in `field`."""
+        return shaped(unshaped(facts, self.field), self.to, [None, None, 3])
 
     def __post_init__(self) -> None:
         import_opencv()
@@ -191,6 +197,10 @@ class Resize(grain.MapTransform):
     _: dataclasses.KW_ONLY
     field: str = "image"
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        height, width = (self.size, self.size) if isinstance(self.size, int) else self.size
+        return resized(facts, self.field, height, width)
+
     def map(self, element: Batch) -> Batch:
         image = np.asarray(element[self.field])
         if self.method is None:
@@ -210,6 +220,9 @@ class Fit(grain.MapTransform):
     fill: int = 255
     _: dataclasses.KW_ONLY
     field: str = "image"
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        return resized(facts, self.field, self.size, self.size)
 
     def map(self, element: Batch) -> Batch:
         import cv2
@@ -525,8 +538,12 @@ def caption(template: str | None = None, *, templates: tuple[str, ...] = (),
 class ConfigureCaption:
     caption: Caption
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """A caption, a string of no fixed shape, beside the rest."""
+        return facts
+
     def __call__(self, metadata: Mapping[str, object]) -> Caption:
-        from dew.records import record, strings
+        from dew.records import strings
 
         labels = record(metadata.get("class_names", {}), "class names").get("label")
         return (
@@ -539,6 +556,9 @@ class ConfigureCaption:
 @dataclasses.dataclass(frozen=True)
 class AugmentationKey(grain.RandomMapTransform):
     """The key `DeviceAugment` augments the record with, drawn from the record's generator."""
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        return shaped(facts, "image_augmentation_key", [2])
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         return {**element, "image_augmentation_key": rng.integers(0, 2**32, size=2, dtype=np.uint32)}
@@ -592,6 +612,10 @@ class DeviceAugment(DeviceStep):
     crop_scale: tuple[float, float] = (1.0, 1.0)
     flip: bool = True
     jitter: bool = False
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Each image cropped to a `size` square, its key spent."""
+        return unshaped(resized(facts, "image", self.size, self.size), "image_augmentation_key")
 
     def __call__(self, batch: Mapping[str, jax.Array]) -> dict[str, jax.Array]:
         from dew.data.image_augmentation import augment_batch

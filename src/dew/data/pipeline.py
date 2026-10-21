@@ -96,6 +96,22 @@ type ExpandStep = Expansion | Callable[[Batch], Iterable[Batch | Rejected]]
 
 
 @runtime_checkable
+class Declares(Protocol):
+    """A step, or a stage, that says what it makes of the facts of the records it reads
+    (`Dataset.facts`): the fields it writes and their shapes, the tokenizer it encodes with."""
+
+    def declared(self, facts: Mapping[str, object], /) -> Mapping[str, object]: ...
+
+
+@runtime_checkable
+class Stated(Protocol):
+    """A store that states facts of its records without reading them (`Dataset.facts`): a token
+    store's tokenizer and vocabulary, say."""
+
+    def stated(self) -> Mapping[str, object]: ...
+
+
+@runtime_checkable
 class Measure(Protocol):
     """A fact a configured step needs that a memory read measures over a store's records where the
     store states none (`Configured.measures`): `fact` names it, and calling it on the records gives
@@ -224,6 +240,10 @@ class BatchStage:
     drop_remainder: bool = True
     batch_fn: Callable[[Sequence[Batch]], Batch] | None = None
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """The same records, `size` of them a batch."""
+        return {**facts, "batch": self.size}
+
 
 @dataclasses.dataclass(frozen=True)
 class Pack:
@@ -254,6 +274,12 @@ class Pack:
         """Every field a window holds: `fields` and those `along` axes of their own."""
         return (*self.fields, *(name for name, _ in self.along))
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Rows of `seq_len` tokens along `fields`, the last of them a target: `seq_len - 1` inputs."""
+        from dew.data.facts import windowed
+
+        return windowed(facts, self.seq_len - 1, self.fields, packed=True)
+
     def __post_init__(self) -> None:
         if self.policy == "concat" and (self.segments is not None or self.along):
             raise ValueError("concatenated packing cuts documents across windows; it takes no "
@@ -273,6 +299,12 @@ class Windows:
     seq_len: int
     stride: int | None = None
     fields: tuple[str, ...] = ("text",)
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Windows of `seq_len` inputs and their targets along `fields`."""
+        from dew.data.facts import windowed
+
+        return windowed(facts, self.seq_len, self.fields, packed=False)
 
     def __post_init__(self) -> None:
         if self.seq_len < 1 or (self.stride is not None and self.stride < 1) or not self.fields:
@@ -461,6 +493,16 @@ class Dataset:
         from dew.data.holdout import holdout
 
         return holdout(self, fraction, key=key, records=records, split=split, **named)
+
+    def facts(self) -> Mapping[str, object]:
+        """What this dataset's records are, read without opening a reader: the facts its stores
+        state (a token store's tokenizer and vocabulary), then what each step makes of them in
+        order: `fields`, each field's shape a record holds; `seq_len` and `packed` for token rows;
+        `tokenizer`, `vocab_size`; `batch` once batched. A step that changes records and doesn't
+        say how leaves their fields unknown."""
+        from dew.data.facts import folded
+
+        return folded(self._chain())
 
     def named(self, name: str) -> Pipeline:
         """This dataset under `name`, which its counts log under in a mix."""
@@ -780,9 +822,8 @@ class Dataset:
         from rich.pretty import pprint
 
         sys.stdout.write("\n".join(_chain_lines(self._chain())) + "\n")
-        for record in itertools.islice(self, count):
-            pprint({name: _shown(value) for name, value in record.items()} if isinstance(record, Mapping)
-                   else record)
+        for row in itertools.islice(self, count):
+            pprint({name: _shown(value) for name, value in row.items()} if isinstance(row, Mapping) else row)
 
 
 @dataclasses.dataclass(frozen=True)

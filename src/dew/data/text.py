@@ -365,6 +365,13 @@ class Tokenize(grain.MapTransform):
     field: str = "text"
     eos: bool | None = False
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Token ids of each document's length under "text", by `tokenizer`, `vocab_size` of them."""
+        from dew.data.facts import unshaped
+
+        return {**unshaped(facts, self.field, "text"), "tokenizer": self.tokenizer,
+                "vocab_size": self.vocabulary.vocab_size}
+
     @functools.cached_property
     def vocabulary(self) -> ByteTokenizer | HFTokenizer:
         """The tokenizer `tokenizer` names, which resolves its name once
@@ -401,6 +408,10 @@ class Chunks:
     _: dataclasses.KW_ONLY
     fields: tuple[str, ...] = ("text",)
     overlap: int = 0
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Pieces of the documents, each field of no fixed length still."""
+        return facts
 
     def __post_init__(self) -> None:
         if not 0 <= self.overlap < self.length:

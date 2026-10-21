@@ -60,6 +60,7 @@ from dew.data.dataset import (
     Records,
     weight_counts,
 )
+from dew.data.facts import merge_facts
 from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _split_spans, _weights, _workers
 from dew.data.materialize import _materialize, _Memory
 from dew.data.mixing import CorpusCounts
@@ -102,7 +103,7 @@ from dew.data.plan import Plan, StepIdentity, fingerprint, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed, tokenizer_contract
 from dew.data.steps.generic import Coordinated
-from dew.records import JSON, integer, json_value, record
+from dew.records import JSON, integer, json_value
 
 _DEFAULT_LOADING = Loading()
 
@@ -964,29 +965,11 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
 
 
 def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]:
-    combined: Batch = {}
-    conflicted: set[str] = set()
-    slots: dict[str, int] = {}
     # A fact a configured step measures binds a mixture's step to the largest of its stores'.
-    measured = {each.measure.fact for pipeline in pipelines for each in _measures(tuple(_steps(pipeline)))}
-    for pipeline in pipelines:
-        for _, source in _leaves(pipeline):
-            if isinstance(source, _Memory) and not source.held:
-                continue
-            facts = source.metadata()
-            for key, value in facts.items():
-                if key == "slots":
-                    for name, size in record(value, "slots").items():
-                        slots[name] = max(slots.get(name, 0), integer(size, f"slots.{name}"))
-                elif key in measured:
-                    combined[key] = max(integer(value, key), integer(combined.get(key, 0), key))
-                elif key not in combined:
-                    combined[key] = value
-                elif combined[key] != value:
-                    # A fact two sources state differently is no fact of the run, whatever a third states.
-                    conflicted.add(key)
-    shared = {key: value for key, value in combined.items() if key not in conflicted}
-    return {**shared, "slots": slots} if slots else shared
+    measured = frozenset(each.measure.fact for pipeline in pipelines
+                         for each in _measures(tuple(_steps(pipeline))))
+    return merge_facts((source.metadata() for pipeline in pipelines for _, source in _leaves(pipeline)
+                        if not (isinstance(source, _Memory) and not source.held)), measured=measured)
 
 
 def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
