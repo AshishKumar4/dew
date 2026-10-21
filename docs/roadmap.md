@@ -26,7 +26,8 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Let an FP8 frozen base differentiate in forward mode through the shared tangent boundary, keeping its reverse kernel, and test MeanFlow over it. [782]
 - Take the grouped convolution's backward off Qwix's private modules: its public provider API, or an upstream Qwix fix carried meanwhile. [783]
 - Let Llama 4's mixer take any KV cache, its context derived from the caller's, not rebuilt. [784]
-- Let latent attention (MLA and its sparse pooling) and DeepSeek V4's compressed cache take paged and quantized KV cache layouts. [830, 831]
+- Let latent attention (MLA and its sparse pooling), DeepSeek V4's compressed cache and a bidirectional canvas's encoder prefix take paged and quantized KV cache layouts. [830, 831, 838]
+- Place a loaded pretrained model's variables on JAX's default device, as jnp arrays are; keeping them on the host is an explicit request. [832]
 - Route MPConv through Conv's shared operand path after its normalization. [785]
 - One patch projection for every scan order in DiT, UViT and SimpleUDiT, the tokens permuted after it. [787]
 - Build Llama 4's vision adapter from MergeProjector. [788]
@@ -65,19 +66,13 @@ The kernel direction was approved on 2026-10-19:
 - Revisit residual certification and Crouzeix bounds only if a profiled solve or accuracy defect needs them; no speedup has been established. [477]
 - Separate normalization and shared attention policy from `attention.py`. [NNK-11]
 - Measure joined QKV in the same A100 session before adopting it. For unbounded packing, evaluate a recurrence implementation that stores continuation state without one full chunk state per position.
-- Accumulate low-precision bias gradients in fp32, keep cancelling key-bias gradients visible and use a single-rounding bias epilogue without a step-time regression. [620, 621, 634]
-- Prefer XLA for fp32 SwiGLU where its fusion wins. [646]
+- Use a single-rounding bias epilogue without a step-time regression. [634]
 - Profile first compilation separately through lowering and XLA passes. [629]
 - Keep document resets out of recurrence decay prefixes, move decode regrouping into the kernel boundary and finish shared tuner/template coverage. [NNK-4, NNK-8, 597]
 - Take paged attention through the typed kernel selector, so its eligibility is each kernel's own as every other operation's is. [742]
-- Keep each slot's logical key place in a paged KV cache, so chunked and ALiBi attention mask a prompt placed past zero by its places, as on a dense cache. [825]
-- Close the route audit's gaps: rms_norm's inverse rounding and its decode operands, swiglu's dtype and its forward mode, each routed to the kernel its row names. [759]
 - Give the chunked gated delta rule one dtype contract on every route. With mixed operands the port returns their common dtype, while the portable math returns the query's and casts its cotangent to it, so output dtype and gradient precision depend on the GPU row. [730]
 - Move rms_norm and swiglu onto the typed selector, so their routes report and their refusals classify. [762]
 - Let tuning take only the declared resource-exhaustion and profiler-subscription errors for an unusable config. [764]
-- Make fused attention the selector's private executor, its second eligibility pass deleted. [765]
-- Capture only the requested step's routes in the route tool. [763]
-- Record in the target table that no Tokamax implementation is any row's kernel, sm86's narrow row on flash. [766]
 - Widen the fused norm and SwiGLU kernels' reach: norms past 8192 features, a norm with an activation epilogue, operands a mesh splits or a varying shard_map holds, and fp16 qualified against the float64 gate. [820, 821, 822, 823]
 
 ## Data
@@ -110,7 +105,6 @@ The kernel direction was approved on 2026-10-19:
 - Let `from_grain` and `from_iter` work without undocumented names, and `Memory` read a DataFrame directly. [808, 809]
 - Add presets for prompts, preferences and chat canvases, which the run layer's recipes cover today. [810]
 - Rule on the nine public Dataset members the spec does not name: then, chain, map_with_index, slice, windows, token_split, rebatch, limit and iterate. [811]
-- Chunk a long chat conversation and keep an overlong prompt's tail by default, as the spec says, and carry a row's `ability` into its record's extra_info. [812, 813, 814]
 - Teach only names main has in the post-training and inference docs. [815]
 - Build the data design's remaining contracts: uniform stage errors; a pre-read refusal of a missing artifact; slot maxima shared with `fit`'s separately compiled validation chains; per-member committed-token logging; RL prompt tail cuts counted as truncations; volatility read on every stage kind; and the reader's cache report. [design/data.md]
 
@@ -131,10 +125,6 @@ The kernel direction was approved on 2026-10-19:
 - Match PNDM's multistep grouping and startup steps against Diffusers before remeasuring its parity margin. [647]
 - Find the tiled chunked head's residual: at token tile 2, about 40 of 8192 head-gradient elements sit more than twice as far from float64 as the whole-logits reference; at tile 20 there are none. [737]
 - Compile a step lowered by `Trainer(lower_for=)` before allocating training time, carry its executable and tuning picks to the run, and measure the saved startup time. Lowering alone already works. [720]
-- One sampling-module inventory for objective evaluation and TextToImage, so quantized guidance and autoencoders get their compiler options. [774]
-- Restore a distilled student without its teacher, and count its tokens as the student's. [775, 776]
-- Let rCM accumulate, its phase read from the update clock. [778]
-- Index a sweep's grid lazily. [781]
 - Build the training design's remaining contracts: refusing a split leaf that declares no axes, `Layout.validate(mesh)`'s placement report, a token budget ending at the commit that reaches it, and kernel choices in a run's report. [design/training.md]
 
 ## RL and serving
@@ -190,6 +180,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Reconcile requested capabilities with implementation and qualification evidence, and audit upstream reproductions and fixes. [224, 306]
 - The float64 gate is the owner's (2026-10-20): each leaf's RMS error within 1.5× the reference's and its worst row within ROW_FACTOR of the reference's, on the same inputs, with no floor; every element within a certified roundoff bound for its own operation on common native inputs (faithful rounding for pointwise steps, a bound for each sum, native probes at opaque kernels), behind one assertion, `assert_as_exact`. [560, 649, 719, 793, 827]
 - Every accuracy comparison in the tests and tools goes through that assertion; the files that still compare within a tolerance are an inventory that only shrinks, empty by 2026-11-27. [650, 668, 669, 670, 676, 682, 705, 712]
+- Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients and Z-Image's padded flow. [833, 837]
 - Replace test-policy violations with observable lifecycle and reference behavior:
 
   - Training, sampling and objectives: [651, 652, 653, 654, 657, 658, 663, 667, 679, 680, 686, 687, 688, 692, 695, 698, 701, 702, 707, 708].
@@ -204,8 +195,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Judge an image model's layout parity under a sequence split, where its gradients' sums over spatial positions reassociate (edm2's sequence-split cell). [827]
 - Use JAX's supported persistent cache in the remote-cache tests, with handling narrowed to transport errors. [794]
 - Use JAX's own transfer guard on GPUs in place of the steady-state reimplementation, and guard CPU arrays' reads to numpy in JAX itself (jax-ml/jax#16602). [795, 801]
-- One collective parser (telemetry.instrumentation) and one cache-worker fixture in the tests. [796, 797]
 - Check every family, target row and mode in the kernel-route test, an unexplained route failing, and drop the KV cache's unconditional GPU xfail. [798, 799]
 - Hold MeanFlow's fused attention away from zero initialization, the delta rule's document isolation without exclusions, and the Mamba-2 TPU mesh by its numbers. [789, 790]
-- Delete the stock-JAX branches (DEW_UPSTREAM_JAX, the runtime's caching branch) and the step benchmark's re-export facade. [779, 792, 800]
+- Delete the step benchmark's re-export facade. [800]
 - Hold the full suite to ten minutes of wall time: shards cut by the last full run's measured per-test times, no single case past a shard's budget, and a new environment warmed before its first full suite. [826]

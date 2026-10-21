@@ -39,9 +39,9 @@ from dataclasses import dataclass, replace
 import jax
 import jax.numpy as jnp
 
-from dew.nn.kernels.tuning import samples
 from dew.nn.protocols import OutputTable
 from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss, tile_columns
+from dew.telemetry.benchmark import samples
 
 # The loss owns the measured default; reading it keeps one source for it.
 DEFAULT_TILE = inspect.signature(chunked_cross_entropy).parameters["tile"].default

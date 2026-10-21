@@ -173,20 +173,19 @@ def export(
             metadata=metadata,
             length_field=length_field,
         )
-    if isinstance(values, Source):
-        from dew.data.pipeline import Pipeline
+    from dew.data.pipeline import Dataset, Pipeline
 
-        # A source exports as a pipeline of it does, by a read it supports, physical shards or none.
-        values = Pipeline(values)
-    if isinstance(values, Iterable):
-        rows = iter(values)
-    else:
+    if isinstance(values, (Source, Dataset)):
         from dew.data.analysis import _preferred_read
         from dew.data.compile import iterate
         from dew.data.dataset import Loading
 
-        read = values.mode or _preferred_read(lambda _: (values,), provision=True)
-        rows = iter(iterate(values, read=read, provision=True, loading=values.loading or Loading()))
+        # A store exports as a chain of it does, by a read it supports, physical shards or none.
+        chain = values._chain() if isinstance(values, Dataset) else Pipeline(values)
+        read = chain.mode or _preferred_read(lambda _: (chain,), provision=True)
+        rows = iter(iterate(chain, read=read, provision=True, loading=chain._loading or Loading()))
+    else:
+        rows = iter(values)
     root = Store(url, storage_options)
     writer = uuid.uuid4().hex
     target = root.child(f"shards/{writer}")
