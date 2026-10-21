@@ -203,7 +203,8 @@ def _forward_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kind
             logits = jnp.where(seen, logits, -jnp.inf)
         tile_peak = logits.max(axis=-1)
         # The first key holding the keys' running maximum, the backward's anchor (`backward`).
-        tile_arg = jnp.min(jnp.where(logits == tile_peak[:, None], k_pos, jnp.iinfo(jnp.int32).max), axis=-1)
+        tile_arg = jnp.min(jnp.where(logits == tile_peak[:, None], k_pos, jnp.iinfo(jnp.int32).max),
+                           axis=-1).astype(jnp.int32)
         arg = jnp.where(tile_peak > key_peak, tile_arg, arg)
         key_peak = jnp.maximum(key_peak, tile_peak)
         new_peak = jnp.maximum(peak, tile_peak)
