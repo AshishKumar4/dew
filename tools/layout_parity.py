@@ -87,7 +87,6 @@ import functools
 import hashlib
 import json
 import math
-import os
 import sys
 import time
 import traceback
@@ -712,13 +711,13 @@ def _write(path: Path, arrays: Mapping[str, NDArray], meta: dict[str, Any]) -> N
     whole or not at all."""
     import numpy as np
 
+    from dew.files import replacing
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.with_name(f".{path.name}.{os.getpid()}")
-    with partial.open("wb") as file:
+    with replacing(path) as partial, partial.open("wb") as file:
         # Stored as arr_0 (the metadata), arr_1, ... in the names' order.
         np.savez(file, np.array(json.dumps({**meta, "names": list(arrays)})),
                  *[np.asarray(array, np.float64) for array in arrays.values()])
-    partial.replace(path)
 
 
 def _read(path: Path) -> tuple[dict[str, NDArray], dict[str, Any]]:
