@@ -161,6 +161,8 @@ def test_each_seed_draws_its_own_order_and_a_group_moves_whole():
     assert all(sorted(each.tolist()) == list(range(64)) for each in drawn)
     assert len({each.tobytes() for each in drawn}) == 8
     assert np.array_equal(order(64, 3), drawn[3])
+    with pytest.raises(ValueError):
+        order(10, 0, group=4)
     grouped = order(64, 5, group=4)
     assert sorted(grouped.tolist()) == list(range(64))
     assert all(sorted((grouped[at:at + 4] // 4).tolist()) == [grouped[at] // 4] * 4 for at in range(0, 64, 4))
