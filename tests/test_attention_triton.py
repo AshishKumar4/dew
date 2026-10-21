@@ -434,7 +434,7 @@ def test_many_fp16_cotangents_too_small_once_normalized_still_sum_into_dv():
     np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(theirs, np.float32))
 
 
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
+@pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=DTYPE_IDS)
 def test_cotangents_that_cancel_across_a_key_still_cancel_in_dv(dtype):
     """Three queries over three equal keys, cotangents 1, 2 and -3: each key's gradient is the queries'
     equal shares of them, which cancel, 0, as the reference's derivative gives."""
@@ -448,6 +448,25 @@ def test_cotangents_that_cancel_across_a_key_still_cancel_in_dv(dtype):
     [theirs] = pull(dout)
     np.testing.assert_array_equal(np.asarray(theirs, np.float32), 0)
     np.testing.assert_array_equal(np.asarray(ours, np.float32), 0)
+
+
+def test_an_fp32_weight_that_normalizing_would_lose_still_reaches_dv():
+    """fp32, one query over one key beside a resumed state of denominator 2^25 and maximum 87: the key's
+    weight exp(-87) / 2^25 is below fp32's least subnormal, yet against a cotangent of 2^100 its gradient
+    is a normal number, as the reference's derivative gives."""
+    spans = template.spans(1, 1, 1)
+    zeros = jnp.zeros((1, 1, 1, 1), jnp.float32)
+    state = template.Initial(jnp.full((1, 1, 1), 87.0), jnp.full((1, 1, 1), 2.0 ** 25),
+                             jnp.zeros((1, 1, 1, 1)))
+    hooks = template.Hooks(initial=state)
+    dout = jnp.full((1, 1, 1, 1), 2.0 ** 100, jnp.float32)
+    with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
+        ours = attention_triton.backward(zeros, zeros, zeros, spans, hooks, dout, scale=1.0,
+                                         interpret=not ON_GPU).value
+    _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, hooks, scale=1.0), zeros)
+    [theirs] = pull(dout)
+    assert float(theirs[0, 0, 0, 0]) > 0
+    np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
 def test_a_small_fp16_cotangent_channel_beside_a_large_one_still_sums_into_dv():
