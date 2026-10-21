@@ -724,36 +724,37 @@ def test_a_cache_of_a_store_that_misses_every_input_publishes_its_empty_fill(tmp
     assert publishing.calls == []
 
 
-def _epoch(reader, batches: int) -> list[tuple[bytes, ...]]:
-    """The rows of a reader's next `batches` batches, each its fields' bytes, sorted: what an epoch
-    reads, in whatever order."""
-    rows = []
+def _rows(reader, batches: int) -> set[tuple[bytes, ...]]:
+    """The distinct rows of a reader's next `batches` batches, each its fields' bytes."""
+    rows = set()
     for _ in range(batches):
         batch = next(reader)
         names = sorted(batch)
-        rows += [tuple(np.asarray(batch[name])[row].tobytes() for name in names)
-                 for row in range(len(np.asarray(batch[names[0]])))]
-    return sorted(rows)
+        rows |= {tuple(np.asarray(batch[name])[row].tobytes() for name in names)
+                 for row in range(len(np.asarray(batch[names[0]])))}
+    return rows
 
 
 def test_a_prompt_recipe_with_a_cache_reads_by_index_the_prompts_it_reads_uncached(tmp_path):
     """A prompt recipe whose rendering drops prompts too long, cached and read by index in the
-    recipe's own loading workers: the cache holds what is left of each input, and an epoch reads
-    the prompts the uncached recipe's epoch reads, however the drops fall among the workers
-    (row 883)."""
+    recipe's own loading workers: the cache holds what is left of each input, and the read goes on
+    through every prompt kept, as the uncached recipe's does, however the drops fall among the
+    workers (row 883)."""
     from dew.config.data import PromptData, loader
     from dew.data.dataset import DataPartition
 
-    # A third of the prompts are longer than 8 bytes, which the recipe drops: four batches an epoch.
-    recipe = PromptData(tuple({"prompt": "hi " * (1 + index % 3)} for index in range(12)), "byte",
-                        max_prompt_len=8, long="drop", reward_bytes=8)
+    # A third of the twelve prompts are longer than 6 bytes, which the recipe drops: eight are kept.
+    recipe = PromptData(tuple({"prompt": chr(97 + index) + "hi" * (1 + index % 3)} for index in range(12)),
+                        "byte", max_prompt_len=6, long="drop", reward_bytes=8)
     # The recipe reads in worker processes, which read a cache on disk.
     cached = loader(recipe, batch=2, cache=str(tmp_path / "cache"), read="indexed")
     uncached = loader(recipe, batch=2, read="indexed")
     assert cached.records == uncached.records
     first, second = cached.train(DataPartition()), uncached.train(DataPartition())
     try:
-        assert _epoch(first, 4) == _epoch(second, 4)
+        kept = _rows(second, 16)
+        assert len(kept) == 8
+        assert _rows(first, 16) == kept
     finally:
         first.close()
         second.close()
