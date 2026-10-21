@@ -185,7 +185,7 @@ def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placemen
         assert [sharding.spec for sharding in jax.tree.leaves(tree(whole))] == [
             sharding.spec for sharding in jax.tree.leaves(tree(split))]
     for got, want in zip(jax.tree.leaves(whole_trained), jax.tree.leaves(split_trained), strict=True):
-        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
+        np.testing.assert_array_equal(got, want)
 
 
 GEMMA2 = {**TINY, "intermediate_size": 128, "num_key_value_heads": 2, "head_dim": 16, "sliding_window": 32,
