@@ -7,7 +7,8 @@
   `FUNCTION_NODES` syntax nodes), fail, in one file or in two. So do six consecutive statements of two
   statement lists, equal the same way (at least `WINDOW_NODES` nodes). Each copy is named once: the
   windows of one copied run as the run, and a copy that lies inside a larger one as the larger.
-  Imports, stubs (a protocol's members) and a class's annotated fields are declarations and are not read.
+  Imports, stubs (a protocol's members), functions that only store their fields (a constructor, as a
+  dataclass declares it) and a class's annotated fields are declarations and are not read.
   A run of calls to one function (a parser's arguments, a registry's entries, a config's fields read one
   by one) declares data, so its constants are read as their values: runs alike in shape that declare
   other data are no copy, and a run copied with its data is one.
@@ -44,11 +45,11 @@ ARGUMENTS = ("--disable=all", "--enable=duplicate-code", "--min-similarity-lines
              "--ignore-signatures=y", "--ignore-docstrings=y", "--ignore-comments=y", "--score=n")
 """The text reading: pylint's similarity check, as the gate runs it."""
 
-FUNCTION_NODES = 22
+FUNCTION_NODES = 20
 """The fewest syntax nodes a function's body has for its copies to count: below it, a body says too little
-(a property, a one-line delegation) for two to be one logic. The smallest copy filed that shares knowledge,
-two objectives' evaluate (ledger 932), has 23; at 21, two test doubles storing their own fields match by
-shape alone (ledger 934)."""
+(a property, a one-line delegation) for two to be one logic. The smallest copy found that shares knowledge,
+two context managers' cleanup (training/distributed.py's and tracker.py's), has 21; two constructors that
+only store their fields (ledger 934) are declarations, not logic."""
 WINDOW = 6
 """Consecutive statements a window holds, as pylint's six lines."""
 WINDOW_NODES = 28
@@ -100,14 +101,50 @@ def docstring(statement: ast.stmt) -> bool:
             and isinstance(statement.value.value, str))
 
 
+def data(value: ast.expr) -> bool:
+    """A name, a constant, an empty container, or a tuple of them: a value stored as it is."""
+    if isinstance(value, ast.Tuple):
+        return all(data(element) for element in value.elts)
+    if isinstance(value, (ast.List, ast.Set)):
+        return not value.elts
+    if isinstance(value, ast.Dict):
+        return not value.keys
+    return isinstance(value, (ast.Name, ast.Constant))
+
+
+def field(target: ast.expr) -> bool:
+    """`self.name`, or a tuple of them."""
+    if isinstance(target, ast.Tuple):
+        return all(field(element) for element in target.elts)
+    return (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+            and target.value.id == "self")
+
+
+def stores(statement: ast.stmt) -> bool:
+    """A statement that only stores values in the instance's fields, or hands its arguments, as they are, to
+    the parent class's constructor."""
+    if isinstance(statement, ast.Assign):
+        return all(field(target) for target in statement.targets) and data(statement.value)
+    call = statement.value if isinstance(statement, ast.Expr) else None
+    if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "__init__"):
+        return False
+    parent = call.func.value
+    return (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name) and parent.func.id == "super"
+            and all(data(argument) for argument in call.args)
+            and all(data(keyword.value) for keyword in call.keywords))
+
+
 def declaration(statement: ast.stmt, in_class: bool) -> bool:
     """A docstring or a bare string standing as one, an import, a stub (a function whose body is only `...`
-    or `pass`), a bare annotation, or a class's annotated field."""
+    or `pass`), a function that only stores its fields (a constructor as a dataclass declares it), a bare
+    annotation, or a class's annotated field."""
     if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
         body = [line for line in statement.body if not docstring(line)]
-        return len(body) <= 1 and all(
+        stub = len(body) <= 1 and all(
             isinstance(line, ast.Pass) or (isinstance(line, ast.Expr) and isinstance(line.value, ast.Constant)
                                            and line.value.value is Ellipsis) for line in body)
+        return stub or all(stores(line) for line in body)
     if isinstance(statement, ast.AnnAssign):
         return in_class or statement.value is None
     return docstring(statement) or isinstance(statement, (ast.Import, ast.ImportFrom))
@@ -319,9 +356,10 @@ def new(hits: list[Hit], merged: str, top: Path) -> list[Hit]:
     written in more places than at the commit `merged`. A file the checkout leaves as `merged` has it holds
     the places it holds now; a changed, deleted or new one is read as `merged` has it."""
     # --no-renames: a moved file is named at both ends, so its old content is read as `merged` has it.
-    changed = set(git(top, "diff", "--no-renames", "--name-only", merged, "--").splitlines()) | set(
-        git(top, "ls-files", "--others", "--exclude-standard", "--full-name").splitlines())
     present = set(git(top, "ls-tree", "-r", "--name-only", merged).splitlines())
+    # A file the merge-base lacks is new however git sees it now: untracked, ignored or added.
+    changed = set(git(top, "diff", "--no-renames", "--name-only", merged, "--").splitlines()) | {
+        place.file for hit in hits for place in hit.places if place.file not in present}
     before: dict[tuple[str, str], list[Place]] = defaultdict(list)
     for file in sorted(changed & present):
         if file.endswith(".py"):
@@ -337,6 +375,13 @@ def report(hit: Hit) -> str:
     return f"duplicate {hit.kind} at {len(hit.places)} places: {places}"
 
 
+def judged(hits: list[Hit], merged: str, top: Path) -> tuple[list[Hit], list[Hit]]:
+    """`hits` (as `found` gives them) as the copies held to the commit `merged` fails and those it holds,
+    each named."""
+    failing = new(hits, merged, top)
+    return named(failing), named([hit for hit in hits if hit not in failing])
+
+
 def main(arguments: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base", help="a commit: a structural copy fails if written in more places than at"
@@ -344,24 +389,30 @@ def main(arguments: Sequence[str]) -> int:
     parser.add_argument("paths", nargs="+")
     options = parser.parse_args(arguments)
     files = python_files(options.paths)
-    # Held to a base, files are named from the repository's top, as git names them, and an unknown base
-    # fails here, before either reading.
-    top = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip()) if options.base else Path.cwd()
-    merged = merge_base(top, options.base) if options.base else ""
+    # Held to a base, files are named from the repository's top, as git names them, and a base this checkout
+    # shares no history with fails here, before either reading.
+    top = Path.cwd()
+    merged = ""
+    if options.base:
+        try:
+            top = Path(git(top, "rev-parse", "--show-toplevel").strip()).resolve()
+            merged = merge_base(top, options.base)
+        except subprocess.CalledProcessError:
+            print(f"the base {options.base} shares no history with this checkout (git's reason above)")
+            return 2
     started = time.monotonic()
     # pylint reads a directory as a package; the files, as files.
     text = Run([*ARGUMENTS, *map(str, files)], exit=False).linter.msg_status
     read = time.monotonic()
     hits = found({os.path.relpath(file.resolve(), top) if options.base else str(file): file.read_text()
                   for file in files})
-    failing = new(hits, merged, top) if options.base else hits
-    for hit in named(failing):
+    failing, held = judged(hits, merged, top) if options.base else (named(hits), [])
+    for hit in failing:
         print(report(hit))
-    held = named([hit for hit in hits if hit not in failing])
     for hit in held:
         print("(held by the base) " + report(hit))
-    print(f"{len(named(failing))} structural copies failing, {len(held)} held by the base, over {len(files)}"
-          f" files; text read in {read - started:.0f} s, structure in {time.monotonic() - read:.0f} s")
+    print(f"{len(failing)} structural copies failing, {len(held)} held by the base, over {len(files)} files;"
+          f" text read in {read - started:.0f} s, structure in {time.monotonic() - read:.0f} s")
     return 1 if text or failing else 0
 
 
