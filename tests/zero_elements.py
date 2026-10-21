@@ -14,8 +14,8 @@ A primitive is certified only by a verified contract of op_certificates.py:
 - a sum (reduce_sum, dot_general) of m nonzero native terms rounds by at most γ(m - 1) of their
   magnitudes in any order, a dot's products by γ(m), on the CPU at float32 or float64 (XLA:CPU's dot
   accumulates in the operands' format, at any precision);
-- max, min, moves, selections by a decided predicate, and exp at its exact points (exp(-inf) = 0,
-  exp(0) = 1) checked against the native value there, carry bounds exactly;
+- max, min, moves and selections by a decided predicate carry bounds exactly, and exp carries them by
+  its derivative, its native value held to a verified enclosure of the exact one at every element;
 - anything else is NOT_CERTIFIED, named, and so is every value it reaches.
 
 Bounds are rounded outward: every bound expression of a few terms widened by 2^-50 and rounded up, a
@@ -31,12 +31,24 @@ than Dew's own rounding there passes.
 
 import dataclasses
 import fractions
+import math
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.extend import core as jcore
-from op_certificates import FLOAT32, Format, _two_product, fraction_rounded, gamma, two_sum
+from op_certificates import (
+    EXP_BOUND,
+    FLOAT32,
+    Format,
+    _exp_enclosed,
+    _two_product,
+    fraction_rounded,
+    gamma,
+    interval_ends,
+    interval_precision,
+    two_sum,
+)
 
 FLOAT64 = Format("float64", 53, -1022, 1023)
 FORMATS = {np.dtype(np.float32): FLOAT32, np.dtype(np.float64): FLOAT64}
@@ -266,12 +278,15 @@ class Interpreter:
         return [self._infinite(result, natives[0], x, sign * y, operands, finite)]
 
     def _infinite(self, result: Bounded, native, x, y, operands, finite) -> Bounded:
-        """An infinity added to a finite value, both exact, is that infinity exactly (IEEE); any other sum
-        holding an infinity or not a number is not certified."""
-        lone = (np.isinf(x) & np.isfinite(y)) | (np.isinf(y) & np.isfinite(x))
-        exact = np.logical_and.reduce([np.broadcast_to(o.exact & o.certified, native.shape)
-                                       for o in operands])
-        held = lone & exact & (native.astype(np.float64) == np.where(np.isinf(x), x, y))
+        """An exact infinity added to a certified finite value is that infinity exactly (IEEE), whatever the
+        finite value's bound; any other sum holding an infinity or not a number is not certified."""
+        (first, second), shape = operands, native.shape
+        # The infinite operand exact, the finite one certified whatever its bound: its exact value is finite.
+        held = ((np.isinf(x) & np.isfinite(y) & np.broadcast_to(first.exact & first.certified, shape)
+                 & np.broadcast_to(second.certified, shape))
+                | (np.isinf(y) & np.isfinite(x) & np.broadcast_to(second.exact & second.certified, shape)
+                   & np.broadcast_to(first.certified, shape)))
+        held = held & (native.astype(np.float64) == np.where(np.isinf(x), x, y))
         result.certified = np.where(finite, result.certified, held)
         result.exact = np.where(finite, result.exact, held)
         result.error = np.where(finite, result.error, 0.0)
@@ -437,15 +452,47 @@ class Interpreter:
     # Pointwise functions at their exact points.
 
     def _exp(self, eqn, operands, natives):
-        """exp at its exact points only, exp(-inf) = 0 and exp(0) = 1, each checked against the native
-        value there; elsewhere no contract on this backend (an exhaustive sweep would give one)."""
+        """exp, its native value held to an enclosure of the exact one at every element, so no library exp
+        is trusted (the validated double-double of op_certificates for fp32 arguments, within EXP_BOUND;
+        mpmath's interval exp for float64 ones): its rounding the native value's distance from the
+        enclosure. Its bound carried by |exp(t) - exp(x̂)| <= exp(x̂)·e·(1 + e) for |t - x̂| <= e <= 1.
+        exp(-inf) = 0 and exp(0) = 1 exactly where the native value is so; an argument past exp's range
+        (a native infinity), not a number, or carrying a bound over one is not certified."""
         operand, native = operands[0], natives[0]
-        x, value = operand.value.astype(np.float64), native.astype(np.float64)
+        fmt, blocked = self._formatted("exp", natives, operand)
+        if blocked:
+            return blocked
+        x, value, e = operand.value.astype(np.float64), native.astype(np.float64), operand.error
+        ordinary = np.isfinite(x) & np.isfinite(value) & (e <= 1) & operand.certified
+        upper, local = np.zeros(x.shape), np.zeros(x.shape)
+        if fmt is FLOAT32:
+            inside = ordinary & (x >= -110) & (x <= 90)
+            hi, lo = _exp_enclosed(np.where(inside, x, 0.0))
+            slack = np.abs(hi) * EXP_BOUND
+            upper = np.where(inside, _up(np.abs(hi) + np.abs(lo) + slack), 0.0)
+            local = np.where(inside, _up(np.abs(value - hi) + np.abs(lo) + slack), 0.0)
+            # Below -110 exp is under 2^-158, which the format holds as zero or flushes.
+            below = ordinary & (x < -110)
+            upper = np.where(below, 2.0 ** -150, upper)
+            local = np.where(below, _up(np.abs(value) + 2.0 ** -150), local)
+            ordinary = inside | below
+        else:
+            for index in np.flatnonzero(ordinary):
+                with interval_precision(128) as iv:
+                    low, high = interval_ends(iv.exp(iv.mpf(float(x.flat[index]))), 128)
+                native_value = fractions.Fraction(float(value.flat[index]))
+                upper.flat[index] = math.nextafter(float(high), math.inf)
+                apart = max(abs(native_value - low), abs(high - native_value))
+                local.flat[index] = math.nextafter(float(apart), math.inf)
+        transfer = _up(_times(upper, _up(e * (1 + e))))
         point = operand.exact & operand.certified & (
             ((x == -np.inf) & (value == 0.0)) | ((x == 0.0) & (value == 1.0)))
-        if (~point).any():
-            self.blocked["exp"] = self.blocked.get("exp", 0) + int((~point).sum())
-        return [Bounded(native, np.zeros(native.shape), point, point)]
+        certified = (ordinary | point) & np.isfinite(transfer + local)
+        error = np.where(point, 0.0, np.where(certified, _up(transfer + local), 0.0))
+        if (~certified).any():
+            self.blocked["exp (past its range, or not a number)"] = (
+                self.blocked.get("exp (past its range, or not a number)", 0) + int((~certified).sum()))
+        return [Bounded(native, error, point & certified, certified)]
 
     def _integer_pow(self, eqn, operands, natives):
         """x², a correctly rounded product of x with itself (XLA lowers it so): |t² - x̂²| <= 2|x̂|e + e²."""
