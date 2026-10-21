@@ -1279,7 +1279,8 @@ def test_composite_rejection_and_partial_restart_agree_across_processes(tmp_path
                         run_dir=str(tmp_path / "single-state"))
     for report in [*pool, single]:
         assert report["flags"] == [[True, True], [True, False], [True, True], [True, True]]
-        assert report["clocks"] == [4, 3, 1]
+        # The rejected second attempt drops its window, the first with it: the last two make the update.
+        assert report["clocks"] == [4, 2, 1]
         assert report["resumed_equal"]
         assert report["scale"] == 65536.
     for report in pool:
