@@ -25,6 +25,16 @@ from numbers import Real
 type JSON = None | bool | int | float | str | list['JSON'] | dict[str, 'JSON']
 
 
+
+HF_METADATA = frozenset({
+    "architectures", "transformers_version", "torch_dtype", "dtype", "output_hidden_states",
+    "output_attentions", "return_dict", "is_encoder_decoder", "id2label", "label2id", "problem_type",
+    "chunk_size_feed_forward",
+})
+"""The fields every Hugging Face config serializes that describe no computation: its classes and
+release, its output and return flags, its label maps and task. A translator that refuses fields it
+does not read leaves these out, beside its own."""
+
 def duration(value: str) -> datetime.timedelta:
     """A positive recorded duration, in seconds, minutes or hours."""
     match = re.fullmatch(r'(\d+(?:\.\d+)?)(s|m|h)', value)
