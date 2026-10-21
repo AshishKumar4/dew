@@ -683,16 +683,19 @@ class MosaicTgmm(_Mosaic):
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
-        return tuple(tile for tile in MOSAIC_TILES if depth % tile.block_m == 0 and width % tile.block_n == 0
-                     and tile.warpgroups == 1)
+        # A pair takes two depth tiles of one group.
+        return tuple(tile for tile in MOSAIC_TILES
+                     if depth % (tile.block_m * tile.cluster) == 0 and width % tile.block_n == 0)
 
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles that fit `target` (`Template.fitting`), with `exact_sums` those whose two fp32
-        accumulators, the running sum and a step's, stay in the warpgroup's registers."""
+        accumulators, the running sum and a step's, stay in each consumer warpgroup's registers (a
+        warpgroup's 128 threads hold its share of the tile's columns)."""
         fits = super().fitting(ba, target)
         if not ba.arguments.get('exact_sums'):
             return fits
-        return tuple(tile for tile in fits if 2 * tile.block_m * tile.block_n // 128 < cost.THREAD_REGISTERS)
+        return tuple(tile for tile in fits
+                     if 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups) < cost.THREAD_REGISTERS)
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:
@@ -704,9 +707,9 @@ class MosaicTgmm(_Mosaic):
         size, out = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(ba.arguments['out_dtype']).itemsize
         blocks = depth // config.block_m, width // config.block_n
         # A group's rows are read once a band of column tiles, its cotangent once for the row tiles in
-        # flight.
+        # flight, a pair's once between them.
         bands = math.ceil(blocks[1] / config.grid_block_n)
-        in_flight = self._in_flight(config, target)
+        in_flight = self._in_flight(config, target) * config.cluster
         hooks = ba.arguments['hooks']
         rereads = {'rows': groups, 'depth': blocks[0], 'columns': bands}
         moved = ((bands * rows * depth + math.ceil(blocks[0] / in_flight) * rows * width) * size
