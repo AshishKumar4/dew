@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol, runtime_checkabl
 
 import numpy as np
 
-from dew.data.analysis import _bound, _cache_at, _order_at, _preferred_read, _promoted, _serves, _until
+from dew.data.analysis import _cache_at, _order_at, _preferred_read, _promoted, _serves, _until
 from dew.data.compile import compile
 from dew.data.dataset import Batch, DataPhase, Loader, Loading, record_argument
 from dew.data.holdout import (
@@ -443,7 +443,8 @@ class ImageData(_Loadable):
             classes = tuple(Store(self.labels).read().decode().splitlines())
         caption = images.caption(self.caption, templates=self.caption_templates,
                                  classes=classes, columns=self.caption_columns)
-        configured = Configured(ConfigureCaption(caption), needs=(), random=bool(self.caption_templates))
+        configured = Configured(ConfigureCaption(caption), needs=(), random=bool(self.caption_templates),
+                                one_to_one=True)
 
         def prepared(chain: Pipeline, staging: int) -> Pipeline:
             decoded = _decoded_images(chain, staging, field=self.field, at_least=staging, rejects=False)
@@ -598,8 +599,7 @@ def _ordered(pipeline: Pipeline, read: Read, seed: int) -> Pipeline:
     if isinstance(pipeline.source, (Mixture, Phases)):
         children = tuple(_ordered(child, read, seed) for child in pipeline.source.pipelines)
         return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
-    # A configured step bound to the facts the source states is known to keep or drop records.
-    at, indexed = _order_at(_bound(pipeline.source, pipeline.stages), read)
+    at, indexed = _order_at(pipeline.stages, read)
     order = Pipeline(pipeline.source).shuffle(seed, window=None if indexed else 64).repeat().stages
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *order, *pipeline.stages[at:]))
 

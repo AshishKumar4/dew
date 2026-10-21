@@ -255,7 +255,7 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
             # The views of the inputs written before the generation read its rows as they read the
             # inputs, where it holds one row for each input, in their order (`_one_to_one`).
             views = tuple(earlier for earlier in stages[:index] if isinstance(earlier, _VIEWS))
-            if views and not _one_to_one(_bound(source, stages[:index])):
+            if views and not _one_to_one(stages[:index]):
                 raise ValueError(
                     f"generation {stage.cache.url} holds the rows its steps kept, not one for each input, "
                     f"so the views written before it in {_name(pipeline)} can't read it by input; give "
@@ -511,28 +511,14 @@ def _bind(stage: Configured, metadata: Mapping[str, object]) -> Map | RandomMap 
     resolved = stage.factory(metadata)
     if isinstance(resolved, pygrain.RandomMapTransform) != stage.random:
         raise ValueError(f"Configured {_identity(stage).name} random={stage.random} disagrees with its step")
+    if stage.one_to_one and (isinstance(resolved, Expansion) or _declares_rejects(resolved)):
+        raise ValueError(f"Configured {_identity(stage).name} states one_to_one=True and binds to a step "
+                         "that drops or expands records")
     if isinstance(resolved, Expansion):
         return FlatMap(resolved, configured=binding)
     if isinstance(resolved, pygrain.RandomMapTransform):
         return RandomMap(resolved, rejects=_declares_rejects(resolved), configured=binding)
     return Map(resolved, rejects=_declares_rejects(resolved), configured=binding)
-
-
-def _bound(source: Source | Mixture | Phases, stages: Sequence[Stage]) -> tuple[Stage, ...]:
-    """`stages` with each configured step whose facts `source` states resolved, as a run binds it
-    (`_configured`), so whether they keep one record for each input (`_one_to_one`) is known before
-    the run; one that needs a run's facts, or facts the source measures only as it is read, stays
-    as written."""
-    if isinstance(source, (Mixture, Phases)) or not any(isinstance(stage, Configured) for stage in stages):
-        return tuple(stages)
-    stated = source.metadata()
-
-    def bound(stage: Stage) -> Stage:
-        if isinstance(stage, Configured) and stage.scope == "source" and set(stage.needs) <= stated.keys():
-            return _bind(stage, stated)
-        return stage
-
-    return tuple(bound(stage) for stage in stages)
 
 
 def _keyed(stage: Stage) -> bool:
@@ -664,8 +650,9 @@ def _one_to_one(stages: Sequence[Stage]) -> bool:
     or expands records. Such a cache reads as the source's own rows do, by index and in one global
     order (`dew.data.lowering._Inputs`); one that drops or expands is read as a stream, per share. A
     step a run's facts haven't bound yet (`Configured`) may drop records once bound, so it counts as
-    one that does until it is bound."""
-    return not any(_drops(stage) or isinstance(stage, Configured) for stage in stages)
+    one that does unless it states it keeps one for each (`Configured.one_to_one`)."""
+    return not any(_drops(stage) or (isinstance(stage, Configured) and not stage.one_to_one)
+                   for stage in stages)
 
 
 def _indexed_cache(prefix: Sequence[Stage], read: Read) -> bool:
@@ -974,9 +961,7 @@ def _checked(
         )
         # A cache reads as the stages it holds would: by index and in one order where they keep one
         # record for each input, as a stream and per share where they drop or expand them.
-        # A configured step the source's facts bind is the step it binds to (`_bound`).
-        cached = isinstance(stage, Artifact)
-        streamed_cache = cached and not _indexed_cache(_bound(pipeline.source, prefix), read)
+        streamed_cache = isinstance(stage, Artifact) and not _indexed_cache(prefix, read)
         indexed = indexed and not (streams or (streamed_cache and read != "memory"))
         shared = _drops(stage) or isinstance(stage, (Interleave, TokenBudget)) or streamed_cache
         per_share = per_share or shared or (isinstance(stage, Workers) and not batched)
