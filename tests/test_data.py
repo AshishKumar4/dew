@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from data_support import CAPTION_TEMPLATES, FLIP_JITTER, keep_captions
 from reader_support import assert_resumes_where_it_stopped
 
 from dew.config.data import Augment, HoldOut, ImageData, RecordsData, VideoData, loader
@@ -659,17 +660,6 @@ def test_a_video_recipe_reads_the_same_batches_at_any_worker_count_and_after_a_r
     resumed, _ = read(0, 2, saved)
     for expected, found in zip(single[2:], resumed, strict=True):
         np.testing.assert_array_equal(expected["audio"], found["audio"])
-
-
-def keep_captions(captions):
-    """A caption reader that hands the words back, so a test reads what the
-    dataset wrote before a run's encoder tokenizes it."""
-    return {"caption": np.asarray(captions)}
-
-
-CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
-
-FLIP_JITTER = Augment(flip=True, jitter=True, backend="host")
 
 
 # ---------------------------------------------------------------------------------

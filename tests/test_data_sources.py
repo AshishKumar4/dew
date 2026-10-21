@@ -22,7 +22,7 @@ import pyarrow.fs as pafs
 import pytest
 from reader_support import assert_a_rewrite_moves_the_identity, assert_resumes_where_it_stopped
 from storage_support import moto_bucket
-from token_support import export_byte_tokens
+from token_support import export_byte_tokens, write_token_meta
 
 from dew.data.dataset import DataPartition, Loading
 from dew.data.shards import streamed
@@ -1696,19 +1696,7 @@ def test_raw_token_arrayrecords_require_explicit_lengths_for_indexed_reads(tmp_p
     from dew.data.sources.codec import pack_dict_of_byte_arrays
     from dew.data.sources.tokens import TokenFiles
 
-    root = Store(str(tmp_path))
-    root.child("meta.json").write(
-        json.dumps(
-            {
-                "tokenizer": "byte",
-                "dtype": "uint16",
-                "vocab_size": 256,
-                "train_tokens": 15,
-                "val_tokens": 4,
-                "eos_id": None,
-            }
-        ).encode()
-    )
+    write_token_meta(tmp_path, 15, 4)
     for split, count in (("train", 15), ("val", 4)):
         writer = ArrayRecordWriter(str(tmp_path / f"{split}-0.array_record"), "group_size:1")
         for start, stop in zip((0, 2, 4), (2, 4, count), strict=True):
@@ -1869,9 +1857,7 @@ def test_a_token_store_without_its_length_index_is_refused_until_provisioned(tmp
 
     from dew.config.data import TextData, loader
 
-    Store(str(tmp_path)).child("meta.json").write(json.dumps({
-        "tokenizer": "byte", "dtype": "uint16", "vocab_size": 256, "train_tokens": 40, "eos_id": None,
-    }).encode())
+    write_token_meta(tmp_path, 40)
     writer = ArrayRecordWriter(str(tmp_path / "train-0.array_record"), "group_size:1")
     for start in range(0, 40, 10):
         writer.write(np.arange(start, start + 10, dtype=np.uint16).tobytes())
