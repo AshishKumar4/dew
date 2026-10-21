@@ -12,8 +12,8 @@ is fla's gated delta rule (`fla_gdn`) with a decay per key dimension, and shares
 kernels, whose USE_GK branch it takes (`fla_gdn.chunk_fwd_h`, `fla_gdn.chunk_bwd_dhu`), its forward
 substitution and its dot helpers, the recurrence template's decay prefix (`recurrence.cumulated`),
 and the chunked launches' token spans (`Sequences`) and base (`chunked_launch._Launch`, a tuner
-KernelOp); the kernels here are KDA's own. Each names its fla origin. `linear.chunk_gated_delta_rule`
-runs it for a decay per key dimension.
+KernelOp); the kernels here are KDA's own. Each names its fla origin.
+`dew.nn.kernels.recurrence_chunk.chunk_gated_delta_rule` runs it for a decay per key dimension.
 
 fla's grids are kept: a program per place of each chunk for the intra-chunk diagonal blocks (fla's
 per token, which searches the token's sequence), per chunk for the solve, per key block and
@@ -69,9 +69,10 @@ def _intra_rows_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, aqk_ref, akk_re
     `safe_gate=False` path) takes the diagonal 16-token blocks so, and factors every block below them
     through its sub-chunk's first row (`(q exp2(g_i - g_n)) (k exp2(g_n - g_j))`, chunk_intra.py:43-391):
     two exponentials rounded and one more product a term, against one exponential here (Dew's portable
-    math's, `linear.chunk_decay`'s). This port's earlier factored blocks, which moved decayed keys from
-    sub-chunk to sub-chunk where fla recomputes each factor, put 11 of a packed row's 16384 scores and 5
-    of its inverse's past twice the pairwise form's distance from float64; fla's own factored form was
+    math's, `dew.nn.kernels.recurrence_chunk.chunk_decay`'s). This port's earlier factored blocks,
+    which moved decayed keys from sub-chunk to sub-chunk where fla recomputes each factor, put 11 of a
+    packed row's 16384 scores and 5 of its inverse's past twice the pairwise form's distance from
+    float64; fla's own factored form was
     not measured. A program per place of a chunk, where fla's searches the token's sequence; a place
     past the chunk's end does nothing."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)

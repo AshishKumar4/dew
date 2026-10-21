@@ -48,12 +48,15 @@ from dew.nn.linear import (
     GatedDeltaNet,
     _masked_conv1d,
     causal_conv1d,
-    chunk_decay,
-    chunk_delta_rule,
-    chunk_gated_delta_rule,
     held_conv1d,
     l2norm,
     recurrent_gated_delta_rule,
+)
+from dew.nn.kernels.recurrence_chunk import (
+    chunk_decay,
+    chunk_delta_rule,
+    chunk_gated_delta_rule,
+    fla_rule,
     strictly_lower_inverse,
 )
 
@@ -190,7 +193,7 @@ def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, 
 
 @pytest.mark.parametrize("per_key", [False, True], ids=["gated delta net", "Kimi delta attention"])
 def test_the_port_takes_each_packed_tokens_output_and_gradients_as_its_document_alone_does(per_key):
-    """The port (`linear.fla_rule`, interpreted off a GPU) runs each packed document as a sequence of
+    """The port (`fla_rule`, interpreted off a GPU) runs each packed document as a sequence of
     its own, so each packed token's output and its gradients of the token's query, key, value, decay
     and beta are bitwise those of the same row with every other document's tokens zero: no token's
     value or gradient carries another document's, the decay's rounding included. The same program
@@ -214,7 +217,7 @@ def test_the_port_takes_each_packed_tokens_output_and_gradients_as_its_document_
             *rule, do = operands
 
             def loss(*rule):
-                out = linear.fla_rule(*rule, starts=starts)[0]
+                out = recurrence_chunk.fla_rule(*rule, starts=starts)[0]
                 return jnp.sum(out * do), out
             (_, out), grads = jax.value_and_grad(loss, argnums=tuple(range(5)), has_aux=True)(*rule)
             return {"out": out, **dict(zip(("q", "k", "v", "g", "beta"), grads, strict=True))}
@@ -237,7 +240,7 @@ def test_the_port_takes_each_packed_tokens_output_and_gradients_as_its_document_
 def test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound():
     """Two right-padded rows of two packed documents each (segment 0 after them) at the tightest
     bound their coordinates give (`Coordinates.max_segments`, two): each document's output on the
-    port (`linear.fla_rule`) is bitwise the document run alone, a row's first from the row's memory.
+    port (`recurrence_chunk.fla_rule`) is bitwise the document run alone, a row's first from the row's memory.
     A row's padding runs as a sequence of its own, so a bound without it ran the second row's last
     document on from its first."""
     from dew.nn.inputs import coordinates
@@ -249,9 +252,9 @@ def test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound()
     g = -0.1 * jax.nn.softplus(jax.random.normal(keys[3], (2, 128, 1)))
     beta = jnp.full((2, 128, 1), 0.5)
     h0 = 0.1 * jax.random.normal(keys[4], (2, 1, 64, 64))
-    packed = jax.jit(lambda *a: linear.fla_rule(*a, starts=tokens.starts, max_segments=tokens.max_segments))
+    packed = jax.jit(lambda *a: fla_rule(*a, starts=tokens.starts, max_segments=tokens.max_segments))
     out, _ = packed(q, k, v, g, beta, h0)
-    rule = jax.jit(linear.fla_rule)
+    rule = jax.jit(recurrence_chunk.fla_rule)
     for row, cuts in ((0, (0, 70, 120)), (1, (0, 50, 100))):
         for begin, end in itertools.pairwise(cuts):
             alone, _ = rule(*(x[row:row + 1, begin:end] for x in (q, k, v, g, beta)),
