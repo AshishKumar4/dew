@@ -3,23 +3,23 @@
 The reference block runs live here on random weights (tools/hf_reference.py's
 `scatter_weights`), a tiny NoPE config with pools of two keys and a budget of
 two pools, over eleven tokens so the tail alternates between empty and one
-token, one row of the batch left-padded through the attention mask.
-Everything runs at fp32 on CPU; the bound is 1e-4 scaled
-(max|ours - theirs| / max|theirs|) on each comparison.
+token, one row of the batch left-padded through the attention mask. Dew's block,
+its gradients and its decode are on par with the reference's fp32 from the
+reference run in float64 over drawn inputs (check 1, tests/reference_error.py),
+on the valid rows; a decode step that recomputes what a cached selection
+holds is the same computation, to the bit.
 
 The indexer's scores are relu'd sums, so two pools tie at exactly zero
 often; the reference's `topk` and `jax.lax.top_k` break such a tie
-differently, which is not a port error. `boundary_gap` reads the reference's
-own scores and asserts that no valid query's selection is decided by a tie
-at the weights and inputs below, so a failure here is a difference in the
-math and not in a tie-break.
-
-Observed on CPU, all scaled: output 2.2e-07 (1.6e-07 with biased
-projections), the input gradient 1.9e-07 and the parameter gradients
-4.4e-07 at worst, decode 1.6e-07 unpadded and 2.2e-07 with a padded row;
-the dense softmax over the same causal keys sits 0.35 from the sparse
-output. The selection margin at these weights and inputs is 1.5e-02.
+differently, which is not a port error, and a selection decided within
+rounding could pick other pools in float64. A draw (`drawn`) keeps only
+inputs at which the reference's own scores decide every valid query's
+selection by more than MARGIN (`boundary_gap`), so a failure here is a
+difference in the math and not in a tie-break.
 """
+
+import contextlib
+import copy
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +28,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from flax import linen as nn
+from reference_error import assert_as_exact, assert_moves, widened
 from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttention
 
@@ -37,7 +38,6 @@ from dew.nn.mixers import MixerContext
 from dew.registry import mixers
 from tools.hf_reference import scatter_weights
 
-BOUND = 1e-4
 B, S, E, H = 2, 11, 32, 4
 PADDED = 3
 """Leading slots of the second row the attention mask marks as padding."""
@@ -103,8 +103,66 @@ def inputs(seed: int = 0):
     return hidden, valid
 
 
-def scaled(actual, wanted) -> float:
-    return float(np.max(np.abs(np.asarray(actual, np.float64) - wanted)) / np.max(np.abs(wanted)))
+MARGIN = 1e-3
+"""The least selection margin a draw admits (`boundary_gap`): four orders above the scores' fp32
+rounding, so float64 and fp32 select the same pools."""
+
+SEEDS = {'output': 8, 'biased': 8, 'dense': 8, 'gradients': 8, 'parallel': 8, 'decode': 8,
+         'padded decode': 8, 'hole': 8}
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
+
+
+def drawn(block, padded: bool = True, cotangent: bool = False):
+    """Check 1's draw at `block`'s weights: a seed's hidden states and validity (`inputs`, all valid
+    unless `padded`), and with `cotangent` a readout of the valid rows, from the first of the seed's
+    candidates whose every valid query's selection the reference decides by more than MARGIN. The
+    candidates are inputs' seeds past 0, which the file's fixed cases read."""
+    def draw(seed):
+        for attempt in range(64):
+            index = 1 + 64 * seed + attempt
+            hidden, valid = inputs(index)
+            valid = valid if padded else np.ones_like(valid)
+            if boundary_gap(block, torch.from_numpy(hidden), torch.from_numpy(valid)) > MARGIN:
+                if not cotangent:
+                    return hidden, valid
+                readout = np.random.RandomState(index).randn(B, S, E).astype(np.float32) * valid[..., None]
+                return hidden, valid, readout
+        raise AssertionError(f"no candidate of seed {seed} has its selection decided by {MARGIN}")
+    return draw
+
+
+def on_valid_rows(out, valid):
+    """`out` on the valid rows and zero on the padded ones, which neither side defines."""
+    return np.where(np.asarray(valid)[..., None], np.asarray(out), 0)
+
+
+def call(valid):
+    return MixerCall(AttentionMetadata(coordinates=coordinates(valid=valid)))
+
+
+def dew_block(variables, **overrides):
+    """Dew's block over `variables` as a function of a draw: its output on the valid rows."""
+    run = jax.jit(lambda hidden, valid: module(**overrides).apply(variables, hidden, call(valid)))
+    return lambda hidden, valid: {'output': on_valid_rows(run(hidden, valid), valid)}
+
+
+def reference_block_output(block):
+    """The reference block, fp32, as a function of a draw: its output on the valid rows."""
+    return lambda hidden, valid: {'output': on_valid_rows(reference_output(block, hidden, valid), valid)}
+
+
+def float64_block(block):
+    """The reference block run in float64, every float32 pin widened (`float64`), as a function of a
+    widened draw: the truth check 1 measures both sides from."""
+    from tools.diffusers_wan_reference import float64
+
+    wide = copy.deepcopy(block).double()
+
+    def run(hidden, valid):
+        with float64(), torch.no_grad():
+            out = wide(torch.from_numpy(np.asarray(hidden)), torch.from_numpy(np.asarray(valid)))[0]
+        return {'output': on_valid_rows(out.numpy(), valid)}
+    return run
 
 
 def boundary_gap(block: Glm5NextTextAttention, hidden: torch.Tensor, valid: torch.Tensor) -> float:
@@ -142,77 +200,96 @@ def reference_output(block, hidden, valid):
 
 
 def test_the_block_matches_the_reference_and_is_sparse():
-    """Output parity on the valid rows, with the left-padded row pooling from
-    its first real key; and the selection matters: the same weights under a
-    budget that admits every pool (a dense causal softmax) land elsewhere."""
+    """Output on par on the valid rows (check 1), with the left-padded row
+    pooling from its first real key; and the selection matters: the same
+    weights under a budget that admits every pool (a dense causal softmax)
+    move the output past rounding (`assert_moves`)."""
     block = reference_block()
-    hidden, valid = inputs()
-    assert boundary_gap(block, torch.from_numpy(hidden), torch.from_numpy(valid)) > 1e-3
-    wanted = reference_output(block, hidden, valid)
     variables = translated(block)
-    metadata = AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid)))
-
-    ours = np.asarray(module().apply(variables, jnp.asarray(hidden), MixerCall(metadata)))
-    assert scaled(ours[valid], wanted[valid]) < BOUND
-    dense = np.asarray(
-        module(index_topk=64).apply(variables, jnp.asarray(hidden), MixerCall(metadata))
-    )
-    assert scaled(dense[valid], wanted[valid]) > 1e-2
+    draw, truth = drawn(block), float64_block(block)
+    assert_as_exact(dew_block(variables), reference_block_output(block), draw, 'k-pool block',
+                    seeds=SEEDS['output'], truth_fn=truth)
+    assert_moves(dew_block(variables), dew_block(variables, index_topk=64), draw, 'dense budget',
+                 seeds=SEEDS['dense'], truth_fn=truth)
 
 
 def test_the_block_matches_the_reference_with_biased_projections():
     """`attention_bias` puts a bias on q_a_proj, kv_a_proj_with_mqa and o_proj
-    and nowhere else (modeling_glm5_next.py:1097-1127)."""
+    and nowhere else (modeling_glm5_next.py:1097-1127); the biased block's
+    output is on par with the reference's (check 1)."""
     block = reference_block(attention_bias=True)
-    hidden, valid = inputs()
-    assert boundary_gap(block, torch.from_numpy(hidden), torch.from_numpy(valid)) > 1e-3
-    wanted = reference_output(block, hidden, valid)
     variables = translated(block)
     assert set(variables['params']['q_a_proj']) == {'kernel', 'bias'}
     assert set(variables['params']['q_b_proj']) == {'kernel'}
+    assert_as_exact(dew_block(variables, attention_bias=True), reference_block_output(block), drawn(block),
+                    'biased k-pool block', seeds=SEEDS['biased'], truth_fn=float64_block(block))
 
-    metadata = AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid)))
-    ours = module(attention_bias=True).apply(variables, jnp.asarray(hidden), MixerCall(metadata))
-    assert scaled(np.asarray(ours)[valid], wanted[valid]) < BOUND
+
+def torch_gradients(block):
+    """The gradients of a readout of `block`'s output into its input and every attention parameter, as
+    a function of a draw, by name (the input's 'x'); in float64, every float32 pin widened, where the
+    block is."""
+    from tools.diffusers_wan_reference import float64
+
+    wide = next(block.parameters()).dtype == torch.float64
+    named = {name: parameter for name, parameter in block.named_parameters()
+             if not name.startswith('indexer.')}
+
+    def run(hidden, valid, readout):
+        x = torch.from_numpy(np.asarray(hidden)).requires_grad_(requires_grad=True)
+        with float64() if wide else contextlib.nullcontext():
+            out = block(x, torch.from_numpy(np.asarray(valid)))[0]
+            found = torch.autograd.grad(out.mul(torch.from_numpy(np.asarray(readout))).sum(),
+                                        [x, *named.values()])
+        return {'x': found[0].numpy(),
+                **{name: grad.numpy() for name, grad in zip(named, found[1:], strict=True)}}
+    return run
+
+
+def dew_gradients(variables, names):
+    """Dew's gradients of the same readout, under the reference's parameter `names`, each laid out as
+    the reference's."""
+    def loss(x, variables, valid, readout):
+        return jnp.sum(module().apply(variables, x, call(valid)) * readout)
+
+    pulled = jax.jit(jax.grad(loss, argnums=(0, 1)))
+
+    def run(hidden, valid, readout):
+        grad_x, grads = pulled(hidden, variables, valid, readout)
+        ours = {'.'.join(str(key.key) for key in path): leaf
+                for path, leaf in jax.tree_util.tree_flatten_with_path(grads['params'])[0]}
+        found = {'x': np.asarray(grad_x)}
+        for name in names:
+            leaf, transpose = dew_leaf(name)
+            found[name] = np.asarray(ours[leaf]).T if transpose else np.asarray(ours[leaf])
+        return found
+    return run
 
 
 def test_the_gradients_match_torch_autograd():
     """One readout of the valid rows, differentiated into the input and every
-    parameter: the attention's projections and norms carry the reference's
-    gradients and the indexer's weights none, its selection being detached
-    on both sides."""
+    parameter: the attention's projections and norms carry gradients on par
+    with the reference's (check 1) and the indexer's weights none, its
+    selection being detached on both sides."""
     block = reference_block()
-    hidden, valid = inputs()
-    cotangent = np.random.RandomState(1).randn(B, S, E).astype(np.float32) * valid[..., None]
-    needs_grad = True
-    x = torch.from_numpy(hidden).requires_grad_(needs_grad)
-    block(x, torch.from_numpy(valid))[0].mul(torch.from_numpy(cotangent)).sum().backward()
-    theirs = {name: None if p.grad is None else p.grad.numpy() for name, p in block.named_parameters()}
-    assert x.grad is not None
-
     variables = translated(block)
-    metadata = AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid)))
+    draw = drawn(block, cotangent=True)
+    names = [name for name, _ in block.named_parameters() if not name.startswith('indexer.')]
+    assert len(names) == 7
+    assert_as_exact(dew_gradients(variables, names), torch_gradients(block), draw, 'k-pool gradients',
+                    seeds=SEEDS['gradients'], truth_fn=torch_gradients(copy.deepcopy(block).double()))
 
-    def loss(x, variables):
-        out = module().apply(variables, x, MixerCall(metadata))
-        assert isinstance(out, jax.Array)
-        return jnp.sum(out * jnp.asarray(cotangent))
-
-    grad_x, grads = jax.grad(loss, argnums=(0, 1))(jnp.asarray(hidden), variables)
-    assert scaled(grad_x, x.grad.numpy()) < BOUND
+    hidden, valid, readout = draw(0)
+    x = torch.from_numpy(hidden).requires_grad_(requires_grad=True)
+    block(x, torch.from_numpy(valid))[0].mul(torch.from_numpy(readout)).sum().backward()
+    _, grads = jax.grad(lambda x, variables: jnp.sum(module().apply(variables, x, call(valid)) * readout),
+                        argnums=(0, 1))(jnp.asarray(hidden), variables)
     ours = {'.'.join(str(key.key) for key in path): leaf
             for path, leaf in jax.tree_util.tree_flatten_with_path(grads['params'])[0]}
-    compared = 0
-    for name, wanted in theirs.items():
-        leaf, transpose = dew_leaf(name)
+    for name, parameter in block.named_parameters():
         if name.startswith('indexer.'):
-            assert wanted is None, name
-            assert float(jnp.max(jnp.abs(ours[leaf]))) == 0.0, name
-            continue
-        assert wanted is not None, name
-        assert scaled(ours[leaf], wanted.T if transpose else wanted) < BOUND, name
-        compared += 1
-    assert compared == 7
+            assert parameter.grad is None, name
+            assert float(jnp.max(jnp.abs(ours[dew_leaf(name)[0]]))) == 0.0, name
 
 
 def decode_steps(block_module, variables, hidden, valid, prefill: int):
@@ -240,46 +317,55 @@ def decode_steps(block_module, variables, hidden, valid, prefill: int):
     return np.asarray(jnp.concatenate(steps, axis=1))
 
 
+def stepped(variables, rows: bool = True):
+    """Dew's prefill of five tokens and then one at a time (`decode_steps`) as a function of a draw:
+    its output on the valid rows, the steps told the row's validity where `rows`."""
+    return lambda hidden, valid: {'output': on_valid_rows(
+        decode_steps(module(), variables, hidden, valid if rows else None, prefill=5), valid)}
+
+
 def test_prefill_then_token_steps_reproduce_the_parallel_block():
     """Five tokens, then one at a time through the fixed-capacity cache: each
     step's pools are read off the cache slots, the tail is empty after an
     even count of keys and one token after an odd one, so it changes at
-    every step; the steps equal the block over the whole sequence."""
+    every step; the steps are on par with the block over the whole sequence,
+    and it with the reference (check 1)."""
     block = reference_block()
-    hidden, _ = inputs()
     variables = translated(block)
-    wanted = np.asarray(module().apply(variables, jnp.asarray(hidden)))
-    assert scaled(wanted, reference_output(block, hidden, np.ones((B, S), bool))) < BOUND
-
-    assert scaled(decode_steps(module(), variables, hidden, None, prefill=5), wanted) < BOUND
+    draw, truth = drawn(block, padded=False), float64_block(block)
+    assert_as_exact(dew_block(variables), reference_block_output(block), draw, 'unpadded k-pool block',
+                    seeds=SEEDS['parallel'], truth_fn=truth)
+    assert_as_exact(stepped(variables, rows=False), dew_block(variables), draw, 'k-pool decode',
+                    seeds=SEEDS['decode'], truth_fn=truth)
 
 
 def test_a_padded_prefill_decodes_like_the_padded_parallel_block():
     """The cache holds the real tokens compactly where the parallel block
     pools from the row's first real key: the same pools, so the valid rows
-    agree; the padded queries' steps write nothing."""
+    are on par (check 1); the padded queries' steps write nothing."""
     block = reference_block()
-    hidden, valid = inputs()
-    variables = translated(block)
-    wanted = reference_output(block, hidden, valid)
-
-    ours = decode_steps(module(), variables, hidden, valid, prefill=5)
-    assert scaled(ours[valid], wanted[valid]) < BOUND
+    assert_as_exact(stepped(translated(block)), reference_block_output(block), drawn(block),
+                    'padded k-pool decode', seeds=SEEDS['padded decode'], truth_fn=float64_block(block))
 
 
 def test_a_row_with_a_hole_pools_as_its_cache_does():
     """A validity hole inside a row: the parallel block pools and tails the row's real keys in the
-    order its cache compacts them (`valid_order`), so its real queries equal the prefill-then-steps
-    ones, as a left-padded row's do."""
-    block = reference_block()
-    hidden, valid = inputs()
-    valid[0, 3] = False
-    variables = translated(block)
-    metadata = AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid)))
-    parallel = np.asarray(module().apply(variables, jnp.asarray(hidden), MixerCall(metadata)))
+    order its cache compacts them (`valid_order`), which the reference does not, so its real queries
+    are on par with the prefill-then-steps ones (check 1), as a left-padded row's are; the truth is
+    Dew's block in float64."""
+    variables = translated(reference_block())
 
-    stepped = decode_steps(module(), variables, hidden, valid, prefill=5)
-    assert scaled(stepped[valid], parallel[valid]) < BOUND
+    def draw(seed):
+        hidden, valid = inputs(1 + seed)
+        valid[0, 3] = False
+        return hidden, valid
+
+    def truth(hidden, valid):
+        wide = module(dtype=jnp.float64).apply(widened(variables), hidden, call(valid))
+        return {'output': on_valid_rows(wide, valid)}
+
+    assert_as_exact(stepped(variables), dew_block(variables), draw, 'k-pool hole', seeds=SEEDS['hole'],
+                    truth_fn=truth)
 
 
 def test_the_kind_builds_from_the_configs_fields_and_is_nope():
@@ -369,7 +455,7 @@ def test_prediction_selection_seed_miss_hit_and_fixed_tail():
     canonical = {name: value for name, value in next_draft["cache"].items()
                  if name not in ("selection_indices", "selection_position")}
     expected, _ = selection_step(block, variables, canonical, x[:, 7:8], active[:, 7:8], "ordinary")
-    np.testing.assert_allclose(ordinary, expected, atol=BOUND, rtol=0)
+    np.testing.assert_array_equal(ordinary, expected)
     np.testing.assert_array_equal(cleared["cache"]["selection_position"], [-1, -1])
 
 
@@ -393,7 +479,7 @@ def test_prediction_selection_empty_seed_inactive_rows_and_reordering():
     rows = jnp.asarray([1, 0, 0])
     reordered, _ = selection_step(block, variables, gather_cache_rows(extended["cache"], rows),
                                   x[rows, 1:2], valid[rows], "draft")
-    np.testing.assert_allclose(reordered, out[rows], atol=BOUND, rtol=0)
+    np.testing.assert_array_equal(reordered, out[rows])
 
 
 def test_prediction_selection_rewind_recomputes_only_invalidated_row():
@@ -425,6 +511,6 @@ def test_prediction_selection_rewind_recomputes_only_invalidated_row():
     np.testing.assert_array_equal(reactivated["cache"]["selection_position"], [3, 3])
     fresh = {**held["cache"], "selection_position": held["cache"]["selection_position"].at[1].set(-1)}
     expected, recomputed = selection_step(block, variables, fresh, x[:, 7:8], valid[:, :1], "draft")
-    np.testing.assert_allclose(actual[1], expected[1], atol=BOUND, rtol=0)
+    np.testing.assert_array_equal(actual[1], expected[1])
     np.testing.assert_array_equal(reactivated["cache"]["selection_indices"][1],
                                   recomputed["cache"]["selection_indices"][1])
