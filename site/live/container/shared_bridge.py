@@ -48,6 +48,18 @@ differ by the end's accuracy, a few seconds at most, which moves the end by as m
 # largest guest is killed at once: waiting for the kernel's OOM killer lets the host thrash first.
 RESERVE = 1536 << 20
 GUEST_UIDS = range(6100, 6200)
+# A guest cannot lower its OOM score below the 1000 it starts at; its /proc is read-only besides. The
+# smoke checks (smoke-shared.py, benchmark_gateway.py) run this in a guest's context.
+OOM_PROBE = """for score in ("-1000", "-999", "0"):
+    try:
+        with open("/proc/self/oom_score_adj", "w") as file:
+            file.write(score)
+    except OSError:
+        pass
+    else:
+        raise AssertionError(f"a guest lowered its OOM score to {score}")
+assert open("/proc/self/oom_score_adj").read().strip() == "1000"
+"""
 PRELOAD = {"python3": "import model_client; model_client.install()",
            "dew-train": "import live_training; live_training.install()"}
 

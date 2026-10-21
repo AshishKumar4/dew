@@ -15,6 +15,7 @@ records the derived order facts a resume checks.
 
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import logging
 from collections.abc import Mapping, Sequence
@@ -24,7 +25,16 @@ import numpy as np
 
 from dew.data.analysis import _analyzed, _identity, _label, _name
 from dew.data.dataset import Batch, Records
-from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _TokenSplit
+from dew.data.lowering import (
+    _cache_inputs,
+    _CachedOutputs,
+    _fill,
+    _Locality,
+    _outputs,
+    _packed,
+    _threads,
+    _TokenSplit,
+)
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
     FlatMap,
@@ -130,7 +140,10 @@ def _materialize(
     if not isinstance(source, _Memory):
         counter.attempted = len(stored)
     lowering = _analyzed(pipeline, "memory", validation=not training)
-    rows, consumed = _memory_inputs(pipeline, source, stored, counter, lowering.cache)
+    # A cache among the eager stages fills over the whole source here; one after a view of the
+    # inputs is the lowering's, which reads it by input (`_Build.indexed`).
+    eager = lowering.cache if lowering.cache is not None and lowering.eager > lowering.cache else None
+    rows, consumed = _memory_inputs(pipeline, source, stored, counter, eager)
     return _memory_stages(
         pipeline, source, stored, rows, consumed, lowering.eager, counter, training=training
     )
@@ -143,10 +156,16 @@ def _memory_inputs(
     consumed = 0
     if artifact_at is not None:
         filled, manifest, prefix = _fill(pipeline, source, artifact_at, "memory")
-        cached = filled.mapped(pygrain.MapDataset.source(stored), manifest, transform=prefix, source=source)
+        cached = filled.mapped(_cache_inputs(source, stored), manifest, transform=prefix, source=source)
         try:
-            for index in range(len(cached)):
-                outputs = cached[index]
+            if prefix.threads is None:
+                filling = [cached.record(index) for index in range(len(cached))]
+            else:
+                # A fetch with a pool of its own among the cached steps fills that many inputs at once.
+                pool = concurrent.futures.ThreadPoolExecutor(prefix.threads, thread_name_prefix="dew-step")
+                with pool:
+                    filling = list(pool.map(cached.record, range(len(cached))))
+            for index, outputs in enumerate(filling):
                 if not isinstance(outputs, tuple):
                     raise TypeError("cached input must return its tuple of expansion outputs")
                 for child, value in enumerate(_CachedOutputs().flat_map(outputs)):
@@ -167,6 +186,16 @@ def _memory_inputs(
                 identifier = source.identifiers[index] if isinstance(source, _Memory) else (index,)
                 rows.append((identifier, value))
     return rows, consumed
+
+
+@dataclasses.dataclass(frozen=True)
+class _Fetched:
+    """What a stage makes of one identified row, run on a fetch's own pool."""
+
+    stage: Stage
+
+    def __call__(self, row: tuple[tuple[int, ...], Record]) -> tuple[Record, ...]:
+        return _outputs(self.stage, row[0][0], row[1])
 
 
 def _memory_stages(
@@ -249,8 +278,15 @@ def _memory_stages(
             expanded: list[tuple[tuple[int, ...], Record]] = []
             expanded_counts: dict[tuple[int, ...], int] = {}
             counts_targets = isinstance(stage, Map) and isinstance(stage.step, CountTargets)
-            for identifier, value in rows:
-                outputs = _outputs(stage, identifier[0], value, counts=counter)
+            threads = _threads((stage,))
+            if threads is None:
+                made = (_outputs(stage, identifier[0], value, counts=counter) for identifier, value in rows)
+            else:
+                # A fetch with a pool of its own runs that many records at once, in their order.
+                pool = concurrent.futures.ThreadPoolExecutor(threads, thread_name_prefix="dew-step")
+                with pool:
+                    made = iter(list(pool.map(_Fetched(stage), rows)))
+            for (identifier, value), outputs in zip(rows, made, strict=True):
                 for child, output in enumerate(outputs):
                     if isinstance(output, Rejected):
                         counter.rejected[output.reason] += 1

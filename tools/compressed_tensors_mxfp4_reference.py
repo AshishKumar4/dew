@@ -31,18 +31,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from compressed_tensors.compressors.mxfp4.base import MXFP4PackedCompressor
 from compressed_tensors.compressors.nvfp4.helpers import FLOAT_TO_E2M1
-from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
-from compressed_tensors.quantization.utils.helpers import calculate_qparams
+from reference_mxfp4 import encoded
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "compressed_tensors_mxfp4.npz"
-
-# moonshotai/Kimi-K3's one config group (config.json at f831ab6), the scheme
-# Dew's `PACKED_MXFP4_WEIGHTS` reads.
-ARGS = QuantizationArgs(num_bits=4, type="float", strategy="group", group_size=32,
-                        symmetric=True, dynamic=False, scale_dtype=torch.uint8)
-SCHEME = QuantizationScheme(targets=["Linear"], weights=ARGS)
 
 TIES = [(lower + upper) / 2 for lower, upper in itertools.pairwise(FLOAT_TO_E2M1)]
 """Halfway between neighbouring E2M1 magnitudes, the library's own table's;
@@ -83,22 +75,13 @@ def fresh_weight() -> np.ndarray:
     return weight
 
 
-def compress(weight: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
-    """compressed-tensors' packed codes and E8M0 scale bytes for one Linear weight."""
-    groups = weight.unflatten(-1, (-1, ARGS.group_size))
-    scale, zero_point = calculate_qparams(groups.amin(-1), groups.amax(-1), ARGS)
-    state = {"weight": weight, "weight_scale": scale, "weight_zero_point": zero_point}
-    compressed = MXFP4PackedCompressor.compress(state, SCHEME)
-    assert set(compressed) == {"weight_packed", "weight_scale"}, sorted(compressed)
-    return compressed["weight_packed"].numpy(), compressed["weight_scale"].numpy()
-
-
 def main() -> None:
     weight = torch.from_numpy(fresh_weight())
     arrays = {}
     for name, dtype in DTYPES.items():
         cast = weight.to(dtype)
-        packed, scale = compress(cast)
+        packed, scale = encoded(cast)
+        packed, scale = packed.numpy(), scale.numpy()
         assert packed.dtype == np.uint8 and scale.dtype == np.uint8
         # The raw bits, since NumPy has no bfloat16.
         arrays[f"weight_{name}"] = cast.view(torch.int32 if name == "float32" else torch.int16).numpy()
