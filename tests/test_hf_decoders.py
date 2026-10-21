@@ -155,6 +155,17 @@ def fp32_decoder(directory, **kwargs):
     return pretrained.model, pretrained.variables
 
 
+def recorded_logit_difference(model, variables, directory) -> float:
+    """`model`'s logits over a fixture's ids (`directory`/input_ids.npy) against the logits its
+    reference recorded (`directory`/logits.npy): the same argmax everywhere, and their largest
+    difference, which each caller holds to its own bound."""
+    ids = np.load(directory / "input_ids.npy")
+    reference = np.load(directory / "logits.npy")
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    return float(np.max(np.abs(logits - reference)))
+
+
 def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path):
     from shutil import copytree
 

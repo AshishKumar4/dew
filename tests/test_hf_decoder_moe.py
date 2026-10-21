@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from model_support import flat_tree
 from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
-from test_hf_decoders import GEMMA4_MOE, fixture_config, fp32_decoder
+from test_hf_decoders import GEMMA4_MOE, fixture_config, fp32_decoder, recorded_logit_difference
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.codecs import dequantize_mxfp4, quantize_mxfp4
@@ -189,14 +189,8 @@ def test_gpt_oss_logits_match_the_reference_implementation():
     max |logit difference| 2.5e-06 with identical argmax."""
     pretrained = Pretrained.load(str(GPT_OSS), dtype="float32", attention_impl="xla")
     model, variables = pretrained.model, pretrained.variables
-    ids = np.load(GPT_OSS / "input_ids.npy")
-    reference = np.load(GPT_OSS / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, GPT_OSS)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
     flat = flat_tree(variables["params"])
     assert flat["layers_0.self_attn.sinks"].shape == (4,)
     assert flat["layers_1.mlp.experts.gate_up_proj_bias"].shape == (4, 128)
@@ -288,14 +282,8 @@ def test_deepseek_v2_logits_match_the_reference_implementation():
     """fp32 parity: tolerance 1e-4, observed max |logit difference| 2.3e-06
     with identical argmax."""
     model, variables = fp32_decoder(DEEPSEEK_V2)
-    ids = np.load(DEEPSEEK_V2 / "input_ids.npy")
-    reference = np.load(DEEPSEEK_V2 / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, DEEPSEEK_V2)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
     assert "moe" not in variables, "V2 keeps no balancing bias"
 
 
@@ -311,14 +299,8 @@ def test_kimi_k25_logits_match_the_reference_implementation():
     on input_ids alone: tolerance 1e-4, observed max |logit difference|
     the bound applies to the complete vocabulary at every input position."""
     model, variables = fp32_decoder(KIMI_K25)
-    ids = np.load(KIMI_K25 / "input_ids.npy")
-    reference = np.load(KIMI_K25 / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, KIMI_K25)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
 
 
 def test_a_kimi_k25_export_writes_the_source_names_and_the_vision_bytes(tmp_path):
@@ -358,14 +340,8 @@ def test_glm4_moe_logits_match_the_reference_implementation():
     """fp32 parity of the trunk: tolerance 1e-4, observed max |logit
     difference| 3.3e-06 with identical argmax."""
     model, variables = fp32_decoder(GLM4_MOE)
-    ids = np.load(GLM4_MOE / "input_ids.npy")
-    reference = np.load(GLM4_MOE / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, GLM4_MOE)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
 
 
 def test_the_glm4_moe_mtp_depth_matches_the_reference_composition():
@@ -471,14 +447,8 @@ def test_glm_moe_dsa_logits_match_the_reference_implementation():
     difference| 2.7e-05 with identical argmax, over four selecting layers
     and four that share the previous full layer's top-k."""
     model, variables = fp32_decoder(GLM_MOE_DSA)
-    ids = np.load(GLM_MOE_DSA / "input_ids.npy")
-    reference = np.load(GLM_MOE_DSA / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, GLM_MOE_DSA)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
 
 
 def test_the_glm_moe_dsa_mtp_depth_matches_the_reference_composition():
@@ -531,14 +501,8 @@ def test_deepseek_v4_logits_match_the_reference_implementation():
     """fp32 parity over all three attention kinds and both routers:
     tolerance 1e-4 on logits of magnitude 4.4."""
     model, variables = fp32_decoder(DEEPSEEK_V4)
-    ids = np.load(DEEPSEEK_V4 / "input_ids.npy")
-    reference = np.load(DEEPSEEK_V4 / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, DEEPSEEK_V4)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
 
 
 def test_deepseek_v4_a_left_padded_row_pools_its_compressed_windows_over_its_own_tokens():
@@ -724,14 +688,8 @@ def test_llama4_logits_match_the_reference_implementation():
     """fp32 parity: tolerance 1e-4, observed max |logit difference| 3.5e-06
     with identical argmax. The fused expert kernels arrive split in place."""
     model, variables = fp32_decoder(LLAMA4)
-    ids = np.load(LLAMA4 / "input_ids.npy")
-    reference = np.load(LLAMA4 / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, LLAMA4)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
     experts = variables["params"]["layers_1"]["mlp"]["experts"]
     assert experts["gate_proj"]["kernel"].shape == (4, 32, 48)
     assert experts["down_proj"]["kernel"].shape == (4, 48, 32)
@@ -750,14 +708,8 @@ def test_gemma4_moe_logits_match_the_reference_implementation():
     with identical argmax. The fused expert kernels arrive split in place,
     the global layer holds no v_proj, and every layer holds its scalar."""
     model, variables = fp32_decoder(GEMMA4_MOE)
-    ids = np.load(GEMMA4_MOE / "input_ids.npy")
-    reference = np.load(GEMMA4_MOE / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, GEMMA4_MOE)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
     params = variables["params"]
     experts = params["layers_0"]["moe"]["experts"]
     assert experts["gate_proj"]["kernel"].shape == (4, 32, 16)
