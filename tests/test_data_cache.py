@@ -704,6 +704,63 @@ class Keeps:
         return Rejected("unkept") if int(row["id"]) % self.every == 0 else row
 
 
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_shuffled_cache_fills_what_a_publication_of_its_steps_reads(tmp_path, read):
+    """A store missing two of its inputs, shuffled and then cached: the cache fills each input's
+    rows by its place in the store, missing ones too, as a publication of the steps keys them, so
+    publishing afterwards runs no step again and holds every kept row."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    source = Memory([None if index in (3, 7) else {"id": index} for index in range(12)])
+    cache = str(tmp_path / "cache")
+    filling = Offset(10)
+    chain = Pipeline(source).shuffle(3).map(filling).cache(cache).repeat(1).batch(2)
+    reader = compile(chain, read=read, loading=loading).train(DataPartition())
+    try:
+        assert sorted(row for batch in _ids(reader) for row, _ in batch) == [
+            index for index in range(12) if index not in (3, 7)]
+    finally:
+        reader.close()
+    publishing = Offset(10)
+    generation = publish(Pipeline(source).map(publishing), Cache(cache), read=read, loading=loading)
+    assert len(generation) == 10
+    assert publishing.calls == []
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_published_generation_after_a_shuffle_reads_as_the_steps_it_stands_for(tmp_path, read):
+    """A generation published from a step that keeps one row for each input stands in for that
+    step after a shuffle, read as the shuffled step's rows; one published from a step that drops
+    rows holds no row for each input, so a shuffle before it is refused, naming the cache that
+    reads it by input."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    source = Memory([{"id": index} for index in range(12)])
+
+    def batches(chain):
+        reader = compile(chain.repeat().batch(3), read=read, loading=loading).train(DataPartition())
+        try:
+            return _ids(next(reader) for _ in range(4))
+        finally:
+            reader.close()
+
+    generation = publish(Pipeline(source).map(Offset(10)), Cache(str(tmp_path / "one")), read="indexed",
+                         loading=loading)
+    expected = batches(Pipeline(source).shuffle(3).map(Offset(10)))
+    assert batches(Pipeline(source).shuffle(3).map(Offset(10)).cache(generation)) == expected
+    kept = Pipeline(source).map(Offset(10)).filter_map(Keeps(5), identity="keeps@1")
+    dropped = publish(kept, Cache(str(tmp_path / "kept")), read="indexed", loading=loading)
+    with pytest.raises(ValueError):
+        batches(Pipeline(source).shuffle(3).map(Offset(10)).filter_map(Keeps(5), identity="keeps@1")
+                .cache(dropped))
+
+
 @pytest.mark.parametrize("views", ["shuffled", "shuffled in windows", "repeated then shuffled", "taken"])
 @pytest.mark.parametrize("read", ["memory", "indexed"])
 def test_a_cache_after_views_of_the_inputs_reads_as_the_uncached_chain(tmp_path, read, views):
