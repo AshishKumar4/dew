@@ -115,6 +115,16 @@ def widened(tree):
         leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
 
 
+def with_gradients(fn):
+    """`fn` as `run(*inputs, cotangent)`, which returns `fn(*inputs)` and the gradients of its inputs
+    under the cotangent passed last: a differentiated call's leaves, as the gate compares them."""
+    def run(*arguments):
+        out, pull = jax.vjp(fn, *arguments[:-1])
+        return out, *pull(arguments[-1])
+
+    return run
+
+
 def equations(graph):
     """Every equation of a jaxpr, its sub-jaxprs' (scan, cond, custom rules) in turn."""
     if hasattr(graph, "eqns"):

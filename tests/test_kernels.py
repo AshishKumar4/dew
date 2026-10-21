@@ -18,9 +18,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from attention_oracle import attention_terms, exact_attention, kept, qkv, value_and_grads
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, distance
-from test_attention_splash import attention_terms
+from reference_error import assert_as_exact_as_the_reference, distance, with_gradients
 
 from dew.nn import kernels
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention, weighted_values
@@ -133,21 +133,6 @@ def test_flash_through_dews_attention_refuses_rows_it_would_misread(without_dete
 SHARDED_SEEDS = 8
 """The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
 `seeds_for`: the fewest for which one device compared with itself resolves the factor."""
-
-
-def qkv(shape, seed=0):
-    keys = jax.random.split(jax.random.PRNGKey(seed), 3)
-    return tuple(jax.random.normal(key, shape, jnp.bfloat16) for key in keys)
-
-
-def value_and_grads(implementation, query, key, value, **kwargs):
-    def loss(q, k, v):
-        out = scaled_dot_product_attention(q, k, v, implementation=implementation, **kwargs)
-        return jnp.sum(out.astype(jnp.float32) ** 2), out
-
-    (_, out), grads = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True))(
-        query, key, value)
-    return [np.asarray(x, np.float32) for x in (out, *grads)]
 
 
 @on_gpu
@@ -266,40 +251,17 @@ def test_flash_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_d
 
 
 def float64_attention(query, key, value, causal, window=(-1, -1), sinks=None):
-    """Attention of `[S, H, D]` arrays as float64 math, key heads repeated over their group: a
-    query keeps the keys `window` `(left, right)` reaches (-1 bounding neither side), and a head's
-    sink logit joins each row's denominator with no value."""
-    group = query.shape[1] // key.shape[1]
-    key, value = jnp.repeat(key, group, axis=1), jnp.repeat(value, group, axis=1)
-    logits = jnp.einsum('qhd,khd->hqk', query, key) / np.sqrt(query.shape[-1])
-    logits = jnp.where(window_kept(query.shape[0], key.shape[0], causal, window), logits, -jnp.inf)
-    if sinks is None:
-        weights = jax.nn.softmax(logits, axis=-1)
-    else:
-        sink = sinks[:, None, None]
-        top = jnp.maximum(jnp.max(logits, axis=-1, keepdims=True), sink)
-        exponents = jnp.exp(logits - top)
-        weights = exponents / (jnp.sum(exponents, axis=-1, keepdims=True) + jnp.exp(sink - top))
-    return jnp.einsum('hqk,khd->qhd', weights, value)
-
-
-def window_kept(q_len, k_len, causal, window=(-1, -1)):
-    """The keys each of `q_len` queries keeps, `[q, k]`: `float64_attention`'s causality and window."""
-    offset = np.arange(k_len)[None, :] - np.arange(q_len)[:, None]
-    kept = np.ones(offset.shape, bool)
-    if causal:
-        kept &= offset <= 0
-    if window[0] >= 0:
-        kept &= offset >= -window[0]
-    if window[1] >= 0:
-        kept &= offset <= window[1]
-    return kept
+    """`exact_attention` of one row's `[S, H, D]` arrays: a query keeps the keys `window` `(left,
+    right)` reaches (-1 bounding neither side) behind causality, and a head's sink logit joins each
+    row's denominator with no value."""
+    keep = kept(query.shape[0], key.shape[0], causal=causal, window=window)
+    return exact_attention(query[None], key[None], value[None], sinks, keep=keep)[0]
 
 
 def window_terms(query, key, value, cotangent, causal, window=(-1, -1), sinks=None):
     """`attention_terms` of `float64_attention`'s output and gradients for `[S, H, D]` arrays."""
     terms = attention_terms(query[None], key[None], value[None], cotangent[None],
-                            window_kept(query.shape[0], key.shape[0], causal, window)[None, None], sinks)
+                            kept(query.shape[0], key.shape[0], causal=causal, window=window), sinks)
     return [x[0] for x in terms]
 
 
@@ -425,19 +387,12 @@ def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_determin
         _, key, value = qkv((2, 256, 2, 64), seed=3 * seed + 1)
         return query, key, value, qkv((2, 256, 4, 64), seed=3 * seed + 2)[0]
 
-    def gradients(attend):
-        def run(q, k, v, do):
-            out, pull = jax.vjp(attend, q, k, v)
-            return out, *pull(do)
-
-        return run
-
     spec = PartitionSpec(*(axis if dim in split else None for dim in range(3)))
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     flash = functools.partial(scaled_dot_product_attention, implementation='flash', causal=True)
-    assert_runs_per_shard(gradients(flash), draw, [spec] * 4, mesh, f"flash split over {axis}",
-                          seeds=SHARDED_SEEDS,
-                          truth_fn=gradients(jax.vmap(functools.partial(float64_attention, causal=True))))
+    assert_runs_per_shard(with_gradients(flash), draw, [spec] * 4, mesh, f"flash split over {axis}",
+                          seeds=SHARDED_SEEDS, truth_fn=with_gradients(
+                              jax.vmap(functools.partial(float64_attention, causal=True))))
 
 
 @on_gpu
