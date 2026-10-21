@@ -54,13 +54,6 @@ def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
     return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
 
 
-def _two_sum(a: jax.Array, b: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`a + b` and its rounding error, exactly (Knuth's TwoSum)."""
-    total = a + b
-    back = total - a
-    return total, (a - (total - back)) + (b - back)
-
-
 def _wide_enough(dtype) -> bool:
     """Whether `dtype` reaches as far down as fp32 (bf16 does, fp16 does not), so a value fp32 holds
     narrows to it without underflowing."""
@@ -615,9 +608,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         # (dP_j - c) - (D - c): the key that holds a query's maximum enters it as exactly 0, so a query
         # that keeps one key gets 0, and one whose other keys and initial state weigh less than fp32's
         # resolution beside it gets their share in full.
-        # Each running sum carries its rounding error beside it (`_two_sum` across tiles), so the
-        # denominator and numerator over many key tiles round about as a single sum of their terms does.
-        peak, anchor, (total, total_error), (numerator, numerator_error) = carry
+        peak, anchor, total, numerator = carry
         keys, k_pos, seen, params = tile(index)
         logits, _ = _tile_logits(score_mod, query, key_ref[keys, :], seen, q_pos, k_pos, params, scale=scale,
                                  interpret=interpret)
@@ -629,19 +620,14 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         safe = jnp.where(new_peak == -jnp.inf, 0.0, new_peak)
         correction = jnp.exp(peak - safe)
         exponentials = jnp.exp(logits - safe[:, None])
-        moved = correction * (numerator + (anchor - new_anchor) * (total + total_error))
-        numerator, error = _two_sum(moved, jnp.sum(exponentials * (products - new_anchor[:, None]), axis=-1))
-        numerator_error = correction * numerator_error + error
-        total, error = _two_sum(correction * total, exponentials.sum(axis=-1))
-        total_error = correction * total_error + error
-        return new_peak, new_anchor, (total, total_error), (numerator, numerator_error)
+        numerator = (correction * (numerator + (anchor - new_anchor) * total)
+                     + jnp.sum(exponentials * (products - new_anchor[:, None]), axis=-1))
+        return new_peak, new_anchor, correction * total + exponentials.sum(axis=-1), numerator
 
     # From the softmax's initial state (`backward`), anchored at 0.
     peak0, shares = peak, (total, initial_ref[...])
-    nothing = jnp.zeros_like(total)
-    peak, anchor, (total, total_error), (numerator, numerator_error) = jax.lax.fori_loop(
-        bounds_ref[0], bounds_ref[1], row_terms, (peak, nothing, (shares[0], nothing), (shares[1], nothing)))
-    total, numerator = total + total_error, numerator + numerator_error
+    peak, anchor, total, numerator = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_terms,
+                                                       (peak, jnp.zeros_like(total), *shares))
     peak = jnp.where(peak == -jnp.inf, 0.0, peak)
     delta = jnp.where(total > 0, numerator / jnp.where(total > 0, total, 1.0), 0.0)
     summed = tuple(kind in (Kind.HEAD, Kind.QUERY) for kind in score_kinds)
