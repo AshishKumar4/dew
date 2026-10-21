@@ -204,7 +204,8 @@ def test_whitened_advantages_of_rewards_far_above_the_values_are_as_exact_as_the
     zero = {"kernel": jnp.zeros_like(value["kernel"]), "bias": jnp.zeros_like(value["bias"])}
     state = initial.replace(variables={**initial.variables,
                                        "params": {**params, "critic": {**params["critic"], "value": zero}}})
-    task = {"task_id": np.array([31], np.int32)}
+    # Sixteen prompts a draw: over one, the reference compared with itself did not resolve within 512.
+    task = {"task_id": np.arange(16, dtype=np.int32)}
 
     @functools.cache
     def drawn(seed):
