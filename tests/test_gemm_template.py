@@ -536,6 +536,23 @@ def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name
     np.testing.assert_array_equal(np.asarray(exact), np.asarray(default))
 
 
+@pytest.mark.parametrize("case", ["norm and bias", "broadcast axes"])
+def test_a_cooperative_tiles_gradients_hold_check_1(case):
+    """`test_a_cooperative_tile_holds_check_1_with_its_hooks`'s reverse mode: the input gradient through the
+    cooperative transposed launch, the kernel gradient through the cooperative kernel gradient with the
+    prologue each consumer applies to its depth half, against JAX's derivative of the plain program
+    (eagerly: `test_the_templates_gradients_hold_check_1`)."""
+    spec = CASES[case]
+    pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicGmmTransposed: COOPERATIVE,
+              grouped_matmul.MosaicTgmm: COOPERATIVE}
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
+          generation.routes() as taken):
+        assert_as_exact(_loss(_dew(spec, interpret_on_cpu=True)), jax.jit(_loss(_plain(spec))), _draw,
+                        f"{case} cooperative gradients", seeds=SEEDS,
+                        truth_fn=_loss(_plain(spec, truth=True)))
+    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'mosaic_gpu'}
+
+
 def test_a_cooperative_tiles_exact_sums_add_as_its_plain_sum_does():
     """`test_exact_sums_add_each_steps_product_as_the_plain_sum_does` at a cooperative tile: each consumer's
     running fp32 sum, the pipeline's carry, matches its accumulator's bit for bit on the CPU."""
@@ -606,8 +623,13 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
                             interpret=False)
         assert launch.eligible(exact, target)
         kept = launch.fitting(exact, target)
-        # Two accumulators a consumer warpgroup: its 128 threads hold its share of the tile's columns.
-        assert kept and all(2 * tile.block_m * tile.block_n // (128 * tile.warpgroups) < 255 for tile in kept)
+        # Two accumulators a consumer warpgroup: its 128 threads hold its share of the tile's columns, in
+        # the registers a cooperative consumer has (232) or a lone warpgroup's (255).
+        assert mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2) in kept  # 128 registers a thread
+        assert mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2) not in kept  # 256
+        assert kept and all(2 * tile.block_m * tile.block_n // (128 * tile.warpgroups)
+                            < (grouped_matmul.CONSUMER_REGISTERS if tile.warpgroups == 2 else 255)
+                            for tile in kept)
         assert set(kept) < set(launch.fitting(plain, target))
         # Triton's kernel gradient with exact sums takes at most EXACT_STEP rows a step.
         triton = grouped_matmul.Tgmm()

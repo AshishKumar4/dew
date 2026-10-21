@@ -93,7 +93,7 @@ CONSUMER_REGISTERS = 232
 (`mosaic_gpu`'s pipelines' `memory_registers`), and JAX's warp-specialized pipeline gives the consumers
 the rest of the multiprocessor's (`pipeline._compute_registers(40, 2)`)."""
 
-_COOPERATIVE = itertools.product((128,), (256, 128), (64,), (4, 3, 5), (8, 4, 2, 1), (2, 1))
+_COOPERATIVE = itertools.product((128,), (256, 128), (64,), (4, 3, 5), (8, 4, 2, 1), (1, 2))
 _ALONE = itertools.product((128, 192, 64), (128, 192, 64), (64,), (4, 5, 2), (8, 4, 2, 1))
 MOSAIC_TILES = (tuple(mosaic_gpu.Tiles(*shape) for shape in _ALONE)
                 + tuple(mosaic_gpu.Tiles(*shape, warpgroups=2, cluster=pair)
@@ -101,8 +101,10 @@ MOSAIC_TILES = (tuple(mosaic_gpu.Tiles(*shape) for shape in _ALONE)
 """Every tile the Mosaic GPU launches may take: the sweep JAX ships with its one-warpgroup kernels
 (`ragged_dot_mgpu.main`), where an H100's fastest lay (GMM-h100-3), then tiles two consumer warpgroups
 compute, CUTLASS's cooperative sm90 schedule (128 x 256, a pair of multiprocessors sharing the blocks of
-one operand). The cost model prices no term the cooperative schedule changes yet (its MMA issue, the
-second consumer's reads of the shared stage), so where it ties, the first, a one-warpgroup tile, wins."""
+one operand). The cost model prices no term the cooperative schedule or a pair changes yet (its MMA
+issue, the second consumer's reads of the shared stage, the pair's multicast), so where it ties, the
+first wins: a one-warpgroup tile, then a cooperative tile alone (shared memory staging's barriers, a few
+hundred bytes, are not counted against the block either)."""
 
 INTERPRETED = plgpu.InterpretGPUParams(out_of_bounds_reads="uninitialized")
 """How a CPU interprets the Mosaic GPU launches: a read past an operand's rows, which a TMA load zeroes,
@@ -533,7 +535,7 @@ class Tgmm(_Triton):
             program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps, stages=config.stages,
             resident=self._resident(ba, config, target)), target)
 
-def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
+    def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
              exact_sums: bool = False, dense: bool = False, config: Tile, return_residuals: bool = False):
         if dense:

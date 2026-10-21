@@ -34,7 +34,10 @@ a power-of-two ladder of TMA stores. Changed for Dew, each marked `# Dew:`:
   took row counts that were);
 - the program count is the device's multiprocessors, where `ragged_dot` fixed an H100 SXM's 132;
 - `tgmm`'s shared-memory tiling and swizzle are the warpgroup lowering's inference, as `gmm`'s are
-  upstream, where upstream stated them with transforms whose type JAX leaves abstract.
+  upstream, where upstream stated them with transforms whose type JAX leaves abstract;
+- both take a cooperative tile (`Tiles.warpgroups`, `Tiles.cluster`: two consumer warpgroups beside a
+  producer, CUTLASS's cooperative sm90 schedule, as JAX's `hopper_matmul_mgpu`, and a pair of
+  multiprocessors sharing one operand's blocks), and the template's hooks (`gmm`, `tgmm`).
 
 Each sums exact products of its 16-bit operands in fp32 (wgmma's accumulator) and rounds once to the
 output dtype.
@@ -568,7 +571,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
          prologue_operands: tuple = (), prologue_axes: tuple = (), exact_sums: bool = False) -> jax.Array:
     """Each group's rows of `lhs` `[rows, depth]` transposed times its rows of `rhs` `[rows, width]`:
     `[groups, depth, width]` in `out_dtype`, an empty group's zero. The depth must divide by
-    `tiles.block_m` and the width by `tiles.block_n`; `tiles.block_k` is the rows a step takes.
+    `tiles.block_m` (a pair's two) and the width by `tiles.block_n`; `tiles.block_k` is the rows a step
+    takes.
 
     Dew: `prologue(rows, *side_tiles)` transforms each `[block_k, block_m]` stage of `lhs`'s rows (a
     cooperative tile's consumer, half its depth) in place before the group masking and the MMA; side
