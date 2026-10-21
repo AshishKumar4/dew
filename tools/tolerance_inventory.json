@@ -782,11 +782,6 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
-  "tests/test_pipeline_core.py": {
-   "comparisons": 1,
-   "lane": "Data",
-   "by": "2026-11-20"
-  },
   "tests/test_plan.py": {
    "comparisons": 1,
    "lane": "Training",
