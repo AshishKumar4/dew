@@ -359,7 +359,7 @@ def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict 
     return None
 
 
-def kl_config[ConfigT: Mapping](config: ConfigT, where: object) -> ConfigT:
+def kl_config[ConfigT: Mapping](config: ConfigT, where: str | Path) -> ConfigT:
     """`config`, an AutoencoderKL's: one that names another class (`_class_name`, a Wan or Qwen-Image
     VAE's) is refused, naming it, before its tensors meet the KL tree; one that names none is taken
     as the AutoencoderKL older checkpoints are."""
