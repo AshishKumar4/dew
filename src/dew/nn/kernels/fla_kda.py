@@ -62,14 +62,19 @@ SUB = 16
 
 def _intra_rows_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, aqk_ref, akk_ref, *,
                        chunk: int, aligned: bool, scale: float):
-    """One token's row of its sub-chunk's diagonal block of scores and keys' products for `BH` value
-    heads, every pair's decay its own: `Aqk_ij = scale sum_k q_ik k_jk exp2(g_ik - g_jk)` for `j <= i`
-    and `Akk_ij = sum_k beta_i k_ik k_jk exp2(g_ik - g_jk)` for `j < i`, `j` in the token's own 16-token
-    sub-chunk, in fp32, `Aqk` stored in its dtype and `Akk` fp32, the row's other columns zero. fla's
-    `chunk_kda_fwd_kernel_intra_token_parallel` (chunk_intra_token_parallel.py:33-118, its
-    `safe_gate=False` path); the blocks below the diagonal are factored through their sub-chunk's first
-    row in the solve (`_intra_solve_kernel`), as fla's are. A program per place of a chunk, where fla's
-    searches the token's sequence; a place past the chunk's end does nothing."""
+    """One token's row of its chunk's scores and keys' products for `BH` value heads, every pair's
+    decay its own: `Aqk_ij = scale sum_k q_ik k_jk exp2(g_ik - g_jk)` for `j <= i` and `Akk_ij = sum_k
+    beta_i k_ik k_jk exp2(g_ik - g_jk)` for `j < i`, in fp32, `Aqk` stored in its dtype and `Akk` fp32.
+    fla's `chunk_kda_fwd_kernel_intra_token_parallel` (chunk_intra_token_parallel.py:33-118, its
+    `safe_gate=False` path) takes the diagonal 16-token blocks so, and factors every block below them
+    through its sub-chunk's first row (`(q exp2(g_i - g_n)) (k exp2(g_n - g_j))`, chunk_intra.py:43-391):
+    two exponentials rounded and one more product a term, against one exponential here (Dew's portable
+    math's, `dew.nn.kernels.recurrence_algebra.decays`'). This port's earlier factored blocks,
+    which moved decayed keys from sub-chunk to sub-chunk where fla recomputes each factor, put 11 of a
+    packed row's 16384 scores and 5 of its inverse's past twice the pairwise form's distance from
+    float64; fla's own factored form was
+    not measured. A program per place of a chunk, where fla's searches the token's sequence; a place
+    past the chunk's end does nothing."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
     place = pl.program_id(0) % chunk
 
@@ -90,7 +95,7 @@ def _intra_rows_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, aqk_ref, akk_re
                     jnp.where(here & (j < place), jnp.sum(weighted * gated, axis=1)[:, None], sums[1]))
 
         empty = jnp.zeros((query.shape[0], chunk), jnp.float32)
-        qk, kk = jax.lax.fori_loop(place - place % SUB, place + 1, column, (empty, empty))
+        qk, kk = jax.lax.fori_loop(0, place + 1, column, (empty, empty))
         aqk_ref[token] = qk.astype(aqk_ref.dtype)
         akk_ref[token] = kk
 
@@ -144,27 +149,21 @@ _INTRA_ROWS = IntraRows()
 
 def intra_rows(q, k, g, beta, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
                interpret: bool = False):
-    """`(Aqk, Akk)` `[B, T, HV, BT]`, each token's row of its chunk's diagonal 16-token block, zero
-    elsewhere (the solve computes the blocks below it, `intra_solve`), `Aqk` in `k`'s dtype and `Akk`
-    fp32, every pair's decay its own (`_intra_rows_kernel`): a program per place of each chunk (`spans`,
-    the rows' own where None) and `BH` value heads."""
+    """`(Aqk, Akk)` `[B, T, HV, BT]`, each token's row of its chunk, `Aqk` in `k`'s dtype and `Akk` fp32,
+    every pair's decay its own (`_intra_rows_kernel`): a program per place of each chunk (`spans`, the
+    rows' own where None) and `BH` value heads."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
     return _INTRA_ROWS(q, k, g, beta, *spans, chunk=chunk, scale=scale, interpret=interpret)
 
 
-def _intra_solve_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, aqkd_ref, akkd_ref, aqk_ref, akk_ref, *,
-                        chunk: int, aligned: bool, scale: float, exact: bool, solve):
-    """fla's `chunk_kda_fwd_kernel_inter_solve_fused` (chunk_intra.py:43-391), safe_gate off, for one
-    chunk of one head in 16-row blocks: the diagonal blocks the rows `intra_rows` computed, and each
-    block below them factored through its rows' sub-chunk's first row `n`, `Aqk_IJ = scale (q_I
-    exp2(g_I - g_n)) (k_J exp2(g_n - g_J))^T` and `Akk_IJ = beta_I (k_I exp2(g_I - g_n)) (k_J exp2(g_n -
-    g_J))^T`, every factor's exponent at most zero, the factors fp32 and their product at the call's solve
-    precision (`fla_gdn._dot`'s `solve`), beta applied after it, as fla's are (chunk_intra.py:141-161,
-    226-228); `Aqk` stored in the keys' dtype, and `I + Akk`'s diagonal blocks inverted by forward
-    substitution and merged in fla's
+def _intra_solve_kernel(chunk_ref, aqkd_ref, akkd_ref, aqk_ref, akk_ref, *, chunk: int, aligned: bool,
+                        exact: bool, solve):
+    """fla's `chunk_kda_fwd_kernel_inter_solve_fused` (chunk_intra.py:43-391), safe_gate off, from the
+    rows `intra_rows` computed, for one chunk of one head in 16-row blocks: `Aqk` stored in the keys'
+    dtype, and `I + Akk`'s diagonal blocks inverted by forward substitution and merged in fla's
     order, `X_IJ = -(X_II A_IJ) X_JJ` for neighbours and `-X_II (sum_M A_IM X_MJ)` beyond, at the
-    solve precision, the inverse stored in the keys' dtype; both zero above the diagonal. A chunk's
-    rows past its end are none of them stored."""
+    call's solve precision (`fla_gdn._dot`'s `solve`), the inverse stored in the keys' dtype; both
+    zero above the diagonal. A chunk's rows past its end are none of them stored."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
 
     @pl.when(taken > 0)
@@ -180,29 +179,10 @@ def _intra_solve_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, aqkd_ref, akkd
         def store(ref, i, j, value):
             write_rows(_rows(ref, start + i * SUB, SUB, pl.ds(j * SUB, SUB)), taken - i * SUB, value)
 
-        def rows(ref, i):
-            return read_rows(_rows(ref, start + i * SUB, SUB), taken - i * SUB)
-
-        def below(i, j):
-            """Block (i, j), i > j: the scores' and the keys' products factored through row `n`."""
-            # A sub-chunk past the chunk's end reads its last row, so no load leaves the array.
-            first = _row(g_ref, start + jnp.minimum(i * SUB, taken - 1))
-            ahead = jnp.exp2(_gates(g_ref, start, taken, SUB, i * SUB) - first[None, :])
-            behind = jnp.exp2(first[None, :] - _gates(g_ref, start, taken, SUB, j * SUB))
-            beta = rows(beta_ref, i).astype(jnp.float32)
-            right = (rows(k_ref, j).astype(jnp.float32) * behind).T
-            queries = rows(q_ref, i).astype(jnp.float32) * ahead
-            keys = rows(k_ref, i).astype(jnp.float32) * ahead
-            return (_dot(queries, right, exact=exact, solve=solve) * scale,
-                    _dot(keys, right, exact=exact, solve=solve) * beta[:, None])
-
-        blocks = {(i, j): below(i, j) for i in range(count) for j in range(i)}
         for i in range(count):
             for j in range(count):
-                scores = part(aqkd_ref, i, i) if j == i else blocks[i, j][0] if j < i else zero
-                store(aqk_ref, i, j, scores)
-        kks = {(i, j): part(akkd_ref, i, i) if j == i else blocks[i, j][1]
-               for i in range(count) for j in range(i + 1)}
+                store(aqk_ref, i, j, part(aqkd_ref, i, j) if j <= i else zero)
+        kks = {(i, j): part(akkd_ref, i, j) for i in range(count) for j in range(i + 1)}
         inverse = {(i, i): _tril_inverse(kks[i, i], index) for i in range(count)}
         for distance in range(1, count):
             for i in range(distance, count):
@@ -225,33 +205,28 @@ class IntraSolve(_Launch):
 
     NAME = "intra_solve"
     KEYS, VALUES = "aqk", None
-    # The blocks below the diagonal are products over the keys' width, a warp's work no longer.
-    SPACES = _spaces(_tiles([(0, 0)], (1, 2, 4, 8), (1,)))
-    PICKS = _picks(Tiles(0, 0, 4, 1))
-    revision: int = 3
+    SPACES = _spaces(_tiles([(0, 0)], (1, 2, 4), (1,)))
+    PICKS = _picks(Tiles(0, 0, 1, 1), small=Tiles(0, 0, 2, 1))
+    revision: int = 2
 
-    def _fwd(self, q: jax.Array, k: jax.Array, g: jax.Array, beta: jax.Array, aqk: jax.Array, akk: jax.Array,
-             chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, scale: float, interpret: bool,
-             config: Tiles, return_residuals: bool = False):
+    def _fwd(self, aqk: jax.Array, akk: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *,
+             chunk: int, interpret: bool, config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         spans = Sequences(chunk_spans, sequence_spans)
         batch, length, value_heads = aqk.shape[:3]
-        key_heads, width = k.shape[2:]
-        group, tokens = value_heads // key_heads, batch * length
+        tokens = batch * length
         headed = functools.partial(_headed, tokens)
-        keys = pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0))
         shape = jax.ShapeDtypeStruct((tokens, value_heads, chunk), aqk.dtype)
         found = pl.pallas_call(
             functools.partial(_intra_solve_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
-                              scale=scale, exact=interpret, solve=aqk.dtype),
+                              exact=interpret, solve=aqk.dtype),
             grid=(spans.chunks.shape[0], value_heads),
-            in_specs=[_CHUNK, keys, keys, headed(width), pl.BlockSpec((tokens, None), lambda i_t, h: (0, h)),
-                      headed(chunk), headed(chunk)],
+            in_specs=[_CHUNK, headed(chunk), headed(chunk)],
             out_specs=[headed(chunk), headed(chunk)], out_shape=[shape, shape],
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages),
             interpret=interpret, name="fla_kda_intra_solve",
-        )(spans.chunks, *_flat(q, k, g, beta, aqk, akk))
+        )(spans.chunks, *_flat(aqk, akk))
         return tuple(x.reshape(batch, length, value_heads, chunk) for x in found), None
 
 
@@ -263,13 +238,12 @@ def intra_solve(q, k, g, beta, *, scale: float, chunk: int = 64, spans: Sequence
     """`(Aqk, Akk)` `[B, T, HV, BT]` in `k`'s dtype: each chunk's `scale (q exp2(g)) (k exp2(-g))^T`,
     causal, and the inverse `(I + tril(beta (k exp2(g)) (k exp2(-g))^T, -1))^-1`: fla's
     `chunk_kda_fwd_intra` before its `recompute_w_u_fwd` (chunk_intra.py:794-894), each pair's decay
-    its own on the diagonal 16-token blocks (`intra_rows`), then the blocks below them factored and the
-    solve chunk by chunk (`spans`, the rows' own where None). `q`, `k`
+    its own (`intra_rows`), then the solve chunk by chunk (`spans`, the rows' own where None). `q`, `k`
     `[B, T, H, K]`, `g` the base-2 cumulated decay (`recurrence.cumulated`) `[B, T, HV, K]` fp32,
     `beta` `[B, T, HV]`."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
     aqk, akk = intra_rows(q, k, g, beta, scale=scale, chunk=chunk, spans=spans, interpret=interpret)
-    return _INTRA_SOLVE(q, k, g, beta, aqk, akk, *spans, chunk=chunk, scale=scale, interpret=interpret)
+    return _INTRA_SOLVE(aqk, akk, *spans, chunk=chunk, interpret=interpret)
 
 
 def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, *refs, chunk: int, aligned: bool,
