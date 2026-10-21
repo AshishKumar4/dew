@@ -57,19 +57,18 @@ class Cost:
 def seconds(cost: Cost, target: generation.GpuTarget) -> float:
     """The seconds `cost`'s launch is estimated to take on `target` (the module's docstring)."""
     facts = _facts(target)
-    rate = facts.tensor_rate(cost.mode) if cost.program_flops else 1
-    named = (('multiprocessors', facts.multiprocessors), ('clock_hz', facts.clock_hz),
-             (f'tensor_rates[{cost.mode!r}]', rate), ('memory_bandwidth', facts.memory_bandwidth))
-    missing = [name for name, value in named if value is None]
-    if missing:
-        raise ValueError(f"{facts.generation} ({facts.device_kind}) states no {', '.join(missing)}, "
+    multiprocessors, clock, bandwidth = facts.multiprocessors, facts.clock_hz, facts.memory_bandwidth
+    rate = facts.tensor_rate(cost.mode) if cost.program_flops else 1.0
+    if multiprocessors is None or clock is None or bandwidth is None or rate is None:
+        named = (('multiprocessors', multiprocessors), ('clock_hz', clock),
+                 (f'tensor_rates[{cost.mode!r}]', rate), ('memory_bandwidth', bandwidth))
+        raise ValueError(f"{facts.generation} ({facts.device_kind}) states no "
+                         f"{', '.join(name for name, value in named if value is None)}, "
                          "which the kernel cost model needs")
-    clock = facts.clock_hz
     program = max(cost.program_flops / (rate * clock),
                   cost.program_staged / (SHARED_BYTES_PER_CLOCK * clock),
                   cost.program_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
-    return max(math.ceil(cost.programs / facts.multiprocessors) * program,
-               cost.device_bytes / facts.memory_bandwidth)
+    return max(math.ceil(cost.programs / multiprocessors) * program, cost.device_bytes / bandwidth)
 
 
 def _facts(target: generation.GpuTarget) -> generation.GpuTarget:
