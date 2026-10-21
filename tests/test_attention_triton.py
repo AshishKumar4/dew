@@ -187,7 +187,7 @@ def score_hooks(names: tuple, queries: int, keys: int) -> template.Hooks:
                           template.sinks(SINKS, ROWS, queries, 32) if "sinks" in names else None)
 
 
-ROW_TERMS = ("exact", "online", "output", "compensated")
+ROW_TERMS = ("exact", "online", "output", "compensated", "lean")
 """The backward's forms of each query's `D = sum_j p dP`: summed from its tiles in a first pass
 (`backward`'s default), in the dQ launch's one pass beside dQ (`online=`), and `rowsum(dO * O)` from the
 forward's fp32 output (`residuals=`), plainly or compensated (`compensated=`)."""
@@ -220,12 +220,13 @@ def check_backward(case: dict, names: tuple, dtype, forward_config, backward_con
     def ours(query, key, value, dout):
         with pins:
             residuals = None
-            if row_term in ("output", "compensated"):
+            if row_term in ("output", "compensated", "lean"):
                 _, *residuals = attention_triton.forward(query, key, value, spans, hooks, residuals=True,
                                                          wide=True, interpret=not ON_GPU)
             grads = attention_triton.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                               online=row_term == "online",
-                                              compensated=row_term == "compensated", interpret=not ON_GPU)
+                                              compensated=row_term == "compensated", lean=row_term == "lean",
+                                              interpret=not ON_GPU)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
     def xla(query, key, value, dout):
