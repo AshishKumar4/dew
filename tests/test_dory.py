@@ -12,15 +12,14 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from decision_support import decision_rows
 from interop_support import assert_reloads, assert_same_stored_tensors
 from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does
 from tool_support import load as load_tool
 
 from dew.checkpoints import Checkpoints
-from dew.config.data import loader
 from dew.data.dataset import Loader, replayed
 from dew.decision import Choice, DecisionObjective, Example, JointLayout, JointSchemaHead
-from dew.decision.data import Decisions
 from dew.inference import TextGeneration
 from dew.inference.serving import Server
 from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
@@ -362,8 +361,7 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
                                      REFERENCE['logits_2_f64'], "Dory's vocabulary rows")
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
     objective = DecisionObjective(loaded, layout=JointLayout(max_len=1024), head=head)
-    data = loader(Decisions(source=EXAMPLES, validation=EXAMPLES), batch=8, read='memory',
-                  objective=objective.data())
+    data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(str(tmp_path)))
     initial = trainer.initial_state()
     # The step donates the state it is handed; the host keeps what it started from.

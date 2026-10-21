@@ -11,11 +11,10 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from decision_support import decision_rows
 from recording import RecordingTracker
 from reference_error import assert_leaves_as_exact, float64_terms
 
-from dew.config.data import loader
-from dew.data import Loading
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import (
@@ -29,7 +28,6 @@ from dew.decision import (
     Specials,
     StateFirstLayout,
 )
-from dew.decision.data import Decisions
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.layout import OPTION_TILE, DecisionInputs, compacted
 from dew.decision.objective import _ALONG_THE_QUESTIONS
@@ -91,8 +89,7 @@ def objective_for(arm: str) -> DecisionObjective:
 
 def windows(objective, rows: int) -> dict:
     """A batch of `rows` packed windows of the examples, as the run reads it."""
-    data = loader(Decisions(EXAMPLES, validation=EXAMPLES), batch=rows, read="memory",
-                objective=objective.data())
+    data = decision_rows(EXAMPLES, rows, EXAMPLES, objective=objective.data())
     reader = data.val(DataPartition())
     try:
         batch = next(reader)
@@ -309,7 +306,7 @@ def test_a_decision_run_steps_one_program_over_rows_of_every_length():
     finite on every step."""
     objective = objective_for("joint")
     layout = objective.layout
-    data = loader(Decisions(EXAMPLES), tokens=8 * layout.max_len, read="memory", objective=objective.data())
+    data = decision_rows(EXAMPLES, None, objective=objective.data(), tokens=8 * layout.max_len)
     reader = data.train(DataPartition())
     try:
         shapes = {name: {np.shape(value) for value in values} for name, values in
@@ -361,9 +358,9 @@ def test_a_one_question_head_reads_joint_rows_only_of_one_question():
                                   layout=JointLayout(max_len=1536), head=DecisionHead(64, layers=1),
                                   shuffle_options=False)
     with pytest.raises(ValueError):
-        loader(Decisions(EXAMPLES), batch=2, read="memory", objective=objective.data())
+        decision_rows(EXAMPLES, 2, objective=objective.data())
     single = [example for example in EXAMPLES if len(example.questions) == 1]
-    data = loader(Decisions(single), batch=2, read="memory", objective=objective.data())
+    data = decision_rows(single, 2, objective=objective.data())
     reader = data.train(DataPartition())
     try:
         assert np.shape(next(reader)["tokens"])[0] == 2
@@ -412,8 +409,7 @@ def test_single_option_questions_fit_the_packing_bounds(questions):
     objective = DecisionObjective(attending(length), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
                                   head=JointSchemaHead(32, width=32, routing_layers=1, layers=1,
                                                        heads=2, feedforward=64), shuffle_options=False)
-    data = loader(Decisions([example], validation=[example]), batch=1, read="memory",
-                  objective=objective.data())
+    data = decision_rows([example], 1, [example], objective=objective.data())
     (batch,) = list(data.val(DataPartition()))
     batch = {name: np.asarray(value) for name, value in batch.items()}
     np.testing.assert_array_equal(batch["tokens"][0, batch["segments"][0] == 1], encoded.tokens)
@@ -453,8 +449,7 @@ def test_a_reader_tokenizes_each_text_of_its_rows_once(arm):
     tokenizer = Counting()
     objective = DecisionObjective(attending(layout.max_len), tokenizer=tokenizer, specials=SPECIALS,
                                   layout=layout, head=head(), loss=LogLoss())
-    data = loader(Decisions(EXAMPLES), batch=2, read="memory", objective=objective.data(),
-                  loading=Loading(workers=0))
+    data = decision_rows(EXAMPLES, 2, objective=objective.data())
     reader = data.train(DataPartition())
     try:
         assert len(list(itertools.islice(reader, 4))) == 4
@@ -481,8 +476,7 @@ def test_a_packed_loss_counts_only_real_scored_questions():
     objective = DecisionObjective(attending(layout.max_len), tokenizer=TOKENIZER, specials=SPECIALS,
                                   layout=layout, head=JointSchemaHead(32, width=32, routing_layers=1,
                                       layers=1, heads=2, feedforward=64), shuffle_options=False)
-    data = loader(Decisions(examples, validation=examples), batch=3, read="memory",
-                  objective=objective.data())
+    data = decision_rows(examples, 3, examples, objective=objective.data())
     (batch,) = list(data.val(DataPartition()))
     batch = {name: np.asarray(value) for name, value in batch.items()}
     real = batch[VALID_ROWS]

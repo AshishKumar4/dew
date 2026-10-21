@@ -44,3 +44,13 @@ def listed(reader, count: int) -> list[dict[str, list]]:
     every field of every record rather than one of them."""
     return [{name: np.asarray(value).tolist() for name, value in batch.items()}
             for batch in itertools.islice(reader, count)]
+
+
+def record_batches(records, batch: int, validation=None, *, loading=None):
+    """`records` (rows or columns) as a run's batches of `batch`, read in memory, with `validation`'s
+    records as its held-out split, its last batch filled out and marked (`dew.data.compile.compile`)."""
+    from dew.data import Memory
+    from dew.data.compile import compile
+
+    held = None if validation is None else Memory(validation).batch(batch)
+    return compile(Memory(records).batch(batch), validation=held, read="memory", loading=loading)
