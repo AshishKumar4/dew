@@ -1305,8 +1305,9 @@ def assert_step_moves_by_the_hosts_gradient():
 def test_a_quantized_packed_kernel_splits_into_its_members_bit_for_bit(tile):
     """A served task's packed query, key and value kernel, Qwix's quantized array in its serving wrapper,
     split by its members' widths (`split_columns`): each member dequantizes to exactly the packed
-    kernel's dequantized columns, with the wrapper's recipe kept, per-channel scales and tiled ones
-    alike; a split that would cut a tile is refused."""
+    kernel's dequantized columns, with the wrapper's recipe kept, with the input axis's scales per
+    channel or tiled; a kernel tiled along its output axis splits at whole tiles, and a split that
+    would cut a tile is refused."""
     import json
     from pathlib import Path
 
@@ -1329,6 +1330,9 @@ def test_a_quantized_packed_kernel_splits_into_its_members_bit_for_bit(tile):
     for member, start, stop in zip(members, edges[:-1], edges[1:], strict=True):
         assert member.how == packed.how
         np.testing.assert_array_equal(np.asarray(qwix.dequantize(member.array)), whole[..., start:stop])
-    if tile is not None:
-        with pytest.raises(ValueError):
-            split_columns(packed, (tile // 2, width - tile // 2))
+    columns = qwix.quantize(jnp.asarray(whole), jnp.int8, tiled_axes={1: 16})
+    halves = split_columns(columns, (16, width - 16))
+    joined = np.concatenate([np.asarray(qwix.dequantize(half)) for half in halves], axis=1)
+    np.testing.assert_array_equal(joined, np.asarray(qwix.dequantize(columns)))
+    with pytest.raises(ValueError):
+        split_columns(columns, (8, width - 8))
