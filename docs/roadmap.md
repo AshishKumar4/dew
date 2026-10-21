@@ -209,4 +209,3 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Check every family, target row and mode in the kernel-route test, an unexplained route failing, and drop the KV cache's unconditional GPU xfail. [798, 799]
 - Hold MeanFlow's fused attention away from zero initialization, the delta rule's document isolation without exclusions, and the Mamba-2 TPU mesh by its numbers. [789, 790]
 - Delete the step benchmark's re-export facade. [800]
-- Hold the full suite to ten minutes of wall time: shards cut by the last full run's measured per-test times, no single case past a shard's budget, and a new environment warmed before its first full suite. [826]
