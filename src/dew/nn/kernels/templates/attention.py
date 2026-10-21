@@ -488,11 +488,12 @@ def kept_dtype(dtype) -> str:
 class Split(NamedTuple):
     """A training forward's split sums (`attention_algebra.split_accumulate`), residuals the backward
     reads in place of its first pass: the weighted values of every key but each query's anchor key,
-    with the initial state's, `others` `[B, H, Q, Dv]`, and the anchor's own weight `own` `[B, H, Q]`,
-    fp32, both at the forward's maximum."""
+    with the initial state's, `others` `[B, H, Q, Dv]`, the anchor's own weight `own` and the other
+    keys' weights' sum `others_total` `[B, H, Q]`, fp32, all at the forward's maximum."""
 
     others: jax.Array
     own: jax.Array
+    others_total: jax.Array
 
 
 DQ_GRADS = (Kind.HEAD, Kind.QUERY)
@@ -521,23 +522,24 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
               hooks: Hooks | None, dout: jax.Array,
               residuals: tuple[jax.Array, jax.Array, jax.Array, Split], *, block: int,
               scale: float | None = None) -> Gradients:
-    """The template's backward of its forward under the output's cotangent `dout` `[B, Q, H, Dv]`, from
-    the forward's `residuals` (each query's maximum and denominator `[B, H, Q]`, its anchor key, the first
+    """The template's backward of its forward under the output's cotangent `dout` `[B, Q, H, Dv]`, from the
+    forward's `residuals` (each query's maximum and denominator `[B, H, Q]`, its anchor key, the first
     holding the keys' maximum, `[B, H, Q]` int32, and its split sums, `Split`), through a mainloop's
-    `launch` (the Triton one, `attention_triton.backward`; the plain-JAX one, `attention_portable.backward`):
-    the call padded to whole `block`s (`padded_call`), `launch(query, key, value, dout, peak0, total0,
-    initial_term, maximum, key_index, anchor_value, others, own, total, start, end, query_ids, key_ids,
-    score_params, *, score_mod, score_kinds, score_dtypes, scale)` giving dQ, the softmax's rows (`D - c`,
-    `c`, `m`, `T`, the keys' mass), each query's anchor key as it chose it, the dQ program's hook gradients
-    (`DQ_GRADS`), then dK, dV and the dK/dV program's (`DKV_GRADS`); each gradient fp32, then rounded to its
-    input's dtype. D is taken two ways, about 0 and about the anchor key's `v_c · dO`, each query the
-    nearer, from the forward's split sums (`attention_algebra.split_delta`) or a first pass of the dQ
-    launch's own over the keys at the forward's maximum (`off_anchor_delta`): the anchor key's `dP - c`
-    enters as exactly 0; the main pass then refines D once from its own sums for the dK/dV launch and the
-    head, query and initial state's gradients (`attention_algebra.refinement`). The output hook is no part
-    of it: a differentiated call applies `output_mod` past the kernel, where its own derivative runs, and
-    passes `dout` before it. Deterministic: every gradient element is written by one program, a head
-    parameter's partial sums added in a fixed order and a key head's query heads summed in XLA."""
+    `launch` (the Triton one, `attention_triton.backward`; the plain-JAX one,
+    `attention_portable.backward`): the call padded to whole `block`s (`padded_call`), `launch(query, key,
+    value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value, others, own, others_total,
+    total, start, end, query_ids, key_ids, score_params, *, score_mod, score_kinds, score_dtypes, scale)`
+    giving dQ, the softmax's rows (`D - c`, `c`, `m`, `T`, the keys' mass), each query's anchor key as it
+    chose it, the dQ program's hook gradients (`DQ_GRADS`), then dK, dV and the dK/dV program's
+    (`DKV_GRADS`); each gradient fp32, then rounded to its input's dtype. D is taken two ways, about 0 and
+    about the anchor key's `v_c · dO`, each query the nearer, from the forward's split sums
+    (`attention_algebra.split_delta`) or a first pass of the dQ launch's own over the keys at the
+    forward's maximum (`off_anchor_delta`): the anchor key's `dP - c` enters as exactly 0; the main pass
+    then refines D once from its own sums for the dK/dV launch and the head, query and initial state's
+    gradients (`attention_algebra.refinement`). The output hook is no part of it: a differentiated call
+    applies `output_mod` past the kernel, where its own derivative runs, and passes `dout` before it.
+    Deterministic: every gradient element is written by one program, a head parameter's partial sums added
+    in a fixed order and a key head's query heads summed in XLA."""
     hooks = Hooks() if hooks is None else hooks
     if hooks.output_mod is not None:
         raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
@@ -566,14 +568,15 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     maxima, totals, anchors, split = residuals
     key_index = call.rows(anchors.astype(jnp.int32))
     widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)
-    others, own = jnp.pad(call.rows(split.others.astype(jnp.float32)), widened), call.rows(split.own)
+    others = jnp.pad(call.rows(split.others.astype(jnp.float32)), widened)
+    own, others_total = call.rows(split.own), call.rows(split.others_total)
     # The anchor key's value row for each query, `[B, Qp, H, Dvp]`, a key head's for its query heads.
     anchor_value = jnp.take_along_axis(jnp.repeat(call.value, group, axis=2),
                                        jnp.swapaxes(key_index, 1, 2)[..., None], axis=1)
     maximum = call.rows(maxima.astype(jnp.float32))
     outputs = launch(*operands, *(call.rows(start) for start in starts), maximum, key_index, anchor_value,
-                     others, own, call.rows(totals.astype(jnp.float32)), *rows, score_mod=hooks.score_mod,
-                     score_kinds=kinds, score_dtypes=dtypes, scale=scale)
+                     others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows,
+                     score_mod=hooks.score_mod, score_kinds=kinds, score_dtypes=dtypes, scale=scale)
     dq, softmax = outputs[0], outputs[1:6]
     grads_out = list(outputs[7:])
     dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
