@@ -643,7 +643,7 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
     observed = aux.qk_stats["policy"] if kind == "ppo" and aux.qk_stats is not None else aux.qk_stats
     assert observed is not None
     for got, want in zip(jax.tree.leaves(compact_qk(observed)), jax.tree.leaves(expected), strict=True):
-        np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-6)
+        np.testing.assert_array_equal(got, want)
     start = jax.tree.map(np.asarray, policy["params"])
     compiled = trainer.compile(initial, batch)
     final, *_ = compiled(initial, batch)

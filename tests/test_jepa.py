@@ -8,7 +8,7 @@ import optax
 import pytest
 from affine_run import dataset
 from recording import RecordingTracker
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference
 from steady_state import steady_state
 
 from dew.artifacts import Representations
@@ -268,6 +268,27 @@ def context_ablation(objective, params, ema, data, mask, rng):
     return error(context), error(jnp.roll(context, 1, axis=0))
 
 
+def test_a_video_objective_steps_on_an_explicit_data_axis(mask):
+    """Each row's masks are its example's own draws, placed as the row is: under an Explicit data axis
+    (`MeshSpec.explicit`) the video encoder repeats each row's token indices over its frames where
+    the row lives, and the step trains to a finite loss."""
+    objective = JepaObjective(
+        JepaVideoEncoder(patch_size=PATCH, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=2),
+        make_predictor(factorized=True), mask, sample=Field("video", (FRAMES, RES, RES, 3)))
+    rows = jax.device_count()
+
+    def batches():
+        while True:
+            yield {"video": np.asarray(videos(batch=rows), np.float32)}
+
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(explicit=("data",)))
+    tracker = trainer.tracker = RecordingTracker()
+    state = trainer.fit(dataset(batches, batch=rows), steps=1, log_every=1)
+    assert int(state.step) == 1
+    losses = [entry["train/loss"] for _, entry in tracker.scalars if "train/loss" in entry]
+    assert losses and all(np.isfinite(loss) for loss in losses)
+
+
 def test_training_makes_the_prediction_depend_on_the_context(mask):
     """The loss can be driven down by predicting the average target while
     ignoring the context entirely, which would teach the encoder nothing.
@@ -321,17 +342,28 @@ def health_in(z, dtype):
     return np.asarray([z.std(axis=0).mean(), np.sqrt(np.mean(off ** 2))])
 
 
-def test_representation_health_is_the_float64_statistics():
-    """Both statistics against numpy's in float64, as exact as numpy's float32,
-    on embeddings whose dimensions are half redundant; a collapsed batch has
-    neither, to float32's rounding of its mean."""
-    rng = np.random.default_rng(0)
+HEALTH_SEEDS = 256
+"""Check 1's declared seeds for the health statistics, sized by `seeds_for` (2026-10-21, on armada)."""
+
+
+def redundant_embeddings(seed: int) -> tuple[np.ndarray]:
+    """32 embeddings of 16 dimensions, half of them a small perturbation of the other half."""
+    rng = np.random.default_rng(seed)
     base = rng.normal(size=(32, 8))
-    z = np.concatenate([base, base + 0.1 * rng.normal(size=(32, 8))], axis=1).astype(np.float32)
+    return (np.concatenate([base, base + 0.1 * rng.normal(size=(32, 8))], axis=1).astype(np.float32),)
+
+
+def health_of(z):
     health = representation_health(jnp.asarray(z))
-    dew = np.asarray([health["repr_std"], health["repr_cov_offdiag"]])
-    assert_as_exact_as_the_reference(dew, health_in(z, np.float32), health_in(z, np.float64),
-                                     "representation health")
+    return jnp.stack([health["repr_std"], health["repr_cov_offdiag"]])
+
+
+def test_representation_health_is_the_float64_statistics():
+    """Both statistics on par with numpy's (check 1) on embeddings whose dimensions are half
+    redundant; a collapsed batch has neither, to float32's rounding of its mean."""
+    assert_as_exact(jax.jit(health_of), lambda z: health_in(z, z.dtype), redundant_embeddings,
+                    "representation health", seeds=HEALTH_SEEDS)
+    (z,) = redundant_embeddings(0)
     collapsed = representation_health(jnp.tile(jnp.asarray(z[:1]), (32, 1)))
     assert float(collapsed["repr_std"]) < 1e-6 and float(collapsed["repr_cov_offdiag"]) < 1e-6
 
@@ -497,6 +529,8 @@ def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_bl
     batch, step = {"image": images()}, step_with(averaged)
     samples = (np.asarray(batch["image"], np.float32) - 127.5) / 127.5
     context_idx, target_idx = objective.mask.sample(jax.random.split(step.key)[0], len(samples))
+    # The objective reads these masks (`Step.tape`).
+    step = step.replace(tape={"context": context_idx, "targets": target_idx})
     full = np.asarray(objective.encode(part(averaged, "context_encoder"), jnp.asarray(samples)))
     context = objective.encode(part(params, "context_encoder"), jnp.asarray(samples), context_idx)
     blocks = mask.num_targets

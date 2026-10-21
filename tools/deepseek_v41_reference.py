@@ -80,6 +80,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import saved_fixture
 
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash"
 DEEPSEEK_V41_REVISION = "dba1be0a40aa45a94ad051997016db3960a90277"
@@ -796,8 +797,7 @@ def write_kernels():
     meta = {"repo": REPO, "revision": DEEPSEEK_V41_REVISION, "code": "inference/kernel.py",
             "device": torch.cuda.get_device_name(), "torch": torch.__version__,
             "tilelang": tilelang.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(FIXTURE / "kernels.npz", **arrays)
+    saved_fixture(FIXTURE / "kernels.npz", arrays, meta)
     print(f"{FIXTURE / 'kernels.npz'}: {len(arrays)} arrays, {meta['device']}")
 
 
