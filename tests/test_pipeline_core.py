@@ -789,7 +789,8 @@ def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
     delivered = [0, 0]
     for row in itertools.islice(reader, 100):
         delivered[row["id"]] += row["targets"]
-        assert abs(delivered[0] - sum(delivered) / 4) <= 7
+        # The short corpus within 7 targets of its quarter of all delivered, in whole targets.
+        assert abs(4 * int(delivered[0]) - int(sum(delivered))) <= 4 * 7
     saved = reader.get_state()
     rest = take(reader, 20)
     resumed = iter(mix)
@@ -1031,7 +1032,7 @@ def test_a_token_mixture_weighs_a_cropped_corpus_by_the_targets_left_after_the_c
     short = Pipeline(roled(1, 6, 4), name="short").filter_map(CountTargets(role=role))
     left, right = delivered([long, short], role, read)
     rows = (Cropped()(roled(0, 24, 22).records("memory")[0]), roled(1, 6, 4).records("memory")[0])
-    assert abs(left - right) <= sum(int(Scored(role)(row)["targets"]) for row in rows)
+    assert abs(int(left) - int(right)) <= sum(int(Scored(role)(row)["targets"]) for row in rows)
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
@@ -1044,7 +1045,7 @@ def test_a_token_mixture_keeps_a_rows_count_through_a_step_over_its_other_fields
     one = Pipeline(roled(0, 8, 1), name="one").filter_map(CountTargets(role=1)).map(Relabelled())
     three = Pipeline(roled(1, 8, 3), name="three").filter_map(CountTargets(role=1))
     left, right = delivered([one, three], 1, read)
-    assert abs(left - right) <= 1 + 3
+    assert abs(int(left) - int(right)) <= 1 + 3
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
@@ -1081,7 +1082,7 @@ def test_a_rows_count_and_its_rule_ride_through_the_steps_that_leave_its_targets
     scored = (6, 2) if after == "renamed-text-then-cropped" else (1, 3)
     left, right = delivered([corpus(0, scored[0]), corpus(1, scored[1])], role, read)
     bound = {None: 7 + 7, 1: 3 + 2 if after == "renamed-text-then-cropped" else 1 + 3}[role]
-    assert abs(left - right) <= bound
+    assert abs(int(left) - int(right)) <= bound
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])

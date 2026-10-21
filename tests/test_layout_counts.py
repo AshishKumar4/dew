@@ -52,7 +52,7 @@ def test_a_token_mixture_weighs_laid_out_windows_by_the_rule_their_documents_wer
         return laid_out(counted).map(Sourced(source))
 
     left, right = delivered([corpus(0, 1), corpus(1, 5)], role, read)
-    assert abs(left - right) <= most + most
+    assert abs(int(left) - int(right)) <= most + most
 
 
 @pytest.mark.parametrize("route", ["cached prefix", "generation source"])
@@ -76,7 +76,7 @@ def test_a_token_mixture_weighs_a_published_generations_windows_by_its_documents
         return documents.pack(16, fields=ROLED).map(Sourced(source))
 
     left, right = delivered([corpus(0, 1), corpus(1, 5)], 1, read)
-    assert abs(left - right) <= 12 + 12
+    assert abs(int(left) - int(right)) <= 12 + 12
 
 
 @pytest.mark.parametrize("counted", [True, False], ids=["counted", "uncounted"])
@@ -95,7 +95,7 @@ def test_a_crop_after_a_layout_is_counted_as_the_windows_it_leaves(read, counted
         return (windows.map(LengthPolicy(3)) if cropped else windows).map(Sourced(source))
 
     left, right = delivered([corpus(0, cropped=True), corpus(1, cropped=False)], None, read)
-    assert abs(left - right) <= 2 + 4
+    assert abs(int(left) - int(right)) <= 2 + 4
 
 
 @dataclasses.dataclass(frozen=True)
@@ -169,7 +169,7 @@ def test_a_store_of_role_counted_documents_states_its_rule_so_its_pack_counts_by
         return Pipeline(held, name=str(source)).pack(16, fields=ROLED).map(Sourced(source))
 
     left, right = delivered([corpus(0, 1), corpus(1, 5)], 1, read)
-    assert abs(left - right) <= 12 + 12
+    assert abs(int(left) - int(right)) <= 12 + 12
 
 
 def test_a_parquet_store_of_token_documents_with_no_counts_is_packed_by_its_lengths(tmp_path):
