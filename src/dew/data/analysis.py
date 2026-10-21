@@ -598,19 +598,29 @@ def _cache_at(stages: Sequence[Stage]) -> int:
     return next((index for index, stage in enumerate(stages) if not _cacheable(stage)), len(stages))
 
 
+def _one_to_one(stages: Sequence[Stage]) -> bool:
+    """Whether a cache after `stages` holds one record for each of its inputs: none of them drops
+    or expands records. Such a cache reads as the source's own rows do, by index and in one global
+    order (`dew.data.lowering._Cached`); one that drops or expands is read as a stream, per share."""
+    return not any(_drops(stage) or isinstance(stage, FlatMap) for stage in stages)
+
+
 def _order_at(stages: Sequence[Stage], read: Read) -> tuple[int, bool]:
     """Where a recipe's default order goes, and whether the rows there are
     indexed so one shuffle can order them all. A memory read orders the rows
     its deterministic steps made, before the first random step or batch; any other
     read orders the source's rows right after the cache that keys them, and
-    a cache's rows reach an indexed read as a stream."""
+    a cache's rows reach an indexed read by index where it holds one record for each input
+    (`_one_to_one`), else as a stream."""
     if read == "memory":
         # Records are ordered before their batch, as before the first random step.
         boundary = (index for index, stage in enumerate(stages)
                     if _random(stage) or isinstance(stage, (BatchStage, TokenBudget)))
         return next(boundary, len(stages)), True
     cache = _at(stages, Artifact)
-    return (0, read == "indexed") if cache is None else (cache + 1, False)
+    if cache is None:
+        return 0, read == "indexed"
+    return cache + 1, read == "indexed" and _one_to_one(stages[:cache])
 
 
 def _random(stage: Stage) -> bool:
@@ -692,6 +702,9 @@ class _Lowering:
     splits: tuple[int, ...]
     order: Mapping[str, object]
     endless: bool
+    one_to_one: bool
+    """Whether the cache holds one record for each input (`_one_to_one`), so an indexed read reads
+    it by index, in the order the uncached stages would make (`dew.data.lowering._Cached`)."""
 
     @property
     def split(self) -> bool:
@@ -780,6 +793,7 @@ def _analyzed(
         tuple(at for at, stage in enumerate(stages) if at >= eager and isinstance(stage, TokenSplit)),
         order,
         endless,
+        cache is not None and read == "indexed" and _one_to_one(stages[:cache]),
     )
     configured = any(isinstance(stage, Configured) for stage in steps)
     if per_share and lowering.split and not validation and not configured:
@@ -877,8 +891,11 @@ def _checked(
         streams = isinstance(stage, (Interleave, Workers, BatchStage, TokenBudget)) or (
             _drops(stage) and index >= eager
         )
-        indexed = indexed and not (streams or (isinstance(stage, Artifact) and read != "memory"))
-        shared = _drops(stage) or isinstance(stage, (Interleave, Artifact, TokenBudget))
+        # A cache reads as the stages it holds would: by index and in one order where they keep one
+        # record for each input, as a stream and per share where they drop or expand them.
+        streamed_cache = isinstance(stage, Artifact) and not (read == "indexed" and _one_to_one(prefix))
+        indexed = indexed and not (streams or (streamed_cache and read != "memory"))
+        shared = _drops(stage) or isinstance(stage, (Interleave, TokenBudget)) or streamed_cache
         per_share = per_share or shared or (isinstance(stage, Workers) and not batched)
         batched = _check_batch(stage, batched=batched, name=name)
         if isinstance(stage, Workers):
