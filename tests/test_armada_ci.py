@@ -834,7 +834,7 @@ def test_stopping_a_group_spends_one_settle_budget_and_reports_a_leader_that_wil
     """A group is stopped within one settle budget after SIGKILL, the leader's reaping and the other
     members' ending together, and a leader still unreapable then is reported among the members that
     outlived it, never raised: CI writes its verdict either way."""
-    owned = load("owned", "tools/armada")
+    groups = load("child_groups", "tools/armada")
 
     class Stuck:
         pid = 4242
@@ -846,10 +846,10 @@ def test_stopping_a_group_spends_one_settle_budget_and_reports_a_leader_that_wil
             time.sleep(timeout)
             raise subprocess.TimeoutExpired("stuck", timeout)
 
-    monkeypatch.setattr(owned, "signal_group", lambda leader, number: None)
-    monkeypatch.setattr(owned, "members", lambda group: [group])
+    monkeypatch.setattr(groups, "signal_group", lambda leader, number: None)
+    monkeypatch.setattr(groups, "members", lambda group: [group])
     began = time.monotonic()
-    assert owned.stop(Stuck(), settle=0.5) == [4242]
+    assert groups.stop(Stuck(), settle=0.5) == [4242]
     assert time.monotonic() - began < 0.9, "the leader's wait and the members' share one budget"
 
 

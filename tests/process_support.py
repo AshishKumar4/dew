@@ -18,7 +18,7 @@ from tool_support import load
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("multiprocess_worker.py")
 DEVICES = 8
-owned = load("owned", "tools/armada")
+groups = load("child_groups", "tools/armada")
 """The children's group ownership Dew's CI uses too."""
 
 
@@ -97,7 +97,7 @@ def worker_env(devices: int) -> dict[str, str]:
 
 def start_process(command: Sequence[str], devices: int, *,
                   environment: Mapping[str, str] | None = None) -> subprocess.Popen[str]:
-    return owned.start(command, cwd=REPO_ROOT, env={**worker_env(devices), **(environment or {})},
+    return groups.start(command, cwd=REPO_ROOT, env={**worker_env(devices), **(environment or {})},
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 
@@ -119,8 +119,8 @@ def spawn(mode: str, out: Path, processes: int = 1, process_id: int = 0,
 
 def terminate(process: subprocess.Popen[str]) -> None:
     """Kill the session even if its leader already exited and left descendants,
-    and return once none of them still runs (tools/armada/owned.py's `stop`)."""
-    running = owned.stop(process, settle=120.0)
+    and return once none of them still runs (tools/armada/child_groups.py's `stop`)."""
+    running = groups.stop(process, settle=120.0)
     assert not running, f"session {process.pid} still runs {running} after SIGKILL"
 
 
