@@ -1967,7 +1967,7 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
             loosened.append((parent, dict(found)))
         if not loosened:
             continue
-        against = ("its parent " if len(loosened) == 1 else "every parent, ") + ", ".join(
+        against = ("its parent " if len(loosened) == 1 else "its parents ") + ", ".join(
             parent[:9] for parent, _ in loosened)
         for name in sorted({key[0] for _, found in loosened for key in found if key[1] != "held"}):
             why = _merge_loosens(name, [found for _, found in loosened])
