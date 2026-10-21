@@ -186,11 +186,12 @@ def test_a_cooperative_tile_holds_check_1_with_its_hooks(case):
     spec = CASES[case]
     pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicGmmTransposed: COOPERATIVE,
               grouped_matmul.MosaicTgmm: COOPERATIVE}
-    with generation.assumed("sm90"), tuning.pinned(pinned), generation.routes() as taken:
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
+          generation.routes() as taken):
         dew = jax.jit(_drop(_dew(spec, interpret_on_cpu=True)))
         assert_as_exact(dew, jax.jit(_drop(_plain(spec))), _draw, f"{case} cooperative",
                         seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
-    assert 'mosaic_gpu' in {route.kernel for route in taken if route.choice == 'grouped_matmul'}
+    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'mosaic_gpu'}
 
 
 def _loss(run):
