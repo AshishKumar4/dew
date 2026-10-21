@@ -29,6 +29,8 @@ a power-of-two ladder of TMA stores. Changed for Dew, each marked `# Dew:`:
 - each writes the output dtype it is asked for (fp32 for a kernel gradient), not the operands';
 - `tgmm` zeroes the neighbouring groups' rows of both operands by selection, where upstream
   multiplied one operand by a mask, which kept a neighbour's NaN or infinity (NaN * 0);
+- the rows are padded to a multiple of 8, which a TMA descriptor's tiling needs (upstream's examples
+  took row counts that were);
 - the program count is the device's multiprocessors, where `ragged_dot` fixed an H100 SXM's 132;
 - `tgmm`'s shared-memory tiling and swizzle are the warpgroup lowering's inference, as `gmm`'s are
   upstream, where upstream stated them with transforms whose type JAX leaves abstract.
@@ -120,13 +122,16 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     with `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, the rows past the
     routed ones zero. The depth must divide by `tiles.block_k` and the width by `tiles.block_n`."""
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
-    m, k = lhs.shape
+    rows, k = lhs.shape
     g, k2, n = rhs.shape
     if transpose_rhs:
         k2, n = n, k2
     if k != k2 or k % block_k or n % block_n:
-        raise ValueError(f"a [{m}, {k}] x [{g}, {k2}, {n}] product does not take {tiles}")
-    # Dew: the rows past the routed ones are a last group, whose tiles store zeros.
+        raise ValueError(f"a [{rows}, {k}] x [{g}, {k2}, {n}] product does not take {tiles}")
+    # Dew: a TMA descriptor tiles the rows by 8, so they are padded to a multiple of 8, and the rows past
+    # the routed ones, the padding among them, are a last group, whose tiles store zeros.
+    lhs = _rows_padded(lhs)
+    m = lhs.shape[0]
     lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
 
@@ -187,7 +192,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
         compiler_params=_compiler_params(),
         interpret=interpret,
     )
-    return kernel(lengths, lhs, rhs)
+    return kernel(lengths, lhs, rhs)[:rows]
 
 
 def _store_rows(o_smem, o_gmem, group_info: GroupInfo, smem_start, rows: int, column) -> None:
@@ -211,6 +216,9 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     g = group_sizes.shape[0]
     if k != k2 or m % block_m or n % block_n:
         raise ValueError(f"a [{k}, {m}] by [{k2}, {n}] kernel gradient does not take {tiles}")
+    # Dew: the rows padded to a multiple of 8, as `gmm`'s, past every group.
+    lhs, rhs = _rows_padded(lhs), _rows_padded(rhs)
+    k = lhs.shape[0]
 
     group_sizes = group_sizes.astype(jnp.int32)
     group_starts = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(group_sizes)[:-1]]).astype(jnp.int32)
@@ -297,6 +305,12 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
         interpret=interpret,
     )
     return kernel(group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts, lhs, rhs)
+
+
+def _rows_padded(array: jax.Array) -> jax.Array:
+    """`array` with zero rows after its own up to a multiple of 8, the rows a TMA descriptor tiles by."""
+    pad = -array.shape[0] % 8
+    return jnp.pad(array, ((0, pad), (0, 0))) if pad else array
 
 
 def _zero_rows(lhs_smem, rhs_smem, kept, block_k: int, block_m: int, block_n: int) -> None:
