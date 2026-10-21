@@ -1,9 +1,11 @@
 """The choice layer's timing log (dew.nn.kernels.timings): passive where DEW_TIMINGS is unset, one whole
 line per row where it names a directory, appended, never interleaved, and a held lock a stated wait."""
 
+import dataclasses
 import json
 import subprocess
 import sys
+from typing import ClassVar
 
 import filelock
 import jax
@@ -11,7 +13,7 @@ import jax.numpy as jnp
 import pytest
 import tokamax
 
-from dew.nn.kernels import timings
+from dew.nn.kernels import timings, tuning
 
 ROW = {'launch': 'gmm', 'call': '{}', 'config': '{}'}
 
@@ -147,3 +149,67 @@ def test_the_tuner_logs_each_measured_config_with_its_features(monkeypatch, tmp_
     assert norm['features'] is None and norm['estimate_s'] is None and norm['launch'] == 'RmsForward'
     assert norm['features_status'] == 'unsupported' and timed['features_status'] == 'stated'
 
+
+
+@dataclasses.dataclass(frozen=True)
+class Factor:
+    factor: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Scaled(tuning.KernelOp):
+    """A launch that runs anywhere: its input times its config's factor."""
+    config_cls: ClassVar[type[Factor]] = Factor
+
+    def _fwd(self, x, *, config: Factor, return_residuals: bool = False):
+        return x * config.factor, None
+
+    def _get_heuristics_config(self, ba) -> Factor:
+        return Factor(1)
+
+    def _get_autotuning_configs(self, ba) -> set[Factor]:
+        return {Factor(1), Factor(2), Factor(3)}
+
+
+class FailingProfiler:
+    """A stand-in for Mosaic's profiler whose CUPTI times every run as one kernel of 1 ms (the flush's
+    first, named apart), until run `fails`, which raises `error`."""
+
+    def __init__(self, fails: int, error: Exception):
+        self.runs, self.fails, self.error = 0, fails, error
+        profiler = self
+
+        class Cupti:
+            def __init__(self, finalize: bool = True):
+                del finalize
+
+            def measure(self, executable, aggregate: bool = False):
+                def timed(*args):
+                    profiler.runs += 1
+                    if profiler.runs == profiler.fails:
+                        raise profiler.error
+                    name = 'flush' if profiler.runs == 1 else 'scaled'
+                    return executable(*args), [(name, 1.0)]
+                return timed
+
+        self.Cupti = Cupti
+
+
+@pytest.mark.parametrize(("error", "raises"), [(RuntimeError("the device faulted"), True),
+                                               (RuntimeError("another subscriber holds CUPTI"), False)])
+def test_a_measurement_that_fails_part_way_logs_the_configs_it_timed(monkeypatch, tmp_path, error, raises):
+    """A tune whose second config fails, by a fault that propagates or by another subscriber taking
+    CUPTI, logs the config it timed first, with its samples, and nothing for the configs it did not."""
+    monkeypatch.setenv(timings.ENV, str(tmp_path))
+    ba = Scaled().bind(jax.ShapeDtypeStruct((8,), jnp.float32))
+    # The flush's run, the first config's repeats, then the second config's first run fails.
+    profiler = FailingProfiler(fails=2 + tuning.REPEATS, error=error)
+    if raises:
+        with pytest.raises(RuntimeError):
+            tuning._measured(ba.op, ba, profiler)
+    else:
+        measured = tuning._measured(ba.op, ba, profiler)
+        assert all(isinstance(timing, RuntimeError) for timing in measured.values())
+    [row] = [json.loads(line) for line in (tmp_path / "timings.jsonl").read_text().splitlines()]
+    assert row['status'] == 'timed' and row['samples_ms'] == [1.0] * tuning.REPEATS
+    assert row['launch'] == 'Scaled' and row['features_status'] == 'unsupported'

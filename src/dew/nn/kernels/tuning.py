@@ -568,12 +568,14 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments):
     return op.operands([leaves[index] for index in places], 0), fill
 
 
-def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
+def _measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
     kernels, each run after `FLUSH_BYTES` are read, so every config starts
-    with its operands out of cache."""
-    from jax.experimental.mosaic.gpu import profiler
+    with its operands out of cache. `profiler` is Mosaic GPU's, whose `Cupti`
+    reads the times, or a stand-in with its `Cupti`."""
+    if profiler is None:
+        from jax.experimental.mosaic.gpu import profiler
 
     arrays, fill = materialized(op, ba)
     flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
