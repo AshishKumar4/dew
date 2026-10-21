@@ -174,9 +174,9 @@ def _unsqueezed(hook, positions: tuple, tile, *sides):
 def _lowerable(hook):
     """`hook` with each 16-bit float operation Pallas Triton lowers only for fp32 or wider computed in
     fp32 and rounded once, as XLA computes a 16-bit one: its division (`_truediv`), `logistic` (lowered as
-    `1 / (1 + exp(-x))`), a negative power (a reciprocal) and `erf_inv`. A division so rounded is the
-    correctly rounded 16-bit quotient (fp32 holds more than twice a 16-bit float's significand). Other
-    operations, and any inside a hook's control flow, are traced as written."""
+    `1 / (1 + exp(-x))`), `erf_inv`, and a negative power's final reciprocal (the power itself in the input's
+    dtype, as JAX lowers it). Other operations, and any inside a hook's control flow, are traced as
+    written."""
     if hook is None:
         return None
 
@@ -190,7 +190,7 @@ def _lowerable(hook):
 
 
 _FP32_ONLY = ('div', 'logistic', 'erf_inv')
-"""The primitives Pallas Triton lowers for no 16-bit float (`_lowerable`); a negative `integer_pow` too."""
+"""The primitives Pallas Triton lowers for no 16-bit float (`_lowerable`), beside a negative power's division."""
 
 _CALLS = ('pjit', 'jit', 'closed_call', 'core_call', 'custom_jvp_call', 'custom_vjp_call')
 """The primitives that call one jaxpr as written, which `_widened` enters (a kernel never differentiates
@@ -211,17 +211,19 @@ def _widened(jaxpr, consts, args) -> list:
         values = [read(var) for var in equation.invars]
         name, params = equation.primitive.name, equation.params
         out = equation.outvars[0].aval
-        narrow = (jnp.issubdtype(out.dtype, jnp.floating) and jnp.dtype(out.dtype).itemsize == 2
-                  and (name in _FP32_ONLY or (name == 'integer_pow' and params['y'] < 0)))
+        narrow = jnp.issubdtype(out.dtype, jnp.floating) and jnp.dtype(out.dtype).itemsize == 2
         inner = next((p for p in params.values() if isinstance(p, jax_core.ClosedJaxpr)), None)
-        if narrow:
+        if narrow and name in _FP32_ONLY:
             wide = equation.primitive.bind(*(value.astype(jnp.float32) for value in values), **params)
             outs = [wide.astype(out.dtype)]
+        elif narrow and name == 'integer_pow' and params['y'] < 0:
+            # As JAX lowers it: the power in the input's dtype, then its reciprocal, the one division widened.
+            power = jax.lax.integer_pow(values[0], -params['y'])
+            outs = [(1 / power.astype(jnp.float32)).astype(out.dtype)]
         elif name in _CALLS and inner is not None:
             outs = _widened(inner.jaxpr, inner.consts, values)
         else:
-            subfuns, bind_params = equation.primitive.get_bind_params(params)
-            outs = equation.primitive.bind(*subfuns, *values, **bind_params)
+            outs = equation.primitive.bind(*values, **equation.primitive.get_bind_params(params))
             outs = outs if equation.primitive.multiple_results else [outs]
         env.update(zip(equation.outvars, outs, strict=True))
     return [read(var) for var in jaxpr.outvars]
