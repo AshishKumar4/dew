@@ -327,12 +327,13 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
     def loss(run):
         return jax.grad(lambda *a: jnp.sum(run(*a) * jnp.linspace(-1, 1, 100)), argnums=(0, 1, 2, 3, 4))
 
-    with generation.assumed("sm80"), generation.routes() as taken:
+    with generation.assumed("sm80"), tuning.seen() as launches:
         assert_as_exact(jax.jit(dew), jax.jit(plain), draw, "dense 65x40x100", seeds=SEEDS,
                         truth_fn=functools.partial(plain, wide=jnp.float64))
         assert_as_exact(jax.jit(loss(dew)), jax.jit(loss(plain)), draw, "dense 65x40x100 gradients",
                         seeds=SEEDS, truth_fn=loss(functools.partial(plain, wide=jnp.float64)))
-    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'triton'}
+    ran = {(type(launch).__name__, ba.arguments.get('dense')) for launch, ba in launches}
+    assert {('GmmTransposed' if transpose_rhs else 'Gmm', True), ('Tgmm', True)} <= ran
 
 
 def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
@@ -353,10 +354,11 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
     def plain(x, w, wide=jnp.float32):
         return jnp.dot(x.astype(wide), w.astype(wide))
 
-    with generation.assumed("sm90"), generation.routes() as taken:
+    with generation.assumed("sm90"), tuning.seen() as launches:
         assert_as_exact(jax.jit(loss(dew)), jax.jit(loss(plain)), draw, "dense depth 96", seeds=SEEDS,
                         truth_fn=loss(functools.partial(plain, wide=jnp.float64)))
-    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'triton'}
+    # The kernel gradient ran the plain kernel (an fp32 output's cotangent takes XLA's input gradient).
+    assert ('Tgmm', True) in {(type(launch).__name__, ba.arguments.get('dense')) for launch, ba in launches}
 
 
 @pytest.mark.skipif(not generation.triton_runs(), reason="needs a GPU the Pallas kernels compile for")
