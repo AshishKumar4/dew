@@ -372,7 +372,9 @@ def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> li
     is most of a group is not cut into slivers that each pay it again; a heavier test runs alone.
     Counting the setup once a group, rather than scaling every test by the file's total, keeps a
     file from being cut finer each run for the setup its last cut added. A file keeps the cut it
-    ran as while that cut's heaviest group, setup included, stays within `KEPT` of `target`:
+    ran as while that cut's heaviest group, setup included, stays within `KEPT` of `target` either
+    way, so a cut that has grown too fine for the target is made coarser once, as one too coarse is
+    made finer:
     a group's compiled programs are cached under its cut (tests/remote_cache.py), so a new cut
     compiles every group from nothing, and the setup that measures moves the next cut again
     (armada dew-20261020144644-dceff433: a new cut fetched no programs, and 14 of its 20 split
@@ -382,7 +384,8 @@ def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> li
         count = math.ceil(seconds / target)
         return [seconds / count] * count
     setup = max(seconds - sum(tests), 0.0) / cut
-    if cut > 1 and max(sum(tests[run.start:run.stop]) for run in groups(tests, cut)) + setup <= KEPT * target:
+    heaviest = max(sum(tests[run.start:run.stop]) for run in groups(tests, cut)) + setup if cut > 1 else 0.0
+    if cut > 1 and target / KEPT <= heaviest <= KEPT * target:
         count = cut
     else:
         room = max(target - setup, target / 2)
@@ -391,7 +394,7 @@ def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> li
 
 
 KEPT = 1.5
-"""How far past the target a split file's heaviest group may run before the file is cut again."""
+"""How far past the target, or short of it, a split file's heaviest group may run before it is cut again."""
 
 
 def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | None:
@@ -432,30 +435,33 @@ def packed(weights: dict[str, float], count: int) -> list[tuple[float, list[str]
 
 
 def one_wave(timings: dict, pool: int) -> float:
-    """A target whose plan runs as one wave on `pool` containers, no more tasks than containers, so no
-    task waits for another to free its container: train 22's suite, 212 tasks of about a set 240 s
-    target on 160 containers, ran as two waves in 10:10. The first target tried is the timed files'
-    work over the containers left beside the tasks that never shrink (files nothing has timed, which
-    run alone, and the collect tasks), and no less than the heaviest recorded test, which no cut
-    divides; it grows by a tenth until the plan fits. At the heaviest Python's whole timed work every
-    file packs into its family's one task, so where the plan holds more tasks than the pool even
-    there, one wave cannot hold the suite and the plan runs at that target, in waves."""
+    """The target whose plan runs as one wave on `pool` containers, every task starting at once, with
+    the least heaviest task: train 22's suite, 212 tasks of about a set 240 s target on 160 containers,
+    ran as two waves in 10:10. A file heavier than the target runs as groups of its tests, each its own
+    task, and the lighter files fill every container left (`plan`), so a low target splits more files
+    into more tasks and a high one leaves fewer, heavier groups. The targets tried run from the timed
+    work over the pool, and the heaviest recorded test, which no cut divides, by tenths to the heaviest
+    Python's whole timed work, at which every file packs into its family's tasks. Where the plan holds
+    more tasks than the pool even there, one wave cannot hold the suite and the plan runs at that
+    target, in waves."""
     heaviest = max((max(tests) for tests in recorded_tests().values() if tests), default=1.0)
     totals = [[seconds for seconds in weights(files_of(python), timings, python).values()
                if seconds is not None] for python in PYTHONS]
     saturated = float(math.ceil(max([sum(seconds) for seconds in totals] + [heaviest, 1.0])))
-    entries = plan(saturated, timings)
-    if len(entries) > pool:
-        print(f"one wave cannot hold the plan: {len(entries)} tasks on {pool} containers even at a "
-              f"{saturated:.0f} s target", file=sys.stderr)
+    if len(plan(saturated, timings, pool)) > pool:
+        print(f"one wave cannot hold the plan: {len(plan(saturated, timings, pool))} tasks on {pool} "
+              f"containers even at a {saturated:.0f} s target", file=sys.stderr)
         return saturated
-    fixed = sum(1 for entry in entries if entry["split"] == COLLECT or entry.get("untimed"))
-    if fixed == pool:
-        return saturated
-    target = float(max(math.ceil(heaviest), math.ceil(sum(map(sum, totals)) / (pool - fixed)), 1))
-    while target < saturated and len(plan(target, timings)) > pool:
-        target = min(float(math.ceil(target * 1.1)), saturated)
-    return target
+    best = (math.inf, saturated)
+    target = float(max(math.ceil(heaviest), math.ceil(sum(map(sum, totals)) / pool), 1))
+    while target < saturated:
+        entries = plan(target, timings, pool)
+        if len(entries) <= pool:
+            timed = [entry["weight"] for entry in entries
+                     if entry["split"] != COLLECT and not entry.get("untimed")]
+            best = min(best, (max(timed, default=0.0), target))
+        target = float(math.ceil(target * 1.1))
+    return best[1]
 
 
 def files_of(python: str) -> list[str]:
@@ -466,41 +472,54 @@ def files_of(python: str) -> list[str]:
     return every if whole else [name for name in every if name in NEWEST_FILES]
 
 
-def plan(target: float, timings: dict) -> list[dict]:
+def plan(target: float, timings: dict, pool: int | None = None) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
-    then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
-    the test cache's policy, DEW_TEST_CACHE here, to its task."""
+    then on. A file heavier than `target` runs as groups of its tests, each its own task. The lighter
+    files pack into tasks of about `target` seconds, or, given the `pool` of containers, into every
+    container the other tasks leave, shared among the Pythons and families by their work, so no
+    container idles while another runs two files' worth. Files marked `torchax` (`APART`) share tasks
+    only with one another. Each entry carries the test cache's policy, DEW_TEST_CACHE here, to its task."""
     cache = "off" if os.environ.get("DEW_TEST_CACHE") == "off" else "on"
     every = files_of(PYTHONS[0])
     recorded = recorded_tests()
-    entries = []
+    alone: dict[str, list[tuple[list[str], str, float]]] = {}
+    untimed: dict[str, int] = {}
+    families: dict[str, list[dict[str, float]]] = {}
     for python in PYTHONS:
         timed = weights(files_of(python), timings, python)
-        tasks: list[tuple[list[str], str, float]] = [
-            ([name], "", target) for name, seconds in timed.items() if seconds is None]
-        untimed = len(tasks)
+        alone[python] = [([name], "", target) for name, seconds in timed.items() if seconds is None]
+        untimed[python] = len(alone[python])
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
                 at, count = measured_cut(timings, python, name) or (seconds, 1)
                 cut = split(recorded.get(name, []), at, target, count)
                 # A file one group holds runs whole, alone, under its own row.
-                tasks += [([name], f"{group}/{len(cut)}" if len(cut) > 1 else "", weight)
-                          for group, weight in enumerate(cut, start=1)]
+                alone[python] += [([name], f"{group}/{len(cut)}" if len(cut) > 1 else "", weight)
+                                  for group, weight in enumerate(cut, start=1)]
         light = {name: seconds for name, seconds in timed.items()
                  if seconds is not None and seconds <= target}
         apart = {name for name in light if APART.search(Path(name).read_text())}
-        for family in (sorted(set(light) - apart), sorted(apart)):
-            count = max(math.ceil(sum(light[name] for name in family) / target), 1)
-            tasks += [(names, "", held) for held, names in packed({name: light[name] for name in family},
-                                                                  count) if names]
+        families[python] = [{name: light[name] for name in family}
+                            for family in (sorted(set(light) - apart), sorted(apart)) if family]
+    rest = [] if cache == "off" else [name for name in every if name not in NEWEST_FILES]
+    collected = COLLECT_TASKS if rest else 0
+    left = None if pool is None else pool - collected - sum(map(len, alone.values()))
+    work = sum(sum(family.values()) for held in families.values() for family in held)
+    entries = []
+    for python in PYTHONS:
+        tasks = list(alone[python])
+        for family in families[python]:
+            count = max(math.ceil(sum(family.values()) / target), 1)
+            if left is not None and work:
+                count = max(count, min(len(family), math.floor(left * sum(family.values()) / work)))
+            tasks += [(names, "", held) for held, names in packed(family, count) if names]
         for index, (names, group, weight) in enumerate(tasks, start=1):
             entry = {"name": f"{python}-{index}", "python": python, "tests": " ".join(names), "split": group,
                      "rows": [row(python, name, group) for name in names], "weight": weight, "cache": cache}
             # A file nothing has timed runs alone whatever the target (`one_wave` counts it so).
-            entries.append(entry | {"untimed": True} if index <= untimed else entry)
-    rest = [] if cache == "off" else [name for name in every if name not in NEWEST_FILES]
-    for index in range(COLLECT_TASKS if rest else 0):
+            entries.append(entry | {"untimed": True} if index <= untimed[python] else entry)
+    for index in range(collected):
         names = rest[index::COLLECT_TASKS]
         entries.append({"name": f"{PYTHONS[-1]}-{COLLECT}-{index + 1}", "python": PYTHONS[-1],
                         "tests": " ".join(names), "split": COLLECT,
@@ -1029,8 +1048,8 @@ def main() -> int:
         return 0
     if args.operation == "plan":
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
-        target = one_wave(timings, json.loads(Path(".armada.json").read_text())["pool"])
-        print(json.dumps({"include": plan(target, timings)}))
+        pool = json.loads(Path(".armada.json").read_text())["pool"]
+        print(json.dumps({"include": plan(one_wave(timings, pool), timings, pool)}))
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
