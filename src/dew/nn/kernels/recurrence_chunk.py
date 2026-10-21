@@ -91,7 +91,7 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     `attn_inter + attn @ v_new`, reads the state that chunk entered and its
     corrected values, so it is computed for every chunk at once after the
     recurrence. The two decays differ only in how a pair of positions is
-    weighed (`_paired`). It is the portable math: a GPU runs the gated rule on
+    weighed (`recurrence_algebra.paired`). It is the portable math: a GPU runs the gated rule on
     fla's kernels (`chunk_gated_delta_rule`), and this is their test oracle.
 
     Without the `delta` rule (R = 0: Mamba2's SSD, the gated linear
