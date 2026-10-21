@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, declared_seeds, indexed_recording
+from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
 from rl_support import TinyHead, TinyLogits, clipped_surrogate, token_mean
 from steady_state import steady_state
 
@@ -46,7 +46,7 @@ ROWS = 2
 
 @pytest.fixture(scope="module")
 def reference():
-    return dict(np.load(FIXTURE, allow_pickle=True))
+    return recording(FIXTURE)
 
 
 def test_grpo_loss_and_gradient_match_verl(reference):

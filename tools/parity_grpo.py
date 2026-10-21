@@ -112,7 +112,7 @@ def proxy(arrays):
 def main(argv: list[str] | None = None) -> None:
     import torch
     import verl
-    from recorded_references import provenance, record_case
+    from recorded_references import provenance, record_case, save
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=FIXTURES / "rl" / "grpo.npz")
@@ -123,10 +123,11 @@ def main(argv: list[str] | None = None) -> None:
     torch.set_num_threads(1)
     # The proxy's truth is itself on the rollout widened, as check 1 takes a reference's.
     recorded = record_case("grpo", rollout, evaluated, proxy)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out, **recorded, beta=np.asarray(BETA), provenance=provenance(
-        "verl", verl.__version__, "cpu", "python tools/parity_grpo.py", torch=torch.__version__))
-    print(f"{out}: {int(recorded['grpo.seeds'])} seeds, verl {verl.__version__}, torch {torch.__version__}")
+    written = save(out, {**recorded, "beta": np.asarray(BETA), "provenance": provenance(
+        "verl", verl.__version__, "cpu", "python tools/parity_grpo.py", torch=torch.__version__)},
+        reference=f"volcengine/verl {verl.__version__}", license="Apache-2.0")
+    print(f"{written}: {int(recorded['grpo.seeds'])} seeds, verl {verl.__version__}, "
+          f"torch {torch.__version__}")
 
 
 if __name__ == "__main__":

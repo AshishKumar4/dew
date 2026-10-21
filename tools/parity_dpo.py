@@ -134,7 +134,7 @@ def proxy(arrays):
 def main(argv: list[str] | None = None) -> None:
     import torch
     import trl
-    from recorded_references import provenance, record_case
+    from recorded_references import provenance, record_case, save
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=FIXTURES / "rl" / "dpo.npz")
@@ -144,10 +144,10 @@ def main(argv: list[str] | None = None) -> None:
     require("trl")
     torch.set_num_threads(1)
     recorded = record_case("dpo", batch, evaluated, proxy)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out, **recorded, beta=np.asarray(BETA), provenance=provenance(
-        "trl", trl.__version__, "cpu", "python tools/parity_dpo.py", torch=torch.__version__))
-    print(f"{out}: {int(recorded['dpo.seeds'])} seeds, trl {trl.__version__}, torch {torch.__version__}")
+    written = save(out, {**recorded, "beta": np.asarray(BETA), "provenance": provenance(
+        "trl", trl.__version__, "cpu", "python tools/parity_dpo.py", torch=torch.__version__)},
+        reference=f"huggingface/trl {trl.__version__}", license="Apache-2.0")
+    print(f"{written}: {int(recorded['dpo.seeds'])} seeds, trl {trl.__version__}, torch {torch.__version__}")
 
 
 if __name__ == "__main__":
