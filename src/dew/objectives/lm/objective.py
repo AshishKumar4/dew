@@ -776,9 +776,12 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
 
         A rollout uses one snapshot of the policy and draws every completion from it;
         the result records the actual and raw-policy likelihoods that the objective's
-        ratio needs.
+        ratio needs. It is prepared as the task the run publishes is (`prepared`), so a rollout
+        draws what the published policy draws.
         """
-        return TextGeneration(self.model, params, sampling=sampling)
+        from dew.inference.tasks import prepared
+
+        return prepared(TextGeneration(self.model, params, sampling=sampling))
 
     def task_settings(self) -> TextSettings:
         """The decoder's row length, preview budget, sampling policy, and tokenizer or source processor."""

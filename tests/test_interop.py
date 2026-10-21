@@ -442,7 +442,9 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     assert json.loads((destination / "generation_config.json").read_text())["tokenizer_name"] == "byte"
     reloaded = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
-    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
+    # The reload's task, prepared as the run's is, computes the run's own logits bit for bit.
+    reloaded_task = reloaded.text_generation()
+    np.testing.assert_array_equal(np.asarray(reloaded_task.model.apply(reloaded_task.variables, ids)),
                                   np.asarray(task.model.apply(task.variables, ids)))
     assert_transformers_reads_the_run(destination, task, np.asarray([[3, 4, 5, 6, 7, 8, 9, 10]]),
                                       ordered_export=tmp_path / "orders")
