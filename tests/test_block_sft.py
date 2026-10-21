@@ -417,7 +417,7 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     key = jax.random.key(11)
     published_task = readback.block_generation()
     # The run's task stops where the published one does: at the checkpoint's end-of-sequence ids, which
-    # the run's own settings do not carry.
+    # the run's own settings do not carry yet (ledger 895).
     run_task = replace(obj.pipeline(resumed, ema=False, processor=loaded.processor),
                        eos_token_ids=published_task.eos_token_ids)
     generated = run_task(prompt, 4, key=key, process=published_task.process)
