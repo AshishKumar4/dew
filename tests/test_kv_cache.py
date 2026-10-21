@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -399,28 +399,41 @@ def test_a_softcapped_steps_paged_pool_takes_each_devices_kernel():
         assert select(PAGED, paged_case(sinks=True)).kernel == "triton"
 
 
+SOFTCAP_PAGED_SEEDS = 8
+"""The softcapped paged decode's declared draws (check 1)."""
+
+
 @pytest.mark.gpu(reason="the paged BF16 decode kernel needs CUDA sm80+")
 @pytest.mark.skipif(not bf16_dot_runs(), reason="the paged BF16 decode kernel needs CUDA sm80+")
-def test_a_softcapped_model_decodes_a_paged_cache_as_its_compact_cache_decodes(without_deterministic_ops):
-    """A bf16 decoder with a logit softcap over a paged cache decodes through the gathered rows, as the
-    paged selector chooses for a GPU, where the step used to reach the paged kernel and raise; its
-    logits are the compact cache's, step by step."""
-    def model(layout):
+def test_a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache(without_deterministic_ops):
+    """A bf16 decoder with a logit softcap decodes a paged cache through the kernel the paged selector
+    chooses for a GPU (Dew's paged Triton kernel, where the step used to raise), its logits step by
+    step on par with the compact cache's (check 1), the compact cache's reference decode in float64 the
+    truth."""
+    def model(layout, dtype, implementation="auto"):
         # Heads 16 wide, which the paged kernel's geometry takes.
-        return CausalTransformer(**{**TINY_DECODER, "vocab_size": 64, "head_dim": 16, "dtype": "bfloat16",
-                                    "attn_logit_softcap": 20.0, "kv_cache": layout})
+        return CausalTransformer(**{**TINY_DECODER, "vocab_size": 64, "head_dim": 16, "dtype": dtype,
+                                    "attn_logit_softcap": 20.0, "kv_cache": layout,
+                                    "attention_impl": implementation})
 
-    tokens = jax.random.randint(jax.random.key(7), (2, 8), 0, 64)
-    params = model(KVCache()).init(jax.random.key(8), tokens)
+    def decoded(layout, dtype, implementation="auto"):
+        def run(params, tokens):
+            decoder = model(layout, dtype, implementation)
+            found, cache = [], decoder.apply(params, 2, method=CausalTransformer.init_cache,
+                                             mutable=["cache"])[1]["cache"]
+            for step in range(tokens.shape[1]):
+                logits, updated = decoder.apply({**params, "cache": cache},
+                                                tokens[:, step:step + 1], decode=True, mutable=["cache"])
+                cache = updated["cache"]
+                found.append(logits.astype(jnp.promote_types(logits.dtype, jnp.float32)))
+            return jnp.stack(found)
 
-    def decoded(layout):
-        found, cache = [], model(layout).apply(params, 2, method=CausalTransformer.init_cache,
-                                               mutable=["cache"])[1]["cache"]
-        for step in range(tokens.shape[1]):
-            logits, updated = model(layout).apply({**params, "cache": cache}, tokens[:, step:step + 1],
-                                                  decode=True, mutable=["cache"])
-            cache = updated["cache"]
-            found.append(np.asarray(logits, np.float32))
-        return np.stack(found)
+        return jax.jit(run)
 
-    np.testing.assert_array_equal(decoded(KVCache(page_size=16)), decoded(KVCache()))
+    def draw(seed):
+        tokens = jax.random.randint(jax.random.key(seed), (2, 8), 0, 64)
+        return model(KVCache(), "bfloat16").init(jax.random.key(seed + 1000), tokens), tokens
+
+    assert_as_exact(decoded(KVCache(page_size=16), "bfloat16"), decoded(KVCache(), "bfloat16"), draw,
+                    "softcapped paged decode", seeds=SOFTCAP_PAGED_SEEDS,
+                    truth_fn=decoded(KVCache(), "float64", "reference"))

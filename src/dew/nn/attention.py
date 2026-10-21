@@ -1415,8 +1415,10 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
                                        softcap=softcap)
 
         # The kernel has no derivative, so both modes differentiate the attention it stands in for, the
-        # sinks among its operands.
-        out = forward_differentiable(decoded, folded, query, key, value, *([] if sinks is None else [sinks]))
+        # sinks among its operands, at the kernel's arithmetic: IEEE products for fp32 operands
+        # (`decode_attention`), its 16-bit products summed in fp32 otherwise.
+        out = forward_differentiable(decoded, folded, query, key, value, *([] if sinks is None else [sinks]),
+                                     precision="highest" if query.dtype == jnp.float32 else None)
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
         # kernel takes the call the two forms agree bitwise.
@@ -1515,17 +1517,23 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     return _read_nothing(forward_differentiable(fused, reference, query, key, value, bias, sinks), live)
 
 
-def forward_differentiable(value, tangent, *arrays):
+def forward_differentiable(value, tangent, *arrays, precision: str | None = None):
     """`value(*arrays)`, whose JVP is `tangent`'s: a kernel that defines only
     its reverse-mode derivative, or none, takes its derivatives from a
-    reference computing the same function, reverse mode as the transposed JVP."""
+    reference computing the same function, reverse mode as the transposed JVP.
+    `precision` is the kernel's own arithmetic, which the reference's products
+    take too (`jax.default_matmul_precision`), so a kernel of IEEE fp32 products
+    is not differentiated by TF32 ones; None leaves the products at the
+    caller's."""
     @jax.custom_jvp
     def attend(*arrays):
         return value(*arrays)
 
     @attend.defjvp
     def rule(primals, tangents):
-        return attend(*primals), jax.jvp(tangent, primals, tangents)[1]
+        with contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision):
+            differentiated = jax.jvp(tangent, primals, tangents)[1]
+        return attend(*primals), differentiated
 
     return attend(*arrays)
 
