@@ -296,7 +296,8 @@ SKETCH_DEVIATIONS = 2.0
 projections may reach. A truth recomputed within the oracle rule, its difference independent of the
 signs, is refused with probability under 1e-11 (a Rademacher sum's square is no heavier-tailed than a
 normal's: Chernoff's bound on a chi-square of SKETCH degrees past 2² times its mean). A single
-element's move past twice the bound is refused always; a wider move past it in norm is refused but
+element's move past twice the bound and the sketches' own rounding (`sketch_rounding`) is refused
+always; a wider move past them in norm is refused but
 for its chance of lying near the signs' complement, which is no guarantee: two entries swapped whose
 sign words agree move no projection, one pair in 2^32 at a seed, and each seed draws its own signs, so
 a wrong truth repeated over a site's seeds hides at all of them only by that chance to their power."""
