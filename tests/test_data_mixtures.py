@@ -1343,7 +1343,8 @@ def test_phases_read_each_chain_until_its_step_as_the_phased_text_recipe(tmp_pat
     expected = loader(recipe, batch=2, read="indexed", loading=loading)
 
     def packed(path):
-        return TokenFiles(str(path)).pipe(presets.lm, None, seq_len=8, batch=None, pack="first-fit")
+        # Eight open rows, the recipe's default.
+        return TokenFiles(str(path)).pipe(presets.lm, None, seq_len=8, batch=None, pack="first-fit", bins=8)
 
     # The phases ordered and repeated as the recipe's loader orders them, then batched.
     phased = phases((packed(first), 2), (mix([packed(first), packed(second)], by="tokens"), None))
