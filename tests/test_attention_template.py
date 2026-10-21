@@ -7,8 +7,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from attention_oracle import exact_attention
 from reference_error import assert_as_exact
-from test_attention_splash import exact_attention
 
 from dew.nn.attention import (
     alibi_bias,

@@ -15,9 +15,7 @@ bf16 to the tolerance the Splash tests hold bf16 to.
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
-from test_attention_splash import (
-    TOLERANCE,
+from attention_oracle import (
     attention_terms,
     exact_value_and_grads,
     kept,
@@ -26,6 +24,8 @@ from test_attention_splash import (
     reference,
     value_and_grads,
 )
+from reference_error import assert_as_exact_as_the_reference
+from test_attention_splash import TOLERANCE
 
 
 def masked():
