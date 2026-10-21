@@ -52,9 +52,10 @@ def decode_through(module: nn.Module, variables, hidden, prefill: int):
 
 
 def largest_difference(left, right) -> float:
-    """The largest absolute difference between two trees of the same structure, over every leaf."""
-    return max(float(np.max(np.abs(np.asarray(a) - np.asarray(b))))
-               for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
+    """The largest absolute difference between two trees of the same structure, over every leaf; trees
+    of another structure raise, as `jax.tree.map` pairs them."""
+    return max(jax.tree.leaves(jax.tree.map(
+        lambda a, b: float(np.max(np.abs(np.asarray(a) - np.asarray(b)))), left, right)))
 
 
 def flat_tree(tree) -> dict:
