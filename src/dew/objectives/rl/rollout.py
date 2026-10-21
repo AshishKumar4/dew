@@ -12,9 +12,10 @@ import numpy as np
 
 from dew.coordination import agreed
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
-from dew.inference.rollouts import response
+from dew.inference.rollouts import InfrastructureError, response
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.objectives.base import Shown
+from dew.records import finite
 from dew.sampling.text import Sampling
 
 from ..lm import TokenScorer
@@ -33,6 +34,29 @@ type Reward = Callable[[str, PromptRecord], float]
 """A function that scores a completion against its prompt's `PromptRecord` and returns the reward.
 
 verl's four-argument `compute_score` enters through `dew.objectives.rl.verl.verl_reward`."""
+
+def scored_draw(task: str, sample: int, call: Call, text: str, record: PromptRecord,
+                reward: Reward) -> Session:
+    """One draw's one-call session: COMPLETED where its call stopped, TRUNCATED where it ran out,
+    scored by `reward(text, record)` on its decoded `text`. A reward whose external boundary failed
+    (an `InfrastructureError` or an `OSError`: a sandbox, a service) leaves an INFRA_ERROR session
+    naming it, which a scheduler retries; a non-finite score is refused."""
+    try:
+        score = reward(text, record)
+    except (InfrastructureError, OSError) as error:
+        return Session(task, "", sample, 0, (call,), Status.INFRA_ERROR, None, {},
+                       f"reward: {type(error).__name__}: {error}")
+    status = Status.COMPLETED if call.finish_reason == "stop" else Status.TRUNCATED
+    return Session(task, "", sample, 0, (call,), status, finite(score, "a reward"))
+
+
+def drawn_call(prompt: Sequence[int], tokens: Sequence[int], behavior: Sequence[float], terminated: bool,
+               version: int, **records) -> Call:
+    """One draw as a session's call: its finish reason `stop` where it terminated and `length`
+    where it ran out of tokens, and the engine `records` it carries (routing, support)."""
+    return Call(tuple(prompt), tuple(tokens), tuple(behavior), "stop" if terminated else "length", version,
+                **records)
+
 
 def prompt_rows(batch) -> tuple[np.ndarray, np.ndarray, list[PromptRecord]]:
     """Read one host prompt batch: left-padded ids, lengths and each row's `PromptRecord`.
@@ -133,19 +157,16 @@ class SampledRollout:
             return self.decode(list(response(sampled[row, group, :int(lengths[row, group])].tolist(),
                                              self.sampling)))
 
-        rewards = np.asarray([[self.reward(completion(row, group), records[row])
-                               for group in range(self.groups)] for row in range(rows)], np.float32)
         sessions, version = [], int(state.updates)
         for row in range(rows):
-            prompt = tuple(int(token) for token in prompts[row, width - int(prompt_lengths[row]):])
+            prompt = [int(token) for token in prompts[row, width - int(prompt_lengths[row]):]]
             for group in range(self.groups):
-                count, stopped = int(lengths[row, group]), bool(terminated[row, group])
-                call = Call(prompt, tuple(int(token) for token in sampled[row, group, :count]),
-                            tuple(float(value) for value in behavior[row, group, :count]),
-                            "stop" if stopped else "length", version)
-                sessions.append(Session(str(row), "", group, 0, (call,),
-                                        Status.COMPLETED if stopped else Status.TRUNCATED,
-                                        float(rewards[row, group])))
+                count = int(lengths[row, group])
+                call = drawn_call(prompt, [int(token) for token in sampled[row, group, :count]],
+                                  [float(value) for value in behavior[row, group, :count]],
+                                  bool(terminated[row, group]), version)
+                sessions.append(scored_draw(str(row), group, call, completion(row, group), records[row],
+                                            self.reward))
         # Session `row * groups + group` is that draw, which is what `sampled_values` hands its callback.
         # The rows are the objective's, which `pack` refuses a draw too long for.
         packed = pack(sessions, self.objective.seq_len + 1, rows=rows * self.groups,
@@ -153,6 +174,8 @@ class SampledRollout:
         packed[OLD_LOG_PROBS_KEY] = sampled_values(
             packed, lambda index, _: raw[index // self.groups, index % self.groups,
                                          :int(lengths[index // self.groups, index % self.groups])].tolist())
-        self.metrics.update({"reward/mean": float(rewards.mean()), "length/mean": float(lengths.mean()),
+        scores = [session.reward for session in sessions if session.reward is not None]
+        self.metrics.update({"reward/mean": float(np.mean(scores, dtype=np.float32)) if scores else 0.0,
+                             "length/mean": float(lengths.mean()),
                              "status/truncated": float(1 - terminated.mean())})
         return packed

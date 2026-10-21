@@ -60,12 +60,11 @@ from .episodes import (
     EpisodeId,
     EpisodeProgress,
     EpisodeStatus,
-    finite_reward,
     session_of,
     step_action,
 )
-from .rollout import Reward, prompt_rows
-from .sessions import Call, Session, Status, Task
+from .rollout import Reward, drawn_call, prompt_rows, scored_draw
+from .sessions import Session, Status, Task
 
 _INFRASTRUCTURE = (InfrastructureError, OSError)
 """What a draw or a callback fails with when its external boundary, not its code, failed."""
@@ -327,25 +326,10 @@ class PromptSource:
         if draw.version != version:
             return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {},
                            f"draw: served by version {draw.version}, submitted under {version}")
-        call = Call(
-            draw.prompt,
-            draw.tokens,
-            draw.behavior_log_probs,
-            "stop" if draw.terminated else "length",
-            draw.version,
-            routed_experts=draw.routed_experts,
-            support=draw.support,
-        )
-        status = Status.COMPLETED if draw.terminated else Status.TRUNCATED
-        text = self.decode(draw.response(self.server.sampling))
-        try:
-            score = self.reward(text, prompt.record)
-        except _INFRASTRUCTURE as error:
-            # The reward's boundary failed, a sandbox or a service: infrastructure, retried.
-            return Session(
-                task.id, "", 0, 0, (call,), Status.INFRA_ERROR, None, {}, f"reward: {_failure(error)}"
-            )
-        return Session(task.id, "", 0, 0, (call,), status, finite_reward(score))
+        call = drawn_call(draw.prompt, draw.tokens, draw.behavior_log_probs, draw.terminated, draw.version,
+                          routed_experts=draw.routed_experts, support=draw.support)
+        return scored_draw(task.id, 0, call, self.decode(draw.response(self.server.sampling)), prompt.record,
+                           self.reward)
 
     def _scored(self, task: Task, prompt: _Prompt, version: int, drawn: Future[Draw]) -> Future[Session]:
         """The draw's future, chained into its reward on a scorer thread."""
