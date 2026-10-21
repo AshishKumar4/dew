@@ -28,16 +28,17 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Let Llama 4's mixer take any KV cache, its context derived from the caller's, not rebuilt. [784]
 - Let latent attention (MLA and its sparse pooling), DeepSeek V4's compressed cache and a bidirectional canvas's encoder prefix take paged and quantized KV cache layouts. [830, 831, 838]
 - Place a loaded pretrained model's variables on JAX's default device, as jnp arrays are; keeping them on the host is an explicit request. [832]
+- Keep a merged FP8 base finite through training on H100's FP8 tensor cores. [841]
 - Route MPConv through Conv's shared operand path after its normalization. [785]
 - One patch projection for every scan order in DiT, UViT and SimpleUDiT, the tokens permuted after it. [787]
 - Build Llama 4's vision adapter from MergeProjector. [788]
 
 ## Kernels and performance
 
-The kernel direction was approved on 2026-10-19:
+The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case runs whichever is faster, Dew's kernel or XLA's, and where XLA wins the template learns why. Three templates absorb every hand kernel and its variants through hooks; their configs, and the choice between a template and XLA, come from cost models over hardware facts and the problem shape, deterministic and right on GPUs never measured, with a shortfall fixed in the model rather than a table. Measured tuning is opt-in (`dew tune`, `tune_kernels=True`) and writes a persistent cache per device kind. At the end there is no hand-written per-GPU table and no selector: each hand kernel and the flash wheel are deleted once their template matches them, and anything new arrives as a template hook first.
 
 1. Select at the semantic operation boundary. Typed operations, cases and requirements describe support as data; validity travels as coordinates. The route test checks the implementation that ran.
-2. Consolidate kernels into three templates built on upstream Tokamax's public API, with XLA as the general implementation:
+2. Consolidate kernels into three templates built on upstream Tokamax's public API, each case running the faster of the template and XLA:
 
    - Attention with score and mask hooks, coordinate-derived block sparsity, sinks, MLA, split-KV and paged decode.
    - Chunked linear recurrence covering fused decode, delta rules, GDN, KDA, SSD and short convolution.
@@ -48,6 +49,15 @@ The kernel direction was approved on 2026-10-19:
    Tuning's two private Tokamax imports, `dump_bound_args_to_json` and `AutotuningData`, move to `tokamax.autotuning` once a release carries openxla/tokamax#1676. [738]
 
    The templates' entry measurements, at main 5a761cb7b on A100 and H100: Tokamax attention against XLA, cuDNN, the flash wheel and Triton at 128- and 64-wide heads; packed documents; Mosaic GPU attention against FA3 on H100, where FA3 stays until the gap closes; ragged products; narrow heads on sm86, L4 and G4; and attention sinks.
+
+   Linear-attention coverage: the whole of FLA's family (fla main 9d478facb2), each a recurrence or attention template hook, and an orchestrator over them where a family has its own structure:
+
+   - First, in Dew today: Gated DeltaNet, KDA and Mamba2 (SSD).
+   - Next, as recurrence hooks: Mamba (1), RWKV7, Mamba3, the GLA family (GLA, Simple GLA, RetNet, Lightning, HGRN/HGRN2), DeltaNet and Gated DeltaProduct, and GDN-2.
+   - Attention-template variants: FoX, Wall and PaTH (pair scores and position transforms), NSA, MoBA and DSA (externally selected blocks with a log-sum-exp merge), stick-breaking and Parallax (other reductions), and MLA.
+   - Families with their own structure, over recurrence and attention subkernels: log-linear attention, MesaNet, DeltaFormer, Momentum DeltaNet, MoM and Raven, TTT and Titans, and CAT.
+
+   So that each later family is a hook rather than a redesign, the recurrence template takes from the start: decays of every shape composed in a stated order with identity-plus-low-rank or diagonal-plus-low-rank erases; ordered substeps and several writes per token; expanded and feature-mapped keys and several states per head; auxiliary scans before the main one; readout before or after the update, with bonus, skip, gate and norm; and token shift, convolution, previous-token inputs and document resets.
 3. A composite-operation experiment first needs JAX-side differentiation and sharding rules. Mosaic GPU work follows target-specific measurements; Triton Pallas remains the portable CUDA path.
 4. Record compile time beside execution time, keep programs bounded in depth and remove measured split-KV compiler growth, and show the serving barrier that bounds nGPT's depth leaves its training step unchanged. The persistent compilation cache is on by default, with an opt-out. [635, 641, 829]
 5. Optimize memory-bound fusions from profiles. The proposed whole-step megakernel speed estimate was withdrawn.
