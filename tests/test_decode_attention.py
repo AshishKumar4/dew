@@ -17,7 +17,7 @@ from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduct
 from dew.nn.attention import attention_case, scaled_dot_product_attention, with_key_lengths
 from dew.nn.attention_kernels import DECODE, kernel_refusals
 from dew.nn.decode_geometry import folded_attention
-from dew.nn.kernels.generation import chosen
+from dew.nn.kernels.generation import chosen, routes as generation_routes
 
 pytestmark = pytest.mark.kernel
 
@@ -971,3 +971,24 @@ def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask
         assert_as_exact_as_the_reference(np.asarray(mine, np.float64), np.asarray(theirs, np.float64),
                                          np.asarray(true), f"window {window} {name}",
                                          terms=np.asarray(summed))
+
+
+@pytest.mark.parametrize("width", [128, 96])
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_bf16_decode_step_routes_to_the_kernel_its_generation_measured_fastest(generation, width):
+    """A bf16 decode step of 16 query heads over 8 key heads, traced through the public attention for a
+    GPU on this CPU: an A100 runs the decode kernel its row prefers (`generation.TARGETS`' sm80 'decode',
+    from the DCU receipt), and hands a width it does not take (96) on to cuDNN; an H100 runs cuDNN, its
+    default."""
+    from dew.nn.kernels.generation import assumed
+
+    query = jnp.zeros((2, 1, 16, width), jnp.bfloat16)
+    key = jnp.zeros((2, 256, 8, width), jnp.bfloat16)
+    lengths = jnp.asarray([3, 200], jnp.int32)
+    with assumed(generation), generation_routes() as found:
+        jax.make_jaxpr(lambda q, k, v: scaled_dot_product_attention(q, k, v, key_value_seq_lengths=lengths))(
+            query, key, key)
+    [route] = [route for route in found if route.choice == "decode"]
+    preferred = "decode" if generation == "sm80" else "cudnn"
+    assert (route.preferred, route.kernel) == (preferred, preferred if width == 128 else "cudnn")
+    assert (route.refusal is None) == (route.kernel == preferred)

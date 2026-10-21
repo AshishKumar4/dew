@@ -117,8 +117,9 @@ class Unreadable(ValueError):
 def encoded(value: object) -> JSON:
     """`value`, an op's field, a launch's argument or a config, as JSON `decoded` rebuilds equal: a
     scalar, None or string as itself; a shape and dtype, a dtype, a tuple, a list, a mapping, an enum
-    member and a dataclass by their parts, a class by its module and name. Anything else, a callable
-    among them, has no JSON form here, and raises."""
+    member and a dataclass by their parts, a class and a module-level function (a template's hook) by
+    its module and name. Anything else, a lambda, a closure or a local function among them, has no JSON
+    form here, and raises: a measured pick for a launch with a hook needs a module-level hook."""
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, jax.ShapeDtypeStruct):
@@ -129,6 +130,8 @@ def encoded(value: object) -> JSON:
         return {"enum": _named(type(value)), "name": value.name}
     if isinstance(value, type):
         return {"class": _named(value)}
+    if isinstance(value, types.FunctionType):
+        return {"function": _function_name(value)}
     if dataclasses.is_dataclass(value):
         return {"dataclass": _named(type(value)),
                 "fields": {field.name: encoded(getattr(value, field.name))
@@ -163,6 +166,8 @@ def decoded(value: records.JSON) -> Rebuilt:
         return member
     if "class" in value:
         return _located(_field(records.text, value.get("class"), "class"))
+    if "function" in value:
+        return _located_function(_field(records.text, value.get("function"), "function"))
     if "dataclass" in value:
         cls, fields = _located(_field(records.text, value.get("dataclass"), "dataclass")), value.get("fields")
         if not dataclasses.is_dataclass(cls) or not isinstance(fields, dict) or set(fields) != {
@@ -212,17 +217,41 @@ def _named(cls: type) -> str:
     return f"{cls.__module__}:{cls.__qualname__}"
 
 
-def _located(name: str) -> type:
-    """The class `_named` names; `Unreadable` where this checkout has no such class."""
+def _function_name(function: types.FunctionType) -> str:
+    """A module-level function's module and name, which `_located_function` finds again; a lambda, a
+    closure, a local function or one a class holds has none to store."""
+    name = f"{function.__module__}:{function.__qualname__}"
+    if "." in function.__qualname__ or function.__name__ == "<lambda>" or function.__closure__:
+        raise TypeError(f"the hook {name} is no module-level function, which a kernel's stored picks name")
+    return name
+
+
+def _located_function(name: str) -> types.FunctionType:
+    """The module-level function `_function_name` names: `Unreadable` where this checkout's module holds
+    no such function under that name, or another object (a renamed or shadowed hook)."""
     module, _, qualified = name.partition(":")
+    found = vars(_module(module)).get(qualified) if "." not in qualified else None
+    if not isinstance(found, types.FunctionType) or f"{found.__module__}:{found.__qualname__}" != name:
+        raise Unreadable(f"{name} names no module-level function in this checkout")
+    return found
+
+
+def _module(module: str) -> types.ModuleType:
+    """The module `module` names; `Unreadable` where this checkout has no such module."""
     try:
-        found: object = importlib.import_module(module)
+        return importlib.import_module(module)
     except ModuleNotFoundError as error:
         # The named module or a parent of it is absent; a module that fails to import otherwise, or
         # imports something else that is absent, is this checkout's error and propagates.
         if error.name is None or not (module == error.name or module.startswith(error.name + ".")):
             raise
         raise Unreadable(f"this checkout has no module {module}") from error
+
+
+def _located(name: str) -> type:
+    """The class `_named` names; `Unreadable` where this checkout has no such class."""
+    module, _, qualified = name.partition(":")
+    found: object = _module(module)
     for part in qualified.split("."):
         # A module and each class on the way hold the next part among their own attributes.
         found = vars(found).get(part) if isinstance(found, (type, types.ModuleType)) else None
