@@ -463,7 +463,11 @@ def _update_aligned(stages: tuple[Stage, ...], window: int) -> tuple[Stage, ...]
     """`stages` each beginning at the first multiple of `window` steps at or after the step it begins
     at, counted from the run's first: every start is taken from the given schedule, not from the
     stage before it moved, so no stage drifts past its own end, and a stage left with no step is
-    dropped. Each start's record is what the stages before it read up to it."""
+    dropped. Each start's record is what the stages before it read up to it. A window is at least one
+    step."""
+    if window < 1:
+        raise ValueError(f"a ramp aligns its stages to updates of at least one step; got a window of "
+                         f"{window}")
     starts, step = [], 0
     for stage, after in itertools.pairwise(stages):
         starts.append(step)

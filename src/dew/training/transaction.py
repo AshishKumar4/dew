@@ -407,11 +407,12 @@ class Transaction:
         batch = jax.tree.map(lambda x: x[index], previous.batches)
         variables = state.variables if previous.variables is None else {
             **state.variables, **jax.tree.map(lambda x: x[index], previous.variables)}
-        accepted = state.microstep - fill + index
-        step_info = Step(accepted // self.split,
-                    jax.random.fold_in(state.key, previous.attempts[index]),
-                    with_ema(variables, state.ema), committed=state.updates,
-                    **self.examples(state, index, batch, rejected=previous.attempts[index] - accepted))
+        accepted, attempt = state.microstep - fill + index, previous.attempts[index]
+        # The part its input ran as, which an attempt counts (`step` times `split` plus its part).
+        step_info = Step(accepted // self.split, jax.random.fold_in(state.key, attempt),
+                         with_ema(variables, state.ema), committed=state.updates,
+                         **self.examples(state, index, batch, part=attempt % self.split,
+                                         rejected=attempt - accepted))
         return self.read(variables, state.compute), batch, step_info
 
     def examples(self, state, slot, batch, part=None, rejected=0) -> dict:
