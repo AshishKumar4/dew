@@ -477,8 +477,8 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
 def test_a_file_whose_recorded_tests_outweigh_its_median_runs_split_by_them(ci, tmp_path):
     """Train 18's census: main's runs timed the file at 6 s with one test; a head recorded the 1,576
     tests it added (here 40 of 30 s). Each record is a test's least time, so their sum past the median
-    says the file now holds tests those runs did not: it runs split by its records, alone, not packed
-    with the light files by the median it had before."""
+    may mean those runs predate the file's tests, and is a floor on its time: it runs split by its
+    records, alone, not packed with the light files by the median it had before."""
     for name in ("test_census", "test_light", "test_other"):
         (tmp_path / "tests" / f"{name}.py").write_text("")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(

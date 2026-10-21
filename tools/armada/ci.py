@@ -21,7 +21,7 @@ tests' times in tests/test_durations.json, at the cut its rows were last timed
 at and shared among that cut's groups (`measured_cut`), so the file takes the
 fewest groups whose heaviest, setup included, holds to `target` (`split`). A file weighs armada's
 median of its last green runs, or its tests' sum in tests/test_durations.json where that is more
-(the file now holds tests those runs did not), else that sum scaled to armada, else the mean. Each entry names its rows, one a
+(those runs may predate the file's current tests), else that sum scaled to armada, else the mean. Each entry names its rows, one a
 file (or a file's group), so armada grades a task that leaves one out as not
 green, and armada queues the heaviest entries first.
 
@@ -301,12 +301,12 @@ def recorded_tests() -> dict[str, list[float]]:
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
     """Each file's seconds on armada under `python`: its median, which armada
     sums over a split file's groups (`task`), or its tests' sum in
-    tests/test_durations.json where that is more. Each test's record is its
-    least time, so a sum past the median means the file now holds tests its
-    measured runs did not, which a head that added them recorded (`durations`):
-    base/kernels' route census, 1,576 tests recorded at 2,654 s in a file main
-    ran in 6 s, was packed by that median with six other files into one task,
-    which ran past its deadline (train 18). Else the recorded sum, scaled by
+    tests/test_durations.json where that is more: each test's record is its
+    least time (`durations`), so a sum past the median may mean the measured
+    runs predate the file's current tests, and the sum is a floor on what it
+    takes. base/kernels' route census, 1,576 tests recorded at 2,654 s in a
+    file main ran in 6 s, was packed by that median with six other files into
+    one task, which ran past its deadline (train 18). Else the recorded sum, scaled by
     how much slower armada ran the files measured both ways; else None, for a
     file nothing has timed."""
     recorded = {name: sum(tests) for name, tests in recorded_tests().items()}
