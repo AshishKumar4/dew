@@ -6,12 +6,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, TypeGuard, Unpack
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, TypeGuard, Unpack, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
+from typing_extensions import CapsuleType
 
 from dew import records
 from dew._model_types import QWEN35_TYPES
@@ -191,6 +192,14 @@ def _row_start(reference: HostProcessor) -> int | None:
     return None if bos is None else records.integer(bos, "bos_token_id")
 
 
+
+@runtime_checkable
+class _DLPack(Protocol):
+    """A framework's array that exports itself through DLPack (a PyTorch tensor among them), which
+    JAX reads without importing the framework."""
+
+    def __dlpack__(self, *args, **kwargs) -> CapsuleType: ...
+
 @dataclass(frozen=True)
 class Processor:
     """Runs a checkpoint's own processor on the host and arranges its outputs as native model inputs.
@@ -254,7 +263,7 @@ class Processor:
             "text": text if isinstance(text, str) else list(text),
             "padding": not isinstance(text, str) and len(text) > 1,
             "truncation": False,
-            "return_tensors": "np",
+            "return_tensors": None,
         }
         if audio is not None:
             arguments["audio"] = audio
@@ -281,23 +290,30 @@ class Processor:
                     for part in content)
         reference = self._media_reference if media else self.reference
         values = reference.apply_chat_template(
-            messages, tokenize=True, return_dict=True, return_tensors="np",
+            messages, tokenize=True, return_dict=True, return_tensors=None if media else "np",
             add_generation_prompt=add_generation_prompt, **template_options)
         if not isinstance(values, Mapping):
             raise TypeError("the source chat processor must return named numeric inputs")
         return self._from_arrays(values) if media else self.from_hf(values)
 
     def _from_arrays(self, values: Mapping[str, object]) -> ModelInputs:
-        """A media processor's NumPy fields (`return_tensors='np'`, no PyTorch), a bfloat16 one
-        (Llama 4's pixels) widened to float32, which is exact; a processor that returns anything
-        but NumPy arrays is refused by name."""
-        arrays: dict[str, np.ndarray] = {}
-        for name, value in values.items():
-            if not isinstance(value, np.ndarray):
-                raise TypeError(f"{type(self._media_reference).__name__} returned {name!r} as "
-                                f"{type(value).__name__}, not the NumPy array Dew asks it for")
-            arrays[name] = value.astype(np.float32) if value.dtype == ml_dtypes.bfloat16 else value
-        return self.from_hf(arrays)
+        """A media processor's fields, as it computes them (`return_tensors=None`), on the host:
+        NumPy arrays and lists as they are, a framework's tensors (a fast image processor's) read
+        through DLPack, so Dew imports no PyTorch, and a bfloat16 field (Llama 4's pixels) widened to
+        float32, which is exact. A field none of these is refused naming the processor."""
+        return self.from_hf({name: self._host_array(name, value) for name, value in values.items()})
+
+    def _host_array(self, name: str, value: object) -> np.ndarray:
+        if isinstance(value, (list, tuple)) and value and isinstance(value[0], _DLPack):
+            array = np.stack([self._host_array(name, image) for image in value])
+        elif isinstance(value, _DLPack) and not isinstance(value, np.ndarray):
+            array = np.asarray(jax.dlpack.from_dlpack(value))
+        elif isinstance(value, (np.ndarray, list, tuple)):
+            array = np.asarray(value)
+        else:
+            raise TypeError(f"{type(self._media_reference).__name__} returned {name!r} as "
+                            f"{type(value).__name__}, which is no array")
+        return array.astype(np.float32) if array.dtype == ml_dtypes.bfloat16 else array
 
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
         """Check a processor's raw outputs and turn them into `ModelInputs` for the device.
