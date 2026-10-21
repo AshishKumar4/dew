@@ -68,9 +68,10 @@ def token_ids(values: object, *, where: str) -> list[int]:
 
 def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 0,
                    padding_side: Literal["left", "right"] = "left",
-                   fields: Mapping[str, Sequence[Sequence[int]] | np.ndarray] | None = None
-                   ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Pad ragged token rows and their scalar token fields on the host.
+                   fields: Mapping[str, Sequence[Sequence[int]] | np.ndarray] | None = None,
+                   width: int | None = None) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Pad ragged token rows and their scalar token fields on the host, to `width` when given (a
+    fixed shape, which no row may exceed), else to the longest row.
 
     Filler IDs carry no content; attention_mask alone marks real slots. Rows
     that all fill the width come back without one: absent validity says every
@@ -89,7 +90,11 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
         raise ValueError("each prompt must contain a nonempty integer token row")
     for row in arrays:
         _check_token_ids(row)
-    width = max(row.size for row in arrays)
+    longest = max(row.size for row in arrays)
+    if width is None:
+        width = longest
+    elif longest > width:
+        raise ValueError(f"a token row holds {longest} ids, more than the width {width}")
     tokens = np.full((len(arrays), width), pad_id, np.int32)
     valid = np.zeros(tokens.shape, bool)
     slots = [

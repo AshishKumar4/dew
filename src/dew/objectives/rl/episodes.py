@@ -31,7 +31,7 @@ from dew.coordination import (
 )
 from dew.data.dataset import DataPartition
 from dew.inference.rollouts import check_ending
-from dew.nn.inputs import ModelInputs, mesh_of
+from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows
 from dew.objectives.base import Batch, Variables
 from dew.sampling.text import Generation, Sampling
 from dew.training.state import TrainState
@@ -469,23 +469,16 @@ class EpisodeRollout:
         occupies its row: the shapes have to match across ranks, and its
         draw is discarded rather than skipped.
         """
-        tokens = np.full((len(slots), self.max_prompt_tokens), self.sampling.pad, np.int32)
-        valid = np.zeros_like(tokens, bool)
-        for row, slot in enumerate(slots):
+        contexts = []
+        for slot in slots:
             context = None
             if len(slot.transitions) == turn and slot.pending is None:
                 context = slot.next_context(max_prompt_tokens=self.max_prompt_tokens)
-            if context is not None:
-                tokens[row, -len(context):] = context
-                valid[row, -len(context):] = True
-            if not valid[row].any():
-                # Keep global row indices and collective shapes stable. The
-                # draw for a finished slot is discarded, never executed or trained.
-                valid[row, -1] = True
-        # Contexts that fill the width leave no padded slot, and a cohort of
-        # those carries no validity field at all.
-        fields = {} if valid.all() else {"attention_mask": jnp.asarray(valid)}
-        return ModelInputs(jnp.asarray(tokens), fields)
+            # A finished slot keeps its row, one padding id, so global row indices and collective
+            # shapes stay stable. Its draw is discarded, never executed or trained.
+            contexts.append([self.sampling.pad] if context is None or not len(context) else context)
+        tokens, fields = pad_token_rows(contexts, pad_id=self.sampling.pad, width=self.max_prompt_tokens)
+        return ModelInputs(jnp.asarray(tokens), {name: jnp.asarray(value) for name, value in fields.items()})
 
     def _advance(self, slots: list[EpisodeProgress], generation: Generation, policy_step: int,
                  binding_id: str, turn: int, run: JournalRun | None) -> None:
