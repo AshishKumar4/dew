@@ -195,8 +195,11 @@ class GpuTarget:
 # has no Triton kernel in 0.0.15 and its Mosaic one's backward takes no mixed dtypes. No tokamax
 # implementation is a row's kernel; Dew calls its own through tokamax's Op and tuning.
 TARGETS = {target.generation: target for target in (
+    # T4: 40 SMs at a 1590 MHz boost, 320 GB/s; 65 TF fp16 summed in fp32 and 8.1 TF fp32 (the T4
+    # datasheet) -> 1024 and 128 an SM a clock.
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
-              aliases=('gpu:t4', 't4'), multiprocessors=40),
+              aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9,
+              tensor_rates={'16bit': 1024, 'fp32': 128}),
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash',
