@@ -67,20 +67,23 @@ def reference_variables(loaded, name):
     return objective(loaded, variables=values).init(jax.random.key(0))
 
 
-def float64_update(model, build, variables, batch, step, rate):
-    """The SGD update `rate` of `variables`' params under `step`, in float64: `build`'s objective over
-    `model` computing in float64, its decoder's and vision tower's dtype, its gradient taken at
-    `variables` widened. The truth a float32 update and its eager twin are measured from
-    (`assert_leaves_as_exact`); the step's draws fix their dtypes, so it corrupts as the float32 run
-    does."""
+def float64_update(model, build, batch, step, rate):
+    """The SGD update `rate` of a variables tree's params under `step`, in float64, compiled once:
+    `build`'s objective over `model` computing in float64, its decoder's and vision tower's dtype, its
+    gradient taken at the variables widened. The truth check 1 holds a float32 update to; the step's
+    draws fix their dtypes, so it corrupts as the float32 run does. Called under `jax.enable_x64`."""
     with jax.enable_x64(new_val=True):
         conditioner = None if model.conditioner is None else model.conditioner.clone(dtype=jnp.float64)
         exact = build(model.clone(text=model.text.clone(dtype=jnp.float64), conditioner=conditioner))
-        values = jax.tree.map(jnp.asarray, widened(variables))
+    wide = widened(batch)
+
+    @jax.jit
+    def update(values):
         gradient = jax.grad(lambda trainable: exact.scalar_loss(
-            {**values, "params": trainable}, widened(batch), step)[0])(values["params"])
-        updated = jax.tree.map(lambda value, grad: value - rate * grad, values["params"], gradient)
-        return jax.tree.map(np.asarray, {**values, "params": updated})
+            {**values, "params": trainable}, wide, step)[0])(values["params"])
+        return jax.tree.map(lambda value, grad: value - rate * grad, values["params"], gradient)
+
+    return update
 
 
 UPDATE_SEEDS = {"text": 8, "image": 8}
@@ -119,10 +122,7 @@ def update_site(obj, variables, batch, run_key, model, build):
             {**values, "params": trainable}, batch, step)[0])(values["params"])
         return jax.tree.map(lambda value, grad: value - 0.001 * grad, values["params"], gradient)
 
-    def truth(values):
-        return float64_update(model, build, values, batch, step, 0.001)["params"]
-
-    return stepped, objective_update, draw, truth
+    return stepped, objective_update, draw, float64_update(model, build, batch, step, 0.001)
 
 
 def assert_tree_close(actual, expected, tolerance):
