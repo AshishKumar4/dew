@@ -604,7 +604,10 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         # The initial state as one more softmax term, its weight exp(m0 - m) / T and value acc0 / total0:
         # each gradient divides by T first and takes the factor exp(m0 - m) last, so a state that weighs
         # little beside the keys (a subnormal factor) is rounded once there, as the reference rounds it.
-        factor = jnp.where((total > 0) & jnp.isfinite(starts[0]), jnp.exp(starts[0] - peak), 0.0)
+        # Bounded as the launch's own carried factor is (`attention_algebra.below`): the forward's
+        # maximum is the state's too, whatever its rounding.
+        factor = jnp.where((total > 0) & jnp.isfinite(starts[0]), jnp.exp(jnp.minimum(starts[0] - peak, 0.0)),
+                           0.0)
         inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
         # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
         # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.

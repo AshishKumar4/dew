@@ -333,3 +333,31 @@ def test_a_logit_past_the_forwards_rounded_maximum_weighs_one_in_the_backward():
         np.testing.assert_array_equal(np.asarray(found.query), 0)
         np.testing.assert_array_equal(np.asarray(found.key), 0)
         np.testing.assert_array_equal(np.asarray(found.value), 1)
+
+
+def test_a_large_initial_maximum_gives_the_references_state_gradients():
+    """fp32, one query over one key resumed from a state at maximum 1610613120 holding a denominator and
+    weighted value of 1, Q 0 and K, V and dO 1, scale 1: the forward's maximum, the state's, rounds
+    below it taken in base 2 and back. Both mainloops give the state's gradients the reference does
+    (finite: its total's -1 and its weighted values' 1), the launch and the front end taking one
+    bounded carried factor."""
+    spans = template.spans(1, 1, 1)
+    query = jnp.zeros((1, 1, 1, 1), jnp.float32)
+    key = value = dout = jnp.ones((1, 1, 1, 1), jnp.float32)
+    state = template.Initial(jnp.full((1, 1, 1), 1610613120.0), jnp.ones((1, 1, 1)), jnp.ones((1, 1, 1, 1)))
+    hooks = template.Hooks(initial=state)
+    pins = {attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2),
+            attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}
+    with tuning.pinned(pins):
+        triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=1.0, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, hooks, dout, block_q=32, block_k=32,
+                                           pad=attention_triton.BLOCK, scale=1.0)
+
+    def attend(q, k, v, initial):
+        return template.reference(q, k, v, spans, template.Hooks(initial=initial), scale=1.0)
+
+    reference = jax.vjp(attend, query, key, value, state)[1](dout)[3]
+    for found in (triton, portable):
+        for mine, theirs in zip(found.initial, reference, strict=True):
+            assert np.isfinite(np.asarray(mine)).all()
+            np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
