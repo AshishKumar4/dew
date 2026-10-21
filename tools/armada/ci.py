@@ -73,7 +73,6 @@ DIR/coverage.md, a module a line, the least covered first:
 import argparse
 import ast
 import concurrent.futures
-import contextlib
 import hashlib
 import heapq
 import importlib.util
@@ -81,7 +80,6 @@ import json
 import math
 import os
 import re
-import signal
 import subprocess
 import sys
 import threading
@@ -93,6 +91,9 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import owned  # tools/armada/owned.py, beside this file
 
 REPO = Path(__file__).resolve().parents[2]
 _CLASSIFIERS = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["classifiers"]
@@ -138,8 +139,8 @@ SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
 DURATIONS = Path("tests/test_durations.json")
-SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/ci.py", "tools/armada/split.py",
-          "tools/armada/executed.py", "tools/armada/followed.py", str(DURATIONS))
+SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/ci.py", "tools/armada/owned.py",
+          "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py", str(DURATIONS))
 """The files every test file's key covers whole, beside tests/ and src/, every lock (a GPU node
 builds its environment from its CUDA lock) and the environment's own inputs, which .armada.json
 names (`environment_files`)."""
@@ -487,12 +488,6 @@ def file_of(case: ET.Element) -> str:
     return "/".join(parts[:module + 1]) + ".py"
 
 
-def signal_group(leader: int, number: signal.Signals) -> None:
-    """`number` to every process left in the group `leader` led."""
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(leader, number)
-
-
 def shown(output: str) -> str:
     """The end of a task's output, and the stack faulthandler printed for a test that hung, if one did."""
     stack = output.rfind("Timeout (")
@@ -583,10 +578,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     lines: list[str] = []
     # split.py, the plugin that keeps a split file's group, imports from beside this file.
     path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
-    done = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            start_new_session=True,
-                            env={**os.environ, **environ, **CLOSED_HUB, "PYTHONPATH": path,
-                                 "DEW_EXECUTED": str(executed_report)})
+    done = owned.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                       env={**os.environ, **environ, **CLOSED_HUB, "PYTHONPATH": path,
+                            "DEW_EXECUTED": str(executed_report)})
 
     def read() -> None:
         for line in done.stdout or ():
@@ -600,15 +594,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     try:
         done.wait(deadline)
     except subprocess.TimeoutExpired:
-        # ^C first, so pytest reports what ran; a test stuck in C ignores it, and the group is killed.
         expired = True
-        signal_group(done.pid, signal.SIGINT)
-        try:
-            done.wait(grace)
-        except subprocess.TimeoutExpired:
-            signal_group(done.pid, signal.SIGKILL)
-            done.wait()
-    signal_group(done.pid, signal.SIGKILL)
+    # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
+    # killed, what pytest's tests left running with it, and given `grace` to be gone.
+    if left := owned.stop(done, interrupt=grace if expired else None, settle=grace):
+        print(f"processes {left} of the task's group still ran {grace:.0f} s after SIGKILL", flush=True)
     reader.join(10)
     output = "".join(lines)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
