@@ -1,0 +1,218 @@
+"""Check 2 at the elements of float64 truth exactly zero (tests/zero_elements.py) on computations whose
+answer is known: what its own rounding admits, what a defect past it fails, and what it does not
+certify (the specification's fixtures, numbered as there)."""
+
+import fractions
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from zero_elements import FLOAT64, Interpreter, _widened_sum, assert_zero_elements, zero_elements
+
+TWO_24 = np.float32(2.0 ** 24)
+
+
+def _sequential(values):
+    """A sum taken in its written order, one rounding an addition."""
+    def summed(x):
+        total = x[0]
+        for index in range(1, x.shape[0]):
+            total = total + x[index]
+        return total
+    return summed, (jnp.asarray(values, jnp.float32),)
+
+
+def _interpreted(function, *inputs):
+    interpreter = Interpreter()
+    [out] = interpreter.run(jax.make_jaxpr(function)(*inputs), *inputs)
+    return out, interpreter.blocked
+
+
+def test_1_a_cancellation_is_held_to_its_own_rounding_and_a_defect_past_it_fails():
+    """s, the fp32 sum of 2^24, 1, -2^24 and -1 in that order, is -1 where float64's is 0; s·s is 1
+    against a truth of 0, within the rounding of the first addition carried through the product. The
+    same program with 2^30 added fails: its exact result is 2^30."""
+    summed, inputs = _sequential([TWO_24, 1.0, -TWO_24, -1.0])
+
+    def squared(x):
+        s = summed(x)
+        return {"f": s * s}
+
+    assert float(squared(*inputs)["f"]) == 1.0
+    coverage = assert_zero_elements(squared, squared, inputs, "cancelled")
+    assert coverage.certified == 1
+
+    def defective(x):
+        s = summed(x)
+        return {"f": s * s + jnp.float32(2.0 ** 30)}
+
+    with pytest.raises(AssertionError):
+        assert_zero_elements(defective, squared, inputs, "defect")
+
+
+def _one_key(dew_extra=None):
+    """Attention on given scores where every query keeps one key and the third key no query sees: each
+    kept key's weight exp(0) = 1 and every other exp(-inf) = 0, so the softmax is exact and the third
+    key's value gradient a structural zero."""
+    keep = np.array([0, 1, 3, 0])
+    visible = jnp.asarray(np.arange(4)[None, :] == keep[:, None])
+
+    def attention(scores, d_out):
+        scores = jnp.where(visible, scores, -jnp.inf)
+        weights = jnp.exp(scores - jnp.max(scores, axis=-1, keepdims=True))
+        p = weights / jnp.sum(weights, axis=-1, keepdims=True)
+        d_v = p.T @ d_out
+        if dew_extra is not None:
+            d_v = d_v + dew_extra
+        return {"d_v": d_v}
+
+    rng = np.random.default_rng(0)
+    inputs = tuple(jnp.asarray(rng.normal(size=shape), jnp.float32) for shape in ((4, 4), (4, 8)))
+    return attention, inputs
+
+
+def test_2_a_key_no_query_sees_has_a_value_gradient_of_exactly_zero():
+    """The third key's value gradient is zero by structure: zero passes, and 1e-30 added there fails."""
+    attention, inputs = _one_key()
+    coverage = assert_zero_elements(attention, attention, inputs, "masked")
+    assert coverage.certified == 8 and coverage.uncertified == 0
+    injected = jnp.zeros((4, 8), jnp.float32).at[2].set(1e-30)
+    faulty, _ = _one_key(injected)
+    with pytest.raises(AssertionError):
+        assert_zero_elements(faulty, attention, inputs, "masked, injected")
+
+
+def test_4_a_selection_its_predicate_does_not_decide_is_not_certified():
+    """where(s > 0, 1, 0) at s = -1 natively, 0 exactly, its bound reaching past zero: undecided, so
+    not certified, and nothing fails."""
+    summed, inputs = _sequential([TWO_24, 1.0, -TWO_24, -1.0])
+
+    def chosen(x):
+        return {"y": jnp.where(summed(x) > 0, jnp.float32(1.0), jnp.float32(0.0))}
+
+    coverage = zero_elements(chosen, chosen, inputs, "undecided")
+    assert (coverage.certified, coverage.uncertified, coverage.over) == (0, 1, [])
+
+
+def test_5_a_primitive_without_a_contract_is_named_and_its_values_not_certified():
+    def cancelled(x):
+        return {"y": jnp.sin(x) - jnp.sin(x)}
+
+    coverage = zero_elements(cancelled, cancelled, (jnp.ones(3, jnp.float32),), "sine")
+    assert coverage.certified == 0 and coverage.uncertified == 3
+    assert "sin" in coverage.blocked
+
+
+def test_6_a_slot_routing_drops_is_exactly_zero_and_an_ulp_there_fails():
+    """A slot whose score is decided below its threshold carries an exact zero; one ulp added there
+    fails."""
+    scores = jnp.asarray([0.9, 0.1, 0.7], jnp.float32)
+
+    def routed(score, value, extra=0.0):
+        return {"y": jnp.where(score > 0.5, value, jnp.float32(0.0)) + jnp.asarray(extra, jnp.float32)}
+
+    values = jnp.asarray([2.0, 3.0, 4.0], jnp.float32)
+    assert_zero_elements(routed, routed, (scores, values), "dropped")
+
+    def faulty(score, value):
+        return routed(score, value, np.asarray([0.0, 2.0 ** -126, 0.0], np.float32))
+
+    with pytest.raises(AssertionError):
+        assert_zero_elements(faulty, routed, (scores, values), "dropped, injected")
+
+
+def test_7_a_maximum_takes_its_operands_bound():
+    """max(s, 0) for s the fp32 sum of -2^24, -1, 2^24 and 0.5: 0.5 natively, 0 in float64, within
+    the bound s carries."""
+    summed, inputs = _sequential([-TWO_24, -1.0, TWO_24, 0.5])
+
+    def clipped(x):
+        return {"y": jnp.maximum(summed(x), jnp.float32(0.0))}
+
+    assert float(clipped(*inputs)["y"]) == 0.5
+    assert assert_zero_elements(clipped, clipped, inputs, "clipped").certified == 1
+
+
+def test_8_an_underflow_is_held_to_the_least_normal_and_a_defect_past_it_fails():
+    """t·0.5 + t·0.5 - t at t = 2^-149 is -t under gradual underflow and 0 where the backend flushes,
+    within its rounding either way; 2^-100 added fails."""
+    t = (jnp.asarray([2.0 ** -149], jnp.float32),)
+
+    def halves(x):
+        return {"y": (x * 0.5) + (x * 0.5) - x}
+
+    assert_zero_elements(halves, halves, t, "underflow")
+
+    def defective(x):
+        return {"y": (x * 0.5) + (x * 0.5) - x + jnp.float32(2.0 ** -100)}
+
+    with pytest.raises(AssertionError):
+        assert_zero_elements(defective, halves, t, "underflow, defect")
+
+
+def test_9_a_square_counts_its_rounding_and_tanh_has_no_contract():
+    x = jnp.asarray([1 + 2.0 ** -12], jnp.float32)
+    out, _ = _interpreted(lambda v: v ** 2, x)
+    exact = fractions.Fraction(float(x[0])) ** 2
+    assert out.certified.all()
+    assert fractions.Fraction(float(out.error[0])) >= abs(fractions.Fraction(float(out.value[0])) - exact) > 0
+    tanh, blocked = _interpreted(jnp.tanh, x)
+    assert not tanh.certified.any() and "tanh" in blocked
+
+
+def test_10_a_comparison_of_exact_operands_is_decided():
+    out, _ = _interpreted(lambda v: v > 0, jnp.zeros(2, jnp.float32))
+    assert out.certified.all() and out.exact.all()
+
+
+def test_11_an_injected_subnormal_on_an_unused_slot_fails_where_the_backend_keeps_it():
+    """x·0 plus 2^-149 at one slot: an exact zero and an exact subnormal, which fails against a truth of
+    zero wherever the backend holds it; a backend that flushes it holds zero, which passes."""
+    x = (jnp.ones(3, jnp.float32),)
+
+    def clean(v):
+        return {"y": v * 0}
+
+    def injected(v):
+        return {"y": v * 0 + jnp.asarray([0.0, 2.0 ** -149, 0.0], jnp.float32)}
+
+    if float(injected(*x)["y"][1]) != 0.0:
+        with pytest.raises(AssertionError):
+            assert_zero_elements(injected, clean, x, "subnormal")
+    else:
+        assert_zero_elements(injected, clean, x, "subnormal, flushed")
+
+
+def test_12_a_bound_sum_encloses_the_exact_sum():
+    terms = np.array([1.0, *([2.0 ** -54] * 32767)])
+    exact = sum(fractions.Fraction(term) for term in terms)
+    assert fractions.Fraction(float(_widened_sum(np.sum(terms), terms.size))) >= exact
+
+
+def test_15_an_element_its_native_output_does_not_witness_is_not_certified():
+    """An interpretation certifies only the execution it reproduces: a function traced to x·0 that then
+    runs as x·0 - 1 is not certified, and does not fail."""
+    calls = []
+
+    def unlike(v):
+        calls.append(None)
+        return {"y": v * 0 if len(calls) == 1 else v * 0 - 1}
+
+    coverage = zero_elements(unlike, lambda v: {"y": v * 0}, (jnp.ones(2, jnp.float32),), "unwitnessed")
+    assert (coverage.certified, coverage.uncertified, coverage.over) == (0, 2, [])
+
+
+def test_16_a_one_product_dot_counts_its_products_rounding():
+    a = jnp.asarray([1 + 2.0 ** -12], jnp.float32)
+    out, _ = _interpreted(jnp.dot, a, a)
+    assert out.certified.all() and float(out.error) >= 2.0 ** -24
+
+
+def test_the_truths_own_rounding_is_propagated_at_float64():
+    """τ: the float64 truth of 1e16 + 1 - 1e16 is 0 against an exact 1, and its bound covers that."""
+    with jax.enable_x64(new_val=True):
+        inputs = (jnp.asarray([1e16, 1.0, -1e16], jnp.float64),)
+        out, _ = _interpreted(lambda x: (x[0] + x[1]) + x[2], *inputs)
+    assert FLOAT64.precision == 53
+    assert out.certified.all() and float(out.error) >= 1.0
