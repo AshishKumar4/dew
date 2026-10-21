@@ -15,8 +15,8 @@ import pytest
 from delta_rule_support import NAMES, fla_decay_terms, fla_side, float64_truth, recurrence, rule_math, through
 from jax.core import ShapedArray
 from reference_error import (
+    assert_as_exact,
     assert_as_exact_as_the_reference,
-    assert_leaves_as_exact,
     equations,
     float64_terms,
     widened,
@@ -748,6 +748,14 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands():
         assert query.dtype == key.dtype == value.dtype == jnp.bfloat16
 
 
+SEEDS = {(1, 1): 8, (2, 1): 8, (2, 2): 8}
+"""Each remat policy's declared seeds for check 1 (`assert_as_exact`), keyed by the
+(`fla_chunk_fwd_h`, `fla_chunk_fwd_o`) launches its gradient is held to, sized by `seeds_for`: the
+fewest for which the layer's gradient without remat compared with itself resolves the factor in
+every leaf, truth the float64 layer's gradient. The three policies share that reference, the draw
+and the truth, so one sizing gives all three."""
+
+
 @pytest.mark.parametrize("policy, memories, outputs", [
     (None, 1, 1),
     ({"recompute": ("delta_memory",)}, 2, 1),
@@ -763,11 +771,11 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     three. Each is read from the kernels the gradient runs: the memory's (`fla_chunk_fwd_h`) once
     where it is saved and again in the backward where it is recomputed; the output's
     (`fla_chunk_fwd_o`) once, but where the policy recomputes the memory, whose recompute re-runs the
-    rule's forward, output and all. Each computes the gradients the layer computes without remat
-    within tests/reference_error.py's rule against the float64 layer's, each leaf sized by its own
-    float64 terms; off a GPU, bitwise. A GPU compiles the remat step as another program, whose
-    roundings differ: on an H100 even the XLA math's A_log gradient moved by 5.4e-5 relative between
-    the two, the remat one nearer float64."""
+    rule's forward, output and all. Each computes the gradients the layer computes without remat, on
+    par with it by check 1 (`assert_as_exact`) over fresh inputs drawn from each seed with the
+    parameters held fixed, truth the float64 layer's gradient; off a GPU, bitwise. A GPU compiles
+    the remat step as another program, whose roundings differ: on an H100 even the XLA math's A_log
+    gradient moved by 5.4e-5 relative between the two, the remat one nearer float64."""
     from dew.nn.backbones.decoder_block import remat_policy
     from dew.nn.linear import recomputing
 
@@ -775,30 +783,36 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     x = jax.random.normal(jax.random.key(71), (1, 64, 64))
     params = layer.init(jax.random.key(73), x)
 
-    def loss(params):
+    def loss(params, x):
         return jnp.sum(layer.apply(params, x) ** 2)
 
     rung = None if policy is None else remat_policy(policy)
     if rung is None:
         remat = loss
     elif rung.recompute:
-        def remat(params):
+        def remat(params, x):
             with recomputing(rung.recompute):
-                return loss(params)
+                return loss(params, x)
     else:
         remat = jax.checkpoint(loss, policy=rung.checkpoint_policy())
-    graph = jax.make_jaxpr(jax.grad(remat))(params)
+    graph = jax.make_jaxpr(jax.grad(remat))(params, x)
     launched = [str(equation.params["name"]) for equation in equations(graph)
                 if equation.primitive.name == "pallas_call"]
     counted = (launched.count("fla_chunk_fwd_h"), launched.count("fla_chunk_fwd_o"))
     assert counted == (memories, outputs), launched
-    want = jax.jit(jax.grad(loss))(params)
-    got = jax.jit(jax.grad(remat))(params)
-    with jax.enable_x64(new_val=True):
-        wide = layer.clone(dtype=jnp.float64)
-        truth, terms = float64_terms(jax.grad(lambda params: jnp.sum(wide.apply(params, x) ** 2)),
-                                     jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params))
-    assert_leaves_as_exact(got, want, truth, terms=terms)
+    reference_grad, remat_grad = jax.jit(jax.grad(loss)), jax.jit(jax.grad(remat))
+    want, got = reference_grad(params, x), remat_grad(params, x)
+
+    def draw(seed):
+        return params, jax.random.normal(jax.random.key(seed), x.shape)
+
+    wide = layer.clone(dtype=jnp.float64)
+
+    def truth(params, x):
+        return jax.grad(lambda params: jnp.sum(wide.apply(params, x) ** 2))(params)
+
+    assert_as_exact(remat_grad, reference_grad, draw, "remat policy gradient",
+                    seeds=SEEDS[(memories, outputs)], truth_fn=jax.jit(truth))
     if jax.default_backend() != "gpu":
         for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(got), jax.tree.leaves(want),
                                         strict=True):
