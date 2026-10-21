@@ -237,9 +237,9 @@ def _tools(tree: Path, tool: str, newer: Path) -> Path:
 
 
 def _run(tree: Path, python: Path, tool: str, argv: list[str], newer: Path, timeout: float,
-         cache: Path | None = None) -> subprocess.CompletedProcess:
+         cache: Path | None = None, settings: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     tools = _tools(tree, tool or "benchmark_step.py", newer)
-    env = {**os.environ, "PYTHONPATH": f"{tree / 'src'}:{tools}"}
+    env = {**os.environ, **(settings or {}), "PYTHONPATH": f"{tree / 'src'}:{tools}"}
     if cache is not None:
         # The tree's own compile cache, empty at the gate's start: its first round compiles cold (the compile
         # rows), its later rounds load what that round compiled, and neither tree loads the other's programs.
@@ -260,15 +260,17 @@ def hardware_status(row: Row, device_kind: str) -> str | None:
 
 
 def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_head: bool = True,
-            cache: Path | None = None, first: bool = True) -> dict:
-    """One sample of every row in `tree`, run by `python`: a number, or why the row could not run there."""
+            cache: Path | None = None, first: bool = True, settings: dict[str, str] | None = None) -> dict:
+    """One sample of every row in `tree`, run by `python` with `settings` in its environment: a number, or
+    why the row could not run there."""
     sample = {}
 
     @functools.cache
     def hardware() -> str:
         """This machine's device kind, read once and only when a row names hardware."""
         return subprocess.run([str(python), "-c", "import jax; print(jax.devices()[0].device_kind)"],
-                              capture_output=True, text=True, check=True).stdout.strip()
+                              env={**os.environ, **(settings or {})}, capture_output=True, text=True,
+                              check=True).stdout.strip()
 
     with tempfile.TemporaryDirectory() as scratch:
         out = Path(scratch) / "out.json"
@@ -288,7 +290,8 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
                     sample.update({name: reason for name, reason in unsupported.items()
                                    if reason is not None})
                     continue
-                done = _run(tree, python, probe.tool, probe.arguments(args, out), newer, 3600, cache)
+                done = _run(tree, python, probe.tool, probe.arguments(args, out), newer, 3600, cache,
+                            settings)
                 if done.returncode != 0 and not external:
                     raise RuntimeError(f"{probe.tool} exited {done.returncode}: {done.stderr[-1500:]}")
                 values = probe.read(done.stdout, out)
@@ -316,6 +319,7 @@ def run(args: argparse.Namespace) -> int:
 
     trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
     (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())
+    settings = dict(setting.split("=", 1) for setting in getattr(args, "head_env", None) or [])
     # Each tree in the environment its own lock names, so a change of a locked wheel is measured too. A
     # tree that holds no such lock (one older than the locks) cannot run a row, which its samples say.
     lock, pythons, unbuilt = machine_lock(), {}, {}
@@ -328,7 +332,7 @@ def run(args: argparse.Namespace) -> int:
     rows = [row for row in BATTERY if not args.only or any(word in row.name for word in args.only)
             or (claiming and row.hardware)]
     results = {"base": base, "head": head, "rounds": args.rounds, "rows": [row.__dict__ for row in rows],
-               "samples": {base: [], head: []}, "claim": claiming,
+               "samples": {base: [], head: []}, "claim": claiming, "head settings": settings,
                "environments": {name: str(python.parent.parent) for name, python in pythons.items()},
                "seconds": {"first round": 0.0, "later rounds": 0.0}}
     # Each tree's compile cache, for this run alone: removed at its end, so no run loads another's programs.
@@ -343,7 +347,8 @@ def run(args: argparse.Namespace) -> int:
                 results["samples"][name].append(
                     dict.fromkeys(kept, unbuilt[name]) if name in unbuilt
                     else measure(path, pythons[name], args, head_path / "tools", name == head,
-                                 Path(caches) / ("head" if name == head else "base"), first=round_ == 0))
+                                 Path(caches) / ("head" if name == head else "base"), first=round_ == 0,
+                                 settings=settings if name == head else None))
                 write_atomically(args.out, json.dumps(results, indent=2))
                 print(f"round {round_ + 1}: {name} measured", flush=True)
             spent = time.perf_counter() - began
@@ -470,6 +475,10 @@ def report(args: argparse.Namespace) -> int:
         lines.append("")
         lines.append("Rounds: " + ", ".join(f"{part} {spent:.0f} s"
                                             for part, spent in results["seconds"].items()))
+    if results.get("head settings"):
+        lines.append("")
+        lines.append(f"{head} ran with " + ", ".join(f"{name}={value!r}"
+                                                     for name, value in results["head settings"].items()))
     table = "\n".join(lines) + "\n"
     print(table)
     if args.table:
@@ -497,6 +506,9 @@ def main() -> int:
                          help="require every hardware row, including under --only")
     running.add_argument("--only", nargs="*", default=[],
                          help="measure only the rows whose names hold one of these words")
+    running.add_argument("--head-env", action="append", default=[], metavar="NAME=VALUE",
+                         help="set in the head's processes alone; with one tree as base and head, an A/B "
+                              "of that setting (an XLA flag) on every row")
     reporting = operations.add_parser("report")
     reporting.add_argument("results")
     reporting.add_argument("--table")

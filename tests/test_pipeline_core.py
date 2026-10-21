@@ -20,7 +20,7 @@ from dew import position
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, validation
 from dew.data.dataset import DataPartition, Loading
-from dew.data.mixing import SearchBudget, TokenDeficit, token_weights
+from dew.data.mixing import TokenDeficit, token_weights
 from dew.data.pipeline import Configured, Pipeline, Rejected, mix
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources import Files, Memory
@@ -63,6 +63,16 @@ class Shift:
 class Targets:
     def __call__(self, row):
         return int(row["targets"])
+
+
+@dataclasses.dataclass(frozen=True)
+class Kept:
+    """Keeps the record whose id is `id` and no other."""
+
+    id: int
+
+    def __call__(self, row):
+        return int(row["id"]) == self.id
 
 
 @dataclasses.dataclass(frozen=True)
@@ -489,16 +499,39 @@ def test_a_streamed_mix_beneath_a_shuffle_refuses_a_member_joining():
 
 def test_a_member_joining_a_resumed_mix_is_read_ahead_before_the_mix_gives_a_row():
     """A member that joins a resumed mix has its first row read ahead before the mix gives one, as
-    every member has at the start, so a member whose every row is rejected exhausts its budget at
-    once rather than after the others have run on."""
+    every member has at the start, and resumes beside the others however small its weight."""
     _, saved = member_rows([corpus("a", 0)])
-    # A member that joins and can give rows resumes beside the other.
     rows, _ = member_rows([corpus("a", 0), corpus("b", 1)], saved=saved, weights=[1, 1e-9], batches=1)
     assert rows
-    hopeless = (Pipeline(roled(1, 6, 2, count=8), name="b")
-                .filter(lambda row: False, identity="none@1").repeat())
-    with pytest.raises(ValueError):
-        member_rows([corpus("a", 0), hopeless], saved=saved, weights=[1, 1e-9], batches=1)
+
+
+@pytest.mark.parametrize("by", ["records", "tokens"])
+def test_a_streamed_mix_resumed_while_a_member_holds_a_row_read_ahead_reads_on_as_uninterrupted(by):
+    """A streamed mix reads every member's first row ahead before it gives a row, so a position it
+    saves after its first row falls while the other member holds its first row unread. Resumed
+    there, by records or by tokens, the mix gives that row and reads on record for record as the
+    uninterrupted one does."""
+    members = [corpus("a", 0), corpus("b", 1)]
+
+    def rows(saved=None):
+        data = compile(mix(members, by=by).batch(1), read="streamed", loading=READ, seed=5)
+        stream = data.train(DataPartition())
+        try:
+            first = None
+            if saved is None:
+                first = int(next(stream)["source"][0])
+                saved = stream.get_state()
+            else:
+                stream.set_state(saved)
+            read = [(int(batch["source"][0]), int(batch["id"][0])) for batch in itertools.islice(stream, 6)]
+            return read, saved, first
+        finally:
+            stream.close()
+
+    whole, saved, first = rows()
+    resumed, _, _ = rows(saved)
+    assert (1 - first, 0) in whole
+    assert resumed == whole
 
 
 def test_an_indexed_mix_still_refuses_a_member_joining():
@@ -672,7 +705,7 @@ def test_random_validation_is_refused():
 @pytest.mark.parametrize("workers", [0, 2])
 @pytest.mark.parametrize("read", ["memory", "indexed"])
 def test_worker_boundary_keeps_downstream_record_steps_and_exact_positions(workers, read):
-    pipeline = Pipeline(source()).repeat().workers(workers).map(Shift(100)).limit(12).batch(4)
+    pipeline = Pipeline(source()).repeat().workers(workers).map(Shift(100)).take(12).batch(4)
     data = compile(pipeline, read=read, loading=READ)
     for share in range(2):
         reader = data.train(DataPartition(share, 2))
@@ -750,7 +783,8 @@ def test_a_validation_pass_starts_at_most_one_worker_per_batch(monkeypatch):
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
     corpora = [grain.MapDataset.source([{"id": tag, "targets": targets}]).repeat().to_iter_dataset()
                for tag, targets in [(0, 2), (1, 7)]]
-    mix = TokenDeficit(corpora, [1, 3], tokens=Targets(), names=["short", "long"], keys=["short", "long"])
+    mix = TokenDeficit(corpora, [1, 3], tokens=Targets(), names=["short", "long"], labels=["short", "long"],
+                       keys=["short", "long"])
     reader = iter(mix)
     delivered = [0, 0]
     for row in itertools.islice(reader, 100):
@@ -779,7 +813,7 @@ def test_a_token_mixture_weighs_the_rows_each_corpus_delivers(sliced):
         return Pipeline(rows, name=name).filter_map(CountTargets())
 
     long = corpus("long", (2, 10, 10, 10))
-    long = long.slice(slice(1)) if sliced else long
+    long = long.take(1) if sliced else long
     mixed = mix([long.repeat(), corpus("short", (2, 2)).repeat()], by="tokens")
     data = compile(mixed.map(Counted()).batch(8), read="memory", loading=READ)
     stream = data.train(DataPartition())
@@ -1134,18 +1168,61 @@ def test_a_token_mixture_weighs_a_random_holdout_by_the_rows_it_keeps(held):
     assert data.plan is not None and data.plan.lowering == ("per-share" if held else "global")
 
 
-def test_zero_target_corpus_exhausts_named_rejection_budget_without_starvation():
-    parents = [grain.MapDataset.source([{"targets": count}]).repeat().to_iter_dataset()
-               for count in (0, 4)]
-    reader = iter(TokenDeficit(parents, [1, 1], tokens=Targets(), names=["all-zero", "useful"],
-                              keys=["all-zero", "useful"],
-                              budget=SearchBudget(consecutive=5)))
-    with pytest.raises(ValueError):
-        next(reader)
-    counts = reader.get_state()["parents"]["all-zero"]["counts"]
-    assert counts["attempted"] == 5
-    assert counts["rejected"] == {"zero_targets": 5}
-    reader.close()
+class Cursor(grain.IterDataset):
+    """A Grain dataset whose position names its own fields as it likes: here the place it has read
+    to, under `counts`."""
+
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def __iter__(self):
+        return CursorRead(self.rows)
+
+
+class CursorRead(grain.DatasetIterator):
+    def __init__(self, rows):
+        super().__init__()
+        self.rows, self.at = rows, 0
+
+    def __next__(self):
+        if self.at == len(self.rows):
+            raise StopIteration
+        self.at += 1
+        return self.rows[self.at - 1]
+
+    def get_state(self):
+        return {"corpus": "cursor", "counts": self.at}
+
+    def set_state(self, state):
+        self.at = state["counts"]
+
+
+def test_a_repeat_rewinds_a_native_grain_position_as_the_dataset_wrote_it():
+    """A repeat that rewinds a pass keeps its corpus's counts, and leaves the rest of the position
+    as the iterators wrote it, a Grain dataset's own fields whatever their names."""
+    from dew.data import from_grain
+
+    rows = [{"id": np.int32(index)} for index in range(2)]
+    data = compile(from_grain(Cursor(rows), "native").take(2).repeat().batch(1), read="streamed",
+                   loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        assert [int(next(stream)["id"][0]) for _ in range(5)] == [0, 1, 0, 1, 0]
+    finally:
+        stream.close()
+
+
+def test_a_read_finds_a_record_after_any_run_of_rejections():
+    """A training read reads on through however many rejected records come before one its filter
+    keeps: ten thousand and more in a row are no proof the corpus holds none."""
+    rows = Memory([{"id": index} for index in range(10_001)])
+    reader = compile(Pipeline(rows).filter(Kept(10_000)).batch(1), read="indexed",
+                     loading=Loading(workers=0, threads=1, read_buffer=1)).train(DataPartition())
+    try:
+        assert next(reader)["id"].tolist() == [10_000]
+    finally:
+        reader.close()
 
 
 def test_authoritative_zero_target_count_is_refused_before_division():
@@ -1183,6 +1260,48 @@ def test_an_exact_resume_refuses_a_step_that_makes_other_values():
     finally:
         same.close()
     other = reader(2)
+    try:
+        with pytest.raises(ValueError):
+            other.set_state(state)
+    finally:
+        other.close()
+
+
+@dataclasses.dataclass(frozen=True)
+class Offset:
+    """Adds each row its entry of a table, which the step holds whole."""
+
+    table: np.ndarray
+
+    def __call__(self, batch):
+        return {**batch, "id": batch["id"] + self.table[batch["id"] % len(self.table)]}
+
+
+def test_an_exact_resume_refuses_a_table_that_differs_where_its_repr_does_not_show():
+    """Two steps whose 1024-entry tables differ at entry 512 alone, which their reprs elide, make
+    other values: an exact resume under one refuses a position saved under the other, and one
+    under the same table restores it."""
+    table = np.zeros(1024, np.int64)
+    edited = table.copy()
+    edited[512] = 1
+    assert repr(Offset(table)) == repr(Offset(edited))
+
+    def reader(values):
+        return compile(Pipeline(source(8)).map(Offset(values)).shuffle(0).repeat().batch(2),
+                       loading=READ).train(DataPartition())
+
+    first = reader(table)
+    try:
+        next(first)
+        state = first.get_state()
+    finally:
+        first.close()
+    same = reader(table.copy())
+    try:
+        same.set_state(state)
+    finally:
+        same.close()
+    other = reader(edited)
     try:
         with pytest.raises(ValueError):
             other.set_state(state)
@@ -1273,7 +1392,7 @@ def test_an_exact_resume_refuses_a_rewritten_file_whose_token_split_keeps_its_sp
         os.replace(staged, path)
 
     def reader():
-        split = Pipeline(Files(str(path))).token_split(0.25, held=False).batch(1)
+        split = Pipeline(Files(str(path))).holdout(tokens=0.25)[0].batch(1)
         return compile(split, read="indexed", loading=READ).train(DataPartition())
 
     write(0)
@@ -1527,22 +1646,15 @@ def test_block_shuffle_is_a_complete_bounded_physical_order_and_resumes():
     changed.close()
 
 
-@pytest.mark.parametrize("tiny_targets", [0, 1], ids=["broken", "working"])
-def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row(tiny_targets):
-    """A share weighted too small to be chosen is still probed first: one
-    whose rows hold no targets exhausts its budget before the mixture
-    emits a row, and one whose rows hold one lets it."""
+def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row():
+    """A share weighted too small to be chosen is still read ahead before the mixture emits a row,
+    and its first row lets it."""
     parents = [grain.MapDataset.source([{"targets": 3}]).repeat().to_iter_dataset(),
-               grain.MapDataset.source([{"targets": tiny_targets}]).repeat().to_iter_dataset()]
+               grain.MapDataset.source([{"targets": 1}]).repeat().to_iter_dataset()]
     reader = iter(TokenDeficit(parents, [1, 1e-9], tokens=Targets(), names=["normal", "tiny"],
-                              keys=["normal", "tiny"],
-                              budget=SearchBudget(consecutive=3)))
+                              labels=["normal", "tiny"], keys=["normal", "tiny"]))
     try:
-        if tiny_targets:
-            next(reader)
-            return
-        with pytest.raises(ValueError):
-            next(reader)
+        assert next(reader) == {"targets": 3}
     finally:
         reader.close()
 
@@ -1605,7 +1717,7 @@ def test_a_token_split_after_a_shuffle_splits_the_shuffled_order(read):
                 for token in document["text"]]
 
     def branch(*, held):
-        return Pipeline(Memory(documents)).shuffle(0).token_split(0.25, held=held)
+        return Pipeline(Memory(documents)).shuffle(0).holdout(tokens=0.25)[held]
 
     def rows(pipeline):
         return [[int(token) for token in row["text"]] for row in iterate(pipeline, read=read, loading=READ)]
@@ -1623,7 +1735,7 @@ def test_a_stage_without_a_lowering_is_refused_at_compile_time():
 
     compile(Pipeline(source()).batch(4), loading=READ)
     with pytest.raises(ValueError):
-        compile(Pipeline(source()).then(Foreign()).batch(4), loading=READ)
+        compile(Pipeline(source())._then(Foreign()).batch(4), loading=READ)
 
 
 def test_shares_agree_on_one_identity_and_resume_only_their_own_rows():
@@ -1792,6 +1904,26 @@ def test_a_limit_counts_the_whole_order_and_a_prefetch_never_moves_the_share_cut
     assert read(1) == read(2) and len(read(1)) == 12
 
 
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_token_holdout_cuts_the_per_token_fields_it_names_together(read):
+    """A token holdout over a field of another name and its roles keeps the first 3/8 of the tokens
+    for the held part and the rest for training, cutting the one document it splits in both fields
+    alike: the parts together are the corpus, each role beside its token."""
+    documents = [{"ids": np.arange(6 * index, 6 * index + 6, dtype=np.int32),
+                  "ids_roles": np.arange(6 * index, 6 * index + 6, dtype=np.int32) % 2} for index in range(4)]
+    train, held = Memory(documents).holdout(tokens=0.375, fields=("ids", "ids_roles"))
+
+    def rows(part):
+        return [{name: np.asarray(row[name]).tolist() for name in ("ids", "ids_roles")}
+                for row in part.read(read).loading(READ)]
+
+    trained, kept = rows(train), rows(held)
+    tokens = [token for part in (kept, trained) for row in part for token in row["ids"]]
+    assert tokens == list(range(24))
+    assert [len(row["ids"]) for row in kept] == [6, 3]
+    assert all(row["ids_roles"] == [token % 2 for token in row["ids"]] for row in (*kept, *trained))
+
+
 def test_a_token_split_is_part_of_the_order_a_resume_checks():
     """Four 4-token documents split at a quarter train on documents 1-3 and
     at a half on 2-3, so a position saved under one split is refused under
@@ -1799,7 +1931,7 @@ def test_a_token_split_is_part_of_the_order_a_resume_checks():
     documents = [{"text": np.arange(4 * index, 4 * index + 4, dtype=np.int32)} for index in range(4)]
 
     def reader(fraction):
-        split = Pipeline(Memory(documents)).token_split(fraction, held=False).batch(1)
+        split = Pipeline(Memory(documents)).holdout(tokens=fraction)[0].batch(1)
         return compile(split, read="indexed", loading=READ).train(DataPartition())
 
     quarter = reader(0.25)
@@ -1839,7 +1971,7 @@ def test_a_resume_is_refused_where_the_same_token_split_keeps_other_documents(gr
             pipeline = pipeline.map(
                 lambda row: {"text": np.resize(row["text"], first) if row["text"][0] == 0 else row["text"]},
             )
-        split = pipeline.token_split(0.25, held=False).batch(1)
+        split = pipeline.holdout(tokens=0.25)[0].batch(1)
         resume = "exact" if grown == "in the source" else "non-exact"
         return compile(split, read="indexed", loading=READ, resume=resume).train(DataPartition())
 
@@ -1874,7 +2006,7 @@ def test_a_token_split_on_a_mixture_within_a_mixture_records_its_spans():
                                     for index, size in enumerate(sizes)]))
 
         inner = mix([corpus(0, (first, 4)), corpus(100, (4, 4)), corpus(200, (4, 4))])
-        mixed = mix([inner.token_split(0.25, held=False), corpus(300, (4, 4))])
+        mixed = mix([inner.holdout(tokens=0.25)[0], corpus(300, (4, 4))])
         return compile(mixed.batch(1), read="indexed", loading=READ).plan.derived["token_spans"]
 
     assert spans(4) != spans(8)
@@ -1911,7 +2043,7 @@ def test_a_scored_branch_cut_per_share_splits_its_whole_order():
     it is whole even where a filter cuts its order per share: it holds out the
     first half of the documents' tokens."""
     documents = Memory(tuple({"text": np.arange(4, dtype=np.int32) + 4 * index} for index in range(4)))
-    held = Pipeline(documents).token_split(0.5, held=True).filter(lambda row: True, identity="all@1")
+    held = Pipeline(documents).holdout(tokens=0.5)[1].filter(lambda row: True, identity="all@1")
     data = compile(Pipeline(source()).batch(2), validation=held.batch(1), read="indexed", loading=READ)
     assert data.val is not None
     reader = data.val(DataPartition())
@@ -1927,7 +2059,7 @@ def test_a_scored_memory_branch_that_shuffles_before_its_split_holds_out_half_it
     split after a shuffle, in an order a filter cuts per share, holds out the
     first half of the shuffled documents' tokens."""
     documents = Memory(tuple({"text": np.arange(4, dtype=np.int32) + 4 * index} for index in range(4)))
-    split = Pipeline(documents).shuffle(0).token_split(0.5, held=True)
+    split = Pipeline(documents).shuffle(0).holdout(tokens=0.5)[1]
     held = split.filter(lambda row: True, identity="all@1")
     data = compile(Pipeline(source()).batch(2), validation=held.batch(1), read="memory", loading=READ)
     assert data.val is not None
@@ -2095,35 +2227,6 @@ def test_a_worker_batch_shares_its_large_columns_and_pickles_the_small_ones():
         for column in batch.values():
             if isinstance(column, SharedMemoryArray):
                 column.unlink_on_del()
-
-
-@pytest.mark.parametrize("read", ["memory", "streamed"])
-def test_a_rebatched_loader_declares_the_rows_its_batches_hold(read):
-    """A loader's batch is the rows of the batches it yields, the last rebatch's size, which the
-    trainer's preflight and microbatch checks read; it once declared the first batch's."""
-    rows = Memory([{"x": np.int32(index)} for index in range(32)])
-    data = compile(Pipeline(rows).repeat().batch(8).rebatch(4), read=read, loading=READ)
-    stream = data.train(DataPartition())
-    try:
-        assert [len(next(stream)["x"]) for _ in range(3)] == [data.batch] * 3 == [4] * 3
-    finally:
-        stream.close()
-
-
-@pytest.mark.parametrize("read", ["memory", "streamed"])
-def test_a_validation_pass_holds_every_record_whatever_size_training_rebatches_to(read):
-    """A validation pass batches by its own size, so training rebatched to four rows leaves each
-    eight-row held-out batch whole, every held-out record scored once."""
-    rows = Memory([{"x": np.int32(index)} for index in range(32)])
-    held = Memory([{"x": np.int32(100 + index)} for index in range(16)])
-    data = compile(Pipeline(rows).repeat().batch(8).rebatch(4), validation=Pipeline(held).batch(8), read=read,
-                   loading=READ)
-    assert data.val is not None
-    scored = []
-    for batch in data.val(DataPartition()):
-        valid = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["x"]), bool)))
-        scored += [int(value) for value, kept in zip(np.asarray(batch["x"]), valid, strict=True) if kept]
-    assert sorted(scored) == list(range(100, 116))
 
 
 def test_a_step_drops_records_only_when_it_says_so():

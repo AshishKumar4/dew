@@ -30,8 +30,8 @@ without a pick compiles on a thread pool and runs alone, its kernel's device
 time read by CUPTI after `FLUSH_BYTES` are read, and the fastest is kept.
 Any other compile measures nothing and says once how many launches lack a
 measurement. Picks persist per GPU model and jaxlib beside XLA's own
-(`dew.cache.kernel_picks_path`). `samples` is the wall-clock timing every
-benchmark tool in Dew measures with.
+(`dew.cache.kernel_picks_path`). Wall-clock timing is
+`dew.telemetry.benchmark.samples`, which every benchmark tool in Dew measures with.
 
 Tile choice changes a kernel's reduction order, and its error is not
 monotone in tiles, warps or programs, so the space is a declaration of
@@ -59,14 +59,13 @@ import jax.numpy as jnp
 import tokamax
 from jax.extend.backend import get_default_device
 
-# tokamax's writer of launches as JSON, public only as a file writer (`bound_args_to_json`).
+# tokamax's writer of launches as JSON, public only as a file writer (`bound_args_to_json`); goes to
+# `tokamax.autotuning.dump_bound_args_to_json` once a tokamax release carries openxla/tokamax#1676.
 from tokamax._src.autotuning.api import dump_bound_args_to_json
 
 # tokamax names the type of one launch's timings by config nowhere public; its picks are read as this type.
+# Goes to `tokamax.autotuning.AutotuningData` once a tokamax release carries openxla/tokamax#1676.
 from tokamax._src.autotuning.autotuner import AutotuningData
-
-# tokamax's own reading of a launch's target GPU model, which its cache lookups key on, public nowhere.
-from tokamax._src.ops.op import infer_device_kind
 
 from dew import cache, coordination
 from dew.files import write_atomically
@@ -104,28 +103,6 @@ None for its heuristic (`_settle`): what every process launches there, whatever 
 _LOADED: set[str] = set()
 _LOADING = threading.Lock()
 _told: set[str] = set()
-
-
-def samples[T](fn: Callable[..., T], *args, warmup: int = 3, repeats: int = 10,
-               calls: int = 1) -> list[float]:
-    """Seconds per call of `fn(*args)`, one sample a synchronized group of
-    `calls` calls, after `warmup` groups. With one call a group each sample is
-    a call's latency, and its result is released before the next call starts,
-    so no two calls' outputs are ever held at once; more calls a group queue
-    their dispatches and synchronize once, which measures throughput. The
-    caller takes the statistic and units it reports."""
-    for _ in range(warmup):
-        jax.block_until_ready(fn(*args))
-    measured = []
-    for _ in range(repeats):
-        start = time.perf_counter()
-        outputs = fn(*args)
-        for _ in range(calls - 1):
-            outputs = fn(*args)
-        jax.block_until_ready(outputs)
-        measured.append((time.perf_counter() - start) / calls)
-        del outputs
-    return measured
 
 
 @dataclasses.dataclass(frozen=True)
@@ -242,10 +219,20 @@ def _identity(op: tokamax.Op) -> tokamax.Op:
 
 
 def _kind(ba: tokamax.BoundArguments) -> str:
-    """The GPU model the keyed launch `ba` (`keyed`) is chosen for, as tokamax
-    reads it: the context mesh's (`Trainer.lower_for`'s abstract GPU), else
-    the default device's."""
-    return infer_device_kind(ba) or get_default_device().device_kind
+    """The GPU model the launch `ba` is chosen for, as tokamax reads it for its cache lookups: its
+    concrete operands' devices', else the context mesh's (`Trainer.lower_for`'s abstract GPU), else
+    the default device's. A traced or keyed launch (`keyed`) names no device of its own."""
+    from jax.core import Tracer
+
+    kinds = {device.device_kind for leaf in jax.tree.leaves(dict(ba.arguments))
+             if isinstance(leaf, jax.Array) and not isinstance(leaf, Tracer)
+             for device in leaf.devices()}
+    if len(kinds) > 1:
+        raise ValueError(f"a launch's operands lie on GPUs of several models: {sorted(kinds)}")
+    if kinds:
+        return kinds.pop()
+    device = jax.sharding.get_abstract_mesh().abstract_device
+    return (device or get_default_device()).device_kind
 
 
 def _pick(ba: tokamax.BoundArguments) -> AutotuningData | None:

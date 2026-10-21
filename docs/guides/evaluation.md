@@ -2,7 +2,7 @@
 
 While `Trainer.fit` runs, evaluation scores a separate validation split. The objective's `evaluate` returns artifacts, such as token scores or generated images, and metrics read those artifacts to compute the scores. A tracker receives the training scalars, the validation metrics, previews and run records.
 
-Evaluation runs only when the dataset has a validation split and `fit` has `eval_every` set. Something also has to read the pass, so `fit` refuses `eval_every` unless you also pass `metrics` that read the objective's artifact, or `preview=True` with a tracker. Passing `metrics` alone does not turn evaluation on.
+Evaluation runs only when the dataset has a validation split and `fit` has `eval_every` set. Each pass records the objective's validation loss (`val/loss`) where the objective defines one, so a cadence alone is enough for an LM, a diffusion or a JEPA objective. `metrics` that read the objective's artifacts, and `preview=True` with a tracker, add to it. `fit` refuses a cadence only when nothing would read the pass: an objective with no validation loss (Flow-GRPO's), no metrics, no preview a tracker receives, no checkpointer, and no `restore_best=True` keeping the step of lowest validation loss. Asking for a validation loss an objective does not define is refused on its own. Passing `metrics` alone does not turn evaluation on.
 
 ## Example
 
@@ -145,7 +145,7 @@ application's root handlers instead, remove Dew's handler and set
 
 The local JSON writes non-finite metric values as the strings `"NaN"`, `"+Inf"` and `"-Inf"`, and a perfect PSNR stays positive infinity. Read these fields with `float(value)`.
 
-Plots are opt-in. Install `dewml[plots]`, then call `tracker.plot()`, or construct `LocalTracker(path, plots=True)` to render the plots when the tracker closes. Matplotlib uses the Agg backend and never opens a display, and nothing is plotted during training. Non-finite points are marked and left out of the curve segments, and the journal keeps their exact values.
+`tracker.plot("train/loss", "val/loss", smooth=8)` draws the journal's metrics as one `dew.figures` curve, each line at the steps its metric was logged, so training and validation share a figure; with no metric named it plots the training loss beside every split's validation loss. The figure shows itself in a notebook and saves as SVG (`figure.save(path)`). `LocalTracker(path, plots=True)` writes one SVG file per metric when the tracker closes (`plot_files()`, which returns their paths), and nothing is plotted during training. A nonfinite value is left out of its line and counted on the figure, and the journal keeps its exact value.
 
 `MLflowTracker` never touches MLflow's global active run. Scalars become the run's metrics. Each record becomes a JSON artifact at `records/<type>-<step>.json`. Records are not stored as params because MLflow refuses a second value for a param, and a run reports several records of the same type. A preview is uploaded as the files the local renderers write. A `FitEnded` record whose status is not "completed" ends the run as `FAILED`. `uri` can be any store MLflow reads. From MLflow 3.16 on, a local file store also needs `MLFLOW_ALLOW_FILE_STORE=true`.
 

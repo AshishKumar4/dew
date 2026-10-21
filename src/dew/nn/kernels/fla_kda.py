@@ -41,7 +41,6 @@ from dew.nn.kernels.fla_gdn import (
     Tiles,
     _aligned,
     _chunk_of,
-    _chunk_states,
     _dot,
     _flat,
     _gates,
@@ -129,7 +128,7 @@ class IntraDiagonal(_Launch):
             functools.partial(_intra_diagonal_kernel, chunk=chunk,
                               aligned=_aligned(spans, batch, length, chunk), scale=scale),
             grid=(spans.chunks.shape[0] * chunk, value_heads // bh),
-            in_specs=[pl.BlockSpec((None, 2), lambda p, b: (p // chunk, 0)), keys, keys,
+            in_specs=[pl.BlockSpec((None, 4), lambda p, b: (p // chunk, 0)), keys, keys,
                       pl.BlockSpec((tokens, bh, width), lambda p, b: (0, b, 0)),
                       pl.BlockSpec((tokens, bh), lambda p, b: (0, b))],
             out_specs=[out, out],
@@ -397,8 +396,9 @@ def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, o_ref, *, chunk: int
     """fla's `chunk_gla_fwd_kernel_o` (fla/ops/gla/chunk.py:345-432) for one chunk of one head and `BV`
     value columns: `scale (q exp2(g))_narrow h + tril(Aqk) v`, the gated queries rounded to their
     dtype and `Aqk` to the values', fp32 products IEEE as the gated delta rule's output kernel takes
-    them (`fla_gdn._o_kernel`)."""
+    them (`fla_gdn._o_kernel`), the memory the chunk enters read at its slot (`fla_gdn.Sequences`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
+    entered = chunk_ref[2]
 
     @pl.when(taken > 0)
     def _():
@@ -410,7 +410,7 @@ def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, o_ref, *, chunk: int
             columns = pl.ds(block * bk, bk)
             query = read(q_ref, columns)
             gated = (query * jnp.exp2(_gates(g_ref, start, taken, chunk, 0, columns))).astype(query.dtype)
-            out = out + _dot(gated, h_ref[columns, :].astype(gated.dtype), exact=exact, ieee=True)
+            out = out + _dot(gated, h_ref[entered, columns, :].astype(gated.dtype), exact=exact, ieee=True)
         out = out * scale
         index = jnp.arange(chunk)
         value = read(v_ref)
@@ -444,15 +444,15 @@ class ChunkFwdO(_Launch):
             functools.partial(_o_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
                               scale=scale, bk=min(config.bk, width), exact=interpret),
             grid=(columns // bv, spans.chunks.shape[0], value_heads),
-            in_specs=[pl.BlockSpec((None, 2), lambda i_v, i_t, i_h: (i_t, 0)),
+            in_specs=[pl.BlockSpec((None, 4), lambda i_v, i_t, i_h: (i_t, 0)),
                       pl.BlockSpec((tokens, None, width), lambda i_v, i_t, i_h: (0, i_h // group, 0)), values,
                       pl.BlockSpec((tokens, None, width), lambda i_v, i_t, i_h: (0, i_h, 0)),
-                      pl.BlockSpec((None, None, width, bv), lambda i_v, i_t, i_h: (i_t, i_h, 0, i_v)),
+                      pl.BlockSpec((h.shape[0], None, width, bv), lambda i_v, i_t, i_h: (0, i_h, 0, i_v)),
                       pl.BlockSpec((tokens, None, chunk), lambda i_v, i_t, i_h: (0, i_h, 0))],
             out_specs=values, out_shape=jax.ShapeDtypeStruct((tokens, value_heads, columns), v.dtype),
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages),
             interpret=interpret, name="fla_kda_chunk_fwd_o",
-        )(spans.chunks, *_flat(q, v, g), _chunk_states(h), *_flat(a))
+        )(spans.chunks, *_flat(q, v, g), h, *_flat(a))
         return out.reshape(v.shape), None
 
 
@@ -463,7 +463,8 @@ def chunk_fwd_o(q, v, g, a, h, *, scale: float, chunk: int = 64, spans: Sequence
                 interpret: bool = False):
     """The output `[B, T, HV, V]` in `v`'s dtype: fla's `chunk_gla_fwd_o_gk` (gla/chunk.py:962-997). `q`
     `[B, T, H, K]`, `v` the corrected values `[B, T, HV, V]`, `g` the base-2 cumulated decay `[B, T, HV,
-    K]`, `a` `Aqk` `[B, T, HV, BT]`, `h` the memory each chunk enters (`fla_gdn.chunk_fwd_h`'s)."""
+    K]`, `a` `Aqk` `[B, T, HV, BT]`, `h` the memories the chunks enter at their slots
+    (`fla_gdn.chunk_fwd_h`'s)."""
     spans = sequences(*q.shape[:2], chunk=chunk) if spans is None else spans
     return _CHUNK_FWD_O(q, v, g, a, h, *spans, chunk=chunk, scale=scale, interpret=interpret)
 
@@ -538,15 +539,17 @@ def bwd_dav(v, do, a, *, scale: float, chunk: int = 64, spans: Sequences | None 
     return _BWD_DAV(v, do, a, *spans, chunk=chunk, scale=scale, interpret=interpret)
 
 
-def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, beta_ref, a_ref, h_ref, do_ref,
-                    dh_ref, dv_ref, dq_ref, dk_ref, dv2_ref, dg_ref, db_ref, da_ref, *, chunk: int,
-                    aligned: bool, scale: float, bk: int, bv: int, exact: bool):
+def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, beta_ref, a_ref, h_ref, do_ref, dh_ref,
+                    dv_ref, dq_ref, dk_ref, dv2_ref, dg_ref, db_ref, da_ref, *, chunk: int, aligned: bool,
+                    scale: float, bk: int, bv: int, exact: bool):
     """fla's `chunk_kda_bwd_kernel_wy_dqkg_fused` (fla/ops/kda/chunk_bwd.py:132-311) for one chunk of
     one head: the queries', keys', decay's and beta's gradients through the output's memory term and
     the WY representation, the values' through `A`, and the gradient of `Akk`, with fla's casts and
     sums in its order. `A` is read transposed, as fla loads it; fla's first key block's value terms
-    run first, on their own loop."""
+    run first, on their own loop. The memory the chunk enters and its gradient where it leaves are
+    read at their slots (`fla_gdn.Sequences`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
+    entered, left = chunk_ref[2], chunk_ref[3]
 
     @pl.when(taken > 0)
     def _():
@@ -581,7 +584,7 @@ def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, beta_ref, a_r
                 dq, dk, dw, decay_grad = sums
                 values = pl.ds(i_v * bv, bv)
                 corrected, out_grad = read(vn_ref, values), read(do_ref, values)
-                memory, memory_grad = h_ref[keys, values], dh_ref[keys, values]
+                memory, memory_grad = h_ref[entered, keys, values], dh_ref[left, keys, values]
                 return (dq + _dot(out_grad, memory.T.astype(out_grad.dtype), exact=exact),
                         dk + _dot(corrected, memory_grad.T.astype(corrected.dtype), exact=exact),
                         dw + _dot(read(dv_ref, values).astype(corrected.dtype),
@@ -632,8 +635,7 @@ class BwdWyDqkg(_Launch):
     PICKS = _picks(Tiles(32, 64, 4, 1), small=Tiles(32, 32, 4, 1))
 
     def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, corrected: jax.Array, g: jax.Array,
-             beta: jax.Array, a: jax.Array, h: jax.Array, do: jax.Array, dh: jax.Array,
-             dv: jax.Array,
+             beta: jax.Array, a: jax.Array, h: jax.Array, do: jax.Array, dh: jax.Array, dv: jax.Array,
              chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, scale: float, interpret: bool,
              config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
@@ -647,7 +649,7 @@ class BwdWyDqkg(_Launch):
         headed = functools.partial(_headed, tokens)
 
         gate = pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))
-        states = pl.BlockSpec((None, None, width, columns), lambda i_t, h: (i_t, h, 0, 0))
+        states = pl.BlockSpec((h.shape[0], None, width, columns), lambda i_t, head: (0, head, 0, 0))
         wide = jax.ShapeDtypeStruct((tokens, value_heads, width), jnp.float32)
         dq, dk, dv2, dg, db, da = pl.pallas_call(
             functools.partial(_wy_dqkg_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
@@ -662,8 +664,7 @@ class BwdWyDqkg(_Launch):
                        jax.ShapeDtypeStruct((tokens, value_heads, chunk), jnp.float32)],
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages),
             interpret=interpret, name="fla_kda_bwd_wy_dqkg",
-        )(spans.chunks, *_flat(q, k, v, corrected, g, beta, a), _chunk_states(h), *_flat(do),
-          _chunk_states(dh), *_flat(dv))
+        )(spans.chunks, *_flat(q, k, v, corrected, g, beta, a), h, *_flat(do), dh, *_flat(dv))
         keyed = (batch, length, value_heads, width)
         return (dq.reshape(keyed), dk.reshape(keyed), dv2.reshape(v.shape), db.reshape(beta.shape),
                 dg.reshape(keyed), da.reshape(batch, length, value_heads, chunk)), None
@@ -676,11 +677,12 @@ def bwd_wy_dqkg(q, k, v, corrected, g, beta, a, h, do, dh, dv, *, scale: float, 
                 spans: Sequences | None = None, interpret: bool = False):
     """`(dq, dk, dv, db, dg, dAkk)`: fla's `chunk_kda_bwd_wy_dqkg_fused` (chunk_bwd.py:367-431), `dq`,
     `dk`, `dg` `[B, T, HV, K]`, `db` `[B, T, HV]` and `dAkk` `[B, T, HV, BT]` fp32, `dv` in `v`'s dtype.
-    `h` and `dh` the memory each chunk enters and its gradient (`fla_gdn.chunk_fwd_h`'s and
-    `chunk_bwd_dhu`'s), `dv` the corrected values' full gradient, `a` `Akk`'s inverse."""
+    `h` and `dh` the memories the chunks enter and their gradients at their slots
+    (`fla_gdn.chunk_fwd_h`'s and `chunk_bwd_dhu`'s), `dv` the corrected values' full gradient, `a`
+    `Akk`'s inverse."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
     return _BWD_WY_DQKG(q, k, v, corrected, g, beta, a, h, do, dh, dv, *spans, chunk=chunk, scale=scale,
-                   interpret=interpret)
+                        interpret=interpret)
 
 
 def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_ref, dq_ref, dk_ref,
@@ -818,7 +820,7 @@ class BwdIntra(_Launch):
             functools.partial(_bwd_intra_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
                               exact=interpret),
             grid=(blocks, spans.chunks.shape[0] * count, value_heads),
-            in_specs=[pl.BlockSpec((None, 2), lambda i_k, i_s, h: (i_s // count, 0)), keys, keys, headed,
+            in_specs=[pl.BlockSpec((None, 4), lambda i_k, i_s, h: (i_s // count, 0)), keys, keys, headed,
                       gate, scores, scores, headed, headed, headed],
             out_specs=[headed, headed, pl.BlockSpec((None, tokens, None), lambda i_k, i_s, h: (i_k, 0, h)),
                        headed],
@@ -903,8 +905,8 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, residual, c
     daqk, dv = bwd_dav(corrected, do, aqk, scale=scale, **kernels)
     dh, dh0, dv = fla_gdn.chunk_bwd_dhu(qg, kg, w, g, dht.astype(jnp.float32), do, dv, scale=scale,
                                         **kernels)
-    dq, dk, dv, db, dg, dakk = bwd_wy_dqkg(q, k, v, corrected, g, beta, akk, h, do, dh, dv,
-                                           scale=scale, **kernels)
+    dq, dk, dv, db, dg, dakk = bwd_wy_dqkg(q, k, v, corrected, g, beta, akk, h, do, dh, dv, scale=scale,
+                                           **kernels)
     dq, dk, db, dg = bwd_intra(q, k, g, beta, daqk, dakk, dq, dk, db, dg, **kernels)
     group = v.shape[2] // k.shape[2]
     if group > 1:

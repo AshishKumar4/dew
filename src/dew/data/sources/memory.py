@@ -68,6 +68,9 @@ class Memory(Dataset):
         """Gather a small pyspark 4.0+ frame through its Arrow handoff."""
         return cls.from_arrow(frame.toArrow())
 
+    def label(self) -> str:
+        return self.identity or "memory"
+
     def describe(self) -> str:
         return f"memory:{self.identity or self.fingerprint()['sha256']}"
 
