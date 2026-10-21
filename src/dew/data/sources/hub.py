@@ -226,6 +226,9 @@ class Hub(Dataset):
                 return matches, format
         return [], "parquet"
 
+    def label(self) -> str:
+        return self.repo.rsplit("/", 1)[-1]
+
     def describe(self) -> str:
         selected = f":{list(self.columns)}" if self.columns else ""
         return f"hf:{self.repo}@{self.commit}:{self.name}:{self.split}{selected}"
