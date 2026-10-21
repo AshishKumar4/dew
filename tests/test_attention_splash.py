@@ -419,19 +419,14 @@ def test_the_tpu_kernels_lower_for_a_tpu_on_a_mesh_that_splits_rows_or_heads(axe
     kernel of attention_impl 'tpu', splash and the flash kernel a bias sends a call to, lowers
     forward and backward as each shard's rows and heads (`sharded.tpu_lowering`); sinks and a bias
     split with their heads."""
-    from jax.sharding import NamedSharding, PartitionSpec
-    from sharded import tpu_lowering, tpu_mesh
+    from sharded import placed, tpu_lowering, tpu_mesh
 
     mesh = tpu_mesh(**axes)
     rows, heads = ("data" if "data" in axes else None), ("tensor" if "tensor" in axes else None)
-
-    def placed(shape, dtype, *spec):
-        return jax.ShapeDtypeStruct(shape, dtype, sharding=NamedSharding(mesh, PartitionSpec(*spec)))
-
-    query = placed((4, 256, 4, 128), jnp.bfloat16, rows, None, heads)
-    key = placed((4, 256, 2, 128), jnp.bfloat16, rows, None, heads)
-    extra = (placed((4,), jnp.float32, heads) if kernel == "splash"
-             else placed((1, 4, 256, 256), jnp.float32, None, heads))
+    query = placed(jax.ShapeDtypeStruct((4, 256, 4, 128), jnp.bfloat16), mesh, rows, None, heads)
+    key = placed(jax.ShapeDtypeStruct((4, 256, 2, 128), jnp.bfloat16), mesh, rows, None, heads)
+    extra = (placed(jax.ShapeDtypeStruct((4,), jnp.float32), mesh, heads) if kernel == "splash"
+             else placed(jax.ShapeDtypeStruct((1, 4, 256, 256), jnp.float32), mesh, None, heads))
 
     def loss(q, k, v, extra):
         call = {"sinks": extra} if kernel == "splash" else {"bias": extra}

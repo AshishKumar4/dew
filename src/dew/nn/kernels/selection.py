@@ -40,6 +40,8 @@ class Requirement[C]:
     kind: str = 'capability'
 
     def __post_init__(self) -> None:
+        if not self.row:
+            raise ValueError(f"requirement {self.code!r} names the row that tracks lifting it, or INHERENT")
         if self.kind not in ('capability', 'measured', 'handoff'):
             raise ValueError(f"requirement {self.code!r} is of kind {self.kind!r}, not capability, measured "
                              "or handoff")

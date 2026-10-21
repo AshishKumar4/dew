@@ -7,15 +7,16 @@ the cheaper question under that one, and the reason a candidate step change
 is worth measuring at all: which kernel wins at this shape, forward-only and
 forward+backward.
 
-Four of the paths are the attention kernels the trainer can log for a GPU
-run: the flax reference einsum, xla, cudnn, and flash, from the
-dew_flash_attn wheel: FlashAttention-3 on Hopper, FlashAttention-2 on sm8x
-and sm120. The fifth, `triton`, is tokamax's
-Pallas-Triton flash attention, called directly through
-`tokamax.dot_product_attention`; Dew has no route to it, and this tool is
-where the case for one is measured. The sixth, `jax_cudnn`, is
+Six of the paths are the kernels Dew's attention selector names
+(`attention_kernels.ATTENTION`), each timed through the production entry,
+`scaled_dot_product_attention`: flash, from the dew_flash_attn wheel
+(FlashAttention-3 on Hopper, FlashAttention-2 on sm8x and sm120); triton,
+tokamax's Pallas-Triton kernel behind Dew's adapter, which refuses what that
+adapter refuses (windows, softcap, sinks); cudnn; tpu; xla; and the reference
+einsum. Two are upstream arms called directly: `jax_cudnn`,
 `jax.nn.dot_product_attention`'s cuDNN call, which takes heads wider than
-Dew's cudnn path does. Batch and head counts are picked so every
+Dew's cudnn path does, and `tokamax_triton`, `tokamax.dot_product_attention`'s
+Triton kernel with its own window and softcap. Batch and head counts are picked so every
 implementation sees the same token x head count, which is the fair
 comparison at a fixed sequence length; `--batch-size` and `--heads` fix a
 model's own shape instead.
@@ -24,7 +25,7 @@ Usage:
     python tools/benchmark_attention.py
     python tools/benchmark_attention.py --implementations cudnn xla \\
         --sequence-lengths 4096 --head-dims 128
-    python tools/benchmark_attention.py --implementations xla triton \\
+    python tools/benchmark_attention.py --implementations xla tokamax_triton \\
         --head-dims 256 --kv-groups 2 --causal True --reference-error \\
         --triton-device-kind "NVIDIA GeForce RTX 4090"
 """
@@ -73,7 +74,7 @@ class BenchmarkConfig:
     value_dim: Optional[int] = None
     """The value heads' width where it is narrower than the query's (MiMo-V2's 128 under 192)."""
     softcap: Optional[float] = None
-    """Gemma 2's tanh logit cap. Only the reference and xla paths and tokamax_triton take it."""
+    """Gemma 2's tanh logit cap. The reference, xla and tpu paths and tokamax_triton take it."""
     forward_only: bool = False
     """Skip the gradient timings; the fwd row is the cheaper question."""
     reference_error: bool = False
