@@ -128,12 +128,10 @@ Use one tokenizer everywhere: data preparation, model construction, decoding and
 
 `RunProcessor(tokenizer)` in `dew.inference` wraps an `encode`/`decode` tokenizer in the same kind of callable, which is what a task takes as `processor=`. A text-to-image run's captions are tokenized by its condition encoder, for example `CLIPText.tokenize` in `dew.inputs`.
 
-`export` writes token records as committed ArrayRecord shards with a producer manifest and length index. Use the same tokenizer for data, model construction, decoding and checkpoint export. `dew data export` writes one from the command line; optional `--tokenizer` and `--eos` add tokenization to the deterministic prefix.
+`export` writes token records as committed ArrayRecord shards with a producer manifest and length index. Use the same tokenizer for data, model construction, decoding and checkpoint export. `dew data export` writes one from the command line, from a store's URL (a text file's lines here), a chain's `.json` record or a Python file's `data` chain; `--tokenizer` and `--eos` tokenize the records as `text.export_tokens` does.
 
 ```bash
-dew data export records data/corpus-byte \
-    --fields '{"source": "data/corpus.txt"}' \
-    --format array_record --tokenizer byte --eos --read memory
+dew data export data/corpus.txt data/corpus-byte --tokenizer byte --eos --read memory
 ```
 
 That command publishes the complete input. Prepare held-out records separately and read them as a second `Files` source. To preserve a token-axis head split, encode the stream once and export two slices:
