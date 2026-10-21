@@ -67,10 +67,12 @@ the task's artifacts; a traced task records nothing in the cache either.
 `report` combines the artifacts' data under DIR and writes DIR/coverage.json and
 DIR/coverage.md, a module a line, the least covered first:
 
-    armada map --artifacts=DIR --items=ITEMS --timeout=6000 --secrets=DEW_XLA_CACHE_TOKEN -- sh -c {item}
+    armada map --commit=SHA --artifacts=DIR --items=ITEMS --timeout=6000 --secrets=DEW_XLA_CACHE_TOKEN \
+        -- sh -c {item}
 
-A task reads the shared XLA cache as CI's do, and has `COVERAGE_DEADLINE` and armada's timeout past it; a pass
-with a task cut short is refused (`report`), its coverage partial. A target well under CI's keeps tasks short.
+A task reads the shared XLA cache as CI's do (--commit gives the checkout, its environments and the
+cache's URL), and has `COVERAGE_DEADLINE` and armada's timeout past it; a pass with a task cut short is
+refused (`report`), its coverage partial. A target well under CI's keeps tasks short.
 """
 
 import argparse
@@ -850,12 +852,12 @@ def durations(verdicts: list[dict]) -> dict[str, float]:
 
 
 ARTIFACTS = "/armada/task/artifacts"
+"""Where an armada task's files are kept for `armada map --artifacts`."""
 INTERRUPTED = "the task ran past its deadline"
 """How a row says its task was interrupted: tests after the point it reached did not run."""
 COVERAGE_DEADLINE = 5400.0
 """A coverage task's deadline. Branch tracing slows a task several times over, and a task cut short leaves
 its files' coverage partial, which `coverage_report` refuses."""
-"""Where an armada task's files are kept for `armada map --artifacts`."""
 
 
 def coverage_items(target: float, timings: dict) -> list[str]:
@@ -886,7 +888,9 @@ def coverage_report(directory: Path) -> int:
         return not verdict.exists() or any(INTERRUPTED in found["output"]
                                            for found in json.loads(verdict.read_text())["rows"])
 
-    short = [task.name for task in sorted(directory.iterdir()) if task.is_dir() and ran_short(task)]
+    # armada keeps each task's artifacts in a directory named by its index.
+    short = [task.name for task in sorted(directory.iterdir())
+             if task.is_dir() and task.name.isdecimal() and ran_short(task)]
     if short:
         print(f"{len(short)} tasks ran short, so the pass is partial; run them again with a longer deadline: "
               f"{', '.join(short)}", file=sys.stderr)
