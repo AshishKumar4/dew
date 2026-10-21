@@ -274,7 +274,7 @@ class Router(nn.Module):
         if self.routing_block is not None:
             if self.routing_block < 1:
                 raise ValueError(f"routing_block counts a block's tokens, got {self.routing_block}")
-            if not self.top_k <= self.block_experts <= self.num_experts:
+            if self.block_experts is None or not self.top_k <= self.block_experts <= self.num_experts:
                 raise ValueError(
                     f"block_experts must hold the top_k of {self.top_k} and at most the "
                     f"{self.num_experts} experts, got {self.block_experts}")
@@ -335,8 +335,9 @@ class Router(nn.Module):
         selection = scores if not self.expert_bias else scores + self.bias.value
         if media is not None:
             selection = jnp.where(media[..., None], scores + self.bias_vl.value, selection)
-        if self.routing_block is not None:
-            selection = jnp.where(self.block_mask(selection), selection, -jnp.inf)
+        if self.routing_block is not None and self.block_experts is not None:
+            selection = jnp.where(self.block_mask(selection, self.routing_block, self.block_experts),
+                                   selection, -jnp.inf)
         if self.expert_groups > 1:
             selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
         _, indices = jax.lax.top_k(selection, self.top_k)
@@ -375,7 +376,7 @@ class Router(nn.Module):
             jax.nn.one_hot(groups, self.expert_groups, dtype=jnp.int32), axis=-2)
         return jnp.repeat(kept > 0, per_group, axis=-1)
 
-    def block_mask(self, selection):
+    def block_mask(self, selection, block: int, experts: int):
         """True where an expert is among its token's block's best (`routing_block`).
 
         The tokens flatten in row-major order, as the reference's
@@ -384,13 +385,13 @@ class Router(nn.Module):
         """
         flat = selection.reshape(-1, self.num_experts)
         tokens = flat.shape[0]
-        blocks = (tokens + self.routing_block - 1) // self.routing_block
-        padded = jnp.pad(flat, ((0, blocks * self.routing_block - tokens), (0, 0)),
+        blocks = (tokens + block - 1) // block
+        padded = jnp.pad(flat, ((0, blocks * block - tokens), (0, 0)),
                          constant_values=-jnp.inf)
-        best = jnp.max(padded.reshape(blocks, self.routing_block, self.num_experts), axis=1)
-        _, allowed = jax.lax.top_k(best, self.block_experts)
+        best = jnp.max(padded.reshape(blocks, block, self.num_experts), axis=1)
+        _, allowed = jax.lax.top_k(best, experts)
         kept = jnp.sum(jax.nn.one_hot(allowed, self.num_experts, dtype=jnp.int32), axis=-2)
-        return jnp.repeat(kept > 0, self.routing_block, axis=0)[:tokens].reshape(selection.shape)
+        return jnp.repeat(kept > 0, block, axis=0)[:tokens].reshape(selection.shape)
 
 
 def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[Dtype, ...],

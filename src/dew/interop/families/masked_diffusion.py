@@ -236,14 +236,15 @@ def _llada_refusals(hf_config: Mapping[str, object], used: set[str],
 
 
 def _moe_decoder(hf_config: Mapping[str, object], used: set[str], *,
-                 qk_norm: bool, intermediate: int) -> DecoderFields:
+                 qk_norm: bool, intermediate: int, default_rotary: float = 1.0) -> DecoderFields:
     """The released MoE decoders' shared pre-norm GQA and sliced rotate-half rope."""
     if hf_config.get('rope_scaling') is not None:
         refuse('rope_scaling', 'the released MoE checkpoints use plain rotary positions')
-    theta, factor = plain_partial_rope(hf_config, default_factor=1.0, reference='LLaDA MoE rotary')
+    theta, factor = plain_partial_rope(hf_config, default_factor=default_rotary,
+                                      reference='LLaDA MoE rotary')
     used.update(('rope_theta', 'rope_scaling', 'rope_parameters', 'partial_rotary_factor'))
     layers = record_int(hf_config, 'num_hidden_layers')
-    config = base_config({**hf_config, 'intermediate_size': intermediate}, used,
+    config = base_config({'rms_norm_eps': 1e-5, **hf_config, 'intermediate_size': intermediate}, used,
                           rope=Ropes(theta), qk_norm=qk_norm,
                           layer_types=('full_attention',) * layers,
                           reads=frozenset({'attention_bias'}))
@@ -277,9 +278,9 @@ def _llada_moe_config(hf_config: Mapping[str, object], used: set[str], *,
                 'the released v2 SparseMoeBlock reads routing_weights before assigning it')
     layers = record_int(hf_config, 'num_hidden_layers')
     pattern = records.integers(hf_config['moe_layer_freq'], 'moe_layer_freq')
-    if len(pattern) != layers:
+    if len(pattern) < layers:
         refuse('moe_layer_freq', 'it must name each decoder layer')
-    routed = tuple(index for index, enabled in enumerate(pattern) if enabled != 0)
+    routed = tuple(index for index, enabled in enumerate(pattern[:layers]) if enabled != 0)
     if routed:
         bias = bool(hf_config.get('moe_router_enable_expert_bias'))
         config['mixture'] = native_fields(Mixture)(
@@ -306,8 +307,10 @@ def _llada2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     exposes their full bidirectional view, as the other masked LMs do;
     sampling is Dew's MDLM procedure, not the release's block-wise recipe.
     """
-    config = _moe_decoder(hf_config, used, qk_norm=bool(hf_config.get('use_qk_norm', True)),
-                           intermediate=record_int(hf_config, 'intermediate_size'))
+    block = (record_int(hf_config, 'block_size', 32)
+             if 'block_size' in hf_config or 'expert_capacity' in hf_config else None)
+    config = _moe_decoder(hf_config, used, qk_norm=bool(hf_config.get('use_qk_norm', block is None)),
+                           intermediate=record_int(hf_config, 'intermediate_size'), default_rotary=0.5)
     config.update(attention_bias=bool(hf_config.get('use_qkv_bias', False)),
                   o_proj_bias=bool(hf_config.get('use_bias', True)))
     used.update(('use_qkv_bias', 'use_qk_norm', 'use_bias', 'num_experts', 'num_shared_experts',
@@ -321,7 +324,6 @@ def _llada2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     if hf_config.get('num_experts') is None:
         return config
     # These names differ, but the inference gate and dense-first layout are DeepSeek V3's.
-    block = hf_config.get('block_size')
     mixture = deepseek_mixture({
         **hf_config, 'n_routed_experts': hf_config['num_experts'],
         'n_shared_experts': hf_config.get('num_shared_experts'), 'norm_topk_prob': True,
@@ -330,7 +332,7 @@ def _llada2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     }, record_int(hf_config, 'num_hidden_layers'), set())
     mixture['norm_topk_prob'] = record_int(hf_config, 'num_experts_per_tok') > 1
     if block is not None:
-        mixture.update(routing_block=records.integer(block, 'block_size'),
+        mixture.update(routing_block=block,
                        block_experts=record_int(hf_config, 'expert_capacity', 48))
     if mixture['layers']:
         config['mixture'] = mixture

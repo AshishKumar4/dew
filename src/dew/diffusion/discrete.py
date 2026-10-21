@@ -261,7 +261,7 @@ class Unmask:
         alpha_s = process.schedule.alpha(t_next)
         reveal_chance = (alpha_s - alpha_t) / (1 - alpha_t)
         masked = denoise.masked(x)
-        if key.shape == ():
+        if jax.random.key_data(key).ndim == 1:
             reveal_key, token_key = jax.random.split(key)
             reveal = jax.random.uniform(reveal_key, x.shape)
             drawn = jax.random.categorical(token_key, log_probs, axis=-1)
