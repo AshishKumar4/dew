@@ -947,6 +947,22 @@ def media_field(chain: Dataset, run: str) -> Field:
     return Field(name, tuple(shape))
 
 
+def _set_arguments(given: list[str]) -> tuple[list[str], list[str]]:
+    """`given` without its `--set path=value` pairs, and the pairs' assignments, in order."""
+    rest, settings, index = [], [], 0
+    while index < len(given):
+        if given[index] == "--set" and index + 1 < len(given):
+            settings.append(given[index + 1])
+            index += 2
+        elif given[index].startswith("--set="):
+            settings.append(given[index].removeprefix("--set="))
+            index += 1
+        else:
+            rest.append(given[index])
+            index += 1
+    return rest, settings
+
+
 def _chain_label(chain: Dataset | None) -> str:
     """A run name's word for its data: the last preset its recorded chain calls (`lm`, `images`), or
     `data` where it calls none or was not recorded."""
@@ -1214,9 +1230,11 @@ class RunConfig:
         the default's fields; naming another starts from that class's own and
         the default's compute dtype. `--objective` picks the objective's class
         the same way, each argument it takes a flag, `--objective.<argument>`
-        (`ObjectiveConfig`).
+        (`ObjectiveConfig`). `--set path=value`, once a setting, sets a field at its dotted path
+        after the flags, as `dew train` does (`assigned`): the data's settings are its chain's calls'
+        (`--set data.lm.seq_len=512`), which have no flags of their own.
         """
-        given = list(sys.argv[1:] if args is None else args)
+        given, settings = _set_arguments(list(sys.argv[1:] if args is None else args))
         for field, subcommand in cls._FLAG_SELECTED.items():
             flags = [index for index, arg in enumerate(given) if arg.startswith(f"--{field}.")]
             if flags and not any(arg.startswith(f"{field}:") for arg in given):
@@ -1256,11 +1274,12 @@ class RunConfig:
         parsed = tyro.cli(tyro.conf.CascadeSubcommandArgs[parser], args=given, default=held)
         if parsed is None:
             raise ValueError("the command line built no run config")
-        return cls(**{field.name: getattr(parsed, field.name) for field in dataclasses.fields(cls)
-                      if field.name not in ("model", "objective")},
-                   model=_given(model, parsed.model, model_started),
-                   objective=None if objective is None else _given(objective, parsed.objective,
-                                                                   objective_started))
+        built = cls(**{field.name: getattr(parsed, field.name) for field in dataclasses.fields(cls)
+                       if field.name not in ("model", "objective")},
+                    model=_given(model, parsed.model, model_started),
+                    objective=None if objective is None else _given(objective, parsed.objective,
+                                                                    objective_started))
+        return built.assigned(settings) if settings else built
 
     @classmethod
     def _started(cls, default: Self | None, field: str) -> ModelConfig | ObjectiveConfig | None:
