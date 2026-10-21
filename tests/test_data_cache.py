@@ -14,22 +14,21 @@ import fsspec
 import grain.python as grain
 import numpy as np
 import pytest
+from storage_support import moto_bucket
 
 from dew.data.cache import Abandoned, Cache
 from dew.data.pipeline import Rejected
+from dew.data.plan import Manifest, StepIdentity
 from dew.data.sources import Memory
 from dew.data.storage import Store
 
 
-@dataclass(frozen=True)
-class Manifest:
-    canonical: bytes = b'{"revision":"test","source":"memory"}'
-    clean: bool = True
-    exact: bool = True
-
-    @property
-    def key(self):
-        return hashlib.sha256(self.canonical).hexdigest()
+def _key(source: object = "memory", *, revision: str = "test", clean: bool = True,
+         exact: bool = True) -> Manifest:
+    """A dependency manifest of fixed fields, keying a cache of `source`'s rows at `revision`: a
+    dirty checkout's (`clean=False`), or one whose step has no stable identity (`exact=False`)."""
+    steps = () if exact else (StepIdentity("tests.unstable", "<lambda>", exact=False),)
+    return Manifest({"store": source}, steps, revision=revision, clean=clean)
 
 
 def _cache(**kwargs):
@@ -103,7 +102,7 @@ def test_expansion_publication_certifies_empty_and_nonempty_inputs():
     from dew.data.sources.codec import encode
 
     source = Memory([{"id": index} for index in range(5)])
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
 
     def expand(index, value):
         return tuple({"id": value["id"], "part": part} for part in range(index))
@@ -138,7 +137,7 @@ def test_missing_input_completion_refuses_publication():
     """A writer that never read row 1 leaves it uncovered and publication is
     refused; a second writer that reads it completes the generation."""
     source = Memory([{"id": index} for index in range(3)])
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     assert rows[0] == {"id": 0}
     assert rows[2] == {"id": 2}
@@ -156,7 +155,7 @@ def test_missing_input_completion_refuses_publication():
 
 def test_unsealed_writer_cannot_certify_coverage():
     source = Memory([{"id": 0}, {"id": 1}])
-    cache, key = _cache(shard_bytes=1), Manifest()
+    cache, key = _cache(shard_bytes=1), _key()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     rows[0]
     with pytest.raises(ValueError):
@@ -172,7 +171,7 @@ def test_conflicting_duplicate_writers_refuse_publication(second_row):
     """Two writers of one row publish it where they wrote the same row, and
     are refused where they wrote different ones."""
     source = Memory([{"id": 0}])
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     first = cache.mapped(grain.MapDataset.source([{"id": 0}]), key)
     second = cache.mapped(grain.MapDataset.source([second_row]), key)
     first[0], second[0]
@@ -189,7 +188,7 @@ def test_conflicting_duplicate_writers_refuse_publication(second_row):
 
 def test_corrupt_shard_never_reaches_current():
     source = Memory([{"id": 0}])
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     rows[0]
     rows.finish()
@@ -207,7 +206,7 @@ def test_corrupt_shard_never_reaches_current():
 
 def test_corrupt_committed_index_is_an_error_without_fallback():
     source = Memory([{"id": 0}])
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     rows[0]
     rows.finish()
@@ -228,7 +227,7 @@ def test_full_spool_stops_admitting_and_training_continues(spool_bytes):
     """A row larger than the spool is served but not admitted, so its cache
     cannot be published; a spool that holds it publishes."""
     source = Memory([{"bytes": b"x" * 2048}])
-    cache, key = _cache(spool_bytes=spool_bytes, shard_bytes=128), Manifest()
+    cache, key = _cache(spool_bytes=spool_bytes, shard_bytes=128), _key()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     assert rows[0] == source.records("indexed")[0]
     assert rows.writer.admitting is (spool_bytes > 2048)
@@ -245,42 +244,35 @@ def test_full_spool_stops_admitting_and_training_continues(spool_bytes):
 def test_cache_identity_and_clean_revision_are_required(refused):
     source = Memory([{"id": 0}])
     rows = grain.MapDataset.source(source.records("indexed"))
-    _cache().mapped(rows, Manifest()).close()
+    _cache().mapped(rows, _key()).close()
     with pytest.raises(ValueError):
-        _cache().mapped(rows, Manifest(**refused))
-    assert Manifest().key != Manifest(b'{"revision":"changed"}').key
+        _cache().mapped(rows, _key(**refused))
+    assert _key().key != _key(revision="changed").key
 
 
 def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
     import fsspec
-    from moto.server import ThreadedMotoServer
 
-    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
-    server.start()
-    _, port = server.get_host_and_port()
-    options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}"}
-    fs = fsspec.filesystem("s3", **options)
-    bucket = "cache-" + uuid4().hex
-    fs.mkdir(bucket)
-    cache, key = Cache(f"s3://{bucket}/cache", storage_options=options), Manifest()
-    source = Memory([{"id": index} for index in range(8)])
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
-    for index in range(len(rows)):
-        rows[index]
-    rows.finish()
-    rows.close()
-    start = threading.Barrier(2)
+    with moto_bucket("cache") as (bucket, options):
+        fs = fsspec.filesystem("s3", **options)
+        cache, key = Cache(f"s3://{bucket}/cache", storage_options=options), _key()
+        source = Memory([{"id": index} for index in range(8)])
+        rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
+        for index in range(len(rows)):
+            rows[index]
+        rows.finish()
+        rows.close()
+        start = threading.Barrier(2)
 
-    def publish():
-        from dew.data.storage import PreconditionFailed
+        def publish():
+            from dew.data.storage import PreconditionFailed
 
-        start.wait()
-        try:
-            return cache.publish(key, source)
-        except PreconditionFailed as error:
-            return error
+            start.wait()
+            try:
+                return cache.publish(key, source)
+            except PreconditionFailed as error:
+                return error
 
-    try:
         with ThreadPoolExecutor(2) as pool:
             attempts = list(pool.map(lambda _: publish(), range(2)))
         from dew.data.generation import Generation
@@ -295,13 +287,11 @@ def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
         )
         with pytest.raises(OSError):
             cache.publish(key, source)
-    finally:
-        server.stop()
 
 
 def test_stream_completions_use_physical_shards_and_resume_without_rekeying():
     source = Memory([{"id": index} for index in range(8)], shard_rows=2)
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     manifest = source.manifest()
     reader = cache.streamed(manifest.reader, key)
     for shard in reversed(manifest.shards):
@@ -325,7 +315,7 @@ class Draw(grain.RandomMapTransform):
 
 def test_cold_warm_and_resumed_caches_keep_per_epoch_randomness():
     source = Memory([{"id": index} for index in range(8)])
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     parent = grain.MapDataset.source(source.records("indexed"))
     cold = cache.mapped(parent, key)
 
@@ -732,6 +722,42 @@ def test_a_cache_of_a_store_that_misses_every_input_publishes_its_empty_fill(tmp
     publishing = Offset(10)
     assert len(publish(Pipeline(source).map(publishing), Cache(cache), read="indexed", loading=loading)) == 0
     assert publishing.calls == []
+
+
+def _rows(reader, batches: int) -> set[tuple[bytes, ...]]:
+    """The distinct rows of a reader's next `batches` batches, each its fields' bytes."""
+    rows = set()
+    for _ in range(batches):
+        batch = next(reader)
+        names = sorted(batch)
+        rows |= {tuple(np.asarray(batch[name])[row].tobytes() for name in names)
+                 for row in range(len(np.asarray(batch[names[0]])))}
+    return rows
+
+
+def test_a_prompt_recipe_with_a_cache_reads_by_index_the_prompts_it_reads_uncached(tmp_path):
+    """A prompt recipe whose rendering drops prompts too long, cached and read by index in the
+    recipe's own loading workers: the cache holds what is left of each input, and the read goes on
+    through every prompt kept, as the uncached recipe's does, however the drops fall among the
+    workers (row 883)."""
+    from dew.config.data import PromptData, loader
+    from dew.data.dataset import DataPartition
+
+    # A third of the twelve prompts are longer than 6 bytes, which the recipe drops: eight are kept.
+    recipe = PromptData(tuple({"prompt": chr(97 + index) + "hi" * (1 + index % 3)} for index in range(12)),
+                        "byte", max_prompt_len=6, long="drop", reward_bytes=8)
+    # The recipe reads in worker processes, which read a cache on disk.
+    cached = loader(recipe, batch=2, cache=str(tmp_path / "cache"), read="indexed")
+    uncached = loader(recipe, batch=2, read="indexed")
+    assert cached.records == uncached.records
+    first, second = cached.train(DataPartition()), uncached.train(DataPartition())
+    try:
+        kept = _rows(second, 16)
+        assert len(kept) == 8
+        assert _rows(first, 16) == kept
+    finally:
+        first.close()
+        second.close()
 
 
 def test_an_image_recipe_with_a_fixed_caption_and_a_cache_reads_in_its_uncached_order(tmp_path):
@@ -1229,7 +1255,7 @@ def test_published_generation_exposes_only_declared_order_metadata_and_plan():
     source = Memory(
         [{"id": index, "_dew_length": index + 2, "_dew_valid_targets": index + 1} for index in range(4)]
     )
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     for index in range(len(rows)):
         rows[index]
@@ -1248,7 +1274,7 @@ def test_transient_failures_never_certify_cache_coverage_but_permanent_rejection
     from dew.data.pipeline import Rejected
 
     source = Memory([{"id": 0}, {"id": 1}])
-    cache, key = _cache(), Manifest()
+    cache, key = _cache(), _key()
     transient = cache.mapped(
         grain.MapDataset.source(source.records("indexed")),
         key,
@@ -1276,7 +1302,7 @@ def test_transient_failures_never_certify_cache_coverage_but_permanent_rejection
 def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_path):
     source = Memory([{"id": 0}])
     cache = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1)
-    first_key, second_key = Manifest(b'{"source":"one"}'), Manifest(b'{"source":"two"}')
+    first_key, second_key = _key("one"), _key("two")
     first = cache.mapped(grain.MapDataset.source(source.records("indexed")), first_key)
     first[0]
     first.finish()
@@ -1311,10 +1337,10 @@ def test_local_retention_reclaims_the_bytes_of_fills_closed_before_they_sealed(t
     for index in range(3):
         source = rows(index)
         stopped = cache.mapped(grain.MapDataset.source(source.records("indexed")),
-                               Manifest(json.dumps({"source": index}).encode()))
+                               _key(index))
         stopped[0]
         stopped.close()
-    source, key = Memory([{"id": 99}]), Manifest(b'{"source":"kept"}')
+    source, key = Memory([{"id": 99}]), _key("kept")
     filled = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     filled[0]
     filled.finish()
@@ -1340,7 +1366,7 @@ def test_a_local_cache_fails_a_shard_its_disk_refuses_at_once(tmp_path, monkeypa
     monkeypatch.setattr(filelock.FileLock, "acquire", counted)
     source = Memory([{"id": 0, "blob": np.random.default_rng(0).bytes(200_000)}])
     cache = Cache(str(tmp_path), keep_local_bytes=64 * 1024, on_full="block", shard_bytes=1, retry=3)
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest())
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), _key())
     try:
         assert rows[0]["id"] == 0
         with pytest.raises(OSError):
@@ -1385,7 +1411,7 @@ def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
     source = Memory([{"id": index, "blob": blobs.bytes(300_000)} for index in range(2)])
     cache = Cache(f"refusing://cache-{uuid4().hex}", spool_bytes=500_000, shard_bytes=1, on_full="block",
                   retry=1)
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest())
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), _key())
     rows.writer.lock = Observed(threading.RLock())
     raised: list[BaseException] = []
 
@@ -1436,7 +1462,7 @@ def test_training_close_abandons_a_stalled_upload_without_publishing_a_segment()
     fsspec.register_implementation("stalled", Stalled, clobber=True)
     source = Memory([{"id": 0}])
     cache = Cache(f"stalled://cache-{uuid4().hex}", shard_bytes=1, retry=0)
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest())
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), _key())
     try:
         assert rows[0] == {"id": 0}
         assert entered.wait(5)
@@ -1456,7 +1482,7 @@ def test_training_close_abandons_a_stalled_upload_without_publishing_a_segment()
 def test_real_r2_generation_publication_mirror_and_cleanup(tmp_path):
     root = os.environ["DEW_DATA_TEST_URL"]  # a writable remote smoke prefix
     source = Memory([{"id": index, "text": "remote"} for index in range(4)])
-    key = Manifest(b'{"r2-smoke":"artifact-v1"}')
+    key = _key("r2-smoke artifact-v1")
     cache = Cache(
         root.rstrip("/") + "/generation",
         storage_options={"dewcache": {"cache_storage": str(tmp_path), "max_bytes": 2**20}},

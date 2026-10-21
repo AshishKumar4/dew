@@ -23,7 +23,6 @@ with these commands, for example:
 
 import argparse
 import json
-import time
 
 import jax
 import jax.numpy as jnp
@@ -120,15 +119,14 @@ def adam(args: argparse.Namespace) -> dict[str, object]:
 
     run = jax.jit(update, donate_argnums=(0, 1))
     state = solver.init(params)
-    for _ in range(3):
+
+    def step():
+        # Each call donates the last call's parameters and state.
+        nonlocal params, state
         params, state = run(params, state, grads)
-    # The update threads its donated state through each call, which `samples` cannot.
-    updates = []
-    for _ in range(args.repeats):
-        start = time.perf_counter()
-        params, state = run(params, state, grads)
-        jax.block_until_ready((params, state))
-        updates.append((time.perf_counter() - start) * 1e3)
+        return params, state
+
+    updates = [seconds * 1e3 for seconds in samples(step, warmup=3, repeats=args.repeats)]
     return {"state_dtype": args.state_dtype, "params": sum(leaf.size for leaf in params.values()),
             "update_mean_ms": float(np.mean(updates)), "update_min_ms": float(np.min(updates)),
             "state_bytes": sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(state))}
