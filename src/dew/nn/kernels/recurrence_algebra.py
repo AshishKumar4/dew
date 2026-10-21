@@ -1,13 +1,16 @@
-"""The recurrence template's algebra (bible §6, docs/design/kernel-templates.md §3): the chunked form of
-`S' = T S E + W` as named, pure functions on values, which every implementation of the chunked op calls
-and none rewrites. A token updates and reads, per head over a state `S` `[Dk, Dv]`,
+"""The recurrence template's algebra (bible §6; the template design's §3): the chunked form of the update
+as named, pure functions on values, which every implementation of the chunked op calls and none
+rewrites. This rung covers `S' = T S + W` with T a diagonal decay times the delta rule's erase, E the
+identity, and a chunk's transition `(T, W)` dense (`transition`); the value-side decay E and the factored
+transitions follow with the families that need them. A token updates and reads, per head over a state
+`S` `[Dk, Dv]`,
 
     S' = (I - delta beta k k^T) Gamma S + iota k v^T,    o = S'^T q
 
 (`recurrence.update` is its one-token form). Within a chunk of C tokens:
 
 - `decays(g, documents) -> (gc, pairs)`: the log decay cumulated within the chunk and each pair of positions'
-  decay `exp(gc[s] - gc[t])`, its exponent compensated (`chunk_decay`);
+  decay `exp(gc[s] - gc[t])`, its exponent compensated;
 - `intra(k, kb, pairs) -> A`: the delta rule's strictly lower key-key system, `-(beta k k^T)` weighed by the
   pairs;
 - `factor(A) -> L`: its triangular inverse `(I - A)^-1` (WY/UT), skipped where nothing is corrected;
@@ -86,7 +89,7 @@ def _cumulated(g, documents=None):
 
 
 @jax.custom_jvp
-def chunk_decay(g, documents=None):
+def decays(g, documents=None):
     """Cumulate per-chunk log decays and build the pairwise decay between positions.
 
     `g` is `[..., C, F]`: the C positions of a chunk and F decay channels.
@@ -99,18 +102,18 @@ def chunk_decay(g, documents=None):
     exp turns into a relative error on every decay. Here the cumulative sum
     is compensated (`compensated_add`) and the difference takes both
     halves, so an exponent is as precise as its own range. On
-    tests/fixtures/hf/kimi-linear-tiny that error dominated the gradient:
+    a per-key-decay model's tiny fixture that error dominated the gradient:
     over 16 orderings of the residual stream (an exact symmetry, so only the
     rounding moves) the updated logits sat at an RMS 2.04 times the
     reference's distance from float64 with plain sums on CPU and 1.83 on an
     RTX 4080, and 0.92 and 0.72 with these, against the reference's own
-    0.98. Summing each pair's range instead (Mamba-2's `segment_sum`) is as
-    exact and made a KDA layer's forward and backward 25% slower; this
-    costs about 1% (on an RTX 4080, Kimi Linear's KDA layer over 1024 tokens
-    47.6 against 48.0 ms, Qwen3.5-0.8B's gated delta net over 4096 16.3
+    0.98. Summing each pair's range instead (a segment sum) is as
+    exact and made a per-key-decay layer's forward and backward 25% slower; this
+    costs about 1% (on an RTX 4080, a 32-head per-key-decay layer over 1024 tokens
+    47.6 against 48.0 ms, a 0.8B model's per-head-decay layer over 4096 16.3
     against 16.5).
 
-    The gradient is the pairs' own (`_chunk_decay_tangent`): differentiating
+    The gradient is the pairs' own (`_decays_tangent`): differentiating
     the difference of two prefixes sums a pair's cotangent into its two ends
     with opposite signs, and the decay gradient, a row sum less a column sum
     of the chunk's pairs, cancelled to fp32 noise wherever the prefixes ran
@@ -156,12 +159,12 @@ def _ranged_transpose(decay, cotangent):
     return jnp.moveaxis(jnp.diagonal(after, axis1=-3, axis2=-2), -1, -2)
 
 
-@chunk_decay.defjvp
-def _chunk_decay_tangent(primals, tangents):
+@decays.defjvp
+def _decays_tangent(primals, tangents):
     """The pairs' own tangent, in forward and reverse mode alike: the decay's is each pair's range
     (`_ranged`), and its transpose sums only the pairs spanning a position (`_ranged_transpose`).
-    On Qwen3.5-tiny's packed decision rows (tests/test_decision_packing.py, joint) the prefix
-    difference's gradient put the gated delta net's A_log 3.58 and dt_bias 4.49 times as far from
+    On a tiny hybrid's packed decision rows (tests/test_decision_packing.py, joint) the prefix
+    difference's gradient put the per-head-decay layer's A_log 3.58 and dt_bias 4.49 times as far from
     float64 as the rows run alone, against 2 allowed; with this and the memory write's decay row
     (`xla_chunk_states`) every backbone leaf sat at 0.77-0.93, on six CPUs of two models. It costs
     the chunked rule's forward and backward 4% with a decay per head and 26% with one per key
@@ -169,11 +172,11 @@ def _chunk_decay_tangent(primals, tangents):
     1.936 against 2.440 s)."""
     g, documents = primals
     dg, _ = tangents
-    gc, decay = chunk_decay(g, documents)
+    gc, decay = decays(g, documents)
     return (gc, decay), (_cumulated(dg, documents)[0], linear_call(_ranged, _ranged_transpose, decay, dg))
 
 
-def strictly_lower_inverse(a, issue: Issue = portable):
+def factor(a, issue: Issue = portable):
     """Return (I - A)^-1 for strictly lower triangular `a` `[..., C, C]`, the
     chunked delta rules' `attn[i, :i] += sum_k attn[i, k] attn[k, :i]` loop.
 
@@ -182,7 +185,7 @@ def strictly_lower_inverse(a, issue: Issue = portable):
     diagonal and X2 A21 X1 below. Each block is a diagonal block of the
     whole inverse, so every product stays the size of its entries. The
     series I + A + A^2 + ..., summed by doubling powers of A, did not: on
-    Qwen3.5-0.8B's aligned keys the powers grew as binomials (1.8e17 at C=64)
+    a 0.8B model's aligned keys the powers grew as binomials (1.8e17 at C=64)
     and cancelled to an inverse whose entries are at most 1, 1e24 off in
     fp32. The first level is written out rather than as products with
     one-wide identity blocks: XLA TPU rewrites a matmul by a broadcast
@@ -195,7 +198,7 @@ def strictly_lower_inverse(a, issue: Issue = portable):
     width = 1 << (chunk_size - 1).bit_length()
     if width != chunk_size:  # zero rows and columns extend it by the identity
         pad = [(0, 0)] * (a.ndim - 2) + [(0, width - chunk_size)] * 2
-        return strictly_lower_inverse(jnp.pad(a, pad), issue)[..., :chunk_size, :chunk_size]
+        return factor(jnp.pad(a, pad), issue)[..., :chunk_size, :chunk_size]
     lead = a.shape[:-2]
 
     def diagonal_blocks(size):
@@ -227,22 +230,12 @@ def paired(name: str, left, right, decay, issue: Issue = portable):
     return jnp.einsum('...sd,...td,...std->...st', left, right, decay)
 
 
-def decays(g, documents=None):
-    """`(gc, pairs)` of a chunk's log decays `g` `[..., C, F]` (`chunk_decay`)."""
-    return chunk_decay(g, documents)
-
-
 def intra(key, keyed, pairs, issue: Issue = portable):
     """The delta rule's strictly lower system `A` `[..., C, C]`: `-sum_d keyed[s, d] key[t, d] pairs[s, t, d]`
     for s > t, zero on and above the diagonal, `keyed` the write-gated keys `beta k`."""
     chunk_size = pairs.shape[-2]
     strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
     return jnp.where(strict, -paired("intra", keyed, key, pairs, issue), 0.0)
-
-
-def factor(a, issue: Issue = portable):
-    """`(I - A)^-1` of the strictly lower `a` (`strictly_lower_inverse`)."""
-    return strictly_lower_inverse(a, issue)
 
 
 def apply(inverse, keyed, valued, entering, issue: Issue = portable):
@@ -281,7 +274,10 @@ def compose(first, second, issue: Issue = portable):
 
 def transition(key, w, u, gc, last, kept, issue: Issue = portable):
     """A chunk's transition `(T, W)` (`compose`): with `carry`'s operands,
-    `T = exp(gc[-1]) kept - (k last)^T W` and `W = (k last)^T U`, so `carry`'s memory leaving is `T S + W`."""
+    `T = exp(gc[-1]) kept - (k last)^T W` and `W = (k last)^T U`, so `carry`'s memory leaving is `T S + W`.
+    Packed documents keep the memory entering only where `kept` because the operands are built so
+    (`recurrence_chunk.chunked`): `W` is zero outside the document the memory entering belongs to and
+    `last` outside the chunk's last document; `kept` alone gates only the decay's diagonal."""
     decayed = jnp.swapaxes(key * last, -1, -2)
     dk = key.shape[-1]
     diagonal = jnp.eye(dk, dtype=gc.dtype) * jnp.swapaxes(jnp.exp(gc[..., -1:, :]), -1, -2) * kept

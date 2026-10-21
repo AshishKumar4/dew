@@ -33,11 +33,10 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import tyro
-from benchmark_attention import largest_difference
 
 from dew.nn.kernels.recurrence_chunk import chunk_delta_rule
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
-from dew.telemetry.benchmark import samples
+from dew.telemetry.benchmark import largest_difference, samples
 
 IMPLEMENTATIONS = ('xla', 'kernel')
 
