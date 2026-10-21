@@ -3,8 +3,8 @@ from __future__ import annotations
 import copy
 import dataclasses
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
-from typing import Any, ClassVar
+from collections.abc import Iterator, Mapping
+from typing import Any, ClassVar, Self
 
 import jax
 import jax.numpy as jnp
@@ -17,18 +17,26 @@ from dew.objectives.base import Variables
 @dataclasses.dataclass(frozen=True, eq=False)
 class LatentNormalization:
     """A latent normalization, one description: the source values an autoencoder's record keeps
-    (`record`, as given) and the shift and factor derived from them once. Latents are normalized as
-    `(z - shift) * factor` and restored as `z / factor + shift`; one that `divides` normalizes as
-    `(z - shift) / factor` and restores as `z * factor + shift`, as its source rounds."""
-    record: Mapping[str, Any]
-    shift: Any
-    factor: Any
+    (`record`, as given) beside the shift and factor its autoencoder derived from them, written
+    together once and read-only after. Latents are normalized as `(z - shift) * factor` and restored
+    as `z / factor + shift`; one that `divides` normalizes as `(z - shift) / factor` and restores as
+    `z * factor + shift`, as its source rounds."""
+    record: Mapping[str, object]
+    shift: float | np.ndarray
+    factor: float | np.ndarray
     divides: bool = False
 
+    def __post_init__(self):
+        # Read-only copies, so no reader writes the normalization through what it reads.
+        record = {name: _frozen(value) for name, value in self.record.items()}
+        object.__setattr__(self, 'record', _Record(record))
+        object.__setattr__(self, 'shift', _frozen(self.shift))
+        object.__setattr__(self, 'factor', _frozen(self.factor))
+
     @property
-    def scale(self):
+    def scale(self) -> float | np.ndarray:
         """The factor a normalized latent is the shifted one times."""
-        return np.float32(1.0) / self.factor if self.divides else self.factor
+        return _frozen(np.float32(1.0) / self.factor) if self.divides else self.factor
 
     def normalized(self, latent: jnp.ndarray) -> jnp.ndarray:
         shift, factor = (jnp.asarray(value, latent.dtype) for value in (self.shift, self.factor))
@@ -37,6 +45,31 @@ class LatentNormalization:
     def restored(self, z: jnp.ndarray) -> jnp.ndarray:
         shift, factor = (jnp.asarray(value, z.dtype) for value in (self.shift, self.factor))
         return z * factor + shift if self.divides else z / factor + shift
+
+
+class _Record(Mapping[str, object]):
+    """A record's values, read-only (a mapping with no way to set one), and picklable as any object is."""
+
+    def __init__(self, values: dict[str, object]):
+        self._values = values
+
+    def __getitem__(self, name: str) -> object:
+        return self._values[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+
+def _frozen(value):
+    """`value`, or a read-only copy where it is an array."""
+    if not isinstance(value, np.ndarray):
+        return value
+    frozen = np.array(value, copy=True)
+    frozen.setflags(write=False)
+    return frozen
 
 
 IDENTITY = LatentNormalization({}, 0.0, 1.0)
@@ -54,7 +87,8 @@ class AutoEncoder(ABC):
     out, latents are normalized as (z - latent_shift) * latent_scale, and on
     the way in the normalization is inverted, the SD3 convention.
     `latent_shift` and `latent_scale` are each one number or one per latent
-    channel, read from `normalization`. The default is the identity; an
+    channel, read from `normalization`; one that divides by its factor (Qwen-
+    Image's) rounds as a division does. The default is the identity; an
     autoencoder normalized by the dataset's own latent mean and 1/std, so the
     diffusion model sees roughly unit-variance, zero-mean inputs, is
     `with_normalization`'s.
@@ -82,14 +116,14 @@ class AutoEncoder(ABC):
         raise TypeError(f"{type(self).__name__} needs an explicit autoencoder record declaration")
 
     @property
-    def latent_shift(self):
+    def latent_shift(self) -> float | np.ndarray:
         return self.normalization.shift
 
     @property
-    def latent_scale(self):
+    def latent_scale(self) -> float | np.ndarray:
         return self.normalization.scale
 
-    def with_normalization(self, normalization: LatentNormalization) -> AutoEncoder:
+    def with_normalization(self, normalization: LatentNormalization) -> Self:
         """This autoencoder normalizing its latents by `normalization` instead: a copy, this one
         unchanged."""
         replaced = copy.copy(self)
