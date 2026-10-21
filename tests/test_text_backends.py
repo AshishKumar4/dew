@@ -14,6 +14,7 @@ from dew.data.dataset import DataPartition
 
 LOADING = Loading(workers=0, threads=1, read_buffer=1)
 CHAT = Path(__file__).parent / "fixtures" / "tokenizers" / "tiny-chat"
+FIXTURE = Path(__file__).parent / "fixtures" / "tfds" / "dew_passages" / "1.0.0"
 PASSAGES = [f"passage {index}: " + "the quick brown fox jumps over the lazy dog " * (1 + index % 4)
             for index in range(24)]
 
@@ -31,15 +32,10 @@ def stored(backend: str, tmp_path: Path):
         return from_hf(datasets.Dataset.from_list(rows), name="passages")
     if backend == "grain":
         return from_grain(grain.MapDataset.source(rows), name="passages")
-    import tensorflow_datasets as tfds
-
     from dew.data import TFDS
 
-    features = tfds.features.FeaturesDict({"text": tfds.features.Text()})
-    tfds.dataset_builders.store_as_tfds_dataset(
-        name="dew_passages", version="1.0.0", features=features, split_datasets={"train": rows},
-        data_dir=str(tmp_path), file_format="array_record", disable_shuffling=True)
-    return TFDS("dew_passages", split="train", path=str(tmp_path / "dew_passages" / "1.0.0"))
+    # Prepared by tools/datasets/tfds_reference.py from the same passages.
+    return TFDS("dew_passages", split="train", path=str(FIXTURE))
 
 
 def batches(data, count: int, state=None):
