@@ -289,7 +289,8 @@ def test_a_recording_keeps_the_confirmed_count_where_the_proxy_planned_more():
 
 def test_a_recording_of_outputs_alone_draws_its_inputs_again(tmp_path):
     """A generator's seeded draw, called again by the test (`inputs_of`), stands in for recorded inputs:
-    the recording holds the outputs alone and is judged as one that holds both."""
+    the recording holds the outputs alone and is judged as one that holds both. A draw that changed since
+    the recording is refused by its digest, as is `inputs_of` on a recording with no digest."""
     from tool_support import load
 
     recorder = load("recorded_references")
@@ -312,3 +313,9 @@ def test_a_recording_of_outputs_alone_draws_its_inputs_again(tmp_path):
     drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw)
     assert_as_exact(jax.jit(lambda index, inputs: squared(inputs)), reference, drawn, "drawn again",
                     seeds=seeds, truth_fn=truth)
+    changed, _, _ = indexed_recording(recorded, "site", seeds, inputs_of=lambda seed: draw(seed + 1))
+    with pytest.raises(AssertionError):
+        changed(0)
+    undigested = {name: value for name, value in recorded.items() if name != "site.input_digest"}
+    with pytest.raises(AssertionError):
+        indexed_recording(undigested, "site", seeds, inputs_of=draw)
