@@ -18,7 +18,7 @@ from __future__ import annotations
 import datetime
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 type JSON = None | bool | int | float | str | list['JSON'] | dict[str, 'JSON']
 
@@ -107,18 +107,23 @@ def strings(value: object, key: str) -> tuple[str, ...]:
     return tuple(text(entry, key) for entry in value)
 
 
+def listed[ItemT](value: object, key: str, read: Callable[[object, str], ItemT],
+                  what: str) -> tuple[ItemT, ...]:
+    """One list, each entry read by `read(entry, key)`; `what` names what the list holds, as a
+    refusal of anything else says."""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{key}={value!r}: this field is {what}")
+    return tuple(read(entry, key) for entry in value)
+
+
 def integers(value: object, key: str) -> tuple[int, ...]:
     """One list of integers: layer indices, token ids, per-layer widths."""
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key}={value!r}: this field is a list of integers")
-    return tuple(integer(entry, key) for entry in value)
+    return listed(value, key, integer, "a list of integers")
 
 
 def numbers(value: object, key: str) -> tuple[float, ...]:
     """One list of finite numbers: per-frequency rotary factors."""
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key}={value!r}: this field is a list of numbers")
-    return tuple(number(entry, key) for entry in value)
+    return listed(value, key, number, "a list of numbers")
 
 
 def json_value(value: object, key: str) -> JSON:

@@ -2,8 +2,9 @@
 
 import math
 from collections.abc import Callable, Mapping
+from typing import cast
 
-from dew.records import JSON, integer, integers, record as section, text
+from dew.records import JSON, integer, integers, listed, record as section, text
 from dew.sampling.text import Sampling
 
 from .episodes import Action, Episode, EpisodeId, EpisodeStatus, Observation, Transition
@@ -11,9 +12,7 @@ from .episodes import Action, Episode, EpisodeId, EpisodeStatus, Observation, Tr
 
 def sequence[ItemT](value: object, read: Callable[[JSON], ItemT], key: str) -> tuple[ItemT, ...]:
     """Read every entry of a JSON array, each one through `read`."""
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key}={value!r}: this field is a list")
-    return tuple(read(entry) for entry in value)
+    return listed(value, key, lambda entry, _: read(cast(JSON, entry)), "a list")
 
 
 def real(value: object, key: str) -> float:
@@ -25,9 +24,7 @@ def real(value: object, key: str) -> float:
 
 def reals(value: object, key: str) -> tuple[float, ...]:
     """One list of finite numbers: a row's likelihoods."""
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key}={value!r}: this field is a list of finite numbers")
-    return tuple(real(entry, key) for entry in value)
+    return listed(value, key, real, "a list of finite numbers")
 
 
 def observation_record(value: Mapping[str, object]) -> Observation:
@@ -41,9 +38,7 @@ def observation_record(value: Mapping[str, object]) -> Observation:
 
 def messages(value: object, key: str) -> tuple[Mapping[str, object], ...]:
     """A list of chat messages, each a JSON object, kept as written."""
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key}={value!r}: this field is a list of chat messages")
-    return tuple(section(message, key) for message in value)
+    return listed(value, key, section, "a list of chat messages")
 
 
 def action_record(value: Mapping[str, object]) -> Action:
