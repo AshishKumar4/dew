@@ -162,6 +162,7 @@ from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.observe import Observe
 from dew.training.optim import learning_rate, with_rate_scales
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
+from dew.training.profiling import ProfileWindow, owned_capture, start_capture, stop_capture
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, HeldBest, rankings
@@ -205,23 +206,6 @@ class Rollout(Protocol):
     """
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
-
-
-@dataclasses.dataclass(frozen=True)
-class ProfileWindow:
-    """A request for one profiler window per fit.
-
-    It traces `steps` steps into `directory` after `warmup` steps have run, so the
-    trace shows the loop and not the compile.
-
-    `dew.Profiler` is the other way to capture a trace, as a context manager
-    around any code; a fit refuses to schedule a window inside one. The loop
-    reports the window it wrote as the `ProfileWindow` record of
-    `dew.telemetry.records`.
-    """
-    directory: str
-    steps: int
-    warmup: int = 2
 
 
 def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
@@ -1443,7 +1427,7 @@ class Trainer(Generic[Loss, Effects]):
         # A display of this fit's own: one before it may have run other steps.
         self._display = TrainingDisplay()
         profile, checkpoints = self.profile, self.checkpoints
-        profiler = self._own_profile_window()
+        profiler = owned_capture(self.profile)
         # One boundary lookup at setup: the prefetch worker and the step scopes share whichever profiler
         # owns the capture.
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
@@ -1515,7 +1499,7 @@ class Trainer(Generic[Loss, Effects]):
             if (profiler is not None and profile is not None
                     and not run.tracing and run.traced == 0
                     and seen >= profile.warmup):
-                self._start_window(profiler)
+                start_capture(profiler)
                 run.tracing = True
             capturing = tracer is not None and tracer.running
             step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=run.current)
@@ -2056,63 +2040,18 @@ class Trainer(Generic[Loss, Effects]):
                 + "pass metrics to score it, preview=True with a tracker to sample from it, "
                 "or leave eval_every unset")
 
-    def _own_profile_window(self) -> Profiler | None:
-        """Take ownership of the capture a configured window will write.
-
-        A configured window must own the capture. When another profiler already holds it, refuse
-        before the dataset or the mesh do any work, so neither trace is silently dropped or cut short.
-        The window also resolves its optional dependency here, rather than after warmup steps have run.
-
-        Every rank either leaves owning a stopped Profiler or raises together; a rank that proceeded
-        alone would deadlock its peers at the first collective of training.
-        """
-        profile = self.profile
-        if profile is None:
-            return None
-
-        def own_window() -> Profiler:
-            if telemetry_profile.active_profile() is not None:
-                raise ValueError(
-                    "Trainer.profile cannot schedule a window while an explicit "
-                    "dew.Profiler capture is active; drop one or stop the outer "
-                    "profiler before fitting")
-            telemetry_profile.require_profile_support()
-            return telemetry_profile.Profiler(profile.directory)
-
-        return agreed("profiling window setup", own_window)
-
-    def _start_window(self, profiler: Profiler) -> None:
-        """Open the profiler's capture on every rank.
-
-        A peer that failed to start raises here. A capture this rank did
-        start is closed first, so no live trace outlives the aborted run.
-        """
-        capturing = False
-
-        def start() -> None:
-            nonlocal capturing
-            profiler.start()
-            capturing = True
-
-        try:
-            agreed("profiling window start", start)
-        except BaseException as primary:
-            if capturing:
-                try:
-                    profiler.stop()
-                except BaseException as failure:
-                    primary.add_note(f"Profiler stop failed: {failure!r}")
-            raise
-
     def _counted_batch(self, batch: Batch) -> Batch:
         """Prepare host counts before placement, never fetch a device batch to count it.
 
-        The count is the capability: from the first batch whose work the model or objective cannot
-        declare (`MissingFlopsCount`, as a media row's tower), this process counts no more, says why in
-        the debug log, and trains on. Its batches keep their work columns, as unknown work
-        (`uncounted`), so every process runs one step program and the step's global sum leaves
-        train/mfu unreported pool-wide. One thread prepares batches, the prefetch worker or a rollout's
-        caller, and only it writes the reason. A count asked of the objective directly stays strict.
+        The count is the capability: from the first batch whose work the
+        model or objective cannot declare (`MissingFlopsCount`, as a media
+        row's tower), this process counts no more, says why in the debug
+        log, and trains on. Its batches keep their work
+        columns, as unknown work (`uncounted`), so every process runs one
+        step program and the step's global sum leaves train/mfu unreported
+        pool-wide. One thread prepares batches, the prefetch worker or a
+        rollout's caller, and only it writes the reason. A count asked of the
+        objective directly stays strict.
         """
         if self._count_work and self._refusal is None:
             try:
@@ -2426,32 +2365,11 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def _stop_trace(self, run: _FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
-        """Stop the window's owned capture, then report it on process zero.
-
-        The core Profiler drains the backend and exports the native reports
-        on `stop`. The run's last loss is blocked on only to order the
-        primary's failure ahead of the profiler's own drain."""
-        loss, traced = run.loss, run.traced
-
-        def stop() -> None:
-            try:
-                if loss is not None:
-                    loss.block_until_ready()
-            finally:
-                primary = sys.exception()
-                try:
-                    profiler.stop()
-                except BaseException as failure:
-                    if primary is None:
-                        raise
-                    primary.add_note(f"Profiler stop failed: {failure!r}")
-
-        def announce() -> None:
-            self._display.note(f"Wrote profile for {traced} steps to {profile.directory}")
-
-        agreed("profile stop", stop)
-        self._report(ProfileWindowRecord(profile.directory, traced), run.current)
-        agreed("profile announcement", announce)
+        """Stop the window's owned capture (`stop_capture`), then report it on process zero."""
+        stop_capture(profiler, run.loss)
+        self._report(ProfileWindowRecord(profile.directory, run.traced), run.current)
+        agreed("profile announcement", lambda: self._display.note(
+            f"Wrote profile for {run.traced} steps to {profile.directory}"))
 
     def _throughput(self, elapsed: float, steps: int, samples: int, flops: StepFlops | None, *,
                     waited: float = 0.0, compiling: float = 0.0,
