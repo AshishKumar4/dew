@@ -158,6 +158,29 @@ def test_an_override_sets_a_presets_setting_and_the_chain_follows_it():
         override(written, "images.size", 3)
 
 
+def test_an_override_points_a_chain_at_another_store_through_its_holdout(tmp_path):
+    """A run's default chain read from another store: `source.url` sets the token store's URL, and
+    through a holdout's selection `source.path` sets the TFDS split's directory below it. A field
+    no store of the chain declares, or a value its annotation refuses, is refused."""
+    from dew.data import TFDS
+    from dew.data.sources.tokens import TokenFiles
+
+    store = TokenFiles(str(tmp_path / "a"))
+    windows = encode(store.shuffle(0).repeat().pipe(presets.token_windows, seq_len=8, batch=2))
+    assert not isinstance(windows, Unrecorded)
+    moved = decode(override(windows, "source.url", str(tmp_path / "b")))._chain().source
+    assert isinstance(moved, TokenFiles) and moved.url == str(tmp_path / "b")
+    trained, _ = TFDS("flowers", path=str(tmp_path / "tfds")).holdout(records=4)
+    pictures = encode(trained.shuffle(0).repeat().pipe(presets.images, 8, batch=2))
+    assert not isinstance(pictures, Unrecorded)
+    split = decode(override(pictures, "source.path", str(tmp_path / "elsewhere")))._chain().source
+    assert split.source.path == str(tmp_path / "elsewhere") and split.start == 4
+    with pytest.raises(ValueError):
+        override(pictures, "source.colour", "red")
+    with pytest.raises(ValueError):
+        override(windows, "source.url", 3)
+
+
 def test_a_call_whose_argument_changed_since_is_recorded_as_the_stages_it_made():
     """A rename by a mapping changed after the call: the call made again would rename otherwise, so
     the record writes the stages it made, which read back as they were."""
