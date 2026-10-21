@@ -530,19 +530,12 @@ def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path)
     """A decoder fine-tuned from a checkpoint encodes text with the processor the
     checkpoint ships; its run records that processor's source, so the reloaded task
     encodes as the trained one does rather than loading as weights that take ids."""
-    import shutil
-    from pathlib import Path
+    from model_support import tokenized_qwen3
 
     from dew.interop import Pretrained
     from dew.objectives.lm import LMObjective
 
-    fixtures = Path(__file__).parent / "fixtures" / "hf"
-    source = tmp_path / "source"
-    source.mkdir()
-    for name in ("config.json", "model.safetensors"):
-        shutil.copyfile(fixtures / "qwen3-tiny" / name, source / name)
-    for name in ("tokenizer.json", "tokenizer_config.json"):
-        shutil.copyfile(fixtures / "qwen38-dense-tiny" / name, source / name)
+    source = tokenized_qwen3(tmp_path / "source")
     loaded = Pretrained.load(source, dtype="float32", attention_impl="xla", max_seq_len=32)
     objective = LMObjective(loaded, 8)
     batch = {"text": np.random.RandomState(0).randint(1, 100, (8, 9)).astype(np.int32)}

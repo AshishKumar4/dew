@@ -122,3 +122,18 @@ def streamed_export(writer: str, argument: Path, directory: Path, shard_size: st
                          capture_output=True, text=True, env=env)
     assert run.returncode == 0, run.stderr[-2000:]
     return json.loads(run.stdout.splitlines()[-1])
+
+
+def tokenized_qwen3(directory: Path) -> Path:
+    """`directory`, made to hold the tiny Qwen3 checkpoint (fixtures/hf/qwen3-tiny) beside a
+    tokenizer it ships (fixtures/hf/qwen38-dense-tiny's): a decoder source whose processor is a
+    tokenizer, not bytes."""
+    import shutil
+
+    fixtures = Path(__file__).resolve().parent / "fixtures" / "hf"
+    directory.mkdir()
+    for name in ("config.json", "model.safetensors"):
+        shutil.copyfile(fixtures / "qwen3-tiny" / name, directory / name)
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copyfile(fixtures / "qwen38-dense-tiny" / name, directory / name)
+    return directory
