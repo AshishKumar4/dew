@@ -8,6 +8,7 @@ import http.server
 import itertools
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import grain.python as grain
@@ -131,9 +132,10 @@ def test_a_fetch_with_threads_of_its_own_fetches_that_many_at_once_in_order_and_
             first = [next(reader) for _ in range(3)]
             saved = reader.get_state()
             rest = [next(reader) for _ in range(5)]
-            dropped = rejected(reader)
         finally:
             reader.close()
+        # The loader's counts, which every read keeps (a memory read's as it reads its source).
+        dropped = rejected(data)
         assert not [thread for thread in threading.enumerate() if thread.name.startswith("dew-step")]
         resumed = data.train(DataPartition())
         try:
@@ -149,6 +151,60 @@ def test_a_fetch_with_threads_of_its_own_fetches_that_many_at_once_in_order_and_
         f"/{index}".encode() for index in kept[6:]]
     assert [[int(value) for value in batch["id"]] for batch in again] == [
         [int(value) for value in batch["id"]] for batch in rest]
+
+
+@pytest.mark.parametrize("threads", [1, 8], ids=["fewer read threads", "more read threads"])
+@pytest.mark.parametrize("read", ["indexed", "memory"])
+def test_a_cached_fetch_with_threads_of_its_own_fetches_that_many_at_once(tmp_path, read, threads):
+    """A fetch given four threads of its own before a cache, and another given two after it, each
+    fetches as many urls at once as it was given whatever the read's threads, and the run reads
+    what the uncached chain reads."""
+    lock, active, most = threading.Lock(), collections.Counter(), collections.Counter()
+
+    def handle(request):
+        side = request.path.strip("/").split("/")[0]
+        with lock:
+            active[side] += 1
+            most[side] = max(most[side], active[side])
+        time.sleep(0.2)
+        body = request.path.encode()
+        request.send_response(200)
+        request.send_header("Content-Length", str(len(body)))
+        request.end_headers()
+        request.wfile.write(body)
+        with lock:
+            active[side] -= 1
+
+    with serving(handle) as address:
+        catalog = Memory([{"url": f"http://{address}/before/{index}", "id": index} for index in range(12)])
+
+        def ids(cache):
+            fetched = Pipeline(catalog).filter_map(images.fetch(to="bytes", threads=4))
+            cached = fetched if cache is None else fetched.cache(cache)
+            again = cached.map(Again(address)).filter_map(images.fetch("again", to="later", threads=2))
+            loading = Loading(workers=0, threads=threads, read_buffer=threads)
+            reader = compile(again.repeat(1).batch(3), read=read, loading=loading).train(DataPartition())
+            try:
+                return [[(int(row), bytes(later))
+                         for row, later in zip(batch["id"], batch["later"], strict=True)] for batch in reader]
+            finally:
+                reader.close()
+
+        uncached = ids(None)
+        most.clear()
+        assert ids(str(tmp_path / "cache")) == uncached
+    assert most == {"before": 4, "after": 2}
+
+
+@dataclass(frozen=True)
+class Again:
+    """Gives a fetched record a second url, served after the cache."""
+
+    address: str
+    identity = "again@1"
+
+    def __call__(self, row):
+        return {**row, "again": f"http://{self.address}/after/{int(row['id'])}"}
 
 
 Parents = collections.namedtuple("Parents", ["first", "second"])
@@ -427,7 +483,7 @@ def web_table(root: Path) -> list[dict]:
 
 
 def rejected(stream) -> dict[str, float]:
-    """The reader's dropped records by reason, as a run logs them."""
+    """The dropped records of a reader or a loader by reason, as a run logs them."""
     return {key.rsplit("/", 1)[1]: count for key, count in stream.statistics().items()
             if key.startswith("data/rejected/") and count}
 
