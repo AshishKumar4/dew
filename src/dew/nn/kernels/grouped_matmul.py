@@ -88,11 +88,10 @@ Where the cost model ties, the first wins: the deeper step, which synchronizes i
 a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78, GMM-h100-2), and the
 more warps."""
 
-MOSAIC_TILES = tuple(
-    mosaic_gpu.Tiles(*shape, warpgroups=2, cluster=pair)
-    for *shape, pair in itertools.product((128,), (256, 128), (64,), (4, 3, 5), (8, 4, 2, 1), (2, 1))) + tuple(
-    mosaic_gpu.Tiles(*shape)
-    for shape in itertools.product((128, 192, 64), (128, 192, 64), (64,), (4, 5, 2), (8, 4, 2, 1)))
+_COOPERATIVE = itertools.product((128,), (256, 128), (64,), (4, 3, 5), (8, 4, 2, 1), (2, 1))
+_ALONE = itertools.product((128, 192, 64), (128, 192, 64), (64,), (4, 5, 2), (8, 4, 2, 1))
+MOSAIC_TILES = (tuple(mosaic_gpu.Tiles(*shape, warpgroups=2, cluster=pair) for *shape, pair in _COOPERATIVE)
+                + tuple(mosaic_gpu.Tiles(*shape) for shape in _ALONE))
 """Every tile the Mosaic GPU launches may take: tiles two consumer warpgroups compute, CUTLASS's
 cooperative sm90 schedule (128 x 256, a pair of multiprocessors sharing each matrix block), first, then
 the sweep JAX ships with its one-warpgroup kernels (`ragged_dot_mgpu.main`), where an H100's fastest
