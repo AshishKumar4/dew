@@ -390,6 +390,49 @@ def _expanded(rows: pygrain.IterDataset, stage: FlatMap, name: str, label: str) 
             else gx.FlatMapIterDataset(rows, _Rows(stage)))
 
 
+@dataclasses.dataclass
+class _Grouped:
+    """A loading worker's records and the markers of those its steps dropped, a batch's count at a
+    time (`_Build.handed`): the records stacked as a batch is, into shared memory once Grain asks
+    for it, where they hold the same fields, and the markers beside them."""
+
+    shared: bool = False
+
+    def enable_shared_memory_output(self) -> None:
+        self.shared = True
+
+    def __call__(self, elements: Sequence[Record]) -> Batch:
+        markers = [element for element in elements if isinstance(element, Rejected)]
+        rows = [element for element in elements if not isinstance(element, Rejected)]
+        records = [row for row in rows if isinstance(row, Mapping)]
+        alike = (bool(rows) and len(records) == len(rows)
+                 and all(row.keys() == records[0].keys() for row in records))
+        held = record_batch(records, shared=self.shared) if alike else rows
+        return {"held": held, "alike": alike, "rows": len(rows), "markers": markers}
+
+
+@dataclasses.dataclass(frozen=True)
+class _Ungrouped:
+    """A worker's group (`_Grouped`) as the markers and records it holds, for the reading process to
+    drop the markers and read the records."""
+
+    max_fan_out: int
+
+    def flat_map(self, group: Batch) -> Sequence[Record]:
+        markers = list(group["markers"])
+        held, count = group["held"], integer(group["rows"], "grouped rows")
+        if not group["alike"]:
+            return [*markers, *held]
+        columns: dict[str, np.ndarray | list] = {}
+        for name, column in record(held, "grouped records").items():
+            # A batch's column: an array, or a list of a field's values that don't stack.
+            if not isinstance(column, (np.ndarray, list)):
+                raise TypeError(f"a grouped column {name!r} is a {type(column).__name__}, not a batch column")
+            columns[name] = column
+        rows = ({name: column[index] for name, column in columns.items()} for index in range(count))
+        return [*markers, *rows]
+
+
 @dataclasses.dataclass(frozen=True)
 class _Groups:
     """A `map_batches` step over one group: its records, as Grain's flat map takes them."""
@@ -1313,11 +1356,13 @@ class _Build:
         """`rows`, read by this corpus's loading workers (`pool`), each handing on every row with
         a marker in place of each record its steps dropped, which the reading process drops here,
         counting each by its reason."""
-        pool = self.pool or 0
-        # Its rows are records, not batches: as many in flight for each worker as its batches were.
-        workers = Workers(pool, self.loading.worker_buffer * self.batch)
-        handed = self.stage(rows, workers, pipeline, partition, len(pipeline.stages))
-        return Accepted(_as_iter(handed, self.loading), _name(pipeline), _label(pipeline))
+        # A worker hands on its rows and markers a batch's count at a time, the rows stacked as a
+        # batch is where they hold the same fields, as many groups in flight as it had batches.
+        grouped = _as_iter(rows, self.loading).batch(self.batch, drop_remainder=False, batch_fn=_Grouped())
+        workers = Workers(self.pool or 0, self.loading.worker_buffer)
+        handed = self.stage(grouped, workers, pipeline, partition, len(pipeline.stages))
+        flat = gx.FlatMapIterDataset(_as_iter(handed, self.loading), _Ungrouped(self.batch))
+        return Accepted(flat, _name(pipeline), _label(pipeline))
 
     def record_stage(
         self, rows: Rows, stage: Map | RandomMap | MapWithIndex | Filter | FlatMap, pipeline: Pipeline,
