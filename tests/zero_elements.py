@@ -113,7 +113,7 @@ def _input(value) -> Bounded:
 
 
 MOVES = {"broadcast_in_dim", "reshape", "transpose", "squeeze", "expand_dims", "slice", "rev", "copy",
-         "copy_p", "concatenate", "pad", "dynamic_slice", "gather"}
+         "copy_p", "concatenate", "stack", "pad", "dynamic_slice", "gather"}
 """Primitives that only move or select elements, by operands the moved values do not decide: each
 element's bound, exactness and certification move with it."""
 CALLS = {"jit": "jaxpr", "pjit": "jaxpr", "closed_call": "call_jaxpr", "core_call": "call_jaxpr",
