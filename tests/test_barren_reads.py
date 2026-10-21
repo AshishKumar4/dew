@@ -181,8 +181,7 @@ def test_a_grain_filter_in_workers_reads_on():
     assert _ids(reader, 4) == [5] * 4
 
 
-@dataclass(frozen=True)
-class Renamed:
+class Renamed(grain.MapTransform):
     """A Grain map of the caller's that reads its record's id."""
 
     def map(self, row):
@@ -209,14 +208,13 @@ def test_a_grain_map_in_a_workers_read_reads_records_not_markers(before):
     assert set(_ids(reader, 16)) == kept
 
 
-@dataclass(frozen=True)
-class Parsed:
+class Parsed(grain.MapTransform):
     """A record from its JSON bytes, kept where its id is even."""
 
     identity = "parsed@1"
     rejects = True
 
-    def __call__(self, row):
+    def map(self, row):
         record = json.loads(row)
         return record if record["id"] % 2 == 0 else Rejected("odd")
 
@@ -276,5 +274,9 @@ def test_a_nested_mixture_reads_in_the_workers_it_writes():
     inner = mix([_kept("a"), _kept("b")]).workers(3)
     loading = Loading(workers=0, threads=1, read_buffer=1)
     data = compile(mix([inner, _kept("c")]).batch(1), read="indexed", loading=loading)
-    assert sorted(record(data.plan.record()["topology"], "topology")["pools"].values()) == [0, 1, 2]
-    assert set(_ids(data.train(DataPartition()), 8)) <= set(range(0, 12, 2))
+    reader = data.train(DataPartition())
+    # The position a run saves records the workers each corpus read in.
+    plan = record(json.loads(reader.get_state())["dew_data_plan"], "saved plan")
+    pools = record(record(plan["topology"], "topology")["pools"], "pools")
+    assert set(_ids(reader, 8)) <= set(range(0, 12, 2))
+    assert sorted(pools.values()) == [0, 1, 2]
