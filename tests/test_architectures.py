@@ -387,18 +387,6 @@ def widened_state(state):
                         else jnp.copy(leaf), state)
 
 
-def truth(case: Case, tmp_path, initial, steps=2):
-    """The case's `steps` steps on one device in float64, from `initial`
-    widened: the same rows, keys and draws, every float wider."""
-    trainer, encoder = make_trainer(case, tmp_path / f"truth-{steps}", 1, RecordingTracker(), 1)
-    source = batches(case, encoder)
-
-    data = Loader(train=lambda partition: (wide(case, batch) for batch in source()),
-                  val=lambda partition: (wide(case, batch) for batch in [next(source())]),
-                  batch=BATCH, records=None)
-    return trainer.fit(data, steps=steps, state=widened_state(initial))
-
-
 LAYOUT_SEEDS: dict[str, int] = {}
 """Each cell's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`; a cell not
 named takes DEFAULT_LAYOUT_SEEDS."""
@@ -477,9 +465,12 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         for fitted, stepped in zip((alone, *layouts), drawn.values(), strict=True):
             ours = stepped(*draw(0))
             for name, tree in ours.items():
-                for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(jax.device_get(
-                        getattr(fitted, name))), strict=True):
-                    np.testing.assert_array_equal(mine, theirs)
+                held = jax.device_get(getattr(fitted, name))
+                assert jax.tree.structure(tree) == jax.tree.structure(held), name
+                for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(held), strict=True):
+                    mine, theirs = np.asarray(mine), np.asarray(theirs)
+                    assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
+                    assert np.array_equal(mine.view(np.uint8), theirs.view(np.uint8)), name
         truth = drawn_steps(case, tmp_path, 1, 1, initial, steps, exact=True)
         for name in ("8x1 data", "2x4 fsdp"):
             assert_as_exact(drawn[name], drawn["one device"], draw, f"{case.name} {name}, {steps} step(s)",
