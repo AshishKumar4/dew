@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from functools import partial
 
 from dew import records
+from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     FUSED_EXPERTS,
@@ -23,14 +24,13 @@ from dew.interop.decoder_parts import (
     base_config,
     decoder_tensors,
     plain_partial_rope,
+    qkv_widths,
     record_float,
     record_int,
-    qkv_widths,
     refuse,
     renamed_name,
     renamed_path,
 )
-from dew.interop.config_records import native_fields
 from dew.interop.families.deepseek import deepseek_mixture
 from dew.interop.families.gemma import (
     GEMMA4_DEFAULTS,
@@ -43,7 +43,6 @@ from dew.interop.families.gemma import (
 from dew.interop.families.qwen import qwen2_config
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
-
 
 # The 7B tokenizer reserves <|mask|> here; LLaDA2's generate also defaults to it.
 _MOE_MASK_ID = 156895
@@ -250,7 +249,8 @@ def _moe_decoder(hf_config: Mapping[str, object], used: set[str], *,
                           reads=frozenset({'attention_bias'}))
     config.update(causal=False, partial_rotary_factor=None if factor == 1 else factor,
                   partial_rotary_type='default',
-                  mask_token_id=_mask_token({'mask_token_id': _MOE_MASK_ID, **hf_config}, used))
+                  mask_token_id=_mask_token({
+                      'mask_token_id': hf_config.get('mask_id', _MOE_MASK_ID), **hf_config}, used))
     return config
 
 
@@ -428,11 +428,8 @@ _LLADA2_PACKED = tuple(
 def _llada_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     """Return the variables-tree path for one LLaDA tensor name, every one of
     which the release nests under `model.transformer.`."""
-    if config.get('mixture') is not None:
-        return renamed_path(_LLADA_MOE_NAMES, name, config)
-    if not name.startswith('model.transformer.'):
-        raise ValueError(f'unknown tensor name {name!r}')
-    return renamed_path(_LLADA_NAMES, name, config)
+    return renamed_path(_LLADA_NAMES if name.startswith('model.transformer.') else _LLADA_MOE_NAMES,
+                         name, config)
 
 
 def _llada_export_path(name: str, config: Mapping[str, object]) -> str | tuple[str, ...] | None:

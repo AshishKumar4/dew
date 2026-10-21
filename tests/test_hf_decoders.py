@@ -847,7 +847,7 @@ def llada_moe_source(request):
     if name in ('llada2-tiny', 'llada21-tiny', 'llada22-tiny'):
         blocks = np.arange(ids.shape[-1]) // 4
         fields['attention_pairwise_mask'] = jnp.asarray(np.broadcast_to(
-            blocks[None, :] <= blocks[:, None], ids.shape[1:2] + (ids.shape[-1], ids.shape[-1])))
+            blocks[None, :] <= blocks[:, None], (ids.shape[1], ids.shape[-1], ids.shape[-1])))
     return name, source, ids, fields
 
 
@@ -871,7 +871,7 @@ def test_llada_moe_routing_limits_change_the_forward(llada_moe_source):
     """The expert bias, group limit and 2.2 block shortlist each bind on real hidden states."""
     from dataclasses import replace
 
-    name, source, ids, fields = llada_moe_source
+    _, source, ids, fields = llada_moe_source
     model, variables = source.model, source.variables
     mixture = model.mixture
     original = np.asarray(model.apply(variables, ids[0], **fields))
@@ -886,7 +886,7 @@ def test_llada_moe_routing_limits_change_the_forward(llada_moe_source):
         assert not np.array_equal(original, unlimited.apply(variables, ids[0], **fields))
     # Every fixture also distinguishes a causal decoder from the release's attention.
     causal = model.clone(causal=True)
-    assert not np.array_equal(original, causal.apply(variables, ids[0], **fields))
+    assert not np.array_equal(original, causal.apply(variables, ids[0]))
 
 
 @pytest.mark.parametrize('derived', [False, True], ids=['source-layout', 'native-layout'])
