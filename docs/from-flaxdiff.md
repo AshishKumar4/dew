@@ -43,6 +43,23 @@ images = pipe(["a lighthouse on a rocky coast"], key=0, steps=25, solver=Heun())
 
 Anything else, including the older UNets and the 2024 checkpoints, has no loader. Keep each of those runs together with the source revision, environment, data and encoder files that produced it.
 
+## FlaxDiff's named datasets
+
+FlaxDiff named its corpora in three maps (`datasetMap`, `onlineDatasetMap`, `mediaDatasetMap`). Dew keeps no names. Each kept corpus is a chain.
+
+| FlaxDiff name | Dew |
+|---|---|
+| `oxford_flowers102` | `TFDS("oxford_flowers102", split="all", version="2.1.1").pipe(presets.images, 256, batch=64, caption=images.caption(templates=FLOWER_TEMPLATES))` |
+| `voxceleb2` | `Files(f"{root}/train/**", format="files")`, then `presets.clips(16 / 25, frames=16, fps=25, size=256, sample_rate=16000, margin=3 / 25, context=3 / 25, missing="reject", rejects=False)` |
+
+`FLOWER_TEMPLATES` are FlaxDiff's five: "a photo of a {}", "a photo of a {} flower", "This is a photo of a {}", "This is a photo of a {} flower", "A photo of a {} flower".
+
+The other 16 names read buckets that no longer exist (`gs://msml612-diffusion-data`, `gs://flaxdiff-datasets-regional`, `gs://flaxdiff-datasets`). Copies of them read with these chains:
+
+- ArrayRecord corpora (`laion12m_coco`, `laion2b_aesthetic`, `diffusiondb`, `cc3m`, `cc12m`, `laiona_coco`, `aesthetic_coyo`): `Files("<dir>/*.array_record").filter_map(images.DecodeImage()).map(images.Resize(256))`.
+- Combined corpora (`combined_msml612`, `combined_aesthetic`, `laiona_coco_coyo`, `combined_30m`): `concat` of those stores, in FlaxDiff's order, a store listed twice read twice.
+- `combined_online`: `concat` of the `url` and `caption` catalogs with FlaxDiff's repeats, then `.shuffle(0).filter_map(images.fetch(timeout=15)).filter_map(images.DecodeImage()).filter(images.MinSide(128)).filter(images.MaxAspect(2.4)).filter(images.NotFlat()).map(images.Fit(256))`. A fetch is tried once.
+
 ## New runs
 
 A Dew run starts from a current configuration in a new output directory. A recipe writes `run.json` next to its checkpoints. The checkpoint state holds the live variables, the optimizer state, the EMA or reference tree when there is one, the step counters, and the random key. The parameter names and the state structure must match the model you rebuild. Renaming a checkpoint directory or changing the package you import does not convert what is inside it. [Checkpoints](guides/checkpoints.md) describes saving and restoring.
