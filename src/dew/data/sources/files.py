@@ -121,6 +121,19 @@ def _native_gcs(fs: GCSFileSystem) -> bool:
             and fs.requests_timeout is None and fs.timeout is None)
 
 
+def export_content(committed: Mapping[str, object]) -> Mapping[str, object]:
+    """A committed export's manifest without where its writer put each file: a writer names its
+    shards by a nonce of its own (`dew.data.sinks.export`), so two exports of the same rows hold the
+    same content under other names, which the manifest's order, sizes and hashes say alike."""
+    files = committed.get("files")
+    if not isinstance(files, list):
+        raise ValueError("export manifest files must be a list")
+    unplaced = [{name: ({key: fact for key, fact in value.items() if key != "path"}
+                        if isinstance(value, Mapping) else value)
+                 for name, value in entry.items() if name != "path"} for entry in files]
+    return {**committed, "files": unplaced}
+
+
 def _mount_root(paths: Sequence[str]) -> str:
     """The directory local `paths` share, a single file's own directory."""
     if not paths:
@@ -304,6 +317,9 @@ class Files(Dataset):
         # Local copies are named by their place under the files' common directory and their
         # content, so hosts that mounted one dataset at different paths name it alike.
         root = _mount_root([path for _, fs, path in resolved if local(fs)])
+        # A committed export's files are named by their place in its manifest, not the writer's names.
+        places = ({} if self.committed is None
+                  else {url: f"#{number}" for number, url in enumerate(self.paths)})
         for url, fs, path in resolved:
             if url in indexed and not self._present(url):
                 continue
@@ -329,7 +345,7 @@ class Files(Dataset):
                 version = fs.ukey(path)
             files.append(
                 (url, {
-                    "uri": posixpath.relpath(path, root) if local(fs) else url,
+                    "uri": places.get(url, posixpath.relpath(path, root)) if local(fs) else url,
                     "bytes": metadata["size"],
                     "version": version,
                 })
@@ -351,7 +367,7 @@ class Files(Dataset):
             "manifest": None
             if self.committed is None
             else hashlib.sha256(
-                json.dumps(self.committed, sort_keys=True, separators=(",", ":")).encode()
+                json.dumps(export_content(self.committed), sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest(),
             "transport": Store(self.paths[0], self.storage_options).describe() if self.paths else {},
         }
