@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 from tool_support import load
 
+LARGE, SMALL = "tests/fixtures/site/large.npz", "tests/fixtures/site/small.npz"
+
 
 @pytest.fixture
 def store(monkeypatch):
@@ -36,37 +38,46 @@ def _checkout(root: Path) -> Path:
     return root
 
 
-def _uploaded(store, root: Path) -> dict:
-    """The checkout's manifest with every pin given a revision, as `upload` leaves it."""
-    pins = store.manifest(root)
-    for pin in pins["fixtures"].values():
-        pin["revision"] = "a" * 40
-    (root / store.MANIFEST).write_text(json.dumps(pins))
-    return pins
+def _saved(store, root: Path, name: str = LARGE, size: int = 1 << 16) -> Path:
+    return store.save(name, _recorded(size), reference="a reference", license="MIT", root=root)
+
+
+def _uploaded(store, root: Path) -> None:
+    """Every pin given a revision, as `upload` leaves it."""
+    for name, pin in store.pins(root).items():
+        store._pinned(name, {**pin, "revision": "a" * 40}, root)
 
 
 def test_a_small_recording_is_committed_and_a_large_one_pinned_and_read_as_its_pin(store, tmp_path):
     root = _checkout(tmp_path)
-    small = store.save("tests/fixtures/small.npz", _recorded(256), reference="r", license="MIT", root=root)
-    assert small == root / "tests/fixtures/small.npz"
-    assert store.local("tests/fixtures/small.npz", root) == small
-    large = store.save("tests/fixtures/large.npz", _recorded(1 << 16), reference="r", license="MIT",
-                       root=root)
-    pin = store.manifest(root)["fixtures"]["tests/fixtures/large.npz"]
+    small = _saved(store, root, SMALL, 256)
+    assert small == root / SMALL
+    assert store.local(SMALL, root) == small
+    large = _saved(store, root)
+    pin = store.pins(root)[LARGE]
     assert large == root / store.LOCAL / f"{pin['sha256']}.npz"
     assert (pin["revision"], pin["bytes"]) == (None, large.stat().st_size)
-    assert not (root / "tests/fixtures/large.npz").exists()
-    with np.load(store.local("tests/fixtures/large.npz", root)) as read:
+    assert not (root / LARGE).exists()
+    with np.load(store.local(root / LARGE, root)) as read:
         np.testing.assert_array_equal(read["site.truth.y"], _recorded(1 << 16)["site.truth.y"])
+    # A file at a pinned fixture's place is not what the test reads: the pin's is.
+    (root / LARGE).write_bytes(small.read_bytes())
+    assert store.local(LARGE, root) == large
     large.write_bytes(_flipped(large.read_bytes()))
     with pytest.raises(AssertionError):
-        store.local("tests/fixtures/large.npz", root)
+        store.local(LARGE, root)
     large.unlink()
     with pytest.raises(FileNotFoundError):
-        store.local("tests/fixtures/large.npz", root)
+        store.local(LARGE, root)
     # Recorded again small, it is committed and its pin dropped.
-    store.save("tests/fixtures/large.npz", _recorded(256), reference="r", license="MIT", root=root)
-    assert store.manifest(root)["fixtures"] == {}
+    _saved(store, root, LARGE, 256)
+    assert store.pins(root) == {}
+    # A recording outside tests/fixtures/ is read where it is, and none is saved there.
+    elsewhere = tmp_path / "elsewhere.npz"
+    elsewhere.write_bytes(small.read_bytes())
+    assert store.local(elsewhere, root) == elsewhere
+    with pytest.raises(ValueError):
+        _saved(store, root, "tests/../outside.npz")
 
 
 def test_check_refuses_a_large_recording_in_git_and_a_pin_not_uploaded_or_not_whole(store, tmp_path):
@@ -76,24 +87,26 @@ def test_check_refuses_a_large_recording_in_git_and_a_pin_not_uploaded_or_not_wh
     subprocess.run(["git", "add", "-A"], cwd=root, check=True)
     [refused] = store.check(root)
     assert refused.startswith("tests/fixtures/recorded.npz")
-    subprocess.run(["git", "rm", "-q", "tests/fixtures/recorded.npz"], cwd=root, check=True)
-    store.save("tests/fixtures/recorded.npz", _recorded(1 << 16), reference="r", license="MIT", root=root)
+    subprocess.run(["git", "rm", "-q", "--cached", "tests/fixtures/recorded.npz"], cwd=root, check=True)
+    _saved(store, root)
     assert len(store.check(root)) == 1
-    pins = _uploaded(store, root)
+    _uploaded(store, root)
     assert store.check(root) == []
+    pin = store.pins(root)[LARGE]
     for broken in ({"license": ""}, {"revision": "main"}, {"path": "recordings/other.npz"}, {"bytes": 100}):
-        pin = {**pins["fixtures"]["tests/fixtures/recorded.npz"], **broken}
-        broken_pins = {**pins, "fixtures": {"tests/fixtures/recorded.npz": pin}}
-        (root / store.MANIFEST).write_text(json.dumps(broken_pins))
+        store._pinned(LARGE, {**pin, **broken}, root)
         assert len(store.check(root)) == 1
+    store._pinned(LARGE, pin, root)
+    (root / LARGE).write_bytes(b"tracked")
+    subprocess.run(["git", "add", LARGE], cwd=root, check=True)
+    assert len(store.check(root)) == 1
 
 
 def test_fetch_keeps_a_whole_file_and_takes_a_download_only_as_its_pin(store, tmp_path, monkeypatch):
     import huggingface_hub
 
     root = _checkout(tmp_path)
-    stored = store.save("tests/fixtures/large.npz", _recorded(1 << 16), reference="r", license="MIT",
-                        root=root)
+    stored = _saved(store, root)
     _uploaded(store, root)
     hub = tmp_path / "hub.npz"
     hub.write_bytes(stored.read_bytes())
@@ -113,32 +126,55 @@ def test_fetch_keeps_a_whole_file_and_takes_a_download_only_as_its_pin(store, tm
     assert not stored.exists()
 
 
-def test_upload_pins_a_revision_only_once_each_file_reads_back_as_its_pin(store, tmp_path, monkeypatch):
+def test_upload_pins_a_revision_only_once_each_file_reads_back_anonymously_as_its_pin(store, tmp_path,
+                                                                                    monkeypatch):
     import huggingface_hub
+    from huggingface_hub.errors import EntryNotFoundError
 
     root = _checkout(tmp_path)
-    stored = store.save("tests/fixtures/large.npz", _recorded(1 << 16), reference="r", license="MIT",
-                        root=root)
-    commits = []
+    stored = _saved(store, root)
+    commits, private = [], [False]
+    kept = {"0" * 64: {"fixture": "tests/fixtures/old.npz", "bytes": 5000, "reference": "an older one",
+                       "license": "MIT"}}
 
     class Hub:
         def create_repo(self, repo, **options):
-            assert options == {"repo_type": "dataset", "exist_ok": True}
+            assert options == {"repo_type": "dataset", "private": False, "exist_ok": True}
+
+        def repo_info(self, repo, **options):
+            return type("Info", (), {"private": private[0]})()
 
         def create_commit(self, repo, operations, **options):
             commits.append({operation.path_in_repo: operation for operation in operations})
             return type("Commit", (), {"oid": "b" * 40})()
 
     served = tmp_path / "served.npz"
+    catalog = tmp_path / "catalog.json"
+
+    def download(repo, path, **where):
+        if path == store.CATALOG:
+            if not catalog.exists():
+                raise EntryNotFoundError("no catalog")
+            return str(catalog)
+        assert where["token"] is False and where["revision"] == "b" * 40
+        return str(served)
+
     monkeypatch.setattr(huggingface_hub, "HfApi", Hub)
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda repo, path, **where: str(served))
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    private[0] = True
+    with pytest.raises(SystemExit):
+        store.upload(root)
+    private[0] = False
     served.write_bytes(b"not the file")
     with pytest.raises(AssertionError):
         store.upload(root)
-    assert store.manifest(root)["fixtures"]["tests/fixtures/large.npz"]["revision"] is None
+    assert store.pins(root)[LARGE]["revision"] is None
     served.write_bytes(stored.read_bytes())
+    catalog.write_text(json.dumps(kept))
     store.upload(root)
-    pin = store.manifest(root)["fixtures"]["tests/fixtures/large.npz"]
+    pin = store.pins(root)[LARGE]
     assert pin["revision"] == "b" * 40
-    assert set(commits[-1]) == {pin["path"], "README.md"}
+    assert set(commits[-1]) == {pin["path"], store.CATALOG, "README.md"}
+    # The catalog keeps every file the store has held, so the card names each one's source.
+    assert set(json.loads(commits[-1][store.CATALOG].path_or_fileobj)) == {"0" * 64, pin["sha256"]}
     assert store.check(root) == []
