@@ -450,6 +450,8 @@ def one_wave(timings: dict, pool: int) -> float:
               f"{saturated:.0f} s target", file=sys.stderr)
         return saturated
     fixed = sum(1 for entry in entries if entry["split"] == COLLECT or entry.get("untimed"))
+    if fixed == pool:
+        return saturated
     target = float(max(math.ceil(heaviest), math.ceil(sum(map(sum, totals)) / (pool - fixed)), 1))
     while target < saturated and len(plan(target, timings)) > pool:
         target = min(float(math.ceil(target * 1.1)), saturated)
