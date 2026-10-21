@@ -77,18 +77,21 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
 
 
 def kernel_cases(target: str) -> Iterator[KernelCase]:
-    """Each kernel pinned to the tiles `target` runs it with unmeasured (its launch's `PICKS`) for both
-    dtypes at each shape, and the reverse cumsum, for the compile test."""
+    """Each kernel pinned to the tiles `target` runs it with unmeasured (its launch's `PICKS`, the reverse
+    recurrence's `WIDE_KEYS_PICK` past `WIDEST` keys) for both dtypes at each shape, and the reverse
+    cumsum, for the compile test."""
     with generation.assumed(target):
         wide = chunked_launch._wide()
     for dtype in ("bfloat16", "float32"):
         launches = [*vars(fla_gdn).values(), *vars(recurrence).values()]
         for launch in (x for x in launches if isinstance(x, chunked_launch._Launch)):
-            kernel, tiles = launch.NAME, launch.PICKS[dtype, wide]
-            config = {field: value for field, value in dataclasses.asdict(tiles).items() if value}
             for shape_name, shape in COMPILED_SHAPES.items():
                 if shape["width"] > fla_gdn.WIDEST and dtype == "float32":
                     continue
+                kernel, tiles = launch.NAME, launch.PICKS[dtype, wide]
+                if shape["width"] > fla_gdn.WIDEST and isinstance(launch, fla_gdn.ChunkBwdDhu):
+                    tiles = launch.WIDE_KEYS_PICK
+                config = {field: value for field, value in dataclasses.asdict(tiles).items() if value}
                 flags = "-".join(f"{key}{value}" for key, value in sorted(config.items()))
                 for reverse in ((False, True) if kernel == "cumulated" else (False,)):
                     name = f"{target}/{kernel}/{dtype}/{flags}/{shape_name}" + "/reverse" * reverse

@@ -60,8 +60,10 @@ WIDEST = 128
 
 WIDEST_KEYS = 256
 """The widest 16-bit keys the port takes, fla's own bound (chunk_delta_h.py's four 64-wide blocks of
-the memory), at which its spaces are proven too; keys cannot split. fp32 keys take at most WIDEST: at
-256 an A100's fp32 forward h needs 172,292 shared bytes at its narrowest tile (CPU compile)."""
+the memory); keys cannot split. Its heuristics run there (`ChunkBwdDhu.WIDE_KEYS_PICK` the one
+narrower than the 128-wide pick); its spaces' larger configs may not fit a GPU's block, which the
+tuner drops. fp32 keys take at most WIDEST: at 256 an A100's fp32 forward h needs 172,292 shared
+bytes at its narrowest tile (CPU compile)."""
 
 
 def _pairs(rows, columns):
@@ -522,19 +524,23 @@ class ChunkBwdDhu(_Launch):
 
     NAME = "chunk_bwd_dhu"
     KEYS, VALUES = 'k', 'do'
-    SPACES = _spaces(_tiles([(0, 32), (0, 64)], (2, 4), (2, 3)), _tiles([(0, 32), (0, 64)], (2, 4), (1, 2)))
+    SPACES = _spaces(_tiles([(0, 32), (0, 64)], (2, 4), (1, 2, 3)),
+                     _tiles([(0, 32), (0, 64)], (2, 4), (1, 2)))
     # Measured at Qwen3.5-0.8B's shape (8 x 3072, 16 heads of 128, bf16), CUPTI, 2026-10-13: 0/64/4/3
     # 1.09 ms on an A100 and 0.315 on an H100, the fastest on both. One stage for fp32: three took
     # 254,984 bytes of an A100's 166,912 (c58); fla's blocks for 99 KB devices (chunk_delta_h.py:352-353).
     PICKS = _picks(Tiles(0, 64, 4, 3), small=Tiles(0, 64, 4, 1), wide_fp32=Tiles(0, 64, 4, 1),
                    small_fp32=Tiles(0, 32, 4, 1))
+    WIDE_KEYS_PICK = Tiles(0, 64, 4, 1)
+    """The heuristic past `WIDEST` keys, one of `SPACES`: the memory gradient is held a 64-key slice at a
+    time, so 256-wide keys stage twice 128-wide ones', and the pick's three stages took 271,368 shared
+    bytes of an A100's 166,912 and an H100's 232,448 in 16 bits (2026-10-21); one stage ran on both. The
+    tuner measures the whole space there, dropping a config a GPU's block cannot hold."""
 
-    def _tiles(self, ba, tiles: Tiles) -> Tiles:
-        """The picks' tiles for the call, one stage past `WIDEST` keys: the memory gradient is held a
-        64-key slice at a time, so 256-wide keys stage twice 128-wide ones', and three stages took
-        271,368 shared bytes of an A100's 166,912 and an H100's 232,448 in 16 bits."""
-        tiles = super()._tiles(ba, tiles)
-        return dataclasses.replace(tiles, stages=1) if ba.arguments['k'].shape[-1] > WIDEST else tiles
+    def _get_heuristics_config(self, ba) -> Tiles:
+        if ba.arguments['k'].shape[-1] > WIDEST:
+            return self._tiles(ba, self.WIDE_KEYS_PICK)
+        return super()._get_heuristics_config(ba)
 
     def _fwd(self, q: jax.Array, k: jax.Array, w: jax.Array, g: jax.Array, dht: jax.Array,
              do: jax.Array, dv: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, scale: float,

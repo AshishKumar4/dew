@@ -103,9 +103,10 @@ def _spaces(wide: frozenset[Tiles],
     on one of 99 KB: fla's own autotune lists for the kernel (chunk_delta_h.py:41-44, 350-353;
     chunk_o.py:35-37, 151-153, 339-341, 444-446; wy_fast.py:31-33, 111-113; cumsum.py:26-27;
     chunk_scaled_dot_kkt.py:24-27; chunk_intra.py:33-39; gla/chunk.py:335-344; chunk_bwd.py:331), the
-    blocks fla picks by heuristic tried at both of its sizes, each within the GPU's block at the
-    0.8B's, 9B's and 256-wide keys' shapes (every candidate compiled by Triton on a CPU for sm80,
-    sm89 and sm120, 2026-10-13); `narrow` where the 99 KB one differs."""
+    blocks fla picks by heuristic tried at both of its sizes; `narrow` where the 99 KB one differs. A
+    candidate that a call's shape puts past a GPU's block is the tuner's to drop where it measures
+    (`tuning`); the heuristics (`_picks`) are compiled by Triton on a CPU at the training shapes and
+    the widest keys (tests/test_kernel_configs.py)."""
     return {True: wide, False: wide if narrow is None else narrow}
 
 
