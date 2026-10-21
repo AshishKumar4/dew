@@ -344,13 +344,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def _multiprocessors(self, interpret: bool) -> int:
         # The interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret).
-        if interpret:
-            return 1
-        target = generation.gpu_target()
-        if target.multiprocessors is None:
-            raise ValueError(f"{target.generation} states no multiprocessors, which the persistent "
-                             "Mosaic GPU launches spread their tiles over")
-        return target.multiprocessors
+        return 1 if interpret else _multiprocessors(generation.gpu_target())
+
+    @staticmethod
+    def _in_flight(config: mosaic_gpu.Tiles, target) -> float:
+        """The row tiles a band of the planar snake keeps in flight at once on `target`."""
+        return max(1.0, _multiprocessors(_facts(target)) / config.grid_block_n)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -372,7 +371,7 @@ class MosaicGmm(_Mosaic):
         tiles, columns = _block_tiles(rows, groups, config.block_m), width // config.block_n
         # The rows are read once a band; a group's matrix once for the row tiles of it in flight.
         bands = math.ceil(columns / config.grid_block_n)
-        in_flight = max(1.0, _facts(target).multiprocessors / config.grid_block_n)
+        in_flight = self._in_flight(config, target)
         per_group = tiles / max(min(groups, rows), 1)
         matrices = _routed(rows, groups) * kernel.size * size * math.ceil(per_group / in_flight)
         moved = bands * rows * depth * size + matrices + rows * width * out
@@ -409,7 +408,7 @@ class MosaicTgmm(_Mosaic):
         # A group's rows are read once a band of column tiles, its cotangent once for the row tiles in
         # flight.
         bands = math.ceil(blocks[1] / config.grid_block_n)
-        in_flight = max(1.0, _facts(target).multiprocessors / config.grid_block_n)
+        in_flight = self._in_flight(config, target)
         moved = ((bands * rows * depth + math.ceil(blocks[0] / in_flight) * rows * width) * size
                  + groups * depth * width * out)
         steps = _block_tiles(rows, groups, config.block_k) / groups
@@ -425,6 +424,13 @@ class MosaicTgmm(_Mosaic):
 def _facts(target: generation.GpuTarget) -> generation.GpuTarget:
     """The target a launch on `target` is costed as (`cost._facts`): a CPU as an A100."""
     return target if generation.capability(target.generation) is not None else generation.TARGETS['sm80']
+
+
+def _multiprocessors(target: generation.GpuTarget) -> int:
+    """`target`'s multiprocessors, which the persistent Mosaic GPU launches spread their tiles over."""
+    if target.multiprocessors is None:
+        raise ValueError(f"{target.generation} states no multiprocessors, which the Mosaic GPU launches read")
+    return target.multiprocessors
 
 
 def _rated(target: generation.GpuTarget, dtype) -> bool:

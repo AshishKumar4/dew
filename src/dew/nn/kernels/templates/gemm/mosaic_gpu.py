@@ -158,7 +158,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
                     )(lhs_gmem, rhs_gmem.at[jnp.minimum(group_info.group_id, g - 1)])
                 return acc_ref[...]
 
-            acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
+            acc = pl.run_scoped(acc_scope, plgpu.WGMMAAccumulatorRef((block_m, block_n)))
 
             @functools.partial(pl.run_scoped, o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype))
             def store_scope(o_smem):
@@ -277,7 +277,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
 
                 return acc_ref[...]
 
-            acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
+            acc = pl.run_scoped(acc_scope, plgpu.WGMMAAccumulatorRef((block_m, block_n)))
 
             # Dew: the output in its own dtype, an fp32 gradient above all.
             @functools.partial(pl.run_scoped, o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype))
