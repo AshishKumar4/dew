@@ -304,6 +304,40 @@ def test_edm_preset_samples_on_the_karras_grid():
                         1 / jnp.sqrt(sigmas**2 + 0.7**2), rtol=1e-5)
 
 
+def test_a_dynamic_shift_keeps_its_ends_and_their_derivatives_and_a_static_file_maps_statically():
+    """A resolution's shift maps as Diffusers' `time_shift` does and keeps its ends: 0 and 1 map to
+    themselves, and its derivatives there are finite, shift at 0 to the bit, where the reciprocal form
+    would multiply zero by infinity. A scheduler file without dynamic shifting maps as the static
+    preset does, to the bit, and one with it as the resolution's preset does."""
+    from dew.diffusion.presets import Flow, ResolutionShift
+    from dew.diffusion.schedules.source import SourceSchedule
+
+    resolution = ResolutionShift(tokens=1024)
+    schedule = Flow(resolution_shift=resolution)().schedule
+    assert schedule.dynamic
+    ends = jnp.asarray([0.0, 1.0])
+    np.testing.assert_array_equal(schedule.rates(ends)[1], ends)
+
+    def sigma(t):
+        return schedule.rates(t)[1]
+
+    first = jax.vmap(jax.grad(sigma))(ends)
+    second = jax.vmap(jax.grad(jax.grad(sigma)))(ends)
+    assert np.all(np.isfinite(first)) and np.all(np.isfinite(second))
+    assert first[0] == np.float32(schedule.shift)
+    grid = jnp.linspace(0.0, 1.0, 101)
+    static = SourceSchedule.from_config({"_class_name": "FlowMatchEulerDiscreteScheduler",
+                                         "num_train_timesteps": 1000, "shift": 3.0,
+                                         "use_dynamic_shifting": False}).training_process().schedule
+    assert not static.dynamic
+    np.testing.assert_array_equal(static.rates(grid)[1], Flow(shift=3.0)().schedule.rates(grid)[1])
+    dynamic = SourceSchedule.from_config({"_class_name": "FlowMatchEulerDiscreteScheduler",
+                                          "num_train_timesteps": 1000, "use_dynamic_shifting": True,
+                                          "base_shift": 0.5, "max_shift": 1.15, "base_image_seq_len": 256,
+                                          "max_image_seq_len": 4096}).training_process(1024).schedule
+    np.testing.assert_array_equal(dynamic.rates(grid)[1], schedule.rates(grid)[1])
+
+
 def test_presets_rebuild_from_their_fields(rng):
     """Recorded flow fields control the rebuilt rates and training draws."""
     import dataclasses

@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, widened
+from reference_error import Inconclusive, assert_as_exact, widened
 from safetensors.numpy import load_file
 
 from dew.config.data import loader
@@ -183,9 +183,11 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     # A NaN in one gradient leaf fails the same comparison.
     leaves, structure = jax.tree.flatten(fewer_gradient)
     poisoned = jax.tree.unflatten(structure, [np.full_like(leaves[0], np.nan), *leaves[1:]])
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError) as poisoned_failure:
         assert_as_exact(lambda variables: (fewer, poisoned), grid, lambda seed: (variables,), "poisoned",
-                        seeds=1, truth_fn=stepped(wide, widened(batch)))
+                        seeds=SLOT_SEEDS, truth_fn=stepped(wide, widened(batch)))
+    # A failure of the comparison, not a draw too small to judge.
+    assert not isinstance(poisoned_failure.value, Inconclusive)
 
     def loss(held, rows):
         return objective.scalar_loss(held, rows, step)[0]

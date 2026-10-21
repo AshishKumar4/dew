@@ -268,6 +268,27 @@ def context_ablation(objective, params, ema, data, mask, rng):
     return error(context), error(jnp.roll(context, 1, axis=0))
 
 
+def test_a_video_objective_steps_on_an_explicit_data_axis(mask):
+    """Each row's masks are its example's own draws, placed as the row is: under an Explicit data axis
+    (`MeshSpec.explicit`) the video encoder repeats each row's token indices over its frames where
+    the row lives, and the step trains to a finite loss."""
+    objective = JepaObjective(
+        JepaVideoEncoder(patch_size=PATCH, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=2),
+        make_predictor(factorized=True), mask, sample=Field("video", (FRAMES, RES, RES, 3)))
+    rows = jax.device_count()
+
+    def batches():
+        while True:
+            yield {"video": np.asarray(videos(batch=rows), np.float32)}
+
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(explicit=("data",)))
+    tracker = trainer.tracker = RecordingTracker()
+    state = trainer.fit(dataset(batches, batch=rows), steps=1, log_every=1)
+    assert int(state.step) == 1
+    losses = [entry["train/loss"] for _, entry in tracker.scalars if "train/loss" in entry]
+    assert losses and all(np.isfinite(loss) for loss in losses)
+
+
 def test_training_makes_the_prediction_depend_on_the_context(mask):
     """The loss can be driven down by predicting the average target while
     ignoring the context entirely, which would teach the encoder nothing.
