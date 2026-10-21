@@ -32,6 +32,7 @@ from dew.registry import (
     Annotation,
     Configured,
     argument_records,
+    class_record,
     declared_type,
     from_record,
     import_path,
@@ -90,8 +91,10 @@ def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str,
     """`written` with one setting of one call of `pipe` set to `value`, parsed JSON and read against
     the setting's annotation. `path` is "<preset>.<setting>", the preset by its name where the
     chain's own stages call it once, by its entry's place among the record's stages ("2.seq_len"),
-    or "source" for the call that made its store. A call inside a mix or phases is not addressed
-    here. Reading the record back makes the call again, so the stages it makes follow it."""
+    or "source" for the call that made its store. Where no call made the store, "source.<field>"
+    sets that field of the store, or of the first store below its selections (a holdout's) that
+    has it (`_store_with`). A call inside a mix or phases is not addressed here. Reading the record
+    back makes the call again, so the stages it makes follow it."""
     version = written.get("version")
     if version != VERSION:
         raise ValueError(f"a chain's record of version {version!r}; this Dew overrides version {VERSION}")
@@ -100,6 +103,11 @@ def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str,
         raise ValueError(f"an override names a call and its setting, `<preset>.<setting>`, not {path!r}")
     changed = record(json.loads(json.dumps(written)), "chain")
     source = record(changed["source"], "chain source")
+    if target == "source" and "pipe" not in source:
+        moved = json_value({**changed, "source": _store_with(source, setting, value)}, "chain")
+        if not isinstance(moved, dict):
+            raise ValueError("a chain's record is a mapping")
+        return moved
     stages = _entries(changed.get("stages", []), "stages")
     calls = [(str(index), record(stage, "stage")) for index, stage in enumerate(stages)
              if isinstance(stage, Mapping) and "pipe" in stage]
@@ -133,6 +141,34 @@ def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str,
     if not isinstance(written_back, dict):
         raise ValueError("a chain's record is a mapping")
     return written_back
+
+
+def _store_with(store: Mapping[str, object], setting: str, value: JSON) -> Mapping[str, object]:
+    """`store`, a store's class record, with its field `setting` set to `value`, read against the
+    field's annotation; where its class has no such field, the store it selects from (its own
+    `source`, as a holdout's selection holds it) with it, and so on down."""
+    named = class_record(store)
+    if named is None:
+        raise ValueError(f"a chain's store is a class record, {{'class': ..., 'fields': {{...}}}}, "
+                         f"not {store!r}")
+    name, fields = named
+    kind = imported(name)
+    if not isinstance(kind, type) or not dataclasses.is_dataclass(kind):
+        raise ValueError(f"a chain's store names {name}, which is no store's class")
+    declared = [field.name for field in dataclasses.fields(kind) if field.init]
+    if setting in declared:
+        annotation = declared_type(kind, setting)
+        if annotation is not None:
+            # The typed walk refuses a record or a list it doesn't build; `_fits` checks a scalar.
+            from_record(_annotated(annotation), value)
+        if not _fits(value, annotation):
+            raise ValueError(f"{name}'s {setting} is {annotation}, not {value!r}")
+        return {"class": name, "fields": {**fields, setting: value}}
+    below = fields.get("source")
+    if "source" not in declared or not isinstance(below, Mapping):
+        raise ValueError(f"{name} has no setting {setting!r}, nor a store below it that has; it has "
+                         f"{declared}")
+    return {"class": name, "fields": {**fields, "source": _store_with(below, setting, value)}}
 
 
 def _fits(value: JSON, annotation: Annotation) -> bool:
