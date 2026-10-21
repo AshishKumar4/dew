@@ -637,8 +637,10 @@ def _cache_at(stages: Sequence[Stage]) -> int:
 def _one_to_one(stages: Sequence[Stage]) -> bool:
     """Whether a cache after `stages` holds one record for each of its inputs: none of them drops
     or expands records. Such a cache reads as the source's own rows do, by index and in one global
-    order (`dew.data.lowering._Cached`); one that drops or expands is read as a stream, per share."""
-    return not any(_drops(stage) or isinstance(stage, FlatMap) for stage in stages)
+    order (`dew.data.lowering._Single`); one that drops or expands is read as a stream, per share. A
+    step a run's facts haven't bound yet (`Configured`) may drop records once bound, so it counts as
+    one that does until it is bound."""
+    return not any(_drops(stage) or isinstance(stage, Configured) for stage in stages)
 
 
 def _order_at(stages: Sequence[Stage], read: Read) -> tuple[int, bool]:
@@ -740,7 +742,7 @@ class _Lowering:
     endless: bool
     one_to_one: bool
     """Whether the cache holds one record for each input (`_one_to_one`), so an indexed read reads
-    it by index, in the order the uncached stages would make (`dew.data.lowering._Cached`)."""
+    it by index, in the order the uncached stages would make (`dew.data.lowering._Single`)."""
 
     @property
     def split(self) -> bool:
