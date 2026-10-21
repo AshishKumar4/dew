@@ -114,9 +114,9 @@ SEEDS = {'output': 8, 'biased': 8, 'dense': 8, 'gradients': 128, 'parallel': 8, 
 
 def drawn(block, padded: bool = True, cotangent: bool = False):
     """Check 1's draw at `block`'s weights: a seed's hidden states and validity (`inputs`, all valid
-    unless `padded`), and with `cotangent` a readout of the valid rows, from the first of the seed's
-    candidates whose every valid query's selection the reference decides by more than MARGIN. The
-    candidates are inputs' seeds past 0, which the file's fixed cases read."""
+    unless `padded`), and with `cotangent` a readout of the valid rows drawn apart from them, from the
+    first of the seed's candidates whose every valid query's selection the reference decides by more
+    than MARGIN. The candidates are inputs' seeds past 0, which the file's fixed cases read."""
     def draw(seed):
         for attempt in range(64):
             index = 1 + 64 * seed + attempt
@@ -125,7 +125,8 @@ def drawn(block, padded: bool = True, cotangent: bool = False):
             if boundary_gap(block, torch.from_numpy(hidden), torch.from_numpy(valid)) > MARGIN:
                 if not cotangent:
                     return hidden, valid
-                readout = np.random.RandomState(index).randn(B, S, E).astype(np.float32) * valid[..., None]
+                readout = np.random.default_rng([0x5EAD, index]).standard_normal((B, S, E), np.float32)
+                readout = readout * valid[..., None]
                 return hidden, valid, readout
         raise AssertionError(f"no candidate of seed {seed} has its selection decided by {MARGIN}")
     return draw
@@ -282,14 +283,11 @@ def test_the_gradients_match_torch_autograd():
     hidden, valid, readout = draw(0)
     x = torch.from_numpy(hidden).requires_grad_(requires_grad=True)
     block(x, torch.from_numpy(valid))[0].mul(torch.from_numpy(readout)).sum().backward()
-    _, grads = jax.grad(lambda x, variables: jnp.sum(module().apply(variables, x, call(valid)) * readout),
-                        argnums=(0, 1))(jnp.asarray(hidden), variables)
-    ours = {'.'.join(str(key.key) for key in path): leaf
-            for path, leaf in jax.tree_util.tree_flatten_with_path(grads['params'])[0]}
-    for name, parameter in block.named_parameters():
-        if name.startswith('indexer.'):
-            assert parameter.grad is None, name
-            assert float(jnp.max(jnp.abs(ours[dew_leaf(name)[0]]))) == 0.0, name
+    indexer = [name for name, _ in block.named_parameters() if name.startswith('indexer.')]
+    assert indexer and all(dict(block.named_parameters())[name].grad is None for name in indexer)
+    for name, gradient in dew_gradients(variables, indexer)(hidden, valid, readout).items():
+        if name != 'x':
+            assert not np.any(gradient), name
 
 
 def decode_steps(block_module, variables, hidden, valid, prefill: int):
