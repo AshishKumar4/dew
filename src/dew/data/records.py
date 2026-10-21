@@ -232,15 +232,13 @@ def _invocation(entry: Piped, input: Pipeline, pipeline: Pipeline) -> dict[str, 
 
 def _makes(entry: Piped, made: Pipeline, pipeline: Pipeline) -> bool:
     """Whether `made`, `entry`'s call made again, is what it made in `pipeline`: the same stages from
-    the same store, or, where it made another store, an equal store that reads the same records."""
+    the same store, or, where it made another store, an equal one, its settings the same, so it is
+    compared without opening either."""
     if entry.input is None:
         return (made.source is pipeline.source and len(made.stages) == entry.end
                 and _same(made.stages[entry.start:], pipeline.stages[entry.start:entry.end], "call") is None)
-    again, had = made.source, pipeline.source
-    same_store = _same(again, had, "call", sequences=True) is None
-    if same_store and isinstance(again, Source) and isinstance(had, Source):
-        same_store = json_value(again.fingerprint(), "store") == json_value(had.fingerprint(), "store")
-    return (same_store and len(made.stages) == entry.end
+    return (_same(made.source, pipeline.source, "call", sequences=True) is None
+            and len(made.stages) == entry.end
             and _same(made.stages, pipeline.stages[:entry.end], "call") is None)
 
 
@@ -261,17 +259,15 @@ def _source(source: Source | Mixture | Phases) -> dict[str, JSON]:
 
 def _typed(value: object, annotation: Annotation, where: str, *, store: bool = False) -> JSON:
     """`value` as the registry writes it against `annotation`, refused where reading that back
-    through JSON builds anything but the same value (`_same`). A store is the same where it reads
-    the same records, its fingerprint the same, whichever sequence holds them."""
+    through JSON builds anything but the same value (`_same`): a store is the same where its
+    settings are, whichever sequence holds them, compared without opening it, since a run's record
+    is written where its data may not be."""
     try:
         written = to_record(value, annotation)
         rebuilt = from_record(_annotated(annotation), json.loads(json.dumps(written)))
     except (TypeError, ValueError, NameError) as refused:
         raise _Unrecordable(f"the {where} ({type(value).__name__}) can't be recorded: {refused}") from None
     difference = _same(value, rebuilt, where, sequences=store)
-    if difference is None and store and isinstance(value, Source) and isinstance(rebuilt, Source):
-        same = json_value(value.fingerprint(), where) == json_value(rebuilt.fingerprint(), where)
-        difference = None if same else f"{where} reads back other records"
     if difference is not None:
         raise _Unrecordable(f"the {where} ({type(value).__name__}) reads back otherwise: {difference}")
     return written
