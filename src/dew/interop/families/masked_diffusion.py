@@ -1,9 +1,8 @@
-"""Translate the bidirectional decoders: LLaDA, Dream and DiffusionGemma's text half.
+"""Translate the bidirectional LLaDA, Dream and DiffusionGemma decoders.
 
-Each is a causal family's block with the mask replaced: full attention in
-place of the causal mask, and a mask token the sampler denoises to. Dream
-rides the qwen2 layout and DiffusionGemma the Gemma 4 one, so only LLaDA's
-OLMo-style tensor names need a map of their own.
+LLaDA's dense and routed releases configure the shared GQA and expert
+modules. Dream rides Qwen2's layout and DiffusionGemma Gemma 4's; the
+adapters below own only their configuration and tensor spellings.
 """
 
 from __future__ import annotations
@@ -430,8 +429,7 @@ _LLADA2_PACKED = tuple(
 
 
 def _llada_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Return the variables-tree path for one LLaDA tensor name, every one of
-    which the release nests under `model.transformer.`."""
+    """Read dense LLaDA's OLMo envelope or the MoE release's decoder names."""
     return renamed_path(_LLADA_NAMES if name.startswith('model.transformer.') else _LLADA_MOE_NAMES,
                          name, config)
 
