@@ -32,7 +32,6 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Take the grouped convolution's backward off Qwix's private modules: its public provider API, or an upstream Qwix fix carried meanwhile. [783]
 - Let Llama 4's mixer take any KV cache, its context derived from the caller's, not rebuilt. [784]
 - Let latent attention (MLA and its sparse pooling), DeepSeek V4's compressed cache and a bidirectional canvas's encoder prefix take paged and quantized KV cache layouts. [830, 831, 838]
-- Place a loaded pretrained model's variables on JAX's default device, as jnp arrays are; keeping them on the host is an explicit request. [832]
 - Stream a pretrained start onto the trainer's mesh, one device shard at a time, with no whole copy on the host. [848]
 - Keep a merged FP8 base finite through training on H100's FP8 tensor cores. [841]
 - Settle whether a remat rung's step is bitwise its plain step on an sm86 GPU, or held by the float64 gate. [847]
@@ -209,4 +208,4 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Use JAX's own transfer guard on GPUs in place of the steady-state reimplementation, and guard CPU arrays' reads to numpy in JAX itself (jax-ml/jax#16602). [795, 801]
 - Drop the KV cache test's unconditional GPU xfail. [799]
 - Hold MeanFlow's fused attention away from zero initialization, the delta rule's document isolation without exclusions, and the Mamba-2 TPU mesh by its numbers. [789, 790]
-- Delete the step benchmark's re-export facade. [800]
+
