@@ -210,6 +210,39 @@ def test_create_uses_the_configured_defaults(fake):
     assert json.loads((config_dir() / "zones.json").read_text()) == {"slice": "us-central2-b"}
 
 
+def test_a_dry_run_writes_nothing_it_would_keep(fake):
+    """A dry run prints the commands and changes no file: a create with a data disk leaves the
+    zone cache and writes no startup script, and a setup writes no setup script."""
+    fake.offer("slice", "us-central2-b")
+    (config_dir() / "zones.json").write_text(json.dumps({"slice": "europe-west4-a"}))
+    before = {path: path.read_bytes() for path in config_dir().rglob("*") if path.is_file()}
+    assert run("create", "slice", "--dry-run", "--disk", "data") == 0
+    assert run("setup", "slice", "--dry-run", "--zone", "us-central2-b") == 0
+    assert {path: path.read_bytes() for path in config_dir().rglob("*") if path.is_file()} == before
+
+
+def test_ssh_config_refuses_a_block_without_its_end_marker_and_keeps_the_file(fake):
+    """The TPU's ~/.ssh/config block lies between its two markers. A file holding the start marker
+    without the end one is refused, and every entry in it is kept as it was; with the end marker
+    back, the block is replaced and the entries after it are kept. An end marker on the file's last
+    line, with no newline after it, closes the block too."""
+    fake.offer("slice", "us-central2-b")
+    config = Path(os.environ["HOME"]) / ".ssh" / "config"
+    config.parent.mkdir()
+    block = "# dew tpu slice\nHost slice\n    HostName 10.0.0.1\n"
+    other = "Host other\n    HostName 10.9.9.9\n"
+    config.write_text(block + other)
+    with pytest.raises(ValueError):
+        run("ssh-config", "slice")
+    assert config.read_text() == block + other
+    config.write_text(block + "# end dew tpu slice\n" + other)
+    assert run("ssh-config", "slice") == 0
+    assert other in config.read_text() and config.read_text().count("# dew tpu slice") == 1
+    config.write_text(other + block + "# end dew tpu slice")
+    assert run("ssh-config", "slice") == 0
+    assert config.read_text().startswith(other) and config.read_text().count("# dew tpu slice") == 1
+
+
 def test_delete_removes_the_queued_resource_that_holds_the_node(fake):
     fake.offer("slice", "us-central2-b", dict(
         NODE, queuedResource="projects/p/locations/us-central2-b/queuedResources/qr-slice"))
