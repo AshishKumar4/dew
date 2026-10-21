@@ -162,3 +162,18 @@ def test_the_lm_preset_tokenizes_a_field_of_another_name():
     passages = Memory([{"body": "abc " * 6}])
     rows = list(passages.pipe(presets.lm, "byte", seq_len=8, batch=1, field="body", pack=None))
     assert np.asarray(rows[0]["text"])[0].tolist()[:4] == text.ByteTokenizer().encode("abc ")
+
+
+def test_exported_tokens_read_back_as_a_token_store_and_pack(tmp_path):
+    """Documents exported as tokens by bytes, each ended by EOS: the store states the tokenizer and
+    its vocabulary, and packing it reads every next-token target of every document."""
+    rows = documents(6)
+    manifest = text.export_tokens(rows, str(tmp_path / "tokens"), "byte")
+    assert manifest["metadata"]["tokenizer"] == "byte"
+    store = TokenFiles(str(tmp_path / "tokens"))
+    assert (store.stated()["vocab_size"], store.stated()["eos_id"]) == (256, 255)
+    packed = list(store.pipe(presets.lm, None, seq_len=8, batch=1, bins=8))
+    segments = [np.asarray(row["text_coordinates"].segments)[0] for row in packed]
+    held = sum(int(np.count_nonzero((ids[:-1] == ids[1:]) & (ids[:-1] > 0))) for ids in segments)
+    lengths = [len(str(row["text"]).encode()) + 1 for row in rows]
+    assert held == sum(length - 1 for length in lengths)
