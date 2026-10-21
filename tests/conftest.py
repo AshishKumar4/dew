@@ -27,6 +27,10 @@ if os.environ.get("DEW_TEST_NO_CACHE"):
 else:
     _cache = default_compilation_cache_dir()
     if _cache:
+        # A worker that keeps bundles of the shared cache below writes a directory of its own, so the
+        # programs a bundle gains are that worker's whole writes, not another's half-written one.
+        if os.environ.get("PYTEST_XDIST_WORKER") and os.environ.get("DEW_XLA_CACHE_URL"):
+            _cache = os.path.join(_cache, os.environ["PYTEST_XDIST_WORKER"])
         enable_compilation_cache(_cache)
         # On armada, where each task's container starts cold, a cache the tasks share.
         _remote = remote_cache.install_from_environment()
