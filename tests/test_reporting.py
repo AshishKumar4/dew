@@ -283,6 +283,24 @@ def test_the_panel_names_a_lower_bound_utilization_and_its_uncounted_kernels_wit
     assert all(len(name) + 2 <= 24 for name in names)
 
 
+def test_a_metrics_label_names_it_in_evaluations_and_the_summary_too(capsys):
+    """A label (`Shown.label`) is the name everywhere the display shows the metric: an evaluation's
+    scores, its rows and the run's summary, whose trackers keep the metric's own name."""
+    from dew.objectives.base import Shown
+    from dew.training.display import TrainingDisplay
+    from dew.training.evaluation import Evaluation
+
+    display = TrainingDisplay(total=2, first=0, shown={"loss": Shown(better="lower", label="nll"),
+                                                       "accuracy": Shown(percent=True, label="top-1")})
+    evaluation = Evaluation(step=2, split="val", scores={"val/accuracy": 0.5}, coordinated_batches=1,
+                            records=4, event_key=(0,), elapsed_seconds=0.1, previews=())
+    display.evaluation(evaluation)
+    assert display.scores(evaluation).plain.startswith("top-1 ")
+    assert [row.name for _, row in display.evaluation_rows()] == ["top-1"]
+    display.summary(2, 1.0, {"goodput/step_fraction": 0.5}, loss=0.25)
+    assert "final nll" in capsys.readouterr().out
+
+
 def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counters():
     """A run's data counters (`data/...`) reach the panel as one line, not as a row each: each
     label's rows as its reader counted them, named only where there is more than one label, the
