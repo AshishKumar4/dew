@@ -200,6 +200,9 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
             outs = (acc,) if epilogue is None else _epilogue(
                 epilogue, acc, epilogue_gmems, epilogue_axes, group_info.block_start, ni * block_n,
                 block_m, block_n)
+            # Dew: the rows past the routed ones store zeros, whatever the epilogue makes of their empty sums.
+            routed = group_info.group_id < g
+            outs = tuple(jnp.where(routed, out, jnp.zeros_like(out)) for out in outs)
 
             for o_gmem, out in zip(o_gmems, outs, strict=True):
                 @functools.partial(pl.run_scoped, o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype))
