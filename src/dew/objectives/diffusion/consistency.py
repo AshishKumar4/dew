@@ -214,9 +214,9 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
     The loss is the mean over rows, while rCM's trainer backpropagates their
     sum. Under Adam the two take the same steps when the epsilon is rCM's
     divided by the batch size. The phases alternate from one update to the
-    next, so a trainer that accumulates more than one microbatch per update
-    is refused. Sampling runs the student's multistep consistency solver,
-    `Consistency`.
+    next, each read off the committed updates (`Step.updates`), so every
+    microbatch an update accumulates is of its phase. Sampling runs the
+    student's multistep consistency solver, `Consistency`.
 
     sCM's loss differentiates the student with respect to time. The
     recommended training default is `simple_dit(time_scale=0.002)`; other
@@ -265,18 +265,15 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         return jnp.where(iteration < self.tangent_warmup, iteration, self.tangent_warmup
                          + (iteration - self.tangent_warmup) // self.student_update_freq)
 
-    def optimizer(self, tx: optax.GradientTransformation, *,
-                  accumulation: int) -> optax.GradientTransformation:
+    def optimizer(self, tx: optax.GradientTransformation) -> optax.GradientTransformation:
         """Return an optimizer that gives the student and the fake score each their own copy of `tx`.
 
         Each copy steps only on its own network's updates, as rCM's two
-        optimizers do. With DMD2 on, an `accumulation` above one raises
-        `ValueError`.
+        optimizers do. The two alternate update by update, and every
+        microbatch an update accumulates is of its update's phase: the loss
+        reads the committed updates (`Step.updates`), the clock these masks
+        count, however many microbatches an update takes.
         """
-        if accumulation > 1 and self.dmd_weight > 0:
-            raise ValueError(
-                "rCM alternates its student and fake-score updates update by update, so an update "
-                "takes one microbatch: train with accumulation=1 and a larger batch")
 
         def network(params):
             return {name: FAKE_SCORE if name == FAKE_SCORE else "student" for name in params}
@@ -364,7 +361,7 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         count = samples.shape[0]
         given, blank = self._conditions(variables, batch, drop_key)
         draws = self._draws(step, count, samples.shape)
-        iteration = step.step
+        iteration = step.updates
         warm = iteration < self.tangent_warmup
         student_phase = self._student(iteration)
         effective = self._effective(iteration)

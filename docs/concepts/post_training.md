@@ -166,7 +166,7 @@ prompt = [
 | `split` | `train` | Split of a Hub dataset. |
 | `validation` | `None` | An explicit held-out Source, Pipeline, HoldOut or named Split. |
 | `seq_len` | `256` | Prediction length `L`. |
-| `long` | `truncate` | Truncate, drop or chunk an over-length conversation. |
+| `long` | `chunk` | Chunk an over-length conversation, every turn kept; `truncate` keeps its first window and `drop` rejects it. |
 
 The chat template is the rule for turning message boundaries, role headers and content into tokens, and each model is trained on its own format. Joining message strings by hand can change both the input and which tokens count toward the loss. `Chat` also preserves tool calls, tool responses and tool schemas.
 
@@ -358,7 +358,7 @@ A native row keeps its own `min_global_steps` and `max_global_steps`, and Dew wr
 
 Live, imported and journal-restored actions all go through the same validation: a nonempty context, nonnegative integer token ids (booleans excluded), aligned finite likelihoods, and a termination flag that agrees with the configured EOS. Tokens after EOS are refused. Checking the upper bound against the vocabulary is left to the caller, which knows the model.
 
-`tools/verl_interop_reference.py` writes the fixtures `tests/test_verl_interop.py` reads from verl revision `12ebe0cb4d300c58449fb6c675379e8700015c51`, run in an isolated environment: four rows of verl's `gsm8k_tool_agent_loop.py` parquet and two `AgentLoopOutput` dumps with their `as_dict()` tensors. One is a tool loop with routed experts. The other is a video turn whose `mm_processor_output` comes from `build_sglang_video_payload`. The test imports and re-exports verl's rows unchanged, and checks that packing matches verl's tensor mapping. `Prompts` reads the verl parquet's `reward_model.ground_truth`, keeps `tools_kwargs` inside `extra_info`, and reads and drops `ability` and `agent_name`. Dew does not import torch or verl at runtime.
+`tools/verl_interop_reference.py` writes the fixtures `tests/test_verl_interop.py` reads from verl revision `12ebe0cb4d300c58449fb6c675379e8700015c51`, run in an isolated environment: four rows of verl's `gsm8k_tool_agent_loop.py` parquet and two `AgentLoopOutput` dumps with their `as_dict()` tensors. One is a tool loop with routed experts. The other is a video turn whose `mm_processor_output` comes from `build_sglang_video_payload`. The test imports and re-exports verl's rows unchanged, and checks that packing matches verl's tensor mapping. `Prompts` reads the verl parquet's `reward_model.ground_truth`, keeps `tools_kwargs` inside `extra_info`, carries `ability` there too, beside them, for the reward, and reads and drops `agent_name`. Dew does not import torch or verl at runtime.
 
 ### Episode journal
 

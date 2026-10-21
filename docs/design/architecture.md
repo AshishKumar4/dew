@@ -2,7 +2,7 @@
 
 Design record, consolidated 2026-10-19. This page owns the cross-cutting code boundaries. [Training](training.md), [data](data.md) and [post-training](post-training.md) own their topic contracts; [testing](testing.md) owns behavioral qualification. The [roadmap](../roadmap.md) lists work still to complete or qualify.
 
-A model is a plain Flax module. An objective defines variables, loss and validation. The trainer runs the objective with an Optax optimizer and owns execution, placement, checkpoints and logging. Sources and transforms compose through Grain. Serving and external rollouts use the same model capabilities and session records as training.
+A model is a plain Flax module. An objective defines variables, loss and validation. The trainer runs the objective with an Optax optimizer and owns execution, placement, checkpoints and logging. Sources and transforms compose through Grain. Post-training composes Dew's own objectives, rollouts and session sources.
 
 ## One owner per fact
 
@@ -14,21 +14,22 @@ A model is a plain Flax module. An objective defines variables, loss and validat
 | Numerical acceptance | `tests/reference_error.py` | Every numerical consumer uses the [testing contract](testing.md#numerical-accuracy). No local tolerance policy. |
 | Model work and MFU | `src/dew/nn/flops.py` and `WorkloadWork`, `src/dew/telemetry/workload.py` | One analytic FLOP formula per operation. MFU uses real, unpadded work over wall time and the measured device's peak. |
 | Memory plan | `src/dew/training/memory.py` and `planning.py` | One search chooses a fitting micro-batch, rematerialization and head plan for the model and mesh. |
-| Compilation cache | `src/dew/cache.py` | Every entry point uses the same cache policy. A program's identity follows its computation and environment. |
+| Compilation cache | `src/dew/cache.py` | One cache dir and one autotune dir per (GPU model, jaxlib). A program's identity follows its computation and environment. |
 | Data execution | `src/dew/data/pipeline.py`, `analysis.py` and `lowering.py` | One `Dataset` chain, one analyzed plan, and the lowering that plan declares. |
 | Weight layout | `src/dew/interop/` | One reversible source-to-model binding plan serves loading and export. Family adapters describe a source's schema. |
-| Model capabilities | `src/dew/nn/protocols.py` | Objectives, tasks, serving and export ask for capabilities and call through Flax `apply`. They do not inspect model classes or private variable scopes. |
+| Model capabilities | `src/dew/nn/protocols.py` | Objectives, tasks, serving and export ask for capabilities and call through Flax `apply`. |
 | Training state and checkpoints | The training-state schema and `src/dew/checkpoints/` | Save and restore derive fields from the state. Casting and placement happen once. |
-| Run configuration | `RunConfig.record()`, `src/dew/config/__init__.py` | The resolved run configuration is its record. Resume and export read it rather than reconstructing a second configuration. |
+| Run configuration | `RunConfig.record()`, `src/dew/config/__init__.py` | A record pins every value its run built with. Resume and export read it rather than reconstructing a second configuration. |
 | Outcomes and telemetry | `src/dew/telemetry/records.py` | Trackers, display and reports consume the same outcome records. |
-| Environments and suite selection | Project extras and lock files; `tools/armada/ci.py` | Installers and CI read their package and test selections from these owners. |
+| Environments and suite selection | Project extras and lock files; `.armada.json` + `tools/armada/ci.py` | Installers and CI read their package and test selections from these owners. No other package list anywhere. |
+| Reinforcement-learning imports | `src/dew/rl` | `dew.rl` imports nothing from `dew.training`. Nothing under `src/dew` outside `src/dew/rl` and `src/dew/objectives/rl` may import `dew.rl`. A test walks the module tree and asserts it. |
 | Staged training | `Recipe` and `Stage`, `recipes/chain.py` | Stages compose existing data, objectives and rollouts. `Objective.model_variables` defines what passes to the next stage. |
 
 ## Interfaces stay shared
 
-Activations cross every layer-to-kernel boundary physically as `[batch, time, heads, head_dim]`. A kernel adapts its tiling to that interface. Its callers do not carry layout conversions for it. Other tensors keep their own meaning.
+Activations cross every layer-to-kernel boundary physically as `[batch, time, heads, head_dim]`. A kernel adapts its tiling to that interface. Its callers do not carry layout conversions for it. Physical layout checked in optimized HLO (no copies at the edge). Other tensors keep their own meaning.
 
-Coordinates carry validity, positions, document identity and cache extent. Layers use those facts directly. A contract argument is honored, is irrelevant by construction, or fails at the boundary that cannot represent it. It is never silently dropped. Kernel-route qualification follows every registered model, target, mode and cache layout.
+Coordinates carry validity, positions, document identity and cache extent. Layers use those facts directly. A layer or kernel that receives a contract argument (segments, masks, validity, positions, cache, mesh) either uses it, refuses by name when it is set, or is independent of it by construction (a position-wise MLP needs no segments; say so in one comment). Refuse only where the alternative is a silent wrong result at a trust boundary (user input, files, external APIs). It is never silently dropped. Kernel-route qualification follows every registered model, target, mode and cache layout.
 
 Layer identity survives fusion, scans and pipeline stages. The shared LM head owns logits, loss and scoring, including quantized and sharded forms. Guidance has one denoising interface; checkpoint restoration has one state schema. The guarantees exposed by these interfaces are described in [training's shared seams](training.md#9-the-shared-seams-as-a-user-sees-them).
 
@@ -36,9 +37,9 @@ A new family configures the shared attention, MLP, MoE, normalization, position 
 
 ## Keep and compose
 
-Start from the maintained implementation's public interface: JAX, Flax, Optax, Orbax, Grain, Tokamax or the system being integrated. Use it directly when it fits. A custom implementation needs a missing capability or a measured cost that the existing interface cannot remove.
+Start from the maintained implementation's public interface: JAX, Flax, Optax, Orbax, Grain, Tokamax or the system being integrated. Use it directly when it fits. A replacement needs a reason in the direction (not taste), and a parity list: every capability of the old code mapped to the new code or to a drop the user approved, checked before the old code is deleted.
 
-Before replacing code, map every capability of the old path to the new owner or an explicitly approved removal. A replacement is complete only when its callers move together. Before 1.0, the API changes directly, without aliases, migrations or parallel implementations.
+A replacement is complete only when its callers move together. Before 1.0, the API changes directly, without aliases, migrations or parallel implementations.
 
 Tests enumerate implementations from the registry that declares them. A new implementation joins the standing behavioral contracts in the same change. Its siblings are checked against the same contracts. Performance choices need same-session measurements at real shapes, including compilation cost, and [numerical qualification](testing.md#numerical-accuracy).
 

@@ -14,13 +14,16 @@ The plan prints a task matrix for each Python CI proves. Whole test files are
 packed heaviest first into the lightest of the tasks, each near `target`
 seconds, so a task imports only its own modules. A file heavier than that runs
 as groups of its tests (`groups`, tools/armada/split.py): runs of consecutive
-tests in node-id order, as many as it takes to hold each to `target` by their
-times in tests/test_durations.json, a heavier test alone, and each as light as
-that many runs let it be. A file weighs armada's
-median of its last green runs, else its tests' sum in
-tests/test_durations.json, else the mean. Each entry names its rows, one a
-file (or a file's group), so armada grades a task that leaves one out as not
-green, and armada queues the heaviest entries first.
+tests in node-id order, each as light as that many runs let it be, a heavier
+test alone. Each group also pays the file's setup (its module's fixtures,
+imports and compiles), which is what armada measured the file at beyond its
+tests' times in tests/test_durations.json, at the cut its rows were last timed
+at and shared among that cut's groups (`measured_cut`), so the file takes the
+fewest groups whose heaviest, setup included, holds to `target` (`split`). A file weighs armada's
+median of its last green runs, or its tests' sum in tests/test_durations.json where that is more
+(those runs may predate the file's current tests), else that sum scaled to armada, else the mean.
+Each entry names its rows, one a file (or a file's group), so armada grades a task that leaves
+one out as not green, and armada queues the heaviest entries first.
 
 A task runs its files under its Python's environment (tools/armada/install.sh)
 with CI's selection, and writes a verdict row for each. A row is red on a
@@ -297,16 +300,23 @@ def recorded_tests() -> dict[str, list[float]]:
 
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
     """Each file's seconds on armada under `python`: its median, which armada
-    sums over a split file's groups (`task`); else its tests' sum in
-    tests/test_durations.json, scaled by how much slower armada ran the files
-    measured both ways; else None, for a file nothing has timed."""
+    sums over a split file's groups (`task`), or its tests' sum in
+    tests/test_durations.json where that is more: each test's record is its
+    least time (`durations`), so a sum past the median may mean the measured
+    runs predate the file's current tests, and the sum is a floor on what it
+    takes. base/kernels' route census, 1,576 tests recorded at 2,654 s in a
+    file main ran in 6 s, was packed by that median with six other files into
+    one task, which ran past its deadline (train 18). Else the recorded sum, scaled by
+    how much slower armada ran the files measured both ways; else None, for a
+    file nothing has timed."""
     recorded = {name: sum(tests) for name, tests in recorded_tests().items()}
     measured = {name: timings.get("files", {})[row(python, name, "")] for name in files
                 if row(python, name, "") in timings.get("files", {})}
     ratios = sorted(measured[name] / recorded[name] for name in files
                     if name in measured and recorded.get(name, 0) > 1)
     slower = ratios[len(ratios) // 2] if ratios else 1.0
-    return {name: measured.get(name, recorded[name] * slower if name in recorded else None) for name in files}
+    return {name: max(measured[name], recorded.get(name, 0.0)) if name in measured
+            else recorded[name] * slower if name in recorded else None for name in files}
 
 
 def row(python: str, name: str, split: str) -> str:
@@ -351,16 +361,56 @@ def groups(seconds: list[float], count: int) -> list[range]:
     return [range(bounds[index], bounds[index + 1]) for index in range(count)]
 
 
-def split(tests: list[float], seconds: float, target: float) -> list[float]:
-    """The weights of the groups a file of `seconds` runs as: its recorded `tests`' times scaled to
-    `seconds`, cut (`groups`) into as many runs as it takes to hold each to `target`, a heavier test
-    alone. A file with no recorded time runs as equal counts of its tests."""
+def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> list[float]:
+    """The weights of the groups a file that took `seconds` as `cut` groups runs as. Of those
+    seconds, what its recorded `tests`' times leave is what each group paid besides its tests (its
+    module's fixtures, imports and compiles, which a test's least recorded time does not hold), so
+    each group weighs its tests plus that setup. The file is cut (`groups`) into the fewest runs
+    whose tests fit what the setup leaves of `target`, at least half of it, so a file whose setup
+    is most of a group is not cut into slivers that each pay it again; a heavier test runs alone.
+    Counting the setup once a group, rather than scaling every test by the file's total, keeps a
+    file from being cut finer each run for the setup its last cut added. A file keeps the cut it
+    ran as while that cut's heaviest group, setup included, stays within `KEPT` of `target`:
+    a group's compiled programs are cached under its cut (tests/remote_cache.py), so a new cut
+    compiles every group from nothing, and the setup that measures moves the next cut again
+    (armada dew-20261020144644-dceff433: a new cut fetched no programs, and 14 of its 20 split
+    files would have been cut again). A file with no recorded time runs as equal counts of its
+    tests."""
     if sum(tests) <= 0:
         count = math.ceil(seconds / target)
         return [seconds / count] * count
-    scale = seconds / sum(tests)
-    count = len(starts(milliseconds(tests), round(target / scale * 1000)))
-    return [sum(tests[run.start:run.stop]) * scale for run in groups(tests, count) if run]
+    setup = max(seconds - sum(tests), 0.0) / cut
+    if cut > 1 and max(sum(tests[run.start:run.stop]) for run in groups(tests, cut)) + setup <= KEPT * target:
+        count = cut
+    else:
+        room = max(target - setup, target / 2)
+        count = len(starts(milliseconds(tests), round(room * 1000)))
+    return [sum(tests[run.start:run.stop]) + setup for run in groups(tests, count) if run]
+
+
+KEPT = 1.5
+"""How far past the target a split file's heaviest group may run before the file is cut again."""
+
+
+def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | None:
+    """What `name` took under `python` at the cut its rows in `timings` name, and that cut's count:
+    its groups' rows summed where every group of a count has its row (the most groups if several
+    counts do), else its whole row, else None. A row's median is measured at the cut its name
+    holds, unlike the file's median, which mixes the cuts of the runs it remembers."""
+    whole, counts = None, {}
+    for row_name, seconds in timings.get("rows", {}).items():
+        python_, name_, split_ = parsed_row(row_name)
+        if (python_, name_) != (python, name) or split_ == COLLECT:
+            continue
+        if not split_:
+            whole = seconds
+            continue
+        index, count = (int(part) for part in split_.split("/"))
+        counts.setdefault(count, {})[index] = seconds
+    complete = [count for count, held in counts.items() if len(held) == count]
+    if complete:
+        return sum(counts[max(complete)].values()), max(complete)
+    return None if whole is None else (whole, 1)
 
 
 APART = re.compile(r"\bpytest\.mark\.torchax\b")
@@ -397,8 +447,10 @@ def plan(target: float, timings: dict) -> list[dict]:
             ([name], "", target) for name, seconds in timed.items() if seconds is None]
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
-                cut = split(recorded.get(name, []), seconds, target)
-                tasks += [([name], f"{group}/{len(cut)}", weight)
+                at, count = measured_cut(timings, python, name) or (seconds, 1)
+                cut = split(recorded.get(name, []), at, target, count)
+                # A file one group holds runs whole, alone, under its own row.
+                tasks += [([name], f"{group}/{len(cut)}" if len(cut) > 1 else "", weight)
                           for group, weight in enumerate(cut, start=1)]
         light = {name: seconds for name, seconds in timed.items()
                  if seconds is not None and seconds <= target}
@@ -716,7 +768,11 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     and files start heaviest first while what they hold with their children (`gpu_needs`) fits
     the share this process was given (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at
     most `processes` at once. A file that runs out of a measured share is red: it took more than
-    its last run, whose peak its next run is given."""
+    its last run, whose peak its next run is given. A file given the lane's whole share (unmeasured,
+    measured that large, or with a child the lane did not follow, as the fla reference's in another
+    environment's Python) grows its pool as it uses it rather than taking the share at its first GPU
+    op (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a child has what the file has not yet taken; a file
+    that grows to the whole share still leaves its child none."""
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
@@ -741,7 +797,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
             fits = next((name for name in waiting if holds[name] <= free), None)
             if fits is not None and len(running) < processes:
                 waiting.remove(fits)
-                environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total)}
+                environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
+                           **({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"} if shares[fits] >= budget else {})}
                 running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache, 60.0, common,
                                     environ)] = fits
                 continue

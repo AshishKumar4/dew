@@ -624,6 +624,8 @@ def fail_local_save(step: int) -> None:
 
 
 def mode_fit(args) -> dict:
+    import jax
+
     if args.fail_local_save is not None:
         fail_local_save(args.fail_local_save)
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size,
@@ -658,17 +660,28 @@ def mode_fit(args) -> dict:
         val = data.val
         assert val is not None
         available = sum(1 for _ in val(DataPartition.of(trainer.device_mesh)))
-    from dew.training import Best
+    from dew.training import Best, Observe
     counter = Batches()
+    # The variables, split over the processes by fsdp, which an observation gathers whole on each.
+    observe = None if args.observe_every is None else Observe(args.observe_every,
+                                                              lambda state: state.variables)
     state = trainer.fit(Loader(open_train, val=val, batch=BATCH, records=args.records),
                         steps=args.steps, log_every=1,
                         eval_every=args.steps if args.tokens else None,
                         checkpoint_every=args.save_every, metrics=(counter,) if args.tokens else (),
-                        best=Best(counter, mode='max') if args.tokens else None)
+                        best=Best(counter, mode='max') if args.tokens else None, observe=observe)
     dump_params(args.out.with_suffix(".npz"), state.variables)
+    if observe is not None:
+        # Each observation is already whole on this host: written as it is, gathered by nothing.
+        np.savez(args.out.with_suffix(".observed.npz"), **{
+            f"{step}{jax.tree_util.keystr(path)}": np.asarray(leaf) for step, variables in observe.values
+            for path, leaf in jax.tree_util.tree_flatten_with_path(variables)[0]})
     _, final_position = restored_state(trainer)
     return {
         "step": int(as_numpy(state.step)),
+        # A leaf whose shards are this process's and another's, not one replicated over both.
+        "split_between_processes": any(not leaf.is_fully_addressable and not leaf.is_fully_replicated
+                                       for leaf in jax.tree.leaves(state.variables)),
         "restored_step": restored_step,
         "restored_dataset_state": restored,
         "restored_from": None if restored_step is None else checkpoints.source(restored_step),
@@ -2415,6 +2428,7 @@ def parse_args(argv=None):
     parser.add_argument("--explicit", action="store_true",
                         help="spell validity out on every row instead of omitting it")
     parser.add_argument("--save-every", type=int)
+    parser.add_argument("--observe-every", type=int, help="fit observes its parameters every so many steps")
     parser.add_argument("--local-dir", help="every process's local checkpoint directory")
     parser.add_argument("--local-every", type=int)
     parser.add_argument("--records", type=int, default=BATCH * 16)

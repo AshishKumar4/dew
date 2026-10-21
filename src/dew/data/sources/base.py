@@ -12,15 +12,18 @@ find them: a step that needs a global fact reads it here or from config, and
 a streamed source without it is refused before the run opens. `describe` and
 `fingerprint` are its identity: the first is what a saved position names, the
 second what a cache's key and a run's plan record (the URI, the resolved
-revision, each file's size and ETag).
+revision, each file's size and ETag). `label` is the short name a person reads
+in a run's metrics, never its identity.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+
+from dew.records import JSON, json_value
 
 if TYPE_CHECKING:
     import grain.python as pygrain
@@ -35,6 +38,27 @@ records by index through an index the store holds, `streamed` reads shards in
 order with no index."""
 
 READS: tuple[Read, ...] = ("memory", "indexed", "streamed")
+
+TOKENIZER_CONTRACT = ("tokenizer", "vocab_size", "eos_id", "tokenizer_revision")
+"""The facts of a store of token ids that say what its ids mean, which every corpus a run reads
+together, and every store a concatenation joins, must state alike where they state them."""
+
+
+def tokenizer_contract(stated: Iterable[tuple[str, Mapping[str, object]]]) -> dict[str, JSON]:
+    """The tokenizer contract (`TOKENIZER_CONTRACT`) of stores read together, each `(name,
+    metadata)`: every fact any of them states, which every other that states it states alike.
+    Raises ValueError naming the store whose fact differs from the first's."""
+    declared: dict[str, JSON] = {}
+    for name, metadata in stated:
+        for key in TOKENIZER_CONTRACT:
+            if key not in metadata:
+                continue
+            value = json_value(metadata[key], key)
+            if key in declared and value != declared[key]:
+                raise ValueError(f"{name} has {key}={value!r}, expected {declared[key]!r}; stores read "
+                                 "together must share the tokenizer contract, whose ids they hold")
+            declared[key] = value
+    return declared
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,6 +115,10 @@ class Source(Protocol):
         """A stable description: store, URI, revision and split, never an address."""
         ...
 
+    def label(self) -> str:
+        """The store's short name in a run's metrics: its dataset, builder or file name."""
+        ...
+
     def fingerprint(self) -> Mapping[str, object]:
         """The store's identity for a cache key and a run's plan: the URI, the
         resolved revision, and each file's size and ETag or generation."""
@@ -117,6 +145,13 @@ class Source(Protocol):
         """Each record's length when the store states it (a producer's index),
         which length grouping ranks by; None when it does not."""
         ...
+
+
+def url_label(url: str) -> str:
+    """The name a store at `url` goes by: its last path part that is no pattern, without extensions
+    (`s3://corpus/forum/*.jsonl` is `forum`, `data/train.jsonl.gz` is `train`)."""
+    parts = [part for part in url.split("://", 1)[-1].split("/") if part and not set(part) & set("*?[{")]
+    return parts[-1].split(".", 1)[0] if parts else url
 
 
 @runtime_checkable

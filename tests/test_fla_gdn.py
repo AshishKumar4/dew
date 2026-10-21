@@ -529,17 +529,21 @@ def test_packed_documents_on_the_port_are_as_exact_as_flas_own_sequences(dtype):
 @pytest.mark.parametrize("per_key", [False, pytest.param(True, marks=pytest.mark.skipif(
     not INTERPRETED, reason="on a GPU Kimi delta attention's fp32 products are fla's TF32; its packed bar "
                             "is fla's own distance (test_fla_kda's packed case)"))])
-def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key):
+@pytest.mark.parametrize("begun", [False, True])
+def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key, begun):
     """Packed documents (`starts`, each a sequence of its own, fla's varlen), with a
     decay per head or per key dimension (Kimi's delta attention): each document from a zero memory but
     a row's first, from the row's, the row's final memory its last document's; output, final memory
     and gradients within fp32 rounding of the token recurrence run document by document in float64.
-    Documents start on and off the chunk grid, one shorter than a chunk and one longer."""
+    Documents start on and off the chunk grid, one shorter than a chunk and one longer. Where a row's
+    first token is `begun`, marked as a document's start, that row drops its memory, whose gradient
+    is zero."""
     batch, length, key_heads, value_heads, width = 2, 150, 1, 2, 64
     cuts = ((0, 37, 100), (0, 64))
     starts = np.zeros((batch, length), bool)
     for row, begins in enumerate(cuts):
         starts[row, list(begins[1:])] = True
+    starts[1, 0] = begun
     keys = jax.random.split(jax.random.key(19), 8)
     q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width)))
     k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width)))
@@ -554,7 +558,10 @@ def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key):
     port = through(packed, do, dht)(q, k, v, g, beta, h0)
     with jax.enable_x64(new_val=True):
         operands = widened((q, k, v, g, beta, h0, do, dht))
-        documents = functools.partial(recurrence, cuts=cuts)
+        def documents(*operands):
+            memory = jnp.where(jnp.asarray(starts[:, 0])[:, None, None, None], 0.0, operands[-1])
+            return recurrence(*operands[:-1], memory, cuts=cuts)
+
         truth = jax.tree.map(np.asarray, through(documents, *operands[6:])(*operands[:6]))
     names = ("out", "final", "q", "k", "v", "g", "beta", "h0")
     for name, mine, theirs in zip(names, port, truth, strict=True):
@@ -590,6 +597,45 @@ def test_inside_a_shard_map_that_checks_varying_axes_the_rule_runs_the_portable_
         want = run()
     for mine, theirs in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("kind", ["gated delta net", "Kimi delta attention"])
+def test_a_cached_continuation_whose_history_varies_in_a_checked_map_runs_the_portable_math(kind):
+    """A layer's cached continuation of more than one token inside a `shard_map` that checks varying
+    axes, its input and weights the same on every shard and its conv history each shard's own: the
+    convolved queries, keys and values vary though the projections do not, so the rule runs the
+    portable math there (`port_refusal`'s 'varying'), on the values rounded as the port would take
+    them; its outputs are bitwise those of the same continuation with the row naming XLA, rounded the
+    same way."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    from dew.nn.inputs import MixerCall
+    from dew.nn.kda import KimiDeltaAttention
+
+    layer = (GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
+             if kind == "gated delta net" else
+             KimiDeltaAttention(emb_features=64, num_heads=2, head_dim=64))
+    x = jax.random.normal(jax.random.key(29), (1, 72, 64))
+    variables = layer.init(jax.random.key(30), x)
+    step = MixerCall(decode=True)
+    allocated = layer.apply(variables, x[:, :1], step, mutable=["cache"])[1]
+    # Two shards' histories, each its own prefill.
+    caches = [layer.apply({**variables, **allocated}, x[:, start:start + 8] * scale, step,
+                          mutable=["cache"])[1] for start, scale in ((0, 1.0), (8, -0.5))]
+    held = jax.tree.map(lambda *each: jnp.concatenate(each), *caches)
+    rows = PartitionSpec("data")
+
+    def continued(cache):
+        return layer.apply({**variables, **cache}, x[:, 16:48], step, mutable=["cache"])[0]
+
+    mapped = jax.shard_map(continued, mesh=Mesh(np.asarray(jax.devices()[:2]), ("data",)), in_specs=(rows,),
+                           out_specs=rows, check_vma=True)
+    with row_names_port():
+        got = jax.jit(mapped)(held)
+    with row_names_port(port=False):
+        want = jax.jit(mapped)(held)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
 def row_names_port(*, port: bool = True):
@@ -880,3 +926,48 @@ def test_an_fp32_port_dot_names_its_products_whatever_the_global_precision():
         return jnp.dot(a, b, preferred_element_type=jnp.float32)
 
     assert _lowered_dot(unnamed, "default") != _lowered_dot(unnamed, "highest")
+
+
+@pytest.mark.parametrize("packed", [True, False], ids=["packed", "own rows"])
+@pytest.mark.parametrize("read", ["chunks", "spans", "both"])
+def test_a_timed_launch_draws_the_descriptors_it_reads(read, packed):
+    """The tuner times a launch on operands it draws (`_Launch.operands`): a launch that reads only
+    chunk descriptors, only sequence ones, or both, packed or over the rows' own spans, gets
+    descriptors of its own shapes, as a step's measurement (`tuning.tune(measure=True)`,
+    tools/kernel_picks.py) hands it some of them, and valid ones: sequences covering every token in
+    order, none crossing a row, each chunk at most 64 of one sequence's tokens; and the decay cumulated
+    over the drawn chunks bitwise each chunk's run as a row of its own."""
+    batch, length = 2, 150
+    cuts = jnp.asarray([0, 60, 150, 200, 260, 300], jnp.int32)
+    given = fla_gdn.sequences(batch, length, cuts if packed else None)
+    query = jax.ShapeDtypeStruct((batch, length, 2, 64), jnp.bfloat16)
+    descriptors = {"chunks": [given.chunks], "spans": [given.spans],
+                   "both": [given.chunks, given.spans]}[read]
+    specs = [query, *(jax.ShapeDtypeStruct(array.shape, array.dtype) for array in descriptors)]
+    drawn = fla_gdn.ChunkFwdH().operands(specs, 0)
+    assert [array.shape for array in drawn] == [spec.shape for spec in specs]
+    assert all(array.dtype == spec.dtype for array, spec in zip(drawn, specs, strict=True))
+    count = given.spans.shape[0]
+    chunks = len(given.chunks)
+    # The descriptors drawn whichever the launch reads: those it reads are these, of these shapes.
+    full = fla_gdn.ChunkFwdH().operands([query, jax.ShapeDtypeStruct((chunks, 4), jnp.int32),
+                                         jax.ShapeDtypeStruct((count, 5), jnp.int32)], 0)
+    for array in drawn[1:]:
+        np.testing.assert_array_equal(np.asarray(array), np.asarray(full[1 if array.shape[-1] == 4 else 2]))
+    spans, chunked = np.asarray(full[2]), np.asarray(full[1])
+    first, lengths = spans[:, 0], spans[:, 1]
+    np.testing.assert_array_equal(first, np.concatenate([[0], np.cumsum(lengths)[:-1]]))
+    assert lengths.sum() == batch * length and (lengths > 0).all()
+    assert (first // length == (first + lengths - 1) // length).all(), "a sequence crosses a row"
+    start, taken = chunked[:, 0], chunked[:, 1]
+    assert ((taken >= 0) & (taken <= 64)).all() and taken.sum() == batch * length
+    owner = np.searchsorted(first, start, side="right") - 1
+    real = taken > 0
+    assert (start[real] + taken[real] <= (first + lengths)[owner[real]]).all(), "a chunk crosses a sequence"
+    g = jax.random.normal(jax.random.key(0), (batch, length, 2))
+    described = fla_gdn.Sequences(jnp.asarray(chunked), jnp.asarray(spans))
+    found = np.asarray(fla_gdn.chunk_local_cumsum(g, spans=described, interpret=True)).reshape(-1, 2)
+    flat = g.reshape(1, batch * length, 2)
+    for begin, size in zip(start[real], taken[real], strict=True):
+        alone = fla_gdn.chunk_local_cumsum(flat[:, begin:begin + size], interpret=True)
+        np.testing.assert_array_equal(found[begin:begin + size], np.asarray(alone)[0], err_msg=f"at {begin}")
