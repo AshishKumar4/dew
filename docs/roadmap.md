@@ -49,8 +49,6 @@ The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case 
 
    Build on upstream Tokamax's public API, with no fork. A template replaces a kernel only when it matches or beats it on each target's numerical gate, step time and compile time. Until then the cut-down selector serves as the interim, and it is removed as the templates take over. Forward-mode AD is part of every template's acceptance, qualified through MeanFlow and consistency objectives. Follow the upstream issues while qualifying on public APIs: openxla/tokamax#1666 (serializing bound arguments, the autotuning data type and device-kind inference), #1667 (forward-mode differentiation through Ops), #1668 (registering third-party implementations, recording fallbacks and eligibility by device kind) and #1669 (exporting the Op classes, attention's Mask and residuals). [715, 716, 717]
 
-   Tuning's two private Tokamax imports, `dump_bound_args_to_json` and `AutotuningData`, move to `tokamax.autotuning` once a release carries openxla/tokamax#1676. [738]
-
    The templates' entry measurements, at main 5a761cb7b on A100 and H100: Tokamax attention against XLA, cuDNN, the flash wheel and Triton at 128- and 64-wide heads; packed documents; Mosaic GPU attention against FA3 on H100, where FA3 stays until the gap closes; ragged products; narrow heads on sm86, L4 and G4; and attention sinks.
 
    Linear-attention coverage: the whole of FLA's family (fla main 9d478facb2), each a recurrence or attention template hook, and an orchestrator over them where a family has its own structure:
@@ -205,6 +203,6 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Judge an image model's layout parity under a sequence split, where its gradients' sums over spatial positions reassociate (edm2's sequence-split cell). [827]
 - Use JAX's supported persistent cache in the remote-cache tests, with handling narrowed to transport errors. [794]
 - Use JAX's own transfer guard on GPUs in place of the steady-state reimplementation, and guard CPU arrays' reads to numpy in JAX itself (jax-ml/jax#16602). [795, 801]
-- Check every family, target row and mode in the kernel-route test, an unexplained route failing, and drop the KV cache's unconditional GPU xfail. [798, 799]
+- Drop the KV cache test's unconditional GPU xfail. [799]
 - Hold MeanFlow's fused attention away from zero initialization, the delta rule's document isolation without exclusions, and the Mamba-2 TPU mesh by its numbers. [789, 790]
 - Delete the step benchmark's re-export facade. [800]
