@@ -25,20 +25,20 @@ def tiny(**overrides):
                                 "tie_embeddings": False, "loop": Loop(3, exit_gate=True), **overrides})
 
 
-def tokens(rng, length=12):
-    return jax.random.randint(rng, (2, length), 0, VOCAB)
+def tokens(rng, length=12, rows=2):
+    return jax.random.randint(rng, (rows, length), 0, VOCAB)
 
 
 SEEDS = {'decode': 8, 'scanned': 8, 'checkpointed': 8, 'block decode': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
-def drawn(model):
-    """Check 1's draw for `model`: a seed's parameters and tokens."""
+def drawn(model, length=12, rows=2):
+    """Check 1's draw for `model`: a seed's parameters and `rows` rows of `length` tokens."""
     init = jax.jit(model.init)
 
     def draw(seed):
-        ids = tokens(jax.random.fold_in(jax.random.key(1), seed))
+        ids = tokens(jax.random.fold_in(jax.random.key(1), seed), length, rows)
         return init(jax.random.fold_in(jax.random.key(0), seed), ids), ids
     return draw
 
@@ -150,7 +150,8 @@ def test_checkpointed_passes_preserve_logits_and_gradients(backprop_steps, scan_
             return {'logits': logits, 'gradients': pull(logits)[0]}
         return jax.jit(run)
 
-    assert_as_exact(result(checkpointed), result(plain), drawn(plain),
+    # Eight rows of sixteen tokens: a norm's scale sums its gradient over enough of them to resolve.
+    assert_as_exact(result(checkpointed), result(plain), drawn(plain, 16, 8),
                     f'{scan_layers} {backprop_steps} checkpointed', seeds=SEEDS['checkpointed'],
                     truth_fn=result(plain.clone(dtype=jnp.float64)))
     gradients = result(checkpointed)(*drawn(plain)(0))['gradients']['params']
