@@ -39,7 +39,7 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
         (tmp_path / "tests" / f"{name}.py").write_text("")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {"tests/test_heavy.py::test_a": 150.0, "tests/test_heavy.py::test_b": 100.0,
-         "tests/test_light.py::test_c": 30.0, "tests/test_measured.py::test_d": 500.0,
+         "tests/test_light.py::test_c": 30.0, "tests/test_measured.py::test_d": 25.0,
          "tests/test_config.py::test_e": 20.0}))
     monkeypatch.setattr(ci, "NEWEST_FILES", ("tests/test_config.py", "tests/test_light.py"))
     entries = ci.plan(120.0, {"files": {"3.12:tests/test_measured.py": 40.0,
@@ -472,6 +472,25 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     assert files["sign.py"]["summary"]["percent_covered"] == 100.0
     least = (tmp_path / "runs/coverage.md").read_text().splitlines()[2].split(" | ")
     assert Path(least[0].removeprefix("| ")).name == "unused.py" and least[-1] == "0.0% |"
+
+
+def test_a_file_whose_recorded_tests_outweigh_its_median_runs_split_by_them(ci, tmp_path):
+    """Train 18's census: main's runs timed the file at 6 s with one test; a head recorded the 1,576
+    tests it added (here 40 of 30 s). Each record is a test's least time, so their sum past the median
+    says the file now holds tests those runs did not: it runs split by its records, alone, not packed
+    with the light files by the median it had before."""
+    for name in ("test_census", "test_light", "test_other"):
+        (tmp_path / "tests" / f"{name}.py").write_text("")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {**{f"tests/test_census.py::test_cell[{n}]": 30.0 for n in range(40)},
+         "tests/test_light.py::test_a": 20.0, "tests/test_other.py::test_b": 20.0}))
+    timings = {"files": {"3.12:tests/test_census.py": 6.0, "3.12:tests/test_light.py": 20.0,
+                         "3.12:tests/test_other.py": 20.0},
+               "rows": {"3.12:tests/test_census.py": 6.0}}
+    floor = sorted((entry["tests"], entry["split"], entry["weight"]) for entry in ci.plan(240.0, timings)
+                   if entry["python"] == "3.12")
+    assert floor == [*((("tests/test_census.py", f"{group}/5", 240.0)) for group in range(1, 6)),
+                     ("tests/test_light.py tests/test_other.py", "", 40.0)]
 
 
 def test_a_split_file_pays_its_setup_once_a_group_and_is_not_cut_finer_for_it(ci):
