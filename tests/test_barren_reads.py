@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pytest
+from reader_support import assert_resumes_where_it_stopped
 
 from dew.data import Loading, Memory, Rejected, mix
 from dew.data.compile import compile
@@ -80,11 +81,13 @@ class Untouched:
         return row
 
 
-def test_a_repeated_read_by_workers_reads_each_kept_input_once_a_pass():
-    """Two passes over twelve inputs by three loading workers, a filter keeping the even ones:
-    each kept input is read once a pass, and nothing else."""
+@pytest.mark.parametrize("cached", [False, True], ids=["uncached", "cached"])
+def test_a_repeated_read_by_workers_reads_each_kept_input_once_a_pass(tmp_path, cached):
+    """Two passes over twelve inputs by three loading workers, a filter keeping the even ones, read
+    as it is or through a cache of what it keeps: each kept input is read once a pass, and nothing
+    else."""
     evens = Pipeline(Memory([{"id": index} for index in range(12)])).filter_map(KeepsEven())
-    chain = evens.repeat(2).batch(1)
+    chain = (evens.cache(str(tmp_path / "cache")) if cached else evens).repeat(2).batch(1)
     reader = compile(chain, read="indexed", loading=WORKERS).train(DataPartition())
     try:
         ids = sorted(int(value) for batch in reader for value in np.asarray(batch["id"]))
@@ -108,19 +111,67 @@ def test_a_mixture_of_corpora_each_kept_in_one_workers_inputs_reads_on(read):
 
 
 def test_a_workers_read_of_a_dropping_corpus_resumes_where_it_stopped():
-    """A read by three loading workers of a corpus whose filter drops records, saved after its
-    workers' first passes, resumes on the records the uninterrupted read reads next."""
+    """A read by three loading workers of a corpus whose filter drops records, in batches of three
+    that span what the workers hand on, saved mid-way, resumes on the records the uninterrupted read
+    reads next."""
     evens = Pipeline(Memory([{"id": index} for index in range(12)])).filter_map(KeepsEven())
-    chain = evens.repeat().batch(1)
-    data = compile(chain, read="indexed", loading=WORKERS)
-    expected = _ids(data.train(DataPartition()), 16)
-    stopped = data.train(DataPartition())
-    try:
-        for _ in range(10):
-            next(stopped)
-        saved = stopped.get_state()
-    finally:
-        stopped.close()
-    resumed = data.train(DataPartition())
-    resumed.set_state(saved)
-    assert _ids(resumed, 6) == expected[10:]
+    data = compile(evens.repeat().batch(3), read="indexed", loading=WORKERS)
+    assert_resumes_where_it_stopped(lambda: data.train(DataPartition()), _batches, 5, 6)
+
+
+def _batches(reader, count: int) -> list[list[int]]:
+    return [np.asarray(next(reader)["id"]).tolist() for _ in range(count)]
+
+
+@dataclass(frozen=True)
+class Twice:
+    """Each record twice, the second marked, one kept for each input."""
+
+    identity = "twice@1"
+    max_fan_out = 2
+
+    def flat_map(self, row):
+        return [row, {**row, "id": int(row["id"]) + 100}]
+
+
+def test_a_worker_with_no_inputs_ends_and_the_others_read_on_and_resume():
+    """Two inputs read by three loading workers, each expanded to two records of which a filter keeps
+    the even ones, repeated after: the worker with no input ends its pass at once, the others read
+    on, and a position saved mid-way resumes on what the uninterrupted read reads next."""
+    rows = Pipeline(Memory([{"id": 0}, {"id": 1}])).flat_map(Twice()).filter_map(KeepsEven())
+    data = compile(rows.repeat().batch(2), read="indexed", loading=WORKERS)
+    expected = assert_resumes_where_it_stopped(lambda: data.train(DataPartition()), _batches, 3, 4)[0]
+    assert {value for batch in expected for value in batch} == {0, 100}
+
+
+def test_a_written_workers_split_reads_on_whatever_the_loadings_workers():
+    """Workers written into the chain, after a filter keeping one of twelve inputs, with the
+    loading's own workers none: the read goes on, in a corpus of a mixture as on its own."""
+    def kept(name):
+        return Pipeline(Memory([{"id": index} for index in range(12)]), name=name).filter_map(KeepsOne(5))
+
+    alone = kept("alone").repeat().workers(3).batch(1)
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    assert _ids(compile(alone, read="indexed", loading=loading).train(DataPartition()), 4) == [5] * 4
+    mixed = mix([kept("written").repeat().workers(3), Pipeline(Memory([{"id": 7}]), name="other").repeat()])
+    reader = compile(mixed.batch(1), read="indexed", loading=loading).train(DataPartition())
+    assert set(_ids(reader, 8)) == {5, 7}
+
+
+@dataclass(frozen=True)
+class OnlyFive:
+    def __call__(self, row):
+        return int(row["id"]) == 5
+
+
+def _grain_filter(rows):
+    return rows.filter(OnlyFive())
+
+
+def test_a_grain_filter_in_workers_reads_on():
+    """A Grain step of the caller's that keeps one of twelve indexed inputs, read by three loading
+    workers: what it drops goes on as markers, so the read goes on."""
+    rows = Pipeline(Memory([{"id": index} for index in range(12)]))
+    chain = rows.grain(_grain_filter, identity="only-five@1")
+    reader = compile(chain.batch(1), read="indexed", loading=WORKERS).train(DataPartition())
+    assert _ids(reader, 4) == [5] * 4
