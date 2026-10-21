@@ -260,9 +260,12 @@ class RAE(nn.Module):
         self.decoder = _Decoder(self.decoder_width, self.decoder_layers, self.decoder_heads,
                                 self.decoder_intermediate, self.grid, self.patch, dtype=self.dtype)
 
-    def encode(self, images, key=None):
-        """The encoder's tokens; an RAE is deterministic, so `key` is unread."""
+    def encode(self, images, key=None, noise=None):
+        """The encoder's tokens. An RAE is deterministic: `key` is unread, and a posterior's `noise`
+        raises TypeError, since it has none to draw."""
         del key
+        if noise is not None:
+            raise TypeError(f"{type(self).__name__} encodes deterministically and draws no posterior noise")
         pixels = (images + 1) / 2
         if pixels.shape[1:3] != (self.input_size, self.input_size):
             pixels = torch_bicubic_resize(pixels, self.input_size, self.input_size)
@@ -420,6 +423,10 @@ class RAEAutoencoder(ModuleAutoEncoder[RAE]):
 
     record_name = 'rae'
     record_module = RAE
+
+    @property
+    def stochastic(self) -> bool:
+        return False
 
     def __init__(self, *, model: RAE, params: Variables, latents_mean=None, latents_std=None,
                  scaling_factor: float = 1.0):

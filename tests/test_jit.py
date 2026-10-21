@@ -38,15 +38,17 @@ def test_the_loss_is_the_references_velocity_error():
                                    solver=Euler(), steps=2, ema_decay=None)
     params = objective.init(jax.random.PRNGKey(0))
     batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (6, 4, 4, 3), 0, 256), np.uint8)}
-    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
-    loss, _ = objective.scalar_loss(params, batch, step)
-
-    _, _, time_key, noise_key, _ = jax.random.split(step.key, 5)
+    time_key, noise_key = jax.random.split(jax.random.PRNGKey(2))
     x = np.asarray(unit_range(batch["image"]), np.float64)
     t = process.schedule.sample_t(time_key, 6)
+    noise = jax.random.normal(noise_key, x.shape)
+    # The step reads these times and this noise (`Step.tape`).
+    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None, tape={"times": t, "noise": noise})
+    loss, _ = objective.scalar_loss(params, batch, step)
+
     sigma = np.asarray(t, np.float64)[:, None, None, None]
     time = np.asarray(process.schedule.model_time(t), np.float64)[:, None, None, None]
-    e = np.asarray(jax.random.normal(noise_key, x.shape), np.float64)
+    e = np.asarray(noise, np.float64)
     clean_time = 1 - sigma
     z = clean_time * x + (1 - clean_time) * e
     v = (x - z) / np.maximum(1 - clean_time, 0.05)

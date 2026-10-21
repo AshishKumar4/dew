@@ -37,7 +37,7 @@ from .attention_kernels import (
     decodes,
 )
 from .attention_sinks import sink_softmax
-from .decode_geometry import folded_attention, folds, grouped_query
+from .decode_geometry import folded_attention, folds
 from .documents import (
     CrossDocuments,
     aligned_places,
@@ -1481,7 +1481,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         # The key heads repeated as each shard would hold them (`_per_shard`), so the tensor axes
         # split the groups as they split the query heads.
         key, value = split_with_queries(key, value, tensor_shards(query))
-        return grouped_query(functools.partial(
+        return decode_attention.grouped_query(functools.partial(
             attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
             implementation=implementation, softcap=softcap, key_value_seq_lengths=key_value_seq_lengths,
             key_value_seq_starts=key_value_seq_starts),

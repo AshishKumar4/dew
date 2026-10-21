@@ -87,14 +87,14 @@ class TunedAutoEncoder(AutoEncoder):
     def __hash__(self) -> int:
         return hash((TunedAutoEncoder, id(self.autoencoder)))
 
-    def encode_batch(self, params, x, key=None):
-        return self.autoencoder.encode_batch(params[TUNED_WEIGHTS], x, key=key)
+    def encode_batch(self, params, x, key=None, noise=None):
+        return self.autoencoder.encode_batch(params[TUNED_WEIGHTS], x, key=key, noise=noise)
 
     def decode_batch(self, params, z):
         return self.autoencoder.decode_batch(params[TUNED_WEIGHTS], z)
 
-    def encode_video(self, params, x, key=None):
-        return self.autoencoder.encode_video(params[TUNED_WEIGHTS], x, key)
+    def encode_video(self, params, x, key=None, noise=None):
+        return self.autoencoder.encode_video(params[TUNED_WEIGHTS], x, key, noise)
 
     def decode_video(self, params, z):
         return self.autoencoder.decode_video(params[TUNED_WEIGHTS], z)
@@ -102,6 +102,10 @@ class TunedAutoEncoder(AutoEncoder):
     @property
     def downscale_factor(self) -> int:
         return self.autoencoder.downscale_factor
+
+    @property
+    def stochastic(self) -> bool:
+        return self.autoencoder.stochastic
 
     @property
     def latent_channels(self) -> int:
@@ -115,8 +119,9 @@ class TunedAutoEncoder(AutoEncoder):
         statistics = params[LATENT_STATS]
         return jnp.asarray(statistics["mean"], dtype), jnp.asarray(jax.lax.rsqrt(statistics["var"]), dtype)
 
-    def encode(self, params, x, key=None):
-        latent = self.encode_video(params, x, key) if x.ndim == 5 else self.encode_batch(params, x, key=key)
+    def encode(self, params, x, key=None, noise=None):
+        latent = (self.encode_video(params, x, key, noise) if x.ndim == 5
+                  else self.encode_batch(params, x, key=key, noise=noise))
         shift, scale = self.normalization(params, latent.dtype)
         return (latent - shift) * scale
 

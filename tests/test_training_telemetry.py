@@ -10,7 +10,7 @@ import numpy as np
 import optax
 import pytest
 from recording import RecordingTracker
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact
 
 import dew.config
 from dew.config import OptimConfig, RunConfig, TrainerConfig, Wandb
@@ -32,10 +32,13 @@ class Squared(Objective):
 
 
 class ComplexSquared(Objective):
-    """A real loss whose optimizer input has complex coordinates, as an SSM's can."""
+    """A real loss whose optimizer input has `width` complex coordinates, as an SSM's can."""
+
+    def __init__(self, width=2):
+        self.width = width
 
     def fresh_variables(self, key, held):
-        return {'params': {'weight': jnp.zeros(2, jnp.complex64)}}
+        return {'params': {'weight': jnp.zeros(self.width, jnp.complex64)}}
 
     def loss(self, variables, batch, step):
         error = variables['params']['weight'] - batch['target']
@@ -162,7 +165,8 @@ def test_rejected_attempts_do_not_contribute_to_grad_norm():
     trainer.fit(targets([1., float('nan'), 3., 2.]), steps=4, log_every=1)
     rows = {step: values['train/grad_norm'] for step, values in sink.scalars
             if 'train/grad_norm' in values}
-    assert rows == pytest.approx({3: 4.})
+    # The rejection drops its window, the first target's with it: the one update is the last two's.
+    assert rows == pytest.approx({4: 5.})
 
 
 class Repeated:
@@ -185,6 +189,26 @@ class Repeated:
         self.index = json.loads(state)
 
 
+COMPLEX_SEEDS = 8
+"""Check 1's declared seeds for the complex descent, sized by `seeds_for` (2026-10-21, on armada)."""
+
+
+COMPLEX_WIDTH = 64
+"""The drawn targets' complex coordinates: enough for a few seeds to resolve the factor."""
+
+
+def complex_target(seed: int) -> tuple[np.ndarray]:
+    """A target of COMPLEX_WIDTH complex coordinates, each part drawn from a unit normal."""
+    parts = np.random.default_rng(seed).normal(size=(2, COMPLEX_WIDTH))
+    return ((parts[0] + 1j * parts[1]).astype(np.complex64),)
+
+
+def parts(value):
+    """A complex array as its real and imaginary parts, stacked: what check 1 compares."""
+    value = np.asarray(value)
+    return np.stack([value.real, value.imag])
+
+
 @pytest.mark.parametrize('accumulation', [1, 2])
 def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, accumulation):
     """A real loss of complex weights descends. JAX's gradient of a real function of a complex
@@ -194,12 +218,14 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
     updates lands where the whole run does."""
     from dew.training import Checkpoints
 
-    target = np.array([1 + 2j, 3 + 4j])
-    batch = {'target': np.broadcast_to(target.astype(np.complex64), (8, 2))}
+    target = np.array([1 + 2j, 3 + 4j], np.complex64)
+    untracked = Trainer(ComplexSquared(COMPLEX_WIDTH), optax.sgd(.1), key=0, accumulation=accumulation)
 
-    def fit(steps, directory=None, sink=None):
-        trainer = Trainer(ComplexSquared(), optax.sgd(.1), key=0, tracker=sink, accumulation=accumulation,
-                          checkpoints=None if directory is None else Checkpoints(str(directory)))
+    def fit(steps, target=target, directory=None, sink=None):
+        trainer = untracked if directory is None and sink is None else Trainer(
+            ComplexSquared(), optax.sgd(.1), key=0, tracker=sink, accumulation=accumulation,
+            checkpoints=None if directory is None else Checkpoints(str(directory)))
+        batch = {'target': np.broadcast_to(target, (8, len(target)))}
         data = Loader(lambda partition: Repeated(batch), None, None, 8)
         return trainer.fit(data, steps=steps * accumulation, log_every=accumulation,
                            checkpoint_every=None if directory is None else accumulation)
@@ -208,29 +234,33 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
     weight = np.asarray(fit(4, sink=sink).variables['params']['weight'])
 
     # The same four updates in Optax's own loop over the same batch, complex64 as the trainer's, and
-    # the closed form in complex128, which both are held to, real and imaginary parts alike.
+    # the closed form in complex128, which both are held to over drawn targets (check 1), real and
+    # imaginary parts alike.
     @jax.jit
-    def update(weight, state):
-        grads = jax.grad(lambda w: ComplexSquared().loss({'params': {'weight': w}}, batch, None)[0])(weight)
-        updates, state = optax.sgd(.1).update(grads, state, weight)
-        return optax.apply_updates(weight, updates), state
+    def optax_descent(target):
+        batch = {'target': jnp.broadcast_to(target, (8, COMPLEX_WIDTH))}
 
-    reference = jnp.zeros(2, jnp.complex64)
-    state = optax.sgd(.1).init(reference)
-    for _ in range(4):
-        reference, state = update(reference, state)
+        def update(carry, _):
+            weight, state = carry
+            loss = ComplexSquared().loss
+            grads = jax.grad(lambda w: loss({'params': {'weight': w}}, batch, None)[0])(weight)
+            updates, state = optax.sgd(.1).update(grads, state, weight)
+            return (optax.apply_updates(weight, updates), state), None
 
-    def parts(value):
-        value = np.asarray(value)
-        return np.stack([value.real, value.imag]).astype(np.float64)
+        start = jnp.zeros(COMPLEX_WIDTH, jnp.complex64)
+        (weight, _), _ = jax.lax.scan(update, (start, optax.sgd(.1).init(start)), None, length=4)
+        return weight
 
-    assert_as_exact_as_the_reference(parts(weight), parts(reference), parts(target * (1 - 0.8 ** 4)),
-                                     "complex descent")
+    assert_as_exact(lambda target: parts(fit(4, target).variables['params']['weight']),
+                    lambda target: parts(optax_descent(target)), complex_target, "complex descent",
+                    seeds=COMPLEX_SEEDS,
+                    truth_fn=lambda target: parts(np.asarray(target, np.complex128) * (1 - 0.8 ** 4)))
     norms = {step: scalars['train/grad_norm'] for step, scalars in sink.scalars
              if 'train/grad_norm' in scalars}
     assert norms[accumulation] == pytest.approx(np.sqrt(120.))
-    fit(2, tmp_path)
-    np.testing.assert_array_equal(np.asarray(fit(4, tmp_path).variables['params']['weight']), weight)
+    fit(2, directory=tmp_path)
+    resumed = fit(4, directory=tmp_path).variables['params']['weight']
+    np.testing.assert_array_equal(np.asarray(resumed), weight)
 
 
 def test_run_record_names_the_package_checkout_and_hardware(tmp_path, monkeypatch):
