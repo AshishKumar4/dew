@@ -370,6 +370,46 @@ def test_an_integer_parameter_keys_and_runs():
     assert_as_exact(jax.jit(ours), jax.jit(xla), draw, "triton integer parameter", seeds=SEEDS)
 
 
+def test_an_output_hook_of_the_call_s_own_width_keys_and_runs():
+    """An output hook scaling each of the call's 32 value features by its own factor keys its launch at
+    that width and runs on par with the reference arithmetic from float64."""
+    case = CASES["causal-window"]
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+
+    def output_mod(o):
+        return o * jnp.arange(32, dtype=o.dtype)
+
+    hooks = template.Hooks(output_mod=output_mod)
+    pins = tuning.pinned({attention_triton.TritonForward: PINNED[1]})
+
+    def ours(query, key, value):
+        with pins:
+            return attention_triton.forward(query, key, value, spans, hooks, interpret=not ON_GPU)
+
+    def xla(query, key, value):
+        return template.reference(query, key, value, spans, hooks)
+
+    assert_as_exact(jax.jit(ours), jax.jit(xla), drawing(queries, keys, jnp.float32), "triton output width",
+                    seeds=SEEDS)
+
+
+def test_many_fp16_cotangents_too_small_once_normalized_still_sum_into_dv():
+    """fp16, 32 queries over 32 equal keys, every output cotangent 2^-24: each query's share 2^-29 of
+    every value is below fp16's least subnormal, yet their 32 sum to dV = 2^-24, as the reference's
+    derivative gives."""
+    spans = template.spans(32, 32, 1)
+    zeros = jnp.zeros((1, 32, 1, 1), jnp.float16)
+    dout = jnp.full((1, 32, 1, 1), 2.0 ** -24, jnp.float16)
+    with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
+        ours = attention_triton.backward(zeros, zeros, zeros, spans, None, dout, scale=1.0,
+                                         interpret=not ON_GPU).value
+    _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, scale=1.0), zeros)
+    [theirs] = pull(dout)
+    assert float(theirs[0, 0, 0, 0]) == 2.0 ** -24
+    np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(theirs, np.float32))
+
+
 def test_an_fp16_weight_too_small_once_normalized_still_reaches_dv():
     """fp16, one query over keys whose third weight is about 5.3e-8 before its denominator of 2 and
     2.7e-8 after it, which fp16's least subnormal (6e-8) holds only before: dV's third row takes it, as

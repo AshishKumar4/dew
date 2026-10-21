@@ -467,9 +467,20 @@ class KernelOp(tokamax.Op):
 
 def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
     """What `function` computes, traced at `arguments`, as a key: a digest of its jaxpr's printed form
-    (its primitives, shapes, dtypes and literals, a closure's captured numbers among them), the same in
-    every process, so every process keys a launch alike and takes process 0's config (`_settle`)."""
-    return "traced:" + hashlib.sha256(str(jax.make_jaxpr(function)(*arguments)).encode()).hexdigest()[:16]
+    (its primitives, shapes, dtypes and literals) and of the values of the arrays it closes over, the
+    same in every process, so every process keys a launch alike and takes process 0's config
+    (`_settle`). A captured array that is itself traced (a value of the enclosing computation) is data
+    the compiled launch reads, so it keys by its shape and dtype alone."""
+    closed = jax.make_jaxpr(function)(*arguments)
+    digest = hashlib.sha256(str(closed).encode())
+    for constant in closed.consts:
+        if isinstance(constant, jax.core.Tracer):
+            digest.update(repr((constant.shape, str(constant.dtype))).encode())
+        else:
+            value = np.asarray(constant)
+            digest.update(repr((value.shape, str(value.dtype))).encode())
+            digest.update(np.ascontiguousarray(value).tobytes())
+    return "traced:" + digest.hexdigest()[:16]
 
 
 def _identity(op: tokamax.Op) -> tokamax.Op:

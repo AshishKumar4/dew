@@ -54,6 +54,21 @@ def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
     return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
 
 
+def _scaled_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
+    """`a @ b` for fp32 `b` taken in `a`'s dtype, accumulated in fp32: where that dtype's exponents
+    reach less far than fp32's (fp16), `b` is scaled by a power of two that brings its largest entry to
+    [1, 2) before it narrows and unscaled after, both exact, so no entry the sum needs underflows."""
+    if jnp.finfo(a.dtype).minexp <= jnp.finfo(jnp.float32).minexp:
+        return _dot(a, b.astype(a.dtype), interpret)
+    largest = jnp.max(jnp.abs(b))
+    bits = jax.lax.bitcast_convert_type(largest, jnp.int32) & 0x7F800000
+    # 2^-e and 2^e from the largest's biased exponent e, exactly; no scaling for a zero or subnormal one.
+    normal = (bits > 0) & (bits < 0x7F000000)
+    down = jax.lax.bitcast_convert_type(jnp.where(normal, 0x7F000000 - bits, 0x3F800000), jnp.float32)
+    up = jax.lax.bitcast_convert_type(jnp.where(normal, bits, 0x3F800000), jnp.float32)
+    return _dot(a, (b * down).astype(a.dtype), interpret) * up
+
+
 def _power(width: int) -> int:
     """The power of two from 16 that holds `width`."""
     return max(16, 1 << (width - 1).bit_length())
@@ -88,21 +103,22 @@ def _kept_dtype(dtype) -> str:
 
 
 def _hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], *,
-                  differentiated: bool = False) -> str | None:
-    """What a score or output hook computes, as its launch's picks key it (`tuning.program`): traced at
-    a `TRACED_TILE` square fp32 tile, the entries' indices and each parameter as its kind lays it out
-    there, in its dtype in the kernels (`dtypes`); `differentiated`, its pullback too, so a hook whose
+                  differentiated: bool = False, width: int = TRACED_TILE) -> str | None:
+    """What a score or output hook computes, as its launch's picks key it (`tuning.program`): a score
+    hook traced at a `TRACED_TILE` square fp32 tile, an output hook at `TRACED_TILE` queries of the
+    call's padded value `width`, the entries' indices and each parameter as its kind lays it out there,
+    in its dtype in the kernels (`dtypes`); `differentiated`, its pullback too, so a hook whose
     derivative is its own rule (`jax.custom_vjp`) keys by that rule. None or an already traced key as
     it is."""
     if hook is None or isinstance(hook, str):
         return hook
     tile = TRACED_TILE
     layouts = {Kind.HEAD: (), Kind.QUERY: (tile, 1), Kind.KEY: (1, tile), Kind.TILE: (tile, tile),
-               Kind.OUTPUT: (tile, tile)}
+               Kind.OUTPUT: (tile, width)}
     params = [jax.ShapeDtypeStruct(layouts[kind], dtype) for kind, dtype in zip(kinds, dtypes, strict=True)]
     square = jax.ShapeDtypeStruct((tile, tile), jnp.float32)
     if name == "output_mod":
-        return tuning.program(hook, square, *params)
+        return tuning.program(hook, jax.ShapeDtypeStruct((tile, width), jnp.float32), *params)
     positions = (jax.ShapeDtypeStruct((tile, 1), jnp.int32), jax.ShapeDtypeStruct((1, tile), jnp.int32))
     if not differentiated:
         return tuning.program(hook, square, *positions, *params)
@@ -233,6 +249,7 @@ class TritonForward(Template[Tiles]):
     output_kinds: tuple[Kind, ...] = ()
     score_dtypes: tuple[str, ...] = ()
     output_dtypes: tuple[str, ...] = ()
+    output_width: int = TRACED_TILE
     scale: float = 1.0
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, m0, total0,
@@ -327,7 +344,7 @@ class TritonForward(Template[Tiles]):
 
     def traced(self, name: str, value: object) -> object:
         if name == "output_mod":
-            return _hook_program(name, value, self.output_kinds, self.output_dtypes)
+            return _hook_program(name, value, self.output_kinds, self.output_dtypes, width=self.output_width)
         return _hook_program(name, value, self.score_kinds, self.score_dtypes)
 
 
@@ -437,6 +454,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                        output_kinds=tuple(param.kind for param in hooks.output_params),
                        score_dtypes=tuple(_kept_dtype(param.value.dtype) for param in hooks.score_params),
                        output_dtypes=tuple(_kept_dtype(param.value.dtype) for param in hooks.output_params),
+                       output_width=call.value.shape[-1],
                        scale=query.shape[3] ** -0.5 if scale is None else scale)
     out = op(call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
              call.score_params, call.output_params, m0, total0, acc0, residuals=residuals,
@@ -694,8 +712,8 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
         # dV as the reference's derivative takes it: the unnormalized weights in the operands' dtype
         # against the output's cotangent over each query's denominator, so a weight fp16 holds only
         # before it is normalized still counts.
-        scaled = (dout.astype(jnp.float32) * _inverse(total_ref[rows])[:, None]).astype(dout.dtype)
-        dv = dv + _dot(exponentials.astype(dout.dtype).T, scaled, interpret)
+        dv = dv + _scaled_dot(exponentials.astype(dout.dtype).T,
+                              dout.astype(jnp.float32) * _inverse(total_ref[rows])[:, None], interpret)
         # Scaled before it narrows to the operands' dtype, so fp16 holds what fp32 does.
         dk = dk + _dot((logits * scale).astype(query.dtype).T, query, interpret)
         updated = [grad + piece if kind == Kind.KEY else grad
