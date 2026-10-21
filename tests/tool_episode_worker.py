@@ -53,13 +53,13 @@ def main() -> None:
         train=lambda partition: itertools.repeat({"task_id": task_ids}), val=None, records=2, batch=2
     )
     state = None
-    failed = None
+    failed = failure = None
     try:
         state = trainer.fit(data, steps=1, log_every=1)
     except BaseException as error:
         if mode == "ok":
             raise
-        failed = f"{type(error).__name__}: {error}"
+        failed, failure = f"{type(error).__name__}: {error}", type(error).__name__
     if mode == "ok":
         assert state is not None
         parameters = collective_host(state.variables, phase="episode pool test parameters")
@@ -77,7 +77,8 @@ def main() -> None:
             bindings.add(transition["action"].pop("_binding_id"))
         public.append(row)
     output.write_text(json.dumps({
-        "episodes": public, "bindings": sorted(bindings), "error": failed, "opened": len(harness.opened),
+        "episodes": public, "bindings": sorted(bindings), "error": failed, "failure": failure,
+        "opened": len(harness.opened),
         "closed": len(harness.closed), "updates": int(state.updates) if state is not None else None,
     }))
     if processes > 1:
