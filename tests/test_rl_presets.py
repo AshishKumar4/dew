@@ -126,6 +126,14 @@ def test_the_video_preset_reads_a_directorys_media_as_the_video_recipe(tmp_path,
     built = compile(chain, read="indexed", loading=LOADING, host=recipe.pipelines()[2])
     # Six clips, two a batch: an epoch is three batches.
     assert _epoch(built, 3) == _epoch(expected, 3)
+    # The listing is cut to its media as the recipe cuts it, so its corpus is the recipe's.
+    assert built.records == expected.records == 6
+    # The same media read once to validate on: every clip, drawn as validation draws it.
+    from dew.data.compile import held
+
+    once = listing.pipe(presets.video, 4 / FPS, frames=4, fps=FPS, size=16, batch=2, caption="a speaker",
+                        sample_rate=16000, margin=1 / FPS, context=1 / FPS, missing="reject", rejects=False)
+    assert sum(len(batch["video"]) for batch in held(once)(DataPartition())) == 6
 
 
 @pytest.mark.parametrize("missing", ["silence", "reject"])

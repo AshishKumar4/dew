@@ -3,8 +3,9 @@ each step makes of them, in order. They say what the first batch the chain makes
 
 import numpy as np
 import pytest
+from token_support import write_token_corpus
 
-from dew.data import Loading, Memory, from_iter, mix, presets
+from dew.data import Loading, Memory, from_iter, mix, presets, text
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 
@@ -103,3 +104,58 @@ def test_facts_open_no_reader():
     stream = from_iter(_unopenable, name="unopenable")
     facts = stream.pipe(presets.lm, "byte", seq_len=8, batch=2).facts()
     assert facts["seq_len"] == 8
+
+
+def _held_fields(chain, read: str = "indexed"):
+    """Each field the first batch of `chain` holds with its shape, without the batch."""
+    reader = compile(chain, read=read, loading=LOADING).train(DataPartition())
+    try:
+        return {name: list(np.shape(value)[1:]) for name, value in next(reader).items()
+                if not isinstance(value, (str, bytes))}
+    finally:
+        reader.close()
+
+
+def test_the_prompt_presets_facts_are_its_first_batchs_rows():
+    """Prompt rows rendered to eight ids with their reward columns sixteen bytes: every field the
+    facts shape is the first batch's, the rendered prompt and its reward columns among them."""
+    rows = Memory([{"prompt": "hi", "ground_truth": "an answer", "data_source": "rule"} for _ in range(4)])
+    chain = rows.repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2, reward_bytes=16)
+    facts = chain.facts()
+    held = _held_fields(chain)
+    assert facts["fields"]["prompt"] == [8] == held["prompt"]
+    assert facts["fields"]["ground_truth"] == [16] == held["ground_truth"]
+    assert all(held[name] == shape for name, shape in facts["fields"].items())
+
+
+def test_the_preference_presets_facts_are_its_first_batchs_rows():
+    """Chosen and rejected completions laid out in rows of twelve: the facts shape the ids and the
+    completion mask as the first batch holds them."""
+    rows = Memory([{"chosen": [1, 2, 3], "rejected": [4, 5]} for _ in range(4)])
+    chain = rows.repeat().pipe(presets.preferences, seq_len=12, batch=2)
+    facts = chain.facts()
+    held = _held_fields(chain)
+    assert all(held[name] == shape for name, shape in facts["fields"].items())
+    assert facts["fields"]["input_ids"] == [2, 12]
+
+
+def test_a_tokenized_stores_facts_name_its_end_of_document():
+    """Documents tokenized by bytes and ended by EOS: the facts name the byte tokenizer's EOS; not
+    ended, none."""
+    documents = Memory([{"text": "a word"}])
+    assert documents.map(text.tokenize("byte", eos=True)).facts()["eos_id"] == 255
+    assert documents.map(text.tokenize("byte")).facts()["eos_id"] is None
+
+
+def test_a_holdouts_part_states_what_its_store_states(tmp_path):
+    """A token store held out in part: each part's facts name the store's tokenizer and vocabulary,
+    without counting the store's rows, which neither part holds all of."""
+    from dew.data.sources import TokenFiles
+
+    directory = tmp_path
+    write_token_corpus(directory, np.arange(1, 100, dtype=np.uint16), eos_id=0)
+    train, held = TokenFiles(str(directory)).holdout(records=1)
+    for part in (train, held):
+        facts = part.facts()
+        assert (facts["tokenizer"], facts["vocab_size"]) == ("byte", 256)
+        assert "rows" not in facts
