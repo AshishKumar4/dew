@@ -22,8 +22,10 @@ from dew.nn.mlp import GatedMLP, gaussian_topk
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gemma3n"
 HIDDEN, COPIES = 32, 4
-ALTUP_SEEDS, STEP_SEEDS, PADDED_SEEDS, SPARSITY_SEEDS = 16, 16, 16, 16
-"""Each site's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`."""
+ALTUP_SEEDS, STEP_SEEDS, PADDED_SEEDS = 128, 16, 256
+SPARSITY_SEEDS = {0.9: 8, 0.95: 8, 0.99: 32}
+"""Each site's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` (2026-10-21, on
+armada)."""
 
 
 def fixture() -> dict:
@@ -465,7 +467,7 @@ def test_the_sparse_mlp_is_as_exact_as_the_reference_at_each_sparsity(sparsity):
                 **{name: kernel["kernel"] for name, kernel in kernels.items()}}
 
     assert_as_exact(stepped, lambda rows, cotangent: reference(torch.float32, cotangent, rows), draw,
-                    f"a sparse MLP step at sparsity {sparsity}", seeds=SPARSITY_SEEDS,
+                    f"a sparse MLP step at sparsity {sparsity}", seeds=SPARSITY_SEEDS[sparsity],
                     truth_fn=lambda rows, cotangent: reference(torch.float64, cotangent, rows))
 
 
