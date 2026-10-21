@@ -32,7 +32,6 @@ from dew.objectives.base import (
     EXAMPLE_ROWS,
     EXAMPLE_STREAM,
     FROZEN,
-    RECORD,
     Aux,
     Batch,
     Evaluated,
@@ -41,6 +40,7 @@ from dew.objectives.base import (
     Step,
     Variables,
     merge,
+    recorded_metrics,
     with_projected,
 )
 from dew.training.model_flops import _TokenCount, step_counts
@@ -120,10 +120,10 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
     `batch`, wherever it ran: the advanced state, its step counting `stepped`, the loss, the metrics
     with the batch's counts, and whether the loss is finite, the microbatch accepted and the window
     committed."""
-    metrics: dict[str, jax.Array | Recorded] = {**aux.metrics, **step_counts(batch)}
+    metrics = {**aux.metrics, **step_counts(batch)}
     if aux.record is not None:
         assert "evaluated" in aux.record, "a recording transaction stacks its evaluations (`recorded`)"
-        metrics[RECORD] = aux.record
+        metrics |= recorded_metrics(aux.record)
     return (dataclasses.replace(advanced, step=current.step + stepped), loss, metrics, jnp.isfinite(loss),
             advanced.microstep > current.microstep, committed)
 

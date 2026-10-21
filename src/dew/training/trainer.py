@@ -24,7 +24,7 @@ import time
 import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from itertools import accumulate, pairwise
-from typing import TYPE_CHECKING, Generic, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Generic, Literal, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -70,7 +70,6 @@ from dew.nn.sharding import (
 )
 from dew.objectives.base import (
     FROZEN,
-    RECORD,
     Aux,
     Batch,
     Initializer,
@@ -83,6 +82,7 @@ from dew.objectives.base import (
     TrainingScalar,
     Variables,
     select,
+    taken_record,
 )
 from dew.records import JSON, boolean, json_value, record
 from dew.telemetry import profile as telemetry_profile
@@ -180,7 +180,7 @@ the loss and the objective's report out."""
 
 CompiledStep = Callable[
     [TrainState, Batch],
-    tuple[TrainState, jax.Array, dict[str, jax.Array | Recorded], jax.Array, jax.Array, Committed | None]]
+    tuple[TrainState, jax.Array, dict[str, jax.Array], jax.Array, jax.Array, Committed | None]]
 """A call returns the stepped state, the scalar loss, the objective's whole
 report (`Aux.metrics`), whether that loss was finite, and whether the
 step's microbatches were accepted, and the transaction's commit telemetry (None for a custom step)."""
@@ -455,9 +455,8 @@ class Trainer(Generic[Loss, Effects]):
         the first step for it in place of compiling it (`dew.training._lowering.Lowered`).
         `tune_kernels` measures each Pallas launch of a step that has no config measured on this GPU,
         where the process has the GPU to itself (`dew.nn.kernels.tuning.tune`); without it such a
-        launch runs the nearest measured shape's config or its heuristic. `record` makes each step return
-        under its metrics' `RECORD` what each evaluation, the commit's replays too, sampled and passed as
-        a boundary (`Recorded`), which `fit` appends to `records`.
+        launch runs the nearest measured shape's config or its heuristic. `record` makes each step return in
+        its metrics what each evaluation, replays too, sampled or passed as a boundary (`taken_record`).
         """
         whole = _read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -481,7 +480,8 @@ class Trainer(Generic[Loss, Effects]):
         if record and step is not None:
             raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
                              "build them with Step(record=True)")
-        self.record, self.records = record, cast("list[Recorded]", [])
+        self.record = record
+        self.records: list[Recorded] = []
         self.profile = profile
         self.lower_for = lower_for
         # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
@@ -1726,16 +1726,16 @@ class Trainer(Generic[Loss, Effects]):
 
     def _between_steps(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState,
                        shardings: Placement[TrainState], position, loss: jax.Array,
-                       aux: dict[str, jax.Array | Recorded], accepted: jax.Array) -> bool:
+                       aux: dict[str, jax.Array], accepted: jax.Array) -> bool:
         """The cadenced work after one step of `fit`: the log, the validation,
         the checkpoints, and the preemption notice. Returns whether the
         notice stops the run at this step, whose checkpoint is then written."""
         current, checkpoints = run.current, self.checkpoints
         ending = plan.finished(current, interval.real_tokens if plan.tokens is not None else 0)
-        if isinstance(record := aux.get(RECORD), dict):
+        record, aux = taken_record(aux)
+        if record is not None:
             self.records.append(record)
-        aux = {name: value for name, value in aux.items()
-               if name not in (TRAINING_FLOPS, TOKENS, RECORD) and not isinstance(value, dict)}
+        aux = {name: value for name, value in aux.items() if name not in (TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         run.stepped = (loss, aux, accepted)
         if current % plan.log_every == 0:

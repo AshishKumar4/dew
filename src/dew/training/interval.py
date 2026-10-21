@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.data.dataset import rows_of
-from dew.objectives.base import Batch, Recorded
+from dew.objectives.base import Batch
 from dew.telemetry.instrumentation import NO_FLOPS, StepFlops
 from dew.training.display import TrainingDisplay
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
@@ -142,7 +142,7 @@ class Interval:
     compiles: int = 0
 
     def count(self, batch: Batch, flops: StepFlops | None, loss: jax.Array, finite: jax.Array,
-              committed: Committed | None, aux: Mapping[str, jax.Array | Recorded] | None = None) -> None:
+              committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> None:
         """Add one step: its records, its FLOPs, its loss and its optimizer commit."""
         self.since_log += 1
         self.steps += 1
@@ -150,9 +150,7 @@ class Interval:
         self.flops = None if self.flops is None or flops is None else self.flops + flops
         if self.book is None:
             self.book = self.fresh = fresh_book(loss)
-        # A recording step's record (`RECORD`) is no count.
-        aux = {} if aux is None else {name: value for name, value in aux.items()
-                                      if not isinstance(value, dict)}
+        aux = {} if aux is None else aux
         self.model_counted |= TRAINING_FLOPS in aux
         self.tokens_counted |= TOKENS in aux
         assert self.fresh is not None
