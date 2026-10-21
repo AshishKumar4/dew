@@ -50,7 +50,7 @@ FlaxDiff named its corpora in three maps (`datasetMap`, `onlineDatasetMap`, `med
 | FlaxDiff name | Dew |
 |---|---|
 | `oxford_flowers102` | `TFDS("oxford_flowers102", split="all", version="2.1.1").pipe(presets.images, 256, batch=64, caption=images.caption(templates=FLOWER_TEMPLATES))` |
-| `voxceleb2` | `Files(f"{root}/train/**", format="files")`, then `presets.clips(16 / 25, frames=16, fps=25, size=256, sample_rate=16000, margin=3 / 25, context=3 / 25, missing="reject", rejects=False)` |
+| `voxceleb2` | `Files(f"{root}/train/**/*.mp4", format="files").rename_columns({"path": "mp4"}).pipe(presets.clips, 16 / 25, frames=16, fps=25, size=256, batch=8, sample_rate=16000, margin=3 / 25, context=3 / 25, missing="reject", rejects=False)`, its caption "a video of a person speaking" |
 
 `FLOWER_TEMPLATES` are FlaxDiff's five: "a photo of a {}", "a photo of a {} flower", "This is a photo of a {}", "This is a photo of a {} flower", "A photo of a {} flower".
 
