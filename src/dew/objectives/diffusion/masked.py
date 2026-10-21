@@ -211,8 +211,12 @@ class MaskedDiffusionObjective(Objective[Ratio]):
             if media in fields:
                 real &= fields[media] < 0
         rows = tokens.shape[0]
-        t = step.sample("times", lambda key: self.process.sample_t(key, 1)[0], rows=rows)
-        draws = step.sample("mask", jax.random.uniform, tokens.shape[1:], dtype=jnp.float32, rows=rows)
+        # MDLM's antithetic times: each example a point in its own stratum of the update's examples.
+        places, count = step.places(rows)
+        uniforms = step.sample("time uniforms", jax.random.uniform, (), dtype=jnp.float32, rows=rows)
+        t = step.boundary("times", self.process.stratified(uniforms, places, count))
+        draws = step.sample("mask uniforms", jax.random.uniform, tokens.shape[1:], dtype=jnp.float32,
+                            rows=rows)
         masked, is_masked = self.process.masked(draws, tokens, t)
         is_masked = step.boundary("mask", is_masked & real)
         dropout_key = jax.random.fold_in(step.key, 2)

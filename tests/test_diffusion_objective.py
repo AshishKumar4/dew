@@ -20,7 +20,7 @@ from dew.data.dataset import Loader
 from dew.diffusion import broadcast_rates, expand, presets
 from dew.inputs import CharTable, Condition, Field, InputSpec, unit_range
 from dew.nn.backbones import SimpleDiT, SimpleMMDiT
-from dew.objectives.base import Step
+from dew.objectives.base import Recorder, Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.sampling import CFG, Euler
 from dew.training import Trainer
@@ -189,21 +189,20 @@ def test_singlestep_solver_generates_through_the_objective(order, steps):
 def test_loss_is_the_weighted_error_of_the_prediction():
     """With a zero output, the Karras parameterization predicts x_0 as
     c_skip x_t, the target is x_0, and the loss is the EDM lambda weighted
-    mean of the l2 error, with t and the noise drawn from the step's key in
-    the objective's order."""
+    mean of the l2 error, at the t and the noise the step reads (`Step.tape`)."""
     process = presets.EDM(regime="pixel")()
     inputs = InputSpec(Field("image", (RES, RES, 3)))
     objective = DiffusionObjective(Zero(), process, inputs)
     params = objective.init(jax.random.PRNGKey(0))
     batch = make_batch()
-    step = Step(step=jnp.asarray(3), key=jax.random.PRNGKey(7), ema=None)
+    x0 = unit_range(batch["image"])
+    time_key, noise_key = jax.random.split(jax.random.PRNGKey(7))
+    t = process.schedule.sample_t(time_key, 8)
+    noise = jax.random.normal(noise_key, x0.shape)
+    step = Step(step=jnp.asarray(3), key=jax.random.PRNGKey(7), ema=None, tape={"times": t, "noise": noise})
 
     loss, aux = objective.scalar_loss(params, batch, step)
 
-    _, _, time_key, noise_key, _ = jax.random.split(step.key, 5)
-    x0 = unit_range(batch["image"])
-    t = process.schedule.sample_t(time_key, 8)
-    noise = jax.random.normal(noise_key, x0.shape)
     rates = broadcast_rates(process.schedule, t, x0)
     x_t = rates[0] * x0 + rates[1] * noise
     predicted = process.prediction.pred_transform(x_t, jnp.zeros_like(x_t), rates, t)
@@ -295,7 +294,10 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
     conditional = DiffusionObjective(source.model, source.process, source.inputs,
                                      unconditional_prob=0.0, steps=3, solver=Euler(),
                                      variables=variables)
-    mask = jax.random.bernoulli(jax.random.split(step.key, 5)[1], probability, (4,))
+    # The rows the dropped objective's step drops, which the explicit batch blanks itself.
+    recorder = Recorder()
+    dropped.scalar_loss(variables, batch, replace(step, recorder=recorder))
+    (_, mask), = recorder.values["condition dropout"]
     explicit = source.inputs.tokenize([""] * 4)
     explicit = {"image": batch["image"], "text": jax.tree.map(
         lambda blank, given: jnp.where(mask[:, None], blank, given), explicit["text"], batch["text"])}
@@ -344,7 +346,7 @@ def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
     example the same times, noise and dropped condition, and so the same noised input, target and
     loss weight, bitwise, as the transaction places each microbatch's rows among the update's
     examples (`example_places`). The model's dropout stays the attempt's (`Step.key`)."""
-    from dew.objectives.base import Recorder
+    from dew.objectives.base import Recorder, stream
     from dew.training.distributed import microbatch
     from dew.training.transaction import example_places
 
@@ -363,7 +365,8 @@ def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
             objective.loss(params, rows, step)
         return recorder.tape(8)
 
-    halves = [jax.tree.map(lambda value, rows=rows: value[rows], batch) for rows in (slice(0, 4), slice(4, 8))]
+    halves = [jax.tree.map(lambda value, rows=rows: value[rows], batch)
+              for rows in (slice(0, 4), slice(4, 8))]
     microbatches = [microbatch(batch, jnp.asarray(part), 2) for part in range(2)]
     whole = taped([(0, 1, batch)])
     pooled = taped([(slot, 1, half) for slot, half in enumerate(halves)])
@@ -375,3 +378,8 @@ def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
     # Both halves of the dropout draw occur: each example's draw is its own, not one for the batch.
     assert 0 < int(np.sum(np.asarray(whole["condition dropout"]))) < 8
     assert len({float(np.asarray(whole["times"])[row]) for row in range(8)}) == 8
+    # An example's noise is its documented draw: the update's key folded with the draw's name, then the
+    # example's place.
+    third = jax.random.fold_in(jax.random.fold_in(update, stream("noise")), 3)
+    np.testing.assert_array_equal(np.asarray(whole["noise"])[3],
+                                  np.asarray(jax.random.normal(third, (RES, RES, 3), jnp.float32)))

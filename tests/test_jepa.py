@@ -497,6 +497,8 @@ def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_bl
     batch, step = {"image": images()}, step_with(averaged)
     samples = (np.asarray(batch["image"], np.float32) - 127.5) / 127.5
     context_idx, target_idx = objective.mask.sample(jax.random.split(step.key)[0], len(samples))
+    # The objective reads these masks (`Step.tape`).
+    step = step.replace(tape={"context": context_idx, "targets": target_idx})
     full = np.asarray(objective.encode(part(averaged, "context_encoder"), jnp.asarray(samples)))
     context = objective.encode(part(params, "context_encoder"), jnp.asarray(samples), context_idx)
     blocks = mask.num_targets
