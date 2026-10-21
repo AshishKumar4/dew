@@ -189,7 +189,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Reuse test results at executed-function and fixture-dependency granularity. [515]
 - Establish and triage a daily GPU baseline before it replaces batch qualification. Reproduce reference autotune picks in their recorders and qualify FP8 on suitable hardware. [558, 568, TTC-1]
 - Qualify H100, newer-GPU, TPU and paged-decode shard routes at runtime; compile and interpret checks leave those obligations open.
-- Reconcile requested capabilities with implementation and qualification evidence, and audit upstream reproductions and fixes. [224, 306]
+- Audit upstream reproductions and fixes. [306]
 - The float64 gate is the owner's (2026-10-20): each leaf's RMS error within 1.5× the reference's and its worst row within ROW_FACTOR of the reference's, on the same inputs, with no floor; every element within a certified roundoff bound for its own operation on common native inputs (faithful rounding for pointwise steps, a bound for each sum, native probes at opaque kernels), behind one assertion, `assert_as_exact`. [560, 649, 719, 793, 827]
 - Every accuracy comparison in the tests and tools goes through that assertion; the files that still compare within a tolerance are an inventory that only shrinks, empty by 2026-11-27. [650, 668, 669, 670, 676, 682, 705, 712, 844]
 - Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients and Z-Image's padded flow. [833, 837]
