@@ -516,6 +516,7 @@ def test_the_procedure_before_the_two_stages_draws_again_as_it_did():
                           np.zeros((count, 1), int), np.full((count, 1), np.isfinite(dew)))
         return drawn
 
-    assert _staged(law(np.inf), 8, "infinite", two_stage=False)[2] == 2
+    with np.errstate(invalid="ignore"):
+        assert _staged(law(np.inf), 8, "infinite", two_stage=False)[2] == 2
+        assert _staged(law(np.inf), 8, "infinite")[2] == 2
     assert _staged(law(1.0), 8, "equal", two_stage=False)[2] == 1
-    assert _staged(law(np.inf), 8, "infinite")[2] == 2
