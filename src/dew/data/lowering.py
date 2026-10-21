@@ -1603,6 +1603,14 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
             shares = zip(known, weights, strict=True)
             return max(math.ceil(size * sum(weights) / weight) for size, weight in shares)
         at = _until(pipeline.stages, (Repeat,))
+        cache = build.lowering.cache
+        if cache is not None and cache >= at:
+            # A repeat of the inputs before their cache, as a preset's cache follows the order written
+            # before it: a pass reads each input once, and a cache of one record for each input holds
+            # that many, where one that drops or expands them counts none ahead of reading them.
+            if not build.lowering.one_to_one:
+                return None
+            build = dataclasses.replace(build, lowering=dataclasses.replace(build.lowering, cache=None))
         # A token split reads its rows as it is built, filling a cache before it; the probe seals it.
         with _closing(build.records(dataclasses.replace(pipeline, stages=pipeline.stages[:at]),
                                     DataPartition())) as rows:
