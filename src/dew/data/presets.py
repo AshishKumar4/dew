@@ -114,16 +114,21 @@ def _cached(prepared: Dataset, cache: str | Cache | Generation | None) -> Datase
     return prepared if cache is None else prepared.cache(cache)
 
 
-def _finished(prepared: Dataset, *, batch: int, records: int | None, host: tuple[HostStep, ...],
+def _finished(prepared: Dataset, *, batch: int | None, records: int | None, host: tuple[HostStep, ...],
               device: tuple[DeviceStep, ...] = ()) -> Pipeline:
     """`prepared` cut to `records` where given, in batches of `batch`, read by the `host` steps and
     then the `device` steps, in that order (a device step runs in the compiled step, after every
-    host step). Every preset ends through it."""
+    host step). Every preset ends through it. `batch=None` leaves the rows unbatched, for a mix or
+    phases of laid-out corpora batched after (`mix(...).batch(n)`), which host steps can't read."""
     kept = prepared if records is None else prepared.take(records)
+    if batch is None:
+        if host or device:
+            raise ValueError("host and device steps read batches; give batch=, or map them after the batch")
+        return kept._chain()
     return kept.batch(batch).map(*host, *device) if host or device else kept.batch(batch)
 
 
-def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase | None, *, seq_len: int, batch: int,
+def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase | None, *, seq_len: int, batch: int | None,
        field: str = "text", eos: bool | None = None,
        pack: Literal["first-fit", "best-fit", "concat"] | None = "first-fit", bins: int = 32,
        stride: int | None = None, cache: str | Cache | Generation | None = None,
@@ -137,7 +142,8 @@ def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase | None, *, seq
     `tokenizer=None` the documents are token ids already, under "text", such as a token store's,
     whose windows a store reads by index (`TokenFiles(url).pipe(presets.lm, None, seq_len=512,
     batch=8, pack=None)`); a store packed must state where its documents end. `cache` holds the
-    tokenized documents, as `images` holds its images."""
+    tokenized documents, as `images` holds its images. `batch=None` leaves the rows unbatched, for
+    corpora each laid out alone and then mixed or phased (`phases`), batched after."""
 
     if pack is not None and stride is not None:
         raise ValueError("stride places fixed windows, pack=None; a pack lays documents out whole")
@@ -152,7 +158,7 @@ def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase | None, *, seq
     return _finished(windows, batch=batch, records=records, host=host)
 
 
-def token_windows(dataset: Dataset, *, seq_len: int, batch: int, stride: int | None = None,
+def token_windows(dataset: Dataset, *, seq_len: int, batch: int | None, stride: int | None = None,
                   records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """A token store's stream of tokens (`TokenFiles`) cut into windows of `seq_len` inputs and their
     targets, `stride` apart (`seq_len` where None), read by index: each window a record of the
