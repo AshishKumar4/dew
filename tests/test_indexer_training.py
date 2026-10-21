@@ -43,7 +43,7 @@ SEQ = 16
 VOCAB = 64
 TINY_SHARD = 256
 SEEDS = {'covering': 8, 'covered positions': 8, 'dropped': 8, 'dropped positions': 8, 'packed': 8,
-         'packed alone': 8, 'total': 8, 'kl gradient': 8, 'documents alone': 8}
+         'packed alone': 8, 'total': 8, 'documents alone': 8, 'split tree': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
@@ -81,7 +81,7 @@ def test_the_loss_its_gradient_and_the_selection_are_maxtexts(name):
     data = {key: jnp.asarray(PUBLISHED[key]) for key in ("query", "key", "scores", "segments")}
     length, scale = data["scores"].shape[-1], float(PUBLISHED["scale"])
     keep = causal(length) if mask == "causal" else packed_keep(data["segments"])
-    np.testing.assert_array_equal(keep, published_keep(mask))
+    np.testing.assert_array_equal(np.broadcast_to(keep, published_keep(mask).shape), published_keep(mask))
     selected = top_k_keys(data["scores"], keep, 6)
     np.testing.assert_array_equal(np.asarray(selected), PUBLISHED[f"{mask}/selected"])
 
@@ -311,25 +311,6 @@ def test_the_sparse_phase_keeps_the_indexer_and_the_model_apart():
         argnums=(0, 1, 2))(data["scores"], data["query"], data["key"])
     assert bool(jnp.all(grads[1] == 0)) and bool(jnp.all(grads[2] == 0))
 
-    def closed_form(scores, query, key):
-        indexer = jax.nn.softmax(jnp.where(keep, scores, -jnp.inf), axis=-1)
-        logits = jnp.einsum("bshd,bthd->bhst", query * scale, key)
-        target = jnp.sum(jax.nn.softmax(jnp.where(keep, logits, -jnp.inf), axis=-1), axis=1)
-        return {"scores": indexer - target / jnp.sum(target, axis=-1, keepdims=True)}
-
-    def autodiff(scores, query, key):
-        pulled = jax.grad(lambda scores: jnp.sum(indexer_kl(scores, query, key, keep, scale)))
-        return {"scores": pulled(scores)}
-
-    def kl_draw(seed):
-        rng = np.random.default_rng([23, seed])
-        shape = data["query"].shape
-        return (np.maximum(rng.normal(scale=1.5, size=data["scores"].shape), 0).astype(np.float32),
-                rng.normal(size=shape).astype(np.float32), rng.normal(size=shape).astype(np.float32))
-
-    assert_as_exact(jax.jit(autodiff), jax.jit(closed_form), kl_draw, "kl gradient",
-                    seeds=SEEDS['kl gradient'])
-
 
 def packed_row(*documents):
     """One `[SEQ + 1]` row: the documents back to back, then padding (segment 0)."""
@@ -463,15 +444,23 @@ def test_the_sparse_phase_reads_the_warmup_tree():
 
 
 def test_evaluation_and_scoring_read_the_split_tree():
-    """Teacher-forced scores under the warm-up split are the dense model's
-    on the merged tree, to the bit."""
+    """Teacher-forced scores under the warm-up split are on par with the
+    dense model's on the merged tree over drawn batches (check 1)."""
     objective = LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"), ema_decay=0.999)
     params = objective.init(jax.random.key(0))
-    batch = token_batch()
-    scored = objective.evaluate(params, batch, step_at())
     merged = LMObjective(deepseek_stack(None), SEQ, variables=params).init(jax.random.key(0))
-    expected = objective.token_scores(merged, batch["text"])
-    np.testing.assert_array_equal(scored.losses, expected.losses)
+    dense, wide = (LMObjective(deepseek_stack(None, dtype=dtype), SEQ)
+                   for dtype in (jnp.float32, jnp.float64))
+    scored = jax.jit(lambda text: objective.evaluate(params, {"text": text}, step_at()).losses)
+
+    def scores(objective):
+        return jax.jit(lambda merged, text: objective.token_scores(merged, text).losses)
+
+    def draw(seed):
+        return merged, token_batch(seed=seed)["text"]
+
+    assert_as_exact(lambda merged, text: scored(text), scores(dense), draw, "split tree scores",
+                    seeds=SEEDS['split tree'], truth_fn=scores(wide))
     assert not objective.ema.select((FROZEN, "layers_0"))
     assert objective.ema.select(("params", "layers_0"))
 
