@@ -67,7 +67,12 @@ the task's artifacts; a traced task records nothing in the cache either.
 `report` combines the artifacts' data under DIR and writes DIR/coverage.json and
 DIR/coverage.md, a module a line, the least covered first:
 
-    armada map --artifacts=DIR --items=ITEMS -- bash -lc {item}
+    armada map --commit=SHA --artifacts=DIR --items=ITEMS --timeout=6000 --secrets=DEW_XLA_CACHE_TOKEN \
+        -- sh -c {item}
+
+A task reads the shared XLA cache as CI's do (--commit gives the checkout, its environments and the
+cache's URL), and has `COVERAGE_DEADLINE` and armada's timeout past it; a pass with a task cut short is
+refused (`report`), its coverage partial. A target well under CI's keeps tasks short.
 """
 
 import argparse
@@ -632,7 +637,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         if done.returncode not in (0, 1, 5) or (not own and done.returncode == 1):
             red.append(f"pytest exited {done.returncode}" + ("" if own else f" with no report of {name}"))
         if expired:
-            red.append(f"the task ran past its deadline of {deadline:.0f} s and was interrupted")
+            red.append(f"{INTERRUPTED} of {deadline:.0f} s and was interrupted")
         seconds = shares[name]
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart.
@@ -852,14 +857,19 @@ def durations(verdicts: list[dict]) -> dict[str, float]:
 
 ARTIFACTS = "/armada/task/artifacts"
 """Where an armada task's files are kept for `armada map --artifacts`."""
+INTERRUPTED = "the task ran past its deadline"
+"""How a row says its task was interrupted: tests after the point it reached did not run."""
+COVERAGE_DEADLINE = 5400.0
+"""A coverage task's deadline. Branch tracing slows a task several times over, and a task cut short leaves
+its files' coverage partial, which `coverage_report` refuses."""
 
 
 def coverage_items(target: float, timings: dict) -> list[str]:
     """The plan's tasks for the oldest Python, as armada map items: each runs its files under coverage.py
-    with the test cache off, its rows and data among its artifacts."""
+    with the test cache off, its rows and data among its artifacts, by `COVERAGE_DEADLINE`."""
     return [f"mkdir -p {ARTIFACTS} && python3 tools/armada/ci.py task --python={entry['python']} "
             f"--tests='{entry['tests']}' --split='{entry['split']}' --out={ARTIFACTS}/rows.json --cache=off "
-            f"--coverage={ARTIFACTS}"
+            f"--deadline={COVERAGE_DEADLINE:.0f} --coverage={ARTIFACTS}"
             for entry in plan(target, timings) if entry["python"] == PYTHONS[0] and entry["split"] != COLLECT]
 
 
@@ -875,6 +885,19 @@ def coverage_report(directory: Path) -> int:
     parts = sorted(str(path) for path in directory.glob("*/.coverage.*"))
     if not parts:
         print(f"no coverage data under {directory}", file=sys.stderr)
+        return 1
+    # A task that wrote no rows or was interrupted left the coverage of its files' later tests out.
+    def ran_short(task: Path) -> bool:
+        verdict = task / "rows.json"
+        return not verdict.exists() or any(INTERRUPTED in found["output"]
+                                           for found in json.loads(verdict.read_text())["rows"])
+
+    # armada keeps each task's artifacts in a directory named by its index.
+    short = [task.name for task in sorted(directory.iterdir())
+             if task.is_dir() and task.name.isdecimal() and ran_short(task)]
+    if short:
+        print(f"{len(short)} tasks ran short, so the pass is partial; run them again with a longer deadline: "
+              f"{', '.join(short)}", file=sys.stderr)
         return 1
     subprocess.run([python, "-m", "coverage", "combine", "--keep", f"--data-file={data}", *parts], check=True)
     report = directory / "coverage.json"
