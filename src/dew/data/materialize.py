@@ -23,7 +23,7 @@ from collections.abc import Mapping, Sequence
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.analysis import _VIEWS, _analyzed, _identity, _label, _name
+from dew.data.analysis import _analyzed, _identity, _label, _name
 from dew.data.dataset import Batch, Records
 from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _threads, _TokenSplit
 from dew.data.mixing import CorpusCounts
@@ -131,7 +131,10 @@ def _materialize(
     if not isinstance(source, _Memory):
         counter.attempted = len(stored)
     lowering = _analyzed(pipeline, "memory", validation=not training)
-    rows, consumed = _memory_inputs(pipeline, source, stored, counter, lowering.cache)
+    # A cache among the eager stages fills over the whole source here; one after a view of the
+    # inputs is the lowering's, which reads it by input (`_Build.indexed`).
+    eager = lowering.cache if lowering.cache is not None and lowering.eager > lowering.cache else None
+    rows, consumed = _memory_inputs(pipeline, source, stored, counter, eager)
     return _memory_stages(
         pipeline, source, stored, rows, consumed, lowering.eager, counter, training=training
     )
@@ -142,16 +145,18 @@ def _memory_inputs(
 ) -> tuple[list[tuple[tuple[int, ...], Record]], int]:
     rows: list[tuple[tuple[int, ...], Record]] = []
     consumed = 0
-    # A view of the inputs before the cache reads it by input, as the stages lowered over these
-    # rows do (`_Build.indexed`): the rows held are the source's own.
-    viewed = artifact_at is not None and any(isinstance(stage, _VIEWS)
-                                             for stage in pipeline.stages[:artifact_at])
-    if artifact_at is not None and not viewed:
+    if artifact_at is not None:
         filled, manifest, prefix = _fill(pipeline, source, artifact_at, "memory")
         cached = filled.mapped(pygrain.MapDataset.source(stored), manifest, transform=prefix, source=source)
         try:
-            for index in range(len(cached)):
-                outputs = cached[index]
+            if prefix.threads is None:
+                filling = [cached.record(index) for index in range(len(cached))]
+            else:
+                # A fetch with a pool of its own among the cached steps fills that many inputs at once.
+                pool = concurrent.futures.ThreadPoolExecutor(prefix.threads, thread_name_prefix="dew-step")
+                with pool:
+                    filling = list(pool.map(cached.record, range(len(cached))))
+            for index, outputs in enumerate(filling):
                 if not isinstance(outputs, tuple):
                     raise TypeError("cached input must return its tuple of expansion outputs")
                 for child, value in enumerate(_CachedOutputs().flat_map(outputs)):

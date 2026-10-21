@@ -35,6 +35,7 @@ from dew.data.analysis import (
     _VIEWS,
     _at,
     _cache_manifest,
+    _cache_steps,
     _drops,
     _identity,
     _in_memory,
@@ -142,10 +143,13 @@ def _threads(stages: Sequence[Stage]) -> int | None:
 
 
 def _keyed(source: Source) -> Source:
-    """The store a cache over `source` keys its inputs by: the source a memory read holds the rows
-    of, where it ran no step over them (it deferred the cache to a view of the inputs, `_VIEWS`), as
-    an indexed read and a publication key them; else `source` itself."""
-    return source.original if isinstance(source, _Materialized) and not source.ran else source
+    """The source a cache over `source` keys its inputs by: under the memory reads that ran no step
+    over its rows (a compile may materialize a source twice, `_prepared` and `_staged`), the source
+    they hold the rows of, as an indexed read and a publication key it; else `source` itself, the
+    rows a memory read made of it before the first view of its inputs (`_analyzed`)."""
+    while isinstance(source, _Materialized) and not source.ran:
+        source = source.original
+    return source
 
 
 def _outputs(
@@ -406,10 +410,7 @@ def _fill(pipeline: Pipeline, source: Source, at: int, read: Read) -> tuple[Cach
     artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
     if not isinstance(artifact, Artifact):
         raise ValueError(f"stage {at} of {_name(pipeline)} is not a cache")
-    # The views of the inputs written before the cache read it (`_Build.indexed`); its fill runs the
-    # record steps alone.
-    steps = tuple(stage for stage in prefix if not isinstance(stage, _VIEWS))
-    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(steps)
+    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(_cache_steps(prefix))
 
 
 def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[int, int, int]]:
@@ -562,15 +563,15 @@ class _FilledIterator(pygrain.DatasetIterator):
             fill.close()
 
 
-class _Single(pygrain.MapDataset):
-    """A cache that holds one record for each input, read as the source's rows are: by index, at
-    `positions` (the inputs a store holds, those it misses skipped, as an uncached read skips
-    them), each the one output its completion holds. The cache writes the missing inputs'
-    completions itself as its fill starts (`Cache.mapped(missing=)`)."""
+class _Inputs(pygrain.MapDataset):
+    """A cache read by input, as the source's rows are: by index, at `positions` (the inputs a store
+    holds, those it misses skipped, as an uncached read skips them), each input's outputs, or the
+    one output of each where the cache holds one record for each input (`single`). The cache writes
+    the missing inputs' completions itself as its fill starts (`Cache.mapped(missing=)`)."""
 
-    def __init__(self, cached: _Mapped, positions: np.ndarray | None):
+    def __init__(self, cached: _Mapped, positions: np.ndarray | None, *, single: bool):
         super().__init__(cached)
-        self._cached, self._positions = cached, positions
+        self._cached, self._positions, self._single = cached, positions, single
 
     def __len__(self) -> int:
         return len(self._cached) if self._positions is None else len(self._positions)
@@ -579,14 +580,14 @@ class _Single(pygrain.MapDataset):
     def __getitem__(self, index: slice) -> pygrain.MapDataset: ...
 
     @overload
-    def __getitem__(self, index: int) -> Record: ...
+    def __getitem__(self, index: int) -> Record | tuple[Record, ...]: ...
 
     def __getitem__(self, index):
         if isinstance(index, slice):
             return self.slice(index)
         position = index if self._positions is None else int(self._positions[index % len(self)])
         outputs = self._cached[position]
-        return outputs[0] if isinstance(outputs, tuple) else outputs
+        return outputs[0] if self._single and isinstance(outputs, tuple) else outputs
 
 
 def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
@@ -911,30 +912,27 @@ class _Build:
             return self.shared(rows, pipeline, partition), 0
         keyed = _keyed(source)
         if keyed is not source:
-            # A memory read that deferred its cache holds the source's rows; the cache reads them by
-            # their places in the source, as an indexed read does, its missing inputs among them.
+            # A memory read that ran no step before the cache holds the rows of the source it keys,
+            # which the cache reads by their places there, its missing inputs among them.
             records = keyed.records(self.read)
             stored = pygrain.MapDataset.source(records)
         filled, manifest, prefix = _fill(pipeline, keyed, cache, self.read)
+        # Read by input, as the source's own rows are: its missing inputs skipped, as the uncached
+        # root skips them, and written by the fill; one record for each input reads by index and in
+        # the uncached chain's order, the rest as a stream of each input's outputs.
+        present = _Present.of(records) if _in_memory(keyed) else None
+        positions = None if present is None else present.positions
+        missing = () if positions is None else np.setdiff1d(np.arange(len(stored)), positions).tolist()
+        cached = filled.mapped(stored, manifest, transform=prefix, source=keyed, missing=missing)
+        inputs = _Inputs(cached, positions, single=self.lowering.one_to_one)
+        identifiers = source.identifiers if isinstance(source, _Materialized) else ()
+        if positions is not None:
+            identifiers = tuple((int(position),) for position in positions)
+        placed = (inputs.map_with_index(_Placed(identifiers=identifiers, rows=len(inputs)))
+                  if last > cache else inputs)
+        view = self.viewed(self.shared(placed, pipeline, partition), pipeline, partition, cache)
         if self.lowering.one_to_one:
-            # One record for each input: read as the source's own rows, by index and in the
-            # uncached chain's order, its missing inputs skipped as there and written by the fill.
-            present = _Present.of(records) if _in_memory(keyed) else None
-            missing = (() if present is None
-                       else np.setdiff1d(np.arange(len(stored)), present.positions).tolist())
-            cached = filled.mapped(stored, manifest, transform=prefix, source=keyed, missing=missing)
-            single = _Single(cached, None if present is None else present.positions)
-            identifiers = source.identifiers if isinstance(source, _Materialized) else ()
-            if present is not None:
-                identifiers = tuple((int(position),) for position in present.positions)
-            placed = (single.map_with_index(_Placed(identifiers=identifiers, rows=len(single)))
-                      if last > cache else single)
-            view = self.shared(placed, pipeline, partition)
-            return self.viewed(view, pipeline, partition, cache), cache + 1
-        cached = filled.mapped(stored, manifest, transform=prefix, source=keyed)
-        placed = cached.map_with_index(_Placed(rows=len(cached))) if last > cache else cached
-        view = self.shared(placed, pipeline, partition)
-        view = self.viewed(view, pipeline, partition, cache)
+            return view, cache + 1
         # A fetch with a pool of its own among the cached steps reads that many inputs at once.
         threads = max(self.loading.threads, prefix.threads or 0)
         read = dataclasses.replace(self.loading, threads=threads,
