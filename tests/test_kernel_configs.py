@@ -12,11 +12,11 @@ import tokamax
 from fla_gdn_support import CONV_SHAPES, conv_config_cases, conv_training_cases, kda_training_cases
 from kernel_compile import compile_kernels, failures
 
-from dew.nn.kernels import fla_gdn, fla_kda, generation, short_conv, tuning
+from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence, short_conv, tuning
 
-LAUNCHES = {launch for module in (fla_gdn, fla_kda) for launch in vars(module).values()
-            if isinstance(launch, fla_gdn._Launch)}
-"""Every launch of the two ports."""
+LAUNCHES = {launch for module in (fla_gdn, fla_kda, recurrence) for launch in vars(module).values()
+            if isinstance(launch, chunked_launch._Launch)}
+"""Every launch of the two ports and the recurrence template's chunked stages."""
 
 
 def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
@@ -33,7 +33,7 @@ def test_each_gpu_takes_the_picks_its_block_holds_and_measures_a_space_holding_t
     16-bit space holds its unmeasured pick, Kimi delta attention's own kernels' too, and fp32 has a pick
     for every kernel."""
     with generation.assumed(target):
-        assert fla_gdn._wide() is wide
+        assert chunked_launch._wide() is wide
     for launch in LAUNCHES:
         assert launch.PICKS["bfloat16", wide] in launch.SPACES[wide], launch.NAME
         assert {"bfloat16", "float32"} <= {dtype for dtype, _ in launch.PICKS}, launch.NAME
@@ -65,11 +65,12 @@ def rule_launches(module) -> tuple:
 def test_the_tuner_finds_each_of_the_rules_launches_in_its_lowering(module):
     """The rule's forward and backward, traced as the tuner reads a program (`tuning.launches`): each
     of its kernels is a launch tokamax describes, its arguments serializable into its key; the gated
-    delta rule's nine, and Kimi delta attention's seven with the cumsum and memory kernels it shares."""
-    shared = ({fla_gdn.ChunkLocalCumsum, fla_gdn.ChunkFwdH, fla_gdn.ChunkBwdDhu} if module is fla_kda
-              else set())
+    delta rule's eight and the recurrence template's decay prefix, and Kimi delta attention's seven with
+    the prefix and the memory kernels it shares."""
+    shared = {recurrence.ChunkLocalCumsum, *((fla_gdn.ChunkFwdH, fla_gdn.ChunkBwdDhu) if module is fla_kda
+                                             else ())}
     assert {type(ba.op) for ba in rule_launches(module)} == shared | {
-        type(op) for op in vars(module).values() if isinstance(op, fla_gdn._Launch)}
+        type(op) for op in vars(module).values() if isinstance(op, chunked_launch._Launch)}
 
 
 def test_a_launch_clips_its_blocks_to_the_operands():
@@ -80,7 +81,7 @@ def test_a_launch_clips_its_blocks_to_the_operands():
     v = jax.ShapeDtypeStruct((1, 64, 1, 32), jnp.bfloat16)
     h = jax.ShapeDtypeStruct((1, 1, 64, 32), jnp.bfloat16)
     g = jax.ShapeDtypeStruct((1, 64, 1), jnp.float32)
-    spans = fla_gdn.sequences(1, 64)
+    spans = chunked_launch.sequences(1, 64)
     ba = fla_gdn._CHUNK_FWD_O.bind(q, q, v, h, g, *spans, scale=1.0, chunk=64, interpret=True)
     with generation.assumed("sm80"):
         heuristic = fla_gdn._CHUNK_FWD_O._get_heuristics_config(ba)
@@ -94,15 +95,15 @@ def test_a_launch_clips_its_blocks_to_the_operands():
 def test_the_kernel_cases_lower_each_kernel_on_abstract_operands(target):
     """The compile gate's cases (`kernel_cases`) hold each kernel the gated delta rule launches forward
     and backward, at both dtypes at every compiled shape the dtype takes (fp32 keys at most
-    `fla_gdn.WIDEST` wide), the cumsum reversed too, each once, on abstract operands of that shape
-    lowered as on the GPU."""
+    `fla_gdn.WIDEST` wide), the decay prefix (`recurrence.cumulated`) reversed too, each once, on
+    abstract operands of that shape lowered as on the GPU."""
     cases = list(support.kernel_cases(target))
     names = [case.name.split("/") for case in cases]
     assert len({tuple(name) for name in names}) == len(names)
     assert all(name[0] == target for name in names)
     covered = {(kernel, dtype, shape, *reverse) for _, kernel, dtype, _, shape, *reverse in names}
     launched = {ba.op.NAME for ba in rule_launches(fla_gdn)}
-    reversals = {kernel: [(), ("reverse",)] if kernel == "chunk_local_cumsum" else [()]
+    reversals = {kernel: [(), ("reverse",)] if kernel == "cumulated" else [()]
                  for kernel in launched}
     assert covered == {(kernel, dtype, shape, *reverse)
                        for kernel in launched for dtype in ("bfloat16", "float32")
@@ -137,11 +138,10 @@ def test_the_shared_dot_preserves_narrow_products_with_fp32_accumulation():
 
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
 def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block(target):
-    """Each declared config at each declared shape, lowered as on the GPU and compiled by pip's Triton
-    for its capability on this CPU (tests/kernel_compile.py): it compiles, to no more shared memory
+    """Each declared config at each declared shape, lowered as on the GPU and compiled by XLA's CUDA backend
+    for a compile-only device on this CPU (tests/kernel_compile.py): it compiles, to no more shared memory
     than its GPU's block holds. A kernel that does not compile (a two-result inline asm, a mixed-dtype
     dot) fails here and never reaches a GPU."""
-    pytest.importorskip("triton")
     found = compile_kernels(support.kernel_cases(target), target)
     assert found, "the compile gate must not be vacuous"
     assert not failures(found), "\n".join(failures(found))
@@ -150,9 +150,8 @@ def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_bl
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
 def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
     """Every kernel of the port's forward and backward at the training shape, lowered as on the GPU and
-    compiled by pip's Triton for its capability on this CPU (tests/kernel_compile.py), within the
-    compile bound and the block's shared memory."""
-    pytest.importorskip("triton")
+    compiled by XLA's CUDA backend for a compile-only device on this CPU (tests/kernel_compile.py), within
+    the compile bound and the block's shared memory."""
     found = compile_kernels(kda_training_cases(), target)
     assert len(found) == 2
     assert not failures(found), "\n".join(failures(found))
@@ -160,10 +159,9 @@ def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_g
 
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
 def test_the_short_convs_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
-    """Each of the short conv's training cases lowered as on the GPU and compiled by pip's Triton for its
-    capability on this CPU (tests/kernel_compile.py), within the compile bound and the block's shared
-    memory."""
-    pytest.importorskip("triton")
+    """Each of the short conv's training cases lowered as on the GPU and compiled by XLA's CUDA backend for a
+    compile-only device on this CPU (tests/kernel_compile.py), within the compile bound and the block's
+    shared memory."""
     found = compile_kernels(conv_training_cases(), target)
     assert len(found) == 2 * len(CONV_SHAPES) + 2
     assert not failures(found), "\n".join(failures(found))
@@ -174,7 +172,6 @@ def test_every_short_conv_config_compiles_on_tritons_compiler_within_each_gpus_b
     """Each config the tuner may give either launch of the short conv (`short_conv.TILES`,
     `short_conv.WALKS`), pinned at the 9B's packed delta conv, compiled for each GPU within the compile
     bound and the block's shared memory."""
-    pytest.importorskip("triton")
     found = compile_kernels(conv_config_cases(), target)
     assert len(found) == len(short_conv.TILES) + len(short_conv.WALKS)
     assert not failures(found), "\n".join(failures(found))

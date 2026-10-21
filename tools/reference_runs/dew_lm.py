@@ -143,18 +143,21 @@ def build(args: argparse.Namespace) -> Run:
     # On the host: the trainer places the weights over its mesh.
     pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype="float32",
                                  attention_impl=args.attention, on_host=True)
-    model = pretrained.model
-    if args.remat is not None and isinstance(model, MultimodalTransformer):
-        # A multimodal checkpoint's decoder is its language model.
-        model = model.clone(language_model=model.language_model.clone(remat=args.remat))
-    elif args.remat is not None:
+    model, variables = pretrained.model, pretrained.variables
+    if isinstance(model, MultimodalTransformer):
+        # A text run trains a multimodal checkpoint's decoder, its language model, alone: the towers
+        # read no text, and would only carry their weights and moments through every step.
+        model = model.language_model
+        variables = {collection: tree["language_model"] for collection, tree in variables.items()
+                     if "language_model" in tree}
+    if args.remat is not None:
         model = model.clone(remat=args.remat)
     if args.dispatch is not None:
         if not isinstance(model, CausalTransformer) or model.mixture is None:
             raise SystemExit(f"--dispatch sets a mixture's dispatch, and {args.model} builds no mixture")
         model = model.clone(mixture=dataclasses.replace(model.mixture, dispatch=args.dispatch))
     objective = LMObjective(model, seq, ema_decay=None, head_chunks=args.head_chunks,
-                            variables=pretrained.variables, aux_loss_alpha=args.aux_loss_alpha,
+                            variables=variables, aux_loss_alpha=args.aux_loss_alpha,
                             seq_aux=args.seq_aux)
     def rows(indices) -> dict:
         """The windows' rows, a packed run's documents laid out beside them."""

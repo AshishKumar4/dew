@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import TINY_DECODER
+from token_support import token_batch_of
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs, coordinates
@@ -106,8 +107,7 @@ def step_at(key=1):
 
 
 def token_batch(batch=4, seed=0):
-    ids = np.random.RandomState(seed).randint(0, VOCAB, (batch, SEQ + 1))
-    return {TEXT_KEY: jnp.asarray(ids, jnp.int32)}
+    return token_batch_of(VOCAB, SEQ, batch, seed)
 
 
 def cross_entropy(logits, targets):
@@ -214,7 +214,7 @@ def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same(depths):
     for ours, reference in zip((supplied.losses, supplied.weights, *supplied.depths),
                               (explicit.losses, explicit.weights, *explicit.depths), strict=True):
         for left, right in zip(jax.tree.leaves(ours), jax.tree.leaves(reference), strict=True):
-            np.testing.assert_allclose(left, right, rtol=1e-6, atol=1e-6)
+            np.testing.assert_array_equal(left, right)
 
 
 def test_a_routed_depth_balances_only_when_the_depths_run():

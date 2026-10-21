@@ -157,10 +157,13 @@ def write_exchange_cases() -> None:
     import json
     from importlib.metadata import version
 
-    reference = {'transformers': '5.16.1', 'torch': '2.14.0+cpu'}
-    for package, expected in reference.items():
-        if version(package) != expected:
-            raise RuntimeError(f"exchange fixtures require {package}=={expected}")
+    from reference_releases import require
+
+    pins = require("gpt-oss-exchange")
+    build = version("torch")
+    if build != f"{pins['torch']}+cpu":
+        raise RuntimeError(f"the exchange fixtures are recorded on torch's CPU build, not {build}")
+    reference = {**pins, "torch": build}
     for skewed in (False, True):
         config = GptOssConfig(hidden_size=8, intermediate_size=12, num_local_experts=4,
                              num_experts_per_tok=2)

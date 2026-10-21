@@ -18,7 +18,6 @@ Run with the Dew test environment's torch and diffusers, on CPU:
     python tools/vae_encoder_reference.py OUTPUT.npz
 """
 
-import json
 import sys
 from pathlib import Path
 
@@ -51,6 +50,7 @@ def walk(encoder, image, probe, dtype):
 
 def main():
     from diffusers_wan_reference import widened
+    from reference_source import saved_fixture
 
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
@@ -82,8 +82,7 @@ def main():
         print(f"batch {batch}: moments {tuple(shape)}, fp32 off float64 by {gap:.3g}")
     meta = {"diffusers": __import__("diffusers").__version__, "torch": torch.__version__, "config": CONFIG,
             "batches": BATCHES, "size": SIZE}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(sys.argv[1], **arrays)
+    saved_fixture(Path(sys.argv[1]), arrays, meta)
     print(f"{sys.argv[1]}: {Path(sys.argv[1]).stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays")
 
 

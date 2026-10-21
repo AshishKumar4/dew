@@ -15,7 +15,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 import tokamax
-from process_support import READ_ONLY, REPEATABLE, REPO_ROOT, fresh, keeping_picks, run_pool
+from lane_environment import DETERMINISTIC_OPS
+from process_support import READ_ONLY, REPO_ROOT, fresh, keeping_picks, run_pool
 from reference_error import equations
 
 from dew.nn.activations import gated_product
@@ -164,7 +165,7 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
         assert stored[rows]["rms_norm_backward"] == [[-(-int(rows) // 2)], 8]
     assert tuned is True
     assert os.listdir(os.path.dirname(path)) == [os.path.basename(path)]
-    repeatable, _ = fresh(READ, cache_dir=tmp_path / "cache", flags=f"{flags} {REPEATABLE}")
+    repeatable, _ = fresh(READ, cache_dir=tmp_path / "cache", flags=f"{flags} {DETERMINISTIC_OPS}")
     heuristics = {str(rows): launches(step(), *operands(rows)) for rows in (13, 15, 40)}
     assert repeatable == json.loads(json.dumps(heuristics))
     assert repeatable != stored
