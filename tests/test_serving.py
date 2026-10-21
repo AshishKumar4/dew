@@ -32,6 +32,7 @@ from dew.nn.inputs import MixerCall
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
+from dew.nn.protocols import held_groups
 from dew.nn.sharding import BATCH_AXES
 from dew.sampling import Sampling
 from dew.training import Layout, MeshSpec
@@ -908,9 +909,7 @@ class AnsweringDecoder(UserDecoder):
 
     @nn.nowrap
     def inference_projection_groups(self, variables):
-        held = {collection: tree["decoder"] for collection, tree in variables.items() if "decoder" in tree}
-        return tuple(dataclasses.replace(group, path=("decoder", *group.path))
-                     for group in self.decoder.inference_projection_groups(held))
+        return held_groups(self.decoder, "decoder", variables)
 
 
 def wrapped(kind, model, variables, sampling, processor=None):

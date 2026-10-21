@@ -17,7 +17,7 @@ from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import Coordinates, coordinates as build_coordinates, next_position
 from dew.nn.kv_cache import POSITION
-from dew.nn.protocols import OutputTable, ProjectionGroup
+from dew.nn.protocols import OutputTable, ProjectionGroup, held_groups
 from dew.nn.sharding import explicit_spec
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
 
@@ -546,11 +546,8 @@ class MultimodalTransformer(nn.Module):
 
     @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
-        """The towers run once per prefill and keep their layout."""
-        text = {collection: tree["language_model"] for collection, tree in variables.items()
-                if "language_model" in tree}
-        return tuple(dataclasses.replace(group, path=("language_model", *group.path))
-                     for group in self.language_model.inference_projection_groups(text))
+        """The language model's (`held_groups`); the towers run once per prefill and keep their layout."""
+        return held_groups(self.language_model, "language_model", variables)
 
     @property
     def cache_rebuild_position(self) -> int | None:
