@@ -32,9 +32,9 @@ def test_an_unreachable_remote_only_slows_a_task_by_its_first_failed_requests(mo
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     opened = []
-    urlopen = urllib.request.urlopen
-    monkeypatch.setattr(urllib.request, "urlopen",
-                        lambda *args, **kwargs: (opened.append(args), urlopen(*args, **kwargs))[1])
+    open_ = urllib.request.OpenerDirector.open
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open",
+                        lambda self, *args, **kwargs: (opened.append(args), open_(self, *args, **kwargs))[1])
     cache = remote_cache.RemoteCache(tmp_path, f"http://127.0.0.1:{port}", "token", "jax/cpu")
     began = time.monotonic()
     for index in range(10):
@@ -456,3 +456,86 @@ def test_a_bundle_whose_program_could_not_be_read_goes_up_once_it_can(cache_work
     cache.drain()
     bundle = stored["/jax/cpu/bundles/tests/read.py"]
     assert [key for key, _ in remote_cache.unpacked(bundle)] == ["jit_read-1"]
+
+
+def test_a_program_another_file_compiled_while_a_bundle_was_on_its_way_stays_that_files(tmp_path):
+    """A file's bundle that brings a program another file's tests compiled while it was on its way
+    leaves the program the other file's: its bundle carries it."""
+    server, url = counted()
+    stored = {}
+
+    class Keeping(Counted):
+        def do_PUT(self):
+            stored[self.path] = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(204)
+            self.end_headers()
+
+    server.RequestHandlerClass = Keeping
+    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
+    slow = threading.Thread(target=cache.opened, args=("tests/slow.py",))
+    slow.start()
+    while not Counted.requests:
+        time.sleep(0.01)
+    cache.opened("tests/other.py")
+    compiled(tmp_path, "jit_slow-1", b"mine")
+    Counted.released.set()
+    slow.join()
+    cache.closed("tests/other.py")
+    cache.drain()
+    server.shutdown()
+    bundle = stored["/jax/cpu/bundles/tests/other.py"]
+    assert dict(remote_cache.unpacked(bundle)) == {"jit_slow-1": b"mine"}
+
+
+def test_a_program_past_the_cap_leaves_its_files_bundle_as_it_was(cache_worker, tmp_path, monkeypatch):
+    """A file whose tests compile one program larger than `MAX_BYTES` sends no bundle: the one the
+    Worker holds, with the programs that fit, stays."""
+    url, stored, seen = cache_worker
+    monkeypatch.setattr(remote_cache, "MAX_BYTES", 1000)
+    stored["/jax/cpu/bundles/tests/big.py"] = remote_cache.packed([("jit_old-1", b"old")])
+    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
+    cache.opened("tests/big.py")
+    compiled(tmp_path, "jit_big-1", b"b" * 2000)
+    cache.closed("tests/big.py")
+    cache.drain()
+    assert dict(remote_cache.unpacked(stored["/jax/cpu/bundles/tests/big.py"])) == {"jit_old-1": b"old"}
+    assert seen.count("/jax/cpu/bundles/tests/big.py") == 1  # its GET alone
+
+
+def test_the_token_never_follows_a_redirect(tmp_path):
+    """A Worker answering with a redirect to another origin is a failed request: nothing is sent to that
+    origin, the bearer token least of all."""
+    elsewhere: list[str | None] = []
+
+    class Elsewhere(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            elsewhere.append(self.headers.get("Authorization"))
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    other = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Elsewhere)
+    threading.Thread(target=other.serve_forever, daemon=True).start()
+    target = f"http://127.0.0.1:{other.server_address[1]}"
+
+    class Redirecting(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", target + self.path)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirecting)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
+    cache.opened("tests/a.py")
+    server.shutdown()
+    other.shutdown()
+    assert elsewhere == [] and cache.failures == 1
