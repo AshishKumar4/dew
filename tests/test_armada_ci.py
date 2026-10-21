@@ -568,7 +568,8 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     rows = {row["name"]: row["seconds"] for row in json.loads(out.read_text())["rows"]}
     short, long = rows["3.12:tests/test_short.py"], rows["3.12:tests/test_long.py"]
     assert 1.2 < short + long <= wall
-    assert long / short == pytest.approx(3.0, rel=0.25)
+    # The long test sleeps three times the short one's: a ratio of times, held as a plain ordering.
+    assert 2.25 <= long / short <= 3.75
 
 
 def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch,

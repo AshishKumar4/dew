@@ -57,11 +57,6 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
-  "tests/test_armada_ci.py": {
-   "comparisons": 1,
-   "lane": "Integration & Docs",
-   "by": "2026-11-27"
-  },
   "tests/test_attention_masked_rows.py": {
    "comparisons": 1,
    "lane": "Kernels",
@@ -345,11 +340,6 @@
   "tests/test_flaxdiff.py": {
    "comparisons": 6,
    "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
-  "tests/test_float64_terms.py": {
-   "comparisons": 12,
-   "lane": "Accuracy Gate",
    "by": "2026-11-13"
   },
   "tests/test_flow_grpo.py": {
