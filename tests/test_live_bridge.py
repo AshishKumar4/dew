@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 from aiohttp import web
-from tool_support import load
+from tool_support import run_from
 
 CONTAINER = Path(__file__).resolve().parents[1] / "site/live/container"
 SECRET = "bridge-secret"
@@ -20,9 +20,8 @@ FRAME = 4000
 
 @pytest.fixture(scope="module")
 def bridge():
-    sys.path.insert(0, str(CONTAINER))
-    yield load("shared_bridge", "site/live/container")
-    sys.path.remove(str(CONTAINER))
+    with run_from("shared_bridge", "site/live/container") as module:
+        yield module
 
 
 class Kernels:
@@ -362,12 +361,8 @@ def test_every_connection_of_a_session_ends_at_the_session_end(bridge, monkeypat
 def test_the_context_smoke_loads_beside_the_bridge_it_reports_with(bridge):
     """benchmark_gateway.py, the preparation's required context smoke, imports and reports the host's
     load through the bridge's own probe."""
-    sys.path.insert(0, str(CONTAINER))
-    try:
-        smoke = load("benchmark_gateway", "site/live/container")
-    finally:
-        sys.path.remove(str(CONTAINER))
-    assert {"loadavg", "stalls", "cpu_ticks"} <= set(smoke.load())
+    with run_from("benchmark_gateway", "site/live/container") as smoke:
+        assert {"loadavg", "stalls", "cpu_ticks"} <= set(smoke.load())
 
 
 def test_a_training_context_caps_the_batch_of_every_way_a_cell_loads_data_and_its_steps(tmp_path):
