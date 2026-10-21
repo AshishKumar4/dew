@@ -17,6 +17,10 @@ ON_GPU = jax.default_backend() == "gpu"
 SEEDS = 8
 """The forward's declared draws (check 1), sized by `seeds_for`."""
 
+ALL_HOOKS_SEEDS = 32
+"""The draws of a site with every hook at once, which `seeds_for` sizes at 32: the reference compared with
+itself resolves PARITY only there."""
+
 PINNED = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4, 2),
           attention_triton.Tiles(32, 64, 8, 3), attention_triton.Tiles(128, 128, 8, 2))
 """The configs each case runs at on the CPU, where interpreting all of `SPACE` would take hours; a GPU
@@ -74,6 +78,8 @@ def gate_of(queries: int, value_width: int) -> jax.Array:
 
 def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *, residuals: bool = False,
           width: int = 32, value_width: int = 32):
+    """`attention_triton.forward` pinned at `config` on par with `template.reference` over `case`'s keys and
+    the hooks `names`, at the site's declared seeds."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     hooks = hooks_for(names, queries, value_width, gate_of(queries, value_width))
@@ -88,7 +94,8 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
         return template.reference(query, key, value, spans, hooks, residuals=residuals)
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), drawing(queries, keys, dtype, width, value_width),
-                    f"triton forward {case} {sorted(names)} {jnp.dtype(dtype).name} {config}", seeds=SEEDS)
+                    f"triton forward {case} {sorted(names)} {jnp.dtype(dtype).name} {config}",
+                    seeds=ALL_HOOKS_SEEDS if names == HOOKS["all"] else SEEDS)
 
 
 @pytest.mark.parametrize("config", PINNED, ids=str)
