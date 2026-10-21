@@ -200,6 +200,35 @@ class Resize(grain.MapTransform):
 
 
 @dataclasses.dataclass(frozen=True)
+class Fit(grain.MapTransform):
+    """The pixels in `field` fitted into a `size` square whole: the longer side resized to `size`
+    (area down, bicubic up), the shorter in proportion, rounded, and the rest padded on both sides
+    with `fill`, the odd pixel at the bottom or right. A web image keeps all it shows, as the
+    retired online loader fitted it; `Resize` stretches it and `CenterCrop` cuts it instead."""
+
+    size: int
+    fill: int = 255
+    _: dataclasses.KW_ONLY
+    field: str = "image"
+
+    def map(self, element: Batch) -> Batch:
+        import cv2
+
+        image = np.asarray(element[self.field])
+        height, width = image.shape[:2]
+        longer = max(height, width)
+        scale = self.size / longer
+        fitted = (max(1, round(height * scale)), max(1, round(width * scale)))
+        resized = cv2.resize(image, fitted[::-1],
+                             interpolation=cv2.INTER_AREA if longer > self.size else cv2.INTER_CUBIC)
+        resized = resized.reshape(*fitted, *image.shape[2:])
+        tall, wide = self.size - fitted[0], self.size - fitted[1]
+        padding = ((tall // 2, tall - tall // 2), (wide // 2, wide - wide // 2),
+                   *((0, 0) for _ in image.shape[2:]))
+        return {**element, self.field: np.pad(resized, padding, constant_values=self.fill)}
+
+
+@dataclasses.dataclass(frozen=True)
 class CenterCrop(grain.MapTransform):
     """The central `size` square of the pixels in `field`; a smaller image is
     first resized up so its shorter side is `size`."""
