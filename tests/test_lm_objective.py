@@ -671,7 +671,9 @@ def test_z_loss_gradient_carries_the_reference_factor():
     initialized = jax.jit(lambda key: objective.init(key)["params"])
 
     def draw(seed):
-        return initialized(jax.random.key(seed)), np.asarray(token_batch(seed=seed)[TEXT_KEY])
+        # 32 rows: at the 4 of `token_batch`'s default the reference's own rounding of the embedding
+        # and norm gradients does not resolve its parity with itself within 512 seeds (`seeds_for`).
+        return initialized(jax.random.key(seed)), np.asarray(token_batch(batch=32, seed=seed)[TEXT_KEY])
 
     def programs(forward):
         # The forward and its pullback compiled once each, the oracle's cotangent between them.
