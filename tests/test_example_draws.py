@@ -434,3 +434,47 @@ def test_a_record_flags_rows_placed_apart_from_their_slot_and_column():
     assert flags([0, 1], [2, 3]) == [True, True]
     assert flags([1, 0], [2, 3]) == [False, True]
     assert flags([2, 3], [0, 1]) == [False, False]
+
+
+class WitnessedMean(Witnessed):
+    """`Witnessed` pooling a shared mean, which a window sums and never replays."""
+
+    def loss(self, variables, batch, step):
+        (total, mass), aux = super().loss(variables, batch, step)
+        return Ratio(total, mass), aux
+
+    def reduce_loss(self, stats):
+        return stats.mean()
+
+
+def test_a_split_recording_step_returns_every_microbatchs_evaluation():
+    """A step read in two microbatches returns both evaluations in the order they ran, each at the rows
+    its part reads, every row once, at the example's own draw."""
+    from dew.objectives.base import RECORD
+    from dew.training import MeshSpec, Trainer
+
+    trainer = Trainer(WitnessedMean(), optax.sgd(.1), key=jax.random.key(4), split=2, checkpoints=None,
+                      tracker=None, record=True)
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+    state = trainer.initial_state()
+    batch = {"y": jnp.arange(4, dtype=jnp.float32), EXAMPLE_ROWS: jnp.arange(4, dtype=jnp.int32)}
+    key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM), 0), 0)
+    _, _, metrics, *_ = trainer.compile(state, batch)(state, batch)
+    record = jax.device_get(metrics[RECORD])
+    np.testing.assert_array_equal(record["example_index"], [[0, 2], [1, 3]])
+    np.testing.assert_array_equal(record["evaluated"], [True, True])
+    assert bool(np.all(record["column_ok"]))
+    own = Step(jnp.asarray(0), jax.random.key(0), None, example_key=key,
+               example_index=jnp.arange(4, dtype=jnp.int32), example_count=4)
+    drawn = np.asarray(own.sample("noise", jax.random.uniform, (), dtype=jnp.float32, rows=4))
+    np.testing.assert_array_equal(record["values"]["noise"], drawn[[[0, 2], [1, 3]]])
+
+
+def test_a_custom_step_refuses_the_trainers_record():
+    """A custom step builds its own Steps, which the trainer's record cannot reach: asking for both is
+    refused before anything is built."""
+    from dew.training import Trainer
+
+    with pytest.raises(ValueError):
+        Trainer(Witnessed(), optax.sgd(.1), key=jax.random.key(0), step=lambda objective, optimizer: None,
+                record=True)
