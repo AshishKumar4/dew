@@ -114,7 +114,7 @@ IGNORED_FIELDS = {
     'architectures', 'attention_dropout', 'attn_implementation', 'auto_map',
     'bos_token_id', 'cache_implementation', 'chunk_size_feed_forward', 'dtype', 'eos_token_id',
     'id2label', 'initializer_range', 'is_encoder_decoder', 'label2id',
-    'max_window_layers', 'mlp_bias', 'output_attentions',
+    'max_window_layers', 'output_attentions',
     'output_hidden_states', 'pad_token_id', 'pretraining_tp',
     'problem_type', 'return_dict', 'use_cache', 'use_sliding_window',
     'torch_dtype', 'transformers_version', 'unk_token_id',
@@ -643,7 +643,8 @@ def _mlp_features(hf_config: Mapping[str, object]) -> int | tuple[int, ...]:
     return records.integer(stated, 'intermediate_size')
 
 
-_OPTIONAL_FIELDS = frozenset({'layer_types', 'sliding_window', 'rope_local_base_freq', 'attention_bias'})
+_OPTIONAL_FIELDS = frozenset({'layer_types', 'sliding_window', 'rope_local_base_freq', 'attention_bias',
+                              'mlp_bias'})
 """Fields `base_config` reads for a family whose reference reads them, and
 accepts unread at a value that computes nothing. rope_local_base_freq is
 read by the families whose class reads it, through their `RopeSpelling`."""
@@ -745,6 +746,7 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
         scale_after_cast=scale_after_cast,
         qk_norm=qk_norm,
         attention_bias='attention_bias' in reads and bool(hf_config.get('attention_bias', False)),
+        mlp_bias='mlp_bias' in reads and bool(hf_config.get('mlp_bias', False)),
         # Gemma3TextConfig ties by default, and so does Gemma4TextConfig; the
         # others do not, so a config that omits the field (gemma-3-1b-pt
         # does) takes its family's default.
@@ -754,8 +756,7 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
     config['kinds'] = kinds
     used.update(('vocab_size', 'intermediate_size', 'max_position_embeddings',
                  'rms_norm_eps', 'tie_word_embeddings'))
-    if 'attention_bias' in reads:
-        used.add('attention_bias')
+    used.update(reads & {'attention_bias', 'mlp_bias'})
 
     # A ramp lands under the field whose record it is: `rope_scaling` reads
     # the llama3 ramp over the plain frequencies, `yarn` replaces them.
@@ -814,10 +815,7 @@ def translate_family_config(hf_config: Mapping[str, object],
     if (model_type not in ('llada', 'dream', 'Dream', 'diffusion_gemma_text')
             and bidirectional and bidirectional != 'vision'):
         refuse(f"use_bidirectional_attention={bidirectional!r}", "the backbone is causal")
-    if hf_config.get('mlp_bias'):
-        refuse("mlp_bias=True", "the gated MLP is bias-free")
-
-    used = {'model_type', 'use_bidirectional_attention', 'mlp_bias', 'num_hidden_layers'}
+    used = {'model_type', 'use_bidirectional_attention', 'num_hidden_layers'}
     # An omitted field is the config class's default; an explicit null stays null.
     config = family.translate_config({**family.defaults, **hf_config}, used)
 
@@ -1211,11 +1209,13 @@ def _dense_decoder_weights(family: "DecoderFamily", model: CausalTransformer, va
             'no counterpart in this dense tensor encoder: per_layer_input_dim, '
             'kv_shared_layers or v_norm is set')
     mixers = [model.mixer] + [kind.mixer for kind in (model.kinds or {}).values()]
-    if (model.output_gate or model.partial_rotary_factor is not None
-            or any(mixer is not None and not isinstance(mixer, AttentionMixer) for mixer in mixers)):
+    # The rotary's width lays out no tensor: whether the written config states it is
+    # `refuse_lossy_export`'s to say.
+    if model.output_gate or any(mixer is not None and not isinstance(mixer, AttentionMixer)
+                                for mixer in mixers):
         raise ValueError(
-            'the attention output gate, a partial rotary and a mixer other than attention '
-            'have no counterpart in this dense tensor encoder')
+            'the attention output gate and a mixer other than attention have no counterpart in this '
+            'dense tensor encoder')
     if model.mixture is not None and family.export_path is None:
         raise ValueError('a model with a mixture has no routed tensor writer in this family')
     return decoder_tensors(family, model, variables, config)

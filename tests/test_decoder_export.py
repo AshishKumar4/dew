@@ -537,6 +537,38 @@ def test_a_sharded_export_holds_a_few_shards_on_the_host(tmp_path):
     assert measured["rise_gb"] < 4 * 50e6 / 2**30, measured
 
 
+def test_a_decoder_stating_a_full_width_rotary_exports_and_transformers_reads_it(tmp_path):
+    """A Qwen3 decoder built with `partial_rotary_factor=1.0` rotates its whole head, as with none
+    stated: written from the model and its variables alone (`PretrainedDecoder.from_model`), it
+    saves, reloads to its own logits, and transformers reads the export to logits Dew's are as
+    exact as, both from transformers' in float64."""
+    import jax.numpy as jnp
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    from dew.interop import PretrainedDecoder
+    from tools.diffusers_wan_reference import float64
+
+    loaded = Pretrained.load(FIXTURES / "qwen3-tiny", dtype="float32", attention_impl="reference")
+    model = loaded.model.clone(partial_rotary_factor=1.0)
+    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
+    expected = np.asarray(model.apply(loaded.variables, jnp.asarray(ids)))
+    PretrainedDecoder.from_model(model, loaded.variables).save(tmp_path)
+    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, jnp.asarray(ids))),
+                                  expected)
+
+    def theirs(dtype):
+        with float64() if dtype == torch.float64 else torch.no_grad():
+            reference = AutoModelForCausalLM.from_pretrained(tmp_path, attn_implementation="eager")
+            with torch.no_grad():
+                logits = reference.to(dtype).eval()(torch.from_numpy(ids).long(), use_cache=False).logits
+        return logits.double().numpy()
+
+    assert_as_exact_as_the_reference(expected.astype(np.float64), theirs(torch.float32),
+                                     theirs(torch.float64), "full-width rotary export logits")
+
+
 def test_a_policy_transformers_cannot_hold_is_refused_not_dropped():
     from dew.interop.generation_config import generation_config_of
     from dew.sampling import Sampling

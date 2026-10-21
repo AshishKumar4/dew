@@ -171,6 +171,63 @@ def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path
     np.testing.assert_allclose(np.asarray(actual), expected, atol=1e-4, rtol=0)
 
 
+@pytest.mark.parametrize("name, head", [("llama-tiny", "causal"), ("nemotron-h-tiny", "causal"),
+                                        ("modernbert-tiny", "masked")])
+def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name, head, tmp_path):
+    """Llama's MLP, Nemotron-H's MLP layers and ModernBERT's GLU carry biases where their config
+    states mlp_bias, which each reference reads (modeling_llama.py's LlamaMLP, NemotronHMLP,
+    ModernBertMLP's packed Wi): a checkpoint with random biases loads to logits as exact as the
+    reference's float32 ones, both from its float64 ones, and saves, from its source and (but for
+    Nemotron-H, whose hybrid pattern only its source writes) from the model and its variables
+    alone, to a checkpoint that reloads to the same logits."""
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForMaskedLM
+
+    from tools.diffusers_wan_reference import float64
+
+    auto = AutoModelForCausalLM if head == "causal" else AutoModelForMaskedLM
+    config = AutoConfig.from_pretrained(FIXTURES / name)
+    config.mlp_bias = True
+    reference, loading = auto.from_pretrained(FIXTURES / name, config=config, attn_implementation="eager",
+                                             output_loading_info=True)
+    added = set(loading["missing_keys"])
+    assert added and all(key.endswith("bias") for key in added)
+    draws = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        for key, parameter in reference.named_parameters():
+            if key in added:
+                parameter.copy_(0.1 * torch.randn(parameter.shape, generator=draws))
+    source = tmp_path / "source"
+    reference.save_pretrained(source)
+    ids = np.load(FIXTURES / name / "input_ids.npy")
+
+    def theirs(dtype):
+        with float64() if dtype == torch.float64 else torch.no_grad():
+            model = auto.from_config(config, dtype=dtype, attn_implementation="eager").eval()
+            model.load_state_dict(reference.state_dict())
+            with torch.no_grad():
+                return model(torch.from_numpy(ids).long()).logits.double().numpy()
+
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    ours = np.asarray(loaded.model.apply(loaded.variables, ids), np.float64)
+    assert_as_exact_as_the_reference(ours, theirs(torch.float32), theirs(torch.float64),
+                                     f"{name} logits with MLP biases")
+    loaded.save(tmp_path / "export")
+    exports = [tmp_path / "export"]
+    if name == "nemotron-h-tiny":
+        # Nemotron-H writes its hybrid pattern only from its source (`preserve_source_layout`):
+        # written from the model alone, the export refuses rather than drop the pattern.
+        with pytest.raises(ValueError):
+            PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "from_model")
+    else:
+        # Written from the model and its variables alone too, as a trained run exports.
+        PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "from_model")
+        exports.append(tmp_path / "from_model")
+    for export in exports:
+        again = Pretrained.load(export, dtype="float32", attention_impl="reference")
+        reloaded = np.asarray(again.model.apply(again.variables, ids))
+        np.testing.assert_array_equal(reloaded, ours.astype(np.float32))
+
 @pytest.mark.gpu(reason="TF32 is a GPU's: a CPU multiplies float32 operands in float32 at any precision")
 def test_a_float32_decoder_multiplies_float32_products_on_a_gpu():
     """A float32 decoder that states no precision multiplies float32 products, as torch's float32
@@ -203,10 +260,14 @@ def test_a_float32_decoder_multiplies_float32_products_on_a_gpu():
     ("qwen2-tiny", {"use_mrope": True}),
     ("mamba2-tiny", {"rms_norm": False, "intermediate_size": 3, "norm_before_gate": True}),
     ("nemotron-h-tiny", {"mamba_num_groups": 7, "rms_norm_eps": 0.5}),
+    ("qwen35-tiny", {"attn_output_gate": False}),
+    ("granitemoe-tiny", {"router_jitter_noise": 0.5, "activation_function": "gelu"}),
+    ("modernbert-tiny", {"is_causal": True, "causal_mask": True}),
 ])
 def test_a_field_the_reference_does_not_read_leaves_its_logits_whatever_it_holds(tmp_path, name, stale):
     """A released config may carry fields its reference neither declares nor reads (a multimodal
-    rotary flag, mamba_ssm's own sizes, an older name for a field it reads under another), and
+    rotary flag, mamba_ssm's own sizes, an older name for a field it reads under another, an output
+    gate the attention always builds, a router jitter or a direction the reference never applies), and
     the reference computes the same model whatever they hold; so the checkpoint loads to its
     reference logits however they disagree with the fields the reference reads."""
     from shutil import copytree
@@ -717,17 +778,7 @@ def biased_qwen3(rng):
         for index, (path, leaf) in enumerate(leaves)])
 
 
-def qwen3_is_available() -> bool:
-    if os.environ.get("DEW_NETWORK_TESTS") == "1":
-        return True
-    from huggingface_hub import try_to_load_from_cache
-    cached = try_to_load_from_cache("Qwen/Qwen3-0.6B", "model.safetensors")
-    return isinstance(cached, str)
-
-
 @pytest.mark.network
-@pytest.mark.skipif(not qwen3_is_available(),
-                    reason="Qwen3-0.6B is neither cached nor DEW_NETWORK_TESTS=1")
 def test_qwen3_0_6b_matches_the_reference_on_the_real_weights():
     """The real thing: 28 layers of Qwen3-0.6B, fp32, against torch's top 32."""
     prompt = json.loads((REAL / "prompt.json").read_text())

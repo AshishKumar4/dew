@@ -28,6 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import Replaying
 from flax import linen as nn
 from interop_support import extract_fixture, hub_cache
 from reference_error import assert_as_exact_as_the_reference
@@ -793,28 +794,76 @@ def test_a_registry_model_adapts_through_the_names_its_own_kernels_carry(tmp_pat
         unnamed.save(adapted, tmp_path / "unnamed")
 
 
-def test_factors_keep_one_storage_dtype_whether_attached_or_rebuilt_from_the_record():
-    """An adapter's factors are stored in float32 under bfloat16 base weights, as attached and as
-    the model rebuilt from its record initializes them, so a run restoring trained factors onto
-    the rebuilt model's template keeps every bit; the rebuilt model computes what the attached one
-    does over the attached variables."""
+def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_uninterrupted_run(tmp_path):
+    """Factors trained over bfloat16 base weights: a run checkpointed after two steps resumes on the
+    model rebuilt from its record (`ModelConfig.from_model`), whose own initializer draws the
+    restore template, its factors stored in float32 as attached. The restored state is the first
+    run's step-2 state bit for bit, and its next two steps reach every leaf and the outputs an
+    uninterrupted four-step run reaches, bit for bit. A template whose factors took the base's
+    bfloat16 would round the restored factors; a resume that drew afresh would start elsewhere."""
     from dew.config import ModelConfig
+    from dew.inputs import Field, InputSpec
+    from dew.objectives.base import Objective, Ratio
 
     model = nn.Sequential([nn.Dense(8, param_dtype=jnp.bfloat16), nn.Dense(4, param_dtype=jnp.bfloat16)])
-    inputs = jax.random.normal(jax.random.key(1), (2, 6))
-    variables = model.init(jax.random.key(0), inputs)
-    adapter = LoRA(rank=2, modules=("layers_0", "layers_1")).apply(model, variables, key=0)
+    rows = 2 * jax.device_count()
+    inputs = np.asarray(jax.random.normal(jax.random.key(1), (rows, 6)))
+    adapter = LoRA(rank=2, modules=("layers_0", "layers_1")).apply(
+        model, model.init(jax.random.key(0), inputs), key=0)
     rebuilt = ModelConfig.from_model(adapter.model).build()
-    template = rebuilt.init(jax.random.key(0), inputs)
+
+    class Squared(Objective):
+        """The mean squared output; its variables those given, or its model's own draw."""
+
+        inputs = InputSpec(Field("x", (6,)))
+
+        def __init__(self, model, variables=None):
+            self.model, self.variables = model, variables
+
+        def init(self, key, variables=None):
+            if variables is not None:
+                return variables
+            return self.model.init(key, inputs) if self.variables is None else self.variables
+
+        def loss(self, variables, batch, step):
+            outputs = self.model.apply(variables, batch["x"])
+            return Ratio(jnp.sum(outputs.astype(jnp.float32) ** 2), jnp.asarray(outputs.size, jnp.float32))
+
+    def data():
+        # A stream that keeps its position, so a resume continues where the checkpoint left it;
+        # each step's batch is its own, so a resume that restarted the data would diverge.
+        return Loader(train=lambda partition: Replaying(lambda step: {"x": inputs * (1 + step)}), val=None,
+                      records=rows, batch=rows)
+
+    def trainer(objective, directory):
+        return Trainer(objective, optax.adam(1e-2), key=jax.random.key(3), mesh=MeshSpec(),
+                       checkpoints=Checkpoints(str(directory)))
 
     def factors(tree):
-        return {name: leaf.dtype for name, leaf in _flat(tree["params"]).items()
-                if name.endswith(lora.FACTORS)}
+        return {name: leaf for name, leaf in _flat(tree["params"]).items() if name.endswith(lora.FACTORS)}
 
-    attached = factors(adapter.variables)
-    assert factors(template) == attached == dict.fromkeys(attached, jnp.float32)
-    np.testing.assert_array_equal(np.asarray(rebuilt.apply(adapter.variables, inputs)),
-                                  np.asarray(adapter.model.apply(adapter.variables, inputs)))
+    whole = trainer(Squared(adapter.model, adapter.variables), tmp_path / "whole").fit(data(), steps=4,
+                                                                                      log_every=4)
+    first = trainer(Squared(adapter.model, adapter.variables), tmp_path / "split")
+    halfway = first.fit(data(), steps=2, log_every=2, checkpoint_every=2)
+    first.checkpoints.wait()
+
+    resumed = trainer(Squared(rebuilt), tmp_path / "split")
+    template = factors(Squared(rebuilt).init(jax.random.key(3)))
+    assert {leaf.dtype for leaf in template.values()} == {jnp.dtype(jnp.float32)}
+    restored, _, _ = resumed.place()
+    assert int(restored.step) == 2
+    for name, leaf in factors(halfway.variables).items():
+        ours = factors(restored.variables)[name]
+        assert ours.dtype == leaf.dtype and np.array_equal(np.asarray(ours), np.asarray(leaf)), name
+    continued = resumed.fit(data(), steps=4, log_every=2)
+    assert int(continued.step) == 4
+    for (path, ours), theirs in zip(jax.tree_util.tree_leaves_with_path(continued.variables),
+                                    jax.tree.leaves(whole.variables), strict=True):
+        assert ours.dtype == theirs.dtype and np.array_equal(np.asarray(ours), np.asarray(theirs)), \
+            jax.tree_util.keystr(path)
+    np.testing.assert_array_equal(np.asarray(rebuilt.apply(continued.variables, inputs)),
+                                  np.asarray(adapter.model.apply(whole.variables, inputs)))
 
 
 def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):

@@ -21,31 +21,35 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
 from test_t5_encoders import TOLERANCE as T5_TOLERANCE
-from test_text_encoders import TOLERANCE as CLIP_TOLERANCE
+from test_text_encoders import transformers_clip
 from test_vae_16ch import TOLERANCE as VAE_TOLERANCE
 from tool_support import FIXTURES, REPO_ROOT, load
 
 CLAIMS = json.loads((FIXTURES / "provenance.json").read_text())["references"]
 
 # The family parity contracts, read from the tests that hold Dew to these fixtures, not bounds fitted
-# to a CI CPU: test_moe.py (routers and expert sums), test_text_encoders.py (tiny towers),
-# test_t5_encoders.py (tiny hidden states), test_vae_16ch.py (raw encode/decode).
+# to a CI CPU: test_moe.py (routers and expert sums), test_t5_encoders.py (tiny hidden states),
+# test_vae_16ch.py (raw encode/decode). The CLIP towers' outputs are held as their own test holds
+# them, to the reference's float64 run (`transformers_clip`).
 MOE_OUTPUTS = {
     "mixtral.npz": {"router_weights": ROUTER_TOLERANCE, "block_output": OUTPUT_TOLERANCE},
     "deepseek.npz": {"router_weights": ROUTER_TOLERANCE, "block_output": OUTPUT_TOLERANCE},
     "deepseek_v2.npz": {"router_weights": ROUTER_TOLERANCE},
     "deepseek_v4.npz": {"router_weights": ROUTER_TOLERANCE, "experts_output": OUTPUT_TOLERANCE},
 }
-CLIP_OUTPUTS = dict.fromkeys(
-    ("last_hidden_state", "pooler_output", "text_embeds", "image_embeds"), CLIP_TOLERANCE)
+CLIP_OUTPUTS = ("last_hidden_state", "pooler_output", "text_embeds", "image_embeds")
 T5_OUTPUTS = {"last_hidden_state": T5_TOLERANCE}
 VAE_OUTPUTS = {"latent": VAE_TOLERANCE, "decoded": VAE_TOLERANCE}
 
 
-def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, float]) -> None:
-    """Only named arithmetic outputs use the family's fp32 parity bound.
+def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, float],
+                          truth: dict[str, np.ndarray] | None = None) -> None:
+    """Only named arithmetic outputs use the family's fp32 parity bound, or, where `truth` gives
+    their float64 values, are held as exact as the committed float32 output from them
+    (tests/reference_error.py).
 
     Seeds do not promise cross-platform bit identity for arithmetic:
     https://docs.pytorch.org/docs/2.14/notes/randomness.html
@@ -56,12 +60,16 @@ def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, f
     """
     with np.load(written) as ours, np.load(committed) as theirs:
         assert set(ours.files) == set(theirs.files)
-        assert numerical.keys() <= set(theirs.files)
+        truth = {} if truth is None else truth
+        assert numerical.keys() <= set(theirs.files) and truth.keys() <= set(theirs.files)
         for name in theirs.files:
             actual, expected = ours[name], theirs[name]
             assert actual.shape == expected.shape, name
             assert actual.dtype == expected.dtype, name
-            if name in numerical:
+            if name in truth:
+                assert_as_exact_as_the_reference(actual.astype(np.float64), expected.astype(np.float64),
+                                                 truth[name], name)
+            elif name in numerical:
                 assert np.isfinite(actual).all() and np.isfinite(expected).all(), name
                 difference = float(np.max(np.abs(actual - expected)))
                 assert difference < numerical[name], f"{name}: max error {difference:.3e}"
@@ -128,13 +136,19 @@ def test_moe_fixtures_are_what_the_generator_writes(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
-    """Exact checkpoint, tokenizer and pixels; both towers meet fp32 parity."""
+    """Exact checkpoint, tokenizer and pixels; both towers' outputs as exact as the committed ones,
+    both from the reference's float64 run."""
+    import torch
+
     load("clip_reference").write_tiny(tmp_path)
 
     committed = FIXTURES / "clip" / "tiny"
     assert_fixture_json(tmp_path, committed, "clip_reference")
     assert_same_tensors(tmp_path / "model.safetensors", committed / "model.safetensors")
-    assert_fixture_arrays(tmp_path / "reference.npz", committed / "reference.npz", CLIP_OUTPUTS)
+    with np.load(committed / "reference.npz") as inputs:
+        truth = transformers_clip(tmp_path, dict(inputs), torch.float64)
+    assert_fixture_arrays(tmp_path / "reference.npz", committed / "reference.npz", {},
+                          {name: truth[name] for name in CLIP_OUTPUTS})
 
 
 # ---------------------------------------------------------------------------
