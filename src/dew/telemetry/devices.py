@@ -166,19 +166,46 @@ def nvidia_gpus() -> tuple[str, tuple[int, int]] | None:
     return listed_gpus(answered(QUERY, 10))
 
 
+def _driver() -> ctypes.CDLL | None:
+    """The CUDA user-mode driver library JAX's CUDA plugin loads, or None where none loads."""
+    try:
+        return ctypes.CDLL("libcuda.so.1")
+    except OSError as error:  # ctypes' answer for a library the loader does not find
+        _log.debug("no CUDA driver library loads: %s", error)
+        return None
+
+
 def cuda_driver_version() -> int | None:
     """The CUDA version the user-mode driver this process loads supports, as
     `cuDriverGetVersion` reports it (13.0 as 13000), the library JAX's CUDA
     plugin loads; None where no driver library loads. NVIDIA's
     forward-compatibility package raises it past what the kernel driver's
     major gives (`CUDA_BUILDS`)."""
-    try:
-        cuda = ctypes.CDLL("libcuda.so.1")
-    except OSError as error:  # ctypes' answer for a library the loader does not find
-        _log.debug("no CUDA driver library loads: %s", error)
+    cuda = _driver()
+    if cuda is None:
         return None
     version = ctypes.c_int()
     return None if cuda.cuDriverGetVersion(ctypes.byref(version)) else version.value
+
+
+CLOCK_RATE, MEMORY_CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH = 13, 36, 37
+"""`CUdevice_attribute`s (cuda.h): the multiprocessors' peak clock and the device memory's peak clock, in
+kHz, and the device memory bus's width in bits."""
+
+
+def gpu_attribute(ordinal: int, attribute: int) -> int | None:
+    """The CUDA driver's `attribute` (a `CUdevice_attribute`) of the visible GPU `ordinal`: a device fact
+    JAX's Device does not carry, a GPU's clocks above all. None where no driver library loads (a CPU
+    host); a driver error raises."""
+    cuda = _driver()
+    if cuda is None:
+        return None
+    device, value = ctypes.c_int(), ctypes.c_int()
+    for call in (lambda: cuda.cuInit(0), lambda: cuda.cuDeviceGet(ctypes.byref(device), ordinal),
+                 lambda: cuda.cuDeviceGetAttribute(ctypes.byref(value), attribute, device)):
+        if status := call():
+            raise RuntimeError(f"CUDA driver error {status}")
+    return value.value
 
 
 def cpu_only_refusal(env: Mapping[str, str], gpus: tuple[str, tuple[int, int]] | None,
