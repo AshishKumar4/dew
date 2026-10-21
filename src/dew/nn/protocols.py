@@ -558,6 +558,16 @@ class ProjectionSites(Protocol):
     def projection_groups(self) -> tuple[ProjectionGroup, ...]: ...
 
 
+def held_groups(inner: Serving, name: str, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
+    """The groups `inner`, held under `name` in a wrapper's variables, declares
+    (`Serving.inference_projection_groups`), at their paths in the wrapper's tree: what a module
+    around a decoder answers as its own groups, a multimodal model's around its language model or
+    a user's around Dew's decoder."""
+    held = {collection: tree[name] for collection, tree in variables.items() if name in tree}
+    return tuple(dataclasses.replace(group, path=(name, *group.path))
+                 for group in inner.inference_projection_groups(held))
+
+
 def declared_groups(*modules: nn.Module) -> tuple[ProjectionGroup, ...]:
     """The groups the bound `modules` declare, in order; a module declaring none adds none."""
     return tuple(group for module in modules if isinstance(module, ProjectionSites)
