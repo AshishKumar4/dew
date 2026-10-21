@@ -1682,7 +1682,7 @@ class Trainer(Generic[Loss, Effects]):
                 agreed_same("training data", lambda: (
                     f"{plan.dataset.batch} records a step of {stream_identity(run.source)}"))
             run.endless = stream_endless(run.source)
-            self._marked = marked(mesh, self._counted_batch)
+            self._marked = marked(partition, self._counted_batch)
             run.train = DevicePrefetchIterator(run.source, mesh, source_state=position, reads=run.reads,
                                                 prepare=self._marked if self.rollout is None else None)
             run.source = None  # Lifetime transferred to the prefetch worker.

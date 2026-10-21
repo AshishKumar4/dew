@@ -8,6 +8,7 @@ differ. The self-conditioning draw enables row zero and disables row one.
 import math
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import grain.python as grain
 import jax
@@ -146,6 +147,8 @@ def test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target(sourc
 
 def test_sparse_canvas_targets_train_and_score_their_physical_canvas(source):
     loaded, _, step, _ = source
+    # Another batch than the reference's: the step draws its own, not the reference's tape.
+    step = step.replace(tape=None)
     obj = objective(loaded, canvas_size=2, encoder_loss_weight=0)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
     tokens = jnp.tile(jnp.arange(1, 9, dtype=jnp.int32), (4, 1))
@@ -165,6 +168,8 @@ def test_sparse_canvas_targets_train_and_score_their_physical_canvas(source):
 
 def test_canvas_sampling_is_uniform_over_noncontiguous_partial_canvases(source):
     loaded, _, step, _ = source
+    # Another batch than the reference's: the step draws its own, not the reference's tape.
+    step = step.replace(tape=None)
     obj = BlockDiffusionObjective(loaded.model, prompt_length=4, num_canvases=4,
                                   canvas_size=2, variables=loaded.variables)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
@@ -338,8 +343,11 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
     data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
     run_key = jax.random.key(2)
-    step = Step(step=jnp.asarray(0, jnp.int32),
-                key=jax.random.fold_in(jax.random.split(run_key)[1], 0), ema=None)
+    # The trainer's first step: its attempt's key and its examples' draws (`example_fields`).
+    state_key = jax.random.split(run_key)[1]
+    started = SimpleNamespace(key=state_key, updates=jnp.asarray(0))
+    step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.fold_in(state_key, 0), ema=None,
+                **example_fields(started, 0, 1, batch))
     gradient = jax.jit(jax.grad(lambda trainable: obj.scalar_loss(
         {**variables, "params": trainable}, batch, step)[0]))(variables["params"])
     expected = {**variables, "params": jax.tree.map(
