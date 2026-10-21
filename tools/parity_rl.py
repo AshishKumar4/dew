@@ -131,6 +131,9 @@ DRAWN_MASK = np.tile(RESPONSE_MASK, (16, 1))
 one a single token) sixteen times over."""
 DRAWN_GROUPS = 64
 """The recorded draws' groups of GROUP rewards."""
+WHITENED = 32
+"""The recorded draws' tensors whitened apart: a whitening shares one mean and one deviation over its
+tensor, one rounding a draw would otherwise give."""
 
 
 def advantage_inputs(seed: int) -> dict[str, np.ndarray]:
@@ -141,10 +144,13 @@ def advantage_inputs(seed: int) -> dict[str, np.ndarray]:
     rng = np.random.default_rng([0xADB, seed])
     rewards = rng.normal(size=DRAWN_GROUPS * GROUP).astype(np.float32)
     rewards[GROUP:2 * GROUP] = rewards[GROUP]
-    values = rng.normal(size=DRAWN_MASK.shape)
-    values = np.where(DRAWN_MASK > 0, values, 7 * values).astype(np.float32)
+
+    def values(*shape):
+        drawn = rng.normal(size=(*shape, *DRAWN_MASK.shape))
+        return np.where(DRAWN_MASK > 0, drawn, 7 * drawn).astype(np.float32)
+
     return {"rewards": rewards, "token_rewards": rng.normal(size=DRAWN_MASK.shape).astype(np.float32),
-            "values": values}
+            "values": values(), "whitened": values(WHITENED)}
 
 
 def verl_advantages(verl, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
@@ -161,7 +167,8 @@ def verl_advantages(verl, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.
     token_level, ones = tensor(rewards[:, None]), tensor(np.ones((rewards.shape[0], 1)))
     values, mask = tensor(inputs["values"]), tensor(DRAWN_MASK)
     found = {"masked_mean_rows": reductions.masked_mean(values, mask, axis=-1),
-             "masked_whiten": reductions.masked_whiten(values, mask)}
+             "masked_whiten": torch.stack([reductions.masked_whiten(tensor(one), mask)
+                                           for one in inputs["whitened"]])}
     found["group_advantage"] = verl.compute_grpo_outcome_advantage(token_level.clone(), ones, uids)[0][:, 0]
     found["group_advantage_unnormalised"] = verl.compute_grpo_outcome_advantage(
         token_level.clone(), ones, uids, norm_adv_by_std_in_grpo=False)[0][:, 0]
@@ -178,7 +185,8 @@ def tunix_advantages(tunix, inputs: dict[str, np.ndarray], dtype) -> dict[str, n
     rewards, values, mask = (jnp.asarray(inputs.get(name, DRAWN_MASK), dtype)
                              for name in ("rewards", "values", "response_mask"))
     found = {"masked_mean_rows": tunix.masked_mean(values, mask, axis=-1),
-             "masked_whiten": tunix.masked_whiten(values, mask),
+             "masked_whiten": jnp.stack([tunix.masked_whiten(jnp.asarray(one, dtype), mask)
+                                         for one in inputs["whitened"]]),
              "group_advantage": tunix.compute_advantages(rewards, GROUP),
              "group_advantage_unnormalised": tunix.compute_drgrpo_advantages(rewards, GROUP),
              "rloo_advantage": tunix.compute_rloo_advantages(rewards, GROUP)}
@@ -209,7 +217,7 @@ def write_advantage_recording(verl, tunix, command: str, out: Path) -> None:
         mask = jnp.asarray(DRAWN_MASK, inputs["values"].dtype)
         advantages, returns = gae(inputs["token_rewards"], inputs["values"], mask, gamma=GAMMA, lam=LAM)
         return {"masked_mean_rows": masked_mean(inputs["values"], mask, axis=-1),
-                "masked_whiten": masked_whiten(inputs["values"], mask),
+                "masked_whiten": jax.vmap(lambda one: masked_whiten(one, mask))(inputs["whitened"]),
                 "group_advantage": group_advantage(inputs["rewards"], GROUP),
                 "group_advantage_unnormalised": group_advantage(inputs["rewards"], GROUP,
                                                                 normalise_by_std=False),
