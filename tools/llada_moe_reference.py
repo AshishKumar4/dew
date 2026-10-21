@@ -7,33 +7,29 @@ committed as `released.npz` beside the fixture. Dew's own fp32 forward plans the
 recorded release confirms it. LLaDA2's forwards run under its explicit block-causal mask of 4-token
 blocks (`llada_fields`), which its 2.0 forward requires. Sampling-recipe parity is separate.
 
-Uses remote_code_reference's loader, which fetches config and Python only, never weights; --draw
-replaces the committed synthetic weights first. The releases' code reads different transformers:
-LLaDA-MoE, v2 and 2.0 run under 4.57.1, 2.1 and 2.2 under 5.16.1, each in an environment holding Dew
-too, as record_case runs Dew's forward beside the release's:
-  python tools/llada_moe_reference.py llada-moe-tiny llada-moe-v2-tiny llada2-tiny   # 4.57.1
-  python tools/llada_moe_reference.py llada21-tiny llada22-tiny                      # 5.16.1
+The releases' code reads its own transformers, LLaDA-MoE's, v2's and 2.0's 4.57.1 (which refuses the
+huggingface_hub Dew reads) and 2.1's and 2.2's 5.16.1, so the release runs in a process of its own
+(`--serve`, under `--release-python`), fed each draw over a pipe, beside Dew's: it imports torch and
+the release loader alone. remote_code_reference's loader fetches config and Python only, never
+weights; --draw replaces the committed synthetic weights first.
+  python tools/llada_moe_reference.py llada-moe-tiny llada-moe-v2-tiny llada2-tiny \\
+      --release-python <a Python with transformers 4.57.1>
+  python tools/llada_moe_reference.py llada21-tiny llada22-tiny --release-python <transformers 5.16.1>
 """
 
 import argparse
+import io
+import struct
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-import jax.numpy as jnp
 import numpy as np
 import torch
-import transformers
 from diffusers_wan_reference import float64
-from recorded_references import provenance, record_case, save
 from remote_code_reference import FIXTURES, RELEASES as REGISTERED, released_model
 from safetensors.torch import save_file
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-from model_support import llada_draw, llada_fields
-from reference_error import widened
-
-from dew.interop import Pretrained
 
 RELEASES = {
     "llada-moe-tiny": ("inclusionAI/LLaDA-MoE-7B-A1B-Base", "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf",
@@ -67,32 +63,69 @@ def draw(model, directory):
               str(directory / 'model.safetensors'))
 
 
-def released_logits(model, ids, name):
-    """The release's forward of `ids` `[2, 16]`, under LLaDA2's block-causal mask."""
+def _send(stream, arrays: dict) -> None:
+    buffer = io.BytesIO()
+    np.savez(buffer, **arrays)
+    stream.write(struct.pack('<Q', len(buffer.getvalue())) + buffer.getvalue())
+    stream.flush()
+
+
+def _received(stream) -> dict:
+    size = struct.unpack('<Q', stream.read(8))[0]
+    with np.load(io.BytesIO(stream.read(size))) as arrays:
+        return dict(arrays)
+
+
+def released_logits(model, ids, visible):
+    """The release's forward of `ids` `[2, 16]`, under `visible` `[16, 16]` as an additive mask where
+    one is given (LLaDA2's block-causal mask)."""
     fields = {}
-    mask = llada_fields(name, ids.shape[-1])
-    if mask:
-        visible = torch.from_numpy(np.asarray(mask['attention_pairwise_mask']))
-        fields['attention_mask'] = torch.where(visible, 0.0, -torch.inf).to(model.dtype)[None, None].expand(
-            ids.shape[0], 1, -1, -1)
+    if visible is not None:
+        fields['attention_mask'] = torch.where(torch.from_numpy(visible), 0.0, -torch.inf).to(model.dtype)[
+            None, None].expand(ids.shape[0], 1, -1, -1)
     return model(input_ids=ids, **fields).logits.detach().numpy()
 
 
-def record(name: str, workspace: Path) -> None:
+def serve(name: str) -> None:
+    """The release's side: its fp32 and float64 forwards of each draw the pipe brings."""
+    REGISTERED.update(RELEASES)
+    with tempfile.TemporaryDirectory() as workspace, torch.no_grad():
+        native = released_model(name, Path(workspace) / 'fp32').float()
+        with float64():
+            wide = released_model(name, Path(workspace) / 'f64').double()
+        while True:
+            request = _received(sys.stdin.buffer)
+            ids = torch.from_numpy(request['ids'].astype(np.int64))
+            visible = request.get('visible')
+            reference = released_logits(native, ids, visible)
+            with float64():
+                truth = released_logits(wide, ids, visible)
+            _send(sys.stdout.buffer, {'reference': reference, 'truth': truth})
+
+
+def record(name: str, release_python: str) -> None:
+    """`name`'s recording (`record_case`), the release served by `release_python`."""
+    import jax.numpy as jnp
+    from recorded_references import provenance, record_case, save
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tests'))
+    from model_support import llada_draw, llada_fields
+    from reference_error import widened
+
+    from dew.interop import Pretrained
+
     repo, revision = RELEASES[name][:2]
-    native = released_model(name, workspace / 'fp32').float()
-    with float64():
-        wide = released_model(name, workspace / 'f64').double()
+    worker = subprocess.Popen([release_python, __file__, '--serve', name], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE)
+    fields = llada_fields(name, 16)
+    mask = {} if not fields else {'visible': np.asarray(fields['attention_pairwise_mask'])}
 
     def evaluate(inputs):
-        ids = torch.from_numpy(inputs['ids'].astype(np.int64))
-        reference = {'logits': released_logits(native, ids, name)}
-        with float64():
-            truth = {'logits': released_logits(wide, ids, name)}
-        return reference, truth
+        _send(worker.stdin, {'ids': inputs['ids'], **mask})
+        returned = _received(worker.stdout)
+        return {'logits': returned['reference']}, {'logits': returned['truth']}
 
     source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
-    fields = llada_fields(name, 16)
 
     def forward(inputs):
         return {'logits': source.model.apply(source.variables, inputs['ids'], **fields)}
@@ -102,11 +135,17 @@ def record(name: str, workspace: Path) -> None:
     def wide_forward(inputs):
         return {'logits': wide_model.apply(wide_variables, inputs['ids'], **fields)}
 
-    arrays = record_case(name, lambda seed: llada_draw(seed, source.model.vocab_size), evaluate, forward,
-                         truth_proxy=wide_forward, store_inputs=False, summary=True)
+    try:
+        arrays = record_case(name, lambda seed: llada_draw(seed, source.model.vocab_size), evaluate, forward,
+                             truth_proxy=wide_forward, store_inputs=False, summary=True)
+    finally:
+        worker.kill()
+    versions = subprocess.run([release_python, '-c', 'import torch, transformers; '
+                               'print(transformers.__version__, torch.__version__)'],
+                              capture_output=True, text=True, check=True).stdout.split()
     arrays[f'{name}.provenance'] = provenance(
-        repo, revision, 'cpu', f'python tools/llada_moe_reference.py {name}',
-        transformers=transformers.__version__, torch=torch.__version__)
+        repo, revision, 'cpu', f'python tools/llada_moe_reference.py {name} --release-python <python>',
+        transformers=versions[0], torch=versions[1])
     print(save(FIXTURES / name / 'released.npz', arrays, reference=repo, license=LICENSES[name]), flush=True)
 
 
@@ -114,13 +153,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('names', nargs='+', choices=RELEASES)
     parser.add_argument('--draw', action='store_true', help='redraw the committed synthetic checkpoint')
+    parser.add_argument('--serve', action='store_true', help="the release's side of the pipe")
+    parser.add_argument('--release-python', default=sys.executable,
+                        help="the Python that runs the release's code, with its transformers")
     args = parser.parse_args()
+    if args.serve:
+        serve(args.names[0])
+        return
     REGISTERED.update(RELEASES)
-    with tempfile.TemporaryDirectory() as workspace, torch.no_grad():
-        for name in args.names:
-            if args.draw:
+    for name in args.names:
+        if args.draw:
+            with tempfile.TemporaryDirectory() as workspace, torch.no_grad():
                 draw(released_model(name, Path(workspace) / 'draw').float(), FIXTURES / name)
-            record(name, Path(workspace) / name)
+        record(name, args.release_python)
 
 
 if __name__ == '__main__':
