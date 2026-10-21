@@ -843,9 +843,9 @@ def test_llada_logits_match_the_released_model_code():
 
 
 def _recorded_source(name):
-    """A recorded fixture (tools/remote_code_reference.py `RECORDED`) loaded through `Pretrained.load`
+    """A recorded fixture (tools/masked_moe_reference.py `RECORDED`) loaded through `Pretrained.load`
     from its checkpoint in the release's own tensor names, its model reading the recording's block."""
-    from tools import remote_code_reference as tool
+    from tools import masked_moe_reference as tool
 
     source = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
     block = tool.RECORDED[name].block
@@ -859,7 +859,7 @@ def test_masked_moe_logits_are_as_exact_as_the_released_model_code(name):
     group-limited sigmoid router with its bias, a shared expert after a dense layer) and LLaDA2.2
     (its block routing), each held to its release's own modeling code over its recorded seeds:
     LLaDA2 under its generate's block mask, the block the model reads too."""
-    from tools import remote_code_reference as tool
+    from tools import masked_moe_reference as tool
 
     path = FIXTURES / name / "recording.npz"
     seeds = declared_seeds(path)[name]
@@ -888,7 +888,7 @@ def test_llada2_fixtures_route_by_their_bias_and_their_limit(name, limit):
     """The parity above holds where LLaDA2's routing decides: on the recording's draws, its tokens
     choose experts their unbiased scores would not, and experts the bias alone would not without the
     group limit (2.1) or the block's experts (2.2)."""
-    from tools import remote_code_reference as tool
+    from tools import masked_moe_reference as tool
 
     source, model = _recorded_source(name)
     ids = np.concatenate([tool.token_draw(name)(seed)["input_ids"] for seed in range(8)])
