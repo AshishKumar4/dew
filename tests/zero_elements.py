@@ -171,6 +171,10 @@ class Interpreter:
 
     def _equation(self, eqn, operands: list[Bounded]) -> list[Bounded]:
         name = eqn.primitive.name
+        if eqn.effects:
+            return self._blocked(f"{name} (effects)", self._native(eqn, operands))
+        if name in {"scan", "while", "cond"}:
+            return getattr(self, f"_{name}_loop" if name != "cond" else "_branch")(eqn, operands)
         if name == "linear_call":
             # The callee on its own constants and the call's arguments; the transpose is not run forward.
             callee, own = eqn.params["callee"], eqn.params["num_callee_consts"]
@@ -207,6 +211,84 @@ class Interpreter:
         return outs
 
     # Moves and selections.
+
+    # Control flow: interpreted step by step at the native values, every predicate and index decided.
+
+    def _uncertified(self, name: str, eqn, operands) -> list[Bounded]:
+        return self._blocked(name, self._native(eqn, operands))
+
+    @staticmethod
+    def _decided(value: Bounded) -> bool:
+        """A predicate or an index certified and exact throughout: decided, the bounds of what it
+        compares parted (`_compare`), or integers exact."""
+        return bool(value.certified.all() and value.exact.all())
+
+    def _scan_loop(self, eqn, operands):
+        """`scan`, its body interpreted once a step in its order (`reverse`), the carry bounded through
+        it; its stacked outputs in step order. Its consts, carry and stacked inputs told apart by their
+        shapes, a stacked one's the body's with the scan's length before it."""
+        body, length, reverse = eqn.params["jaxpr"], eqn.params["length"], eqn.params["reverse"]
+        inner = body.jaxpr
+        outer_out, inner_out = eqn.outvars, inner.outvars
+        carried = 0
+        while carried < len(outer_out) and outer_out[carried].aval.shape == inner_out[carried].aval.shape:
+            carried += 1
+        stacked = 0
+        while stacked < len(eqn.invars) and (
+                eqn.invars[-1 - stacked].aval.shape == (length, *inner.invars[-1 - stacked].aval.shape)):
+            stacked += 1
+        held = len(eqn.invars) - carried - stacked
+        consts, carry, xs = operands[:held], operands[held:held + carried], operands[held + carried:]
+        steps: list[list[Bounded] | None] = [None] * length
+        for step in (range(length - 1, -1, -1) if reverse else range(length)):
+            sliced = [Bounded(x.value[step], x.error[step], x.exact[step], x.certified[step]) for x in xs]
+            outs = self._program(inner, [_input(c) for c in body.consts], [*consts, *carry, *sliced])
+            carry, steps[step] = outs[:carried], outs[carried:]
+        stacked_outs = []
+        for index, var in enumerate(eqn.outvars[carried:]):
+            if length == 0:
+                empty = np.zeros(var.aval.shape, var.aval.dtype)
+                stacked_outs.append(Bounded(empty, np.zeros(empty.shape), np.ones(empty.shape, bool),
+                                            np.ones(empty.shape, bool)))
+                continue
+            parts = [steps[step][index] for step in range(length)]
+
+            def stacked_field(field, parts=parts):
+                return np.stack([np.broadcast_to(getattr(part, field), part.value.shape) for part in parts])
+
+            stacked_outs.append(Bounded(np.stack([part.value for part in parts]), stacked_field("error"),
+                                        stacked_field("exact"), stacked_field("certified")))
+        return [*carry, *stacked_outs]
+
+    WHILE_STEPS = 1 << 20
+    """The most steps a `while` is followed before its outputs are taken as not certified."""
+
+    def _while_loop(self, eqn, operands):
+        """`while`, its predicate interpreted at every step with its operands' bounds, the last one that
+        stops it included, each required decided (`_decided`); else every output not certified."""
+        cond, body = eqn.params["cond_jaxpr"], eqn.params["body_jaxpr"]
+        held_cond, held_body = eqn.params["cond_nconsts"], eqn.params["body_nconsts"]
+        cond_consts = operands[:held_cond]
+        body_consts = operands[held_cond:held_cond + held_body]
+        carry = operands[held_cond + held_body:]
+        for _ in range(self.WHILE_STEPS):
+            [going] = self._program(cond.jaxpr, [_input(c) for c in cond.consts], [*cond_consts, *carry])
+            if not self._decided(going):
+                return self._uncertified("while (its predicate undecided)", eqn, operands)
+            if not bool(going.value):
+                return carry
+            carry = self._program(body.jaxpr, [_input(c) for c in body.consts], [*body_consts, *carry])
+        return self._uncertified("while (past its step limit)", eqn, operands)
+
+    def _branch(self, eqn, operands):
+        """`cond` or `switch`, the branch its decided index selects (clamped, as XLA does); an index not
+        decided leaves every output not certified."""
+        index, *rest = operands
+        if not self._decided(index):
+            return self._uncertified("cond (its index undecided)", eqn, operands)
+        branches = eqn.params["branches"]
+        chosen = branches[int(np.clip(int(index.value), 0, len(branches) - 1))]
+        return self._program(chosen.jaxpr, [_input(c) for c in chosen.consts], rest)
 
     def _moved(self, eqn, operands: list[Bounded], natives: list[np.ndarray]) -> list[Bounded]:
         """A move applied to each operand's bound, exactness and certification, its index operands (an
