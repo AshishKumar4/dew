@@ -544,7 +544,8 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     out of recorded seeds.
 
     A recording of the reference's evidence alone (`record_case(..., summary=True)`: `<site>.mse.<name>`,
-    `<site>.worst.<name>`, `<site>.finite.<name>` and `<site>.sketch.<name>` over the seeds, and its
+    `<site>.worst.<name>`, `<site>.finite.<name>` and `<site>.sketch.<name>` over the seeds, the truth's
+    shape `<site>.shape.<name>`, and its
     rows of float64 zero's indices and errors, `<site>.zero_rows.<name>` and `<site>.zero_errors.<name>`,
     each seed's span of them in `<site>.zero_offsets.<name>`) keeps no outputs: its reference arm gives
     check 1 that evidence (`RecordedLeaf`), and its truth is `truth_fn(inputs)`, Dew's own float64 path,
@@ -605,8 +606,8 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         return {name.removeprefix(prefix): np.asarray(value) for name, value in stored.items()
                 if name.startswith(prefix)}
 
-    kinds = ("mse", "worst", "finite", "sketch", "zero_rows", "zero_errors", "zero_offsets")
-    mse, worst, finite, sketch, zero_rows, zero_errors, zero_offsets = (tree(kind) for kind in kinds)
+    kinds = ("mse", "worst", "finite", "sketch", "zero_rows", "zero_errors", "zero_offsets", "shape")
+    mse, worst, finite, sketch, zero_rows, zero_errors, zero_offsets, shapes = (tree(kind) for kind in kinds)
     if truth_fn is None or inputs_of is None:
         raise AssertionError(f"{site}: a recording of the reference's evidence alone takes `truth_fn`, "
                              f"Dew's float64 path, and `inputs_of`, its inputs drawn again")
@@ -644,8 +645,14 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         if not roundings:
             roundings["count"] = chain_roundings(jax.make_jaxpr(truth_fn)(inputs))
         eps = float(np.finfo(np.float64).eps)
+        if set(computed) != set(sketch):
+            raise AssertionError(f"{site}: `truth_fn` gives the leaves {sorted(computed)}, the recording "
+                                 f"{sorted(sketch)}")
         for name, value in computed.items():
             value = np.asarray(value, np.float64)
+            if value.shape != tuple(shapes[name].tolist()):
+                raise AssertionError(f"{site}: the truth of {name!r} recomputed is {value.shape}, the "
+                                     f"recorded reference's {tuple(shapes[name].tolist())}")
             recorded = sketch[name][index]
             scale = float(np.sqrt(np.mean(np.square(value)))) if value.size else 0.0
             # The oracle rule bounds the difference's norm; its projection on a standard normal vector
