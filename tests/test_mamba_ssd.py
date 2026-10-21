@@ -33,9 +33,15 @@ def row_names_port(*, port: bool = True):
     return generation.chosen(ssd="pallas" if port else "xla")
 
 
-SHARDED_SEEDS = 8
-"""The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
-`seeds_for`: the fewest for which one device compared with itself resolves the factor."""
+SHARDED_SEEDS = 256
+"""The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`) at `SHARDED`, sized
+by `seeds_for` on the port (2026-10-21, on armada): the fewest for which one device compared with itself
+resolves the factor, its final state's leaf the last to."""
+
+SHARDED = (4, 80, 8, 16, 2, 16)
+"""The per-shard site's rows, tokens, heads, head width, groups and state width: the final state needs the
+rows (at 2 rows it resolves at no seed count up to 512, at any length or heads), and 4 rows and 8 heads of 2
+groups split two ways on either axis."""
 
 
 def scan_operands(batch, length, heads, width, groups, state, *, documents: bool, seed: int = 0):
@@ -172,7 +178,7 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
     one device's over the site's draws, and no operand moved between devices."""
     from jax.sharding import Mesh, PartitionSpec
 
-    operands, starts = scan_operands(2, 80, 4, 16, 2, 16, documents=True)
+    operands, starts = scan_operands(*SHARDED, documents=True)
     # The cotangents' key is one no draw's seed reaches: `scan_operands` draws a seed's x from its own
     # key, so a cotangent keyed by a small seed equals that seed's x, and its dD = sum dy * x is that
     # draw's alone, an outlier the comparison cannot resolve.
@@ -182,7 +188,7 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
     run = through(32, starts, dy, dfinal)
 
     def draw(seed):
-        return scan_operands(2, 80, 4, 16, 2, 16, documents=True, seed=seed)[0]
+        return scan_operands(*SHARDED, documents=True, seed=seed)[0]
 
     def exact(*operands):
         return jax.jit(through(32, starts, *widened((dy, dfinal))))(*operands)
