@@ -14,14 +14,12 @@ persistent-cache hit still counts as a compile), and runs it under
 `jax.transfer_guard("disallow")`, which refuses implicit transfers and lets
 explicit ones through.
 
-JAX's guard refuses an implicit device-to-host read only where the read
-copies, on a GPU. On the CPU backend an array reaches numpy as a view, with
-no copy for the guard to refuse, so `float(x)` under the guard passes there
-(jax 0.11.2: float, int, np.asarray and item all pass on CPU; jax-ml/jax#16602).
-A block's reads are therefore held on a GPU, where the suite's GPU lane runs
-these tests; on a CPU its host-to-device and device-to-device transfers are.
-Holding CPU reads too belongs in JAX's guard (ledger 801), not in a second
-guard over JAX's private array class.
+JAX's guard refuses an implicit device-to-host read where the read copies,
+on a GPU; on the CPU backend an array reaches numpy as a view, with no copy
+for upstream's guard to refuse (jax-ml/jax#16602). Dew's JAX build holds a
+CPU array's read to the guard too (constraints.txt: its host value, its copy
+to host and its buffer, as an accelerator's copy is held), so a block's
+`float(x)` fails on the CPU suite as it does on a GPU.
 
 A checkpoint's save passes the guard: Orbax moves a GPU array to pinned host
 memory with an explicit `jax.device_put` and reads that (a save under
