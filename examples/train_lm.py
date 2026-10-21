@@ -9,10 +9,8 @@ examples/evaluate_and_serve.py scores.
         https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
     head -n 36000 data/shakespeare.txt > data/shakespeare-train.txt
     tail -n +36001 data/shakespeare.txt > data/shakespeare-val.txt
-    dew data export records data/shakespeare --fields '{"source": "data/shakespeare-train.txt"}' \\
-        --tokenizer byte --eos --read memory
-    dew data export records data/shakespeare-val --fields '{"source": "data/shakespeare-val.txt"}' \\
-        --tokenizer byte --eos --read memory
+    dew data export data/shakespeare-train.txt data/shakespeare --tokenizer byte --eos --read memory
+    dew data export data/shakespeare-val.txt data/shakespeare-val --tokenizer byte --eos --read memory
     python examples/train_lm.py --tokens data/shakespeare --epochs 4
     python examples/train_lm.py --tokens data/shakespeare --steps 20 --sequence-length 32   # smoke run
 """

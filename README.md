@@ -1266,9 +1266,7 @@ Every host runs the same script. The example below uses two hosts with two GPUs 
 Prepare byte-token data from your corpus and place it on shared storage:
 
 ```bash
-dew data export records /shared/tokens \
-    --fields '{"source": "corpus.txt"}' \
-    --format array_record --tokenizer byte --read memory
+dew data export corpus.txt /shared/tokens --tokenizer byte --read memory
 ```
 
 Save this as `train_multihost.py`. `prepare_process` joins the process pool, so call it before you create any device array.
