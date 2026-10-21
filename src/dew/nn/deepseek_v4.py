@@ -721,12 +721,7 @@ class DeepseekV4Attention(FakeQuantizing):
         # where `down_projection` places them: on each tensor shard's own
         # tokens where the link pays for gathering them back.
         place = down_projection(x, self.q_lora_rank + self.head_dim)
-        q_resid = constrain(self.q_a_norm(self.q_a_proj(constrain(x, place))), place)
-        query = checkpoint_name(self.q_b_proj(constrain(q_resid, RESIDUAL)), 'q_proj').reshape(
-            batch, length, self.num_heads, self.head_dim)
-        if self.query_norm:
-            query = unweighted_rmsnorm(query, self.norm_eps)
-        query = _rotate_rope(query, cos, sin)
+        query, q_resid = self._queries(x, cos, sin, place)
         # V4.1's window cache keeps FP8, RoPE included (v41:700-707)
         keys = self._window_keys(x, cos, sin, place)
 
@@ -762,6 +757,20 @@ class DeepseekV4Attention(FakeQuantizing):
 
         output = self._attend(query, keys, allowed, cos, sin)
         return output if valid is None else jnp.where(valid[..., None], output, 0)
+
+    def _queries(self, x, cos, sin, place):
+        """The heads' queries of `x` `[B, S, width]`: the residual projected down to the query latent
+        where `place` puts it (`down_projection`), normed, projected up and marked `q_proj` for a
+        remat policy, split into heads, normed without a weight where the release does
+        (`query_norm`), and rotated by `cos` and `sin` on their trailing channels: the ordinary
+        forward's and DSpark's draft step's alike. Returns them with the normed query latent, which
+        a compressor's indexer reads."""
+        q_resid = constrain(self.q_a_norm(self.q_a_proj(constrain(x, place))), place)
+        query = checkpoint_name(self.q_b_proj(constrain(q_resid, RESIDUAL)), 'q_proj').reshape(
+            *x.shape[:2], self.num_heads, self.head_dim)
+        if self.query_norm:
+            query = unweighted_rmsnorm(query, self.norm_eps)
+        return _rotate_rope(query, cos, sin), q_resid
 
     def _window_keys(self, x, cos, sin, place: LogicalAxes):
         """The shared key head, projected where `place` puts it and gathered
@@ -849,12 +858,7 @@ class DSparkAttention(DeepseekV4Attention):
         cos, sin = yarn_rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn,
                                    dtype=at_least_fp32(x.dtype))
         place = down_projection(x, self.q_lora_rank + self.head_dim)
-        q_resid = constrain(self.q_a_norm(self.q_a_proj(constrain(x, place))), place)
-        query = self.q_b_proj(constrain(q_resid, RESIDUAL)).reshape(
-            batch, length, self.num_heads, self.head_dim)
-        if self.query_norm:
-            query = unweighted_rmsnorm(query, self.norm_eps)
-        query = _rotate_rope(query, cos, sin)
+        query, _ = self._queries(x, cos, sin, place)
         window = (places <= last[:, None]) & (places > last[:, None] - self.sliding_window)
         if real is not None:
             window = window & real
