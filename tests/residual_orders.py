@@ -96,6 +96,27 @@ def permuted(variables, order: np.ndarray):
     return {**variables, "params": jax.tree_util.tree_map_with_path(reorder, variables["params"])}
 
 
+def order(width: int, seed: int, group: int = 1) -> np.ndarray:
+    """One order of `width` units drawn by `seed`, each seed its own draw of the law `orders` draws
+    from (moving whole groups of `group` units and permuting within each): check 1's draw over an orbit
+    (`orbit`), its seeds declared and sized as any site's (`seeds_for`)."""
+    rng = np.random.default_rng([0x0BB17, width, group, seed])
+    blocks = rng.permutation(width // group)
+    return np.concatenate([block * group + rng.permutation(group) for block in blocks])
+
+
+def orbit(variables, *rest, group: int = 1):
+    """Check 1's draw over the residual orbit of `variables` (`assert_as_exact`'s `draw`): seed s gives
+    `variables` with the residual stream in `order(width, s)`, and the rest of the arguments as they are.
+    The truth of each draw is the reference's own float64 run on it, so nothing is permuted back."""
+    width = residual_width(variables)
+
+    def draw(seed):
+        return (permuted(variables, order(width, seed, group)), *rest)
+
+    return draw
+
+
 def orders(width: int, count: int, seed: int, group: int = 1) -> np.ndarray:
     """`count` orders of `width` units, the first the identity. With `group`,
     each order moves whole groups of that many consecutive units and permutes
