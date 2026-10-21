@@ -8,6 +8,7 @@ import http.server
 import itertools
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import grain.python as grain
@@ -85,6 +86,125 @@ def serving(handle):
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed", "interleaved", "memory"])
+def test_a_fetch_with_threads_of_its_own_fetches_that_many_at_once_in_order_and_resumes(read):
+    """A fetch given four threads of its own fetches four urls at once whatever the read's threads,
+    in every read, before an interleave too; delivers the records it keeps in the order they were
+    read, a gone url dropped and counted; leaves the plan as a fetch without threads makes it; a
+    position saved part way restores to the same remaining records; and a closed reader leaves no
+    thread of its pool running."""
+    lock, active, most = threading.Lock(), [0], [0]
+
+    def handle(request):
+        index = int(request.path.strip("/"))
+        if index == 9:
+            request.send_response(404)
+            request.end_headers()
+            return
+        with lock:
+            active[0] += 1
+            most[0] = max(most[0], active[0])
+        time.sleep(0.2)
+        body = request.path.encode()
+        request.send_response(200)
+        request.send_header("Content-Length", str(len(body)))
+        request.end_headers()
+        request.wfile.write(body)
+        with lock:
+            active[0] -= 1
+
+    with serving(handle) as address:
+        catalog = Memory([{"url": f"http://{address}/{index}", "id": index} for index in range(17)],
+                         shard_rows=17)
+
+        def built(threads):
+            fetched = Pipeline(catalog).filter_map(images.fetch(to="bytes", threads=threads))
+            chain = (fetched.interleave(1) if read == "interleaved" else fetched).batch(2)
+            return compile(chain, read="streamed" if read == "interleaved" else read,
+                           loading=Loading(workers=0, threads=1, read_buffer=1))
+
+        data = built(4)
+        assert data.plan.identity() == built(None).plan.identity()
+        reader = data.train(DataPartition())
+        try:
+            first = [next(reader) for _ in range(3)]
+            saved = reader.get_state()
+            rest = [next(reader) for _ in range(5)]
+        finally:
+            reader.close()
+        # The loader's counts, which every read keeps (a memory read's as it reads its source).
+        dropped = rejected(data)
+        assert not [thread for thread in threading.enumerate() if thread.name.startswith("dew-step")]
+        resumed = data.train(DataPartition())
+        try:
+            resumed.set_state(saved)
+            again = [next(resumed) for _ in range(5)]
+        finally:
+            resumed.close()
+    assert most[0] == 4
+    kept = [index for index in range(17) if index != 9]
+    assert [int(value) for batch in [*first, *rest] for value in batch["id"]] == kept
+    assert dropped == {"http_404": 1}
+    assert [bytes(value) for batch in rest for value in batch["bytes"]] == [
+        f"/{index}".encode() for index in kept[6:]]
+    assert [[int(value) for value in batch["id"]] for batch in again] == [
+        [int(value) for value in batch["id"]] for batch in rest]
+
+
+@pytest.mark.parametrize("threads", [1, 8], ids=["fewer read threads", "more read threads"])
+@pytest.mark.parametrize("read", ["indexed", "memory"])
+def test_a_cached_fetch_with_threads_of_its_own_fetches_that_many_at_once(tmp_path, read, threads):
+    """A fetch given four threads of its own before a cache, and another given two after it, each
+    fetches as many urls at once as it was given whatever the read's threads, and the run reads
+    what the uncached chain reads."""
+    lock, active, most = threading.Lock(), collections.Counter(), collections.Counter()
+
+    def handle(request):
+        side = request.path.strip("/").split("/")[0]
+        with lock:
+            active[side] += 1
+            most[side] = max(most[side], active[side])
+        time.sleep(0.2)
+        body = request.path.encode()
+        request.send_response(200)
+        request.send_header("Content-Length", str(len(body)))
+        request.end_headers()
+        request.wfile.write(body)
+        with lock:
+            active[side] -= 1
+
+    with serving(handle) as address:
+        catalog = Memory([{"url": f"http://{address}/before/{index}", "id": index} for index in range(12)])
+
+        def ids(cache):
+            fetched = Pipeline(catalog).filter_map(images.fetch(to="bytes", threads=4))
+            cached = fetched if cache is None else fetched.cache(cache)
+            again = cached.map(Again(address)).filter_map(images.fetch("again", to="later", threads=2))
+            loading = Loading(workers=0, threads=threads, read_buffer=threads)
+            reader = compile(again.repeat(1).batch(3), read=read, loading=loading).train(DataPartition())
+            try:
+                return [[(int(row), bytes(later))
+                         for row, later in zip(batch["id"], batch["later"], strict=True)] for batch in reader]
+            finally:
+                reader.close()
+
+        uncached = ids(None)
+        most.clear()
+        assert ids(str(tmp_path / "cache")) == uncached
+    assert most == {"before": 4, "after": 2}
+
+
+@dataclass(frozen=True)
+class Again:
+    """Gives a fetched record a second url, served after the cache."""
+
+    address: str
+    identity = "again@1"
+
+    def __call__(self, row):
+        return {**row, "again": f"http://{self.address}/after/{int(row['id'])}"}
 
 
 Parents = collections.namedtuple("Parents", ["first", "second"])
@@ -363,7 +483,7 @@ def web_table(root: Path) -> list[dict]:
 
 
 def rejected(stream) -> dict[str, float]:
-    """The reader's dropped records by reason, as a run logs them."""
+    """The dropped records of a reader or a loader by reason, as a run logs them."""
     return {key.rsplit("/", 1)[1]: count for key, count in stream.statistics().items()
             if key.startswith("data/rejected/") and count}
 
@@ -420,6 +540,57 @@ def test_a_snapshot_of_fetched_bytes_trains_and_resumes_exactly_after_every_url_
         resumed.close()
     for expected, found in zip(rest, again, strict=True):
         np.testing.assert_array_equal(expected["image"], found["image"])
+
+
+@pytest.mark.parametrize(("width", "height"), [(40, 20), (23, 40), (16, 16), (8, 6)])
+def test_a_fetched_web_image_is_fitted_whole_into_its_square(tmp_path, width, height):
+    """A fetched image fitted into a 16-pixel square keeps all it shows, as the retired online
+    loader fitted it: its longer side 16 pixels (area down, bicubic up), the shorter in proportion,
+    rounded, and the rest white, split evenly with the odd pixel at the bottom or right."""
+    import cv2
+
+    rng = np.random.default_rng(width * height)
+    pixels = rng.integers(0, 256, (height, width, 3), np.uint8)
+    Image.fromarray(pixels).save(tmp_path / "image.png")
+    chain = (Pipeline(Memory([{"url": (tmp_path / "image.png").as_uri()}])).filter_map(images.fetch(to="png"))
+             .filter_map(DecodeImage(field="png", to="image")).map(images.Fit(16)).batch(1))
+    reader = compile(chain, read="indexed", loading=READ).train(DataPartition())
+    try:
+        fitted = np.asarray(next(reader)["image"][0])
+    finally:
+        reader.close()
+    scale = 16 / max(width, height)
+    tall, wide = max(1, round(height * scale)), max(1, round(width * scale))
+    top, left = (16 - tall) // 2, (16 - wide) // 2
+    method = cv2.INTER_AREA if max(width, height) > 16 else cv2.INTER_CUBIC
+    assert fitted.shape == (16, 16, 3)
+    np.testing.assert_array_equal(fitted[top : top + tall, left : left + wide],
+                                  cv2.resize(pixels, (wide, tall), interpolation=method))
+    inside = np.zeros((16, 16), bool)
+    inside[top : top + tall, left : left + wide] = True
+    assert (fitted[~inside] == 255).all()
+
+
+def test_a_fetched_clip_under_the_least_size_is_dropped_before_it_is_fitted(tmp_path):
+    """Clips stored at 32 pixels a side, read for 16-pixel frames: with a least size of 48 they
+    are counted and dropped as too small before they are fitted, as the retired loader dropped
+    them; with 32 they are read."""
+    from test_data_av import FPS, _mux
+
+    clip = Path(_mux(tmp_path / "clip.avi", sound=0))
+
+    def read(least):
+        chain = (Pipeline(Memory([{"url": clip.as_uri()}])).repeat(1).filter_map(video.fetch())
+                 .random_filter_map(video.PickClip(8 / FPS))
+                 .filter_map(video.DecodeVideo(8, size=16, min_size=least)).batch(1))
+        reader = compile(chain, read="indexed", loading=READ).train(DataPartition())
+        try:
+            return [batch["video"].shape for batch in reader], rejected(reader)
+        finally:
+            reader.close()
+
+    assert read(32) == ([(1, 8, 16, 16, 3)], {})
+    assert read(48) == ([], {"too_small": 1})
 
 
 def test_a_web_video_flow_decodes_frames_from_fetched_bytes(tmp_path):
