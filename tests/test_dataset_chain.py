@@ -760,6 +760,94 @@ def test_a_mixtures_grain_step_drops_rows_it_rejects_and_counts_them(read):
     assert data.statistics()["data/rejected/mixture/odd"] > 0
 
 
+@dataclasses.dataclass(frozen=True)
+class Tagged:
+    """Marks a record as read from the second corpus."""
+
+    def __call__(self, row):
+        return {**row, "tagged": True}
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_stats_reports_the_records_a_second_tokens_and_padding_of_packed_rows(read):
+    """Token documents of differing lengths packed into rows of 16: stats reports the tokens
+    the rows hold, all the documents' (one of them id 0, a token like any other), the share of
+    the rows' places that pad them, and the records it read a second; rows with no token ids
+    report none of those two."""
+    lengths = [5, 7, 3, 9, 11, 2, 6, 8]
+    documents = Memory([{"text": np.arange(length, dtype=np.int32)} for length in lengths]).named("docs")
+    counts = documents.pack(16).read(read).loading(READ).stats(records=100)
+    packed = counts["data/rows/docs"]
+    assert counts["data/tokens"] == sum(lengths)
+    assert counts["data/padding"] == (16 * packed - sum(lengths)) / (16 * packed)
+    assert 0 < counts["data/records_per_second"] < float("inf")
+    plain = Memory(rows("a", 4)).named("plain").read(read).loading(READ).stats(records=4)
+    assert "data/tokens" not in plain and "data/padding" not in plain
+    # Rows stored packed, their documents and validity beside them: a place of segment 0 or
+    # marked invalid pads its row.
+    stored = Memory({"text": [np.arange(9, dtype=np.int32)] * 2,
+                     "text_segment_ids": [np.asarray([1, 1, 1, 2, 2, 2, 2, 2, 0], np.int32)] * 2,
+                     "text_attention_mask": [np.asarray([1] * 8 + [0], bool),
+                                             np.asarray([1] * 7 + [0, 0], bool)]}).named("stored")
+    held = stored.read(read).loading(READ).stats(records=2)
+    assert held["data/tokens"] == 8 + 7
+    assert held["data/padding"] == (1 + 2) / 18
+
+
+@dataclasses.dataclass(frozen=True)
+class Twice:
+    """Each record of a group twice, as columns."""
+
+    def __call__(self, columns):
+        return {name: [value for value in values for _ in range(2)] for name, values in columns.items()}
+
+
+@dataclasses.dataclass(frozen=True)
+class Keep:
+    """Keeps every record, though it may drop one."""
+
+    rejects = True
+
+    def __call__(self, row):
+        return row
+
+
+def test_show_prints_the_chain_as_written_then_the_records_and_leaves_a_reader_where_it_was(capsys):
+    """`show` prints the store and each verb as the chain wrote it, a preset's expanded steps and
+    a verb that drops or expands records under its own name, then the first records as a reader
+    makes them; a reader open beside it reads on as one never shown would."""
+    from dew.data import presets
+
+    pictures = Memory([{"image": np.full((8, 8, 3), index, np.uint8), "label": index % 2}
+                       for index in range(6)])
+    chain = pictures.pipe(presets.images, 4, batch=2, augment=True).loading(READ)
+    data = compile(chain, read="indexed", loading=READ)
+    reader, untouched = data.train(DataPartition()), data.train(DataPartition())
+    try:
+        next(reader)
+        chain.show(count=1)
+        rest, expected = next(reader), (next(untouched), next(untouched))[1]
+        for name in expected:
+            np.testing.assert_array_equal(np.asarray(rest[name]), np.asarray(expected[name]))
+    finally:
+        reader.close()
+        untouched.close()
+    lines = capsys.readouterr().out.splitlines()
+    written = [line.strip() for line in lines[:6]]
+    assert written[0].startswith("Memory")
+    assert [line.split("(")[0] for line in written[1:]] == [
+        ".filter_map", ".map", ".random_map", ".batch", ".map"]
+    assert "DecodeImage" in written[1] and "Resize" in written[2] and "AugmentationKey" in written[3]
+    assert written[4] == ".batch(2)" and "DeviceAugment" in written[5] and "device" in written[5]
+    assert "uint8[2, 4, 4, 3]" in "".join(lines[6:])
+
+    grouped = Memory(rows("a", 4)).named("a").flat_map(Twice(), batched=True, batch_size=2)
+    grouped.filter_map(Keep()).loading(READ).show(count=1)
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1].strip() == ".flat_map(Twice(), batched=True, batch_size=2)"
+    assert lines[2].strip().startswith(".filter_map(Keep")
+
+
 def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
     """A memory read runs a corpus's steps before its repeat and reads the rest as it goes: every
     row it delivers was cut short after the repeat, so its truncated share is one, whatever the
