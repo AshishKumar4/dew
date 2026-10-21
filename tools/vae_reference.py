@@ -29,6 +29,7 @@ What lands in tests/fixtures/vae:
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,9 @@ import torch
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.models.autoencoders.vae import DecoderOutput
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reference_source import recipe_images
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "vae"
 
@@ -54,12 +58,6 @@ TINY_CONFIG: dict[str, object] = dict(
 IMAGE = {"seed": 0, "shape": [1, 16, 16, 3]}
 
 
-def synthetic_image(recipe) -> np.ndarray:
-    """The uint8 image the fixture was run on, reproduced the same way by the
-    test."""
-    return np.random.RandomState(recipe["seed"]).randint(
-        0, 256, tuple(recipe["shape"]), dtype=np.uint8)
-
 
 def tiny_model() -> AutoencoderKL:
     torch.manual_seed(0)
@@ -74,7 +72,7 @@ def write_tiny(directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     model = tiny_model()
 
-    pixels = synthetic_image(IMAGE)
+    pixels = recipe_images(IMAGE)
     # The objective's [-1, 1] scale, NHWC, as dew hands it to an autoencoder.
     sample = (pixels.astype(np.float32) - 127.5) / 127.5
     torch_sample = torch.tensor(sample).permute(0, 3, 1, 2)

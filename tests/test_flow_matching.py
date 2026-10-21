@@ -176,8 +176,12 @@ def test_the_flow_loss_and_its_gradient_are_diffusers_flux_trainings(case):
                                    InputSpec(Field("image", pixels.shape[1:])), guidance=None, solver=Euler(),
                                    steps=2, unconditional_prob=0.0, ema_decay=None)
     variables = objective.init(jax.random.PRNGKey(0))
-    step = Step(step=jnp.asarray(0), key=jax.random.key(int(LOSS["key"])), ema=None)
-    times = objective.process.schedule.sample_t(jax.random.split(step.key, 5)[2], pixels.shape[0])
+    # The step reads the reference's times and noise (`Step.tape`), drawn as tools/flow_loss_reference.py
+    # draws them.
+    keys = jax.random.split(jax.random.key(int(LOSS["key"])), 5)
+    times = objective.process.schedule.sample_t(keys[2], pixels.shape[0])
+    step = Step(step=jnp.asarray(0), key=keys[0], ema=None,
+                tape={"times": times, "noise": jax.random.normal(keys[3], pixels.shape)})
     np.testing.assert_array_equal(np.asarray(objective.process.schedule.rates(times)[1]),
                                   LOSS[f"sigmas_{case}"])
 

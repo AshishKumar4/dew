@@ -17,19 +17,24 @@ FLASH=2026-10-17T18:46:06Z
 # The agent environments' SDKs resolve as they stood when their adapters were written: OpenEnv
 # 0.9.0 and Daytona 0.225.0 with the API clients it pins to its own version.
 ENVIRONMENTS=2026-10-17T00:00:00Z
+# certifi resolves past RESOLVED to 2026.10.19, the first without the emSign root whose intermediates'
+# keys were compromised (constraints.txt holds that floor); nothing else moves.
+CERTIFI=2026-10-20T03:00:00Z
 lock() {
   name=$1
   shift
   uv pip compile -q --no-header pyproject.toml --extra ci --extra tutorials --extra mutation -c constraints.txt \
     --exclude-newer "$RESOLVED" --exclude-newer-package "dew-flash-attn-cu12=$FLASH" \
     --exclude-newer-package "dew-flash-attn-cu13=$FLASH" -P dew-flash-attn-cu12 -P dew-flash-attn-cu13 \
-    --exclude-newer-package jax=false --emit-index-url \
+    --exclude-newer-package jax=false --exclude-newer-package "certifi=$CERTIFI" -P certifi --emit-index-url \
     $(for package in openenv daytona daytona-api-client daytona-api-client-async daytona-toolbox-api-client \
         daytona-toolbox-api-client-async daytona-analytics-api-client daytona-analytics-api-client-async; do
       echo --exclude-newer-package "$package=$ENVIRONMENTS"; done) \
     --python-version "$(tr -d '\n' < .python-version)" "$@" -o "locks/$name.txt"
 }
-lock cpu --universal --torch-backend cpu
+# A host with no GPU compiles kernels for one with the CUDA plugin of the kernel-compile extra; a GPU host's
+# own CUDA extra holds its plugin, and two CUDA plugins in one environment would both claim 'cuda'.
+lock cpu --universal --torch-backend cpu --extra kernel-compile
 gpu="--python-platform x86_64-manylinux_2_35"
 lock cuda12 --extra cuda12 --torch-backend cpu $gpu
 lock cuda13 --extra cuda13 --torch-backend cpu $gpu

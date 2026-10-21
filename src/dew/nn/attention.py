@@ -37,7 +37,7 @@ from .attention_kernels import (
     decodes,
 )
 from .attention_sinks import sink_softmax
-from .decode_geometry import folded_attention, folds, grouped_query
+from .decode_geometry import folded_attention, folds
 from .documents import (
     CrossDocuments,
     aligned_places,
@@ -394,7 +394,7 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
     again. `fp32_statistics=False` retains the input-dtype arithmetic.
     `implementation` selects the generation's measured kernel by default;
     explicit 'pallas' interprets on CPU. The fused VJP retains only the
-    narrow input, weight and per-row inverse RMS, not fp32 activations.
+    narrow input, weight and per-row mean square, not fp32 activations.
     Unsupported variants run the checkpointed XLA reference instead
     (`norm_swiglu.rms_kernel`), including float64 and input-dtype statistics.
     `axes`, `x`'s logical axes, place the kernel's rows on a mesh; without
@@ -1395,21 +1395,30 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
     elif implementation == 'decode':
         starts = key_value_seq_starts
 
-        def decoded(query, key, value):
+        def decoded(query, key, value, *sunk):
             # A Pallas call has no partitioning rule: each shard decodes its own rows and heads.
-            def attend(query, key, value, lengths, starts=None):
-                return decode_attention.attend(query, key, value, lengths, starts)
+            def attend(query, key, value, lengths, starts=None, sinks=None):
+                return decode_attention.attend(query, key, value, lengths, starts, softcap=softcap,
+                                               sinks=sinks)
 
             rows = ("activation_batch",)
             return _per_shard(attend, query, key, value, lengths=(key_value_seq_lengths, rows),
-                              starts=(starts, rows))
+                              starts=(starts, rows), sinks=(sunk[0] if sunk else None, ("activation_heads",)))
 
-        def folded(query, key, value):
-            return folded_attention(query, key, value, with_key_starts(
-                with_key_lengths(None, key_value_seq_lengths, key.shape[-3]), starts, key.shape[-3]))
+        def folded(query, key, value, *sunk):
+            visible = with_key_starts(with_key_lengths(None, key_value_seq_lengths, key.shape[-3]), starts,
+                                      key.shape[-3])
+            if not sunk and softcap is None:
+                return folded_attention(query, key, value, visible)
+            # The folded form has neither; the reference path computes both over the same keys.
+            return reference_attention(query, key, value, mask=visible, sinks=sunk[0] if sunk else None,
+                                       softcap=softcap)
 
-        # The kernel has no derivative, so both modes differentiate the folded attention it stands in for.
-        out = forward_differentiable(decoded, folded, query, key, value)
+        # The kernel has no derivative, so both modes differentiate the attention it stands in for, the
+        # sinks among its operands, at the kernel's arithmetic: IEEE products for fp32 operands
+        # (`decode_attention`), its 16-bit products summed in fp32 otherwise.
+        out = forward_differentiable(decoded, folded, query, key, value, *([] if sinks is None else [sinks]),
+                                     precision="highest" if query.dtype == jnp.float32 else None)
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
         # kernel takes the call the two forms agree bitwise.
@@ -1474,7 +1483,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         # The key heads repeated as each shard would hold them (`_per_shard`), so the tensor axes
         # split the groups as they split the query heads.
         key, value = split_with_queries(key, value, tensor_shards(query))
-        return grouped_query(functools.partial(
+        return decode_attention.grouped_query(functools.partial(
             attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
             implementation=implementation, softcap=softcap, key_value_seq_lengths=key_value_seq_lengths,
             key_value_seq_starts=key_value_seq_starts),
@@ -1508,17 +1517,23 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     return _read_nothing(forward_differentiable(fused, reference, query, key, value, bias, sinks), live)
 
 
-def forward_differentiable(value, tangent, *arrays):
+def forward_differentiable(value, tangent, *arrays, precision: str | None = None):
     """`value(*arrays)`, whose JVP is `tangent`'s: a kernel that defines only
     its reverse-mode derivative, or none, takes its derivatives from a
-    reference computing the same function, reverse mode as the transposed JVP."""
+    reference computing the same function, reverse mode as the transposed JVP.
+    `precision` is the kernel's own arithmetic, which the reference's products
+    take too (`jax.default_matmul_precision`), so a kernel of IEEE fp32 products
+    is not differentiated by TF32 ones; None leaves the products at the
+    caller's."""
     @jax.custom_jvp
     def attend(*arrays):
         return value(*arrays)
 
     @attend.defjvp
     def rule(primals, tangents):
-        return attend(*primals), jax.jvp(tangent, primals, tangents)[1]
+        with contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision):
+            differentiated = jax.jvp(tangent, primals, tangents)[1]
+        return attend(*primals), differentiated
 
     return attend(*arrays)
 

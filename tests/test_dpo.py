@@ -16,9 +16,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
 from rl_support import TinyHead
 from steady_state import steady_state
+from tool_support import load
 
 from dew.config.data import PreferenceData, loader
 from dew.data import Loading
@@ -27,7 +28,6 @@ from dew.data.dataset import DataPartition
 from dew.data.preferences import IDS_KEY, MASK_KEY
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
-from dew.rl import preference_logsigmoid_terms
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "dpo.npz"
 VOCAB = 8
@@ -37,42 +37,26 @@ WIDTH = 6
 
 @pytest.fixture(scope="module")
 def reference():
-    return dict(np.load(FIXTURE, allow_pickle=True))
-
-
-def trl_layout_loss(policy_logits, fixture):
-    """Dew's DPO loss and mean chosen and rejected rewards over the fixture's
-    TRL-layout batch: token log-probabilities read off the shifted logits,
-    the shifted completion mask, and `preference_logsigmoid_terms` over the
-    [chosen; rejected] halves, averaged over pairs as `DPOObjective` does."""
-    ids = jnp.asarray(fixture["input_ids"], jnp.int32)[:, 1:, None]
-    mask = jnp.asarray(fixture["completion_mask"], jnp.float32)[:, 1:]
-
-    def token_log_probs(logits):
-        return jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids, axis=-1)[..., 0]
-
-    policy = token_log_probs(policy_logits)
-    ref = token_log_probs(jnp.asarray(fixture["ref_logits"], jnp.float32))
-    half = policy.shape[0] // 2
-    terms, (chosen, rejected) = preference_logsigmoid_terms(
-        policy[:half], policy[half:], ref[:half], ref[half:], mask[:half], mask[half:],
-        float(fixture["beta"]))
-    return jnp.mean(terms), (jnp.mean(chosen), jnp.mean(rejected))
+    return recording(FIXTURE)
 
 
 def test_dpo_loss_rewards_and_gradient_match_trl(reference):
     """Dew against TRL 1.12.0's own `DPOTrainer._compute_loss` with its
-    default settings (tools/parity_dpo.py), on fixed policy and reference
-    logits, held to the float64 rule over the loss, its gradient in the
-    policy logits and the chosen and rejected rewards: Dew's RMS error from
-    TRL's float64 values at most twice TRL's own fp32 error."""
-    (loss, rewards), gradient = jax.value_and_grad(trl_layout_loss, has_aux=True)(
-        jnp.asarray(reference["policy_logits"], jnp.float32), reference)
-    mine = np.concatenate([[loss], np.ravel(gradient), rewards])
-    theirs, truth = (np.concatenate([np.ravel(reference[f"trl_loss{tail}"]),
-                                     np.ravel(reference[f"trl_policy_logits_grad{tail}"]),
-                                     reference[f"trl_rewards{tail}"]]) for tail in ("", "_f64"))
-    assert_as_exact_as_the_reference(mine, theirs, truth, "DPO loss, gradient and rewards")
+    default settings (tools/parity_dpo.py), on par with TRL's fp32 over the
+    recorded policy and reference logits (check 1): the loss, its gradient in
+    the policy logits and the chosen and rejected rewards, TRL's float64 run
+    the truth."""
+    seeds = declared_seeds(FIXTURE)["dpo"]
+    draw, recorded, truth = indexed_recording(reference, "dpo", seeds)
+    # Dew's composition over the TRL-layout batch, the one the recorder planned its seeds by: token
+    # log-probabilities off the shifted logits and `preference_logsigmoid_terms` over the halves.
+    composed = load("parity_dpo").proxy
+
+    @jax.jit
+    def dew(index, arrays):
+        return composed(arrays)
+
+    assert_as_exact(dew, recorded, draw, "DPO loss, gradient and rewards", seeds=seeds, truth_fn=truth)
 
 
 # --- the objective -------------------------------------------------------------

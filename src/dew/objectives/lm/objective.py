@@ -55,6 +55,7 @@ from dew.nn.inputs import (
 )
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_moments
+from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import (
     AffineHead,
     CountedLogits,
@@ -623,6 +624,15 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     (`token_scores`' `z_loss`, `LMObjective`'s training loss): the fit ladder turns it off where the
     fused chunk does not fit (`LMObjective.unfuse_head`), and tiling the head turns it on."""
 
+    scored_fields: ClassVar[tuple[str, ...] | None] = None
+    """The batch fields `_evaluation_scores` reads, which alone enter its compiled program (`evaluate`),
+    so a batch's other fields (rollouts, rewards) neither enter it nor key it; None passes the batch whole."""
+
+    def evaluate(self, params, batch, step: Step):
+        """The base's scores (`Objective.evaluate`) over the `scored_fields` of `batch`."""
+        if self.scored_fields is not None:
+            batch = {name: batch[name] for name in self.scored_fields}
+        return super().evaluate(params, batch, step)
 
     def __init__(self, model, seq_len: int, *, head_chunks: int = 4,
                  head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
@@ -1290,9 +1300,11 @@ class LMObjective(TokenScorer):
             raise ValueError(
                 "no attention layer sowed an indexer KL, though the model's mla "
                 "mixer carries the indexer")
-        weights = self._query_weights(prepared, jnp.float32)
+        # The KL's own width, at least fp32: a float64 model's KL is summed in float64.
+        width = at_least_fp32(jnp.result_type(*kls))
+        weights = self._query_weights(prepared, width)
         total = jnp.sum(jnp.stack([
-            self.row_mean(kl.astype(jnp.float32) * weights[:, :kl.shape[1]], batch).total for kl in kls]))
+            self.row_mean(kl.astype(width) * weights[:, :kl.shape[1]], batch).total for kl in kls]))
         mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
         return total / len(kls), mass
 
@@ -1537,7 +1549,7 @@ class LMObjective(TokenScorer):
         prepared = {TEXT_KEY: batch_text(batch), ROLES_KEY: self._batch_roles(batch)}
         return super().evaluate(params, prepared, step)
 
-    def _evaluation_scores(self, params, batch, key) -> TokenScores:
+    def _evaluation_scores(self, params, batch, step) -> TokenScores:
         scores = self.token_scores(params, batch[TEXT_KEY], roles=batch[ROLES_KEY], predict=True)
         assert scores.correct is not None
         return TokenScores(scores.losses, scores.weights, scores.correct)

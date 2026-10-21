@@ -188,7 +188,11 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
                                    autoencoder=loaded.autoencoder, variables=loaded.variables,
                                    unconditional_prob=0.0, ema_decay=None, steps=2)
     batch = image_batch(loaded, pipeline_record["prompts"])
+    held = jax.device_get(loaded.variables)
     _, state = trained_step(objective, batch, Checkpoints(str(tmp_path / "run")))
+    # The step donated a state of its own: the source it started from still reads as loaded.
+    for leaf, before in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(held), strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), before)
 
     export = tmp_path / "export"
     loaded.save(export, variables=state.variables)
@@ -249,9 +253,9 @@ def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
             dict(pipeline_record["prompts"][1], guidance=6.0)]
     same = [dict(rows[0]), dict(rows[1], guidance=2.0)]
     tokens = encoder.tokenize(rows)
-    np.testing.assert_allclose(tokens["guidance"], [2.0, 6.0], atol=0)
+    np.testing.assert_array_equal(tokens["guidance"], [2.0, 6.0])
     given = encoder.encode(params, tokens)
-    np.testing.assert_allclose(np.asarray(given.guidance), [2.0, 6.0], atol=0)
+    np.testing.assert_array_equal(np.asarray(given.guidance), [2.0, 6.0])
     # A value that is not a finite number is refused rather than embedded.
     with pytest.raises(ValueError):
         encoder.tokenize([{"text": "a red cat", "guidance": float("inf")}])

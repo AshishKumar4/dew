@@ -7,7 +7,10 @@ import threading
 import urllib.parse
 from pathlib import Path
 
-import lane_environment  # configures the backend before JAX reads the environment
+import lane_environment
+
+# The lane's environment, before JAX reads it.
+os.environ.update(lane_environment.configured(os.environ))
 import jax
 import pytest
 import remote_cache
@@ -27,6 +30,10 @@ if os.environ.get("DEW_TEST_NO_CACHE"):
 else:
     _cache = default_compilation_cache_dir()
     if _cache:
+        # A worker that keeps bundles of the shared cache below writes a directory of its own, so the
+        # programs a bundle gains are that worker's whole writes, not another's half-written one.
+        if os.environ.get("PYTEST_XDIST_WORKER") and os.environ.get("DEW_XLA_CACHE_URL"):
+            _cache = os.path.join(_cache, os.environ["PYTEST_XDIST_WORKER"])
         enable_compilation_cache(_cache)
         # On armada, where each task's container starts cold, a cache the tasks share.
         _remote = remote_cache.install_from_environment()
@@ -147,9 +154,8 @@ def without_deterministic_ops(monkeypatch):
     variable at the compile above, so taking the flag back out of the
     environment leaves this executable's reductions as they are and lets a
     test reach the cudnn path it is about."""
-    kept = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-            if not flag.startswith("--xla_gpu_deterministic_ops")]
-    monkeypatch.setenv("XLA_FLAGS", " ".join(kept))
+    flags = os.environ.get("XLA_FLAGS", "")
+    monkeypatch.setenv("XLA_FLAGS", lane_environment.without_deterministic_ops(flags))
 
 
 @pytest.fixture

@@ -15,7 +15,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 import tokamax
-from process_support import READ_ONLY, REPEATABLE, REPO_ROOT, fresh, keeping_picks, run_pool
+from lane_environment import DETERMINISTIC_OPS
+from process_support import READ_ONLY, REPO_ROOT, fresh, keeping_picks, run_pool
 from reference_error import equations
 
 from dew.nn.activations import gated_product
@@ -74,7 +75,7 @@ write_atomically(path, sys.argv[1])
 print(json.dumps([path]))
 """
 
-FOREIGN = "dew.nn.kernels.another_branch.Kernel"
+FOREIGN = "dew.nn.kernels.another_branch:Kernel"
 """A kernel another checkout stores and this one cannot read."""
 
 
@@ -84,9 +85,9 @@ def with_foreign(text: str) -> str:
     it, as before a launch gained an operand). The first is last."""
     stored = json.loads(text)
     entry = json.loads(json.dumps(stored["data"][0]))
-    entry[0]["op"]["__type"] = FOREIGN
+    entry["op"]["dataclass"] = FOREIGN
     unbound = json.loads(json.dumps(stored["data"][0]))
-    del unbound[0]["arguments"][next(iter(unbound[0]["arguments"]))]
+    del unbound["arguments"][next(iter(unbound["arguments"]))]
     return json.dumps({**stored, "data": [*stored["data"], unbound, entry]})
 
 
@@ -143,14 +144,13 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     # A plain norm's pick beside them: a launch with no branch, which the seam's nearest search passes over.
     with tuning.launches():
         [alone] = tokamax.autotuning.get_bound_args(jax.jit(plain), operands(15)[0], operands(15)[2])
-    picks = tokamax.AutotuningResult(jax.devices()[0].device_kind, (
-        *((ba, tuning.AutotuningData({picked[type(ba.op)]: timing})) for ba in found),
-        (alone, tuning.AutotuningData({norm_swiglu.RowsConfig(2, 1): timing}))))
-    # Stored as every checkout writes its picks, and wrote them before a describing launch bypassed
-    # tokamax's device check: each op with the check on, which its picks' identity sets aside.
-    written = json.loads(picks.dumps())
-    for entry in written["data"]:
-        entry[0]["op"]["bypass_device_check"] = False
+    picks = tuning.dumps_picks(jax.devices()[0].device_kind, (
+        *((ba, tuning.Timings({picked[type(ba.op)]: timing})) for ba in found),
+        (alone, tuning.Timings({norm_swiglu.RowsConfig(2, 1): timing}))))
+    # Stored as every checkout writes its picks: each op as its picks name it, without the device check
+    # a describing launch bypasses (`tuning._identity`).
+    written = json.loads(picks)
+    assert all(entry["op"]["fields"]["bypass_device_check"] is False for entry in written["data"])
     flags = f"{keeping_picks()} {READ_ONLY}".strip()
     [path] = fresh(STORED, with_foreign(json.dumps(written)), cache_dir=tmp_path / "cache", flags=flags)
     assert path.startswith(str(tmp_path / "cache" / "autotune" / "jaxlib-")) and path.endswith(".json")
@@ -162,7 +162,7 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
         assert stored[rows]["rms_norm_backward"] == [[-(-int(rows) // 2)], 8]
     assert tuned is True
     assert os.listdir(os.path.dirname(path)) == [os.path.basename(path)]
-    repeatable, _ = fresh(READ, cache_dir=tmp_path / "cache", flags=f"{flags} {REPEATABLE}")
+    repeatable, _ = fresh(READ, cache_dir=tmp_path / "cache", flags=f"{flags} {DETERMINISTIC_OPS}")
     heuristics = {str(rows): launches(step(), *operands(rows)) for rows in (13, 15, 40)}
     assert repeatable == json.loads(json.dumps(heuristics))
     assert repeatable != stored
@@ -220,7 +220,7 @@ def layers(x, branch, scale, gate, up):
 
 def described(launches):
     return sorted([type(ba.op).__name__, repr(sorted(ba.autotuning_cache_key.items()))]
-                  for ba in tokamax.autotuning.bound_args_from_json(launches))
+                  for ba in tuning.loads_launches(launches))
 
 
 class Told(logging.Handler):
@@ -284,10 +284,10 @@ def test_every_process_launches_process_zeros_config_for_a_launch_without_a_pick
     picks = tmp_path / "picks"
     picks.mkdir()
     for process, held in stores.items():
-        stored = tuple((keyed(count), tuning.AutotuningData({norm_swiglu.RowsConfig(*config): timing}))
+        stored = tuple((keyed(count), tuning.Timings({norm_swiglu.RowsConfig(*config): timing}))
                        for count, config in held.items())
-        result = tokamax.AutotuningResult(jax.devices()[0].device_kind, stored)
-        (picks / f"process{process}.json").write_text(result.dumps())
+        (picks / f"process{process}.json").write_text(tuning.dumps_picks(jax.devices()[0].device_kind,
+                                                                         stored))
     reports = run_pool("settle", tmp_path / "pool", 2, script=Path(__file__).with_name("tuning_worker.py"),
                        cache=tmp_path / "cache", picks=picks, rows=",".join(map(str, rows)))
     assert reports[0] == reports[1]
@@ -354,21 +354,21 @@ def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_
         found = tokamax.autotuning.get_bound_args(step(), *operands(15))
     timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                    metadata={})
-    seed = tokamax.AutotuningResult(jax.devices()[0].device_kind, (
-        (found[0], tuning.AutotuningData({found[0].heuristics_config: timing})),))
-    foreign = json.loads(with_foreign(seed.dumps()))["data"][-2:]
-    fresh(STORED, json.dumps({**json.loads(seed.dumps()), "data": foreign}), cache_dir=tmp_path / "cache",
+    seed = tuning.dumps_picks(jax.devices()[0].device_kind,
+                              ((found[0], tuning.Timings({found[0].heuristics_config: timing})),))
+    foreign = json.loads(with_foreign(seed))["data"][-2:]
+    fresh(STORED, json.dumps({**json.loads(seed), "data": foreign}), cache_dir=tmp_path / "cache",
           flags=inherited)
     path, measured, settled, _ = fresh(MEASURED, "2048", cache_dir=tmp_path / "cache", flags=inherited)
     assert settled is True
     with open(path) as file:
         written = json.load(file)
     assert all(entry in written["data"] for entry in foreign)
-    stored = tokamax.AutotuningResult.loads(json.dumps(
-        {**written, "data": [entry for entry in written["data"] if entry not in foreign]}))
-    kinds = {type(ba.op) for ba, _ in stored.data}
+    stored, others = tuning._read(path)
+    assert others == foreign
+    kinds = {type(ba.op) for ba, _ in stored.values()}
     assert {norm_swiglu.RmsForward, norm_swiglu.RmsBackward} <= kinds
-    for ba, timings in stored.data:
+    for ba, timings in stored.values():
         assert len(timings) > 1, type(ba.op)
         assert all(data.median_evaluation_time_ms > 0 for data in timings.values())
         assert timings.fastest_config in ba.autotuning_configs
@@ -439,8 +439,8 @@ with tuning.launches():
 timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                metadata={})
 config = norm_swiglu.RowsConfig(*json.loads(sys.argv[1]))
-pick = tuning.AutotuningData({config: timing})
-tuning._store(tokamax.AutotuningResult(jax.devices()[0].device_kind, ((norm, pick),)))
+pick = tuning.Timings({config: timing})
+tuning._store(jax.devices()[0].device_kind, ((norm, pick),))
 path = cache.kernel_picks_path(jax.devices()[0].device_kind)
 read, foreign = tuning._read(path)
 picks = {json.dumps(sorted(ba.arguments)): [timings.fastest_config.rows, timings.fastest_config.warps]

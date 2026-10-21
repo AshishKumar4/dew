@@ -15,6 +15,7 @@ from dew.telemetry.devices import deterministic_ops_requested
 
 from .kernels import decode_attention, generation
 from .kernels.generation import (
+    INHERENT,
     Refusal,
     bf16_dot_runs,
     capability,
@@ -177,8 +178,8 @@ def _row_names_flash(case: AttentionCase) -> bool:
 
 _ARITHMETIC = _Need('arithmetic', lambda case: not case.arithmetic,
                           "the call asks for arithmetic only the reference path computes "
-                          "(`reference_only`)", inherent=True)
-_ON_GPU = _Need('backend', _on_gpu, "it runs on a GPU", inherent=True)
+                          "(`reference_only`)", row=INHERENT)
+_ON_GPU = _Need('backend', _on_gpu, "it runs on a GPU", row=INHERENT)
 
 FLASH_SUPPORTS = (
     _ON_GPU,
@@ -192,22 +193,22 @@ FLASH_SUPPORTS = (
                "the call packs documents"),
     _Need('document_bound', lambda case: case.documents is None or case.max_segments is not None,
                 "the call packs documents with no bound on a row's (`Coordinates.max_segments`), which its "
-                "packed sequences need", inherent=True),
+                "packed sequences need", row=INHERENT),
     _Need('packed_documents', lambda case: case.documents is None or case.max_segments is None
                 or case.max_segments <= FLASH_PACKED_SEGMENTS,
                 lambda case: f"the call packs up to {case.max_segments} documents a row, past the "
                              f"{FLASH_PACKED_SEGMENTS} its empty sequences cost less than the document mask",
                 row='measured: flash packed-document cap (docs/performance.md)', kind='measured'),
     _Need('dtype', lambda case: case.dtype in CUDNN_DTYPES, lambda case: f"the query is {case.dtype}",
-                inherent=True),
+                row=INHERENT),
     _Need('head_dim', lambda case: case.head_dim % 8 == 0 and case.head_dim <= _flash_widest(),
                 lambda case: f"the heads are {case.head_dim} wide, past the {_flash_widest()} its "
-                             "backward takes here", inherent=True),
+                             "backward takes here", row=INHERENT),
     _Need('square', lambda case: not (case.causal or case.window is not None)
                 or case.queries == case.keys or case.documents == 'cross',
                 "a causal or windowed call has another number of keys than of queries, which FlashAttention "
-                "aligns to the last key", inherent=True),
-    _Need('mask', lambda case: not case.mask, "the call has an arbitrary mask", inherent=True),
+                "aligns to the last key", row=INHERENT),
+    _Need('mask', lambda case: not case.mask, "the call has an arbitrary mask", row=INHERENT),
     _Need('key_lengths', lambda case: not case.lengths, "the call ends its rows' keys by lengths",
                 row='roadmap: flash attention over key lengths'),
     _Need('key_starts', lambda case: not case.starts, "the call starts its rows' keys by starts",
@@ -218,9 +219,9 @@ FLASH_SUPPORTS = (
                 row='roadmap: flash attention softcap'),
     _Need('deterministic', lambda case: not deterministic_ops_requested(),
                 "--xla_gpu_deterministic_ops is set, which its backward's atomic sum of the query gradient "
-                "does not keep", inherent=True),
+                "does not keep", row=INHERENT),
     _ARITHMETIC,
-    _Need('not_installed', _flash_installed, "dew_flash_attn is not installed", inherent=True),
+    _Need('not_installed', _flash_installed, "dew_flash_attn is not installed", row=INHERENT),
     _Need('binary_arch', _flash_built,
                 lambda case: f"the installed dew_flash_attn holds no code for {device_generation()}",
                 row='roadmap: flash wheel architectures'),
@@ -234,17 +235,17 @@ for the target."""
 CUDNN_SUPPORTS = (
     _ON_GPU,
     _Need('capability', lambda case: bf16_dot_runs(), "cuDNN takes bf16 and fp16 from sm80",
-                inherent=True),
+                row=INHERENT),
     _Need('dtype', lambda case: case.dtype in CUDNN_DTYPES, lambda case: f"the query is {case.dtype}",
-                inherent=True),
+                row=INHERENT),
     _Need('head_dim', lambda case: case.head_dim % 8 == 0 and case.head_dim <= cudnn_max_head_dim(),
                 lambda case: f"the heads are {case.head_dim} wide, past the {cudnn_max_head_dim()} it "
-                             "tiles here", inherent=True),
+                             "tiles here", row=INHERENT),
     _Need('softcap', lambda case: case.softcap is None, "the call has a logit softcap",
-                inherent=True),
-    _Need('sinks', lambda case: not case.sinks, "the call has attention sinks", inherent=True),
+                row=INHERENT),
+    _Need('sinks', lambda case: not case.sinks, "the call has attention sinks", row=INHERENT),
     _Need('bidirectional_window', lambda case: case.window is None or case.causal or case.aligned,
-                "cuDNN keeps a window behind the query only", inherent=True),
+                "cuDNN keeps a window behind the query only", row=INHERENT),
     _Need('documents', lambda case: case.documents is None or case.aligned,
                 "cuDNN takes no segment ids, a call's packed documents only as their mask, a dense bias "
                 "that costs more than the xla kernel's mask (`_attention_kernel` builds it where cuDNN is "
@@ -259,7 +260,7 @@ CUDNN_SUPPORTS = (
                 row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
     _Need('deterministic', lambda case: not deterministic_ops_requested(),
                 "--xla_gpu_deterministic_ops is set, under which XLA's cuDNN attention backward crashes "
-                "(openxla/xla#46500)", inherent=True),
+                "(openxla/xla#46500)", row=INHERENT),
     _ARITHMETIC,
 )
 """cuDNN's fused attention's requirements (`cudnn_attention`): a GPU of sm80 or later (cuDNN refuses
@@ -271,7 +272,7 @@ fused kernel runs at the query's head width, values included (`widen_value_heads
 TRITON_SUPPORTS = (
     _ON_GPU,
     _Need('capability', lambda case: bf16_dot_runs(), "tokamax's Triton kernel needs sm80",
-                inherent=True),
+                row=INHERENT),
     _Need('dtype', lambda case: case.dtype in CUDNN_DTYPES,
                 lambda case: f"the query is {case.dtype}, where it was measured on bf16 and fp16 alone",
                 row='measured: tokamax Triton attention (docs/performance.md)', kind='measured'),
@@ -279,7 +280,7 @@ TRITON_SUPPORTS = (
                 lambda case: f"the heads are {case.head_dim} wide, where it measured no faster than "
                              "cuDNN (`attention_narrow`)",
                 row='measured: tokamax Triton attention (docs/performance.md)', kind='measured'),
-    *(_Need(code, test, detail, inherent=True) for code, test, detail in (
+    *(_Need(code, test, detail, row=INHERENT) for code, test, detail in (
         ('window', lambda case: case.window is None, "the call has a sliding window"),
         ('mask', lambda case: not case.mask, "the call has an arbitrary mask"),
         ('bias', lambda case: not case.bias, "the call has a bias"),
@@ -298,17 +299,17 @@ sinks, softcap, documents or key lengths or starts."""
 
 TPU_SUPPORTS = (
     # Elsewhere it runs interpreted, where 'tpu' is named.
-    _Need('backend', lambda case: generation.backend() == 'tpu', "it runs on a TPU", inherent=True,
+    _Need('backend', lambda case: generation.backend() == 'tpu', "it runs on a TPU", row=INHERENT,
                 kind='measured'),
-    _Need('bias', lambda case: not case.bias, "splash takes no bias", inherent=True, kind='measured'),
+    _Need('bias', lambda case: not case.bias, "splash takes no bias", row=INHERENT, kind='measured'),
     _Need('key_lengths', lambda case: not (case.lengths or case.starts),
-                "splash takes key lengths and starts only as a mask it cannot describe", inherent=True,
+                "splash takes key lengths and starts only as a mask it cannot describe", row=INHERENT,
                 kind='measured'),
     # Named, the tpu path takes the documents' mask on its pallas flash kernel (`_attention_kernel`).
     _Need('aligned', lambda case: not case.aligned,
                 "splash aligns causality to the first key, not a cache call's last",
                 row='roadmap: splash over cache documents', kind='measured'),
-    *(_Need(code, test, detail, inherent=True, kind='measured') for code, test, detail in (
+    *(_Need(code, test, detail, row=INHERENT, kind='measured') for code, test, detail in (
         ('dtype', lambda case: case.dtype in SPLASH_DTYPES, "splash takes bf16 and fp32"),
         ('shards', lambda case: case.shards == 1,
          "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back"),
@@ -324,16 +325,16 @@ sequence axis. A call the measured ones turn down still runs when 'tpu' is named
 kernel with the call's mask, interpreted off a TPU."""
 
 XLA_SUPPORTS = (
-    _Need('sinks', lambda case: not case.sinks, "jax.nn's attention has no sinks", inherent=True,
+    _Need('sinks', lambda case: not case.sinks, "jax.nn's attention has no sinks", row=INHERENT,
                 kind='handoff'),
     _Need('softcap', lambda case: case.softcap is None, "jax.nn's attention has no softcap",
-                inherent=True, kind='handoff'),
+                row=INHERENT, kind='handoff'),
     _Need('narrows', lambda case: not case.narrows,
                 "jax.nn's xla kernel would compute the call below its precision or sum it in one chain",
-                inherent=True, kind='handoff'),
+                row=INHERENT, kind='handoff'),
     _Need('arithmetic', lambda case: not case.arithmetic,
                 "the call asks for arithmetic only the reference path computes (`reference_only`)",
-                inherent=True, kind='handoff'),
+                row=INHERENT, kind='handoff'),
 )
 """jax.nn's xla attention's requirements: the generic kernel, which hands what it cannot honour to
 the reference path."""
@@ -397,13 +398,18 @@ kernel (`decode_attention.attend`) and the folded xla attention (`folded_attenti
 
 
 def decodes(case: AttentionCase) -> bool:
-    """Whether a call is the decode selector's (`DECODE`): a few query positions of the keys' own heads
-    over key lengths, one the folded attention reads (`decode_geometry.folds`), with no mask, bias,
-    causality, window, documents, sinks or softcap."""
-    return (case.lengths and case.folds and case.queries <= decode_attention.QUERIES
-            and case.heads == case.kv_heads
-            and not (case.mask or case.bias or case.causal or case.sinks) and case.window is None
-            and case.documents is None and case.softcap is None)
+    """Whether a call is the decode selector's (`DECODE`): a few query positions over key lengths, with
+    no mask, bias, causality, window or documents. Plain, they are the keys' own heads, which the
+    folded attention reads (`decode_geometry.folds`) and differentiates; with sinks or a softcap, which
+    the decode kernel applies itself, any query heads that group over the key heads on a GPU, which the
+    reference path differentiates."""
+    if not (case.lengths and case.queries <= decode_attention.QUERIES
+            and not (case.mask or case.bias or case.causal) and case.window is None
+            and case.documents is None):
+        return False
+    if case.sinks or case.softcap is not None:
+        return generation.backend() == 'gpu' and case.heads % case.kv_heads == 0
+    return case.folds and case.heads == case.kv_heads
 
 
 def kernel_refusals(op: Op[AttentionCase], kernel: str, case: AttentionCase) -> list[Refusal]:
