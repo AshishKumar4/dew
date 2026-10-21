@@ -298,7 +298,7 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
             **_staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), prologue_gmems[i])
                                  for i in fixed]),
             halves=plgpu.Barrier(num_arrivals=2, num_barriers=2),
-            drained=plgpu.Barrier(num_arrivals=2),
+            drained=_drained(tiles),
             collective_axes="wg",
         )
         def scope(allocations, o_smems, side_smems, side_barriers, fixed_smems, fixed_barriers, halves,
@@ -476,9 +476,18 @@ stage is released one step late, past its end, so a persistent kernel's producer
 tile's first stages over one an MMA still reads: the consumers report each tile drained (`_drain`)."""
 
 
+def _drained(tiles: Tiles):
+    """Dew: the barrier the consumers report a tile drained at: both multiprocessors' of a pair (each
+    producer's next loads are multicast into both), a block's own otherwise."""
+    if tiles.cluster == 2:
+        return plgpu.ClusterBarrier(collective_axes=("cluster",), num_arrivals=2)
+    return plgpu.Barrier(num_arrivals=2)
+
+
 def _drain(drained, wg) -> None:
-    """Dew: the producer warpgroup waits until both consumers have finished the tile's MMAs (each arrives
-    at `drained` after its last wait) before its next tile's loads reuse the pipeline's stages."""
+    """Dew: the producer warpgroup waits until the consumers have finished the tile's MMAs (each arrives at
+    `drained` after its last wait; a pair's four, `_drained`) before its next tile's loads reuse the
+    pipeline's stages."""
     pl.when(wg == 2)(lambda: plgpu.barrier_wait(drained))
 
 
@@ -681,7 +690,7 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
             **_staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), side_gmems[i])
                                  for i in fixed]),
             halves=plgpu.Barrier(num_arrivals=2, num_barriers=2),
-            drained=plgpu.Barrier(num_arrivals=2),
+            drained=_drained(tiles),
             collective_axes="wg",
         )
         def scope(allocations, o_smem, fixed_smems, fixed_barriers, halves, drained):
