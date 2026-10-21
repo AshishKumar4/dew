@@ -422,17 +422,8 @@ class Pretrained:
         around (`TrainerConfig.resumes`), as MaxText loads its base parameters only
         for a run with no checkpoint.
         """
-        if fallback not in (None, "torchax"):
-            raise ValueError(f"fallback={fallback!r} names no loader; the one fallback is 'torchax', "
-                             "tier 3 through transformers' PyTorch forward")
-        selected = [name for name, given in (("gguf_file", gguf_file), ("single_file", single_file),
-                                             ("dduf_file", dduf_file)) if given is not None]
-        if len(selected) > 1:
-            raise ValueError(f"{' and '.join(selected)} each name the whole payload to load; pass one")
-        if fallback is not None and selected:
-            raise ValueError(f"fallback='torchax' builds the transformers model the repo's config.json "
-                             f"and weights describe, and {' and '.join(selected)} selects another payload; "
-                             "load it without fallback")
+        selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
+                                     dduf_file=dduf_file)
         if on_host and (mesh is not None or layout is not None):
             raise ValueError("on_host keeps the variables as host arrays, and mesh and layout place them; "
                              "pass one")
@@ -1239,6 +1230,22 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
             export_adapter = partial(_spelled_source_weights, {
                 entry.spelling(name): name for name in tensors if entry.spelling(name) != name})
     return _Built(model, variables, record, built, layouts, retained, export_adapter)
+
+
+def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
+    """The payload `files` `Pretrained.load` was given by name (`gguf_file`, `single_file`,
+    `dduf_file`), refusing more than one, a fallback beside any, and a fallback no loader is."""
+    if fallback not in (None, "torchax"):
+        raise ValueError(f"fallback={fallback!r} names no loader; the one fallback is 'torchax', "
+                         "tier 3 through transformers' PyTorch forward")
+    selected = [name for name, given in files.items() if given is not None]
+    if len(selected) > 1:
+        raise ValueError(f"{' and '.join(selected)} each name the whole payload to load; pass one")
+    if fallback is not None and selected:
+        raise ValueError(f"fallback='torchax' builds the transformers model the repo's config.json "
+                         f"and weights describe, and {' and '.join(selected)} selects another payload; "
+                         "load it without fallback")
+    return selected
 
 
 def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | None, *,
