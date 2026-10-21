@@ -404,7 +404,7 @@ def _repae_step(tmp_path: Path, dtype) -> SimpleNamespace:
     rows = len(STEPPED["classes"])
     latents = (rows, *task.latent_shape)
     tape = {"times": presets.Flow(density="uniform")().schedule.sample_t(keys[2], rows),
-            "noise": jax.random.normal(keys[3], latents),
+            "noise": jax.random.normal(keys[3], latents, jnp.float32),
             "condition dropout": jnp.asarray(STEPPED["dropped"])}
     step = Step(step=jnp.asarray(0), key=jax.random.key(int(STEPPED["key"])), ema=None, tape=tape)
 

@@ -1084,13 +1084,12 @@ def shard_batch(mesh: Mesh, batch: Batch, reads: Mapping[Signature, tuple[bool, 
     return tree.unflatten([held[index] if index in held else next(moved) for index in range(len(leaves))])
 
 
-def marked(mesh: Mesh, prepare: Callable[[Batch], Batch] | None = None) -> Callable[[Batch], Batch]:
+def marked(partition: DataPartition, prepare: Callable[[Batch], Batch] | None = None
+           ) -> Callable[[Batch], Batch]:
     """A training batch's host preparation: `prepare`'s, then each row's place among its step's
-    records (`EXAMPLE_ROWS`). A share of `DataPartition.of(mesh)` reads the records `index :: count`,
-    so its `j`th row is the step's record `j * count + index` at every count: a record draws what it
-    draws however many processes read it (`Step.sample`)."""
-    partition = DataPartition.of(mesh)
-
+    records (`EXAMPLE_ROWS`). A share (`DataPartition.of`) reads the records `index :: count`, so its
+    `j`th row is the step's record `j * count + index` at every count: a record draws what it draws
+    however many processes read it (`Step.sample`)."""
     def prepared(batch: Batch) -> Batch:
         batch = batch if prepare is None else prepare(batch)
         rows = np.arange(rows_of(batch), dtype=np.int32)
