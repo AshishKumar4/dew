@@ -112,8 +112,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import flat_tree
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference
+from model_support import flat_tree, llada_draw, llada_fields
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, declared_seeds, recording
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config, translate_weights
@@ -930,31 +930,38 @@ LLADA_MOE = ('llada-moe-tiny', 'llada-moe-v2-tiny', 'llada2-tiny', 'llada21-tiny
 
 @pytest.fixture(scope='module', params=LLADA_MOE)
 def llada_moe_source(request):
+    """A LLaDA-MoE release's synthetic checkpoint, its forward's fields (`llada_fields`), one of its
+    recording's draws for a single forward, and its recording of the release over seeds
+    (tools/llada_moe_reference.py, `record_case`)."""
     name = request.param
     source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
-    ids = np.load(FIXTURES / name / 'probe_ids.npy')
-    fields = {}
-    if name in ('llada2-tiny', 'llada21-tiny', 'llada22-tiny'):
-        blocks = np.arange(ids.shape[-1]) // 4
-        fields['attention_pairwise_mask'] = jnp.asarray(np.broadcast_to(
-            blocks[None, :] <= blocks[:, None], (ids.shape[1], ids.shape[-1], ids.shape[-1])))
-    return name, source, ids, fields
+    path = FIXTURES / name / 'released.npz'
+    return name, source, llada_draw(0, source.model.vocab_size)['ids'], llada_fields(name, 16), (
+        recording(path), declared_seeds(path)[name])
+
+
+def assert_released_logits(name, source, fields, recorded, forward, label):
+    """`forward(ids)` as exact as the release's fp32 forward over its recording's seeds (check 1), both
+    measured from the release run in float64, held through Dew's own float64 forward to the recorded
+    truth's sketch (`indexed_recording`)."""
+    from reference_error import indexed_recording, widened
+
+    stored, seeds = recorded
+    wide_model, wide_variables = source.model.clone(dtype=jnp.float64), widened(source.variables)
+    wide = jax.jit(lambda ids: {'logits': wide_model.apply(wide_variables, ids, **fields)})
+    draw, reference, truth = indexed_recording(
+        stored, name, seeds, inputs_of=lambda seed: llada_draw(seed, source.model.vocab_size),
+        truth_fn=lambda index, inputs: wide(inputs['ids']))
+    assert_as_exact(lambda index, inputs: {'logits': forward(inputs['ids'])}, reference, draw,
+                    f'{name} {label}', seeds=seeds, truth_fn=truth)
 
 
 def test_llada_moe_logits_match_the_released_model_code(llada_moe_source):
-    """The pinned release's own fp32 forward, including its router and block mask.
-
-    Forty distinct token grids share each synthetic checkpoint. The first
-    eight draws, and all forty if the gate redraws, measure both native
-    fp32 implementations against the release run entirely in float64.
-    """
-    name, source, ids, fields = llada_moe_source
-    reference = np.load(FIXTURES / name / 'probe_logits.npy')
-    truth = np.load(FIXTURES / name / 'probe_logits_f64.npy')
+    """The pinned release's own fp32 forward, including its router and block mask, over its
+    recording's seeds of two 16-token rows, whole blocks of 2.2's routing block."""
+    name, source, _, fields, recorded = llada_moe_source
     forward = jax.jit(lambda tokens: source.model.apply(source.variables, tokens, **fields))
-    assert_as_exact(lambda seed: forward(ids[int(seed)]), lambda seed: reference[int(seed)],
-                    lambda seed: (np.asarray(seed, np.int32),), name + ' released logits',
-                    truth_fn=lambda seed: truth[int(seed)], seeds=8)
+    assert_released_logits(name, source, fields, recorded, forward, 'released logits')
 
 
 @pytest.mark.mesh(devices=4)
@@ -962,32 +969,28 @@ def test_llada_moe_expert_and_sequence_shards_match_released_logits(llada_moe_so
     from dew.nn.sharding import mesh_axes
     from dew.training import Layout, MeshSpec
 
-    name, _, ids, fields = llada_moe_source
+    name, _, _, fields, recorded = llada_moe_source
     mesh = MeshSpec(expert=2, sequence=2).build(jax.devices()[:4])
     source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference',
                               mesh=mesh, layout=Layout(min_shard=1, tolerance=1.0))
     kernels = [value for path, value in flat_tree(source.variables['params']).items()
                if '.experts.' in path]
     assert all(any('expert' in mesh_axes(axis) for axis in value.sharding.spec) for value in kernels)
-    reference = np.load(FIXTURES / name / 'probe_logits.npy')
-    truth = np.load(FIXTURES / name / 'probe_logits_f64.npy')
     with jax.set_mesh(mesh):
         forward = jax.jit(lambda tokens: source.model.apply(source.variables, tokens, **fields))
-        assert_as_exact(lambda seed: forward(ids[int(seed)]), lambda seed: reference[int(seed)],
-                        lambda seed: (np.asarray(seed, np.int32),), name + ' sharded released logits',
-                        truth_fn=lambda seed: truth[int(seed)], seeds=8)
+        assert_released_logits(name, source, fields, recorded, forward, 'sharded released logits')
 
 
 def test_llada_moe_routing_limits_change_the_forward(llada_moe_source):
     """The expert bias, group limit and 2.2 block shortlist each bind on real hidden states."""
     from dataclasses import replace
 
-    name, source, ids, fields = llada_moe_source
+    name, source, ids, fields, recorded = llada_moe_source
     model, variables = source.model, source.variables
     mixture = model.mixture
 
     def chosen(run_model, run_variables):
-        _, state = run_model.apply(run_variables, ids[0], **fields, mutable=['router'])
+        _, state = run_model.apply(run_variables, ids, **fields, mutable=['router'])
         return {layer: np.sort(np.asarray(values['mlp']['gate']['indices'][0]), axis=-1)
                 for layer, values in state['router'].items()}
 
@@ -1009,12 +1012,8 @@ def test_llada_moe_routing_limits_change_the_forward(llada_moe_source):
     # Every fixture also distinguishes a causal decoder from the release's attention.
     causal = model.clone(causal=True)
     forward = jax.jit(lambda tokens: causal.apply(variables, tokens))
-    reference = np.load(FIXTURES / name / 'probe_logits.npy')
-    truth = np.load(FIXTURES / name / 'probe_logits_f64.npy')
     with pytest.raises(AssertionError):
-        assert_as_exact(lambda seed: forward(ids[int(seed)]), lambda seed: reference[int(seed)],
-                        lambda seed: (np.asarray(seed, np.int32),), name + ' causal negative control',
-                        truth_fn=lambda seed: truth[int(seed)], seeds=8)
+        assert_released_logits(name, source, fields, recorded, forward, 'causal negative control')
 
 
 def llada22_routes(source, tokens, **fields) -> dict:
@@ -1029,13 +1028,14 @@ def test_llada22_block_routing_is_each_requests_own():
     """LLaDA2.2 routes each block of `block_size` places together. The release cuts its blocks from
     the batch flattened into one stream, so there a row's experts depend on the rows beside it; Dew
     numbers each request's blocks over its own real tokens (`numbered_blocks`), the release's blocks
-    wherever a row is whole blocks (the recorded probes). Two requests 6 and 9 tokens long, neither a
+    wherever a row is whole blocks (the recorded draws). Two requests 6 and 9 tokens long, neither a
     whole number of 4-token blocks, batched with left padding, route every real token to the experts
-    it routes to alone: their blocks do not meet, and the padding votes for none."""
+    it routes to alone: their blocks do not meet, and the padding votes for none. (The recorded draws
+    are two 16-token rows, whole blocks, where Dew's routing is the release's.)"""
     source = Pretrained.load(FIXTURES / 'llada22-tiny', dtype='float32', attention_impl='reference')
     assert source.model.mixture.routing_block == 4
-    ids = np.load(FIXTURES / 'llada22-tiny' / 'probe_ids.npy')
-    requests = [ids[1, 0, :6], ids[2, 1, :9]]
+    vocabulary = source.model.vocab_size
+    requests = [llada_draw(1, vocabulary)['ids'][0, :6], llada_draw(2, vocabulary)['ids'][1, :9]]
     width = max(len(request) for request in requests)
     padded = np.stack([np.pad(request, (width - len(request), 0)) for request in requests])
     valid = np.stack([np.arange(width) >= width - len(request) for request in requests])
@@ -1053,8 +1053,8 @@ def test_llada22_block_routing_is_each_packed_documents_own():
     alone: each document's blocks are counted from its own first token, so neither a block nor its
     shortlist spans the boundary."""
     source = Pretrained.load(FIXTURES / 'llada22-tiny', dtype='float32', attention_impl='reference')
-    ids = np.load(FIXTURES / 'llada22-tiny' / 'probe_ids.npy')
-    documents = [ids[3, 0, :6], ids[4, 1, :7]]
+    vocabulary = source.model.vocab_size
+    documents = [llada_draw(3, vocabulary)['ids'][0, :6], llada_draw(4, vocabulary)['ids'][1, :7]]
     packed = np.concatenate(documents)[None]
     segments = np.concatenate([np.full(len(document), index + 1) for index, document in enumerate(documents)])
     together = llada22_routes(source, packed, segment_ids=jnp.asarray(segments[None], jnp.int32))
@@ -1069,15 +1069,16 @@ def test_llada22_block_routing_is_each_packed_documents_own():
 
 @pytest.mark.parametrize('derived', [False, True], ids=['source-layout', 'native-layout'])
 def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, derived):
-    name, source, ids, fields = llada_moe_source
+    name, source, ids, fields, _ = llada_moe_source
     model, variables = source.model, source.variables
+    draws = np.stack([llada_draw(seed, model.vocab_size)['ids'] for seed in range(40)])
     loss, gradients = jax.value_and_grad(lambda params: jnp.mean(model.apply(
-        {**variables, 'params': params}, ids[0], **fields) ** 2))(variables['params'])
+        {**variables, 'params': params}, ids, **fields) ** 2))(variables['params'])
     assert np.isfinite(loss) and all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(gradients))
     trained = {**variables, 'params': jax.tree.map(lambda p, g: p - 0.01 * g,
                                                  variables['params'], gradients)}
-    before = model.apply(variables, ids[0], **fields)
-    after = model.apply(trained, ids[0], **fields)
+    before = model.apply(variables, ids, **fields)
+    after = model.apply(trained, ids, **fields)
     with pytest.raises(AssertionError):
         assert_as_exact(lambda seed: after, lambda seed: before,
                         lambda seed: (np.asarray(seed, np.int32),), name + ' update negative control',
@@ -1090,10 +1091,10 @@ def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, de
     actual = jax.jit(lambda tokens: reloaded.model.apply(reloaded.variables, tokens, **fields))
     expected = jax.jit(lambda tokens: model.apply(trained, tokens, **fields))
     # Saving and loading is an identity, so the reference is exact at every draw.
-    assert_as_exact(lambda seed: actual(ids[int(seed)]), lambda seed: expected(ids[int(seed)]),
+    assert_as_exact(lambda seed: actual(draws[int(seed)]), lambda seed: expected(draws[int(seed)]),
                     lambda seed: (np.asarray(seed, np.int32),), name + ' trained export', seeds=8,
-                    truth_fn=lambda seed: np.asarray(expected(ids[int(seed)]), np.float64))
-    prompt = ids[0, :1, :4]
+                    truth_fn=lambda seed: np.asarray(expected(draws[int(seed)]), np.float64))
+    prompt = ids[:1, :4]
     generated = reloaded.text_generation()(prompt, 4, key=7, steps=3).host().tokens
     np.testing.assert_array_equal(generated[:, :4], prompt)
     assert generated.shape == (1, 8) and np.all(generated[:, 4:] != model.mask_token_id)
