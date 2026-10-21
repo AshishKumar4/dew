@@ -156,10 +156,12 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
                                     grouped_matmul.MosaicTgmm()], ids=lambda launch: type(launch).__name__)
 def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
     """The tiles the Mosaic GPU launches may pick at an expert layer's shapes lower for an H100 on the
-    CPU, as a GPU session's compile would: every block shape and every schedule among those that fit an
-    H100's block (`Template.fitting`). The interpreter takes kernels Mosaic GPU's layout inference
-    refuses; the GPU's tile gate runs each one (test_moe_precision)."""
-    rows, depth, width, groups = 2048, 768, 1536, 8
+    CPU, as a GPU session's compile would, over rows no multiple of 8: every block shape and every
+    schedule among those that fit an H100's block (`Template.fitting`). The interpreter takes kernels
+    Mosaic GPU's layout inference and TMA descriptors refuse; the GPU's tile gate runs each one
+    (test_moe_precision)."""
+    # Rows not a multiple of 8, which a TMA descriptor tiles by.
+    rows, depth, width, groups = 2044, 768, 1536, 8
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     sizes, matrices = jax.ShapeDtypeStruct((groups,), jnp.int32), bf16((groups, depth, width))
     if isinstance(launch, grouped_matmul.MosaicTgmm):
