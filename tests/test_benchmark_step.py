@@ -9,7 +9,7 @@ every suite run.
 
 import numpy as np
 import pytest
-from tool_support import load
+from tool_support import REPO_ROOT, load
 
 from tools.benchmark_cases import cpu_smoke_cases
 
@@ -19,7 +19,7 @@ pytestmark = pytest.mark.mesh
 
 @pytest.mark.parametrize("architecture, fixed_batch", [
     *[(case.architecture, False) for case in cpu_smoke_cases()], ("causal_transformer", True)])
-def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architecture, fixed_batch):
+def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architecture, fixed_batch, monkeypatch):
     """The tool's row is the trainer's own compiled step run for real: a
     finite loss out of it, timed over the steps asked for, for every case of
     the preset, and whether each step reads a fresh placement or reuses one.
@@ -28,6 +28,8 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     from dew.nn.flops import MissingFlopsCount
 
     tool = load("benchmark_step")
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
+    import benchmark_models as models  # the objective and batch the tool builds its step from
     config = tool.BenchmarkConfig(preset='cpu-smoke', architectures=[architecture],
                                   warmup=1, steps=2, dtype='float32', fixed_batch=fixed_batch)
     (case,) = tool.build_cases(config)
@@ -38,7 +40,7 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     assert row["measured_steps"] == 2 and row["fixed_batch"] is fixed_batch
     assert row["ms_per_step"] > 0 and row["p50_ms"] > 0
     try:
-        counted = tool.build_objective(case).training_flops(None, tool.global_batch(case))
+        counted = models.build_objective(case).training_flops(None, models.global_batch(case))
     except MissingFlopsCount:
         counted = None
     assert row["training_flops"] == counted
