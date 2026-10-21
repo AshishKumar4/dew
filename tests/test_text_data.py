@@ -225,7 +225,7 @@ def test_written_tokens_round_trip_through_the_source(tmp_path):
     assert stored.metadata()["tokenizer"] == "byte" and stored.metadata()["vocab_size"] == 256
     expected = ByteTokenizer().encode("".join(documents))
     np.testing.assert_array_equal(stored.tokens[:], expected)
-    assert stored.metadata()["train_tokens"] == len(expected)
+    assert stored.metadata()["tokens"] == len(expected)
     data = _trained(stored, 32, 1, loading=Loading(workers=0))
     assert data.records == (len(expected) - 1) // 32 and manifest["rows"] == 2
     stream = data.train(DataPartition())
@@ -248,9 +248,13 @@ def test_documents_write_one_eos_each_and_empty_documents_write_nothing(tmp_path
 
 
 def _export_cli(input_path, destination):
+    """`dew data export` of a run file whose chain reads `input_path` as text, a line a document,
+    whatever its name, into `destination` as byte tokens."""
     import subprocess
 
-    return subprocess.run([sys.executable, "-m", "dew.cli.main", "data", "export", str(input_path),
+    chain = destination.parent / "corpus_chain.py"
+    chain.write_text(f"from dew.data import Files\n\ndata = Files({str(input_path)!r}, format='text')\n")
+    return subprocess.run([sys.executable, "-m", "dew.cli.main", "data", "export", str(chain),
                            str(destination), "--format", "array_record", "--tokenizer", "byte",
                            "--read", "memory"], cwd=destination.parent,
                           capture_output=True, text=True,

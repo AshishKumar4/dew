@@ -526,6 +526,36 @@ def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
     assert tokens.tolist() == list(original)
 
 
+def test_a_split_names_a_split_of_a_hub_or_tfds_url_and_a_file_store_refuses_one(tmp_path):
+    """`source(url, split=)` picks a split of a Hub or TFDS URL; a file store reads what it holds, so
+    it refuses a split by name rather than read its files as the split asked for."""
+    from dew.data.sources import TFDS, source
+
+    rows = tmp_path / "rows.jsonl"
+    rows.write_text('{"text": "a"}\n')
+    tfds_test = source("tfds://dew_images", split="test")
+    assert isinstance(tfds_test, TFDS) and tfds_test.split == "test"
+    assert isinstance(source(str(rows)), Files)
+    with pytest.raises(ValueError):
+        source(str(rows), split="val")
+
+
+def test_a_token_export_of_no_documents_reads_as_an_empty_corpus(tmp_path):
+    """An export whose input yields no rows commits no shards, and reads back as no tokens and no
+    documents rather than failing to open."""
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources.tokens import TokenFiles
+
+    manifest = export([], str(tmp_path), format="array_record", length_field="text",
+                      metadata={"token_store": True, "dtype": "int32", "tokenizer": "byte",
+                                "vocab_size": 256, "eos_id": None})
+    assert manifest["rows"] == 0 and manifest["files"] == []
+    stored = TokenFiles(str(tmp_path))
+    assert len(stored.tokens) == 0 and stored.metadata()["tokens"] == 0
+    assert list(iterate(Pipeline(stored), read="memory")) == []
+
+
 def test_exported_token_lengths_support_indexed_spans_without_record_scan():
     from dew.data.sources.tokens import TokenFiles
 
@@ -629,7 +659,7 @@ def test_cli_token_exports_are_readable_by_the_dispatched_token_source(tmp_path,
     assert stored.tokens[:].tolist() == expected.tolist()
     assert stored.supports("indexed")
     assert stored.metadata()["eos_id"] == vocabulary.eos_id
-    assert stored.metadata()["train_tokens"] == len(expected)
+    assert stored.metadata()["tokens"] == len(expected)
     records = stored.records("indexed")
     actual = np.concatenate([records[index]["text"] for index in range(len(records))])
     assert actual.tolist() == expected.tolist()
