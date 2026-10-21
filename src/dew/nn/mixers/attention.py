@@ -848,7 +848,7 @@ class CausalSelfAttention(nn.Module):
             key_places = key_places if key_positions is None else key_positions
             causal, window, documents = False, None, None
             implementation = masked
-        structure = self._structure(places, key_places, prefix, key.shape[-3])
+        structure = self._structure(places, key_places, prefix)
         if structure is not None:
             mask = self._structured(mask, documents, causal, window, S, key.shape[-3], structure)
             causal, window, documents = False, None, None
@@ -871,22 +871,19 @@ class CausalSelfAttention(nn.Module):
         base = combined_attention_mask(length, keys, causal, window, mask)
         return structure if base is None else base & structure
 
-    def _structure(self, places, key_places, prefix, keys: int):
+    def _structure(self, places, key_places, prefix):
         """The keys the layer's own structure leaves each query, by counted places, or None: its
         chunk's (`chunk_mask`), or its diffusion block's and the blocks' before it
-        (`diffusion_block_mask`), where a canvas over a cached prefix reads every prefix key, which
-        comes before its blocks by construction. A chunk is causal and a diffusion block is not, so a
-        layer has one at most."""
+        (`diffusion_block_mask`). A chunk is causal and a diffusion block is not, so a layer has one
+        at most."""
         if self.ctx.attention_chunk is not None:
             return chunk_mask(places, key_places, self.ctx.attention_chunk)
-        block = self.ctx.diffusion_block
-        if block is None:
+        if self.ctx.diffusion_block is None:
             return None
-        if prefix is None:
-            return diffusion_block_mask(places, key_places, block)
-        canvas = diffusion_block_mask(places, places, block)
-        return jnp.concatenate([jnp.ones((*canvas.shape[:-1], keys - canvas.shape[-1]), bool), canvas],
-                               axis=-1)
+        if prefix is not None:
+            self.ctx.refuse("attention", {"diffusion_block": True}, "a canvas over a cached prefix reads "
+                            "the prefix's keys at their cache slots, which count no blocks")
+        return diffusion_block_mask(places, key_places, self.ctx.diffusion_block)
 
     def _pairwise_mask(self, metadata: AttentionMetadata, rotary_positions, B: int, S: int, keys: int):
         """A call's own mask `[B, 1, S, keys]` (`AttentionMetadata.pairwise_mask`) and the places its

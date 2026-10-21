@@ -86,10 +86,11 @@ class MLPMixer(MixerBase):
         if mixture is not None and not isinstance(mixture, Mixture):
             raise ValueError('MLPMixer mixture is a Mixture, its record, or None')
         if mixture is not None and (mixture.layers is not None or mixture.hash_layers is not None
-                                    or mixture.media_bias or mixture.beside_dense):
+                                    or mixture.media_bias or mixture.beside_dense
+                                    or mixture.routing_block is not None):
             raise ValueError('MLPMixer uses the layer-kind pattern; mixture layers, hash_layers, '
-                             'media_bias and a branch beside a dense feed-forward need a decoder '
-                             'feed-forward slot')
+                             'media_bias, routing_block and a branch beside a dense feed-forward need '
+                             'a decoder feed-forward slot')
 
     def generation_refusal(self) -> str | None:
         """Its mixture's (`Mixture.generation_refusal`), where the slot is routed."""
