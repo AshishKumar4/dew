@@ -839,10 +839,34 @@ def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(c
     out = tmp_path / "verdict.json"
     began = time.monotonic()
     ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py"], "", out, 3.0, grace=2.0)
-    assert time.monotonic() - began < 60
+    # The deadline, the interrupt's grace, one settle budget and the reader's join, with room to spare.
+    assert time.monotonic() - began < 3.0 + 2.0 + ci.SETTLE + 10 + 15
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     assert {name: row["exitCode"] for name, row in rows.items()} == {
         "3.12:tests/test_quick.py": 1, "3.12:tests/test_hangs.py": 1}
+
+
+def test_stopping_a_group_spends_one_settle_budget_and_reports_a_leader_that_will_not_reap(monkeypatch):
+    """A group is stopped within one settle budget after SIGKILL, the leader's reaping and the other
+    members' ending together, and a leader still unreapable then is reported among the members that
+    outlived it, never raised: CI writes its verdict either way."""
+    groups = load("child_groups", "tools/armada")
+
+    class Stuck:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            time.sleep(timeout)
+            raise subprocess.TimeoutExpired("stuck", timeout)
+
+    monkeypatch.setattr(groups, "signal_group", lambda leader, number: None)
+    monkeypatch.setattr(groups, "members", lambda group: [group])
+    began = time.monotonic()
+    assert groups.stop(Stuck(), settle=0.5) == [4242]
+    assert time.monotonic() - began < 0.9, "the leader's wait and the members' share one budget"
 
 
 def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):
