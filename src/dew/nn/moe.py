@@ -324,21 +324,22 @@ class Router(nn.Module):
             selection = jnp.where(media[..., None], scores + self.bias_vl.value, selection)
         if self.expert_groups > 1:
             selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
-        if blocks is not None:
-            selection = jnp.where(self.block_mask(selection, blocks), selection, -jnp.inf)
+        if self.block_experts is not None:
+            selection = jnp.where(self.block_mask(selection, blocks, self.block_experts), selection, -jnp.inf)
         _, indices = jax.lax.top_k(selection, self.top_k)
         return indices
 
-    def block_mask(self, selection, blocks):
-        """True where an expert is one of the `block_experts` its token's block chose: the experts of
-        the best selection scores over the block's tokens (LLaDA2.2's `block_routing`,
+    @staticmethod
+    def block_mask(selection, blocks, capacity: int):
+        """True where an expert is one of the `capacity` its token's block chose: the experts of the best
+        selection scores over the block's tokens (LLaDA2.2's `block_routing`,
         modeling_llada2_moe.py:244-275). `blocks` `[..., S]` numbers each row's blocks from 0, and a
         token numbered -1 (padding) votes for none."""
         rows, (length, experts) = selection.shape[:-2], selection.shape[-2:]
 
         def row(scores, ids):
             best = jax.ops.segment_max(scores, ids, num_segments=length)
-            _, chosen = jax.lax.top_k(best, self.block_experts)
+            _, chosen = jax.lax.top_k(best, capacity)
             allowed = jnp.zeros((length, experts), bool).at[jnp.arange(length)[:, None], chosen].set(True)
             return allowed[jnp.maximum(ids, 0)]
 

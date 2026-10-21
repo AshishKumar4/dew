@@ -848,14 +848,9 @@ class CausalSelfAttention(nn.Module):
             key_places = key_places if key_positions is None else key_positions
             causal, window, documents = False, None, None
             implementation = masked
-        if self.ctx.attention_chunk is not None:
-            mask = self._structured(mask, documents, causal, window, S, key.shape[-3],
-                                    chunk_mask(places, key_places, self.ctx.attention_chunk))
-            causal, window, documents = False, None, None
-            implementation = masked
-        if self.ctx.diffusion_block is not None:
-            mask = self._structured(mask, documents, causal, window, S, key.shape[-3],
-                                    self._diffusion_blocks(places, key_places, prefix, key.shape[-3]))
+        structure = self._structure(places, key_places, prefix, key.shape[-3])
+        if structure is not None:
+            mask = self._structured(mask, documents, causal, window, S, key.shape[-3], structure)
             causal, window, documents = False, None, None
             implementation = masked
         max_segments = (None if documents is None else 1 if isinstance(documents, CrossDocuments)
@@ -876,11 +871,17 @@ class CausalSelfAttention(nn.Module):
         base = combined_attention_mask(length, keys, causal, window, mask)
         return structure if base is None else base & structure
 
-    def _diffusion_blocks(self, places, key_places, prefix, keys: int):
-        """The keys of each query's diffusion block and of the blocks before it
-        (`diffusion_block_mask`). A canvas over a cached prefix reads every prefix key, which comes
-        before its blocks by construction, and its own keys by their blocks."""
+    def _structure(self, places, key_places, prefix, keys: int):
+        """The keys the layer's own structure leaves each query, by counted places, or None: its
+        chunk's (`chunk_mask`), or its diffusion block's and the blocks' before it
+        (`diffusion_block_mask`), where a canvas over a cached prefix reads every prefix key, which
+        comes before its blocks by construction. A chunk is causal and a diffusion block is not, so a
+        layer has one at most."""
+        if self.ctx.attention_chunk is not None:
+            return chunk_mask(places, key_places, self.ctx.attention_chunk)
         block = self.ctx.diffusion_block
+        if block is None:
+            return None
         if prefix is None:
             return diffusion_block_mask(places, key_places, block)
         canvas = diffusion_block_mask(places, places, block)

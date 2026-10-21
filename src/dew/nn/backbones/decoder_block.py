@@ -838,7 +838,8 @@ class DecoderBlock(nn.Module):
                 mlp_input = (normed if self.wiring.shared_parallel_norm else
                              self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
             hidden = self.mlp(mlp_input,
-                              **self._feedforward_inputs(attention_metadata, mlp_input.shape[:2]),
+                              **self._feedforward_inputs(attention_metadata, mlp_input.shape[0],
+                                                         mlp_input.shape[1]),
                               **({} if self.parallel is not None else routes),
                               **({"train": train} if isinstance(self.mlp, ReadsTrain) and self.mlp.reads_train
                                  else {}))
@@ -1040,12 +1041,12 @@ class DecoderBlock(nn.Module):
             **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
         )
 
-    def _feedforward_inputs(self, attention_metadata, shape: tuple[int, int]) -> dict:
+    def _feedforward_inputs(self, attention_metadata, batch: int, length: int) -> dict:
         """The token ids for a hash-routed feed-forward, the media mask, when
         the call has one, for one that routes a media span apart, each token's
         numbered block for one that routes by blocks, nothing for the rest."""
-        blocks = {} if self.routing_block is None else {
-            "blocks": numbered_blocks(coordinates_of(attention_metadata, *shape), shape, self.routing_block)}
+        blocks = {} if self.routing_block is None else {"blocks": numbered_blocks(
+            coordinates_of(attention_metadata, batch, length), (batch, length), self.routing_block)}
         if self.media_routed:
             media = None if attention_metadata is None else attention_metadata.media
             return blocks if media is None else {**blocks, "media": media}

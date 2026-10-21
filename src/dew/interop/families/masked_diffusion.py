@@ -390,15 +390,16 @@ def _llada2_mixture(hf_config: Mapping[str, object], experts: int,
     expert_width = records.integer(width, 'moe_intermediate_size')
     shared = records.integer(hf_config.get('num_shared_experts', 0) or 0, 'num_shared_experts')
     blocks = hf_config.get('block_size')
-    routing = ({'groups': records.integer(hf_config.get('n_group', 8), 'n_group'),
-                'groups_per_token': records.integer(hf_config.get('topk_group', 4), 'topk_group')}
-               if blocks is None else
-               {'routing_block': records.integer(blocks, 'block_size'),
-                'block_experts': records.integer(hf_config.get('expert_capacity', 48), 'expert_capacity')})
+    by_block = blocks is not None
     return native_fields(Mixture)(
         experts=experts, top_k=top_k, layers=sparse, score_function='sigmoid', norm_topk_prob=top_k > 1,
         scaling=records.number(hf_config.get('routed_scaling_factor', 2.5), 'routed_scaling_factor'),
-        bias=True, expert_features=expert_width, shared_features=shared * expert_width, **routing)
+        bias=True, expert_features=expert_width, shared_features=shared * expert_width,
+        groups=1 if by_block else records.integer(hf_config.get('n_group', 8), 'n_group'),
+        groups_per_token=1 if by_block else records.integer(hf_config.get('topk_group', 4), 'topk_group'),
+        routing_block=records.integer(blocks, 'block_size') if by_block else None,
+        block_experts=(records.integer(hf_config.get('expert_capacity', 48), 'expert_capacity')
+                       if by_block else None))
 
 
 def _dream_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
