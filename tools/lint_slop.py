@@ -1830,13 +1830,7 @@ def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict
     the rule now reads there was in the file all along, and `grants` takes the count it reached. A file
     may also sit at a count `authorized` holds for it, one a commit between `parent` and `commit`
     reached so (HEAD against its base). No date moves later either way."""
-    renamed, changed = {}, set()
-    changes = _git(checkout, "diff", "--name-status", "-M", parent, commit, "--", "tests", "tools")
-    for change in changes.splitlines():
-        status, *paths = change.split("\t")
-        changed.update(paths)
-        if status.startswith("R") and len(paths) == 2:
-            renamed[paths[1]] = paths[0]
+    renamed, changed = _changes(checkout, parent, commit)
     reread = RULE in changed
     if mine["empty_by"] > theirs["empty_by"]:
         yield ("empty_by", "date"), "moves empty_by later"
@@ -1857,15 +1851,18 @@ def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict
             yield (name, "count"), f"raises {name}'s count"
 
 
-def _renamed(checkout: Path, parent: str, commit: str) -> dict[str, str]:
-    """The files `commit` renamed from `parent`'s, by their new names."""
-    renamed = {}
+@functools.cache
+def _changes(checkout: Path, parent: str, commit: str) -> tuple[dict[str, str], frozenset[str]]:
+    """What `commit` changed of `parent`'s tests and tools: the files it renamed, by their new names, and
+    every path it touched."""
+    renamed, changed = {}, set()
     changes = _git(checkout, "diff", "--name-status", "-M", parent, commit, "--", "tests", "tools")
     for change in changes.splitlines():
         status, *paths = change.split("\t")
+        changed.update(paths)
         if status.startswith("R") and len(paths) == 2:
             renamed[paths[1]] = paths[0]
-    return renamed
+    return renamed, frozenset(changed)
 
 
 def _lineage(checkout: Path, walk: list[tuple[str, list[str]]]) -> dict[str, dict[str, frozenset[str]]]:
@@ -1878,7 +1875,7 @@ def _lineage(checkout: Path, walk: list[tuple[str, list[str]]]) -> dict[str, dic
         if mine is None:
             lineage[commit] = {}
             continue
-        traced = [(lineage[parent], _renamed(checkout, parent, commit))
+        traced = [(lineage[parent], _changes(checkout, parent, commit)[0])
                   for parent in parents if parent in lineage]
         lineage[commit] = {}
         for name in mine["files"]:
