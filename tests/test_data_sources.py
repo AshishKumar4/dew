@@ -40,6 +40,48 @@ def test_memory_columns_snapshot_changes_with_content():
     assert Memory([{"x": 1}], shard_rows=1).fingerprint() != Memory([{"x": 1}], shard_rows=2).fingerprint()
 
 
+@dataclasses.dataclass(frozen=True)
+class Numbered:
+    """Adds one to each record's id."""
+
+    def __call__(self, row):
+        return {**row, "id": int(row["id"]) + 1}
+
+
+@pytest.mark.parametrize("table", ["pandas", "arrow"])
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_memory_reads_a_dataframe_or_arrow_table_as_its_rows(read, table):
+    """A DataFrame with an index of its own, or an Arrow table, read by `Memory`: each row a record
+    of its columns and nothing of the index, as the same rows given as records read; a changed
+    cell changes the store."""
+    import pandas as pd
+    import pyarrow as pa
+
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    columns = {"id": list(range(6)), "text": [f"row {index}" for index in range(6)]}
+    frame = pd.DataFrame(columns, index=[10 * index for index in range(6)])
+    given = frame if table == "pandas" else pa.table(columns)
+    records = [{"id": index, "text": f"row {index}"} for index in range(6)]
+
+    def read_back(memory):
+        chain = Pipeline(memory).map(Numbered(), identity="numbered@1").batch(2)
+        reader = compile(chain, read=read, loading=Loading(workers=0, threads=1, read_buffer=1)).train(
+            DataPartition())
+        try:
+            return [(np.asarray(batch["id"]).tolist(), list(batch["text"]))
+                    for batch in (next(reader) for _ in range(3))]
+        finally:
+            reader.close()
+
+    assert read_back(Memory(given)) == read_back(Memory(records))
+    assert Memory(given).fingerprint()["sha256"] == Memory(records).fingerprint()["sha256"]
+    changed = frame.assign(text=[*columns["text"][:5], "changed"])
+    assert Memory(changed).fingerprint()["sha256"] != Memory(frame).fingerprint()["sha256"]
+
+
 def test_memory_columns_of_different_row_counts_are_refused():
     assert len(Memory({"x": [1, 2], "y": [1, 2]}).records("indexed")) == 2
     with pytest.raises(ValueError):
