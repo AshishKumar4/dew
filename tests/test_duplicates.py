@@ -8,7 +8,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tool_support import load
+
 GATE = Path(__file__).resolve().parents[1] / "tools" / "duplicates.py"
+duplicates = load("duplicates")
 
 BLOCK = """\
     total = 0
@@ -52,6 +55,16 @@ def gate(root: Path, *arguments: str) -> subprocess.CompletedProcess:
                           text=True, timeout=300)
 
 
+def copies(root: Path) -> list:
+    """The structural copies the gate reads in `root`'s files, as it names them from `root`."""
+    return duplicates.structural({str(path.relative_to(root)): path.read_text()
+                                  for path in sorted(root.rglob("*.py"))})
+
+
+def owners(hits: list) -> list[tuple[str, list[str]]]:
+    return [(hit.kind, [f"{place.file} {place.owner}" for place in hit.places]) for hit in hits]
+
+
 def tree(tmp_path: Path, name: str, files: dict[str, str]) -> Path:
     # duplicates_*: CI puts tools/armada on its children's PYTHONPATH, where a plain name can be a module.
     root = tmp_path / f"duplicates_{name}"
@@ -78,9 +91,8 @@ def test_seven_lines_two_files_copy_fail_the_gate_and_six_or_one_owner_pass_it(t
 
 def test_a_function_two_files_write_under_other_names_fails_and_one_owner_passes(tmp_path):
     copied = tree(tmp_path, "copied", {"spread.py": SPREAD, "ranges.py": RANGE_OVER_COUNT})
-    done = gate(copied)
-    assert done.returncode == 1 and "duplicate function in 2 files" in done.stdout
-    assert "spread.py:1 spread" in done.stdout and "ranges.py:1 range_over_count" in done.stdout
+    assert gate(copied).returncode == 1
+    assert owners(copies(copied)) == [("function", ["ranges.py range_over_count", "spread.py spread"])]
     calling = ("from spread import spread\n\n\n"
                "def range_over_count(items, floor):\n    return spread(items, floor)\n")
     owned = tree(tmp_path, "owned", {"spread.py": SPREAD, "ranges.py": calling})
@@ -100,8 +112,9 @@ def test_six_statements_two_functions_share_fail_where_their_functions_differ(tm
     second = ("def second(values, limit):\n    values = sorted(values)\n"
               + "".join(f"    {s}\n" for s in renamed)
               + "    return {'balance': balance, 'kept': len(chosen)}\n")
-    done = gate(tree(tmp_path, "copied", {"first.py": first, "second.py": second}))
-    assert done.returncode == 1 and "duplicate statements in 2 files" in done.stdout
+    copied = tree(tmp_path, "copied", {"first.py": first, "second.py": second})
+    assert gate(copied).returncode == 1
+    assert owners(copies(copied)) == [("statements", ["first.py first", "second.py second"])]
     # Seven shared statements are two windows over one copy: the gate names the copy once.
     steps.append("spread = max(kept) - min(kept)")
     renamed.append("spread = max(chosen) - min(chosen)")
@@ -110,8 +123,9 @@ def test_six_statements_two_functions_share_fail_where_their_functions_differ(tm
     second = ("def second(values, limit):\n    values = sorted(values)\n"
               + "".join(f"    {s}\n" for s in renamed)
               + "    return {'balance': balance, 'kept': len(chosen)}\n")
-    done = gate(tree(tmp_path, "longer", {"first.py": first, "second.py": second}))
-    assert done.returncode == 1 and done.stdout.count("duplicate statements") == 1, done.stdout
+    longer = tree(tmp_path, "longer", {"first.py": first, "second.py": second})
+    assert gate(longer).returncode == 1
+    assert owners(copies(longer)) == [("statements", ["first.py first", "second.py second"])]
 
 
 def test_two_files_evaluating_alike_fail(tmp_path):
@@ -120,10 +134,10 @@ def test_two_files_evaluating_alike_fail(tmp_path):
     evaluate = ("class {0}:\n    def evaluate(self, params, batch, step):\n"
                 "        {1} = {{{2!r}: batch[{2!r}], {3!r}: batch[{3!r}]}}\n"
                 "        return self.compiled(self.variables(params, step), {1}, step.key)\n")
-    done = gate(tree(tmp_path, "copied", {"grpo.py": evaluate.format("Grpo", "prompts", "prompt", "length"),
-                                          "dpo.py": evaluate.format("Dpo", "pairs", "ids", "mask")}))
-    assert done.returncode == 1 and "duplicate function in 2 files" in done.stdout, done.stdout
-    assert "Grpo.evaluate" in done.stdout and "Dpo.evaluate" in done.stdout
+    copied = tree(tmp_path, "copied", {"grpo.py": evaluate.format("Grpo", "prompts", "prompt", "length"),
+                                       "dpo.py": evaluate.format("Dpo", "pairs", "ids", "mask")})
+    assert gate(copied).returncode == 1
+    assert owners(copies(copied)) == [("function", ["dpo.py Dpo.evaluate", "grpo.py Grpo.evaluate"])]
 
 
 def test_declarations_alike_are_no_copy(tmp_path):
@@ -147,7 +161,8 @@ def test_declarations_alike_are_no_copy(tmp_path):
         "right_stubs.py": stubs.format("RightNames", "field"),
         "left_reads.py": "values = {}\n" + reads.format("width", "values.get"),
         "right_reads.py": "import re\n" + reads.format("PATTERN", "re.compile")})
-    assert gate(alike).returncode == 0, gate(alike).stdout
+    assert copies(alike) == []
+    assert gate(alike).returncode == 0
 
 
 def commit(root: Path, message: str) -> None:
@@ -155,7 +170,7 @@ def commit(root: Path, message: str) -> None:
         subprocess.run(["git", *command], cwd=root, check=True)
 
 
-def test_held_to_a_base_only_a_copy_the_base_lacked_fails(tmp_path):
+def test_held_to_a_base_only_a_copy_the_base_lacked_fails(tmp_path, monkeypatch):
     """Main holds a copy (spread.py, ranges.py): a head that leaves it passes with the base and fails
     without; a head that writes the function a third time fails with the base too, naming the new copy."""
     root = tree(tmp_path, "repository",
@@ -165,11 +180,11 @@ def test_held_to_a_base_only_a_copy_the_base_lacked_fails(tmp_path):
     subprocess.run(["git", "checkout", "-q", "-b", "head"], cwd=root, check=True)
     (root / "other.py").write_text("VALUE = 2\n")
     commit(root, "a head that leaves the copy")
-    held = gate(root, "--base=main")
-    assert held.returncode == 0 and "(held by the base) duplicate function in 2 files" in held.stdout
+    monkeypatch.chdir(root)
+    assert gate(root, "--base=main").returncode == 0 and duplicates.new(copies(root), "main") == []
     assert gate(root).returncode == 1
     (root / "third.py").write_text(SPREAD.replace("spread", "third"))
     commit(root, "a head that copies it again")
-    added = gate(root, "--base=main")
-    assert added.returncode == 1 and "duplicate function in 3 files" in added.stdout
-    assert "third.py:1 third" in added.stdout
+    assert gate(root, "--base=main").returncode == 1
+    assert owners(duplicates.new(copies(root), "main")) == [
+        ("function", ["ranges.py range_over_count", "spread.py spread", "third.py third"])]
