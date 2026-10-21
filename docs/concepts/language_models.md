@@ -514,11 +514,11 @@ Trained 1 steps in 0:00:03: first step after 3.18 s
 Optimizer updates: 1
 ```
 
-`recipes/lm/train.py --objective block_diffusion` runs the same objective; there is no separate recipe. It trains on complete token-window rows, and `data.seq_len + 1` must equal `--objective.prompt-length` plus a whole number of training canvases. `--objective.canvas-size` defaults to the checkpoint's canvas length. Packed documents are rejected, because their context boundaries differ. Block SFT logs `canvas_ce` and `encoder_ce`. It does not report autoregressive perplexity or use the autoregressive preview settings.
+`recipes/lm/train.py --objective block_diffusion` runs the same objective; there is no separate recipe. It trains on complete token-window rows, and the chain's `seq_len + 1` must equal `--objective.prompt-length` plus a whole number of training canvases. `--objective.canvas-size` defaults to the checkpoint's canvas length. Packed documents are rejected, because their context boundaries differ. Block SFT logs `canvas_ce` and `encoder_ce`. It does not report autoregressive perplexity or use the autoregressive preview settings.
 
 ```bash
-python recipes/lm/train.py data:text --data.source data/diffusion-token-windows \
-    --data.seq-len 511 --objective block_diffusion --objective.prompt-length 256 \
+python recipes/lm/train.py --set data.source.url=data/diffusion-token-windows \
+    --set data.lm.seq_len=511 --objective block_diffusion --objective.prompt-length 256 \
     --pretrained google/diffusiongemma-26B-A4B-it \
     --tokenizer google/diffusiongemma-26B-A4B-it \
     --max-new-tokens 0 --optim.learning-rate 0.00015
