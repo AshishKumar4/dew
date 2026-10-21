@@ -1,11 +1,14 @@
-"""The weights a served decoder reads, packed for its decode step.
+"""The weights a decoder's generations read, packed for its decode step.
 
 A decoder's separate query, key and value projections, and a gated MLP's
 gate and up projections, read the same input; packed into one kernel each,
 a decode step multiplies once where it would three or two times. The model
-names the groups it reads packed (`dew.nn.protocols.Serving`), and
-the loader (`dew.inference.pipeline`) and the server pack those whose stored
-members concatenate, through `inference_projections`.
+names the groups it reads packed (`dew.nn.protocols.Serving`). A task that
+owns its weights, loaded from a source (`dew.pipeline`) or a saved run,
+packs them once at its load (`packed_owned`); a generation over weights it
+borrows, a live objective's, packs them inside its compiled call (`pending`,
+`packed_in_call`). A server serves the weights its task holds, and a reload
+packs what those hold packed (`packed_layout`).
 """
 
 
@@ -19,7 +22,6 @@ import numpy as np
 from flax import linen as nn
 from flax.core import unfreeze
 
-from dew.interop.streaming import SourceLeaf
 from dew.nn.kernels.options import QuantizedClass
 from dew.nn.protocols import ProjectionGroup, Serving
 from dew.objectives.base import Variables
@@ -44,25 +46,37 @@ def _same_quantization(variables: Variables, group: ProjectionGroup) -> bool:
         for leaves in held)
 
 
+def _placed_alike(leaves: Sequence[object]) -> bool:
+    """Whether `leaves`, packed along their last axis, keep one placement: host arrays all, or
+    device arrays one sharding places alike, in one memory space, none split on its last axis.
+    The packed leaf then takes that sharding, and its product splits back into the members' on
+    the devices that computed it. A member split on its last axis (a tensor-parallel layout's
+    heads, an FSDP layout's widest axis) would leave its packed columns on another member's
+    devices, and one in pinned host memory is staged on its own, so either keeps its group apart."""
+    if all(isinstance(leaf, np.ndarray) for leaf in leaves):
+        return True
+    if not all(isinstance(leaf, jax.Array) for leaf in leaves):
+        return False
+    first = leaves[0].sharding
+    return all(leaf.sharding.is_equivalent_to(first, leaf.ndim)
+               and leaf.sharding.shard_shape(leaf.shape)[-1] == leaf.shape[-1] for leaf in leaves)
+
+
 def _concatenates(variables: Variables, group: ProjectionGroup) -> bool:
-    """Whether `variables` hold `group` packed, or hold members that concatenate:
-    each a kernel and maybe a bias, of one dtype and one input shape, stored
-    as arrays or source leaves, under one input quantization."""
+    """Whether `variables` hold `group` packed, or hold members that concatenate where they live:
+    each a kernel and maybe a bias, of one dtype and one input shape, placed alike (`_placed_alike`),
+    under one input quantization."""
     node = _node(variables, "params", group.path)
     held = [node.get(name, {}) for name in group.members]
     fields = set(held[0])
-    # Members in different memory spaces (a selectively offloaded member in pinned host memory) do
-    # not concatenate: the layer stages each on its own.
-    spaces = {projection[field].sharding.memory_kind for projection in held for field in fields
-              if isinstance(projection.get(field), jax.Array)}
     return group.packed in node or (_same_quantization(variables, group) and "kernel" in fields
-                                    and len(spaces) <= 1
                                     and fields <= {"kernel", "bias"} and all(
         set(projection) == fields for projection in held) and all(
-        isinstance(projection[field], (jax.Array, np.ndarray, SourceLeaf))
+        isinstance(projection[field], (jax.Array, np.ndarray))
         and projection[field].dtype == held[0][field].dtype
         and projection[field].shape[:-1] == held[0][field].shape[:-1]
-        for projection in held for field in fields))
+        for projection in held for field in fields) and all(
+        _placed_alike([projection[field] for projection in held]) for field in fields))
 
 
 def projection_groups(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
@@ -121,8 +135,6 @@ def _joined(variables: Variables, groups: Sequence[ProjectionGroup]) -> Variable
             node = node[part]
         def joined(field, node=node, projections=group.members):
             leaves = [node[projection][field] for projection in projections]
-            if isinstance(leaves[0], SourceLeaf):
-                return SourceLeaf.concatenate(leaves)
             concatenate = np.concatenate if isinstance(leaves[0], np.ndarray) else jnp.concatenate
             return concatenate(leaves, axis=-1)
         node[group.packed] = {field: joined(field) for field in node[group.members[0]]}
@@ -153,61 +165,26 @@ def packed_in_call(variables: Variables, groups: Sequence[ProjectionGroup]) -> V
     return jax.lax.optimization_barrier(_joined(variables, groups)) if groups else variables
 
 
-def packed_owned(model: nn.Module, variables: Variables, layout=None) -> Variables:
-    """`variables`, a tree its caller owns and gives up (a run's restored weights), with its groups
-    packed one at a time: each packed kernel and bias placed as `layout` (the trainer's default when
-    None) places the packed tree on its mesh, and each member's buffers deleted once its packed leaf
-    is written, so the devices hold one copy of the weights and one group's more at most. A host
-    tree packs on the host."""
-    from dew.nn.inputs import mesh_of
-    from dew.training.distributed import Layout as DefaultLayout
-
-    groups = pending(model, variables)
-    if not groups:
-        return variables
-    mesh = mesh_of(variables)
-    shardings = None
-    if mesh is not None:
-        shapes = jax.eval_shape(lambda tree: _joined(tree, groups), variables)
-        shardings = (DefaultLayout() if layout is None else layout).shardings(mesh, shapes)
-    for group in groups:
-        members = [leaf for name in group.members
-                   for leaf in jax.tree.leaves(_node(variables, "params", group.path)[name])]
+def packed_owned(model: nn.Module, variables: Variables) -> Variables:
+    """`variables`, a tree its caller owns and gives up (a source's or a saved run's placed
+    weights), with its groups packed one at a time: each packed kernel and bias kept where its
+    members were (`_placed_alike`), and the members' buffers deleted once it is written, so the
+    devices hold one copy of the weights and one group's more at most. A host tree packs on the
+    host."""
+    for group in pending(model, variables):
+        held = _node(variables, "params", group.path)
+        members = [held[name] for name in group.members]
         variables = _joined(variables, [group])
-        if shardings is not None:
-            node, target = _node(variables, "params", group.path), _node(shardings, "params", group.path)
-            node[group.packed] = {field: jax.device_put(leaf, target[group.packed][field])
-                                  for field, leaf in node[group.packed].items()}
-        jax.block_until_ready([leaf for leaf in jax.tree.leaves(_node(variables, "params", group.path)[
-            group.packed]) if isinstance(leaf, jax.Array)])
-        for leaf in members:
-            if isinstance(leaf, jax.Array):
-                leaf.delete()
+        node = _node(variables, "params", group.path)
+        node[group.packed] = {field: leaf if isinstance(leaf, np.ndarray)
+                              else jax.device_put(leaf, members[0][field].sharding)
+                              for field, leaf in node[group.packed].items()}
+        jax.block_until_ready([leaf for leaf in node[group.packed].values() if isinstance(leaf, jax.Array)])
+        for member in members:
+            for leaf in member.values():
+                if isinstance(leaf, jax.Array):
+                    leaf.delete()
     return variables
-
-
-def unpacked(model: nn.Module, variables: Variables) -> Variables:
-    """`variables` with each group they hold packed split back into its members by their widths
-    (`packed_layout`'s geometry), and the packed input quantization each member's own again: the
-    tree as the source names it, which an export writes. The inverse of `pack_projections`."""
-    groups, _ = packed_layout(model, variables)
-    if not groups:
-        return variables
-    split = unfreeze(dict(variables))
-    for group in groups:
-        node = _node(split, "params", group.path)
-        packed = node.pop(group.packed)
-        edges = np.cumsum(group.widths)[:-1].tolist()
-        for field, leaf in packed.items():
-            parts = (np.split if isinstance(leaf, np.ndarray) else jnp.split)(leaf, edges, axis=-1)
-            for projection, part in zip(group.members, parts, strict=True):
-                node.setdefault(projection, {})[field] = part
-        quantized = _node(split, QUANTIZATION, group.path)
-        if group.packed in quantized:
-            scale = quantized.pop(group.packed)
-            for projection in group.members:
-                quantized[projection] = scale
-    return split
 
 
 def packed_layout(model: nn.Module, variables: Variables) -> tuple[tuple[ProjectionGroup, ...], Variables]:
@@ -235,10 +212,6 @@ def packed_layout(model: nn.Module, variables: Variables) -> tuple[tuple[Project
 
 
 def inference_projections(model: nn.Module, variables: Variables) -> Variables:
-    """Pack a decoder's constant projections during placement.
-
-    A model that does not decode autoregressively names no groups, so other
-    task kinds retain their own parameter layouts; adapted decoders retain
-    the original projection paths their LoRA branches bind.
-    """
+    """`variables` with the groups `model` reads packed packed, as a new tree that leaves
+    `variables` whole: what `packed_owned` holds of a tree it is given up."""
     return pack_projections(variables, projection_groups(model, variables))

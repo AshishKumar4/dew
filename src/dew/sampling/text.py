@@ -922,7 +922,7 @@ def generate(model: nn.Module, params: Variables,
     # A tree a loader owns arrives packed; one borrowed from a live objective packs in the call.
     failure, output = program(model, decoding_storage(model, params), plan.place(request.padded()),
                               plan.keys(request.key), jnp.int32(max_new_tokens), scanned, sampling.pad, n,
-                              *components, packing=pending(model, params))
+                              *components, pending(model, params))
     # The error's flags are the one read a request waits on.
     jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)
