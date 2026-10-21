@@ -24,13 +24,10 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import OptimConfig
-from dew.config.data import TextData, loader
-from dew.data import ByteTokenizer, Loading
-from dew.data.sources.tokens import TokenFiles
+from dew.data import ByteTokenizer, Files, presets
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Samples
-from dew.records import integer
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Trainer
 
@@ -52,15 +49,18 @@ class Config:
 
 
 def main(config: Config):
-    stored = TokenFiles(str(config.tokens))
-    vocabulary = integer(stored.metadata()["vocab_size"], "vocab_size")
     tokenizer = ByteTokenizer()
-    data = loader(TextData(source=stored, seq_len=config.sequence_length), batch=config.batch_size,
-                read="memory", validation_records=4 * config.batch_size, loading=Loading(workers=4))
-    steps = config.steps or data.epoch_steps(config.epochs)
+    # The first hundredth of the store's tokens validates; the store already holds ids, so the lm
+    # preset takes no tokenizer and cuts the stream into windows.
+    train, held = Files(str(config.tokens)).holdout(tokens=0.01, fields=("text",))
+    data = (train.shuffle(seed=0).repeat()
+            .pipe(presets.lm, None, seq_len=config.sequence_length, batch=config.batch_size, pack=None)
+            .workers(4))
+    validation = held.pipe(presets.lm, None, seq_len=config.sequence_length, batch=config.batch_size,
+                           pack=None, records=4 * config.batch_size)
 
     prompt = tokenizer.encode(config.prompt)
-    model = CausalTransformer(**config.model, vocab_size=vocabulary,
+    model = CausalTransformer(**config.model, vocab_size=tokenizer.vocab_size,
                               max_seq_len=max(config.sequence_length, len(prompt) + config.max_new_tokens),
                               dtype=jnp.bfloat16)
     objective = LMObjective(
@@ -78,7 +78,8 @@ def main(config: Config):
 
     trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
-    state = trainer.fit(data, steps=steps, log_every=50)
+    state = trainer.fit(data, validation=validation, steps=config.steps,
+                        epochs=None if config.steps else config.epochs, log_every=50)
 
     # No reload is needed; the weights stay where the trainer placed them, and
     # the tokenizer decodes the rows.
