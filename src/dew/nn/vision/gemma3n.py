@@ -188,10 +188,7 @@ def _gemma3n_vision_record(
             "vocab_size", "vocab_offset", "rms_norm_eps"}
     # These are serialized HF metadata. Vocabulary and RMS fields above feed
     # the vision embedder; construction fields feed the MobileNet encoder.
-    metadata = {"architectures", "transformers_version", "torch_dtype", "dtype",
-                "initializer_range", "label_names", "num_classes", "id2label",
-                "label2id", "output_hidden_states", "output_attentions", "return_dict",
-                "is_encoder_decoder", "problem_type", "chunk_size_feed_forward"}
+    metadata = records.HF_METADATA | {"initializer_range", "label_names", "num_classes"}
     unknown = (set(vision) - used - metadata
                - {key for key in vision if str(key).startswith("_")})
     if unknown:

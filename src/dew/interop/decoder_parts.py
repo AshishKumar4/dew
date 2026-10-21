@@ -114,14 +114,10 @@ LINEAR_FIELDS = ('linear_num_key_heads', 'linear_num_value_heads',
 # These fields have no effect on an eval-time forward pass: metadata, token
 # ids, or runtime knobs of the reference implementation (Gemma 3 ships
 # cache_implementation 'hybrid', which describes transformers' KV cache).
-IGNORED_FIELDS = {
-    'architectures', 'attention_dropout', 'attn_implementation', 'auto_map',
-    'bos_token_id', 'cache_implementation', 'chunk_size_feed_forward', 'dtype', 'eos_token_id',
-    'id2label', 'initializer_range', 'is_encoder_decoder', 'label2id',
-    'max_window_layers', 'output_attentions',
-    'output_hidden_states', 'pad_token_id', 'pretraining_tp',
-    'problem_type', 'return_dict', 'use_cache', 'use_sliding_window',
-    'torch_dtype', 'transformers_version', 'unk_token_id',
+IGNORED_FIELDS = set(records.HF_METADATA) | {
+    'attention_dropout', 'attn_implementation', 'auto_map', 'bos_token_id', 'cache_implementation',
+    'eos_token_id', 'initializer_range', 'max_window_layers', 'pad_token_id', 'pretraining_tp',
+    'use_cache', 'use_sliding_window', 'unk_token_id',
 }
 
 # Read by the codec rather than by any family: `codecs.source_quantization`

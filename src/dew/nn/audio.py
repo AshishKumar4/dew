@@ -21,6 +21,7 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
+from dew import records
 from dew.interop.weights import ParamTree, placed
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general, float32_products, products_dtype
@@ -552,9 +553,7 @@ class Gemma4AudioEncoder(nn.Module):
         return AudioEncoding(x, mask)
 
 
-_METADATA = frozenset({"model_type", "architectures", "transformers_version", "torch_dtype", "dtype",
-                       "output_hidden_states", "output_attentions", "return_dict", "is_encoder_decoder",
-                       "id2label", "label2id", "problem_type", "chunk_size_feed_forward"})
+_METADATA = records.HF_METADATA | {"model_type"}
 
 
 def audio_config(record: Mapping[str, object]) -> Gemma3nAudio | Gemma4Audio:
