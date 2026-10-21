@@ -20,12 +20,14 @@ from typing import Generic, overload
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
 from dew.data.dataset import rows_of
+from dew.nn.sharding import rows_spec
 from dew.objectives.base import (
     EXAMPLE_STREAM,
     FROZEN,
@@ -386,7 +388,12 @@ class Transaction:
         if not rows:
             return {}
         key = jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM), state.updates)
-        return {"example_key": key, "example_index": example_places(slot, self.split, rows)}
+        index = example_places(slot, self.split, rows)
+        # Placed as the batch's rows are, so each device draws its own rows' examples alone.
+        like = next(leaf for leaf in jax.tree.leaves(batch) if np.ndim(leaf))
+        if (placed := rows_spec(like, 1)) is not None:
+            index = jax.sharding.reshard(index, placed)
+        return {"example_key": key, "example_index": index}
 
     def read(self, variables, compute):
         """The variables a step's forward reads: the narrow copies in place of
