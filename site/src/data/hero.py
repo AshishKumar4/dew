@@ -10,11 +10,15 @@ from dew.training.optim import Cosine
 steps = 1000
 
 # Begin command line
-import argparse  # noqa: E402
+def command_line_steps() -> int:
+    import argparse
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--steps", type=int, default=steps)
-steps = parser.parse_args().steps
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--steps", type=int, default=steps)
+    return parser.parse_args().steps
+
+
+steps = command_line_steps()
 # End command line
 
 train, val = Hub("winglian/tiny-shakespeare").holdout(0.01)
