@@ -47,7 +47,7 @@ from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import FROZEN, Step, merge, thaw
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer
-from dew.training.transaction import Realization
+from dew.training.transaction import Realization, placed_as_rows
 
 if TYPE_CHECKING:
     from dew.data.pipeline import DeviceStep
@@ -459,9 +459,13 @@ class HostExecution:
         layout = (treedef, held)
         with jax.set_mesh(self.accelerator):
             batch = transfer(batch, batch_shardings(self.accelerator, batch))
-            clock, key, updates = self.on_accelerator((step.step, step.key, step.updates))
+            clock, key, updates, example_key, examples, tape = self.on_accelerator(
+                (step.step, step.key, step.updates, step.example_key, step.example_index, step.tape))
             rest = {name: tree for name, tree in store.items() if name != "params"}
-            here = Step(clock, key, ema, committed=updates)
+            # The examples' draws are the step's, wherever its loss runs (`Step.sample`).
+            here = Step(clock, key, ema, committed=updates, example_key=example_key,
+                        example_index=None if examples is None else placed_as_rows(examples, batch),
+                        example_count=step.example_count, tape=tape, recorder=step.recorder)
             stats, back, aux = self.forward(primal, frozen, rest, batch, here, layout=layout)
         stats, aux = self.on_cpu((stats, aux))
         if aux.variables is not None:
