@@ -96,7 +96,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
     def loss(self, variables, batch, step: Step):
         # Each example's scale, time and noise are its own (`Step.sample`).
         encode_key, drop_key, _, _, _ = jax.random.split(step.key, 5)
-        samples = self.clean_samples(variables, batch, encode_key)
+        samples = self.clean_samples(variables, batch, encode_key, step)
         count = samples.shape[0]
         low, high = self.scales
         scale = step.sample("guidance scale", lambda key: jax.random.uniform(key, minval=low, maxval=high),
@@ -116,7 +116,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
         conditional, unconditional = denoise.raw_both(noisy, t)
         target = jax.lax.stop_gradient(guide(conditional, unconditional, scale))
 
-        conditions, _ = self._conditions(variables, batch, drop_key)
+        conditions, _ = self._conditions(variables, batch, drop_key, step)
         if not any(isinstance(value, DenoisingCondition) and value.guidance is not None
                    for value in conditions.values()):
             raise ValueError("the student's conditioning carries no guidance input to distill into")

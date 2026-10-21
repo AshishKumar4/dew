@@ -34,6 +34,7 @@ from dew.data.dataset import (
     RampedStream,
     Stage,
     Stoppable,
+    rows_of,
     stream_identity,
 )
 from dew.files import write_atomically
@@ -61,7 +62,7 @@ from dew.nn.sharding import (
     microbatched,
     ruled_boxes,
 )
-from dew.objectives.base import FROZEN, Batch, Variables
+from dew.objectives.base import EXAMPLE_ROWS, FROZEN, Batch, Variables
 from dew.records import JSON, number, record
 from dew.telemetry.profile import region
 from dew.training.state import VARIABLE_FIELDS
@@ -1081,6 +1082,21 @@ def shard_batch(mesh: Mesh, batch: Batch, reads: Mapping[Signature, tuple[bool, 
 
         moved = iter([place(leaf, sharding) for leaf, sharding in zip(moving, shardings, strict=True)])
     return tree.unflatten([held[index] if index in held else next(moved) for index in range(len(leaves))])
+
+
+def marked(mesh: Mesh, prepare: Callable[[Batch], Batch] | None = None) -> Callable[[Batch], Batch]:
+    """A training batch's host preparation: `prepare`'s, then each row's place among its step's
+    records (`EXAMPLE_ROWS`). A share of `DataPartition.of(mesh)` reads the records `index :: count`,
+    so its `j`th row is the step's record `j * count + index` at every count: a record draws what it
+    draws however many processes read it (`Step.sample`)."""
+    partition = DataPartition.of(mesh)
+
+    def prepared(batch: Batch) -> Batch:
+        batch = batch if prepare is None else prepare(batch)
+        rows = np.arange(rows_of(batch), dtype=np.int32)
+        return {**batch, EXAMPLE_ROWS: rows * partition.count + partition.index}
+
+    return prepared
 
 
 def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:

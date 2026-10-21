@@ -118,7 +118,8 @@ def test_padding_that_holds_the_mask_token_scores_nothing(given):
         batch = ({"text": ModelInputs(tokens, {"attention_mask": mask})} if given == "attention_mask"
                  else {"text": tokens, "text_coordinates": coordinates(valid=mask)})
         loss, grads = jax.value_and_grad(lambda v: objective.scalar_loss(v, batch, step)[0])(variables)
-        return loss, grads, objective._evaluation_scores(variables, batch, jax.random.key(2))
+        scoring = Step(jnp.asarray(0), jax.random.key(2), None)
+        return loss, grads, objective._evaluation_scores(variables, batch, scoring)
 
     mask_padded, other_padded = scored(31), scored(7)
     assert np.isfinite(float(mask_padded[0]))

@@ -260,9 +260,9 @@ class RAE(nn.Module):
         self.decoder = _Decoder(self.decoder_width, self.decoder_layers, self.decoder_heads,
                                 self.decoder_intermediate, self.grid, self.patch, dtype=self.dtype)
 
-    def encode(self, images, key=None):
-        """The encoder's tokens; an RAE is deterministic, so `key` is unread."""
-        del key
+    def encode(self, images, key=None, noise=None):
+        """The encoder's tokens; an RAE is deterministic, so `key` and `noise` are unread."""
+        del key, noise
         pixels = (images + 1) / 2
         if pixels.shape[1:3] != (self.input_size, self.input_size):
             pixels = torch_bicubic_resize(pixels, self.input_size, self.input_size)

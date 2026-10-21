@@ -362,9 +362,9 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
 
     def loss(self, variables, batch, step: Step):
         encode_key, drop_key = jax.random.split(jax.random.fold_in(step.key, 1))
-        samples = self.clean_samples(variables, batch, encode_key)
+        samples = self.clean_samples(variables, batch, encode_key, step)
         count = samples.shape[0]
-        given, blank = self._conditions(variables, batch, drop_key)
+        given, blank = self._conditions(variables, batch, drop_key, step)
         draws = self._draws(step, count, samples.shape)
         iteration = step.updates
         warm = iteration < self.tangent_warmup

@@ -28,6 +28,7 @@ from dew.diffusion.schedules.common import GeneralizedNoiseScheduler, NoiseSched
 from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
 from dew.diffusion.schedules.flow import RectifiedFlow
 from dew.diffusion.transforms import PredictionTransform
+from dew.nn.sharding import rows_taken
 from dew.records import JSON
 
 if TYPE_CHECKING:
@@ -54,14 +55,14 @@ class TabulatedVP(DiscreteNoiseScheduler):
     def rates(self, t):
         t = jnp.asarray(t, jnp.float32)
         index = jnp.clip(t.astype(jnp.int32), 0, self.T - 1)
-        return (jnp.where(t < 0, self.final_rates[0], self.sqrt_alpha_cumprod[index]),
-                jnp.where(t < 0, self.final_rates[1], self.sqrt_one_minus_alpha_cumprod[index]))
+        return (jnp.where(t < 0, self.final_rates[0], rows_taken(self.sqrt_alpha_cumprod, index)),
+                jnp.where(t < 0, self.final_rates[1], rows_taken(self.sqrt_one_minus_alpha_cumprod, index)))
 
     def variances(self, t):
         t = jnp.asarray(t, jnp.float32)
         index = jnp.clip(t.astype(jnp.int32), 0, self.T - 1)
-        return (jnp.where(t < 0, self.final_variances[0], self.alpha_cumprod[index]),
-                jnp.where(t < 0, self.final_variances[1], self.one_minus_alpha_cumprod[index]))
+        return (jnp.where(t < 0, self.final_variances[0], rows_taken(self.alpha_cumprod, index)),
+                jnp.where(t < 0, self.final_variances[1], rows_taken(self.one_minus_alpha_cumprod, index)))
 
     def model_time(self, t):
         return jnp.maximum(jnp.asarray(t, jnp.float32), 0.0)
@@ -94,10 +95,12 @@ def _interpolate(x, xp, fp):
     """
     x = jnp.asarray(x, jnp.float32)
     i = jnp.clip(jnp.searchsorted(xp, x, side="right", method="compare_all"), 1, len(xp) - 1)
-    df = fp[i] - fp[i - 1]
-    dx = xp[i] - xp[i - 1]
+    # Each example's time reads the replicated grid at its own shard (`rows_taken`).
+    left, right = rows_taken(fp, i - 1), rows_taken(fp, i)
+    low, high = rows_taken(xp, i - 1), rows_taken(xp, i)
+    dx = high - low
     flat = jnp.abs(dx) <= np.spacing(np.finfo(np.float32).eps)
-    f = jnp.where(flat, fp[i - 1], fp[i - 1] + (x - xp[i - 1]) / jnp.where(flat, 1, dx) * df)
+    f = jnp.where(flat, left, left + (x - low) / jnp.where(flat, 1, dx) * (right - left))
     return jnp.where(x > xp[-1], fp[-1], jnp.where(x < xp[0], fp[0], f))
 
 

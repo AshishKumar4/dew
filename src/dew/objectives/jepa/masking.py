@@ -30,6 +30,7 @@ import jax.numpy as jnp
 
 from dew.nn.dit import scan_indices
 from dew.nn.scan_orders import ScanOrder, inverse_permutation
+from dew.nn.sharding import rows_taken
 
 
 def _factorizations(area: int, grid: tuple[int, int], aspect: tuple[float, float]):
@@ -134,7 +135,9 @@ class MultiBlockMask:
                 lambda key, shape: jax.random.uniform(key, shape, dtype=jnp.float32))
 
     def placed(self, choice: jax.Array, corner: jax.Array, order: jax.Array):
-        """`sample`'s indices from its draws (`draws`), `[B, ...]` each."""
+        """`sample`'s indices from its draws (`draws`), `[B, ...]` each. Every row's work is its own:
+        the grid's constants are read at each row's draws where they are (`rows_taken`), and a token's
+        membership of the targets is a comparison, not a scatter, so each device places its own rows'."""
         H_P, W_P = self.grid
         batch_size = choice.shape[0]
         heights = jnp.asarray([h for h, _ in self.block_shapes])
@@ -142,16 +145,16 @@ class MultiBlockMask:
         # flat offsets of a block's tokens from its top-left corner, per shape
         offsets = jnp.asarray([[(i // w) * W_P + (i % w) for i in range(h * w)]
                                for h, w in self.block_shapes])
-        top = jnp.floor(corner[..., 0] * (H_P - heights[choice] + 1)).astype(jnp.int32)
-        left = jnp.floor(corner[..., 1] * (W_P - widths[choice] + 1)).astype(jnp.int32)
-        target_idx = (top * W_P + left)[..., None] + offsets[choice]
+        top = jnp.floor(corner[..., 0] * (H_P - rows_taken(heights, choice) + 1)).astype(jnp.int32)
+        left = jnp.floor(corner[..., 1] * (W_P - rows_taken(widths, choice) + 1)).astype(jnp.int32)
+        target_idx = (top * W_P + left)[..., None] + rows_taken(offsets, choice)
         scan = scan_indices(self.scan_order, H_P, W_P)
         if scan is not None:
             # A grid position's place in the encoder's sequence.
-            target_idx = jnp.sort(jnp.asarray(inverse_permutation(scan))[target_idx], axis=-1)
+            target_idx = jnp.sort(rows_taken(jnp.asarray(inverse_permutation(scan)), target_idx), axis=-1)
 
-        is_target = jnp.zeros((batch_size, self.num_patches), dtype=bool).at[
-            jnp.arange(batch_size)[:, None], target_idx.reshape(batch_size, -1)].set(True)
+        flat = target_idx.reshape(batch_size, -1)
+        is_target = jnp.any(flat[:, :, None] == jnp.arange(self.num_patches, dtype=flat.dtype), axis=1)
         # target tokens sort last, so the first num_context entries of a random
         # ordering are a uniform sample of the complement
         order = order + is_target

@@ -56,7 +56,10 @@ class NoiseScheduler(ABC):
 
     @abstractmethod
     def sample_t(self, key, n: int) -> jax.Array:
-        """Draw `n` training times from this schedule's training distribution."""
+        """Draw `n` training times from this schedule's training distribution, independent and alike:
+        an objective draws each example's time as `sample_t(its key, 1)` (`Step.sample`), so a draw
+        that couples the `n` (stratified, antithetic) is the objective's, over the update's places
+        (`Step.places`), as MDLM's is."""
 
     @abstractmethod
     def weight(self, t) -> jax.Array:

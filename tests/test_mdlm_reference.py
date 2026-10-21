@@ -80,8 +80,8 @@ def test_the_nelbo_and_its_gradient_are_mdlms():
         return model.scalar_loss(variables, batch, step)
 
     (value, aux), gradient = jax.value_and_grad(mean, has_aux=True)(variables)
-    # The per-token terms of the same corruption, the validation pass's scores of the taped step.
-    terms = model._validation_scores(variables, batch, step)[1].losses
+    # The per-token terms of the same corruption, which the taped step's evaluation reads.
+    terms = model.evaluate(variables, batch, step).losses
     assert_as_exact_as_the_reference(terms, REFERENCE["nlls"], REFERENCE["nlls_f64"], "per-token NELBO")
     assert_as_exact_as_the_reference(gradient["params"]["hidden"], REFERENCE["grad/hidden"],
                                      REFERENCE["grad/hidden_f64"], "gradient in the hidden states")

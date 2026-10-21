@@ -29,6 +29,7 @@ from typing_extensions import TypeVar
 from dew.data.dataset import rows_of
 from dew.nn.sharding import rows_spec
 from dew.objectives.base import (
+    EXAMPLE_ROWS,
     EXAMPLE_STREAM,
     FROZEN,
     Aux,
@@ -232,26 +233,37 @@ class PendingAttempt(Generic[Loss]):
     gradient: Variables
 
 
-def example_places(slot, split: int, rows: int) -> jax.Array:
+def example_places(slot, split: int, rows: int, column: jax.Array | None = None, part=None) -> jax.Array:
     """The places among an update's examples of the `rows` rows of the microbatch in window slot `slot`,
     of steps read in `split` microbatches each: the step's place in the window times a step's rows, plus
-    the row's in the step's batch, every `split`th from row `slot % split` (`microbatch`)."""
-    step, part = slot // split, slot % split
-    return (step * rows * split + part + split * jnp.arange(rows, dtype=jnp.int32)).astype(jnp.int32)
+    each row's place among its step's records, its `column` (`EXAMPLE_ROWS`) where the batch holds one,
+    else its row in the step's batch, every `split`th from row `part` (`microbatch`; by default
+    `slot % split`).
+
+    A window pools its steps' microbatches in the order it accepts them, so a dynamic loss scale's
+    rejected microbatch leaves its slot to the next: places then repeat within the update, and the next
+    batch at a slot reads its rejected predecessor's draws. A window across a ramp's stage change
+    places each slot at its rows: its places stay distinct, its count is the slot's stage's, and an
+    update's examples are the same on every layout only within a stage."""
+    step = slot // split
+    if column is None:
+        part = slot % split if part is None else part
+        column = part + split * jnp.arange(rows, dtype=jnp.int32)
+    return (step * rows * split + column).astype(jnp.int32)
 
 
-def example_fields(state, slot, split: int, batch, slots: int = 1) -> dict:
+def example_fields(state, slot, split: int, batch, slots: int = 1, part=None) -> dict:
     """The `Step` fields of the microbatch in window slot `slot` of the update `state` commits next, of
-    `slots` microbatches, its steps read in `split` microbatches each: the update's key
-    (`Step.example_key`), each row's place among the update's examples (`example_places`), placed as the
-    batch's rows are, so each device draws its own rows' examples alone, and how many examples the update
-    pools. A batch with no rows has no examples."""
+    `slots` microbatches, its steps read in `split` microbatches each, this the `part`th: the update's
+    key (`Step.example_key`), each row's place among the update's examples (`example_places`), placed as
+    the batch's rows are, so each device draws its own rows' examples alone, and how many examples the
+    update pools. A batch with no rows has no examples."""
     rows = rows_of(batch)
     if not rows:
         return {}
     key = jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM), state.updates)
-    return {"example_key": key, "example_index": placed_as_rows(example_places(slot, split, rows), batch),
-            "example_count": slots * rows}
+    index = example_places(slot, split, rows, batch.get(EXAMPLE_ROWS), part)
+    return {"example_key": key, "example_index": placed_as_rows(index, batch), "example_count": slots * rows}
 
 
 def placed_as_rows(index: jax.Array, batch) -> jax.Array:
@@ -401,8 +413,8 @@ class Transaction:
                     **self.examples(state, index, batch))
         return self.read(variables, state.compute), batch, step_info
 
-    def examples(self, state, slot, batch) -> dict:
-        return example_fields(state, slot, self.split, batch, self.size)
+    def examples(self, state, slot, batch, part=None) -> dict:
+        return example_fields(state, slot, self.split, batch, self.size, part)
 
     def read(self, variables, compute):
         """The variables a step's forward reads: the narrow copies in place of
@@ -600,7 +612,7 @@ class Transaction:
             attempt = state.step * self.split + part
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
                              with_ema(state.variables, state.ema), committed=state.updates,
-                             **self.examples(state, state.microstep % self.size, batch))
+                             **self.examples(state, state.microstep % self.size, batch, part))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             realized = realize(self.read(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)

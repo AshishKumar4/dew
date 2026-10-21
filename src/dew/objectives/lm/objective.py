@@ -1537,7 +1537,7 @@ class LMObjective(TokenScorer):
         prepared = {TEXT_KEY: batch_text(batch), ROLES_KEY: self._batch_roles(batch)}
         return super().evaluate(params, prepared, step)
 
-    def _evaluation_scores(self, params, batch, key) -> TokenScores:
+    def _evaluation_scores(self, params, batch, step) -> TokenScores:
         scores = self.token_scores(params, batch[TEXT_KEY], roles=batch[ROLES_KEY], predict=True)
         assert scores.correct is not None
         return TokenScores(scores.losses, scores.weights, scores.correct)

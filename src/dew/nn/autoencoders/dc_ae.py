@@ -390,8 +390,8 @@ class DCAE(nn.Module):
                                 self.decoder_channels, self.decoder_layers, self.decoder_scales,
                                 self.decoder_norms, self.decoder_activations, self.interpolate, self.dtype)
 
-    def encode(self, image, key=None):
-        """The latent of `image`; the encoder is deterministic, so `key` is unused."""
+    def encode(self, image, key=None, noise=None):
+        """The latent of `image`; the encoder is deterministic, so `key` and `noise` are unused."""
         return self.encoder(image)
 
     def decode(self, latents):
