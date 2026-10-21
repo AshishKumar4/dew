@@ -169,10 +169,11 @@ def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(mo
 
 @pytest.mark.parametrize("wrapper,read", [
     ("hash", "streamed"), ("concatenate", "streamed"), ("concatenate_hash", "streamed"),
-    ("concatenate", "indexed"), ("slice", "indexed"), ("random", "indexed"), ("hash", "memory"),
+    ("concatenate", "indexed"), ("slice", "indexed"), ("hash", "memory"),
 ])
 def test_wrapped_hub_resume_checks_the_conversion_only_when_consumed(moving_hub_conversion, wrapper, read):
-    from dew.config.data import HoldOut, RecordsData, loader
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
     from dew.data.sources import Hub
     from dew.data.sources.concatenate import Concatenate
 
@@ -180,12 +181,13 @@ def test_wrapped_hub_resume_checks_the_conversion_only_when_consumed(moving_hub_
         source = Hub("owner/data")
         if wrapper.startswith("concatenate"):
             source = Concatenate((source, Memory([{"id": index} for index in range(40, 48)])))
-        holdout = (
-            HoldOut(fraction=.25, by="hash") if wrapper.endswith("hash") else
-            HoldOut(records=8, by="index" if wrapper == "slice" else "random")
-            if wrapper in ("slice", "random") else None
-        )
-        return loader(RecordsData(source, validation=holdout), batch=2, read=read, loading=Loading(workers=0))
+        train = Pipeline(source)
+        if wrapper.endswith("hash"):
+            train, _ = train.holdout(.25)
+        elif wrapper == "slice":
+            train, _ = train.holdout(records=8)
+        order = train.shuffle(0, window=64 if read == "streamed" else None).repeat()
+        return compile(order.batch(2), read=read, loading=Loading(workers=0))
 
     data = loaded()
     reader = data.train(DataPartition())

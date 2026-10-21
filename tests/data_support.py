@@ -9,7 +9,7 @@ import grain.python as grain
 import numpy as np
 from absl import flags
 
-from dew.config.data import Augment
+from dew.data import images
 
 
 def parse_grain_flags() -> None:
@@ -22,7 +22,8 @@ def parse_grain_flags() -> None:
 CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
 """More than one, so a test can see which the record's rng drew."""
 
-FLIP_JITTER = Augment(flip=True, jitter=True, backend="host")
+FLIP_JITTER = (images.Flip(), images.ColorJitter())
+"""A flip and a colour jitter on the host, as `presets.images(augment=)` takes them."""
 
 
 def keep_captions(captions):

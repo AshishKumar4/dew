@@ -142,11 +142,6 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
-  "tests/test_data.py": {
-   "comparisons": 1,
-   "lane": "Data",
-   "by": "2026-11-20"
-  },
   "tests/test_data_av.py": {
    "comparisons": 2,
    "lane": "Data",
