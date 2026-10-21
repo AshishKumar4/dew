@@ -339,6 +339,44 @@ def test_a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver():
     assert min(rows) / 2 < target.memory_bandwidth < 2 * max(rows)
 
 
+@pytest.mark.gpu(reason="two processes, each seeing one of two GPUs")
+@pytest.mark.skipif(jax.default_backend() != "gpu" or len(jax.devices()) < 2, reason="needs two GPUs")
+def test_each_process_reads_the_facts_of_the_gpu_it_sees(tmp_path):
+    """Two processes, each seeing one GPU (`CUDA_VISIBLE_DEVICES`): the second's device is global id 1
+    and its own ordinal 0, and each process's kernel target holds the CUDA driver's clock, bandwidth and
+    multiprocessors for that GPU, the same in both, as GPUs of one kind give."""
+    from process_support import ProcessGroup, free_port, report_of, start_process
+
+    worker = Path(__file__).with_name("device_facts_worker.py")
+    coordinator = f"127.0.0.1:{free_port()}"
+    outs = [tmp_path / f"process{rank}.json" for rank in range(2)]
+    with ProcessGroup() as pool:
+        for rank, out in enumerate(outs):
+            pool.running.append(start_process(
+                [sys.executable, str(worker), str(rank), coordinator, str(out)], devices=1,
+                environment={"JAX_PLATFORMS": "cuda", "CUDA_VISIBLE_DEVICES": str(rank)}))
+        reports = [report_of(process, out, timeout=300, pool=pool.running)
+                   for process, out in zip(pool.running, outs, strict=True)]
+    placed = [(report["processes"], report["id"], report["ordinal"]) for report in reports]
+    assert placed == [(2, 0, 0), (2, 1, 0)]
+    for report in reports:
+        assert report["clock_hz"] == report["driver_clock_hz"]
+        assert report["memory_bandwidth"] == report["driver_bandwidth"]
+        assert report["multiprocessors"] == report["driver_multiprocessors"]
+    assert reports[0]["clock_hz"] == reports[1]["clock_hz"]
+
+
+def test_a_run_over_gpus_of_two_kinds_is_refused():
+    """Each process's kernel choices read its own GPU's facts and must agree with every other's, so a
+    run whose devices are of two kinds is refused; devices of one kind pass."""
+    from dew.nn.kernels.generation import _one_kind
+
+    h100 = SimpleNamespace(device_kind="NVIDIA H100 80GB HBM3")
+    _one_kind([h100, h100])
+    with pytest.raises(ValueError):
+        _one_kind([h100, SimpleNamespace(device_kind="NVIDIA A100-SXM4-80GB")])
+
+
 def test_chosen_kernels_keep_other_choices_and_restore_the_row_after_an_exception():
     with assumed("sm80"):
         measured = measured_kernel("attention", "xla")
