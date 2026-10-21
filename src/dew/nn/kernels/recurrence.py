@@ -163,9 +163,26 @@ def gated_rms(out, z, weight, norm: OutputNorm):
     return out * inverse * weight * norm_swiglu.activation_and_slope(z, norm.activation)[0]
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Gated:
+    """The operands the hooks read beside the queries, keys and values, a decode token's (`Step`) and a
+    chunked sequence's (`recurrence_chunk.Chunk`) alike, each None where its hook is off: the log
+    decay, the gates' pre-activations, the write gate, the skip's `D`, the epilogue's gate and
+    weight, and a rated decay's rate. A value kind the hooks gain is a field here."""
+    log_decay: jax.Array | None = None
+    gate: jax.Array | None = None
+    log_a: jax.Array | None = None
+    bias: jax.Array | None = None
+    beta: jax.Array | None = None
+    skip: jax.Array | None = None
+    z: jax.Array | None = None
+    weight: jax.Array | None = None
+    rate: jax.Array | None = None
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class Step:
+class Step(Gated):
     """A decode token's operands, each `[rows, ...]`; a hook's are None where it is off.
 
     Without a conv, `query` and `key` `[rows, Hk, Dk]` and `value` `[rows, Hv, Dv]` (the query scaled
@@ -185,15 +202,6 @@ class Step:
     token: jax.Array | None = None
     held: jax.Array | None = None
     taps: jax.Array | None = None
-    log_decay: jax.Array | None = None
-    gate: jax.Array | None = None
-    log_a: jax.Array | None = None
-    bias: jax.Array | None = None
-    beta: jax.Array | None = None
-    skip: jax.Array | None = None
-    z: jax.Array | None = None
-    weight: jax.Array | None = None
-    rate: jax.Array | None = None
     active: jax.Array | None = None
 
 
@@ -274,7 +282,8 @@ def log_gates(hooks: Hooks, given: dict, work):
     or a write gate the hooks have not."""
     if hooks.gates is not None:
         beta = given['beta'].astype(work) if hooks.gates.write == 'sigmoid' else None
-        return gated(hooks.gates, *(given[name].astype(work) for name in ('gate', 'log_a', 'bias')), beta)
+        return gated(hooks.gates, given['gate'].astype(work), given['log_a'].astype(work),
+                     given['bias'].astype(work), beta)
     if hooks.rated:
         beta = given['beta'].astype(work)
         return given['rate'].astype(work) * beta, beta
@@ -658,9 +667,9 @@ def _cumsum_kernel(chunk_ref, s_ref, o_ref, *, chunk: int, aligned: bool, scale:
     if not reverse:
         @pl.when(count > 0)
         def _():
-            tokens = chunked_launch._read(chunked_launch._rows(s_ref, start, chunk), count)
+            tokens = chunked_launch.read_rows(chunked_launch._rows(s_ref, start, chunk), count)
             total = jnp.cumsum(tokens.astype(jnp.float32), axis=0)
-            chunked_launch._write(chunked_launch._rows(o_ref, start, chunk), count,
+            chunked_launch.write_rows(chunked_launch._rows(o_ref, start, chunk), count,
                                   total if scale is None else total * scale)
         return
 

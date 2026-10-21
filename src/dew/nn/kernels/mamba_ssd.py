@@ -44,7 +44,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import tuning
-from dew.nn.kernels.chunked_launch import _read, _write
+from dew.nn.kernels.chunked_launch import read_rows, write_rows
 from dew.nn.kernels.fla_gdn import _dot
 
 
@@ -209,7 +209,7 @@ def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int)
     heads = pl.ds(h * bh, bh)
     start = c * chunk
     steps = pl.ds(start, chunk)
-    dt = _read(dt_ref.at[steps, heads], _limit(c, length, chunk)).astype(jnp.float32).T
+    dt = read_rows(dt_ref.at[steps, heads], _limit(c, length, chunk)).astype(jnp.float32).T
     step_ref[:, steps] = dt
     decay = dt * a_ref[heads].astype(jnp.float32)[:, None]
     if not seq:
@@ -266,8 +266,8 @@ def _chunk_cumsum_bwd_kernel(dacs_ref, ddt_ref, dt_ref, a_ref, out_ref, da_ref, 
     limit = _limit(c, length, chunk)
     dacs = dacs_ref[:, steps]
     ddt = dacs * a_ref[heads].astype(jnp.float32)[:, None] + ddt_ref[:, steps]
-    _write(out_ref.at[steps, heads], limit, ddt.T)
-    dt = _read(dt_ref.at[steps, heads], limit).astype(jnp.float32).T
+    write_rows(out_ref.at[steps, heads], limit, ddt.T)
+    dt = read_rows(dt_ref.at[steps, heads], limit).astype(jnp.float32).T
     da_ref[...] = jnp.sum(dacs * dt, axis=1)
 
 
@@ -315,8 +315,8 @@ def _chunk_state_kernel(x_ref, b_ref, dt_ref, da_ref, *refs, batch: int, length:
     def step(k, acc):
         offset = k * bk
         rows = pl.ds(start + offset, bk)
-        x = _read(x_ref.at[rows], _from(limit, offset))
-        b = _read(b_ref.at[rows], _from(limit, offset)).astype(jnp.float32)
+        x = read_rows(x_ref.at[rows], _from(limit, offset))
+        b = read_rows(b_ref.at[rows], _from(limit, offset)).astype(jnp.float32)
         scale = jnp.exp(jnp.minimum(last - da_ref[rows], 0.0)) * dt_ref[rows]
         if seq:
             scale = jnp.where(seq[0][rows] == seq[0][start + chunk - 1], scale, 0.0)
@@ -429,8 +429,8 @@ def _bmm_kernel(a_ref, b_ref, *refs, length: int, chunk: int, groups: int, bm: i
 
     def step(k, acc):
         width = pl.ds(k * bk, bk)
-        a = _read(a_ref.at[rows_m, width], _from(limit, m * bm))
-        b = _read(b_ref.at[rows_n, width], _from(limit, n * bn))
+        a = read_rows(a_ref.at[rows_m, width], _from(limit, m * bm))
+        b = read_rows(b_ref.at[rows_n, width], _from(limit, n * bn))
         return acc + _dot(a, b.T, exact=exact)
 
     acc = jax.lax.fori_loop(0, a_ref.shape[-1] // bk, step, jnp.zeros((bm, bn), jnp.float32))
@@ -495,7 +495,7 @@ def _chunk_scan_kernel(cb_ref, x_ref, dt_ref, da_ref, c_ref, states_ref, d_ref, 
     acc = jnp.zeros((bm, bn), jnp.float32)
     for k in range(state // span):
         part = pl.ds(k * span, span)
-        cm = _read(c_ref.at[rows, part], _from(limit, m * bm))
+        cm = read_rows(c_ref.at[rows, part], _from(limit, m * bm))
         acc = acc + _dot(cm, states_ref[:, part].astype(cm.dtype).T, exact=exact)
     acc = acc * scale[:, None]
 
@@ -506,12 +506,12 @@ def _chunk_scan_kernel(cb_ref, x_ref, dt_ref, da_ref, c_ref, states_ref, d_ref, 
         cb = cb * jnp.exp(jnp.minimum(da_m[:, None] - da_ref[steps][None, :], 0.0))
         cb = cb * dt_ref[steps][None, :]
         cb = jnp.where(_causal(m * bm, bm, offset, bk), cb, 0.0).astype(x_ref.dtype)
-        return acc + _dot(cb, _read(x_ref.at[steps], _from(limit, offset)), exact=exact)
+        return acc + _dot(cb, read_rows(x_ref.at[steps], _from(limit, offset)), exact=exact)
 
     acc = jax.lax.fori_loop(0, ((m + 1) * bm + bk - 1) // bk, step, acc)
     taken = _from(limit, m * bm)
-    acc = acc + _read(x_ref.at[rows], taken).astype(jnp.float32) * d_ref[h]
-    _write(out_ref.at[rows], taken, acc)
+    acc = acc + read_rows(x_ref.at[rows], taken).astype(jnp.float32) * d_ref[h]
+    write_rows(out_ref.at[rows], taken, acc)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -569,12 +569,12 @@ def _dstates_kernel(dout_ref, c_ref, da_ref, *refs, batch: int, length: int, chu
     def step(k, acc):
         offset = k * bk
         rows = pl.ds(start + offset, bk)
-        dout = _read(dout_ref.at[rows], _from(limit, offset))
+        dout = read_rows(dout_ref.at[rows], _from(limit, offset))
         scale = jnp.exp(da_ref[rows])
         if seq:
             scale = jnp.where(seq[0][rows] == earlier, scale, 0.0)
         dout = (dout.astype(jnp.float32) * scale[:, None]).astype(dout.dtype)
-        cm = _read(c_ref.at[rows], _from(limit, offset)).astype(dout.dtype)
+        cm = read_rows(c_ref.at[rows], _from(limit, offset)).astype(dout.dtype)
         return acc + _dot(dout.T, cm, exact=exact)
 
     out_ref[...] = jax.lax.fori_loop(0, chunk // bk, step, jnp.zeros(out_ref.shape, jnp.float32))
@@ -732,7 +732,7 @@ def _dx_kernel(x_ref, cb_ref, dout_ref, dt_ref, da_ref, d_ref, b_ref, dstates_re
     acc = jnp.zeros((bm, bn), jnp.float32)
     for k in range(state // span):
         part = pl.ds(k * span, span)
-        bmat = _read(b_ref.at[rows, part], taken)
+        bmat = read_rows(b_ref.at[rows, part], taken)
         acc = acc + _dot(bmat, dstates_ref[:, part].astype(bmat.dtype).T, exact=exact)
     acc = acc * scale[:, None]
 
@@ -742,13 +742,13 @@ def _dx_kernel(x_ref, cb_ref, dout_ref, dt_ref, da_ref, d_ref, b_ref, dstates_re
         cb = cb_ref[pl.ds(offset, bk), pl.ds(m * bm, bm)].T
         cb = cb * jnp.exp(jnp.minimum(da_ref[steps][None, :] - da_m[:, None], 0.0))
         cb = jnp.where(_causal(offset, bk, m * bm, bm).T, cb, 0.0).astype(dout_ref.dtype)
-        return acc + _dot(cb, _read(dout_ref.at[steps], _from(limit, offset)), exact=exact)
+        return acc + _dot(cb, read_rows(dout_ref.at[steps], _from(limit, offset)), exact=exact)
 
     acc = jax.lax.fori_loop(0, (chunk - m * bm + bk - 1) // bk, step, acc)
     dx = acc * dt_ref[rows][:, None]
-    dout = _read(dout_ref.at[rows], taken).astype(jnp.float32)
-    _write(dx_ref.at[rows], taken, dx + dout * d_ref[h])
-    x = _read(x_ref.at[rows], taken).astype(jnp.float32)
+    dout = read_rows(dout_ref.at[rows], taken).astype(jnp.float32)
+    write_rows(dx_ref.at[rows], taken, dx + dout * d_ref[h])
+    x = read_rows(x_ref.at[rows], taken).astype(jnp.float32)
     dd_ref[m, n] = _block_sum(dout * x, exact)
     ddt_ref[rows] = jnp.sum(acc * x, axis=1)
 
@@ -834,7 +834,7 @@ def _state_gradient_kernel(left_ref, states_ref, mat_ref, *refs, leaving: bool, 
     limit = _limit(c, length, chunk)
     rows = pl.ds(start + m * bm, bm)
     taken = _from(limit, m * bm)
-    mat = _read(mat_ref.at[rows], taken).astype(jnp.float32)
+    mat = read_rows(mat_ref.at[rows], taken).astype(jnp.float32)
     # The tokens of the chunk's last document (mamba_ssm's `seq_idx_m == seq_idx_last`), or of the
     # entered state's (`seq_idx_m == seq_idx_prev`).
     same = True
@@ -843,7 +843,7 @@ def _state_gradient_kernel(left_ref, states_ref, mat_ref, *refs, leaving: bool, 
 
     def head(i, acc):
         h = first + i
-        left = _read(left_ref.at[rows, h], taken)
+        left = read_rows(left_ref.at[rows, h], taken)
         grad = _dot(left, states_ref[h].astype(left.dtype), exact=exact)
         if leaving:
             decay = jnp.exp(jnp.minimum(da_ref[h, start + chunk - 1] - da_ref[h, rows], 0.0))
@@ -856,7 +856,7 @@ def _state_gradient_kernel(left_ref, states_ref, mat_ref, *refs, leaving: bool, 
         dacs_ref[h, rows] = jnp.sum(grad * mat, axis=1)
         return acc + grad
 
-    _write(grad_ref.at[rows], taken, jax.lax.fori_loop(0, count, head, jnp.zeros((bm, bn), jnp.float32)))
+    write_rows(grad_ref.at[rows], taken, jax.lax.fori_loop(0, count, head, jnp.zeros((bm, bn), jnp.float32)))
 
 
 def _state_gradient(left, states, mat, dt, da, seq, *, chunk: int, groups: int, interpret: bool,
@@ -951,8 +951,8 @@ def _dcb_kernel(x_ref, dout_ref, dt_ref, da_ref, *refs, batch: int, length: int,
 
         def head(i, acc):
             h = first + i
-            dout = _read(dout_ref.at[rows_m, h], _from(limit, m * bm))
-            x = _read(x_ref.at[rows_n, h], _from(limit, n * bn))
+            dout = read_rows(dout_ref.at[rows_m, h], _from(limit, m * bm))
+            x = read_rows(x_ref.at[rows_n, h], _from(limit, n * bn))
             dcb = _dot(dout, x.T, exact=exact) * dt_ref[h, rows_n][None, :]
             decay = jnp.exp(jnp.minimum(da_ref[h, rows_m][:, None] - da_ref[h, rows_n][None, :], 0.0))
             return acc + dcb * decay
@@ -1018,12 +1018,12 @@ def _bmm_bwd_kernel(a_ref, dout_ref, res_ref, out_ref, *, length: int, chunk: in
             g = dout_ref[pl.ds(m * bm, bm), pl.ds(offset, bk)]
         else:
             g = dout_ref[pl.ds(offset, bk), pl.ds(m * bm, bm)].T
-        a = _read(a_ref.at[pl.ds(start + offset, bk)], _from(limit, offset))
+        a = read_rows(a_ref.at[pl.ds(start + offset, bk)], _from(limit, offset))
         return acc + _dot(g.astype(a.dtype), a, exact=exact)
 
     acc = jax.lax.fori_loop(0, chunk // bk, step, jnp.zeros((bm, bn), jnp.float32))
     taken = _from(limit, m * bm)
-    _write(out_ref.at[rows], taken, acc + _read(res_ref.at[rows], taken))
+    write_rows(out_ref.at[rows], taken, acc + read_rows(res_ref.at[rows], taken))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1071,13 +1071,13 @@ def _ddacs_kernel(x_ref, dout_ref, dt_ref, da_ref, cb_ref, out_ref, *, batch: in
     start = c * chunk
     limit = _limit(c, length, chunk)
     rows = pl.ds(start + m * bm, bm)
-    dout = _read(dout_ref.at[rows], _from(limit, m * bm))
+    dout = read_rows(dout_ref.at[rows], _from(limit, m * bm))
     da_m = da_ref[rows]
 
     def step(k, rowsum):
         offset = k * bn
         steps = pl.ds(start + offset, bn)
-        acc = _dot(dout, _read(x_ref.at[steps], _from(limit, offset)).T, exact=exact)
+        acc = _dot(dout, read_rows(x_ref.at[steps], _from(limit, offset)).T, exact=exact)
         acc = acc * dt_ref[steps][None, :] * cb_ref[pl.ds(m * bm, bm), pl.ds(offset, bn)]
         acc = acc * jnp.exp(jnp.minimum(da_m[:, None] - da_ref[steps][None, :], 0.0))
         strict = _causal(m * bm, bm, offset, bn, strict=True)

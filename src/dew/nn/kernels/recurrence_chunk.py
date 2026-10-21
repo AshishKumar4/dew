@@ -375,7 +375,7 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class Chunk:
+class Chunk(recurrence.Gated):
     """A sequence's operands for the chunked op (`chunk`), each `[B, S, ...]`; a hook's are None where
     it is off, as a decode token's are (`recurrence.Step`).
 
@@ -389,15 +389,6 @@ class Chunk:
     query: jax.Array
     key: jax.Array
     value: jax.Array
-    log_decay: jax.Array | None = None
-    gate: jax.Array | None = None
-    log_a: jax.Array | None = None
-    bias: jax.Array | None = None
-    beta: jax.Array | None = None
-    skip: jax.Array | None = None
-    z: jax.Array | None = None
-    weight: jax.Array | None = None
-    rate: jax.Array | None = None
     state: jax.Array | None = None
     starts: jax.Array | None = None
 
