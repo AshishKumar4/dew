@@ -17,7 +17,7 @@ LOADING = Loading(workers=0, threads=1, read_buffer=2)
 
 def test_the_preferences_preset_lays_out_pairs_as_its_step_written_out():
     """Chosen and rejected token ids with their completion masks, laid out in six tokens padded
-    with 7, read by index: the plan and batches of the pair step written out."""
+    with 7, read by index: the batches of the pair step written out."""
     from dew.data.preferences import PreferencePair
 
     pairs = Memory([{"chosen": [1, 2, 3, 4][: 2 + index % 3], "rejected": [1, 2, 5][: 2 + index % 2],
@@ -27,15 +27,13 @@ def test_the_preferences_preset_lays_out_pairs_as_its_step_written_out():
     written = compile(pairs.shuffle(0).repeat().map(PreferencePair(6, pad_id=7)).batch(4), read="indexed",
                       loading=LOADING)
     chain = pairs.shuffle(0).repeat().pipe(presets.preferences, seq_len=6, batch=4, pad_id=7)
-    built = compile(chain, read="indexed", loading=LOADING)
-    assert built.plan.identity() == written.plan.identity()
-    same_batches(written, built, 3)
+    same_batches(written, compile(chain, read="indexed", loading=LOADING), 3)
 
 
 def test_the_canvas_preset_lays_out_turns_as_its_steps_written_out():
     """Conversations rendered by a chat template, each assistant turn one row of a prompt of 24
-    tokens and two canvases of 8, ended by the tokenizer's EOS, read by index: the plan and batches
-    of the rendering and the canvas step written out."""
+    tokens and two canvases of 8, ended by the tokenizer's EOS, read by index: the batches of the
+    rendering and the canvas step written out."""
     from dew.data import chat
     from dew.data.steps.chat import ResponseCanvases
 
@@ -49,9 +47,7 @@ def test_the_canvas_preset_lays_out_turns_as_its_steps_written_out():
     written = compile(steps.batch(2), read="indexed", loading=LOADING)
     chain = conversations.shuffle(0).repeat().pipe(presets.canvas, str(CHAT), prompt_length=24, canvas_size=8,
                                                    batch=2, canvases=2, messages="talk")
-    built = compile(chain, read="indexed", loading=LOADING)
-    assert built.plan.identity() == written.plan.identity()
-    same_batches(written, built, 3)
+    same_batches(written, compile(chain, read="indexed", loading=LOADING), 3)
 
 
 def test_a_canvas_needs_a_tokenizer_that_ends_a_response():

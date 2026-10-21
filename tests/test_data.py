@@ -406,13 +406,14 @@ def test_an_indexed_filter_resumes_the_exact_accepted_record_order():
 # Video datasets
 # ---------------------------------------------------------------------------------
 
-def _voxceleb_tree(root, split="train", identities=("id00012", "id00015")):
-    """Build <root>/<split>/<identity>/<clip>/<utterance>.avi, 2 seconds of 16 kHz sound under 25 fps
-    frames, plus a file that is no clip. AVI with PCM, where the sound's seek is sample-exact."""
+def _voxceleb_tree(root, split="train", identities=("id00012", "id00015"), rate=16000):
+    """Build <root>/<split>/<identity>/<clip>/<utterance>.avi, 2 seconds of a constant tone at `rate`
+    under 25 fps frames, plus a file that is no clip. AVI with PCM, where the sound's seek is
+    sample-exact."""
     from moviepy.config import FFMPEG_BINARY
 
     (root / "frames.rgb").write_bytes(np.full((50, 32, 48, 3), 90, np.uint8).tobytes())
-    (root / "sound.pcm").write_bytes(np.full(32000, 3000, np.int16).tobytes())
+    (root / "sound.pcm").write_bytes(np.full(2 * rate, 3000, np.int16).tobytes())
     clips = []
     for identity in identities:
         for clip in ("_raOc3-IRsw", "21Uxsk56VDQ"):
@@ -420,7 +421,7 @@ def _voxceleb_tree(root, split="train", identities=("id00012", "id00015")):
             path.parent.mkdir(parents=True, exist_ok=True)
             subprocess.run([FFMPEG_BINARY, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
                             "-s", "48x32", "-r", "25", "-i", str(root / "frames.rgb"), "-f", "s16le",
-                            "-ar", "16000", "-ac", "1", "-i", str(root / "sound.pcm"), "-c:v", "ffv1",
+                            "-ar", str(rate), "-ac", "1", "-i", str(root / "sound.pcm"), "-c:v", "ffv1",
                             "-c:a", "pcm_s16le", str(path)], check=True)
             clips.append(path)
     (root / split / "filelist.txt").write_text("ignored\n")
@@ -449,12 +450,12 @@ def test_local_videos_lists_every_file_under_the_directory(tmp_path):
 def test_a_video_listing_reads_frames_and_the_sound_around_them_at_the_rate_asked(tmp_path, rate):
     """Every clip under the directory, and nothing else, gives one record of `frames` frames fitted
     into `size` squares and the sound under them with a frame's worth either side, at the rate the
-    preset asks: at 48 kHz a record holds 1920 samples a frame where at 16 kHz it holds 640. At the
-    track's own 16 kHz every sample is the track's, exactly."""
+    preset asks, the track's own: at 48 kHz a record holds 1920 samples a frame where at 16 kHz it
+    holds 640, every one the track's, exactly."""
     from dew.data import Files, presets
     from dew.data.sources.av_utils import FPS
 
-    clips = _voxceleb_tree(tmp_path)
+    clips = _voxceleb_tree(tmp_path, rate=rate)
     chain = Files(str(tmp_path / "train"), format="files").pipe(
         presets.video, 4 / FPS, frames=4, fps=FPS, size=16, batch=1, caption="a video of a speaker",
         sample_rate=rate, margin=1 / FPS, context=1 / FPS, missing="reject", rejects=False)
@@ -469,8 +470,7 @@ def test_a_video_listing_reads_frames_and_the_sound_around_them_at_the_rate_aske
         assert record["audio"].shape == (6 * rate // 25,) and record["audio"].dtype == np.float32
         # Two seconds of sound under every clip: each window's 0.24 seconds are all the track's.
         assert record["audio_valid"].dtype == bool and int(record["audio_valid"].sum()) == 6 * rate // 25
-        if rate == 16000:
-            assert (record["audio"] == np.float32(3000 / 32768)).all()
+        assert (record["audio"] == np.float32(3000 / 32768)).all()
         assert record["caption"] == "a video of a speaker"
 
 
@@ -736,6 +736,11 @@ def test_a_prepared_set_is_the_deterministic_half_of_the_transform(tmp_path):
     finally:
         stream.close()
     assert sorted(seen) == list(range(16))
+    for index in range(16):
+        pixels, caption = seen[index]
+        assert pixels == rows[index]["image"].tobytes()
+        assert caption == rows[index]["caption"]
+        assert np.frombuffer(pixels, np.uint8).shape == (8 * 8 * 3,)
 
 
 # ---------------------------------------------------------------------------------
