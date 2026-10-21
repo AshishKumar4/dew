@@ -284,7 +284,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             cotangents = algebra.grad_scores(weights, _dot(do, v_tile.T), anchor, delta, seen,
                                              columns[None, :] == chosen[:, None])
             pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
-            dq = dq + _dot((pulled * (scale * over_prior)[:, None]).astype(k_tile.dtype), k_tile)
+            dq = dq + _dot((pulled * scale * over_prior[:, None]).astype(k_tile.dtype), k_tile)
             grads = tuple(grad + piece if add else grad for grad, add, piece in zip(grads, summed, pieces,
                                                                                    strict=True))
             if any(summed):
