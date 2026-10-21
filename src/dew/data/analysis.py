@@ -547,10 +547,12 @@ def _manifest(
 
 
 def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest:
+    """What a cache after `prefix` over `source` holds: the source and the record steps, without the
+    views of its inputs (`_VIEWS`), which order or select what it holds and make none of it."""
     return _manifest(
         source.fingerprint(),
         (source,),
-        tuple(_identity(stage, cache=True) for stage in prefix),
+        tuple(_identity(stage, cache=True) for stage in prefix if not isinstance(stage, _VIEWS)),
         fill={"read": read, "row_ids": "sharded" if read == "streamed" else "indexed"},
     )
 
@@ -576,6 +578,31 @@ _ROOTED = (*_LOCAL, Configured, Artifact, Interleave, Shuffle, Pack, Windows, Pr
 """The stages a streamed read's repeat can move before, to its root: none
 counts the rows or draws from the record rng, so they read one continuous
 stream whose shards reshuffle each epoch."""
+
+
+_VIEWS = (Shuffle, Repeat, Slice, Limit)
+"""The stages that order or select a source's inputs and change none: a cache keyed by each input's
+place in its source holds what the record steps make of it whatever view reads it, so these may
+stand before a cache (`_cache_view`) and are no part of its key (`_cache_manifest`)."""
+
+
+def _cache_view(stages: Sequence[Stage]) -> str | None:
+    """Why a cache after `stages` cannot hold what they make of each input, or None where it can: its
+    stages are deterministic record steps and views of the inputs (`_VIEWS`), and a step before a
+    view keeps one record for each input, so a view of the inputs reads what the written chain
+    does (a record dropped, kept twice or replaced by pieces before a view would change which
+    inputs the view orders)."""
+    last = max((index for index, stage in enumerate(stages) if isinstance(stage, _VIEWS)), default=-1)
+    for index, stage in enumerate(stages):
+        if isinstance(stage, _VIEWS):
+            continue
+        if not _cacheable(stage):
+            return f"{type(stage).__name__} is no deterministic record step a cache can key"
+        if index < last and (_drops(stage) or isinstance(stage, FlatMap)):
+            view = type(stages[last]).__name__
+            return (f"{type(stage).__name__} before {view} drops or expands records, so the view orders "
+                    "other rows than the source's inputs (expansions and drops before a view: roadmap 803b)")
+    return None
 
 
 def _cacheable(stage: Stage) -> bool:
@@ -714,8 +741,12 @@ def _analyzed(
     cache = _at(stages, Artifact)
     if nested or (cache is not None and any(isinstance(stage, Configured) for stage in stages[:cache])):
         cache = None
-    eager = 0 if cache is None else cache + 1
-    while read == "memory" and not nested and eager < len(stages) and isinstance(stages[eager], _EAGER):
+    # A view of the inputs before a cache leaves the cache to the lowering, which reads it by input
+    # as an indexed read does: a memory read runs nothing over the whole source first.
+    viewed = cache is not None and any(isinstance(stage, _VIEWS) for stage in stages[:cache])
+    eager = 0 if cache is None or viewed else cache + 1
+    while (read == "memory" and not nested and not viewed and eager < len(stages)
+           and isinstance(stages[eager], _EAGER)):
         eager += 1
     per_share = _checked(pipeline, read, ancestry, eager, validation=validation, promotion=promotion)
     if isinstance(source, Mixture) and source.tokens is not None:
@@ -859,10 +890,13 @@ def _checked(
                     f"cache prefix in {name} contains random step {random}; cache before stochastic steps"
                 )
             for earlier in prefix:
-                _identity(earlier, cache=True)
+                if not isinstance(earlier, _VIEWS):
+                    _identity(earlier, cache=True)
             mixed = isinstance(pipeline.source, (Mixture, Phases))
-            if not mixed and _cache_at(pipeline.stages[:index]) < index:
-                raise ValueError(f"cache prefix in {name} must hold only deterministic record steps")
+            refused = None if mixed else _cache_view(pipeline.stages[:index])
+            if refused is not None:
+                raise ValueError(f"cache prefix in {name} must hold deterministic record steps and views of "
+                                 f"the inputs: {refused}")
         if isinstance(stage, Shuffle) and stage.window is None and not indexed and not promotion:
             raise ValueError(f"global shuffle in {name} needs an indexed pipeline; give window=")
         if isinstance(stage, Slice) and not indexed and not promotion:

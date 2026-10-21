@@ -31,6 +31,7 @@ import numpy as np
 
 from dew.data.analysis import (
     _LOCAL,
+    _VIEWS,
     _at,
     _cache_manifest,
     _drops,
@@ -377,7 +378,10 @@ def _fill(pipeline: Pipeline, source: Source, at: int, read: Read) -> tuple[Cach
     artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
     if not isinstance(artifact, Artifact):
         raise ValueError(f"stage {at} of {_name(pipeline)} is not a cache")
-    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(prefix)
+    # The views of the inputs written before the cache read it (`_Build.indexed`); its fill runs the
+    # record steps alone.
+    steps = tuple(stage for stage in prefix if not isinstance(stage, _VIEWS))
+    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(steps)
 
 
 def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[int, int, int]]:
@@ -780,6 +784,16 @@ class _Build:
         cached = filled.mapped(stored, manifest, transform=prefix, source=source)
         placed = cached.map_with_index(_Placed(rows=len(cached))) if last > cache else cached
         view = self.shared(placed, pipeline, partition)
+        # The views of the inputs written before the cache, where and as they are written: each
+        # input's cached outputs follow it, as the record steps make them after the view.
+        for at, stage in enumerate(pipeline.stages[:cache]):
+            if isinstance(stage, _VIEWS):
+                viewed = self.stage(view, stage, pipeline, partition, at)
+                if not isinstance(viewed, pygrain.MapDataset):
+                    raise ValueError(f"{type(stage).__name__} before the cache of {_name(pipeline)} reads "
+                                     "its inputs as a stream, and the cache is read by index: write it after "
+                                     "the cache")
+                view = viewed
         rows = cached.iterated(view, pygrain.ReadOptions(self.loading.threads, self.loading.read_buffer))
         flat = gx.FlatMapIterDataset(rows, _CachedOutputs())
         return Accepted(flat, _name(pipeline), _label(pipeline)), cache + 1
