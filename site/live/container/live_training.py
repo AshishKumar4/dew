@@ -1,11 +1,11 @@
 """Bounds a live training cell to a couple of minutes on a shared 4-vCPU host.
 
 A training context runs Dew itself, not the stand-ins of model_client.
-`install` has IPython run each cell with its calls that name a batch, steps
-or log_every, unpack keywords, or batch a dataset, passed through `capped`: a
-preset of `dew.data.presets`, called or given to a dataset's `pipe`, and a
-dataset's own `batch(n)` make batches of at most BATCH rows, and a Dew `fit`
-runs at most STEPS steps, logging at least four times. Each cap prints what it
+`install` has IPython run each cell with its calls passed through `capped`,
+whatever name it calls them by: a preset of `dew.data.presets`, called or given
+to a dataset's `pipe`, and a dataset's own `batch(n)` make batches of at most
+BATCH rows, and a Dew `fit` runs at most STEPS steps, logging at least four
+times. Each cap prints what it
 changed before the run's own output, so the cell's first lines say how this
 run differs from the code on the page.
 """
@@ -14,8 +14,9 @@ import ast
 import inspect
 
 BATCH, STEPS = 8, 20
-CAPPED = ("batch", "steps", "log_every")
-"""The keywords a call names that `Capped` sends through `capped`, beside any `**` it unpacks."""
+FRAME = frozenset({"super", "locals", "globals", "vars", "dir", "eval", "exec", "breakpoint"})
+"""The builtins that read the frame they are called from, which `capped`'s would replace: `Capped` leaves
+their calls as written, and none of them is Dew's."""
 
 
 def batch(asked):
@@ -64,13 +65,12 @@ def capped(call, /, *args, **options):
 
 
 class Capped(ast.NodeTransformer):
-    """A cell with each call that names one of `CAPPED`, unpacks keywords or calls a `batch` method made
-    through `capped`, as IPython runs every cell of a training context (`install`)."""
+    """A cell with each of its calls made through `capped`, but those of `FRAME`, as IPython runs every
+    cell of a training context (`install`): which function a name holds is known only as the cell runs."""
 
     def visit_Call(self, node: ast.Call) -> ast.Call:
         self.generic_visit(node)
-        method = isinstance(node.func, ast.Attribute) and node.func.attr == "batch"
-        if not method and not any(keyword.arg is None or keyword.arg in CAPPED for keyword in node.keywords):
+        if isinstance(node.func, ast.Name) and node.func.id in FRAME:
             return node
         # This module, as a cell reaches it without binding a name of its own.
         module = ast.Call(ast.Name("__import__", ast.Load()), [ast.Constant("live_training")], [])
