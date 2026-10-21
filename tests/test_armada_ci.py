@@ -310,6 +310,50 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                                    "tests/test_own_environment.py": ["changed"]}
 
 
+def fetcher(root: Path, *, due: bool = False) -> Path:
+    """A stand-in tools/fetched_fixtures.py under `root`: its fetch records that it ran, and with `due`
+    refuses as the real one does a pin whose upload is due."""
+    (root / "tools").mkdir(exist_ok=True)
+    (root / "tools/fetched_fixtures.py").write_text(
+        "import sys, time\nfrom pathlib import Path\n"
+        "assert sys.argv[1:] == ['fetch']\n"
+        "Path('fetched').write_text(str(time.monotonic()))\n"
+        + ("raise SystemExit('x.npz: pinned with no revision: its upload is due')\n" if due else ""))
+    return root / "fetched"
+
+
+def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_one_is_due(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """The tests read pinned fixtures offline (CLOSED_HUB), so the lane fetches them first, while the Hub is
+    reachable; a pin whose upload is due stops the lane before any file runs."""
+    url, _, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    (tools / "nvidia-smi").write_text("#!/bin/sh\necho 81920\n")
+    (tools / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    (tmp_path / "tests/test_reads.py").write_text(
+        "import time\nfrom pathlib import Path\n"
+        "def test_reads(): Path('read').write_text(str(time.monotonic()))\n")
+    out = tmp_path / "verdict.json"
+    fetched = fetcher(tmp_path)
+    assert ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache=True, processes=1, deadline=600.0) == 0
+    assert float(fetched.read_text()) < float((tmp_path / "read").read_text())
+    fetched.unlink()
+    (tmp_path / "read").unlink()
+    fetcher(tmp_path, due=True)
+    with pytest.raises(subprocess.CalledProcessError):
+        ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache=True, processes=1, deadline=600.0)
+    assert fetched.is_file() and not (tmp_path / "read").exists()
+
+
 def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_share(
         ci, tmp_path, monkeypatch, cache_worker):
     """The GPU lane runs each file once, in a process of its own. A file no
@@ -352,6 +396,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
+    fetcher(tmp_path)
 
     def ran(stem: str) -> list[list[str]]:
         return [path.read_text().split() for path in sorted(tmp_path.glob(f"ran-{stem}-*"),
@@ -575,10 +620,24 @@ def test_durations_are_each_tests_least_time_over_green_runs_floors(ci):
         ci.durations([{"rows": [{"name": "3.12:tests/test_b.py", "exitCode": 0}]}])
 
 
+def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
+    """A task's wall time split among its files in proportion to their tests'
+    own times, and evenly over its rows where no test recorded one: recorded
+    times whose shares are exact in binary."""
+    assert ci.apportioned({"tests/test_a.py": 0.25, "tests/test_b.py": 0.75}, 2.0, 2) == {
+        "tests/test_a.py": 0.5, "tests/test_b.py": 1.5}
+    assert ci.apportioned({"tests/test_a.py": 0.0, "tests/test_b.py": 0.0}, 3.0, 2) == {
+        "tests/test_a.py": 1.5, "tests/test_b.py": 1.5}
+    # A file named twice is two of the task's rows.
+    assert ci.apportioned({"tests/test_a.py": 0.0, "tests/test_b.py": 0.0}, 3.0, 3) == {
+        "tests/test_a.py": 1.0, "tests/test_b.py": 1.0}
+
+
 def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     """The plan weighs a file by what a task spends on it, its import and
-    collection included, so a task's rows add up to its wall time, split in
-    proportion to their tests' own times."""
+    collection included, so a task's rows add up to its wall time, split by
+    their tests' own times (`apportioned`): at least what the tests slept, at
+    most the task's wall time, and the longer sleep the larger row."""
     (tmp_path / "tests").mkdir(exist_ok=True)
     (tmp_path / "tests/test_short.py").write_text("import time\ndef test_a(): time.sleep(0.3)\n")
     (tmp_path / "tests/test_long.py").write_text("import time\ndef test_b(): time.sleep(0.9)\n")
@@ -593,7 +652,7 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     rows = {row["name"]: row["seconds"] for row in json.loads(out.read_text())["rows"]}
     short, long = rows["3.12:tests/test_short.py"], rows["3.12:tests/test_long.py"]
     assert 1.2 < short + long <= wall
-    assert long / short == pytest.approx(3.0, rel=0.25)
+    assert short < long
 
 
 def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch,
