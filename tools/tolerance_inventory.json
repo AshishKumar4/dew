@@ -13,7 +13,7 @@
    "by": "2026-11-13"
   },
   "tests/kimi_support.py": {
-   "comparisons": 3,
+   "comparisons": 4,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -38,7 +38,7 @@
    "by": "2026-11-13"
   },
   "tests/test_adversarial.py": {
-   "comparisons": 5,
+   "comparisons": 6,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -48,17 +48,17 @@
    "by": "2026-11-13"
   },
   "tests/test_alignment.py": {
-   "comparisons": 4,
+   "comparisons": 5,
    "lane": "Training",
    "by": "2026-11-20"
   },
   "tests/test_architectures.py": {
-   "comparisons": 1,
+   "comparisons": 2,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_attention_masked_rows.py": {
-   "comparisons": 1,
+   "comparisons": 2,
    "lane": "Kernels",
    "by": "2026-11-06"
   },
@@ -68,12 +68,12 @@
    "by": "2026-11-13"
   },
   "tests/test_attention_splash.py": {
-   "comparisons": 4,
+   "comparisons": 5,
    "lane": "Kernels",
    "by": "2026-11-06"
   },
   "tests/test_audio.py": {
-   "comparisons": 8,
+   "comparisons": 10,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -83,12 +83,12 @@
    "by": "2026-11-20"
   },
   "tests/test_autoencoder.py": {
-   "comparisons": 4,
+   "comparisons": 6,
    "lane": "Training",
    "by": "2026-11-20"
   },
   "tests/test_beam_search.py": {
-   "comparisons": 1,
+   "comparisons": 2,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -97,8 +97,13 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
+  "tests/test_bf16_reference.py": {
+   "comparisons": 4,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
   "tests/test_block_diffusion.py": {
-   "comparisons": 2,
+   "comparisons": 7,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -113,7 +118,7 @@
    "by": "2026-11-13"
   },
   "tests/test_causal_transformer.py": {
-   "comparisons": 44,
+   "comparisons": 47,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -123,7 +128,7 @@
    "by": "2026-11-20"
   },
   "tests/test_chunked_cross_entropy.py": {
-   "comparisons": 25,
+   "comparisons": 29,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -131,6 +136,11 @@
    "comparisons": 10,
    "lane": "Training",
    "by": "2026-11-20"
+  },
+  "tests/test_codec_checkpoints.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
   },
   "tests/test_codecs.py": {
    "comparisons": 1,
@@ -167,8 +177,18 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
-  "tests/test_decision_joint_checkpoint.py": {
+  "tests/test_dduf.py": {
    "comparisons": 2,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_decision_joint_checkpoint.py": {
+   "comparisons": 5,
+   "lane": "Training",
+   "by": "2026-11-20"
+  },
+  "tests/test_decision_laya.py": {
+   "comparisons": 4,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -178,12 +198,12 @@
    "by": "2026-11-20"
   },
   "tests/test_decision_option_slots.py": {
-   "comparisons": 1,
+   "comparisons": 4,
    "lane": "Training",
    "by": "2026-11-20"
   },
   "tests/test_decision_packing.py": {
-   "comparisons": 2,
+   "comparisons": 4,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -193,12 +213,12 @@
    "by": "2026-11-20"
   },
   "tests/test_decision_task.py": {
-   "comparisons": 6,
+   "comparisons": 8,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_decode_attention.py": {
-   "comparisons": 1,
+   "comparisons": 12,
    "lane": "Kernels",
    "by": "2026-11-06"
   },
@@ -213,7 +233,12 @@
    "by": "2026-11-13"
   },
   "tests/test_decoder_export.py": {
-   "comparisons": 16,
+   "comparisons": 17,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_decoder_packed_cached_source.py": {
+   "comparisons": 2,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -223,7 +248,7 @@
    "by": "2026-11-20"
   },
   "tests/test_decoding_components.py": {
-   "comparisons": 8,
+   "comparisons": 9,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -242,6 +267,11 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
+  "tests/test_dense.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
   "tests/test_depthwise_conv.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL",
@@ -252,10 +282,20 @@
    "lane": "Training",
    "by": "2026-11-20"
   },
+  "tests/test_diffusion_gemma_workflow.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
   "tests/test_diffusion_objective.py": {
    "comparisons": 9,
    "lane": "Training",
    "by": "2026-11-20"
+  },
+  "tests/test_diffusion_run_sources.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
   },
   "tests/test_discrete.py": {
    "comparisons": 8,
@@ -268,7 +308,7 @@
    "by": "2026-11-13"
   },
   "tests/test_distillation.py": {
-   "comparisons": 4,
+   "comparisons": 7,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -278,12 +318,12 @@
    "by": "2026-11-20"
   },
   "tests/test_dory.py": {
-   "comparisons": 3,
+   "comparisons": 9,
    "lane": "Recurrence & Dory",
    "by": "2026-11-06"
   },
   "tests/test_dpo.py": {
-   "comparisons": 7,
+   "comparisons": 8,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -293,9 +333,14 @@
    "by": "2026-11-13"
   },
   "tests/test_edm2.py": {
-   "comparisons": 2,
+   "comparisons": 5,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
+  },
+  "tests/test_edm_loss.py": {
+   "comparisons": 6,
+   "lane": "Training",
+   "by": "2026-11-20"
   },
   "tests/test_encoders.py": {
    "comparisons": 3,
@@ -303,12 +348,12 @@
    "by": "2026-11-20"
   },
   "tests/test_end_to_end.py": {
-   "comparisons": 8,
+   "comparisons": 10,
    "lane": "Training",
    "by": "2026-11-20"
   },
   "tests/test_engine_replay.py": {
-   "comparisons": 2,
+   "comparisons": 3,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -323,22 +368,27 @@
    "by": "2026-11-13"
   },
   "tests/test_fid.py": {
-   "comparisons": 9,
+   "comparisons": 10,
    "lane": "Training",
    "by": "2026-11-20"
   },
   "tests/test_fla_gdn.py": {
-   "comparisons": 19,
+   "comparisons": 22,
    "lane": "Recurrence & Dory",
    "by": "2026-11-06"
   },
   "tests/test_fla_kda.py": {
-   "comparisons": 1,
+   "comparisons": 4,
    "lane": "Recurrence & Dory",
    "by": "2026-11-06"
   },
   "tests/test_flaxdiff.py": {
-   "comparisons": 6,
+   "comparisons": 8,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_flaxdiff_family_source.py": {
+   "comparisons": 2,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -348,12 +398,17 @@
    "by": "2026-11-13"
   },
   "tests/test_flow_matching.py": {
-   "comparisons": 8,
+   "comparisons": 10,
    "lane": "Training",
    "by": "2026-11-20"
   },
+  "tests/test_flux2_source.py": {
+   "comparisons": 8,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
   "tests/test_flux_source.py": {
-   "comparisons": 7,
+   "comparisons": 13,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -363,7 +418,7 @@
    "by": "2026-11-06"
   },
   "tests/test_gemma3n.py": {
-   "comparisons": 9,
+   "comparisons": 13,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -377,8 +432,13 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
-  "tests/test_generate.py": {
+  "tests/test_gemma4_wrapper_config.py": {
    "comparisons": 1,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_generate.py": {
+   "comparisons": 2,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -397,10 +457,20 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
+  "tests/test_grouped_gemm.py": {
+   "comparisons": 3,
+   "lane": "Kernels",
+   "by": "2026-11-06"
+  },
   "tests/test_grpo.py": {
-   "comparisons": 2,
+   "comparisons": 3,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
+  },
+  "tests/test_guidance.py": {
+   "comparisons": 5,
+   "lane": "Training",
+   "by": "2026-11-20"
   },
   "tests/test_guidance_distillation.py": {
    "comparisons": 1,
@@ -409,6 +479,11 @@
   },
   "tests/test_guided_decoding.py": {
    "comparisons": 2,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_hf_bloom.py": {
+   "comparisons": 1,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -423,12 +498,12 @@
    "by": "2026-11-13"
   },
   "tests/test_hf_decoder_moe.py": {
-   "comparisons": 19,
+   "comparisons": 28,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_hf_decoders.py": {
-   "comparisons": 21,
+   "comparisons": 27,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -437,8 +512,18 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
-  "tests/test_hf_lifecycle.py": {
+  "tests/test_hf_gptj.py": {
    "comparisons": 1,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_hf_lifecycle.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_hf_modernbert.py": {
+   "comparisons": 5,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -447,8 +532,23 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
+  "tests/test_hf_phi.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_hf_phi3.py": {
+   "comparisons": 5,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
   "tests/test_hf_qwen35_moe_wrapper.py": {
    "comparisons": 3,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_hf_reference_decoders.py": {
+   "comparisons": 1,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -478,12 +578,12 @@
    "by": "2026-11-20"
   },
   "tests/test_indexer_training.py": {
-   "comparisons": 18,
+   "comparisons": 19,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_inference.py": {
-   "comparisons": 10,
+   "comparisons": 11,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -507,18 +607,33 @@
    "lane": "Training",
    "by": "2026-11-20"
   },
+  "tests/test_interop.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
   "tests/test_jepa.py": {
-   "comparisons": 16,
+   "comparisons": 18,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_jepa_source.py": {
+   "comparisons": 3,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_jit.py": {
-   "comparisons": 2,
+   "comparisons": 3,
    "lane": "Training",
    "by": "2026-11-20"
   },
+  "tests/test_joined.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
   "tests/test_k2_horizon.py": {
-   "comparisons": 1,
+   "comparisons": 2,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -528,32 +643,37 @@
    "by": "2026-11-13"
   },
   "tests/test_kernels.py": {
-   "comparisons": 10,
+   "comparisons": 26,
    "lane": "Kernels",
    "by": "2026-11-06"
   },
   "tests/test_kimi_k3.py": {
-   "comparisons": 1,
+   "comparisons": 2,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_kv_cache.py": {
-   "comparisons": 3,
+   "comparisons": 4,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_layer_stack.py": {
-   "comparisons": 21,
+   "comparisons": 22,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_linear_attention.py": {
-   "comparisons": 39,
-   "lane": "Recurrence & Dory",
+   "comparisons": 49,
+   "lane": "Kernels",
    "by": "2026-11-06"
   },
   "tests/test_llama4.py": {
    "comparisons": 7,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_llama_cpp_export.py": {
+   "comparisons": 1,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -563,7 +683,7 @@
    "by": "2026-11-20"
   },
   "tests/test_lm_objective.py": {
-   "comparisons": 38,
+   "comparisons": 40,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -573,7 +693,7 @@
    "by": "2026-11-13"
   },
   "tests/test_local_attention.py": {
-   "comparisons": 8,
+   "comparisons": 15,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -583,12 +703,12 @@
    "by": "2026-11-13"
   },
   "tests/test_lora.py": {
-   "comparisons": 26,
+   "comparisons": 31,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_lora_peft.py": {
-   "comparisons": 1,
+   "comparisons": 5,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -603,17 +723,17 @@
    "by": "2026-11-13"
   },
   "tests/test_mamba2.py": {
-   "comparisons": 1,
+   "comparisons": 2,
    "lane": "Training",
    "by": "2026-11-20"
   },
   "tests/test_mamba2_interop.py": {
-   "comparisons": 3,
+   "comparisons": 5,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_mamba_ssd.py": {
-   "comparisons": 2,
+   "comparisons": 3,
    "lane": "Recurrence & Dory",
    "by": "2026-11-06"
   },
@@ -628,7 +748,7 @@
    "by": "2026-11-13"
   },
   "tests/test_mdlm_reference.py": {
-   "comparisons": 5,
+   "comparisons": 8,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -648,12 +768,12 @@
    "by": "2026-11-20"
   },
   "tests/test_mimo_audio.py": {
-   "comparisons": 1,
+   "comparisons": 5,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_mimo_v2.py": {
-   "comparisons": 1,
+   "comparisons": 2,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -663,7 +783,7 @@
    "by": "2026-11-13"
   },
   "tests/test_mixers.py": {
-   "comparisons": 6,
+   "comparisons": 8,
    "lane": "Kernels",
    "by": "2026-11-06"
   },
@@ -672,8 +792,13 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
+  "tests/test_model_protocols.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
   "tests/test_models.py": {
-   "comparisons": 10,
+   "comparisons": 15,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -693,7 +818,7 @@
    "by": "2026-11-13"
   },
   "tests/test_moe_exchange.py": {
-   "comparisons": 6,
+   "comparisons": 7,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -722,18 +847,23 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
+  "tests/test_native_diffusion.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
   "tests/test_native_rollout_server.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_norm_swiglu.py": {
-   "comparisons": 6,
+   "comparisons": 8,
    "lane": "Kernels",
    "by": "2026-11-06"
   },
   "tests/test_objectives.py": {
-   "comparisons": 5,
+   "comparisons": 6,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -743,7 +873,7 @@
    "by": "2026-11-13"
   },
   "tests/test_optim.py": {
-   "comparisons": 19,
+   "comparisons": 21,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -758,7 +888,7 @@
    "by": "2026-11-13"
   },
   "tests/test_ouro.py": {
-   "comparisons": 1,
+   "comparisons": 3,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -782,6 +912,11 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
+  "tests/test_pipeline_streaming.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
   "tests/test_plan.py": {
    "comparisons": 1,
    "lane": "Training",
@@ -793,7 +928,7 @@
    "by": "2026-11-20"
   },
   "tests/test_ppo.py": {
-   "comparisons": 18,
+   "comparisons": 19,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -818,12 +953,12 @@
    "by": "2026-11-13"
   },
   "tests/test_quantization.py": {
-   "comparisons": 16,
+   "comparisons": 18,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_quantization_sites.py": {
-   "comparisons": 1,
+   "comparisons": 4,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -833,7 +968,7 @@
    "by": "2026-11-13"
   },
   "tests/test_qwen_image_source.py": {
-   "comparisons": 2,
+   "comparisons": 3,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -858,7 +993,12 @@
    "by": "2026-11-20"
   },
   "tests/test_reference_runs.py": {
-   "comparisons": 2,
+   "comparisons": 4,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_reference_trees.py": {
+   "comparisons": 1,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -892,6 +1032,11 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
+  "tests/test_router_source.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
   "tests/test_router_statistics.py": {
    "comparisons": 4,
    "lane": "Training",
@@ -903,12 +1048,17 @@
    "by": "2026-11-13"
   },
   "tests/test_samplers.py": {
-   "comparisons": 10,
+   "comparisons": 19,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_schedulers.py": {
-   "comparisons": 18,
+   "comparisons": 20,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_sd3_source.py": {
+   "comparisons": 1,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -922,8 +1072,13 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
+  "tests/test_short_conv.py": {
+   "comparisons": 2,
+   "lane": "Recurrence & Dory",
+   "by": "2026-11-06"
+  },
   "tests/test_source_schedulers.py": {
-   "comparisons": 5,
+   "comparisons": 8,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -936,6 +1091,11 @@
    "comparisons": 2,
    "lane": "Training",
    "by": "2026-11-20"
+  },
+  "tests/test_ssd_kernel.py": {
+   "comparisons": 1,
+   "lane": "Recurrence & Dory",
+   "by": "2026-11-06"
   },
   "tests/test_ssm.py": {
    "comparisons": 4,
@@ -968,7 +1128,7 @@
    "by": "2026-11-20"
   },
   "tests/test_text_encoders.py": {
-   "comparisons": 15,
+   "comparisons": 16,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -998,7 +1158,7 @@
    "by": "2026-11-13"
   },
   "tests/test_torchax_fallback.py": {
-   "comparisons": 6,
+   "comparisons": 8,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -1023,7 +1183,7 @@
    "by": "2026-11-20"
   },
   "tests/test_training_telemetry.py": {
-   "comparisons": 5,
+   "comparisons": 6,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -1034,6 +1194,11 @@
   },
   "tests/test_tread.py": {
    "comparisons": 1,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tests/test_uvit_source.py": {
+   "comparisons": 2,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -1048,7 +1213,7 @@
    "by": "2026-11-13"
   },
   "tests/test_vision.py": {
-   "comparisons": 21,
+   "comparisons": 28,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -1057,8 +1222,13 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
+  "tests/test_wan_source.py": {
+   "comparisons": 8,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
   "tests/test_wan_vae.py": {
-   "comparisons": 5,
+   "comparisons": 6,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -1072,13 +1242,23 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
+  "tests/test_z_image_source.py": {
+   "comparisons": 5,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
   "tools/benchmark_depthwise.py": {
    "comparisons": 2,
    "lane": "Training",
    "by": "2026-11-20"
   },
   "tools/check_native_diffusion.py": {
-   "comparisons": 1,
+   "comparisons": 7,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
+  },
+  "tools/check_native_diffusion_edges.py": {
+   "comparisons": 3,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -1191,6 +1371,11 @@
    "comparisons": 1,
    "lane": "Training",
    "by": "2026-11-20"
+  },
+  "tools/vllm_replay_reference.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
   }
  }
 }
