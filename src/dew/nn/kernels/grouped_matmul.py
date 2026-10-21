@@ -640,11 +640,14 @@ class MosaicGmm(_Mosaic):
         (rows, depth), groups = tokens.shape, kernel.shape[0]
         width = kernel.shape[1] if ba.arguments['trans_rhs'] else kernel.shape[2]
         size = jnp.dtype(tokens.dtype).itemsize
-        tiles, columns = _block_tiles(rows, groups, config.block_m), width // config.block_n
-        # The rows are read once a band; a group's matrix once for the row tiles of it in flight.
+        # A pair of multiprocessors runs two row tiles of one group, its second empty past the group.
+        pair = config.cluster
+        tiles, columns = pair * _block_tiles(rows, groups, pair * config.block_m), width // config.block_n
+        # The rows are read once a band; a group's matrix once for the row tiles of it in flight, once a
+        # pair's.
         bands = math.ceil(columns / config.grid_block_n)
         in_flight = self._in_flight(config, target)
-        per_group = tiles / max(min(groups, rows), 1)
+        per_group = tiles / pair / max(min(groups, rows), 1)
         matrices = _routed(rows, groups) * kernel.size * size * math.ceil(per_group / in_flight)
         hooks = ba.arguments['hooks']
         rereads = {'rows': tiles, 'columns': bands}

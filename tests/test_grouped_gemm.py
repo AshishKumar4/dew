@@ -81,12 +81,15 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
     reference = xla_products(x, w, dy, sizes, dtype, jnp.float32)
     arrays = [jnp.asarray(value, dtype) for value in (x, w, dy)]
     group_sizes = jnp.asarray(sizes, jnp.int32)
-    for block_m, transpose in itertools.product((64, 128), (False, True)):
-        tiles = mosaic_gpu.Tiles(block_m, 64, 64, 2, 1)
+    # One warpgroup a tile at two row blocks, and two (CUTLASS's cooperative schedule; a pair of
+    # multiprocessors the interpreter does not model, the GPU's tile gate runs).
+    tiled = [mosaic_gpu.Tiles(64, 64, 64, 2, 1), mosaic_gpu.Tiles(128, 64, 64, 2, 1),
+             mosaic_gpu.Tiles(64, 128, 64, 2, 1, warpgroups=2)]
+    for tiles, transpose in itertools.product(tiled, (False, True)):
         matrix = jnp.swapaxes(arrays[1], 1, 2) if transpose else arrays[1]
         got = mosaic_gpu.gmm(arrays[0], matrix, group_sizes, tiles=tiles, transpose_rhs=transpose,
                              out_dtype=dtype, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
-        check(got, reference[0], truth[0], group, f"forward block_m={block_m} transpose={transpose}")
+        check(got, reference[0], truth[0], group, f"forward {tiles} transpose={transpose}")
     for block_k in (64, 128):
         tiles = mosaic_gpu.Tiles(64, 64, block_k, 2, 1)
         got = mosaic_gpu.tgmm(arrays[0], arrays[2], group_sizes, tiles=tiles, out_dtype=jnp.float32,
@@ -185,8 +188,10 @@ def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
         # (shared memory, the snake's index arithmetic), each value once.
         covering = set({(c.block_m, c.block_n): c for c in reversed(fits)}.values())
         covering |= set({(c.stages, c.grid_block_n): c for c in reversed(fits)}.values())
+        covering |= set({(c.warpgroups, c.cluster, c.block_n): c for c in reversed(fits)}.values())
         assert {(c.block_m, c.block_n) for c in covering} == {(c.block_m, c.block_n) for c in fits}
         assert {(c.stages, c.grid_block_n) for c in covering} == {(c.stages, c.grid_block_n) for c in fits}
+        assert {(c.warpgroups, c.cluster) for c in covering} == {(c.warpgroups, c.cluster) for c in fits}
         for config in sorted(covering, key=repr):
             jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
                 lowering_platforms=("cuda",))
