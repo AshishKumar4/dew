@@ -92,9 +92,9 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
         d_product = d_acc.astype(work)
         matrix = rhs.astype(lhs.dtype)
         # The cotangent of the operand the forward multiplied, `prologue(lhs)` rounded to `lhs`'s dtype.
-        d_operand = _gemm(d_product, matrix, group_sizes, None, (), (), None, (), (), (jnp.dtype(lhs.dtype),),
-                          several=False, transpose_rhs=not transpose_rhs, interpret_on_cpu=interpret_on_cpu,
-                          precision=precision)
+        d_operand = jnp.asarray(_gemm(d_product, matrix, group_sizes, None, (), (), None, (), (),
+                                      (jnp.dtype(lhs.dtype),), several=False, transpose_rhs=not transpose_rhs,
+                                      interpret_on_cpu=interpret_on_cpu, precision=precision))
         if narrow:
             d_rhs = gemm_t(lhs, d_product, group_sizes, prologue=prologue,
                            prologue_operands=tuple(zip(prologue_arrays, prologue_axes, strict=True)),

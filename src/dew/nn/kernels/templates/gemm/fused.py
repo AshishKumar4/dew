@@ -82,7 +82,7 @@ def _axes(consumer, values, acc) -> tuple | None:
     axes = []
     specs = jax.tree.leaves(value_specs, is_leaf=_is_spec)
     for leaf, leaf_spec in zip(jax.tree.leaves(values), specs, strict=True):
-        if not isinstance(leaf_spec, pl.BlockSpec) or leaf_spec.index_map is None:
+        if not _is_block(leaf_spec):
             return None
         named = []
         indices = leaf_spec.index_map(1, 2)
@@ -104,8 +104,12 @@ def _specs(consumer, values, acc, block: tuple):
 
 def _is_tile(spec, probe: tuple) -> bool:
     """Whether `spec` is the probe tile at its own place: a block of `probe` at (row, column)."""
-    return (isinstance(spec, pl.BlockSpec) and spec.index_map is not None
-            and tuple(spec.block_shape) == probe and tuple(spec.index_map(1, 2)) == (1, 2))
+    return _is_block(spec) and tuple(spec.block_shape) == probe and tuple(spec.index_map(1, 2)) == (1, 2)
+
+
+def _is_block(spec) -> bool:
+    """Whether `spec` is a block spec with a block and an index map: a scalar's is not."""
+    return isinstance(spec, pl.BlockSpec) and spec.index_map is not None and spec.block_shape is not None
 
 
 def _probe(size: int) -> int:
