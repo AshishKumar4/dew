@@ -25,29 +25,25 @@ from pathlib import Path
 
 import numpy as np
 
-os.environ["TRITON_F32_DEFAULT"] = "ieee"
-
-import torch
-
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mamba2" / "ssd_mamba_ssm.npz"
 SEED = 2026
 CASES = {
     # name: (batch, tokens, heads, head width, groups, state, chunk, dtype, packed documents)
     # Three heads a group, a ragged last chunk, one row starting on a document, one carrying its
     # initial state into its first: in bf16, and in fp32 at a smaller state.
-    "bf16": (2, 200, 6, 16, 2, 32, 64, torch.bfloat16, True),
-    "ragged-documents": (2, 100, 6, 16, 2, 16, 32, torch.float32, True),
+    "bf16": (2, 200, 6, 16, 2, 32, 64, "bfloat16", True),
+    "ragged-documents": (2, 100, 6, 16, 2, 16, 32, "float32", True),
     # Whole chunks, one group, no documents.
-    "whole-chunks": (1, 128, 4, 32, 1, 32, 64, torch.float32, False),
+    "whole-chunks": (1, 128, 4, 32, 1, 32, 64, "float32", False),
     # A state wider than one 128-wide product, as Falcon-H1's 256.
-    "wide-state-documents": (1, 48, 2, 16, 2, 256, 16, torch.float32, True),
+    "wide-state-documents": (1, 48, 2, 16, 2, 256, 16, "float32", True),
 }
 
 
-def operands(rng, batch, tokens, heads, width, groups, state, dtype, documents) -> dict[str, np.ndarray]:
-    """A case's inputs, those in `dtype` stored as the fp32 values they hold."""
+def operands(rng, batch, tokens, heads, width, groups, state, cast, documents) -> dict[str, np.ndarray]:
+    """A case's inputs, with `cast` narrowing native operands and storing their values in fp32."""
     def narrow(shape):
-        return torch.tensor(rng.standard_normal(shape), dtype=dtype).float().numpy()
+        return cast(rng.standard_normal(shape))
 
     starts = rng.random((batch, tokens)) < 3.0 / tokens
     starts[0, 0] = True
@@ -71,6 +67,8 @@ def minimal_truth(minimal, arrays, chunk):
     zero-dt steps writes nothing and decays by exp(0)=1, so the final state and every native output
     are unchanged. The artificial padding is removed before applying the original cotangents.
     """
+    import torch
+
     names = ("x", "dt", "A", "B", "C", "D", "h0")
     inputs = tuple(torch.tensor(arrays[name], dtype=torch.float64, device="cuda", requires_grad=True)
                    for name in names)
@@ -110,17 +108,27 @@ def write_seeded(scan, minimal, version, revision):
     """
     import jax
     import jax.numpy as jnp
-    from recorded_references import provenance, record_case
+    import torch
+    from recorded_references import provenance, record_case, save
     from reference_error import assert_computes_the_oracle, chain_roundings, widened
-    from ssd_support import mamba_ssd_xla, ssd_orbit
+    from ssd_support import mamba_ssd_draw, mamba_ssd_xla, ssd_orbit
 
     stored = {"precision": np.asarray("ieee")}
     for case, (*shape, chunk, dtype, documents) in CASES.items():
-        narrow_dtype = jnp.dtype(str(dtype).removeprefix("torch."))
+        narrow_dtype, dtype = jnp.dtype(dtype), getattr(torch, dtype)
         exact_run = jax.jit(lambda arrays, chunk=chunk: mamba_ssd_xla(arrays, chunk))
 
-        def draw(seed, shape=shape, dtype=dtype, documents=documents):
-            return ssd_orbit(operands(np.random.default_rng(seed), *shape, dtype, documents), seed)
+        def draw(seed, shape=shape, dtype=dtype, documents=documents, narrow_dtype=narrow_dtype):
+            inputs = ssd_orbit(operands(np.random.default_rng(seed), *shape,
+                                        lambda value: torch.tensor(value, dtype=dtype).float().numpy(),
+                                        documents), seed)
+            redrawn = mamba_ssd_draw(seed, shape, narrow_dtype, documents)
+            assert inputs.keys() == redrawn.keys(), f"mamba_ssm seed {seed}: regenerated inputs differ"
+            for name, value in inputs.items():
+                other = redrawn[name]
+                assert (value.dtype == other.dtype and value.shape == other.shape
+                        and value.tobytes() == other.tobytes()), f"mamba_ssm seed {seed}: {name} differs"
+            return inputs
 
         with jax.enable_x64(new_val=True):
             roundings = chain_roundings(jax.make_jaxpr(exact_run)(widened(draw(0))))
@@ -147,9 +155,11 @@ def write_seeded(scan, minimal, version, revision):
         stored.update(record_case(
             case, draw, evaluate,
             lambda arrays, chunk=chunk, dtype=narrow_dtype: mamba_ssd_xla(arrays, chunk, dtype),
-            truth_proxy=exact_run))
+            truth_proxy=exact_run, store_inputs=False))
         stored[f"{case}.chunk"] = np.int32(chunk)
         stored[f"{case}.dtype"] = np.asarray(str(narrow_dtype))
+        stored[f"{case}.shape"] = np.asarray(shape, np.int32)
+        stored[f"{case}.documents"] = np.bool_(documents)
     stored["provenance"] = provenance(
         f"mamba_ssm {version}", revision, torch.cuda.get_device_name(),
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu "
@@ -157,11 +167,15 @@ def write_seeded(scan, minimal, version, revision):
         truth="mamba_ssm.modules.ssd_minimal.ssd_minimal_discrete in torch float64, per padded document",
         cross_check="Dew XLA float64; assert_computes_the_oracle with its traced chain_roundings")
     destination = FIXTURE.with_name("ssd_mamba_ssm_seeded.npz")
-    np.savez_compressed(destination, **stored)
-    print(f"wrote {destination.name}", flush=True)
+    written = save(destination, stored, reference=f"mamba_ssm {version}", license="Apache-2.0")
+    print(f"wrote {destination.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
 
 
 def main() -> None:
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+
+    import torch
+
     sys.path.insert(0, sys.argv[1])
     from mamba_ssm import __version__
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
@@ -177,7 +191,10 @@ def main() -> None:
     rng = np.random.default_rng(SEED)
     stored = {}
     for name, (*shape, chunk, dtype, documents) in CASES.items():
-        arrays = operands(rng, *shape, dtype, documents)
+        dtype = getattr(torch, dtype)
+        arrays = operands(rng, *shape,
+                           lambda value, dtype=dtype: torch.tensor(value, dtype=dtype).float().numpy(),
+                           documents)
         cuda = {key: torch.tensor(value, device="cuda") for key, value in arrays.items()}
         narrow = {key: cuda[key].to(dtype).requires_grad_() for key in ("x", "B", "C")}
         wide = {key: cuda[key].clone().requires_grad_() for key in ("dt", "A", "D", "h0")}

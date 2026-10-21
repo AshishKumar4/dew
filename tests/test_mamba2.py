@@ -27,6 +27,7 @@ from reference_error import (
     assert_as_exact_as_the_reference,
     declared_seeds,
     indexed_recording,
+    recording,
     widened,
 )
 from ssd_support import mamba2_draw, mamba2_run
@@ -38,8 +39,7 @@ from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd, recurrent_ssd
 from dew.objectives.lm import LMObjective
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
-REFERENCE_SEEDS = declared_seeds(FIXTURES / "ssd_seeded.npz")
-"""Sized by seeds_for on the recorded transformers reference; recording date and CPU are in NPZ provenance."""
+SEEDED = FIXTURES / "ssd_seeded.npz"
 
 
 @pytest.fixture(scope="module")
@@ -49,7 +49,7 @@ def reference():
 
 @pytest.fixture(scope="module")
 def seeded_reference():
-    return dict(np.load(FIXTURES / "ssd_seeded.npz"))
+    return recording(SEEDED)
 
 
 @pytest.fixture(scope="module")
@@ -99,9 +99,10 @@ def operands(reference):
 
 def assert_recorded_as_exact(reference, site):
     """The recorded reference and its torch-float64 truth on each fresh native-input/orbit draw."""
-    draw, recorded, truth = indexed_recording(reference, site, REFERENCE_SEEDS[site])
+    seeds = declared_seeds(SEEDED)[site]
+    draw, recorded, truth = indexed_recording(reference, site, seeds, inputs_of=mamba2_draw)
     run = jax.jit(lambda index, inputs: mamba2_run(site, inputs))
-    assert_as_exact(run, recorded, draw, f"transformers {site}", seeds=REFERENCE_SEEDS[site], truth_fn=truth)
+    assert_as_exact(run, recorded, draw, f"transformers {site}", seeds=seeds, truth_fn=truth)
 
 
 def test_the_chunked_scan_matches_the_reference(seeded_reference):

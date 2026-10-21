@@ -3,8 +3,11 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tool_support import load
 
 from dew.nn.mixers.mamba2 import chunk_ssd, recurrent_ssd
+
+_mamba_ssm = load("mamba_ssd_reference")
 
 
 def ssd_orbit(arrays, seed):
@@ -53,6 +56,16 @@ def mamba2_draw(seed, shape=(2, 70, 4, 6, 2, 5)):
         "C": normal((batch, length, groups, state)), "D": normal((heads,)),
         "dt_bias": normal((heads,)), "h0": normal((batch, heads, width, state)),
     }, seed)
+
+
+def mamba_ssd_operands(rng, shape, dtype, documents):
+    """The upstream recorder's native operands without torch, including its bf16-to-fp32 storage."""
+    return _mamba_ssm.operands(rng, *shape, lambda value: value.astype(dtype).astype(np.float32), documents)
+
+
+def mamba_ssd_draw(seed, shape, dtype, documents):
+    """Regenerate a seeded mamba_ssm recording's native inputs and exact coordinate orbit."""
+    return ssd_orbit(mamba_ssd_operands(np.random.default_rng(seed), shape, dtype, documents), seed)
 
 
 def mamba2_run(site, arrays):
