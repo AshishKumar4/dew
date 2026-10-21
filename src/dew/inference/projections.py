@@ -14,7 +14,7 @@ packs what those hold packed (`packed_layout`).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -55,11 +55,12 @@ def _placed_alike(leaves: Sequence[object]) -> bool:
     devices, and one in pinned host memory is staged on its own, so either keeps its group apart."""
     if all(isinstance(leaf, np.ndarray) for leaf in leaves):
         return True
-    if not all(isinstance(leaf, jax.Array) for leaf in leaves):
+    arrays = [leaf for leaf in leaves if isinstance(leaf, jax.Array)]
+    if len(arrays) != len(leaves):
         return False
-    first = leaves[0].sharding
-    return all(leaf.sharding.is_equivalent_to(first, leaf.ndim)
-               and leaf.sharding.shard_shape(leaf.shape)[-1] == leaf.shape[-1] for leaf in leaves)
+    first = arrays[0].sharding
+    return all(array.sharding.is_equivalent_to(first, array.ndim)
+               and array.sharding.shard_shape(array.shape)[-1] == array.shape[-1] for array in arrays)
 
 
 def _concatenates(variables: Variables, group: ProjectionGroup) -> bool:
@@ -187,28 +188,60 @@ def packed_owned(model: nn.Module, variables: Variables) -> Variables:
     return variables
 
 
-def packed_layout(model: nn.Module, variables: Variables) -> tuple[tuple[ProjectionGroup, ...], Variables]:
-    """The groups `variables` hold packed, and the shapes of the tree they
-    were packed from, `pack_projections` undone: each packed kernel and bias
-    split back into its members by their widths, and the packed input
-    quantization each member's own again. A served model's reload takes
-    that tree and packs it again."""
-    shapes = unfreeze(dict(jax.tree.map(
-        lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables)))
-    groups = tuple(group for group in projection_groups(model, variables)
-                   if group.packed in _node(variables, "params", group.path))
+def _held_packed(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
+    """The groups `model` reads packed that `variables` hold packed."""
+    return tuple(group for group in projection_groups(model, variables)
+                 if group.packed in _node(variables, "params", group.path))
+
+
+type _Leaf = jax.Array | np.ndarray | jax.ShapeDtypeStruct
+
+
+def _split(variables: Variables, groups: Sequence[ProjectionGroup],
+           parts: Callable[[_Leaf, tuple[int, ...]], Sequence[_Leaf]]) -> Variables:
+    """`variables` with each of `groups`, packed, split back into its members, `parts(leaf,
+    widths)` giving a packed kernel's or bias's members, and the packed input quantization each
+    member's own again: `pack_projections` undone, on values or on shapes alike."""
+    split = unfreeze(dict(variables))
     for group in groups:
-        node = _node(shapes, "params", group.path)
-        packed = node.pop(group.packed)
-        for projection, width in zip(group.members, group.widths, strict=True):
-            node[projection] = {field: jax.ShapeDtypeStruct((*leaf.shape[:-1], width), leaf.dtype)
-                                for field, leaf in packed.items()}
-        quantized = _node(shapes, QUANTIZATION, group.path)
+        node = _node(split, "params", group.path)
+        packed = {field: parts(leaf, group.widths) for field, leaf in node.pop(group.packed).items()}
+        for index, projection in enumerate(group.members):
+            node[projection] = {field: members[index] for field, members in packed.items()}
+        quantized = _node(split, QUANTIZATION, group.path)
         if group.packed in quantized:
             scale = quantized.pop(group.packed)
             for projection in group.members:
                 quantized[projection] = scale
-    return groups, shapes
+    return split
+
+
+def packed_layout(model: nn.Module, variables: Variables) -> tuple[tuple[ProjectionGroup, ...], Variables]:
+    """The groups `variables` hold packed, and the shapes of the tree they
+    were packed from (`_split`). A served model's reload takes that tree and
+    packs it again."""
+    shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables)
+    groups = _held_packed(model, variables)
+    return groups, _split(shapes, groups, lambda leaf, widths: [
+        jax.ShapeDtypeStruct((*leaf.shape[:-1], width), leaf.dtype) for width in widths])
+
+
+def unpacked(model: nn.Module, variables: Variables) -> Variables:
+    """`variables` as training and an export read them, the model's own tree: each group they hold
+    packed (a loaded task's serving layout) split back into its members (`_split`), on the host one
+    group at a time, so the devices hold no second copy. A packed leaf no one process holds whole
+    splits where it lives. A tree that holds no group packed is returned as it is."""
+    groups = _held_packed(model, variables)
+    if not groups:
+        return variables
+
+    def parts(leaf, widths):
+        edges = np.cumsum(widths)[:-1].tolist()
+        if isinstance(leaf, jax.Array) and not leaf.is_fully_addressable:
+            return jnp.split(leaf, edges, axis=-1)
+        return np.split(np.asarray(leaf), edges, axis=-1)
+
+    return _split(variables, groups, parts)
 
 
 def inference_projections(model: nn.Module, variables: Variables) -> Variables:
