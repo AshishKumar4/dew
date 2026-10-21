@@ -314,7 +314,7 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 - `records=n` keeps `n` prepared records before the batch, as a validation split's `take(n)`; `host=` steps read each batch on the host, before any step on the accelerator. Every preset takes both.
 - `clips` draws a window `margin` seconds clear of the media's ends and its sound `context` seconds wider on each side; `missing="reject"` drops media without sound instead of filling silence, and `rejects=False` stops the run on media that is too short or does not decode.
 - `canvas` never packs: the objective splits each row at `prompt_length`. A tokenizer with no EOS cannot end a response, and is refused.
-- `cache=url` caches the preset's fixed steps (decode and resize, or tokenize). Augmentation, packing and batching run after the cache.
+- `cache=url` (or a `Cache`, or a published `Generation`) caches the preset's fixed steps: decode, resize and a fixed caption, tokenize, or render. Augmentation, a drawn caption, packing and batching run after the cache. The cache holds each input's outputs whatever order reads it, so a `shuffle`, `repeat` or `take` written before the preset reads the cache as it reads the inputs, in indexed and memory reads; a streamed read fills its cache shard by shard and refuses a view before it. A step that drops or expands records before such a view is refused, and is tracked in the roadmap.
 
 ### Where the rest of the chain goes
 
