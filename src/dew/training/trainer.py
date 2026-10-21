@@ -2059,15 +2059,12 @@ class Trainer(Generic[Loss, Effects]):
     def _own_profile_window(self) -> Profiler | None:
         """Take ownership of the capture a configured window will write.
 
-        A configured window must own the capture. When another profiler
-        already holds it, refuse before the dataset or the mesh do any work,
-        so neither trace is silently dropped or cut short. The window also
-        resolves its optional dependency here, rather than after warmup steps
-        have run.
+        A configured window must own the capture. When another profiler already holds it, refuse
+        before the dataset or the mesh do any work, so neither trace is silently dropped or cut short.
+        The window also resolves its optional dependency here, rather than after warmup steps have run.
 
-        Every rank either leaves owning a stopped Profiler or raises
-        together; a rank that proceeded alone would deadlock its peers at the
-        first collective of training.
+        Every rank either leaves owning a stopped Profiler or raises together; a rank that proceeded
+        alone would deadlock its peers at the first collective of training.
         """
         profile = self.profile
         if profile is None:
@@ -2110,15 +2107,12 @@ class Trainer(Generic[Loss, Effects]):
     def _counted_batch(self, batch: Batch) -> Batch:
         """Prepare host counts before placement, never fetch a device batch to count it.
 
-        The count is the capability: from the first batch whose work the
-        model or objective cannot declare (`MissingFlopsCount`, as a media
-        row's tower), this process counts no more, says why in the debug
-        log, and trains on. Its batches keep their work
-        columns, as unknown work (`uncounted`), so every process runs one
-        step program and the step's global sum leaves train/mfu unreported
-        pool-wide. One thread prepares batches, the prefetch worker or a
-        rollout's caller, and only it writes the reason. A count asked of the
-        objective directly stays strict.
+        The count is the capability: from the first batch whose work the model or objective cannot
+        declare (`MissingFlopsCount`, as a media row's tower), this process counts no more, says why in
+        the debug log, and trains on. Its batches keep their work columns, as unknown work
+        (`uncounted`), so every process runs one step program and the step's global sum leaves
+        train/mfu unreported pool-wide. One thread prepares batches, the prefetch worker or a rollout's
+        caller, and only it writes the reason. A count asked of the objective directly stays strict.
         """
         if self._count_work and self._refusal is None:
             try:
