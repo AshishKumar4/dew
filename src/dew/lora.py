@@ -84,7 +84,7 @@ from dew.quantization import (
     frozen_fp8_kernel,
     measured_fp8_sites,
 )
-from dew.registry import constructor_values, wrapper_layers
+from dew.registry import rebuilt, wrapper_layers
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -290,7 +290,10 @@ class Adapter:
     def binding(self) -> Bound:
         """The settings `model` was adapted with (`Bound`), the one record its branch computes from and
         `merge` and `save` read."""
-        return type(self.model)._dew_lora_interceptor.bound
+        adapted = type(self.model)
+        if not isinstance(adapted, AdaptedClass):
+            raise TypeError(f"{adapted.__name__} is not adapted, so it carries no adapter")
+        return adapted._dew_lora_bound
 
     @property
     def targets(self) -> Mapping[Path, Target]:
@@ -732,6 +735,7 @@ def _adapted(model: nn.Module, bound: Bound) -> nn.Module:
     class Adapted(adapted_base):
         # Staticmethods, or Flax would wrap the callables as module methods.
         _dew_lora_interceptor: ClassVar[Interceptor] = staticmethod(branch)
+        _dew_lora_bound: ClassVar[Bound] = bound
         _dew_wrapped: ClassVar[type[nn.Module]] = base
 
         @staticmethod
@@ -748,7 +752,7 @@ def _adapted(model: nn.Module, bound: Bound) -> nn.Module:
             return output, _fp8_packed(model, dict(freeze(variables, lambda path: path in factors)))
 
     Adapted.__name__ = Adapted.__qualname__ = base.__name__
-    return Adapted(**constructor_values(model))
+    return rebuilt(Adapted, model)
 
 
 @dataclass(frozen=True)
@@ -1222,11 +1226,11 @@ def unadapted(model: nn.Module) -> nn.Module:
     base, layers = wrapper_layers(type(model))
     if not any("_dew_lora_interceptor" in vars(layer) for layer in layers):
         return model
-    rebuilt = base(**constructor_values(model))
+    model = rebuilt(base, model)
     for layer in reversed(layers):
         if "_dew_lora_interceptor" not in vars(layer):
-            rebuilt = layer._dew_wrapper().apply(rebuilt)
-    return rebuilt
+            model = layer._dew_wrapper().apply(model)
+    return model
 
 
 @runtime_checkable
@@ -1239,6 +1243,7 @@ class AdaptedClass(Protocol):
     """
 
     _dew_lora_interceptor: ClassVar[Interceptor]
+    _dew_lora_bound: ClassVar[Bound]
 
 
 __all__ = ["Adapter", "AdapterRecord", "LoRA", "PeftConfig", "Target", "unadapted"]
