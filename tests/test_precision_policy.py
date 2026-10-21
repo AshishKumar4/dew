@@ -178,6 +178,27 @@ def test_a_compensated_running_sum_holds_its_value_rounded_in_its_high_half():
     assert np.float64(high) + np.float64(low) == exact
 
 
+def test_a_compensated_running_sum_that_reaches_an_infinity_is_the_plain_sum():
+    """A running pair keeps an infinity it is given, or rounds a sum to, with no residual, as IEEE
+    addition does: one infinity stays infinite, never inf - inf's NaN; opposite infinities and a NaN
+    give NaN; a finite sum past the largest float32 is infinite."""
+    from dew.nn import precision
+    inf, big = np.float32(np.inf), np.float32(3e38)
+    zero = jnp.zeros((), jnp.float32)
+
+    def running(values):
+        total = (zero, zero)
+        for value in values:
+            total = precision.compensated_add(total, (jnp.float32(value), zero))
+        return tuple(np.asarray(half) for half in total)
+
+    for values, infinity in (([inf], inf), ([1.0, inf, 2.0], inf), ([-inf, -1.0], -inf), ([big, big], inf),
+                             ([big, big, -big], inf)):
+        assert running(values) == (infinity, 0)
+    for values in ([inf, -inf], [np.float32(np.nan), 1.0], [inf, np.float32(np.nan)]):
+        assert np.isnan(running(values)[0])
+
+
 @pytest.mark.parametrize("bit_split,subtract,barrier", [(False, False, False), (True, False, True),
                                                        (True, True, False)],
                          ids=["projection", "norm", "division"])
