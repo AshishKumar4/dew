@@ -103,7 +103,7 @@ from reference_error import (
 )
 from residual_orders import orders, permuted, residual_width
 
-from dew.interop import Pretrained
+from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.safetensors_io import save_hf_layout
 from tools import decoder_export_reference as tool
 
@@ -1204,3 +1204,24 @@ def test_standalone_glm5_export_preserves_native_and_source_computation(variant,
             actual_leaves = flat_tree(restored.variables[collection])
             for name, value in flat_tree(variables[collection]).items():
                 np.testing.assert_array_equal(actual_leaves[name], value)
+
+
+@pytest.mark.parametrize("name", ["qwen3-moe-tiny", "deepseek-v3-tiny"])
+def test_a_moe_decoder_written_from_its_model_holds_its_sources_tensors(name, tmp_path):
+    """A causal MoE decoder written from its model and variables alone (`PretrainedDecoder.from_model`)
+    writes the tensors its source's own layout writes (`Pretrained.export`), each expert's projections
+    split from their stacked kernel and DeepSeek V3's balancing bias read from the `moe` collection,
+    bit for bit, and records `use_cache` as a causal decoder's config does."""
+    from safetensors.numpy import load_file
+
+    loaded = Pretrained.load(FIXTURES / name, dtype="float32", param_dtype="auto", attention_impl="xla")
+    expected = loaded.export()
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path)
+    written = {}
+    for shard in sorted(tmp_path.glob("*.safetensors")):
+        written.update(load_file(str(shard)))
+    assert set(written) == set(expected)
+    for tensor, value in expected.items():
+        value = np.asarray(value)
+        assert written[tensor].dtype == value.dtype and np.array_equal(written[tensor], value), tensor
+    assert json.loads((tmp_path / "config.json").read_text())["use_cache"] is True
