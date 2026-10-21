@@ -556,10 +556,21 @@ def test_durations_are_each_tests_least_time_over_green_runs_floors(ci):
         ci.durations([{"rows": [{"name": "3.12:tests/test_b.py", "exitCode": 0}]}])
 
 
+def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
+    """A task's wall time split among its files in proportion to their tests'
+    own times, and evenly where no test recorded one: recorded times whose
+    shares are exact in binary."""
+    assert ci.apportioned({"tests/test_a.py": 0.25, "tests/test_b.py": 0.75}, 2.0) == {
+        "tests/test_a.py": 0.5, "tests/test_b.py": 1.5}
+    assert ci.apportioned({"tests/test_a.py": 0.0, "tests/test_b.py": 0.0}, 3.0) == {
+        "tests/test_a.py": 1.5, "tests/test_b.py": 1.5}
+
+
 def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     """The plan weighs a file by what a task spends on it, its import and
-    collection included, so a task's rows add up to its wall time, split in
-    proportion to their tests' own times."""
+    collection included, so a task's rows add up to its wall time, split by
+    their tests' own times (`apportioned`): at least what the tests slept, at
+    most the task's wall time, and the longer sleep the larger row."""
     (tmp_path / "tests").mkdir(exist_ok=True)
     (tmp_path / "tests/test_short.py").write_text("import time\ndef test_a(): time.sleep(0.3)\n")
     (tmp_path / "tests/test_long.py").write_text("import time\ndef test_b(): time.sleep(0.9)\n")
@@ -574,7 +585,7 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     rows = {row["name"]: row["seconds"] for row in json.loads(out.read_text())["rows"]}
     short, long = rows["3.12:tests/test_short.py"], rows["3.12:tests/test_long.py"]
     assert 1.2 < short + long <= wall
-    assert long / short == pytest.approx(3.0, rel=0.25)
+    assert short < long
 
 
 def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch,
