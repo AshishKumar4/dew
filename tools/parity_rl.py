@@ -21,6 +21,13 @@ observed. Run it with an interpreter that has torch and jax:
 
   ~/Desktop/dew/.venv/bin/python tools/parity_rl.py
 
+`recording` records the advantage estimators over check 1's seeds instead
+(tools/recorded_references.py), each reference's float32 run beside verl's
+float64 run, every float32 pin widened, each seed's inputs drawn again by
+tests/test_rl_advantage.py (`advantage_inputs`):
+
+  PYTHONPATH=src:tools python tools/parity_rl.py recording
+
 Both references import their whole training stack at module scope (ray,
 tensordict and omegaconf for verl; metrax, jaxtyping and the SFT trainer for
 Tunix), so the reference files are compiled directly with those names stubbed.
@@ -112,6 +119,106 @@ DUAL_CLIP = 3.0
 EXTREME_KL_DIFF = np.array([[30.0, -5.0, 2.5]], dtype=np.float32)
 EXTREME_LOG_PROBS = np.full((1, 3), -1.0, dtype=np.float32)
 EXTREME_REF_LOG_PROBS = EXTREME_LOG_PROBS + EXTREME_KL_DIFF
+
+
+ESTIMATORS = ("masked_mean_rows", "masked_whiten", "group_advantage", "group_advantage_unnormalised",
+              "rloo_advantage", "gae_advantage", "gae_return")
+"""The advantage recording's leaves, one per estimator output."""
+
+
+def advantage_inputs(seed: int) -> dict[str, np.ndarray]:
+    """A seed's inputs to every estimator at the fixed fixture's shapes and masks: rewards in groups of
+    GROUP, the second group's equal (the case only the eps under the deviation divides), token rewards,
+    and values, large behind RESPONSE_MASK (which a recursion that reads them moves), the same on every
+    run. Check 1's draw for the recorded references."""
+    rng = np.random.default_rng([0xADB, seed])
+    rewards = rng.normal(size=REWARDS.shape).astype(np.float32)
+    rewards[GROUP:2 * GROUP] = rewards[GROUP]
+    values = rng.normal(size=VALUES.shape)
+    values = np.where(RESPONSE_MASK > 0, values, 7 * values).astype(np.float32)
+    return {"rewards": rewards, "token_rewards": rng.normal(size=TOKEN_REWARDS.shape).astype(np.float32),
+            "values": values}
+
+
+def verl_advantages(verl, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
+    """verl's estimators on `inputs` at the torch `dtype`."""
+    import torch
+
+    reductions = sys.modules["verl.utils.torch_functional"]
+
+    def tensor(x):
+        return torch.tensor(np.asarray(x), dtype=dtype)
+
+    rewards = inputs["rewards"]
+    token_level, ones = tensor(rewards[:, None]), tensor(np.ones((rewards.shape[0], 1)))
+    values, mask = tensor(inputs["values"]), tensor(RESPONSE_MASK)
+    found = {"masked_mean_rows": reductions.masked_mean(values, mask, axis=-1),
+             "masked_whiten": reductions.masked_whiten(values, mask)}
+    found["group_advantage"] = verl.compute_grpo_outcome_advantage(token_level.clone(), ones, UIDS)[0][:, 0]
+    found["group_advantage_unnormalised"] = verl.compute_grpo_outcome_advantage(
+        token_level.clone(), ones, UIDS, norm_adv_by_std_in_grpo=False)[0][:, 0]
+    found["rloo_advantage"] = verl.compute_rloo_outcome_advantage(token_level.clone(), ones, UIDS)[0][:, 0]
+    found["gae_advantage"], found["gae_return"] = verl.compute_gae_advantage_return(
+        tensor(inputs["token_rewards"]), values, mask, GAMMA, LAM)
+    return {name: found[name].detach().numpy() for name in ESTIMATORS}
+
+
+def tunix_advantages(tunix, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
+    """Tunix's estimators on `inputs` at the JAX `dtype`."""
+    import jax.numpy as jnp
+
+    rewards, values, mask = (jnp.asarray(inputs.get(name, RESPONSE_MASK), dtype)
+                             for name in ("rewards", "values", "response_mask"))
+    found = {"masked_mean_rows": tunix.masked_mean(values, mask, axis=-1),
+             "masked_whiten": tunix.masked_whiten(values, mask),
+             "group_advantage": tunix.compute_advantages(rewards, GROUP),
+             "group_advantage_unnormalised": tunix.compute_drgrpo_advantages(rewards, GROUP),
+             "rloo_advantage": tunix.compute_rloo_advantages(rewards, GROUP)}
+    found["gae_advantage"], found["gae_return"] = tunix.compute_gae_advantages(
+        jnp.asarray(inputs["token_rewards"], dtype), values, mask, GAMMA, LAM)
+    return {name: np.asarray(found[name]) for name in ESTIMATORS}
+
+
+def write_advantage_recording(verl, tunix, command: str, out: Path) -> None:
+    """recorded_advantage_<reference>.npz: each reference's estimators recorded over check 1's seeds
+    (`record_case`), its float32 run against verl's float64 run (every float32 pin widened,
+    tools/diffusers_wan_reference.py `float64`), the count planned on Dew's own estimators."""
+    import jax
+    import jax.numpy as jnp
+    import torch
+    from diffusers_wan_reference import float64
+    from fetched_fixtures import save
+    from recorded_references import provenance, record_case
+
+    from dew.rl.advantage import gae, group_advantage, masked_mean, masked_whiten, rloo_advantage
+
+    def truth(inputs):
+        with float64():
+            return verl_advantages(verl, inputs, torch.float64)
+
+    def proxy(inputs):
+        mask = jnp.asarray(RESPONSE_MASK, inputs["values"].dtype)
+        advantages, returns = gae(inputs["token_rewards"], inputs["values"], mask, gamma=GAMMA, lam=LAM)
+        return {"masked_mean_rows": masked_mean(inputs["values"], mask, axis=-1),
+                "masked_whiten": masked_whiten(inputs["values"], mask),
+                "group_advantage": group_advantage(inputs["rewards"], GROUP),
+                "group_advantage_unnormalised": group_advantage(inputs["rewards"], GROUP,
+                                                                normalise_by_std=False),
+                "rloo_advantage": rloo_advantage(inputs["rewards"], GROUP),
+                "gae_advantage": advantages, "gae_return": returns}
+
+    evaluations = {"verl": lambda inputs: (verl_advantages(verl, inputs, torch.float32), truth(inputs)),
+                   "tunix": lambda inputs: (tunix_advantages(tunix, inputs, jnp.float32), truth(inputs))}
+    for name, evaluate in evaluations.items():
+        with jax.enable_x64(new_val=True):
+            recorded = record_case(name, advantage_inputs, evaluate, proxy, truth_proxy=proxy,
+                                   store_inputs=False)
+        commit = {"verl": "896a9bb", "tunix": "b9f5e65"}[name]
+        recorded[f"{name}.provenance"] = provenance(name, commit, "cpu", command, torch=torch.__version__,
+                                                    truth="verl float64")
+        written = save(out / f"recorded_advantage_{name}.npz", recorded, reference=f"{name} {commit}",
+                       license="Apache-2.0")
+        print(f"{written}: {written.stat().st_size} bytes", flush=True)
 
 
 def stub(name, **attributes):
@@ -365,10 +472,16 @@ def write_surrogate(verl, tunix_common):
 def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("mode", nargs="?", choices=("recording",))
     parser.add_argument("--out", type=Path, default=FIXTURES)
-    out = parser.parse_args(argv).out
+    parsed = parser.parse_args(argv)
+    out = parsed.out
     verl = load_verl()
     tunix, tunix_common = load_tunix()
+    if parsed.mode == "recording":
+        write_advantage_recording(verl, tunix, "PYTHONPATH=src:tools python tools/parity_rl.py recording",
+                                  out)
+        return
 
     out.mkdir(parents=True, exist_ok=True)
     for name, written in (("advantage", write_advantage(verl, tunix)),
