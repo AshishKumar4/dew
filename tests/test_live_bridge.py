@@ -370,32 +370,30 @@ def test_the_context_smoke_loads_beside_the_bridge_it_reports_with(bridge):
     assert {"loadavg", "stalls", "cpu_ticks"} <= set(smoke.load())
 
 
-def test_a_training_context_caps_the_batch_of_every_way_a_cell_loads_data_and_its_steps(tmp_path):
-    """In a training context (live_training.install), a cell's bare source through dew.data.load, a
-    recipe through its loader and a recipe's own load each read batches of BATCH rows, and its fit,
-    called by another name with its steps unpacked, trains STEPS steps, each saying so first: IPython
-    runs the cell with its calls capped, and Dew's own functions are untouched."""
-    import numpy as np
-
-    np.arange(400, dtype=np.uint16).tofile(tmp_path / "train.bin")
-    np.arange(400, dtype=np.uint16).tofile(tmp_path / "val.bin")
-    cell = f"""
+def test_a_training_context_caps_the_batch_of_every_way_a_cell_loads_data_and_its_steps():
+    """In a training context (live_training.install), a cell's dataset batched itself, a preset called and
+    a preset through `pipe` each read batches of BATCH rows, and its fit, called by another name with its
+    steps unpacked, trains STEPS steps, each saying so first: IPython runs the cell with its calls capped,
+    and Dew's own functions are untouched."""
+    cell = """
+import numpy as np
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.config.data import TextData, loader
-from dew.data import Loading, Memory, load
+from dew.data import Memory, presets
+from dew.data.compile import compile as compile_data
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
-windows = TextData(source={str(tmp_path)!r}, seq_len=4, stride=1)
-options = dict(read="memory", loading=Loading(workers=0), validation_records=32)
-bare = load(Memory([{{"id": index}} for index in range(320)]), batch=64, provision=False,
-            loading=Loading(workers=0))
-batches = [bare.batch, loader(windows, batch=64, **options).batch, windows.load(batch=64, **options).batch]
+records = Memory([{"id": index} for index in range(320)])
+tokens = Memory([{"text": np.arange(400, dtype=np.int32)}])
+windows = dict(seq_len=4, pack=None, stride=1)
+batches = [compile_data(records.batch(64)).batch,
+           compile_data(presets.lm(tokens, None, batch=64, **windows)).batch,
+           compile_data(tokens.pipe(presets.lm, None, batch=64, **windows)).batch]
 model = CausalTransformer(vocab_size=400, emb_features=8, num_layers=1, num_heads=1, mlp_features=16,
                           max_seq_len=4)
 run = Trainer(LMObjective(model, seq_len=4), OptimConfig(learning_rate=1e-3), key=0).fit
-state = run(windows.load(batch=64, **options), **dict(steps=1000))
-print("ran", json.dumps([batches, int(state.step), load is dew.data.load]))
+state = run(tokens.pipe(presets.lm, None, batch=64, **windows), **dict(steps=1000))
+print("ran", json.dumps([batches, int(state.step), presets.lm is dew.data.presets.lm]))
 """
     code = f"""
 import json, sys
@@ -404,7 +402,7 @@ from IPython.core.interactiveshell import InteractiveShell
 import live_training
 shell = InteractiveShell.instance()
 live_training.install()
-shell.run_cell("import json, dew.data")
+shell.run_cell("import json, dew.data.presets")
 shell.run_cell({cell!r}).raise_error()
 """
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600,
