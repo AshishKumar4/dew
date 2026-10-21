@@ -1306,8 +1306,10 @@ def test_a_quantized_packed_kernel_splits_into_its_members_bit_for_bit(tile):
     """A served task's packed query, key and value kernel, Qwix's quantized array in its serving wrapper,
     split by its members' widths (`split_columns`): each member dequantizes to exactly the packed
     kernel's dequantized columns, with the wrapper's recipe kept, with the input axis's scales per
-    channel or tiled; a kernel tiled along its output axis splits at whole tiles, and a split that
-    would cut a tile is refused."""
+    channel or tiled; Qwix's other layouts split as exactly (scales tiled along the split, one shared
+    scale, a zero point, float8, the other axis), as plain host and device arrays do; a split that would
+    cut a tile, or whose widths do not partition the axis, is refused. A leaf this process cannot
+    materialize whole is `projections.unpacked`'s sharded tests' to cover."""
     import json
     from pathlib import Path
 
@@ -1330,9 +1332,21 @@ def test_a_quantized_packed_kernel_splits_into_its_members_bit_for_bit(tile):
     for member, start, stop in zip(members, edges[:-1], edges[1:], strict=True):
         assert member.how == packed.how
         np.testing.assert_array_equal(np.asarray(qwix.dequantize(member.array)), whole[..., start:stop])
-    columns = qwix.quantize(jnp.asarray(whole), jnp.int8, tiled_axes={1: 16})
-    halves = split_columns(columns, (16, width - 16))
-    joined = np.concatenate([np.asarray(qwix.dequantize(half)) for half in halves], axis=1)
-    np.testing.assert_array_equal(joined, np.asarray(qwix.dequantize(columns)))
+    layouts = {"tiled along the split": {"qtype": jnp.int8, "tiled_axes": {1: 16}},
+               "one scale shared": {"qtype": jnp.int8},
+               "a zero point": {"qtype": jnp.int8, "channelwise_axes": (1,), "calibration_method": "minmax"},
+               "float8": {"qtype": jnp.float8_e4m3fn, "channelwise_axes": (1,)}}
+    for name, how in layouts.items():
+        columns = qwix.quantize(jnp.asarray(whole), **how)
+        halves = split_columns(columns, (16, width - 16))
+        joined = np.concatenate([np.asarray(qwix.dequantize(half)) for half in halves], axis=1)
+        np.testing.assert_array_equal(joined, np.asarray(qwix.dequantize(columns)), err_msg=name)
+    rows = split_columns(qwix.quantize(jnp.asarray(whole), jnp.int8, channelwise_axes=(1,)), (16, 48), axis=0)
+    assert [part.qvalue.shape[0] for part in rows] == [16, 48]
+    for plain in (whole, jnp.asarray(whole)):
+        np.testing.assert_array_equal(np.concatenate(split_columns(plain, widths), axis=-1), whole)
     with pytest.raises(ValueError):
-        split_columns(columns, (8, width - 8))
+        split_columns(qwix.quantize(jnp.asarray(whole), jnp.int8, tiled_axes={1: 16}), (8, width - 8))
+    for wrong in ((), (16,), (16, width), (-16, width + 16)):
+        with pytest.raises(ValueError):
+            split_columns(packed, wrong)
