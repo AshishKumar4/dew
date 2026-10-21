@@ -47,6 +47,8 @@ import concurrent.futures
 import contextlib
 import dataclasses
 import enum
+import functools
+import hashlib
 import importlib
 import json
 import logging
@@ -348,8 +350,8 @@ class KernelOp(tokamax.Op):
     (group sizes, indices) overrides `operands`. A template names in `HOOKS`
     its fields and arguments that hold the plain functions it traces in (a
     score or epilogue hook, closures as often as not): its picks key on
-    whether each is there, never on which function it is (`_traced`), so
-    every launch's picks store and read back alike.
+    what each computes (`_traced`), never on the function object, so every
+    launch's picks store and read back alike.
     """
 
     ROWS: ClassVar[tuple[str, ...]] = ()
@@ -457,14 +459,10 @@ class KernelOp(tokamax.Op):
                 else jnp.zeros(spec.shape, spec.dtype) for key, spec in zip(keys, specs, strict=True)]
 
 
-TRACED = "traced"
-"""What a hook's function is in a pick's key (`_traced`)."""
-
-
 def _traced(value: object) -> object:
-    """`value` with every function in it, through dataclasses, tuples, lists and mappings, as `TRACED`:
-    a hook keys a pick by its presence and the rest of its value (its axes, its dtypes), not by which
-    function it is, which a closure could not be stored as. None stays None."""
+    """`value` with every function in it, through dataclasses, tuples, lists and mappings, as the digest
+    of its computation (`_computation`), so a hook keys a pick by what it computes and by the rest of its
+    value (its axes, its dtypes), and a closure, which has no name to store, stores. None stays None."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return dataclasses.replace(value, **{field.name: _traced(getattr(value, field.name))
                                              for field in dataclasses.fields(value) if field.init})
@@ -473,8 +471,57 @@ def _traced(value: object) -> object:
     if isinstance(value, Mapping):
         return {name: _traced(item) for name, item in value.items()}
     if callable(value) and not isinstance(value, type):
-        return TRACED
+        return f"traced:{_computation(value)}"
     return value
+
+
+def _computation(function: Callable) -> str:
+    """A digest of what `function` computes, the same in every process: its code, through nested code
+    objects, with the names and constants it reads, and what it closes over or is partial in, a number
+    or string by value, an array by its shape and dtype, a function by its own digest. Two closures over
+    equal values digest alike; other code or other captured values digest apart."""
+    digest = hashlib.sha256()
+    visited: set[int] = set()
+
+    def code(body: types.CodeType) -> None:
+        digest.update(body.co_code)
+        digest.update(repr(body.co_names).encode())
+        for constant in body.co_consts:
+            if isinstance(constant, types.CodeType):
+                code(constant)
+            else:
+                static(constant)
+
+    def static(item: object) -> None:
+        if id(item) in visited:
+            return
+        visited.add(id(item))
+        if isinstance(item, functools.partial):
+            static(item.func)
+            static(item.args)
+            static(sorted(item.keywords.items()))
+        elif isinstance(item, types.FunctionType):
+            digest.update(f"{item.__module__}:{item.__qualname__}".encode())
+            code(item.__code__)
+            static(item.__defaults__)
+            for cell in item.__closure__ or ():
+                static(cell.cell_contents)
+        elif isinstance(item, (jax.Array, np.ndarray)):
+            digest.update(repr((item.shape, str(item.dtype))).encode())
+        elif isinstance(item, (tuple, list)):
+            for entry in item:
+                static(entry)
+        elif isinstance(item, (set, frozenset)):
+            # A set's order follows the process's string hashing; its entries' sorted forms do not.
+            digest.update(repr(sorted(repr(entry) for entry in item)).encode())
+        elif item is None or isinstance(item, (bool, int, float, complex, str, bytes)):
+            digest.update(repr(item).encode())
+        else:
+            digest.update(f"{type(item).__module__}:{type(item).__qualname__}:"
+                          f"{getattr(item, '__name__', '')}".encode())
+
+    static(function)
+    return digest.hexdigest()[:16]
 
 
 def _identity(op: tokamax.Op) -> tokamax.Op:
@@ -735,7 +782,9 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     (`seen`); process 0 takes its stored pick for each, with `measure`
     measuring and storing one for a launch without where it has its GPU to
     itself, and every process takes exactly process 0's configs (`_settle`).
-    Where that changes a config the lowering traced, it lowers again: a
+    Where that changes a config the lowering traced, it lowers again, and
+    settles the launches that lowering traces anew (a launch whose identity
+    another's config names), until none is new: a
     launch's description in the program, which tokamax reads its launches out
     of (`launches`), keeps it from the persistent cache, so reading them so
     took a lowering of its own, about 62 s of each cold plan candidate's
@@ -748,10 +797,20 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     tuned = cache.KERNEL_TUNES.get_global()
     with seen() as found:
         lowered = lower()
-    distinct = _distinct(found)
-    _settle(distinct, measure=measure)
-    if cache.KERNEL_TUNES.get_global() != tuned:
-        lowered = lower()
+    distinct = pending = _distinct(found)
+    while pending:
+        _settle(pending, measure=measure)
+        if cache.KERNEL_TUNES.get_global() == tuned:
+            break
+        # A settled config can name a later launch (one launch takes another's tiles), so the program
+        # lowers again and settles each launch it traces anew; launches are finitely many, so it ends.
+        tuned = cache.KERNEL_TUNES.get_global()
+        with seen() as found:
+            lowered = lower()
+        known = {(_identity(ba.op), ba.autotuning_cache_key) for _, ba in distinct}
+        pending = [(op, ba) for op, ba in _distinct(found)
+                   if (_identity(ba.op), ba.autotuning_cache_key) not in known]
+        distinct = [*distinct, *pending]
     return lowered, dumps_launches([ba for _, ba in distinct])
 
 

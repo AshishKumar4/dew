@@ -132,10 +132,11 @@ class _HookedKernel(tuning.KernelOp):
         return {1, 2}
 
 
-def test_a_hooked_launch_keys_by_its_hooks_presence_and_round_trips():
-    """A template's traced functions, closures among them, key its picks by whether each is there, not
-    by which function it is: two closures key alike and store and read back as the same launch; hooks
-    whose other fields differ (axes) key apart, and so does a launch without the function."""
+def test_a_hooked_launch_keys_by_what_its_hooks_compute_and_round_trips():
+    """A template's traced functions, closures among them, key its picks by what they compute: two
+    closures over equal values key alike and store and read back as the same launch; a closure over
+    another value, hooks whose other fields differ (axes), and a launch without the function key
+    apart."""
     def closure(scale):
         return lambda tile: tile * scale
 
@@ -145,12 +146,13 @@ def test_a_hooked_launch_keys_by_its_hooks_presence_and_round_trips():
         op = _HookedKernel(prologue=prologue)
         return op.keyed(op.bind(x, _Hooks(epilogue, axes)))
 
-    first, second = keyed(closure(2.0), closure(3.0), (0,)), keyed(closure(5.0), closure(7.0), (0,))
-    assert (tuning._identity(first.op), first.autotuning_cache_key) == (
-        tuning._identity(second.op), second.autotuning_cache_key)
-    [again] = tuning.loads_launches(tuning.dumps_launches([first]))
-    assert (again.op, again.autotuning_cache_key) == (tuning._identity(first.op), first.autotuning_cache_key)
-    other_axes, no_prologue = keyed(closure(2.0), closure(3.0), (1,)), keyed(None, closure(3.0), (0,))
-    assert other_axes.autotuning_cache_key != first.autotuning_cache_key
-    assert tuning._identity(no_prologue.op) != tuning._identity(first.op)
+    def key(launch):
+        return tuning._identity(launch.op), launch.autotuning_cache_key
 
+    first, again_alike = keyed(closure(2.0), closure(3.0), (0,)), keyed(closure(2.0), closure(3.0), (0,))
+    assert key(first) == key(again_alike)
+    [again] = tuning.loads_launches(tuning.dumps_launches([first]))
+    assert (again.op, again.autotuning_cache_key) == key(first)
+    for other in (keyed(closure(5.0), closure(3.0), (0,)), keyed(closure(2.0), closure(7.0), (0,)),
+                  keyed(closure(2.0), closure(3.0), (1,)), keyed(None, closure(3.0), (0,))):
+        assert key(other) != key(first)

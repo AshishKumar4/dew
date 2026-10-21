@@ -156,10 +156,30 @@ def test_a_query_that_sees_no_key_reads_zero_and_a_sink_keeps_its_share():
 
 SCORE_HOOKS = {"none": (), "softcap": ("softcap",), "sinks": ("sinks",), "alibi": ("alibi",),
                "temperature": ("temperature",), "key-bias": ("key",), "tile-bias": ("tile",),
-               "resumed": ("resumed",), "softcap-sinks-alibi": ("softcap", "sinks", "alibi")}
+               "resumed": ("resumed",), "custom-vjp": ("custom",),
+               "softcap-sinks-alibi": ("softcap", "sinks", "alibi")}
 """The score hooks the backward differentiates, each kind of parameter among them: ALiBi's slopes a
 head's, a query's temperature (divided by, so padding's zeros would be infinite slopes), a per-key bias,
-a dense bias; and the softmax's initial state as sinks or as a resumed partial."""
+a dense bias, a softcap through a `jax.custom_vjp` (which forward-mode differentiation refuses); and the
+softmax's initial state as sinks or as a resumed partial."""
+
+
+@jax.custom_vjp
+def custom_softcap(s):
+    """A softcap whose derivative is its own rule, as a hook may call one."""
+    return SOFTCAP * jnp.tanh(s / SOFTCAP)
+
+
+def _custom_softcap_forward(s):
+    capped = custom_softcap(s)
+    return capped, capped
+
+
+def _custom_softcap_backward(capped, cotangent):
+    return (cotangent * (1 - (capped / SOFTCAP) ** 2),)
+
+
+custom_softcap.defvjp(_custom_softcap_forward, _custom_softcap_backward)
 
 BACKWARD_SEEDS = {(("alibi",), "float32"): 64, (("alibi",), "bfloat16"): 128,
                   (("alibi",), "float16"): 128, (("sinks",), "bfloat16"): 16,
@@ -184,6 +204,8 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32):
         values = list(values)
         if "softcap" in names:
             s = SOFTCAP * jnp.tanh(s / SOFTCAP)
+        if "custom" in names:
+            s = custom_softcap(s)
         if "alibi" in names:
             s = s + values.pop(0).astype(s.dtype) * k_pos.astype(s.dtype)
         if "temperature" in names:
@@ -212,7 +234,7 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32):
             initial = template.Initial(jax.random.normal(streams[5], (ROWS, 4, queries)), total, acc)
         return tuple(params), initial
 
-    scoring = bool({"softcap", "alibi", "temperature", "key", "tile"} & set(names))
+    scoring = bool({"softcap", "custom", "alibi", "temperature", "key", "tile"} & set(names))
     return (score_mod if scoring else None), tuple(kinds), draw
 
 
@@ -281,6 +303,28 @@ def test_the_backward_is_on_par_under_every_score_hook(hooks, dtype):
     """Each score hook over causal packed documents under a window: the gradients of its parameters and
     of the initial state too."""
     check_backward(CASES["causal-documents-window"], hooks, dtype, PINNED[0])
+
+
+def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wide():
+    """Under x64, a float64 ALiBi slope reaches the kernels as its fp32 value, which they compute in, and
+    its gradient returns in float64, equal to the fp32 slope's."""
+    case = CASES["causal-window"]
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    score_mod, kinds, draw_hooks = score_hooks(("alibi",), queries, keys)
+    query, key, value = drawing(queries, keys, jnp.float32)(0)
+    dout = jax.random.normal(jax.random.key(5), query.shape, jnp.float32)
+    (slopes,), _ = draw_hooks(0)
+    with jax.enable_x64(new_val=True), tuning.pinned({attention_triton.TritonDq: PINNED[0],
+                                                       attention_triton.TritonDkv: PINNED[0]}):
+        grads = [attention_triton.backward(query, key, value, spans,
+                                           template.Hooks(score_mod, (template.Param(wide, kinds[0]),)), dout,
+                                           interpret=not ON_GPU)
+                 for wide in (slopes.astype(jnp.float64), slopes)]
+    assert grads[0].score_params[0].dtype == jnp.float64
+    np.testing.assert_array_equal(np.asarray(grads[0].score_params[0], np.float32),
+                                  np.asarray(grads[1].score_params[0]))
+    np.testing.assert_array_equal(np.asarray(grads[0].query), np.asarray(grads[1].query))
 
 
 def test_the_backward_resumes_queries_that_read_no_key():
