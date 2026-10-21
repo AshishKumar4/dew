@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, equations, float64_terms
+from reference_error import assert_as_exact_as_the_reference, equations, float64_terms, with_gradients
 
 from dew.nn.dense import Dense
 from dew.nn.joined import joined_dense
@@ -45,15 +45,6 @@ def assert_joined_as_exact(choice: str, run, arguments, wide_run):
         assert_as_exact_as_the_reference(mine, theirs, want, jax.tree_util.keystr(path), terms=size)
 
 
-def gradients(apply):
-    """`apply`'s output and the gradients of its arguments under a cotangent, the last argument."""
-    def run(*arguments):
-        out, pull = jax.vjp(apply, *arguments[:-1])
-        return out, *pull(arguments[-1])
-
-    return run
-
-
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("bias", [False, True])
 def test_gate_and_up_joined_are_as_exact_as_apart_from_float64(dtype, bias):
@@ -71,8 +62,8 @@ def test_gate_and_up_joined_are_as_exact_as_apart_from_float64(dtype, bias):
         assert dots(layer.apply, params, x) == 3
     with row_joins("gate_up"):
         assert dots(layer.apply, params, x) == 2
-    assert_joined_as_exact("gate_up", gradients(layer.apply), (params, x, cotangent),
-                           gradients(layer.clone(dtype=jnp.float64).apply))
+    assert_joined_as_exact("gate_up", with_gradients(layer.apply), (params, x, cotangent),
+                           with_gradients(layer.clone(dtype=jnp.float64).apply))
 
 
 def test_joined_projections_keep_the_dtype_their_promotion_gives_a_wider_bias():
@@ -121,5 +112,5 @@ def test_a_delta_nets_gates_joined_are_as_exact_as_apart_from_float64(dtype):
         apart = dots(layer.apply, params, x)
     with row_joins("delta_gates"):
         assert dots(layer.apply, params, x) == apart - 1
-    assert_joined_as_exact("delta_gates", gradients(layer.apply), (params, x, cotangent),
-                           gradients(layer.clone(dtype=jnp.float64).apply))
+    assert_joined_as_exact("delta_gates", with_gradients(layer.apply), (params, x, cotangent),
+                           with_gradients(layer.clone(dtype=jnp.float64).apply))
