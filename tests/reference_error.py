@@ -63,7 +63,6 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
 import dataclasses
-import functools
 import hashlib
 import math
 
@@ -299,27 +298,29 @@ signs, is refused with probability under 2e-12 (a Rademacher sum's square is no 
 normal's: Chernoff's bound on a chi-square of SKETCH degrees past 2.5² times its mean). A single
 element's move past 2.5 times the bound is refused always; a wider move past it in norm is refused but
 for its chance of lying near the signs' complement, which is no guarantee: two entries swapped whose
-sign words agree (one pair in 2^16) move no projection, at every seed alike."""
+sign words agree move no projection, one pair in 2^16 at a seed, and each seed draws its own signs, so
+a wrong truth repeated over a site's seeds hides at all of them only by that chance to their power."""
 SKETCH_BLOCK = 64
 """The entries `truth_sketch` sums in float64 in one block, each block's sum then summed exactly: its
 rounding at most gamma(SKETCH_BLOCK) of the magnitudes', in whatever order a host takes a block."""
 
 
-@functools.cache
-def _sign_bits(size: int) -> np.ndarray:
-    """SKETCH random signs for each of `size` entries, one bit a sign, the same on every host and run."""
-    return np.random.default_rng([0x5E7C4, size]).integers(0, 1 << SKETCH, size, dtype=np.uint32)
+def _sign_bits(size: int, seed: int) -> np.ndarray:
+    """SKETCH random signs for each of `size` entries at a recorded seed, one bit a sign, the same on every
+    host and run, and drawn apart at every seed."""
+    return np.random.default_rng([0x5E7C4, size, seed]).integers(0, 1 << SKETCH, size, dtype=np.uint32)
 
 
-def truth_sketch(truth) -> np.ndarray:
-    """A float64 truth leaf's sketch `[SKETCH]`: its entries summed under SKETCH random signs, each sign's
+def truth_sketch(truth, seed: int) -> np.ndarray:
+    """A float64 truth leaf's sketch `[SKETCH]` at a recorded seed: its entries summed under SKETCH random
+    signs of that seed's own (`_sign_bits`), each sign's
     product exact, in blocks of SKETCH_BLOCK whose float64 sums are summed exactly (`math.fsum`), so a
     truth recomputed apart is held to the recorded one without the recording keeping it, every host
     rounding the sketch alike within `sketch_rounding` (`indexed_recording`)."""
     flat = np.asarray(truth, np.float64).reshape(-1)
     if not flat.size:
         return np.zeros(SKETCH)
-    bits, shifts, partials = _sign_bits(flat.size), np.arange(SKETCH, dtype=np.uint32), []
+    bits, shifts, partials = _sign_bits(flat.size, seed), np.arange(SKETCH, dtype=np.uint32), []
     for start in range(0, flat.size, 1 << 16):
         chunk = flat[start:start + (1 << 16)]
         signs = ((bits[start:start + chunk.size, None] >> shifts) & 1).astype(np.float64) * 2 - 1
@@ -683,7 +684,7 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
             oracle = 2 * roundings["count"] * eps * norm
             magnitude = float(np.sum(np.abs(value))) * (1 + value.size * eps) + np.sqrt(value.size) * oracle
             bound = (SKETCH_DEVIATIONS * oracle + 2 * sketch_rounding(magnitude)) * (1 + 1e-6)
-            apart = truth_sketch(value) - recorded
+            apart = truth_sketch(value, index) - recorded
             # Its root mean square, scaled by its largest first so no square overflows.
             widest = float(np.max(np.abs(apart))) if apart.shape == recorded.shape else np.inf
             away = (widest * float(np.sqrt(np.mean(np.square(apart / widest)))) if 0 < widest < np.inf
