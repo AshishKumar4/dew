@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from generation_support import INTERPRETS, generations, lowers
 from jax.sharding import Mesh
-from reference_error import assert_as_exact_as_the_reference, equations
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations
 
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.templates import cost
@@ -196,6 +196,10 @@ def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
                 lowering_platforms=("cuda",))
 
 
+SIGMOID_SEEDS = 8
+"""The widened sigmoid's declared draws (`reference_error.seeds_for` of XLA's on them)."""
+
+
 def bf16_reciprocal(x):
     return 1 / x
 
@@ -231,24 +235,23 @@ def test_a_hooks_16_bit_divisions_lower_for_cuda(launch, generation_name):
 
 
 def test_a_hooks_widened_16_bit_operations_round_as_xla_s():
-    """Every bf16 value through the 16-bit operations a kernel computes in fp32 (`Hooks.before`): a division
-    and a negative power give XLA's bits; a sigmoid, rounded once where XLA's 16-bit form rounds each step,
-    is never further from the float64 value than XLA's."""
+    """Every bf16 value through the division and negative power a kernel computes in fp32
+    (`Hooks.before`) gives XLA's bits."""
     every = jax.lax.bitcast_convert_type(jnp.arange(-(2 ** 15), 2 ** 15, dtype=jnp.int32).astype(jnp.int16),
                                          jnp.bfloat16)
-
-    def widened_and_xla(hook):
-        return (np.asarray(jax.jit(grouped_matmul.Hooks(hook).before())(every), np.float64),
-                np.asarray(jax.jit(hook)(every), np.float64))
-
     for hook in (bf16_reciprocal, lambda x: x ** -2):
-        widened, xla = widened_and_xla(hook)
-        np.testing.assert_array_equal(widened, xla)
-    widened, xla = widened_and_xla(jax.nn.sigmoid)
-    with np.errstate(over="ignore"):
-        exact = 1 / (1 + np.exp(-np.asarray(every, np.float64)))
-    np.testing.assert_array_equal(np.isnan(widened), np.isnan(xla))
-    assert not np.any(np.abs(widened - exact) > np.abs(xla - exact))
+        np.testing.assert_array_equal(np.asarray(jax.jit(grouped_matmul.Hooks(hook).before())(every)),
+                                      np.asarray(jax.jit(hook)(every)))
+
+
+def test_a_hooks_widened_sigmoid_holds_check_1():
+    """A bf16 sigmoid a kernel computes in fp32 and rounds once (`Hooks.before`) holds check 1 against
+    XLA's bf16 sigmoid, which rounds each step."""
+    def draw(seed):
+        return (jnp.asarray(np.random.default_rng(seed).normal(scale=4.0, size=(64, 128)), jnp.bfloat16),)
+
+    assert_as_exact(jax.jit(grouped_matmul.Hooks(jax.nn.sigmoid).before()), jax.jit(jax.nn.sigmoid), draw,
+                    "a widened bf16 sigmoid", seeds=SIGMOID_SEEDS)
 
 
 def test_a_forced_implementation_runs_or_says_why_it_cannot():
