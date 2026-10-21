@@ -52,7 +52,8 @@ def _placed_alike(leaves: Sequence[object]) -> bool:
     The packed leaf then takes that sharding, and its product splits back into the members' on
     the devices that computed it. A member split on its last axis (a tensor-parallel layout's
     heads, an FSDP layout's widest axis) would leave its packed columns on another member's
-    devices, and one in pinned host memory is staged on its own, so either keeps its group apart."""
+    devices, and members in different memory spaces (one offloaded to pinned host memory, which the
+    layer stages on its own) do not concatenate where they are, so either keeps its group apart."""
     if all(isinstance(leaf, np.ndarray) for leaf in leaves):
         return True
     arrays = [leaf for leaf in leaves if isinstance(leaf, jax.Array)]
@@ -230,7 +231,8 @@ def unpacked(model: nn.Module, variables: Variables) -> Variables:
     """`variables` as training and an export read them, the model's own tree: each group they hold
     packed (a loaded task's serving layout) split back into its members (`_split`), on the host one
     group at a time, so the devices hold no second copy. A packed leaf no one process holds whole
-    splits where it lives. A group stored quantized for serving (`TextGeneration.quantized`, Qwix's
+    splits where it lives; one every process holds whole (replicated) splits on the host too. A
+    group stored quantized for serving (`TextGeneration.quantized`, Qwix's
     arrays in place of its kernel) stays packed: such a tree computes only as the served model it
     was quantized for, which reads it packed. A tree that holds no group to split is returned as it
     is."""
@@ -242,7 +244,7 @@ def unpacked(model: nn.Module, variables: Variables) -> Variables:
 
     def parts(leaf, widths):
         edges = np.cumsum(widths)[:-1].tolist()
-        if isinstance(leaf, jax.Array) and not leaf.is_fully_addressable:
+        if isinstance(leaf, jax.Array) and not (leaf.is_fully_addressable or leaf.is_fully_replicated):
             return jnp.split(leaf, edges, axis=-1)
         return np.split(np.asarray(leaf), edges, axis=-1)
 
