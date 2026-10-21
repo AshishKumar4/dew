@@ -7,7 +7,7 @@ configuration and checkpoint files; no external model implementation runs.
 
 import json
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Literal
@@ -359,6 +359,16 @@ def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict 
     return None
 
 
+def kl_config[ConfigT: Mapping](config: ConfigT, where: object) -> ConfigT:
+    """`config`, an AutoencoderKL's: one that names another class (`_class_name`, a Wan or Qwen-Image
+    VAE's) is refused, naming it, before its tensors meet the KL tree; one that names none is taken
+    as the AutoencoderKL older checkpoints are."""
+    named = config.get("_class_name")
+    if named is not None and named != "AutoencoderKL":
+        raise ValueError(f"{where} holds a {named}, not an AutoencoderKL")
+    return config
+
+
 def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) -> dict:
     """Read a pretrained AutoencoderKL's config and params, local or from the Hub.
 
@@ -377,12 +387,13 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) 
     if os.path.isdir(modelname):
         directory = Path(modelname)
         with open(directory / "config.json") as handle:
-            config = json.load(handle)
+            config = kl_config(json.load(handle), directory)
         return {"config": config, "params": _read_vae_weights(directory) if params is None else params}
 
     errors: list[Exception] = []
     loaded = _load_from_hub(modelname, revision, params, errors)
     if loaded is not None:
+        kl_config(loaded["config"], modelname)
         return loaded
     last_error = errors[-1] if errors else None
     pinned = revision not in FLAX_REVISIONS

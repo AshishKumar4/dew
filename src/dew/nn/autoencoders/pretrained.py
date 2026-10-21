@@ -9,6 +9,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
+import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
@@ -22,7 +23,7 @@ from .kl import AutoencoderKL
 from .qwen_image import load_qwen_image_vae
 from .rae import load_rae
 from .sd_vae import StableDiffusionVAE, published_normalization
-from .vae import FLAX_REVISIONS, _vae_path
+from .vae import FLAX_REVISIONS, _vae_path, kl_config
 from .wan import load_wan_vae
 
 if TYPE_CHECKING:
@@ -70,13 +71,16 @@ def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
     standalone one is read by `StableDiffusionVAE` instead, which also reads
     the SD1-era flax layouts on their own revisions (`load_pretrained_vae`)."""
     directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
-    model = AutoencoderKL.from_diffusers(config, compute)
+    model = AutoencoderKL.from_diffusers(kl_config(config, directory), compute)
     shift, scale = published_normalization(config)
+    image = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
+                                 jnp.float32)
     return bind_component(
         directory, "vae", config, model, _vae_path,
         lambda bound: StableDiffusionVAE(str(name_or_dir), dtype=compute, params=bound, model=model,
                                          latent_shift=shift, latent_scale=scale),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, shapes=shapes)
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(image,),
+        shapes=shapes)
 
 
 def _published(modelname: str, revision: str) -> tuple[str | None, str | None]:
