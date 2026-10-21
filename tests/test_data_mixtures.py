@@ -32,17 +32,7 @@ from token_support import write_token_corpus
 from dew.config.data import TextData, loader
 from dew.data import Files, Loading, Memory
 from dew.data.compile import compile, publish, validation
-from dew.data.dataset import (
-    CAPTION,
-    DataPartition,
-    DataPhase,
-    GlobalStream,
-    Loader,
-    Ramp,
-    Stage,
-    ramped,
-    update_aligned,
-)
+from dew.data.dataset import CAPTION, DataPartition, DataPhase, GlobalStream, Loader, Ramp, Stage, ramped
 from dew.data.images import EncodeCaptions
 from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
@@ -1026,13 +1016,16 @@ def test_a_ramp_stage_begins_where_an_update_does_and_an_update_pools_one_stage(
 def test_each_aligned_stage_begins_from_its_own_schedule_and_one_left_no_step_is_dropped():
     """Every stage's start moves to the update boundary at or after its own, not after the moved
     start before it, so no stage drifts past its end; a stage whose start and the next's meet
-    there runs no step and is gone."""
-    stages = (Stage(batch=4, records=0), Stage(batch=8, records=4), Stage(batch=12, records=12),
-              Stage(batch=16, records=60))
-    # Nominal starts at steps 0, 1, 2 and 6; a window of four moves them to 0, 4, 4 and 8.
-    assert update_aligned(stages, 4) == (Stage(batch=4, records=0), Stage(batch=12, records=16),
-                                          Stage(batch=16, records=64))
-    assert update_aligned(stages, 1) == stages
+    there runs no step and is gone. A window is at least one step."""
+    ramp = Ramp(start=4, increment=4, samples=12)
+    # A step each of 4, 8 and 12 records, from steps 0, 1 and 2; 16 from step 3.
+    assert ramp.stages(16) == (Stage(batch=4, records=0), Stage(batch=8, records=4),
+                               Stage(batch=12, records=12), Stage(batch=16, records=24))
+    assert ramp.stages(16, window=2) == (Stage(batch=4, records=0), Stage(batch=12, records=8),
+                                         Stage(batch=16, records=32))
+    assert ramp.stages(16, window=4) == (Stage(batch=4, records=0), Stage(batch=16, records=16))
+    with pytest.raises(ValueError):
+        DataPartition(window=0)
 
 
 def test_a_window_that_replays_its_batches_pools_a_ramps_stages_as_batches_of_their_records(tmp_path):
