@@ -40,8 +40,8 @@ from __future__ import annotations
 import hashlib
 import threading
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
-from contextlib import AbstractContextManager, suppress
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
 from uuid import uuid4
 
@@ -50,6 +50,7 @@ import numpy as np
 
 from dew.data.prompts import PromptRecord
 from dew.inference.rollouts import Draw, InfrastructureError, RolloutServer
+from dew.inference.serving import settled
 from dew.objectives.base import Batch
 
 from .episodes import (
@@ -357,18 +358,15 @@ class PromptSource:
                 rollout = self._rollout(task, prompt, version, drawn)
             except BaseException as failure:
                 # Broken code or a broken contract, not infrastructure: the scheduler raises it.
-                with suppress(InvalidStateError):  # cancelled while scoring
-                    scored.set_exception(failure)
+                settled(scored, failure)
                 return
-            with suppress(InvalidStateError):  # cancelled while scoring
-                scored.set_result(rollout)
+            settled(scored, rollout)
 
         def chained(_: Future[Draw]) -> None:
             try:
                 self._scorers.submit(score)
             except RuntimeError as closed:
-                with suppress(InvalidStateError):
-                    scored.set_exception(closed)
+                settled(scored, closed)
 
         drawn.add_done_callback(chained)
         return scored
