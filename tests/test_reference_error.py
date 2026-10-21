@@ -17,6 +17,7 @@ from reference_error import (
     indexed_recording,
     input_digest,
     seeds_for,
+    widened,
 )
 
 
@@ -331,3 +332,46 @@ def test_a_recording_of_outputs_alone_draws_its_inputs_again(tmp_path):
     undigested = {name: value for name, value in recorded.items() if name != "site.input_digest"}
     with pytest.raises(AssertionError):
         indexed_recording(undigested, "site", seeds, inputs_of=draw)
+
+
+def test_a_recording_of_the_references_evidence_alone_holds_the_recomputed_truth_to_its_sketch():
+    """A recording that keeps the reference's evidence (`leaf_summary`) and its truth's sketch, no
+    outputs: check 1 judges Dew against it with the test's own float64 path as truth, held at every seed
+    to the recorded sketch, so a float64 path that computes one row a millionth off is refused, and a
+    recording without that path is refused outright."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    def draw(seed):
+        rng = np.random.default_rng(400 + seed)
+        return {"x": rng.normal(size=(16, 8)).astype(np.float32),
+                "w": rng.normal(size=(8, 32)).astype(np.float32)}
+
+    def evaluate(inputs):
+        x, w = inputs["x"], inputs["w"]
+        return ({"y": np.dot(x, w)},
+                {"y": np.dot(x.astype(np.float64), w.astype(np.float64))})
+
+    def product(inputs):
+        return {"y": jnp.dot(inputs["x"], inputs["w"], precision="highest")}
+
+    def wide(inputs):
+        return {"y": jnp.dot(jnp.asarray(inputs["x"], jnp.float64), jnp.asarray(inputs["w"], jnp.float64))}
+
+    recorded = recorder.record_case("site", draw, evaluate, product, summary=True)
+    assert not any(name.startswith(("site.reference.", "site.truth.", "site.input.")) for name in recorded)
+    seeds = int(recorded["site.seeds"])
+    drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw, truth_fn=wide)
+    assert_as_exact(jax.jit(lambda index, inputs: product(inputs)), reference, drawn, "evidence", seeds=seeds,
+                    truth_fn=truth)
+
+    def off(inputs):
+        y = wide(inputs)["y"]
+        return {"y": y.at[3].multiply(1 + 1e-6)}
+
+    _, _, wrong = indexed_recording(recorded, "site", seeds, inputs_of=draw, truth_fn=off)
+    with pytest.raises(AssertionError), jax.enable_x64(new_val=True):
+        wrong(*widened(drawn(0)))
+    with pytest.raises(AssertionError):
+        indexed_recording(recorded, "site", seeds, inputs_of=draw)
