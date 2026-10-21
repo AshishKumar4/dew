@@ -264,7 +264,8 @@ def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupte
     loading = dataclasses.replace(READ, workers=workers)
 
     def stream():
-        mixed = mix([corpus(0, 1), corpus(1, 5)], by="tokens")
+        # A token's role scores the one after it: two scored tokens make one target a document.
+        mixed = mix([corpus(0, 2), corpus(1, 5)], by="tokens")
         return compile(mixed.map(Delivered()).batch(2), read=read, loading=loading).train(DataPartition())
 
     uninterrupted = stream()
