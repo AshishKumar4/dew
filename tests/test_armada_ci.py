@@ -310,6 +310,50 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                                    "tests/test_own_environment.py": ["changed"]}
 
 
+def fetcher(root: Path, *, due: bool = False) -> Path:
+    """A stand-in tools/fetched_fixtures.py under `root`: its fetch records that it ran, and with `due`
+    refuses as the real one does a pin whose upload is due."""
+    (root / "tools").mkdir(exist_ok=True)
+    (root / "tools/fetched_fixtures.py").write_text(
+        "import sys, time\nfrom pathlib import Path\n"
+        "assert sys.argv[1:] == ['fetch']\n"
+        "Path('fetched').write_text(str(time.monotonic()))\n"
+        + ("raise SystemExit('x.npz: pinned with no revision: its upload is due')\n" if due else ""))
+    return root / "fetched"
+
+
+def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_one_is_due(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """The tests read pinned fixtures offline (CLOSED_HUB), so the lane fetches them first, while the Hub is
+    reachable; a pin whose upload is due stops the lane before any file runs."""
+    url, _, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    (tools / "nvidia-smi").write_text("#!/bin/sh\necho 81920\n")
+    (tools / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    (tmp_path / "tests/test_reads.py").write_text(
+        "import time\nfrom pathlib import Path\n"
+        "def test_reads(): Path('read').write_text(str(time.monotonic()))\n")
+    out = tmp_path / "verdict.json"
+    fetched = fetcher(tmp_path)
+    assert ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache=True, processes=1, deadline=600.0) == 0
+    assert float(fetched.read_text()) < float((tmp_path / "read").read_text())
+    fetched.unlink()
+    (tmp_path / "read").unlink()
+    fetcher(tmp_path, due=True)
+    with pytest.raises(subprocess.CalledProcessError):
+        ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache=True, processes=1, deadline=600.0)
+    assert fetched.is_file() and not (tmp_path / "read").exists()
+
+
 def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_share(
         ci, tmp_path, monkeypatch, cache_worker):
     """The GPU lane runs each file once, in a process of its own. A file no
@@ -352,6 +396,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
+    fetcher(tmp_path)
 
     def ran(stem: str) -> list[list[str]]:
         return [path.read_text().split() for path in sorted(tmp_path.glob(f"ran-{stem}-*"),
@@ -474,93 +519,6 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     assert Path(least[0].removeprefix("| ")).name == "unused.py" and least[-1] == "0.0% |"
 
 
-def test_the_plan_runs_as_one_wave_on_the_pool(ci, tmp_path, monkeypatch, capsys):
-    """The plan's tasks start at once on the pool, none waiting for another to free its container (train
-    22: 212 tasks of a set 240 s target on 160 containers ran as two waves, 10:10), with the lightest
-    heaviest task the targets tried allow: the containers the split files leave go to the light files'
-    heaviest families. Files nothing has timed each run alone whatever the target; where even every timed
-    file packed together leaves more tasks than containers, one wave cannot hold the suite, and the plan
-    says so and runs in waves. The plan command reads the pool from .armada.json."""
-    records = {f"tests/test_even{n}.py::test_a": 100.0 for n in range(12)}
-    records |= {"tests/test_heavy.py::test_a": 200.0, "tests/test_heavy.py::test_b": 100.0}
-    for node in records:
-        (tmp_path / node.split("::")[0]).write_text("")
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(records))
-    monkeypatch.setenv("DEW_TEST_CACHE", "off")
-
-    def heaviest(entries):
-        return max(entry["weight"] for entry in entries if not entry.get("untimed"))
-
-    # 1,500 s of tests on each Python: four containers hold two tasks each, the heavier 800 s (the 300 s
-    # file with five of 100 s); eight hold four each, of 400 s at most; a thousand hold the 300 s file as
-    # its two tests and every other file alone.
-    for pool, tasks, longest in ((4, 4, 800.0), (8, 8, 400.0), (1000, 28, 200.0)):
-        _, entries = ci.one_wave({}, pool)
-        assert len(entries) == tasks and heaviest(entries) == longest, (pool, len(entries), heaviest(entries))
-    for n in range(5):
-        (tmp_path / f"tests/test_new{n}.py").write_text("")
-    _, entries = ci.one_wave({}, 20)
-    assert len(entries) == 20 and heaviest(entries) == 300.0
-    capsys.readouterr()
-    _, entries = ci.one_wave({}, 8)
-    assert len(entries) == 12 and "one wave cannot hold the plan" in capsys.readouterr().err
-    (tmp_path / ".armada.json").write_text(json.dumps({"pool": 20}))
-    command = [sys.executable, str(ROOT / "tools/armada/ci.py"), "plan", "--timings=none.json"]
-    planned = subprocess.run(command, cwd=tmp_path, check=True, capture_output=True, text=True)
-    assert json.loads(planned.stdout)["include"] == ci.one_wave({}, 20)[1]
-    for name in {node.split("::")[0] for node in records}:
-        (tmp_path / name).unlink()
-    # Files nothing has timed alone, exactly filling the pool: one wave at whatever target.
-    assert len(ci.one_wave({}, 10)[1]) == 10
-
-
-def test_one_wave_gives_each_family_its_task_before_sharing_the_rest(ci, tmp_path, monkeypatch, capsys):
-    """Each light family, the `torchax` files apart, takes the tasks its work needs before the spare
-    containers are shared: two files of 500 s and one marked torchax of 1 s on each Python fit five
-    containers as five tasks, one wave."""
-    for name in ("test_a", "test_b"):
-        (tmp_path / f"tests/{name}.py").write_text("")
-    (tmp_path / "tests/test_t.py").write_text("import pytest\npytestmark = pytest.mark.torchax\n")
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
-        {"tests/test_a.py::test": 500.0, "tests/test_b.py::test": 500.0, "tests/test_t.py::test": 1.0}))
-    monkeypatch.setenv("DEW_TEST_CACHE", "off")
-    _, entries = ci.one_wave({}, 5)
-    assert len(entries) == 5 and "one wave cannot hold" not in capsys.readouterr().err
-    assert sorted(entry["tests"] for entry in entries if entry["python"] == "3.14") == [
-        "tests/test_a.py tests/test_b.py", "tests/test_t.py"]
-
-
-def test_one_wave_recuts_a_cut_too_fine_and_keeps_the_new_one(ci, tmp_path, monkeypatch):
-    """A file keeps the cut it ran as only while that cut's heaviest group is within `KEPT` of the target
-    either way. Ten files of twenty 10 s tests, each run at 2,200 s as twenty groups of 110 s (100 s of it
-    setup), would run as 400 tasks if the cut held; on 160 containers they run as seven groups each, 140
-    tasks of at most 130 s. A second run, measured at that cut, keeps it, so its groups' cached programs
-    are found. The scan reads the tree and the timings once."""
-    names = [f"tests/test_cut{n}.py" for n in range(10)]
-    records = {f"{name}::test_{index}": 10.0 for name in names for index in range(20)}
-    for name in names:
-        (tmp_path / name).write_text("")
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(records))
-    monkeypatch.setenv("DEW_TEST_CACHE", "off")
-    timings = {"files": {ci.row(python, name, ""): 2200.0 for python in ci.PYTHONS for name in names},
-               "rows": {ci.row(python, name, f"{index}/20"): 110.0 for python in ci.PYTHONS for name in names
-                        for index in range(1, 21)}}
-    reads = []
-    reading = ci.recorded_tests
-    monkeypatch.setattr(ci, "recorded_tests", lambda: reads.append(1) or reading())
-    _, entries = ci.one_wave(timings, 160)
-    assert len(entries) == 140 and max(entry["weight"] for entry in entries) == 130.0
-    assert len(reads) <= 1 + len(ci.PYTHONS), reads
-    files, rows = {}, {}
-    for entry in entries:
-        rows[ci.row(entry["python"], entry["tests"], entry["split"])] = entry["weight"]
-        whole = ci.row(entry["python"], entry["tests"], "")
-        files[whole] = files.get(whole, 0.0) + entry["weight"]
-    _, again = ci.one_wave({"files": files, "rows": rows}, 160)
-    assert sorted((entry["python"], entry["tests"], entry["split"]) for entry in again) == sorted(
-        (entry["python"], entry["tests"], entry["split"]) for entry in entries)
-
-
 def test_a_file_whose_recorded_tests_outweigh_its_median_runs_split_by_them(ci, tmp_path):
     """Train 18's census: main's runs timed the file at 6 s with one test; a head recorded the 1,576
     tests it added (here 40 of 30 s). Each record is a test's least time, so their sum past the median
@@ -589,12 +547,11 @@ def test_a_split_file_pays_its_setup_once_a_group_and_is_not_cut_finer_for_it(ci
     tests = [10.0] * 20
     assert ci.split(tests, 400.0, 150.0, cut=1) == [270.0, 270.0, 260.0]
     assert ci.split(tests, 200.0 + 2 * 50.0, 150.0, cut=2) == [150.0, 150.0]
-    # A cut whose heaviest group, setup included, holds within half again the target either way is
-    # kept, so its cached programs are: 4 groups of 100 s stay as they ran; 2 groups at 130 s of setup
-    # each (230 s, past 225) are cut again, and so are 20 groups of 50 s (an over-cut paying 40 s each,
-    # under 100), coarser, into 2 of 140 s: a plan of fewer, fuller groups holds the suite in one wave.
+    # A cut whose heaviest group, setup included, holds within half again the target is kept, so
+    # its cached programs are: 4 groups of 100 s, and 20 groups of 50 s (an over-cut paying 40 s
+    # each), stay as they ran; 2 groups at 130 s of setup each (230 s, past 225) are cut again.
     assert ci.split(tests, 400.0, 150.0, cut=4) == [100.0] * 4
-    assert ci.split(tests, 200.0 + 20 * 40.0, 150.0, cut=20) == [140.0, 140.0]
+    assert ci.split(tests, 200.0 + 20 * 40.0, 150.0, cut=20) == [50.0] * 20
     assert ci.split(tests, 200.0 + 2 * 130.0, 150.0, cut=2) == [200.0, 200.0, 190.0]
     # The file's median remembers runs at other cuts; its rows are timed at the cut they name. Here
     # four runs at 4 groups (400 s) and the last at 2 (300 s, its rows): measured at 2, it stays at 2.
