@@ -151,8 +151,9 @@ SCORE_HOOKS = {"none": (), "softcap": ("softcap",), "sinks": ("sinks",), "alibi"
 """The score hooks the backward differentiates, each kind of parameter among them: ALiBi's slopes a
 head's, a per-key bias, a dense bias."""
 
-BACKWARD_SEEDS = {(("alibi",), "float32"): 64, (("alibi",), "bfloat16"): 128, (("sinks",), "bfloat16"): 16,
-                  (("softcap", "sinks", "alibi"), "float32"): 64, (("softcap", "sinks", "alibi"), "bfloat16"): 256}
+BACKWARD_SEEDS = {(("alibi",), "float32"): 64, (("alibi",), "bfloat16"): 128,
+                  (("sinks",), "bfloat16"): 16, (("softcap", "sinks", "alibi"), "float32"): 64,
+                  (("softcap", "sinks", "alibi"), "bfloat16"): 256}
 """The backward sites' declared draws where `seeds_for` sizes them above `SEEDS`: a head's ALiBi slope
 is a gradient of four values a draw, and the sinks' bf16 state's of a few."""
 
