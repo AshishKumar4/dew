@@ -118,6 +118,15 @@ Exact-sum promotion and FP8 block scales (DeepSeek-V3's 1×128 and 128×128; sm1
 
 **RMSNorm's row statistic** reduces over the whole depth, so it isn't a prologue hook. It is either an algebra pre-pass or the algebraic fold, `RMSNorm(x)·W = diag(inv)·x·(diag(w)·W)`. The fold moves rounding points (§13, question 2).
 
+### Formulations: each written once, chosen per device and shape
+
+"Written once" means each template's algebra is a small set of equivalent formulations, each written once and available to every mainloop. The choice layer (§7) picks one per device and shape, and each one passes both checks. Examples:
+- attention: FA4's lazy rescale and partial software exp2, which pay where the exponential unit is the bottleneck, as on Blackwell; the D forms (§8);
+- recurrence: the fused or split solve, and sequential or composed state passing;
+- GEMM: split-K or stream-K, and two-level accumulation.
+
+A device that needs a formulation the set lacks gets it added to the algebra once, for every backend, never as a device-specific kernel.
+
 ### Rules for every template
 - Every structural choice is static: form, hook present, solve or identity. An absent feature emits no code.
 - No inflation of a semantic group. GVA's 3 value heads per key head padded to 4 cost 36–43% today. A width that isn't a power of two is tiled into pieces Triton accepts (80 = 64 + 16) or padded neutrally in the final hardware tile, whichever measures faster. Logical widths, reduction denominators and outputs never change. The SSD width-80 loss (4–5×) was a different cause: a refusal routed it to XLA. wgmma's K granularity depends on the dtype (FP8 differs from bf16).
