@@ -31,7 +31,7 @@ from reference_error import assert_leaves_as_exact, float64_terms
 from dew.data.dataset import Loader
 from dew.interop.codecs import dequantize_fp8_blocks, quantize_fp8_blocks
 from dew.lora import LoRA, unadapted
-from dew.nn.kernels.generation import assumed, device_generation, gpu_target
+from dew.nn.kernels.generation import assumed, device_generation, fp8_tensor_cores
 from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
 from dew.quantization import (
@@ -292,7 +292,7 @@ def test_a_checkpoints_input_quantization_and_an_fp8_base_share_one_wrapper():
     np.testing.assert_array_equal(np.asarray(output), np.asarray(expected.reshape(output.shape)))
 
 
-FP8_CORES = gpu_target(device_generation()).fp8_peak is not None
+FP8_CORES = fp8_tensor_cores(device_generation())
 
 
 @pytest.mark.skipif(FP8_CORES, reason="this GPU has FP8 tensor cores")
