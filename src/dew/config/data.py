@@ -35,7 +35,7 @@ from dew.data.pipeline import (
 if TYPE_CHECKING:
     from dew.data.cache import Cache
     from dew.data.generation import Generation
-from dew.data import images
+from dew.data import images, video
 from dew.data.chat import RenderChat
 from dew.data.images import ConfigureCaption, EncodeCaptions
 from dew.data.preferences import PreferencePair
@@ -435,7 +435,7 @@ class VideoData(_Loadable):
                 source,
                 url=tuple(path for path in source.paths if PurePosixPath(path).suffix.lower() in extensions),
             )
-        prefix = Pipeline(source).map(_VideoRow(self.caption)).stages
+        prefix = Pipeline(source).map(video.Row(self.caption)).stages
         train, held = _branches(source, self.validation, split=self.split, prefix=prefix)
         # The sound at the rate the audio model reads, `audio_padding` frames either side of the frames.
         rate = sampling_rate(AutoFeatureExtractor.from_pretrained(self.audio_model))
@@ -448,19 +448,6 @@ class VideoData(_Loadable):
                           margin=padding, sample_rate=rate, context=padding, missing="reject", rejects=False)
 
         return clips(train), None if held is None else clips(held), (EncodeCaptions(),)
-
-
-@dataclasses.dataclass(frozen=True)
-class _VideoRow:
-    """A listed clip's path as the decoder reads it, and its caption."""
-
-    caption: str = ""
-
-    def __call__(self, element: Batch) -> Batch:
-        from dew.records import text
-
-        path = text(element.get("video_path", element.get("path")), "video_path")
-        return {"mp4": path, "caption": element.get("caption", self.caption)}
 
 
 def loader(
