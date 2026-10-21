@@ -32,13 +32,16 @@ class KeySpans:
     """Each query's visible keys: the interval `[start, end)` `[B, Q]` of key indices, int32, empty
     where `end <= start`, and where the call packs documents, the queries' ids `[B, Q]` and the keys'
     `[B, K]`, 0 as padding, a key visible only to queries of its own id (`visible`). `keys` is the
-    key count, static."""
+    key count, static, and `form` what the spans are, static, so a kernel resolves at trace time what
+    a plain call needs: 'full', every query sees every key; 'causal', query i sees keys 0 to i (top
+    left aligned); 'spans', anything else, which the intervals and ids say."""
 
     start: jax.Array
     end: jax.Array
     query_ids: jax.Array | None
     key_ids: jax.Array | None
     keys: int = dataclasses.field(metadata={"static": True})
+    form: str = dataclasses.field(default="spans", metadata={"static": True})
 
 
 def visible(spans: KeySpans, row: jax.Array | int, queries: jax.Array, keys: jax.Array) -> jax.Array:
@@ -168,7 +171,9 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         end = jnp.minimum(end, lengths.astype(jnp.int32)[:, None])
     if starts is not None:
         start = jnp.maximum(start, starts.astype(jnp.int32)[:, None])
-    return KeySpans(start, end, query_ids, key_ids, keys)
+    narrowed = (sliding_window, chunk, segment_ids, lengths, starts)
+    form = "spans" if any(item is not None for item in narrowed) else "causal" if causal else "full"
+    return KeySpans(start, end, query_ids, key_ids, keys, form)
 
 
 @jax.tree_util.register_dataclass
