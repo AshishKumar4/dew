@@ -102,9 +102,11 @@ CASES = {
     "two outputs": Case(epilogue=doubled, out_dtypes=(jnp.bfloat16, jnp.float32)),
     "wide output": Case(out_dtypes=(jnp.float32,)),
     "dense": Case(out_dtypes=(jnp.float32,), dense=True),
+    "dense norm and bias": Case(normed, lambda x, w, ms, nw, b, u, s: ((ms, ("rows",)), (nw, ("depth",))),
+                                biased, lambda x, w, ms, nw, b, u, s: ((b, ("columns",)),), dense=True),
 }
 GRADIENT_CASES = ("norm and bias", "gated prologue", "cast prologue", "broadcast axes", "scaled",
-                  "two outputs", "wide output")
+                  "two outputs", "wide output", "dense norm and bias")
 
 
 def _draw(seed):
@@ -744,3 +746,14 @@ def test_a_measured_launch_draws_its_integer_side_operands_as_operands():
     arrays = grouped_matmul.Gmm().operands(specs, seed=0)
     assert [a.shape for a in arrays] == [spec.shape for spec in specs]
     assert int(jnp.sum(arrays[2])) == 128
+
+
+def test_a_dense_product_runs_the_plain_tiled_kernel():
+    """On Triton a dense product (no group sizes) runs `triton_dense`'s kernels, forward and both gradients,
+    keyed apart from a one-group ragged call's: their launches are told `dense`."""
+    x, w, ms, nw, b, u, s, ct = _draw(9)
+    spec = CASES["dense norm and bias"]
+    with generation.assumed("sm80"), tuning.seen() as launches:
+        jax.jit(_loss(_dew(spec, interpret_on_cpu=True))).trace(x, w, ms, nw, b, u, s, ct).lower()
+    told = {(type(launch).__name__, ba.arguments.get('dense')) for launch, ba in launches}
+    assert {('Gmm', True), ('GmmTransposed', True), ('Tgmm', True)} <= told
