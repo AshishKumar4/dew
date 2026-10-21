@@ -53,7 +53,7 @@ def runnable(name: str, windows, tmp_path):
         archive.extractall(tmp_path / "flux", filter="data")
     teacher = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102", split="all", image_size=8), preset=Flow(),
+        data=images_of("tfds://oxford_flowers102", 8), preset=Flow(),
             val_metrics=(),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(tmp_path / "flux" / "pipeline")),
         objective=ObjectiveConfig("diffusion",
