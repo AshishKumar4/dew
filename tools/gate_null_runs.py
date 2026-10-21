@@ -96,6 +96,48 @@ def decoder_residual_orders():
 CLASSES = {"cross-entropy-columns": cross_entropy_columns, "decoder-residual-orders": decoder_residual_orders}
 
 
+def _faulted(change):
+    """A fault of a class's reference: `change(arguments)` applied to its inputs before it runs."""
+    def fault(reference):
+        return lambda *arguments: reference(*change(arguments))
+    return fault
+
+
+def _scaled(factor):
+    def change(arguments):
+        states, *rest = arguments
+        return (states * factor, *rest)
+    return change
+
+
+def _bfloat16(arguments):
+    import jax.numpy as jnp
+
+    states, *rest = arguments
+    return (jnp.asarray(states, jnp.bfloat16).astype(states.dtype), *rest)
+
+
+def _dropped(arguments):
+    import numpy as np
+
+    states, matrix, scale, bias, *rest = arguments
+    bias = np.asarray(bias).copy()
+    bias[0] = -np.inf
+    return (states, matrix, scale, bias, *rest)
+
+
+FAULTS = {
+    "scale-2^-10": _faulted(_scaled(1 + 2.0 ** -10)),
+    "scale-2^-20": _faulted(_scaled(1 + 2.0 ** -20)),
+    "scale-2^-22": _faulted(_scaled(1 + 2.0 ** -22)),
+    "bf16-states": _faulted(_bfloat16),
+    "dropped-column": _faulted(_dropped),
+}
+"""Real faults of the cross-entropy class, its own computation changed before it runs: its states
+scaled by a wrong factor at three sizes, rounded to bfloat16 where float32 is claimed, and a column of
+its vocabulary dropped, for the procedures' power on the class (`null_runs`'s `dew_fn`)."""
+
+
 def _law(name: str, rng, size: int):
     """`size` per-draw mean squared errors of a synthetic law: "exact-f" a squared standard normal, so
     a pooled ratio's square over its own is F(K, K); "flip" 1 but 70 at one draw in 1,000, a rare bf16
@@ -111,12 +153,6 @@ def _law(name: str, rng, size: int):
     raise ValueError(name)
 
 
-def _procedure(two_stage: bool) -> dict:
-    """`_staged`'s keywords for check 1's two stages, or for the procedure before them (one stage, an
-    over drawing again, its interval's tails 5e-4 each)."""
-    return {} if two_stage else {"two_stage": False, "tails": (5e-4, 5e-4)}
-
-
 def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stage: bool) -> list:
     """Check 1's verdicts (`_staged`) on known-ratio controls, `runs` runs from `chunk`'s own stream:
     Dew's per-draw errors ratio² times a draw of the law and the reference's an independent draw of it,
@@ -126,7 +162,8 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
     import numpy as np
     from reference_error import REDRAW, _drawn, _Draws, _staged
 
-    rng = np.random.default_rng([chunk, int(ratio * 1000), seeds, int(two_stage)])
+    # The same draws under either procedure, so their verdicts compare run by run.
+    rng = np.random.default_rng([chunk, int(ratio * 1000), seeds])
     span = (1 + REDRAW) * seeds
     if law in CLASSES:
         reference, draw, truth = CLASSES[law]()
@@ -147,7 +184,7 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
             return _Draws(names, mine[start:stop], theirs[start:stop], np.zeros((count, leaves, 2)),
                           np.zeros((count, leaves), int), np.ones((count, leaves), bool))
 
-        over, unresolved, stage = _staged(drawn, seeds, law, **_procedure(two_stage))
+        over, unresolved, stage = _staged(drawn, seeds, law, two_stage=two_stage)
         verdicts.append(("over" if over else "inconclusive" if unresolved else "pass", stage))
     return verdicts
 
@@ -158,6 +195,8 @@ def main(argv: list[str]) -> int:
                         "law: a class's or exact-f, flip, gamma-1")
     parser.add_argument("--ratio", type=float, help="run known-ratio controls of this population ratio")
     parser.add_argument("--today", action="store_true", help="the procedure before the two stages")
+    parser.add_argument("--fault", choices=sorted(FAULTS), help="run the class's reference with this fault "
+                        "as Dew, for power")
     parser.add_argument("--seeds", type=int, help="the class's declared count; without it, size it "
                         "(`seeds_for`, on the seeds below OFFSET) and print it")
     parser.add_argument("--runs", type=int, default=10)
@@ -191,9 +230,10 @@ def main(argv: list[str]) -> int:
         return 0
     verdicts = null_runs(reference, draw, options.name, seeds=options.seeds, runs=options.runs,
                          first=OFFSET + options.chunk * options.runs, truth_fn=truth,
-                         **_procedure(not options.today))
+                         two_stage=not options.today,
+                         dew_fn=FAULTS[options.fault](reference) if options.fault else None)
     print(json.dumps({"class": options.name, "chunk": options.chunk, "seeds": options.seeds,
-                      "today": options.today, "verdicts": verdicts}), flush=True)
+                      "today": options.today, "fault": options.fault, "verdicts": verdicts}), flush=True)
     return 0
 
 
