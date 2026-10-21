@@ -33,8 +33,8 @@ VOCAB = 64
 SEQ_LEN = 15
 BATCH = 8
 TINY_SHARD = 256
-HOST_STACK_SEEDS = 16
-"""The host-resident stack's declared check-1 seeds, sized by `seeds_for`."""
+HOST_STACK_SEEDS = 512
+"""The host-resident stack's check-1 seeds, sized by `seeds_for` on 2026-10-20 on armada."""
 
 FIXTURE_NAMES = ("qwen3-tiny", "deepseek-v3-tiny", "gemma4-e2b", "gemma3n-tiny")
 
