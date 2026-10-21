@@ -54,7 +54,7 @@ from dew.nn.kernels.chunked_launch import (
     sequences,
     write_rows,
 )
-from dew.nn.kernels.fla_gdn import RCP_LN2, _dot, _tril_inverse, _weighted_values
+from dew.nn.kernels.fla_gdn import _dot, _tril_inverse, _weighted_values
 
 SUB = 16
 """fla's BC: the sub-chunk the intra-chunk kernels build their 16 x 16 blocks over."""
@@ -807,11 +807,8 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     (`fla_gdn.chunk_fwd_h`'s USE_GK branch), then the output. Saves what fla saves, and where `keep`
     its memory: `w`, the gated queries and keys, the memory each chunk enters and the corrected
     values, which fla recomputes in its backward ('delta_memory', as `fla_gdn._rule_fwd` keeps it)."""
-    spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
-    # Named as the gated delta rule's port names them (`fla_gdn._rule_fwd`) for a remat policy.
-    g = checkpoint_name(recurrence.cumulated(g, scale=RCP_LN2, chunk=chunk, spans=spans, interpret=interpret),
-                        'delta_decay')
-    return cumulated_fwd(q, k, v, g, beta, h0, spans, scale, chunk, interpret, keep, wide)
+    return fla_gdn.prefixed_fwd(cumulated_fwd, q, k, v, g, beta, h0, cu_seqlens, scale, chunk, interpret,
+                                keep, wide)
 
 
 def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: int, interpret: bool,
