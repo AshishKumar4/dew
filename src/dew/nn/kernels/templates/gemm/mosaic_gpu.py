@@ -202,12 +202,19 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
                 block_m, block_n)
             # Dew: the rows past the routed ones store zeros, whatever the epilogue makes of their empty sums.
             routed = group_info.group_id < g
-            outs = tuple(jnp.where(routed, out, jnp.zeros_like(out)) for out in outs)
 
             for o_gmem, out in zip(o_gmems, outs, strict=True):
                 @functools.partial(pl.run_scoped, o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype))
                 def store_scope(o_smem, o_gmem=o_gmem, out=out):
-                    o_smem[...] = out.astype(o_smem.dtype)
+                    @pl.when(routed)
+                    def _():
+                        o_smem[...] = out.astype(o_smem.dtype)
+
+                    @pl.when(~routed)
+                    def _():
+                        zeros = jnp.zeros(o_smem.shape, o_smem.dtype)
+                        o_smem[...] = plgpu.layout_cast(zeros, plgpu.Layout.WGMMA)
+
                     plgpu.commit_smem()
 
                     smem_start = group_info.start_within_block
