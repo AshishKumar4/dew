@@ -7,14 +7,13 @@ import dataclasses
 import fnmatch
 import functools
 import hashlib
-import itertools
 import json
 import logging
 import math
 import statistics
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Concatenate, Protocol, overload
 
@@ -32,8 +31,8 @@ from dew.data.dataset import (
     Closeable,
     DataPartition,
     RampedStream,
-    Stage,
     Stoppable,
+    rows_of,
     stream_identity,
 )
 from dew.files import write_atomically
@@ -61,7 +60,7 @@ from dew.nn.sharding import (
     microbatched,
     ruled_boxes,
 )
-from dew.objectives.base import FROZEN, Batch, Variables
+from dew.objectives.base import EXAMPLE_ROWS, FROZEN, Batch, Variables
 from dew.records import JSON, number, record
 from dew.telemetry.profile import region
 from dew.training.state import VARIABLE_FIELDS
@@ -529,23 +528,6 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, *, rows: boo
             f"its stages, and {dict(mesh.shape)} with "
             f"{microbatches} microbatch(es) "
             f"holds a batch that is a multiple of {divisor}")
-
-
-def check_ramp_window(stages: Sequence[Stage], window: int) -> None:
-    """Refuse a batch ramp whose stage begins inside an accumulation window of `window` steps that
-    replays its batches (a loss of composite statistics): the window's replay slots hold one
-    stage's batches, reallocated for the next where a window begins (`Trainer`'s accumulation)."""
-    starts = itertools.accumulate((after.records - stage.records) // stage.batch
-                                  for stage, after in itertools.pairwise(stages))
-    inside = [(start, stage.batch) for start, stage in zip(starts, stages[1:], strict=True) if start % window]
-    if inside:
-        start, batch = inside[0]
-        raise ValueError(
-            f"a loss of composite statistics replays its accumulation window's batches, and a batch "
-            f"ramp changes their shape at each stage, so each stage begins where a window of {window} "
-            f"steps does; the stage of {batch} records a step begins at step {start}. Ramp in stages "
-            f"of a multiple of {window} steps (Ramp.samples), or pool a shared mean (Ratio), whose "
-            f"window keeps no batch")
 
 
 def microbatch(batch: Batch, part: jax.Array, split: int) -> Batch:
@@ -1081,6 +1063,20 @@ def shard_batch(mesh: Mesh, batch: Batch, reads: Mapping[Signature, tuple[bool, 
 
         moved = iter([place(leaf, sharding) for leaf, sharding in zip(moving, shardings, strict=True)])
     return tree.unflatten([held[index] if index in held else next(moved) for index in range(len(leaves))])
+
+
+def marked(partition: DataPartition, prepare: Callable[[Batch], Batch] | None = None
+           ) -> Callable[[Batch], Batch]:
+    """A training batch's host preparation: `prepare`'s, then each row's place among its step's
+    records (`EXAMPLE_ROWS`). A share (`DataPartition.of`) reads the records `index :: count`, so its
+    `j`th row is the step's record `j * count + index` at every count: a record draws what it draws
+    however many processes read it (`Step.sample`)."""
+    def prepared(batch: Batch) -> Batch:
+        batch = batch if prepare is None else prepare(batch)
+        rows = np.arange(rows_of(batch), dtype=np.int32)
+        return {**batch, EXAMPLE_ROWS: rows * partition.count + partition.index}
+
+    return prepared
 
 
 def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:

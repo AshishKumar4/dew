@@ -327,8 +327,8 @@ class WanVAE(nn.Module):
             raise ValueError(f"a Wan VAE encodes 1 + {self.temporal_factor}k frames, not {video.shape[1]}")
         return self.quant_conv(self.encoder(video))
 
-    def encode(self, video, key=None):
-        return posterior_latent(self.moments(video), key)
+    def encode(self, video, key=None, noise=None):
+        return posterior_latent(self.moments(video), key, noise)
 
     def decode(self, latents):
         return jnp.clip(self.decoder(self.post_quant_conv(latents)), -1.0, 1.0)
@@ -443,8 +443,9 @@ class WanAutoencoder(AutoEncoder):
                 f"latents_mean {self.latent_shift.shape} and latents_std {self.latent_scale.shape} "
                 f"must both hold one value per latent channel {expected}"
             )
-        self._encode = jax.jit(lambda params, video, key=None: posterior_latent(
-            chunked_moments(model, {"params": params}, video), key))
+        # The posterior's draw reads the whole video's moments, its chunks assembled, and its noise whole.
+        self._encode = jax.jit(lambda params, video, key=None, noise=None: posterior_latent(
+            chunked_moments(model, {"params": params}, video), key, noise))
         self._decode = jax.jit(lambda params, latents: chunked_decode(model, {"params": params}, latents))
 
     def record_arguments(self) -> dict:
@@ -466,14 +467,14 @@ class WanAutoencoder(AutoEncoder):
             raise ValueError(f"a Wan VAE encodes 1 + {self.model.temporal_factor}k frames, not {frames}")
         return ((frames - 1) // self.model.temporal_factor + 1, *super().latent_shape(tuple(image)))
 
-    def encode_batch(self, params, x, key=None):
-        return self._encode(params, x[:, None], key)[:, 0]
+    def encode_batch(self, params, x, key=None, noise=None):
+        return self._encode(params, x[:, None], key, None if noise is None else noise[:, None])[:, 0]
 
     def decode_batch(self, params, z):
         return self._decode(params, z[:, None])[:, 0]
 
-    def encode_video(self, params, x, key=None):
-        return self._encode(params, x, key)
+    def encode_video(self, params, x, key=None, noise=None):
+        return self._encode(params, x, key, noise)
 
     def decode_video(self, params, z):
         return self._decode(params, z)
