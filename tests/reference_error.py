@@ -682,7 +682,10 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
             magnitude = float(np.sum(np.abs(value))) * (1 + value.size * eps) + np.sqrt(value.size) * oracle
             bound = (SKETCH_DEVIATIONS * oracle + 2 * sketch_rounding(magnitude)) * (1 + 1e-6)
             apart = truth_sketch(value) - recorded
-            away = float(np.sqrt(np.mean(np.square(apart)))) if apart.shape == recorded.shape else np.inf
+            # Its root mean square, scaled by its largest first so no square overflows.
+            widest = float(np.max(np.abs(apart))) if apart.shape == recorded.shape else np.inf
+            away = (widest * float(np.sqrt(np.mean(np.square(apart / widest)))) if 0 < widest < np.inf
+                    else widest)
             if not (np.isfinite(bound) and away <= bound):
                 raise AssertionError(
                     f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not the recorded "
