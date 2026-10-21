@@ -201,10 +201,26 @@ On TPU, mainloops follow Splash, Megablox and ragged paged attention: no warp ro
 - cp.async doesn't predicate out-of-bounds accesses;
 - there is no f64 MMA.
 
-Its sm80 speed is unmeasured. The plan:
-- **Probe first:** an sm80 Mosaic GPU attention forward and GEMMs, measured against Pallas Triton, FA2 and cuBLAS.
-- **If it reaches par:** one Mosaic GPU toolkit spans sm80 through sm100, and Pallas Triton becomes a pinned fallback until it is deleted.
-- **If not:** sm80 stays on Pallas Triton under the pin. The survivable path after upstream removal is our Python fork lowering jaxprs to TTIR and compiling them with pip Triton through jaxlib's Triton kernel call.
+**Measured (A100-SXM4-40GB, jax 0.11.2.post4, 2026-10-21; one session, CUPTI):** Mosaic GPU on sm80 is not at par. The probe used the plainest kernels jax's examples give on the Ampere path: one warpgroup a program, `emit_pipeline` with swizzled cp.async tiles, `plgpu.load` into the MMA layouts, `plgpu.mma`.
+
+| Workload | Pallas Triton (best) | Reference | Mosaic sm80 (best) | Mosaic / best |
+|---|---|---|---|---|
+| Attention forward, Qwen3-8B 1×8192 causal | template 3.41 ms; jax mha 3.50 | FA2 3.43 | 3.94 | 1.16 |
+| GEMM 4096³ | 0.515 | cuBLAS 0.53 | 0.715 | 1.39 |
+| GEMM 8192×4096×24576 | 6.45 | cuBLAS 6.38 | 9.70 | 1.52 |
+| GEMM 512×2048×1536 (MoE expert) | 0.0257 | cuBLAS 0.0274 | 0.0356 | 1.39 |
+| GEMM 2048×2048×1536 | 0.0728 | cuBLAS 0.0726 | 0.0856 | 1.18 |
+
+Mosaic lowers and compiles in 0.9–2.9 s against Pallas Triton's 0.4–0.8 s. The causes, as measured:
+1. P can't move from the accumulator's layout to the left operand's in registers: Mosaic's layout inference finds no assignment for that cast. So P goes through SMEM every tile, where FA2 reuses the accumulator fragment as the A fragment.
+2. One warpgroup a CTA. A two-warpgroup kernel fails because emit_pipeline's SMEM isn't a thread-collective allocation, and pre-Hopper emit_pipeline takes inputs only, so no larger CTA tile shares its B operand.
+3. A GEMM at equal tile and warps runs 1.35× Pallas Triton (128×128×32, 4 warps, 3 stages). The schedule within a K-step (synchronous mma.sync, ldmatrix interleaving, cp.async waits) is the likely cause; unconfirmed without ncu.
+
+**Decision:** sm80 stays on Pallas Triton under the pin. Mosaic sm80 is a rung re-measured at each jax bump.
+
+**Fallbacks, if Pallas Triton's removal forces the move:**
+- Mosaic GPU's layout inference and `emit_pipeline` are Python (`jax/experimental/mosaic/gpu`, `jax/_src/pallas/mosaic_gpu`), so causes 1 and 2 are fixable in Dew's Python-only JAX fork.
+- Alternatively, the fork keeps lowering jaxprs to TTIR and compiles them with pip Triton through jaxlib's Triton kernel call.
 
 A second copy of the algebra written in triton.language is not an acceptable answer.
 
