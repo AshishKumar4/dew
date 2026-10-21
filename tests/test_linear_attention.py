@@ -86,6 +86,25 @@ def largest(left, right) -> float:
     return float(np.max(np.abs(np.asarray(left) - np.asarray(right))))
 
 
+def assert_matches(outputs, reference, name: str):
+    """A form's output and final state within 1e-5 of the reference's recording `name`."""
+    out, state = outputs
+    assert largest(out, reference[f"{name}.output"]) < 1e-5
+    assert largest(state, reference[f"{name}.state"]) < 1e-5
+
+
+def decode_operands(rng, rows: int, heads: int, width: int):
+    """A decode token's operands from `rng`: unit queries and keys, values, a log decay in (-3, 0], a
+    write gate in [0, 1) and a memory of scale 0.1, each fp32."""
+    unit = [rng.normal(size=(rows, 1, heads, width)) for _ in range(2)]
+    query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
+    value = jnp.asarray(rng.normal(size=(rows, 1, heads, width)), jnp.float32)
+    g = jnp.asarray(-rng.random((rows, 1, heads)) * 3, jnp.float32)
+    beta = jnp.asarray(rng.random((rows, 1, heads)), jnp.float32)
+    state = jnp.asarray(rng.normal(size=(rows, heads, width, width)) * 0.1, jnp.float32)
+    return query, key, value, g, beta, state
+
+
 def test_the_chunked_rule_matches_the_reference(reference):
     """`torch_chunk_gated_delta_rule` on 70 tokens: a full chunk and a padded
     one, so both the in-chunk operator and the cross-chunk memory are read.
@@ -94,8 +113,7 @@ def test_the_chunked_rule_matches_the_reference(reference):
     `tril(..., -1)`) the output moves by 1.5e-01."""
     out, state = chunk_gated_delta_rule(*operands(reference))
 
-    assert largest(out, reference["chunk.output"]) < 1e-5
-    assert largest(state, reference["chunk.state"]) < 1e-5
+    assert_matches((out, state), reference, "chunk")
 
 
 def portable(query, key, value, g, beta, state=None):
@@ -129,8 +147,7 @@ def test_the_recurrent_rule_matches_the_reference(reference):
     of `q^T S` the output moves by 4.7e-01."""
     out, state = recurrent_gated_delta_rule(*operands(reference))
 
-    assert largest(out, reference["recurrent.output"]) < 1e-5
-    assert largest(state, reference["recurrent.state"]) < 1e-5
+    assert_matches((out, state), reference, "recurrent")
 
 
 def test_the_chunked_and_recurrent_forms_agree(reference):
@@ -289,12 +306,10 @@ def test_an_initial_state_is_carried_by_both_forms(reference):
     initial = jnp.asarray(reference["rule.initial_state"])
 
     out, state = chunk_gated_delta_rule(*operands(reference), initial)
-    assert largest(out, reference["chunk_carried.output"]) < 1e-5
-    assert largest(state, reference["chunk_carried.state"]) < 1e-5
+    assert_matches((out, state), reference, "chunk_carried")
 
     out, state = recurrent_gated_delta_rule(*operands(reference), initial)
-    assert largest(out, reference["recurrent_carried.output"]) < 1e-5
-    assert largest(state, reference["recurrent_carried.state"]) < 1e-5
+    assert_matches((out, state), reference, "recurrent_carried")
 
 
 def test_a_sequence_split_in_two_carries_its_memory_across_the_cut(reference):
@@ -786,12 +801,7 @@ def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
 
     def draw(seed):
         rng = np.random.default_rng(2 + seed)
-        unit = [rng.normal(size=(rows, 1, H, D)) for _ in range(2)]
-        query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
-        value = jnp.asarray(rng.normal(size=(rows, 1, H, D)), jnp.float32)
-        g = jnp.asarray(-rng.random((rows, 1, H)) * 3, jnp.float32)
-        beta = jnp.asarray(rng.random((rows, 1, H)), jnp.float32)
-        state = jnp.asarray(rng.normal(size=(rows, H, D, D)) * 0.1, jnp.float32)
+        query, key, value, g, beta, state = decode_operands(rng, rows, H, D)
         return query, key, value, g, beta, state, active
 
     def exact(*operands):
@@ -820,12 +830,7 @@ def test_the_decode_kernel_leaves_an_idle_row_alone():
 
     rng = np.random.default_rng(1)
     rows, H, D = 8, 16, 128
-    unit = [rng.normal(size=(rows, 1, H, D)) for _ in range(2)]
-    query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
-    value = jnp.asarray(rng.normal(size=(rows, 1, H, D)), jnp.float32)
-    g = jnp.asarray(-rng.random((rows, 1, H)) * 3, jnp.float32)
-    beta = jnp.asarray(rng.random((rows, 1, H)), jnp.float32)
-    state = jnp.asarray(rng.normal(size=(rows, H, D, D)) * 0.1, jnp.float32)
+    query, key, value, g, beta, state = decode_operands(rng, rows, H, D)
     active = jnp.asarray([True, False, True, True, False, False, True, False])
     every, every_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
     got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state, active)
