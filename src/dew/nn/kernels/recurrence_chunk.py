@@ -244,7 +244,7 @@ def _paired(left, right, decay):
 
 
 def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *, starts=None,
-                     delta: bool = True, scale: float | None = None):
+                     delta: bool = True, scale: float | None = None, dtype=None):
     """The chunked delta rule over [B, S, H, D] operands with the log decay
     `g` `[B, S, H, D]`, D one for a decay per head (the gated delta rule) or
     Dk for one per key dimension (Kimi Delta Attention); returns
@@ -265,7 +265,8 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     Without the `delta` rule (R = 0: Mamba2's SSD, the gated linear
     attentions) nothing is corrected: the inverse is the identity and each
     token writes `beta k v^T`, beta its write gate. The queries are scaled by
-    `scale` in the working precision, `Dk^-1/2` where None.
+    `scale` in the working precision, `Dk^-1/2` where None, and the output is
+    returned in `dtype` where one is given.
 
     `starts` `[B, S]` marks packed documents' first tokens, each from a zero
     memory: within a chunk each document's decays are its own (`chunk_decay`),
@@ -275,8 +276,8 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     entered passing through only where no document starts in it. A document
     computes as it would alone.
     """
-    dtype = jnp.result_type(query, key, value)
-    work = at_least_fp32(dtype)
+    dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
+    work = at_least_fp32(jnp.result_type(query, key, value))
     query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
     B, S, H, Dk = key.shape
     Dv = value.shape[-1]
@@ -453,18 +454,16 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         group = value.shape[2] // key.shape[2]
         if group > 1:
             query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
+        # Unrounded: the epilogue runs in the working precision, and the output rounds once.
         out, final = chunk_delta_rule(query, key, value, g.reshape(*value.shape[:3], -1), beta,
                                       operands.state, chunk_size, starts=operands.starts, delta=hooks.delta,
-                                      scale=scale)
-    if hooks.skip or hooks.output is not None:
-        out = out.astype(work)
-        if hooks.skip:
-            out = out + operands.skip.astype(work)[:, None] * value.astype(work)
-        if hooks.output is not None:
-            out = recurrence.gated_rms(out, operands.z.astype(work), operands.weight.astype(work),
-                                       hooks.output)
-        out = out.astype(dtype)
-    return out, final
+                                      scale=scale, dtype=work)
+    if hooks.skip:
+        out = out.astype(work) + operands.skip.astype(work)[:, None] * value.astype(work)
+    if hooks.output is not None:
+        out = recurrence.gated_rms(out.astype(work), operands.z.astype(work), operands.weight.astype(work),
+                                   hooks.output)
+    return out.astype(dtype), final
 
 
 def port_refusal(query, key, value) -> Refusal | None:
@@ -662,8 +661,10 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None)
 def _rated_scan(hooks: recurrence.Hooks, query, key, beta, operands: Chunk, chunk_size: int, work):
     """`chunk` without the delta rule over a rated decay (Mamba2's SSD: `x` the values, `B` the keys,
     `C` the queries, `dt` the write gate and `A` the rate): on the port of mamba_ssm's kernels where
-    it takes the call, which adds the skip itself; else on a TPU's Pallas scan where its tiling covers
-    the geometry, or the portable math, the skip added after. Returns the output in `work`, unrounded,
+    it takes the call, which adds the skip itself and takes the rated decay's declared domain, a
+    contraction (`recurrence.Hooks`), as its kernels clamp each pairwise decay to at most one; else
+    on a TPU's Pallas scan where its tiling covers the geometry, or the portable math, the skip added
+    after. Returns the output in `work`, unrounded,
     and the memory `[B, Hv, Dk, Dv]`."""
     value = operands.value
     rate = operands.rate.astype(work)
@@ -689,8 +690,9 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, beta, operands: Chunk, chun
     if group > 1:
         query, key = (jnp.repeat(t, group, axis=2) for t in (query, key))
     out, final = chunk_delta_rule(query, key, value, (rate[None, None, :] * beta)[..., None], beta,
-                                  operands.state, chunk_size, starts=starts, delta=False, scale=1.0)
-    return out.astype(work) + skip[:, None] * value.astype(work), final
+                                  operands.state, chunk_size, starts=starts, delta=False, scale=1.0,
+                                  dtype=work)
+    return out + skip[:, None] * value.astype(work), final
 
 
 RESET_DECAY = -1e4

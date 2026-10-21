@@ -73,7 +73,8 @@ class Hooks:
     gates, the delta rule, whether a write gate `beta` scales what the token writes (always under the
     delta rule or the gates; without them, an input gate, else one), whether a scalar decay is
     `rated`: the write gate times the head's `rate` (Mamba's discretization, `A dt` with `dt` the
-    write gate), a skip `D v`, and the epilogue. The chunked op (`recurrence_chunk.chunk`) takes
+    write gate), declared on its domain, a contraction (`rate <= 0`, the write gate `>= 0`), which
+    a port may take as given; a skip `D v`, and the epilogue. The chunked op (`recurrence_chunk.chunk`) takes
     the same form."""
     conv: Conv | None = None
     l2norm: bool = False
@@ -620,7 +621,7 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     operand = given['token' if hooks.conv is not None else 'value'].dtype
     if 'beta' in given:
         given['beta'] = given['beta'].reshape(rows, -1)
-    if hooks.decay == 'scalar' and hooks.gates is None:
+    if 'log_decay' in given and hooks.decay == 'scalar':
         given['log_decay'] = given['log_decay'].reshape(rows, -1)
     named = jnp.dtype(operand if dtype is None else dtype).name
     # Positional, None where a hook is off: the tuner keys a launch by its positional arrays.
