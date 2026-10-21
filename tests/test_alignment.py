@@ -183,7 +183,9 @@ def test_repa_trains_on_repas_composed_loss_and_its_gradient():
               "head": COMPOSED["weights/head"], "block": {"kernel": COMPOSED["weights/block"]},
               ALIGNMENT: projector}
     params = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)
-    step = Step(step=jnp.asarray(0), key=jax.random.key(settings["key"]), ema=None)
+    # The step reads REPA's own times and noise (`Step.tape`).
+    step = Step(step=jnp.asarray(0), key=jax.random.key(settings["key"]), ema=None,
+                tape={"times": COMPOSED["times"], "noise": COMPOSED["noise"]})
 
     def loss(params):
         return objective.scalar_loss({**variables, "params": params}, {"image": pixels}, step)[0]
