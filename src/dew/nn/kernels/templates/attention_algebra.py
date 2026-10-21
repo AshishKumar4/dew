@@ -74,8 +74,10 @@ class Coords(NamedTuple):
 
 
 class Partial(NamedTuple):
-    """A query block's softmax state, unhooked: the weighted values `acc` `[bq, Dv]`, the running
-    maximum `m` `[bq]` (in base 2 where the step's logits are) and the denominator `total` `[bq]`, fp32."""
+    """A query block's softmax state, unhooked: the weighted values `acc` `[..., bq, Dv]`, the running
+    maximum `m` `[..., bq]` (in base 2 where the step's logits are) and the denominator `total`
+    `[..., bq]`, fp32. `rescale`, `merge` and `finish` take any leading axes, so states a launch wrote
+    per slice merge in XLA after it."""
 
     acc: jax.Array
     m: jax.Array
@@ -133,7 +135,7 @@ def peak(spec: Forward, m: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Arra
 
 def weights(spec: Forward, s: jax.Array, m: jax.Array) -> jax.Array:
     """A tile's unnormalized weights `[bq, bk]` under the running maximum `m`, fp32."""
-    return spec.power(s - _safe(spec, m)[:, None])
+    return spec.power(s - _safe(spec, m)[..., None])
 
 
 def narrow(p: jax.Array, dtype) -> jax.Array:
@@ -148,7 +150,7 @@ def total(denominator: jax.Array, alpha: jax.Array, p: jax.Array) -> jax.Array:
 
 def rescale(acc: jax.Array, alpha: jax.Array) -> jax.Array:
     """The weighted values before a tile, taken to the new maximum; `P·V` adds the tile's to them."""
-    return alpha[:, None] * acc
+    return alpha[..., None] * acc
 
 
 def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
@@ -157,7 +159,8 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     m = jnp.maximum(first.m, second.m)
     safe = _safe(spec, m)
     a, b = spec.power(first.m - safe), spec.power(second.m - safe)
-    return Partial(a[:, None] * first.acc + b[:, None] * second.acc, m, a * first.total + b * second.total)
+    acc = a[..., None] * first.acc + b[..., None] * second.acc
+    return Partial(acc, m, a * first.total + b * second.total)
 
 
 def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable | None = None,
@@ -168,11 +171,11 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     m = state.m / LOG2E if spec.base2 else state.m
     denominator = state.total
     if spec.guarded or initial:
-        out = jnp.where(denominator[:, None] > 0,
-                        state.acc / jnp.where(denominator > 0, denominator, 1.0)[:, None], 0.0)
+        out = jnp.where(denominator[..., None] > 0,
+                        state.acc / jnp.where(denominator > 0, denominator, 1.0)[..., None], 0.0)
         m = jnp.where(m == -jnp.inf, 0.0, m)
     else:
-        out = state.acc / denominator[:, None]
+        out = state.acc / denominator[..., None]
     if output_mod is not None:
         out = output_mod(out, *output_params)
     return out, m, denominator
