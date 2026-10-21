@@ -318,6 +318,7 @@ Four things the design was not written for, in the proposed API, with the fricti
 ```python
 class CausalTransformer(...):
     causal: bool = True                  # False: full attention, no cache
+    diffusion_block: int | None = None   # not causal: each block reads itself and the ones before (LLaDA2)
 
 @presets("mdlm")
 @dataclass(frozen=True)
@@ -334,7 +335,7 @@ class MaskedDiffusionObjective(Objective):
         return jnp.sum(losses * is_masked * self.process.weight(t)[:, None]) / jnp.sum(is_masked), Aux({})
 ```
 
-The Gaussian `Process` does not describe this. `dew.diffusion.discrete` gets `MaskingSchedule`, `DiscreteProcess` and an unmasking `Solver`, shaped like the continuous ones. The trainer is untouched; `chunked_cross_entropy` is reused.
+The Gaussian `Process` does not describe this. `dew.diffusion.discrete` gets `MaskingSchedule`, `DiscreteProcess` and an unmasking `Solver`, shaped like the continuous ones. The trainer is untouched; `chunked_cross_entropy` is reused. A model that reads in blocks (`diffusion_block`) has its process unmask the blocks in order, each clean before the next, and this objective, which corrupts the whole row at once, refuses it.
 
 ### 6.2 MoE training
 
