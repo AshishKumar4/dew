@@ -45,8 +45,10 @@ from .templates.product import declared, promoted
 def ragged_dot_refusal(compute: Dtype, operands: tuple[Dtype, ...],
                        precision: PrecisionLike) -> str | None:
     """Why the kernels do not compute the product a caller asked for, or None where they do: the
-    declared product's refusal (`templates.product.declared`)."""
-    return declared(compute, precision, operands=operands).refusal
+    declared product's refusal (`templates.product.declared`). `operands`' dtypes are no wider than
+    fp32 but under x64, which the declaration refuses."""
+    del operands
+    return declared(compute, precision).refusal
 
 
 @dataclasses.dataclass(frozen=True)

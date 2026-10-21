@@ -734,14 +734,13 @@ def test_an_interpreted_launch_takes_no_pair():
 
 
 def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
-    """`exact_sums` is set for an fp32 output at the highest precision, never for a 16-bit output or the
-    default precision; Mosaic's forward launches, which do not add apart, refuse it, Mosaic's kernel
+    """The declared product promotes (`exact_sums`) for an fp32 output at the highest precision, never for
+    a 16-bit output or the default precision; Mosaic's forward launches, which do not add apart, refuse it, Mosaic's kernel
     gradient keeps only tiles whose two accumulators stay in registers, and Triton's only steps of at most
     `EXACT_STEP` rows."""
-    hooks = grouped_matmul.NO_HOOKS
-    assert grouped_matmul._exact_sums(exact=True, hooks=hooks, out_dtype="float32")
-    assert not grouped_matmul._exact_sums(exact=True, hooks=hooks, out_dtype="bfloat16")
-    assert not grouped_matmul._exact_sums(exact=False, hooks=hooks, out_dtype="float32")
+    assert product.promoted(True, ("float32",))
+    assert not product.promoted(True, ("bfloat16",))
+    assert not product.promoted(False, ("float32",))
     rows = 2048
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
@@ -940,9 +939,10 @@ def test_a_product_declares_its_promotion_and_the_kernels_refusal(compute, preci
     assert grouped_matmul.ragged_dot_refusal(compute, (), precision) == declared.refusal
 
 
-def test_a_product_refuses_operands_wider_than_fp32_and_x64():
-    """The kernels sum gradients in fp32 and offset groups in int32."""
-    assert "wider than fp32" in product.declared(jnp.bfloat16, DEFAULT, operands=(jnp.float64,)).refusal
+def test_a_product_under_x64_is_refused():
+    """x64 widens the kernels' int32 group offsets, and the operands it allows wider than fp32 would need
+    their gradients summed wider than the kernels sum."""
     with jax.enable_x64(new_val=True):
         assert "x64" in product.declared(jnp.bfloat16, DEFAULT).refusal
+        assert grouped_matmul.ragged_dot_refusal(jnp.bfloat16, (jnp.float64,), DEFAULT) is not None
 
