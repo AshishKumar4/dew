@@ -33,7 +33,7 @@ from dew.nn.activations import gated_product
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.dense import Dense
-from dew.nn.flops import attention_flops, matching_lengths, patch_lengths, projection_flops
+from dew.nn.flops import matching_lengths, patch_lengths, projection_flops, self_attention_flops
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables, rotate
 from dew.nn.sharding import logical_axes
@@ -93,8 +93,7 @@ class Flux2SingleBlock(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """The fused QKV/gate/up map and joined output; modulation is shared."""
-        return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
-                + attention_flops(lengths, self.heads, self.head_dim, self.head_dim, causal=False))
+        return self_attention_flops(lengths, self.projections(), self.heads, self.head_dim)
 
     @nn.compact
     def __call__(self, x, mods, rotation):
