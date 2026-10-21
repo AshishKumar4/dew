@@ -15,8 +15,10 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
+import jax
 import numpy as np
 
+from dew.data.sources.codec import content_fingerprint
 from dew.records import JSON, json_value, record
 
 _log = logging.getLogger(__name__)
@@ -73,6 +75,8 @@ class StepIdentity:
 
     @classmethod
     def of(cls, step: object, identity: str | None = None, *, cache: bool = False) -> StepIdentity:
+        """`step`'s identity, refused where a cache keys it (`cache`) and
+        cannot (`keyable`)."""
         kind = step if inspect.isfunction(step) else type(step)
         module = kind.__module__
         name = f"{module}.{kind.__qualname__}"
@@ -82,10 +86,6 @@ class StepIdentity:
         unstable = any(marker in name or marker in config for marker in ("<lambda>", "<locals>", " at 0x"))
         exact = bool(declared) or (not unstable and (frozen or inspect.isfunction(step)))
         external = not module.startswith("dew.")
-        if cache and (
-            not exact or (external and declared is None) or (inspect.isfunction(step) and declared is None)
-        ):
-            raise ValueError(f"cache prefix step {name} needs identity='name@version'")
         path = (
             None if inspect.isbuiltin(step) or kind.__module__ == "builtins" else inspect.getsourcefile(kind)
         )
@@ -102,9 +102,19 @@ class StepIdentity:
             if dataclasses.is_dataclass(step) and not isinstance(step, type)
             else {}
         )
-        if dependencies and dataclasses.is_dataclass(step) and not isinstance(step, type):
+        if dataclasses.is_dataclass(step) and not isinstance(step, type) and (
+                dependencies or _holds_arrays(step)):
             config = json.dumps(_configuration(step), sort_keys=True)
-        return cls(name, config, exact, modules, declared, dependencies)
+        named = cls(name, config, exact, modules, declared, dependencies)
+        if cache and not named.keyable(function=inspect.isfunction(step), external=external):
+            raise ValueError(f"cache prefix step {name} needs identity='name@version'")
+        return named
+
+    def keyable(self, *, function: bool, external: bool) -> bool:
+        """Whether a cache can key what the step computes: a stable identity,
+        declared wherever the step is a function or its code is outside Dew,
+        which Dew's revision does not name."""
+        return self.exact and not ((external or function) and self.declared is None)
 
     def semantic(self) -> dict[str, JSON]:
         """What the step computes, on any host: its identity without its
@@ -148,11 +158,40 @@ def _configuration(step: DataclassInstance) -> dict[str, JSON]:
         value = getattr(step, field.name)
         if isinstance(value, _Dependencies):
             configured[field.name] = json_value(value.dependencies(), field.name)
-        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
-            configured[field.name] = _configuration(value)
         else:
-            configured[field.name] = re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))
+            configured[field.name] = _configured(value)
     return configured
+
+
+def _configured(value) -> JSON:
+    """A step's field, any value, as its configuration records it: a dataclass by its own fields, a
+    value that holds an array entry by entry with the array by its fingerprint, which its repr
+    rounds to eight digits and cuts short past a thousand entries, and anything else by its repr,
+    without addresses."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _configuration(value)
+    if _holds_arrays(value):
+        if isinstance(value, (list, tuple)):
+            return [_configured(entry) for entry in value]
+        if isinstance(value, Mapping):
+            return {repr(name): _configured(entry) for name, entry in value.items()}
+        if isinstance(value, (np.ndarray, jax.Array)):
+            # Its dtype by name and structure, which a dtype's code (`|V1` for both float8s) is not.
+            return {"array": content_fingerprint(np.asarray(value)).hex()}
+    return re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))
+
+
+def _holds_arrays(value) -> bool:
+    """Whether `value`, a step or a field of one, holds an array, whose repr does not spell it out
+    (`_configured`)."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return any(_holds_arrays(getattr(value, field.name))
+                   for field in dataclasses.fields(value) if field.repr)
+    if isinstance(value, (np.ndarray, jax.Array)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return any(map(_holds_arrays, value))
+    return isinstance(value, Mapping) and any(map(_holds_arrays, value.values()))
 
 
 _ENVIRONMENT = ("revision", "lock", "python", "platform", "clean")
@@ -161,6 +200,36 @@ _ENVIRONMENT = ("revision", "lock", "python", "platform", "clean")
 def _changed(saved: Mapping[str, object], current: Mapping[str, object]) -> tuple[str, ...]:
     """The fields of a saved record that `current` does not repeat."""
     return tuple(name for name in sorted(set(saved) | set(current)) if saved.get(name) != current.get(name))
+
+
+def _identities(value: object) -> list[dict[str, JSON]]:
+    if not isinstance(value, list):
+        raise ValueError(f"{value!r}: a manifest's steps are a list of step identities")
+    return [{name: json_value(entry, name) for name, entry in record(step, "step").items()} for step in value]
+
+
+def _semantic(recorded: Mapping[str, object]) -> dict[str, JSON]:
+    """What the rows a manifest's record (`Manifest.record`) names are, on
+    any host: the pinned sources, each step's identity and dependencies
+    (`StepIdentity.semantic`), the tokenizers and the fill."""
+    return {
+        name: [{key: entry for key, entry in step.items() if key != "modules"} for step in _identities(value)]
+        if name == "steps" else json_value(value, name)
+        for name, value in recorded.items()
+        if name not in (*_ENVIRONMENT, "ran")
+    }
+
+
+def _environment(recorded: Mapping[str, object]) -> dict[str, JSON]:
+    """The code and machine that ran a manifest's steps, from its record:
+    Dew's revision and lock, the interpreter, the platform and each external
+    module's bytes, for the steps a memory read ran and then the plan's own.
+    A step states a change to what it computes in its configuration or
+    declared identity; its modules' bytes change with any edit to their
+    files, as Dew's revision does with any edit to Dew."""
+    steps = (*_identities(recorded["ran"]), *_identities(recorded["steps"]))
+    return {**{name: json_value(recorded[name], name) for name in _ENVIRONMENT},
+            "modules": [step["modules"] for step in steps]}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -262,25 +331,10 @@ class Manifest:
         return recorded
 
     def semantic(self) -> dict[str, JSON]:
-        """What the rows are, on any host: the pinned sources, each step's
-        identity and dependencies (`StepIdentity.semantic`), the tokenizers
-        and the fill."""
-        recorded = self.record()
-        recorded["steps"] = [step.semantic() for step in self.steps]
-        return {name: value for name, value in recorded.items() if name not in (*_ENVIRONMENT, "ran")}
+        return _semantic(self.record())
 
     def environment(self) -> dict[str, JSON]:
-        """The code and machine that ran the steps: Dew's revision and lock,
-        the interpreter, the platform and each external module's bytes, for
-        the steps a memory read ran and then the plan's own. A step states a
-        change to what it computes in its configuration or declared identity;
-        its modules' bytes change with any edit to their files, as Dew's
-        revision does with any edit to Dew."""
-        recorded = self.record()
-        return {
-            **{name: recorded[name] for name in _ENVIRONMENT},
-            "modules": [list(step.modules) for step in (*self.ran, *self.steps)],
-        }
+        return _environment(self.record())
 
     @property
     def canonical(self) -> bytes:
@@ -327,15 +381,8 @@ class Plan:
     """Order-defining fields checked before a restored iterator opens readers.
 
     `version` names how Dew reads a plan into rows, which its fields do not say: a change that
-    makes other rows or draws from the same plan raises it, so a position saved before the change
-    is refused. Version 2 keys each random step by its place in what the run wrote
-    (`dew.data.lowering._Build.stage_seed`), runs a global order's stages after its batch by index
-    and resumes a count inside a batch past that batch's first rows, in the batches' final order.
-    Version 3 keys a mixture member's draws by the name it goes by, or an unnamed one's place among
-    the unnamed, rather than its place among all the members (`dew.data.lowering._member_key`), so
-    a named member joining or leaving leaves the others' draws as they were, and records those
-    names in the order (`dew.data.analysis._members`), so a position is refused where a member was
-    renamed, joined or left."""
+    makes other rows or draws from the same plan raises it, and a position saved under another
+    version is refused."""
 
     lowering: Literal["global", "per-share"]
     manifest: Manifest
@@ -349,7 +396,7 @@ class Plan:
     """A mixture's members, each what it reads and runs as one digest under its key, and its own
     stages under the empty key (`dew.data.analysis._member_manifests`): what a streamed mix's
     resume reads of a member that joined or left (`check`)."""
-    version: ClassVar[int] = 3
+    version: ClassVar[int] = 4
 
     def record(self) -> dict[str, JSON]:
         return {

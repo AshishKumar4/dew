@@ -71,6 +71,26 @@ class PromptRecord:
         return cls(_text(data_source), _text(ground_truth), _text(extra_info))
 
 
+def _extra_info(element: Mapping[str, object]) -> JSON:
+    """A prompt row's `extra_info`, its `ability` (a verl row's task family) folded in as a field of
+    it, as the reward reads it. An `extra_info` that is no mapping (a string, a list) rides beside it
+    as `{"extra_info": ..., "ability": ...}`. One whose `ability` names another contradicts the
+    row and is refused, since keeping either would lose the other."""
+    context = json_value(element.get("extra_info"), "prompt extra_info")
+    if "ability" not in element:
+        return context
+    ability = json_value(element["ability"], "prompt ability")
+    match context:
+        case None:
+            return {"ability": ability}
+        case {"ability": held} if held != ability:
+            raise ValueError(f"a prompt row's ability {ability!r} differs from its extra_info's {held!r}")
+        case dict():
+            return {**context, "ability": ability}
+        case _:
+            return {"extra_info": context, "ability": ability}
+
+
 FIELDS = ("prompt", "data_source", "ground_truth", "extra_info", "tools", "reward_model")
 """The fields prompt encoding reads, leaving the others unchanged.
 
@@ -157,10 +177,11 @@ def _utf8(text: str, width: int) -> np.ndarray:
 
 
 def encode(tokenizer: str | PreTrainedTokenizerBase, *, max_prompt_len: int = 256, pad_id: int = 0,
-           long: Literal["drop", "truncate"] = "drop", thinking: bool | None = None) -> RenderPrompt:
+           long: Literal["drop", "truncate"] = "truncate", thinking: bool | None = None) -> RenderPrompt:
     """A record step that renders a prompt row (verl's columns: "prompt",
     "data_source", "ground_truth", ...) to `max_prompt_len` left-padded ids,
-    dropping (counted) or cutting a longer one."""
+    keeping a longer one's tail, or dropping it (`long="drop"`), counted as a
+    rejection."""
     from dew.data.steps.chat import RenderPrompt
     from dew.data.text import tokenizer_name
 

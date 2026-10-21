@@ -41,7 +41,8 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                     "dew.objectives.diffusion.guidance_distillation",
                     "dew.objectives.jepa", "dew.objectives.supervised", "dew.objectives.rl",
                     "dew.objectives.rl.flow",
-                    "dew.objectives.rl.scheduler", "dew.rl.sandbox", "dew.interop.harbor"]),
+                    "dew.objectives.rl.scheduler", "dew.rl.sandbox", "dew.interop.gateway",
+                    "dew.interop.harness", "dew.interop.harbor"]),
     ("Data", ["dew.data", "dew.data.presets", "dew.data.pipeline", "dew.data.holdout", "dew.data.compile",
               "dew.data.dataset", "dew.data.plan", "dew.data.mixing", "dew.data.cache",
               "dew.data.storage", "dew.data.sinks",
@@ -74,7 +75,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.data", "dew.config.sweep"]),
     ("Utilities", ["dew.rl", "dew.artifacts", "dew.coordination", "dew.records", "dew.telemetry.profile",
-                   "dew.figures"]),
+                   "dew.telemetry.benchmark", "dew.figures"]),
 ]
 # Places that show users Dew code; every Dew name they use must resolve to the
 # documented API. A landing snippet file shows only its marked regions.

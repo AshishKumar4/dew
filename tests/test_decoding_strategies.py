@@ -11,7 +11,7 @@ import pytest
 from jax.experimental import checkify
 from model_support import decoder, greedy_walk as walk
 
-from dew.sampling import Sample, Sampling, decoding, generate
+from dew.sampling import Beam, Sample, Sampling, decoding, generate
 from dew.sampling.decoding import StepState
 from dew.sampling.strategies import draw
 
@@ -226,6 +226,28 @@ def test_any_sequence_of_components_decodes_as_its_tuple_does(model):
     written = generate(module, params, prompt, 4, key=jax.random.key(0), logits=transforms, stopping=criteria)
     np.testing.assert_array_equal(np.asarray(given.tokens), np.asarray(written.tokens))
     np.testing.assert_array_equal(np.asarray(given.lengths), np.asarray(written.lengths))
+
+
+def test_a_length_limit_truncates_a_row_and_a_stop_terminates_it(model):
+    """A criterion that cuts a row short at a length (`MaxNewTokens`, `MaxLength`) finishes it
+    unterminated, as the draw's own budget does, and one that ends it, a caller's test, terminates
+    it, each row stopping where its criterion fires; a beam's hypotheses alike."""
+    module, params = model
+    prompt = jnp.asarray([[1, 2, 3], [4, 5, 6]], jnp.int32)
+
+    def at_two(state, tokens):
+        return state.step >= 2
+
+    sampling = Sampling(temperature=0, pad_token_id=11)
+    for stopping, terminated in (((decoding.MaxNewTokens(2),), False), ((decoding.MaxLength(5),), False),
+                                 ((at_two,), True)):
+        drawn = generate(module, params, prompt, 5, key=jax.random.key(0), sampling=sampling,
+                         stopping=stopping)
+        assert drawn.lengths.tolist() == [2, 2]
+        assert drawn.terminated.tolist() == [terminated, terminated]
+    searched = generate(module, params, prompt[:1], 5, key=jax.random.key(0), sampling=sampling,
+                        stopping=(decoding.MaxNewTokens(2),), strategy=Beam(width=2))
+    assert searched.lengths.tolist() == [2] and searched.terminated.tolist() == [False]
 
 
 def test_a_callers_criterion_ends_the_row_it_names(model):

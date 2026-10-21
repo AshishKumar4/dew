@@ -14,7 +14,6 @@ import dataclasses
 import itertools
 import json
 import os
-import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -26,7 +25,7 @@ import optax
 import orbax.checkpoint as ocp
 import pytest
 from affine_run import BATCH, FEATURES, Counting, Features, Regression, Spread, dataset, raw_leaf, val_batches
-from recording import RecordingTracker
+from recording import Preempting, RecordingTracker
 from steady_state import steady_state
 
 from dew import position
@@ -37,6 +36,8 @@ from dew.config.data import loader
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.objectives.base import Aux, EMASpec, Objective, merge, under
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
+from dew.training.evaluation import WARM_BATCHES
+from dew.training.model_flops import _TokenCount
 from dew.training.optim import Cosine, Power
 from dew.training.runtime import Preempted
 from dew.training.state import CHECKPOINTED
@@ -73,15 +74,18 @@ class TokenRegression(Regression):
 
 
 @pytest.mark.parametrize("log_every", [1, 4])
-@pytest.mark.parametrize("accumulation", [1, 2])
-def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, accumulation):
+@pytest.mark.parametrize(("accumulation", "steps", "logged"), [(1, 3, [8, 16, 24]), (2, 4, [0, 24, 0, 56])])
+def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, accumulation, steps, logged):
+    """Eight rows of lengths 1, 2, 3, 4 a step, without padding: a budget of 30 tokens counts the
+    updates committed, so it ends at the first commit past 30, step 3 (48) one microbatch an update
+    and step 4 (80) two, whose first update commits 24."""
     tracker = RecordingTracker()
     trainer = make_trainer(objective=TokenRegression(), tracker=tracker, accumulation=accumulation)
     state = trainer.fit(dataset(), tokens=30, log_every=log_every)
-    assert int(state.step) == 3  # Eight rows of lengths 1, 2, 3 cross 30 at 48.
+    assert int(state.step) == steps
     if log_every == 1:
-        assert [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars] == [
-            8, 16, 24]
+        assert [scalars["train/tokens"] for _, scalars in tracker.scalars
+                if "train/tokens" in scalars] == logged
 
 
 def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
@@ -100,12 +104,53 @@ def test_a_token_only_run_uses_the_schedules_own_horizon(schedule):
 def test_a_token_budget_resumes_its_count_from_the_checkpoint(tmp_path):
     first = make_trainer(tmp_path, objective=TokenRegression())
     assert int(first.fit(dataset(), steps=2, tokens=30, log_every=1).step) == 2
-    assert first.checkpoints.control(2)["tokens"] == 24
+    assert first.checkpoints.control(2)["committed_tokens"] == 24
     resumed = make_trainer(tmp_path, objective=TokenRegression())
     assert int(resumed.fit(dataset(), tokens=30, log_every=1).step) == 3
-    assert resumed.checkpoints.control(3)["tokens"] == 48
+    assert resumed.checkpoints.control(3)["committed_tokens"] == 48
     complete = make_trainer(tmp_path, objective=TokenRegression())
     assert int(complete.fit(dataset(), tokens=30).step) == 3
+
+
+def test_a_token_budget_counts_the_tokens_of_committed_updates(tmp_path):
+    """Under an accumulation of two, a run's tokens are those of the updates it committed: a run
+    stopped inside a window counts none of its batch, and its resume counts that batch at the
+    window's commit, once (spec training §3)."""
+    first = make_trainer(tmp_path, objective=TokenRegression(), accumulation=2)
+    stopped = first.fit(dataset(), steps=3, log_every=1)
+    assert int(stopped.step) == 3
+    assert first.checkpoints.control(3)["committed_tokens"] == 24
+    assert _TokenCount.host(jax.device_get(stopped.accumulation.tokens)) == 24
+    resumed = make_trainer(tmp_path, objective=TokenRegression(), accumulation=2)
+    assert int(resumed.fit(dataset(), steps=4, log_every=1).step) == 4
+    assert resumed.checkpoints.control(4)["committed_tokens"] == 80
+
+
+def test_a_checkpoint_that_counted_every_steps_tokens_cannot_resume_a_token_budget(tmp_path):
+    """A checkpoint whose control counts every step's tokens (`tokens`, as runs counted before they
+    counted commits) holds no committed count: a run whose length is its tokens refuses to resume
+    from it, and a run of steps resumes and keeps the count unknown in its own checkpoints, so a
+    token budget after it is refused too."""
+    import json
+    import pathlib
+
+    first = make_trainer(tmp_path, objective=TokenRegression())
+    first.fit(dataset(), steps=2, log_every=1, checkpoint_every=1)
+    first.checkpoints.wait()
+    # The step's metadata as a run before commits counted wrote it: the old field, every step's count.
+    (written,) = pathlib.Path(first.checkpoints.directory, "2").glob("_CHECKPOINT_METADATA")
+    metadata = json.loads(written.read_text())
+    control = metadata["custom_metadata"]["control"]
+    control["tokens"] = control.pop("committed_tokens")
+    written.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=30)
+    resumed = make_trainer(tmp_path, objective=TokenRegression())
+    assert int(resumed.fit(dataset(), steps=3, log_every=1, checkpoint_every=1).step) == 3
+    assert "tokens" in resumed.checkpoints.control(3)
+    assert "committed_tokens" not in resumed.checkpoints.control(3)
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=60)
 
 
 def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
@@ -118,7 +163,7 @@ def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
 def test_a_step_only_prefix_keeps_lifetime_real_tokens(tmp_path):
     first = make_trainer(tmp_path, objective=TokenRegression())
     first.fit(dataset(), steps=2, log_every=1)
-    assert first.checkpoints.control(2)["tokens"] == 24
+    assert first.checkpoints.control(2)["committed_tokens"] == 24
     resumed = make_trainer(tmp_path, objective=TokenRegression())
     assert int(resumed.fit(dataset(), tokens=30, log_every=1).step) == 3
 
@@ -149,7 +194,7 @@ def test_a_token_budget_stays_exact_above_float32_integer_resolution(cadence):
 def test_resumed_tokens_stay_exact_above_float32_integer_resolution(tmp_path, cadence):
     first = make_trainer(tmp_path, objective=LargeTokenRegression())
     first.fit(dataset(LargeTokenRows), steps=65, log_every=cadence)
-    assert first.checkpoints.control(65)["tokens"] == 65 * 262143
+    assert first.checkpoints.control(65)["committed_tokens"] == 65 * 262143
     resumed = make_trainer(tmp_path, objective=LargeTokenRegression())
     state = resumed.fit(dataset(LargeTokenRows), tokens=65 * 262143 + 1, log_every=cadence)
     assert int(state.step) == 66
@@ -360,22 +405,6 @@ def drawn(seed=0, opened=None, diverge=None):
 
 def stream(reader):
     return Loader(reader, None, batch=BATCH, records=None)
-
-
-class Preempting(RecordingTracker):
-    """Sends this process the scheduler's SIGTERM, once, when step `at` is
-    logged. The loop reads a step's log once the next step is dispatched, so
-    the notice stops the run after step `at` + 1."""
-
-    def __init__(self, at):
-        super().__init__()
-        self.at = at
-
-    def log(self, scalars, step):
-        super().log(scalars, step)
-        if step == self.at:
-            self.at = None
-            os.kill(os.getpid(), signal.SIGTERM)
 
 
 def preempted(tmp_path, data, at=3, steps=6):
@@ -1092,8 +1121,9 @@ def test_eval_every_scores_the_validation_split_and_logs_the_artifacts():
     state = trainer.fit(dataset(val=val_batches(3)), steps=4, log_every=2, eval_every=2,
                         metrics=(Spread(seen),), preview=True)
 
-    # Two passes: at step 2, and at the end of the run.
-    assert seen == [((BATCH, 2), (BATCH, FEATURES))] * 6
+    # The pass that warms the evaluations before the first step scores its first batches, and two
+    # passes the whole split: at step 2, and at the end of the run.
+    assert seen == [((BATCH, 2), (BATCH, FEATURES))] * (WARM_BATCHES + 6)
     scored = [(step, s) for step, s in tracker.scalars if "val/spread" in s]
     assert [step for step, _ in scored] == [2, 4]
     # The pass at the end scores the averaged weights over the whole split, so

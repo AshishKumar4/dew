@@ -34,7 +34,7 @@ from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_c
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key, token_id
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
-from dew.objectives.base import Variables, thaw
+from dew.objectives.base import UNREAD, Variables, thaw
 from dew.records import integer, record as named_fields, text as named
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping
@@ -290,7 +290,7 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
         raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
     objective = objectives[named(record['objective'], 'objective')]
     declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
-    stray = set(record) - {'objective', 'model', *declared}
+    stray = set(record) - {'objective', 'model', UNREAD, *declared}
     if stray:
         raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                          f"{sorted(stray)}")
@@ -609,7 +609,9 @@ class TextGeneration(_NativeTextTask):
         policy = self.sampling if sampling is None else with_ids_of(sampling, self.sampling)
         stops = self._stops if policy.stop == self.sampling.stop else self._stop_criteria(policy.stop)
         chain = (self.logits if sampling is None else None) if logits is None else logits
-        criteria = decoding.components(self.stopping if stopping is None else stopping) + stops
+        given = self.stopping if stopping is None else stopping
+        # As given: `resolve` tells the criteria that truncate from those that end a row by their kind.
+        criteria = (tuple(given) if isinstance(given, Sequence) else (given,)) + stops
         return replace(policy, stop=(), pad_token_id=policy.pad), chain, criteria
 
     def quantized(self, spec: Quantization, example: Rows = ((0,),)) -> TextGeneration:
