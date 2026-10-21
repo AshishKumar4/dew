@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
-def images(dataset: Dataset, size: int, *, batch: int,
+def images(dataset: Dataset, size: int, *, batch: int | None,
            augment: bool | image_steps.DeviceAugment | RandomStep | tuple[RandomStep, ...] = False,
            crop_scale: tuple[float, float] = (1.0, 1.0), field: str = "image",
            staging_size: int | None = None, draft: bool = False, rejects: bool = True,
@@ -84,7 +84,9 @@ def images(dataset: Dataset, size: int, *, batch: int,
       before the preset reads the cache as it reads the inputs. Drawn captions and augmentation
       run after it.
     - `records` keeps that many prepared records before the batch; `host` steps then read each
-      batch on the host, before any step on the accelerator."""
+      batch on the host, before any step on the accelerator. `batch=None` leaves the records
+      unbatched, for corpora mixed or phased and batched after, which no host step or
+      accelerator augmentation can then read."""
 
     device: image_steps.DeviceAugment | None = None
     on_host: tuple[RandomStep, ...] = ()
@@ -155,19 +157,21 @@ def lm(dataset: Dataset, tokenizer: str | SavedTokenizer | None, *, seq_len: int
     `tokenizer=None` the documents are token ids already, under "text", such as a token store's,
     whose windows a store reads by index (`TokenFiles(url).pipe(presets.lm, None, seq_len=512,
     batch=8, pack=None)`); a store packed must state where its documents end. `cache` holds the
-    tokenized documents, as `images` holds its images. `batch=None` leaves the rows unbatched, for
-    corpora each laid out alone and then mixed or phased (`phases`), batched after."""
+    tokenized documents, packed cut into the pieces a row holds, as `images` holds its images; a
+    generation published from the preset's own rows (`publish`) reads its packing plan in place of
+    the pack. `batch=None` leaves the rows unbatched, for corpora each laid out alone and then
+    mixed or phased (`phases`), batched after."""
 
     if pack is not None and stride is not None:
         raise ValueError("stride places fixed windows, pack=None; a pack lays documents out whole")
-    documents = _cached(dataset if tokenizer is None else dataset.map(
-        text_steps.tokenize(tokenizer, field=field, eos=eos)), cache)
+    documents = dataset if tokenizer is None else dataset.map(text_steps.tokenize(tokenizer, field=field,
+                                                                                  eos=eos))
     if pack is None:
-        windows = documents.windows(seq_len, stride=stride)
+        windows = _cached(documents, cache).windows(seq_len, stride=stride)
     else:
         if tokenizer is None:
             _documented(dataset)
-        windows = _next_token_windows(documents, Pack(seq_len + 1, bins=bins, policy=pack))
+        windows = _next_token_windows(documents, Pack(seq_len + 1, bins=bins, policy=pack), cache=cache)
     return _finished(windows, batch=batch, records=records, host=host)
 
 
@@ -196,7 +200,7 @@ def token_windows(dataset: Dataset, *, seq_len: int, batch: int | None, stride: 
     return _finished(windows, batch=batch, records=records, host=host)
 
 
-def sft(dataset: Dataset, tokenizer: str | SavedTokenizer, *, seq_len: int, batch: int,
+def sft(dataset: Dataset, tokenizer: str | SavedTokenizer, *, seq_len: int, batch: int | None,
         messages: str = "messages", long: Literal["chunk", "truncate", "drop"] = "chunk",
         pack: Literal["first-fit", "best-fit", "concat"] = "first-fit", bins: int = 32,
         cache: str | Cached | None = None, records: int | None = None,
@@ -204,15 +208,15 @@ def sft(dataset: Dataset, tokenizer: str | SavedTokenizer, *, seq_len: int, batc
     """Conversations in `messages` rendered through the tokenizer's chat
     template, each token's speaker kept beside it for an assistant-only loss,
     and packed into rows of `seq_len + 1` tokens by `pack`, as `lm` packs,
-    in batches of `batch` rows (`records` and `host` as `images` takes
-    them). A conversation longer than a row is cut into pieces that keep
+    in batches of `batch` rows (`batch=None`, `records` and `host` as
+    `images` takes them). A conversation longer than a row is cut into pieces that keep
     every turn (`long="chunk"`), cut at its end (`"truncate"`), or dropped
-    and counted (`"drop"`). `cache` holds the rendered conversations, as `images` holds its
-    images."""
+    and counted (`"drop"`). `cache` holds the rendered conversations so cut, as `lm` holds its
+    documents."""
 
-    rendered = _cached(dataset.map(chat.template(tokenizer, messages=messages)), cache)
+    rendered = dataset.map(chat.template(tokenizer, messages=messages))
     packing = Pack(seq_len + 1, _CHAT_FIELDS, bins=bins, policy=pack)
-    windows = _conversation_windows(rendered, packing, long=long)
+    windows = _conversation_windows(rendered, packing, long=long, cache=cache)
     return _finished(windows, batch=batch, records=records, host=host)
 
 
@@ -250,43 +254,46 @@ _CHAT_FIELDS = ("text", chat.ROLES_KEY)
 """The per-token fields a rendered conversation packs: its ids and each one's speaker."""
 
 
-def _next_token_windows(documents: Dataset, pack: Pack) -> Pipeline:
+def _next_token_windows(documents: Dataset, pack: Pack, *, cache: str | Cached | None = None) -> Pipeline:
     """Token documents packed by `pack` with every cut through one overlapping by one token, so each
     token's next-token target stays in one piece: a fitting pack's documents are cut into pieces of
     its length first, and a concatenating pack overlaps the cuts it makes itself (`Pack.overlap`).
-    `lm`, a conversation cut into pieces and the text and chat recipes (`dew.config.data`) prepare
-    text through it."""
+    `cache` holds the documents so cut, before the pack, where a published generation's packing
+    plan takes the pack's place. `lm`, a conversation cut into pieces and the text and chat recipes
+    (`dew.config.data`) prepare text through it."""
     if pack.policy == "concat":
-        return documents._then(dataclasses.replace(pack, overlap=1))
-    return documents.flat_map(text_steps.Chunks(pack.seq_len, fields=pack.fields, overlap=1))._then(pack)
+        return _cached(documents, cache)._then(dataclasses.replace(pack, overlap=1))
+    pieces = documents.flat_map(text_steps.Chunks(pack.seq_len, fields=pack.fields, overlap=1))
+    return _cached(pieces, cache)._then(pack)
 
 
-def _conversation_windows(rendered: Dataset, pack: Pack, *,
-                          long: Literal["truncate", "drop", "chunk"]) -> Pipeline:
+def _conversation_windows(rendered: Dataset, pack: Pack, *, long: Literal["truncate", "drop", "chunk"],
+                          cache: str | Cached | None = None) -> Pipeline:
     """Rendered conversations (`chat.template`) packed by `pack` with their speakers: one longer
     than a window cut at its end, dropped and counted, or cut into pieces (`_next_token_windows`),
     as `long` says. `sft` and the chat recipe (`dew.config.data.ChatData`) share it."""
     if long == "chunk":
-        return _next_token_windows(rendered, pack)
+        return _next_token_windows(rendered, pack, cache=cache)
     fitted = chat.fit_length(pack.seq_len, long=long)
     # A concatenating pack cuts conversations where its rows end, so its cuts overlap by one token too.
     pack = dataclasses.replace(pack, overlap=1) if pack.policy == "concat" else pack
-    return (rendered.filter_map(fitted) if long == "drop" else rendered.map(fitted))._then(pack)
+    return _cached(rendered.filter_map(fitted) if long == "drop" else rendered.map(fitted), cache)._then(pack)
 
 
-def prompts(dataset: Dataset, tokenizer: str | SavedTokenizer, *, max_prompt_len: int, batch: int,
+def prompts(dataset: Dataset, tokenizer: str | SavedTokenizer, *, max_prompt_len: int, batch: int | None,
             pad_id: int = 0, long: Literal["drop", "truncate"] = "truncate", thinking: bool | None = None,
-            reward_bytes: int | None = None, records: int | None = None,
+            reward_bytes: int | None = None, cache: str | Cached | None = None, records: int | None = None,
             host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Prompt rows (verl's columns: "prompt", "data_source", "ground_truth", ...) rendered to
     `max_prompt_len` left-padded ids, keeping a longer prompt's tail, or dropping it (`long="drop"`),
-    with their reward columns padded to `reward_bytes`, in batches of `batch` (`records` and `host`
-    as `images` takes them). Without `reward_bytes`, a memory read measures it over each store, the
-    widest reward string it holds, so every row fits whole; another read needs it given, or stated
-    by the store's metadata."""
+    with their reward columns padded to `reward_bytes`, in batches of `batch` (`batch=None`,
+    `records` and `host` as `images` takes them). Without `reward_bytes`, a memory read measures
+    it over each store, the widest reward string it holds, so every row fits whole; another read
+    needs it given, or stated by the store's metadata. `cache` holds the rendered prompts, as
+    `images` holds its images."""
     rendered = _rendered_prompts(dataset, tokenizer, max_prompt_len, pad_id=pad_id, long=long,
                                  thinking=thinking, reward_bytes=reward_bytes)
-    return _finished(rendered, batch=batch, records=records, host=host)
+    return _finished(_cached(rendered, cache), batch=batch, records=records, host=host)
 
 
 def _rendered_prompts(dataset: Dataset, tokenizer: str | SavedTokenizer, max_prompt_len: int, *,
@@ -304,28 +311,30 @@ def _rendered_prompts(dataset: Dataset, tokenizer: str | SavedTokenizer, max_pro
     return dataset.map(Configured(configure, needs=("reward_bytes",), measures=RewardWidth()))
 
 
-def preferences(dataset: Dataset, *, seq_len: int, batch: int, pad_id: int = 0, records: int | None = None,
+def preferences(dataset: Dataset, *, seq_len: int, batch: int | None, pad_id: int = 0,
+                cache: str | Cached | None = None, records: int | None = None,
                 host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Preference pairs of token ids, chosen and rejected, each laid out in `seq_len` tokens with
     its completion's mask, padded with `pad_id` (`preferences.PreferencePair`), in batches of
-    `batch` (`records` and `host` as `images` takes them). No tokenizer: a pair of raw text is
-    tokenized by a step before it."""
+    `batch` (`batch=None`, `records`, `host` and `cache` as `images` takes them). No tokenizer: a
+    pair of raw text is tokenized by a step before it."""
     from dew.data.preferences import PreferencePair
 
-    return _finished(dataset.map(PreferencePair(seq_len, pad_id=pad_id)), batch=batch, records=records,
-                     host=host)
+    laid = _cached(dataset.map(PreferencePair(seq_len, pad_id=pad_id)), cache)
+    return _finished(laid, batch=batch, records=records, host=host)
 
 
 def canvas(dataset: Dataset, tokenizer: str | SavedTokenizer, *, prompt_length: int,
-           canvas_size: int, batch: int, canvases: int = 1, pad_id: int = 0, messages: str = "messages",
-           records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
+           canvas_size: int, batch: int | None, canvases: int = 1, pad_id: int = 0,
+           messages: str = "messages", cache: str | Cached | None = None, records: int | None = None,
+           host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat template, then each
     assistant turn one row of a block-diffusion objective (`ResponseCanvases`): what comes before
     it in `prompt_length` tokens, padded with `pad_id`, and its response in `canvases` canvases of
     `canvas_size`, the tokenizer's EOS filling the rest of its last canvas and `pad_id` the canvases
     after it; a longer prompt or response keeps its first tokens. Never packed, in batches of
-    `batch` (`records` and `host` as `images` takes them). A tokenizer with no EOS cannot fill a
-    canvas, and is refused."""
+    `batch` (`batch=None`, `records`, `host` and `cache` as `images` takes them). A tokenizer with
+    no EOS cannot fill a canvas, and is refused."""
     from dew.data.steps.chat import ResponseCanvases
 
     renderer = chat.template(tokenizer, messages=messages)
@@ -333,10 +342,11 @@ def canvas(dataset: Dataset, tokenizer: str | SavedTokenizer, *, prompt_length: 
     if eos is None:
         raise ValueError(f"tokenizer {renderer.tokenizer!r} declares no eos token to end a response's canvas")
     layout = ResponseCanvases(prompt_length, canvas_size, canvases, eos, pad_id)
-    return _finished(dataset.map(renderer).flat_map(layout), batch=batch, records=records, host=host)
+    return _finished(_cached(dataset.map(renderer).flat_map(layout), cache), batch=batch, records=records,
+                     host=host)
 
 
-def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: int, batch: int,
+def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: int, batch: int | None,
           sample_rate: int | None = None, margin: float = 0.0, context: float = 0.0,
           missing: Literal["silence", "reject"] = "silence", rejects: bool = True, records: int | None = None,
           host: tuple[HostStep, ...] = ()) -> Pipeline:
@@ -348,15 +358,15 @@ def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: in
     `missing="reject"` dropped. Media shorter than the window, or that does not decode, is
     counted and dropped, or with `rejects=False` stops the run. A window is drawn `margin`
     seconds clear of the media's ends, and its sound is `context` seconds wider on each side. The
-    media and its window are read here and leave the record. `records` and `host` as `images`
-    takes them."""
+    media and its window are read here and leave the record. `batch=None`, `records` and `host` as
+    `images` takes them."""
 
     windows = _clips(dataset, seconds, frames=frames, fps=fps, size=size, margin=margin,
                      sample_rate=sample_rate, context=context, missing=missing, rejects=rejects)
     return _finished(windows, batch=batch, records=records, host=host)
 
 
-def video(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: int, batch: int,
+def video(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: int, batch: int | None,
           caption: str = "", extensions: tuple[str, ...] = (".mp4", ".avi", ".mov", ".webm"),
           sample_rate: int | None = None, margin: float = 0.0, context: float = 0.0,
           missing: Literal["silence", "reject"] = "silence", rejects: bool = True, records: int | None = None,
