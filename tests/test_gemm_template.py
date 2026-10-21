@@ -570,7 +570,8 @@ def transposed_twice_nested(x, side):
 def test_an_fp32_product_above_the_default_precision_runs_xla():
     """fp32 products are TF32 in the kernels, which only the default precision asks for: an explicit
     'highest' under a configured default runs XLA's portable program, reported as the route with the
-    reason, with the products' low mantissa bits TF32 would drop; a kernel chosen for it raises."""
+    reason, its products of low-mantissa fp32 values XLA's at 'highest' bit for bit; a kernel chosen for
+    it raises."""
     rng = np.random.default_rng(8)
     x = jnp.asarray(1 + rng.integers(1, 2 ** 10, size=(64, DEPTH)) * 2.0 ** -20, jnp.float32)
     w = jnp.asarray(1 + rng.integers(1, 2 ** 10, size=(1, DEPTH, WIDTH)) * 2.0 ** -20, jnp.float32)
@@ -590,8 +591,9 @@ def test_an_fp32_product_above_the_default_precision_runs_xla():
              if route.choice == "grouped_matmul"]
     assert taken == [("xla", True)]
     assert {route.kernel for route in default if route.choice == "grouped_matmul"} == {"triton"}
-    exact = np.asarray(x, np.float64) @ np.asarray(w[0], np.float64)
-    assert float(np.max(np.abs(np.asarray(got, np.float64) - exact) / exact)) < 2.0 ** -20
+    xla = jax.jit(lambda x, w: jax.lax.ragged_dot(x, w, jnp.asarray([64]), precision="highest",
+                                                  preferred_element_type=jnp.float32))(x, w)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(xla))
 
 
 def test_an_integer_side_operand_takes_no_gradient():
