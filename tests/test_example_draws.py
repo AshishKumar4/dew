@@ -308,15 +308,18 @@ def test_a_distilled_inpainting_step_reads_no_draw_of_its_attempt():
 
     @dataclass(frozen=True, eq=False)
     class GuidedText(StubText):
+        """`StubText` for a guidance-embedded model: its conditioning carries a guidance value."""
+
         def encode(self, params, tokens):
-            return DenoisingCondition(params["table"][jnp.asarray(tokens["input_ids"])])
+            context = params["table"][jnp.asarray(tokens["input_ids"])]
+            return DenoisingCondition(context, guidance=jnp.ones((context.shape[0],), jnp.float32))
 
     class GuidedInpainting(nn.Module):
         @nn.compact
         def __call__(self, x, temb, textcontext, mask=None, masked_image=None, train=False):
             gain = self.param("gain", nn.initializers.constant(0.25), ())
             text = jnp.mean(textcontext.context, axis=(1, 2))[:, None, None, None]
-            guidance = 0.0 if textcontext.guidance is None else textcontext.guidance[:, None, None, None]
+            guidance = textcontext.guidance[:, None, None, None]
             return (gain * x + 0.3 * masked_image * (1 - mask) + 0.1 * text + 0.01 * guidance
                     + (temb / 1000)[:, None, None, None] * 0.1)
 
