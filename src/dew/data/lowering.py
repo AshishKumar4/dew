@@ -17,6 +17,8 @@ the last `map_with_index`, which is the only step that reads it.
 
 from __future__ import annotations
 
+import collections
+import concurrent.futures
 import contextlib
 import dataclasses
 import functools
@@ -98,6 +100,7 @@ from dew.data.pipeline import (
 from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
+from dew.data.sources.urls import Fetch
 from dew.data.steps.generic import Fields
 from dew.data.steps.text import LayoutRule, ValidTargets, recounted
 from dew.data.text import Chunks
@@ -283,6 +286,63 @@ class _Rows(gx.FlatMapTransform):
 def _expanded(rows: pygrain.IterDataset, stage: FlatMap, name: str, label: str) -> pygrain.IterDataset:
     return (Chunked(rows, name, label, functools.partial(_Rows, stage)) if isinstance(stage.step, Chunks)
             else gx.FlatMapIterDataset(rows, _Rows(stage)))
+
+
+class _Concurrently(pygrain.IterDataset):
+    """`step` over each of a stream's records, `threads` of them at once on a pool of the stage's
+    own, delivered in the order they were read (`Fetch.threads`)."""
+
+    def __init__(self, parent: pygrain.IterDataset, step: _Rows, threads: int):
+        super().__init__(parent)
+        self._rows, self._step, self._threads = parent, step, threads
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        return _ConcurrentIterator(self._rows.__iter__(), self._step, self._threads)
+
+
+class _ConcurrentIterator(pygrain.DatasetIterator):
+    """Reads up to `threads` records ahead, each running on the pool. Its position is its parent's
+    before the oldest record it has read and not delivered, so a restore reads those again."""
+
+    def __init__(self, parent: pygrain.DatasetIterator, step: _Rows, threads: int):
+        super().__init__(parent)
+        self._rows, self._step, self._threads = parent, step, threads
+        self._pool = concurrent.futures.ThreadPoolExecutor(threads, thread_name_prefix="dew-step")
+        self._pending: collections.deque[tuple[Mapping[str, object], concurrent.futures.Future]] = (
+            collections.deque())
+        self._ended = False
+
+    def _fill(self) -> None:
+        while not self._ended and len(self._pending) < self._threads:
+            before = self._rows.get_state()
+            try:
+                element = next(self._rows)
+            except StopIteration:
+                self._ended = True
+                return
+            self._pending.append((before, self._pool.submit(self._step, element)))
+
+    def __next__(self):
+        self._fill()
+        if not self._pending:
+            raise StopIteration
+        _, done = self._pending.popleft()
+        return done.result()
+
+    def get_state(self) -> Mapping[str, object]:
+        return self._pending[0][0] if self._pending else self._rows.get_state()
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        for _, running in self._pending:
+            running.cancel()
+        self._pending.clear()
+        self._ended = False
+        self._rows.set_state(state)
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=False, cancel_futures=True)
+        self._pending.clear()
+        self._rows.close()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1080,7 +1140,11 @@ class _Build:
         partition: DataPartition, at: int,
     ) -> Rows:
         lowered = _Rows(stage)
-        if isinstance(stage, FlatMap):
+        threads = stage.step.threads if isinstance(stage, Map) and isinstance(stage.step, Fetch) else None
+        if threads is not None:
+            # A step with a pool of its own: its records in flight at once, delivered in order.
+            rows = _Concurrently(_as_iter(rows, self.loading), lowered, threads)
+        elif isinstance(stage, FlatMap):
             rows = _expanded(_as_iter(rows, self.loading), stage, _name(pipeline), _label(pipeline))
         elif isinstance(stage, RandomMap):
             rows = rows.random_map(lowered, seed=self.stage_seed(pipeline, at, partition))
