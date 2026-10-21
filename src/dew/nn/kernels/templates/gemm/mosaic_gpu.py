@@ -428,6 +428,10 @@ def _gmm_pipeline(tiles: Tiles, transpose_rhs: bool, steps: int, side_axes: tupl
     )
 
 
+_TGMM_IN_FLIGHT = 1
+"""The MMAs the cooperative `tgmm` keeps in flight while it prepares the next stage."""
+
+
 def _meet(halves) -> None:
     """Dew: the two consumer warpgroups wait for each other at `halves`, two barriers of two arrivals, in
     turn: neither arrives at a barrier's next phase before the other has seen its last, however the meets
@@ -670,8 +674,8 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                     staged(indices[0], lhs_smem, rhs_smem, side_smems)
                     if not exact_sums:
                         product(lhs_smem, rhs_smem, carry)
-                        # One MMA in flight: the next stage is prepared while this one runs.
-                        plgpu.wgmma_wait(1)
+                        # MMAs in flight: the next stage is prepared while this one runs.
+                        plgpu.wgmma_wait(_TGMM_IN_FLIGHT)
                         return carry
 
                     def step_scope(step_ref):
@@ -742,16 +746,17 @@ def _tgmm_pipeline(tiles: Tiles, side_axes: tuple, body, context, steps):
     def side_spec(axes):
         return plgpu.BlockSpec(tuple(extent[axis] for axis in axes),
                                lambda step: tuple(step if axis == 'rows' else 0 for axis in axes),
-                               memory_space=plgpu.SMEM, delay_release=1)
+                               memory_space=plgpu.SMEM, delay_release=_TGMM_IN_FLIGHT)
 
     return plgpu.emit_pipeline_warp_specialized(
         body,
         grid=(steps,),
         memory_registers=40,
         in_specs=[plgpu.BlockSpec((tiles.block_k, tiles.block_m), lambda step: (step, 0),
-                                  memory_space=plgpu.SMEM, delay_release=1),
+                                  memory_space=plgpu.SMEM, delay_release=_TGMM_IN_FLIGHT),
                   plgpu.BlockSpec((tiles.block_k, tiles.block_n), lambda step: (step, 0),
-                                  memory_space=plgpu.SMEM, delay_release=1, collective_axes=_shared(tiles)),
+                                  memory_space=plgpu.SMEM, delay_release=_TGMM_IN_FLIGHT,
+                                  collective_axes=_shared(tiles)),
                   *(side_spec(axes) for axes in side_axes)],
         wg_axis="wg",
         num_compute_wgs=2,
