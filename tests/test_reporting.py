@@ -272,9 +272,9 @@ def test_the_panel_names_a_lower_bound_utilization_and_its_uncounted_kernels_wit
     as lower bounds beside how many launches went uncounted: the panel shows them as `hfu ≥` and
     `hlo_flops_util ≥` and the count as `uncounted kernels`, each whole within the name column, where
     the metrics' own names would be cut."""
-    from dew.training.display import TrainingDisplay
+    from dew.training.display import TRAINER_SHOWN, TrainingDisplay
 
-    display = TrainingDisplay(total=10)
+    display = TrainingDisplay(total=10, shown=TRAINER_SHOWN)
     display.interval(1, {"train/loss": 2.0, "train/hfu_lower_bound": 0.41,
                          "train/hlo_flops_util_lower_bound": 0.38, "train/unsized_kernels": 50.0})
     names = {row.name: group for group, row in display.rows()}
