@@ -284,7 +284,9 @@ def _reads_alike(original: Source, rebuilt: Source, where: str) -> str | None:
     settings, as a run's record is written where its data may not be."""
     try:
         same = json_value(original.fingerprint(), where) == json_value(rebuilt.fingerprint(), where)
-    except FileNotFoundError:
+    except FileNotFoundError as missing:
+        _log.info("%s (%s) is not here, so its record is its settings: %s", where, original.describe(),
+                  missing)
         return None
     return None if same else f"{where} reads back other records"
 
@@ -306,9 +308,10 @@ def _same(original: object, rebuilt: object, where: str, *, sequences: bool = Fa
     every level, a tuple a tuple and a list a list, an array of the same dtype and values, a
     function of the same code over the same values, a class or a method of the same object. With
     `sequences`, a value or a dataclass's field may be any sequence where it was another, as a
-    store's settings may, and so may the settings of the dataclasses a sequence or mapping holds
-    (`_settings`), but anything else they hold keeps its own types. A value no record carries is
-    refused."""
+    store's settings may, and so may the settings of the dataclasses a sequence or mapping holds,
+    as a concatenation's stores are, but anything else they hold keeps its own types. A value no
+    record carries is refused."""
+
     alike = sequences and isinstance(original, (list, tuple)) and isinstance(rebuilt, (list, tuple))
     if type(original) is not type(rebuilt) and not alike:
         return f"{where} is a {type(original).__name__} and reads back a {type(rebuilt).__name__}"
@@ -338,24 +341,20 @@ def _same(original: object, rebuilt: object, where: str, *, sequences: bool = Fa
     if isinstance(original, Mapping) and isinstance(rebuilt, Mapping):
         if list(original) != list(rebuilt):
             return f"{where} reads back other keys"
-        differences = (_same(value, rebuilt[key], f"{where}[{key!r}]",
-                             sequences=sequences and _settings(value)) for key, value in original.items())
+        differences = (_same(value, rebuilt[key], f"{where}[{key!r}]", sequences=sequences
+                             and dataclasses.is_dataclass(value) and not isinstance(value, type))
+                       for key, value in original.items())
         return next((difference for difference in differences if difference is not None), None)
     if isinstance(original, (list, tuple)) and isinstance(rebuilt, (list, tuple)):
         if len(original) != len(rebuilt):
             return f"{where} reads back {len(rebuilt)} entries, not {len(original)}"
-        differences = (_same(left, right, f"{where}[{index}]", sequences=sequences and _settings(left))
+        differences = (_same(left, right, f"{where}[{index}]", sequences=sequences
+                             and dataclasses.is_dataclass(left) and not isinstance(left, type))
                        for index, (left, right) in enumerate(zip(original, rebuilt, strict=True)))
         return next((difference for difference in differences if difference is not None), None)
     if isinstance(original, (str, bytes, int, float, complex, bool, Enum, np.generic)) or original is None:
         return None if original == rebuilt else f"{where} reads back {rebuilt!r}, not {original!r}"
     raise _Unrecordable(f"{where} holds a {type(original).__name__}, which no record carries")
-
-
-def _settings(value: object) -> bool:
-    """Whether `value` is a dataclass instance, whose fields are settings a record may hold in any
-    sequence, as a concatenation's stores are."""
-    return dataclasses.is_dataclass(value) and not isinstance(value, type)
 
 
 def _read_chain(written: Mapping[str, object]) -> Pipeline:
