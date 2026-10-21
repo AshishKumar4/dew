@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Protocol
 
 import numpy as np
@@ -96,7 +97,15 @@ class Memory(Dataset):
         return _indexed_manifest(self, "memory", "memory", self.shard_rows)
 
     def metadata(self) -> Mapping[str, object]:
-        return {"rows": len(self.records("indexed"))}
+        return {"rows": len(self.records("indexed")), "count_rules": self._count_rules}
+
+    @cached_property
+    def _count_rules(self) -> list[list[int | None]]:
+        """The rules its rows' targets were counted by, read off the rows it holds."""
+        from dew.data.steps.text import count_rules
+
+        records = self.records("indexed")
+        return count_rules(records[index] for index in range(len(records)))
 
     def lengths(self) -> np.ndarray | None:
         if isinstance(self.values, Mapping) and "length" in self.values:
