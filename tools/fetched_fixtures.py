@@ -23,6 +23,7 @@ import argparse
 import hashlib
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -47,11 +48,12 @@ which marks an NPZ as one."""
 
 def fixture(path, root: Path = REPO_ROOT) -> str | None:
     """`path` as a fixture's name, relative to the checkout and under tests/fixtures/ (a pin's key), or
-    None for a file elsewhere, which no pin holds."""
-    resolved = (root / path).resolve()
-    if not resolved.is_relative_to((root / FIXTURES).resolve()):
+    None for a file elsewhere, which no pin holds. The name is the path's own, normalized but not
+    followed: a symlink at a pinned fixture's place names that fixture, not its target."""
+    named, checkout = Path(os.path.abspath(root / path)), Path(os.path.abspath(root))
+    if not named.is_relative_to(checkout / FIXTURES):
         return None
-    return resolved.relative_to(root.resolve()).as_posix()
+    return named.relative_to(checkout).as_posix()
 
 
 def pins(root: Path = REPO_ROOT) -> dict[str, dict]:

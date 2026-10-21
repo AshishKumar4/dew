@@ -60,9 +60,14 @@ def test_a_small_recording_is_committed_and_a_large_one_pinned_and_read_as_its_p
     assert not (root / LARGE).exists()
     with np.load(store.local(root / LARGE, root)) as read:
         np.testing.assert_array_equal(read["site.truth.y"], _recorded(1 << 16)["site.truth.y"])
-    # A file at a pinned fixture's place is not what the test reads: the pin's is.
+    # A file at a pinned fixture's place is not what the test reads: the pin's is, a symlink's too.
     (root / LARGE).write_bytes(small.read_bytes())
     assert store.local(LARGE, root) == large
+    (root / LARGE).unlink()
+    (tmp_path / "elsewhere.npz").write_bytes(small.read_bytes())
+    (root / LARGE).symlink_to(tmp_path / "elsewhere.npz")
+    assert store.local(LARGE, root) == large
+    (root / LARGE).unlink()
     large.write_bytes(_flipped(large.read_bytes()))
     with pytest.raises(AssertionError):
         store.local(LARGE, root)
@@ -74,7 +79,6 @@ def test_a_small_recording_is_committed_and_a_large_one_pinned_and_read_as_its_p
     assert store.pins(root) == {}
     # A recording outside tests/fixtures/ is read where it is, and none is saved there.
     elsewhere = tmp_path / "elsewhere.npz"
-    elsewhere.write_bytes(small.read_bytes())
     assert store.local(elsewhere, root) == elsewhere
     with pytest.raises(ValueError):
         _saved(store, root, "tests/../outside.npz")
