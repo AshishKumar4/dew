@@ -84,16 +84,8 @@ jobs:
       with:
         name: complexity
         path: complexity.json
-    - uses: pnpm/action-setup@v4
-      with:
-        package_json_file: site/package.json
-    - uses: actions/setup-node@v4
-      with:
-        node-version: 22
-        cache: pnpm
-        cache-dependency-path: site/pnpm-lock.yaml
-    - name: Install site dependencies
-      run: pnpm --dir site install --frozen-lockfile
+    - name: The site's toolchain and dependencies
+      uses: ./.github/actions/site
     - name: Check site content
       run: |
         node site/scripts/sync-docs.mjs --check
